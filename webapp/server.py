@@ -8397,6 +8397,12 @@ def pricing_reference_payload_matches_existing_pack(payload: dict[str, Any], exi
     return payload_signature == existing_signature
 
 
+def pricing_reference_unchanged_save_summary(storage: KqagStorage, reference_id: str, source: str, existing: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(storage, DatabaseKqagStorage):
+        return public_company_pricing_reference(existing)
+    return load_pricing_reference_pack(reference_id, source=source).public_summary()
+
+
 def pricing_reference_payload_updates_existing_pack(payload: dict[str, Any], reference_id: str) -> bool:
     if payload.get("update_existing") is not True:
         return False
@@ -13908,11 +13914,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                     return
                 existing = storage.pricing_reference_detail(reference_id, source=source) if reference_id else None
                 if existing and pricing_reference_payload_matches_existing_pack(payload, existing):
-                    pricing_reference_summary = (
-                        public_company_pricing_reference(existing)
-                        if isinstance(storage, DatabaseKqagStorage)
-                        else load_pricing_reference_pack(reference_id, source=source).public_summary()
-                    )
+                    pricing_reference_summary = pricing_reference_unchanged_save_summary(storage, reference_id, source, existing)
                     self.send_json({
                         "status": "unchanged",
                         "pricing_reference": pricing_reference_summary,
