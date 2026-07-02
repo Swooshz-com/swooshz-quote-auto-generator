@@ -1900,10 +1900,10 @@ def production_readiness_status(security_scan_status: str = "not_run_by_command"
         workspace_scoped=database_mode,
         persistent_across_restart=database_mode or bool(clean_text(read_dotenv_value(QUOTE_DATA_ROOT_ENV_NAME))),
         persistent_across_redeploy=database_mode,
-        internal_alpha_suitable=False,
+        internal_alpha_suitable=database_mode and database_artifacts and database_configured,
         production_suitable=False,
         follow_up=(
-            "Resolve generation-time profile layout/defaults from workspace database artifacts."
+            "Keep profile defaults/layout assets as workspace-owned database rows/artifacts; move uploaded profile assets to object storage for production."
             if database_mode
             else "Move mutable quote-company profiles to workspace-scoped database storage before rollout beyond local UAT."
         ),
@@ -1963,13 +1963,11 @@ def production_readiness_status(security_scan_status: str = "not_run_by_command"
     if not database_mode:
         blockers.append(readiness_blocker("local_runtime_storage", "P1", "Profiles, pricing references, and quote sessions are still using local runtime storage."))
     if not database_artifacts:
-        blockers.append(readiness_blocker("local_artifact_storage", "P1", "Generated quote artifacts and saved exports are still using local filesystem storage."))
+        blockers.append(readiness_blocker("local_artifact_storage", "P1", "Generated quote artifacts, saved exports, and profile layout assets are still using local filesystem storage."))
     if (database_mode or database_artifacts) and not database_configured:
         blockers.append(readiness_blocker("database_url_missing", "P1", "Database-backed storage mode is selected but no database URL is configured."))
     if database_scheme == "sqlite":
         blockers.append(readiness_blocker("sqlite_not_final_production", "P1", "SQLite is acceptable only as an explicitly backed-up internal-alpha/simple-hosting option, not final production storage."))
-    if database_mode:
-        blockers.append(readiness_blocker("profile_runtime_layout_dependency", "P1", "Saved database profiles still need generation-time layout/default resolution from workspace-scoped profile artifacts."))
     blockers.append(readiness_blocker(
         "legacy_job_artifact_download_authorization",
         "P1",
@@ -1995,7 +1993,7 @@ def production_readiness_status(security_scan_status: str = "not_run_by_command"
         "local_storage_dependencies_found": [
             item["id"]
             for item in blockers
-            if item["id"] in {"local_runtime_storage", "local_artifact_storage", "profile_runtime_layout_dependency"}
+            if item["id"] in {"local_runtime_storage", "local_artifact_storage"}
         ],
         "security_scan_status": clean_text(security_scan_status) or "not_run_by_command",
         "local_uat_supported": True,
@@ -6594,6 +6592,43 @@ def payload_with_workspace_quote_profile_defaults(payload: dict[str, Any]) -> di
     return resolved
 
 
+def payload_with_profile_defaults(payload: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
+    resolved = copy.deepcopy(payload)
+    defaults = profile.get("defaults") if isinstance(profile.get("defaults"), dict) else {}
+    for section in ("tax", "company", "quote_text", "signature", "rich_text"):
+        section_defaults = defaults.get(section)
+        if not isinstance(section_defaults, dict):
+            continue
+        existing = resolved.get(section)
+        if isinstance(existing, dict):
+            fill_missing_profile_defaults(existing, section_defaults)
+        elif not profile_default_value_present(existing):
+            resolved[section] = copy.deepcopy(section_defaults)
+    return resolved
+
+
+def public_database_profile_summary(profile: dict[str, Any]) -> dict[str, Any]:
+    profile_id = safe_resource_id(profile.get("id") or profile.get("label"), "")
+    label = clean_text(profile.get("label")) or profile_id or "Company Profile"
+    defaults = copy.deepcopy(profile.get("defaults")) if isinstance(profile.get("defaults"), dict) else {}
+    summary: dict[str, Any] = {
+        "id": profile_id,
+        "label": label,
+        "description": clean_text(profile.get("description")),
+        "default_pricing_reference": safe_resource_id(profile.get("default_pricing_reference"), ""),
+        "default_quote_detail_preset": "default" if defaults else "",
+        "quote_detail_presets": [],
+        "source": "company",
+    }
+    if defaults:
+        summary["quote_detail_presets"] = [{
+            "id": "default",
+            "name": label,
+            "details": defaults,
+        }]
+    return summary
+
+
 def company_profile_pack_config(profile: dict[str, Any], layout_filename: str = "", rules_filename: str = "") -> dict[str, Any]:
     profile_id = safe_resource_id(profile.get("id") or profile.get("label"), "")
     label = clean_text(profile.get("label")) or profile_id or "Company Profile"
@@ -7133,18 +7168,30 @@ class DatabaseKqagStorage:
             return cursor.rowcount > 0
 
     def list_profiles(self) -> list[dict[str, Any]]:
-        profiles = [profile_public_summary(load_profile_pack(DEFAULT_PROFILE_ID))]
-        seen_ids = {safe_resource_id(profiles[0].get("id"), "")} if profiles else set()
-        for profile in self.list_company_profiles():
-            pack_config = company_profile_pack_config(profile)
-            summary = ProfilePack(safe_resource_id(profile.get("id"), ""), PROJECT_ROOT, pack_config, source="company").public_summary()
-            if summary["id"] not in seen_ids:
-                profiles.append(summary)
-                seen_ids.add(summary["id"])
-        return profiles
+        profiles = [
+            public_database_profile_summary(profile)
+            for profile in self.list_company_profiles()
+            if safe_resource_id(profile.get("id") or profile.get("label"), "")
+        ]
+        return sorted(profiles, key=lambda item: (clean_text(item.get("label") or item.get("id")).casefold(), clean_text(item.get("id")).casefold()))
 
     def list_company_profiles(self) -> list[dict[str, Any]]:
         return self._read_payloads("kqag_profiles", "profile_id")
+
+    def profile_detail(self, profile_id: str, source: str = "") -> dict[str, Any] | None:
+        safe_id = safe_resource_id(profile_id, "")
+        if not safe_id:
+            raise ValueError("Profile id is required and may only contain letters, numbers, dashes, or underscores.")
+        requested_source = clean_text(source).lower()
+        if requested_source not in {"", "company"}:
+            return None
+        profile = self._read_payload("kqag_profiles", "profile_id", safe_id)
+        if profile is None:
+            return None
+        detail = copy.deepcopy(profile)
+        detail["id"] = safe_id
+        detail["source"] = "company"
+        return detail
 
     def save_profile(self, profile: dict[str, Any]) -> dict[str, Any]:
         profile_id = safe_resource_id(profile.get("id") or profile.get("label"), "")
@@ -7237,6 +7284,51 @@ class DatabaseKqagStorage:
                 (self.workspace_id, safe_owner_type, safe_owner_id, safe_kind, safe_filename, clean_text(content_type) or "application/octet-stream", len(content), sqlite3.Binary(content), now, now),
             )
             connection.commit()
+
+    def _read_file_artifact(self, owner_type: str, owner_id: str, artifact_kind: str) -> dict[str, Any] | None:
+        safe_owner_type = safe_resource_id(owner_type, "")
+        safe_owner_id = safe_resource_id(owner_id, "")
+        safe_kind = safe_resource_id(artifact_kind, "")
+        if not safe_owner_type or not safe_owner_id or not safe_kind:
+            return None
+        with self.connection() as connection:
+            row = connection.execute(
+                "select filename, content_type, size_bytes, content_blob from kqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+                (self.workspace_id, safe_owner_type, safe_owner_id, safe_kind),
+            ).fetchone()
+        if not row:
+            return None
+        content = bytes(row["content_blob"] or b"")
+        size = int(row["size_bytes"] or 0)
+        if not content or len(content) != size:
+            return None
+        return {
+            "filename": row["filename"],
+            "content_type": row["content_type"],
+            "size_bytes": size,
+            "content": content,
+        }
+
+    def profile_layout_artifact(self, profile_id: str) -> dict[str, Any] | None:
+        if configured_artifact_storage_mode() != "database":
+            return None
+        safe_id = safe_resource_id(profile_id, "")
+        if not safe_id:
+            return None
+        artifact = self._read_file_artifact("profile", safe_id, "quotation_layout")
+        if not artifact:
+            return None
+        content = artifact.get("content") if isinstance(artifact.get("content"), bytes) else b""
+        try:
+            validate_profile_layout_xlsx(content)
+        except ValueError:
+            return None
+        return {
+            "filename": safe_profile_pack_filename(artifact.get("filename"), "quotation-layout.xlsx", {".xlsx"}),
+            "content_type": clean_text(artifact.get("content_type")) or QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"],
+            "size_bytes": len(content),
+            "content": content,
+        }
 
     def _store_profile_pack_artifacts(self, profile_id: str, profile: dict[str, Any]) -> None:
         pack_assets = profile.get("_pack_assets") if isinstance(profile.get("_pack_assets"), dict) else {}
@@ -7568,6 +7660,11 @@ def profile_id_from_payload(payload: dict[str, Any]) -> str:
     return workspace_profile_pack_id()
 
 
+def explicit_profile_id_from_payload(payload: dict[str, Any]) -> str:
+    profile = payload.get("quote_company_profile") if isinstance(payload.get("quote_company_profile"), dict) else {}
+    return safe_resource_id(payload.get("profile_id") or profile.get("id"), "")
+
+
 def pricing_reference_id_from_payload(payload: dict[str, Any]) -> str:
     explicit_reference_id = safe_resource_id(payload.get("pricing_reference_id"), "")
     if explicit_reference_id:
@@ -7617,6 +7714,89 @@ def database_pricing_reference_detail_for_payload(payload: dict[str, Any], auth_
     if not isinstance(storage, DatabaseKqagStorage):
         return None
     return storage.pricing_reference_detail(reference_id, source="company")
+
+
+PROFILE_SELECTION_ERROR_MESSAGE = "Select a valid company profile before generating a quote."
+
+
+def database_profile_storage_for_auth_session(auth_session: dict[str, Any] | None = None) -> DatabaseKqagStorage | None:
+    if configured_storage_mode() != "database":
+        return None
+    try:
+        storage = app_storage_for_auth_session(auth_session)
+    except KqagStorageAccessError:
+        return None
+    return storage if isinstance(storage, DatabaseKqagStorage) else None
+
+
+def database_profile_detail_for_payload(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    profile_id = explicit_profile_id_from_payload(payload)
+    if not profile_id:
+        return None
+    storage = database_profile_storage_for_auth_session(auth_session)
+    if storage is None:
+        return None
+    return storage.profile_detail(profile_id, source="company")
+
+
+def database_profile_layout_artifact_for_payload(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    profile_id = explicit_profile_id_from_payload(payload)
+    if not profile_id:
+        return None
+    storage = database_profile_storage_for_auth_session(auth_session)
+    if storage is None:
+        return None
+    return storage.profile_layout_artifact(profile_id)
+
+
+def log_database_profile_resolution_block(payload: dict[str, Any], reason: str = "workspace_profile_missing_or_unavailable") -> None:
+    if configured_storage_mode() != "database":
+        return
+    write_local_log(
+        "profile_resolution_blocked",
+        {
+            "storage_mode": configured_storage_mode(),
+            "artifact_storage_mode": configured_artifact_storage_mode(),
+            "selected_profile_id_present": bool(explicit_profile_id_from_payload(payload)),
+            "reason": safe_resource_id(reason, "workspace_profile_missing_or_unavailable"),
+        },
+    )
+
+
+def profile_selection_error(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> str:
+    if configured_storage_mode() != "database":
+        return ""
+    if database_profile_detail_for_payload(payload, auth_session=auth_session) is None:
+        return PROFILE_SELECTION_ERROR_MESSAGE
+    if database_profile_layout_artifact_for_payload(payload, auth_session=auth_session) is None:
+        return PROFILE_SELECTION_ERROR_MESSAGE
+    return ""
+
+
+def payload_with_database_profile_defaults(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any]:
+    profile = database_profile_detail_for_payload(payload, auth_session=auth_session)
+    if not profile:
+        return copy.deepcopy(payload)
+    return payload_with_profile_defaults(payload, profile)
+
+
+def generation_payload_with_profile_defaults(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any]:
+    if configured_storage_mode() == "database":
+        return payload_with_database_profile_defaults(payload, auth_session=auth_session)
+    return payload_with_workspace_quote_profile_defaults(payload)
+
+
+def write_database_profile_layout_for_generation(payload: dict[str, Any], job_tmp: Path, auth_session: dict[str, Any] | None = None) -> Path | None:
+    artifact = database_profile_layout_artifact_for_payload(payload, auth_session=auth_session)
+    if not artifact:
+        return None
+    content = artifact.get("content") if isinstance(artifact.get("content"), bytes) else b""
+    if not content:
+        return None
+    filename = safe_profile_pack_filename(artifact.get("filename"), "quotation-layout.xlsx", {".xlsx"})
+    path = job_tmp / filename
+    path.write_bytes(content)
+    return path
 
 
 def runtime_pricing_reference_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -9302,6 +9482,9 @@ def validate_generation_payload(payload: dict[str, Any], auth_session: dict[str,
     pricing_reference_error = pricing_reference_selection_error(payload, auth_session=auth_session)
     if pricing_reference_error:
         errors.append(pricing_reference_error)
+    selected_profile_error = profile_selection_error(payload, auth_session=auth_session)
+    if selected_profile_error:
+        errors.append(selected_profile_error)
 
     project = payload.get("project") if isinstance(payload.get("project"), dict) else {}
     if not clean_text(payload.get("quote_date")):
@@ -12527,7 +12710,7 @@ def quote_session_profile_summary(payload: dict[str, Any], patch: dict[str, Any]
     company = payload.get("company") if isinstance(payload.get("company"), dict) else {}
     if not display_name:
         display_name = dashboard_safe_text(company.get("name"))
-    if not display_name and profile_id:
+    if not display_name and profile_id and configured_storage_mode() != "database":
         with contextlib.suppress(Exception):
             display_name = profile_prompt_summary(load_profile_pack(profile_id)).get("label", "")
     return {
@@ -13257,6 +13440,8 @@ def create_job(
     image_error = image_limit_error(payload)
     if image_error:
         return {"status": "blocked", "errors": [image_error]}
+    if normalized_type in {"generate", "generate_pdf"}:
+        payload = generation_payload_with_profile_defaults(payload, auth_session=auth_session)
     missing_details = quote_detail_missing_fields(payload)
     if missing_details:
         action_label = {
@@ -13271,6 +13456,10 @@ def create_job(
     if pricing_reference_error:
         log_database_pricing_reference_resolution_block(payload)
         return {"status": "blocked", "errors": [pricing_reference_error]}
+    profile_error = profile_selection_error(payload, auth_session=auth_session) if normalized_type in {"generate", "generate_pdf"} else ""
+    if profile_error:
+        log_database_profile_resolution_block(payload)
+        return {"status": "blocked", "errors": [profile_error]}
     resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=auth_session)
     if resolved_payload is None:
         log_database_pricing_reference_resolution_block(payload)
@@ -13322,11 +13511,13 @@ def run_quote_job(
     pdf_mode: str = "none",
     auth_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    payload = payload_with_workspace_quote_profile_defaults(payload)
+    payload = generation_payload_with_profile_defaults(payload, auth_session=auth_session)
     errors = validate_generation_payload(payload, auth_session=auth_session)
     if errors:
         if PRICING_REFERENCE_SELECTION_ERROR_MESSAGE in errors:
             log_database_pricing_reference_resolution_block(payload)
+        if PROFILE_SELECTION_ERROR_MESSAGE in errors:
+            log_database_profile_resolution_block(payload)
         return {"status": "blocked", "errors": errors}
     resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=auth_session)
     if resolved_payload is None:
@@ -13345,9 +13536,16 @@ def run_quote_job(
     if normalized_pdf_mode not in {"none", "workbook"}:
         normalized_pdf_mode = "none"
 
-    profile = load_profile_pack(profile_id_from_payload(payload))
+    if configured_storage_mode() == "database":
+        profile = database_profile_detail_for_payload(payload, auth_session=auth_session)
+        layout_template_path = write_database_profile_layout_for_generation(payload, job_tmp, auth_session=auth_session)
+        if profile is None or layout_template_path is None:
+            log_database_profile_resolution_block(payload, "workspace_profile_layout_missing_or_unavailable")
+            return {"status": "blocked", "errors": [PROFILE_SELECTION_ERROR_MESSAGE]}
+    else:
+        profile = load_profile_pack(profile_id_from_payload(payload))
+        layout_template_path = profile.quotation_layout_path
     pricing_catalog_path = pricing_catalog_path_for_payload(payload, job_tmp, auth_session=auth_session)
-    layout_template_path = profile.quotation_layout_path
     uploaded_images = save_uploaded_images(image_entries(payload), job_tmp)
     brief = payload_to_brief(payload)
     brief["_webapp"] = {

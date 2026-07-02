@@ -13,14 +13,13 @@ SAQG/KQAG remains suitable for local UAT only:
 | Gate | Verdict | Reason |
 | --- | --- | --- |
 | `local_uat_supported` | Yes | Local localhost mode, local runtime storage, seeded test setup, and current CI remain supported. |
-| `internal_alpha_ready` | No | Workspace-scoped auth/session work exists, but profile/pricing/artifact behavior can still fall back to local or globally shared resources. |
-| `production_ready` | No | Object storage, backup/restore evidence, workspace-owned profile assets, strict pricing isolation, and legacy artifact download authorization are not complete. |
+| `internal_alpha_ready` | No | Workspace-scoped auth/session work exists, but legacy downloads, AI fallback policy, local artifact mode, and backup/restore evidence still block release. |
+| `production_ready` | No | Object storage, backup/restore evidence, strict hosted logging/monitoring, and legacy artifact download authorization are not complete. |
 
 This PR does not claim production readiness. It is a release-grade security audit and release-gate review for the implementation PRs that must follow.
 
 Highest-priority blockers:
 
-- High: generation-time profile/layout resolution still uses local profile pack fallback instead of workspace-owned DB/object artifacts.
 - High: legacy `/api/jobs/{job}/files/{filename}` downloads are not bound to workspace, session, or job owner.
 - High: local AI draft fallback can create product-visible "drafted" success when remote AI is missing or failed; this must be disallowed in internal-alpha/production mode.
 - Medium: local quote-session storage and job status are local-UAT-only and not an internal-alpha ownership model.
@@ -31,9 +30,14 @@ Load Sample status: product-visible Load Sample UI/API/JS paths are gone after P
 PR #88 pricing-reference isolation update: database/platform pricing-reference
 list/detail/export/generation now resolve only workspace-owned database rows.
 Local and bundled pricing packs remain local-UAT-only behavior, not a hosted or
-internal-alpha fallback. The release gate remains closed because profile/layout
-fallback, legacy job downloads, AI draft fallback, object storage, and
-backup/restore blockers are still unresolved.
+internal-alpha fallback.
+
+PR #89 profile/layout isolation update: database/platform quote generation now
+requires the selected workspace-owned DB profile row and stored DB layout
+artifact. Missing/deleted profiles or missing layout artifacts block generation
+instead of falling back to bundled/default/local profile packs. The release gate
+remains closed because legacy job downloads, AI draft fallback, object storage,
+and backup/restore blockers are still unresolved.
 
 ## Threat Model
 
@@ -119,19 +123,19 @@ Global route controls:
 | `/callback` | GET | Public callback | No workspace unless OIDC mode | State cookie | OIDC allowlist | N/A | OIDC code/state | State check exists; logs redact callback query values. |
 | `/logout`, `/signed-out` | GET | Session optional | N/A | Current cookies | Any | N/A | Session termination | Acceptable. |
 | `/api/platform/launch` | POST | Platform token | Required in launch context | Platform user and workspace become signed session | Platform membership role mapped to local role | Exempt from CSRF by design, rate-limited | Launch token/session boundary | Acceptable shape, but not verified against live Platform repo. |
-| `/api/profiles` | GET | Required in deploy | Uses current storage workspace | N/A | Any authenticated user | N/A | Profile and pricing summaries | Pricing list is workspace-strict in DB mode after PR #88; profile fallback blockers remain. |
-| `/api/settings` | GET | Required in deploy | Uses current storage workspace | N/A | `canManageSettings` | N/A | Settings, profiles, pricing refs | Role-gated; inherits pricing/profile fallback blockers. |
+| `/api/profiles` | GET | Required in deploy | Uses current storage workspace | N/A | Any authenticated user | N/A | Profile and pricing summaries | Pricing list is workspace-strict in DB mode after PR #88; profile list is workspace-strict in DB mode after PR #89. |
+| `/api/settings` | GET | Required in deploy | Uses current storage workspace | N/A | `canManageSettings` | N/A | Settings, profiles, pricing refs | Role-gated; DB pricing/profile lists are workspace-strict after PR #88/#89. |
 | `/api/settings/pricing-references` | GET | Required in deploy | DB rows keyed by workspace | N/A | `canManagePricingReferences` | N/A | Pricing metadata | PR #88 removes local/bundled fallback in DB mode. |
 | `/api/settings/pricing-references/{id}` | GET | Required in deploy | DB rows keyed by workspace | N/A | `canManagePricingReferences` | N/A | Pricing rows/catalog | PR #88 returns not found for local/bundled/missing DB references. |
 | `/api/settings/pricing-references/{id}/export.xlsx` | GET | Required in deploy | DB rows keyed by workspace | N/A | `canManagePricingReferences` | N/A | Pricing export workbook | PR #88 exports only workspace-owned DB references. |
 | `/api/pricing-reference/template.xlsx` | GET | Required in deploy | N/A | N/A | Any authenticated user | N/A | Blank template | Acceptable. |
 | `/api/pricing-reference/validate` | POST | Required in deploy | N/A | N/A | Any authenticated user | Yes | Uploaded pricing file | Medium: validation exists, but import surface should be retested with hostile workbooks before production. |
 | `/api/settings/pricing-references/import-preview` | POST | Required in deploy | N/A until save | N/A | `canImportPricingReferences` | Yes | Uploaded pricing source and AI normalization | Medium: parser limits exist; AI import must remain privacy-minimized. |
-| `/api/settings/pricing-references` | POST | Required in deploy | Saves DB rows by workspace in DB mode | N/A | `canManagePricingReferences` | Yes | Pricing rows/catalog | Save path is workspace-scoped, but existing checks use fallback detail and local pack helper for unchanged case. |
+| `/api/settings/pricing-references` | POST | Required in deploy | Saves DB rows by workspace in DB mode | N/A | `canManagePricingReferences` | Yes | Pricing rows/catalog | Save path is workspace-scoped after PR #88, including unchanged responses. |
 | `/api/settings/pricing-references/{id}` | DELETE | Required in deploy | Deletes DB row by workspace in DB mode | N/A | `canManagePricingReferences` | Yes | Pricing reference deletion | DB delete is workspace-scoped; local mode remains local-UAT only. |
-| `/api/settings/profiles` | GET | Required in deploy | DB profiles keyed by workspace, but default profile is bundled | N/A | `canManageProfiles` | N/A | Profile metadata | High blocker: default/local profile pack remains mixed into DB list. |
+| `/api/settings/profiles` | GET | Required in deploy | DB profiles keyed by workspace | N/A | `canManageProfiles` | N/A | Profile metadata | PR #89 removes bundled/default/local profile mixing in DB mode. |
 | `/api/settings/profiles/{id}/export.json` | GET | Required in deploy | DB row export in DB mode; local helper can export pack assets in local mode | N/A | `canManageProfiles` | N/A | Profile defaults/layout assets | Medium/high depending mode: profile asset export needs object-storage ownership before internal alpha. |
-| `/api/settings/profiles` | POST | Required in deploy | Saves DB row by workspace in DB mode | N/A | `canManageProfiles` | Yes | Profile defaults/layout assets | Save is scoped; generation does not yet consume DB artifacts as source of truth. |
+| `/api/settings/profiles` | POST | Required in deploy | Saves DB row by workspace in DB mode | N/A | `canManageProfiles` | Yes | Profile defaults/layout assets | Save is scoped; DB generation consumes stored profile layout artifacts after PR #89. |
 | `/api/settings/profiles/{id}` | DELETE | Required in deploy | Deletes DB row by workspace in DB mode | N/A | `canManageProfiles` | Yes | Profile deletion | DB delete is workspace-scoped; confirm artifact cleanup in follow-up. |
 | `/api/quote-sessions` | GET | Required in deploy | DB rows keyed by workspace | Owner visibility in DB mode | Any authenticated user | N/A | Quote session summaries | DB visibility exists; local mode is not multi-user. |
 | `/api/quote-sessions/{id}` | GET | Required in deploy | DB row keyed by workspace | Owner/admin visibility in DB mode | Any authenticated user | N/A | Draft state, filenames, session metadata | DB visibility exists; local mode is local-UAT only. |
@@ -142,7 +146,7 @@ Global route controls:
 | `/api/jobs/{job}/files/{filename}` | GET | Required in deploy | None | None | Any authenticated user | N/A | Generated XLSX/PDF direct file | High blocker: legacy download is not workspace/session/job-owner bound. |
 | `/api/line-items/normalize` | POST | Required in deploy | Uses selected pricing path in payload; DB mode attaches workspace-owned pricing detail | N/A | `canGenerateQuote` | Yes | Quote basis/line item normalization | Pricing fallback is blocked in DB mode after PR #88. |
 | `/api/draft` | POST | Required in deploy | Payload/state only | N/A | Any authenticated user today | Yes | Uploaded images/PDFs, quote details, AI draft | High for hosted mode: local fallback can return success-like draft on missing/failed AI. |
-| `/api/generate` | POST | Required in deploy | Payload/session storage may be DB-scoped | Session update through storage if supplied | Any authenticated user today | Yes | Quote generation, temp/output files | Pricing references are workspace-strict in DB mode after PR #88; profile/layout fallback remains High. |
+| `/api/generate` | POST | Required in deploy | Payload/session storage may be DB-scoped | Session update through storage if supplied | Any authenticated user today | Yes | Quote generation, temp/output files | Pricing references are workspace-strict in DB mode after PR #88; profile/layout resolution is workspace-strict after PR #89. |
 | `/api/log` | POST | Required in deploy | Current log context only | N/A | Any authenticated user | Yes | Client diagnostics | Logs are sanitized, but hosted logging/retention is not productionized. |
 | `OPTIONS *` | OPTIONS | Host guard | N/A | N/A | None | N/A | CORS preflight | Blocks CORS preflight. |
 
@@ -156,17 +160,17 @@ Fail-open and client-trusting routes:
 
 | Surface | Workspace-bound proof | Gap | Severity | Release gate |
 | --- | --- | --- | --- | --- |
-| DB profiles | `kqag_profiles` primary key includes `(workspace_id, profile_id)` (`webapp/server.py:6807`), reads use `where workspace_id = ?` (`webapp/server.py:7112`). | `DatabaseKqagStorage.list_profiles()` always prepends a bundled default profile (`webapp/server.py:7140`), and generation uses `load_profile_pack()` (`webapp/server.py:13287`). | High | Internal alpha blocker. |
+| DB profiles | `kqag_profiles` primary key includes `(workspace_id, profile_id)` and DB profile reads use the current workspace. PR #89 makes DB profile lists workspace-row-only and generation consume workspace DB profile defaults/layout artifacts. | Object storage is still missing for final production profile asset storage. | Medium | Keep regression coverage; production object-storage blocker remains. |
 | DB pricing references | `kqag_pricing_references` primary key includes `(workspace_id, reference_id)`; PR #88 list/detail/export/generation read only current-workspace DB rows. | Uploaded/reference assets still need final object-storage productionization. | Medium | Keep regression tests; production object-storage blocker remains. |
 | DB quote sessions | `kqag_quote_sessions` key includes `(workspace_id, session_id)` (`webapp/server.py:6823`), reads include workspace predicate (`webapp/server.py:7437`). | Ownerless legacy/local sessions remain local-UAT-only. Admin can view other-user sessions only under visibility conditions (`webapp/server.py:7405`). | Medium | Add tests and hosted policy before internal alpha. |
-| DB artifacts | `kqag_quote_artifacts` and `kqag_file_artifacts` keys include `workspace_id` (`webapp/server.py:6833`). | This is SQLite/BLOB mode, not final object storage. Profile file artifacts are stored but not used by generation as source of truth. | High | Internal alpha temporary exception only after backup/restore; production blocker. |
+| DB artifacts | `kqag_quote_artifacts` and `kqag_file_artifacts` keys include `workspace_id`. PR #89 uses stored profile layout artifacts for DB-mode generation. | This is SQLite/BLOB mode, not final object storage. | Medium/High | Internal alpha temporary exception only after backup/restore; production blocker. |
 | Local profile/pricing/session roots | Local roots are shared by process and company/default identifiers. | Not tenant-isolated. | High in hosted mode | Allowed only for local UAT/test harness. |
 | Platform session | `safe_platform_session_context()` requires consumed outcome, user id, workspace id, app key, and supported role (`webapp/server.py:6944`). | Live platform contract not verified in this repo; Swooshz Platform repo out of scope. | Medium | Verify in platform integration PR. |
 
 Cross-workspace leak paths:
 
 - Pricing references: PR #88 blocks DB/platform list, detail, export, and generation fallback to local/bundled pricing packs.
-- Profile layout/defaults: generation can use bundled/default/local profile layout fallback instead of workspace-owned profile assets.
+- Profile layout/defaults: PR #89 blocks database-mode generation unless the selected workspace DB profile row and DB layout artifact are present.
 - Legacy job files: any authenticated user with a valid job id and filename can request output-root files without workspace/session ownership lookup.
 
 ## Artifact Lifecycle And Security Matrix
@@ -178,7 +182,7 @@ Cross-workspace leak paths:
 | Quote-session XLSX/PDF in DB artifact mode | `kqag_quote_artifacts` | `/api/quote-sessions/{id}/download/{kind}` | Workspace/session/artifact-kind query and owner visibility through session metadata (`webapp/server.py:7355`). | SQLite/BLOB is not final object storage; backup/restore and retention not proven. | Medium/High |
 | Uploaded booth/render images | Request payload and draft session files | Stored in draft files and temp job directory | MIME from data URL/name, base64 decode, size limits (`webapp/server.py:8388`, `8422`, `12320`). | MIME sniff is partial; persistent object ownership is not final. | Medium |
 | Pricing visual assets | Local pricing pack or DB file artifacts | Export/reference rendering | Filename sanitization, image data URL parse, byte limits (`webapp/server.py:7287`). | DB artifacts are not final object storage; local pack path is shared. | Medium/High |
-| Profile layout workbook | Local profile pack or DB file artifacts | Profile export/generation | XLSX zip validation (`webapp/server.py:4728`), safe filenames (`webapp/server.py:4719`). | Generation still reads local profile pack layout path (`webapp/server.py:13287`). | High |
+| Profile layout workbook | Local profile pack in local mode; DB file artifacts in database mode | Profile export/generation | XLSX zip validation, safe filenames, workspace-scoped DB artifact lookup after PR #89. | Object storage is still missing for production storage. | Medium |
 
 Path traversal review:
 
@@ -256,7 +260,7 @@ Current fallback blockers:
 | Fallback | Evidence | Risk | Severity |
 | --- | --- | --- | --- |
 | DB pricing list/detail/export/generation local/bundled fallback | Resolved in PR #88 | Database/platform mode now returns only workspace-owned DB pricing references and blocks same-id local/bundled fallback after delete. | Resolved High |
-| Profile/layout generation local fallback | `webapp/server.py:7711`, `7762`, `13287` | Missing workspace profile assets can silently use bundled/default layout. | High |
+| Profile/layout generation local fallback | Fixed by PR #89 | Missing workspace profile assets now block database-mode generation instead of using bundled/default/local layout. | Resolved for DB/platform mode |
 | AI draft local fallback | `webapp/server.py:12152` to `12285` | Missing/failed remote AI can return `status: drafted` with local starter basis. | High in hosted/internal alpha |
 | Job/session summary local pack fallback | `webapp/server.py:12474`, `12491` | Display names can resolve through local pack loaders. Lower data impact, but still wrong product shape. | Medium |
 | Broad defensive exception handlers | `webapp/server.py:13365`, `13764`, `13803` | Mostly privacy-safe failure handling, but review each before hosted release. | Medium |
@@ -322,13 +326,13 @@ Local dependency validation results are recorded later in this document.
 | Software/Data Integrity Failures | CI validates syntax/tests and security gates, but external actions/images are not fully pinned. | Medium gap. |
 | Logging/Monitoring Failures | Privacy-safe local logging exists. Hosted monitoring, alerting, retention, and audit trail are not productionized. | Medium gap. |
 | SSRF / External Fetch Risk | OIDC and platform launch outbound URLs come from env config; AI provider requests go to configured providers. No arbitrary user-supplied URL fetch was confirmed. | Low/Medium, keep config allowlists strict. |
-| Business Logic Vulnerabilities | Mixed workspace/local profile/pricing state can influence quote generation; disabled/deleted artifact cases need tests. | High blockers remain. |
+| Business Logic Vulnerabilities | Mixed workspace/local pricing and profile generation fallbacks are fixed for DB/platform mode; disabled/deleted artifact cases still need tests. | Medium/High blockers remain. |
 
 ## Business Logic Security Findings
 
 | Scenario | Result | Severity | Required follow-up |
 | --- | --- | --- | --- |
-| Generate quote with mixed workspace profile/session state | Still possible because generation applies workspace defaults from local company store and loads profile packs through fallback resolvers. Pricing references are workspace-strict in DB mode after PR #88. | High | Generate only from workspace-owned profile artifacts in DB/platform mode and keep pricing isolation tests green. |
+| Generate quote with mixed workspace profile/session state | PR #89 makes database-mode generation use workspace-owned profile defaults/layout artifacts only. Pricing references are workspace-strict in DB mode after PR #88. | Resolved for profile/pricing; remaining artifact download risk is separate. | Keep workspace profile/pricing/session isolation tests green. |
 | Disabled/deleted pricing reference still usable | PR #88 blocks same-id local/bundled fallback after DB reference deletion. | Resolved High | Keep regression coverage while adding future disabled/reference lifecycle states. |
 | Deleted sessions/artifacts restored/exported/downloaded | DB session delete removes metadata but artifact cleanup/retention is not fully verified; legacy job files remain under output root. | Medium/High | Add artifact lifecycle cleanup/authorization tests and object-storage metadata. |
 | Edited past session leaks current/default settings | Session summary fallback can recalculate display names/defaults from current local packs; generated artifact stale logic exists but not a full historical snapshot model. | Medium | Store immutable profile/pricing snapshot metadata with session/artifacts. |
@@ -341,7 +345,7 @@ Local dependency validation results are recorded later in this document.
 | --- | --- | --- | --- | --- |
 | Critical | None confirmed in the audited source and metadata-only scans. | N/A | N/A | Keep Critical gate open for any confirmed cross-workspace private data leak, unauthorized artifact byte access, production auth bypass, committed secret, or arbitrary file read/write. |
 | High, resolved in PR #88 | DB/platform pricing references could include shared local/bundled packs. | Regression coverage in `tests/test_webapp.py` | Workspace users can no longer list/detail/export/generate from non-owned local/bundled references in DB mode. | Keep DB pricing isolation tests in the release gate. |
-| High | Profile/layout generation still resolves local/default profile packs. | `webapp/server.py:7711`, `7762`, `13287` | Missing workspace profile assets can silently use shared local/default assets. | Resolve layout/defaults from workspace DB/object artifacts only. |
+| High, resolved in PR #89 | Profile/layout generation still resolved local/default profile packs. | Regression coverage in `tests/test_webapp.py` | Missing workspace profile assets now block DB/platform generation. | Keep DB profile/layout isolation tests in the release gate; object storage remains separate. |
 | High | Legacy job-file downloads are not workspace/session-owner bound. | `webapp/server.py:13595`, `14213` | Any authenticated user with a leaked job URL can fetch generated artifacts. | Disable route in hosted modes or authorize through workspace/session artifact metadata. |
 | High | Local AI draft fallback returns product-visible drafted result when remote AI is missing/failed. | `webapp/server.py:12232`, `12274` | Hosted/internal-alpha users can receive fake success from local starter data. | Disallow fallback in internal-alpha/production; return safe failure requiring real AI/workspace data. |
 | Medium | Async job status/result is random-ID gated, not owner-bound. | `webapp/server.py:13226`, `13257`, `13598` | Leaked job IDs can expose job status/result metadata. | Store job owner/workspace or remove legacy job polling for hosted mode. |
@@ -356,7 +360,7 @@ Do not start internal alpha until all are true:
 
 - No product-visible Load Sample/sample/demo/fake seeded path exists.
 - Database/platform mode cannot list, detail, export, delete, or generate from local/bundled private-like pricing references. PR #88 satisfies this pricing-reference gate; keep it covered by regression tests.
-- Generation resolves profile defaults and layout workbook from workspace-owned profile assets.
+- Generation resolves profile defaults and layout workbook from workspace-owned profile assets. PR #89 satisfies this gate for DB/platform mode; keep it covered by regression tests.
 - Legacy `/api/jobs/{job}/files/{filename}` is disabled in hosted modes or authorized by workspace/session ownership.
 - `/api/draft` does not return local fallback success in internal-alpha mode.
 - Quote sessions and artifacts are workspace-owned, owner-aware, and restart persistent.
@@ -382,7 +386,7 @@ Do not claim production readiness until all internal-alpha gates plus these are 
 ## Recommended Implementation PR Sequence
 
 1. Pricing-reference isolation: completed in PR #88 for database/platform/deploy list/detail/export/generation fallback removal and same-id delete regression coverage.
-2. Workspace profile/layout resolution: generate quotes from workspace-scoped profile defaults and layout artifacts; fail clearly if missing.
+2. Workspace profile/layout resolution: completed in PR #89 for DB/platform mode; generation now uses workspace-scoped profile defaults/layout artifacts and fails clearly if missing.
 3. Legacy job route lockdown: disable `/api/jobs/{job}/files/{filename}` in hosted modes or route it through session-owned artifact metadata.
 4. AI fallback policy: disallow local starter draft success in internal-alpha/production; keep only test/local-UAT harness behavior.
 5. Artifact object-storage design: move generated outputs and uploaded/reference/profile assets to object storage with DB metadata and checksums.
