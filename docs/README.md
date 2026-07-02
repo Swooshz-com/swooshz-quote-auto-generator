@@ -25,6 +25,9 @@ platform concerns belong in `Swooshz-com/swooshz-platform`.
 - `docs/production-readiness-audit.md`: production-readiness verdict, storage
   surface audit, Codex Security findings, safe readiness command, and follow-up
   PR sequence before internal alpha or production hosting.
+- `docs/architecture-dead-code-fallback-audit.md`: whole-codebase architecture,
+  dead-code, local-trace, Load Sample, fallback, and docs-cleanup audit that
+  defines the stricter no-product-visible-sample direction.
 - `docs/platform-launch-mode.md`: first KQAG-side Swooshz Platform launch
   consume adapter boundary, env flags, safe consume shape, and cloud-storage
   deferral.

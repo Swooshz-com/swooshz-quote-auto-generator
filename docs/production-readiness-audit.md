@@ -6,6 +6,12 @@ Verdict: KQAG/SAQG is still local-UAT ready, but it is not ready for internal
 alpha or production hosting yet. PR #84 does not make KQAG production-ready;
 it documents the current blockers and adds a safe readiness check.
 
+Follow-up note: `docs/architecture-dead-code-fallback-audit.md` extends this
+audit with the stricter product direction that Load Sample is not part of the
+sellable product path. The first implementation PR after that audit should
+remove Load Sample from product UI/routes/JS/docs and replace test reliance
+with test-only seeded setup.
+
 This audit did not inspect private runtime data, generated customer files,
 local `.env` values, secrets, or private pricing/profile contents. It reviewed
 source, migrations, existing runbooks, the storage implementation, and a Codex
@@ -217,19 +223,22 @@ UAT until these are true:
 
 ## Recommended Follow-Up PR Sequence
 
-1. Pricing-reference isolation:
+1. Load Sample product-path removal:
+   remove Load Sample completely from product UI/routes/JS/docs and replace
+   Playwright/unit-test reliance with test-only seeded setup.
+2. Pricing-reference isolation:
    remove local private reference fallback in database/platform mode and add
    cross-workspace tests.
-2. Profile artifact/layout resolution:
+3. Profile artifact/layout resolution:
    generate quotes from workspace-scoped profile layout/default assets instead
    of local profile-pack paths.
-3. Artifact authorization / legacy job download lockdown:
+4. Artifact authorization / legacy job download lockdown:
    disable or replace legacy job-file downloads in deploy/database mode and add
    cross-user artifact tests.
-4. Storage productionization / object storage:
+5. Storage productionization / object storage:
    introduce object-storage metadata, object-key authorization, checksum
    recording, and retention hooks.
-5. Backup/restore/rollback/monitoring operations readiness:
+6. Backup/restore/rollback/monitoring operations readiness:
    add backup/restore/rollback runbooks, hosted smoke checklist, and monitoring
    requirements.
 
