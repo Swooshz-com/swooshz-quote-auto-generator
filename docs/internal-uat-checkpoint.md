@@ -41,7 +41,9 @@ Recent fixes included in this baseline:
 
 - Platform Google login.
 - Launch KQAG from Platform.
-- Load Sample.
+- Seeded local reference fixture flow, now superseded by the PR #86 direction:
+  real operator UAT should use workspace-shaped setup with private profile,
+  pricing, layout, and booth/render image imports kept outside Git.
 - Customer details.
 - Quote commercial fields: Currency, Exchange rate, Tax, and Rate.
 - AI analysis.

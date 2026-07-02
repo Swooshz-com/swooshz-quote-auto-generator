@@ -63,8 +63,8 @@ Important module surfaces inspected for this audit:
   matching stays data-driven.
 - `templates/profile/default/` and `templates/pricing-reference/`: generic local
   templates, not private company data.
-- `tests/fixtures/quote-generator/` and `fixtures/samples/`: synthetic or sample
-  fixtures used for automated/local smoke coverage only.
+- `tests/fixtures/quote-generator/`: synthetic and test-only seeded fixtures
+  used for automated coverage only.
 
 ## Runtime Data Model
 
@@ -88,7 +88,7 @@ Current storage behavior:
 - the clean runtime API can expose no pricing references, leaving the quote
   company step blocked until a valid reference is selected
 
-The repo still contains generic templates and synthetic test/sample fixtures.
+The repo still contains generic templates and synthetic test-only fixtures.
 Those are not the private-company RC data path and should not be treated as
 normal working pricing data for team testing.
 
@@ -170,8 +170,8 @@ Risks and known limitations:
   output remains the default and should be treated as the RC master output.
 - Existing local auth/deploy scaffolding is outside the internal RC path and was
   not expanded. Hosting should wait for a separate platform/security decision.
-- Sample fixtures remain available for automated and local smoke coverage, but
-  team RC should start from clean runtime data and imported private files.
+- Test-only seeded fixtures remain available for automated coverage, but team
+  RC should start from clean runtime data and imported private files.
 
 Required fixes before internal team testing:
 
