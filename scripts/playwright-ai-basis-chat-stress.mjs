@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
+import { seedQuoteDraftFromTestFixture } from "./playwright-test-seeded-setup.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const args = process.argv.slice(2);
@@ -382,9 +383,7 @@ async function main() {
       await page.locator("#newQuoteButton").click();
     }
     await page.locator("#imageIntake").waitFor({ state: "visible" });
-    await page.locator("#sampleDetailsButton:not([disabled])").waitFor({ timeout: 15000 });
-    await page.locator("#sampleDetailsButton").click();
-    await page.locator("#fileList .file-item").first().waitFor({ timeout: 15000 });
+    await seedQuoteDraftFromTestFixture(page);
     await page.locator("#sideNextButton", { hasText: "Next: Customer" }).click();
     await page.locator("#customerDetailsPanel").waitFor({ state: "visible", timeout: 15000 });
     if (!(await page.locator("#showName").inputValue()).trim()) {

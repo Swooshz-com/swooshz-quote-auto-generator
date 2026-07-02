@@ -53,12 +53,12 @@ PAYMENT_RE = re.compile(
     re.IGNORECASE,
 )
 KNOWN_SYNTHETIC_REVIEW_ALLOWLIST = {
-    ("committed-pdf-sample", "fixtures/samples/kent-group/kent-group.pdf"),
+    ("committed-pdf-sample", "tests/fixtures/quote-generator/samples/kent-group/kent-group.pdf"),
     (
         "committed-fixture-media",
         "tests/fixtures/quote-generator/pricing-references/synthetic-exhibition-fixture-pricing/pricing-catalog-images/synthetic-chip.png",
     ),
-    ("customer-sample-marker", "fixtures/samples/kent-group/sample.json"),
+    ("customer-sample-marker", "tests/fixtures/quote-generator/samples/kent-group/sample.json"),
     (
         "embedded-logo-reference",
         "tests/fixtures/quote-generator/profiles/synthetic-exhibition-fixture-template/profile.json",

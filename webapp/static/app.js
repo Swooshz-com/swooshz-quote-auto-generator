@@ -1,7 +1,6 @@
 const EMPTY_LINE_ITEMS_MESSAGE = "AI analysis will populate line items here.";
 const DEFAULT_PROFILE_ID = "";
 const DEFAULT_PRICING_REFERENCE_ID = "";
-const DEFAULT_SAMPLE_ID = "kent-group";
 const CSRF_HEADER_NAME = "X-Swooshz-CSRF";
 const LEGACY_QUOTE_PRESETS_STORAGE_KEY = "swooshz_quote_detail_presets_v1";
 const LAST_SELECTION_STORAGE_KEY = "swooshz_last_selection_v1";
@@ -70,7 +69,7 @@ const DEFAULT_BOOTH_DIMENSIONS = {
 
 const QUOTE_COPY = {
   label: "Quotation",
-  intakeSubtitle: "Drop reference images or PDFs for a real quote, or load the demo fixture for a quick test run.",
+  intakeSubtitle: "Drop reference images or PDFs for a real workspace quote.",
   dropTitle: "Drop reference images or PDFs to start",
   dropMeta: `JPG, PNG, WebP, or PDF. Up to ${MAX_REFERENCE_IMAGES} references, 12 MB each; remote AI analysis sends selected refs to the configured provider.`,
   imageNoun: "reference file",
@@ -338,7 +337,6 @@ const elements = {
   sideDrawerTitle: qs("#sideDrawerTitle"),
   sideDrawerEyebrow: qs("#sideDrawerEyebrow"),
   sideDrawerSubtitle: qs("#sideDrawerSubtitle"),
-  sampleDetailsButton: qs("#sampleDetailsButton"),
   clientName: qs("#clientName"),
   clientAttention: qs("#clientAttention"),
   clientTitle: qs("#clientTitle"),
@@ -6204,37 +6202,6 @@ function handleProfileSelectionChange() {
   syncControlStates();
 }
 
-async function setSampleDetails() {
-  if (state.isBooting || appIsBusy()) return;
-  elements.sampleDetailsButton.disabled = true;
-  try {
-    const { ok, data } = await getJson(`/api/samples/${DEFAULT_SAMPLE_ID}`);
-    if (!ok) {
-      return;
-    }
-    if (!state.profiles.length) await loadProfiles();
-    renderProfileOptions();
-    renderPresetOptions();
-    selectPricingReferenceOptionValue(firstPricingReferenceOptionValue());
-    selectPresetValue(firstAvailablePresetValue());
-    loadSelectedPreset({ silent: true });
-    updateGeneratorCopy();
-    applyQuoteDetails(data.details || {}, { partial: true });
-    state.images = Array.isArray(data.images) ? data.images.slice(0, MAX_REFERENCE_IMAGES) : [];
-    await persistSessionFiles(sessionFileRecordsFromDraft()).catch(() => {});
-    if (state.images.length) {
-      saveSessionState();
-    }
-    renderFiles();
-    setImageUploadStatus(`${state.images.length} sample reference file${state.images.length === 1 ? "" : "s"} loaded.`);
-    setWorkflowStage(state.images.length ? "ready_to_analyze" : "needs_images");
-    syncControlStates();
-  } finally {
-    elements.sampleDetailsButton.disabled = false;
-    syncControlStates();
-  }
-}
-
 function buildPayload(options = {}) {
   syncRichTextSources();
   const generator = currentGenerator();
@@ -11375,8 +11342,6 @@ function updateSidePanelNav() {
   const isBasisStep = state.activeSidePanel === "basis";
   const isOutputStep = state.activeSidePanel === "output";
   const busy = appIsBusy();
-  elements.sampleDetailsButton.hidden = state.activeSidePanel !== "images";
-  elements.sampleDetailsButton.disabled = state.isBooting || busy;
   elements.resetImagesButton.hidden = state.activeSidePanel !== "images";
   elements.clearCustomerButton.hidden = state.activeSidePanel !== "customer";
   elements.clearQuoteCompanyButton.hidden = state.activeSidePanel !== "quote_company";
@@ -11693,7 +11658,6 @@ function wireEvents() {
     }
   });
 
-  elements.sampleDetailsButton.addEventListener("click", setSampleDetails);
   elements.topbarBrandButton?.addEventListener("click", handleTopbarBrandClick);
   elements.newQuoteButton.addEventListener("click", startNewQuote);
   elements.dashboardEmptyNewQuoteButton?.addEventListener("click", startNewQuote);

@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
+import { TEST_REFERENCE_FILE_NAME, seedQuoteDraftFromTestFixture } from "./playwright-test-seeded-setup.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const args = process.argv.slice(2);
@@ -491,9 +492,7 @@ async function verifyConcurrentInitialDraftSaveUsesSingleSession(page) {
   } else {
     await page.locator("#newQuoteButton:not([disabled])").click();
   }
-  await page.locator("#sampleDetailsButton:not([disabled])").waitFor({ timeout: 15000 });
-  await page.locator("#sampleDetailsButton").click();
-  await page.locator("#fileList .file-item").first().waitFor({ timeout: 15000 });
+  await seedQuoteDraftFromTestFixture(page);
   const raceResult = await page.evaluate(async () => {
     setSidePanel("customer", { force: true });
     state.quoteSessionId = "";
@@ -548,9 +547,7 @@ async function verifyInitialDraftSaveReservesSessionIdBeforeNetwork(page) {
   } else {
     await page.locator("#newQuoteButton:not([disabled])").click();
   }
-  await page.locator("#sampleDetailsButton:not([disabled])").waitFor({ timeout: 15000 });
-  await page.locator("#sampleDetailsButton").click();
-  await page.locator("#fileList .file-item").first().waitFor({ timeout: 15000 });
+  await seedQuoteDraftFromTestFixture(page);
   const reservation = await page.evaluate(async () => {
     setSidePanel("customer", { force: true });
     state.quoteSessionId = "";
@@ -603,9 +600,7 @@ async function verifyDashboardNewQuoteDoesNotSaveHiddenDraft(page) {
   } else {
     await page.locator("#newQuoteButton:not([disabled])").click();
   }
-  await page.locator("#sampleDetailsButton:not([disabled])").waitFor({ timeout: 15000 });
-  await page.locator("#sampleDetailsButton").click();
-  await page.locator("#fileList .file-item").first().waitFor({ timeout: 15000 });
+  await seedQuoteDraftFromTestFixture(page);
   const beforeIds = await page.evaluate(async () => {
     const beforeData = await fetch("/api/quote-sessions").then((response) => response.json());
     const ids = (beforeData.quote_sessions || []).map((session) => session.session_id);
@@ -618,9 +613,7 @@ async function verifyDashboardNewQuoteDoesNotSaveHiddenDraft(page) {
   });
   await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
   await page.locator("#newQuoteButton:not([disabled])").click();
-  await page.locator("#sampleDetailsButton:not([disabled])").waitFor({ timeout: 15000 });
-  await page.locator("#sampleDetailsButton").click();
-  await page.locator("#fileList .file-item").first().waitFor({ timeout: 15000 });
+  await seedQuoteDraftFromTestFixture(page);
   await page.locator("#sideNextButton", { hasText: "Next: Customer" }).click();
   await page.waitForFunction(() => {
     try {
@@ -796,9 +789,7 @@ async function main() {
     await page.locator("#imageIntake").waitFor({ state: "visible" });
     await expectTopbarPrimaryAction(page, "dashboard");
 
-    await page.locator("#sampleDetailsButton:not([disabled])").waitFor({ timeout: 15000 });
-    await page.locator("#sampleDetailsButton").click();
-    await page.locator("#fileList .file-item").first().waitFor({ timeout: 15000 });
+    await seedQuoteDraftFromTestFixture(page);
     const preCustomerQuoteSessionId = await currentQuoteSessionId(page);
     if (preCustomerQuoteSessionId) {
       throw new Error(`Expected dashboard draft saving to wait until Next: Customer, found ${preCustomerQuoteSessionId}.`);
@@ -828,9 +819,9 @@ async function main() {
     await page.locator('.rail-button[data-side-panel="quote_company"]:not([disabled])').waitFor({ timeout: 15000 });
     await page.locator('.rail-button[data-side-panel="quote_company"]').click();
     await page.locator("#quoteCompanyPanel").waitFor({ state: "visible" });
-    const samplePresetValue = await page.locator("#presetSelect").inputValue();
-    if (samplePresetValue !== "profile:synthetic-fixture-default") {
-      throw new Error(`Expected sample to select the synthetic fixture preset, found ${samplePresetValue}.`);
+    const seededPresetValue = await page.locator("#presetSelect").inputValue();
+    if (seededPresetValue !== "profile:synthetic-fixture-default") {
+      throw new Error(`Expected seeded setup to select the synthetic fixture preset, found ${seededPresetValue}.`);
     }
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
@@ -885,8 +876,8 @@ async function main() {
     const restoredFiles = await page.locator("#fileList .file-item").evaluateAll((items) => (
       items.map((item) => item.textContent?.trim() || "")
     ));
-    if (restoredFiles.length !== 1 || !restoredFiles[0].includes("kent-group.pdf")) {
-      throw new Error(`Expected refresh to preserve the sample PDF reference, found ${JSON.stringify(restoredFiles)}.`);
+    if (restoredFiles.length !== 1 || !restoredFiles[0].includes(TEST_REFERENCE_FILE_NAME)) {
+      throw new Error(`Expected refresh to preserve the seeded PDF reference, found ${JSON.stringify(restoredFiles)}.`);
     }
     await page.locator("#backToDashboardButton", { hasText: "Dashboard" }).click();
     await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
@@ -1064,7 +1055,7 @@ async function main() {
     }
     const currentDashboardDetail = await dashboardQuoteSessionDetail(page, currentDashboardSessionId);
     const currentDraftState = currentDashboardDetail.quote_session?.draft_state || {};
-    if (!Array.isArray(currentDraftState.images) || !currentDraftState.images.some((image) => /kent-group\.pdf/i.test(image.name || ""))) {
+    if (!Array.isArray(currentDraftState.images) || !currentDraftState.images.some((image) => image.name === TEST_REFERENCE_FILE_NAME)) {
       throw new Error(`Expected dashboard session draft state to include the reference PDF metadata, found ${JSON.stringify(currentDraftState.images || [])}.`);
     }
     if (JSON.stringify(currentDraftState).includes("data:application/pdf")) {
@@ -1093,7 +1084,7 @@ async function main() {
     const dashboardSingleSelectedShot = await screenshot(page, "dashboard-single-selected.png");
     await createDashboardSmokeSession(page, "reference-c", {
       sessionIdPrefix: "quote-4f-search-row",
-      customerName: "Kent Group Exhibition Booth",
+      customerName: "Internal Test Exhibition Booth",
       projectName: "Four Foxtrot Smoke Search",
     });
     await page.getByRole("button", { name: "Clear selected session", exact: true }).click();

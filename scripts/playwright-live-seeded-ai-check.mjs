@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
+import { TEST_REFERENCE_FILE_NAME, seedQuoteDraftFromTestFixture } from "./playwright-test-seeded-setup.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const args = process.argv.slice(2);
@@ -253,7 +254,7 @@ async function writeReport(report) {
   const logDir = path.join(root, "_logs", "browser");
   await fs.mkdir(logDir, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const reportPath = path.join(logDir, `live-sample-ai-check-${stamp}.json`);
+  const reportPath = path.join(logDir, `live-seeded-ai-check-${stamp}.json`);
   await fs.writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
   return reportPath;
 }
@@ -281,9 +282,8 @@ async function main() {
   try {
     await page.goto(baseUrl, { waitUntil: "networkidle" });
     await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
-    await page.locator("#sampleDetailsButton:not([disabled])").waitFor({ timeout: 15000 });
-    await page.locator("#sampleDetailsButton").click();
-    await page.locator("#fileList .file-item", { hasText: "kent-group.pdf" }).waitFor({ timeout: 15000 });
+    await seedQuoteDraftFromTestFixture(page);
+    await page.locator("#fileList .file-item", { hasText: TEST_REFERENCE_FILE_NAME }).waitFor({ timeout: 15000 });
 
     await page.locator('[data-side-panel="quote_company"]:not([disabled])').waitFor({ timeout: 15000 });
     await page.locator('[data-side-panel="quote_company"]').click();
@@ -325,7 +325,7 @@ async function main() {
     }, null, 2));
 
     if (report.status !== "ok") {
-      throw new Error(`Live sample AI check failed; see ${reportPath}`);
+      throw new Error(`Live seeded AI check failed; see ${reportPath}`);
     }
   } finally {
     await browser.close();

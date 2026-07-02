@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 QUOTE_GENERATOR_FIXTURE_ROOT = ROOT / "tests" / "fixtures" / "quote-generator"
 KONCEPT_PROFILE = QUOTE_GENERATOR_FIXTURE_ROOT / "profiles" / "synthetic-exhibition-fixture-template"
 KONCEPT_PRICING_REFERENCE = QUOTE_GENERATOR_FIXTURE_ROOT / "pricing-references" / "synthetic-exhibition-fixture-pricing"
+TEST_SAMPLE_ROOT = QUOTE_GENERATOR_FIXTURE_ROOT / "samples" / "kent-group"
 LEGACY_BUNDLED_PROFILE = ROOT / "profiles" / "koncept"
 LEGACY_BUNDLED_PRICING_REFERENCE = ROOT / "pricing-references" / "koncept-exhibition-quotation"
 KONCEPT_CATALOG = KONCEPT_PRICING_REFERENCE / "pricing-catalog.json"
@@ -5277,38 +5278,24 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(profile_pack.layout_rules_path, expected_layout)
         self.assertEqual(webapp.default_layout_rules_payload()["template"]["workbook"], "quotation-layout.xlsx")
 
-    def test_sample_fixture_loads_details_and_images_without_pricing_source(self):
-        raw_sample = json.loads((ROOT / "fixtures" / "samples" / "kent-group" / "sample.json").read_text(encoding="utf-8"))
-        sample = webapp.load_sample("kent-group")
+    def test_sample_fixture_is_test_only_and_not_product_loaded(self):
+        raw_sample = json.loads((TEST_SAMPLE_ROOT / "sample.json").read_text(encoding="utf-8"))
 
-        self.assertIsNotNone(sample)
         self.assertEqual(raw_sample["profile_id"], "koncept")
         self.assertEqual(raw_sample["pricing_reference_id"], "koncept-exhibition-quotation")
-        self.assertEqual(sample["profile_id"], "synthetic-exhibition-fixture-template")
-        self.assertEqual(sample["pricing_reference_id"], "synthetic-exhibition-fixture-pricing")
-        self.assertEqual(sample["details"]["project"]["title"], "RE: Kent Group Exhibition Booth")
-        self.assertEqual(sample["details"]["project"]["show_name"], "SAMPLE")
-        self.assertNotIn("booth_width", sample["details"]["project"])
-        self.assertNotIn("booth_depth", sample["details"]["project"])
-        self.assertNotIn("quote_date", sample["details"])
-        self.assertEqual(sample["details"]["project_number"], "KI-SAMPLE-001")
-        self.assertEqual(sample["details"]["rich_text"]["clientName"], "<div><strong>Kent Group</strong></div>")
-        self.assertEqual(sample["details"]["rich_text"]["clientAddress"], "<div>Singapore</div>")
-        self.assertEqual(sample["details"]["rich_text"]["clientAttention"], "<div><strong>Kent Group Team</strong></div>")
-        self.assertEqual(sample["details"]["rich_text"]["clientTitle"], "<div>Project Team</div>")
-        self.assertEqual(
-            sample["details"]["rich_text"]["projectTitle"],
-            "<div><strong>RE: Kent Group Exhibition Booth</strong></div>",
-        )
-        self.assertEqual(sample["details"]["rich_text"]["projectNumber"], "<div>KI-SAMPLE-001</div>")
-        self.assertNotIn("company", sample["details"])
-        self.assertNotIn("quote_text", sample["details"])
-        self.assertEqual(len(sample["images"]), 1)
-        self.assertEqual(sample["images"][0]["name"], "kent-group.pdf")
-        self.assertTrue(sample["images"][0]["data_url"].startswith("data:application/pdf"))
-        self.assertFalse(any(image["data_url"].startswith("data:image/") for image in sample["images"]))
-        self.assertNotIn("internal_cost", json.dumps(sample))
-        self.assertNotIn("pricing-catalog", json.dumps(sample))
+        self.assertTrue((TEST_SAMPLE_ROOT / "kent-group.pdf").is_file())
+        self.assertFalse(hasattr(webapp, "load_sample"))
+        self.assertFalse(hasattr(webapp, "list_samples"))
+        self.assertFalse(hasattr(webapp, "sample_dir"))
+        self.assertFalse(hasattr(webapp, "samples_root"))
+
+    def test_sample_product_routes_are_removed(self):
+        with LocalRunnerServer() as runner:
+            for path in ("/api/samples", "/api/samples/kent-group"):
+                with self.subTest(path=path):
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        urllib.request.urlopen(f"{runner.base_url}{path}", timeout=3)
+                    self.assertEqual(raised.exception.code, 404)
 
     def test_persist_pdf_page_debug_images_writes_review_copies_under_tmp(self):
         pages = [{
@@ -5432,7 +5419,7 @@ class WebappServerTest(unittest.TestCase):
         except Exception:
             self.skipTest("pypdfium2 is not installed in this runtime.")
 
-        pdf_path = ROOT / "fixtures" / "samples" / "kent-group" / "kent-group.pdf"
+        pdf_path = TEST_SAMPLE_ROOT / "kent-group.pdf"
         entry = {
             "name": "kent-group.pdf",
             "type": "application/pdf",
@@ -8940,8 +8927,6 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertIn("quoteSessionDraftStateCanSave()", quote_detail_change_body)
         add_images_body = js.split("async function addImagesFromFiles", 1)[1].split("function removeImageAt", 1)[0]
         self.assertNotIn("ensureQuoteSession", add_images_body)
-        sample_details_body = js.split("async function setSampleDetails", 1)[1].split("function buildPayload", 1)[0]
-        self.assertNotIn("ensureQuoteSession", sample_details_body)
         next_panel_body = js.split("async function goToNextSidePanel", 1)[1].split("function handleQuoteBasisClick", 1)[0]
         self.assertIn('nextPanel === "customer"', next_panel_body)
         self.assertIn("startQuoteSessionDraftSaveAfterCustomerStep", next_panel_body)
@@ -9269,7 +9254,6 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
             "sideDownloadButton",
             "newQuoteButton",
             "imageIntake",
-            "sampleDetailsButton",
             "matchSummary",
             "pricingReviewMessages",
             "pricingEmptyState",
@@ -9346,8 +9330,14 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertNotIn('id="workflowStage"', html)
         self.assertNotIn('id="busyText"', html)
         self.assertNotIn("Run AI Analysis", html)
-        self.assertIn("Load Sample", html)
-        self.assertIn('id="sampleDetailsButton" disabled', html)
+        self.assertNotIn("Load Sample", html)
+        self.assertNotIn('id="sampleDetailsButton"', html)
+        self.assertNotIn("sampleDetailsButton", js)
+        self.assertNotIn("setSampleDetails", js)
+        self.assertNotIn("/api/samples", js)
+        self.assertNotIn("DEFAULT_SAMPLE_ID", js)
+        self.assertNotIn("load the demo fixture", js)
+        self.assertNotIn("load the sample fixture", html)
         self.assertNotIn("sample-start-card", html)
         self.assertIn("renderMatchSummary", js)
         self.assertIn("LEGACY_QUOTE_PRESETS_STORAGE_KEY", js)
@@ -9521,13 +9511,11 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertNotIn('`<optgroup label="Profile Actions">', js)
         self.assertNotIn("Save Profile", html)
         self.assertNotIn('class="company-preset-control-group" hidden', html)
-        self.assertLess(html.index('id="sampleDetailsButton"'), html.index('id="imageIntake"'))
         self.assertLess(html.index('id="clearCustomerButton"'), html.index('id="customerDetailsPanel"'))
         self.assertLess(html.index('id="clearQuoteCompanyButton"'), html.index('id="quoteCompanyPanel"'))
         self.assertGreater(html.index('id="profileSelect"'), html.index('id="imageInput"'))
         self.assertLess(html.index('id="profileSelect"'), html.index('id="clientName"'))
         self.assertLess(html.index('id="profileSelect"'), html.index('id="clientName"'))
-        self.assertLess(html.index('id="sampleDetailsButton"'), html.index('id="imageInput"'))
         self.assertGreater(html.index('id="presetSelect"'), html.index('id="quoteCompanyPanel"'))
         self.assertLess(html.index('id="clientName"'), html.index('id="clientAddress"'))
         self.assertLess(html.index('id="clientAddress"'), html.index('id="clientAttention"'))
@@ -9652,9 +9640,10 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertIn("syncRichTextSources", js)
         self.assertIn("startAnalysisBlockReason", js)
         self.assertIn("state.isBooting", js)
-        self.assertIn("if (state.isBooting || appIsBusy()) return;", js)
+        self.assertIn("if (state.isBooting) return;", js)
+        self.assertIn("if (appIsBusy()) return;", js)
         self.assertIn("state.isPreparingOutput", js)
-        self.assertIn("if (!state.profiles.length) await loadProfiles();", js)
+        self.assertIn("await loadProfiles();", js)
         self.assertIn("Complete Customer details before starting analysis", js)
         self.assertIn("Complete Quote Company details before starting analysis", js)
         self.assertIn("Complete Customer details before opening Quote Company", js)
@@ -9782,19 +9771,15 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertNotIn(".side-workspace.is-open", css)
 
         initial_values_body = js.split("async function setInitialValues()", 1)[1].split("async function boot()", 1)[0]
-        profile_change_body = js.split("function handleProfileSelectionChange()", 1)[1].split("async function setSampleDetails()", 1)[0]
-        sample_loader_body = js.split("async function setSampleDetails()", 1)[1].split("function buildPayload()", 1)[0]
+        profile_change_body = js.split("function handleProfileSelectionChange()", 1)[1].split("function buildPayload(options = {})", 1)[0]
         self.assertIn("loadDefaultProfilePreset({ silent: true })", initial_values_body)
         self.assertIn("syncSelectedPricingReference();", profile_change_body)
         self.assertIn("clearGeneratedQuoteState();", profile_change_body)
         self.assertIn("syncControlStates();", profile_change_body)
         self.assertNotIn("loadDefaultProfilePreset", profile_change_body)
-        self.assertIn("selectPricingReferenceOptionValue(firstPricingReferenceOptionValue());", sample_loader_body)
-        self.assertIn("selectPresetValue(firstAvailablePresetValue());", sample_loader_body)
-        self.assertIn("loadSelectedPreset({ silent: true })", sample_loader_body)
-        self.assertNotIn("loadConfiguredProfilePreset({ silent: true })", sample_loader_body)
-        self.assertNotIn("state.profileId = data.profile_id", sample_loader_body)
-        self.assertNotIn("data.pricing_reference_id", sample_loader_body)
+        self.assertNotIn("setSampleDetails", js)
+        self.assertNotIn("DEFAULT_SAMPLE_ID", js)
+        self.assertNotIn("/api/samples", js)
 
     def test_static_mobile_ui_polish_has_responsive_header_legend_and_output_cards(self):
         static_dir = ROOT / "webapp" / "static"
@@ -9948,7 +9933,10 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertNotIn("Brazil pavilion demo", html)
         self.assertIn("Drag and drop reference images or PDFs here", html)
         self.assertIn("Quote Pricing Reference", html)
-        self.assertIn('id="sampleDetailsButton" disabled', html)
+        self.assertNotIn('id="sampleDetailsButton"', html)
+        self.assertNotIn("Load Sample", html)
+        self.assertNotIn("load the sample fixture", html)
+        self.assertNotIn("load the demo fixture", js)
         self.assertNotIn("0 loaded", html)
         self.assertNotIn('id="imageCount"', html)
         self.assertNotIn('id="profileDescription"', html)
@@ -9983,12 +9971,9 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertNotIn(".chat-form", css)
         self.assertIn("--accent: #f5c84c", css)
         self.assertNotIn(".sample-start-card", css)
-        self.assertIn(".secondary-button.sample-button", css)
         self.assertIn(".secondary-button.panel-clear-button", css)
         self.assertIn(".company-preset-panel", css)
         self.assertNotIn(".quote-company-toolbar", css)
-        self.assertLess(html.index('id="sampleDetailsButton"'), html.index('id="imageInput"'))
-        self.assertLess(html.index('id="sampleDetailsButton"'), html.index('id="imageIntake"'))
         self.assertLess(html.index('id="clearCustomerButton"'), html.index('id="customerDetailsPanel"'))
         self.assertLess(html.index('id="clearQuoteCompanyButton"'), html.index('id="quoteCompanyPanel"'))
         self.assertGreater(html.index('id="profileSelect"'), html.index('id="imageInput"'))
@@ -10031,13 +10016,13 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertNotIn("Koncept Image Pte Limited", html)
         self.assertNotIn("70% payment upon confirmation", html)
         self.assertNotIn("Francies Cheng", html)
-        self.assertIn("setSampleDetails", js)
+        self.assertNotIn("setSampleDetails", js)
         self.assertIn("function todayDateInputValue", js)
         self.assertIn("function applyDefaultQuoteDate", js)
         self.assertIn("applyDefaultQuoteDate();", js)
         self.assertIn("setInputValue(elements.quoteDate, todayDateInputValue())", js)
-        self.assertIn("/api/samples/", js)
-        self.assertIn("DEFAULT_SAMPLE_ID", js)
+        self.assertNotIn("/api/samples", js)
+        self.assertNotIn("DEFAULT_SAMPLE_ID", js)
         self.assertNotIn("Brazil Experience Pavilion - 6m x 6m Draft", js)
         self.assertNotIn("Nova Latitude Events Pte Ltd", js)
         self.assertNotIn("Koncept Image Pte Limited", js)
@@ -11895,7 +11880,7 @@ assert.ok(renderCount >= 1);
 
         self.assertNotIn("handleModalEnterKey", js)
         self.assertNotIn("visiblePrimaryModalActionButton", js)
-        keydown_body = js.split('document.addEventListener("keydown"', 1)[1].split("elements.sampleDetailsButton", 1)[0]
+        keydown_body = js.split('document.addEventListener("keydown"', 1)[1].split("elements.topbarBrandButton", 1)[0]
         self.assertNotIn('event.key === "Enter"', keydown_body)
         queue_focus_body = js.split("function queueActionButtonFocus(button)", 1)[1].split("function profileActionsMenuItems", 1)[0]
         self.assertIn("focusActionButton(button);", queue_focus_body)
@@ -12820,7 +12805,6 @@ const elements = {
   sideBackButton: { disabled: false },
   sideNextButton: button,
   sideDownloadButton: { hidden: false },
-  sampleDetailsButton: { hidden: false, disabled: false },
   resetImagesButton: { hidden: false, disabled: false },
   clearCustomerButton: { hidden: false, disabled: false },
   clearQuoteCompanyButton: { hidden: false, disabled: false },
@@ -12964,7 +12948,6 @@ const state = {
   originalOutputRows: [],
 };
 const elements = {
-  sampleDetailsButton: control(),
   resetImagesButton: control(),
   clearCustomerButton: control(),
   clearQuoteCompanyButton: control(),
@@ -13379,10 +13362,10 @@ async function loadQuoteSessionDetail() {
   return {
     session_id: "quote-legacy-output",
     customer_summary: {
-      customer_name: "Kent Group",
-      project_name: "RE: Kent Group Exhibition Booth",
-      show_name: "SAMPLE",
-      project_number: "KI-SAMPLE-001",
+      customer_name: "Internal Test Workspace",
+      project_name: "RE: Internal Test Exhibition Booth",
+      show_name: "TEST",
+      project_number: "KI-TEST-001",
     },
     draft_state: {
       version: QUOTE_SESSION_STATE_VERSION,
@@ -13390,8 +13373,8 @@ async function loadQuoteSessionDetail() {
       activeSidePanel: "output",
       quoteSessionDraftSaveStarted: true,
       quoteDetails: {
-        client: { name: "Kent Group" },
-        project: { title: "RE: Kent Group Exhibition Booth" },
+        client: { name: "Internal Test Workspace" },
+        project: { title: "RE: Internal Test Exhibition Booth" },
       },
       images: [{ name: "render.jpg", type: "image/jpeg", size: 12, data_url: "data:image/jpeg;base64,UkVOREVS" }],
       quoteBasisSections: [{ id: "surfaces", title: "Surfaces", lines: [] }],
@@ -13423,8 +13406,8 @@ eval([
   await modifyDashboardQuote("quote-legacy-output");
 
   assert.ok(appliedSnapshot);
-  assert.strictEqual(appliedSnapshot.quoteDetails.project.show_name, "SAMPLE");
-  assert.strictEqual(appliedSnapshot.quoteDetails.project_number, "KI-SAMPLE-001");
+  assert.strictEqual(appliedSnapshot.quoteDetails.project.show_name, "TEST");
+  assert.strictEqual(appliedSnapshot.quoteDetails.project_number, "KI-TEST-001");
 })().catch((error) => {
   console.error(error);
   process.exit(1);
@@ -20772,7 +20755,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
 
     def test_static_escape_closes_pricing_reference_modal_without_settings_hub(self):
         js = (ROOT / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
-        escape_handler = js.split('document.addEventListener("keydown"', 1)[1].split("elements.sampleDetailsButton", 1)[0]
+        escape_handler = js.split('document.addEventListener("keydown"', 1)[1].split("elements.topbarBrandButton", 1)[0]
 
         self.assertIn("elements.pricingReferenceModal && !elements.pricingReferenceModal.hidden", escape_handler)
         self.assertNotIn("settingsModal", escape_handler)

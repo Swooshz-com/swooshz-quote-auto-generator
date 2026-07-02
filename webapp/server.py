@@ -129,7 +129,6 @@ BUNDLED_DEFAULT_PRICING_REFERENCE_ID = discovered_default_pricing_reference_id(P
 DEFAULT_PROFILE_ID = BUNDLED_DEFAULT_PROFILE_ID
 DEFAULT_PRICING_REFERENCE_ID = BUNDLED_DEFAULT_PRICING_REFERENCE_ID
 PRICING_REFERENCE_TEMPLATE_PATH = TEMPLATES_ROOT / "pricing-reference" / "pricing-reference-template.xlsx"
-SAMPLES_ROOT = PROJECT_ROOT / "fixtures" / "samples"
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "_output" / "webapp"
 DEFAULT_TMP_ROOT = PROJECT_ROOT / "_tmp" / "webapp"
 DEFAULT_LOG_ROOT = PROJECT_ROOT / "_logs" / "app"
@@ -7573,10 +7572,6 @@ def company_config_store() -> CompanyConfigStore:
     return CompanyConfigStore()
 
 
-def samples_root() -> Path:
-    return PROJECT_ROOT / "fixtures" / "samples"
-
-
 def profile_id_from_payload(payload: dict[str, Any]) -> str:
     explicit_profile_id = safe_resource_id(payload.get("profile_id"), "")
     if explicit_profile_id:
@@ -13049,80 +13044,6 @@ def file_data_url(path: Path) -> str:
     return f"data:{content_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
 
 
-def sample_dir(sample_id: str) -> Path:
-    root = samples_root()
-    resolved_id = safe_resource_id(sample_id, "kent-group")
-    path = root / resolved_id
-    try:
-        path.resolve().relative_to(root.resolve())
-    except ValueError:
-        return root / "kent-group"
-    return path
-
-
-def list_samples() -> list[dict[str, str]]:
-    root = samples_root()
-    if not root.exists():
-        return []
-    samples: list[dict[str, str]] = []
-    for path in sorted(root.iterdir()):
-        if not path.is_dir():
-            continue
-        data = load_json_file(path / "sample.json")
-        if not data:
-            continue
-        samples.append(
-            {
-                "id": safe_resource_id(data.get("id"), path.name),
-                "label": clean_text(data.get("label")) or path.name,
-                "description": clean_text(data.get("description")),
-                "profile_id": safe_resource_id(data.get("profile_id"), DEFAULT_PROFILE_ID),
-                "pricing_reference_id": safe_resource_id(data.get("pricing_reference_id"), DEFAULT_PRICING_REFERENCE_ID),
-            }
-        )
-    return samples
-
-
-def load_sample(sample_id: str) -> dict[str, Any] | None:
-    path = sample_dir(sample_id)
-    data = load_json_file(path / "sample.json")
-    if not data:
-        return None
-    profile_id = load_profile_pack(safe_resource_id(data.get("profile_id"), DEFAULT_PROFILE_ID)).id
-    pricing_reference_id = load_pricing_reference_pack(
-        safe_resource_id(data.get("pricing_reference_id"), DEFAULT_PRICING_REFERENCE_ID)
-    ).id
-    image_entries_for_sample: list[dict[str, Any]] = []
-    raw_images = data.get("images") if isinstance(data.get("images"), list) else []
-    for index, raw_image in enumerate(raw_images, start=1):
-        relative = Path(str(raw_image or ""))
-        image_path = path / relative
-        try:
-            resolved = image_path.resolve()
-            resolved.relative_to(path.resolve())
-        except ValueError:
-            continue
-        if not resolved.exists() or not resolved.is_file():
-            continue
-        image_entries_for_sample.append(
-            {
-                "name": resolved.name,
-                "type": mimetypes.guess_type(str(resolved))[0] or "image/jpeg",
-                "size": resolved.stat().st_size,
-                "data_url": file_data_url(resolved),
-            }
-        )
-    return {
-        "id": safe_resource_id(data.get("id"), path.name),
-        "label": clean_text(data.get("label")) or path.name,
-        "description": clean_text(data.get("description")),
-        "profile_id": profile_id,
-        "pricing_reference_id": pricing_reference_id,
-        "details": data.get("details") if isinstance(data.get("details"), dict) else {},
-        "images": image_entries_for_sample,
-    }
-
-
 def utc_timestamp() -> str:
     return dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z")
 
@@ -13668,19 +13589,8 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 "company_profiles": storage.list_company_profiles(),
             })
             return
-        if path == "/api/samples":
-            self.send_json({"samples": list_samples()})
-            return
         if path == "/api/pricing-reference/template.xlsx":
             self.send_pricing_reference_template()
-            return
-        sample_match = re.fullmatch(r"/api/samples/([A-Za-z0-9_-]+)", path)
-        if sample_match:
-            sample = load_sample(sample_match.group(1))
-            if not sample:
-                self.send_json({"error": "Not found"}, status=404)
-                return
-            self.send_json(sample)
             return
         if path.startswith("/api/jobs/") and "/files/" in path:
             self.send_download(path)
