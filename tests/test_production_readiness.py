@@ -54,7 +54,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertTrue(status["internal_alpha_future_exception"]["possible"])
         blocker_ids = {item["id"] for item in status["blockers"]}
         self.assertIn("local_runtime_storage", blocker_ids)
-        self.assertIn("pricing_reference_local_pack_isolation", blocker_ids)
+        self.assertNotIn("pricing_reference_local_pack_isolation", blocker_ids)
         self.assertIn("legacy_job_artifact_download_authorization", blocker_ids)
 
     def test_readiness_command_redacts_sensitive_runtime_values(self):
@@ -137,7 +137,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertTrue(database_status["workspace_scoped"])
         self.assertIn("object_storage_missing", {item["id"] for item in database_status["blockers"]})
         self.assertIn("profile_runtime_layout_dependency", {item["id"] for item in database_status["blockers"]})
-        self.assertIn("pricing_reference_local_pack_isolation", {item["id"] for item in database_status["blockers"]})
+        self.assertNotIn("pricing_reference_local_pack_isolation", {item["id"] for item in database_status["blockers"]})
         self.assertIn("legacy_job_artifact_download_authorization", {item["id"] for item in database_status["blockers"]})
 
 

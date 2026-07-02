@@ -20,7 +20,6 @@ This PR does not claim production readiness. It is a release-grade security audi
 
 Highest-priority blockers:
 
-- High: database/platform pricing-reference list/detail/generation can still use local or bundled references outside the workspace boundary.
 - High: generation-time profile/layout resolution still uses local profile pack fallback instead of workspace-owned DB/object artifacts.
 - High: legacy `/api/jobs/{job}/files/{filename}` downloads are not bound to workspace, session, or job owner.
 - High: local AI draft fallback can create product-visible "drafted" success when remote AI is missing or failed; this must be disallowed in internal-alpha/production mode.
@@ -28,6 +27,13 @@ Highest-priority blockers:
 - Medium: docs and runbooks still include local/deploy helper paths that must be rewritten before operators treat them as the real happy path.
 
 Load Sample status: product-visible Load Sample UI/API/JS paths are gone after PR #86. No Load Sample button, product API, or Playwright smoke dependency is part of the sellable path. Remaining sample/Kent references are test-only or historical audit references.
+
+PR #88 pricing-reference isolation update: database/platform pricing-reference
+list/detail/export/generation now resolve only workspace-owned database rows.
+Local and bundled pricing packs remain local-UAT-only behavior, not a hosted or
+internal-alpha fallback. The release gate remains closed because profile/layout
+fallback, legacy job downloads, AI draft fallback, object storage, and
+backup/restore blockers are still unresolved.
 
 ## Threat Model
 
@@ -113,11 +119,11 @@ Global route controls:
 | `/callback` | GET | Public callback | No workspace unless OIDC mode | State cookie | OIDC allowlist | N/A | OIDC code/state | State check exists; logs redact callback query values. |
 | `/logout`, `/signed-out` | GET | Session optional | N/A | Current cookies | Any | N/A | Session termination | Acceptable. |
 | `/api/platform/launch` | POST | Platform token | Required in launch context | Platform user and workspace become signed session | Platform membership role mapped to local role | Exempt from CSRF by design, rate-limited | Launch token/session boundary | Acceptable shape, but not verified against live Platform repo. |
-| `/api/profiles` | GET | Required in deploy | Uses current storage workspace | N/A | Any authenticated user | N/A | Profile and pricing summaries | Risk: DB pricing list can include local/bundled shared references. |
+| `/api/profiles` | GET | Required in deploy | Uses current storage workspace | N/A | Any authenticated user | N/A | Profile and pricing summaries | Pricing list is workspace-strict in DB mode after PR #88; profile fallback blockers remain. |
 | `/api/settings` | GET | Required in deploy | Uses current storage workspace | N/A | `canManageSettings` | N/A | Settings, profiles, pricing refs | Role-gated; inherits pricing/profile fallback blockers. |
-| `/api/settings/pricing-references` | GET | Required in deploy | DB rows keyed by workspace, but list also merges local/bundled | N/A | `canManagePricingReferences` | N/A | Pricing metadata | High blocker: shared local/bundled fallback in DB mode. |
-| `/api/settings/pricing-references/{id}` | GET | Required in deploy | DB lookup first, then local/bundled fallback | N/A | `canManagePricingReferences` | N/A | Pricing rows/catalog | High blocker: detail falls through to `pricing_reference_pack_detail()`. |
-| `/api/settings/pricing-references/{id}/export.xlsx` | GET | Required in deploy | Same as detail | N/A | `canManagePricingReferences` | N/A | Pricing export workbook | High blocker: export can be built from shared fallback detail. |
+| `/api/settings/pricing-references` | GET | Required in deploy | DB rows keyed by workspace | N/A | `canManagePricingReferences` | N/A | Pricing metadata | PR #88 removes local/bundled fallback in DB mode. |
+| `/api/settings/pricing-references/{id}` | GET | Required in deploy | DB rows keyed by workspace | N/A | `canManagePricingReferences` | N/A | Pricing rows/catalog | PR #88 returns not found for local/bundled/missing DB references. |
+| `/api/settings/pricing-references/{id}/export.xlsx` | GET | Required in deploy | DB rows keyed by workspace | N/A | `canManagePricingReferences` | N/A | Pricing export workbook | PR #88 exports only workspace-owned DB references. |
 | `/api/pricing-reference/template.xlsx` | GET | Required in deploy | N/A | N/A | Any authenticated user | N/A | Blank template | Acceptable. |
 | `/api/pricing-reference/validate` | POST | Required in deploy | N/A | N/A | Any authenticated user | Yes | Uploaded pricing file | Medium: validation exists, but import surface should be retested with hostile workbooks before production. |
 | `/api/settings/pricing-references/import-preview` | POST | Required in deploy | N/A until save | N/A | `canImportPricingReferences` | Yes | Uploaded pricing source and AI normalization | Medium: parser limits exist; AI import must remain privacy-minimized. |
@@ -134,16 +140,16 @@ Global route controls:
 | `/api/jobs` | POST | Required in deploy | Auth session passed to worker | No job owner stored in `JOBS` | Any authenticated user; generation checks later | Yes | Async draft/generate jobs | Medium: job status/result is random-ID gated, not owner-bound. |
 | `/api/jobs/{job}` | GET | Required in deploy | None | None | Any authenticated user | N/A | Job status/result/files | Medium: in-memory job result is not session/workspace-owned. |
 | `/api/jobs/{job}/files/{filename}` | GET | Required in deploy | None | None | Any authenticated user | N/A | Generated XLSX/PDF direct file | High blocker: legacy download is not workspace/session/job-owner bound. |
-| `/api/line-items/normalize` | POST | Required in deploy | Uses selected pricing path in payload | N/A | `canGenerateQuote` | Yes | Quote basis/line item normalization | Inherits pricing fallback risk. |
+| `/api/line-items/normalize` | POST | Required in deploy | Uses selected pricing path in payload; DB mode attaches workspace-owned pricing detail | N/A | `canGenerateQuote` | Yes | Quote basis/line item normalization | Pricing fallback is blocked in DB mode after PR #88. |
 | `/api/draft` | POST | Required in deploy | Payload/state only | N/A | Any authenticated user today | Yes | Uploaded images/PDFs, quote details, AI draft | High for hosted mode: local fallback can return success-like draft on missing/failed AI. |
-| `/api/generate` | POST | Required in deploy | Payload/session storage may be DB-scoped | Session update through storage if supplied | Any authenticated user today | Yes | Quote generation, temp/output files | High: profile/pricing generation still resolves local fallback assets. |
+| `/api/generate` | POST | Required in deploy | Payload/session storage may be DB-scoped | Session update through storage if supplied | Any authenticated user today | Yes | Quote generation, temp/output files | Pricing references are workspace-strict in DB mode after PR #88; profile/layout fallback remains High. |
 | `/api/log` | POST | Required in deploy | Current log context only | N/A | Any authenticated user | Yes | Client diagnostics | Logs are sanitized, but hosted logging/retention is not productionized. |
 | `OPTIONS *` | OPTIONS | Host guard | N/A | N/A | None | N/A | CORS preflight | Blocks CORS preflight. |
 
 Fail-open and client-trusting routes:
 
 - `/api/jobs/{job}` and `/api/jobs/{job}/files/{filename}` trust the random job id rather than workspace/session ownership.
-- `/api/generate` accepts payload-selected `profile_id`, `pricing_reference_id`, and pricing reference source; validation checks existence, but existence can be satisfied by local/bundled fallback.
+- `/api/generate` accepts payload-selected `profile_id`; profile existence can still be satisfied by local/bundled fallback. Pricing reference validation is workspace-strict in DB mode after PR #88.
 - `/api/draft` can produce local fallback draft data when remote AI is missing or failed.
 
 ## Workspace And Tenant Isolation Matrix
@@ -151,7 +157,7 @@ Fail-open and client-trusting routes:
 | Surface | Workspace-bound proof | Gap | Severity | Release gate |
 | --- | --- | --- | --- | --- |
 | DB profiles | `kqag_profiles` primary key includes `(workspace_id, profile_id)` (`webapp/server.py:6807`), reads use `where workspace_id = ?` (`webapp/server.py:7112`). | `DatabaseKqagStorage.list_profiles()` always prepends a bundled default profile (`webapp/server.py:7140`), and generation uses `load_profile_pack()` (`webapp/server.py:13287`). | High | Internal alpha blocker. |
-| DB pricing references | `kqag_pricing_references` primary key includes `(workspace_id, reference_id)` (`webapp/server.py:6815`). | DB list merges workspace rows with `list_local_pricing_references()` and `list_bundled_pricing_references()` (`webapp/server.py:7180`), and detail falls through to `pricing_reference_pack_detail()` (`webapp/server.py:7223`). | High | Internal alpha blocker. |
+| DB pricing references | `kqag_pricing_references` primary key includes `(workspace_id, reference_id)`; PR #88 list/detail/export/generation read only current-workspace DB rows. | Uploaded/reference assets still need final object-storage productionization. | Medium | Keep regression tests; production object-storage blocker remains. |
 | DB quote sessions | `kqag_quote_sessions` key includes `(workspace_id, session_id)` (`webapp/server.py:6823`), reads include workspace predicate (`webapp/server.py:7437`). | Ownerless legacy/local sessions remain local-UAT-only. Admin can view other-user sessions only under visibility conditions (`webapp/server.py:7405`). | Medium | Add tests and hosted policy before internal alpha. |
 | DB artifacts | `kqag_quote_artifacts` and `kqag_file_artifacts` keys include `workspace_id` (`webapp/server.py:6833`). | This is SQLite/BLOB mode, not final object storage. Profile file artifacts are stored but not used by generation as source of truth. | High | Internal alpha temporary exception only after backup/restore; production blocker. |
 | Local profile/pricing/session roots | Local roots are shared by process and company/default identifiers. | Not tenant-isolated. | High in hosted mode | Allowed only for local UAT/test harness. |
@@ -159,7 +165,7 @@ Fail-open and client-trusting routes:
 
 Cross-workspace leak paths:
 
-- Pricing references: one workspace can list, inspect, export, or generate with local/bundled pricing references present on the host when DB/platform mode falls through to global local pack resolution.
+- Pricing references: PR #88 blocks DB/platform list, detail, export, and generation fallback to local/bundled pricing packs.
 - Profile layout/defaults: generation can use bundled/default/local profile layout fallback instead of workspace-owned profile assets.
 - Legacy job files: any authenticated user with a valid job id and filename can request output-root files without workspace/session ownership lookup.
 
@@ -249,7 +255,7 @@ Current fallback blockers:
 
 | Fallback | Evidence | Risk | Severity |
 | --- | --- | --- | --- |
-| DB pricing list/detail local/bundled fallback | `webapp/server.py:7180`, `7223` | Workspace users can see/use shared host pricing packs. | High |
+| DB pricing list/detail/export/generation local/bundled fallback | Resolved in PR #88 | Database/platform mode now returns only workspace-owned DB pricing references and blocks same-id local/bundled fallback after delete. | Resolved High |
 | Profile/layout generation local fallback | `webapp/server.py:7711`, `7762`, `13287` | Missing workspace profile assets can silently use bundled/default layout. | High |
 | AI draft local fallback | `webapp/server.py:12152` to `12285` | Missing/failed remote AI can return `status: drafted` with local starter basis. | High in hosted/internal alpha |
 | Job/session summary local pack fallback | `webapp/server.py:12474`, `12491` | Display names can resolve through local pack loaders. Lower data impact, but still wrong product shape. | Medium |
@@ -322,8 +328,8 @@ Local dependency validation results are recorded later in this document.
 
 | Scenario | Result | Severity | Required follow-up |
 | --- | --- | --- | --- |
-| Generate quote with mixed workspace profile/pricing/session state | Possible because generation applies workspace defaults from local company store and then loads profile/pricing packs through fallback resolvers. | High | Generate only from workspace-owned profile/pricing artifacts in DB/platform mode. |
-| Disabled/deleted pricing reference still usable | DB delete removes workspace row, but bundled/local fallback by same id can still satisfy lookup. | High | Remove fallback in DB/platform mode and add deleted-reference regression tests. |
+| Generate quote with mixed workspace profile/session state | Still possible because generation applies workspace defaults from local company store and loads profile packs through fallback resolvers. Pricing references are workspace-strict in DB mode after PR #88. | High | Generate only from workspace-owned profile artifacts in DB/platform mode and keep pricing isolation tests green. |
+| Disabled/deleted pricing reference still usable | PR #88 blocks same-id local/bundled fallback after DB reference deletion. | Resolved High | Keep regression coverage while adding future disabled/reference lifecycle states. |
 | Deleted sessions/artifacts restored/exported/downloaded | DB session delete removes metadata but artifact cleanup/retention is not fully verified; legacy job files remain under output root. | Medium/High | Add artifact lifecycle cleanup/authorization tests and object-storage metadata. |
 | Edited past session leaks current/default settings | Session summary fallback can recalculate display names/defaults from current local packs; generated artifact stale logic exists but not a full historical snapshot model. | Medium | Store immutable profile/pricing snapshot metadata with session/artifacts. |
 | Cross-user dashboard visibility | DB mode owner visibility exists; ownerless sessions remain visible. | Medium | Define migration/owner policy before internal alpha. |
@@ -334,7 +340,7 @@ Local dependency validation results are recorded later in this document.
 | Severity | Finding | Evidence | Impact | Required fix |
 | --- | --- | --- | --- | --- |
 | Critical | None confirmed in the audited source and metadata-only scans. | N/A | N/A | Keep Critical gate open for any confirmed cross-workspace private data leak, unauthorized artifact byte access, production auth bypass, committed secret, or arbitrary file read/write. |
-| High | DB/platform pricing references can include shared local/bundled packs. | `webapp/server.py:7180`, `7223` | Workspace users can see/use references not owned by the workspace. | Remove local/bundled fallback in database/platform/deploy mode and test workspace isolation. |
+| High, resolved in PR #88 | DB/platform pricing references could include shared local/bundled packs. | Regression coverage in `tests/test_webapp.py` | Workspace users can no longer list/detail/export/generate from non-owned local/bundled references in DB mode. | Keep DB pricing isolation tests in the release gate. |
 | High | Profile/layout generation still resolves local/default profile packs. | `webapp/server.py:7711`, `7762`, `13287` | Missing workspace profile assets can silently use shared local/default assets. | Resolve layout/defaults from workspace DB/object artifacts only. |
 | High | Legacy job-file downloads are not workspace/session-owner bound. | `webapp/server.py:13595`, `14213` | Any authenticated user with a leaked job URL can fetch generated artifacts. | Disable route in hosted modes or authorize through workspace/session artifact metadata. |
 | High | Local AI draft fallback returns product-visible drafted result when remote AI is missing/failed. | `webapp/server.py:12232`, `12274` | Hosted/internal-alpha users can receive fake success from local starter data. | Disallow fallback in internal-alpha/production; return safe failure requiring real AI/workspace data. |
@@ -349,7 +355,7 @@ Local dependency validation results are recorded later in this document.
 Do not start internal alpha until all are true:
 
 - No product-visible Load Sample/sample/demo/fake seeded path exists.
-- Database/platform mode cannot list, detail, export, delete, or generate from local/bundled private-like pricing references.
+- Database/platform mode cannot list, detail, export, delete, or generate from local/bundled private-like pricing references. PR #88 satisfies this pricing-reference gate; keep it covered by regression tests.
 - Generation resolves profile defaults and layout workbook from workspace-owned profile assets.
 - Legacy `/api/jobs/{job}/files/{filename}` is disabled in hosted modes or authorized by workspace/session ownership.
 - `/api/draft` does not return local fallback success in internal-alpha mode.
@@ -375,7 +381,7 @@ Do not claim production readiness until all internal-alpha gates plus these are 
 
 ## Recommended Implementation PR Sequence
 
-1. Pricing-reference isolation: remove local/bundled fallback from database/platform/deploy mode, block deleted-reference fallback, and add cross-workspace tests.
+1. Pricing-reference isolation: completed in PR #88 for database/platform/deploy list/detail/export/generation fallback removal and same-id delete regression coverage.
 2. Workspace profile/layout resolution: generate quotes from workspace-scoped profile defaults and layout artifacts; fail clearly if missing.
 3. Legacy job route lockdown: disable `/api/jobs/{job}/files/{filename}` in hosted modes or route it through session-owned artifact metadata.
 4. AI fallback policy: disallow local starter draft success in internal-alpha/production; keep only test/local-UAT harness behavior.

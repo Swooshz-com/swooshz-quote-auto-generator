@@ -1921,7 +1921,7 @@ def production_readiness_status(security_scan_status: str = "not_run_by_command"
         internal_alpha_suitable=database_mode and database_configured,
         production_suitable=False,
         follow_up=(
-            "Keep company pricing references workspace-scoped and remove local JSON fallback for database-only references."
+            "Keep pricing references imported or seeded as workspace-owned database rows; move uploaded/reference assets to object storage for production."
             if database_mode
             else "Move mutable pricing references and uploaded/imported assets to workspace-scoped database/object storage."
         ),
@@ -1970,11 +1970,6 @@ def production_readiness_status(security_scan_status: str = "not_run_by_command"
         blockers.append(readiness_blocker("sqlite_not_final_production", "P1", "SQLite is acceptable only as an explicitly backed-up internal-alpha/simple-hosting option, not final production storage."))
     if database_mode:
         blockers.append(readiness_blocker("profile_runtime_layout_dependency", "P1", "Saved database profiles still need generation-time layout/default resolution from workspace-scoped profile artifacts."))
-    blockers.append(readiness_blocker(
-        "pricing_reference_local_pack_isolation",
-        "P1",
-        "High security finding: database/platform pricing-reference mode can include local private packs across workspaces until local fallback is removed.",
-    ))
     blockers.append(readiness_blocker(
         "legacy_job_artifact_download_authorization",
         "P1",
@@ -7179,12 +7174,7 @@ class DatabaseKqagStorage:
 
     def list_pricing_references(self) -> list[dict[str, Any]]:
         company_references = [public_company_pricing_reference(reference) for reference in self._read_payloads("kqag_pricing_references", "reference_id")]
-        references_by_key: dict[tuple[str, str], dict[str, Any]] = {}
-        for reference in company_references + list_local_pricing_references() + list_bundled_pricing_references():
-            key = (clean_text(reference.get("source")) or "bundled", safe_resource_id(reference.get("id"), ""))
-            if key[1]:
-                references_by_key[key] = reference
-        return sorted(references_by_key.values(), key=lambda item: (clean_text(item.get("label") or item.get("id")).casefold(), clean_text(item.get("source")).casefold(), clean_text(item.get("id")).casefold()))
+        return sorted(company_references, key=lambda item: (clean_text(item.get("label") or item.get("id")).casefold(), clean_text(item.get("source")).casefold(), clean_text(item.get("id")).casefold()))
 
     def save_pricing_reference(self, reference: dict[str, Any]) -> dict[str, Any]:
         reference_id = safe_resource_id(reference.get("id") or reference.get("label"), "")
@@ -7210,17 +7200,16 @@ class DatabaseKqagStorage:
         if not safe_id:
             raise ValueError("Pricing reference id is required and may only contain letters, numbers, dashes, or underscores.")
         requested_source = clean_text(source).lower()
-        if requested_source in {"", "company"}:
-            reference = self._read_payload("kqag_pricing_references", "reference_id", safe_id)
-            if reference is not None:
-                detail = public_company_pricing_reference(reference)
-                items = [dict(item) for item in (reference.get("items") if isinstance(reference.get("items"), list) else []) if isinstance(item, dict)]
-                ensure_pricing_reference_order_fields(items)
-                detail.update({"schema_version": int(parse_pricing_number(reference.get("schema_version")) or 1), "items": sorted_pricing_reference_items(items), "item_count": len(items)})
-                return detail
-            if requested_source == "company":
-                return None
-        return pricing_reference_pack_detail(safe_id, source=requested_source)
+        if requested_source not in {"", "company"}:
+            return None
+        reference = self._read_payload("kqag_pricing_references", "reference_id", safe_id)
+        if reference is None:
+            return None
+        detail = public_company_pricing_reference(reference)
+        items = [dict(item) for item in (reference.get("items") if isinstance(reference.get("items"), list) else []) if isinstance(item, dict)]
+        ensure_pricing_reference_order_fields(items)
+        detail.update({"schema_version": int(parse_pricing_number(reference.get("schema_version")) or 1), "items": sorted_pricing_reference_items(items), "item_count": len(items)})
+        return detail
 
     def pricing_reference_export_xlsx(self, reference_id: str, source: str = "") -> tuple[str, bytes] | None:
         detail = self.pricing_reference_detail(reference_id, source=source)
@@ -7600,12 +7589,34 @@ def pricing_reference_source_from_payload(payload: dict[str, Any]) -> str:
     return source if source in {"bundled", "company", "local"} else ""
 
 
+def explicit_pricing_reference_id_from_payload(payload: dict[str, Any]) -> str:
+    reference = pricing_reference_payload(payload)
+    return safe_resource_id(payload.get("pricing_reference_id") or reference.get("id"), "")
+
+
 def pricing_reference_company_id_from_payload(payload: dict[str, Any]) -> str:
     reference = pricing_reference_payload(payload)
     workspace = default_runtime_workspace()
     workspace_company = workspace.get("company") if isinstance(workspace.get("company"), dict) else {}
     fallback = safe_company_id(workspace_company.get("id"), DEFAULT_COMPANY_ID)
     return safe_company_id(reference.get("company_id") or payload.get("company_id"), fallback)
+
+
+def database_pricing_reference_detail_for_payload(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    if configured_storage_mode() != "database":
+        return None
+    reference_id = explicit_pricing_reference_id_from_payload(payload)
+    if not reference_id:
+        return None
+    if pricing_reference_source_from_payload(payload) not in {"", "company"}:
+        return None
+    try:
+        storage = app_storage_for_auth_session(auth_session)
+    except KqagStorageAccessError:
+        return None
+    if not isinstance(storage, DatabaseKqagStorage):
+        return None
+    return storage.pricing_reference_detail(reference_id, source="company")
 
 
 def runtime_pricing_reference_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -7639,7 +7650,37 @@ def runtime_pricing_catalog_payload_for_payload(payload: dict[str, Any]) -> dict
     return pricing_reference_catalog_payload(reference) if reference else None
 
 
-def selected_pricing_reference_is_resolved(payload: dict[str, Any]) -> bool:
+PRICING_REFERENCE_SELECTION_ERROR_MESSAGE = "Select a valid pricing reference before generating a quote."
+
+
+def log_database_pricing_reference_resolution_block(payload: dict[str, Any], reason: str = "workspace_reference_missing_or_unavailable") -> None:
+    if configured_storage_mode() != "database":
+        return
+    write_local_log(
+        "pricing_reference_resolution_blocked",
+        {
+            "storage_mode": "database",
+            "source": pricing_reference_source_from_payload(payload) or "unspecified",
+            "reason": safe_resource_id(reason, "workspace_reference_missing_or_unavailable"),
+        },
+    )
+
+
+def payload_with_database_pricing_reference_detail(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    if configured_storage_mode() != "database":
+        return payload
+    pricing_detail = database_pricing_reference_detail_for_payload(payload, auth_session=auth_session)
+    if pricing_detail is None:
+        return None
+    next_payload = copy.deepcopy(payload)
+    next_payload["pricing_reference_id"] = safe_resource_id(pricing_detail.get("id"), "")
+    next_payload["pricing_reference"] = pricing_detail
+    return next_payload
+
+
+def selected_pricing_reference_is_resolved(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> bool:
+    if configured_storage_mode() == "database":
+        return database_pricing_reference_detail_for_payload(payload, auth_session=auth_session) is not None
     reference_id = pricing_reference_id_from_payload(payload)
     if not reference_id:
         return False
@@ -7650,11 +7691,18 @@ def selected_pricing_reference_is_resolved(payload: dict[str, Any]) -> bool:
     return pack.id == reference_id and bool(pack.config)
 
 
-def pricing_reference_selection_error(payload: dict[str, Any]) -> str:
-    return "" if selected_pricing_reference_is_resolved(payload) else "Select a valid pricing reference before generating a quote."
+def pricing_reference_selection_error(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> str:
+    return "" if selected_pricing_reference_is_resolved(payload, auth_session=auth_session) else PRICING_REFERENCE_SELECTION_ERROR_MESSAGE
 
 
-def pricing_catalog_path_for_payload(payload: dict[str, Any], job_tmp: Path) -> Path:
+def pricing_catalog_path_for_payload(payload: dict[str, Any], job_tmp: Path, auth_session: dict[str, Any] | None = None) -> Path:
+    if configured_storage_mode() == "database":
+        detail = database_pricing_reference_detail_for_payload(payload, auth_session=auth_session)
+        if detail is None:
+            raise ValueError("Selected pricing reference is not available.")
+        catalog_path = job_tmp / "pricing-catalog.json"
+        catalog_path.write_text(json.dumps(pricing_reference_catalog_payload(detail), indent=2), encoding="utf-8")
+        return catalog_path
     runtime_catalog = runtime_pricing_catalog_payload_for_payload(payload)
     if runtime_catalog is None:
         return pricing_reference_pack_for_payload(payload).pricing_catalog_path
@@ -9239,7 +9287,7 @@ def quote_detail_missing_fields(payload: dict[str, Any]) -> list[str]:
     return missing
 
 
-def validate_generation_payload(payload: dict[str, Any]) -> list[str]:
+def validate_generation_payload(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> list[str]:
     errors: list[str] = []
     if not image_entries(payload):
         errors.append(MISSING_IMAGES_MESSAGE)
@@ -9251,7 +9299,7 @@ def validate_generation_payload(payload: dict[str, Any]) -> list[str]:
     missing_details = quote_detail_missing_fields(payload)
     if missing_details:
         errors.append(f"Fill quote details before generating: {', '.join(missing_details)}.")
-    pricing_reference_error = pricing_reference_selection_error(payload)
+    pricing_reference_error = pricing_reference_selection_error(payload, auth_session=auth_session)
     if pricing_reference_error:
         errors.append(pricing_reference_error)
 
@@ -13219,9 +13267,15 @@ def create_job(
             "status": "blocked",
             "errors": [f"Fill quote details before {action_label}: {', '.join(missing_details)}."],
         }
-    pricing_reference_error = pricing_reference_selection_error(payload)
+    pricing_reference_error = pricing_reference_selection_error(payload, auth_session=auth_session)
     if pricing_reference_error:
+        log_database_pricing_reference_resolution_block(payload)
         return {"status": "blocked", "errors": [pricing_reference_error]}
+    resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=auth_session)
+    if resolved_payload is None:
+        log_database_pricing_reference_resolution_block(payload)
+        return {"status": "blocked", "errors": [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE]}
+    payload = resolved_payload
 
     job_id = f"job-{secrets.token_hex(6)}"
     now = utc_timestamp()
@@ -13269,9 +13323,16 @@ def run_quote_job(
     auth_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = payload_with_workspace_quote_profile_defaults(payload)
-    errors = validate_generation_payload(payload)
+    errors = validate_generation_payload(payload, auth_session=auth_session)
     if errors:
+        if PRICING_REFERENCE_SELECTION_ERROR_MESSAGE in errors:
+            log_database_pricing_reference_resolution_block(payload)
         return {"status": "blocked", "errors": errors}
+    resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=auth_session)
+    if resolved_payload is None:
+        log_database_pricing_reference_resolution_block(payload)
+        return {"status": "blocked", "errors": [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE]}
+    payload = resolved_payload
 
     output_root = output_root or configured_output_root()
     tmp_root = tmp_root or configured_tmp_root()
@@ -13285,7 +13346,7 @@ def run_quote_job(
         normalized_pdf_mode = "none"
 
     profile = load_profile_pack(profile_id_from_payload(payload))
-    pricing_catalog_path = pricing_catalog_path_for_payload(payload, job_tmp)
+    pricing_catalog_path = pricing_catalog_path_for_payload(payload, job_tmp, auth_session=auth_session)
     layout_template_path = profile.quotation_layout_path
     uploaded_images = save_uploaded_images(image_entries(payload), job_tmp)
     brief = payload_to_brief(payload)
@@ -13713,6 +13774,12 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             if not allowed:
                 self.send_json(error, status=403)
                 return
+            resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=self.current_auth_session())
+            if resolved_payload is None:
+                log_database_pricing_reference_resolution_block(payload)
+                self.send_json({"status": "blocked", "errors": [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE]}, status=400)
+                return
+            payload = resolved_payload
             self.send_json({"status": "normalized", "line_items": normalize_line_items_for_quote_basis_review(payload)})
             return
 
@@ -13751,6 +13818,21 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                     write_local_log("draft_blocked", {"errors": errors})
                     self.send_json({"status": "blocked", "errors": errors}, status=400)
                     return
+                pricing_reference_error = pricing_reference_selection_error(payload, auth_session=self.current_auth_session())
+                if pricing_reference_error:
+                    log_database_pricing_reference_resolution_block(payload)
+                    errors = safe_error_messages([pricing_reference_error])
+                    write_local_log("draft_blocked", {"errors": errors})
+                    self.send_json({"status": "blocked", "errors": errors}, status=400)
+                    return
+                resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=self.current_auth_session())
+                if resolved_payload is None:
+                    log_database_pricing_reference_resolution_block(payload)
+                    errors = safe_error_messages([PRICING_REFERENCE_SELECTION_ERROR_MESSAGE])
+                    write_local_log("draft_blocked", {"errors": errors})
+                    self.send_json({"status": "blocked", "errors": errors}, status=400)
+                    return
+                payload = resolved_payload
                 try:
                     result = draft_quote_basis(payload)
                     self.send_json(result)
