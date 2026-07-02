@@ -13710,9 +13710,14 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                     return
                 existing = storage.pricing_reference_detail(reference_id, source=source) if reference_id else None
                 if existing and pricing_reference_payload_matches_existing_pack(payload, existing):
+                    pricing_reference_summary = (
+                        public_company_pricing_reference(existing)
+                        if isinstance(storage, DatabaseKqagStorage)
+                        else load_pricing_reference_pack(reference_id, source=source).public_summary()
+                    )
                     self.send_json({
                         "status": "unchanged",
-                        "pricing_reference": load_pricing_reference_pack(reference_id, source=source).public_summary(),
+                        "pricing_reference": pricing_reference_summary,
                         "unchanged": True,
                     })
                     return

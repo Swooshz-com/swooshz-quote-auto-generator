@@ -2,6 +2,7 @@ import tempfile
 import threading
 import unittest
 import base64
+import copy
 import hashlib
 import html
 import http.client
@@ -18916,6 +18917,87 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
 
         self.assertEqual(result["status"], "blocked")
         self.assertIn("Select a valid pricing reference before generating a quote.", result["errors"])
+
+    def test_database_pricing_reference_unchanged_save_returns_workspace_db_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{(root / 'kqag-storage.sqlite3').as_posix()}"
+            local_root = root / "local-pricing"
+            bundled_root = root / "bundled-pricing"
+            write_test_pricing_reference(local_root, "unchanged-db-pricing", [with_required_pricing_metadata({
+                "id": "local-row",
+                "section": "Graphics",
+                "description": "Local row should not appear",
+                "unit_hint": "sqm",
+                "sale_unit_price": 10,
+            })])
+            write_test_pricing_reference(bundled_root, "unchanged-db-pricing", [with_required_pricing_metadata({
+                "id": "bundled-row",
+                "section": "Graphics",
+                "description": "Bundled row should not appear",
+                "unit_hint": "sqm",
+                "sale_unit_price": 20,
+            })])
+            db_reference = workspace_pricing_reference("unchanged-db-pricing")
+            db_reference["label"] = "Workspace DB Pricing"
+            payload = {
+                "id": "unchanged-db-pricing",
+                "label": "Workspace DB Pricing",
+                "source": "company",
+                "tax": db_reference["tax"],
+                "currency": db_reference["currency"],
+                "items": copy.deepcopy(db_reference["items"]),
+            }
+            platform_session = self.platform_auth_session("workspace-unchanged-pricing", membership_role="admin")
+            env = {
+                "APP_MODE": "local",
+                "USER_TYPE": "admin",
+                "SESSION_SECRET": "test-session-secret",
+                "KQAG_STORAGE_MODE": "database",
+                "KQAG_DATABASE_URL": database_url,
+            }
+
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(webapp, "pricing_references_root", return_value=local_root),
+                mock.patch.object(webapp, "bundled_pricing_references_root", return_value=bundled_root),
+                mock.patch.object(webapp, "ai_pricing_reference_metadata_enrichment", side_effect=AssertionError("metadata should not run")),
+            ):
+                webapp.apply_kqag_storage_migrations(database_url)
+                storage = webapp.app_storage_for_auth_session(platform_session)
+                storage.save_pricing_reference(db_reference)
+                cookie = webapp.signed_cookie_value(platform_session)
+                session_cookie = f"{webapp.SESSION_COOKIE_NAME}={cookie}"
+                with LocalRunnerServer() as runner:
+                    parsed = urllib.parse.urlparse(runner.base_url)
+                    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
+                    try:
+                        connection.request(
+                            "POST",
+                            "/api/settings/pricing-references",
+                            body=json.dumps(payload).encode("utf-8"),
+                            headers={
+                                "Content-Type": "application/json",
+                                "Cookie": session_cookie,
+                                webapp.configured_csrf_header_name(): webapp.configured_csrf_token(),
+                            },
+                        )
+                        response = connection.getresponse()
+                        body = json.loads(response.read().decode("utf-8"))
+                    finally:
+                        connection.close()
+
+        self.assertEqual(response.status, 200, body)
+        self.assertEqual(body["status"], "unchanged")
+        self.assertTrue(body["unchanged"])
+        self.assertEqual(body["pricing_reference"]["id"], "unchanged-db-pricing")
+        self.assertEqual(body["pricing_reference"]["label"], "Workspace DB Pricing")
+        self.assertEqual(body["pricing_reference"]["source"], "company")
+        self.assertEqual(body["pricing_reference"]["item_count"], 1)
+        serialized = json.dumps(body)
+        self.assertNotIn("Test Pricing Reference", serialized)
+        self.assertNotIn("local-row", serialized)
+        self.assertNotIn("bundled-row", serialized)
 
     def test_database_storage_filters_quote_sessions_by_owner_role_and_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:
