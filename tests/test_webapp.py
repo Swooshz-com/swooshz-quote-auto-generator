@@ -19108,6 +19108,10 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 mock.patch.object(webapp, "pricing_references_root", return_value=local_root),
                 mock.patch.object(webapp, "bundled_pricing_references_root", return_value=bundled_root),
                 mock.patch.object(webapp, "ai_pricing_reference_metadata_enrichment", side_effect=AssertionError("metadata should not run")),
+                mock.patch.object(webapp, "load_pricing_reference_pack", side_effect=AssertionError("old pack loader must not run")),
+                mock.patch.object(webapp, "pricing_reference_pack_detail", side_effect=AssertionError("old pack detail must not run")),
+                mock.patch.object(webapp, "list_local_pricing_references", side_effect=AssertionError("local pack listing must not run")),
+                mock.patch.object(webapp, "list_bundled_pricing_references", side_effect=AssertionError("bundled pack listing must not run")),
             ):
                 webapp.apply_kqag_storage_migrations(database_url)
                 storage = webapp.app_storage_for_auth_session(platform_session)
