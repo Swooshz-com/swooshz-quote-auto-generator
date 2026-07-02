@@ -136,7 +136,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertEqual(database_status["generated_artifacts_storage"]["mode"], "database")
         self.assertTrue(database_status["workspace_scoped"])
         self.assertIn("object_storage_missing", {item["id"] for item in database_status["blockers"]})
-        self.assertIn("profile_runtime_layout_dependency", {item["id"] for item in database_status["blockers"]})
+        self.assertNotIn("profile_runtime_layout_dependency", {item["id"] for item in database_status["blockers"]})
         self.assertNotIn("pricing_reference_local_pack_isolation", {item["id"] for item in database_status["blockers"]})
         self.assertIn("legacy_job_artifact_download_authorization", {item["id"] for item in database_status["blockers"]})
 

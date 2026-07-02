@@ -37,8 +37,6 @@ Primary blockers:
 
 - Runtime data can still depend on local filesystem storage.
 - Generated quote artifacts can still depend on local filesystem storage.
-- Database mode exists, but generated profile layout/default resolution still
-  depends on local profile-pack loading.
 - Legacy job artifact downloads are not bound to workspace/session ownership.
 - No object-storage layer exists for XLSX/PDF outputs and uploaded assets.
 - Backup, restore, retention, and rollback have not been implemented or proven.
@@ -46,6 +44,12 @@ Primary blockers:
 PR #88 update: database/platform pricing-reference list/detail/export/generation
 paths now resolve only workspace-owned database rows. Local and bundled pricing
 packs remain available only in local-UAT storage mode.
+
+PR #89 update: database/platform quote generation now resolves the selected
+profile defaults and quotation layout from workspace-owned DB profile rows and
+stored DB layout artifacts. Missing/deleted workspace profiles or missing
+layout artifacts block generation instead of falling back to bundled/default or
+local profile packs.
 
 ## Safe Readiness Command
 
@@ -80,7 +84,7 @@ Current expected posture in local mode:
 
 | Surface | Current local mode path/source | Database/platform support | Workspace-scoped today | Restart-persistent today | Redeploy-persistent today | Internal alpha suitability | Production suitability | Blocker or follow-up PR |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Profiles | `QUOTE_DATA_ROOT/{company_id}/profiles.json` and `profile-packs/{profile_id}` | `kqag_profiles` rows plus profile file artifacts exist | Yes in DB row storage; no in local mode | Only if mounted local roots or DB mode are configured | DB rows survive; local mode requires mounted volume | Blocked | No | Resolve generation-time profile layout/defaults from workspace DB artifacts instead of local profile-pack files. |
+| Profiles | `QUOTE_DATA_ROOT/{company_id}/profiles.json` and `profile-packs/{profile_id}` | `kqag_profiles` rows plus profile file artifacts exist; PR #89 uses DB rows/artifacts for DB-mode generation | Yes in DB row/artifact mode; no in local mode | Only if mounted local roots or DB mode are configured | DB rows survive; local mode requires mounted volume | No until the remaining non-profile blockers are resolved | No | Keep profile defaults/layouts workspace-owned; move uploaded profile assets to object storage for production. |
 | Pricing references | `KQAG_LOCAL_PRICING_REFERENCES_ROOT` or `_pricing-references/{reference_id}` plus bundled references | `kqag_pricing_references` rows with runtime catalog JSON | Yes in DB mode; local/bundled packs are local-UAT only | Only if mounted local roots or DB mode are configured | DB rows survive; local mode requires mounted volume | No until the remaining non-pricing blockers are resolved | No | Keep pricing references imported or seeded as workspace-owned database rows; move uploaded/reference assets to object storage for production. |
 | Quote sessions | `QUOTE_DATA_ROOT/quote-sessions/{session_id}` | `kqag_quote_sessions` rows keyed by `workspace_id` | Yes in DB mode; no in local mode | Only if mounted local roots or DB mode are configured | DB rows survive; local mode requires mounted volume | Blocked until backup/retention is proven | No | Add backup/restore, retention, owner isolation tests, and hosted smoke evidence. |
 | Generated artifacts | `QUOTE_OUTPUT_ROOT/{job_id}` and quote-session `exports` folders | `kqag_quote_artifacts` and `kqag_file_artifacts` DB BLOBs exist | Only when both storage and artifact mode are database-backed | Local mode requires mounted output root; DB artifact mode survives restart | DB artifact mode survives, but is not final production storage | Blocked | No | Move generated XLSX/PDF and uploaded assets to object storage with DB metadata. |
@@ -91,20 +95,23 @@ Current expected posture in local mode:
 
 Local mode reads and writes mutable profile config through `CompanyConfigStore`
 and local profile packs. Database mode stores profile rows and can store profile
-file artifacts, but quote generation still calls `load_profile_pack()` from the
-payload path. That path resolves local company/bundled profile packs and uses
-`profile.quotation_layout_path`.
+file artifacts. PR #89 makes DB/platform quote generation resolve the selected
+profile row, apply its defaults, and extract the stored DB layout artifact for
+the generator instead of calling local/bundled profile-pack loaders as fallback
+source of truth.
 
 Evidence:
 
-- `webapp/server.py:7562` selects `profile_id` from the request payload.
-- `webapp/server.py:7937` resolves profile packs through local pack loading.
-- `webapp/server.py:13348` loads the generation profile and
-  `webapp/server.py:13350` uses the local layout template path.
+- `DatabaseKqagStorage.list_profiles()` now returns only current-workspace DB
+  profile rows.
+- DB/platform generation now blocks when the selected profile row or stored
+  quotation-layout artifact is missing.
+- Local-UAT storage mode still uses local profile packs.
 
 Production requirement: profile defaults, layout rules, and layout workbook
-assets must resolve from the authenticated workspace's database/object-storage
-records before internal alpha.
+assets resolve from the authenticated workspace's database records in DB mode
+after PR #89. Final production still requires object storage, backup/restore,
+retention, and hosted monitoring evidence.
 
 ## Pricing References Audit
 
@@ -232,8 +239,9 @@ UAT until these are true:
    completed in PR #88 for database/platform list/detail/export/generation
    fallback removal and same-id delete regression coverage.
 3. Profile artifact/layout resolution:
-   generate quotes from workspace-scoped profile layout/default assets instead
-   of local profile-pack paths.
+   completed in PR #89 for DB/platform mode; generation now uses
+   workspace-scoped profile defaults/layout artifacts and fails clearly when
+   the selected workspace profile or layout is missing.
 4. Artifact authorization / legacy job download lockdown:
    disable or replace legacy job-file downloads in deploy/database mode and add
    cross-user artifact tests.

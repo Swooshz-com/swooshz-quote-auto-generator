@@ -493,6 +493,31 @@ def payload_with_workspace_pricing(reference_id: str = "workspace-pricing") -> d
     return payload
 
 
+def workspace_profile_with_layout(profile_id: str = "workspace-profile") -> dict:
+    layout_data_url = (
+        "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,"
+        + base64.b64encode(KONCEPT_LAYOUT.read_bytes()).decode("ascii")
+    )
+    payload = valid_payload()
+    return webapp.normalize_profile_payload({
+        "id": profile_id,
+        "label": "Workspace Profile",
+        "defaults": {
+            "company": copy.deepcopy(payload["company"]),
+            "quote_text": copy.deepcopy(payload["quote_text"]),
+            "signature": copy.deepcopy(payload["signature"]),
+            "rich_text": copy.deepcopy(payload["rich_text"]),
+            "tax": copy.deepcopy(payload["tax"]),
+        },
+        "pack": {
+            "quotation_layout": {
+                "filename": "quotation-layout.xlsx",
+                "data_url": layout_data_url,
+            }
+        },
+    })
+
+
 class LocalRunnerServer:
     def __enter__(self):
         self.server = webapp.ThreadingHTTPServer(("127.0.0.1", 0), webapp.QuoteRunnerHandler)
@@ -3231,6 +3256,7 @@ class WebappServerTest(unittest.TestCase):
                 QUOTE_LOG_ROOT=str(tmp_path / "logs"),
             )
             payload = payload_with_workspace_pricing("workspace-platform-uat-pricing")
+            payload["profile_id"] = "workspace-platform-uat-profile"
             payload["quote_session"] = {"session_id": "quote-platform-uat-smoke"}
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -3238,6 +3264,7 @@ class WebappServerTest(unittest.TestCase):
                 webapp.apply_kqag_storage_migrations(database_url)
                 storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-123"))
                 storage.save_pricing_reference(workspace_pricing_reference("workspace-platform-uat-pricing"))
+                storage.save_profile(workspace_profile_with_layout("workspace-platform-uat-profile"))
                 with LocalRunnerServer() as runner:
                     with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=fake_urlopen):
                         launch_request = urllib.request.Request(
@@ -18821,6 +18848,125 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 self.assertTrue(workspace_a.delete_quote_session("quote-team-a"))
                 self.assertEqual(workspace_a.list_quote_sessions(), [])
 
+    def test_database_storage_profiles_are_workspace_db_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{(root / 'kqag-storage.sqlite3').as_posix()}"
+            local_profiles_root = root / "local-profiles"
+            write_test_profile_pack(local_profiles_root, "local-only-profile", "local-pricing")
+            env = {"KQAG_STORAGE_MODE": "database", "KQAG_DATABASE_URL": database_url}
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(webapp, "profiles_root", return_value=local_profiles_root),
+            ):
+                webapp.apply_kqag_storage_migrations(database_url)
+                workspace_a = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-profile-a"))
+                workspace_b = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-profile-b"))
+                workspace_a.save_profile(webapp.normalize_profile_payload({
+                    "id": "workspace-only-profile",
+                    "label": "Workspace Only Profile",
+                    "defaults": {"company": {"name": "Workspace A Quote Co"}},
+                }))
+
+                self.assertEqual(
+                    [(item.get("source"), item["id"]) for item in workspace_a.list_profiles()],
+                    [("company", "workspace-only-profile")],
+                )
+                self.assertEqual(workspace_b.list_profiles(), [])
+                self.assertIsNone(workspace_b.company_profile_export_payload("workspace-only-profile"))
+
+    def test_database_profile_delete_does_not_fall_back_to_same_id_local_pack_for_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{(root / 'kqag-storage.sqlite3').as_posix()}"
+            local_profiles_root = root / "local-profiles"
+            write_test_profile_pack(local_profiles_root, "deleted-profile", "workspace-pricing")
+            platform_session = self.platform_auth_session("workspace-deleted-profile")
+            payload = payload_with_workspace_pricing("workspace-pricing")
+            payload["profile_id"] = "deleted-profile"
+            env = {
+                "KQAG_STORAGE_MODE": "database",
+                "KQAG_ARTIFACT_STORAGE_MODE": "database",
+                "KQAG_DATABASE_URL": database_url,
+                "QUOTE_DATA_ROOT": str(root / "data"),
+                "QUOTE_OUTPUT_ROOT": str(root / "output"),
+                "QUOTE_TMP_ROOT": str(root / "tmp"),
+                "QUOTE_LOG_ROOT": str(root / "logs"),
+            }
+            completed = webapp.subprocess.CompletedProcess(args=[], returncode=0, stdout="Wrote quotation.xlsx\n", stderr="")
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(webapp, "profiles_root", return_value=local_profiles_root),
+                mock.patch.object(webapp.subprocess, "run", return_value=completed) as run,
+            ):
+                webapp.apply_kqag_storage_migrations(database_url)
+                storage = webapp.app_storage_for_auth_session(platform_session)
+                storage.save_pricing_reference(workspace_pricing_reference("workspace-pricing"))
+                storage.save_profile(workspace_profile_with_layout("deleted-profile"))
+                self.assertTrue(storage.delete_profile("deleted-profile"))
+
+                result = webapp.run_quote_job(
+                    payload,
+                    output_root=root / "out",
+                    tmp_root=root / "tmp",
+                    auth_session=platform_session,
+                )
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("Select a valid company profile before generating a quote.", result["errors"])
+        run.assert_not_called()
+
+    def test_database_generate_uses_workspace_profile_layout_artifact_and_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{(root / 'kqag-storage.sqlite3').as_posix()}"
+            platform_session = self.platform_auth_session("workspace-profile-generate")
+            payload = payload_with_workspace_pricing("workspace-pricing")
+            payload["profile_id"] = "workspace-profile"
+            for key in ("company", "tax", "quote_text", "signature", "rich_text"):
+                payload.pop(key, None)
+            env = {
+                "KQAG_STORAGE_MODE": "database",
+                "KQAG_ARTIFACT_STORAGE_MODE": "database",
+                "KQAG_DATABASE_URL": database_url,
+                "QUOTE_DATA_ROOT": str(root / "data"),
+                "QUOTE_OUTPUT_ROOT": str(root / "output"),
+                "QUOTE_TMP_ROOT": str(root / "tmp"),
+                "QUOTE_LOG_ROOT": str(root / "logs"),
+            }
+            completed = webapp.subprocess.CompletedProcess(args=[], returncode=0, stdout="Wrote quotation.xlsx\n", stderr="")
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(webapp.subprocess, "run", return_value=completed) as run,
+            ):
+                webapp.apply_kqag_storage_migrations(database_url)
+                storage = webapp.app_storage_for_auth_session(platform_session)
+                storage.save_pricing_reference(workspace_pricing_reference("workspace-pricing"))
+                storage.save_profile(workspace_profile_with_layout("workspace-profile"))
+
+                result = webapp.run_quote_job(
+                    payload,
+                    output_root=root / "out",
+                    tmp_root=root / "tmp",
+                    auth_session=platform_session,
+                )
+
+                self.assertIsNotNone(run.call_args, result)
+                command = run.call_args.args[0]
+                brief_path = Path(command[command.index("--brief") + 1])
+                layout_path = Path(command[command.index("--layout-template") + 1])
+                brief = json.loads(brief_path.read_text(encoding="utf-8"))
+                layout_bytes = layout_path.read_bytes()
+                layout_path_text = str(layout_path)
+
+        self.assertEqual(result["status"], "completed")
+        webapp.validate_profile_layout_xlsx(layout_bytes)
+        self.assertGreater(len(layout_bytes), 0)
+        self.assertNotEqual(layout_path_text, str(KONCEPT_LAYOUT))
+        self.assertIn(str(root / "tmp"), layout_path_text)
+        self.assertEqual(brief["company"]["name"], valid_payload()["company"]["name"])
+        self.assertEqual(brief["_webapp"]["profile"]["id"], "workspace-profile")
+
     def test_database_storage_pricing_references_are_workspace_db_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -19362,6 +19508,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             platform_session = self.platform_auth_session("workspace-async-expired-artifact")
             platform_session["user"]["platform"]["launchTokenExpiresAt"] = "2000-01-01T00:00:00.000Z"
             payload = payload_with_workspace_pricing("workspace-async-pricing")
+            payload["profile_id"] = "workspace-async-profile"
             payload["quote_session"] = {"session_id": "quote-async-expired-artifact"}
             env = {
                 "KQAG_STORAGE_MODE": "database",
@@ -19377,6 +19524,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 webapp.apply_kqag_storage_migrations(database_url)
                 storage = webapp.app_storage_for_auth_session(platform_session)
                 storage.save_pricing_reference(workspace_pricing_reference("workspace-async-pricing"))
+                storage.save_profile(workspace_profile_with_layout("workspace-async-profile"))
                 with mock.patch.object(webapp.subprocess, "run", side_effect=fake_generator_run):
                     created = webapp.create_job("generate", payload, auth_session=platform_session)
                     job = wait_for_job(created["job_id"], timeout=3.0)
