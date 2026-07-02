@@ -1009,6 +1009,12 @@ async function main() {
     let mobileScrollAfter = await page.evaluate(() => window.scrollY);
     let paneScrollAfter = await page.locator(".workspace-pane-scroll").evaluate((element) => element.scrollTop);
     if (mobileScrollAfter <= mobileScrollBefore + 10 && paneScrollAfter <= paneScrollBefore + 10) {
+      await page.evaluate(() => {
+        if (document.activeElement instanceof HTMLElement) {
+          document.activeElement.blur();
+        }
+        document.body.focus();
+      });
       await page.keyboard.press("PageDown");
       await page.waitForTimeout(100);
       mobileScrollAfter = await page.evaluate(() => window.scrollY);
