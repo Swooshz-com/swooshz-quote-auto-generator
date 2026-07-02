@@ -1849,6 +1849,181 @@ def deploy_uat_preflight_status() -> dict[str, Any]:
     return {"status": "ready" if all(check["ok"] for check in checks) else "blocked", "checks": checks}
 
 
+def configured_database_scheme() -> str:
+    raw = clean_text(read_dotenv_value(KQAG_DATABASE_URL_ENV_NAME))
+    if not raw:
+        return ""
+    return clean_text(urlparse(raw).scheme).lower()
+
+
+def readiness_surface(
+    *,
+    mode: str,
+    source: str,
+    workspace_scoped: bool,
+    persistent_across_restart: bool,
+    persistent_across_redeploy: bool,
+    internal_alpha_suitable: bool,
+    production_suitable: bool,
+    follow_up: str,
+) -> dict[str, Any]:
+    return {
+        "mode": mode,
+        "source": source,
+        "workspace_scoped": workspace_scoped,
+        "persistent_across_restart": persistent_across_restart,
+        "persistent_across_redeploy": persistent_across_redeploy,
+        "internal_alpha_suitable": internal_alpha_suitable,
+        "production_suitable": production_suitable,
+        "follow_up": follow_up,
+    }
+
+
+def readiness_blocker(blocker_id: str, severity: str, summary: str) -> dict[str, str]:
+    return {"id": blocker_id, "severity": severity, "summary": summary}
+
+
+def production_readiness_status(security_scan_status: str = "not_run_by_command") -> dict[str, Any]:
+    storage_mode = configured_storage_mode()
+    artifact_mode = configured_artifact_storage_mode()
+    database_scheme = configured_database_scheme()
+    database_configured = bool(database_scheme)
+    database_mode = storage_mode == "database"
+    database_artifacts = artifact_mode == "database"
+
+    profiles = readiness_surface(
+        mode=storage_mode,
+        source=(
+            "kqag_profiles table plus kqag_file_artifacts for imported layout assets"
+            if database_mode
+            else "QUOTE_DATA_ROOT/{company_id}/profiles.json and QUOTE_DATA_ROOT/{company_id}/profile-packs/{profile_id}"
+        ),
+        workspace_scoped=database_mode,
+        persistent_across_restart=database_mode or bool(clean_text(read_dotenv_value(QUOTE_DATA_ROOT_ENV_NAME))),
+        persistent_across_redeploy=database_mode,
+        internal_alpha_suitable=False,
+        production_suitable=False,
+        follow_up=(
+            "Resolve generation-time profile layout/defaults from workspace database artifacts."
+            if database_mode
+            else "Move mutable quote-company profiles to workspace-scoped database storage before rollout beyond local UAT."
+        ),
+    )
+    pricing_references = readiness_surface(
+        mode=storage_mode,
+        source=(
+            "kqag_pricing_references table with request-time runtime catalog JSON"
+            if database_mode
+            else "KQAG_LOCAL_PRICING_REFERENCES_ROOT or _pricing-references/{reference_id}"
+        ),
+        workspace_scoped=database_mode,
+        persistent_across_restart=database_mode or bool(clean_text(read_dotenv_value(QUOTE_DATA_ROOT_ENV_NAME))),
+        persistent_across_redeploy=database_mode,
+        internal_alpha_suitable=database_mode and database_configured,
+        production_suitable=False,
+        follow_up=(
+            "Keep company pricing references workspace-scoped and remove local JSON fallback for database-only references."
+            if database_mode
+            else "Move mutable pricing references and uploaded/imported assets to workspace-scoped database/object storage."
+        ),
+    )
+    quote_sessions = readiness_surface(
+        mode=storage_mode,
+        source="kqag_quote_sessions table" if database_mode else "QUOTE_DATA_ROOT/quote-sessions/{session_id}",
+        workspace_scoped=database_mode,
+        persistent_across_restart=database_mode or bool(clean_text(read_dotenv_value(QUOTE_DATA_ROOT_ENV_NAME))),
+        persistent_across_redeploy=database_mode,
+        internal_alpha_suitable=database_mode and database_configured,
+        production_suitable=False,
+        follow_up=(
+            "Add backup/restore and retention policy for workspace-scoped quote sessions."
+            if database_mode
+            else "Move quote sessions to workspace-scoped database storage for any multi-user or hosted rollout."
+        ),
+    )
+    generated_artifacts = readiness_surface(
+        mode=artifact_mode,
+        source=(
+            "kqag_quote_artifacts and kqag_file_artifacts tables"
+            if database_artifacts
+            else "QUOTE_OUTPUT_ROOT/{job_id} plus QUOTE_DATA_ROOT/quote-sessions/{session_id}/exports"
+        ),
+        workspace_scoped=database_mode and database_artifacts,
+        persistent_across_restart=database_artifacts or bool(clean_text(read_dotenv_value(QUOTE_OUTPUT_ROOT_ENV_NAME))),
+        persistent_across_redeploy=database_artifacts,
+        internal_alpha_suitable=database_artifacts and database_configured,
+        production_suitable=False,
+        follow_up=(
+            "Move generated XLSX/PDF and uploaded assets to object storage with database metadata."
+            if database_artifacts
+            else "Enable database artifact mode for internal alpha or object storage for production."
+        ),
+    )
+
+    blockers: list[dict[str, str]] = []
+    if not database_mode:
+        blockers.append(readiness_blocker("local_runtime_storage", "P1", "Profiles, pricing references, and quote sessions are still using local runtime storage."))
+    if not database_artifacts:
+        blockers.append(readiness_blocker("local_artifact_storage", "P1", "Generated quote artifacts and saved exports are still using local filesystem storage."))
+    if (database_mode or database_artifacts) and not database_configured:
+        blockers.append(readiness_blocker("database_url_missing", "P1", "Database-backed storage mode is selected but no database URL is configured."))
+    if database_scheme == "sqlite":
+        blockers.append(readiness_blocker("sqlite_not_final_production", "P1", "SQLite is acceptable only as an explicitly backed-up internal-alpha/simple-hosting option, not final production storage."))
+    if database_mode:
+        blockers.append(readiness_blocker("profile_runtime_layout_dependency", "P1", "Saved database profiles still need generation-time layout/default resolution from workspace-scoped profile artifacts."))
+    blockers.append(readiness_blocker(
+        "pricing_reference_local_pack_isolation",
+        "P1",
+        "High security finding: database/platform pricing-reference mode can include local private packs across workspaces until local fallback is removed.",
+    ))
+    blockers.append(readiness_blocker(
+        "legacy_job_artifact_download_authorization",
+        "P1",
+        "Medium security finding: legacy direct job artifact downloads are not bound to workspace/session ownership.",
+    ))
+    blockers.append(readiness_blocker("object_storage_missing", "P1", "No object-storage-backed asset/artifact layer exists for production XLSX/PDF and uploaded reference assets."))
+    blockers.append(readiness_blocker("backup_restore_unverified", "P1", "Backup, restore, retention, and rollback procedures are not implemented or verified by this command."))
+
+    workspace_scoped = all(
+        surface["workspace_scoped"]
+        for surface in (profiles, pricing_references, quote_sessions, generated_artifacts)
+    )
+    p1_or_higher = [item for item in blockers if item["severity"] in {"P0", "P1"}]
+    return {
+        "schema": "swooshz.kqag.production-readiness.v1",
+        "kqag_storage_mode": storage_mode,
+        "kqag_artifact_storage_mode": artifact_mode,
+        "profiles_storage": profiles,
+        "pricing_references_storage": pricing_references,
+        "quote_sessions_storage": quote_sessions,
+        "generated_artifacts_storage": generated_artifacts,
+        "workspace_scoped": workspace_scoped,
+        "local_storage_dependencies_found": [
+            item["id"]
+            for item in blockers
+            if item["id"] in {"local_runtime_storage", "local_artifact_storage", "profile_runtime_layout_dependency"}
+        ],
+        "security_scan_status": clean_text(security_scan_status) or "not_run_by_command",
+        "local_uat_supported": True,
+        "internal_alpha_ready": False if p1_or_higher else True,
+        "internal_alpha_future_exception": {
+            "possible": True,
+            "summary": (
+                "A temporary small-team internal alpha may become acceptable only after database storage, "
+                "database artifacts, and documented backup/restore/rollback are in place; SQLite/BLOB mode "
+                "is not final production storage."
+            ),
+        },
+        "production_ready": False,
+        "blockers_count": len(blockers),
+        "blockers": blockers,
+        "notes": [
+            "This command reports readiness posture without printing DB URLs, absolute private local paths, OAuth values, tokens, cookies, callback URLs with query params, customer data, generated quote contents, private pricing/profile contents, or staff emails.",
+            "Local UAT passing does not equal internal-alpha or production readiness.",
+        ],
+    }
+
+
 def configured_csrf_header_name() -> str:
     header_name = clean_text(read_dotenv_value(CSRF_HEADER_NAME_ENV_NAME))
     if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{2,63}", header_name):
@@ -14215,6 +14390,7 @@ def parse_args() -> argparse.Namespace:
     default_host = "0.0.0.0" if configured_app_mode() == "deploy" else "127.0.0.1"
     default_port = int(os.environ.get("PORT") or 8765)
     parser.add_argument("--check-deploy-uat-env", action="store_true", help="Check deploy UAT env shape without printing secret values.")
+    parser.add_argument("--check-production-readiness", action="store_true", help="Report storage/security readiness posture without printing secret values.")
     parser.add_argument("--host", default=default_host)
     parser.add_argument("--port", type=int, default=default_port)
     return parser.parse_args()
@@ -14226,6 +14402,10 @@ def main() -> int:
         status = deploy_uat_preflight_status()
         safe_stdout(json.dumps(status, indent=2, ensure_ascii=True) + "\n")
         return 0 if status["status"] == "ready" else 2
+    if args.check_production_readiness:
+        status = production_readiness_status()
+        safe_stdout(json.dumps(status, indent=2, ensure_ascii=True) + "\n")
+        return 0 if status["production_ready"] else 2
     if deploy_requires_auth_guard():
         safe_stderr(
             "Refusing deploy mode without a complete auth boundary. Configure SESSION_SECRET with OIDC_* "
