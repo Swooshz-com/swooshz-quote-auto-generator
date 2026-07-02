@@ -2,6 +2,7 @@ import tempfile
 import threading
 import unittest
 import base64
+import copy
 import hashlib
 import html
 import http.client
@@ -465,6 +466,31 @@ def write_test_profile_pack(root: Path, profile_id: str, pricing_reference_id: s
         encoding="utf-8",
     )
     return profile_dir
+
+
+def workspace_pricing_reference(reference_id: str = "workspace-pricing") -> dict:
+    return webapp.normalize_pricing_reference_payload({
+        "id": reference_id,
+        "label": "Workspace Pricing",
+        "items": [with_required_pricing_metadata({
+            "id": "workspace-row",
+            "section": "Graphics",
+            "description": "Workspace printed graphics",
+            "unit_hint": "sqm",
+            "internal_cost": 10,
+            "markup_multiplier": 2,
+        })],
+    })
+
+
+def payload_with_workspace_pricing(reference_id: str = "workspace-pricing") -> dict:
+    payload = valid_payload()
+    payload["pricing_reference_id"] = reference_id
+    payload["pricing_reference"] = {
+        "id": reference_id,
+        "source": "company",
+    }
+    return payload
 
 
 class LocalRunnerServer:
@@ -3204,12 +3230,14 @@ class WebappServerTest(unittest.TestCase):
                 QUOTE_TMP_ROOT=str(tmp_path / "tmp"),
                 QUOTE_LOG_ROOT=str(tmp_path / "logs"),
             )
-            payload = valid_payload()
+            payload = payload_with_workspace_pricing("workspace-platform-uat-pricing")
             payload["quote_session"] = {"session_id": "quote-platform-uat-smoke"}
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
             with mock.patch.dict(os.environ, env, clear=True):
                 webapp.apply_kqag_storage_migrations(database_url)
+                storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-123"))
+                storage.save_pricing_reference(workspace_pricing_reference("workspace-platform-uat-pricing"))
                 with LocalRunnerServer() as runner:
                     with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=fake_urlopen):
                         launch_request = urllib.request.Request(
@@ -18793,6 +18821,184 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 self.assertTrue(workspace_a.delete_quote_session("quote-team-a"))
                 self.assertEqual(workspace_a.list_quote_sessions(), [])
 
+    def test_database_storage_pricing_references_are_workspace_db_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{(root / 'kqag-storage.sqlite3').as_posix()}"
+            local_root = root / "local-pricing"
+            bundled_root = root / "bundled-pricing"
+            write_test_pricing_reference(local_root, "local-only", [with_required_pricing_metadata({
+                "id": "local-row",
+                "section": "Graphics",
+                "description": "Local fixture row",
+                "unit_hint": "sqm",
+                "sale_unit_price": 10,
+            })])
+            write_test_pricing_reference(bundled_root, "bundled-only", [with_required_pricing_metadata({
+                "id": "bundled-row",
+                "section": "Graphics",
+                "description": "Bundled fixture row",
+                "unit_hint": "sqm",
+                "sale_unit_price": 20,
+            })])
+            env = {"KQAG_STORAGE_MODE": "database", "KQAG_DATABASE_URL": database_url}
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(webapp, "pricing_references_root", return_value=local_root),
+                mock.patch.object(webapp, "bundled_pricing_references_root", return_value=bundled_root),
+            ):
+                webapp.apply_kqag_storage_migrations(database_url)
+                workspace_a = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-pricing-a"))
+                workspace_b = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-pricing-b"))
+                workspace_a.save_pricing_reference(workspace_pricing_reference("workspace-only"))
+
+                self.assertEqual(
+                    [(item["source"], item["id"]) for item in workspace_a.list_pricing_references()],
+                    [("company", "workspace-only")],
+                )
+                self.assertEqual(workspace_b.list_pricing_references(), [])
+                self.assertIsNone(workspace_a.pricing_reference_detail("local-only", source="local"))
+                self.assertIsNone(workspace_a.pricing_reference_detail("bundled-only", source="bundled"))
+                self.assertIsNone(workspace_a.pricing_reference_export_xlsx("local-only", source="local"))
+                self.assertIsNone(workspace_a.pricing_reference_export_xlsx("bundled-only", source="bundled"))
+
+    def test_database_pricing_reference_delete_does_not_fall_back_to_same_id_pack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{(root / 'kqag-storage.sqlite3').as_posix()}"
+            local_root = root / "local-pricing"
+            bundled_root = root / "bundled-pricing"
+            write_test_pricing_reference(local_root, "deleted-pricing", [with_required_pricing_metadata({
+                "id": "local-row",
+                "section": "Graphics",
+                "description": "Local same-id row",
+                "unit_hint": "sqm",
+                "sale_unit_price": 10,
+            })])
+            write_test_pricing_reference(bundled_root, "deleted-pricing", [with_required_pricing_metadata({
+                "id": "bundled-row",
+                "section": "Graphics",
+                "description": "Bundled same-id row",
+                "unit_hint": "sqm",
+                "sale_unit_price": 20,
+            })])
+            platform_session = self.platform_auth_session("workspace-deleted-pricing")
+            payload = payload_with_workspace_pricing("deleted-pricing")
+            env = {
+                "KQAG_STORAGE_MODE": "database",
+                "KQAG_DATABASE_URL": database_url,
+                "QUOTE_DATA_ROOT": str(root / "data"),
+                "QUOTE_OUTPUT_ROOT": str(root / "output"),
+                "QUOTE_TMP_ROOT": str(root / "tmp"),
+                "QUOTE_LOG_ROOT": str(root / "logs"),
+            }
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(webapp, "pricing_references_root", return_value=local_root),
+                mock.patch.object(webapp, "bundled_pricing_references_root", return_value=bundled_root),
+            ):
+                webapp.apply_kqag_storage_migrations(database_url)
+                storage = webapp.app_storage_for_auth_session(platform_session)
+                storage.save_pricing_reference(workspace_pricing_reference("deleted-pricing"))
+                self.assertTrue(storage.delete_pricing_reference("deleted-pricing"))
+
+                self.assertEqual(storage.list_pricing_references(), [])
+                self.assertIsNone(storage.pricing_reference_detail("deleted-pricing"))
+                self.assertIsNone(storage.pricing_reference_detail("deleted-pricing", source="local"))
+                self.assertIsNone(storage.pricing_reference_detail("deleted-pricing", source="bundled"))
+                self.assertIsNone(storage.pricing_reference_export_xlsx("deleted-pricing", source="local"))
+                self.assertEqual(
+                    webapp.pricing_reference_selection_error(payload, auth_session=platform_session),
+                    "Select a valid pricing reference before generating a quote.",
+                )
+                created = webapp.create_job("generate", payload, auth_session=platform_session)
+                self.assertEqual(created["status"], "blocked")
+                result = webapp.run_quote_job(payload, output_root=root / "out", tmp_root=root / "tmp", auth_session=platform_session)
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("Select a valid pricing reference before generating a quote.", result["errors"])
+
+    def test_database_pricing_reference_unchanged_save_returns_workspace_db_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{(root / 'kqag-storage.sqlite3').as_posix()}"
+            local_root = root / "local-pricing"
+            bundled_root = root / "bundled-pricing"
+            write_test_pricing_reference(local_root, "unchanged-db-pricing", [with_required_pricing_metadata({
+                "id": "local-row",
+                "section": "Graphics",
+                "description": "Local row should not appear",
+                "unit_hint": "sqm",
+                "sale_unit_price": 10,
+            })])
+            write_test_pricing_reference(bundled_root, "unchanged-db-pricing", [with_required_pricing_metadata({
+                "id": "bundled-row",
+                "section": "Graphics",
+                "description": "Bundled row should not appear",
+                "unit_hint": "sqm",
+                "sale_unit_price": 20,
+            })])
+            db_reference = workspace_pricing_reference("unchanged-db-pricing")
+            db_reference["label"] = "Workspace DB Pricing"
+            payload = {
+                "id": "unchanged-db-pricing",
+                "label": "Workspace DB Pricing",
+                "source": "company",
+                "tax": db_reference["tax"],
+                "currency": db_reference["currency"],
+                "items": copy.deepcopy(db_reference["items"]),
+            }
+            platform_session = self.platform_auth_session("workspace-unchanged-pricing", membership_role="admin")
+            env = {
+                "APP_MODE": "local",
+                "USER_TYPE": "admin",
+                "SESSION_SECRET": "test-session-secret",
+                "KQAG_STORAGE_MODE": "database",
+                "KQAG_DATABASE_URL": database_url,
+            }
+
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(webapp, "pricing_references_root", return_value=local_root),
+                mock.patch.object(webapp, "bundled_pricing_references_root", return_value=bundled_root),
+                mock.patch.object(webapp, "ai_pricing_reference_metadata_enrichment", side_effect=AssertionError("metadata should not run")),
+            ):
+                webapp.apply_kqag_storage_migrations(database_url)
+                storage = webapp.app_storage_for_auth_session(platform_session)
+                storage.save_pricing_reference(db_reference)
+                cookie = webapp.signed_cookie_value(platform_session)
+                session_cookie = f"{webapp.SESSION_COOKIE_NAME}={cookie}"
+                with LocalRunnerServer() as runner:
+                    parsed = urllib.parse.urlparse(runner.base_url)
+                    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
+                    try:
+                        connection.request(
+                            "POST",
+                            "/api/settings/pricing-references",
+                            body=json.dumps(payload).encode("utf-8"),
+                            headers={
+                                "Content-Type": "application/json",
+                                "Cookie": session_cookie,
+                                webapp.configured_csrf_header_name(): webapp.configured_csrf_token(),
+                            },
+                        )
+                        response = connection.getresponse()
+                        body = json.loads(response.read().decode("utf-8"))
+                    finally:
+                        connection.close()
+
+        self.assertEqual(response.status, 200, body)
+        self.assertEqual(body["status"], "unchanged")
+        self.assertTrue(body["unchanged"])
+        self.assertEqual(body["pricing_reference"]["id"], "unchanged-db-pricing")
+        self.assertEqual(body["pricing_reference"]["label"], "Workspace DB Pricing")
+        self.assertEqual(body["pricing_reference"]["source"], "company")
+        self.assertEqual(body["pricing_reference"]["item_count"], 1)
+        serialized = json.dumps(body)
+        self.assertNotIn("Test Pricing Reference", serialized)
+        self.assertNotIn("local-row", serialized)
+        self.assertNotIn("bundled-row", serialized)
+
     def test_database_storage_filters_quote_sessions_by_owner_role_and_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:
             database_url = f"sqlite:///{(Path(tmp) / 'kqag-storage.sqlite3').as_posix()}"
@@ -19155,7 +19361,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             database_url = f"sqlite:///{(tmp_path / 'kqag-storage.sqlite3').as_posix()}"
             platform_session = self.platform_auth_session("workspace-async-expired-artifact")
             platform_session["user"]["platform"]["launchTokenExpiresAt"] = "2000-01-01T00:00:00.000Z"
-            payload = valid_payload()
+            payload = payload_with_workspace_pricing("workspace-async-pricing")
             payload["quote_session"] = {"session_id": "quote-async-expired-artifact"}
             env = {
                 "KQAG_STORAGE_MODE": "database",
@@ -19169,11 +19375,12 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
 
             with mock.patch.dict(os.environ, env, clear=True):
                 webapp.apply_kqag_storage_migrations(database_url)
+                storage = webapp.app_storage_for_auth_session(platform_session)
+                storage.save_pricing_reference(workspace_pricing_reference("workspace-async-pricing"))
                 with mock.patch.object(webapp.subprocess, "run", side_effect=fake_generator_run):
                     created = webapp.create_job("generate", payload, auth_session=platform_session)
                     job = wait_for_job(created["job_id"], timeout=3.0)
 
-                storage = webapp.app_storage_for_auth_session(platform_session)
                 sessions = storage.list_quote_sessions()
                 artifact = storage.quote_session_export_artifact("quote-async-expired-artifact", "xlsx")
 

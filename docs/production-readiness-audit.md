@@ -39,11 +39,13 @@ Primary blockers:
 - Generated quote artifacts can still depend on local filesystem storage.
 - Database mode exists, but generated profile layout/default resolution still
   depends on local profile-pack loading.
-- Database pricing-reference mode can still expose local saved pricing packs
-  alongside workspace rows.
 - Legacy job artifact downloads are not bound to workspace/session ownership.
 - No object-storage layer exists for XLSX/PDF outputs and uploaded assets.
 - Backup, restore, retention, and rollback have not been implemented or proven.
+
+PR #88 update: database/platform pricing-reference list/detail/export/generation
+paths now resolve only workspace-owned database rows. Local and bundled pricing
+packs remain available only in local-UAT storage mode.
 
 ## Safe Readiness Command
 
@@ -71,16 +73,15 @@ Current expected posture in local mode:
 - `internal_alpha_ready`: `false`
 - `production_ready`: `false`
 - Expected blockers include `local_runtime_storage`,
-  `local_artifact_storage`, `pricing_reference_local_pack_isolation`,
-  `legacy_job_artifact_download_authorization`, `object_storage_missing`, and
-  `backup_restore_unverified`.
+  `local_artifact_storage`, `legacy_job_artifact_download_authorization`,
+  `object_storage_missing`, and `backup_restore_unverified`.
 
 ## Storage Surface Audit
 
 | Surface | Current local mode path/source | Database/platform support | Workspace-scoped today | Restart-persistent today | Redeploy-persistent today | Internal alpha suitability | Production suitability | Blocker or follow-up PR |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Profiles | `QUOTE_DATA_ROOT/{company_id}/profiles.json` and `profile-packs/{profile_id}` | `kqag_profiles` rows plus profile file artifacts exist | Yes in DB row storage; no in local mode | Only if mounted local roots or DB mode are configured | DB rows survive; local mode requires mounted volume | Blocked | No | Resolve generation-time profile layout/defaults from workspace DB artifacts instead of local profile-pack files. |
-| Pricing references | `KQAG_LOCAL_PRICING_REFERENCES_ROOT` or `_pricing-references/{reference_id}` plus bundled references | `kqag_pricing_references` rows with runtime catalog JSON | Partially; DB rows are scoped, but DB list/detail still falls back to local packs | Only if mounted local roots or DB mode are configured | DB rows survive; local mode requires mounted volume | Blocked | No | Remove local private pricing-reference fallback from database/platform mode and add isolation tests. |
+| Pricing references | `KQAG_LOCAL_PRICING_REFERENCES_ROOT` or `_pricing-references/{reference_id}` plus bundled references | `kqag_pricing_references` rows with runtime catalog JSON | Yes in DB mode; local/bundled packs are local-UAT only | Only if mounted local roots or DB mode are configured | DB rows survive; local mode requires mounted volume | No until the remaining non-pricing blockers are resolved | No | Keep pricing references imported or seeded as workspace-owned database rows; move uploaded/reference assets to object storage for production. |
 | Quote sessions | `QUOTE_DATA_ROOT/quote-sessions/{session_id}` | `kqag_quote_sessions` rows keyed by `workspace_id` | Yes in DB mode; no in local mode | Only if mounted local roots or DB mode are configured | DB rows survive; local mode requires mounted volume | Blocked until backup/retention is proven | No | Add backup/restore, retention, owner isolation tests, and hosted smoke evidence. |
 | Generated artifacts | `QUOTE_OUTPUT_ROOT/{job_id}` and quote-session `exports` folders | `kqag_quote_artifacts` and `kqag_file_artifacts` DB BLOBs exist | Only when both storage and artifact mode are database-backed | Local mode requires mounted output root; DB artifact mode survives restart | DB artifact mode survives, but is not final production storage | Blocked | No | Move generated XLSX/PDF and uploaded assets to object storage with DB metadata. |
 | Temp uploads/intermediates | `QUOTE_TMP_ROOT/{job_id}` | No durable production storage expected | No | No | No | Local/single-job only | No | Keep temp data ephemeral, but ensure generated durable artifacts are copied to owned artifact storage before download. |
@@ -107,22 +108,25 @@ records before internal alpha.
 
 ## Pricing References Audit
 
-Database pricing references are stored in `kqag_pricing_references`, but the
-database storage implementation currently merges workspace rows with local and
-bundled pricing references. Detail lookup can also fall through to the shared
-local/bundled pack resolver.
+Database pricing references are stored in `kqag_pricing_references`. PR #88
+removes the database-mode fallback that previously merged workspace rows with
+local and bundled pricing references. Detail/export/generation now fail safely
+when the selected pricing reference is missing, deleted, or not owned by the
+current workspace.
 
 Evidence:
 
-- `webapp/server.py:7166` merges company database references with
-  `list_local_pricing_references()` and `list_bundled_pricing_references()`.
-- `webapp/server.py:7191` starts database detail lookup, and
-  `webapp/server.py:7206` falls through to `pricing_reference_pack_detail()`.
+- `DatabaseKqagStorage.list_pricing_references()` returns only public summaries
+  for `kqag_pricing_references` rows in the current workspace.
+- `DatabaseKqagStorage.pricing_reference_detail()` returns `None` for local or
+  bundled sources in database mode.
+- Generation validation and runtime catalog creation use the authenticated
+  workspace storage in database mode.
 
 Production requirement: in database/platform mode, mutable pricing references
-must be workspace-scoped. Public bundled references can remain only through an
-explicit allowlist. Local private reference packs must not be listed, fetched,
-or used by other workspaces.
+must remain workspace-scoped. Public bundled references can be added later only
+through an explicit workspace-owned import or allowlist design; they are not a
+silent fallback.
 
 ## Sessions And Artifact Download Audit
 
@@ -180,7 +184,7 @@ Reportable findings:
 
 | Severity | Finding | Production impact | Required follow-up |
 | --- | --- | --- | --- |
-| High | Database pricing references can include local packs across workspaces | Hosted database mode can cross workspace boundaries if private local pricing packs exist on the host. | Remove local private fallback from DB/platform mode and add isolation tests. |
+| High, resolved in PR #88 | Database pricing references could include local packs across workspaces | Hosted database mode could cross workspace boundaries if private local pricing packs existed on the host. | Keep regression tests proving DB mode lists/details/exports/generates only workspace-owned references. |
 | Medium | Legacy job artifact downloads are not bound to workspace/session ownership | Any leaked valid job URL can bypass object-level ownership checks in a hosted multi-user deployment. | Route downloads through workspace/session-aware artifact storage or disable the legacy route in deploy mode. |
 
 Positive controls reviewed:
@@ -203,10 +207,8 @@ UAT until these are true:
 - `python scripts\check_production_readiness.py` reports no P1 blockers.
 - Profile generation resolves workspace-scoped DB/object-storage profile assets.
 - Pricing-reference list/detail/generation paths do not expose local private
-  packs in database/platform mode.
-- The high security finding for database pricing-reference local pack leakage
-  is fixed or explicitly risk-accepted only for a narrow internal-alpha
-  exception.
+  packs in database/platform mode. PR #88 adds this guard; keep it in the
+  release gate.
 - Generated XLSX/PDF and uploaded assets are stored in object storage or a
   documented, backed-up internal-alpha equivalent.
 - Artifact downloads are bound to workspace/session ownership.
@@ -227,8 +229,8 @@ UAT until these are true:
    remove Load Sample completely from product UI/routes/JS/docs and replace
    Playwright/unit-test reliance with test-only seeded setup.
 2. Pricing-reference isolation:
-   remove local private reference fallback in database/platform mode and add
-   cross-workspace tests.
+   completed in PR #88 for database/platform list/detail/export/generation
+   fallback removal and same-id delete regression coverage.
 3. Profile artifact/layout resolution:
    generate quotes from workspace-scoped profile layout/default assets instead
    of local profile-pack paths.
