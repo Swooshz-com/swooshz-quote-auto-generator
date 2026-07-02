@@ -1971,6 +1971,16 @@ def production_readiness_status(security_scan_status: str = "not_run_by_command"
         blockers.append(readiness_blocker("sqlite_not_final_production", "P1", "SQLite is acceptable only as an explicitly backed-up internal-alpha/simple-hosting option, not final production storage."))
     if database_mode:
         blockers.append(readiness_blocker("profile_runtime_layout_dependency", "P1", "Saved database profiles still need generation-time layout/default resolution from workspace-scoped profile artifacts."))
+    blockers.append(readiness_blocker(
+        "pricing_reference_local_pack_isolation",
+        "P1",
+        "High security finding: database/platform pricing-reference mode can include local private packs across workspaces until local fallback is removed.",
+    ))
+    blockers.append(readiness_blocker(
+        "legacy_job_artifact_download_authorization",
+        "P1",
+        "Medium security finding: legacy direct job artifact downloads are not bound to workspace/session ownership.",
+    ))
     blockers.append(readiness_blocker("object_storage_missing", "P1", "No object-storage-backed asset/artifact layer exists for production XLSX/PDF and uploaded reference assets."))
     blockers.append(readiness_blocker("backup_restore_unverified", "P1", "Backup, restore, retention, and rollback procedures are not implemented or verified by this command."))
 
@@ -1996,11 +2006,19 @@ def production_readiness_status(security_scan_status: str = "not_run_by_command"
         "security_scan_status": clean_text(security_scan_status) or "not_run_by_command",
         "local_uat_supported": True,
         "internal_alpha_ready": False if p1_or_higher else True,
+        "internal_alpha_future_exception": {
+            "possible": True,
+            "summary": (
+                "A temporary small-team internal alpha may become acceptable only after database storage, "
+                "database artifacts, and documented backup/restore/rollback are in place; SQLite/BLOB mode "
+                "is not final production storage."
+            ),
+        },
         "production_ready": False,
         "blockers_count": len(blockers),
         "blockers": blockers,
         "notes": [
-            "This command reports readiness posture without printing DB URLs, absolute runtime paths, tokens, cookies, customer data, generated quote contents, or private pricing/profile contents.",
+            "This command reports readiness posture without printing DB URLs, absolute private local paths, OAuth values, tokens, cookies, callback URLs with query params, customer data, generated quote contents, private pricing/profile contents, or staff emails.",
             "Local UAT passing does not equal internal-alpha or production readiness.",
         ],
     }

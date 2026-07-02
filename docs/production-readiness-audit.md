@@ -3,7 +3,8 @@
 Audit date: 2026-07-02
 
 Verdict: KQAG/SAQG is still local-UAT ready, but it is not ready for internal
-alpha or production hosting yet.
+alpha or production hosting yet. PR #84 does not make KQAG production-ready;
+it documents the current blockers and adds a safe readiness check.
 
 This audit did not inspect private runtime data, generated customer files,
 local `.env` values, secrets, or private pricing/profile contents. It reviewed
@@ -15,6 +16,16 @@ Security standard scan focused on production-readiness boundaries.
 Local UAT can continue under the existing repo rules: single operator, local
 runtime data, ignored generated outputs, and no public deployment. Production
 or broad internal rollout needs follow-up work first.
+
+Readiness verdicts are intentionally separate:
+
+- `local_uat_supported`: yes. Existing local UAT can continue.
+- `internal_alpha_ready`: no today. A temporary small-team exception could
+  become acceptable after database storage, database artifacts, and documented
+  backup/restore/rollback are in place, but that would still be an explicit
+  internal-alpha exception rather than final production clearance.
+- `production_ready`: no. SQLite/database BLOB mode is not final
+  production-ready storage.
 
 Primary blockers:
 
@@ -37,8 +48,9 @@ python scripts\check_production_readiness.py
 ```
 
 The command prints JSON only. It intentionally does not print database URLs,
-absolute runtime paths, token values, cookie values, customer data, generated
-quote contents, or private pricing/profile contents. It exits nonzero until the
+absolute private local paths, OAuth values, token values, cookie values,
+callback URLs with query params, customer data, generated quote contents,
+private pricing/profile contents, or staff emails. It exits nonzero until the
 known production blockers are fixed.
 
 Equivalent server entry point:
@@ -53,7 +65,8 @@ Current expected posture in local mode:
 - `internal_alpha_ready`: `false`
 - `production_ready`: `false`
 - Expected blockers include `local_runtime_storage`,
-  `local_artifact_storage`, `object_storage_missing`, and
+  `local_artifact_storage`, `pricing_reference_local_pack_isolation`,
+  `legacy_job_artifact_download_authorization`, `object_storage_missing`, and
   `backup_restore_unverified`.
 
 ## Storage Surface Audit
@@ -144,9 +157,12 @@ Recommended final architecture:
   profile assets, pricing assets, sessions, and generated XLSX outputs come
   back together.
 
-SQLite/database BLOB artifact mode is acceptable only for local UAT or an
-explicitly backed-up internal-alpha/simple-hosting experiment. It is not the
-recommended final production storage model.
+SQLite/database BLOB artifact mode is acceptable only for local UAT or, as a
+future temporary small-team exception, an explicitly backed-up internal-alpha
+setup with database-backed profiles, pricing references, quote sessions, and
+artifacts plus documented restore and rollback procedures. It is not the
+recommended final production storage model and must not be treated as
+production-ready.
 
 ## Security Audit
 
@@ -158,7 +174,7 @@ Reportable findings:
 
 | Severity | Finding | Production impact | Required follow-up |
 | --- | --- | --- | --- |
-| High | Database pricing references include local packs across workspaces | Hosted database mode can cross workspace boundaries if private local pricing packs exist on the host. | Remove local private fallback from DB/platform mode and add isolation tests. |
+| High | Database pricing references can include local packs across workspaces | Hosted database mode can cross workspace boundaries if private local pricing packs exist on the host. | Remove local private fallback from DB/platform mode and add isolation tests. |
 | Medium | Legacy job artifact downloads are not bound to workspace/session ownership | Any leaked valid job URL can bypass object-level ownership checks in a hosted multi-user deployment. | Route downloads through workspace/session-aware artifact storage or disable the legacy route in deploy mode. |
 
 Positive controls reviewed:
@@ -175,15 +191,21 @@ exhaustive line-by-line security review of every source-like file.
 
 ## Final Readiness Checklist
 
-KQAG should not move beyond local UAT until these are true:
+PR #84 does not make KQAG production-ready. KQAG should not move beyond local
+UAT until these are true:
 
 - `python scripts\check_production_readiness.py` reports no P1 blockers.
 - Profile generation resolves workspace-scoped DB/object-storage profile assets.
 - Pricing-reference list/detail/generation paths do not expose local private
   packs in database/platform mode.
+- The high security finding for database pricing-reference local pack leakage
+  is fixed or explicitly risk-accepted only for a narrow internal-alpha
+  exception.
 - Generated XLSX/PDF and uploaded assets are stored in object storage or a
   documented, backed-up internal-alpha equivalent.
 - Artifact downloads are bound to workspace/session ownership.
+- The medium security finding for legacy direct job artifact downloads is fixed
+  or the legacy route is disabled in deploy/database mode.
 - Backup and restore are documented, automated where possible, and drill-tested.
 - Rollback procedure is documented for app version, DB migration, and object
   storage compatibility.
@@ -195,21 +217,22 @@ KQAG should not move beyond local UAT until these are true:
 
 ## Recommended Follow-Up PR Sequence
 
-1. Pricing-reference isolation PR:
+1. Pricing-reference isolation:
    remove local private reference fallback in database/platform mode and add
    cross-workspace tests.
-2. Profile artifact resolution PR:
+2. Profile artifact/layout resolution:
    generate quotes from workspace-scoped profile layout/default assets instead
    of local profile-pack paths.
-3. Artifact authorization PR:
+3. Artifact authorization / legacy job download lockdown:
    disable or replace legacy job-file downloads in deploy/database mode and add
    cross-user artifact tests.
-4. Storage productionization PR:
+4. Storage productionization / object storage:
    introduce object-storage metadata, object-key authorization, checksum
    recording, and retention hooks.
-5. Operations readiness PR:
+5. Backup/restore/rollback/monitoring operations readiness:
    add backup/restore/rollback runbooks, hosted smoke checklist, and monitoring
    requirements.
 
 Do not combine these with public deployment, billing, Stripe, production auth
-redesign, or customer data migration in this repo.
+redesign, customer data migration, or any claim that PR #84 alone makes KQAG
+production-ready.
