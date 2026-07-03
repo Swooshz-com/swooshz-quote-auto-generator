@@ -119,7 +119,7 @@ evidence and tests.
 
 | Surface | Responsibilities | Current posture | Classification |
 | --- | --- | --- | --- |
-| `webapp/server.py` routes | Serves app shell, APIs, storage mode selection, profile/pricing/session/artifact handlers, sample routes, quote generation, readiness checks. | Large mixed boundary. Some routes are workspace-aware, while Load Sample, local pack resolution, and legacy job downloads remain product-reachable. | Live app code with production blockers. |
+| `webapp/server.py` routes | Serves app shell, APIs, storage mode selection, profile/pricing/session/artifact handlers, sample routes, quote generation, readiness checks. | Large mixed boundary. Some routes are workspace-aware; PR #91 disables legacy job downloads in protected modes, while other storage/fallback blockers remain. | Live app code with production blockers. |
 | `webapp/static/app.js` | Main product UI flow, intake state, uploads, profile/pricing selection, quote basis, generation, sessions, dashboard, sample loading. | Live app UI includes Load Sample and demo fixture copy. | Live app code with product-visible sample blockers. |
 | `webapp/static/index.html` | App shell and control placement. | Live app shell includes Load Sample button and sample fixture wording. | Live app code with product-visible sample blockers. |
 | `scripts/generate_quote.py` | XLSX generation, layout handling, optional PDF generation, spreadsheet hardening. | Core quote output path. It has layout/PDF fallback paths that are useful locally but must not hide missing profile assets in production. | Live core code; fallback policy needed. |
@@ -129,8 +129,8 @@ evidence and tests.
 | Runtime directories | Local data, output, temp, logs, private imports, generated artifacts. | Local UAT only. Must not be treated as production persistence. | Local-UAT-only; production blocker if hosted. |
 | Fixtures/sample/bundled data | Repo sample PDF/JSON, synthetic test values, bundled references. | Useful for tests, but product-visible sample and bundled-private-like fallback paths are not sellable-product behavior. | Move to test-only or historical/audit-only. |
 | Platform launch/auth/session handling | Platform session consume adapter, approved-tester login, CSRF/same-origin, host guard, workspace context. | Directionally correct, but still mixed with local storage and sample shortcuts. | Live, not production-complete. |
-| Quote session/dashboard handling | Save, list, duplicate, modify, delete, export artifacts. | DB storage is closer to target; local mode and legacy downloads still exist. | Live; production blockers remain. |
-| Artifact generation/download handling | Writes XLSX/PDF artifacts and serves downloads. | Quote-session downloads are closer to workspace-aware behavior. Legacy `/api/jobs` direct files are not workspace/session-bound. | Live with production-blocking route. |
+| Quote session/dashboard handling | Save, list, duplicate, modify, delete, export artifacts. | DB storage is closer to target; local mode still exists, and PR #91 owner-binds hosted job status/result reads. | Live; production blockers remain. |
+| Artifact generation/download handling | Writes XLSX/PDF artifacts and serves downloads. | Quote-session downloads are closer to workspace-aware behavior. PR #91 disables legacy `/api/jobs` direct files in hosted/database/platform/deploy paths. | Live; object-storage production blocker remains. |
 | Pricing reference import/list/detail/use | Import AI/manual catalogs, save/list details, generate with selected reference. | DB mode currently merges DB references with local/bundled packs and detail can fall through to local pack resolver. | Production blocker. |
 | Profile import/list/detail/use | Manage customer profile data and layout assets. | DB rows/artifacts exist, but generation-time profile pack resolution still reads local layout/default assets. | Production blocker. |
 | AI analysis flow | Draft quote basis from images and notes; local fallback when model is unavailable or fails. | Useful in local UAT, but fake success must not mask AI/storage failure in internal alpha or production. | Must be mode-gated or converted to explicit error. |
@@ -188,7 +188,7 @@ Required sellable-product posture:
 | `/api/samples`, `/api/samples/{id}` | Historical product API request. | Real workspace data/imports. | Repo sample fixture. | No private-file read by default, but trained product toward fake data. | Shared across all sessions. | Details, images, profile, pricing setup. | Removed from product code in this follow-up. | No product route/API in internal alpha or production. |
 | `setSampleDetails()` | Historical product UI button click. | User-uploaded booth/render images and real workspace data. | Repo sample details, files, profile, pricing. | No private-file read by default, but created product-visible fake success. | Shared sample behavior. | Quote basis and generation setup. | Removed from product code in this follow-up. | No product CTA/handler in internal alpha or production. |
 | AI draft local fallback | AI unavailable, not configured, or call fails. | Model-backed image analysis. | Local starter draft / local source result. | No direct private-file read, but can mask AI failure. | No direct cross-workspace data leak found. | Quote basis. | Needs stricter mode gate. | Allowed only as explicit local/test failure mode; disallow fake success in internal alpha/production. |
-| `send_download` on `/api/jobs/{job}/files/{filename}` | Direct legacy job-file URL. | Session-owned artifact lookup. | Output-root file by job id and filename. | Yes, reads configured output root. | Yes, no workspace/session owner lookup. | Generated artifacts. | Route is product-reachable. | Disable or authorize before internal alpha. |
+| `send_download` on `/api/jobs/{job}/files/{filename}` | Direct legacy job-file URL. | Session-owned artifact lookup. | Output-root file by job id and filename. | Local-UAT only after PR #91. | Disabled in hosted/database/platform/deploy paths after PR #91. | Generated artifacts. | Protected paths now return generic not found. | Keep disabled in hosted modes; use quote-session downloads. |
 | Quote-session download route | Session artifact download. | Direct file path. | Storage-backed artifact lookup. | Lower risk when storage mode is DB/artifact aware. | Storage visibility check exists. | Generated artifacts. | Better boundary. | Keep and strengthen with object storage. |
 | `scripts/generate_quote.py` layout fallback | Layout template missing. | Active profile layout workbook. | Minimal generated workbook. | No private-file leak, but hides missing profile assets. | No direct cross-workspace risk. | Customer-ready XLSX formatting. | Not product-mode strict. | Local/dev only; production should fail clearly if workspace layout is missing. |
 | `scripts/generate_quote.py` PDF fallback | Optional PDF mode requested and styled PDF path unavailable/fails. | Styled PDF renderer. | Text/simple PDF path. | No private-file leak. | No direct cross-workspace risk. | Optional PDF artifact only. | PDF is not default webapp output. | Keep local/tooling only; do not make PDF fallback part of sellable product path without tests. |
@@ -266,10 +266,12 @@ architecture blockers are tracked below and should not be hidden by sample data.
 
 ## Security Scan Status
 
-PR #84 completed a focused Codex Security standard scan and this audit carries
-forward its two production-readiness findings: database pricing references can
+PR #84 completed a focused Codex Security standard scan and this audit carried
+forward two production-readiness findings: database pricing references could
 include local packs across workspaces, and legacy direct job artifact downloads
-are not bound to workspace/session ownership.
+were not bound to workspace/session ownership. PR #88 resolves the database
+pricing-reference finding for DB/platform mode; PR #91 resolves the legacy
+direct job artifact download finding for hosted/database/platform/deploy mode.
 
 For this PR, the Codex Security plugin setup workspace was opened in standard
 whole-repo mode, but no new scan result was produced because the app-side Start
@@ -308,7 +310,6 @@ production-blocking fallback paths.
 - Playwright smoke/stress paths depending on the Load Sample product control.
 - Database/platform pricing reference mode listing or resolving local packs.
 - Generation-time profile layout/default resolution from local profile packs.
-- Legacy direct job downloads without workspace/session authorization.
 - AI/local starter draft fallback returning fake success in hosted modes.
 - Missing object-storage path for generated artifacts and uploaded assets.
 - Missing backup/restore/rollback evidence for DB plus artifact storage.
@@ -348,8 +349,8 @@ After seeded test setup exists, these become good deletion candidates:
    database/platform/deploy mode; add workspace isolation tests.
 3. Resolve profile layout/defaults from workspace-scoped DB/object-storage
    assets instead of local profile packs.
-4. Disable legacy direct job artifact downloads in deploy/database mode or make
-   them workspace/session-authorized.
+4. Legacy direct job artifact downloads:
+   completed in PR #91 by disabling them in protected hosted/database/platform/deploy modes.
 5. Convert AI/local starter draft fallback into explicit local/test-only
    behavior; production should fail safely instead of returning fake success.
 6. Delete proven dead compatibility/sample/demo code after tests no longer
