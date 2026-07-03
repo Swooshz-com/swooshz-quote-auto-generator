@@ -17,6 +17,11 @@ REQUIRED_KEYS = (
     "APP_MODE",
     "AUTH_REQUIRED",
     "SESSION_SECRET",
+    "KQAG_STORAGE_MODE",
+    "KQAG_ARTIFACT_STORAGE_MODE",
+    "KQAG_DATABASE_URL",
+    "KQAG_PLATFORM_LAUNCH_MODE",
+    "KQAG_PLATFORM_BASE_URL",
     "OIDC_ISSUER_URL",
     "OIDC_CLIENT_ID",
     "OIDC_CLIENT_SECRET",
@@ -38,25 +43,32 @@ REQUIRED_KEYS = (
 
 PLACEHOLDER_KEYS = {
     "SESSION_SECRET",
+    "KQAG_DATABASE_URL",
+    "KQAG_PLATFORM_BASE_URL",
     "OIDC_ISSUER_URL",
     "OIDC_CLIENT_ID",
     "OIDC_CLIENT_SECRET",
+    "OIDC_REDIRECT_URI",
     "OIDC_AUTHORIZE_URL",
     "OIDC_TOKEN_URL",
     "OIDC_USERINFO_URL",
     "OIDC_LOGOUT_URL",
     "AUTH_ALLOWED_EMAILS",
     "AUTH_ALLOWED_DOMAINS",
+    "QUOTE_DATA_ROOT",
+    "QUOTE_OUTPUT_ROOT",
+    "QUOTE_TMP_ROOT",
+    "QUOTE_LOG_ROOT",
+    "PORT",
 }
 
 EXPECTED_VALUES = {
     "APP_MODE": "deploy",
     "AUTH_REQUIRED": "true",
+    "KQAG_STORAGE_MODE": "database",
+    "KQAG_ARTIFACT_STORAGE_MODE": "database",
+    "KQAG_PLATFORM_LAUNCH_MODE": "platform",
     "AUTH_ALLOW_ANY_AUTHENTICATED_USER": "false",
-    "QUOTE_DATA_ROOT": "/var/lib/kqag/data",
-    "QUOTE_OUTPUT_ROOT": "/var/lib/kqag/output",
-    "QUOTE_TMP_ROOT": "/var/lib/kqag/tmp",
-    "QUOTE_LOG_ROOT": "/var/log/kqag",
 }
 
 FORBIDDEN_MARKERS = {
@@ -67,6 +79,10 @@ FORBIDDEN_MARKERS = {
         re.IGNORECASE,
     ),
     "private-local-path": re.compile(r"([A-Za-z]:\\Users\\|/Users/|/home/[^/\s]+/)", re.IGNORECASE),
+    "committed-url-or-db-url": re.compile(
+        r"\b(?:https?://(?!<)|postgres(?:ql)?://|mysql://|sqlite:///|s3://)",
+        re.IGNORECASE,
+    ),
     "generated-export-path": re.compile(
         r"(^|[/\\])(?:_output|generated[-_]?outputs?)(?:[/\\]|$)|quotation\.(xlsx|pdf)",
         re.IGNORECASE,
@@ -132,10 +148,6 @@ def verify_template(path: Path = DEFAULT_TEMPLATE) -> dict[str, object]:
             continue
         if value and not is_placeholder(value):
             findings.append(Finding(key, "non-placeholder-value", "provider-specific or secret value must remain a placeholder"))
-
-    redirect_uri = values.get("OIDC_REDIRECT_URI", "")
-    if redirect_uri and redirect_uri != "https://quote-uat.example.com/callback":
-        findings.append(Finding("OIDC_REDIRECT_URI", "unexpected-example-redirect", "redirect URI must use the placeholder example.com callback"))
 
     for key, expected in EXPECTED_VALUES.items():
         if values.get(key, "") != expected:

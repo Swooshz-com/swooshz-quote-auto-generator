@@ -39,6 +39,10 @@ python webapp\server.py --check-deploy-uat-env
 ```
 
 ```powershell
+python scripts\verify_internal_alpha_hosted_validation.py --work-dir _tmp\validation\internal-alpha-hosted
+```
+
+```powershell
 python -m unittest tests.test_webapp.WebappServerTest.test_deploy_auth_routes_block_unauthenticated_access_and_redirect_login
 python -m unittest tests.test_webapp.WebappServerTest.test_deploy_oidc_callback_exchanges_code_fetches_userinfo_and_sets_session_cookie
 python -m unittest tests.test_webapp.WebappServerTest.test_internal_uat_coolify_env_template_is_offline_verifiable
@@ -49,8 +53,11 @@ These checks verify:
 - The Coolify env template has the required deploy-auth keys.
 - Template secret/provider-specific fields remain placeholders.
 - `AUTH_ALLOW_ANY_AUTHENTICATED_USER=false`.
-- Runtime roots point to `/var/lib/kqag/data`, `/var/lib/kqag/output`,
-  `/var/lib/kqag/tmp`, and `/var/log/kqag`.
+- Runtime roots remain placeholders in committed templates and must be
+  host-managed housekeeping paths, not durable quote-session or artifact
+  storage for hosted use.
+- The current internal-alpha hosted validation bundle uses database storage and
+  database artifact storage with synthetic data only.
 - Deploy preflight can reach `ready` with synthetic env and temporary runtime
   roots outside the repo.
 - Missing deploy-auth config blocks without printing secret values.
@@ -76,25 +83,22 @@ These items cannot be completed before live infrastructure exists:
 
 ## Safe Temporary Env Shape
 
-Use only synthetic values in local tests. Runtime roots should be temporary
-folders outside the repository.
+Use only placeholders or synthetic values in local tests. Runtime roots should
+be temporary folders outside the repository and should not be reported.
 
 ```powershell
-$env:APP_MODE="deploy"
-$env:AUTH_REQUIRED="true"
-$env:SESSION_SECRET="synthetic-session-secret-for-local-test-only"
-$env:OIDC_ISSUER_URL="https://issuer.example"
-$env:OIDC_CLIENT_ID="synthetic-client-id"
-$env:OIDC_CLIENT_SECRET="synthetic-client-secret"
-$env:OIDC_REDIRECT_URI="https://quote-uat.example.com/callback"
-$env:OIDC_AUTHORIZE_URL="https://issuer.example/authorize"
-$env:OIDC_TOKEN_URL="https://issuer.example/token"
-$env:OIDC_USERINFO_URL="https://issuer.example/userinfo"
-$env:OIDC_LOGOUT_URL="https://issuer.example/logout"
-$env:AUTH_ALLOWED_EMAILS="tester@example.com"
-$env:AUTH_ALLOWED_DOMAINS=""
-$env:AUTH_ALLOW_ANY_AUTHENTICATED_USER="false"
-$env:AUTH_APPROVED_TESTER_ROLE="admin"
+$env:APP_MODE="<deploy>"
+$env:AUTH_REQUIRED="<true>"
+$env:SESSION_SECRET="<synthetic-session-secret>"
+$env:KQAG_STORAGE_MODE="<database>"
+$env:KQAG_ARTIFACT_STORAGE_MODE="<database>"
+$env:KQAG_DATABASE_URL="<synthetic-database-url>"
+$env:KQAG_PLATFORM_LAUNCH_MODE="<platform>"
+$env:KQAG_PLATFORM_BASE_URL="<synthetic-platform-base-url>"
+$env:AUTH_ALLOWED_EMAILS="<synthetic-allowlist>"
+$env:AUTH_ALLOWED_DOMAINS="<synthetic-allowlist-domain>"
+$env:AUTH_ALLOW_ANY_AUTHENTICATED_USER="<false>"
+$env:AUTH_APPROVED_TESTER_ROLE="<role>"
 ```
 
 Do not commit populated env files, real provider values, private local paths,

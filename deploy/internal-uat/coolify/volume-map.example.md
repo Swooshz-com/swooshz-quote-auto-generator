@@ -1,20 +1,19 @@
-# KQAG Internal UAT Volume Map
+# KQAG Internal-Alpha Runtime Housekeeping Map
 
-Map persistent storage for these container paths in the single Coolify UAT app.
-Names below are examples; use the prepared host's approved volume naming
-convention.
+The current internal-alpha posture uses database quote-session storage and
+database artifact storage. The runtime roots below are housekeeping surfaces
+for deploy preflight, temporary work, and logs. They must not become durable
+product-visible quote-session or generated-artifact storage in hosted modes.
 
-| Purpose | Env var | Container path | Example Coolify volume |
-| --- | --- | --- | --- |
-| Runtime company/profile/pricing/session data | `QUOTE_DATA_ROOT` | `/var/lib/kqag/data` | `kqag-uat-data` |
-| Generated quote outputs | `QUOTE_OUTPUT_ROOT` | `/var/lib/kqag/output` | `kqag-uat-output` |
-| Temporary job/work files | `QUOTE_TMP_ROOT` | `/var/lib/kqag/tmp` | `kqag-uat-tmp` |
-| Runtime logs | `QUOTE_LOG_ROOT` | `/var/log/kqag` | `kqag-uat-logs` |
+Use host-approved non-public locations in the host secret/environment manager.
+Do not commit populated paths.
 
-These paths may contain private internal quote workflow data. Do not expose them
-as public static directories, do not browse them through the app, and do not
-commit their contents to git.
+| Purpose | Env var | Hosted posture |
+| --- | --- | --- |
+| Runtime housekeeping | `QUOTE_DATA_ROOT` | Required by deploy preflight; not a profile/pricing/session source of truth. |
+| Output staging | `QUOTE_OUTPUT_ROOT` | Required by deploy preflight; generated artifacts must persist through `KQAG_ARTIFACT_STORAGE_MODE=database`. |
+| Temporary work files | `QUOTE_TMP_ROOT` | Temporary lifecycle only. |
+| Runtime logs | `QUOTE_LOG_ROOT` | Metadata-only logs only. |
 
-Multi-instance deployment is intentionally out of scope. Durable per-user or
-per-account storage partitioning belongs to future platform work, not this
-single-instance internal UAT adapter.
+Do not expose these paths as public static directories, browse them through the
+app, or commit their contents to git.
