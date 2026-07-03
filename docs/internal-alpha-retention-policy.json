@@ -1,0 +1,54 @@
+{
+  "schema": "swooshz.kqag.internal-alpha-retention-policy.v1",
+  "scope": "temporary database/database-artifact internal-alpha exception only",
+  "non_destructive_verifier_only": true,
+  "notes": [
+    "This policy is generic and secret-safe.",
+    "The verifier validates the policy shape with synthetic data only.",
+    "Final production still requires object storage, hosted logging/monitoring, and approved deletion workflows."
+  ],
+  "data_classes": [
+    {
+      "data_class": "quote_sessions",
+      "storage": "kqag_quote_sessions",
+      "retention_days": 90,
+      "rollback_note": "Restore the SQLite database from the prior known-good backup and verify workspace/session checksums before reopening internal-alpha access."
+    },
+    {
+      "data_class": "generated_artifacts",
+      "storage": "kqag_quote_artifacts",
+      "retention_days": 90,
+      "rollback_note": "Restore generated artifact rows together with quote-session metadata from the same backup set; verify artifact checksums before download routes are re-enabled."
+    },
+    {
+      "data_class": "uploaded_references",
+      "storage": "kqag_file_artifacts",
+      "retention_days": 90,
+      "rollback_note": "Restore uploaded reference artifact rows from the same backup set as pricing/profile metadata and validate row counts plus checksums."
+    },
+    {
+      "data_class": "profile_layout_assets",
+      "storage": "kqag_file_artifacts owner_type=profile",
+      "retention_days": 180,
+      "rollback_note": "Restore profile layout assets with their owning profile rows and verify workspace/profile ownership metadata before generation is enabled."
+    },
+    {
+      "data_class": "pricing_visual_assets",
+      "storage": "kqag_file_artifacts owner_type=pricing_reference",
+      "retention_days": 180,
+      "rollback_note": "Restore pricing visual assets with their owning pricing-reference rows and verify workspace/reference ownership metadata before reference exports are enabled."
+    },
+    {
+      "data_class": "logs",
+      "storage": "_logs local-UAT only until hosted logging exists",
+      "retention_days": 30,
+      "rollback_note": "Logs are not restored as authoritative app data; use them only for privacy-minimized diagnostics and keep hosted logging as a blocker."
+    },
+    {
+      "data_class": "backups",
+      "storage": "operator-managed encrypted backup location outside the repository",
+      "retention_days": 30,
+      "rollback_note": "Keep at least one prior known-good backup while internal-alpha testers are active, and verify restore before discarding the previous backup."
+    }
+  ]
+}

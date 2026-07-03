@@ -58,6 +58,33 @@ python scripts/migrate_kqag_storage.py
 
 The app does not auto-run migrations on startup.
 
+## Backup, Restore, Retention, And Rollback Evidence
+
+Database artifact mode is a temporary internal-alpha/simple-hosting exception,
+not final production storage. Before using it for internal alpha evidence, run
+the synthetic verifier:
+
+```powershell
+python scripts/verify_database_backup_restore.py
+python scripts/check_production_readiness.py --with-backup-restore-evidence
+```
+
+The verifier creates synthetic SQLite rows and BLOB artifacts only. It backs up
+and restores the database and database-artifact rows together, compares
+metadata checksums and row counts, verifies workspace/session ownership metadata
+survives restore, validates the machine-readable retention policy in
+`docs/internal-alpha-retention-policy.json`, and verifies rollback to a prior
+known-good synthetic state.
+
+Verifier output is metadata-only. It must not include DB URLs, absolute private
+paths, artifact bytes, generated quote contents, customer data, pricing/profile
+payloads, staff emails, OAuth values, cookies, tokens, or API keys.
+
+This evidence does not replace hosted smoke testing, hosted logging/monitoring,
+or production object storage. Production still requires object storage plus DB
+metadata, retention state, and backup/restore evidence for DB rows and objects
+together.
+
 ## Workspace Scope
 
 Database rows are keyed by the platform workspace ID from the KQAG platform

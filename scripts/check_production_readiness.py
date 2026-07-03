@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sys
+import argparse
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,10 +13,43 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from webapp import server as webapp
+import verify_database_backup_restore
 
 
-def main() -> int:
-    status = webapp.production_readiness_status()
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Report KQAG production-readiness posture without printing private values.")
+    parser.add_argument(
+        "--with-backup-restore-evidence",
+        action="store_true",
+        help="Run the synthetic SQLite database/database-artifact backup/restore verifier and include only its pass/fail status.",
+    )
+    parser.add_argument(
+        "--backup-restore-work-dir",
+        type=Path,
+        default=None,
+        help="Synthetic verifier workspace. The path is never printed.",
+    )
+    return parser
+
+
+def backup_restore_evidence_status(*, enabled: bool, work_dir: Path | None) -> str:
+    if not enabled:
+        return "not_run_by_checker"
+    try:
+        report = verify_database_backup_restore.run_verification(work_dir=work_dir)
+    except Exception:
+        return "failed"
+    return "passed" if report.get("status") == "passed" else "failed"
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    status = webapp.production_readiness_status(
+        backup_restore_evidence_status=backup_restore_evidence_status(
+            enabled=args.with_backup_restore_evidence,
+            work_dir=args.backup_restore_work_dir,
+        )
+    )
     print(json.dumps(status, indent=2, ensure_ascii=True))
     return 0 if status["production_ready"] else 2
 

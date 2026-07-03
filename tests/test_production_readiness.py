@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -11,11 +12,21 @@ from webapp import server as webapp
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_temp_root() -> Path:
+    root = ROOT / "_tmp" / "tests"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 class ProductionReadinessStatusTest(unittest.TestCase):
     def readiness_json(self, env):
         with mock.patch.dict(webapp.os.environ, env, clear=True):
             status = webapp.production_readiness_status(security_scan_status="standard_scan_started")
         return json.dumps(status, sort_keys=True)
+
+    def readiness_status(self, env, **kwargs):
+        with mock.patch.dict(webapp.os.environ, env, clear=True):
+            return webapp.production_readiness_status(security_scan_status="standard_scan_started", **kwargs)
 
     def test_readiness_status_redacts_private_values_and_lists_storage_surfaces(self):
         private_root = "C:/Users/Private/Koncept Runtime"
@@ -55,6 +66,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         blocker_ids = {item["id"] for item in status["blockers"]}
         self.assertIn("local_runtime_storage", blocker_ids)
         self.assertIn("hosted_logging_monitoring_missing", blocker_ids)
+        self.assertIn("hosted_smoke_evidence_missing", blocker_ids)
         self.assertNotIn("pricing_reference_local_pack_isolation", blocker_ids)
         self.assertNotIn("legacy_job_artifact_download_authorization", blocker_ids)
 
@@ -111,6 +123,47 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         for value in private_values:
             self.assertNotIn(value, text)
 
+    def test_readiness_command_can_include_synthetic_backup_restore_evidence(self):
+        work_dir = test_temp_root() / f"readiness-backup-evidence-{time.time_ns()}"
+        command_env = {
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONPATH": str(ROOT),
+            "KQAG_STORAGE_MODE": "database",
+            "KQAG_ARTIFACT_STORAGE_MODE": "database",
+            "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+        }
+        for name in ("COMSPEC", "SystemRoot", "TEMP", "TMP"):
+            if os.environ.get(name):
+                command_env[name] = os.environ[name]
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "check_production_readiness.py"),
+                "--with-backup-restore-evidence",
+                "--backup-restore-work-dir",
+                str(work_dir),
+            ],
+            cwd=ROOT,
+            env=command_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        status = json.loads(completed.stdout)
+        blocker_ids = {item["id"] for item in status["blockers"]}
+        self.assertEqual(status["backup_restore_evidence"]["status"], "passed")
+        self.assertNotIn("backup_restore_unverified", blocker_ids)
+        self.assertIn("object_storage_missing", blocker_ids)
+        self.assertIn("hosted_logging_monitoring_missing", blocker_ids)
+        self.assertIn("hosted_smoke_evidence_missing", blocker_ids)
+        self.assertFalse(status["internal_alpha_ready"])
+        self.assertFalse(status["production_ready"])
+        self.assertNotIn(str(work_dir), completed.stdout + completed.stderr)
+
     def test_database_and_artifact_modes_are_evaluated_separately(self):
         database_url = "sqlite:///tmp/kqag-storage.sqlite3"
         with mock.patch.dict(
@@ -141,6 +194,50 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertNotIn("profile_runtime_layout_dependency", {item["id"] for item in database_status["blockers"]})
         self.assertNotIn("pricing_reference_local_pack_isolation", {item["id"] for item in database_status["blockers"]})
         self.assertNotIn("legacy_job_artifact_download_authorization", {item["id"] for item in database_status["blockers"]})
+
+    def test_database_backup_restore_evidence_can_be_reported_without_readiness_overclaim(self):
+        database_url = "sqlite:///tmp/kqag-storage.sqlite3"
+        status = self.readiness_status(
+            {
+                "KQAG_STORAGE_MODE": "database",
+                "KQAG_ARTIFACT_STORAGE_MODE": "database",
+                "KQAG_DATABASE_URL": database_url,
+            },
+            backup_restore_evidence_status="passed",
+        )
+
+        blocker_ids = {item["id"] for item in status["blockers"]}
+        internal_alpha_blocker_ids = {item["id"] for item in status["internal_alpha_blockers"]}
+        production_blocker_ids = {item["id"] for item in status["production_blockers"]}
+        self.assertEqual(status["backup_restore_evidence"]["status"], "passed")
+        self.assertTrue(status["backup_restore_evidence"]["database_artifact_temporary_exception_supported"])
+        self.assertNotIn("backup_restore_unverified", blocker_ids)
+        self.assertIn("object_storage_missing", blocker_ids)
+        self.assertNotIn("object_storage_missing", internal_alpha_blocker_ids)
+        self.assertIn("object_storage_missing", production_blocker_ids)
+        self.assertNotIn("sqlite_not_final_production", internal_alpha_blocker_ids)
+        self.assertIn("sqlite_not_final_production", production_blocker_ids)
+        self.assertIn("hosted_logging_monitoring_missing", blocker_ids)
+        self.assertIn("hosted_smoke_evidence_missing", blocker_ids)
+        self.assertIn("hosted_logging_monitoring_missing", internal_alpha_blocker_ids)
+        self.assertIn("hosted_smoke_evidence_missing", internal_alpha_blocker_ids)
+        self.assertFalse(status["internal_alpha_ready"])
+        self.assertFalse(status["production_ready"])
+
+    def test_database_backup_restore_evidence_is_not_assumed_when_not_run(self):
+        database_url = "sqlite:///tmp/kqag-storage.sqlite3"
+        status = self.readiness_status(
+            {
+                "KQAG_STORAGE_MODE": "database",
+                "KQAG_ARTIFACT_STORAGE_MODE": "database",
+                "KQAG_DATABASE_URL": database_url,
+            }
+        )
+
+        blocker_ids = {item["id"] for item in status["blockers"]}
+        self.assertEqual(status["backup_restore_evidence"]["status"], "not_run_by_checker")
+        self.assertFalse(status["backup_restore_evidence"]["database_artifact_temporary_exception_supported"])
+        self.assertIn("backup_restore_unverified", blocker_ids)
 
 
 if __name__ == "__main__":
