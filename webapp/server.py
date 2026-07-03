@@ -2250,6 +2250,33 @@ def production_readiness_status(
             else "Move quote sessions to workspace-scoped database storage for any multi-user or hosted rollout."
         ),
     )
+    quote_session_snapshots = {
+        "schema": "swooshz.kqag.quote-generation-snapshot.v1",
+        "mode": storage_mode,
+        "source": "kqag_quote_sessions.metadata_json.generation_snapshot",
+        "workspace_scoped": database_mode,
+        "privacy_minimized": True,
+        "immutable_on_draft_edit": True,
+        "stores": [
+            "profile/pricing labels",
+            "profile/pricing ids",
+            "profile/pricing safe digests",
+            "workspace scope",
+            "safe storage modes",
+            "generated timestamp",
+        ],
+        "does_not_store": [
+            "raw pricing rows",
+            "generated quote contents",
+            "uploaded file contents",
+            "artifact bytes",
+            "local paths",
+            "secrets",
+        ],
+        "internal_alpha_suitable": database_mode and database_configured,
+        "production_suitable": False,
+        "follow_up": "Complete remaining session/business hardening, immutable generated audit trails, and race coverage before production.",
+    }
     generated_artifacts = readiness_surface(
         mode=artifact_mode,
         source=(
@@ -2304,6 +2331,7 @@ def production_readiness_status(
     if object_artifacts:
         blockers.append(readiness_blocker("object_retention_delete_live_evidence_missing", "P1", "Live object provider retention/delete evidence is still missing for production.", gates=("production",)))
         blockers.append(readiness_blocker("db_object_backup_restore_live_evidence_missing", "P1", "Live DB+object backup/restore evidence is still missing for production.", gates=("production",)))
+    blockers.append(readiness_blocker("session_business_hardening_incomplete", "P1", "Immutable quote-session snapshot groundwork exists, but final session/business hardening and generated audit race coverage remain incomplete.", gates=("production",)))
     blockers.append(readiness_blocker("production_deployment_operations_evidence_missing", "P1", "Production deployment, operations, alert delivery, and live host evidence are not verified by this command.", gates=("production",)))
     if not backup_restore_evidence["database_artifact_temporary_exception_supported"]:
         blockers.append(readiness_blocker("backup_restore_unverified", "P1", "Backup, restore, retention, and rollback evidence has not been verified for the selected database/database-artifact mode."))
@@ -2329,6 +2357,7 @@ def production_readiness_status(
         "profiles_storage": profiles,
         "pricing_references_storage": pricing_references,
         "quote_sessions_storage": quote_sessions,
+        "quote_session_snapshots": quote_session_snapshots,
         "generated_artifacts_storage": generated_artifacts,
         "workspace_scoped": workspace_scoped,
         "local_storage_dependencies_found": [
@@ -8021,11 +8050,13 @@ class DatabaseKqagStorage:
             export = public.get("exports", {}).get(kind) if isinstance(public.get("exports"), dict) else None
             if not isinstance(export, dict):
                 continue
-            recorded_filename = clean_text(export.get("filename"))
+            metadata_export = metadata.get("exports", {}).get(kind) if isinstance(metadata.get("exports"), dict) else None
+            raw_export = metadata_export if isinstance(metadata_export, dict) else export
+            recorded_filename = clean_text(raw_export.get("filename"))
             safe_recorded = recorded_filename if recorded_filename == filename else ""
             artifact = self._quote_artifact_metadata(public["session_id"], kind) if configured_artifact_storage_mode() in {"database", "object"} and safe_recorded else None
             artifact_exists = bool(artifact)
-            stale = bool(artifact_exists and quote_session_export_is_stale(metadata, export))
+            stale = bool(artifact_exists and quote_session_export_is_stale(metadata, raw_export))
             exists = bool(artifact_exists and not stale)
             has_stale_export = has_stale_export or stale
             has_available_export = has_available_export or exists
@@ -8125,6 +8156,16 @@ class DatabaseKqagStorage:
             metadata["draft_state"] = quote_session_draft_state(patch)
         if result_has_generated_quote(result):
             metadata["status"]["quote_generated"] = True
+            profile_id = safe_resource_id(payload.get("profile_id"), "")
+            pricing_reference_id = pricing_reference_id_from_payload(payload) or safe_resource_id(payload.get("pricing_reference_id"), "")
+            metadata["generation_snapshot"] = quote_session_generation_snapshot(
+                payload,
+                patch,
+                created_at=now,
+                workspace_id=self.workspace_id,
+                profile_detail=self.profile_detail(profile_id, source="company") if profile_id else None,
+                pricing_reference_detail=self.pricing_reference_detail(pricing_reference_id, source="company") if pricing_reference_id else None,
+            )
             if configured_artifact_storage_mode() in {"database", "object"}:
                 self._store_quote_export_artifacts(resolved_session_id, metadata, result, output_dir)
         if not result_has_generated_quote(result):
@@ -13436,6 +13477,114 @@ def quote_session_pricing_reference_summary(payload: dict[str, Any], patch: dict
     }
 
 
+def quote_session_safe_digest(value: dict[str, Any]) -> str:
+    safe_value = quote_session_draft_state_value(value)
+    if not isinstance(safe_value, dict):
+        safe_value = {}
+    raw = json.dumps(safe_value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def quote_session_snapshot_resource(summary: dict[str, Any], detail: dict[str, Any] | None = None) -> dict[str, str]:
+    detail = detail if isinstance(detail, dict) else {}
+    resource_id = safe_resource_id(detail.get("id") or summary.get("id"), "")
+    display_name = dashboard_safe_text(
+        detail.get("display_name")
+        or detail.get("label")
+        or detail.get("name")
+        or summary.get("display_name")
+        or summary.get("label")
+        or summary.get("name")
+    )
+    source = safe_resource_id(detail.get("source") or summary.get("source") or "company", "company")
+    resource = {
+        "id": resource_id,
+        "display_name": display_name or dashboard_safe_text(summary.get("display_name")) or "Workspace Data",
+        "source": source,
+        "scope": "workspace" if source == "company" else source,
+    }
+    digest_input = {key: resource[key] for key in ("id", "display_name", "source", "scope")}
+    schema_version = detail.get("schema_version")
+    if schema_version not in (None, ""):
+        digest_input["schema_version"] = dashboard_safe_text(schema_version, 40)
+        resource["schema_version"] = dashboard_safe_text(schema_version, 40)
+    resource["digest_sha256"] = quote_session_safe_digest(digest_input)
+    return resource
+
+
+def quote_session_generation_snapshot(
+    payload: dict[str, Any],
+    patch: dict[str, Any],
+    *,
+    created_at: str,
+    workspace_id: str = "",
+    profile_detail: dict[str, Any] | None = None,
+    pricing_reference_detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    profile = quote_session_snapshot_resource(quote_session_profile_summary(payload, patch), profile_detail)
+    pricing_reference = quote_session_snapshot_resource(
+        quote_session_pricing_reference_summary(payload, patch),
+        pricing_reference_detail,
+    )
+    storage = {
+        "app_mode": configured_app_mode(),
+        "storage_mode": configured_storage_mode(),
+        "artifact_storage_mode": configured_artifact_storage_mode(),
+    }
+    snapshot: dict[str, Any] = {
+        "schema": "swooshz.kqag.quote-generation-snapshot.v1",
+        "created_at": dashboard_safe_text(created_at),
+        "profile": profile,
+        "pricing_reference": pricing_reference,
+        "workspace": {
+            "scope": "workspace",
+            "workspace_id": safe_resource_id(workspace_id, "") if workspace_id else "",
+        },
+        "storage": storage,
+    }
+    snapshot["digest_sha256"] = quote_session_safe_digest({
+        "created_at": snapshot["created_at"],
+        "profile": profile,
+        "pricing_reference": pricing_reference,
+        "workspace": snapshot["workspace"],
+        "storage": storage,
+    })
+    return snapshot
+
+
+def normalized_quote_session_generation_snapshot(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    schema = dashboard_safe_text(value.get("schema"), 120)
+    if schema != "swooshz.kqag.quote-generation-snapshot.v1":
+        return {}
+    snapshot = {
+        "schema": schema,
+        "created_at": dashboard_safe_text(value.get("created_at")),
+        "profile": quote_session_snapshot_resource(value.get("profile") if isinstance(value.get("profile"), dict) else {}),
+        "pricing_reference": quote_session_snapshot_resource(
+            value.get("pricing_reference") if isinstance(value.get("pricing_reference"), dict) else {}
+        ),
+        "workspace": {
+            "scope": dashboard_safe_text((value.get("workspace") if isinstance(value.get("workspace"), dict) else {}).get("scope"), 40) or "workspace",
+            "workspace_id": safe_resource_id((value.get("workspace") if isinstance(value.get("workspace"), dict) else {}).get("workspace_id"), ""),
+        },
+        "storage": {},
+    }
+    storage = value.get("storage") if isinstance(value.get("storage"), dict) else {}
+    for key in ("app_mode", "storage_mode", "artifact_storage_mode"):
+        snapshot["storage"][key] = safe_resource_id(storage.get(key), "")
+    digest = clean_text(value.get("digest_sha256"))
+    snapshot["digest_sha256"] = digest if re.fullmatch(r"[a-f0-9]{64}", digest) else quote_session_safe_digest({
+        "created_at": snapshot["created_at"],
+        "profile": snapshot["profile"],
+        "pricing_reference": snapshot["pricing_reference"],
+        "workspace": snapshot["workspace"],
+        "storage": snapshot["storage"],
+    })
+    return snapshot
+
+
 def quote_session_commercials(payload: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     supplied = patch.get("commercials") if isinstance(patch.get("commercials"), dict) else {}
     tax = quote_tax_from_payload(payload)
@@ -13626,6 +13775,7 @@ def blank_quote_session_metadata(session_id: str, created_at: str) -> dict[str, 
             "user_id": "",
         },
         "draft_state": {},
+        "generation_snapshot": {},
     }
 
 
@@ -13639,6 +13789,9 @@ def normalized_quote_session_metadata(metadata: dict[str, Any]) -> dict[str, Any
     for key in ("customer_summary", "quote_company_profile", "pricing_reference", "commercials", "status", "exports", "owner", "draft_state"):
         if isinstance(metadata.get(key), dict):
             normalized[key].update(copy.deepcopy(metadata[key]))
+    snapshot = normalized_quote_session_generation_snapshot(metadata.get("generation_snapshot"))
+    if snapshot:
+        normalized["generation_snapshot"] = snapshot
     quote_session_apply_draft_summary_fallbacks(normalized)
     return normalized
 
@@ -13815,6 +13968,11 @@ def create_or_update_quote_session(
         write_quote_session_draft_files(resolved_session_id, quote_session_draft_files(patch))
     if result_has_generated_quote(result):
         metadata["status"]["quote_generated"] = True
+        metadata["generation_snapshot"] = quote_session_generation_snapshot(
+            payload,
+            patch,
+            created_at=now,
+        )
     copy_quote_session_exports(resolved_session_id, metadata, result, output_dir)
     if not result_has_generated_quote(result):
         mark_quote_session_exports_stale(metadata, quote_session_current_draft_export_kinds(patch))

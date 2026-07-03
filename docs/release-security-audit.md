@@ -18,11 +18,13 @@ verified.
 | --- | --- | --- |
 | `local_uat_supported` | Yes | Local localhost mode, local runtime storage, seeded test setup, and current CI remain supported. |
 | `internal_alpha_ready` | Conditional | Default local mode remains blocked. Under `KQAG_STORAGE_MODE=database`, `KQAG_ARTIFACT_STORAGE_MODE=database`, and explicit passing backup/restore, hosted observability, and hosted smoke evidence flags, the checker may report `internal_alpha_ready=true` for the temporary SQLite/DB-artifact simple-hosting exception only. |
-| `production_ready` | No | The object-storage contract and lifecycle paths now have synthetic/stubbed evidence, but live provider evidence, real DB+object backup/restore, real retention/delete evidence, and production deployment/operations evidence are not complete. |
+| `production_ready` | No | Immutable quote-session snapshot groundwork and synthetic/stubbed object lifecycle evidence exist, but live provider evidence, real DB+object backup/restore, real retention/delete evidence, production deployment/operations evidence, and final session/business hardening are not complete. |
 
-This PR does not claim production readiness. It hardens object-mode generated
-artifact lifecycle behavior after the S3-compatible runtime groundwork, adds
-synthetic/stubbed lifecycle evidence, and keeps production blocked.
+This PR does not claim production readiness. It adds privacy-minimized immutable
+quote-session generation snapshot groundwork so generated sessions retain the
+workspace-owned profile/pricing labels and safe audit metadata used at
+generation time even if current workspace packs are later renamed, edited, or
+deleted. Production remains blocked.
 
 Highest-priority remaining blockers:
 
@@ -72,6 +74,23 @@ quote-session list, detail, save, delete, download, and generate-session
 persistence when workspace-owned database quote-session storage is unavailable.
 Local-UAT/local-development mode still keeps the local filesystem quote-session
 runtime store for localhost dashboard testing only.
+
+Immutable quote-session snapshot update: generated quote sessions now store a
+privacy-minimized `generation_snapshot` in quote-session metadata. The snapshot
+contains the selected workspace profile/pricing ids, display labels, safe
+digests of those summary fields, workspace scope, generation timestamp, and
+storage mode metadata. It intentionally does not add raw pricing catalog rows,
+generated quote contents, uploaded file contents, artifact bytes, object keys,
+local paths, DB URLs, secrets, customer payloads, staff emails, OAuth values,
+cookies, or tokens. Existing sessions without snapshots remain readable. Draft
+edits can update current session state, but the generated snapshot remains tied
+to the generated artifact/audit metadata. Workspace isolation is unchanged:
+database/platform modes read snapshots only through workspace-owned
+`kqag_quote_sessions` rows, and missing/deleted current profile/pricing rows do
+not fall back to local, bundled, or synthetic fixture packs for generated-session
+display. This is groundwork only; production still needs final session/business
+hardening, generated audit race coverage, live object-storage evidence, and
+deployment/operations evidence.
 
 Local artifact storage policy update: protected generate paths now block before
 creating or returning local `QUOTE_OUTPUT_ROOT` quote artifacts when database
@@ -412,7 +431,7 @@ Current fallback blockers:
 | AI draft local fallback | Resolved in PR #92 | Protected modes now require the real OpenAI draft path and return blocked status with a generic message if remote AI is missing, unconfigured, unavailable, or returns unusable output. Local-UAT mode keeps the local starter fallback only for localhost testing. | Resolved High |
 | Quote-session local runtime storage | Resolved in PR #93 | Protected modes now return a generic blocked/failed response instead of listing, reading, saving, deleting, downloading, or generate-persisting quote sessions through `QUOTE_DATA_ROOT/quote-sessions` when database storage is unavailable. | Resolved High |
 | Local quote artifact storage | Resolved in PR #94 for protected generate and artifact-upload paths | Protected modes now return a generic failed response before creating or returning local `QUOTE_OUTPUT_ROOT` quote artifacts, profile layout uploads, or pricing visual uploads when database artifact storage is unavailable. Database artifact mode remains a temporary internal-alpha/simple-hosting exception only, not production object storage. | Resolved High for protected local artifact success path |
-| Job/session summary local pack fallback | `webapp/server.py:12474`, `12491` | Display names can resolve through local pack loaders. Lower data impact, but still wrong product shape. | Medium |
+| Job/session summary local pack fallback | Resolved for newly generated quote sessions by immutable `generation_snapshot` metadata | Generated session display/audit labels come from saved workspace-owned profile/pricing summaries instead of current local/bundled pack loaders. Existing legacy sessions without snapshots remain readable with backward-compatible summaries. | Low/legacy |
 | Broad defensive exception handlers | `webapp/server.py:13365`, `13764`, `13803` | Mostly privacy-safe failure handling, but review each before hosted release. | Medium |
 
 ## Secrets, Privacy, And Logging Review
