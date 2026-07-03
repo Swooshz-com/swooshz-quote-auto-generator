@@ -48,6 +48,8 @@ import build_pricing_catalog as pricing_catalog
 import verify_internal_uat_deploy_template as deploy_template
 from webapp import server as webapp
 
+AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE = "AI draft generation is not available in this environment."
+
 
 def require_node(test_case: unittest.TestCase) -> str:
     node = shutil.which("node")
@@ -155,6 +157,36 @@ def wait_for_job(job_id: str, timeout: float = 2.0, auth_session: dict | None = 
             return job
         time.sleep(0.02)
     raise AssertionError(f"Timed out waiting for job {job_id}")
+
+
+def env_only_dotenv_value(name: str, env_path: Path | None = None) -> str:
+    _ = env_path
+    return str(os.environ.get(name) or "")
+
+
+def test_temp_root() -> Path:
+    root = ROOT / "_tmp" / "tests"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def isolated_env(**overrides: str) -> dict[str, str]:
+    env = {
+        "APP_MODE": "local",
+        "KQAG_STORAGE_MODE": "local",
+        "KQAG_ARTIFACT_STORAGE_MODE": "local",
+        "KQAG_PLATFORM_LAUNCH_MODE": "disabled",
+        "OPENAI_API_KEY": "",
+        "DEEPSEEK_API_KEY": "",
+        "PYTHONIOENCODING": "utf-8",
+        "TEMP": str(test_temp_root()),
+        "TMP": str(test_temp_root()),
+    }
+    for name in ("COMSPEC", "SystemRoot", "PATH"):
+        if os.environ.get(name):
+            env[name] = os.environ[name]
+    env.update({key: value for key, value in overrides.items() if value is not None})
+    return env
 
 
 
@@ -552,8 +584,8 @@ class JsonResponseMock:
 class WebappServerTest(unittest.TestCase):
     def setUp(self):
         super().setUp()
-        self._empty_bundled_pricing_root = tempfile.TemporaryDirectory()
-        self.addCleanup(self._empty_bundled_pricing_root.cleanup)
+        self._empty_bundled_pricing_root = test_temp_root() / "empty-bundled-pricing"
+        self._empty_bundled_pricing_root.mkdir(parents=True, exist_ok=True)
         fixture_profiles_root = QUOTE_GENERATOR_FIXTURE_ROOT / "profiles"
         fixture_pricing_root = QUOTE_GENERATOR_FIXTURE_ROOT / "pricing-references"
         patchers = [
@@ -563,7 +595,7 @@ class WebappServerTest(unittest.TestCase):
             mock.patch.object(webapp, "BUNDLED_DEFAULT_PRICING_REFERENCE_ID", "synthetic-exhibition-fixture-pricing"),
             mock.patch.object(webapp, "profiles_root", return_value=fixture_profiles_root),
             mock.patch.object(webapp, "pricing_references_root", return_value=fixture_pricing_root),
-            mock.patch.object(webapp, "bundled_pricing_references_root", return_value=Path(self._empty_bundled_pricing_root.name)),
+            mock.patch.object(webapp, "bundled_pricing_references_root", return_value=self._empty_bundled_pricing_root),
         ]
         for patcher in patchers:
             patcher.start()
@@ -1430,6 +1462,121 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(lines[0]["tag"], "Custom")
         self.assertEqual(lines[0].get("custom_pricing"), True)
         self.assertEqual(draft["line_items"], [])
+
+    def test_protected_draft_missing_remote_ai_blocks_without_local_fallback(self):
+        payload = valid_payload()
+        with (
+            mock.patch.dict(os.environ, isolated_env(APP_MODE="deploy"), clear=False),
+            mock.patch.object(webapp, "read_dotenv_value", side_effect=env_only_dotenv_value),
+            mock.patch.object(webapp, "default_quote_basis", side_effect=AssertionError("local fallback should not run")),
+        ):
+            result = webapp.draft_quote_basis(payload)
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+        self.assertNotEqual(result.get("source"), "local")
+        self.assertNotIn("quote_basis", result)
+        self.assertNotIn("quote_basis_sections", result)
+        self.assertNotIn("line_items", result)
+
+    def test_protected_draft_remote_ai_failure_blocks_without_local_success(self):
+        payload = valid_payload()
+        with (
+            mock.patch.dict(os.environ, isolated_env(APP_MODE="deploy", OPENAI_API_KEY="sk-test-redacted"), clear=False),
+            mock.patch.object(webapp, "read_dotenv_value", side_effect=env_only_dotenv_value),
+            mock.patch.object(
+                webapp,
+                "request_openai_quote_basis",
+                side_effect=webapp.OpenAIAnalysisError("Provider failed before a usable draft."),
+            ),
+        ):
+            result = webapp.draft_quote_basis(payload)
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+        self.assertNotEqual(result.get("source"), "local")
+        self.assertNotIn("quote_basis", result)
+        self.assertNotIn("quote_basis_sections", result)
+        self.assertNotIn("line_items", result)
+
+    def test_protected_draft_job_missing_remote_ai_is_blocked_not_degraded(self):
+        payload = valid_payload()
+        auth_session = self.platform_auth_session("workspace-draft-job")
+        with (
+            mock.patch.dict(os.environ, isolated_env(), clear=False),
+            mock.patch.object(webapp, "read_dotenv_value", side_effect=env_only_dotenv_value),
+        ):
+            created = webapp.create_job("draft", payload, auth_session=auth_session)
+            job = wait_for_job(created["job_id"], timeout=3.0, auth_session=auth_session)
+
+        self.assertEqual(job["status"], "blocked")
+        self.assertEqual(job["result"]["status"], "blocked")
+        self.assertEqual(job["result"]["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+        self.assertNotIn("quote_basis", job["result"])
+        self.assertNotIn("line_items", job["result"])
+
+    def test_local_uat_draft_missing_remote_ai_keeps_local_fallback(self):
+        payload = valid_payload()
+        with (
+            mock.patch.dict(os.environ, isolated_env(), clear=False),
+            mock.patch.object(webapp, "read_dotenv_value", side_effect=env_only_dotenv_value),
+        ):
+            result = webapp.draft_quote_basis(payload)
+
+        self.assertEqual(result["status"], "drafted")
+        self.assertEqual(result["source"], "local")
+        self.assertTrue(result["ai_failed"])
+        self.assertIn("quote_basis", result)
+        self.assertIn("quote_basis_sections", result)
+        self.assertIn("line_items", result)
+
+    def test_protected_draft_failure_logs_metadata_without_sensitive_values(self):
+        payload = valid_payload()
+        sensitive_error = (
+            "synthetic-confidential-marker in synthetic private runtime failed with "
+            "sk-test-redacted and generated draft text."
+        )
+        log_root = test_temp_root() / f"draft-protected-log-{time.time_ns()}"
+        with (
+            mock.patch.dict(
+                os.environ,
+                    isolated_env(
+                        APP_MODE="deploy",
+                        OPENAI_API_KEY="sk-test-redacted",
+                        QUOTE_LOG_ROOT=str(log_root),
+                    ),
+                clear=False,
+            ),
+            mock.patch.object(webapp, "read_dotenv_value", side_effect=env_only_dotenv_value),
+            mock.patch.object(
+                webapp,
+                "request_openai_quote_basis",
+                side_effect=webapp.OpenAIAnalysisError(sensitive_error),
+            ),
+        ):
+            result = webapp.draft_quote_basis(payload)
+
+        log_path = next((log_root / "ai").glob("*.jsonl"))
+        records = [
+            json.loads(line)
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("ai_draft_protected_mode_blocked", {record["event"] for record in records})
+        log_text = json.dumps(records, sort_keys=True)
+        for private_value in (
+            "synthetic-confidential-marker",
+            "synthetic private runtime",
+            "sk-test-redacted",
+            "generated draft text",
+            payload["client"]["name"],
+            payload["quote_basis"]["platform"],
+        ):
+            self.assertNotIn(private_value, log_text)
+        self.assertNotIn('"quote_basis"', log_text)
+        self.assertNotIn('"line_items"', log_text)
 
     def test_normalize_ai_draft_appends_missing_catalog_backed_basis_lines(self):
         parsed = {

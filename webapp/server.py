@@ -308,6 +308,7 @@ ALLOWED_LOG_EVENTS = {
     "abuse_signal",
     "ai_call_attempt",
     "ai_draft_fallback_used",
+    "ai_draft_protected_mode_blocked",
     "ai_draft_remote_unconfigured",
     "basis_chat_failed",
     "basis_chat_model_retry",
@@ -396,6 +397,7 @@ OPENAI_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 AI_PROVIDER_OPENAI = "openai"
 AI_PROVIDER_DEEPSEEK = "deepseek"
 SUPPORTED_TEXT_AI_PROVIDERS = {AI_PROVIDER_OPENAI, AI_PROVIDER_DEEPSEEK}
+AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE = "AI draft generation is not available in this environment."
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_PRO_MODEL = "deepseek-v4-pro"
 DEEPSEEK_FLASH_MODEL = "deepseek-v4-flash"
@@ -916,6 +918,8 @@ def log_meaning(event: str, details: dict[str, Any], context: str) -> str:
         meaning = "AI quote-basis drafting or revision chat failed. Check details.errors or provider_errors; retry after fixing provider/network/configuration issues."
     elif event in {"openai_draft_completed"}:
         meaning = "AI quote-basis drafting completed. Check details counts and section titles to confirm whether the model returned usable quote content."
+    elif event == "ai_draft_protected_mode_blocked":
+        meaning = "Protected-mode AI quote-basis drafting was blocked because a real remote AI draft was unavailable or failed."
     elif event in {"ai_draft_fallback_used", "ai_draft_remote_unconfigured"}:
         meaning = "Remote AI analysis was unavailable or unconfigured, so the app used or offered a local fallback path."
     elif event == "server_pricing_reference_import_timing":
@@ -944,7 +948,7 @@ def log_meaning(event: str, details: dict[str, Any], context: str) -> str:
 
 def ai_log_simple_task(event: str, details: dict[str, Any]) -> str:
     feature = log_event_name(details.get("feature") or details.get("source") or event)
-    if feature in {"draft_quote_basis", "openai_draft_completed"} or event in {"openai_draft_completed", "draft_failed", "draft_worker_failed", "draft_blocked"}:
+    if feature in {"draft_quote_basis", "openai_draft_completed"} or event in {"openai_draft_completed", "draft_failed", "draft_worker_failed", "draft_blocked", "ai_draft_protected_mode_blocked"}:
         return "Quote basis draft"
     if feature == "basis_chat" or "basis_chat" in event:
         return "Quote basis chat"
@@ -963,7 +967,7 @@ def ai_log_simple_status(event: str, details: dict[str, Any]) -> str:
         return status
     if event in {"openai_draft_completed"}:
         return "success"
-    if event in {"draft_blocked", "draft_failed", "draft_worker_failed", "basis_chat_failed", "basis_chat_worker_failed", "openai_draft_failed", "openai_basis_chat_failed"}:
+    if event in {"draft_blocked", "draft_failed", "draft_worker_failed", "basis_chat_failed", "basis_chat_worker_failed", "openai_draft_failed", "openai_basis_chat_failed", "ai_draft_protected_mode_blocked"}:
         return "failed"
     if event in {"ai_draft_fallback_used", "ai_draft_remote_unconfigured"}:
         return "fallback"
@@ -12382,23 +12386,92 @@ def finalized_remote_draft_result(
     }
 
 
-def draft_quote_basis(payload: dict[str, Any]) -> dict[str, Any]:
-    fallback, fallback_sections = confirm_only_basis_from_basis(default_quote_basis(payload))
-    fallback_line_items = normalize_line_items(payload) or default_line_items(payload)
-    fallback_project = booth_dimensions_from_payload(payload)
+def protected_ai_draft_mode_enabled(auth_session: dict[str, Any] | None = None) -> bool:
+    return protected_job_routes_enabled(auth_session)
+
+
+def protected_ai_draft_blocked_result(error_reference: str) -> dict[str, Any]:
+    return {
+        "status": "blocked",
+        "errors": [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE],
+        "error_reference": clean_text(error_reference),
+    }
+
+
+def log_protected_ai_draft_block(
+    *,
+    error_reference: str,
+    reason: str,
+    provider: str,
+    model: str = "",
+    exc: BaseException | str | None = None,
+    missing_env: list[str] | None = None,
+) -> None:
+    details: dict[str, Any] = {
+        "reason": safe_resource_id(reason, "remote_ai_unavailable"),
+        "error_reference": clean_text(error_reference),
+        "selected_provider": clean_text(provider) or AI_PROVIDER_OPENAI,
+        "app_mode": configured_app_mode(),
+        "storage_mode": configured_storage_mode(),
+        "artifact_storage_mode": configured_artifact_storage_mode(),
+        "platform_launch_mode": configured_platform_launch_mode(),
+    }
+    if model:
+        details["model"] = clean_text(model)
+    if missing_env:
+        details["missing_env"] = [clean_text(name) for name in missing_env if clean_text(name)]
+    if exc is not None:
+        details.update(
+            ai_failure_metadata(
+                exc,
+                provider=provider,
+                timeout_seconds=ai_provider_timeout_seconds(provider, "draft_quote_basis"),
+                error_reference=error_reference,
+            )
+        )
+    write_local_log("ai_draft_protected_mode_blocked", details)
+
+
+def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any]:
+    protected_mode = protected_ai_draft_mode_enabled(auth_session)
     provider = "openai"
     provider_label = "OpenAI"
     missing_env = OPENAI_API_KEY_ENV_NAME
     remote_errors: list[str] = []
 
     openai_key = read_dotenv_value(OPENAI_API_KEY_ENV_NAME)
+    image_count, pdf_count = ai_payload_media_counts(payload)
+    analysis_mode = draft_analysis_mode(payload)
+    draft_model = configured_openai_draft_model(analysis_mode)
+    if protected_mode and not openai_key:
+        error_reference = new_error_reference()
+        log_ai_call_attempt(
+            feature="draft_quote_basis",
+            provider=AI_PROVIDER_OPENAI,
+            model=draft_model,
+            status="missing_api_key",
+            duration_ms=0,
+            analysis_mode=analysis_mode,
+            image_count=image_count,
+            pdf_count=pdf_count,
+            error_reference=error_reference,
+            details={"missing_env": [missing_env]},
+        )
+        log_protected_ai_draft_block(
+            error_reference=error_reference,
+            reason="remote_ai_unconfigured",
+            provider=AI_PROVIDER_OPENAI,
+            model=draft_model,
+            missing_env=[missing_env],
+        )
+        return protected_ai_draft_blocked_result(error_reference)
+
     if openai_key:
         attempt_started_at = time.perf_counter()
-        analysis_mode = draft_analysis_mode(payload)
-        image_count, pdf_count = ai_payload_media_counts(payload)
-        draft_model = configured_openai_draft_model(analysis_mode)
         try:
             ai_basis = request_openai_quote_basis(payload, openai_key)
+            fallback_line_items = normalize_line_items(payload) or default_line_items(payload)
+            fallback_project = booth_dimensions_from_payload(payload)
             result = finalized_remote_draft_result(
                 payload,
                 ai_basis,
@@ -12431,6 +12504,15 @@ def draft_quote_basis(payload: dict[str, Any]) -> dict[str, Any]:
         except OpenAIAnalysisError as exc:
             openai_error = str(exc)
             remote_errors.append(openai_error)
+            provider_failure_details = (
+                ai_failure_metadata(
+                    exc,
+                    provider=AI_PROVIDER_OPENAI,
+                    timeout_seconds=ai_provider_timeout_seconds(AI_PROVIDER_OPENAI, "draft_quote_basis"),
+                )
+                if protected_mode
+                else {"errors": safe_error_messages([openai_error])}
+            )
             log_ai_call_attempt(
                 feature="draft_quote_basis",
                 provider=AI_PROVIDER_OPENAI,
@@ -12440,11 +12522,24 @@ def draft_quote_basis(payload: dict[str, Any]) -> dict[str, Any]:
                 analysis_mode=analysis_mode,
                 image_count=image_count,
                 pdf_count=pdf_count,
-                details={"errors": safe_error_messages([openai_error])},
+                details=provider_failure_details,
             )
+            if protected_mode:
+                error_reference = new_error_reference()
+                log_protected_ai_draft_block(
+                    error_reference=error_reference,
+                    reason="remote_ai_failed",
+                    provider=AI_PROVIDER_OPENAI,
+                    model=draft_model,
+                    exc=exc,
+                )
+                return protected_ai_draft_blocked_result(error_reference)
             write_local_log("openai_draft_failed", {"errors": safe_error_messages([openai_error])})
 
     if remote_errors:
+        fallback_line_items = normalize_line_items(payload) or default_line_items(payload)
+        fallback_project = booth_dimensions_from_payload(payload)
+        fallback, fallback_sections = confirm_only_basis_from_basis(default_quote_basis(payload))
         error_reference = new_error_reference()
         warning_messages = [
             "Remote AI analysis was unavailable, so I used a local starter draft from the current quote details. Review it carefully or regenerate later.",
@@ -12477,17 +12572,19 @@ def draft_quote_basis(payload: dict[str, Any]) -> dict[str, Any]:
         }
 
     error_reference = new_error_reference()
+    fallback_line_items = normalize_line_items(payload) or default_line_items(payload)
+    fallback_project = booth_dimensions_from_payload(payload)
+    fallback, fallback_sections = confirm_only_basis_from_basis(default_quote_basis(payload))
     warnings = safe_error_messages([
         f"Remote AI is not configured on this PC. Selected provider is {provider_label}. Add {missing_env} to .env, restart the local server, then regenerate analysis.",
     ])
-    image_count, pdf_count = ai_payload_media_counts(payload)
     log_ai_call_attempt(
         feature="draft_quote_basis",
         provider=AI_PROVIDER_OPENAI,
-        model=configured_openai_draft_model(draft_analysis_mode(payload)),
+        model=draft_model,
         status="missing_api_key",
         duration_ms=0,
-        analysis_mode=draft_analysis_mode(payload),
+        analysis_mode=analysis_mode,
         image_count=image_count,
         pdf_count=pdf_count,
         error_reference=error_reference,
@@ -13405,11 +13502,15 @@ def set_job_state(job_id: str, **updates: Any) -> None:
         job["updated_at"] = utc_timestamp()
 
 
-def finish_draft_job(job_id: str, payload: dict[str, Any]) -> None:
+def finish_draft_job(job_id: str, payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> None:
     try:
-        result = draft_quote_basis(payload)
-        status = "degraded" if result.get("source") == "local" and result.get("warnings") else "completed"
-        set_job_state(job_id, status=status, result=result, errors=[])
+        result = draft_quote_basis(payload, auth_session=auth_session)
+        result_status = clean_text(result.get("status"))
+        if result_status in {"blocked", "failed"}:
+            status = result_status
+        else:
+            status = "degraded" if result.get("source") == "local" and result.get("warnings") else "completed"
+        set_job_state(job_id, status=status, result=result, errors=result.get("errors") or [])
     except OpenAIAnalysisError as exc:
         error_reference = new_error_reference()
         result = failed_result_payload(error_reference)
@@ -13480,7 +13581,7 @@ def run_job_worker(
     auth_session: dict[str, Any] | None = None,
 ) -> None:
     with ai_log_tracking_scope(ai_tracking_context):
-        if worker in {finish_generate_job, finish_generate_pdf_job}:
+        if worker in {finish_generate_job, finish_generate_pdf_job, finish_draft_job}:
             worker(job_id, payload, auth_session=auth_session)
         else:
             worker(job_id, payload)
@@ -14100,7 +14201,10 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                     return
                 payload = resolved_payload
                 try:
-                    result = draft_quote_basis(payload)
+                    result = draft_quote_basis(payload, auth_session=self.current_auth_session())
+                    if result.get("status") == "blocked":
+                        self.send_json(result, status=503)
+                        return
                     self.send_json(result)
                 except OpenAIAnalysisError as exc:
                     error_reference = new_error_reference()
