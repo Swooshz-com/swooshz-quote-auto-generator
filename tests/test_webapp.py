@@ -684,6 +684,32 @@ class WebappServerTest(unittest.TestCase):
 
         return urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
 
+    def http_json(self, runner, method: str, path: str, *, cookie: str = "", body: dict | None = None, headers: dict | None = None) -> dict:
+        parsed = urllib.parse.urlparse(runner.base_url)
+        request_headers = {"Accept": "application/json"}
+        if cookie:
+            request_headers["Cookie"] = cookie
+        if body is not None:
+            request_headers["Content-Type"] = "application/json"
+        request_headers.update(headers or {})
+        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
+        try:
+            connection.request(
+                method,
+                path,
+                body=json.dumps(body).encode("utf-8") if body is not None else None,
+                headers=request_headers,
+            )
+            response = connection.getresponse()
+            text = response.read().decode("utf-8")
+        finally:
+            connection.close()
+        try:
+            parsed_body = json.loads(text)
+        except json.JSONDecodeError:
+            parsed_body = {}
+        return {"status": response.status, "body": parsed_body, "text": text}
+
     def oidc_login_state(self, runner, opener):
         with self.assertRaises(urllib.error.HTTPError) as login_redirect:
             opener.open(f"{runner.base_url}/login", timeout=3)
@@ -9161,6 +9187,179 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 self.assertEqual(outside_marker.read_text(encoding="utf-8"), "keep")
                 self.assertNotIn(str(data_root), response_text)
                 self.assertNotIn(str(Path(tmp)), response_text)
+
+    def test_protected_deploy_quote_session_routes_block_local_runtime_storage(self):
+        root = test_temp_root() / f"quote-session-protected-deploy-{time.time_ns()}"
+        data_root = root / "data"
+        log_root = root / "logs"
+        private_customer = "Synthetic Private Customer"
+        local_payload = valid_payload()
+        local_payload["quote_session"] = {
+            "session_id": "quote-local-protected",
+            "customer_summary": {"customer_name": private_customer},
+        }
+        local_env = {
+            "APP_MODE": "local",
+            "KQAG_STORAGE_MODE": "local",
+            "KQAG_ARTIFACT_STORAGE_MODE": "local",
+            "QUOTE_DATA_ROOT": str(data_root),
+            "QUOTE_LOG_ROOT": str(log_root),
+        }
+        with mock.patch.dict(os.environ, local_env, clear=True):
+            webapp.create_or_update_quote_session(local_payload)
+        local_session_path = data_root / "quote-sessions" / "quote-local-protected" / "quote-session.json"
+        self.assertTrue(local_session_path.is_file())
+
+        env = self.deploy_auth_env(
+            KQAG_STORAGE_MODE="local",
+            KQAG_ARTIFACT_STORAGE_MODE="local",
+            QUOTE_DATA_ROOT=str(data_root),
+            QUOTE_LOG_ROOT=str(log_root),
+        )
+        with mock.patch.dict(os.environ, env, clear=True):
+            session_cookie = (
+                f"{webapp.SESSION_COOKIE_NAME}="
+                f"{webapp.signed_cookie_value({'user': {'subject': 'deploy-user', 'email': 'alex@example.com'}})}"
+            )
+            with LocalRunnerServer() as runner:
+                session_body = self.http_json(runner, "GET", "/api/session", cookie=session_cookie)
+                csrf_header = session_body["body"]["csrf_header"]
+                csrf_token = session_body["body"]["csrf_token"]
+                requests = [
+                    self.http_json(runner, "GET", "/api/quote-sessions", cookie=session_cookie),
+                    self.http_json(runner, "GET", "/api/quote-sessions/quote-local-protected", cookie=session_cookie),
+                    self.http_json(
+                        runner,
+                        "POST",
+                        "/api/quote-sessions",
+                        cookie=session_cookie,
+                        body={"quote_session": {"session_id": "quote-local-protected"}},
+                        headers={csrf_header: csrf_token},
+                    ),
+                    self.http_json(
+                        runner,
+                        "DELETE",
+                        "/api/quote-sessions/quote-local-protected",
+                        cookie=session_cookie,
+                        headers={csrf_header: csrf_token},
+                    ),
+                ]
+
+        for response in requests:
+            self.assertEqual(response["status"], 503, response)
+            self.assertIn("Quote session storage is not available in this environment.", response["text"])
+            self.assertNotIn(private_customer, response["text"])
+            self.assertNotIn("quote-local-protected", response["text"])
+            self.assertNotIn(str(data_root), response["text"])
+            self.assertNotIn(str(root), response["text"])
+        self.assertTrue(local_session_path.is_file())
+        log_records = []
+        for log_path in log_root.rglob("*.jsonl"):
+            log_records.extend(
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
+        self.assertIn("quote_session_runtime_storage_blocked", {record["event"] for record in log_records})
+        serialized_logs = json.dumps(log_records, sort_keys=True)
+        self.assertNotIn(private_customer, serialized_logs)
+        self.assertNotIn("quote-local-protected", serialized_logs)
+        self.assertNotIn(str(data_root), serialized_logs)
+        self.assertNotIn(str(root), serialized_logs)
+
+    def test_platform_session_context_blocks_local_quote_session_runtime_storage_in_local_app_mode(self):
+        root = test_temp_root() / f"quote-session-platform-local-{time.time_ns()}"
+        data_root = root / "data"
+        private_customer = "Synthetic Platform Private Customer"
+        local_payload = valid_payload()
+        local_payload["quote_session"] = {
+            "session_id": "quote-platform-local",
+            "customer_summary": {"customer_name": private_customer},
+        }
+        with mock.patch.dict(
+            os.environ,
+            {
+                "APP_MODE": "local",
+                "KQAG_STORAGE_MODE": "local",
+                "KQAG_ARTIFACT_STORAGE_MODE": "local",
+                "QUOTE_DATA_ROOT": str(data_root),
+            },
+            clear=True,
+        ):
+            webapp.create_or_update_quote_session(local_payload)
+
+        platform_session = self.platform_auth_session("workspace-platform-local", membership_role="owner")
+        env = {
+            "APP_MODE": "local",
+            "SESSION_SECRET": "test-session-secret-with-enough-entropy",
+            "KQAG_STORAGE_MODE": "local",
+            "KQAG_ARTIFACT_STORAGE_MODE": "local",
+            "QUOTE_DATA_ROOT": str(data_root),
+            "QUOTE_LOG_ROOT": str(root / "logs"),
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            session_cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(platform_session)}"
+            with LocalRunnerServer() as runner:
+                session_body = self.http_json(runner, "GET", "/api/session", cookie=session_cookie)
+                csrf_header = session_body["body"]["csrf_header"]
+                csrf_token = session_body["body"]["csrf_token"]
+                requests = [
+                    self.http_json(runner, "GET", "/api/quote-sessions", cookie=session_cookie),
+                    self.http_json(runner, "GET", "/api/quote-sessions/quote-platform-local", cookie=session_cookie),
+                    self.http_json(
+                        runner,
+                        "POST",
+                        "/api/quote-sessions",
+                        cookie=session_cookie,
+                        body={"quote_session": {"session_id": "quote-platform-local"}},
+                        headers={csrf_header: csrf_token},
+                    ),
+                    self.http_json(
+                        runner,
+                        "DELETE",
+                        "/api/quote-sessions/quote-platform-local",
+                        cookie=session_cookie,
+                        headers={csrf_header: csrf_token},
+                    ),
+                ]
+
+        for response in requests:
+            self.assertEqual(response["status"], 503, response)
+            self.assertIn("Quote session storage is not available in this environment.", response["text"])
+            self.assertNotIn(private_customer, response["text"])
+            self.assertNotIn("quote-platform-local", response["text"])
+            self.assertNotIn(str(data_root), response["text"])
+
+    def test_protected_generate_with_quote_session_blocks_before_local_runtime_session_success(self):
+        root = test_temp_root() / f"quote-session-generate-block-{time.time_ns()}"
+        payload = valid_payload()
+        payload["quote_session"] = {
+            "session_id": "quote-generate-protected",
+            "customer_summary": {"customer_name": "Synthetic Generate Private Customer"},
+        }
+        env = self.deploy_auth_env(
+            KQAG_STORAGE_MODE="local",
+            KQAG_ARTIFACT_STORAGE_MODE="local",
+            QUOTE_DATA_ROOT=str(root / "data"),
+            QUOTE_OUTPUT_ROOT=str(root / "output"),
+            QUOTE_TMP_ROOT=str(root / "tmp"),
+            QUOTE_LOG_ROOT=str(root / "logs"),
+        )
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp.subprocess, "run", side_effect=AssertionError("generator should not run")),
+        ):
+            result = webapp.run_quote_job(
+                payload,
+                output_root=root / "out",
+                tmp_root=root / "tmp",
+                auth_session={"user": {"subject": "deploy-user", "email": "alex@example.com"}},
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["errors"], ["Quote session storage is not available in this environment."])
+        self.assertNotIn("quote_session", result)
+        self.assertFalse((root / "data" / "quote-sessions" / "quote-generate-protected").exists())
 
     def test_static_webapp_adds_quote_dashboard_without_replacing_quote_flow(self):
         static_dir = ROOT / "webapp" / "static"

@@ -329,6 +329,7 @@ ALLOWED_LOG_EVENTS = {
     "ai_pricing_reference_metadata_enrichment_completed",
     "profile_export_failed",
     "profile_export_not_found",
+    "quote_session_runtime_storage_blocked",
     "security_event",
     "server_pricing_reference_import_timing",
     "server_error",
@@ -398,6 +399,7 @@ AI_PROVIDER_OPENAI = "openai"
 AI_PROVIDER_DEEPSEEK = "deepseek"
 SUPPORTED_TEXT_AI_PROVIDERS = {AI_PROVIDER_OPENAI, AI_PROVIDER_DEEPSEEK}
 AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE = "AI draft generation is not available in this environment."
+QUOTE_SESSION_STORAGE_UNAVAILABLE_MESSAGE = "Quote session storage is not available in this environment."
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_PRO_MODEL = "deepseek-v4-pro"
 DEEPSEEK_FLASH_MODEL = "deepseek-v4-flash"
@@ -922,6 +924,8 @@ def log_meaning(event: str, details: dict[str, Any], context: str) -> str:
         meaning = "Protected-mode AI quote-basis drafting was blocked because a real remote AI draft was unavailable or failed."
     elif event in {"ai_draft_fallback_used", "ai_draft_remote_unconfigured"}:
         meaning = "Remote AI analysis was unavailable or unconfigured, so the app used or offered a local fallback path."
+    elif event == "quote_session_runtime_storage_blocked":
+        meaning = "Protected-mode quote-session storage was blocked because local runtime storage is local-UAT only."
     elif event == "server_pricing_reference_import_timing":
         meaning = "Pricing-reference upload/import timing. Check details.route and details.timings_ms to see whether local extraction, AI cleanup, or row validation dominated the wait."
     elif event == "ai_pricing_reference_import_timing":
@@ -1975,6 +1979,7 @@ def production_readiness_status(security_scan_status: str = "not_run_by_command"
         blockers.append(readiness_blocker("sqlite_not_final_production", "P1", "SQLite is acceptable only as an explicitly backed-up internal-alpha/simple-hosting option, not final production storage."))
     blockers.append(readiness_blocker("object_storage_missing", "P1", "No object-storage-backed asset/artifact layer exists for production XLSX/PDF and uploaded reference assets."))
     blockers.append(readiness_blocker("backup_restore_unverified", "P1", "Backup, restore, retention, and rollback procedures are not implemented or verified by this command."))
+    blockers.append(readiness_blocker("hosted_logging_monitoring_missing", "P1", "Hosted privacy-minimized logging, monitoring, alerting, and support traceability are not implemented or verified by this command."))
 
     workspace_scoped = all(
         surface["workspace_scoped"]
@@ -6968,7 +6973,12 @@ def safe_auth_session_for_async(session: dict[str, Any] | None) -> dict[str, Any
 def storage_access_error_payload(exc: KqagStorageAccessError) -> dict[str, Any]:
     error_reference = new_error_reference()
     write_local_log("server_error", {"error_reference": error_reference, "reason": exc.reason, "status": exc.status, "errors": safe_error_messages([str(exc)])})
-    return {"status": "blocked" if exc.status < 500 else "failed", "errors": ["KQAG storage is not available for this workspace."], "error_reference": error_reference}
+    message = (
+        QUOTE_SESSION_STORAGE_UNAVAILABLE_MESSAGE
+        if exc.reason == "protected_local_quote_session_storage_unavailable"
+        else "KQAG storage is not available for this workspace."
+    )
+    return {"status": "blocked" if exc.status < 500 else "failed", "errors": [message], "error_reference": error_reference}
 
 
 def safe_platform_session_context(platform: dict[str, Any]) -> dict[str, Any]:
@@ -13444,6 +13454,32 @@ def protected_job_routes_enabled(session: dict[str, Any] | None = None) -> bool:
     )
 
 
+def log_protected_local_quote_session_storage_block(reason: str = "protected_local_quote_session_storage_unavailable") -> None:
+    write_local_log(
+        "quote_session_runtime_storage_blocked",
+        {
+            "reason": safe_resource_id(reason, "protected_local_quote_session_storage_unavailable"),
+            "app_mode": configured_app_mode(),
+            "storage_mode": configured_storage_mode(),
+            "artifact_storage_mode": configured_artifact_storage_mode(),
+            "platform_launch_mode": configured_platform_launch_mode(),
+        },
+    )
+
+
+def quote_session_storage_for_auth_session(session: dict[str, Any] | None) -> LocalKqagStorage | DatabaseKqagStorage:
+    if configured_storage_mode() == "database":
+        return app_storage_for_auth_session(session)
+    if protected_job_routes_enabled(session):
+        log_protected_local_quote_session_storage_block()
+        raise KqagStorageAccessError(
+            QUOTE_SESSION_STORAGE_UNAVAILABLE_MESSAGE,
+            status=503,
+            reason="protected_local_quote_session_storage_unavailable",
+        )
+    return LocalKqagStorage()
+
+
 def job_owner_context_from_auth_session(session: dict[str, Any] | None) -> dict[str, str]:
     user = session.get("user") if isinstance(session, dict) and isinstance(session.get("user"), dict) else {}
     platform = platform_context_from_auth_session(session)
@@ -13690,6 +13726,13 @@ def run_quote_job(
         return {"status": "blocked", "errors": [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE]}
     payload = resolved_payload
 
+    quote_session_storage: LocalKqagStorage | DatabaseKqagStorage | None = None
+    if isinstance(payload.get("quote_session"), dict):
+        try:
+            quote_session_storage = quote_session_storage_for_auth_session(auth_session)
+        except KqagStorageAccessError as exc:
+            return storage_access_error_payload(exc)
+
     output_root = output_root or configured_output_root()
     tmp_root = tmp_root or configured_tmp_root()
     job_id = safe_resource_id(job_id, f"job-{secrets.token_hex(6)}")
@@ -13787,7 +13830,11 @@ def run_quote_job(
         result["error_reference"] = error_reference
     if isinstance(payload.get("quote_session"), dict):
         try:
-            result["quote_session"] = app_storage_for_auth_session(auth_session).create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+            storage = quote_session_storage or quote_session_storage_for_auth_session(auth_session)
+            result["quote_session"] = storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+        except KqagStorageAccessError as exc:
+            storage_error = storage_access_error_payload(exc)
+            result.update(storage_error)
         except Exception as exc:  # pragma: no cover - defensive dashboard metadata boundary
             write_local_log(
                 "quote_session_update_failed",
@@ -13855,21 +13902,21 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             })
             return
         if path == "/api/quote-sessions":
-            storage = self.current_app_storage()
+            storage = self.current_quote_session_storage()
             if storage is None:
                 return
             self.send_json({"quote_sessions": storage.list_quote_sessions()})
             return
         quote_session_download_match = re.fullmatch(r"/api/quote-sessions/([A-Za-z0-9_-]+)/download/([A-Za-z0-9_-]+)", path)
         if quote_session_download_match:
-            storage = self.current_app_storage()
+            storage = self.current_quote_session_storage()
             if storage is None:
                 return
             self.send_quote_session_download(quote_session_download_match.group(1), quote_session_download_match.group(2), storage)
             return
         quote_session_detail_match = re.fullmatch(r"/api/quote-sessions/([A-Za-z0-9_-]+)", path)
         if quote_session_detail_match:
-            storage = self.current_app_storage()
+            storage = self.current_quote_session_storage()
             if storage is None:
                 return
             session = storage.get_quote_session(quote_session_detail_match.group(1), include_draft_state=True)
@@ -14156,7 +14203,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 self.send_json(error, status=403)
                 return
             try:
-                storage = self.current_app_storage()
+                storage = self.current_quote_session_storage()
                 if storage is None:
                     return
                 session = storage.create_or_update_quote_session(payload)
@@ -14253,7 +14300,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 self.send_json(error, status=403)
                 return
             try:
-                storage = self.current_app_storage()
+                storage = self.current_quote_session_storage()
                 if storage is None:
                     return
                 deleted = storage.delete_quote_session(quote_session_match.group(1))
@@ -14326,6 +14373,13 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
     def current_app_storage(self) -> LocalKqagStorage | DatabaseKqagStorage | None:
         try:
             return app_storage_for_auth_session(self.current_auth_session())
+        except KqagStorageAccessError as exc:
+            self.send_json(storage_access_error_payload(exc), status=exc.status)
+            return None
+
+    def current_quote_session_storage(self) -> LocalKqagStorage | DatabaseKqagStorage | None:
+        try:
+            return quote_session_storage_for_auth_session(self.current_auth_session())
         except KqagStorageAccessError as exc:
             self.send_json(storage_access_error_payload(exc), status=exc.status)
             return None
