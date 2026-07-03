@@ -583,8 +583,9 @@ Severity summary from plugin: unavailable because the scan did not start. This a
 | `node --check scripts/playwright-smoke.mjs` | Passed. |
 | `node --check scripts/playwright-ai-basis-chat-stress.mjs` | Passed. |
 | `Invoke-WebRequest http://127.0.0.1:8765/api/health` | Passed after starting the local webapp server with `scripts/start-webapp.ps1`: HTTP 200. |
-| `npm run playwright:smoke -- --port 8766` | Passed with `status=ok` on isolated local test server. The plain `npm run playwright:smoke` reused the already-running health-check server on port 8765 and hit a stale dashboard/localStorage assertion, so the isolated-port run is the recorded smoke evidence. |
-| `npm run playwright:ai-stress -- --port 8767` | Passed with `status=ok` on isolated local test server. |
+| `npm run playwright:smoke -- --port 8768` | Passed with `status=ok` on isolated local test server. The plain `npm run playwright:smoke` reused the already-running health-check server on port 8765 and hit a stale dashboard/localStorage assertion, so the isolated-port run is the recorded smoke evidence. |
+| `npm run playwright:ai-stress -- --port 8769` | Passed with `status=ok` on isolated local test server. |
+| `QUOTE_DATA_ROOT=_tmp\validation\ci-smoke-fresh-8770 npm run playwright:ai-stress -- --port 8770; npm run playwright:smoke -- --port 8770` | Passed with both scripts reporting `status=ok` against a fresh isolated quote data root in the same order used by CI. This verifies the dashboard search smoke assertion does not require global uniqueness when another legitimate saved quote can also match `7a`, while still requiring the intended `REF QUOTE-7A` row. |
 | `npm audit` | Passed: 0 vulnerabilities. |
 | `git diff --check` | Passed with line-ending warnings only. |
 
