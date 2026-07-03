@@ -19780,6 +19780,143 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 self.assertFalse(operator_storage.delete_quote_session("quote-owner-basis"))
                 self.assertTrue(owner_storage.delete_quote_session("quote-owner-basis"))
 
+    def test_generated_quote_session_keeps_immutable_profile_pricing_snapshot(self):
+        root = test_temp_root() / f"quote-session-snapshot-{time.time_ns()}"
+        root.mkdir(parents=True)
+        database_url = f"sqlite:///{(root / 'kqag-storage.sqlite3').as_posix()}"
+        output_dir = root / "out" / "quote-snapshot"
+        output_dir.mkdir(parents=True)
+        (output_dir / "quotation.xlsx").write_bytes(xlsx_with_rows([["snapshot artifact"]]))
+        env = {
+            "KQAG_STORAGE_MODE": "database",
+            "KQAG_ARTIFACT_STORAGE_MODE": "database",
+            "KQAG_DATABASE_URL": database_url,
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            webapp.apply_kqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session("workspace-snapshot-a", membership_role="operator", user_id="snapshot-owner")
+            )
+            other_workspace = webapp.app_storage_for_auth_session(
+                self.platform_auth_session("workspace-snapshot-b", membership_role="admin", user_id="snapshot-admin")
+            )
+            storage.save_profile(webapp.normalize_profile_payload({
+                "id": "snapshot-profile",
+                "label": "Original Snapshot Profile",
+                "defaults": {"company": {"name": "Workspace Snapshot Quote Co"}},
+            }))
+            storage.save_pricing_reference(webapp.normalize_pricing_reference_payload({
+                "id": "snapshot-pricing",
+                "label": "Original Snapshot Pricing",
+                "items": [with_required_pricing_metadata({
+                    "id": "snapshot-row",
+                    "section": "Graphics",
+                    "description": "Snapshot graphics",
+                    "unit_hint": "sqm",
+                    "internal_cost": 10,
+                    "markup_multiplier": 2,
+                })],
+            }))
+            payload = valid_payload()
+            payload["profile_id"] = "snapshot-profile"
+            payload["pricing_reference_id"] = "snapshot-pricing"
+            payload.pop("company", None)
+            payload.pop("pricing_reference", None)
+            payload["quote_session"] = {
+                "session_id": "quote-snapshot",
+                "customer_summary": {"customer_name": "Snapshot Customer"},
+                "draft_state": {"activeSidePanel": "output", "outputRevision": 1},
+            }
+            result = {"status": "completed", "files": [{"name": "quotation.xlsx"}]}
+
+            generated = storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+            storage.save_profile(webapp.normalize_profile_payload({
+                "id": "snapshot-profile",
+                "label": "Renamed Snapshot Profile",
+                "defaults": {"company": {"name": "Workspace Snapshot Quote Co Renamed"}},
+            }))
+            storage.save_pricing_reference(webapp.normalize_pricing_reference_payload({
+                "id": "snapshot-pricing",
+                "label": "Renamed Snapshot Pricing",
+                "items": [with_required_pricing_metadata({
+                    "id": "renamed-row",
+                    "section": "Graphics",
+                    "description": "Renamed graphics",
+                    "unit_hint": "sqm",
+                    "internal_cost": 20,
+                    "markup_multiplier": 2,
+                })],
+            }))
+            storage.delete_profile("snapshot-profile")
+            storage.delete_pricing_reference("snapshot-pricing")
+            fetched = storage.get_quote_session("quote-snapshot", include_draft_state=True)
+
+            with storage.connection() as connection:
+                metadata_row = connection.execute(
+                    "select metadata_json from kqag_quote_sessions where workspace_id = ? and session_id = ?",
+                    ("workspace-snapshot-a", "quote-snapshot"),
+                ).fetchone()
+            stored_metadata = json.loads(metadata_row["metadata_json"])
+
+            self.assertEqual(generated["generation_snapshot"]["profile"]["display_name"], "Original Snapshot Profile")
+            self.assertEqual(generated["generation_snapshot"]["pricing_reference"]["display_name"], "Original Snapshot Pricing")
+            self.assertEqual(fetched["generation_snapshot"]["profile"]["display_name"], "Original Snapshot Profile")
+            self.assertEqual(fetched["generation_snapshot"]["pricing_reference"]["display_name"], "Original Snapshot Pricing")
+            self.assertEqual(stored_metadata["generation_snapshot"]["workspace"]["workspace_id"], "workspace-snapshot-a")
+            self.assertEqual(stored_metadata["generation_snapshot"]["profile"]["id"], "snapshot-profile")
+            self.assertEqual(stored_metadata["generation_snapshot"]["pricing_reference"]["id"], "snapshot-pricing")
+            self.assertIsNone(other_workspace.get_quote_session("quote-snapshot", include_draft_state=True))
+            serialized_snapshot = json.dumps(stored_metadata["generation_snapshot"], sort_keys=True)
+            self.assertNotIn("Snapshot graphics", serialized_snapshot)
+            self.assertNotIn("snapshot artifact", serialized_snapshot)
+            self.assertNotIn(str(root), serialized_snapshot)
+
+    def test_editing_generated_quote_session_preserves_generation_snapshot(self):
+        root = test_temp_root() / f"quote-session-snapshot-edit-{time.time_ns()}"
+        root.mkdir(parents=True)
+        database_url = f"sqlite:///{(root / 'kqag-storage.sqlite3').as_posix()}"
+        output_dir = root / "out" / "quote-snapshot-edit"
+        output_dir.mkdir(parents=True)
+        (output_dir / "quotation.xlsx").write_bytes(xlsx_with_rows([["snapshot edit artifact"]]))
+        env = {
+            "KQAG_STORAGE_MODE": "database",
+            "KQAG_ARTIFACT_STORAGE_MODE": "database",
+            "KQAG_DATABASE_URL": database_url,
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            webapp.apply_kqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session("workspace-snapshot-edit", membership_role="operator", user_id="snapshot-owner")
+            )
+            storage.save_profile(webapp.normalize_profile_payload({"id": "generated-profile", "label": "Generated Profile"}))
+            storage.save_pricing_reference(workspace_pricing_reference("generated-pricing") | {"label": "Generated Pricing"})
+            generated_payload = valid_payload()
+            generated_payload["profile_id"] = "generated-profile"
+            generated_payload["pricing_reference_id"] = "generated-pricing"
+            generated_payload["quote_session"] = {"session_id": "quote-snapshot-edit"}
+            storage.create_or_update_quote_session(
+                generated_payload,
+                result={"status": "completed", "files": [{"name": "quotation.xlsx"}]},
+                output_dir=output_dir,
+            )
+
+            edit_payload = valid_payload()
+            edit_payload["quote_session"] = {
+                "session_id": "quote-snapshot-edit",
+                "quote_company_profile": {"id": "draft-profile", "display_name": "Draft Profile"},
+                "pricing_reference": {"id": "draft-pricing", "display_name": "Draft Pricing"},
+                "draft_state": {"activeSidePanel": "pricing_review", "outputRevision": 2},
+            }
+            edited = storage.create_or_update_quote_session(edit_payload)
+            fetched = storage.get_quote_session("quote-snapshot-edit", include_draft_state=True)
+
+            self.assertEqual(edited["generation_snapshot"]["profile"]["display_name"], "Generated Profile")
+            self.assertEqual(edited["generation_snapshot"]["pricing_reference"]["display_name"], "Generated Pricing")
+            self.assertEqual(edited["quote_company_profile"]["display_name"], "Draft Profile")
+            self.assertEqual(edited["pricing_reference"]["display_name"], "Draft Pricing")
+            self.assertEqual(fetched["generation_snapshot"]["profile"]["display_name"], "Generated Profile")
+            self.assertTrue(fetched["exports"]["xlsx"]["stale"])
+
     def test_database_storage_does_not_persist_raw_platform_launch_token(self):
         raw_launch_token = self.synthetic_platform_launch_token()
         with tempfile.TemporaryDirectory() as tmp:
@@ -20048,6 +20185,10 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             webapp.apply_kqag_storage_migrations(database_url)
             workspace_a = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-a"))
             workspace_b = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-b"))
+            workspace_a.save_profile(webapp.normalize_profile_payload({"id": "object-snapshot-profile", "label": "Object Snapshot Profile"}))
+            workspace_a.save_pricing_reference(workspace_pricing_reference("object-snapshot-pricing") | {"label": "Object Snapshot Pricing"})
+            payload["profile_id"] = "object-snapshot-profile"
+            payload["pricing_reference_id"] = "object-snapshot-pricing"
             session = workspace_a.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
             artifact = workspace_a.quote_session_export_artifact("quote-object-artifact", "xlsx")
             blocked_artifact = workspace_b.quote_session_export_artifact("quote-object-artifact", "xlsx")
@@ -20076,6 +20217,8 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
 
         self.assertTrue(session["exports"]["xlsx"]["exists"])
         self.assertEqual(session["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-object-artifact/download/xlsx")
+        self.assertEqual(session["generation_snapshot"]["profile"]["display_name"], "Object Snapshot Profile")
+        self.assertEqual(session["generation_snapshot"]["pricing_reference"]["display_name"], "Object Snapshot Pricing")
         result_files = webapp.quote_session_result_files(session)
         self.assertEqual(result_files[0]["url"], "/api/quote-sessions/quote-object-artifact/download/xlsx")
         self.assertNotIn("/api/jobs/", json.dumps(result_files))

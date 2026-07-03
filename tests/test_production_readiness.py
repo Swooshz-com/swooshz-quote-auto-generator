@@ -195,6 +195,29 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertNotIn("pricing_reference_local_pack_isolation", {item["id"] for item in database_status["blockers"]})
         self.assertNotIn("legacy_job_artifact_download_authorization", {item["id"] for item in database_status["blockers"]})
 
+    def test_readiness_reports_immutable_quote_session_snapshot_groundwork(self):
+        status = self.readiness_status(
+            {
+                "KQAG_STORAGE_MODE": "database",
+                "KQAG_ARTIFACT_STORAGE_MODE": "database",
+                "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            },
+            backup_restore_evidence_status="passed",
+            hosted_observability_evidence_status="passed",
+            hosted_smoke_evidence_status="passed",
+        )
+
+        snapshots = status["quote_session_snapshots"]
+        self.assertEqual(snapshots["schema"], "swooshz.kqag.quote-generation-snapshot.v1")
+        self.assertTrue(snapshots["workspace_scoped"])
+        self.assertTrue(snapshots["privacy_minimized"])
+        self.assertFalse(snapshots["production_suitable"])
+        self.assertIn("profile/pricing labels", snapshots["stores"])
+        blocker_ids = {item["id"] for item in status["production_blockers"]}
+        self.assertIn("session_business_hardening_incomplete", blocker_ids)
+        self.assertTrue(status["internal_alpha_ready"])
+        self.assertFalse(status["production_ready"])
+
     def test_database_backup_restore_evidence_can_be_reported_without_readiness_overclaim(self):
         database_url = "sqlite:///tmp/kqag-storage.sqlite3"
         status = self.readiness_status(
