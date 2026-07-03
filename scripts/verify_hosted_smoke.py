@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Synthetic hosted internal-alpha smoke verifier.
+"""Synthetic hosted-shape smoke verifier.
 
 The verifier exercises KQAG through local HTTP routes bound to 127.0.0.1
 with synthetic platform/workspace context, SQLite database storage, and database
-artifact storage. It emits metadata-only JSON and does not call Swooshz Platform
-or any external identity provider.
+artifact storage. It emits metadata-only JSON and does not call Swooshz Platform,
+prove object storage, or make DB/BLOB artifact mode launch-ready.
 """
 
 from __future__ import annotations
@@ -482,7 +482,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
         "internal_alpha_ready": False,
         "production_ready": False,
         "notes": [
-            "This verifies a synthetic hosted-like internal-alpha smoke path only.",
+            "This verifies a synthetic hosted-like smoke path only.",
             "It does not call Swooshz Platform, configure object storage, prove external deployment operations, or claim production readiness.",
         ],
     }
@@ -548,7 +548,7 @@ def contains_sensitive_value(text: str) -> bool:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Verify synthetic hosted internal-alpha smoke evidence.")
+    parser = argparse.ArgumentParser(description="Verify synthetic hosted smoke evidence.")
     parser.add_argument("--work-dir", type=Path, default=None, help="Synthetic verifier workspace. The path is never printed.")
     return parser
 

@@ -23,7 +23,7 @@ def test_temp_root() -> Path:
 
 
 class InternalAlphaHostedValidationVerifierTest(unittest.TestCase):
-    def test_report_is_metadata_only_and_keeps_production_blocked(self):
+    def test_report_is_metadata_only_and_keeps_launch_and_production_blocked(self):
         private_values = {
             "sqlite:///",
             "C:/Users/Private",
@@ -54,8 +54,10 @@ class InternalAlphaHostedValidationVerifierTest(unittest.TestCase):
         self.assertEqual(report["target_posture"]["storage_mode"], "database")
         self.assertEqual(report["target_posture"]["artifact_storage_mode"], "database")
         self.assertEqual(report["target_posture"]["database_url_source"], "host_secret_manager_only")
-        self.assertTrue(report["readiness"]["internal_alpha_ready"])
+        self.assertFalse(report["target_posture"]["launch_ready"])
+        self.assertFalse(report["readiness"]["internal_alpha_ready"])
         self.assertFalse(report["readiness"]["production_ready"])
+        self.assertIn("database_blob_artifact_storage_not_launch_ready", report["readiness"]["blocker_ids"])
         self.assertIn("object_storage_missing", report["readiness"]["production_blocker_ids"])
         self.assertEqual(report["evidence"]["backup_restore"], "passed")
         self.assertEqual(report["evidence"]["hosted_observability"], "passed")

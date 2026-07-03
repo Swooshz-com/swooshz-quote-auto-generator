@@ -2,9 +2,10 @@
 
 Audit date: 2026-07-02
 
-Verdict: KQAG/SAQG is still local-UAT ready, but it is not ready for internal
-alpha or production hosting yet. PR #84 does not make KQAG production-ready;
-it documents the current blockers and adds a safe readiness check.
+Verdict: KQAG/SAQG is still local-UAT ready, but it is not ready for hosted,
+protected, deploy, or production hosting yet. PR #84 does not make KQAG
+production-ready; it documents the current blockers and adds a safe readiness
+check.
 
 Follow-up note: `docs/architecture-dead-code-fallback-audit.md` extends this
 audit with the stricter product direction that Load Sample is not part of the
@@ -26,12 +27,10 @@ or broad internal rollout needs follow-up work first.
 Readiness verdicts are intentionally separate:
 
 - `local_uat_supported`: yes. Existing local UAT can continue.
-- `internal_alpha_ready`: no today. A temporary small-team exception could
-  become acceptable after database storage, database artifacts, and documented
-  backup/restore/rollback are in place, but that would still be an explicit
-  internal-alpha exception rather than final production clearance.
-- `production_ready`: no. SQLite/database BLOB mode is not final
-  production-ready storage.
+- `internal_alpha_ready`: no. The readiness checker no longer recognizes a
+  DB/BLOB artifact exception for hosted/protected/deploy readiness.
+- `production_ready`: no. Generated XLSX/PDF bytes require object storage;
+  database rows store metadata and quote-domain records only.
 
 Primary blockers:
 
@@ -87,12 +86,12 @@ Current expected posture in local mode:
 
 ## Storage Surface Audit
 
-| Surface | Current local mode path/source | Database/platform support | Workspace-scoped today | Restart-persistent today | Redeploy-persistent today | Internal alpha suitability | Production suitability | Blocker or follow-up PR |
+| Surface | Current local mode path/source | Database/platform support | Workspace-scoped today | Restart-persistent today | Redeploy-persistent today | Hosted/protected/deploy suitability | Production suitability | Blocker or follow-up PR |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Profiles | `QUOTE_DATA_ROOT/{company_id}/profiles.json` and `profile-packs/{profile_id}` | `kqag_profiles` rows plus profile file artifacts exist; PR #89 uses DB rows/artifacts for DB-mode generation | Yes in DB row/artifact mode; no in local mode | Only if mounted local roots or DB mode are configured | DB rows survive; local mode requires mounted volume | No until the remaining non-profile blockers are resolved | No | Keep profile defaults/layouts workspace-owned; move uploaded profile assets to object storage for production. |
 | Pricing references | `KQAG_LOCAL_PRICING_REFERENCES_ROOT` or `_pricing-references/{reference_id}` plus bundled references | `kqag_pricing_references` rows with runtime catalog JSON | Yes in DB mode; local/bundled packs are local-UAT only | Only if mounted local roots or DB mode are configured | DB rows survive; local mode requires mounted volume | No until the remaining non-pricing blockers are resolved | No | Keep pricing references imported or seeded as workspace-owned database rows; move uploaded/reference assets to object storage for production. |
 | Quote sessions | `QUOTE_DATA_ROOT/quote-sessions/{session_id}` | `kqag_quote_sessions` rows keyed by `workspace_id` | Yes in DB mode; no in local mode | Only if mounted local roots or DB mode are configured | DB rows survive; local mode requires mounted volume | Blocked until backup/retention is proven | No | Add backup/restore, retention, owner isolation tests, and hosted smoke evidence. |
-| Generated artifacts | `QUOTE_OUTPUT_ROOT/{job_id}` and quote-session `exports` folders | `kqag_quote_artifacts` and `kqag_file_artifacts` DB BLOBs exist | Only when both storage and artifact mode are database-backed | Local mode requires mounted output root; DB artifact mode survives restart | DB artifact mode survives, but is not final production storage | Blocked | No | Move generated XLSX/PDF and uploaded assets to object storage with DB metadata. |
+| Generated artifacts | `QUOTE_OUTPUT_ROOT/{job_id}` and quote-session `exports` folders | `kqag_quote_artifacts` and `kqag_file_artifacts` DB BLOBs exist for local-UAT/synthetic coverage; object mode stores bytes in object storage with DB metadata | Workspace-scoped only when storage is database-backed and artifact metadata is database/object-backed | Local mode requires mounted output root; DB artifact mode can survive restart but is not launch posture | DB artifact mode survives, but cannot satisfy hosted/protected/deploy readiness | Blocked | No | Move generated XLSX/PDF and uploaded assets to object storage with DB metadata. |
 | Temp uploads/intermediates | `QUOTE_TMP_ROOT/{job_id}` | No durable production storage expected | No | No | No | Local/single-job only | No | Keep temp data ephemeral, but ensure generated durable artifacts are copied to owned artifact storage before download. |
 | Runtime logs | `_logs/app/` or configured log root | External log backend not implemented | N/A | Only if configured | Depends on host | Local UAT only | No | Add privacy-minimized hosted logging/monitoring before production. |
 
@@ -181,12 +180,11 @@ Recommended final architecture:
   profile assets, pricing assets, sessions, and generated XLSX outputs come
   back together.
 
-SQLite/database BLOB artifact mode is acceptable only for local UAT or, as a
-future temporary small-team exception, an explicitly backed-up internal-alpha
-setup with database-backed profiles, pricing references, quote sessions, and
-artifacts plus documented restore and rollback procedures. It is not the
-recommended final production storage model and must not be treated as
-production-ready.
+SQLite/database BLOB artifact mode is acceptable only for local UAT and
+synthetic verifier coverage. It is not a hosted/protected/deploy launch posture
+and must not be treated as production-ready. Production generated XLSX/PDF bytes
+require object storage; database rows should store metadata, ownership,
+checksums, retention state, and audit data only.
 
 ## Security Audit
 
@@ -223,8 +221,8 @@ UAT until these are true:
 - Pricing-reference list/detail/generation paths do not expose local private
   packs in database/platform mode. PR #88 adds this guard; keep it in the
   release gate.
-- Generated XLSX/PDF and uploaded assets are stored in object storage or a
-  documented, backed-up internal-alpha equivalent.
+- Generated XLSX/PDF and uploaded assets are stored in object storage with
+  database metadata; DB/BLOB artifact mode is not an equivalent launch posture.
 - Artifact downloads are bound to workspace/session ownership.
 - The medium security finding for legacy direct job artifact downloads remains
   fixed: PR #91 disables the legacy route in deploy/database/platform modes.

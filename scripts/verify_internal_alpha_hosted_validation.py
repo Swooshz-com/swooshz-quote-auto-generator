@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run metadata-only internal-alpha hosted validation evidence.
+"""Run metadata-only blocked hosted-validation evidence.
 
-This verifier composes existing synthetic KQAG evidence checks for the
-VPS/Coolify-style internal-alpha posture. It does not deploy, contact a live
-host, read committed secrets, or prove production readiness.
+This verifier composes existing synthetic KQAG evidence checks and verifies
+that database/BLOB artifact mode remains blocked for hosted, protected, deploy,
+and production readiness. It does not deploy, contact a live host, read
+committed secrets, or prove hosted or production readiness.
 """
 
 from __future__ import annotations
@@ -111,7 +112,7 @@ def safe_failure_report(stage: str) -> dict[str, Any]:
         "production_ready": False,
         "privacy": privacy_summary(),
         "notes": [
-            "Hosted internal-alpha validation failed before producing complete evidence.",
+            "Hosted validation failed before producing complete blocked-readiness evidence.",
             "Failure details are omitted to avoid printing private paths, URLs, secrets, or payloads.",
         ],
     }
@@ -158,9 +159,15 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
         "hosted_observability": evidence_status(observability_report),
         "hosted_smoke": evidence_status(hosted_smoke_report),
     }
-    status = "passed" if all(value == "passed" for value in evidence.values()) and readiness.get("internal_alpha_ready") else "failed"
     blocker_ids = [item.get("id", "") for item in readiness.get("blockers", []) if item.get("id")]
     production_blocker_ids = [item.get("id", "") for item in readiness.get("production_blockers", []) if item.get("id")]
+    blocked_database_blob_posture = "database_blob_artifact_storage_not_launch_ready" in blocker_ids
+    status = "passed" if (
+        all(value == "passed" for value in evidence.values())
+        and blocked_database_blob_posture
+        and not readiness.get("internal_alpha_ready")
+        and not readiness.get("production_ready")
+    ) else "failed"
 
     report = {
         "schema": "swooshz.kqag.internal-alpha-hosted-validation.v1",
@@ -168,12 +175,13 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
         "synthetic_only": True,
         "live_deployment_evidence": False,
         "target_posture": {
-            "environment": "internal-alpha-vps-coolify-simple-hosting",
+            "environment": "blocked-deploy-database-blob-artifact-validation",
             "app_mode": "deploy",
             "storage_mode": "database",
             "artifact_storage_mode": "database",
             "database_url_source": "host_secret_manager_only",
             "platform_workspace_context_required": True,
+            "launch_ready": False,
             "object_mode_final_production_storage": False,
         },
         "required_env_names": list(REQUIRED_ENV_NAMES),
@@ -197,20 +205,20 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
             "python scripts/check_production_readiness.py --with-backup-restore-evidence --with-hosted-observability-evidence --with-hosted-smoke-evidence",
         ],
         "proves": [
-            "synthetic SQLite database/database-artifact backup, restore, rollback, and retention-policy evidence",
+            "synthetic SQLite database/database-artifact backup, restore, rollback, and retention-policy evidence ran",
             "synthetic privacy-minimized hosted observability schema and health metadata evidence",
             "synthetic deploy/database/database-artifact hosted smoke evidence on 127.0.0.1",
-            "readiness checker can recognize the narrow DB/DB-artifact internal-alpha posture",
+            "readiness checker blocks DB/BLOB artifact mode from launch, hosted, protected, deploy, and production readiness",
         ],
         "does_not_prove": [
             "live VPS, Coolify, DNS, TLS, firewall, reverse proxy, or host health evidence",
             "real OIDC provider login/logout or live Swooshz Platform integration",
             "real object-storage provider, DB+object backup/restore, or live retention/delete evidence",
-            "production deployment operations, alert delivery, supply-chain hardening, or production readiness",
+            "hosted launch readiness, production deployment operations, alert delivery, supply-chain hardening, or production readiness",
         ],
         "privacy": privacy_summary(),
         "notes": [
-            "Use this as metadata-only local/synthetic evidence before entering values into a host secret manager.",
+            "Use this as metadata-only local/synthetic evidence that the old DB/BLOB launch posture remains blocked.",
             "Do not paste environment values, DB URLs, hostnames, tokens, cookies, generated quotes, or private tenant data into reports.",
         ],
     }
@@ -221,7 +229,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Verify metadata-only KQAG internal-alpha hosted validation evidence.")
+    parser = argparse.ArgumentParser(description="Verify metadata-only KQAG blocked hosted validation evidence.")
     parser.add_argument("--work-dir", type=Path, default=None, help="Synthetic verifier workspace. The path is never printed.")
     return parser
 

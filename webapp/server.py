@@ -1999,12 +1999,13 @@ def backup_restore_evidence_summary(
             "rollback_to_prior_known_good_state",
             "retention_policy_shape",
         ],
-        "database_artifact_temporary_exception_supported": bool(
-            passed and database_mode and database_artifacts and database_configured
-        ),
+        "database_artifact_temporary_exception_supported": False,
+        "database_artifact_launch_supported": False,
+        "evidence_passed_for_selected_database_mode": bool(passed and database_mode and database_configured),
         "notes": [
             "Evidence is synthetic and metadata-only.",
-            "This is not production object storage or hosted operations evidence.",
+            "Database BLOB artifact storage is not a hosted, protected, deploy, or production readiness posture.",
+            "Production generated XLSX/PDF bytes require object storage; the database stores metadata only.",
         ],
     }
 
@@ -2210,7 +2211,7 @@ def production_readiness_status(
         workspace_scoped=database_mode,
         persistent_across_restart=database_mode or bool(clean_text(read_dotenv_value(QUOTE_DATA_ROOT_ENV_NAME))),
         persistent_across_redeploy=database_mode,
-        internal_alpha_suitable=database_mode and database_artifacts and database_configured,
+        internal_alpha_suitable=False,
         production_suitable=False,
         follow_up=(
             "Keep profile defaults/layout assets as workspace-owned database rows/artifacts; move uploaded profile assets to object storage for production."
@@ -2228,7 +2229,7 @@ def production_readiness_status(
         workspace_scoped=database_mode,
         persistent_across_restart=database_mode or bool(clean_text(read_dotenv_value(QUOTE_DATA_ROOT_ENV_NAME))),
         persistent_across_redeploy=database_mode,
-        internal_alpha_suitable=database_mode and database_configured,
+        internal_alpha_suitable=False,
         production_suitable=False,
         follow_up=(
             "Keep pricing references imported or seeded as workspace-owned database rows; move uploaded/reference assets to object storage for production."
@@ -2242,7 +2243,7 @@ def production_readiness_status(
         workspace_scoped=database_mode,
         persistent_across_restart=database_mode or bool(clean_text(read_dotenv_value(QUOTE_DATA_ROOT_ENV_NAME))),
         persistent_across_redeploy=database_mode,
-        internal_alpha_suitable=database_mode and database_configured,
+        internal_alpha_suitable=False,
         production_suitable=False,
         follow_up=(
             "Add backup/restore and retention policy for workspace-scoped quote sessions."
@@ -2273,7 +2274,7 @@ def production_readiness_status(
             "local paths",
             "secrets",
         ],
-        "internal_alpha_suitable": database_mode and database_configured,
+        "internal_alpha_suitable": False,
         "production_suitable": False,
         "follow_up": "Complete remaining session/business hardening, immutable generated audit trails, and race coverage before production.",
     }
@@ -2290,7 +2291,7 @@ def production_readiness_status(
         ),
         "legacy_direct_job_routes_locked_in_protected_modes": True,
         "local_or_db_fallback_in_object_mode": False,
-        "internal_alpha_suitable": database_mode and database_artifacts and database_configured,
+        "internal_alpha_suitable": False,
         "production_suitable": False,
         "follow_up": "Complete live object-provider stale/delete race evidence, production audit trails, and operations evidence before production.",
     }
@@ -2308,7 +2309,7 @@ def production_readiness_status(
         workspace_scoped=database_mode and (database_artifacts or object_artifacts),
         persistent_across_restart=database_artifacts or object_artifacts or bool(clean_text(read_dotenv_value(QUOTE_OUTPUT_ROOT_ENV_NAME))),
         persistent_across_redeploy=database_artifacts or object_artifacts,
-        internal_alpha_suitable=database_artifacts and database_configured,
+        internal_alpha_suitable=False,
         production_suitable=(
             object_storage_evidence["production_object_storage_contract_supported"]
             and bool(object_storage_provider.get("production_provider_ready"))
@@ -2319,7 +2320,7 @@ def production_readiness_status(
             else (
                 "Wire a real credentialed object-storage provider, deployment operations, retention/delete evidence, and DB+object backup/restore before production."
                 if object_artifacts
-                else "Enable database artifact mode for internal alpha or object storage for production."
+                else "Enable object storage for hosted, protected, deploy, and production readiness."
             )
         ),
     )
@@ -2331,8 +2332,14 @@ def production_readiness_status(
         blockers.append(readiness_blocker("local_artifact_storage", "P1", "Generated quote artifacts, saved exports, and profile layout assets are still using local filesystem storage."))
     if (database_mode or database_artifacts or object_artifacts) and not database_configured:
         blockers.append(readiness_blocker("database_url_missing", "P1", "Database-backed storage mode is selected but no database URL is configured."))
+    if database_artifacts:
+        blockers.append(readiness_blocker(
+            "database_blob_artifact_storage_not_launch_ready",
+            "P1",
+            "Database/BLOB artifact mode is local-UAT evidence only and cannot satisfy hosted, protected, deploy, or production readiness; generated XLSX/PDF bytes require object storage.",
+        ))
     if database_scheme == "sqlite":
-        blockers.append(readiness_blocker("sqlite_not_final_production", "P1", "SQLite is acceptable only as an explicitly backed-up internal-alpha/simple-hosting option, not final production storage.", gates=("production",)))
+        blockers.append(readiness_blocker("sqlite_not_final_production", "P1", "SQLite is acceptable only for local-UAT/dev database evidence, not hosted, protected, deploy, or production storage.", gates=("production",)))
     if not object_storage_evidence["production_object_storage_contract_supported"]:
         blockers.append(readiness_blocker("object_storage_missing", "P1", "No verified object-storage-backed asset/artifact contract exists for production XLSX/PDF and uploaded reference assets.", gates=("production",)))
     if object_artifacts and not object_storage_provider.get("production_provider_ready"):
@@ -2350,7 +2357,7 @@ def production_readiness_status(
         blockers.append(readiness_blocker("db_object_backup_restore_live_evidence_missing", "P1", "Live DB+object backup/restore evidence is still missing for production.", gates=("production",)))
     blockers.append(readiness_blocker("session_business_hardening_incomplete", "P1", "Immutable quote-session snapshot groundwork exists, but final session/business hardening and generated audit race coverage remain incomplete.", gates=("production",)))
     blockers.append(readiness_blocker("production_deployment_operations_evidence_missing", "P1", "Production deployment, operations, alert delivery, and live host evidence are not verified by this command.", gates=("production",)))
-    if not backup_restore_evidence["database_artifact_temporary_exception_supported"]:
+    if backup_restore_evidence["status"] != "passed":
         blockers.append(readiness_blocker("backup_restore_unverified", "P1", "Backup, restore, retention, and rollback evidence has not been verified for the selected database/database-artifact mode."))
     if not hosted_observability_evidence["internal_alpha_observability_supported"]:
         blockers.append(readiness_blocker("hosted_logging_monitoring_missing", "P1", "Hosted privacy-minimized logging, monitoring, alerting, and support traceability are not implemented or verified by this command."))
@@ -2396,13 +2403,13 @@ def production_readiness_status(
         "local_uat_supported": True,
         "internal_alpha_blockers": internal_alpha_blockers,
         "production_blockers": production_blockers,
-        "internal_alpha_ready": False if internal_alpha_blockers else True,
+        "internal_alpha_ready": False,
         "internal_alpha_future_exception": {
-            "possible": True,
+            "possible": False,
             "summary": (
-                "A temporary small-team internal alpha may become acceptable only after database storage, "
-                "database artifacts, documented backup/restore/rollback, hosted smoke evidence, and hosted "
-                "privacy-minimized observability evidence are in place; SQLite/BLOB mode is not final production storage."
+                "No database/BLOB artifact launch exception is recognized. Hosted, protected, deploy, and "
+                "production readiness require workspace-owned database app records plus object storage for "
+                "generated XLSX/PDF bytes, live provider evidence, DB+object backup/restore, operations, and final audit."
             ),
         },
         "production_ready": False if production_blockers else True,
@@ -2410,7 +2417,7 @@ def production_readiness_status(
         "blockers": blockers,
         "notes": [
             "This command reports readiness posture without printing DB URLs, absolute private local paths, OAuth values, tokens, cookies, callback URLs with query params, customer data, generated quote contents, private pricing/profile contents, or staff emails.",
-            "Local UAT passing does not equal internal-alpha or production readiness.",
+            "Local UAT passing does not equal hosted, protected, deploy, or production readiness.",
         ],
     }
 
