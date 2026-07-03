@@ -34,6 +34,9 @@ platform concerns belong in `Swooshz-com/swooshz-platform`.
 - `docs/platform-launch-mode.md`: first KQAG-side Swooshz Platform launch
   consume adapter boundary, env flags, safe consume shape, and cloud-storage
   deferral.
+- `docs/platform-integration-contract.md`: KQAG-side audit of the expected
+  Swooshz Platform launch/auth/workspace contract, source evidence, fail-closed
+  behavior, and live integration gaps.
 - `docs/platform-scoped-storage-mode.md`: platform-workspace-scoped KQAG app
   data storage boundary, migration command, and local-vs-database mode notes.
 - `docs/pricing-catalog-import.md`: current pricing-reference import behavior,

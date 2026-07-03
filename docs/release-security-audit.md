@@ -18,7 +18,7 @@ verified.
 | --- | --- | --- |
 | `local_uat_supported` | Yes | Local localhost mode, local runtime storage, seeded test setup, and current CI remain supported. |
 | `internal_alpha_ready` | Conditional | Default local mode remains blocked. Under `KQAG_STORAGE_MODE=database`, `KQAG_ARTIFACT_STORAGE_MODE=database`, and explicit passing backup/restore, hosted observability, and hosted smoke evidence flags, the checker may report `internal_alpha_ready=true` for the temporary SQLite/DB-artifact simple-hosting exception only. |
-| `production_ready` | No | Immutable quote-session snapshot groundwork, stale/deleted artifact route hardening, deterministic delete/export/download race evidence, and synthetic/stubbed object lifecycle evidence exist, but live provider evidence, real DB+object backup/restore, real retention/delete evidence, production deployment/operations evidence, and final session/business hardening are not complete. |
+| `production_ready` | No | Immutable quote-session snapshot groundwork, stale/deleted artifact route hardening, deterministic delete/export/download race evidence, synthetic/stubbed object lifecycle evidence, and a source-level Platform integration contract audit exist, but live Platform integration evidence, live provider evidence, real DB+object backup/restore, real retention/delete evidence, production deployment/operations evidence, and final session/business hardening are not complete. |
 
 This update does not claim production readiness. It adds an internal-alpha
 VPS/Coolify-style deployment scaffold, placeholder-only environment template,
@@ -31,6 +31,9 @@ Highest-priority remaining blockers:
 - Medium: database artifact storage remains only a temporary internal-alpha/simple-hosting exception when synthetic backup/restore, hosted observability, and hosted smoke verifiers pass; production still requires real object-storage provider wiring and production operations evidence.
 - Medium: live hosted deployment/operations evidence is still missing; the new
   scaffold is a runbook and synthetic validation path only.
+- Medium: live Swooshz Platform integration evidence is still missing; the
+  source-level contract has been audited against current Platform main, but no
+  live Platform-to-KQAG deployment smoke is claimed.
 
 Load Sample status: product-visible Load Sample UI/API/JS paths are gone after PR #86. No Load Sample button, product API, or Playwright smoke dependency is part of the sellable path. Remaining sample/Kent references are test-only or historical audit references.
 
@@ -164,6 +167,17 @@ backup/restore, hosted observability, hosted smoke, and readiness-checker
 evidence. It does not prove a live VPS/Coolify deployment, live Platform
 integration, real OIDC, real object storage, alert delivery, production
 operations, or production readiness.
+
+Platform integration contract audit update:
+`docs/platform-integration-contract.md` records the current KQAG-side
+expectations for Swooshz Platform launch, auth, workspace, role, app-gating,
+and tenant isolation. The audit cites KQAG functions in `webapp/server.py`, the
+existing KQAG platform/storage regression coverage, and Swooshz Platform
+`origin/main` at `5bce4d52e4273762375d97149b1d77e5716189b2`, including the
+Platform KQAG integration, app-access, auth/session security, route-contract,
+and launch-token consume surfaces. This is source-contract evidence only. It
+does not change runtime behavior, prove live Platform deployment behavior, add
+secrets, or claim production readiness.
 
 Object-storage contract evidence update: PR #98 added `webapp/object_storage.py`,
 a provider-neutral artifact backend contract for generated quote XLSX/PDF
@@ -359,7 +373,7 @@ Fail-open and client-trusting routes:
 | DB artifacts | `kqag_quote_artifacts` and `kqag_file_artifacts` keys include `workspace_id`. PR #89 uses stored profile layout artifacts for DB-mode generation. | This is SQLite/BLOB mode, not final object storage. | Medium/High | Internal alpha temporary exception only when `scripts/verify_database_backup_restore.py` passes and hosted smoke/logging gates are satisfied; production still requires real object-storage provider wiring. |
 | Object-storage contract | `webapp/object_storage.py` defines workspace-scoped object metadata, checksums, retrieve/delete, and wrong-workspace denial. | Synthetic in-memory evidence only; no live cloud/object provider is wired. Runtime `object` mode fails closed. | Medium | Use `scripts/verify_object_storage_contract.py` as provider-neutral evidence; add a real provider adapter, DB metadata integration, DB+object backup/restore, and retention/delete evidence before production. |
 | Local profile/pricing/session roots | Local roots are shared by process and company/default identifiers. | Not tenant-isolated. | High in hosted mode | Allowed only for local UAT/test harness. |
-| Platform session | `safe_platform_session_context()` requires consumed outcome, user id, workspace id, app key, and supported role (`webapp/server.py:6944`). | Live platform contract not verified in this repo; Swooshz Platform repo out of scope. | Medium | Verify in platform integration PR. |
+| Platform session | `safe_platform_session_context()` requires consumed outcome, user id, workspace id, app key, and supported role (`webapp/server.py:6944`). | Source contract has been audited against Swooshz Platform `origin/main` at `5bce4d52e4273762375d97149b1d77e5716189b2`, but live Platform-to-KQAG deployment behavior is not verified. | Medium | Keep `docs/platform-integration-contract.md` current and complete live Platform smoke before production. |
 
 Cross-workspace leak paths:
 
@@ -430,7 +444,9 @@ Release blockers and gaps:
 - Auth/session does not compensate for data paths that resolve local/bundled pricing/profile assets in DB/platform mode.
 - `/api/draft` and `/api/generate` do not currently require an explicit generate permission at every path. `/api/line-items/normalize` and quote-session save do, but draft/generate should be reviewed for internal alpha role expectations.
 - Local-UAT job status/download behavior remains local-only; PR #91 owner-binds job status and disables legacy file downloads in hosted/database/platform/deploy modes.
-- Platform-owned auth/workspace verification against the Platform repo was not performed because the Swooshz Platform repo is out of scope.
+- Platform-owned auth/workspace source contract has been audited against the
+  current Swooshz Platform main contract, but live Platform-to-KQAG deployment
+  behavior remains unverified.
 
 ## Fallback/Fail-Open Audit
 
@@ -556,6 +572,7 @@ Local dependency validation results are recorded later in this document.
 | Medium, lifecycle evidence added in this PR | Object-mode generated artifact lifecycle, staging cleanup, and DB+object restore behavior had only partial coverage. | `webapp/server.py`, `scripts/verify_object_artifact_lifecycle.py`, `tests/test_webapp.py`, `tests/test_object_artifact_lifecycle_verifier.py`, `tests/test_production_readiness.py` | Quote-session deletion tombstones object metadata, stubbed object deletion is attempted, deleted/missing/corrupt/wrong-workspace object artifacts fail closed, local staging files are cleaned after object persistence, and synthetic SQLite+stubbed-object backup/restore evidence is metadata-only. | This is synthetic/stubbed evidence only; live provider retention/delete, real DB+object backup/restore, production operations, and final audit remain blockers. |
 | Medium, route/race hardening added in this PR | Generated quote-session download routes needed focused delete/export/download race and stale/deleted artifact coverage. | `webapp/server.py`, `tests/test_webapp.py`, `tests/test_production_readiness.py` | DB and object artifact downloads revalidate current workspace-owned metadata before returning bytes; tests cover DB delete/download, stale DB exports, object mid-retrieve tombstone, missing/corrupt object content, generated snapshot digest stability, and readiness reporting. | This is deterministic local/stubbed evidence only; live object-provider race evidence, operations evidence, and final audit remain blockers. |
 | Medium, scaffold added in this PR | Internal-alpha VPS/Coolify deployment guidance still needed a current DB + DB-artifact posture and metadata-only validation bundle. | `docs/internal-uat-coolify-deploy.md`, `deploy/internal-uat/coolify/kqag.uat.env.example`, `scripts/verify_internal_alpha_hosted_validation.py`, `tests/test_internal_alpha_hosted_validation_verifier.py` | Operators now have placeholder-only env names, a runbook for the temporary DB/DB-artifact internal-alpha posture, and a synthetic validation bundle that does not print secrets, paths, DB URLs, hostnames, quote contents, or artifact bytes. | This is not live deployment evidence. Production still requires live provider evidence, real DB+object backup/restore, retention/delete evidence, production operations, Platform integration, observability export/alerts, supply-chain hardening, and final audit. |
+| Medium, source-contract audit added in this PR | Live Swooshz Platform integration expectations needed to be checked against the current Platform repo contract. | `docs/platform-integration-contract.md`, `docs/README.md`, this audit | KQAG's expected header-only launch token, safe consume context, role mapping, workspace isolation, and fail-closed storage assumptions are documented against current Platform main source evidence. | This is not live Platform deployment evidence. Production still requires live Platform-to-KQAG smoke, production operations, object storage, observability export/alerts, supply-chain hardening, and final audit. |
 | Medium, resolved in PR #91 | Async job status/result was random-ID gated, not owner-bound. | Regression coverage in `tests/test_webapp.py` | Hosted/database/platform/deploy job status/result reads require the creating platform user/workspace. | Keep job owner visibility tests in the release gate. |
 | Medium | Import/upload validation is good but hostile-corpus evidence is incomplete. | `webapp/server.py:3713`, `4728`, `6322`, `8422` | Malformed XLSX/PDF/image edge cases could cause parser failure or resource pressure. | Add synthetic hostile upload fixtures and regression tests. |
 | Medium | Hosted alert delivery and production observability wiring are not productionized. | `webapp/server.py:1182`, docs | Synthetic evidence proves local schema/privacy properties, but not a host/vended log pipeline. | Add host-specific export/alert wiring before treating this as production observability. |
@@ -617,7 +634,7 @@ Do not claim production readiness until all internal-alpha gates plus these are 
 15. Internal-alpha VPS/Coolify scaffold: this PR adds placeholder-only env docs and a synthetic hosted validation bundle for the DB/DB-artifact simple-hosting posture; live host evidence remains separate.
 16. Hosted production operations: host-specific logging export, alert delivery, DB+object backup/restore/rollback runbooks, production deployment evidence, and live host smoke evidence.
 17. Supply-chain hardening: CodeQL/equivalent, Python dependency audit, pinned security scanner image, branch protection docs.
-18. Platform integration audit: verify launch/auth/workspace claims against the Swooshz Platform repo in a separate PR.
+18. Platform integration audit: source-contract audit added in this PR against current Swooshz Platform main; live Platform-to-KQAG smoke remains required before production.
 
 ## Codex Security Scan
 
@@ -683,7 +700,7 @@ Readiness command note: the nonzero result from the default `python scripts/chec
 
 ## What Was Not Verified
 
-- Live Swooshz Platform repo behavior, platform token service, or platform workspace membership enforcement; `scripts/verify_hosted_smoke.py` uses only synthetic platform/workspace context.
+- Live deployed Swooshz Platform behavior, platform token service, or platform workspace membership enforcement; this audit checked source-contract surfaces only, and `scripts/verify_hosted_smoke.py` uses only synthetic platform/workspace context.
 - Live OIDC provider behavior.
 - Live AI provider privacy posture, data retention, or rate limits.
 - Real private Koncept pricing/profile/layout data import.
