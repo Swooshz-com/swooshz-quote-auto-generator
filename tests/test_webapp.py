@@ -21525,9 +21525,23 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
     def test_deploy_generate_response_omits_local_paths_and_raw_process_output(self):
         payload = valid_payload()
         completed = webapp.subprocess.CompletedProcess(args=[], returncode=1, stdout="raw out", stderr="raw err")
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"APP_MODE": "deploy"}, clear=False):
+        tmp_path = test_temp_root() / f"deploy-redaction-{time.time_ns()}"
+        database_url = f"sqlite:///{(tmp_path / 'kqag-artifacts.sqlite3').as_posix()}"
+        env = {
+            "APP_MODE": "deploy",
+            "KQAG_ARTIFACT_STORAGE_MODE": "database",
+            "KQAG_DATABASE_URL": database_url,
+        }
+        auth_session = self.platform_auth_session("workspace-deploy-redaction")
+        with mock.patch.dict(os.environ, env, clear=False):
+            webapp.apply_kqag_storage_migrations(database_url)
             with mock.patch.object(webapp.subprocess, "run", return_value=completed):
-                result = webapp.run_quote_job(payload, output_root=Path(tmp) / "out", tmp_root=Path(tmp) / "tmp")
+                result = webapp.run_quote_job(
+                    payload,
+                    output_root=tmp_path / "out",
+                    tmp_root=tmp_path / "tmp",
+                    auth_session=auth_session,
+                )
         self.assertEqual(result["status"], "failed")
         self.assertRegex(result["error_reference"], r"^ERR-[0-9A-F]{8}$")
         self.assertEqual(result["errors"], webapp.generic_referenced_errors(result["error_reference"]))
@@ -21537,6 +21551,190 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertNotIn("stderr", result)
         self.assertNotIn("brief_path", result)
         self.assertNotIn("output_dir", result)
+
+    def test_protected_deploy_generate_blocks_local_artifact_storage_before_success(self):
+        private_customer = "Synthetic Private Artifact Customer"
+        root = test_temp_root() / f"local-artifact-protected-deploy-{time.time_ns()}"
+        output_root = root / "output"
+        log_root = root / "logs"
+        payload = valid_payload()
+        payload["client"]["name"] = private_customer
+
+        def fake_generator_run(command, **kwargs):
+            output_dir = Path(command[command.index("--out") + 1])
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "quotation.xlsx").write_bytes(b"synthetic-private-quote-content")
+            return webapp.subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout="Wrote quotation.xlsx\n",
+                stderr="",
+            )
+
+        env = self.deploy_auth_env(
+            KQAG_STORAGE_MODE="local",
+            KQAG_ARTIFACT_STORAGE_MODE="local",
+            QUOTE_OUTPUT_ROOT=str(output_root),
+            QUOTE_TMP_ROOT=str(root / "tmp"),
+            QUOTE_LOG_ROOT=str(log_root),
+        )
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(webapp.subprocess, "run", side_effect=fake_generator_run) as run:
+            result = webapp.run_quote_job(
+                payload,
+                output_root=output_root,
+                tmp_root=root / "tmp",
+                job_id="job-local-artifact-protected",
+                auth_session={"user": {"subject": "deploy-user", "email": "alex@example.com"}},
+            )
+
+        result_text = json.dumps(result, sort_keys=True)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["errors"], ["Quote artifact storage is not available in this environment."])
+        self.assertEqual(run.call_count, 0)
+        self.assertNotIn("files", result)
+        self.assertNotIn(private_customer, result_text)
+        self.assertNotIn("synthetic-private-quote-content", result_text)
+        self.assertNotIn(str(output_root), result_text)
+        self.assertFalse((output_root / "job-local-artifact-protected" / "quotation.xlsx").exists())
+
+        log_records = []
+        for log_path in log_root.rglob("*.jsonl"):
+            log_records.extend(
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
+        self.assertIn("quote_artifact_storage_blocked", {record["event"] for record in log_records})
+        serialized_logs = json.dumps(log_records, sort_keys=True)
+        self.assertNotIn(private_customer, serialized_logs)
+        self.assertNotIn("synthetic-private-quote-content", serialized_logs)
+        self.assertNotIn(str(output_root), serialized_logs)
+        self.assertNotIn(str(root), serialized_logs)
+
+    def test_platform_session_context_blocks_local_artifact_storage_in_local_app_mode(self):
+        private_customer = "Synthetic Platform Artifact Customer"
+        root = test_temp_root() / f"local-artifact-platform-context-{time.time_ns()}"
+        output_root = root / "output"
+        payload = valid_payload()
+        payload["client"]["name"] = private_customer
+
+        def fake_generator_run(command, **kwargs):
+            output_dir = Path(command[command.index("--out") + 1])
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "quotation.xlsx").write_bytes(b"synthetic-platform-quote-content")
+            return webapp.subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout="Wrote quotation.xlsx\n",
+                stderr="",
+            )
+
+        env = {
+            "APP_MODE": "local",
+            "KQAG_STORAGE_MODE": "local",
+            "KQAG_ARTIFACT_STORAGE_MODE": "local",
+            "QUOTE_OUTPUT_ROOT": str(output_root),
+            "QUOTE_TMP_ROOT": str(root / "tmp"),
+            "QUOTE_LOG_ROOT": str(root / "logs"),
+        }
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(webapp.subprocess, "run", side_effect=fake_generator_run) as run:
+            result = webapp.run_quote_job(
+                payload,
+                output_root=output_root,
+                tmp_root=root / "tmp",
+                job_id="job-local-artifact-platform",
+                auth_session=self.platform_auth_session("workspace-local-artifact"),
+            )
+
+        result_text = json.dumps(result, sort_keys=True)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["errors"], ["Quote artifact storage is not available in this environment."])
+        self.assertEqual(run.call_count, 0)
+        self.assertNotIn("files", result)
+        self.assertNotIn(private_customer, result_text)
+        self.assertNotIn("synthetic-platform-quote-content", result_text)
+        self.assertNotIn(str(output_root), result_text)
+        self.assertFalse((output_root / "job-local-artifact-platform" / "quotation.xlsx").exists())
+
+    def test_protected_settings_profile_layout_upload_blocks_local_artifact_storage(self):
+        root = test_temp_root() / f"profile-layout-artifact-block-{time.time_ns()}"
+        layout_data_url = (
+            "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,"
+            + base64.b64encode(KONCEPT_LAYOUT.read_bytes()).decode("ascii")
+        )
+        env = self.deploy_auth_env(
+            KQAG_STORAGE_MODE="local",
+            KQAG_ARTIFACT_STORAGE_MODE="local",
+            QUOTE_DATA_ROOT=str(root / "data"),
+            QUOTE_LOG_ROOT=str(root / "logs"),
+        )
+        with mock.patch.dict(os.environ, env, clear=True):
+            session_cookie = (
+                f"{webapp.SESSION_COOKIE_NAME}="
+                f"{webapp.signed_cookie_value({'user': {'subject': 'deploy-user', 'email': 'alex@example.com', 'role': 'admin'}})}"
+            )
+            with LocalRunnerServer() as runner:
+                session_body = self.http_json(runner, "GET", "/api/session", cookie=session_cookie)
+                response = self.http_json(
+                    runner,
+                    "POST",
+                    "/api/settings/profiles",
+                    cookie=session_cookie,
+                    body={
+                        "id": "profile-local-layout-block",
+                        "label": "Synthetic Profile Layout Block",
+                        "pack": {"quotation_layout": {"filename": "quotation-layout.xlsx", "data_url": layout_data_url}},
+                    },
+                    headers={session_body["body"]["csrf_header"]: session_body["body"]["csrf_token"]},
+                )
+
+        self.assertEqual(response["status"], 503, response)
+        self.assertIn("Quote artifact storage is not available in this environment.", response["text"])
+        self.assertNotIn(str(root), response["text"])
+        self.assertFalse((root / "data" / "default" / "profile-packs" / "profile-local-layout-block" / "quotation-layout.xlsx").exists())
+
+    def test_protected_settings_pricing_visual_upload_blocks_local_artifact_storage(self):
+        root = test_temp_root() / f"pricing-visual-artifact-block-{time.time_ns()}"
+        visual_data_url = "data:image/png;base64," + base64.b64encode(b"synthetic-private-pricing-visual").decode("ascii")
+        env = self.deploy_auth_env(
+            KQAG_STORAGE_MODE="local",
+            KQAG_ARTIFACT_STORAGE_MODE="local",
+            QUOTE_DATA_ROOT=str(root / "data"),
+            KQAG_LOCAL_PRICING_REFERENCES_ROOT=str(root / "pricing-references"),
+            QUOTE_LOG_ROOT=str(root / "logs"),
+        )
+        with mock.patch.dict(os.environ, env, clear=True):
+            session_cookie = (
+                f"{webapp.SESSION_COOKIE_NAME}="
+                f"{webapp.signed_cookie_value({'user': {'subject': 'deploy-user', 'email': 'alex@example.com', 'role': 'admin'}})}"
+            )
+            with LocalRunnerServer() as runner:
+                session_body = self.http_json(runner, "GET", "/api/session", cookie=session_cookie)
+                response = self.http_json(
+                    runner,
+                    "POST",
+                    "/api/settings/pricing-references",
+                    cookie=session_cookie,
+                    body={
+                        "id": "pricing-local-visual-block",
+                        "label": "Synthetic Pricing Visual Block",
+                        "items": [with_required_pricing_metadata({
+                            "id": "visual-row",
+                            "section": "Graphics",
+                            "description": "Printed graphics",
+                            "unit_hint": "sqm",
+                            "internal_cost": 10,
+                            "markup_multiplier": 2,
+                            "visual_references": [{"source": "xl/media/image4.png", "data_url": visual_data_url}],
+                        })],
+                    },
+                    headers={session_body["body"]["csrf_header"]: session_body["body"]["csrf_token"]},
+                )
+
+        self.assertEqual(response["status"], 503, response)
+        self.assertIn("Quote artifact storage is not available in this environment.", response["text"])
+        self.assertNotIn(str(root), response["text"])
+        self.assertFalse((root / "pricing-references" / "pricing-local-visual-block").exists())
 
     def test_blocking_clarifications_prevent_final_basis_rows(self):
         draft = webapp.normalize_ai_draft({
