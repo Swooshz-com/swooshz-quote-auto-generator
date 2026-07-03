@@ -1,0 +1,61 @@
+{
+  "schema": "swooshz.kqag.hosted-observability-policy.v1",
+  "scope": "internal-alpha hosted logging and monitoring readiness evidence only",
+  "synthetic_verifier_only": true,
+  "allowed_event_categories": [
+    "ai",
+    "app",
+    "client",
+    "generation",
+    "security",
+    "server"
+  ],
+  "forbidden_content": [
+    "db_urls",
+    "absolute_private_paths",
+    "artifact_bytes",
+    "raw_uploads",
+    "raw_prompts",
+    "raw_provider_responses",
+    "generated_quote_contents",
+    "customer_details",
+    "pricing_profile_payloads",
+    "staff_emails",
+    "oauth_values",
+    "cookies",
+    "tokens",
+    "api_keys",
+    "authorization_headers"
+  ],
+  "minimum_metadata": [
+    "timestamp",
+    "event",
+    "category",
+    "status_or_reason",
+    "error_reference_when_failed",
+    "duration_ms_when_available",
+    "counts_when_available",
+    "privacy_safe_user_or_workspace_reference_when_available"
+  ],
+  "support_traceability": {
+    "failed_product_paths_require_error_reference": true,
+    "user_facing_errors_are_generic": true,
+    "logs_keep_metadata_only_reference": true
+  },
+  "health_readiness": {
+    "public_health_endpoint_metadata_only": true,
+    "do_not_expose_generator_paths": true,
+    "do_not_expose_runtime_roots_or_database_urls": true
+  },
+  "retention": {
+    "internal_alpha_log_retention_days": 30,
+    "host_specific_export_required": true,
+    "external_vendor_dependency_required_by_this_repo": false
+  },
+  "limitations": [
+    "This policy does not configure an external logging vendor.",
+    "Hosted deployment wiring and alert delivery remain host-specific.",
+    "Hosted smoke evidence remains a separate internal-alpha blocker.",
+    "Production readiness still requires object storage and production operations evidence."
+  ]
+}

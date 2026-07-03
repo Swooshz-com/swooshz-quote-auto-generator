@@ -341,9 +341,16 @@ LOG_OMIT_KEYS = {
     "client",
     "company",
     "content",
+    "cookie",
     "customer",
+    "customer_details",
+    "customer_name",
     "data_url",
+    "db_url",
     "details_text",
+    "email",
+    "generated_quote",
+    "generated_quote_contents",
     "header_details",
     "image_base64",
     "image_data",
@@ -351,12 +358,22 @@ LOG_OMIT_KEYS = {
     "notes",
     "payment_terms",
     "payload",
+    "pricing_payload",
+    "private_path",
+    "profile_payload",
     "prompt",
+    "provider_response",
     "quote_basis",
+    "quote_contents",
     "rich_text",
+    "raw_provider_response",
     "standard_notes",
+    "staff_email",
     "text",
+    "user_email",
     "user_input",
+    "artifact_bytes",
+    "oauth_value",
 }
 RICH_TEXT_DETAIL_KEYS = {
     "acceptanceText",
@@ -1934,10 +1951,36 @@ def backup_restore_evidence_summary(
     }
 
 
+def hosted_observability_evidence_summary(*, status: str) -> dict[str, Any]:
+    normalized_status = clean_text(status).lower() or "not_run_by_checker"
+    if normalized_status not in {"passed", "failed", "not_run_by_checker"}:
+        normalized_status = "not_run_by_checker"
+    passed = normalized_status == "passed"
+    return {
+        "status": normalized_status,
+        "verifier": "scripts/verify_hosted_observability.py",
+        "policy": "docs/hosted-observability-policy.json",
+        "covers": [
+            "structured_log_schema",
+            "allowed_event_categories",
+            "sensitive_value_omission",
+            "support_error_references",
+            "health_readiness_metadata",
+            "synthetic_observability_policy_shape",
+        ],
+        "internal_alpha_observability_supported": bool(passed),
+        "notes": [
+            "Evidence is synthetic and metadata-only.",
+            "This is not external vendor wiring, alert delivery, hosted smoke evidence, or production readiness.",
+        ],
+    }
+
+
 def production_readiness_status(
     security_scan_status: str = "not_run_by_command",
     *,
     backup_restore_evidence_status: str = "not_run_by_checker",
+    hosted_observability_evidence_status: str = "not_run_by_checker",
 ) -> dict[str, Any]:
     storage_mode = configured_storage_mode()
     artifact_mode = configured_artifact_storage_mode()
@@ -1950,6 +1993,9 @@ def production_readiness_status(
         database_mode=database_mode,
         database_artifacts=database_artifacts,
         database_configured=database_configured,
+    )
+    hosted_observability_evidence = hosted_observability_evidence_summary(
+        status=hosted_observability_evidence_status,
     )
 
     profiles = readiness_surface(
@@ -2033,7 +2079,8 @@ def production_readiness_status(
     blockers.append(readiness_blocker("object_storage_missing", "P1", "No object-storage-backed asset/artifact layer exists for production XLSX/PDF and uploaded reference assets.", gates=("production",)))
     if not backup_restore_evidence["database_artifact_temporary_exception_supported"]:
         blockers.append(readiness_blocker("backup_restore_unverified", "P1", "Backup, restore, retention, and rollback evidence has not been verified for the selected database/database-artifact mode."))
-    blockers.append(readiness_blocker("hosted_logging_monitoring_missing", "P1", "Hosted privacy-minimized logging, monitoring, alerting, and support traceability are not implemented or verified by this command."))
+    if not hosted_observability_evidence["internal_alpha_observability_supported"]:
+        blockers.append(readiness_blocker("hosted_logging_monitoring_missing", "P1", "Hosted privacy-minimized logging, monitoring, alerting, and support traceability are not implemented or verified by this command."))
     blockers.append(readiness_blocker("hosted_smoke_evidence_missing", "P1", "Hosted smoke evidence for platform launch, workspace storage, quote generation, session persistence, artifact download, delete, and logout is not verified by this command."))
 
     workspace_scoped = all(
@@ -2061,6 +2108,7 @@ def production_readiness_status(
             if item["id"] in {"local_runtime_storage", "local_artifact_storage"}
         ],
         "backup_restore_evidence": backup_restore_evidence,
+        "hosted_observability_evidence": hosted_observability_evidence,
         "security_scan_status": clean_text(security_scan_status) or "not_run_by_command",
         "local_uat_supported": True,
         "internal_alpha_blockers": internal_alpha_blockers,
@@ -2071,7 +2119,7 @@ def production_readiness_status(
             "summary": (
                 "A temporary small-team internal alpha may become acceptable only after database storage, "
                 "database artifacts, documented backup/restore/rollback, hosted smoke evidence, and hosted "
-                "privacy-minimized logging are in place; SQLite/BLOB mode is not final production storage."
+                "privacy-minimized observability evidence are in place; SQLite/BLOB mode is not final production storage."
             ),
         },
         "production_ready": False if production_blockers else True,
@@ -13477,6 +13525,20 @@ def failed_result_payload(error_reference: str) -> dict[str, Any]:
     }
 
 
+def health_status() -> dict[str, Any]:
+    generator_available = GENERATOR_PATH.is_file()
+    return {
+        "status": "ok" if generator_available else "blocked",
+        "generator_available": bool(generator_available),
+        "checks": [
+            {
+                "name": "quote_generator_script",
+                "ok": bool(generator_available),
+            }
+        ],
+    }
+
+
 def unexpected_error_log_details(error_reference: str, exc: BaseException | None = None, **details: Any) -> dict[str, Any]:
     log_details: dict[str, Any] = {"error_reference": clean_text(error_reference)}
     if exc is not None:
@@ -14003,7 +14065,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             self.send_static_file(STATIC_DIR / relative)
             return
         if path == "/api/health":
-            self.send_json({"status": "ok", "generator": str(GENERATOR_PATH)})
+            self.send_json(health_status())
             return
         if path == "/api/session":
             session = self.current_auth_session()

@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 
 from webapp import server as webapp
 import verify_database_backup_restore
+import verify_hosted_observability
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -29,6 +30,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Synthetic verifier workspace. The path is never printed.",
     )
+    parser.add_argument(
+        "--with-hosted-observability-evidence",
+        action="store_true",
+        help="Run the synthetic hosted observability verifier and include only its pass/fail status.",
+    )
+    parser.add_argument(
+        "--hosted-observability-work-dir",
+        type=Path,
+        default=None,
+        help="Synthetic hosted observability verifier workspace. The path is never printed.",
+    )
     return parser
 
 
@@ -42,13 +54,27 @@ def backup_restore_evidence_status(*, enabled: bool, work_dir: Path | None) -> s
     return "passed" if report.get("status") == "passed" else "failed"
 
 
+def hosted_observability_evidence_status(*, enabled: bool, work_dir: Path | None) -> str:
+    if not enabled:
+        return "not_run_by_checker"
+    try:
+        report = verify_hosted_observability.run_verification(work_dir=work_dir)
+    except Exception:
+        return "failed"
+    return "passed" if report.get("status") == "passed" else "failed"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     status = webapp.production_readiness_status(
         backup_restore_evidence_status=backup_restore_evidence_status(
             enabled=args.with_backup_restore_evidence,
             work_dir=args.backup_restore_work_dir,
-        )
+        ),
+        hosted_observability_evidence_status=hosted_observability_evidence_status(
+            enabled=args.with_hosted_observability_evidence,
+            work_dir=args.hosted_observability_work_dir,
+        ),
     )
     print(json.dumps(status, indent=2, ensure_ascii=True))
     return 0 if status["production_ready"] else 2

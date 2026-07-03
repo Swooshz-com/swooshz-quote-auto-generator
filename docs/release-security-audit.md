@@ -13,14 +13,14 @@ SAQG/KQAG remains suitable for local UAT only:
 | Gate | Verdict | Reason |
 | --- | --- | --- |
 | `local_uat_supported` | Yes | Local localhost mode, local runtime storage, seeded test setup, and current CI remain supported. |
-| `internal_alpha_ready` | No | Workspace-scoped auth/session work exists, AI draft fallback now fails closed, protected quote-session routes no longer use local runtime storage, protected generate paths no longer return local artifact success, and a synthetic DB/DB-artifact backup/restore verifier now exists, but hosted smoke evidence and hosted logging/monitoring still block release. |
-| `production_ready` | No | Object storage and strict hosted logging/monitoring are not complete. |
+| `internal_alpha_ready` | No | Workspace-scoped auth/session work exists, AI draft fallback now fails closed, protected quote-session routes no longer use local runtime storage, protected generate paths no longer return local artifact success, synthetic DB/DB-artifact backup/restore evidence exists, and synthetic hosted observability evidence now exists, but hosted smoke evidence still blocks release. |
+| `production_ready` | No | Object storage and production deployment observability evidence are not complete. |
 
 This PR does not claim production readiness. It is a release-grade security audit and release-gate review for the implementation PRs that must follow.
 
 Highest-priority remaining blockers:
 
-- Medium: database artifact storage remains only a temporary internal-alpha/simple-hosting exception when the synthetic backup/restore verifier passes and hosted smoke/logging gates are also satisfied; production still requires object storage.
+- Medium: database artifact storage remains only a temporary internal-alpha/simple-hosting exception when synthetic backup/restore and hosted observability verifiers pass and hosted smoke evidence is also satisfied; production still requires object storage.
 - Medium: docs and runbooks still include local/deploy helper paths that must be rewritten before operators treat them as the real happy path.
 
 Load Sample status: product-visible Load Sample UI/API/JS paths are gone after PR #86. No Load Sample button, product API, or Playwright smoke dependency is part of the sellable path. Remaining sample/Kent references are test-only or historical audit references.
@@ -43,8 +43,9 @@ mode disables direct `/api/jobs/{job}/files/{filename}` downloads from the
 legacy output root, and `/api/jobs/{job}` status/result responses are bound to
 the creating platform user/workspace. Local-UAT local storage mode keeps the
 legacy direct download route for localhost workflows. The release gate remains
-closed because object storage, backup/restore, hosted logging/monitoring, and
-other non-AI production blockers are still unresolved.
+closed because object storage, hosted smoke evidence, and other non-AI
+production blockers are still unresolved; backup/restore and hosted
+observability now have synthetic evidence paths only.
 
 AI draft fallback policy update: protected modes now block AI draft generation
 when the real OpenAI draft path is missing, unconfigured, unavailable, or
@@ -62,8 +63,8 @@ creating or returning local `QUOTE_OUTPUT_ROOT` quote artifacts when database
 artifact storage is not enabled. Protected profile layout uploads and pricing
 visual uploads also block before local filesystem artifact writes. Database
 artifact mode remains a documented temporary internal-alpha/simple-hosting
-exception only after backup/restore and hosted smoke evidence; it is not final
-production object storage.
+exception only after backup/restore, hosted observability, and hosted smoke
+evidence; it is not final production object storage.
 
 Database backup/restore evidence update: `scripts/verify_database_backup_restore.py`
 now performs a synthetic SQLite drill for the temporary database +
@@ -75,7 +76,18 @@ proves rollback to a prior known-good synthetic state. The output is
 metadata-only and omits DB URLs, local paths, artifact bytes, generated quote
 contents, customer details, pricing/profile payloads, staff emails, OAuth
 values, cookies, tokens, and API keys. This is not production object storage,
-hosted logging, or hosted smoke evidence.
+external hosted logging wiring, or hosted smoke evidence.
+
+Hosted observability evidence update: `scripts/verify_hosted_observability.py`
+now performs a synthetic structured-logging and health/readiness drill. It
+checks event allowlisting, metadata-only log records, support-traceable error
+references, sensitive-value omission, the machine-readable policy in
+`docs/hosted-observability-policy.json`, and path-free health metadata. The
+output is metadata-only and omits DB URLs, local paths, artifact bytes,
+generated quote contents, customer details, pricing/profile payloads, staff
+emails, OAuth values, cookies, tokens, API keys, and raw provider responses.
+This is internal-alpha evidence only; external vendor wiring, alert delivery,
+hosted smoke checks, object storage, and production readiness remain separate.
 
 ## Threat Model
 
@@ -155,7 +167,7 @@ Global route controls:
 | `/` | GET | Required in deploy | Platform session indirectly | N/A | Any authenticated user | N/A | App shell | Acceptable route gate. |
 | `/privacy` | GET | Public | N/A | N/A | None | N/A | Public legal page | Acceptable. |
 | `/static/*` | GET | Public | N/A | N/A | None | N/A | Static assets | Path containment check exists at `webapp/server.py:14194`. |
-| `/api/health` | GET | Public | N/A | N/A | None | N/A | Low, exposes generator path string | Acceptable for local/readiness, but should avoid local path detail in hosted production. |
+| `/api/health` | GET | Public | N/A | N/A | None | N/A | Low, metadata-only health signal | Path-free health payload now reports status and boolean checks without exposing generator/runtime paths. |
 | `/api/session` | GET | Required in deploy | Platform session returned when present | Current session | Any authenticated user | N/A | Auth context, CSRF token | Acceptable for app bootstrap; keep payload privacy-minimized. |
 | `/login` | GET | Public entry | Platform mode blocks local OIDC login | N/A | Approved tester through OIDC or platform | N/A | Auth boundary | Acceptable fail-closed direction. |
 | `/callback` | GET | Public callback | No workspace unless OIDC mode | State cookie | OIDC allowlist | N/A | OIDC code/state | State check exists; logs redact callback query values. |
@@ -238,7 +250,7 @@ Path traversal review:
 | Pricing import preview | `.xlsx`, `.csv`, `.md` | Same decode limits; parser exceptions become sanitized validation errors; AI timing logs are metadata-only. | AI normalization can see source rows; hosted privacy posture depends on provider config and data handling policy. | Medium |
 | Profile save/import | JSON payload with optional embedded layout workbook/rules | Profile id/filename sanitization, layout XLSX validation, rules JSON limit, formula-neutralized defaults. | Profile layout assets stored in DB artifact mode but not consumed from workspace artifacts during generation. | High |
 | Booth/render images | Data URL images/PDFs | Max files, max bytes, base64 decode, basic PDF and image checks. | MIME sniffing is partial; temp/local roots not production storage. | Medium |
-| Client log events | JSON event/details | Event allowlist/category and sanitize log values. | Hosted logging backend, retention, monitoring, and support traceability are not productionized. | Medium |
+| Client log events | JSON event/details | Event allowlist/category and sanitize log values. Synthetic hosted observability verifier now checks metadata-only output, sensitive-value omission, and error references. | External hosted logging backend wiring, alert delivery, and hosted smoke evidence are not productionized. | Medium |
 
 Formula injection:
 
@@ -329,7 +341,7 @@ Findings:
 
 Gaps:
 
-- Hosted logging backend, alerting, retention, and support-safe trace correlation are not productionized.
+- Hosted logging backend vendor/export wiring and alert delivery are not productionized in this repo.
 - Local logs are acceptable for local UAT only.
 - Future scanner/report output must remain metadata-only and must not echo source lines containing private values.
 
@@ -366,7 +378,7 @@ Local dependency validation results are recorded later in this document.
 | Vulnerable/Outdated Components | `npm audit` is part of CI; local result is tracked below. Python audit not present. | Evidence incomplete. |
 | Identification/Auth Failures | OIDC state, allowlist, platform launch validation, and signed cookies exist. Live platform contract not verified. | Medium gap. |
 | Software/Data Integrity Failures | CI validates syntax/tests and security gates, but external actions/images are not fully pinned. | Medium gap. |
-| Logging/Monitoring Failures | Privacy-safe local logging exists. Hosted monitoring, alerting, retention, and audit trail are not productionized. | Medium gap. |
+| Logging/Monitoring Failures | Privacy-safe local logging exists, and synthetic hosted observability evidence now checks metadata-only logs, event allowlisting, support references, and health/readiness metadata. External vendor wiring and alert delivery are host-specific. | Medium gap. |
 | SSRF / External Fetch Risk | OIDC and platform launch outbound URLs come from env config; AI provider requests go to configured providers. No arbitrary user-supplied URL fetch was confirmed. | Low/Medium, keep config allowlists strict. |
 | Business Logic Vulnerabilities | Mixed workspace/local pricing and profile generation fallbacks are fixed for DB/platform mode; legacy job files are disabled in protected modes; disabled/deleted artifact lifecycle cases still need tests. | Medium gaps remain. |
 
@@ -392,10 +404,11 @@ Local dependency validation results are recorded later in this document.
 | High, resolved in PR #92 | Local AI draft fallback returned product-visible drafted result when remote AI was missing/failed. | Regression coverage in `tests/test_webapp.py` | Protected-mode users now receive a blocked draft result with a generic message, and no local starter draft/result is returned. | Keep protected-mode fail-closed draft tests in the release gate; local-UAT fallback remains local only. |
 | High, resolved in PR #93 | Local quote-session runtime storage could be product-visible in protected modes when database storage was unavailable. | Regression coverage in `tests/test_webapp.py` | Protected-mode quote-session routes and generate-session persistence now return a generic storage-unavailable response instead of using local runtime session files. | Keep protected-mode quote-session storage tests in the release gate; local-UAT fallback remains local only. |
 | High, resolved in PR #94 | Local artifact storage could be product-visible in protected generate and artifact-upload paths when database artifact storage was unavailable. | Regression coverage in `tests/test_webapp.py` | Protected-mode generate paths, profile layout uploads, and pricing visual uploads now fail with a generic artifact-storage-unavailable response before local output or upload artifact files are created or returned. | Keep protected-mode artifact storage tests green; database artifact mode is still only a temporary exception, and production object storage remains required. |
-| Medium, evidence path added in this PR | DB/DB-artifact backup, restore, retention, and rollback had no safe verifier. | `scripts/verify_database_backup_restore.py`, `docs/internal-alpha-retention-policy.json`, `tests/test_database_backup_restore_verifier.py` | Synthetic SQLite rows and BLOB artifacts can now be backed up, restored, checksum-verified, and rolled back together without private data. | This is temporary internal-alpha/simple-hosting evidence only; production still requires object storage and hosted operations evidence. |
+| Medium, evidence path added in PR #95 | DB/DB-artifact backup, restore, retention, and rollback had no safe verifier. | `scripts/verify_database_backup_restore.py`, `docs/internal-alpha-retention-policy.json`, `tests/test_database_backup_restore_verifier.py` | Synthetic SQLite rows and BLOB artifacts can now be backed up, restored, checksum-verified, and rolled back together without private data. | This is temporary internal-alpha/simple-hosting evidence only; production still requires object storage and hosted operations evidence. |
+| Medium, evidence path added in this PR | Hosted logging/monitoring evidence had no safe verifier. | `scripts/verify_hosted_observability.py`, `docs/hosted-observability-policy.json`, `tests/test_hosted_observability_verifier.py` | Synthetic structured logs, event categories, support error references, and health metadata can now be checked without private data or an external vendor dependency. | This is internal-alpha evidence only; hosted smoke, alert delivery, vendor/export wiring, and production object storage remain separate. |
 | Medium, resolved in PR #91 | Async job status/result was random-ID gated, not owner-bound. | Regression coverage in `tests/test_webapp.py` | Hosted/database/platform/deploy job status/result reads require the creating platform user/workspace. | Keep job owner visibility tests in the release gate. |
 | Medium | Import/upload validation is good but hostile-corpus evidence is incomplete. | `webapp/server.py:3713`, `4728`, `6322`, `8422` | Malformed XLSX/PDF/image edge cases could cause parser failure or resource pressure. | Add synthetic hostile upload fixtures and regression tests. |
-| Medium | Hosted logging/monitoring/retention is not productionized. | `webapp/server.py:1182`, docs | Local logs are not a production support/audit trail. | Add hosted privacy-minimized logging and retention design. |
+| Medium | Hosted alert delivery and production observability wiring are not productionized. | `webapp/server.py:1182`, docs | Synthetic evidence proves local schema/privacy properties, but not a host/vended log pipeline. | Add host-specific export/alert wiring before treating this as production observability. |
 | Medium | Supply-chain evidence is incomplete. | `.github/workflows/ci.yml`, `package.json` | CI has useful gates but no CodeQL/Python audit and unpinned Gitleaks image. | Add CodeQL/dependency review or documented equivalent before production. |
 | Low | Historical docs still mention Load Sample/sample paths as audit evidence. | `docs/architecture-dead-code-fallback-audit.md`, `docs/production-readiness-audit.md` | Could confuse future readers if not superseded by this doc. | Link this audit as the current release gate and trim historical wording later. |
 
@@ -413,7 +426,7 @@ Do not start internal alpha until all are true:
 - Quote sessions and artifacts still need the chosen workspace-owned durable storage and hosted smoke evidence before internal alpha.
 - Backup/restore/rollback is documented and tested for the temporary SQLite DB/DB-artifact internal-alpha option by `scripts/verify_database_backup_restore.py`; run it for each internal-alpha evidence bundle and keep the output metadata-only.
 - Hosted smoke covers platform launch, workspace profile import/use, pricing import/use, quote generation, session persistence, artifact download, delete, and logout.
-- Logs remain privacy-minimized and support-traceable without raw prompts, uploads, provider responses, secrets, or generated quote contents.
+- Logs remain privacy-minimized and support-traceable without raw prompts, uploads, provider responses, secrets, or generated quote contents; `scripts/verify_hosted_observability.py` satisfies this synthetic evidence gate.
 - Codex Security standard scan is complete or any incomplete status is explicitly disclosed.
 
 ## Production Release Gate
@@ -438,12 +451,14 @@ Do not claim production readiness until all internal-alpha gates plus these are 
 4. AI fallback policy: completed in PR #92 for protected modes; local starter draft fallback is kept only for local-UAT/local-development behavior.
 5. Quote-session local runtime policy: completed in PR #93 for protected modes; local quote-session filesystem storage is kept only for local-UAT/local-development behavior.
 6. Local artifact storage policy: completed in PR #94 for protected generate paths and artifact-bearing settings uploads; local output/upload artifact storage is kept only for local-UAT/local-development behavior.
-7. DB/DB-artifact backup evidence: completed in this PR for the temporary SQLite internal-alpha exception with synthetic backup, restore, checksum, retention-policy, and rollback verification.
-8. Artifact object-storage design: move generated outputs and uploaded/reference/profile assets to object storage with DB metadata and checksums.
-9. Session and business-logic hardening: immutable profile/pricing snapshots, stale/deleted artifact tests, delete/export race tests.
-10. Hosted logging and operations: privacy-minimized logging, monitoring, backup/restore/rollback runbooks, and hosted smoke evidence.
-11. Supply-chain hardening: CodeQL/equivalent, Python dependency audit, pinned security scanner image, branch protection docs.
-12. Platform integration audit: verify launch/auth/workspace claims against the Swooshz Platform repo in a separate PR.
+7. DB/DB-artifact backup evidence: completed in PR #95 for the temporary SQLite internal-alpha exception with synthetic backup, restore, checksum, retention-policy, and rollback verification.
+8. Hosted observability evidence: completed in this PR for synthetic privacy-minimized structured logs, support references, event categories, and health metadata.
+9. Hosted smoke evidence: verify platform launch, workspace storage, quote generation, session persistence, artifact download, delete, and logout in the intended host.
+10. Artifact object-storage design: move generated outputs and uploaded/reference/profile assets to object storage with DB metadata and checksums.
+11. Session and business-logic hardening: immutable profile/pricing snapshots, stale/deleted artifact tests, delete/export race tests.
+12. Hosted production operations: host-specific logging export, alert delivery, backup/restore/rollback runbooks, and smoke evidence.
+13. Supply-chain hardening: CodeQL/equivalent, Python dependency audit, pinned security scanner image, branch protection docs.
+14. Platform integration audit: verify launch/auth/workspace claims against the Swooshz Platform repo in a separate PR.
 
 ## Codex Security Scan
 
@@ -463,11 +478,13 @@ Severity summary from plugin: unavailable because the scan did not start. This a
 
 | Command | Result |
 | --- | --- |
-| `python -m py_compile webapp/server.py scripts/generate_quote.py scripts/audit_architecture_fallbacks.py scripts/check_production_readiness.py scripts/verify_database_backup_restore.py` | Passed. |
+| `python -m py_compile webapp/server.py scripts/generate_quote.py scripts/audit_architecture_fallbacks.py scripts/check_production_readiness.py scripts/verify_database_backup_restore.py scripts/verify_hosted_observability.py` | Passed. |
 | `python scripts/verify_database_backup_restore.py --work-dir _tmp\validation\backup-restore-evidence` | Passed. Reported `status=passed`, `synthetic_only=true`, row counts/checksums matched, workspace ownership was preserved, rollback restored a prior known-good state, retention policy covered required data classes, and output omitted paths, DB URLs, artifact bytes, and payloads. |
+| `python scripts/verify_hosted_observability.py --work-dir _tmp\validation\hosted-observability-evidence` | Passed. Reported `status=passed`, `synthetic_only=true`, structured log records checked, allowed events enforced, sensitive values omitted, support error reference present, health metadata path-free, and output omitted paths, DB URLs, artifact bytes, payloads, provider responses, staff emails, and tokens. |
 | `python -m unittest tests.test_architecture_fallback_audit` | Passed: 3 tests OK. |
-| `python -m unittest tests.test_production_readiness` | Passed: 7 tests OK. |
+| `python -m unittest tests.test_production_readiness` | Passed: 10 tests OK. |
 | `python -m unittest tests.test_database_backup_restore_verifier` | Passed: 6 tests OK. |
+| `python -m unittest tests.test_hosted_observability_verifier` | Passed: 4 tests OK. |
 | `python -m unittest -k database_pricing tests.test_webapp.WebappServerTest` | Passed on escalated rerun: 2 tests OK. |
 | `python -m unittest -k database_profile tests.test_webapp.WebappServerTest` | Passed on escalated rerun: 1 test OK. |
 | `python -m unittest -k legacy_job tests.test_webapp.WebappServerTest` | Passed on escalated rerun: 2 tests OK. |
@@ -475,10 +492,10 @@ Severity summary from plugin: unavailable because the scan did not start. This a
 | `python -m unittest -k quote_session tests.test_webapp.WebappServerTest` | Passed on escalated rerun: 11 tests OK. |
 | `python -m unittest -k local_artifact tests.test_webapp.WebappServerTest` | Passed on escalated rerun: 4 tests OK. |
 | `python -m unittest -k database_artifact tests.test_webapp.WebappServerTest` | Passed on escalated rerun: 7 tests OK. |
-| `python -m unittest discover -s tests` | Passed on escalated rerun: 513 tests OK. |
+| `python -m unittest discover -s tests` | Passed on escalated rerun: 520 tests OK. |
 | `python scripts/audit_architecture_fallbacks.py --max-hits-per-pattern 1 --max-possible-unused 5` | Passed; metadata-only scanner output recorded above. |
-| `python scripts/check_production_readiness.py` | Expected nonzero exit. Reported `local_uat_supported=true`, `internal_alpha_ready=false`, `production_ready=false`, backup evidence `not_run_by_checker`, and six remaining blockers in local mode: `local_runtime_storage`, `local_artifact_storage`, `object_storage_missing`, `backup_restore_unverified`, `hosted_logging_monitoring_missing`, and `hosted_smoke_evidence_missing`. |
-| `KQAG_STORAGE_MODE=database KQAG_ARTIFACT_STORAGE_MODE=database KQAG_DATABASE_URL=sqlite:///tmp/kqag-storage.sqlite3 python scripts/check_production_readiness.py --with-backup-restore-evidence --backup-restore-work-dir _tmp\validation\readiness-backup-evidence-db` | Expected nonzero exit 2. Reported backup evidence `passed`, `database_artifact_temporary_exception_supported=true`, `internal_alpha_ready=false` with hosted logging/monitoring and hosted smoke evidence still blocking internal alpha, and `production_ready=false` with SQLite-not-final, object storage, hosted logging/monitoring, and hosted smoke still blocking production. |
+| `python scripts/check_production_readiness.py` | Expected nonzero exit 2. Reported `local_uat_supported=true`, `internal_alpha_ready=false`, `production_ready=false`, backup evidence `not_run_by_checker`, hosted observability evidence `not_run_by_checker`, and six remaining blockers in local mode: `local_runtime_storage`, `local_artifact_storage`, `object_storage_missing`, `backup_restore_unverified`, `hosted_logging_monitoring_missing`, and `hosted_smoke_evidence_missing`. |
+| `KQAG_STORAGE_MODE=database KQAG_ARTIFACT_STORAGE_MODE=database KQAG_DATABASE_URL=sqlite:///tmp/kqag-storage.sqlite3 python scripts/check_production_readiness.py --with-backup-restore-evidence --with-hosted-observability-evidence --backup-restore-work-dir _tmp\validation\readiness-backup-evidence-db --hosted-observability-work-dir _tmp\validation\readiness-observability-evidence` | Expected nonzero exit 2. Reported backup evidence `passed`, hosted observability evidence `passed`, `internal_alpha_ready=false` with hosted smoke evidence still blocking internal alpha, and `production_ready=false` with SQLite-not-final, object storage, and hosted smoke still blocking production. |
 | `python scripts/scan_sensitive_fixtures.py` | Passed: 0 blocking, 0 review findings. |
 | `python scripts/validate_local_pdf_dependency_usage.py` | Passed. |
 | `python scripts/validate_dynamic_pricing_reference_rules.py` | Passed. |
@@ -502,7 +519,8 @@ Readiness command note: the nonzero result from `python scripts/check_production
 - Generated customer quote contents.
 - Object storage, because it is not implemented in this repo.
 - Production backup/restore/rollback for object storage, because production object storage is not implemented.
-- Hosted backup/restore evidence against a real internal-alpha host; this PR verifies only synthetic SQLite database/database-artifact drills.
+- Hosted backup/restore evidence against a real internal-alpha host; PR #95 verifies only synthetic SQLite database/database-artifact drills.
+- External hosted observability vendor/export wiring and alert delivery; this PR verifies only synthetic structured log and health metadata properties.
 - Exhaustive hostile upload corpus beyond existing unit tests and static review.
 - Every possible race/deletion edge case in session/artifact lifecycle.
 
