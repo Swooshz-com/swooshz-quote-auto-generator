@@ -45,6 +45,15 @@ remained closed because legacy job downloads, AI draft fallback, object storage,
 and backup/restore blockers were still unresolved at that point; AI draft
 fallback was resolved by PR #92.
 
+Tenancy data correction: Koncept Images Pte Ltd profile, pricing, and layout
+packs are tenant/workspace-imported data, not app defaults, bundled defaults,
+global seeds, or fallback data for every organization. A new workspace starts
+without any real Koncept pack. In protected/database/platform/deploy modes,
+profile/pricing/layout reads must use only workspace-owned persisted records.
+If a workspace has not explicitly imported or seeded a pack, settings surfaces
+must show an empty state and generation must block/fail closed instead of
+reading local-drive, bundled, or synthetic fixture packs.
+
 PR #91 legacy job artifact lockdown update: hosted/database/platform/deploy
 mode disables direct `/api/jobs/{job}/files/{filename}` downloads from the
 legacy output root, and `/api/jobs/{job}` status/result responses are bound to
@@ -256,7 +265,7 @@ Fail-open and client-trusting routes:
 
 - Local-UAT `/api/jobs/{job}/files/{filename}` remains a localhost convenience route; PR #91 disables it in hosted/database/platform/deploy paths.
 - `/api/quote-sessions` local runtime list/detail/save/delete/download paths now block in protected modes when workspace-owned database quote-session storage is unavailable.
-- `/api/generate` accepts payload-selected `profile_id`; profile existence can still be satisfied by local/bundled fallback. Pricing reference validation is workspace-strict in DB mode after PR #88.
+- `/api/generate` accepts payload-selected `profile_id`; in DB/platform mode, profile/pricing/layout existence must be satisfied only by workspace-owned persisted records, with no local/bundled fallback.
 - `/api/draft` blocks instead of returning local fallback draft data when remote AI is missing or failed in protected modes.
 
 ## Workspace And Tenant Isolation Matrix
@@ -475,6 +484,7 @@ Do not start internal alpha until all are true:
 - No product-visible Load Sample/sample/demo/fake seeded path exists.
 - Database/platform mode cannot list, detail, export, delete, or generate from local/bundled private-like pricing references. PR #88 satisfies this pricing-reference gate; keep it covered by regression tests.
 - Generation resolves profile defaults and layout workbook from workspace-owned profile assets. PR #89 satisfies this gate for DB/platform mode; keep it covered by regression tests.
+- New workspaces have no real Koncept Images profile/pricing/layout pack by default; Koncept packs become available only after explicit import/seed into the intended workspace.
 - Legacy `/api/jobs/{job}/files/{filename}` is disabled in hosted modes or authorized by workspace/session ownership. PR #91 satisfies this by disabling the route in deploy/database/platform/database-artifact modes.
 - `/api/draft` does not return local fallback success in internal-alpha/protected modes; PR #92 satisfies that gate with protected-mode regression coverage.
 - Quote-session routes do not use local runtime storage in internal-alpha/protected modes; PR #93 satisfies that local-runtime fail-closed gate.
@@ -551,6 +561,7 @@ Severity summary from plugin: unavailable because the scan did not start. This a
 | `python -m unittest tests.test_hosted_smoke_verifier` | Passed: 3 tests OK. |
 | `python -m unittest tests.test_object_storage_contract_verifier` | Passed: 3 tests OK. |
 | `python -m unittest tests.test_object_storage_provider_config` | Passed: 4 tests OK. |
+| `python -m unittest -k database_storage tests.test_webapp.WebappServerTest` | Passed on escalated rerun: 7 tests OK, including new-workspace no-default-Koncept evidence and workspace-scoped profile layout artifact isolation. |
 | `python -m unittest -k database_pricing tests.test_webapp.WebappServerTest` | Passed on escalated rerun: 2 tests OK. |
 | `python -m unittest -k database_profile tests.test_webapp.WebappServerTest` | Passed on escalated rerun: 1 test OK. |
 | `python -m unittest -k legacy_job tests.test_webapp.WebappServerTest` | Passed on escalated rerun: 2 tests OK. |
@@ -558,7 +569,7 @@ Severity summary from plugin: unavailable because the scan did not start. This a
 | `python -m unittest -k quote_session tests.test_webapp.WebappServerTest` | Passed on escalated rerun: 11 tests OK. |
 | `python -m unittest -k local_artifact tests.test_webapp.WebappServerTest` | Passed on escalated rerun: 4 tests OK. |
 | `python -m unittest -k database_artifact tests.test_webapp.WebappServerTest` | Passed on escalated rerun: 7 tests OK. |
-| `python -m unittest discover -s tests` | Passed on escalated rerun: 540 tests OK. |
+| `python -m unittest discover -s tests` | Passed on escalated rerun: 542 tests OK. |
 | `python scripts/audit_architecture_fallbacks.py --max-hits-per-pattern 1 --max-possible-unused 5` | Passed; metadata-only scanner output recorded above. |
 | `python scripts/check_production_readiness.py` | Expected nonzero exit 2. Reported `local_uat_supported=true`, `internal_alpha_ready=false`, `production_ready=false`, all evidence statuses `not_run_by_checker`, and seven remaining blockers in local mode: `local_runtime_storage`, `local_artifact_storage`, `object_storage_missing`, `production_deployment_operations_evidence_missing`, `backup_restore_unverified`, `hosted_logging_monitoring_missing`, and `hosted_smoke_evidence_missing`. |
 | `KQAG_STORAGE_MODE=database KQAG_ARTIFACT_STORAGE_MODE=database KQAG_DATABASE_URL=<synthetic-sqlite-url> python scripts/check_production_readiness.py --with-backup-restore-evidence --with-hosted-observability-evidence --with-hosted-smoke-evidence --backup-restore-work-dir _tmp\validation\readiness-backup-evidence-db --hosted-observability-work-dir _tmp\validation\readiness-observability-evidence --hosted-smoke-work-dir _tmp\validation\readiness-hosted-smoke-evidence` | Expected nonzero exit 2. Reported backup evidence `passed`, hosted observability evidence `passed`, hosted smoke evidence `passed`, object-storage evidence `not_run_by_checker`, `internal_alpha_ready=true` for the synthetic DB/DB-artifact internal-alpha/simple-hosting posture, and `production_ready=false` with SQLite-not-final, object storage, and production deployment/operations evidence still blocking production. |
