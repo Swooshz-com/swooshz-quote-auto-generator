@@ -218,6 +218,30 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertTrue(status["internal_alpha_ready"])
         self.assertFalse(status["production_ready"])
 
+    def test_readiness_reports_stale_deleted_artifact_route_and_race_evidence(self):
+        status = self.readiness_status(
+            {
+                "KQAG_STORAGE_MODE": "database",
+                "KQAG_ARTIFACT_STORAGE_MODE": "object",
+                "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            },
+            backup_restore_evidence_status="passed",
+            hosted_observability_evidence_status="passed",
+            hosted_smoke_evidence_status="passed",
+            object_storage_evidence_status="passed",
+            object_artifact_lifecycle_evidence_status="passed",
+        )
+
+        hardening = status["session_artifact_hardening"]
+        self.assertEqual(hardening["mode"], "object")
+        self.assertTrue(hardening["immutable_snapshot_groundwork"])
+        self.assertTrue(hardening["stale_deleted_route_hardening"])
+        self.assertTrue(hardening["delete_export_download_race_evidence"])
+        self.assertFalse(hardening["production_suitable"])
+        production_blocker_ids = {item["id"] for item in status["production_blockers"]}
+        self.assertIn("session_business_hardening_incomplete", production_blocker_ids)
+        self.assertFalse(status["production_ready"])
+
     def test_database_backup_restore_evidence_can_be_reported_without_readiness_overclaim(self):
         database_url = "sqlite:///tmp/kqag-storage.sqlite3"
         status = self.readiness_status(

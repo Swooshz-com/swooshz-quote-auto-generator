@@ -2277,6 +2277,23 @@ def production_readiness_status(
         "production_suitable": False,
         "follow_up": "Complete remaining session/business hardening, immutable generated audit trails, and race coverage before production.",
     }
+    session_artifact_hardening = {
+        "mode": artifact_mode,
+        "source": "quote-session generated artifact routes with workspace-owned storage metadata",
+        "workspace_scoped": database_mode and (database_artifacts or object_artifacts),
+        "immutable_snapshot_groundwork": True,
+        "stale_deleted_route_hardening": database_mode and (database_artifacts or object_artifacts),
+        "delete_export_download_race_evidence": database_mode
+        and (
+            database_artifacts
+            or (object_artifacts and bool(object_lifecycle_evidence["object_lifecycle_supported"]))
+        ),
+        "legacy_direct_job_routes_locked_in_protected_modes": True,
+        "local_or_db_fallback_in_object_mode": False,
+        "internal_alpha_suitable": database_mode and database_artifacts and database_configured,
+        "production_suitable": False,
+        "follow_up": "Complete live object-provider stale/delete race evidence, production audit trails, and operations evidence before production.",
+    }
     generated_artifacts = readiness_surface(
         mode=artifact_mode,
         source=(
@@ -2358,6 +2375,7 @@ def production_readiness_status(
         "pricing_references_storage": pricing_references,
         "quote_sessions_storage": quote_sessions,
         "quote_session_snapshots": quote_session_snapshots,
+        "session_artifact_hardening": session_artifact_hardening,
         "generated_artifacts_storage": generated_artifacts,
         "workspace_scoped": workspace_scoped,
         "local_storage_dependencies_found": [
@@ -7867,6 +7885,34 @@ class DatabaseKqagStorage:
             updated_at=updated_at,
         )
 
+    def _object_quote_artifact_row_is_current(self, session_id: str, kind: str, row: sqlite3.Row) -> bool:
+        current = self._object_quote_artifact_row(session_id, kind)
+        if not current:
+            return False
+        for field in ("artifact_id", "workspace_id", "owner_type", "owner_id", "session_id", "artifact_kind", "filename", "checksum_sha256", "object_key_ref"):
+            if clean_text(current[field]) != clean_text(row[field]):
+                return False
+        return int(current["size_bytes"] or 0) == int(row["size_bytes"] or 0)
+
+    def _database_quote_artifact_row_is_current(self, session_id: str, kind: str, row: sqlite3.Row) -> bool:
+        safe_id = safe_quote_session_id(session_id, "")
+        safe_kind = clean_text(kind).lower()
+        if not safe_id or not safe_kind:
+            return False
+        with self.connection() as connection:
+            current = connection.execute(
+                "select filename, content_type, size_bytes, updated_at from kqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
+                (self.workspace_id, safe_id, safe_kind),
+            ).fetchone()
+        if not current:
+            return False
+        return (
+            clean_text(current["filename"]) == clean_text(row["filename"])
+            and clean_text(current["content_type"]) == clean_text(row["content_type"])
+            and int(current["size_bytes"] or 0) == int(row["size_bytes"] or 0)
+            and clean_text(current["updated_at"]) == clean_text(row["updated_at"])
+        )
+
     def _upsert_object_quote_artifact(self, session_id: str, kind: str, filename: str, content_type: str, metadata: ObjectArtifactMetadata) -> None:
         artifact_id = f"obj-{secrets.token_hex(12)}"
         now = utc_timestamp()
@@ -7996,16 +8042,20 @@ class DatabaseKqagStorage:
                 return None
             if not content or len(content) != object_metadata.size_bytes:
                 return None
+            if not self._object_quote_artifact_row_is_current(safe_id, safe_kind, row):
+                return None
             return {"filename": row["filename"], "content_type": row["content_type"], "size_bytes": object_metadata.size_bytes, "content": content}
         with self.connection() as connection:
             row = connection.execute(
-                "select filename, content_type, size_bytes, content_blob from kqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
+                "select filename, content_type, size_bytes, content_blob, updated_at from kqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
                 (self.workspace_id, safe_id, safe_kind),
             ).fetchone()
         if not row or clean_text(row["filename"]) != expected_filename:
             return None
         content = bytes(row["content_blob"] or b"")
         if not content or len(content) != int(row["size_bytes"] or 0):
+            return None
+        if not self._database_quote_artifact_row_is_current(safe_id, safe_kind, row):
             return None
         return {"filename": row["filename"], "content_type": row["content_type"], "size_bytes": int(row["size_bytes"] or 0), "content": content}
 
