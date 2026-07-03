@@ -13,14 +13,14 @@ SAQG/KQAG remains suitable for local UAT only:
 | Gate | Verdict | Reason |
 | --- | --- | --- |
 | `local_uat_supported` | Yes | Local localhost mode, local runtime storage, seeded test setup, and current CI remain supported. |
-| `internal_alpha_ready` | No | Workspace-scoped auth/session work exists and AI draft fallback now fails closed in protected modes, but local runtime/artifact storage, object storage, backup/restore evidence, and hosted logging/monitoring still block release. |
+| `internal_alpha_ready` | No | Workspace-scoped auth/session work exists, AI draft fallback now fails closed, and protected quote-session routes no longer use local runtime storage, but local artifact storage, object storage, backup/restore evidence, and hosted logging/monitoring still block release. |
 | `production_ready` | No | Object storage, backup/restore evidence, and strict hosted logging/monitoring are not complete. |
 
 This PR does not claim production readiness. It is a release-grade security audit and release-gate review for the implementation PRs that must follow.
 
 Highest-priority remaining blockers:
 
-- Medium: local quote-session storage is local-UAT-only and not an internal-alpha ownership model.
+- Medium: local artifact storage remains local-UAT-only unless database artifact mode is used under an explicitly backed-up temporary exception.
 - Medium: docs and runbooks still include local/deploy helper paths that must be rewritten before operators treat them as the real happy path.
 
 Load Sample status: product-visible Load Sample UI/API/JS paths are gone after PR #86. No Load Sample button, product API, or Playwright smoke dependency is part of the sellable path. Remaining sample/Kent references are test-only or historical audit references.
@@ -36,7 +36,7 @@ artifact. Missing/deleted profiles or missing layout artifacts block generation
 instead of falling back to bundled/default/local profile packs. The release gate
 remained closed because legacy job downloads, AI draft fallback, object storage,
 and backup/restore blockers were still unresolved at that point; AI draft
-fallback is resolved by the current protected-mode fail-closed update.
+fallback was resolved by PR #92.
 
 PR #91 legacy job artifact lockdown update: hosted/database/platform/deploy
 mode disables direct `/api/jobs/{job}/files/{filename}` downloads from the
@@ -50,6 +50,12 @@ AI draft fallback policy update: protected modes now block AI draft generation
 when the real OpenAI draft path is missing, unconfigured, unavailable, or
 returns unusable output. Local-UAT/local-development mode still keeps the
 intentional local starter draft fallback for localhost testing only.
+
+Quote-session local runtime storage policy update: protected modes now block
+quote-session list, detail, save, delete, download, and generate-session
+persistence when workspace-owned database quote-session storage is unavailable.
+Local-UAT/local-development mode still keeps the local filesystem quote-session
+runtime store for localhost dashboard testing only.
 
 ## Threat Model
 
@@ -149,10 +155,10 @@ Global route controls:
 | `/api/settings/profiles/{id}/export.json` | GET | Required in deploy | DB row export in DB mode; local helper can export pack assets in local mode | N/A | `canManageProfiles` | N/A | Profile defaults/layout assets | Medium/high depending mode: profile asset export needs object-storage ownership before internal alpha. |
 | `/api/settings/profiles` | POST | Required in deploy | Saves DB row by workspace in DB mode | N/A | `canManageProfiles` | Yes | Profile defaults/layout assets | Save is scoped; DB generation consumes stored profile layout artifacts after PR #89. |
 | `/api/settings/profiles/{id}` | DELETE | Required in deploy | Deletes DB row by workspace in DB mode | N/A | `canManageProfiles` | Yes | Profile deletion | DB delete is workspace-scoped; confirm artifact cleanup in follow-up. |
-| `/api/quote-sessions` | GET | Required in deploy | DB rows keyed by workspace | Owner visibility in DB mode | Any authenticated user | N/A | Quote session summaries | DB visibility exists; local mode is not multi-user. |
-| `/api/quote-sessions/{id}` | GET | Required in deploy | DB row keyed by workspace | Owner/admin visibility in DB mode | Any authenticated user | N/A | Draft state, filenames, session metadata | DB visibility exists; local mode is local-UAT only. |
-| `/api/quote-sessions/{id}` | DELETE | Required in deploy | DB row keyed by workspace | Owner editable in DB mode | `canGenerateQuote` | Yes | Session deletion | DB editability exists; artifact cleanup/retention needs follow-up. |
-| `/api/quote-sessions/{id}/download/{kind}` | GET | Required in deploy | DB artifact keyed by workspace/session in DB artifact mode | Owner/admin visibility through metadata lookup | Any authenticated user | N/A | Generated XLSX/PDF | Better path. Production still needs object storage and retention. |
+| `/api/quote-sessions` | GET | Required in deploy | DB rows keyed by workspace | Owner visibility in DB mode | Any authenticated user | N/A | Quote session summaries | Protected modes block local runtime quote-session listing when database storage is unavailable; local mode remains local-UAT only. |
+| `/api/quote-sessions/{id}` | GET | Required in deploy | DB row keyed by workspace | Owner/admin visibility in DB mode | Any authenticated user | N/A | Draft state, filenames, session metadata | Protected modes block local runtime quote-session detail reads when database storage is unavailable; local mode remains local-UAT only. |
+| `/api/quote-sessions/{id}` | DELETE | Required in deploy | DB row keyed by workspace | Owner editable in DB mode | `canGenerateQuote` | Yes | Session deletion | Protected modes block local runtime quote-session deletion when database storage is unavailable; artifact cleanup/retention still needs follow-up. |
+| `/api/quote-sessions/{id}/download/{kind}` | GET | Required in deploy | DB artifact keyed by workspace/session in DB artifact mode | Owner/admin visibility through metadata lookup | Any authenticated user | N/A | Generated XLSX/PDF | Protected modes block local runtime quote-session downloads when database storage is unavailable. Production still needs object storage and retention. |
 | `/api/jobs` | POST | Required in deploy | Auth session passed to worker | Job owner context stored for protected modes | Any authenticated user; generation checks later | Yes | Async draft/generate jobs | PR #91 stores privacy-safe owner/workspace context for hosted job visibility. |
 | `/api/jobs/{job}` | GET | Required in deploy | Owner workspace in protected modes | Creating platform user/workspace in protected modes | Any authenticated user | N/A | Job status/result/files | PR #91 blocks cross-user/cross-workspace job status/result reads in hosted/database/platform/deploy mode. |
 | `/api/jobs/{job}/files/{filename}` | GET | Required in deploy | Disabled in protected modes | Disabled in protected modes | Any authenticated user | N/A | Generated XLSX/PDF direct file | PR #91 disables legacy output-root downloads in deploy/database/platform/database-artifact mode; local-UAT local mode remains supported. |
@@ -165,6 +171,7 @@ Global route controls:
 Fail-open and client-trusting routes:
 
 - Local-UAT `/api/jobs/{job}/files/{filename}` remains a localhost convenience route; PR #91 disables it in hosted/database/platform/deploy paths.
+- `/api/quote-sessions` local runtime list/detail/save/delete/download paths now block in protected modes when workspace-owned database quote-session storage is unavailable.
 - `/api/generate` accepts payload-selected `profile_id`; profile existence can still be satisfied by local/bundled fallback. Pricing reference validation is workspace-strict in DB mode after PR #88.
 - `/api/draft` blocks instead of returning local fallback draft data when remote AI is missing or failed in protected modes.
 
@@ -174,7 +181,7 @@ Fail-open and client-trusting routes:
 | --- | --- | --- | --- | --- |
 | DB profiles | `kqag_profiles` primary key includes `(workspace_id, profile_id)` and DB profile reads use the current workspace. PR #89 makes DB profile lists workspace-row-only and generation consume workspace DB profile defaults/layout artifacts. | Object storage is still missing for final production profile asset storage. | Medium | Keep regression coverage; production object-storage blocker remains. |
 | DB pricing references | `kqag_pricing_references` primary key includes `(workspace_id, reference_id)`; PR #88 list/detail/export/generation read only current-workspace DB rows. | Uploaded/reference assets still need final object-storage productionization. | Medium | Keep regression tests; production object-storage blocker remains. |
-| DB quote sessions | `kqag_quote_sessions` key includes `(workspace_id, session_id)` (`webapp/server.py:6823`), reads include workspace predicate (`webapp/server.py:7437`). | Ownerless legacy/local sessions remain local-UAT-only. Admin can view other-user sessions only under visibility conditions (`webapp/server.py:7405`). | Medium | Add tests and hosted policy before internal alpha. |
+| DB quote sessions | `kqag_quote_sessions` key includes `(workspace_id, session_id)` (`webapp/server.py:6823`), reads include workspace predicate (`webapp/server.py:7437`). | Protected modes block local runtime quote sessions when DB storage is unavailable. Admin can view other-user DB sessions only under visibility conditions (`webapp/server.py:7405`). | Medium | Keep protected-mode local-runtime block and DB owner tests green; add hosted policy before internal alpha. |
 | DB artifacts | `kqag_quote_artifacts` and `kqag_file_artifacts` keys include `workspace_id`. PR #89 uses stored profile layout artifacts for DB-mode generation. | This is SQLite/BLOB mode, not final object storage. | Medium/High | Internal alpha temporary exception only after backup/restore; production blocker. |
 | Local profile/pricing/session roots | Local roots are shared by process and company/default identifiers. | Not tenant-isolated. | High in hosted mode | Allowed only for local UAT/test harness. |
 | Platform session | `safe_platform_session_context()` requires consumed outcome, user id, workspace id, app key, and supported role (`webapp/server.py:6944`). | Live platform contract not verified in this repo; Swooshz Platform repo out of scope. | Medium | Verify in platform integration PR. |
@@ -274,7 +281,8 @@ Current fallback blockers:
 | DB pricing list/detail/export/generation local/bundled fallback | Resolved in PR #88 | Database/platform mode now returns only workspace-owned DB pricing references and blocks same-id local/bundled fallback after delete. | Resolved High |
 | Profile/layout generation local fallback | Fixed by PR #89 | Missing workspace profile assets now block database-mode generation instead of using bundled/default/local layout. | Resolved for DB/platform mode |
 | Legacy job-file download authorization | Fixed by PR #91 | Hosted/database/platform/deploy mode disables `/api/jobs/{job}/files/{filename}` legacy output-root downloads; job status/result is owner/workspace-bound in protected modes. | Resolved High |
-| AI draft local fallback | Resolved in this PR | Protected modes now require the real OpenAI draft path and return blocked status with a generic message if remote AI is missing, unconfigured, unavailable, or returns unusable output. Local-UAT mode keeps the local starter fallback only for localhost testing. | Resolved High |
+| AI draft local fallback | Resolved in PR #92 | Protected modes now require the real OpenAI draft path and return blocked status with a generic message if remote AI is missing, unconfigured, unavailable, or returns unusable output. Local-UAT mode keeps the local starter fallback only for localhost testing. | Resolved High |
+| Quote-session local runtime storage | Resolved in this PR | Protected modes now return a generic blocked/failed response instead of listing, reading, saving, deleting, downloading, or generate-persisting quote sessions through `QUOTE_DATA_ROOT/quote-sessions` when database storage is unavailable. | Resolved High |
 | Job/session summary local pack fallback | `webapp/server.py:12474`, `12491` | Display names can resolve through local pack loaders. Lower data impact, but still wrong product shape. | Medium |
 | Broad defensive exception handlers | `webapp/server.py:13365`, `13764`, `13803` | Mostly privacy-safe failure handling, but review each before hosted release. | Medium |
 
@@ -360,7 +368,8 @@ Local dependency validation results are recorded later in this document.
 | High, resolved in PR #88 | DB/platform pricing references could include shared local/bundled packs. | Regression coverage in `tests/test_webapp.py` | Workspace users can no longer list/detail/export/generate from non-owned local/bundled references in DB mode. | Keep DB pricing isolation tests in the release gate. |
 | High, resolved in PR #89 | Profile/layout generation still resolved local/default profile packs. | Regression coverage in `tests/test_webapp.py` | Missing workspace profile assets now block DB/platform generation. | Keep DB profile/layout isolation tests in the release gate; object storage remains separate. |
 | High, resolved in PR #91 | Legacy job-file downloads were not workspace/session-owner bound. | Regression coverage in `tests/test_webapp.py` | Hosted/database/platform/deploy mode now returns a generic not-found response instead of legacy output-root bytes; local-UAT local mode remains supported. | Prefer quote-session artifact downloads and add object storage before production. |
-| High, resolved in this PR | Local AI draft fallback returned product-visible drafted result when remote AI was missing/failed. | Regression coverage in `tests/test_webapp.py` | Protected-mode users now receive a blocked draft result with a generic message, and no local starter draft/result is returned. | Keep protected-mode fail-closed draft tests in the release gate; local-UAT fallback remains local only. |
+| High, resolved in PR #92 | Local AI draft fallback returned product-visible drafted result when remote AI was missing/failed. | Regression coverage in `tests/test_webapp.py` | Protected-mode users now receive a blocked draft result with a generic message, and no local starter draft/result is returned. | Keep protected-mode fail-closed draft tests in the release gate; local-UAT fallback remains local only. |
+| High, resolved in this PR | Local quote-session runtime storage could be product-visible in protected modes when database storage was unavailable. | Regression coverage in `tests/test_webapp.py` | Protected-mode quote-session routes and generate-session persistence now return a generic storage-unavailable response instead of using local runtime session files. | Keep protected-mode quote-session storage tests in the release gate; local-UAT fallback remains local only. |
 | Medium, resolved in PR #91 | Async job status/result was random-ID gated, not owner-bound. | Regression coverage in `tests/test_webapp.py` | Hosted/database/platform/deploy job status/result reads require the creating platform user/workspace. | Keep job owner visibility tests in the release gate. |
 | Medium | Import/upload validation is good but hostile-corpus evidence is incomplete. | `webapp/server.py:3713`, `4728`, `6322`, `8422` | Malformed XLSX/PDF/image edge cases could cause parser failure or resource pressure. | Add synthetic hostile upload fixtures and regression tests. |
 | Medium | Hosted logging/monitoring/retention is not productionized. | `webapp/server.py:1182`, docs | Local logs are not a production support/audit trail. | Add hosted privacy-minimized logging and retention design. |
@@ -375,8 +384,8 @@ Do not start internal alpha until all are true:
 - Database/platform mode cannot list, detail, export, delete, or generate from local/bundled private-like pricing references. PR #88 satisfies this pricing-reference gate; keep it covered by regression tests.
 - Generation resolves profile defaults and layout workbook from workspace-owned profile assets. PR #89 satisfies this gate for DB/platform mode; keep it covered by regression tests.
 - Legacy `/api/jobs/{job}/files/{filename}` is disabled in hosted modes or authorized by workspace/session ownership. PR #91 satisfies this by disabling the route in deploy/database/platform/database-artifact modes.
-- `/api/draft` does not return local fallback success in internal-alpha/protected modes; this PR satisfies that gate with protected-mode regression coverage.
-- Quote sessions and artifacts are workspace-owned, owner-aware, and restart persistent.
+- `/api/draft` does not return local fallback success in internal-alpha/protected modes; PR #92 satisfies that gate with protected-mode regression coverage.
+- Quote-session routes do not use local runtime storage in internal-alpha/protected modes; this PR satisfies that local-runtime fail-closed gate. Quote sessions and artifacts still need the chosen workspace-owned durable storage, artifact storage, backup, and retention evidence before internal alpha.
 - Backup/restore/rollback is documented and tested for the chosen internal-alpha storage mode.
 - Hosted smoke covers platform launch, workspace profile import/use, pricing import/use, quote generation, session persistence, artifact download, delete, and logout.
 - Logs remain privacy-minimized and support-traceable without raw prompts, uploads, provider responses, secrets, or generated quote contents.
@@ -401,12 +410,13 @@ Do not claim production readiness until all internal-alpha gates plus these are 
 1. Pricing-reference isolation: completed in PR #88 for database/platform/deploy list/detail/export/generation fallback removal and same-id delete regression coverage.
 2. Workspace profile/layout resolution: completed in PR #89 for DB/platform mode; generation now uses workspace-scoped profile defaults/layout artifacts and fails clearly if missing.
 3. Legacy job route lockdown: completed in PR #91 by disabling `/api/jobs/{job}/files/{filename}` in hosted/database/platform/deploy paths and owner-binding `/api/jobs/{job}` status/result reads in protected modes.
-4. AI fallback policy: completed in this PR for protected modes; local starter draft fallback is kept only for local-UAT/local-development behavior.
-5. Artifact object-storage design: move generated outputs and uploaded/reference/profile assets to object storage with DB metadata and checksums.
-6. Session and business-logic hardening: immutable profile/pricing snapshots, stale/deleted artifact tests, delete/export race tests.
-7. Hosted logging and operations: privacy-minimized logging, monitoring, backup/restore/rollback runbooks, and hosted smoke evidence.
-8. Supply-chain hardening: CodeQL/equivalent, Python dependency audit, pinned security scanner image, branch protection docs.
-9. Platform integration audit: verify launch/auth/workspace claims against the Swooshz Platform repo in a separate PR.
+4. AI fallback policy: completed in PR #92 for protected modes; local starter draft fallback is kept only for local-UAT/local-development behavior.
+5. Quote-session local runtime policy: completed in this PR for protected modes; local quote-session filesystem storage is kept only for local-UAT/local-development behavior.
+6. Artifact object-storage design: move generated outputs and uploaded/reference/profile assets to object storage with DB metadata and checksums.
+7. Session and business-logic hardening: immutable profile/pricing snapshots, stale/deleted artifact tests, delete/export race tests.
+8. Hosted logging and operations: privacy-minimized logging, monitoring, backup/restore/rollback runbooks, and hosted smoke evidence.
+9. Supply-chain hardening: CodeQL/equivalent, Python dependency audit, pinned security scanner image, branch protection docs.
+10. Platform integration audit: verify launch/auth/workspace claims against the Swooshz Platform repo in a separate PR.
 
 ## Codex Security Scan
 
@@ -432,7 +442,7 @@ Severity summary from plugin: unavailable because the scan did not start. This a
 | `python -m unittest tests.test_generate_quote` | Passed on escalated rerun: 63 tests OK. Initial sandbox run failed on Windows temp-directory permissions, not code assertions. |
 | `python -m unittest tests.test_production_readiness` | Passed: 4 tests OK. |
 | `python scripts/audit_architecture_fallbacks.py --max-hits-per-pattern 1 --max-possible-unused 5` | Passed; metadata-only scanner output recorded above. |
-| `python scripts/check_production_readiness.py` | Expected nonzero exit. Reported `local_uat_supported=true`, `internal_alpha_ready=false`, `production_ready=false`, and four remaining blockers: `local_runtime_storage`, `local_artifact_storage`, `object_storage_missing`, and `backup_restore_unverified`. |
+| `python scripts/check_production_readiness.py` | Expected nonzero exit. Reported `local_uat_supported=true`, `internal_alpha_ready=false`, `production_ready=false`, and five remaining blockers in local mode: `local_runtime_storage`, `local_artifact_storage`, `object_storage_missing`, `backup_restore_unverified`, and `hosted_logging_monitoring_missing`. |
 | `python scripts/scan_sensitive_fixtures.py` | Passed: 0 blocking, 0 review findings. |
 | `python scripts/validate_local_pdf_dependency_usage.py` | Passed. |
 | `python scripts/validate_dynamic_pricing_reference_rules.py` | Passed. |
