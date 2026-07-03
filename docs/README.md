@@ -19,9 +19,9 @@ platform concerns belong in `Swooshz-com/swooshz-platform`.
 - `docs/internal-uat-deploy-auth-readiness.md`: existing gated single-instance
   internal UAT deploy/auth readiness notes, boundaries, smoke checks, and
   non-production limitations.
-- `docs/internal-uat-coolify-deploy.md`: KQAG-specific adapter notes for
-  running the gated single-instance internal UAT app on an already-prepared
-  Coolify host.
+- `docs/internal-uat-coolify-deploy.md`: KQAG-specific internal-alpha
+  VPS/Coolify scaffold for the DB + DB-artifact simple-hosting posture,
+  metadata-only validation commands, and non-production limits.
 - `docs/internal-uat-login-and-pre-vps-dry-run.md`: approved-tester login
   expectations and local/offline deploy-auth checks to run before buying or
   touching a VPS.

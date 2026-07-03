@@ -40,8 +40,18 @@ The deploy/auth surface is already represented in `.env.example` and
   identity from the configured OIDC provider.
 - `AUTH_APPROVED_TESTER_ROLE`: shared role for approved internal testers:
   `admin`, `management`, `operator`, or `viewer`.
-- `QUOTE_DATA_ROOT`: runtime company/profile/pricing/session data root.
-- `QUOTE_OUTPUT_ROOT`: generated quote output root.
+- `KQAG_STORAGE_MODE`: storage mode. The current hosted internal-alpha posture
+  uses database storage.
+- `KQAG_ARTIFACT_STORAGE_MODE`: generated artifact storage mode. The current
+  hosted internal-alpha posture uses database artifact storage as a temporary
+  exception only.
+- `KQAG_DATABASE_URL`: database connection configured through the host secret
+  manager only.
+- `KQAG_PLATFORM_LAUNCH_MODE` and `KQAG_PLATFORM_BASE_URL`: platform/workspace
+  launch context for protected hosted use.
+- `QUOTE_DATA_ROOT`: runtime housekeeping root; not the hosted source of truth
+  for profile/pricing/session data.
+- `QUOTE_OUTPUT_ROOT`: output staging root; not durable hosted artifact storage.
 - `QUOTE_TMP_ROOT`: temporary job/work root.
 - `QUOTE_LOG_ROOT`: runtime log root.
 - `USER_TYPE`: local role simulation for desktop/internal testing. Deploy mode
@@ -82,9 +92,13 @@ Use this shape only for gated internal UAT:
 - Single app instance.
 - `APP_MODE=deploy`.
 - `AUTH_REQUIRED=true`.
-- Complete OIDC configuration.
-- `AUTH_ALLOWED_EMAILS` and/or `AUTH_ALLOWED_DOMAINS` set for approved testers.
-- Persistent runtime data root outside the repository.
+- `KQAG_STORAGE_MODE=database`.
+- `KQAG_ARTIFACT_STORAGE_MODE=database`.
+- `KQAG_DATABASE_URL` set through the host secret manager only.
+- Platform/workspace launch context for protected hosted use.
+- OIDC configuration only when using the OIDC deploy-auth fallback path.
+- `AUTH_ALLOWED_EMAILS` and/or `AUTH_ALLOWED_DOMAINS` set when using OIDC.
+- Runtime housekeeping roots outside the repository.
 - Approved tester access only.
 - No public/customer access.
 - No multi-instance scaling.
@@ -136,12 +150,15 @@ Pass means:
 - `APP_MODE=deploy`.
 - `AUTH_REQUIRED=true`.
 - `SESSION_SECRET` is present.
-- Required OIDC endpoint/client settings are present.
+- Database storage and database artifact storage are selected for the current
+  internal-alpha posture.
+- Required platform launch settings are present, or required OIDC
+  endpoint/client settings are present for the OIDC fallback path.
 - `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL`, and `OIDC_USERINFO_URL` are provided
-  explicitly.
+  explicitly when OIDC is used.
 - An internal allowlist or explicit internal escape hatch is configured.
 - `AUTH_APPROVED_TESTER_ROLE` is valid.
-- Runtime roots are set and outside the repository.
+- Runtime housekeeping roots are set and outside the repository.
 
 Fail means fix the env shape before starting the UAT app. Do not paste secret
 values into bug reports; report only which check name failed.
@@ -159,14 +176,18 @@ Use this checklist for the gated internal UAT deploy path. Do not print secrets
 while checking env values.
 
 - [ ] Confirm required env names are present without printing values:
-      `APP_MODE`, `AUTH_REQUIRED`, `SESSION_SECRET`, `OIDC_ISSUER_URL`,
-      `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI`,
-      `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL`, `OIDC_USERINFO_URL`, allowlist
-      settings, tester role, and the runtime root envs being used.
+      `APP_MODE`, `AUTH_REQUIRED`, `SESSION_SECRET`, `KQAG_STORAGE_MODE`,
+      `KQAG_ARTIFACT_STORAGE_MODE`, `KQAG_DATABASE_URL`,
+      `KQAG_PLATFORM_LAUNCH_MODE`, `KQAG_PLATFORM_BASE_URL`, optional OIDC
+      names if used, allowlist settings, tester role, and runtime
+      housekeeping root envs.
 - [ ] Run `python webapp\server.py --check-deploy-uat-env`.
+- [ ] Run `python scripts\verify_internal_alpha_hosted_validation.py --work-dir _tmp\validation\internal-alpha-hosted`.
 - [ ] Confirm `APP_MODE=deploy`.
 - [ ] Confirm `AUTH_REQUIRED=true`.
 - [ ] Confirm runtime roots are outside the repository.
+- [ ] Confirm quote sessions and generated artifacts use workspace-owned
+      database storage/database artifact storage in hosted mode.
 - [ ] Confirm the app refuses unsafe or incomplete deploy-auth configuration.
 - [ ] Confirm the health endpoint responds.
 - [ ] Confirm unauthenticated users are blocked or redirected.

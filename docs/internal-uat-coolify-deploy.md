@@ -1,143 +1,132 @@
-# KQAG Internal UAT Coolify Deploy Adapter
+# KQAG Internal-Alpha VPS/Coolify Scaffold
 
 ## Purpose
 
-This adapter is for running KQAG/SAQG as a bounded single-instance internal UAT
-app on an already-prepared Coolify host.
+This runbook is the KQAG app-specific scaffold for an already-prepared
+VPS/Coolify-style host. It is metadata-only guidance for internal-alpha
+validation. It does not deploy anything, configure infrastructure, add secrets,
+prove live hosting, or claim production readiness.
 
-Primary workspace/company: Koncept Images Pte Ltd.
-Workspace slug: `koncept-images-pte-ltd`.
+KQAG is an internal Koncept Images Pte Ltd quote generator module, not
+ecommerce or public SaaS. Koncept profile, pricing, and layout packs are
+workspace-imported tenant data only. A new workspace starts with no real
+Koncept pack until an authorized import or seed action targets that workspace.
 
-This document is not a generic Hostinger, VPS, Coolify, SSH, firewall, DNS, or
-server-maintenance guide. Toolkit-owned infrastructure guidance remains outside
-this repo. KQAG owns only the app-specific internal UAT requirements listed
-here.
+## Target Posture
 
-This adapter does not approve production launch, public SaaS, customer portal
-access, ecommerce, billing, DB-backed multi-user mode, multi-instance scaling,
-or full Swooshz platform integration.
+Use this posture only for the temporary internal-alpha/simple-hosting path:
 
-## App Shape
-
-Use this shape only for internal UAT:
-
-- One prepared Coolify host.
-- One KQAG application.
-- One running app instance.
-- Python buildpack or equivalent repo build using `requirements.txt`.
-- Start command: `python webapp/server.py`.
 - `APP_MODE=deploy`.
-- `AUTH_REQUIRED=true`.
-- Complete OIDC settings, including explicit `OIDC_AUTHORIZE_URL`,
-  `OIDC_TOKEN_URL`, and `OIDC_USERINFO_URL`.
-- Approved tester allowlist through `AUTH_ALLOWED_EMAILS` and/or
-  `AUTH_ALLOWED_DOMAINS`.
-- Persistent runtime storage mounted outside the repository path.
-- No public/customer access.
-- No real secrets, runtime files, profile exports, pricing files, or generated
-  quote exports committed to git.
+- `KQAG_STORAGE_MODE=database`.
+- `KQAG_ARTIFACT_STORAGE_MODE=database`.
+- `KQAG_DATABASE_URL` is configured only through the host secret manager.
+- Platform/workspace launch context is required for protected hosted use.
+- Object mode remains blocked for production until live provider evidence,
+  DB+object backup/restore, retention/delete evidence, and operations evidence
+  are complete.
 
-The server reads `PORT` and binds to `0.0.0.0` automatically when
-`APP_MODE=deploy`, so a separate app-specific Dockerfile is not required for the
-current internal UAT path.
+The database artifact mode is a temporary internal-alpha exception. It is not
+final production object storage.
 
-## Coolify App Settings
+## Host Boundary
 
-Use the already-prepared Coolify host and create a single KQAG app from this
-repository.
+This repo owns only the app-specific shape:
 
-- Build/install command: install Python dependencies from `requirements.txt`
-  using the platform's Python buildpack defaults.
 - Start command: `python webapp/server.py`.
-- Port: `8765`, or the value supplied by `PORT`.
-- Healthcheck path: `/api/health`.
-- Healthcheck expected result: HTTP `200` with JSON status `ok`.
-- Instance count: `1`.
-- Scaling: disabled for this UAT adapter.
+- Health path: `/api/health`.
+- Deploy-mode environment variable names.
+- Metadata-only validation commands.
+- KQAG private-data and tenant-import guardrails.
 
-Do not add a database, queue, object store, external session store, Supabase
-project, platform shell, app registry, billing service, or customer portal for
-this UAT adapter.
+Infrastructure runbooks outside this repo own VPS purchase, Coolify
+installation, SSH access, DNS, TLS, firewall, reverse proxy, backups on the
+host, and server maintenance.
 
-## Environment Template
+## Environment Names
 
-Use `deploy/internal-uat/coolify/kqag.uat.env.example` as the app-specific
-placeholder checklist. Copy values into Coolify secrets/environment management;
-do not commit a populated `.env`.
+Use `deploy/internal-uat/coolify/kqag.uat.env.example` as the placeholder
+checklist. Copy names into the host secret/environment manager and replace
+placeholders there. Do not commit populated values.
 
-Before a VPS is available, verify the placeholder template locally:
+Required names for this internal-alpha posture:
+
+| Area | Names |
+| --- | --- |
+| App/auth | `APP_MODE`, `AUTH_REQUIRED`, `SESSION_SECRET` |
+| Storage | `KQAG_STORAGE_MODE`, `KQAG_ARTIFACT_STORAGE_MODE`, `KQAG_DATABASE_URL` |
+| Platform launch | `KQAG_PLATFORM_LAUNCH_MODE`, `KQAG_PLATFORM_BASE_URL` |
+| Optional OIDC fallback/checklist | `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI`, `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL`, `OIDC_USERINFO_URL`, `OIDC_LOGOUT_URL` |
+| Tester policy | `AUTH_ALLOWED_EMAILS`, `AUTH_ALLOWED_DOMAINS`, `AUTH_ALLOW_ANY_AUTHENTICATED_USER`, `AUTH_APPROVED_TESTER_ROLE` |
+| Runtime housekeeping | `QUOTE_DATA_ROOT`, `QUOTE_OUTPUT_ROOT`, `QUOTE_TMP_ROOT`, `QUOTE_LOG_ROOT`, `PORT` |
+
+`QUOTE_DATA_ROOT` and `QUOTE_OUTPUT_ROOT` are not durable product-visible
+storage in this posture. Quote sessions and generated artifacts must persist
+through workspace-owned database rows and database artifact records.
+
+## Validation Commands
+
+Run the placeholder template check locally before copying names into the host:
 
 ```powershell
 python scripts\verify_internal_uat_deploy_template.py
 ```
 
-Required UAT checks before starting the app:
+Run the metadata-only hosted validation bundle with synthetic data:
 
 ```powershell
-python webapp\server.py --check-deploy-uat-env
+python scripts\verify_internal_alpha_hosted_validation.py --work-dir _tmp\validation\internal-alpha-hosted
 ```
 
-The preflight reports only check names/messages and must not print secret
-values.
+The bundle composes the existing synthetic evidence:
 
-Approved internal tester login expectations and the full pre-VPS dry-run scope
-are documented in `docs/internal-uat-login-and-pre-vps-dry-run.md`.
+```powershell
+python scripts\verify_database_backup_restore.py --work-dir _tmp\validation\backup-restore
+python scripts\verify_hosted_observability.py --work-dir _tmp\validation\hosted-observability
+python scripts\verify_hosted_smoke.py --work-dir _tmp\validation\hosted-smoke
+```
 
-## Persistent Runtime Storage
+Run the readiness checker for the same DB + DB-artifact posture:
 
-Map persistent storage for the four runtime roots in the env template:
+```powershell
+python scripts\check_production_readiness.py --with-backup-restore-evidence --with-hosted-observability-evidence --with-hosted-smoke-evidence
+```
 
-- `QUOTE_DATA_ROOT=/var/lib/kqag/data`
-- `QUOTE_OUTPUT_ROOT=/var/lib/kqag/output`
-- `QUOTE_TMP_ROOT=/var/lib/kqag/tmp`
-- `QUOTE_LOG_ROOT=/var/log/kqag`
+The readiness checker is expected to keep `production_ready=false`. It may
+report conditional internal-alpha readiness only when database storage,
+database artifact storage, and the evidence flags all pass.
 
-See `deploy/internal-uat/coolify/volume-map.example.md` for the repo-specific
-volume map. These paths are runtime data, not source files. They must not be
-committed, exposed as static files, or browsable through the public app.
+## Hosted Smoke Checklist
 
-## Smoke Checklist
+After a real host exists, record only metadata and never paste secrets, DB URLs,
+cookies, platform tokens, generated quote contents, customer data, artifact
+bytes, host IPs, or private paths into issue/PR output.
 
-Run this after Coolify deploys the single UAT app. Do not print secrets while
-checking env values.
+- App build completes.
+- App starts with the documented start command.
+- `/api/health` returns metadata-only JSON.
+- Unauthenticated protected routes block or redirect.
+- Platform/workspace launch reaches the app.
+- Intended workspace starts without a Koncept pack until import.
+- Workspace-owned profile pack import/save/use works.
+- Workspace-owned pricing reference import/save/use works.
+- Quote generation persists through database quote sessions.
+- XLSX/PDF artifacts download only through authorized quote-session routes.
+- Delete makes the session and artifacts inaccessible.
+- Logout/sign-out behaves safely.
+- Legacy direct job file downloads remain disabled in deploy/database/platform
+  paths.
+- Logs remain metadata-only and omit secrets, provider responses, private data,
+  generated quote contents, and artifact bytes.
 
-- [ ] App deploy/build succeeds.
-- [ ] App starts.
-- [ ] `/api/health` works.
-- [ ] Unauthenticated browser request redirects to login.
-- [ ] Unauthenticated API request blocks.
-- [ ] OIDC login redirects to exact configured `OIDC_AUTHORIZE_URL`.
-- [ ] Approved tester reaches dashboard.
-- [ ] Unapproved tester is blocked generically.
-- [ ] New Quote works.
-- [ ] Profile import works with an authorised private local file.
-- [ ] Pricing reference import works with an authorised private local file.
-- [ ] Quote generation works.
-- [ ] XLSX/PDF export works.
-- [ ] Dashboard modify/download/delete works.
-- [ ] Runtime/output/tmp/log files are not publicly browsable.
-- [ ] Logs do not reveal secrets, auth codes, tokens, provider responses,
-      private data, or raw customer/company/bank data.
-- [ ] `git status --short` is clean of runtime/private files.
+## Not Proven
 
-## Boundary
+This scaffold does not prove:
 
-Toolkit or infrastructure runbooks own:
-
-- Hostinger/VPS setup.
-- Coolify installation and upgrades.
-- SSH access and owner approvals.
-- Firewall, DNS, TLS, and network exposure.
-- Server maintenance evidence and infrastructure workflow.
-
-KQAG owns:
-
-- App start command.
-- App healthcheck path.
-- App deploy-mode env shape.
-- App runtime root names and volume expectations.
-- Internal UAT auth/smoke checklist.
-- Private-data and secret guardrails for KQAG quote workflow files.
-
-Future production platform/accounts/billing/DB/customer portal work remains out
-of scope for this repo.
+- Live VPS/Coolify host health.
+- DNS, TLS, firewall, reverse proxy, or server operations.
+- Real OIDC provider behavior.
+- Live Swooshz Platform integration.
+- Real object-storage provider wiring.
+- DB+object backup/restore or live object retention/delete evidence.
+- Production observability export or alert delivery.
+- Production readiness.

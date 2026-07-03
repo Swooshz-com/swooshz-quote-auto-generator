@@ -3792,7 +3792,7 @@ class WebappServerTest(unittest.TestCase):
             bad_template.write_text(
                 source.read_text(encoding="utf-8")
                 .replace("AUTH_ALLOW_ANY_AUTHENTICATED_USER=false", "AUTH_ALLOW_ANY_AUTHENTICATED_USER=true")
-                .replace("QUOTE_DATA_ROOT=/var/lib/kqag/data", "QUOTE_DATA_ROOT=C:\\Users\\Private\\runtime")
+                .replace("QUOTE_DATA_ROOT=<host-managed-runtime-root>", "QUOTE_DATA_ROOT=C:\\Users\\Private\\runtime")
                 .replace("OIDC_CLIENT_SECRET=<placeholder>", "OIDC_CLIENT_SECRET=sk-real-looking-token-123456"),
                 encoding="utf-8",
             )

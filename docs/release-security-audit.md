@@ -20,16 +20,17 @@ verified.
 | `internal_alpha_ready` | Conditional | Default local mode remains blocked. Under `KQAG_STORAGE_MODE=database`, `KQAG_ARTIFACT_STORAGE_MODE=database`, and explicit passing backup/restore, hosted observability, and hosted smoke evidence flags, the checker may report `internal_alpha_ready=true` for the temporary SQLite/DB-artifact simple-hosting exception only. |
 | `production_ready` | No | Immutable quote-session snapshot groundwork, stale/deleted artifact route hardening, deterministic delete/export/download race evidence, and synthetic/stubbed object lifecycle evidence exist, but live provider evidence, real DB+object backup/restore, real retention/delete evidence, production deployment/operations evidence, and final session/business hardening are not complete. |
 
-This PR does not claim production readiness. It adds privacy-minimized immutable
-quote-session generation snapshot groundwork so generated sessions retain the
-workspace-owned profile/pricing labels and safe audit metadata used at
-generation time even if current workspace packs are later renamed, edited, or
-deleted. Production remains blocked.
+This update does not claim production readiness. It adds an internal-alpha
+VPS/Coolify-style deployment scaffold, placeholder-only environment template,
+and metadata-only hosted validation bundle for the existing DB + DB-artifact
+simple-hosting posture. It does not deploy anything live, add secrets, or prove
+production operations.
 
 Highest-priority remaining blockers:
 
 - Medium: database artifact storage remains only a temporary internal-alpha/simple-hosting exception when synthetic backup/restore, hosted observability, and hosted smoke verifiers pass; production still requires real object-storage provider wiring and production operations evidence.
-- Medium: docs and runbooks still include local/deploy helper paths that must be rewritten before operators treat them as the real happy path.
+- Medium: live hosted deployment/operations evidence is still missing; the new
+  scaffold is a runbook and synthetic validation path only.
 
 Load Sample status: product-visible Load Sample UI/API/JS paths are gone after PR #86. No Load Sample button, product API, or Playwright smoke dependency is part of the sellable path. Remaining sample/Kent references are test-only or historical audit references.
 
@@ -149,6 +150,20 @@ details, pricing/profile payloads, artifact bytes, staff emails, OAuth values,
 cookies, tokens, API keys, callback query values, and provider responses. This
 does not call Swooshz Platform, prove a live hosted deployment, add object
 storage, or claim production readiness.
+
+Internal-alpha VPS/Coolify scaffold update:
+`docs/internal-uat-coolify-deploy.md`,
+`deploy/internal-uat/coolify/kqag.uat.env.example`, and
+`scripts/verify_internal_alpha_hosted_validation.py` now document and validate
+the metadata-only internal-alpha simple-hosting posture. The scaffold lists env
+names and placeholders only, requires database quote-session storage plus
+database artifact storage, requires host-secret-manager handling for the DB URL
+and session/OIDC/platform values, and keeps object mode outside the temporary
+internal-alpha exception. The validation bundle composes synthetic
+backup/restore, hosted observability, hosted smoke, and readiness-checker
+evidence. It does not prove a live VPS/Coolify deployment, live Platform
+integration, real OIDC, real object storage, alert delivery, production
+operations, or production readiness.
 
 Object-storage contract evidence update: PR #98 added `webapp/object_storage.py`,
 a provider-neutral artifact backend contract for generated quote XLSX/PDF
@@ -540,6 +555,7 @@ Local dependency validation results are recorded later in this document.
 | Medium, runtime groundwork added in PR #100 | Generated quote artifacts had no real object-mode runtime integration boundary. | `webapp/object_storage.py`, `webapp/server.py`, `migrations/003_object_artifact_metadata.sql`, `tests/test_object_storage_provider_config.py`, `tests/test_webapp.py` | A credentialed S3-compatible adapter boundary can store/retrieve/delete through injected fake clients, generated artifacts are stored in the object backend with safe DB metadata, and authorized quote-session downloads use DB metadata plus object retrieval. | Live provider evidence, uploaded/reference/profile object wiring, DB+object backup/restore, and retention/delete evidence remained blockers. |
 | Medium, lifecycle evidence added in this PR | Object-mode generated artifact lifecycle, staging cleanup, and DB+object restore behavior had only partial coverage. | `webapp/server.py`, `scripts/verify_object_artifact_lifecycle.py`, `tests/test_webapp.py`, `tests/test_object_artifact_lifecycle_verifier.py`, `tests/test_production_readiness.py` | Quote-session deletion tombstones object metadata, stubbed object deletion is attempted, deleted/missing/corrupt/wrong-workspace object artifacts fail closed, local staging files are cleaned after object persistence, and synthetic SQLite+stubbed-object backup/restore evidence is metadata-only. | This is synthetic/stubbed evidence only; live provider retention/delete, real DB+object backup/restore, production operations, and final audit remain blockers. |
 | Medium, route/race hardening added in this PR | Generated quote-session download routes needed focused delete/export/download race and stale/deleted artifact coverage. | `webapp/server.py`, `tests/test_webapp.py`, `tests/test_production_readiness.py` | DB and object artifact downloads revalidate current workspace-owned metadata before returning bytes; tests cover DB delete/download, stale DB exports, object mid-retrieve tombstone, missing/corrupt object content, generated snapshot digest stability, and readiness reporting. | This is deterministic local/stubbed evidence only; live object-provider race evidence, operations evidence, and final audit remain blockers. |
+| Medium, scaffold added in this PR | Internal-alpha VPS/Coolify deployment guidance still needed a current DB + DB-artifact posture and metadata-only validation bundle. | `docs/internal-uat-coolify-deploy.md`, `deploy/internal-uat/coolify/kqag.uat.env.example`, `scripts/verify_internal_alpha_hosted_validation.py`, `tests/test_internal_alpha_hosted_validation_verifier.py` | Operators now have placeholder-only env names, a runbook for the temporary DB/DB-artifact internal-alpha posture, and a synthetic validation bundle that does not print secrets, paths, DB URLs, hostnames, quote contents, or artifact bytes. | This is not live deployment evidence. Production still requires live provider evidence, real DB+object backup/restore, retention/delete evidence, production operations, Platform integration, observability export/alerts, supply-chain hardening, and final audit. |
 | Medium, resolved in PR #91 | Async job status/result was random-ID gated, not owner-bound. | Regression coverage in `tests/test_webapp.py` | Hosted/database/platform/deploy job status/result reads require the creating platform user/workspace. | Keep job owner visibility tests in the release gate. |
 | Medium | Import/upload validation is good but hostile-corpus evidence is incomplete. | `webapp/server.py:3713`, `4728`, `6322`, `8422` | Malformed XLSX/PDF/image edge cases could cause parser failure or resource pressure. | Add synthetic hostile upload fixtures and regression tests. |
 | Medium | Hosted alert delivery and production observability wiring are not productionized. | `webapp/server.py:1182`, docs | Synthetic evidence proves local schema/privacy properties, but not a host/vended log pipeline. | Add host-specific export/alert wiring before treating this as production observability. |
@@ -562,6 +578,7 @@ Do not start internal alpha until all are true:
 - Backup/restore/rollback is documented and tested for the temporary SQLite DB/DB-artifact internal-alpha option by `scripts/verify_database_backup_restore.py`; run it for each internal-alpha evidence bundle and keep the output metadata-only.
 - Hosted smoke covers platform launch, workspace profile save/use, pricing save/use, quote generation, session persistence, authorized XLSX/PDF artifact download, delete, logout, and legacy direct job-file lockdown; `scripts/verify_hosted_smoke.py` satisfies this synthetic evidence gate.
 - Logs remain privacy-minimized and support-traceable without raw prompts, uploads, provider responses, secrets, or generated quote contents; `scripts/verify_hosted_observability.py` satisfies this synthetic evidence gate.
+- The VPS/Coolify scaffold is a metadata-only operator checklist for the same DB + DB-artifact posture; it is not live host evidence.
 - Object-storage contract/provider/lifecycle evidence is not required for the temporary DB/DB-artifact internal-alpha exception; if `KQAG_ARTIFACT_STORAGE_MODE=object` is selected, runtime paths must use the configured object backend and DB metadata only, with no local/DB-BLOB fallback.
 - Codex Security standard scan is complete or any incomplete status is explicitly disclosed.
 
@@ -597,9 +614,10 @@ Do not claim production readiness until all internal-alpha gates plus these are 
 12. Real object-storage provider integration groundwork: completed in PR #100 with the credentialed S3-compatible adapter boundary, mocked adapter tests, generated artifact object metadata, and authorized quote-session retrieval; live provider evidence, uploaded/reference/profile object wiring, DB+object backup/restore, and retention/delete evidence remained.
 13. Object artifact lifecycle groundwork: this PR adds generated object artifact tombstones, stubbed delete evidence, local staging cleanup, and synthetic DB+object backup/restore lifecycle verification; live provider retention/delete and real DB+object backup/restore remain.
 14. Session and business-logic hardening: immutable profile/pricing snapshots, stale/deleted artifact route hardening, and deterministic delete/export/download race tests are in place; broader live/provider race evidence remains.
-15. Hosted production operations: host-specific logging export, alert delivery, DB+object backup/restore/rollback runbooks, production deployment evidence, and live host smoke evidence.
-16. Supply-chain hardening: CodeQL/equivalent, Python dependency audit, pinned security scanner image, branch protection docs.
-17. Platform integration audit: verify launch/auth/workspace claims against the Swooshz Platform repo in a separate PR.
+15. Internal-alpha VPS/Coolify scaffold: this PR adds placeholder-only env docs and a synthetic hosted validation bundle for the DB/DB-artifact simple-hosting posture; live host evidence remains separate.
+16. Hosted production operations: host-specific logging export, alert delivery, DB+object backup/restore/rollback runbooks, production deployment evidence, and live host smoke evidence.
+17. Supply-chain hardening: CodeQL/equivalent, Python dependency audit, pinned security scanner image, branch protection docs.
+18. Platform integration audit: verify launch/auth/workspace claims against the Swooshz Platform repo in a separate PR.
 
 ## Codex Security Scan
 
