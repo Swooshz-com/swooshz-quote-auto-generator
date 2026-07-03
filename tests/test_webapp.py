@@ -19917,6 +19917,75 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             self.assertEqual(fetched["generation_snapshot"]["profile"]["display_name"], "Generated Profile")
             self.assertTrue(fetched["exports"]["xlsx"]["stale"])
 
+    def test_generation_snapshot_digest_is_stable_and_privacy_minimized(self):
+        env = {
+            "APP_MODE": "deploy",
+            "KQAG_STORAGE_MODE": "database",
+            "KQAG_ARTIFACT_STORAGE_MODE": "object",
+        }
+        payload = valid_payload()
+        payload["profile_id"] = "digest-profile"
+        payload["pricing_reference_id"] = "digest-pricing"
+        payload["client"]["name"] = "Synthetic Sensitive Snapshot Customer"
+        payload["quote_session"] = {
+            "session_id": "quote-digest",
+            "draft_state": {
+                "generated_quote_text": "Synthetic generated quote line that must not be snapshotted",
+                "object_key": "tenant/private/generated/quotation.xlsx",
+                "local_path": "Z:/synthetic/private/runtime/quotation.xlsx",
+                "cookie": "synthetic-session-cookie",
+                "staff_email": "staff.member@example.test",
+            },
+        }
+        patch = payload["quote_session"]
+        profile_detail = {
+            "id": "digest-profile",
+            "label": "Digest Profile",
+            "layout_rows": [{"private": "layout payload should not be snapshotted"}],
+        }
+        pricing_detail = {
+            "id": "digest-pricing",
+            "label": "Digest Pricing",
+            "items": [{"description": "raw pricing row should not be snapshotted", "internal_cost": 123}],
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            snapshot = webapp.quote_session_generation_snapshot(
+                payload,
+                patch,
+                created_at="2026-06-06T00:00:00Z",
+                workspace_id="workspace-digest",
+                profile_detail=profile_detail,
+                pricing_reference_detail=pricing_detail,
+            )
+            normalized = webapp.normalized_quote_session_generation_snapshot(snapshot)
+            renamed = webapp.quote_session_generation_snapshot(
+                payload,
+                patch,
+                created_at="2026-06-06T00:00:00Z",
+                workspace_id="workspace-digest",
+                profile_detail={**profile_detail, "label": "Digest Profile Renamed"},
+                pricing_reference_detail=pricing_detail,
+            )
+
+        snapshot_text = json.dumps(snapshot, sort_keys=True)
+        self.assertEqual(snapshot["digest_sha256"], normalized["digest_sha256"])
+        self.assertEqual(len(snapshot["digest_sha256"]), 64)
+        self.assertNotEqual(snapshot["digest_sha256"], renamed["digest_sha256"])
+        self.assertEqual(snapshot["profile"]["display_name"], "Digest Profile")
+        self.assertEqual(snapshot["pricing_reference"]["display_name"], "Digest Pricing")
+        for sensitive in (
+            "Synthetic Sensitive Snapshot Customer",
+            "Synthetic generated quote line",
+            "tenant/private/generated/quotation.xlsx",
+            "Z:/synthetic/private/runtime",
+            "synthetic-session-cookie",
+            "staff.member@example.test",
+            "raw pricing row should not be snapshotted",
+            "layout payload should not be snapshotted",
+            "internal_cost",
+        ):
+            self.assertNotIn(sensitive, snapshot_text)
+
     def test_database_storage_does_not_persist_raw_platform_launch_token(self):
         raw_launch_token = self.synthetic_platform_launch_token()
         with tempfile.TemporaryDirectory() as tmp:
@@ -20154,6 +20223,142 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertEqual(status, 200)
         self.assertEqual(downloaded, xlsx_bytes)
 
+    def test_database_artifact_download_fails_after_session_delete_and_legacy_route_stays_locked(self):
+        tmp_path = test_temp_root() / f"db-artifact-delete-route-{time.time_ns()}"
+        tmp_path.mkdir(parents=True)
+        database_url = f"sqlite:///{(tmp_path / 'kqag-storage.sqlite3').as_posix()}"
+        output_dir = tmp_path / "out" / "job-db-delete"
+        output_dir.mkdir(parents=True)
+        xlsx_bytes = b"xlsx-db-delete"
+        (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
+        payload = valid_payload()
+        payload["quote_session"] = {"session_id": "quote-db-delete"}
+        result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-db-delete/files/quotation.xlsx"}]}
+        env = {**self.deploy_auth_env(), "KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "database", "KQAG_DATABASE_URL": database_url}
+        with mock.patch.dict(os.environ, env, clear=True):
+            webapp.apply_kqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-db-delete"))
+            storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+            cookie = webapp.signed_cookie_value(self.platform_auth_session("workspace-db-delete"))
+            session_cookie = f"{webapp.SESSION_COOKIE_NAME}={cookie}"
+            with LocalRunnerServer() as runner:
+                parsed = urllib.parse.urlparse(runner.base_url)
+                connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
+                try:
+                    connection.request(
+                        "GET",
+                        "/api/quote-sessions/quote-db-delete/download/xlsx",
+                        headers={"Cookie": session_cookie},
+                    )
+                    before = connection.getresponse()
+                    before_body = before.read()
+                finally:
+                    connection.close()
+
+                connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
+                try:
+                    connection.request("GET", "/api/session", headers={"Cookie": session_cookie})
+                    session_http_response = connection.getresponse()
+                    session_response = json.loads(session_http_response.read().decode("utf-8"))
+                finally:
+                    connection.close()
+                connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
+                try:
+                    connection.request(
+                        "DELETE",
+                        "/api/quote-sessions/quote-db-delete",
+                        headers={
+                            "Cookie": session_cookie,
+                            "Origin": runner.base_url,
+                            session_response["csrf_header"]: session_response["csrf_token"],
+                        },
+                    )
+                    delete_http_response = connection.getresponse()
+                    delete_response = json.loads(delete_http_response.read().decode("utf-8"))
+                finally:
+                    connection.close()
+
+                for path in (
+                    "/api/quote-sessions/quote-db-delete/download/xlsx",
+                    "/api/jobs/job-db-delete/files/quotation.xlsx",
+                ):
+                    with self.subTest(path=path):
+                        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
+                        try:
+                            connection.request("GET", path, headers={"Cookie": session_cookie})
+                            response = connection.getresponse()
+                            body = response.read().decode("utf-8")
+                        finally:
+                            connection.close()
+                        self.assertEqual(response.status, 404)
+                        self.assertNotIn(str(tmp_path), body)
+
+            artifact_after_delete = storage.quote_session_export_artifact("quote-db-delete", "xlsx")
+
+        self.assertEqual(before.status, 200)
+        self.assertEqual(before_body, xlsx_bytes)
+        self.assertEqual(delete_response["status"], "deleted")
+        self.assertIsNone(artifact_after_delete)
+
+    def test_database_artifact_stale_export_does_not_download_and_snapshot_is_preserved(self):
+        tmp_path = test_temp_root() / f"db-artifact-stale-{time.time_ns()}"
+        tmp_path.mkdir(parents=True)
+        database_url = f"sqlite:///{(tmp_path / 'kqag-storage.sqlite3').as_posix()}"
+        output_dir = tmp_path / "out" / "job-db-stale"
+        output_dir.mkdir(parents=True)
+        (output_dir / "quotation.xlsx").write_bytes(b"xlsx-db-stale")
+        env = {**self.deploy_auth_env(), "KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "database", "KQAG_DATABASE_URL": database_url}
+        with mock.patch.dict(os.environ, env, clear=True):
+            webapp.apply_kqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-db-stale"))
+            storage.save_profile(webapp.normalize_profile_payload({"id": "stale-profile", "label": "Generated Stale Profile"}))
+            storage.save_pricing_reference(workspace_pricing_reference("stale-pricing") | {"label": "Generated Stale Pricing"})
+            payload = valid_payload()
+            payload["profile_id"] = "stale-profile"
+            payload["pricing_reference_id"] = "stale-pricing"
+            payload["quote_session"] = {"session_id": "quote-db-stale"}
+            generated = storage.create_or_update_quote_session(
+                payload,
+                result={"status": "completed", "files": [{"name": "quotation.xlsx"}]},
+                output_dir=output_dir,
+            )
+
+            edit_payload = valid_payload()
+            edit_payload["quote_session"] = {
+                "session_id": "quote-db-stale",
+                "draft_state": {"activeSidePanel": "pricing_review", "outputRevision": 2},
+                "quote_company_profile": {"id": "draft-profile", "display_name": "Draft Profile"},
+                "pricing_reference": {"id": "draft-pricing", "display_name": "Draft Pricing"},
+            }
+            edited = storage.create_or_update_quote_session(edit_payload)
+            storage.save_profile(webapp.normalize_profile_payload({"id": "stale-profile", "label": "Renamed Current Profile"}))
+            storage.delete_pricing_reference("stale-pricing")
+            fetched = storage.get_quote_session("quote-db-stale", include_draft_state=True)
+            artifact = storage.quote_session_export_artifact("quote-db-stale", "xlsx")
+            cookie = webapp.signed_cookie_value(self.platform_auth_session("workspace-db-stale"))
+            with LocalRunnerServer() as runner:
+                parsed = urllib.parse.urlparse(runner.base_url)
+                connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
+                try:
+                    connection.request(
+                        "GET",
+                        "/api/quote-sessions/quote-db-stale/download/xlsx",
+                        headers={"Cookie": f"{webapp.SESSION_COOKIE_NAME}={cookie}"},
+                    )
+                    stale_response = connection.getresponse()
+                    stale_response.read()
+                finally:
+                    connection.close()
+
+        self.assertEqual(generated["generation_snapshot"]["profile"]["display_name"], "Generated Stale Profile")
+        self.assertEqual(edited["generation_snapshot"]["pricing_reference"]["display_name"], "Generated Stale Pricing")
+        self.assertTrue(fetched["exports"]["xlsx"]["stale"])
+        self.assertIsNone(fetched["exports"]["xlsx"]["url"])
+        self.assertEqual(fetched["generation_snapshot"]["profile"]["display_name"], "Generated Stale Profile")
+        self.assertEqual(fetched["generation_snapshot"]["pricing_reference"]["display_name"], "Generated Stale Pricing")
+        self.assertIsNone(artifact)
+        self.assertEqual(stale_response.status, 404)
+
     def test_object_artifact_storage_saves_db_metadata_and_downloads_through_authorized_route(self):
         backend = webapp.InMemoryObjectStorageBackend()
         tmp_path = test_temp_root() / f"object-artifact-route-{time.time_ns()}"
@@ -20281,6 +20486,81 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertFalse(session["exports"]["xlsx"]["exists"])
         self.assertTrue(session["exports"]["xlsx"]["missing"])
         self.assertIsNone(artifact)
+
+    def test_object_artifact_storage_tombstone_during_retrieve_fails_closed(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        tmp_path = test_temp_root() / f"object-artifact-race-{time.time_ns()}"
+        db_path = tmp_path / "kqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        output_dir = tmp_path / "out" / "job-object-race"
+        output_dir.mkdir(parents=True)
+        (output_dir / "quotation.xlsx").write_bytes(b"xlsx-object-race")
+        payload = valid_payload()
+        payload["quote_session"] = {"session_id": "quote-object-race"}
+        result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-object-race/files/quotation.xlsx"}]}
+        env = {
+            **self.deploy_auth_env(),
+            "KQAG_STORAGE_MODE": "database",
+            "KQAG_ARTIFACT_STORAGE_MODE": "object",
+            "KQAG_DATABASE_URL": database_url,
+        }
+        original_retrieve = backend.retrieve_artifact
+
+        def tombstone_then_retrieve(metadata, *, workspace_id):
+            content = original_retrieve(metadata, workspace_id=workspace_id)
+            with webapp.sqlite_storage_connection(database_url) as connection:
+                connection.execute(
+                    "update kqag_object_artifacts set status = ?, retention_status = ?, deleted_at = ? where workspace_id = ? and session_id = ?",
+                    ("deleted", "deleted", webapp.utc_timestamp(), "workspace-object-race", "quote-object-race"),
+                )
+                connection.commit()
+            return content
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_kqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-race"))
+            storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+            with mock.patch.object(backend, "retrieve_artifact", side_effect=tombstone_then_retrieve):
+                artifact = storage.quote_session_export_artifact("quote-object-race", "xlsx")
+
+        self.assertIsNone(artifact)
+
+    def test_object_artifact_storage_corrupt_or_missing_remote_object_fails_closed(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        tmp_path = test_temp_root() / f"object-artifact-corrupt-{time.time_ns()}"
+        db_path = tmp_path / "kqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        output_dir = tmp_path / "out" / "job-object-corrupt"
+        output_dir.mkdir(parents=True)
+        (output_dir / "quotation.xlsx").write_bytes(b"xlsx-object-corrupt")
+        payload = valid_payload()
+        payload["quote_session"] = {"session_id": "quote-object-corrupt"}
+        result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-object-corrupt/files/quotation.xlsx"}]}
+        env = {
+            **self.deploy_auth_env(),
+            "KQAG_STORAGE_MODE": "database",
+            "KQAG_ARTIFACT_STORAGE_MODE": "object",
+            "KQAG_DATABASE_URL": database_url,
+        }
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_kqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-corrupt"))
+            storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+            row = storage._object_quote_artifact_row("quote-object-corrupt", "xlsx")
+            metadata = storage._object_metadata_from_row(row)
+            backend._objects[metadata.storage_key] = b"corrupt-remote-object"
+            corrupt = storage.quote_session_export_artifact("quote-object-corrupt", "xlsx")
+            backend._objects.pop(metadata.storage_key, None)
+            missing = storage.quote_session_export_artifact("quote-object-corrupt", "xlsx")
+
+        self.assertIsNone(corrupt)
+        self.assertIsNone(missing)
 
     def test_object_artifact_storage_delete_session_tombstones_metadata_and_backend_object(self):
         backend = webapp.InMemoryObjectStorageBackend()
