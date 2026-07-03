@@ -1968,11 +1968,6 @@ def production_readiness_status(security_scan_status: str = "not_run_by_command"
         blockers.append(readiness_blocker("database_url_missing", "P1", "Database-backed storage mode is selected but no database URL is configured."))
     if database_scheme == "sqlite":
         blockers.append(readiness_blocker("sqlite_not_final_production", "P1", "SQLite is acceptable only as an explicitly backed-up internal-alpha/simple-hosting option, not final production storage."))
-    blockers.append(readiness_blocker(
-        "legacy_job_artifact_download_authorization",
-        "P1",
-        "Medium security finding: legacy direct job artifact downloads are not bound to workspace/session ownership.",
-    ))
     blockers.append(readiness_blocker("object_storage_missing", "P1", "No object-storage-backed asset/artifact layer exists for production XLSX/PDF and uploaded reference assets."))
     blockers.append(readiness_blocker("backup_restore_unverified", "P1", "Backup, restore, retention, and rollback procedures are not implemented or verified by this command."))
 
@@ -13335,6 +13330,65 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def protected_job_routes_enabled(session: dict[str, Any] | None = None) -> bool:
+    return bool(
+        configured_app_mode() == "deploy"
+        or configured_storage_mode() == "database"
+        or configured_artifact_storage_mode() == "database"
+        or platform_launch_mode_enabled()
+        or platform_context_from_auth_session(session) is not None
+    )
+
+
+def job_owner_context_from_auth_session(session: dict[str, Any] | None) -> dict[str, str]:
+    user = session.get("user") if isinstance(session, dict) and isinstance(session.get("user"), dict) else {}
+    platform = platform_context_from_auth_session(session)
+    platform_user = platform.get("user") if isinstance(platform, dict) and isinstance(platform.get("user"), dict) else {}
+    platform_workspace = platform.get("workspace") if isinstance(platform, dict) and isinstance(platform.get("workspace"), dict) else {}
+    user_id = privacy_safe_tracking_id(platform_user.get("userId") or user.get("subject"), "")
+    workspace_id = privacy_safe_tracking_id(platform_workspace.get("workspaceId") or user.get("account"), "")
+    owner: dict[str, str] = {}
+    if user_id:
+        owner["user_id"] = user_id
+    if workspace_id:
+        owner["workspace_id"] = workspace_id
+    return owner
+
+
+def job_visible_to_auth_session(job: dict[str, Any], session: dict[str, Any] | None) -> bool:
+    if not protected_job_routes_enabled(session):
+        return True
+    owner = job.get("owner") if isinstance(job.get("owner"), dict) else {}
+    requester = job_owner_context_from_auth_session(session)
+    owner_user_id = clean_text(owner.get("user_id"))
+    requester_user_id = clean_text(requester.get("user_id"))
+    if not owner_user_id or not requester_user_id or owner_user_id != requester_user_id:
+        return False
+    owner_workspace_id = clean_text(owner.get("workspace_id"))
+    requester_workspace_id = clean_text(requester.get("workspace_id"))
+    if owner_workspace_id and owner_workspace_id != requester_workspace_id:
+        return False
+    return True
+
+
+def legacy_job_artifact_download_allowed(session: dict[str, Any] | None) -> bool:
+    return not protected_job_routes_enabled(session)
+
+
+def log_legacy_job_route_block(reason: str, *, route: str) -> None:
+    write_local_log(
+        "legacy_job_route_blocked",
+        {
+            "reason": safe_resource_id(reason, "legacy_job_route_blocked"),
+            "route": safe_resource_id(route, "job"),
+            "app_mode": configured_app_mode(),
+            "storage_mode": configured_storage_mode(),
+            "artifact_storage_mode": configured_artifact_storage_mode(),
+            "platform_launch_mode": configured_platform_launch_mode(),
+        },
+    )
+
+
 def set_job_state(job_id: str, **updates: Any) -> None:
     with JOBS_LOCK:
         job = JOBS.get(job_id)
@@ -13476,6 +13530,7 @@ def create_job(
         "updated_at": now,
         "result": None,
         "errors": [],
+        "owner": job_owner_context_from_auth_session(auth_session),
     }
     with JOBS_LOCK:
         JOBS[job_id] = job
@@ -13497,9 +13552,11 @@ def create_job(
         return public_job(JOBS[job_id])
 
 
-def get_job(job_id: str) -> dict[str, Any] | None:
+def get_job(job_id: str, auth_session: dict[str, Any] | None = None) -> dict[str, Any] | None:
     with JOBS_LOCK:
         job = JOBS.get(safe_resource_id(job_id, ""))
+        if job and not job_visible_to_auth_session(job, auth_session):
+            return None
         return public_job(job) if job else None
 
 
@@ -13856,8 +13913,11 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             return
         job_match = re.fullmatch(r"/api/jobs/([A-Za-z0-9_-]+)", path)
         if job_match:
-            job = get_job(job_match.group(1))
+            auth_session = self.current_auth_session()
+            job = get_job(job_match.group(1), auth_session=auth_session)
             if not job:
+                if protected_job_routes_enabled(auth_session):
+                    log_legacy_job_route_block("job_status_not_visible", route="status")
                 self.send_json({"error": "Not found"}, status=404)
                 return
             self.send_json(job)
@@ -14498,6 +14558,11 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
     def send_download(self, path: str) -> None:
         match = re.fullmatch(r"/api/jobs/([A-Za-z0-9_-]+)/files/([^/]+)", path)
         if not match:
+            self.send_json({"error": "Not found"}, status=404)
+            return
+        auth_session = self.current_auth_session()
+        if not legacy_job_artifact_download_allowed(auth_session):
+            log_legacy_job_route_block("legacy_job_file_download_disabled", route="files")
             self.send_json({"error": "Not found"}, status=404)
             return
         job_id, filename = match.groups()

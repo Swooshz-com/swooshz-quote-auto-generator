@@ -147,10 +147,10 @@ def valid_payload():
     }
 
 
-def wait_for_job(job_id: str, timeout: float = 2.0) -> dict:
+def wait_for_job(job_id: str, timeout: float = 2.0, auth_session: dict | None = None) -> dict:
     deadline = time.time() + timeout
     while time.time() < deadline:
-        job = webapp.get_job(job_id)
+        job = webapp.get_job(job_id, auth_session=auth_session)
         if job and job["status"] in {"completed", "degraded", "needs_review", "blocked", "failed"}:
             return job
         time.sleep(0.02)
@@ -8487,6 +8487,95 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertEqual([item["name"] for item in files], ["quotation.pdf", "quotation.xlsx"])
         self.assertEqual(files[0]["url"], "/api/jobs/job-pdf/files/quotation.pdf")
         self.assertEqual(files[1]["url"], "/api/jobs/job-pdf/files/quotation.xlsx")
+
+    def test_local_uat_allows_legacy_job_file_download(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp) / "out"
+            output_dir = output_root / "job-local-download"
+            output_dir.mkdir(parents=True)
+            (output_dir / "quotation.xlsx").write_bytes(b"xlsx-local")
+
+            with mock.patch.object(webapp, "configured_output_root", return_value=output_root):
+                with LocalRunnerServer() as runner:
+                    with urllib.request.urlopen(
+                        f"{runner.base_url}/api/jobs/job-local-download/files/quotation.xlsx",
+                        timeout=3,
+                    ) as response:
+                        status = response.status
+                        body = response.read()
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"xlsx-local")
+
+    def test_database_platform_blocks_legacy_job_file_download_by_leaked_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_root = root / "out"
+            output_dir = output_root / "job-leaked-download"
+            output_dir.mkdir(parents=True)
+            (output_dir / "quotation.xlsx").write_bytes(b"private-xlsx")
+            db_path = root / "kqag-storage.sqlite3"
+            database_url = f"sqlite:///{db_path.as_posix()}"
+            env = self.platform_launch_env(
+                KQAG_STORAGE_MODE="database",
+                KQAG_ARTIFACT_STORAGE_MODE="database",
+                KQAG_DATABASE_URL=database_url,
+                QUOTE_OUTPUT_ROOT=str(output_root),
+                QUOTE_LOG_ROOT=str(root / "logs"),
+            )
+
+            with mock.patch.dict(os.environ, env, clear=True):
+                owner_cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(self.platform_auth_session('workspace-a', user_id='owner-user'))}"
+                other_cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(self.platform_auth_session('workspace-b', user_id='other-user'))}"
+                webapp.apply_kqag_storage_migrations(database_url)
+                with LocalRunnerServer() as runner:
+                    for cookie in (owner_cookie, other_cookie):
+                        with self.subTest(cookie=cookie[:20]):
+                            request = urllib.request.Request(
+                                f"{runner.base_url}/api/jobs/job-leaked-download/files/quotation.xlsx",
+                                headers={"Cookie": cookie},
+                            )
+                            with self.assertRaises(urllib.error.HTTPError) as error:
+                                urllib.request.urlopen(request, timeout=3)
+                            body = error.exception.read().decode("utf-8")
+                            self.assertIn(error.exception.code, {403, 404})
+                            self.assertNotIn("private-xlsx", body)
+                            self.assertNotIn(str(output_root), body)
+
+    def test_database_platform_job_status_is_owner_bound(self):
+        owner_session = self.platform_auth_session("workspace-a", user_id="owner-user")
+        same_workspace_other = self.platform_auth_session("workspace-a", user_id="other-user")
+        other_workspace_admin = self.platform_auth_session("workspace-b", membership_role="admin", user_id="owner-user")
+        env = self.platform_launch_env()
+        with mock.patch.dict(os.environ, env, clear=True):
+            thread = mock.Mock()
+            with mock.patch.object(webapp.threading, "Thread", return_value=thread):
+                created = webapp.create_job("draft", valid_payload(), auth_session=owner_session)
+            job_id = created["job_id"]
+            owner_cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(owner_session)}"
+            same_workspace_cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(same_workspace_other)}"
+            other_workspace_cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(other_workspace_admin)}"
+
+            with LocalRunnerServer() as runner:
+                owner_request = urllib.request.Request(
+                    f"{runner.base_url}/api/jobs/{job_id}",
+                    headers={"Cookie": owner_cookie},
+                )
+                owner_body = json.loads(urllib.request.urlopen(owner_request, timeout=3).read().decode("utf-8"))
+
+                for cookie in (same_workspace_cookie, other_workspace_cookie):
+                    with self.subTest(cookie=cookie[:20]):
+                        request = urllib.request.Request(
+                            f"{runner.base_url}/api/jobs/{job_id}",
+                            headers={"Cookie": cookie},
+                        )
+                        with self.assertRaises(urllib.error.HTTPError) as error:
+                            urllib.request.urlopen(request, timeout=3)
+                        self.assertIn(error.exception.code, {403, 404})
+
+        self.assertEqual(owner_body["job_id"], job_id)
+        self.assertEqual(owner_body["status"], "running")
+        thread.start.assert_called_once()
 
     def test_quote_session_metadata_creation_update_and_sorted_listing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -19527,7 +19616,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 storage.save_profile(workspace_profile_with_layout("workspace-async-profile"))
                 with mock.patch.object(webapp.subprocess, "run", side_effect=fake_generator_run):
                     created = webapp.create_job("generate", payload, auth_session=platform_session)
-                    job = wait_for_job(created["job_id"], timeout=3.0)
+                    job = wait_for_job(created["job_id"], timeout=3.0, auth_session=platform_session)
 
                 sessions = storage.list_quote_sessions()
                 artifact = storage.quote_session_export_artifact("quote-async-expired-artifact", "xlsx")

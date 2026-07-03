@@ -37,7 +37,6 @@ Primary blockers:
 
 - Runtime data can still depend on local filesystem storage.
 - Generated quote artifacts can still depend on local filesystem storage.
-- Legacy job artifact downloads are not bound to workspace/session ownership.
 - No object-storage layer exists for XLSX/PDF outputs and uploaded assets.
 - Backup, restore, retention, and rollback have not been implemented or proven.
 
@@ -50,6 +49,12 @@ profile defaults and quotation layout from workspace-owned DB profile rows and
 stored DB layout artifacts. Missing/deleted workspace profiles or missing
 layout artifacts block generation instead of falling back to bundled/default or
 local profile packs.
+
+PR #90 update: hosted/database/platform/deploy mode disables legacy direct
+`/api/jobs/{job}/files/{filename}` output-root downloads, and job
+status/result reads are owner/workspace-bound in protected modes. Local-UAT
+local storage mode keeps the legacy direct download route for localhost
+workflows.
 
 ## Safe Readiness Command
 
@@ -77,8 +82,8 @@ Current expected posture in local mode:
 - `internal_alpha_ready`: `false`
 - `production_ready`: `false`
 - Expected blockers include `local_runtime_storage`,
-  `local_artifact_storage`, `legacy_job_artifact_download_authorization`,
-  `object_storage_missing`, and `backup_restore_unverified`.
+  `local_artifact_storage`, `object_storage_missing`, and
+  `backup_restore_unverified`.
 
 ## Storage Surface Audit
 
@@ -137,24 +142,26 @@ silent fallback.
 
 ## Sessions And Artifact Download Audit
 
-Quote-session downloads are closer to the desired production path because they
-use current storage and database visibility checks. The legacy direct job-file
-download route is not production-safe because it treats the job id as the object
-selector and does not bind the artifact to the current workspace or session.
+Quote-session downloads are the intended owned artifact path because they use
+current storage and database visibility checks. PR #90 disables the legacy
+direct job-file download route in hosted/database/platform/deploy mode because
+that route treats the job id as the object selector instead of resolving
+workspace/session artifact ownership.
 
 Evidence:
 
-- `webapp/server.py:13667` routes `/api/jobs/.../files/...` directly to
-  `send_download()`.
-- `webapp/server.py:14285` reads from the configured output root by URL job id
-  and filename after path/filename checks, but without workspace/session owner
-  lookup.
-- `webapp/server.py:14317` shows the safer quote-session download path using
+- `webapp/server.py` routes `/api/jobs/.../files/...` to `send_download()`,
+  which now returns a generic not-found response in deploy, database storage,
+  platform launch/session, or database artifact mode.
+- `webapp/server.py` records privacy-safe job owner/workspace context for
+  asynchronous jobs and filters `/api/jobs/{job}` status/result reads in
+  protected modes.
+- `webapp/server.py` shows the safer quote-session download path using
   storage-backed artifact lookup.
 
-Production requirement: disable the legacy job-file route in deploy/database
-mode or make it workspace-aware. Prefer quote-session artifact URLs backed by
-database metadata and object storage.
+Production requirement: keep the legacy job-file route disabled in hosted
+modes. Prefer quote-session artifact URLs backed by database metadata and,
+before production, object storage.
 
 ## Production Storage Recommendation
 
@@ -192,7 +199,7 @@ Reportable findings:
 | Severity | Finding | Production impact | Required follow-up |
 | --- | --- | --- | --- |
 | High, resolved in PR #88 | Database pricing references could include local packs across workspaces | Hosted database mode could cross workspace boundaries if private local pricing packs existed on the host. | Keep regression tests proving DB mode lists/details/exports/generates only workspace-owned references. |
-| Medium | Legacy job artifact downloads are not bound to workspace/session ownership | Any leaked valid job URL can bypass object-level ownership checks in a hosted multi-user deployment. | Route downloads through workspace/session-aware artifact storage or disable the legacy route in deploy mode. |
+| Medium, resolved in PR #90 | Legacy job artifact downloads were not bound to workspace/session ownership | Hosted/database/platform/deploy mode now disables the legacy direct download route and owner-binds job status/result reads. | Keep regression tests proving leaked job IDs cannot download legacy bytes in protected modes; use quote-session artifact downloads. |
 
 Positive controls reviewed:
 
@@ -219,8 +226,8 @@ UAT until these are true:
 - Generated XLSX/PDF and uploaded assets are stored in object storage or a
   documented, backed-up internal-alpha equivalent.
 - Artifact downloads are bound to workspace/session ownership.
-- The medium security finding for legacy direct job artifact downloads is fixed
-  or the legacy route is disabled in deploy/database mode.
+- The medium security finding for legacy direct job artifact downloads remains
+  fixed: PR #90 disables the legacy route in deploy/database/platform modes.
 - Backup and restore are documented, automated where possible, and drill-tested.
 - Rollback procedure is documented for app version, DB migration, and object
   storage compatibility.
@@ -243,8 +250,8 @@ UAT until these are true:
    workspace-scoped profile defaults/layout artifacts and fails clearly when
    the selected workspace profile or layout is missing.
 4. Artifact authorization / legacy job download lockdown:
-   disable or replace legacy job-file downloads in deploy/database mode and add
-   cross-user artifact tests.
+   completed in PR #90 by disabling legacy job-file downloads in protected
+   modes and adding cross-user artifact/status tests.
 5. Storage productionization / object storage:
    introduce object-storage metadata, object-key authorization, checksum
    recording, and retention hooks.
