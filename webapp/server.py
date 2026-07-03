@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import http.client
 import http.cookies
+import importlib
 import io
 import json
 import math
@@ -56,12 +57,18 @@ import pricing_reference_cleanup
 import pricing_reference_enrichment
 from webapp.object_storage import (
     ALLOWED_OWNER_TYPES,
+    InMemoryObjectStorageBackend,
     OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME,
     OBJECT_STORAGE_BUCKET_ENV_NAME,
     OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME,
     OBJECT_STORAGE_PROVIDER_ENV_NAME,
     OBJECT_STORAGE_REGION_ENV_NAME,
     OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME,
+    ObjectArtifactMetadata,
+    ObjectStorageBackend,
+    ObjectStorageConfigurationError,
+    ObjectStorageContractError,
+    S3CompatibleObjectStorageBackend,
     object_storage_provider_status,
 )
 
@@ -1347,6 +1354,31 @@ def configured_object_storage_status() -> dict[str, Any]:
         OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME,
     )
     return object_storage_provider_status({name: read_dotenv_value(name) for name in env_names})
+
+
+def configured_object_storage_backend() -> ObjectStorageBackend:
+    status = configured_object_storage_status()
+    if status.get("provider") != "s3_compatible" or not status.get("configured"):
+        raise ObjectStorageConfigurationError("Object storage backend is not available.")
+    try:
+        boto3 = importlib.import_module("boto3")
+    except Exception as exc:
+        raise ObjectStorageConfigurationError("Object storage backend is not available.") from exc
+    try:
+        client = boto3.client(
+            "s3",
+            endpoint_url=read_dotenv_value(OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME),
+            region_name=read_dotenv_value(OBJECT_STORAGE_REGION_ENV_NAME),
+            aws_access_key_id=read_dotenv_value(OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME),
+            aws_secret_access_key=read_dotenv_value(OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME),
+        )
+        return S3CompatibleObjectStorageBackend(
+            bucket=read_dotenv_value(OBJECT_STORAGE_BUCKET_ENV_NAME),
+            client=client,
+            status=status,
+        )
+    except Exception as exc:
+        raise ObjectStorageConfigurationError("Object storage backend is not available.") from exc
 
 
 def configured_database_url() -> str:
@@ -7072,6 +7104,7 @@ class CompanyConfigStore:
 KQAG_STORAGE_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "001_platform_scoped_storage.sql",
     PROJECT_ROOT / "migrations" / "002_platform_scoped_artifacts.sql",
+    PROJECT_ROOT / "migrations" / "003_object_artifact_metadata.sql",
 ]
 KQAG_STORAGE_SQL = """
 create table if not exists kqag_profiles (
@@ -7125,6 +7158,28 @@ create table if not exists kqag_file_artifacts (
   created_at text not null,
   updated_at text not null,
   primary key (workspace_id, owner_type, owner_id, artifact_kind)
+);
+create table if not exists kqag_object_artifacts (
+  artifact_id text not null primary key,
+  workspace_id text not null,
+  owner_type text not null,
+  owner_id text not null,
+  platform_user_id text,
+  session_id text,
+  job_id text,
+  artifact_kind text not null,
+  filename text not null,
+  content_type text not null,
+  size_bytes integer not null,
+  checksum_sha256 text not null,
+  object_provider_type text not null,
+  object_key_ref text not null,
+  status text not null default 'active',
+  retention_status text not null default 'active',
+  created_at text not null,
+  updated_at text not null,
+  deleted_at text,
+  unique (workspace_id, owner_type, owner_id, artifact_kind)
 );
 """
 
@@ -7210,7 +7265,7 @@ def storage_access_error_payload(exc: KqagStorageAccessError) -> dict[str, Any]:
     write_local_log("server_error", {"error_reference": error_reference, "reason": exc.reason, "status": exc.status, "errors": safe_error_messages([str(exc)])})
     message = (
         QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE
-        if exc.reason in {"protected_local_artifact_storage_unavailable", "object_artifact_storage_unavailable"}
+        if exc.reason in {"protected_local_artifact_storage_unavailable", "object_artifact_storage_unavailable", "storage_object_artifact_database_not_migrated"}
         else (
             QUOTE_SESSION_STORAGE_UNAVAILABLE_MESSAGE
             if exc.reason == "protected_local_quote_session_storage_unavailable"
@@ -7352,6 +7407,9 @@ class DatabaseKqagStorage:
     def ensure_artifact_ready(self) -> None:
         required = {"kqag_quote_artifacts", "kqag_file_artifacts"}
         self._ensure_tables(required, reason="storage_artifact_database_not_migrated")
+
+    def ensure_object_artifact_ready(self) -> None:
+        self._ensure_tables({"kqag_object_artifacts"}, reason="storage_object_artifact_database_not_migrated")
 
     def _ensure_tables(self, required: set[str], *, reason: str) -> None:
         placeholders = ", ".join("?" for _ in required)
@@ -7634,6 +7692,17 @@ class DatabaseKqagStorage:
         expected_filename = QUOTE_SESSION_EXPORT_KINDS.get(safe_kind)
         if not safe_id or not expected_filename:
             return None
+        if configured_artifact_storage_mode() == "object":
+            row = self._object_quote_artifact_row(safe_id, safe_kind)
+            if not row:
+                return None
+            return {
+                "filename": row["filename"],
+                "content_type": row["content_type"],
+                "size_bytes": int(row["size_bytes"] or 0),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
         with self.connection() as connection:
             row = connection.execute(
                 "select filename, content_type, size_bytes, created_at, updated_at from kqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
@@ -7643,9 +7712,86 @@ class DatabaseKqagStorage:
             return None
         return {"filename": row["filename"], "content_type": row["content_type"], "size_bytes": int(row["size_bytes"] or 0), "created_at": row["created_at"], "updated_at": row["updated_at"]}
 
+    def _object_quote_artifact_row(self, session_id: str, kind: str) -> sqlite3.Row | None:
+        safe_id = safe_quote_session_id(session_id, "")
+        safe_kind = clean_text(kind).lower()
+        expected_filename = QUOTE_SESSION_EXPORT_KINDS.get(safe_kind)
+        if not safe_id or not expected_filename:
+            return None
+        with self.connection() as connection:
+            row = connection.execute(
+                "select artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at "
+                "from kqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ? and status = ? and retention_status = ? and deleted_at is null",
+                (self.workspace_id, "generated_quote", safe_id, safe_kind, "active", "active"),
+            ).fetchone()
+        if not row or clean_text(row["filename"]) != expected_filename or clean_text(row["session_id"]) != safe_id:
+            return None
+        if len(clean_text(row["checksum_sha256"])) != 64 or not clean_text(row["object_key_ref"]):
+            return None
+        return row
+
+    def _object_metadata_from_row(self, row: sqlite3.Row) -> ObjectArtifactMetadata:
+        created_at = clean_text(row["created_at"]) or utc_timestamp()
+        updated_at = clean_text(row["updated_at"]) or created_at
+        return ObjectArtifactMetadata(
+            workspace_id=clean_text(row["workspace_id"]),
+            owner_type=clean_text(row["owner_type"]),
+            owner_id=clean_text(row["owner_id"]),
+            artifact_kind=clean_text(row["artifact_kind"]),
+            filename=clean_text(row["filename"]),
+            content_type=clean_text(row["content_type"]) or "application/octet-stream",
+            size_bytes=int(row["size_bytes"] or 0),
+            checksum_sha256=clean_text(row["checksum_sha256"]),
+            storage_key=clean_text(row["object_key_ref"]),
+            created_at=created_at,
+            updated_at=updated_at,
+        )
+
+    def _upsert_object_quote_artifact(self, session_id: str, kind: str, filename: str, content_type: str, metadata: ObjectArtifactMetadata) -> None:
+        artifact_id = f"obj-{secrets.token_hex(12)}"
+        now = utc_timestamp()
+        with self.connection() as connection:
+            connection.execute(
+                "insert into kqag_object_artifacts (artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at) "
+                "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "on conflict(workspace_id, owner_type, owner_id, artifact_kind) do update set artifact_id = excluded.artifact_id, platform_user_id = excluded.platform_user_id, session_id = excluded.session_id, job_id = excluded.job_id, filename = excluded.filename, content_type = excluded.content_type, size_bytes = excluded.size_bytes, checksum_sha256 = excluded.checksum_sha256, object_provider_type = excluded.object_provider_type, object_key_ref = excluded.object_key_ref, status = excluded.status, retention_status = excluded.retention_status, updated_at = excluded.updated_at, deleted_at = excluded.deleted_at",
+                (
+                    artifact_id,
+                    self.workspace_id,
+                    "generated_quote",
+                    session_id,
+                    self.user_id,
+                    session_id,
+                    "",
+                    kind,
+                    filename,
+                    content_type,
+                    metadata.size_bytes,
+                    metadata.checksum_sha256,
+                    "s3_compatible",
+                    metadata.storage_key,
+                    "active",
+                    "active",
+                    metadata.created_at or now,
+                    now,
+                    None,
+                ),
+            )
+            connection.commit()
+
     def _store_quote_export_artifacts(self, session_id: str, metadata: dict[str, Any], result: dict[str, Any] | None, output_dir: Path | None) -> None:
         if not result_has_generated_quote(result) or output_dir is None:
             return
+        object_backend: ObjectStorageBackend | None = None
+        if configured_artifact_storage_mode() == "object":
+            try:
+                object_backend = configured_object_storage_backend()
+            except ObjectStorageContractError as exc:
+                raise KqagStorageAccessError(
+                    QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                    status=503,
+                    reason="object_artifact_storage_unavailable",
+                ) from exc
         for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
             source = output_dir / filename
             if not source.exists() or not source.is_file() or source.name != filename:
@@ -7658,6 +7804,27 @@ class DatabaseKqagStorage:
                 continue
             now = utc_timestamp()
             content_type = QUOTE_SESSION_EXPORT_CONTENT_TYPES.get(kind, mimetypes.guess_type(filename)[0] or "application/octet-stream")
+            if object_backend is not None:
+                try:
+                    object_metadata = object_backend.store_artifact(
+                        workspace_id=self.workspace_id,
+                        owner_type="generated_quote",
+                        owner_id=session_id,
+                        artifact_kind=kind,
+                        filename=filename,
+                        content_type=content_type,
+                        content=content,
+                    )
+                    self._upsert_object_quote_artifact(session_id, kind, filename, content_type, object_metadata)
+                except ObjectStorageContractError as exc:
+                    raise KqagStorageAccessError(
+                        QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                        status=503,
+                        reason="object_artifact_storage_unavailable",
+                    ) from exc
+                metadata["exports"][kind] = {"filename": filename, "created_at": now, "size_bytes": size, "stale": False}
+                metadata["status"][f"{kind}_exported"] = True
+                continue
             with self.connection() as connection:
                 connection.execute(
                     "insert into kqag_quote_artifacts (workspace_id, session_id, artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?) "
@@ -7669,7 +7836,8 @@ class DatabaseKqagStorage:
             metadata["status"][f"{kind}_exported"] = True
 
     def quote_session_export_artifact(self, session_id: str, kind: str) -> dict[str, Any] | None:
-        if configured_artifact_storage_mode() != "database":
+        artifact_mode = configured_artifact_storage_mode()
+        if artifact_mode not in {"database", "object"}:
             return None
         safe_id = safe_quote_session_id(session_id, "")
         safe_kind = clean_text(kind).lower()
@@ -7682,6 +7850,18 @@ class DatabaseKqagStorage:
             return None
         if quote_session_export_is_stale(metadata, export):
             return None
+        if artifact_mode == "object":
+            row = self._object_quote_artifact_row(safe_id, safe_kind)
+            if not row:
+                return None
+            object_metadata = self._object_metadata_from_row(row)
+            try:
+                content = configured_object_storage_backend().retrieve_artifact(object_metadata, workspace_id=self.workspace_id)
+            except ObjectStorageContractError:
+                return None
+            if not content or len(content) != object_metadata.size_bytes:
+                return None
+            return {"filename": row["filename"], "content_type": row["content_type"], "size_bytes": object_metadata.size_bytes, "content": content}
         with self.connection() as connection:
             row = connection.execute(
                 "select filename, content_type, size_bytes, content_blob from kqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
@@ -7709,7 +7889,7 @@ class DatabaseKqagStorage:
                 continue
             recorded_filename = clean_text(export.get("filename"))
             safe_recorded = recorded_filename if recorded_filename == filename else ""
-            artifact = self._quote_artifact_metadata(public["session_id"], kind) if configured_artifact_storage_mode() == "database" and safe_recorded else None
+            artifact = self._quote_artifact_metadata(public["session_id"], kind) if configured_artifact_storage_mode() in {"database", "object"} and safe_recorded else None
             artifact_exists = bool(artifact)
             stale = bool(artifact_exists and quote_session_export_is_stale(metadata, export))
             exists = bool(artifact_exists and not stale)
@@ -7811,7 +7991,7 @@ class DatabaseKqagStorage:
             metadata["draft_state"] = quote_session_draft_state(patch)
         if result_has_generated_quote(result):
             metadata["status"]["quote_generated"] = True
-            if configured_artifact_storage_mode() == "database":
+            if configured_artifact_storage_mode() in {"database", "object"}:
                 self._store_quote_export_artifacts(resolved_session_id, metadata, result, output_dir)
         if not result_has_generated_quote(result):
             mark_quote_session_exports_stale(metadata, quote_session_current_draft_export_kinds(patch))
@@ -7870,22 +8050,34 @@ class DatabaseKqagStorage:
 
 
 def artifact_storage_for_auth_session(session: dict[str, Any] | None) -> DatabaseKqagStorage | None:
-    if configured_artifact_storage_mode() == "object":
-        raise KqagStorageAccessError(
-            QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
-            status=503,
-            reason="object_artifact_storage_unavailable",
-        )
-    if configured_artifact_storage_mode() != "database":
+    artifact_mode = configured_artifact_storage_mode()
+    if artifact_mode not in {"database", "object"}:
         return None
     workspace_id = platform_workspace_id_from_auth_session(session)
     if not workspace_id:
         raise KqagStorageAccessError("Platform workspace context is required for database storage.", status=403, reason="storage_platform_session_required")
     database_url = configured_database_url()
     if not database_url:
+        if artifact_mode == "object":
+            raise KqagStorageAccessError(
+                QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                status=503,
+                reason="object_artifact_storage_unavailable",
+            )
         raise KqagStorageAccessError("KQAG database storage is not configured.", status=503, reason="storage_database_not_configured")
     storage = DatabaseKqagStorage(database_url, workspace_id, permissions_for_auth_session(session).get("role", "viewer"), platform_user_id_from_auth_session(session))
-    storage.ensure_artifact_ready()
+    if artifact_mode == "object":
+        storage.ensure_object_artifact_ready()
+        try:
+            configured_object_storage_backend()
+        except ObjectStorageContractError as exc:
+            raise KqagStorageAccessError(
+                QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                status=503,
+                reason="object_artifact_storage_unavailable",
+            ) from exc
+    else:
+        storage.ensure_artifact_ready()
     return storage
 
 
@@ -7902,6 +8094,8 @@ def app_storage_for_auth_session(session: dict[str, Any] | None) -> LocalKqagSto
     storage.ensure_ready()
     if configured_artifact_storage_mode() == "database":
         storage.ensure_artifact_ready()
+    elif configured_artifact_storage_mode() == "object":
+        storage.ensure_object_artifact_ready()
     return storage
 
 def company_config_store() -> CompanyConfigStore:
@@ -12949,6 +13143,23 @@ def output_files(job_id: str, output_dir: Path) -> list[dict[str, str]]:
     return files
 
 
+def quote_session_result_files(session: dict[str, Any] | None) -> list[dict[str, str]]:
+    if not isinstance(session, dict):
+        return []
+    exports = session.get("exports") if isinstance(session.get("exports"), dict) else {}
+    files: list[dict[str, str]] = []
+    for kind, filename in sorted(QUOTE_SESSION_EXPORT_KINDS.items(), key=lambda item: item[1]):
+        export = exports.get(kind) if isinstance(exports.get(kind), dict) else {}
+        url = clean_text(export.get("url"))
+        if export.get("exists") is True and url.startswith("/api/quote-sessions/"):
+            item = {"name": filename, "url": url}
+            size = int(export.get("size_bytes") or 0)
+            if size > 0:
+                item["bytes"] = str(size)
+            files.append(item)
+    return files
+
+
 def safe_quote_session_id(value: Any, fallback: str = "") -> str:
     session_id = clean_text(value) or fallback
     return session_id if QUOTE_SESSION_ID_RE.fullmatch(session_id) else fallback
@@ -13788,16 +13999,9 @@ def log_protected_local_artifact_storage_block(reason: str = "protected_local_ar
 
 
 def ensure_quote_artifact_storage_available_for_auth_session(session: dict[str, Any] | None) -> None:
-    if configured_artifact_storage_mode() == "database":
+    if configured_artifact_storage_mode() in {"database", "object"}:
         artifact_storage_for_auth_session(session)
         return
-    if configured_artifact_storage_mode() == "object":
-        log_protected_local_artifact_storage_block("object_artifact_storage_unavailable")
-        raise KqagStorageAccessError(
-            QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
-            status=503,
-            reason="object_artifact_storage_unavailable",
-        )
     if protected_job_routes_enabled(session):
         log_protected_local_artifact_storage_block()
         raise KqagStorageAccessError(
@@ -14041,6 +14245,14 @@ def run_quote_job(
             quote_session_storage = quote_session_storage_for_auth_session(auth_session)
         except KqagStorageAccessError as exc:
             return storage_access_error_payload(exc)
+    elif configured_artifact_storage_mode() == "object":
+        return storage_access_error_payload(
+            KqagStorageAccessError(
+                QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                status=503,
+                reason="object_artifact_storage_unavailable",
+            )
+        )
 
     try:
         ensure_quote_artifact_storage_available_for_auth_session(auth_session)
@@ -14146,6 +14358,8 @@ def run_quote_job(
         try:
             storage = quote_session_storage or quote_session_storage_for_auth_session(auth_session)
             result["quote_session"] = storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+            if configured_artifact_storage_mode() in {"database", "object"}:
+                result["files"] = quote_session_result_files(result.get("quote_session"))
         except KqagStorageAccessError as exc:
             storage_error = storage_access_error_payload(exc)
             result.update(storage_error)
