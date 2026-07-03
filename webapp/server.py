@@ -47,11 +47,14 @@ from xml.sax.saxutils import escape as xml_escape
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = PROJECT_ROOT / "scripts"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import pricing_reference_cleanup
 import pricing_reference_enrichment
+from webapp.object_storage import ALLOWED_OWNER_TYPES
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 GENERATOR_PATH = PROJECT_ROOT / "scripts" / "generate_quote.py"
@@ -1320,7 +1323,9 @@ def configured_storage_mode() -> str:
 
 def configured_artifact_storage_mode() -> str:
     mode = clean_text(read_dotenv_value(KQAG_ARTIFACT_STORAGE_MODE_ENV_NAME)).lower()
-    return "database" if mode == "database" else "local"
+    if mode in {"database", "object"}:
+        return mode
+    return "local"
 
 
 def configured_database_url() -> str:
@@ -2005,12 +2010,42 @@ def hosted_smoke_evidence_summary(*, status: str) -> dict[str, Any]:
     }
 
 
+def object_storage_evidence_summary(*, status: str, artifact_mode: str, database_mode: bool, database_configured: bool) -> dict[str, Any]:
+    normalized_status = clean_text(status).lower() or "not_run_by_checker"
+    if normalized_status not in {"passed", "failed", "not_run_by_checker"}:
+        normalized_status = "not_run_by_checker"
+    passed = normalized_status == "passed"
+    object_mode = artifact_mode == "object"
+    return {
+        "status": normalized_status,
+        "verifier": "scripts/verify_object_storage_contract.py",
+        "covers": [
+            "generated_quote_artifacts",
+            "uploaded_references",
+            "profile_layout_assets",
+            "pricing_visual_assets",
+            "workspace_scoped_metadata",
+            "checksum_verification",
+            "retrieve_delete_contract",
+            "wrong_workspace_denial",
+        ],
+        "owner_types": sorted(ALLOWED_OWNER_TYPES),
+        "production_object_storage_contract_supported": bool(passed and object_mode and database_mode and database_configured),
+        "runtime_backend_configured": False,
+        "notes": [
+            "Evidence is synthetic and metadata-only.",
+            "This proves the provider-neutral contract, not live cloud credentials, provider wiring, retention jobs, deployment operations, or production readiness.",
+        ],
+    }
+
+
 def production_readiness_status(
     security_scan_status: str = "not_run_by_command",
     *,
     backup_restore_evidence_status: str = "not_run_by_checker",
     hosted_observability_evidence_status: str = "not_run_by_checker",
     hosted_smoke_evidence_status: str = "not_run_by_checker",
+    object_storage_evidence_status: str = "not_run_by_checker",
 ) -> dict[str, Any]:
     storage_mode = configured_storage_mode()
     artifact_mode = configured_artifact_storage_mode()
@@ -2018,6 +2053,7 @@ def production_readiness_status(
     database_configured = bool(database_scheme)
     database_mode = storage_mode == "database"
     database_artifacts = artifact_mode == "database"
+    object_artifacts = artifact_mode == "object"
     backup_restore_evidence = backup_restore_evidence_summary(
         status=backup_restore_evidence_status,
         database_mode=database_mode,
@@ -2029,6 +2065,12 @@ def production_readiness_status(
     )
     hosted_smoke_evidence = hosted_smoke_evidence_summary(
         status=hosted_smoke_evidence_status,
+    )
+    object_storage_evidence = object_storage_evidence_summary(
+        status=object_storage_evidence_status,
+        artifact_mode=artifact_mode,
+        database_mode=database_mode,
+        database_configured=database_configured,
     )
 
     profiles = readiness_surface(
@@ -2086,30 +2128,39 @@ def production_readiness_status(
         source=(
             "kqag_quote_artifacts and kqag_file_artifacts tables"
             if database_artifacts
-            else "QUOTE_OUTPUT_ROOT/{job_id} plus QUOTE_DATA_ROOT/quote-sessions/{session_id}/exports"
+            else (
+                "provider-neutral object storage contract with workspace-owned database metadata"
+                if object_artifacts
+                else "QUOTE_OUTPUT_ROOT/{job_id} plus QUOTE_DATA_ROOT/quote-sessions/{session_id}/exports"
+            )
         ),
-        workspace_scoped=database_mode and database_artifacts,
-        persistent_across_restart=database_artifacts or bool(clean_text(read_dotenv_value(QUOTE_OUTPUT_ROOT_ENV_NAME))),
-        persistent_across_redeploy=database_artifacts,
+        workspace_scoped=database_mode and (database_artifacts or object_artifacts),
+        persistent_across_restart=database_artifacts or object_artifacts or bool(clean_text(read_dotenv_value(QUOTE_OUTPUT_ROOT_ENV_NAME))),
+        persistent_across_redeploy=database_artifacts or object_artifacts,
         internal_alpha_suitable=database_artifacts and database_configured,
-        production_suitable=False,
+        production_suitable=object_storage_evidence["production_object_storage_contract_supported"],
         follow_up=(
             "Move generated XLSX/PDF and uploaded assets to object storage with database metadata."
             if database_artifacts
-            else "Enable database artifact mode for internal alpha or object storage for production."
+            else (
+                "Wire a real credentialed object-storage provider, deployment operations, retention/delete evidence, and DB+object backup/restore before production."
+                if object_artifacts
+                else "Enable database artifact mode for internal alpha or object storage for production."
+            )
         ),
     )
 
     blockers: list[dict[str, Any]] = []
     if not database_mode:
         blockers.append(readiness_blocker("local_runtime_storage", "P1", "Profiles, pricing references, and quote sessions are still using local runtime storage."))
-    if not database_artifacts:
+    if not (database_artifacts or object_artifacts):
         blockers.append(readiness_blocker("local_artifact_storage", "P1", "Generated quote artifacts, saved exports, and profile layout assets are still using local filesystem storage."))
-    if (database_mode or database_artifacts) and not database_configured:
+    if (database_mode or database_artifacts or object_artifacts) and not database_configured:
         blockers.append(readiness_blocker("database_url_missing", "P1", "Database-backed storage mode is selected but no database URL is configured."))
     if database_scheme == "sqlite":
         blockers.append(readiness_blocker("sqlite_not_final_production", "P1", "SQLite is acceptable only as an explicitly backed-up internal-alpha/simple-hosting option, not final production storage.", gates=("production",)))
-    blockers.append(readiness_blocker("object_storage_missing", "P1", "No object-storage-backed asset/artifact layer exists for production XLSX/PDF and uploaded reference assets.", gates=("production",)))
+    if not object_storage_evidence["production_object_storage_contract_supported"]:
+        blockers.append(readiness_blocker("object_storage_missing", "P1", "No verified object-storage-backed asset/artifact contract exists for production XLSX/PDF and uploaded reference assets.", gates=("production",)))
     blockers.append(readiness_blocker("production_deployment_operations_evidence_missing", "P1", "Production deployment, operations, alert delivery, and live host evidence are not verified by this command.", gates=("production",)))
     if not backup_restore_evidence["database_artifact_temporary_exception_supported"]:
         blockers.append(readiness_blocker("backup_restore_unverified", "P1", "Backup, restore, retention, and rollback evidence has not been verified for the selected database/database-artifact mode."))
@@ -2145,6 +2196,7 @@ def production_readiness_status(
         "backup_restore_evidence": backup_restore_evidence,
         "hosted_observability_evidence": hosted_observability_evidence,
         "hosted_smoke_evidence": hosted_smoke_evidence,
+        "object_storage_evidence": object_storage_evidence,
         "security_scan_status": clean_text(security_scan_status) or "not_run_by_command",
         "local_uat_supported": True,
         "internal_alpha_blockers": internal_alpha_blockers,
@@ -7122,7 +7174,7 @@ def storage_access_error_payload(exc: KqagStorageAccessError) -> dict[str, Any]:
     write_local_log("server_error", {"error_reference": error_reference, "reason": exc.reason, "status": exc.status, "errors": safe_error_messages([str(exc)])})
     message = (
         QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE
-        if exc.reason == "protected_local_artifact_storage_unavailable"
+        if exc.reason in {"protected_local_artifact_storage_unavailable", "object_artifact_storage_unavailable"}
         else (
             QUOTE_SESSION_STORAGE_UNAVAILABLE_MESSAGE
             if exc.reason == "protected_local_quote_session_storage_unavailable"
@@ -7782,6 +7834,12 @@ class DatabaseKqagStorage:
 
 
 def artifact_storage_for_auth_session(session: dict[str, Any] | None) -> DatabaseKqagStorage | None:
+    if configured_artifact_storage_mode() == "object":
+        raise KqagStorageAccessError(
+            QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+            status=503,
+            reason="object_artifact_storage_unavailable",
+        )
     if configured_artifact_storage_mode() != "database":
         return None
     workspace_id = platform_workspace_id_from_auth_session(session)
@@ -13613,7 +13671,7 @@ def protected_job_routes_enabled(session: dict[str, Any] | None = None) -> bool:
     return bool(
         configured_app_mode() == "deploy"
         or configured_storage_mode() == "database"
-        or configured_artifact_storage_mode() == "database"
+        or configured_artifact_storage_mode() in {"database", "object"}
         or platform_launch_mode_enabled()
         or platform_context_from_auth_session(session) is not None
     )
@@ -13697,6 +13755,13 @@ def ensure_quote_artifact_storage_available_for_auth_session(session: dict[str, 
     if configured_artifact_storage_mode() == "database":
         artifact_storage_for_auth_session(session)
         return
+    if configured_artifact_storage_mode() == "object":
+        log_protected_local_artifact_storage_block("object_artifact_storage_unavailable")
+        raise KqagStorageAccessError(
+            QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+            status=503,
+            reason="object_artifact_storage_unavailable",
+        )
     if protected_job_routes_enabled(session):
         log_protected_local_artifact_storage_block()
         raise KqagStorageAccessError(
