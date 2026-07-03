@@ -8529,18 +8529,44 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 other_cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(self.platform_auth_session('workspace-b', user_id='other-user'))}"
                 webapp.apply_kqag_storage_migrations(database_url)
                 with LocalRunnerServer() as runner:
+                    parsed = urllib.parse.urlparse(runner.base_url)
                     for cookie in (owner_cookie, other_cookie):
                         with self.subTest(cookie=cookie[:20]):
-                            request = urllib.request.Request(
-                                f"{runner.base_url}/api/jobs/job-leaked-download/files/quotation.xlsx",
-                                headers={"Cookie": cookie},
-                            )
-                            with self.assertRaises(urllib.error.HTTPError) as error:
-                                urllib.request.urlopen(request, timeout=3)
-                            body = error.exception.read().decode("utf-8")
-                            self.assertIn(error.exception.code, {403, 404})
+                            connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
+                            try:
+                                connection.request(
+                                    "GET",
+                                    "/api/jobs/job-leaked-download/files/quotation.xlsx",
+                                    headers={"Cookie": cookie},
+                                )
+                                response = connection.getresponse()
+                                body = response.read().decode("utf-8")
+                                status = response.status
+                            finally:
+                                connection.close()
+                            self.assertIn(status, {403, 404})
                             self.assertNotIn("private-xlsx", body)
                             self.assertNotIn(str(output_root), body)
+                log_path = next((root / "logs" / "security").glob("*.jsonl"))
+                log_records = [
+                    json.loads(line)
+                    for line in log_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+
+        self.assertGreaterEqual(len(log_records), 2)
+        for record in log_records:
+            self.assertEqual(record["event"], "legacy_job_route_blocked")
+            self.assertEqual(record["details"]["reason"], "legacy_job_file_download_disabled")
+            self.assertEqual(record["details"]["route"], "files")
+            self.assertEqual(record["details"]["app_mode"], "deploy")
+            self.assertEqual(record["details"]["storage_mode"], "database")
+            self.assertEqual(record["details"]["artifact_storage_mode"], "database")
+        serialized_logs = json.dumps(log_records)
+        self.assertNotIn("job-leaked-download", serialized_logs)
+        self.assertNotIn("quotation.xlsx", serialized_logs)
+        self.assertNotIn("private-xlsx", serialized_logs)
+        self.assertNotIn(str(output_root), serialized_logs)
 
     def test_database_platform_job_status_is_owner_bound(self):
         owner_session = self.platform_auth_session("workspace-a", user_id="owner-user")

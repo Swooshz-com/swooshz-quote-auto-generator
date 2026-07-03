@@ -50,7 +50,7 @@ stored DB layout artifacts. Missing/deleted workspace profiles or missing
 layout artifacts block generation instead of falling back to bundled/default or
 local profile packs.
 
-PR #90 update: hosted/database/platform/deploy mode disables legacy direct
+PR #91 update: hosted/database/platform/deploy mode disables legacy direct
 `/api/jobs/{job}/files/{filename}` output-root downloads, and job
 status/result reads are owner/workspace-bound in protected modes. Local-UAT
 local storage mode keeps the legacy direct download route for localhost
@@ -143,7 +143,7 @@ silent fallback.
 ## Sessions And Artifact Download Audit
 
 Quote-session downloads are the intended owned artifact path because they use
-current storage and database visibility checks. PR #90 disables the legacy
+current storage and database visibility checks. PR #91 disables the legacy
 direct job-file download route in hosted/database/platform/deploy mode because
 that route treats the job id as the object selector instead of resolving
 workspace/session artifact ownership.
@@ -199,7 +199,7 @@ Reportable findings:
 | Severity | Finding | Production impact | Required follow-up |
 | --- | --- | --- | --- |
 | High, resolved in PR #88 | Database pricing references could include local packs across workspaces | Hosted database mode could cross workspace boundaries if private local pricing packs existed on the host. | Keep regression tests proving DB mode lists/details/exports/generates only workspace-owned references. |
-| Medium, resolved in PR #90 | Legacy job artifact downloads were not bound to workspace/session ownership | Hosted/database/platform/deploy mode now disables the legacy direct download route and owner-binds job status/result reads. | Keep regression tests proving leaked job IDs cannot download legacy bytes in protected modes; use quote-session artifact downloads. |
+| Medium, resolved in PR #91 | Legacy job artifact downloads were not bound to workspace/session ownership | Hosted/database/platform/deploy mode now disables the legacy direct download route and owner-binds job status/result reads. | Keep regression tests proving leaked job IDs cannot download legacy bytes in protected modes; use quote-session artifact downloads. |
 
 Positive controls reviewed:
 
@@ -227,7 +227,7 @@ UAT until these are true:
   documented, backed-up internal-alpha equivalent.
 - Artifact downloads are bound to workspace/session ownership.
 - The medium security finding for legacy direct job artifact downloads remains
-  fixed: PR #90 disables the legacy route in deploy/database/platform modes.
+  fixed: PR #91 disables the legacy route in deploy/database/platform modes.
 - Backup and restore are documented, automated where possible, and drill-tested.
 - Rollback procedure is documented for app version, DB migration, and object
   storage compatibility.
@@ -250,7 +250,7 @@ UAT until these are true:
    workspace-scoped profile defaults/layout artifacts and fails clearly when
    the selected workspace profile or layout is missing.
 4. Artifact authorization / legacy job download lockdown:
-   completed in PR #90 by disabling legacy job-file downloads in protected
+   completed in PR #91 by disabling legacy job-file downloads in protected
    modes and adding cross-user artifact/status tests.
 5. Storage productionization / object storage:
    introduce object-storage metadata, object-key authorization, checksum

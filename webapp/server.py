@@ -319,6 +319,7 @@ ALLOWED_LOG_EVENTS = {
     "draft_worker_failed",
     "generate_failed",
     "generate_needs_review",
+    "legacy_job_route_blocked",
     "openai_basis_chat_failed",
     "openai_basis_chat_model_retry",
     "openai_draft_completed",
@@ -601,7 +602,7 @@ def is_loggable_event(event_type: str) -> bool:
 
 def log_event_category(event_type: str) -> str:
     event = log_event_name(event_type)
-    if event.startswith(("security_", "abuse_")):
+    if event.startswith(("security_", "abuse_", "legacy_job_")):
         return "security"
     if event.startswith(("openai_", "deepseek_", "basis_chat", "draft", "ai_")):
         return "ai"
