@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Synthetic KQAG SQLite backup/restore/rollback verifier.
 
-The verifier creates only synthetic rows and emits only metadata. It is a
-temporary internal-alpha evidence path for SQLite database + database-artifact
-mode, not final production object-storage readiness.
+The verifier creates only synthetic rows and emits only metadata. It is local
+database + database-artifact evidence only; it does not make DB/BLOB artifact
+mode hosted/protected/deploy-ready or final production object-storage ready.
 """
 
 from __future__ import annotations

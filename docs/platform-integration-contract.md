@@ -65,15 +65,16 @@ host secret manager or local UAT process environment and must not be committed.
 - `KQAG_ARTIFACT_STORAGE_MODE`
 - `KQAG_DATABASE_URL`
 
-For the current internal-alpha simple-hosting posture, KQAG expects database
-quote-session storage plus temporary database artifact storage:
+For hosted/protected/deploy readiness, KQAG expects workspace-owned database
+app records plus object storage for generated artifact bytes:
 
 - `KQAG_STORAGE_MODE=database`
-- `KQAG_ARTIFACT_STORAGE_MODE=database`
+- `KQAG_ARTIFACT_STORAGE_MODE=object`
 
-Object artifact mode remains production-blocked until live provider,
-backup/restore, retention/delete, deployment, and operations evidence are
-complete.
+Database artifact/BLOB mode is local-UAT/synthetic evidence only and must not
+satisfy hosted/protected/deploy or production readiness. Object artifact mode
+remains production-blocked until live provider, backup/restore,
+retention/delete, deployment, and operations evidence are complete.
 
 ## Launch And Consume Contract
 
@@ -169,7 +170,7 @@ Platform credentials:
 | Profile/pricing/layout workspace-only reads | `test_database_storage_profiles_are_workspace_db_only`, `test_database_storage_pricing_references_are_workspace_db_only`, `test_database_artifact_profile_layout_is_workspace_db_only` |
 | Database artifact workspace scoping and raw token omission | `test_database_artifact_storage_saves_workspace_scoped_generated_exports`, `test_database_artifact_storage_does_not_persist_raw_platform_launch_token` |
 | Local quote-session and artifact fallback blocked by Platform context | `test_platform_session_context_blocks_local_quote_session_runtime_storage_in_local_app_mode`, `test_platform_session_context_blocks_local_artifact_storage_in_local_app_mode` |
-| Synthetic internal-alpha launch/generate/session/download/delete smoke | `test_platform_uat_smoke_launch_generate_list_and_download_database_artifact` and `scripts/verify_hosted_smoke.py` |
+| Synthetic hosted negative launch/generate/session/download/delete smoke | `test_platform_uat_smoke_launch_generate_list_and_download_database_artifact` and `scripts/verify_hosted_smoke.py`; readiness remains blocked until object storage evidence is live |
 
 This PR adds no duplicate runtime behavior tests because the existing tests
 already cover the KQAG-side fail-closed and isolation behavior. The new docs
@@ -193,18 +194,18 @@ The current Platform `origin/main` contract matches KQAG's adapter assumptions:
 - Platform viewer access for KQAG is blocked because KQAG has no approved
   read-only launch mode.
 
-## Internal-Alpha Checklist
+## Hosted Readiness Checklist
 
-Before treating a hosted KQAG environment as internal-alpha, operators should:
+Before treating a hosted KQAG environment as launch-ready, operators should:
 
 1. Configure KQAG with Platform launch mode, a host-managed session secret,
-   database storage, database artifact storage, and a host-managed database URL.
+   database storage, object artifact storage, and a host-managed database URL.
 2. Configure Platform KQAG browser handoff with the KQAG app base URL through
    Platform's own secret/config surface.
 3. Verify Platform workspace membership, app entitlement, and role access are
    present for the intended internal workspace.
-4. Run KQAG's metadata-only backup/restore, hosted observability, and hosted
-   smoke evidence commands.
+4. Run KQAG's metadata-only readiness checker and confirm DB/BLOB artifact mode
+   remains blocked by `database_blob_artifact_storage_not_launch_ready`.
 5. Run a live Platform-to-KQAG smoke using safe synthetic tenant data only.
 6. Confirm no raw launch token, OAuth value, cookie, DB URL, callback query,
    private path, generated quote content, or artifact bytes appear in logs,

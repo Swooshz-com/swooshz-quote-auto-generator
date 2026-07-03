@@ -1,18 +1,18 @@
 {
   "schema": "swooshz.kqag.internal-alpha-retention-policy.v1",
-  "scope": "temporary database/database-artifact internal-alpha exception only",
+  "scope": "synthetic database/database-artifact local-UAT evidence only; not launch readiness",
   "non_destructive_verifier_only": true,
   "notes": [
     "This policy is generic and secret-safe.",
     "The verifier validates the policy shape with synthetic data only.",
-    "Final production still requires object storage, hosted logging/monitoring, and approved deletion workflows."
+    "Hosted/protected/deploy and production readiness require object storage, hosted logging/monitoring, and approved deletion workflows."
   ],
   "data_classes": [
     {
       "data_class": "quote_sessions",
       "storage": "kqag_quote_sessions",
       "retention_days": 90,
-      "rollback_note": "Restore the SQLite database from the prior known-good backup and verify workspace/session checksums before reopening internal-alpha access."
+      "rollback_note": "Restore the SQLite database from the prior known-good backup and verify workspace/session checksums before using local-UAT access."
     },
     {
       "data_class": "generated_artifacts",
@@ -48,7 +48,7 @@
       "data_class": "backups",
       "storage": "operator-managed encrypted backup location outside the repository",
       "retention_days": 30,
-      "rollback_note": "Keep at least one prior known-good backup while internal-alpha testers are active, and verify restore before discarding the previous backup."
+      "rollback_note": "Keep at least one prior known-good backup for local-UAT evidence drills, and verify restore before discarding the previous backup."
     }
   ]
 }

@@ -62,7 +62,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertTrue(status["local_uat_supported"])
         self.assertFalse(status["internal_alpha_ready"])
         self.assertFalse(status["production_ready"])
-        self.assertTrue(status["internal_alpha_future_exception"]["possible"])
+        self.assertFalse(status["internal_alpha_future_exception"]["possible"])
         blocker_ids = {item["id"] for item in status["blockers"]}
         self.assertIn("local_runtime_storage", blocker_ids)
         self.assertIn("hosted_logging_monitoring_missing", blocker_ids)
@@ -215,10 +215,14 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertIn("profile/pricing labels", snapshots["stores"])
         blocker_ids = {item["id"] for item in status["production_blockers"]}
         self.assertIn("session_business_hardening_incomplete", blocker_ids)
-        self.assertTrue(status["internal_alpha_ready"])
+        self.assertFalse(status["internal_alpha_ready"])
+        self.assertIn(
+            "database_blob_artifact_storage_not_launch_ready",
+            {item["id"] for item in status["internal_alpha_blockers"]},
+        )
         self.assertFalse(status["production_ready"])
 
-    def test_readiness_reports_stale_deleted_artifact_route_and_race_evidence(self):
+    def test_readiness_reports_stale_deleted_artifact_route_and_race_evidence_without_overclaim(self):
         status = self.readiness_status(
             {
                 "KQAG_STORAGE_MODE": "database",
@@ -259,10 +263,10 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         internal_alpha_blocker_ids = {item["id"] for item in status["internal_alpha_blockers"]}
         production_blocker_ids = {item["id"] for item in status["production_blockers"]}
         self.assertEqual(status["backup_restore_evidence"]["status"], "passed")
-        self.assertTrue(status["backup_restore_evidence"]["database_artifact_temporary_exception_supported"])
+        self.assertFalse(status["backup_restore_evidence"]["database_artifact_temporary_exception_supported"])
         self.assertNotIn("backup_restore_unverified", blocker_ids)
         self.assertIn("object_storage_missing", blocker_ids)
-        self.assertNotIn("object_storage_missing", internal_alpha_blocker_ids)
+        self.assertIn("database_blob_artifact_storage_not_launch_ready", internal_alpha_blocker_ids)
         self.assertIn("object_storage_missing", production_blocker_ids)
         self.assertNotIn("sqlite_not_final_production", internal_alpha_blocker_ids)
         self.assertIn("sqlite_not_final_production", production_blocker_ids)
@@ -275,7 +279,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertNotIn("hosted_logging_monitoring_missing", internal_alpha_blocker_ids)
         self.assertNotIn("hosted_smoke_evidence_missing", internal_alpha_blocker_ids)
         self.assertEqual(status["object_storage_evidence"]["status"], "not_run_by_checker")
-        self.assertTrue(status["internal_alpha_ready"])
+        self.assertFalse(status["internal_alpha_ready"])
         self.assertFalse(status["production_ready"])
 
     def test_object_storage_contract_evidence_is_not_assumed_when_not_run(self):
@@ -487,6 +491,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertNotIn("local_staging_cleanup_evidence_missing", blocker_ids)
         self.assertIn("object_retention_delete_live_evidence_missing", production_blocker_ids)
         self.assertIn("db_object_backup_restore_live_evidence_missing", production_blocker_ids)
+        self.assertFalse(status["internal_alpha_ready"])
         self.assertFalse(status["production_ready"])
         text = completed.stdout + completed.stderr
         self.assertNotIn(str(object_work_dir), text)
@@ -530,7 +535,11 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertIn("object_storage_missing", production_blocker_ids)
         self.assertIn("sqlite_not_final_production", production_blocker_ids)
         self.assertIn("production_deployment_operations_evidence_missing", production_blocker_ids)
-        self.assertTrue(status["internal_alpha_ready"])
+        self.assertIn(
+            "database_blob_artifact_storage_not_launch_ready",
+            {item["id"] for item in status["internal_alpha_blockers"]},
+        )
+        self.assertFalse(status["internal_alpha_ready"])
         self.assertFalse(status["production_ready"])
 
     def test_hosted_observability_evidence_is_not_assumed_when_not_run(self):
@@ -652,7 +661,8 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertNotIn("backup_restore_unverified", blocker_ids)
         self.assertNotIn("hosted_logging_monitoring_missing", blocker_ids)
         self.assertNotIn("hosted_smoke_evidence_missing", blocker_ids)
-        self.assertTrue(status["internal_alpha_ready"])
+        self.assertIn("database_blob_artifact_storage_not_launch_ready", blocker_ids)
+        self.assertFalse(status["internal_alpha_ready"])
         self.assertFalse(status["production_ready"])
         self.assertIn("object_storage_missing", blocker_ids)
         self.assertIn("production_deployment_operations_evidence_missing", blocker_ids)

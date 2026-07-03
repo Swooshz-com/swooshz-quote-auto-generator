@@ -1,32 +1,31 @@
-# KQAG Internal-Alpha VPS/Coolify Scaffold
+# KQAG Hosted Validation Notes
 
 ## Purpose
 
-This runbook is the KQAG app-specific scaffold for an already-prepared
-VPS/Coolify-style host. It is metadata-only guidance for internal-alpha
-validation. It does not deploy anything, configure infrastructure, add secrets,
-prove live hosting, or claim production readiness.
+This note preserves the KQAG app-specific hosted validation checklist shape for
+an already-prepared host. It is metadata-only local guidance only. It does not
+deploy anything, configure infrastructure, add secrets, prove live hosting, or
+claim hosted/protected/deploy/production readiness.
 
 KQAG is an internal Koncept Images Pte Ltd quote generator module, not
 ecommerce or public SaaS. Koncept profile, pricing, and layout packs are
 workspace-imported tenant data only. A new workspace starts with no real
 Koncept pack until an authorized import or seed action targets that workspace.
 
-## Target Posture
+## Blocked DB/BLOB Posture
 
-Use this posture only for the temporary internal-alpha/simple-hosting path:
+The former DB/BLOB artifact posture is no longer a launch target:
 
 - `APP_MODE=deploy`.
 - `KQAG_STORAGE_MODE=database`.
 - `KQAG_ARTIFACT_STORAGE_MODE=database`.
 - `KQAG_DATABASE_URL` is configured only through the host secret manager.
 - Platform/workspace launch context is required for protected hosted use.
-- Object mode remains blocked for production until live provider evidence,
-  DB+object backup/restore, retention/delete evidence, and operations evidence
-  are complete.
+- Readiness remains blocked because generated XLSX/PDF bytes require object
+  storage. Database rows store metadata and workspace-owned app records only.
 
-The database artifact mode is a temporary internal-alpha exception. It is not
-final production object storage.
+Database/BLOB artifact mode is local-UAT/synthetic evidence only. It must not
+satisfy hosted, protected, deploy, or production readiness.
 
 ## Host Boundary
 
@@ -48,7 +47,7 @@ Use `deploy/internal-uat/coolify/kqag.uat.env.example` as the placeholder
 checklist. Copy names into the host secret/environment manager and replace
 placeholders there. Do not commit populated values.
 
-Required names for this internal-alpha posture:
+Required names for any future hosted validation environment:
 
 | Area | Names |
 | --- | --- |
@@ -60,8 +59,9 @@ Required names for this internal-alpha posture:
 | Runtime housekeeping | `QUOTE_DATA_ROOT`, `QUOTE_OUTPUT_ROOT`, `QUOTE_TMP_ROOT`, `QUOTE_LOG_ROOT`, `PORT` |
 
 `QUOTE_DATA_ROOT` and `QUOTE_OUTPUT_ROOT` are not durable product-visible
-storage in this posture. Quote sessions and generated artifacts must persist
-through workspace-owned database rows and database artifact records.
+storage in this posture. Quote-domain records must use workspace-owned database
+rows. Production generated artifact bytes must use object storage, not database
+BLOB rows or local runtime roots.
 
 ## Validation Commands
 
@@ -71,10 +71,10 @@ Run the placeholder template check locally before copying names into the host:
 python scripts\verify_internal_uat_deploy_template.py
 ```
 
-Run the metadata-only hosted validation bundle with synthetic data:
+Run the metadata-only blocked hosted validation bundle with synthetic data:
 
 ```powershell
-python scripts\verify_internal_alpha_hosted_validation.py --work-dir _tmp\validation\internal-alpha-hosted
+python scripts\verify_internal_alpha_hosted_validation.py --work-dir _tmp\validation\hosted-blocked
 ```
 
 The bundle composes the existing synthetic evidence:
@@ -85,15 +85,16 @@ python scripts\verify_hosted_observability.py --work-dir _tmp\validation\hosted-
 python scripts\verify_hosted_smoke.py --work-dir _tmp\validation\hosted-smoke
 ```
 
-Run the readiness checker for the same DB + DB-artifact posture:
+Run the readiness checker for the same DB + DB-artifact negative posture:
 
 ```powershell
 python scripts\check_production_readiness.py --with-backup-restore-evidence --with-hosted-observability-evidence --with-hosted-smoke-evidence
 ```
 
-The readiness checker is expected to keep `production_ready=false`. It may
-report conditional internal-alpha readiness only when database storage,
-database artifact storage, and the evidence flags all pass.
+The readiness checker is expected to keep both `internal_alpha_ready=false` and
+`production_ready=false`. It should report
+`database_blob_artifact_storage_not_launch_ready` when DB/BLOB artifact mode is
+selected.
 
 ## Hosted Smoke Checklist
 
@@ -109,8 +110,9 @@ bytes, host IPs, or private paths into issue/PR output.
 - Intended workspace starts without a Koncept pack until import.
 - Workspace-owned profile pack import/save/use works.
 - Workspace-owned pricing reference import/save/use works.
-- Quote generation persists through database quote sessions.
-- XLSX/PDF artifacts download only through authorized quote-session routes.
+- Quote generation persists metadata through database quote sessions.
+- XLSX/PDF artifacts require object storage before hosted/protected/deploy or
+  production readiness can be claimed.
 - Delete makes the session and artifacts inaccessible.
 - Logout/sign-out behaves safely.
 - Legacy direct job file downloads remain disabled in deploy/database/platform

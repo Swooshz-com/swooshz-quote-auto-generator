@@ -39,7 +39,7 @@ python webapp\server.py --check-deploy-uat-env
 ```
 
 ```powershell
-python scripts\verify_internal_alpha_hosted_validation.py --work-dir _tmp\validation\internal-alpha-hosted
+python scripts\verify_internal_alpha_hosted_validation.py --work-dir _tmp\validation\hosted-blocked
 ```
 
 ```powershell
@@ -56,8 +56,9 @@ These checks verify:
 - Runtime roots remain placeholders in committed templates and must be
   host-managed housekeeping paths, not durable quote-session or artifact
   storage for hosted use.
-- The current internal-alpha hosted validation bundle uses database storage and
-  database artifact storage with synthetic data only.
+- The hosted validation bundle proves database storage plus database
+  artifact/BLOB mode remains blocked as launch readiness, even with synthetic
+  evidence.
 - Deploy preflight can reach `ready` with synthetic env and temporary runtime
   roots outside the repo.
 - Missing deploy-auth config blocks without printing secret values.
@@ -91,7 +92,7 @@ $env:APP_MODE="<deploy>"
 $env:AUTH_REQUIRED="<true>"
 $env:SESSION_SECRET="<synthetic-session-secret>"
 $env:KQAG_STORAGE_MODE="<database>"
-$env:KQAG_ARTIFACT_STORAGE_MODE="<database>"
+$env:KQAG_ARTIFACT_STORAGE_MODE="<object-for-readiness-or-database-for-negative-test>"
 $env:KQAG_DATABASE_URL="<synthetic-database-url>"
 $env:KQAG_PLATFORM_LAUNCH_MODE="<platform>"
 $env:KQAG_PLATFORM_BASE_URL="<synthetic-platform-base-url>"

@@ -34,14 +34,16 @@ KQAG database URL:
 $env:KQAG_PLATFORM_LAUNCH_MODE="platform"
 $env:KQAG_PLATFORM_BASE_URL="https://platform.example.test"
 $env:KQAG_STORAGE_MODE="database"
-$env:KQAG_ARTIFACT_STORAGE_MODE="database"
+$env:KQAG_ARTIFACT_STORAGE_MODE="object"
 $env:KQAG_DATABASE_URL="sqlite:///C:/path/to/local/kqag-storage.sqlite3"
 ```
 
 The first implementation supports the reviewed SQLite migration path. Unsupported
 database URL schemes fail closed with a generic app-facing storage error and
 privacy-safe logs. `KQAG_ARTIFACT_STORAGE_MODE=database` stores generated quote
-exports and file assets in workspace-scoped SQLite BLOB rows for internal UAT.
+exports and file assets in workspace-scoped SQLite BLOB rows for local-UAT and
+synthetic verifier coverage only; it is not a hosted/protected/deploy readiness
+or production artifact path.
 `KQAG_ARTIFACT_STORAGE_MODE=object` requires database storage plus a configured
 S3-compatible object backend. Object mode stores generated artifact bytes in the
 object backend and safe workspace-owned metadata in the database; it must not
@@ -65,9 +67,10 @@ The app does not auto-run migrations on startup.
 
 ## Backup, Restore, Retention, And Rollback Evidence
 
-Database artifact mode is a temporary internal-alpha/simple-hosting exception,
-not final production storage. Before using it for internal alpha evidence, run
-the synthetic verifier:
+Database artifact mode is not a hosted/protected/deploy readiness path and is
+not final production storage. The synthetic verifier remains useful as a
+metadata-only local-UAT guard, but it cannot make DB/BLOB artifact storage
+launch-ready:
 
 ```powershell
 python scripts/verify_database_backup_restore.py
@@ -86,9 +89,9 @@ paths, artifact bytes, generated quote contents, customer data, pricing/profile
 payloads, staff emails, OAuth values, cookies, tokens, or API keys.
 
 This evidence does not replace hosted smoke testing, hosted logging/monitoring,
-or production object storage. Production still requires object storage plus DB
-metadata, retention state, and backup/restore evidence for DB rows and objects
-together.
+or production object storage. Hosted/protected/deploy and production readiness
+require object storage plus DB metadata, retention state, and backup/restore
+evidence for DB rows and objects together.
 
 ## Object Artifact Mode
 

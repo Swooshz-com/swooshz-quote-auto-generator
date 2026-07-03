@@ -1,6 +1,6 @@
 {
   "schema": "swooshz.kqag.hosted-observability-policy.v1",
-  "scope": "internal-alpha hosted logging and monitoring readiness evidence only",
+  "scope": "synthetic hosted logging and monitoring evidence only; not launch readiness",
   "synthetic_verifier_only": true,
   "allowed_event_categories": [
     "ai",
@@ -48,14 +48,14 @@
     "do_not_expose_runtime_roots_or_database_urls": true
   },
   "retention": {
-    "internal_alpha_log_retention_days": 30,
+    "local_uat_log_retention_days": 30,
     "host_specific_export_required": true,
     "external_vendor_dependency_required_by_this_repo": false
   },
   "limitations": [
     "This policy does not configure an external logging vendor.",
     "Hosted deployment wiring and alert delivery remain host-specific.",
-    "Hosted smoke evidence remains a separate internal-alpha blocker.",
+    "Hosted smoke evidence remains separate from launch readiness.",
     "Production readiness still requires object storage and production operations evidence."
   ]
 }

@@ -19,15 +19,15 @@ platform concerns belong in `Swooshz-com/swooshz-platform`.
 - `docs/internal-uat-deploy-auth-readiness.md`: existing gated single-instance
   internal UAT deploy/auth readiness notes, boundaries, smoke checks, and
   non-production limitations.
-- `docs/internal-uat-coolify-deploy.md`: KQAG-specific internal-alpha
-  VPS/Coolify scaffold for the DB + DB-artifact simple-hosting posture,
-  metadata-only validation commands, and non-production limits.
+- `docs/internal-uat-coolify-deploy.md`: KQAG-specific historical hosted
+  validation notes; the DB/BLOB artifact path is now documented as blocked for
+  hosted/protected/deploy/production readiness.
 - `docs/internal-uat-login-and-pre-vps-dry-run.md`: approved-tester login
   expectations and local/offline deploy-auth checks to run before buying or
   touching a VPS.
 - `docs/production-readiness-audit.md`: production-readiness verdict, storage
   surface audit, Codex Security findings, safe readiness command, and follow-up
-  PR sequence before internal alpha or production hosting.
+  PR sequence before any hosted/protected/deploy or production launch.
 - `docs/architecture-dead-code-fallback-audit.md`: whole-codebase architecture,
   dead-code, local-trace, removed sample-path, fallback, and docs-cleanup audit
   that defines the stricter no-product-visible-sample direction.
