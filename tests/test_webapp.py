@@ -19294,7 +19294,6 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 self.assertNotIn("team-pricing", {item["id"] for item in workspace_b.list_pricing_references()})
                 self.assertEqual(workspace_a.pricing_reference_detail("team-pricing")["items"][0]["id"], "graphics-row")
                 self.assertIsNone(workspace_b.pricing_reference_detail("team-pricing"))
-
                 payload = valid_payload()
                 payload["quote_session"] = {
                     "session_id": "quote-team-a",
@@ -19310,6 +19309,94 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 self.assertFalse(workspace_b.delete_quote_session("quote-team-a"))
                 self.assertTrue(workspace_a.delete_quote_session("quote-team-a"))
                 self.assertEqual(workspace_a.list_quote_sessions(), [])
+
+    def test_database_storage_new_workspace_has_no_koncept_or_synthetic_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{(root / 'kqag-storage.sqlite3').as_posix()}"
+            local_profiles_root = root / "local-profiles"
+            local_pricing_root = root / "local-pricing"
+            bundled_pricing_root = root / "bundled-pricing"
+            write_test_profile_pack(local_profiles_root, "koncept-images-pte-ltd", "koncept-pricing")
+            write_test_profile_pack(local_profiles_root, "synthetic-exhibition-fixture-template", "synthetic-exhibition-fixture-pricing")
+            write_test_pricing_reference(local_pricing_root, "koncept-pricing", [with_required_pricing_metadata({
+                "id": "koncept-row",
+                "section": "Graphics",
+                "description": "Koncept local row",
+                "unit_hint": "sqm",
+                "sale_unit_price": 10,
+            })])
+            write_test_pricing_reference(bundled_pricing_root, "synthetic-exhibition-fixture-pricing", [with_required_pricing_metadata({
+                "id": "synthetic-row",
+                "section": "Graphics",
+                "description": "Synthetic fixture row",
+                "unit_hint": "sqm",
+                "sale_unit_price": 20,
+            })])
+            platform_session = self.platform_auth_session("workspace-new-empty")
+            payload = valid_payload()
+            payload["profile_id"] = "koncept-images-pte-ltd"
+            payload["pricing_reference_id"] = "koncept-pricing"
+            env = {
+                "KQAG_STORAGE_MODE": "database",
+                "KQAG_ARTIFACT_STORAGE_MODE": "database",
+                "KQAG_DATABASE_URL": database_url,
+                "QUOTE_DATA_ROOT": str(root / "data"),
+                "QUOTE_OUTPUT_ROOT": str(root / "output"),
+                "QUOTE_TMP_ROOT": str(root / "tmp"),
+                "QUOTE_LOG_ROOT": str(root / "logs"),
+            }
+            completed = webapp.subprocess.CompletedProcess(args=[], returncode=0, stdout="Wrote quotation.xlsx\n", stderr="")
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(webapp, "profiles_root", return_value=local_profiles_root),
+                mock.patch.object(webapp, "pricing_references_root", return_value=local_pricing_root),
+                mock.patch.object(webapp, "bundled_pricing_references_root", return_value=bundled_pricing_root),
+                mock.patch.object(webapp.subprocess, "run", return_value=completed) as run,
+            ):
+                webapp.apply_kqag_storage_migrations(database_url)
+                storage = webapp.app_storage_for_auth_session(platform_session)
+
+                self.assertEqual(storage.list_profiles(), [])
+                self.assertEqual(storage.list_pricing_references(), [])
+                self.assertIsNone(storage.profile_detail("koncept-images-pte-ltd", source="company"))
+                self.assertIsNone(storage.pricing_reference_detail("koncept-pricing", source="company"))
+                self.assertIsNone(storage.profile_detail("synthetic-exhibition-fixture-template", source="company"))
+                self.assertIsNone(storage.pricing_reference_detail("synthetic-exhibition-fixture-pricing", source="company"))
+                self.assertEqual(webapp.profile_selection_error(payload, auth_session=platform_session), "Select a valid company profile before generating a quote.")
+                self.assertEqual(webapp.pricing_reference_selection_error(payload, auth_session=platform_session), "Select a valid pricing reference before generating a quote.")
+
+                result = webapp.run_quote_job(
+                    payload,
+                    output_root=root / "out",
+                    tmp_root=root / "tmp",
+                    auth_session=platform_session,
+                )
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("Select a valid company profile before generating a quote.", result["errors"])
+        self.assertIn("Select a valid pricing reference before generating a quote.", result["errors"])
+        run.assert_not_called()
+
+    def test_database_artifact_profile_layout_is_workspace_db_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{(root / 'kqag-storage.sqlite3').as_posix()}"
+            env = {
+                "KQAG_STORAGE_MODE": "database",
+                "KQAG_ARTIFACT_STORAGE_MODE": "database",
+                "KQAG_DATABASE_URL": database_url,
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                webapp.apply_kqag_storage_migrations(database_url)
+                workspace_a = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-layout-a"))
+                workspace_b = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-layout-b"))
+                workspace_a.save_profile(workspace_profile_with_layout("team-layout-profile"))
+
+                self.assertIsNotNone(workspace_a.profile_detail("team-layout-profile", source="company"))
+                self.assertIsNotNone(workspace_a.profile_layout_artifact("team-layout-profile"))
+                self.assertIsNone(workspace_b.profile_detail("team-layout-profile", source="company"))
+                self.assertIsNone(workspace_b.profile_layout_artifact("team-layout-profile"))
 
     def test_database_storage_profiles_are_workspace_db_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -19796,6 +19883,47 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertNotIn("synthetic-private-object-quote", result_text)
         self.assertNotIn(str(output_root), result_text)
         self.assertFalse((output_root / "job-object-artifact-protected" / "quotation.xlsx").exists())
+
+    def test_object_artifact_storage_mode_with_incomplete_provider_config_fails_closed(self):
+        private_endpoint = "https://private-object-store.example.test/path"
+        private_bucket = "private-koncept-bucket"
+        private_access_key = "AKIA_PRIVATE_TEST_KEY"
+        root = test_temp_root() / f"object-artifact-incomplete-provider-{time.time_ns()}"
+        payload = valid_payload()
+
+        env = self.deploy_auth_env(
+            KQAG_STORAGE_MODE="local",
+            KQAG_ARTIFACT_STORAGE_MODE="object",
+            KQAG_OBJECT_STORAGE_PROVIDER="s3_compatible",
+            KQAG_OBJECT_STORAGE_ENDPOINT_URL=private_endpoint,
+            KQAG_OBJECT_STORAGE_BUCKET=private_bucket,
+            KQAG_OBJECT_STORAGE_REGION="ap-southeast-private",
+            KQAG_OBJECT_STORAGE_ACCESS_KEY_ID=private_access_key,
+            QUOTE_OUTPUT_ROOT=str(root / "output"),
+            QUOTE_TMP_ROOT=str(root / "tmp"),
+            QUOTE_LOG_ROOT=str(root / "logs"),
+        )
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(webapp.subprocess, "run") as run:
+            provider_status = webapp.configured_object_storage_status()
+            result = webapp.run_quote_job(
+                payload,
+                output_root=root / "output",
+                tmp_root=root / "tmp",
+                job_id="job-object-provider-incomplete",
+                auth_session=self.platform_auth_session("workspace-object-provider"),
+            )
+
+        result_text = json.dumps(result, sort_keys=True)
+        self.assertEqual(provider_status["provider"], "s3_compatible")
+        self.assertEqual(provider_status["missing_fields"], ["KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY"])
+        self.assertFalse(provider_status["runtime_backend_available"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["errors"], ["Quote artifact storage is not available in this environment."])
+        self.assertEqual(run.call_count, 0)
+        self.assertNotIn(private_endpoint, result_text)
+        self.assertNotIn(private_bucket, result_text)
+        self.assertNotIn(private_access_key, result_text)
+        self.assertNotIn("KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY", result_text)
 
     def test_database_artifact_storage_requires_platform_context_and_migration(self):
         with mock.patch.dict(os.environ, {"KQAG_ARTIFACT_STORAGE_MODE": "database"}, clear=True):

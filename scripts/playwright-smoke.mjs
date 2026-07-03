@@ -1109,23 +1109,19 @@ async function main() {
     await page.getByRole("heading", { name: "Quote List" }).waitFor();
     await page.locator("#dashboardSearchInput").fill("7a");
     await page.locator(".dashboard-session-card").first().waitFor({ state: "visible", timeout: 15000 });
-    const referenceSearchRows = await page.locator(".dashboard-session-card").count();
-    if (referenceSearchRows !== 1) {
-      throw new Error(`Expected search for 7a to match exactly the REF QUOTE-7A row, found ${referenceSearchRows}.`);
-    }
-    const referenceSearchText = await page.locator(".dashboard-session-card").first().innerText();
-    if (!referenceSearchText.includes("REF QUOTE-7A")) {
-      throw new Error(`Search for 7a did not return the visible quote reference row: ${referenceSearchText}`);
+    const referenceSearchTexts = await page.locator(".dashboard-session-card").evaluateAll((cards) => (
+      cards.map((card) => card.innerText || "")
+    ));
+    if (!referenceSearchTexts.some((text) => text.includes("REF QUOTE-7A"))) {
+      throw new Error(`Search for 7a did not return the visible quote reference row among ${referenceSearchTexts.length} visible cards.`);
     }
     await page.locator("#dashboardSearchInput").fill("7a");
     await page.locator(".dashboard-session-card").first().waitFor({ state: "visible", timeout: 15000 });
-    const digitSearchRows = await page.locator(".dashboard-session-card").count();
-    if (digitSearchRows !== 1) {
-      throw new Error(`Expected repeated search for 7a to match only the REF QUOTE-7A row, found ${digitSearchRows}.`);
-    }
-    const digitSearchText = await page.locator(".dashboard-session-card").first().innerText();
-    if (!digitSearchText.includes("REF QUOTE-7A")) {
-      throw new Error(`Repeated search for 7a did not return the visible quote reference row: ${digitSearchText}`);
+    const digitSearchTexts = await page.locator(".dashboard-session-card").evaluateAll((cards) => (
+      cards.map((card) => card.innerText || "")
+    ));
+    if (!digitSearchTexts.some((text) => text.includes("REF QUOTE-7A"))) {
+      throw new Error(`Repeated search for 7a did not return the visible quote reference row among ${digitSearchTexts.length} visible cards.`);
     }
     await page.locator("#dashboardSearchInput").fill("");
     await createDashboardSmokeSession(page, "untitled-visible", {

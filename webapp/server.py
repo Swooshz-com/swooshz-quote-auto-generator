@@ -54,7 +54,16 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 import pricing_reference_cleanup
 import pricing_reference_enrichment
-from webapp.object_storage import ALLOWED_OWNER_TYPES
+from webapp.object_storage import (
+    ALLOWED_OWNER_TYPES,
+    OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME,
+    OBJECT_STORAGE_BUCKET_ENV_NAME,
+    OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME,
+    OBJECT_STORAGE_PROVIDER_ENV_NAME,
+    OBJECT_STORAGE_REGION_ENV_NAME,
+    OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME,
+    object_storage_provider_status,
+)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 GENERATOR_PATH = PROJECT_ROOT / "scripts" / "generate_quote.py"
@@ -1328,6 +1337,18 @@ def configured_artifact_storage_mode() -> str:
     return "local"
 
 
+def configured_object_storage_status() -> dict[str, Any]:
+    env_names = (
+        OBJECT_STORAGE_PROVIDER_ENV_NAME,
+        OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME,
+        OBJECT_STORAGE_BUCKET_ENV_NAME,
+        OBJECT_STORAGE_REGION_ENV_NAME,
+        OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME,
+        OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME,
+    )
+    return object_storage_provider_status({name: read_dotenv_value(name) for name in env_names})
+
+
 def configured_database_url() -> str:
     return clean_text(read_dotenv_value(KQAG_DATABASE_URL_ENV_NAME))
 
@@ -2010,7 +2031,14 @@ def hosted_smoke_evidence_summary(*, status: str) -> dict[str, Any]:
     }
 
 
-def object_storage_evidence_summary(*, status: str, artifact_mode: str, database_mode: bool, database_configured: bool) -> dict[str, Any]:
+def object_storage_evidence_summary(
+    *,
+    status: str,
+    artifact_mode: str,
+    database_mode: bool,
+    database_configured: bool,
+    provider_status: dict[str, Any],
+) -> dict[str, Any]:
     normalized_status = clean_text(status).lower() or "not_run_by_checker"
     if normalized_status not in {"passed", "failed", "not_run_by_checker"}:
         normalized_status = "not_run_by_checker"
@@ -2031,7 +2059,7 @@ def object_storage_evidence_summary(*, status: str, artifact_mode: str, database
         ],
         "owner_types": sorted(ALLOWED_OWNER_TYPES),
         "production_object_storage_contract_supported": bool(passed and object_mode and database_mode and database_configured),
-        "runtime_backend_configured": False,
+        "runtime_backend_configured": bool(provider_status.get("runtime_backend_available")),
         "notes": [
             "Evidence is synthetic and metadata-only.",
             "This proves the provider-neutral contract, not live cloud credentials, provider wiring, retention jobs, deployment operations, or production readiness.",
@@ -2054,6 +2082,7 @@ def production_readiness_status(
     database_mode = storage_mode == "database"
     database_artifacts = artifact_mode == "database"
     object_artifacts = artifact_mode == "object"
+    object_storage_provider = configured_object_storage_status()
     backup_restore_evidence = backup_restore_evidence_summary(
         status=backup_restore_evidence_status,
         database_mode=database_mode,
@@ -2071,6 +2100,7 @@ def production_readiness_status(
         artifact_mode=artifact_mode,
         database_mode=database_mode,
         database_configured=database_configured,
+        provider_status=object_storage_provider,
     )
 
     profiles = readiness_surface(
@@ -2138,7 +2168,10 @@ def production_readiness_status(
         persistent_across_restart=database_artifacts or object_artifacts or bool(clean_text(read_dotenv_value(QUOTE_OUTPUT_ROOT_ENV_NAME))),
         persistent_across_redeploy=database_artifacts or object_artifacts,
         internal_alpha_suitable=database_artifacts and database_configured,
-        production_suitable=object_storage_evidence["production_object_storage_contract_supported"],
+        production_suitable=(
+            object_storage_evidence["production_object_storage_contract_supported"]
+            and bool(object_storage_provider.get("production_provider_ready"))
+        ),
         follow_up=(
             "Move generated XLSX/PDF and uploaded assets to object storage with database metadata."
             if database_artifacts
@@ -2161,6 +2194,8 @@ def production_readiness_status(
         blockers.append(readiness_blocker("sqlite_not_final_production", "P1", "SQLite is acceptable only as an explicitly backed-up internal-alpha/simple-hosting option, not final production storage.", gates=("production",)))
     if not object_storage_evidence["production_object_storage_contract_supported"]:
         blockers.append(readiness_blocker("object_storage_missing", "P1", "No verified object-storage-backed asset/artifact contract exists for production XLSX/PDF and uploaded reference assets.", gates=("production",)))
+    if object_artifacts and not object_storage_provider.get("production_provider_ready"):
+        blockers.append(readiness_blocker("object_storage_provider_unavailable", "P1", "Object artifact mode is selected, but no production-ready credentialed object-storage provider adapter is available.", gates=("production",)))
     blockers.append(readiness_blocker("production_deployment_operations_evidence_missing", "P1", "Production deployment, operations, alert delivery, and live host evidence are not verified by this command.", gates=("production",)))
     if not backup_restore_evidence["database_artifact_temporary_exception_supported"]:
         blockers.append(readiness_blocker("backup_restore_unverified", "P1", "Backup, restore, retention, and rollback evidence has not been verified for the selected database/database-artifact mode."))
@@ -2197,6 +2232,7 @@ def production_readiness_status(
         "hosted_observability_evidence": hosted_observability_evidence,
         "hosted_smoke_evidence": hosted_smoke_evidence,
         "object_storage_evidence": object_storage_evidence,
+        "object_storage_provider": object_storage_provider,
         "security_scan_status": clean_text(security_scan_status) or "not_run_by_command",
         "local_uat_supported": True,
         "internal_alpha_blockers": internal_alpha_blockers,
