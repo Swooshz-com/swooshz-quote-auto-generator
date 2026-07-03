@@ -19797,6 +19797,47 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertNotIn(str(output_root), result_text)
         self.assertFalse((output_root / "job-object-artifact-protected" / "quotation.xlsx").exists())
 
+    def test_object_artifact_storage_mode_with_incomplete_provider_config_fails_closed(self):
+        private_endpoint = "https://private-object-store.example.test/path"
+        private_bucket = "private-koncept-bucket"
+        private_access_key = "AKIA_PRIVATE_TEST_KEY"
+        root = test_temp_root() / f"object-artifact-incomplete-provider-{time.time_ns()}"
+        payload = valid_payload()
+
+        env = self.deploy_auth_env(
+            KQAG_STORAGE_MODE="local",
+            KQAG_ARTIFACT_STORAGE_MODE="object",
+            KQAG_OBJECT_STORAGE_PROVIDER="s3_compatible",
+            KQAG_OBJECT_STORAGE_ENDPOINT_URL=private_endpoint,
+            KQAG_OBJECT_STORAGE_BUCKET=private_bucket,
+            KQAG_OBJECT_STORAGE_REGION="ap-southeast-private",
+            KQAG_OBJECT_STORAGE_ACCESS_KEY_ID=private_access_key,
+            QUOTE_OUTPUT_ROOT=str(root / "output"),
+            QUOTE_TMP_ROOT=str(root / "tmp"),
+            QUOTE_LOG_ROOT=str(root / "logs"),
+        )
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(webapp.subprocess, "run") as run:
+            provider_status = webapp.configured_object_storage_status()
+            result = webapp.run_quote_job(
+                payload,
+                output_root=root / "output",
+                tmp_root=root / "tmp",
+                job_id="job-object-provider-incomplete",
+                auth_session=self.platform_auth_session("workspace-object-provider"),
+            )
+
+        result_text = json.dumps(result, sort_keys=True)
+        self.assertEqual(provider_status["provider"], "s3_compatible")
+        self.assertEqual(provider_status["missing_fields"], ["KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY"])
+        self.assertFalse(provider_status["runtime_backend_available"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["errors"], ["Quote artifact storage is not available in this environment."])
+        self.assertEqual(run.call_count, 0)
+        self.assertNotIn(private_endpoint, result_text)
+        self.assertNotIn(private_bucket, result_text)
+        self.assertNotIn(private_access_key, result_text)
+        self.assertNotIn("KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY", result_text)
+
     def test_database_artifact_storage_requires_platform_context_and_migration(self):
         with mock.patch.dict(os.environ, {"KQAG_ARTIFACT_STORAGE_MODE": "database"}, clear=True):
             with self.assertRaises(webapp.KqagStorageAccessError) as missing_session:

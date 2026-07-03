@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import importlib.util
 import re
 from dataclasses import asdict, dataclass
-from typing import Protocol
+from typing import Mapping, Protocol
 
 
 SAFE_SEGMENT_RE = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -20,10 +21,27 @@ ALLOWED_OWNER_TYPES = {
     "profile",
     "pricing_reference",
 }
+OBJECT_STORAGE_PROVIDER_ENV_NAME = "KQAG_OBJECT_STORAGE_PROVIDER"
+OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME = "KQAG_OBJECT_STORAGE_ENDPOINT_URL"
+OBJECT_STORAGE_BUCKET_ENV_NAME = "KQAG_OBJECT_STORAGE_BUCKET"
+OBJECT_STORAGE_REGION_ENV_NAME = "KQAG_OBJECT_STORAGE_REGION"
+OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME = "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID"
+OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME = "KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY"
+S3_COMPATIBLE_REQUIRED_ENV_NAMES = [
+    OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME,
+    OBJECT_STORAGE_BUCKET_ENV_NAME,
+    OBJECT_STORAGE_REGION_ENV_NAME,
+    OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME,
+    OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME,
+]
 
 
 class ObjectStorageContractError(Exception):
     """Raised when the provider-neutral object storage contract is violated."""
+
+
+class ObjectStorageConfigurationError(ObjectStorageContractError):
+    """Raised when object storage configuration exists but no safe backend can run."""
 
 
 @dataclass(frozen=True)
@@ -91,6 +109,126 @@ def normalize_owner_type(value: object) -> str:
 
 def artifact_checksum(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+def _clean_config_value(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _configured_provider(env: Mapping[str, str] | None) -> str:
+    raw = _clean_config_value((env or {}).get(OBJECT_STORAGE_PROVIDER_ENV_NAME)).lower().replace("-", "_")
+    if raw in {"", "disabled", "none", "off", "false", "0"}:
+        return "disabled"
+    if raw in {"s3", "s3_compatible", "s3compatible"}:
+        return "s3_compatible"
+    if raw == "synthetic":
+        return "synthetic"
+    return "unsupported"
+
+
+def _optional_s3_sdk_available() -> bool:
+    return importlib.util.find_spec("boto3") is not None
+
+
+def object_storage_provider_status(env: Mapping[str, str] | None) -> dict[str, object]:
+    """Return metadata-only provider configuration status.
+
+    Secret values, endpoint values, bucket names, and object keys are never
+    returned. The S3-compatible provider is a scaffold until credentialed
+    runtime wiring and integration tests are added.
+    """
+
+    provider = _configured_provider(env)
+    base: dict[str, object] = {
+        "provider": provider,
+        "configured": False,
+        "required_fields": [],
+        "missing_fields": [],
+        "adapter": None,
+        "runtime_backend_available": False,
+        "production_provider_ready": False,
+        "synthetic_only": False,
+        "sdk": None,
+        "blockers": [],
+        "notes": [
+            "Provider status is metadata-only; environment values, credentials, endpoint URLs, bucket names, and object keys are not reported.",
+        ],
+    }
+    if provider == "disabled":
+        base["blockers"] = ["provider_disabled"]
+        return base
+    if provider == "unsupported":
+        base["blockers"] = ["unsupported_provider"]
+        return base
+    if provider == "synthetic":
+        base.update(
+            {
+                "configured": True,
+                "adapter": "synthetic-test-only",
+                "synthetic_only": True,
+                "blockers": ["synthetic_provider_test_only"],
+                "notes": list(base["notes"])
+                + ["Synthetic object storage is for contract tests and verifiers only, not production runtime readiness."],
+            }
+        )
+        return base
+
+    missing_fields = [
+        name
+        for name in S3_COMPATIBLE_REQUIRED_ENV_NAMES
+        if not _clean_config_value((env or {}).get(name))
+    ]
+    sdk_available = _optional_s3_sdk_available()
+    configured = not missing_fields
+    blockers = []
+    if missing_fields:
+        blockers.append("missing_provider_config")
+    blockers.append("provider_adapter_unwired")
+    base.update(
+        {
+            "configured": configured,
+            "required_fields": list(S3_COMPATIBLE_REQUIRED_ENV_NAMES),
+            "missing_fields": missing_fields,
+            "adapter": "s3_compatible_scaffold",
+            "sdk": {"name": "boto3", "available": sdk_available},
+            "blockers": blockers,
+            "notes": list(base["notes"])
+            + [
+                "S3-compatible configuration validation is present, but the credentialed runtime adapter is not wired in this PR.",
+                "A missing optional SDK or unwired adapter keeps runtime object storage fail-closed.",
+            ],
+        }
+    )
+    return base
+
+
+class S3CompatibleObjectStorageBackend:
+    """S3/R2/MinIO-compatible adapter scaffold.
+
+    The credentialed implementation is intentionally not wired here. This
+    scaffold preserves the runtime contract while failing closed until a later
+    PR adds provider integration tests and safe deployment evidence.
+    """
+
+    backend_name = "s3-compatible-scaffold"
+
+    def __init__(self, *, status: Mapping[str, object]) -> None:
+        self.status = dict(status)
+
+    def _unavailable(self) -> None:
+        raise ObjectStorageConfigurationError("Object storage backend is not available.")
+
+    def store_artifact(self, **kwargs: object) -> ObjectArtifactMetadata:
+        self._unavailable()
+
+    def retrieve_artifact(self, metadata: ObjectArtifactMetadata, *, workspace_id: str) -> bytes:
+        self._unavailable()
+
+    def delete_artifact(self, metadata: ObjectArtifactMetadata, *, workspace_id: str) -> bool:
+        self._unavailable()
+
+    def verify_metadata(self, metadata: ObjectArtifactMetadata, *, workspace_id: str) -> bool:
+        return False
 
 
 def object_artifact_key(

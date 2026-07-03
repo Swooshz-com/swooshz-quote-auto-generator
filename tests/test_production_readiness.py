@@ -268,8 +268,58 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertEqual(status["generated_artifacts_storage"]["mode"], "object")
         self.assertEqual(status["object_storage_evidence"]["status"], "passed")
         self.assertTrue(status["object_storage_evidence"]["production_object_storage_contract_supported"])
+        self.assertEqual(status["object_storage_provider"]["provider"], "disabled")
+        self.assertFalse(status["object_storage_provider"]["production_provider_ready"])
         self.assertNotIn("object_storage_missing", blocker_ids)
+        self.assertIn("object_storage_provider_unavailable", production_blocker_ids)
         self.assertIn("production_deployment_operations_evidence_missing", production_blocker_ids)
+        self.assertFalse(status["production_ready"])
+
+    def test_object_storage_provider_config_status_is_metadata_only(self):
+        env = {
+            "KQAG_STORAGE_MODE": "database",
+            "KQAG_ARTIFACT_STORAGE_MODE": "object",
+            "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://private-object-store.example.test/path",
+            "KQAG_OBJECT_STORAGE_BUCKET": "private-koncept-bucket",
+            "KQAG_OBJECT_STORAGE_REGION": "ap-southeast-private",
+            "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "AKIA_PRIVATE_TEST_KEY",
+        }
+        status = self.readiness_status(env, object_storage_evidence_status="passed")
+        text = json.dumps(status, sort_keys=True)
+
+        provider = status["object_storage_provider"]
+        self.assertEqual(provider["provider"], "s3_compatible")
+        self.assertFalse(provider["configured"])
+        self.assertEqual(provider["missing_fields"], ["KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY"])
+        self.assertFalse(provider["runtime_backend_available"])
+        self.assertFalse(provider["production_provider_ready"])
+        self.assertIn("object_storage_provider_unavailable", {item["id"] for item in status["production_blockers"]})
+        for value in env.values():
+            if value in {"database", "object", "s3_compatible"} or value.startswith("sqlite:///"):
+                continue
+            self.assertNotIn(value, text)
+
+    def test_synthetic_object_storage_provider_is_not_production_credited(self):
+        status = self.readiness_status(
+            {
+                "KQAG_STORAGE_MODE": "database",
+                "KQAG_ARTIFACT_STORAGE_MODE": "object",
+                "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+                "KQAG_OBJECT_STORAGE_PROVIDER": "synthetic",
+            },
+            backup_restore_evidence_status="passed",
+            hosted_observability_evidence_status="passed",
+            hosted_smoke_evidence_status="passed",
+            object_storage_evidence_status="passed",
+        )
+
+        production_blocker_ids = {item["id"] for item in status["production_blockers"]}
+        self.assertEqual(status["object_storage_provider"]["provider"], "synthetic")
+        self.assertTrue(status["object_storage_provider"]["synthetic_only"])
+        self.assertFalse(status["object_storage_provider"]["production_provider_ready"])
+        self.assertIn("object_storage_provider_unavailable", production_blocker_ids)
         self.assertFalse(status["production_ready"])
 
     def test_readiness_command_can_include_synthetic_object_storage_contract_evidence(self):
