@@ -193,6 +193,29 @@ class ObjectStorageProviderConfigTest(unittest.TestCase):
         self.assertEqual(client.deleted, [])
         self.assertTrue(backend.verify_metadata(metadata, workspace_id="workspace-a"))
 
+    def test_s3_compatible_adapter_delete_fails_closed_on_corrupt_remote_metadata(self):
+        client = FakeS3Client()
+        backend = object_storage.S3CompatibleObjectStorageBackend(
+            bucket="example-artifact-bucket",
+            client=client,
+        )
+        metadata = backend.store_artifact(
+            workspace_id="workspace-a",
+            owner_type="generated_quote",
+            owner_id="quote-session-a",
+            artifact_kind="xlsx",
+            filename="quotation.xlsx",
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            content=b"synthetic-xlsx-content",
+        )
+        stored = client.objects[("example-artifact-bucket", metadata.storage_key)]
+        stored["metadata"]["kqag-workspace-id"] = "workspace-b"
+
+        self.assertFalse(backend.verify_metadata(metadata, workspace_id="workspace-a"))
+        with self.assertRaises(object_storage.ObjectStorageContractError):
+            backend.delete_artifact(metadata, workspace_id="workspace-a")
+        self.assertEqual(client.deleted, [])
+
 
 if __name__ == "__main__":
     unittest.main()

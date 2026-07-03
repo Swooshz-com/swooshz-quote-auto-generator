@@ -113,6 +113,22 @@ not prove live provider credentials, provider IAM policy, network reachability,
 DB+object backup/restore, retention/delete jobs, alert delivery, or production
 deployment operations.
 
+Object artifact lifecycle evidence is synthetic/stubbed only:
+
+```powershell
+python scripts/verify_object_artifact_lifecycle.py
+python scripts/check_production_readiness.py --with-object-storage-evidence --with-object-artifact-lifecycle-evidence
+```
+
+The lifecycle verifier uses synthetic SQLite metadata and the in-memory object
+backend to check metadata backup/restore, restored object retrieval, missing
+object detection, checksum mismatch detection, tombstoned artifact denial,
+wrong-workspace denial, and local staging cleanup. It does not prove live
+provider retention/delete, live DB+object backup/restore, production alerts, or
+host operations. Object mode must not fall back to local artifacts or database
+BLOB artifacts when object storage is unavailable, stale, deleted, corrupt,
+unauthorized, or failing.
+
 ## Workspace Scope
 
 Database rows are keyed by the platform workspace ID from the KQAG platform
@@ -132,6 +148,8 @@ The boundary covers:
   when artifact database mode is enabled
 - generated `quotation.xlsx` and optional `quotation.pdf` object metadata when
   artifact object mode is enabled with a usable object backend
+- object-mode generated artifact tombstone status, retention status, and
+  synthetic lifecycle evidence for generated quote artifacts
 
 Local profile/pricing/session/artifact behavior remains the default and continues
 to use existing runtime storage. Database artifact mode enforces allowed generated

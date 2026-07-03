@@ -1,7 +1,8 @@
-"""Object-storage artifact backend contract for KQAG production readiness.
+"""Object-storage artifact backend contract and adapter boundary for KQAG.
 
-This module defines the provider-neutral contract only. It intentionally does
-not configure AWS, GCP, Azure, R2, MinIO, or any credentialed backend.
+This module defines provider-neutral metadata plus S3-compatible adapter
+operations. Runtime configuration is handled elsewhere and must fail closed
+without committing or printing credentials.
 """
 
 from __future__ import annotations
@@ -337,7 +338,8 @@ class S3CompatibleObjectStorageBackend:
 
     def delete_artifact(self, metadata: ObjectArtifactMetadata, *, workspace_id: str) -> bool:
         self._require_workspace(metadata, workspace_id)
-        self.verify_metadata(metadata, workspace_id=workspace_id)
+        if not self.verify_metadata(metadata, workspace_id=workspace_id):
+            raise ObjectStorageContractError("Artifact metadata verification failed.")
         try:
             self.client.delete_object(Bucket=self.bucket, Key=metadata.storage_key)
         except Exception as exc:
