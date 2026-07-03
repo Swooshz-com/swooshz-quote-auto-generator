@@ -19727,6 +19727,10 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(webapp.configured_artifact_storage_mode(), "local")
 
+        with mock.patch.dict(os.environ, {"KQAG_ARTIFACT_STORAGE_MODE": "object"}, clear=True):
+            self.assertEqual(webapp.configured_artifact_storage_mode(), "object")
+            self.assertTrue(webapp.protected_job_routes_enabled(None))
+
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             database_url = f"sqlite:///{(tmp_path / 'kqag-storage.sqlite3').as_posix()}"
@@ -19745,6 +19749,53 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertEqual(session["session_id"], "quote-local-artifacts")
         self.assertFalse(session["exports"]["xlsx"]["exists"])
         self.assertIsNone(session["exports"]["xlsx"]["url"])
+
+    def test_object_artifact_storage_mode_fails_closed_without_runtime_backend(self):
+        private_customer = "Synthetic Object Artifact Customer"
+        root = test_temp_root() / f"object-artifact-fail-closed-{time.time_ns()}"
+        output_root = root / "output"
+        payload = valid_payload()
+        payload["client"]["name"] = private_customer
+
+        def fake_generator_run(command, **kwargs):
+            output_dir = Path(command[command.index("--out") + 1])
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "quotation.xlsx").write_bytes(b"synthetic-private-object-quote")
+            return webapp.subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout="Wrote quotation.xlsx\n",
+                stderr="",
+            )
+
+        env = self.deploy_auth_env(
+            KQAG_STORAGE_MODE="local",
+            KQAG_ARTIFACT_STORAGE_MODE="object",
+            QUOTE_OUTPUT_ROOT=str(output_root),
+            QUOTE_TMP_ROOT=str(root / "tmp"),
+            QUOTE_LOG_ROOT=str(root / "logs"),
+        )
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(webapp.subprocess, "run", side_effect=fake_generator_run) as run:
+            with self.assertRaises(webapp.KqagStorageAccessError) as missing_runtime:
+                webapp.artifact_storage_for_auth_session(self.platform_auth_session("workspace-object-runtime"))
+            result = webapp.run_quote_job(
+                payload,
+                output_root=output_root,
+                tmp_root=root / "tmp",
+                job_id="job-object-artifact-protected",
+                auth_session=self.platform_auth_session("workspace-object-runtime"),
+            )
+
+        result_text = json.dumps(result, sort_keys=True)
+        self.assertEqual(missing_runtime.exception.reason, "object_artifact_storage_unavailable")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["errors"], ["Quote artifact storage is not available in this environment."])
+        self.assertEqual(run.call_count, 0)
+        self.assertNotIn("files", result)
+        self.assertNotIn(private_customer, result_text)
+        self.assertNotIn("synthetic-private-object-quote", result_text)
+        self.assertNotIn(str(output_root), result_text)
+        self.assertFalse((output_root / "job-object-artifact-protected" / "quotation.xlsx").exists())
 
     def test_database_artifact_storage_requires_platform_context_and_migration(self):
         with mock.patch.dict(os.environ, {"KQAG_ARTIFACT_STORAGE_MODE": "database"}, clear=True):

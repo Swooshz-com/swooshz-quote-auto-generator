@@ -227,8 +227,92 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertNotIn("hosted_smoke_evidence_missing", blocker_ids)
         self.assertNotIn("hosted_logging_monitoring_missing", internal_alpha_blocker_ids)
         self.assertNotIn("hosted_smoke_evidence_missing", internal_alpha_blocker_ids)
+        self.assertEqual(status["object_storage_evidence"]["status"], "not_run_by_checker")
         self.assertTrue(status["internal_alpha_ready"])
         self.assertFalse(status["production_ready"])
+
+    def test_object_storage_contract_evidence_is_not_assumed_when_not_run(self):
+        status = self.readiness_status(
+            {
+                "KQAG_STORAGE_MODE": "database",
+                "KQAG_ARTIFACT_STORAGE_MODE": "object",
+                "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            },
+            backup_restore_evidence_status="passed",
+            hosted_observability_evidence_status="passed",
+            hosted_smoke_evidence_status="passed",
+        )
+
+        blocker_ids = {item["id"] for item in status["blockers"]}
+        self.assertEqual(status["kqag_artifact_storage_mode"], "object")
+        self.assertEqual(status["object_storage_evidence"]["status"], "not_run_by_checker")
+        self.assertFalse(status["object_storage_evidence"]["production_object_storage_contract_supported"])
+        self.assertIn("object_storage_missing", blocker_ids)
+        self.assertFalse(status["production_ready"])
+
+    def test_object_storage_contract_evidence_drops_only_object_missing_blocker(self):
+        status = self.readiness_status(
+            {
+                "KQAG_STORAGE_MODE": "database",
+                "KQAG_ARTIFACT_STORAGE_MODE": "object",
+                "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            },
+            backup_restore_evidence_status="passed",
+            hosted_observability_evidence_status="passed",
+            hosted_smoke_evidence_status="passed",
+            object_storage_evidence_status="passed",
+        )
+
+        blocker_ids = {item["id"] for item in status["blockers"]}
+        production_blocker_ids = {item["id"] for item in status["production_blockers"]}
+        self.assertEqual(status["generated_artifacts_storage"]["mode"], "object")
+        self.assertEqual(status["object_storage_evidence"]["status"], "passed")
+        self.assertTrue(status["object_storage_evidence"]["production_object_storage_contract_supported"])
+        self.assertNotIn("object_storage_missing", blocker_ids)
+        self.assertIn("production_deployment_operations_evidence_missing", production_blocker_ids)
+        self.assertFalse(status["production_ready"])
+
+    def test_readiness_command_can_include_synthetic_object_storage_contract_evidence(self):
+        work_dir = test_temp_root() / f"readiness-object-contract-{time.time_ns()}"
+        command_env = {
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONPATH": str(ROOT),
+            "KQAG_STORAGE_MODE": "database",
+            "KQAG_ARTIFACT_STORAGE_MODE": "object",
+            "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+        }
+        for name in ("COMSPEC", "SystemRoot", "TEMP", "TMP"):
+            if os.environ.get(name):
+                command_env[name] = os.environ[name]
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "check_production_readiness.py"),
+                "--with-object-storage-evidence",
+                "--object-storage-work-dir",
+                str(work_dir),
+            ],
+            cwd=ROOT,
+            env=command_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        status = json.loads(completed.stdout)
+        blocker_ids = {item["id"] for item in status["blockers"]}
+        self.assertEqual(status["object_storage_evidence"]["status"], "passed")
+        self.assertNotIn("object_storage_missing", blocker_ids)
+        self.assertIn("backup_restore_unverified", blocker_ids)
+        self.assertIn("hosted_logging_monitoring_missing", blocker_ids)
+        self.assertIn("hosted_smoke_evidence_missing", blocker_ids)
+        self.assertFalse(status["internal_alpha_ready"])
+        self.assertFalse(status["production_ready"])
+        self.assertNotIn(str(work_dir), completed.stdout + completed.stderr)
+        self.assertNotIn("sqlite:///", completed.stdout + completed.stderr)
 
     def test_hosted_smoke_evidence_is_not_assumed_when_not_run(self):
         database_url = "sqlite:///tmp/kqag-storage.sqlite3"
