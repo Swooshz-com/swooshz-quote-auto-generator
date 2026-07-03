@@ -20139,6 +20139,96 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertTrue(session["exports"]["xlsx"]["missing"])
         self.assertIsNone(artifact)
 
+    def test_object_artifact_storage_delete_session_tombstones_metadata_and_backend_object(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        tmp_path = test_temp_root() / f"object-artifact-delete-session-{time.time_ns()}"
+        db_path = tmp_path / "kqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        output_dir = tmp_path / "out" / "job-object-delete-session"
+        output_dir.mkdir(parents=True)
+        (output_dir / "quotation.xlsx").write_bytes(b"synthetic-xlsx-delete-session")
+        payload = valid_payload()
+        payload["quote_session"] = {"session_id": "quote-object-delete-session"}
+        result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-object-delete-session/files/quotation.xlsx"}]}
+        env = {
+            **self.deploy_auth_env(),
+            "KQAG_STORAGE_MODE": "database",
+            "KQAG_ARTIFACT_STORAGE_MODE": "object",
+            "KQAG_DATABASE_URL": database_url,
+            "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
+            "KQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
+            "KQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
+            "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
+            "KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
+        }
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_kqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-delete-session"))
+            storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+            row_before = storage._object_quote_artifact_row("quote-object-delete-session", "xlsx")
+            metadata_before = storage._object_metadata_from_row(row_before)
+            self.assertEqual(
+                backend.retrieve_artifact(metadata_before, workspace_id="workspace-object-delete-session"),
+                b"synthetic-xlsx-delete-session",
+            )
+
+            self.assertTrue(storage.delete_quote_session("quote-object-delete-session"))
+            session = storage.get_quote_session("quote-object-delete-session")
+            artifact = storage.quote_session_export_artifact("quote-object-delete-session", "xlsx")
+            with sqlite3.connect(db_path) as connection:
+                tombstone = connection.execute(
+                    "select status, retention_status, deleted_at from kqag_object_artifacts where workspace_id = ? and session_id = ?",
+                    ("workspace-object-delete-session", "quote-object-delete-session"),
+                ).fetchone()
+
+        self.assertIsNone(session)
+        self.assertIsNone(artifact)
+        self.assertEqual(tombstone[0], "deleted")
+        self.assertEqual(tombstone[1], "deleted")
+        self.assertTrue(tombstone[2])
+        with self.assertRaises(webapp.ObjectStorageContractError):
+            backend.retrieve_artifact(metadata_before, workspace_id="workspace-object-delete-session")
+
+    def test_object_artifact_storage_cleans_local_staging_files_after_persist(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        tmp_path = test_temp_root() / f"object-artifact-staging-cleanup-{time.time_ns()}"
+        db_path = tmp_path / "kqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        output_dir = tmp_path / "out" / "job-object-staging-cleanup"
+        output_dir.mkdir(parents=True)
+        (output_dir / "quotation.xlsx").write_bytes(b"synthetic-xlsx-staging-cleanup")
+        payload = valid_payload()
+        payload["quote_session"] = {"session_id": "quote-object-staging-cleanup"}
+        result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-object-staging-cleanup/files/quotation.xlsx"}]}
+        env = {
+            **self.deploy_auth_env(),
+            "KQAG_STORAGE_MODE": "database",
+            "KQAG_ARTIFACT_STORAGE_MODE": "object",
+            "KQAG_DATABASE_URL": database_url,
+            "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
+            "KQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
+            "KQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
+            "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
+            "KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
+        }
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_kqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-staging-cleanup"))
+            session = storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+            artifact = storage.quote_session_export_artifact("quote-object-staging-cleanup", "xlsx")
+
+        self.assertTrue(session["exports"]["xlsx"]["exists"])
+        self.assertEqual(artifact["content"], b"synthetic-xlsx-staging-cleanup")
+        self.assertFalse((output_dir / "quotation.xlsx").exists())
+
     def test_database_artifact_storage_saves_profile_and_pricing_assets_by_workspace(self):
         layout_bytes = (KONCEPT_PROFILE / "quotation-layout.xlsx").read_bytes()
         layout_data_url = "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + base64.b64encode(layout_bytes).decode("ascii")

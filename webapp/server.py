@@ -2099,6 +2099,49 @@ def object_storage_evidence_summary(
     }
 
 
+def object_artifact_lifecycle_evidence_summary(*, status: str, artifact_mode: str, database_mode: bool, database_configured: bool) -> dict[str, Any]:
+    normalized_status = clean_text(status).lower() or "not_run_by_checker"
+    if normalized_status not in {"passed", "failed", "not_run_by_checker"}:
+        normalized_status = "not_run_by_checker"
+    passed = normalized_status == "passed"
+    object_mode_ready = artifact_mode == "object" and database_mode and database_configured
+    return {
+        "status": normalized_status,
+        "verifier": "scripts/verify_object_artifact_lifecycle.py",
+        "synthetic_only": True,
+        "object_lifecycle_supported": bool(passed and object_mode_ready),
+        "covers": [
+            "object_metadata_tombstone",
+            "authorized_download_after_restore",
+            "missing_object_detection",
+            "checksum_mismatch_detection",
+            "wrong_workspace_denial",
+            "local_staging_cleanup",
+        ],
+        "notes": [
+            "Evidence is synthetic and metadata-only.",
+            "This does not prove live provider retention/delete or DB+object backup/restore readiness.",
+        ],
+    }
+
+
+def derived_object_artifact_evidence_summary(
+    *,
+    source: dict[str, Any],
+    evidence_name: str,
+    covers: list[str],
+) -> dict[str, Any]:
+    supported = bool(source.get("object_lifecycle_supported"))
+    return {
+        "status": clean_text(source.get("status")) or "not_run_by_checker",
+        "verifier": source.get("verifier"),
+        "synthetic_only": True,
+        "covers": covers,
+        evidence_name: supported,
+        "notes": list(source.get("notes") or []),
+    }
+
+
 def production_readiness_status(
     security_scan_status: str = "not_run_by_command",
     *,
@@ -2106,6 +2149,7 @@ def production_readiness_status(
     hosted_observability_evidence_status: str = "not_run_by_checker",
     hosted_smoke_evidence_status: str = "not_run_by_checker",
     object_storage_evidence_status: str = "not_run_by_checker",
+    object_artifact_lifecycle_evidence_status: str = "not_run_by_checker",
 ) -> dict[str, Any]:
     storage_mode = configured_storage_mode()
     artifact_mode = configured_artifact_storage_mode()
@@ -2133,6 +2177,27 @@ def production_readiness_status(
         database_mode=database_mode,
         database_configured=database_configured,
         provider_status=object_storage_provider,
+    )
+    object_lifecycle_evidence = object_artifact_lifecycle_evidence_summary(
+        status=object_artifact_lifecycle_evidence_status,
+        artifact_mode=artifact_mode,
+        database_mode=database_mode,
+        database_configured=database_configured,
+    )
+    object_retention_delete_evidence = derived_object_artifact_evidence_summary(
+        source=object_lifecycle_evidence,
+        evidence_name="synthetic_retention_delete_supported",
+        covers=["object_delete_attempt", "metadata_tombstone", "deleted_artifact_inaccessible"],
+    )
+    db_object_backup_restore_evidence = derived_object_artifact_evidence_summary(
+        source=object_lifecycle_evidence,
+        evidence_name="synthetic_db_object_backup_restore_supported",
+        covers=["database_metadata_backup_restore", "restored_metadata_object_retrieval", "missing_object_detection"],
+    )
+    local_staging_cleanup_evidence = derived_object_artifact_evidence_summary(
+        source=object_lifecycle_evidence,
+        evidence_name="synthetic_local_staging_cleanup_supported",
+        covers=["generated_artifact_tmp_staging_removed_after_object_store"],
     )
 
     profiles = readiness_surface(
@@ -2228,6 +2293,17 @@ def production_readiness_status(
         blockers.append(readiness_blocker("object_storage_missing", "P1", "No verified object-storage-backed asset/artifact contract exists for production XLSX/PDF and uploaded reference assets.", gates=("production",)))
     if object_artifacts and not object_storage_provider.get("production_provider_ready"):
         blockers.append(readiness_blocker("object_storage_provider_unavailable", "P1", "Object artifact mode is selected, but no production-ready credentialed object-storage provider adapter is available.", gates=("production",)))
+    if object_artifacts and not object_lifecycle_evidence["object_lifecycle_supported"]:
+        blockers.append(readiness_blocker("object_lifecycle_evidence_missing", "P1", "Object artifact delete/tombstone/stale lifecycle evidence has not been verified for object artifact mode.", gates=("production",)))
+    if object_artifacts and not object_retention_delete_evidence["synthetic_retention_delete_supported"]:
+        blockers.append(readiness_blocker("object_retention_delete_evidence_missing", "P1", "Synthetic object artifact retention/delete evidence has not been verified for object artifact mode.", gates=("production",)))
+    if object_artifacts and not db_object_backup_restore_evidence["synthetic_db_object_backup_restore_supported"]:
+        blockers.append(readiness_blocker("db_object_backup_restore_evidence_missing", "P1", "Synthetic DB+object artifact backup/restore evidence has not been verified for object artifact mode.", gates=("production",)))
+    if object_artifacts and not local_staging_cleanup_evidence["synthetic_local_staging_cleanup_supported"]:
+        blockers.append(readiness_blocker("local_staging_cleanup_evidence_missing", "P1", "Object-mode generated artifact local staging cleanup evidence has not been verified.", gates=("production",)))
+    if object_artifacts:
+        blockers.append(readiness_blocker("object_retention_delete_live_evidence_missing", "P1", "Live object provider retention/delete evidence is still missing for production.", gates=("production",)))
+        blockers.append(readiness_blocker("db_object_backup_restore_live_evidence_missing", "P1", "Live DB+object backup/restore evidence is still missing for production.", gates=("production",)))
     blockers.append(readiness_blocker("production_deployment_operations_evidence_missing", "P1", "Production deployment, operations, alert delivery, and live host evidence are not verified by this command.", gates=("production",)))
     if not backup_restore_evidence["database_artifact_temporary_exception_supported"]:
         blockers.append(readiness_blocker("backup_restore_unverified", "P1", "Backup, restore, retention, and rollback evidence has not been verified for the selected database/database-artifact mode."))
@@ -2264,6 +2340,10 @@ def production_readiness_status(
         "hosted_observability_evidence": hosted_observability_evidence,
         "hosted_smoke_evidence": hosted_smoke_evidence,
         "object_storage_evidence": object_storage_evidence,
+        "object_lifecycle_evidence": object_lifecycle_evidence,
+        "object_retention_delete_evidence": object_retention_delete_evidence,
+        "db_object_backup_restore_evidence": db_object_backup_restore_evidence,
+        "local_staging_cleanup_evidence": local_staging_cleanup_evidence,
         "object_storage_provider": object_storage_provider,
         "security_scan_status": clean_text(security_scan_status) or "not_run_by_command",
         "local_uat_supported": True,
@@ -7730,6 +7810,17 @@ class DatabaseKqagStorage:
             return None
         return row
 
+    def _object_quote_artifact_rows_for_session(self, session_id: str) -> list[sqlite3.Row]:
+        safe_id = safe_quote_session_id(session_id, "")
+        if not safe_id:
+            return []
+        with self.connection() as connection:
+            return connection.execute(
+                "select artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at "
+                "from kqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and session_id = ? and deleted_at is null",
+                (self.workspace_id, "generated_quote", safe_id, safe_id),
+            ).fetchall()
+
     def _object_metadata_from_row(self, row: sqlite3.Row) -> ObjectArtifactMetadata:
         created_at = clean_text(row["created_at"]) or utc_timestamp()
         updated_at = clean_text(row["updated_at"]) or created_at
@@ -7779,6 +7870,20 @@ class DatabaseKqagStorage:
             )
             connection.commit()
 
+    def _cleanup_object_staging_file(self, source: Path, output_dir: Path) -> None:
+        expected_names = set(QUOTE_SESSION_EXPORT_KINDS.values())
+        try:
+            resolved_source = source.resolve()
+            resolved_output = output_dir.resolve()
+        except OSError:
+            return
+        if resolved_source.parent != resolved_output or source.name not in expected_names:
+            return
+        try:
+            source.unlink(missing_ok=True)
+        except OSError:
+            return
+
     def _store_quote_export_artifacts(self, session_id: str, metadata: dict[str, Any], result: dict[str, Any] | None, output_dir: Path | None) -> None:
         if not result_has_generated_quote(result) or output_dir is None:
             return
@@ -7824,6 +7929,7 @@ class DatabaseKqagStorage:
                     ) from exc
                 metadata["exports"][kind] = {"filename": filename, "created_at": now, "size_bytes": size, "stale": False}
                 metadata["status"][f"{kind}_exported"] = True
+                self._cleanup_object_staging_file(source, output_dir)
                 continue
             with self.connection() as connection:
                 connection.execute(
@@ -7873,6 +7979,34 @@ class DatabaseKqagStorage:
         if not content or len(content) != int(row["size_bytes"] or 0):
             return None
         return {"filename": row["filename"], "content_type": row["content_type"], "size_bytes": int(row["size_bytes"] or 0), "content": content}
+
+    def tombstone_object_quote_artifacts(self, session_id: str) -> int:
+        safe_id = safe_quote_session_id(session_id, "")
+        if not safe_id:
+            return 0
+        rows = self._object_quote_artifact_rows_for_session(safe_id)
+        backend: ObjectStorageBackend | None = None
+        if rows:
+            try:
+                backend = configured_object_storage_backend()
+            except ObjectStorageContractError:
+                backend = None
+        for row in rows:
+            if backend is None:
+                continue
+            try:
+                backend.delete_artifact(self._object_metadata_from_row(row), workspace_id=self.workspace_id)
+            except ObjectStorageContractError:
+                continue
+        now = utc_timestamp()
+        with self.connection() as connection:
+            cursor = connection.execute(
+                "update kqag_object_artifacts set status = ?, retention_status = ?, updated_at = ?, deleted_at = ? "
+                "where workspace_id = ? and owner_type = ? and owner_id = ? and session_id = ? and deleted_at is null",
+                ("deleted", "deleted", now, now, self.workspace_id, "generated_quote", safe_id, safe_id),
+            )
+            connection.commit()
+            return cursor.rowcount
 
     def _public_quote_session(self, metadata: dict[str, Any], *, include_draft_state: bool = False, draft_files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         public = public_quote_session(metadata, include_draft_state=False)
@@ -8039,6 +8173,8 @@ class DatabaseKqagStorage:
         metadata, _draft_files = self._read_quote_session_metadata_for_workspace(safe_id)
         if not metadata or not self._quote_session_editable_by_current_user(metadata):
             return False
+        if configured_artifact_storage_mode() == "object":
+            self.tombstone_object_quote_artifacts(safe_id)
         with self.connection() as connection:
             cursor = connection.execute("delete from kqag_quote_sessions where workspace_id = ? and session_id = ?", (self.workspace_id, safe_id))
             connection.commit()
