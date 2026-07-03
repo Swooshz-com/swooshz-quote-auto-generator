@@ -1976,11 +1976,41 @@ def hosted_observability_evidence_summary(*, status: str) -> dict[str, Any]:
     }
 
 
+def hosted_smoke_evidence_summary(*, status: str) -> dict[str, Any]:
+    normalized_status = clean_text(status).lower() or "not_run_by_checker"
+    if normalized_status not in {"passed", "failed", "not_run_by_checker"}:
+        normalized_status = "not_run_by_checker"
+    passed = normalized_status == "passed"
+    return {
+        "status": normalized_status,
+        "verifier": "scripts/verify_hosted_smoke.py",
+        "covers": [
+            "health_metadata",
+            "unauthenticated_route_gate",
+            "synthetic_platform_workspace_session",
+            "workspace_profile_save_and_use",
+            "workspace_pricing_save_and_use",
+            "database_mode_quote_generation",
+            "database_quote_session_persistence",
+            "authorized_quote_session_artifact_download",
+            "quote_session_delete",
+            "logout",
+            "legacy_job_file_lockdown",
+        ],
+        "internal_alpha_hosted_smoke_supported": bool(passed),
+        "notes": [
+            "Evidence is synthetic, metadata-only, and bound to 127.0.0.1.",
+            "This is not live Swooshz Platform integration, object storage, production deployment evidence, or production readiness.",
+        ],
+    }
+
+
 def production_readiness_status(
     security_scan_status: str = "not_run_by_command",
     *,
     backup_restore_evidence_status: str = "not_run_by_checker",
     hosted_observability_evidence_status: str = "not_run_by_checker",
+    hosted_smoke_evidence_status: str = "not_run_by_checker",
 ) -> dict[str, Any]:
     storage_mode = configured_storage_mode()
     artifact_mode = configured_artifact_storage_mode()
@@ -1996,6 +2026,9 @@ def production_readiness_status(
     )
     hosted_observability_evidence = hosted_observability_evidence_summary(
         status=hosted_observability_evidence_status,
+    )
+    hosted_smoke_evidence = hosted_smoke_evidence_summary(
+        status=hosted_smoke_evidence_status,
     )
 
     profiles = readiness_surface(
@@ -2077,11 +2110,13 @@ def production_readiness_status(
     if database_scheme == "sqlite":
         blockers.append(readiness_blocker("sqlite_not_final_production", "P1", "SQLite is acceptable only as an explicitly backed-up internal-alpha/simple-hosting option, not final production storage.", gates=("production",)))
     blockers.append(readiness_blocker("object_storage_missing", "P1", "No object-storage-backed asset/artifact layer exists for production XLSX/PDF and uploaded reference assets.", gates=("production",)))
+    blockers.append(readiness_blocker("production_deployment_operations_evidence_missing", "P1", "Production deployment, operations, alert delivery, and live host evidence are not verified by this command.", gates=("production",)))
     if not backup_restore_evidence["database_artifact_temporary_exception_supported"]:
         blockers.append(readiness_blocker("backup_restore_unverified", "P1", "Backup, restore, retention, and rollback evidence has not been verified for the selected database/database-artifact mode."))
     if not hosted_observability_evidence["internal_alpha_observability_supported"]:
         blockers.append(readiness_blocker("hosted_logging_monitoring_missing", "P1", "Hosted privacy-minimized logging, monitoring, alerting, and support traceability are not implemented or verified by this command."))
-    blockers.append(readiness_blocker("hosted_smoke_evidence_missing", "P1", "Hosted smoke evidence for platform launch, workspace storage, quote generation, session persistence, artifact download, delete, and logout is not verified by this command."))
+    if not hosted_smoke_evidence["internal_alpha_hosted_smoke_supported"]:
+        blockers.append(readiness_blocker("hosted_smoke_evidence_missing", "P1", "Hosted smoke evidence for platform launch, workspace storage, quote generation, session persistence, artifact download, delete, and logout is not verified by this command."))
 
     workspace_scoped = all(
         surface["workspace_scoped"]
@@ -2109,6 +2144,7 @@ def production_readiness_status(
         ],
         "backup_restore_evidence": backup_restore_evidence,
         "hosted_observability_evidence": hosted_observability_evidence,
+        "hosted_smoke_evidence": hosted_smoke_evidence,
         "security_scan_status": clean_text(security_scan_status) or "not_run_by_command",
         "local_uat_supported": True,
         "internal_alpha_blockers": internal_alpha_blockers,

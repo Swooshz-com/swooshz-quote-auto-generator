@@ -158,6 +158,7 @@ const state = {
   quoteSessionId: "",
   quoteSessions: [],
   quoteSessionLoadError: "",
+  quoteSessionDashboardLoadId: 0,
   quoteSessionDashboardBusy: false,
   quoteSessionRestoreError: "",
   quoteSessionRestoreBusy: false,
@@ -9358,6 +9359,8 @@ async function handleTopbarBrandClick() {
 
 async function loadQuoteDashboard(options = {}) {
   if (!elements.quoteDashboardPanel) return;
+  const loadId = (Number(state.quoteSessionDashboardLoadId) || 0) + 1;
+  state.quoteSessionDashboardLoadId = loadId;
   const showLoading = options.showLoading !== false;
   if (showLoading) {
     setDashboardLoadingState(true, {
@@ -9372,6 +9375,7 @@ async function loadQuoteDashboard(options = {}) {
   renderQuoteDashboard();
   try {
     const { ok, data } = await getJson("/api/quote-sessions", { logFetchFailure: false });
+    if (state.quoteSessionDashboardLoadId !== loadId) return;
     if (!ok) {
       state.quoteSessions = [];
       state.quoteSessionLoadError = genericFailureMessage(data);
@@ -9380,7 +9384,7 @@ async function loadQuoteDashboard(options = {}) {
     }
     renderQuoteDashboard();
   } finally {
-    if (showLoading) setDashboardLoadingState(false);
+    if (state.quoteSessionDashboardLoadId === loadId && showLoading) setDashboardLoadingState(false);
   }
 }
 
