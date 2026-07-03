@@ -131,24 +131,41 @@ When `KQAG_ARTIFACT_STORAGE_MODE=object` is selected at runtime, KQAG fails
 closed with the generic artifact-storage-unavailable message until a usable
 provider backend is available.
 
-Object-storage provider configuration update: this PR adds strict
+Object-storage provider configuration update: PR #99 added strict
 metadata-only configuration validation for the production object-storage
-provider scaffold. The recognized object provider setting is
+provider boundary. The recognized object provider setting is
 `KQAG_OBJECT_STORAGE_PROVIDER`; unset, `disabled`, `none`, `off`, `false`, or
-`0` mean disabled. `s3_compatible` is the scaffolded production-provider
-family and requires these environment names to be present:
+`0` mean disabled. `s3_compatible` is the credentialed provider family for
+AWS S3, Cloudflare R2, MinIO, or similar S3-compatible APIs and requires these
+environment names to be present:
 `KQAG_OBJECT_STORAGE_ENDPOINT_URL`, `KQAG_OBJECT_STORAGE_BUCKET`,
 `KQAG_OBJECT_STORAGE_REGION`, `KQAG_OBJECT_STORAGE_ACCESS_KEY_ID`, and
 `KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY`. The checker reports only provider
-type, required field names, missing field names, adapter/scaffold status, and
+type, required field names, missing field names, adapter status, and
 runtime availability booleans; it never prints endpoint URLs, bucket values,
 access keys, secret keys, object keys, DB URLs, paths, artifact bytes, quote
 contents, or customer data. A `synthetic` provider is accepted only as
-test/verifier metadata and is never production-credited. The S3-compatible
-adapter remains a fail-closed scaffold in this PR, so production still requires
-a credentialed runtime implementation, DB object metadata integration,
-DB+object backup/restore, retention/delete evidence, and deployment/operations
-evidence before readiness can be claimed.
+test/verifier metadata and is never production-credited.
+
+Object-storage runtime integration update: this PR begins the real runtime
+boundary for generated quote XLSX/PDF artifacts. It adds a credentialed
+S3-compatible adapter implementation that supports store, retrieve, delete,
+workspace/owner metadata checks, and SHA-256 integrity validation. Unit tests
+use a fake S3-compatible client only; no live AWS/R2/MinIO account, endpoint,
+bucket, or credential is configured or claimed. The database migration
+`migrations/003_object_artifact_metadata.sql` adds generated object-artifact
+metadata rows with opaque artifact IDs, workspace/session/owner linkage,
+content type, byte size, checksum, provider type, internal object key reference,
+status, retention status, and tombstone timestamp fields. Object mode stores
+generated artifact bytes in the object backend and DB metadata in
+`kqag_object_artifacts`; it does not store raw artifact bytes in database rows
+and does not expose object keys in public API responses. Authorized downloads
+continue to use `/api/quote-sessions/{id}/download/{kind}`. Production still
+requires live provider evidence, DB+object backup/restore evidence,
+retention/delete evidence against the real object backend, production
+deployment/operations evidence, live Swooshz Platform integration audit,
+observability export/alert delivery, supply-chain hardening, and final audit
+before readiness can be claimed.
 
 ## Threat Model
 
@@ -523,9 +540,9 @@ Do not claim production readiness until all internal-alpha gates plus these are 
 7. DB/DB-artifact backup evidence: completed in PR #95 for the temporary SQLite internal-alpha exception with synthetic backup, restore, checksum, retention-policy, and rollback verification.
 8. Hosted observability evidence: completed in PR #96 for synthetic privacy-minimized structured logs, support references, event categories, and health metadata.
 9. Hosted smoke evidence: completed in PR #97 for synthetic deploy/database/database-artifact smoke coverage on `127.0.0.1`; live Platform verification remains separate.
-10. Artifact object-storage contract: completed in PR #98 as provider-neutral contract and synthetic in-memory evidence only; runtime object mode fails closed without a real provider adapter.
-11. Object-storage provider configuration validation: completed in this PR as S3-compatible provider env-name validation and a fail-closed adapter scaffold; no credentials or live provider wiring are added.
-12. Real object-storage provider integration: wire generated outputs and uploaded/reference/profile assets to a credentialed object store with DB metadata and checksums.
+10. Artifact object-storage contract: completed in PR #98 as provider-neutral contract and synthetic in-memory evidence only.
+11. Object-storage provider configuration validation: completed in PR #99 as S3-compatible provider env-name validation without credentials or production readiness claims.
+12. Real object-storage provider integration groundwork: this PR adds the credentialed S3-compatible adapter boundary, mocked adapter tests, generated artifact object metadata, and authorized quote-session retrieval; live provider evidence, uploaded/reference/profile object wiring, DB+object backup/restore, and retention/delete evidence remain.
 13. Session and business-logic hardening: immutable profile/pricing snapshots, stale/deleted artifact tests, delete/export race tests.
 14. Hosted production operations: host-specific logging export, alert delivery, DB+object backup/restore/rollback runbooks, production deployment evidence, and live host smoke evidence.
 15. Supply-chain hardening: CodeQL/equivalent, Python dependency audit, pinned security scanner image, branch protection docs.
@@ -553,14 +570,14 @@ Severity summary from plugin: unavailable because the scan did not start. This a
 | `python scripts/verify_database_backup_restore.py --work-dir _tmp\validation\backup-restore-evidence` | Passed. Reported `status=passed`, `synthetic_only=true`, row counts/checksums matched, workspace ownership was preserved, rollback restored a prior known-good state, retention policy covered required data classes, and output omitted paths, DB URLs, artifact bytes, and payloads. |
 | `python scripts/verify_hosted_observability.py --work-dir _tmp\validation\hosted-observability-evidence` | Passed. Reported `status=passed`, `synthetic_only=true`, structured log records checked, allowed events enforced, sensitive values omitted, support error reference present, health metadata path-free, and output omitted paths, DB URLs, artifact bytes, payloads, provider responses, staff emails, and tokens. |
 | `python scripts/verify_hosted_smoke.py --work-dir _tmp\validation\hosted-smoke-evidence` | Passed. Reported `status=passed`, `synthetic_only=true`, `network.host=127.0.0.1`, database/database-artifact mode, health/auth/platform/profile/pricing/generate/session/download/delete/logout/legacy-lockdown checks true, XLSX/PDF authorized downloads, and no local quote-session or local artifact success path. |
-| `python scripts/verify_object_storage_contract.py --work-dir _tmp\validation\object-storage-contract` | Passed. Reported `status=passed`, `synthetic_only=true`, backend `synthetic-in-memory`, generated quote/uploaded reference/profile layout/pricing visual artifact classes covered, store/retrieve/delete, checksum, workspace metadata, wrong-workspace denial, and metadata-only output without object keys or artifact bytes. |
+| `python scripts/verify_object_storage_contract.py --work-dir _tmp\validation\object-storage-runtime-contract` | Passed. Reported `status=passed`, `synthetic_only=true`, backend `synthetic-in-memory`, generated quote/uploaded reference/profile layout/pricing visual artifact classes covered, store/retrieve/delete, checksum, workspace metadata, wrong-workspace denial, and metadata-only output without object keys or artifact bytes. |
 | `python -m unittest tests.test_architecture_fallback_audit` | Passed: 3 tests OK. |
 | `python -m unittest tests.test_production_readiness` | Passed: 18 tests OK. |
 | `python -m unittest tests.test_database_backup_restore_verifier` | Passed: 6 tests OK. |
 | `python -m unittest tests.test_hosted_observability_verifier` | Passed: 4 tests OK. |
 | `python -m unittest tests.test_hosted_smoke_verifier` | Passed: 3 tests OK. |
 | `python -m unittest tests.test_object_storage_contract_verifier` | Passed: 3 tests OK. |
-| `python -m unittest tests.test_object_storage_provider_config` | Passed: 4 tests OK. |
+| `python -m unittest tests.test_object_storage_provider_config` | Passed: 7 tests OK, covering metadata-only provider config, complete-config/no-SDK fail-closed status, SDK-present runtime-available/not-production-ready status, fake-client S3-compatible store/retrieve/delete/checksum, and wrong-workspace denial. |
 | `python -m unittest -k database_storage tests.test_webapp.WebappServerTest` | Passed on escalated rerun: 7 tests OK, including new-workspace no-default-Koncept evidence and workspace-scoped profile layout artifact isolation. |
 | `python -m unittest -k database_pricing tests.test_webapp.WebappServerTest` | Passed on escalated rerun: 2 tests OK. |
 | `python -m unittest -k database_profile tests.test_webapp.WebappServerTest` | Passed on escalated rerun: 1 test OK. |
@@ -568,14 +585,15 @@ Severity summary from plugin: unavailable because the scan did not start. This a
 | `python -m unittest -k protected_draft tests.test_webapp.WebappServerTest` | Passed on escalated rerun: 4 tests OK. |
 | `python -m unittest -k quote_session tests.test_webapp.WebappServerTest` | Passed on escalated rerun: 11 tests OK. |
 | `python -m unittest -k local_artifact tests.test_webapp.WebappServerTest` | Passed on escalated rerun: 4 tests OK. |
-| `python -m unittest -k database_artifact tests.test_webapp.WebappServerTest` | Passed on escalated rerun: 7 tests OK. |
-| `python -m unittest discover -s tests` | Passed on escalated rerun: 542 tests OK. |
+| `python -m unittest -k object_artifact tests.test_webapp.WebappServerTest` | Passed: 4 tests OK, covering object-mode fail-closed provider paths plus mocked object metadata persistence, authorized quote-session download, wrong-workspace denial, no DB BLOB row for object mode, and tombstoned metadata fail-closed behavior. |
+| `python -m unittest -k database_artifact tests.test_webapp.WebappServerTest` | Passed on escalated rerun: 8 tests OK. |
+| `python -m unittest discover -s tests` | Passed on escalated rerun: 547 tests OK. |
 | `python scripts/audit_architecture_fallbacks.py --max-hits-per-pattern 1 --max-possible-unused 5` | Passed; metadata-only scanner output recorded above. |
 | `python scripts/check_production_readiness.py` | Expected nonzero exit 2. Reported `local_uat_supported=true`, `internal_alpha_ready=false`, `production_ready=false`, all evidence statuses `not_run_by_checker`, and seven remaining blockers in local mode: `local_runtime_storage`, `local_artifact_storage`, `object_storage_missing`, `production_deployment_operations_evidence_missing`, `backup_restore_unverified`, `hosted_logging_monitoring_missing`, and `hosted_smoke_evidence_missing`. |
 | `KQAG_STORAGE_MODE=database KQAG_ARTIFACT_STORAGE_MODE=database KQAG_DATABASE_URL=<synthetic-sqlite-url> python scripts/check_production_readiness.py --with-backup-restore-evidence --with-hosted-observability-evidence --with-hosted-smoke-evidence --backup-restore-work-dir _tmp\validation\readiness-backup-evidence-db --hosted-observability-work-dir _tmp\validation\readiness-observability-evidence --hosted-smoke-work-dir _tmp\validation\readiness-hosted-smoke-evidence` | Expected nonzero exit 2. Reported backup evidence `passed`, hosted observability evidence `passed`, hosted smoke evidence `passed`, object-storage evidence `not_run_by_checker`, `internal_alpha_ready=true` for the synthetic DB/DB-artifact internal-alpha/simple-hosting posture, and `production_ready=false` with SQLite-not-final, object storage, and production deployment/operations evidence still blocking production. |
 | `KQAG_STORAGE_MODE=database KQAG_ARTIFACT_STORAGE_MODE=database KQAG_DATABASE_URL=<synthetic-sqlite-url> python scripts/check_production_readiness.py --with-backup-restore-evidence --with-hosted-observability-evidence --with-hosted-smoke-evidence --with-object-storage-evidence --backup-restore-work-dir _tmp\validation\readiness-backup-evidence-db-object-flag --hosted-observability-work-dir _tmp\validation\readiness-observability-evidence-object-flag --hosted-smoke-work-dir _tmp\validation\readiness-hosted-smoke-evidence-object-flag --object-storage-work-dir _tmp\validation\readiness-object-storage-contract-db-mode` | Expected nonzero exit 2. Reported backup/observability/smoke/object evidence `passed`, `internal_alpha_ready=true` for the prior DB/DB-artifact posture, and `production_ready=false`; object contract support was not credited as production object storage because artifact mode was `database`, so SQLite-not-final, object storage, and production deployment/operations remained production blockers. |
-| `KQAG_STORAGE_MODE=database KQAG_ARTIFACT_STORAGE_MODE=object KQAG_DATABASE_URL=<synthetic-sqlite-url> python scripts/check_production_readiness.py --with-object-storage-evidence --object-storage-work-dir _tmp\validation\readiness-object-provider-contract` | Expected nonzero exit 2. Reported object-storage contract evidence `passed`, `object_storage_provider.provider=disabled`, `object_storage_provider.production_provider_ready=false`, `object_storage_provider_unavailable`, and `production_ready=false`. |
-| `KQAG_STORAGE_MODE=database KQAG_ARTIFACT_STORAGE_MODE=object KQAG_DATABASE_URL=<synthetic-sqlite-url> KQAG_OBJECT_STORAGE_PROVIDER=s3_compatible KQAG_OBJECT_STORAGE_ENDPOINT_URL=<redacted> KQAG_OBJECT_STORAGE_BUCKET=<redacted> KQAG_OBJECT_STORAGE_REGION=<redacted> KQAG_OBJECT_STORAGE_ACCESS_KEY_ID=<redacted> KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY=<redacted> python scripts/check_production_readiness.py --with-object-storage-evidence --object-storage-work-dir _tmp\validation\readiness-object-provider-s3-config` | Expected nonzero exit 2. Reported provider `s3_compatible`, required field names present, no missing fields, adapter `s3_compatible_scaffold`, `runtime_backend_available=false`, `production_provider_ready=false`, `object_storage_provider_unavailable`, and `production_ready=false`; output omitted provider values/secrets. |
+| `KQAG_STORAGE_MODE=database KQAG_ARTIFACT_STORAGE_MODE=object KQAG_DATABASE_URL=<synthetic-sqlite-url> KQAG_OBJECT_STORAGE_PROVIDER=s3_compatible KQAG_OBJECT_STORAGE_ENDPOINT_URL=<redacted> KQAG_OBJECT_STORAGE_BUCKET=<redacted> KQAG_OBJECT_STORAGE_REGION=<redacted> KQAG_OBJECT_STORAGE_ACCESS_KEY_ID=<redacted> python scripts/check_production_readiness.py --with-object-storage-evidence --object-storage-work-dir _tmp\validation\readiness-object-incomplete` | Expected nonzero exit 2. Reported object-storage contract evidence `passed`, provider `s3_compatible`, missing field name `KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY`, `runtime_backend_available=false`, `production_provider_ready=false`, `object_storage_provider_unavailable`, and `production_ready=false`; output omitted provider values/secrets. |
+| `KQAG_STORAGE_MODE=database KQAG_ARTIFACT_STORAGE_MODE=object KQAG_DATABASE_URL=<synthetic-sqlite-url> KQAG_OBJECT_STORAGE_PROVIDER=s3_compatible KQAG_OBJECT_STORAGE_ENDPOINT_URL=<redacted> KQAG_OBJECT_STORAGE_BUCKET=<redacted> KQAG_OBJECT_STORAGE_REGION=<redacted> KQAG_OBJECT_STORAGE_ACCESS_KEY_ID=<redacted> KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY=<redacted> python scripts/check_production_readiness.py --with-object-storage-evidence --object-storage-work-dir _tmp\validation\readiness-object-complete` | Expected nonzero exit 2. Reported provider `s3_compatible`, required field names present, no missing fields, adapter `s3_compatible`, `runtime_backend_available=false` because optional `boto3` was not installed locally, `production_provider_ready=false`, `object_storage_provider_unavailable`, and `production_ready=false`; output omitted provider values/secrets. |
 | `python scripts/scan_sensitive_fixtures.py` | Passed: 0 blocking, 0 review findings. |
 | `python scripts/validate_local_pdf_dependency_usage.py` | Passed. |
 | `python scripts/validate_dynamic_pricing_reference_rules.py` | Passed. |
@@ -583,9 +601,8 @@ Severity summary from plugin: unavailable because the scan did not start. This a
 | `node --check scripts/playwright-smoke.mjs` | Passed. |
 | `node --check scripts/playwright-ai-basis-chat-stress.mjs` | Passed. |
 | `Invoke-WebRequest http://127.0.0.1:8765/api/health` | Passed after starting the local webapp server with `scripts/start-webapp.ps1`: HTTP 200. |
-| `npm run playwright:smoke -- --port 8768` | Passed with `status=ok` on isolated local test server. The plain `npm run playwright:smoke` reused the already-running health-check server on port 8765 and hit a stale dashboard/localStorage assertion, so the isolated-port run is the recorded smoke evidence. |
-| `npm run playwright:ai-stress -- --port 8769` | Passed with `status=ok` on isolated local test server. |
-| `QUOTE_DATA_ROOT=_tmp\validation\ci-smoke-fresh-8770 npm run playwright:ai-stress -- --port 8770; npm run playwright:smoke -- --port 8770` | Passed with both scripts reporting `status=ok` against a fresh isolated quote data root in the same order used by CI. This verifies the dashboard search smoke assertion does not require global uniqueness when another legitimate saved quote can also match `7a`, while still requiring the intended `REF QUOTE-7A` row. |
+| `npm run playwright:smoke -- --port 8771` | Passed with `status=ok` on isolated local test server. The script recorded an expected negative-path `400` for `/api/quote-sessions` during its stale/session validation path. |
+| `npm run playwright:ai-stress -- --port 8772` | Passed with `status=ok` on isolated local test server. |
 | `npm audit` | Passed: 0 vulnerabilities. |
 | `git diff --check` | Passed with line-ending warnings only. |
 
@@ -598,8 +615,8 @@ Readiness command note: the nonzero result from the default `python scripts/chec
 - Live AI provider privacy posture, data retention, or rate limits.
 - Real private Koncept pricing/profile/layout data import.
 - Generated customer quote contents.
-- Real object-storage provider runtime wiring, because this PR adds only S3-compatible configuration validation and a fail-closed adapter scaffold.
-- Production backup/restore/rollback for DB+object storage, because no real provider is wired.
+- Live object-storage provider runtime evidence, because the S3-compatible adapter is tested only with fake/stubbed clients in this PR.
+- Production backup/restore/rollback for DB+object storage, because no live provider backup/restore drill is implemented.
 - Hosted backup/restore evidence against a real internal-alpha host; PR #95 verifies only synthetic SQLite database/database-artifact drills.
 - External hosted observability vendor/export wiring and alert delivery; PR #96 verifies only synthetic structured log and health metadata properties.
 - Production deployment/operations evidence and live hosted smoke checks; PR #97 verifies only a synthetic `127.0.0.1` hosted-like path.

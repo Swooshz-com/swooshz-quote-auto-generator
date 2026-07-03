@@ -19885,9 +19885,9 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertFalse((output_root / "job-object-artifact-protected" / "quotation.xlsx").exists())
 
     def test_object_artifact_storage_mode_with_incomplete_provider_config_fails_closed(self):
-        private_endpoint = "https://private-object-store.example.test/path"
-        private_bucket = "private-koncept-bucket"
-        private_access_key = "AKIA_PRIVATE_TEST_KEY"
+        example_endpoint = "https://object-store.example.test/path"
+        example_bucket = "example-artifact-bucket"
+        example_access_key = "EXAMPLE_ACCESS_KEY_ID"
         root = test_temp_root() / f"object-artifact-incomplete-provider-{time.time_ns()}"
         payload = valid_payload()
 
@@ -19895,10 +19895,10 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             KQAG_STORAGE_MODE="local",
             KQAG_ARTIFACT_STORAGE_MODE="object",
             KQAG_OBJECT_STORAGE_PROVIDER="s3_compatible",
-            KQAG_OBJECT_STORAGE_ENDPOINT_URL=private_endpoint,
-            KQAG_OBJECT_STORAGE_BUCKET=private_bucket,
+            KQAG_OBJECT_STORAGE_ENDPOINT_URL=example_endpoint,
+            KQAG_OBJECT_STORAGE_BUCKET=example_bucket,
             KQAG_OBJECT_STORAGE_REGION="ap-southeast-private",
-            KQAG_OBJECT_STORAGE_ACCESS_KEY_ID=private_access_key,
+            KQAG_OBJECT_STORAGE_ACCESS_KEY_ID=example_access_key,
             QUOTE_OUTPUT_ROOT=str(root / "output"),
             QUOTE_TMP_ROOT=str(root / "tmp"),
             QUOTE_LOG_ROOT=str(root / "logs"),
@@ -19920,9 +19920,9 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["errors"], ["Quote artifact storage is not available in this environment."])
         self.assertEqual(run.call_count, 0)
-        self.assertNotIn(private_endpoint, result_text)
-        self.assertNotIn(private_bucket, result_text)
-        self.assertNotIn(private_access_key, result_text)
+        self.assertNotIn(example_endpoint, result_text)
+        self.assertNotIn(example_bucket, result_text)
+        self.assertNotIn(example_access_key, result_text)
         self.assertNotIn("KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY", result_text)
 
     def test_database_artifact_storage_requires_platform_context_and_migration(self):
@@ -20016,6 +20016,128 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
 
         self.assertEqual(status, 200)
         self.assertEqual(downloaded, xlsx_bytes)
+
+    def test_object_artifact_storage_saves_db_metadata_and_downloads_through_authorized_route(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        tmp_path = test_temp_root() / f"object-artifact-route-{time.time_ns()}"
+        db_path = tmp_path / "kqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        output_dir = tmp_path / "out" / "job-object-artifact"
+        output_dir.mkdir(parents=True)
+        xlsx_bytes = b"xlsx-object-artifact"
+        (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
+        payload = valid_payload()
+        payload["quote_session"] = {"session_id": "quote-object-artifact"}
+        result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-object-artifact/files/quotation.xlsx"}]}
+        env = {
+            **self.deploy_auth_env(),
+            "KQAG_STORAGE_MODE": "database",
+            "KQAG_ARTIFACT_STORAGE_MODE": "object",
+            "KQAG_DATABASE_URL": database_url,
+            "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
+            "KQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
+            "KQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
+            "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
+            "KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
+        }
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_kqag_storage_migrations(database_url)
+            workspace_a = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-a"))
+            workspace_b = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-b"))
+            session = workspace_a.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+            artifact = workspace_a.quote_session_export_artifact("quote-object-artifact", "xlsx")
+            blocked_artifact = workspace_b.quote_session_export_artifact("quote-object-artifact", "xlsx")
+            cookie = webapp.signed_cookie_value(self.platform_auth_session("workspace-object-a"))
+            session_cookie = f"{webapp.SESSION_COOKIE_NAME}={cookie}"
+            with LocalRunnerServer() as runner:
+                parsed = urllib.parse.urlparse(runner.base_url)
+                connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
+                try:
+                    connection.request(
+                        "GET",
+                        "/api/quote-sessions/quote-object-artifact/download/xlsx",
+                        headers={"Cookie": session_cookie},
+                    )
+                    response = connection.getresponse()
+                    downloaded = response.read()
+                    status = response.status
+                finally:
+                    connection.close()
+
+        with sqlite3.connect(db_path) as connection:
+            row = connection.execute(
+                "select artifact_id, workspace_id, session_id, artifact_kind, object_provider_type, object_key_ref, checksum_sha256, size_bytes, content_type, deleted_at, retention_status from kqag_object_artifacts",
+            ).fetchone()
+            blob_rows = connection.execute("select count(*) from kqag_quote_artifacts").fetchone()[0]
+
+        self.assertTrue(session["exports"]["xlsx"]["exists"])
+        self.assertEqual(session["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-object-artifact/download/xlsx")
+        result_files = webapp.quote_session_result_files(session)
+        self.assertEqual(result_files[0]["url"], "/api/quote-sessions/quote-object-artifact/download/xlsx")
+        self.assertNotIn("/api/jobs/", json.dumps(result_files))
+        self.assertIsNotNone(artifact)
+        self.assertEqual(artifact["content"], xlsx_bytes)
+        self.assertIsNone(blocked_artifact)
+        self.assertEqual(status, 200)
+        self.assertEqual(downloaded, xlsx_bytes)
+        self.assertEqual(blob_rows, 0)
+        self.assertEqual(row[1], "workspace-object-a")
+        self.assertEqual(row[2], "quote-object-artifact")
+        self.assertEqual(row[3], "xlsx")
+        self.assertEqual(row[4], "s3_compatible")
+        self.assertTrue(row[5])
+        self.assertEqual(len(row[6]), 64)
+        self.assertEqual(row[7], len(xlsx_bytes))
+        self.assertEqual(row[8], webapp.QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"])
+        self.assertIsNone(row[9])
+        self.assertEqual(row[10], "active")
+
+    def test_object_artifact_storage_deleted_metadata_fails_closed(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        tmp_path = test_temp_root() / f"object-artifact-deleted-{time.time_ns()}"
+        db_path = tmp_path / "kqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        output_dir = tmp_path / "out" / "job-object-deleted"
+        output_dir.mkdir(parents=True)
+        (output_dir / "quotation.xlsx").write_bytes(b"xlsx-object-deleted")
+        payload = valid_payload()
+        payload["quote_session"] = {"session_id": "quote-object-deleted"}
+        result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-object-deleted/files/quotation.xlsx"}]}
+        env = {
+            **self.deploy_auth_env(),
+            "KQAG_STORAGE_MODE": "database",
+            "KQAG_ARTIFACT_STORAGE_MODE": "object",
+            "KQAG_DATABASE_URL": database_url,
+            "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
+            "KQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
+            "KQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
+            "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
+            "KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
+        }
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_kqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-deleted"))
+            storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+            with webapp.sqlite_storage_connection(database_url) as connection:
+                connection.execute(
+                    "update kqag_object_artifacts set deleted_at = ?, retention_status = ? where workspace_id = ?",
+                    (webapp.utc_timestamp(), "deleted", "workspace-object-deleted"),
+                )
+                connection.commit()
+            session = storage.get_quote_session("quote-object-deleted")
+            artifact = storage.quote_session_export_artifact("quote-object-deleted", "xlsx")
+
+        self.assertFalse(session["exports"]["xlsx"]["exists"])
+        self.assertTrue(session["exports"]["xlsx"]["missing"])
+        self.assertIsNone(artifact)
 
     def test_database_artifact_storage_saves_profile_and_pricing_assets_by_workspace(self):
         layout_bytes = (KONCEPT_PROFILE / "quotation-layout.xlsx").read_bytes()

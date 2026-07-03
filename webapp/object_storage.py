@@ -183,19 +183,30 @@ def object_storage_provider_status(env: Mapping[str, str] | None) -> dict[str, o
     blockers = []
     if missing_fields:
         blockers.append("missing_provider_config")
-    blockers.append("provider_adapter_unwired")
+    if not sdk_available:
+        blockers.append("optional_s3_sdk_missing")
+    if configured and sdk_available:
+        runtime_backend_available = True
+        blockers.extend([
+            "live_provider_evidence_missing",
+            "db_object_backup_restore_unverified",
+            "retention_delete_evidence_missing",
+        ])
+    else:
+        runtime_backend_available = False
     base.update(
         {
             "configured": configured,
             "required_fields": list(S3_COMPATIBLE_REQUIRED_ENV_NAMES),
             "missing_fields": missing_fields,
-            "adapter": "s3_compatible_scaffold",
+            "adapter": "s3_compatible",
             "sdk": {"name": "boto3", "available": sdk_available},
+            "runtime_backend_available": runtime_backend_available,
             "blockers": blockers,
             "notes": list(base["notes"])
             + [
-                "S3-compatible configuration validation is present, but the credentialed runtime adapter is not wired in this PR.",
-                "A missing optional SDK or unwired adapter keeps runtime object storage fail-closed.",
+                "S3-compatible runtime integration requires the optional SDK plus complete provider configuration.",
+                "Runtime availability is not production readiness; live provider evidence, DB+object backup/restore, and retention/delete evidence remain separate gates.",
             ],
         }
     )
@@ -203,32 +214,145 @@ def object_storage_provider_status(env: Mapping[str, str] | None) -> dict[str, o
 
 
 class S3CompatibleObjectStorageBackend:
-    """S3/R2/MinIO-compatible adapter scaffold.
+    """S3/R2/MinIO-compatible object adapter.
 
-    The credentialed implementation is intentionally not wired here. This
-    scaffold preserves the runtime contract while failing closed until a later
-    PR adds provider integration tests and safe deployment evidence.
+    The adapter accepts an already configured client so tests can use a stubbed
+    S3-compatible client without credentials or network access. Runtime factory
+    code is responsible for constructing the real credentialed client.
     """
 
-    backend_name = "s3-compatible-scaffold"
+    backend_name = "s3-compatible"
 
-    def __init__(self, *, status: Mapping[str, object]) -> None:
-        self.status = dict(status)
+    def __init__(self, *, bucket: str, client: object, status: Mapping[str, object] | None = None) -> None:
+        self.bucket = str(bucket or "").strip()
+        self.client = client
+        self.status = dict(status or {})
+        if not self.bucket or self.client is None:
+            raise ObjectStorageConfigurationError("Object storage backend is not available.")
 
-    def _unavailable(self) -> None:
-        raise ObjectStorageConfigurationError("Object storage backend is not available.")
+    def _require_workspace(self, metadata: ObjectArtifactMetadata, workspace_id: str) -> None:
+        if metadata.workspace_id != safe_segment(workspace_id, ""):
+            raise ObjectStorageContractError("Artifact is not available for this workspace.")
 
-    def store_artifact(self, **kwargs: object) -> ObjectArtifactMetadata:
-        self._unavailable()
+    def _object_metadata(
+        self,
+        *,
+        workspace_id: str,
+        owner_type: str,
+        owner_id: str,
+        artifact_kind: str,
+        checksum_sha256: str,
+    ) -> dict[str, str]:
+        return {
+            "kqag-workspace-id": safe_segment(workspace_id, ""),
+            "kqag-owner-type": normalize_owner_type(owner_type),
+            "kqag-owner-id": safe_segment(owner_id, ""),
+            "kqag-artifact-kind": safe_segment(artifact_kind, ""),
+            "kqag-checksum-sha256": checksum_sha256,
+        }
+
+    def _validate_remote_metadata(self, metadata: ObjectArtifactMetadata, response: Mapping[str, object]) -> None:
+        remote_metadata = response.get("Metadata") if isinstance(response.get("Metadata"), Mapping) else {}
+        normalized_remote = {str(key).lower(): str(value) for key, value in dict(remote_metadata).items()}
+        expected = self._object_metadata(
+            workspace_id=metadata.workspace_id,
+            owner_type=metadata.owner_type,
+            owner_id=metadata.owner_id,
+            artifact_kind=metadata.artifact_kind,
+            checksum_sha256=metadata.checksum_sha256,
+        )
+        for key, value in expected.items():
+            if normalized_remote.get(key) != value:
+                raise ObjectStorageContractError("Artifact metadata verification failed.")
+
+    def store_artifact(
+        self,
+        *,
+        workspace_id: str,
+        owner_type: str,
+        owner_id: str,
+        artifact_kind: str,
+        filename: str,
+        content_type: str,
+        content: bytes,
+    ) -> ObjectArtifactMetadata:
+        if not content:
+            raise ObjectStorageContractError("Artifact content is required.")
+        checksum = artifact_checksum(content)
+        key = object_artifact_key(
+            workspace_id=workspace_id,
+            owner_type=owner_type,
+            owner_id=owner_id,
+            artifact_kind=artifact_kind,
+            filename=filename,
+            checksum_sha256=checksum,
+        )
+        now = utc_timestamp()
+        metadata = ObjectArtifactMetadata(
+            workspace_id=safe_segment(workspace_id, ""),
+            owner_type=normalize_owner_type(owner_type),
+            owner_id=safe_segment(owner_id, ""),
+            artifact_kind=safe_segment(artifact_kind, ""),
+            filename=safe_segment(filename, "artifact.bin"),
+            content_type=str(content_type or "application/octet-stream").strip() or "application/octet-stream",
+            size_bytes=len(content),
+            checksum_sha256=checksum,
+            storage_key=key,
+            created_at=now,
+            updated_at=now,
+        )
+        try:
+            self.client.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=bytes(content),
+                ContentType=metadata.content_type,
+                Metadata=self._object_metadata(
+                    workspace_id=metadata.workspace_id,
+                    owner_type=metadata.owner_type,
+                    owner_id=metadata.owner_id,
+                    artifact_kind=metadata.artifact_kind,
+                    checksum_sha256=metadata.checksum_sha256,
+                ),
+            )
+        except Exception as exc:
+            raise ObjectStorageContractError("Artifact could not be stored.") from exc
+        return metadata
 
     def retrieve_artifact(self, metadata: ObjectArtifactMetadata, *, workspace_id: str) -> bytes:
-        self._unavailable()
+        self._require_workspace(metadata, workspace_id)
+        try:
+            response = self.client.get_object(Bucket=self.bucket, Key=metadata.storage_key)
+            self._validate_remote_metadata(metadata, response)
+            body = response.get("Body")
+            content = body.read() if hasattr(body, "read") else body
+            content_bytes = bytes(content or b"")
+        except ObjectStorageContractError:
+            raise
+        except Exception as exc:
+            raise ObjectStorageContractError("Artifact is not available.") from exc
+        if len(content_bytes) != metadata.size_bytes or artifact_checksum(content_bytes) != metadata.checksum_sha256:
+            raise ObjectStorageContractError("Artifact integrity check failed.")
+        return content_bytes
 
     def delete_artifact(self, metadata: ObjectArtifactMetadata, *, workspace_id: str) -> bool:
-        self._unavailable()
+        self._require_workspace(metadata, workspace_id)
+        self.verify_metadata(metadata, workspace_id=workspace_id)
+        try:
+            self.client.delete_object(Bucket=self.bucket, Key=metadata.storage_key)
+        except Exception as exc:
+            raise ObjectStorageContractError("Artifact could not be deleted.") from exc
+        return True
 
     def verify_metadata(self, metadata: ObjectArtifactMetadata, *, workspace_id: str) -> bool:
-        return False
+        try:
+            self._require_workspace(metadata, workspace_id)
+            response = self.client.head_object(Bucket=self.bucket, Key=metadata.storage_key)
+            self._validate_remote_metadata(metadata, response)
+            content_length = int(response.get("ContentLength") or 0)
+            return content_length == metadata.size_bytes
+        except Exception:
+            return False
 
 
 def object_artifact_key(

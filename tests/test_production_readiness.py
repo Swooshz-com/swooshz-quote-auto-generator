@@ -281,10 +281,10 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
             "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
             "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
-            "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://private-object-store.example.test/path",
-            "KQAG_OBJECT_STORAGE_BUCKET": "private-koncept-bucket",
-            "KQAG_OBJECT_STORAGE_REGION": "ap-southeast-private",
-            "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "AKIA_PRIVATE_TEST_KEY",
+            "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test/path",
+            "KQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
+            "KQAG_OBJECT_STORAGE_REGION": "example-region-1",
+            "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
         }
         status = self.readiness_status(env, object_storage_evidence_status="passed")
         text = json.dumps(status, sort_keys=True)

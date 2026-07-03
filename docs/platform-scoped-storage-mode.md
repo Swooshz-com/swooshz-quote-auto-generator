@@ -42,7 +42,11 @@ The first implementation supports the reviewed SQLite migration path. Unsupporte
 database URL schemes fail closed with a generic app-facing storage error and
 privacy-safe logs. `KQAG_ARTIFACT_STORAGE_MODE=database` stores generated quote
 exports and file assets in workspace-scoped SQLite BLOB rows for internal UAT.
-Object storage such as S3 or R2 is intentionally out of scope for this layer.
+`KQAG_ARTIFACT_STORAGE_MODE=object` requires database storage plus a configured
+S3-compatible object backend. Object mode stores generated artifact bytes in the
+object backend and safe workspace-owned metadata in the database; it must not
+fall back to local artifacts or database BLOB artifacts when the provider is
+missing, incomplete, unauthorized, or failing.
 
 ## Migration
 
@@ -50,6 +54,7 @@ Review the migrations, then apply them explicitly:
 
 - `migrations/001_platform_scoped_storage.sql` for workspace-scoped app data
 - `migrations/002_platform_scoped_artifacts.sql` for workspace-scoped file and quote artifacts
+- `migrations/003_object_artifact_metadata.sql` for generated object-artifact metadata
 
 ```powershell
 $env:KQAG_DATABASE_URL="sqlite:///C:/path/to/local/kqag-storage.sqlite3"
@@ -85,6 +90,29 @@ or production object storage. Production still requires object storage plus DB
 metadata, retention state, and backup/restore evidence for DB rows and objects
 together.
 
+## Object Artifact Mode
+
+Object artifact mode is production groundwork, not production readiness. The
+required environment variable names are:
+
+- `KQAG_OBJECT_STORAGE_PROVIDER`
+- `KQAG_OBJECT_STORAGE_ENDPOINT_URL`
+- `KQAG_OBJECT_STORAGE_BUCKET`
+- `KQAG_OBJECT_STORAGE_REGION`
+- `KQAG_OBJECT_STORAGE_ACCESS_KEY_ID`
+- `KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY`
+
+Only the names should appear in docs, diagnostics, tests, and readiness output.
+Do not print or commit provider values, bucket values, endpoints, access keys,
+secret keys, object keys, DB URLs, generated artifacts, uploaded content, or
+private paths.
+
+The current S3-compatible adapter supports mocked/stubbed store, retrieve,
+delete, workspace metadata checks, and checksum validation. This evidence does
+not prove live provider credentials, provider IAM policy, network reachability,
+DB+object backup/restore, retention/delete jobs, alert delivery, or production
+deployment operations.
+
 ## Workspace Scope
 
 Database rows are keyed by the platform workspace ID from the KQAG platform
@@ -102,6 +130,8 @@ The boundary covers:
 - quote-session list, read, save, delete, and download metadata resolution
 - generated `quotation.xlsx` and optional `quotation.pdf` artifact persistence
   when artifact database mode is enabled
+- generated `quotation.xlsx` and optional `quotation.pdf` object metadata when
+  artifact object mode is enabled with a usable object backend
 
 Local profile/pricing/session/artifact behavior remains the default and continues
 to use existing runtime storage. Database artifact mode enforces allowed generated
