@@ -3096,6 +3096,8 @@ class WebappServerTest(unittest.TestCase):
             with LocalRunnerServer() as runner:
                 health = json.loads(urllib.request.urlopen(f"{runner.base_url}/api/health", timeout=3).read().decode("utf-8"))
                 self.assertEqual(health["status"], "ok")
+                self.assertTrue(health["generator_available"])
+                self.assertNotIn("generator", health)
 
                 with self.assertRaises(urllib.error.HTTPError) as root_error:
                     opener.open(f"{runner.base_url}/", timeout=3)
