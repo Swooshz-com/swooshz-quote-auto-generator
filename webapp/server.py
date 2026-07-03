@@ -329,6 +329,7 @@ ALLOWED_LOG_EVENTS = {
     "ai_pricing_reference_metadata_enrichment_completed",
     "profile_export_failed",
     "profile_export_not_found",
+    "quote_artifact_storage_blocked",
     "quote_session_runtime_storage_blocked",
     "security_event",
     "server_pricing_reference_import_timing",
@@ -399,6 +400,7 @@ AI_PROVIDER_OPENAI = "openai"
 AI_PROVIDER_DEEPSEEK = "deepseek"
 SUPPORTED_TEXT_AI_PROVIDERS = {AI_PROVIDER_OPENAI, AI_PROVIDER_DEEPSEEK}
 AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE = "AI draft generation is not available in this environment."
+QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE = "Quote artifact storage is not available in this environment."
 QUOTE_SESSION_STORAGE_UNAVAILABLE_MESSAGE = "Quote session storage is not available in this environment."
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_PRO_MODEL = "deepseek-v4-pro"
@@ -924,6 +926,8 @@ def log_meaning(event: str, details: dict[str, Any], context: str) -> str:
         meaning = "Protected-mode AI quote-basis drafting was blocked because a real remote AI draft was unavailable or failed."
     elif event in {"ai_draft_fallback_used", "ai_draft_remote_unconfigured"}:
         meaning = "Remote AI analysis was unavailable or unconfigured, so the app used or offered a local fallback path."
+    elif event == "quote_artifact_storage_blocked":
+        meaning = "Protected-mode quote artifact storage was blocked because local filesystem artifact storage is local-UAT only."
     elif event == "quote_session_runtime_storage_blocked":
         meaning = "Protected-mode quote-session storage was blocked because local runtime storage is local-UAT only."
     elif event == "server_pricing_reference_import_timing":
@@ -6974,9 +6978,13 @@ def storage_access_error_payload(exc: KqagStorageAccessError) -> dict[str, Any]:
     error_reference = new_error_reference()
     write_local_log("server_error", {"error_reference": error_reference, "reason": exc.reason, "status": exc.status, "errors": safe_error_messages([str(exc)])})
     message = (
-        QUOTE_SESSION_STORAGE_UNAVAILABLE_MESSAGE
-        if exc.reason == "protected_local_quote_session_storage_unavailable"
-        else "KQAG storage is not available for this workspace."
+        QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE
+        if exc.reason == "protected_local_artifact_storage_unavailable"
+        else (
+            QUOTE_SESSION_STORAGE_UNAVAILABLE_MESSAGE
+            if exc.reason == "protected_local_quote_session_storage_unavailable"
+            else "KQAG storage is not available for this workspace."
+        )
     )
     return {"status": "blocked" if exc.status < 500 else "failed", "errors": [message], "error_reference": error_reference}
 
@@ -13515,6 +13523,49 @@ def legacy_job_artifact_download_allowed(session: dict[str, Any] | None) -> bool
     return not protected_job_routes_enabled(session)
 
 
+def log_protected_local_artifact_storage_block(reason: str = "protected_local_artifact_storage_unavailable") -> None:
+    write_local_log(
+        "quote_artifact_storage_blocked",
+        {
+            "reason": safe_resource_id(reason, "protected_local_artifact_storage_unavailable"),
+            "app_mode": configured_app_mode(),
+            "storage_mode": configured_storage_mode(),
+            "artifact_storage_mode": configured_artifact_storage_mode(),
+            "platform_launch_mode": configured_platform_launch_mode(),
+        },
+    )
+
+
+def ensure_quote_artifact_storage_available_for_auth_session(session: dict[str, Any] | None) -> None:
+    if configured_artifact_storage_mode() == "database":
+        artifact_storage_for_auth_session(session)
+        return
+    if protected_job_routes_enabled(session):
+        log_protected_local_artifact_storage_block()
+        raise KqagStorageAccessError(
+            QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+            status=503,
+            reason="protected_local_artifact_storage_unavailable",
+        )
+
+
+def profile_payload_has_layout_artifact(profile: dict[str, Any]) -> bool:
+    pack_assets = profile.get("_pack_assets") if isinstance(profile.get("_pack_assets"), dict) else {}
+    layout = pack_assets.get("quotation_layout") if isinstance(pack_assets.get("quotation_layout"), dict) else {}
+    return bool(layout.get("bytes"))
+
+
+def pricing_reference_payload_has_visual_artifacts(reference: dict[str, Any]) -> bool:
+    items = reference.get("items") if isinstance(reference.get("items"), list) else []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for visual in sanitize_visual_references(item.get("visual_references")):
+            if clean_text(visual.get("data_url")):
+                return True
+    return False
+
+
 def log_legacy_job_route_block(reason: str, *, route: str) -> None:
     write_local_log(
         "legacy_job_route_blocked",
@@ -13732,6 +13783,11 @@ def run_quote_job(
             quote_session_storage = quote_session_storage_for_auth_session(auth_session)
         except KqagStorageAccessError as exc:
             return storage_access_error_payload(exc)
+
+    try:
+        ensure_quote_artifact_storage_available_for_auth_session(auth_session)
+    except KqagStorageAccessError as exc:
+        return storage_access_error_payload(exc)
 
     output_root = output_root or configured_output_root()
     tmp_root = tmp_root or configured_tmp_root()
@@ -14137,6 +14193,12 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                         "Choose a different pricing reference name, or switch to Manage to edit it."
                     )
                 reference = normalize_pricing_reference_payload(payload)
+                if pricing_reference_payload_has_visual_artifacts(reference):
+                    try:
+                        ensure_quote_artifact_storage_available_for_auth_session(self.current_auth_session())
+                    except KqagStorageAccessError as exc:
+                        self.send_json(storage_access_error_payload(exc), status=exc.status)
+                        return
                 with ai_log_tracking_scope(request_ai_tracking):
                     reference, metadata_enrichment_status = pricing_reference_with_ai_metadata_before_save(reference)
                 saved = storage.save_pricing_reference(reference)
@@ -14157,6 +14219,12 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 return
             try:
                 profile = normalize_profile_payload(payload)
+                if profile_payload_has_layout_artifact(profile):
+                    try:
+                        ensure_quote_artifact_storage_available_for_auth_session(self.current_auth_session())
+                    except KqagStorageAccessError as exc:
+                        self.send_json(storage_access_error_payload(exc), status=exc.status)
+                        return
                 storage = self.current_app_storage()
                 if storage is None:
                     return
