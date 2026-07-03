@@ -1891,17 +1891,66 @@ def readiness_surface(
     }
 
 
-def readiness_blocker(blocker_id: str, severity: str, summary: str) -> dict[str, str]:
-    return {"id": blocker_id, "severity": severity, "summary": summary}
+def readiness_blocker(
+    blocker_id: str,
+    severity: str,
+    summary: str,
+    *,
+    gates: tuple[str, ...] = ("internal_alpha", "production"),
+) -> dict[str, Any]:
+    return {"id": blocker_id, "severity": severity, "summary": summary, "gates": list(gates)}
 
 
-def production_readiness_status(security_scan_status: str = "not_run_by_command") -> dict[str, Any]:
+def backup_restore_evidence_summary(
+    *,
+    status: str,
+    database_mode: bool,
+    database_artifacts: bool,
+    database_configured: bool,
+) -> dict[str, Any]:
+    normalized_status = clean_text(status).lower() or "not_run_by_checker"
+    if normalized_status not in {"passed", "failed", "not_run_by_checker"}:
+        normalized_status = "not_run_by_checker"
+    passed = normalized_status == "passed"
+    return {
+        "status": normalized_status,
+        "verifier": "scripts/verify_database_backup_restore.py",
+        "retention_policy": "docs/internal-alpha-retention-policy.json",
+        "covers": [
+            "synthetic_sqlite_database_rows",
+            "synthetic_database_artifacts",
+            "checksums",
+            "workspace_session_ownership_metadata",
+            "rollback_to_prior_known_good_state",
+            "retention_policy_shape",
+        ],
+        "database_artifact_temporary_exception_supported": bool(
+            passed and database_mode and database_artifacts and database_configured
+        ),
+        "notes": [
+            "Evidence is synthetic and metadata-only.",
+            "This is not production object storage or hosted operations evidence.",
+        ],
+    }
+
+
+def production_readiness_status(
+    security_scan_status: str = "not_run_by_command",
+    *,
+    backup_restore_evidence_status: str = "not_run_by_checker",
+) -> dict[str, Any]:
     storage_mode = configured_storage_mode()
     artifact_mode = configured_artifact_storage_mode()
     database_scheme = configured_database_scheme()
     database_configured = bool(database_scheme)
     database_mode = storage_mode == "database"
     database_artifacts = artifact_mode == "database"
+    backup_restore_evidence = backup_restore_evidence_summary(
+        status=backup_restore_evidence_status,
+        database_mode=database_mode,
+        database_artifacts=database_artifacts,
+        database_configured=database_configured,
+    )
 
     profiles = readiness_surface(
         mode=storage_mode,
@@ -1972,7 +2021,7 @@ def production_readiness_status(security_scan_status: str = "not_run_by_command"
         ),
     )
 
-    blockers: list[dict[str, str]] = []
+    blockers: list[dict[str, Any]] = []
     if not database_mode:
         blockers.append(readiness_blocker("local_runtime_storage", "P1", "Profiles, pricing references, and quote sessions are still using local runtime storage."))
     if not database_artifacts:
@@ -1980,16 +2029,23 @@ def production_readiness_status(security_scan_status: str = "not_run_by_command"
     if (database_mode or database_artifacts) and not database_configured:
         blockers.append(readiness_blocker("database_url_missing", "P1", "Database-backed storage mode is selected but no database URL is configured."))
     if database_scheme == "sqlite":
-        blockers.append(readiness_blocker("sqlite_not_final_production", "P1", "SQLite is acceptable only as an explicitly backed-up internal-alpha/simple-hosting option, not final production storage."))
-    blockers.append(readiness_blocker("object_storage_missing", "P1", "No object-storage-backed asset/artifact layer exists for production XLSX/PDF and uploaded reference assets."))
-    blockers.append(readiness_blocker("backup_restore_unverified", "P1", "Backup, restore, retention, and rollback procedures are not implemented or verified by this command."))
+        blockers.append(readiness_blocker("sqlite_not_final_production", "P1", "SQLite is acceptable only as an explicitly backed-up internal-alpha/simple-hosting option, not final production storage.", gates=("production",)))
+    blockers.append(readiness_blocker("object_storage_missing", "P1", "No object-storage-backed asset/artifact layer exists for production XLSX/PDF and uploaded reference assets.", gates=("production",)))
+    if not backup_restore_evidence["database_artifact_temporary_exception_supported"]:
+        blockers.append(readiness_blocker("backup_restore_unverified", "P1", "Backup, restore, retention, and rollback evidence has not been verified for the selected database/database-artifact mode."))
     blockers.append(readiness_blocker("hosted_logging_monitoring_missing", "P1", "Hosted privacy-minimized logging, monitoring, alerting, and support traceability are not implemented or verified by this command."))
+    blockers.append(readiness_blocker("hosted_smoke_evidence_missing", "P1", "Hosted smoke evidence for platform launch, workspace storage, quote generation, session persistence, artifact download, delete, and logout is not verified by this command."))
 
     workspace_scoped = all(
         surface["workspace_scoped"]
         for surface in (profiles, pricing_references, quote_sessions, generated_artifacts)
     )
-    p1_or_higher = [item for item in blockers if item["severity"] in {"P0", "P1"}]
+    internal_alpha_blockers = [
+        item for item in blockers if "internal_alpha" in item.get("gates", []) and item["severity"] in {"P0", "P1"}
+    ]
+    production_blockers = [
+        item for item in blockers if "production" in item.get("gates", []) and item["severity"] in {"P0", "P1"}
+    ]
     return {
         "schema": "swooshz.kqag.production-readiness.v1",
         "kqag_storage_mode": storage_mode,
@@ -2004,18 +2060,21 @@ def production_readiness_status(security_scan_status: str = "not_run_by_command"
             for item in blockers
             if item["id"] in {"local_runtime_storage", "local_artifact_storage"}
         ],
+        "backup_restore_evidence": backup_restore_evidence,
         "security_scan_status": clean_text(security_scan_status) or "not_run_by_command",
         "local_uat_supported": True,
-        "internal_alpha_ready": False if p1_or_higher else True,
+        "internal_alpha_blockers": internal_alpha_blockers,
+        "production_blockers": production_blockers,
+        "internal_alpha_ready": False if internal_alpha_blockers else True,
         "internal_alpha_future_exception": {
             "possible": True,
             "summary": (
                 "A temporary small-team internal alpha may become acceptable only after database storage, "
-                "database artifacts, and documented backup/restore/rollback are in place; SQLite/BLOB mode "
-                "is not final production storage."
+                "database artifacts, documented backup/restore/rollback, hosted smoke evidence, and hosted "
+                "privacy-minimized logging are in place; SQLite/BLOB mode is not final production storage."
             ),
         },
-        "production_ready": False,
+        "production_ready": False if production_blockers else True,
         "blockers_count": len(blockers),
         "blockers": blockers,
         "notes": [
