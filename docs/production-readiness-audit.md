@@ -80,9 +80,13 @@ python -m webapp.server --check-production-readiness
 Object-mode reviews can include synthetic contract/lifecycle evidence and the
 opt-in live-provider verifier. The live verifier fails closed unless
 `KQAG_LIVE_OBJECT_STORAGE_EVIDENCE` and the required S3-compatible provider env
-names are present in the operator environment:
+names are present in the operator environment. The S3-compatible SDK path is
+repo-controlled through pinned dependencies in `requirements.txt`; real
+provider values still belong only in the host secret manager or operator
+environment:
 
 ```powershell
+python -m pip install --only-binary=:all: -r requirements.txt
 python scripts\check_production_readiness.py --with-object-storage-evidence --with-object-artifact-lifecycle-evidence --with-live-object-storage-provider-evidence
 ```
 
@@ -198,11 +202,13 @@ require object storage; database rows should store metadata, ownership,
 checksums, retention state, and audit data only.
 
 `scripts/verify_live_object_storage_provider.py` is the opt-in live-provider
-evidence path. It uses synthetic XLSX/PDF bytes and reports only provider family,
-status booleans, required/missing env names, and check results. It must not print
-provider values, object keys, artifact bytes, DB URLs, private paths, customer
-data, uploaded content, or secrets. Without a successful operator-run live
-provider verifier, `production_ready` remains false.
+evidence path. It uses the pinned S3-compatible SDK dependency set from
+`requirements.txt`, synthetic XLSX/PDF bytes, and reports only provider family,
+status booleans, required/missing env names, and check results. It must not
+print provider values, object keys, artifact bytes, DB URLs, private paths,
+customer data, uploaded content, or secrets. Without a successful operator-run
+live provider verifier and the remaining production gates, `production_ready`
+remains false.
 
 ## Security Audit
 

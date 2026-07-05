@@ -125,6 +125,13 @@ def _empty_checks() -> dict[str, bool]:
     }
 
 
+def _provider_blockers(provider_status: Mapping[str, Any], *, live_provider_evidence_supported: bool) -> list[str]:
+    blockers = [str(item) for item in provider_status.get("blockers") or []]
+    if live_provider_evidence_supported:
+        return [item for item in blockers if item != "live_provider_evidence_missing"]
+    return blockers
+
+
 def _metadata_report(provider_status: Mapping[str, Any], *, status: str, checks: Mapping[str, bool], missing_env_names: list[str], test_injected_backend: bool = False) -> dict[str, Any]:
     supported = bool(status == "passed" and not test_injected_backend)
     return {
@@ -137,7 +144,7 @@ def _metadata_report(provider_status: Mapping[str, Any], *, status: str, checks:
             "configured": bool(provider_status.get("configured")),
             "runtime_backend_available": bool(provider_status.get("runtime_backend_available")),
             "synthetic_only": bool(provider_status.get("synthetic_only")),
-            "blockers": list(provider_status.get("blockers") or []),
+            "blockers": _provider_blockers(provider_status, live_provider_evidence_supported=supported),
         },
         "checks": dict(checks),
         "required_env_names": list(REQUIRED_ENV_NAMES),

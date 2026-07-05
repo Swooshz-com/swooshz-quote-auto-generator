@@ -5,6 +5,7 @@ import sys
 import unittest
 from io import BytesIO
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -121,6 +122,36 @@ class LiveObjectStorageProviderVerifierTest(unittest.TestCase):
         self.assertNotIn("<redacted-bucket-name>", text)
         self.assertNotIn("workspaces/", text)
         self.assertNotIn("synthetic-live-provider-xlsx-bytes", text)
+
+    def test_simulated_real_provider_pass_removes_only_live_evidence_missing_blocker(self):
+        fake_client = FakeLiveS3Client()
+        provider_status = {
+            "provider": "s3_compatible",
+            "configured": True,
+            "runtime_backend_available": True,
+            "synthetic_only": False,
+            "missing_fields": [],
+            "blockers": [
+                "live_provider_evidence_missing",
+                "db_object_backup_restore_unverified",
+                "retention_delete_evidence_missing",
+            ],
+        }
+
+        with mock.patch.object(verifier, "object_storage_provider_status", return_value=provider_status):
+            with mock.patch.object(
+                verifier,
+                "_build_live_s3_backend",
+                return_value=verifier.build_s3_backend_for_test(bucket="<redacted-bucket-name>", client=fake_client),
+            ):
+                report = verifier.run_verification(env=complete_env())
+
+        self.assertEqual(report["status"], "passed")
+        self.assertFalse(report["test_injected_backend"])
+        self.assertTrue(report["live_provider_evidence_supported"])
+        self.assertNotIn("live_provider_evidence_missing", report["provider"]["blockers"])
+        self.assertIn("db_object_backup_restore_unverified", report["provider"]["blockers"])
+        self.assertIn("retention_delete_evidence_missing", report["provider"]["blockers"])
 
     def test_cli_output_is_json_metadata_only_when_env_missing(self):
         stdout = io.StringIO()

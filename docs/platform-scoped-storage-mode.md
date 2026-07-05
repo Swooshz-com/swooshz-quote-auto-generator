@@ -118,12 +118,17 @@ deployment operations.
 
 The live-provider verifier is explicit opt-in. In addition to the provider env
 names above, it requires `KQAG_LIVE_OBJECT_STORAGE_EVIDENCE` to be enabled by an
-operator in the execution environment. It stores, retrieves, checks, and deletes
-synthetic XLSX/PDF bytes only, and its output is metadata-only. It must not print
-or commit provider values, object keys, generated artifact bytes, DB URLs,
-private paths, customer data, uploaded content, or secrets.
+operator in the execution environment. The repo-controlled Python dependencies
+in `requirements.txt` include pinned `boto3`/`botocore` plus compatible pinned
+transitive packages so the S3-compatible provider path is reproducible from repo
+dependencies. Real provider values still belong only in the host secret manager
+or operator environment, never in Git. The verifier stores, retrieves, checks,
+and deletes synthetic XLSX/PDF bytes only, and its output is metadata-only. It
+must not print or commit provider values, object keys, generated artifact bytes,
+DB URLs, private paths, customer data, uploaded content, or secrets.
 
 ```powershell
+python -m pip install --only-binary=:all: -r requirements.txt
 python scripts/verify_live_object_storage_provider.py
 python scripts/check_production_readiness.py --with-live-object-storage-provider-evidence
 ```
