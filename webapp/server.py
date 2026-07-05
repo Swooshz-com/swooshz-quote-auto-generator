@@ -2100,6 +2100,56 @@ def object_storage_evidence_summary(
     }
 
 
+def live_object_storage_provider_evidence_summary(
+    *,
+    status: str,
+    artifact_mode: str,
+    database_mode: bool,
+    database_configured: bool,
+    provider_status: dict[str, Any],
+) -> dict[str, Any]:
+    normalized_status = clean_text(status).lower() or "not_run_by_checker"
+    if normalized_status not in {"passed", "failed", "not_run_by_checker"}:
+        normalized_status = "not_run_by_checker"
+    supported = bool(
+        normalized_status == "passed"
+        and artifact_mode == "object"
+        and database_mode
+        and database_configured
+        and provider_status.get("provider") == "s3_compatible"
+        and provider_status.get("configured")
+        and provider_status.get("runtime_backend_available")
+    )
+    return {
+        "status": normalized_status,
+        "verifier": "scripts/verify_live_object_storage_provider.py",
+        "required_env_names": [
+            "KQAG_LIVE_OBJECT_STORAGE_EVIDENCE",
+            OBJECT_STORAGE_PROVIDER_ENV_NAME,
+            OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME,
+            OBJECT_STORAGE_BUCKET_ENV_NAME,
+            OBJECT_STORAGE_REGION_ENV_NAME,
+            OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME,
+            OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME,
+        ],
+        "covers": [
+            "generated_xlsx_test_bytes",
+            "generated_pdf_test_bytes",
+            "store_retrieve_delete",
+            "checksum_verification",
+            "content_type_verification",
+            "byte_size_verification",
+            "wrong_workspace_denial",
+            "tombstone_and_missing_object_fail_closed",
+        ],
+        "live_provider_evidence_supported": supported,
+        "notes": [
+            "Evidence is opt-in and metadata-only.",
+            "This does not print endpoint values, bucket values, object keys, credentials, artifact bytes, DB URLs, private paths, or tenant data.",
+        ],
+    }
+
+
 def object_artifact_lifecycle_evidence_summary(*, status: str, artifact_mode: str, database_mode: bool, database_configured: bool) -> dict[str, Any]:
     normalized_status = clean_text(status).lower() or "not_run_by_checker"
     if normalized_status not in {"passed", "failed", "not_run_by_checker"}:
@@ -2151,6 +2201,7 @@ def production_readiness_status(
     hosted_smoke_evidence_status: str = "not_run_by_checker",
     object_storage_evidence_status: str = "not_run_by_checker",
     object_artifact_lifecycle_evidence_status: str = "not_run_by_checker",
+    live_object_storage_provider_evidence_status: str = "not_run_by_checker",
 ) -> dict[str, Any]:
     storage_mode = configured_storage_mode()
     artifact_mode = configured_artifact_storage_mode()
@@ -2184,6 +2235,13 @@ def production_readiness_status(
         artifact_mode=artifact_mode,
         database_mode=database_mode,
         database_configured=database_configured,
+    )
+    live_object_storage_provider_evidence = live_object_storage_provider_evidence_summary(
+        status=live_object_storage_provider_evidence_status,
+        artifact_mode=artifact_mode,
+        database_mode=database_mode,
+        database_configured=database_configured,
+        provider_status=object_storage_provider,
     )
     object_retention_delete_evidence = derived_object_artifact_evidence_summary(
         source=object_lifecycle_evidence,
@@ -2312,7 +2370,7 @@ def production_readiness_status(
         internal_alpha_suitable=False,
         production_suitable=(
             object_storage_evidence["production_object_storage_contract_supported"]
-            and bool(object_storage_provider.get("production_provider_ready"))
+            and bool(live_object_storage_provider_evidence["live_provider_evidence_supported"])
         ),
         follow_up=(
             "Move generated XLSX/PDF and uploaded assets to object storage with database metadata."
@@ -2342,8 +2400,8 @@ def production_readiness_status(
         blockers.append(readiness_blocker("sqlite_not_final_production", "P1", "SQLite is acceptable only for local-UAT/dev database evidence, not hosted, protected, deploy, or production storage.", gates=("production",)))
     if not object_storage_evidence["production_object_storage_contract_supported"]:
         blockers.append(readiness_blocker("object_storage_missing", "P1", "No verified object-storage-backed asset/artifact contract exists for production XLSX/PDF and uploaded reference assets.", gates=("production",)))
-    if object_artifacts and not object_storage_provider.get("production_provider_ready"):
-        blockers.append(readiness_blocker("object_storage_provider_unavailable", "P1", "Object artifact mode is selected, but no production-ready credentialed object-storage provider adapter is available.", gates=("production",)))
+    if object_artifacts and not live_object_storage_provider_evidence["live_provider_evidence_supported"]:
+        blockers.append(readiness_blocker("object_storage_provider_unavailable", "P1", "Object artifact mode is selected, but no passing live S3-compatible object-storage provider evidence is available.", gates=("production",)))
     if object_artifacts and not object_lifecycle_evidence["object_lifecycle_supported"]:
         blockers.append(readiness_blocker("object_lifecycle_evidence_missing", "P1", "Object artifact delete/tombstone/stale lifecycle evidence has not been verified for object artifact mode.", gates=("production",)))
     if object_artifacts and not object_retention_delete_evidence["synthetic_retention_delete_supported"]:
@@ -2394,6 +2452,7 @@ def production_readiness_status(
         "hosted_observability_evidence": hosted_observability_evidence,
         "hosted_smoke_evidence": hosted_smoke_evidence,
         "object_storage_evidence": object_storage_evidence,
+        "live_object_storage_provider_evidence": live_object_storage_provider_evidence,
         "object_lifecycle_evidence": object_lifecycle_evidence,
         "object_retention_delete_evidence": object_retention_delete_evidence,
         "db_object_backup_restore_evidence": db_object_backup_restore_evidence,
@@ -14714,6 +14773,8 @@ def run_quote_job(
         except KqagStorageAccessError as exc:
             storage_error = storage_access_error_payload(exc)
             result.update(storage_error)
+            if configured_artifact_storage_mode() in {"database", "object"}:
+                result.pop("files", None)
         except Exception as exc:  # pragma: no cover - defensive dashboard metadata boundary
             write_local_log(
                 "quote_session_update_failed",

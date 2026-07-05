@@ -116,11 +116,33 @@ not prove live provider credentials, provider IAM policy, network reachability,
 DB+object backup/restore, retention/delete jobs, alert delivery, or production
 deployment operations.
 
+The live-provider verifier is explicit opt-in. In addition to the provider env
+names above, it requires `KQAG_LIVE_OBJECT_STORAGE_EVIDENCE` to be enabled by an
+operator in the execution environment. The repo-controlled Python dependencies
+in `requirements.txt` include pinned `boto3`/`botocore` plus compatible pinned
+transitive packages so the S3-compatible provider path is reproducible from repo
+dependencies. Real provider values still belong only in the host secret manager
+or operator environment, never in Git. The verifier stores, retrieves, checks,
+and deletes synthetic XLSX/PDF bytes only, and its output is metadata-only. It
+must not print or commit provider values, object keys, generated artifact bytes,
+DB URLs, private paths, customer data, uploaded content, or secrets.
+
+```powershell
+python -m pip install --only-binary=:all: -r requirements.txt
+python scripts/verify_live_object_storage_provider.py
+python scripts/check_production_readiness.py --with-live-object-storage-provider-evidence
+```
+
+Without complete provider configuration and the live-evidence opt-in, the
+verifier fails closed and production readiness remains false. A test-injected or
+synthetic backend can exercise verifier logic, but it is not live-provider
+evidence and cannot satisfy hosted/protected/deploy readiness.
+
 Object artifact lifecycle evidence is synthetic/stubbed only:
 
 ```powershell
 python scripts/verify_object_artifact_lifecycle.py
-python scripts/check_production_readiness.py --with-object-storage-evidence --with-object-artifact-lifecycle-evidence
+python scripts/check_production_readiness.py --with-object-storage-evidence --with-object-artifact-lifecycle-evidence --with-live-object-storage-provider-evidence
 ```
 
 The lifecycle verifier uses synthetic SQLite metadata and the in-memory object
@@ -163,5 +185,6 @@ uploaded reference files as permanent artifacts.
 
 This does not add a platform admin dashboard, invites or member management,
 KQAG-owned login/auth, fake login, billing, Stripe, deployment, DNS/TLS, public
-signup, object storage, private profile/pricing files, arbitrary permanent uploads, or
-generated customer quotes in Git.
+signup, live object-storage credentials or provider accounts, private
+profile/pricing files, arbitrary permanent uploads, or generated customer quotes
+in Git.
