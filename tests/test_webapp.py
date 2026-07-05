@@ -20131,6 +20131,87 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertNotIn(example_access_key, result_text)
         self.assertNotIn("KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY", result_text)
 
+    def test_object_artifact_store_failure_does_not_fallback_to_local_links_or_db_blob(self):
+        class StoreFailingBackend(webapp.InMemoryObjectStorageBackend):
+            def store_artifact(self, **kwargs):
+                raise webapp.ObjectStorageContractError("synthetic store failure")
+
+        xlsx_bytes = b"synthetic-object-store-failure-xlsx"
+
+        def fake_generator_run(command, **kwargs):
+            output_dir = Path(command[command.index("--out") + 1])
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
+            return webapp.subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout="Wrote quotation.xlsx\n",
+                stderr="",
+            )
+
+        tmp_path = test_temp_root() / f"object-artifact-store-failure-{time.time_ns()}"
+        tmp_path.mkdir(parents=True)
+        db_path = tmp_path / "kqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        platform_session = self.platform_auth_session("workspace-object-store-failure")
+        payload = payload_with_workspace_pricing("object-store-failure-pricing")
+        payload["profile_id"] = "object-store-failure-profile"
+        payload["quote_session"] = {"session_id": "quote-object-store-failure"}
+        env = {
+            "APP_MODE": "deploy",
+            "KQAG_STORAGE_MODE": "database",
+            "KQAG_ARTIFACT_STORAGE_MODE": "object",
+            "KQAG_DATABASE_URL": database_url,
+            "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
+            "KQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
+            "KQAG_OBJECT_STORAGE_REGION": "<redacted-region>",
+            "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "<redacted-access-key-id>",
+            "KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "<redacted-secret-access-key>",
+            "QUOTE_OUTPUT_ROOT": str(tmp_path / "output"),
+            "QUOTE_TMP_ROOT": str(tmp_path / "tmp"),
+            "QUOTE_LOG_ROOT": str(tmp_path / "logs"),
+        }
+        backend = StoreFailingBackend()
+        layout_artifact = {
+            "filename": "quotation-layout.xlsx",
+            "content": KONCEPT_LAYOUT.read_bytes(),
+        }
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+            mock.patch.object(webapp, "database_profile_layout_artifact_for_payload", return_value=layout_artifact),
+            mock.patch.object(webapp.subprocess, "run", side_effect=fake_generator_run) as run,
+        ):
+            webapp.apply_kqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(platform_session)
+            storage.save_profile(workspace_profile_with_layout("object-store-failure-profile"))
+            storage.save_pricing_reference(workspace_pricing_reference("object-store-failure-pricing"))
+            result = webapp.run_quote_job(
+                payload,
+                output_root=tmp_path / "output",
+                tmp_root=tmp_path / "tmp",
+                job_id="job-object-store-failure",
+                auth_session=platform_session,
+            )
+
+        with sqlite3.connect(db_path) as connection:
+            quote_session_rows = connection.execute("select count(*) from kqag_quote_sessions").fetchone()[0]
+            object_rows = connection.execute("select count(*) from kqag_object_artifacts").fetchone()[0]
+            blob_rows = connection.execute("select count(*) from kqag_quote_artifacts").fetchone()[0]
+
+        result_text = json.dumps(result, sort_keys=True)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["errors"], ["Quote artifact storage is not available in this environment."])
+        self.assertNotIn("files", result)
+        self.assertNotIn("/api/jobs/", result_text)
+        self.assertNotIn("synthetic-object-store-failure-xlsx", result_text)
+        self.assertNotIn(str(tmp_path), result_text)
+        self.assertEqual(quote_session_rows, 0)
+        self.assertEqual(object_rows, 0)
+        self.assertEqual(blob_rows, 0)
+
     def test_database_artifact_storage_requires_platform_context_and_migration(self):
         with mock.patch.dict(os.environ, {"KQAG_ARTIFACT_STORAGE_MODE": "database"}, clear=True):
             with self.assertRaises(webapp.KqagStorageAccessError) as missing_session:
@@ -20615,6 +20696,64 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertTrue(tombstone[2])
         with self.assertRaises(webapp.ObjectStorageContractError):
             backend.retrieve_artifact(metadata_before, workspace_id="workspace-object-delete-session")
+
+    def test_object_artifact_delete_failure_tombstones_metadata_without_db_blob_or_local_fallback(self):
+        class DeleteFailingBackend(webapp.InMemoryObjectStorageBackend):
+            def delete_artifact(self, metadata, *, workspace_id):
+                self._require_workspace(metadata, workspace_id)
+                raise webapp.ObjectStorageContractError("synthetic delete failure")
+
+        backend = DeleteFailingBackend()
+        tmp_path = test_temp_root() / f"object-artifact-delete-failure-{time.time_ns()}"
+        db_path = tmp_path / "kqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        output_dir = tmp_path / "out" / "job-object-delete-failure"
+        output_dir.mkdir(parents=True)
+        xlsx_bytes = b"synthetic-xlsx-delete-failure"
+        (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
+        payload = valid_payload()
+        payload["quote_session"] = {"session_id": "quote-object-delete-failure"}
+        result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-object-delete-failure/files/quotation.xlsx"}]}
+        env = {
+            **self.deploy_auth_env(),
+            "KQAG_STORAGE_MODE": "database",
+            "KQAG_ARTIFACT_STORAGE_MODE": "object",
+            "KQAG_DATABASE_URL": database_url,
+            "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
+            "KQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
+            "KQAG_OBJECT_STORAGE_REGION": "<redacted-region>",
+            "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "<redacted-access-key-id>",
+            "KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "<redacted-secret-access-key>",
+        }
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_kqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-delete-failure"))
+            storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+            row_before = storage._object_quote_artifact_row("quote-object-delete-failure", "xlsx")
+            metadata_before = storage._object_metadata_from_row(row_before)
+            self.assertTrue(storage.delete_quote_session("quote-object-delete-failure"))
+            session = storage.get_quote_session("quote-object-delete-failure")
+            artifact = storage.quote_session_export_artifact("quote-object-delete-failure", "xlsx")
+
+        with sqlite3.connect(db_path) as connection:
+            tombstone = connection.execute(
+                "select status, retention_status, deleted_at from kqag_object_artifacts where workspace_id = ? and session_id = ?",
+                ("workspace-object-delete-failure", "quote-object-delete-failure"),
+            ).fetchone()
+            blob_rows = connection.execute("select count(*) from kqag_quote_artifacts").fetchone()[0]
+
+        self.assertIsNone(session)
+        self.assertIsNone(artifact)
+        self.assertEqual(tombstone[0], "deleted")
+        self.assertEqual(tombstone[1], "deleted")
+        self.assertTrue(tombstone[2])
+        self.assertEqual(blob_rows, 0)
+        self.assertFalse((output_dir / "quotation.xlsx").exists())
+        self.assertEqual(backend.retrieve_artifact(metadata_before, workspace_id="workspace-object-delete-failure"), xlsx_bytes)
 
     def test_object_artifact_storage_cleans_local_staging_files_after_persist(self):
         backend = webapp.InMemoryObjectStorageBackend()

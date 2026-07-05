@@ -354,6 +354,62 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertIn("local_staging_cleanup_evidence_missing", production_blocker_ids)
         self.assertFalse(status["production_ready"])
 
+    def test_live_object_storage_provider_evidence_is_not_assumed_when_not_run(self):
+        status = self.readiness_status(
+            {
+                "KQAG_STORAGE_MODE": "database",
+                "KQAG_ARTIFACT_STORAGE_MODE": "object",
+                "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            },
+            backup_restore_evidence_status="passed",
+            hosted_observability_evidence_status="passed",
+            hosted_smoke_evidence_status="passed",
+            object_storage_evidence_status="passed",
+            object_artifact_lifecycle_evidence_status="passed",
+        )
+
+        production_blocker_ids = {item["id"] for item in status["production_blockers"]}
+        self.assertEqual(status["live_object_storage_provider_evidence"]["status"], "not_run_by_checker")
+        self.assertFalse(status["live_object_storage_provider_evidence"]["live_provider_evidence_supported"])
+        self.assertIn("object_storage_provider_unavailable", production_blocker_ids)
+        self.assertFalse(status["production_ready"])
+
+    def test_live_object_storage_provider_evidence_drops_only_provider_blocker(self):
+        env = {
+            "KQAG_STORAGE_MODE": "database",
+            "KQAG_ARTIFACT_STORAGE_MODE": "object",
+            "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
+            "KQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
+            "KQAG_OBJECT_STORAGE_REGION": "<redacted-region>",
+            "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "<redacted-access-key-id>",
+            "KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "<redacted-secret-access-key>",
+        }
+        with mock.patch("webapp.object_storage._optional_s3_sdk_available", return_value=True):
+            status = self.readiness_status(
+                env,
+                backup_restore_evidence_status="passed",
+                hosted_observability_evidence_status="passed",
+                hosted_smoke_evidence_status="passed",
+                object_storage_evidence_status="passed",
+                object_artifact_lifecycle_evidence_status="passed",
+                live_object_storage_provider_evidence_status="passed",
+            )
+
+        production_blocker_ids = {item["id"] for item in status["production_blockers"]}
+        text = json.dumps(status, sort_keys=True)
+        self.assertEqual(status["live_object_storage_provider_evidence"]["status"], "passed")
+        self.assertTrue(status["live_object_storage_provider_evidence"]["live_provider_evidence_supported"])
+        self.assertNotIn("object_storage_provider_unavailable", production_blocker_ids)
+        self.assertIn("db_object_backup_restore_live_evidence_missing", production_blocker_ids)
+        self.assertIn("production_deployment_operations_evidence_missing", production_blocker_ids)
+        self.assertFalse(status["production_ready"])
+        for value in env.values():
+            if value in {"database", "object", "s3_compatible"} or value.startswith("sqlite:///"):
+                continue
+            self.assertNotIn(value, text)
+
     def test_object_storage_provider_config_status_is_metadata_only(self):
         env = {
             "KQAG_STORAGE_MODE": "database",

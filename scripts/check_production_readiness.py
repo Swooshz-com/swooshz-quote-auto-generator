@@ -18,6 +18,7 @@ import verify_hosted_observability
 import verify_hosted_smoke
 import verify_object_artifact_lifecycle
 import verify_object_storage_contract
+import verify_live_object_storage_provider
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -77,6 +78,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Synthetic object artifact lifecycle verifier workspace. The path is never printed.",
     )
+    parser.add_argument(
+        "--with-live-object-storage-provider-evidence",
+        action="store_true",
+        help="Run the opt-in live S3-compatible object-storage verifier; it fails closed unless explicit provider env vars are present.",
+    )
     return parser
 
 
@@ -130,6 +136,16 @@ def object_artifact_lifecycle_evidence_status(*, enabled: bool, work_dir: Path |
     return "passed" if report.get("status") == "passed" else "failed"
 
 
+def live_object_storage_provider_evidence_status(*, enabled: bool) -> str:
+    if not enabled:
+        return "not_run_by_checker"
+    try:
+        report = verify_live_object_storage_provider.run_verification()
+    except Exception:
+        return "failed"
+    return "passed" if report.get("status") == "passed" and report.get("live_provider_evidence_supported") else "failed"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     status = webapp.production_readiness_status(
@@ -152,6 +168,9 @@ def main(argv: list[str] | None = None) -> int:
         object_artifact_lifecycle_evidence_status=object_artifact_lifecycle_evidence_status(
             enabled=args.with_object_artifact_lifecycle_evidence,
             work_dir=args.object_artifact_lifecycle_work_dir,
+        ),
+        live_object_storage_provider_evidence_status=live_object_storage_provider_evidence_status(
+            enabled=args.with_live_object_storage_provider_evidence,
         ),
     )
     print(json.dumps(status, indent=2, ensure_ascii=True))
