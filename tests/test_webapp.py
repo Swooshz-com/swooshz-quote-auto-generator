@@ -20100,11 +20100,11 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         env = self.deploy_auth_env(
             KQAG_STORAGE_MODE="local",
             KQAG_ARTIFACT_STORAGE_MODE="object",
-            KQAG_OBJECT_STORAGE_PROVIDER="s3_compatible",
-            KQAG_OBJECT_STORAGE_ENDPOINT_URL=example_endpoint,
-            KQAG_OBJECT_STORAGE_BUCKET=example_bucket,
-            KQAG_OBJECT_STORAGE_REGION="ap-southeast-private",
-            KQAG_OBJECT_STORAGE_ACCESS_KEY_ID=example_access_key,
+            SQAG_OBJECT_STORAGE_PROVIDER="s3_compatible",
+            SQAG_OBJECT_STORAGE_ENDPOINT_URL=example_endpoint,
+            SQAG_OBJECT_STORAGE_BUCKET=example_bucket,
+            SQAG_OBJECT_STORAGE_REGION="ap-southeast-private",
+            SQAG_OBJECT_STORAGE_ACCESS_KEY_ID=example_access_key,
             QUOTE_OUTPUT_ROOT=str(root / "output"),
             QUOTE_TMP_ROOT=str(root / "tmp"),
             QUOTE_LOG_ROOT=str(root / "logs"),
@@ -20121,7 +20121,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
 
         result_text = json.dumps(result, sort_keys=True)
         self.assertEqual(provider_status["provider"], "s3_compatible")
-        self.assertEqual(provider_status["missing_fields"], ["KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY"])
+        self.assertEqual(provider_status["missing_fields"], ["SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY"])
         self.assertFalse(provider_status["runtime_backend_available"])
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["errors"], ["Quote artifact storage is not available in this environment."])
@@ -20129,7 +20129,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertNotIn(example_endpoint, result_text)
         self.assertNotIn(example_bucket, result_text)
         self.assertNotIn(example_access_key, result_text)
-        self.assertNotIn("KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY", result_text)
+        self.assertNotIn("SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY", result_text)
 
     def test_object_artifact_store_failure_does_not_fallback_to_local_links_or_db_blob(self):
         class StoreFailingBackend(webapp.InMemoryObjectStorageBackend):
@@ -20162,12 +20162,12 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
             "KQAG_DATABASE_URL": database_url,
-            "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
-            "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
-            "KQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
-            "KQAG_OBJECT_STORAGE_REGION": "<redacted-region>",
-            "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "<redacted-access-key-id>",
-            "KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "<redacted-secret-access-key>",
+            "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
+            "SQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
+            "SQAG_OBJECT_STORAGE_REGION": "<redacted-region>",
+            "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "<redacted-access-key-id>",
+            "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "<redacted-secret-access-key>",
             "QUOTE_OUTPUT_ROOT": str(tmp_path / "output"),
             "QUOTE_TMP_ROOT": str(tmp_path / "tmp"),
             "QUOTE_LOG_ROOT": str(tmp_path / "logs"),
@@ -20457,12 +20457,12 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
             "KQAG_DATABASE_URL": database_url,
-            "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
-            "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
-            "KQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
-            "KQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
-            "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
-            "KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
+            "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
+            "SQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
+            "SQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
+            "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
+            "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
         }
         with (
             mock.patch.dict(os.environ, env, clear=True),
@@ -20541,12 +20541,12 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
             "KQAG_DATABASE_URL": database_url,
-            "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
-            "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
-            "KQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
-            "KQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
-            "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
-            "KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
+            "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
+            "SQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
+            "SQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
+            "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
+            "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
         }
         with (
             mock.patch.dict(os.environ, env, clear=True),
@@ -20659,12 +20659,12 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
             "KQAG_DATABASE_URL": database_url,
-            "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
-            "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
-            "KQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
-            "KQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
-            "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
-            "KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
+            "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
+            "SQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
+            "SQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
+            "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
+            "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
         }
         with (
             mock.patch.dict(os.environ, env, clear=True),
@@ -20719,12 +20719,12 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
             "KQAG_DATABASE_URL": database_url,
-            "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
-            "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
-            "KQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
-            "KQAG_OBJECT_STORAGE_REGION": "<redacted-region>",
-            "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "<redacted-access-key-id>",
-            "KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "<redacted-secret-access-key>",
+            "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
+            "SQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
+            "SQAG_OBJECT_STORAGE_REGION": "<redacted-region>",
+            "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "<redacted-access-key-id>",
+            "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "<redacted-secret-access-key>",
         }
         with (
             mock.patch.dict(os.environ, env, clear=True),
@@ -20771,12 +20771,12 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
             "KQAG_DATABASE_URL": database_url,
-            "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
-            "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
-            "KQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
-            "KQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
-            "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
-            "KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
+            "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
+            "SQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
+            "SQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
+            "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
+            "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
         }
         with (
             mock.patch.dict(os.environ, env, clear=True),

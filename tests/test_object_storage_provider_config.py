@@ -58,11 +58,11 @@ class ObjectStorageProviderConfigTest(unittest.TestCase):
 
     def test_s3_compatible_provider_lists_missing_field_names_only(self):
         env = {
-            "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
-            "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test/path",
-            "KQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
-            "KQAG_OBJECT_STORAGE_REGION": "example-region-1",
-            "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
+            "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test/path",
+            "SQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
+            "SQAG_OBJECT_STORAGE_REGION": "example-region-1",
+            "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
         }
 
         status = object_storage.object_storage_provider_status(env)
@@ -70,22 +70,22 @@ class ObjectStorageProviderConfigTest(unittest.TestCase):
 
         self.assertEqual(status["provider"], "s3_compatible")
         self.assertFalse(status["configured"])
-        self.assertEqual(status["missing_fields"], ["KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY"])
+        self.assertEqual(status["missing_fields"], ["SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY"])
         self.assertFalse(status["runtime_backend_available"])
         self.assertFalse(status["production_provider_ready"])
         for name, value in env.items():
-            if name == "KQAG_OBJECT_STORAGE_PROVIDER":
+            if name == "SQAG_OBJECT_STORAGE_PROVIDER":
                 continue
             self.assertNotIn(value, text)
 
     def test_s3_compatible_provider_config_is_metadata_only_and_unwired(self):
         env = {
-            "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
-            "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
-            "KQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
-            "KQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
-            "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
-            "KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
+            "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
+            "SQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
+            "SQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
+            "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
+            "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
         }
 
         with mock.patch.object(object_storage, "_optional_s3_sdk_available", return_value=False):
@@ -100,18 +100,18 @@ class ObjectStorageProviderConfigTest(unittest.TestCase):
         self.assertFalse(status["production_provider_ready"])
         self.assertIn("optional_s3_sdk_missing", status["blockers"])
         for name, value in env.items():
-            if name == "KQAG_OBJECT_STORAGE_PROVIDER":
+            if name == "SQAG_OBJECT_STORAGE_PROVIDER":
                 continue
             self.assertNotIn(value, text)
 
     def test_s3_compatible_provider_with_sdk_is_runtime_available_but_not_production_ready(self):
         env = {
-            "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
-            "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
-            "KQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
-            "KQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
-            "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
-            "KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
+            "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
+            "SQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
+            "SQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
+            "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
+            "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
         }
 
         with mock.patch.object(object_storage, "_optional_s3_sdk_available", return_value=True):
@@ -125,12 +125,31 @@ class ObjectStorageProviderConfigTest(unittest.TestCase):
         self.assertIn("db_object_backup_restore_unverified", status["blockers"])
         self.assertIn("retention_delete_evidence_missing", status["blockers"])
         for name, value in env.items():
-            if name == "KQAG_OBJECT_STORAGE_PROVIDER":
+            if name == "SQAG_OBJECT_STORAGE_PROVIDER":
                 continue
             self.assertNotIn(value, text)
 
+    def test_legacy_kqag_provider_env_is_ignored(self):
+        status = object_storage.object_storage_provider_status(
+            {
+                "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+                "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
+                "KQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
+                "KQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
+                "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
+                "KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
+            }
+        )
+
+        self.assertEqual(status["provider"], "disabled")
+        self.assertFalse(status["configured"])
+        self.assertEqual(status["required_fields"], [])
+        self.assertEqual(status["missing_fields"], [])
+        self.assertFalse(status["runtime_backend_available"])
+        self.assertFalse(status["production_provider_ready"])
+
     def test_synthetic_provider_is_test_only_and_not_production_ready(self):
-        status = object_storage.object_storage_provider_status({"KQAG_OBJECT_STORAGE_PROVIDER": "synthetic"})
+        status = object_storage.object_storage_provider_status({"SQAG_OBJECT_STORAGE_PROVIDER": "synthetic"})
 
         self.assertEqual(status["provider"], "synthetic")
         self.assertTrue(status["configured"])

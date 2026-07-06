@@ -1,9 +1,9 @@
-# KQAG Production-Readiness Audit
+# SQAG Production-Readiness Audit
 
 Audit date: 2026-07-02
 
-Verdict: KQAG/SAQG is still local-UAT ready, but it is not ready for hosted,
-protected, deploy, or production hosting yet. PR #84 does not make KQAG
+Verdict: Swooshz Quote Auto Generator (SQAG) is still local-UAT ready, but it is not ready for hosted,
+protected, deploy, or production hosting yet. PR #84 does not make SQAG
 production-ready; it documents the current blockers and adds a safe readiness
 check.
 
@@ -79,7 +79,7 @@ python -m webapp.server --check-production-readiness
 
 Object-mode reviews can include synthetic contract/lifecycle evidence and the
 opt-in live-provider verifier. The live verifier fails closed unless
-`KQAG_LIVE_OBJECT_STORAGE_EVIDENCE` and the required S3-compatible provider env
+`SQAG_LIVE_OBJECT_STORAGE_EVIDENCE` and the required S3-compatible provider env
 names are present in the operator environment. The S3-compatible SDK path is
 repo-controlled through pinned dependencies in `requirements.txt`; real
 provider values still belong only in the host secret manager or operator
@@ -209,6 +209,12 @@ print provider values, object keys, artifact bytes, DB URLs, private paths,
 customer data, uploaded content, or secrets. Without a successful operator-run
 live provider verifier and the remaining production gates, `production_ready`
 remains false.
+
+The canonical object-storage provider and live-evidence env names use the
+`SQAG_` prefix. Legacy `KQAG_*` object-storage provider names are not aliases
+and do not silently satisfy live-provider evidence or readiness checks. Existing
+database table names and non-object storage compatibility env names remain
+unchanged by this cleanup PR.
 
 ## Security Audit
 

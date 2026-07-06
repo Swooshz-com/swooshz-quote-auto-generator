@@ -17,7 +17,7 @@ KQAG quote generation and dashboard flow.
 
 Repos involved:
 
-- KQAG: `Swooshz-com/koncept-quote-auto-generator`
+- SQAG: `Swooshz-com/swooshz-quote-auto-generator`
 - Platform: `Swooshz-com/swooshz-platform`
 
 Current local URLs:

@@ -1,6 +1,6 @@
-# KQAG Platform-Scoped Storage Mode
+# SQAG Platform-Scoped Storage Mode
 
-This runbook covers the first KQAG-owned app-data storage boundary for platform
+This runbook covers the first SQAG-owned app-data storage boundary for platform
 team mode. It is disabled by default. Existing local/internal mode continues to
 use local runtime storage under `QUOTE_DATA_ROOT` and related local roots. The
 artifact layer is separately gated so app-data database mode can be tested before
@@ -95,15 +95,21 @@ evidence for DB rows and objects together.
 
 ## Object Artifact Mode
 
+SQAG is the canonical operator-facing prefix for object-storage provider and
+live-provider evidence environment variables. The older `KQAG_*` object-storage
+provider names are not compatibility aliases and do not satisfy live-provider
+or production-readiness evidence. Existing non-object storage mode names such as
+`KQAG_STORAGE_MODE` remain out of scope for this compatibility-preserving PR.
+
 Object artifact mode is production groundwork, not production readiness. The
 required environment variable names are:
 
-- `KQAG_OBJECT_STORAGE_PROVIDER`
-- `KQAG_OBJECT_STORAGE_ENDPOINT_URL`
-- `KQAG_OBJECT_STORAGE_BUCKET`
-- `KQAG_OBJECT_STORAGE_REGION`
-- `KQAG_OBJECT_STORAGE_ACCESS_KEY_ID`
-- `KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY`
+- `SQAG_OBJECT_STORAGE_PROVIDER`
+- `SQAG_OBJECT_STORAGE_ENDPOINT_URL`
+- `SQAG_OBJECT_STORAGE_BUCKET`
+- `SQAG_OBJECT_STORAGE_REGION`
+- `SQAG_OBJECT_STORAGE_ACCESS_KEY_ID`
+- `SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY`
 
 Only the names should appear in docs, diagnostics, tests, and readiness output.
 Do not print or commit provider values, bucket values, endpoints, access keys,
@@ -117,7 +123,7 @@ DB+object backup/restore, retention/delete jobs, alert delivery, or production
 deployment operations.
 
 The live-provider verifier is explicit opt-in. In addition to the provider env
-names above, it requires `KQAG_LIVE_OBJECT_STORAGE_EVIDENCE` to be enabled by an
+names above, it requires `SQAG_LIVE_OBJECT_STORAGE_EVIDENCE` to be enabled by an
 operator in the execution environment. The repo-controlled Python dependencies
 in `requirements.txt` include pinned `boto3`/`botocore` plus compatible pinned
 transitive packages so the S3-compatible provider path is reproducible from repo
