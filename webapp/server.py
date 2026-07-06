@@ -2124,7 +2124,7 @@ def live_object_storage_provider_evidence_summary(
         "status": normalized_status,
         "verifier": "scripts/verify_live_object_storage_provider.py",
         "required_env_names": [
-            "KQAG_LIVE_OBJECT_STORAGE_EVIDENCE",
+            "SQAG_LIVE_OBJECT_STORAGE_EVIDENCE",
             OBJECT_STORAGE_PROVIDER_ENV_NAME,
             OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME,
             OBJECT_STORAGE_BUCKET_ENV_NAME,

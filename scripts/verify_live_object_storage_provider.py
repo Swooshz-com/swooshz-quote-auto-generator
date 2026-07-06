@@ -37,7 +37,7 @@ from webapp.object_storage import (
 )
 
 
-LIVE_OBJECT_STORAGE_EVIDENCE_ENV_NAME = "KQAG_LIVE_OBJECT_STORAGE_EVIDENCE"
+LIVE_OBJECT_STORAGE_EVIDENCE_ENV_NAME = "SQAG_LIVE_OBJECT_STORAGE_EVIDENCE"
 REQUIRED_ENV_NAMES = [
     LIVE_OBJECT_STORAGE_EVIDENCE_ENV_NAME,
     OBJECT_STORAGE_PROVIDER_ENV_NAME,
@@ -135,7 +135,7 @@ def _provider_blockers(provider_status: Mapping[str, Any], *, live_provider_evid
 def _metadata_report(provider_status: Mapping[str, Any], *, status: str, checks: Mapping[str, bool], missing_env_names: list[str], test_injected_backend: bool = False) -> dict[str, Any]:
     supported = bool(status == "passed" and not test_injected_backend)
     return {
-        "schema": "swooshz.kqag.live-object-storage-provider-evidence.v1",
+        "schema": "swooshz.sqag.live-object-storage-provider-evidence.v1",
         "status": status,
         "live_provider_evidence_supported": supported,
         "test_injected_backend": bool(test_injected_backend),

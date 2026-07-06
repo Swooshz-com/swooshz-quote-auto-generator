@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report KQAG production-readiness posture without printing private values."""
+"""Report SQAG production-readiness posture without printing private values."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ import verify_live_object_storage_provider
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Report KQAG production-readiness posture without printing private values.")
+    parser = argparse.ArgumentParser(description="Report SQAG production-readiness posture without printing private values.")
     parser.add_argument(
         "--with-backup-restore-evidence",
         action="store_true",

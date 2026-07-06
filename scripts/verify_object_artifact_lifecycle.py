@@ -102,12 +102,12 @@ def object_mode_env(database_path: Path) -> dict[str, str]:
         "KQAG_STORAGE_MODE": "database",
         "KQAG_ARTIFACT_STORAGE_MODE": "object",
         "KQAG_DATABASE_URL": sqlite_url(database_path),
-        "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
-        "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
-        "KQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
-        "KQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
-        "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
-        "KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
+        "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+        "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
+        "SQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
+        "SQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
+        "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
+        "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
     }
 
 

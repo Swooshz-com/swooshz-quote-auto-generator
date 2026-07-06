@@ -1,4 +1,4 @@
-# SAQG/KQAG Release Security Audit
+# SQAG Release Security Audit
 
 Audit date: 2026-07-02
 
@@ -8,7 +8,7 @@ Base evidence ref: `origin/main` at `29de611ee1723ae1e9d1755c32b013efdbc4511e`
 
 ## Executive Verdict
 
-SAQG/KQAG remains suitable for local UAT by default. The readiness checker now
+Swooshz Quote Auto Generator (SQAG) remains suitable for local UAT by default. The readiness checker now
 keeps hosted/protected/deploy and production readiness blocked when generated
 artifact bytes are stored in local runtime paths or database BLOB rows, even if
 synthetic backup/restore, hosted observability, and hosted smoke evidence pass.
@@ -25,6 +25,15 @@ workspace-owned database rows remain the KQAG app-data path, while generated
 XLSX/PDF bytes require object storage before hosted/protected/deploy or
 production readiness can be claimed. It does not deploy anything live, add
 secrets, or prove production operations.
+
+Canonical naming update: the repository has been renamed to
+`Swooshz-com/swooshz-quote-auto-generator`, and SQAG is the canonical
+operator-facing product/runtime name for current object-storage provider and
+live-evidence configuration. The live object-storage path now requires
+`SQAG_*` object-storage env names; legacy `KQAG_*` object-storage names are not
+aliases and do not silently satisfy live-provider evidence. Existing
+database/table names and non-object storage compatibility variables remain out
+of scope for this cleanup.
 
 Highest-priority remaining blockers:
 
@@ -200,13 +209,13 @@ provider backend is available.
 Object-storage provider configuration update: PR #99 added strict
 metadata-only configuration validation for the production object-storage
 provider boundary. The recognized object provider setting is
-`KQAG_OBJECT_STORAGE_PROVIDER`; unset, `disabled`, `none`, `off`, `false`, or
+`SQAG_OBJECT_STORAGE_PROVIDER`; unset, `disabled`, `none`, `off`, `false`, or
 `0` mean disabled. `s3_compatible` is the credentialed provider family for
 AWS S3, Cloudflare R2, MinIO, or similar S3-compatible APIs and requires these
 environment names to be present:
-`KQAG_OBJECT_STORAGE_ENDPOINT_URL`, `KQAG_OBJECT_STORAGE_BUCKET`,
-`KQAG_OBJECT_STORAGE_REGION`, `KQAG_OBJECT_STORAGE_ACCESS_KEY_ID`, and
-`KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY`. The checker reports only provider
+`SQAG_OBJECT_STORAGE_ENDPOINT_URL`, `SQAG_OBJECT_STORAGE_BUCKET`,
+`SQAG_OBJECT_STORAGE_REGION`, `SQAG_OBJECT_STORAGE_ACCESS_KEY_ID`, and
+`SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY`. The checker reports only provider
 type, required field names, missing field names, adapter status, and
 runtime availability booleans; it never prints endpoint URLs, bucket values,
 access keys, secret keys, object keys, DB URLs, paths, artifact bytes, quote
@@ -254,11 +263,11 @@ payloads, staff emails, OAuth values, cookies, tokens, API keys, and provider
 responses. This is not live provider retention/delete evidence or real
 DB+object backup/restore evidence.
 
-Live object-storage provider evidence update: this PR adds
+Live object-storage provider evidence update: PR #108 added
 `scripts/verify_live_object_storage_provider.py` and a readiness-checker flag,
 `--with-live-object-storage-provider-evidence`. The verifier is explicit
-opt-in through `KQAG_LIVE_OBJECT_STORAGE_EVIDENCE` plus complete
-S3-compatible provider configuration env names. This PR also pins the
+opt-in through `SQAG_LIVE_OBJECT_STORAGE_EVIDENCE` plus complete
+S3-compatible provider configuration env names. PR #108 also pins the
 repo-controlled S3 SDK dependency set in `requirements.txt` (`boto3`,
 `botocore`, and compatible transitive packages) so the live provider path does
 not rely on undeclared host-level manual installs. It stores, retrieves, checks,
@@ -273,6 +282,10 @@ responses. No live provider values or live evidence are committed. No live
 provider evidence is claimed unless an operator runs it with real provider
 configuration supplied outside Git; test-injected or synthetic backends are
 never credited as live provider evidence.
+
+The old `KQAG_*` object-storage provider env names are intentionally not
+accepted by this live-evidence path. Operators must use the canonical `SQAG_*`
+object-storage names for current SQAG provider evidence.
 
 ## Threat Model
 
@@ -663,7 +676,7 @@ Do not claim production readiness until all hosted/protected/deploy gates plus t
 12. Real object-storage provider integration groundwork: completed in PR #100 with the credentialed S3-compatible adapter boundary, mocked adapter tests, generated artifact object metadata, and authorized quote-session retrieval; live provider evidence, uploaded/reference/profile object wiring, DB+object backup/restore, and retention/delete evidence remained.
 13. Object artifact lifecycle groundwork: this PR adds generated object artifact tombstones, stubbed delete evidence, local staging cleanup, and synthetic DB+object backup/restore lifecycle verification; live provider retention/delete and real DB+object backup/restore remain.
 14. Session and business-logic hardening: immutable profile/pricing snapshots, stale/deleted artifact route hardening, and deterministic delete/export/download race tests are in place; broader live/provider race evidence remains.
-15. Live object-storage provider evidence path: this PR adds an opt-in metadata-only verifier, readiness flag, and repo-pinned S3 SDK dependency set; operator-run live provider evidence remains required before production.
+15. Live object-storage provider evidence path: PR #108 added an opt-in metadata-only verifier, readiness flag, and repo-pinned S3 SDK dependency set; operator-run live provider evidence remains required before production.
 16. Blocked hosted validation scaffold: this PR updates placeholder-only env docs and a synthetic validation bundle so DB/DB-artifact mode stays blocked for launch readiness; live host evidence remains separate.
 17. Hosted production operations: host-specific logging export, alert delivery, DB+object backup/restore/rollback runbooks, production deployment evidence, and live host smoke evidence.
 18. Supply-chain hardening: CodeQL/equivalent, Python dependency audit, pinned security scanner image, branch protection docs.
@@ -689,11 +702,12 @@ Severity summary from plugin: unavailable because the scan did not start. This a
 | --- | --- |
 | `python -m pip install --dry-run --ignore-installed --only-binary=:all: -r requirements.txt --disable-pip-version-check` | Passed. Resolver would install the pinned repo dependency set: `pypdfium2-5.9.0`, `Pillow-12.2.0`, `boto3-1.43.40`, `botocore-1.43.40`, `jmespath-1.1.0`, `python-dateutil-2.9.0.post0`, `s3transfer-0.19.0`, `six-1.17.0`, and `urllib3-2.7.0`. |
 | `python -m pip install --only-binary=:all: -r requirements.txt --disable-pip-version-check` | Passed. Installed/confirmed the repo-pinned Python dependency set locally, including `boto3-1.43.40` and `botocore-1.43.40`, without provider credentials, endpoints, bucket names, object keys, or live evidence values. |
-| `python -m unittest tests.test_live_object_storage_provider_verifier tests.test_object_storage_provider_config tests.test_production_readiness` | Passed: 38 tests OK, covering live-provider verifier no-env/incomplete/test-injected behavior, simulated real-provider metadata cleanup, object provider metadata-only status, and readiness credit boundaries. |
+| `python -m unittest tests.test_live_object_storage_provider_verifier tests.test_object_storage_provider_config tests.test_production_readiness` | Passed: 41 tests OK, covering live-provider verifier no-env/incomplete/test-injected behavior, simulated real-provider metadata cleanup, object provider metadata-only status, readiness credit boundaries, and legacy `KQAG_*` object-storage env names not satisfying SQAG live evidence. |
 | `python -m unittest tests.test_webapp.WebappServerTest.test_object_artifact_store_failure_does_not_fallback_to_local_links_or_db_blob tests.test_webapp.WebappServerTest.test_object_artifact_storage_mode_fails_closed_without_runtime_backend tests.test_webapp.WebappServerTest.test_object_artifact_storage_mode_with_incomplete_provider_config_fails_closed tests.test_webapp.WebappServerTest.test_object_artifact_storage_saves_db_metadata_and_downloads_through_authorized_route tests.test_webapp.WebappServerTest.test_object_artifact_storage_deleted_metadata_fails_closed tests.test_webapp.WebappServerTest.test_object_artifact_storage_tombstone_during_retrieve_fails_closed tests.test_webapp.WebappServerTest.test_object_artifact_storage_corrupt_or_missing_remote_object_fails_closed tests.test_webapp.WebappServerTest.test_object_artifact_storage_delete_session_tombstones_metadata_and_backend_object tests.test_webapp.WebappServerTest.test_object_artifact_delete_failure_tombstones_metadata_without_db_blob_or_local_fallback tests.test_webapp.WebappServerTest.test_object_artifact_storage_cleans_local_staging_files_after_persist` | Passed: 10 tests OK, covering object-mode fail-closed runtime behavior, no local job-file link fallback after store failure, no DB/BLOB fallback, wrong-workspace/corrupt/missing/tombstoned denial, tombstone-on-delete, and local staging cleanup. |
-| `python -m py_compile webapp/server.py webapp/object_storage.py scripts/check_production_readiness.py scripts/verify_live_object_storage_provider.py` | Passed. |
-| `python scripts/verify_live_object_storage_provider.py` | Expected nonzero exit 1. Reported `status=failed`, `live_provider_evidence_supported=false`, provider family `disabled`, missing env names `KQAG_LIVE_OBJECT_STORAGE_EVIDENCE` and `KQAG_OBJECT_STORAGE_PROVIDER`, all checks false, and metadata-only privacy booleans true. |
-| `KQAG_LIVE_OBJECT_STORAGE_EVIDENCE=1 KQAG_OBJECT_STORAGE_PROVIDER=s3_compatible KQAG_OBJECT_STORAGE_ENDPOINT_URL=<redacted> KQAG_OBJECT_STORAGE_BUCKET=<redacted> KQAG_OBJECT_STORAGE_REGION=<redacted> KQAG_OBJECT_STORAGE_ACCESS_KEY_ID=<redacted> python scripts/verify_live_object_storage_provider.py` | Expected nonzero exit 1. Reported `status=failed`, `live_provider_evidence_supported=false`, provider family `s3_compatible`, missing env name `KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY`, provider blocker `missing_provider_config`, and no provider values, object keys, artifact bytes, or secrets in output. |
+| `python -m py_compile webapp/server.py webapp/object_storage.py scripts/check_production_readiness.py scripts/verify_live_object_storage_provider.py scripts/verify_object_artifact_lifecycle.py` | Passed. |
+| `python scripts/verify_live_object_storage_provider.py` | Expected nonzero exit 1. Reported `status=failed`, `live_provider_evidence_supported=false`, provider family `disabled`, missing env names `SQAG_LIVE_OBJECT_STORAGE_EVIDENCE` and `SQAG_OBJECT_STORAGE_PROVIDER`, all checks false, and metadata-only privacy booleans true. |
+| `SQAG_LIVE_OBJECT_STORAGE_EVIDENCE=1 SQAG_OBJECT_STORAGE_PROVIDER=s3_compatible SQAG_OBJECT_STORAGE_ENDPOINT_URL=<redacted> SQAG_OBJECT_STORAGE_BUCKET=<redacted> SQAG_OBJECT_STORAGE_REGION=<redacted> SQAG_OBJECT_STORAGE_ACCESS_KEY_ID=<redacted> python scripts/verify_live_object_storage_provider.py` | Expected nonzero exit 1. Reported `status=failed`, `live_provider_evidence_supported=false`, provider family `s3_compatible`, missing env name `SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY`, provider blocker `missing_provider_config`, and no provider values, object keys, artifact bytes, or secrets in output. |
+| `KQAG_LIVE_OBJECT_STORAGE_EVIDENCE=1 KQAG_OBJECT_STORAGE_PROVIDER=s3_compatible KQAG_OBJECT_STORAGE_ENDPOINT_URL=<redacted> KQAG_OBJECT_STORAGE_BUCKET=<redacted> KQAG_OBJECT_STORAGE_REGION=<redacted> KQAG_OBJECT_STORAGE_ACCESS_KEY_ID=<redacted> KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY=<redacted> python scripts/verify_live_object_storage_provider.py` | Expected nonzero exit 1. Reported `status=failed`, `live_provider_evidence_supported=false`, provider family `disabled`, missing env names `SQAG_LIVE_OBJECT_STORAGE_EVIDENCE` and `SQAG_OBJECT_STORAGE_PROVIDER`, and canonical `SQAG_*` required env names only. |
 | `python scripts/check_production_readiness.py` | Expected nonzero exit 1. Reported `local_uat_supported=true`, `internal_alpha_ready=false`, `production_ready=false`, live object-provider evidence `not_run_by_checker`, and blockers including `local_runtime_storage`, `local_artifact_storage`, `object_storage_missing`, `session_business_hardening_incomplete`, `production_deployment_operations_evidence_missing`, `backup_restore_unverified`, `hosted_logging_monitoring_missing`, and `hosted_smoke_evidence_missing`. |
 | `KQAG_STORAGE_MODE=database KQAG_ARTIFACT_STORAGE_MODE=object KQAG_DATABASE_URL=<synthetic-sqlite-url> python scripts/check_production_readiness.py --with-backup-restore-evidence --with-hosted-observability-evidence --with-hosted-smoke-evidence --with-object-storage-evidence --with-object-artifact-lifecycle-evidence --with-live-object-storage-provider-evidence --backup-restore-work-dir _tmp\validation\s3-sdk-pr-backup --hosted-observability-work-dir _tmp\validation\s3-sdk-pr-observability --hosted-smoke-work-dir _tmp\validation\s3-sdk-pr-smoke --object-storage-work-dir _tmp\validation\s3-sdk-pr-object-contract --object-artifact-lifecycle-work-dir _tmp\validation\s3-sdk-pr-lifecycle` | Expected nonzero exit 2. Reported `internal_alpha_ready=false`, `production_ready=false`, live object-provider evidence `failed/supported=false`, and remaining blockers `sqlite_not_final_production`, `object_storage_provider_unavailable`, `object_retention_delete_live_evidence_missing`, `db_object_backup_restore_live_evidence_missing`, `session_business_hardening_incomplete`, and `production_deployment_operations_evidence_missing`. |
 | `python -m unittest tests.test_production_readiness tests.test_internal_alpha_hosted_validation_verifier tests.test_database_backup_restore_verifier tests.test_hosted_smoke_verifier tests.test_platform_integration_contract_docs` | Passed: 38 tests OK, covering empty new DB workspace, workspace-owned profile/pricing isolation, wrong-workspace denial, missing workspace profile/pricing/layout fail-closed generation, and DB/BLOB artifact mode readiness denial. |
@@ -707,7 +721,7 @@ Severity summary from plugin: unavailable because the scan did not start. This a
 | `KQAG_STORAGE_MODE=database KQAG_ARTIFACT_STORAGE_MODE=database KQAG_DATABASE_URL=<synthetic-sqlite-url> python scripts/check_production_readiness.py --with-backup-restore-evidence --with-hosted-observability-evidence --with-hosted-smoke-evidence --backup-restore-work-dir _tmp\validation\readiness-backup-evidence-db --hosted-observability-work-dir _tmp\validation\readiness-observability-evidence --hosted-smoke-work-dir _tmp\validation\readiness-hosted-smoke-evidence` | Expected nonzero exit 2. Reported backup evidence `passed`, hosted observability evidence `passed`, hosted smoke evidence `passed`, object-storage evidence `not_run_by_checker`, `internal_alpha_ready=false`, `production_ready=false`, and `database_blob_artifact_storage_not_launch_ready`; DB/BLOB artifact mode was not credited as hosted/protected/deploy readiness. |
 | `KQAG_STORAGE_MODE=database KQAG_ARTIFACT_STORAGE_MODE=object KQAG_DATABASE_URL=<synthetic-sqlite-url> python scripts/check_production_readiness.py --with-backup-restore-evidence --with-hosted-observability-evidence --with-hosted-smoke-evidence --with-object-storage-evidence --with-object-artifact-lifecycle-evidence --backup-restore-work-dir _tmp\validation\readiness-backup-evidence-object --hosted-observability-work-dir _tmp\validation\readiness-observability-object --hosted-smoke-work-dir _tmp\validation\readiness-hosted-smoke-object --object-storage-work-dir _tmp\validation\readiness-object-contract --object-artifact-lifecycle-work-dir _tmp\validation\readiness-object-lifecycle` | Expected nonzero exit 2. Reported workspace-scoped DB app records, object artifact mode, synthetic backup/observability/smoke/object contract/lifecycle evidence `passed`, `internal_alpha_ready=false`, `production_ready=false`, and remaining production blockers focused on non-final SQLite evidence, missing real object-storage provider, live object retention/delete, live DB+object backup/restore, session/business hardening, and production deployment/operations. |
 | `python scripts/verify_internal_alpha_hosted_validation.py --work-dir _tmp\validation\hosted-blocked` | Passed. Reported synthetic backup/restore, hosted observability, and hosted smoke evidence `passed`, `target_posture.launch_ready=false`, `internal_alpha_ready=false`, `production_ready=false`, and `database_blob_artifact_storage_not_launch_ready`. |
-| `python -m unittest discover -s tests` | Initial sandbox run failed with Windows temp-directory `PermissionError`; escalated rerun passed: 581 tests OK. |
+| `python -m unittest discover -s tests` | Initial sandbox run failed with Windows temp-directory `PermissionError`; escalated rerun passed: 584 tests OK. |
 
 Readiness command note: the nonzero result from `python scripts/check_production_readiness.py` is expected and desired in this audit. The legacy `internal_alpha_ready` field must stay `false`; DB/BLOB artifact mode must also keep `production_ready=false` even when all synthetic evidence flags pass.
 
