@@ -9,7 +9,6 @@ gap without printing database URL values, hostnames, usernames, or passwords.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
 import re
@@ -72,7 +71,7 @@ def database_family(raw_url: str) -> str:
 
 
 def postgres_driver_available() -> bool:
-    return bool(importlib.util.find_spec("psycopg") or importlib.util.find_spec("psycopg2"))
+    return webapp.postgres_driver_available()
 
 
 def metadata_migration_status(paths: tuple[Path, ...] = PRODUCTION_METADATA_MIGRATION_PATHS) -> dict[str, object]:
@@ -113,17 +112,54 @@ def metadata_migration_status(paths: tuple[Path, ...] = PRODUCTION_METADATA_MIGR
     }
 
 
+def postgres_schema_status(database_url: str) -> dict[str, object]:
+    required = REQUIRED_METADATA_TABLES
+    tables = set(required)
+    placeholders = ", ".join("?" for _ in tables)
+    with webapp.postgres_storage_connection(database_url) as connection:
+        rows = connection.execute(
+            f"select table_name, column_name from information_schema.columns where table_schema = current_schema() and table_name in ({placeholders})",
+            tuple(sorted(tables)),
+        ).fetchall()
+    present: dict[str, set[str]] = {}
+    for row in rows:
+        table_name = _clean(row["table_name"])
+        column_name = _clean(row["column_name"])
+        if table_name and column_name:
+            present.setdefault(table_name, set()).add(column_name)
+    missing_tables = sorted(table for table in required if table not in present)
+    missing_columns = {
+        table: sorted(columns - present.get(table, set()))
+        for table, columns in required.items()
+        if columns - present.get(table, set())
+    }
+    return {
+        "schema_available": not missing_tables and not missing_columns,
+        "required_tables": {
+            table: {"present": table in present, "missing_columns": missing_columns.get(table, [])}
+            for table in sorted(required)
+        },
+        "missing_tables": missing_tables,
+        "missing_columns": missing_columns,
+    }
+
+
 def run_verification(
     *,
     env: Mapping[str, str] | None = None,
     migration_paths: tuple[Path, ...] = PRODUCTION_METADATA_MIGRATION_PATHS,
     driver_available: bool | None = None,
+    schema_validator=None,
 ) -> dict[str, object]:
     effective_env = env or os.environ
-    family = database_family(effective_env.get(webapp.KQAG_DATABASE_URL_ENV_NAME, ""))
+    database_url = effective_env.get(webapp.KQAG_DATABASE_URL_ENV_NAME, "")
+    family = database_family(database_url)
     migration_status = metadata_migration_status(migration_paths)
     postgres_driver = postgres_driver_available() if driver_available is None else bool(driver_available)
     live_evidence_enabled = _enabled(effective_env.get(webapp.SQAG_LIVE_DATABASE_EVIDENCE_ENV_NAME, ""))
+    runtime_supported = webapp.postgres_metadata_storage_adapter_supported()
+    connection_attempted = False
+    runtime_schema_status: dict[str, object] | None = None
 
     blockers: list[str] = []
     if family == "missing":
@@ -138,12 +174,31 @@ def run_verification(
         if not migration_status["metadata_tables_declared"]:
             blockers.append("postgres_metadata_migrations_missing")
         if not postgres_driver:
-            blockers.append("optional_postgres_driver_missing")
-        blockers.append("postgres_runtime_adapter_missing")
+            blockers.append("postgres_driver_unavailable")
+        if not runtime_supported:
+            blockers.append("postgres_runtime_adapter_missing")
+        if live_evidence_enabled and migration_status["metadata_tables_declared"] and postgres_driver and runtime_supported:
+            connection_attempted = True
+            try:
+                validator = schema_validator or postgres_schema_status
+                runtime_schema_status = validator(database_url)
+            except Exception:
+                blockers.append("postgres_connection_failed")
+                runtime_schema_status = {
+                    "schema_available": False,
+                    "required_tables": {},
+                    "missing_tables": [],
+                    "missing_columns": {},
+                }
+            else:
+                if not runtime_schema_status.get("schema_available"):
+                    blockers.append("postgres_schema_missing")
+
+    passed = family == "postgres_compatible" and live_evidence_enabled and not blockers
 
     return {
         "schema": "swooshz.sqag.production-database-provider-verification.v1",
-        "status": "failed",
+        "status": "passed" if passed else "failed",
         "database_family": family,
         "intended_production_family": "postgres_neon_compatible",
         "required_env_names": [
@@ -152,12 +207,19 @@ def run_verification(
         ],
         "live_database_evidence_enabled": live_evidence_enabled,
         "postgres_driver_available": postgres_driver,
-        "app_runtime_postgres_supported": False,
-        "connection_attempted": False,
-        "production_database_evidence_supported": False,
+        "app_runtime_postgres_supported": runtime_supported,
+        "connection_attempted": connection_attempted,
+        "production_database_evidence_supported": passed,
         "metadata_migrations": migration_status,
-        "workspace_isolation_check": "not_run_runtime_adapter_missing",
-        "object_artifact_metadata_check": "declared" if migration_status["metadata_tables_declared"] else "missing",
+        "runtime_schema": runtime_schema_status
+        or {
+            "schema_available": False,
+            "required_tables": {},
+            "missing_tables": [],
+            "missing_columns": {},
+        },
+        "workspace_isolation_check": "runtime_adapter_available" if runtime_supported else "not_run_runtime_adapter_missing",
+        "object_artifact_metadata_check": "validated" if passed else ("declared" if migration_status["metadata_tables_declared"] else "missing"),
         "db_object_pairing": {
             "database_stores": "rows_and_metadata_only",
             "generated_artifact_bytes": "object_storage_only",
@@ -173,7 +235,7 @@ def run_verification(
         },
         "blockers": blockers,
         "notes": [
-            "This is a fail-closed scaffold until SQAG has a Postgres/Neon runtime adapter and live operator-run database evidence.",
+            "This verifier fails closed unless SQAG live database evidence is explicitly enabled by the operator.",
             "No DB URL value, hostname, username, password, tenant data, object key, or artifact bytes are printed.",
             "SQLite remains local-UAT/synthetic evidence only.",
         ],

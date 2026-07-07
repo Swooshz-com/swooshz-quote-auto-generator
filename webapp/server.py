@@ -20,6 +20,7 @@ import hmac
 import http.client
 import http.cookies
 import importlib
+import importlib.util
 import io
 import json
 import math
@@ -284,6 +285,7 @@ KQAG_DATABASE_URL_ENV_NAME = "KQAG_DATABASE_URL"
 SQAG_LIVE_DATABASE_EVIDENCE_ENV_NAME = "SQAG_LIVE_DATABASE_EVIDENCE"
 POSTGRES_COMPATIBLE_DATABASE_SCHEMES = {"postgres", "postgresql"}
 SQLITE_DATABASE_SCHEMES = {"sqlite"}
+POSTGRES_METADATA_STORAGE_ADAPTER_IMPLEMENTED = True
 USER_TYPE_ENV_NAME = "USER_TYPE"
 LOCAL_USER_ROLE_ENV_NAME = "LOCAL_USER_ROLE"
 SESSION_COOKIE_NAME = "swooshz_quote_session"
@@ -1388,6 +1390,26 @@ def configured_database_url() -> str:
     return clean_text(read_dotenv_value(KQAG_DATABASE_URL_ENV_NAME))
 
 
+def database_family_from_url(database_url: str) -> str:
+    raw = clean_text(database_url)
+    if not raw:
+        return "missing"
+    scheme = clean_text(urlparse(raw).scheme).lower()
+    if scheme in SQLITE_DATABASE_SCHEMES:
+        return "sqlite"
+    if scheme in POSTGRES_COMPATIBLE_DATABASE_SCHEMES:
+        return "postgres_compatible"
+    return "unsupported"
+
+
+def postgres_metadata_storage_adapter_supported() -> bool:
+    return POSTGRES_METADATA_STORAGE_ADAPTER_IMPLEMENTED
+
+
+def postgres_driver_available() -> bool:
+    return importlib.util.find_spec("psycopg") is not None
+
+
 def comma_separated_env_values(name: str) -> list[str]:
     raw = read_dotenv_value(name)
     return [clean_text(item) for item in raw.split(",") if clean_text(item)]
@@ -1947,14 +1969,7 @@ def configured_database_scheme() -> str:
 
 
 def configured_database_family() -> str:
-    scheme = configured_database_scheme()
-    if not scheme:
-        return "missing"
-    if scheme in SQLITE_DATABASE_SCHEMES:
-        return "sqlite"
-    if scheme in POSTGRES_COMPATIBLE_DATABASE_SCHEMES:
-        return "postgres_compatible"
-    return "unsupported"
+    return database_family_from_url(read_dotenv_value(KQAG_DATABASE_URL_ENV_NAME))
 
 
 def readiness_surface(
@@ -2174,13 +2189,15 @@ def production_database_evidence_summary(
     normalized_status = clean_text(status).lower() or "not_run_by_checker"
     if normalized_status not in {"passed", "failed", "not_run_by_checker"}:
         normalized_status = "not_run_by_checker"
-    app_runtime_postgres_supported = False
+    app_runtime_postgres_supported = postgres_metadata_storage_adapter_supported()
+    driver_available = postgres_driver_available()
     supported = bool(
         normalized_status == "passed"
         and database_mode
         and database_configured
         and database_family == "postgres_compatible"
         and app_runtime_postgres_supported
+        and driver_available
     )
     return {
         "status": normalized_status,
@@ -2192,6 +2209,7 @@ def production_database_evidence_summary(
         "database_family": database_family,
         "intended_production_family": "postgres_neon_compatible",
         "app_runtime_postgres_supported": app_runtime_postgres_supported,
+        "postgres_driver_available": driver_available,
         "production_database_evidence_supported": supported,
         "stores": [
             "workspace_scoped_rows",
@@ -2210,7 +2228,7 @@ def production_database_evidence_summary(
         "notes": [
             "Evidence is opt-in and metadata-only.",
             "SQLite remains local-UAT/synthetic evidence only.",
-            "Postgres/Neon-compatible runtime support and live DB evidence are not yet implemented by the app.",
+            "Postgres/Neon-compatible runtime adapter support is implemented for SQAG metadata rows; live DB evidence remains a separate gate.",
         ],
     }
 
@@ -2473,8 +2491,10 @@ def production_readiness_status(
         ))
     if database_scheme == "sqlite":
         blockers.append(readiness_blocker("sqlite_not_final_production", "P1", "SQLite is acceptable only for local-UAT/dev database evidence, not hosted, protected, deploy, or production storage.", gates=("production",)))
-    if database_mode and database_family == "postgres_compatible":
+    if database_mode and database_family == "postgres_compatible" and not production_database_evidence["app_runtime_postgres_supported"]:
         blockers.append(readiness_blocker("postgres_neon_runtime_adapter_missing", "P1", "Postgres/Neon-compatible database storage is the intended production direction, but the app runtime adapter is not implemented yet.", gates=("production",)))
+    if database_mode and database_family == "postgres_compatible" and not production_database_evidence["postgres_driver_available"]:
+        blockers.append(readiness_blocker("postgres_driver_unavailable", "P1", "Postgres/Neon-compatible database storage is selected but the pinned Postgres driver is not available in the runtime.", gates=("production",)))
     if database_mode and database_configured and not production_database_evidence["production_database_evidence_supported"]:
         blockers.append(readiness_blocker("postgres_neon_database_evidence_missing", "P1", "Live Postgres/Neon-compatible metadata database evidence is missing; SQLite remains local-UAT evidence only.", gates=("production",)))
     if not object_storage_evidence["production_object_storage_contract_supported"]:
@@ -7380,6 +7400,63 @@ KQAG_STORAGE_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "002_platform_scoped_artifacts.sql",
     PROJECT_ROOT / "migrations" / "003_object_artifact_metadata.sql",
 ]
+KQAG_POSTGRES_METADATA_MIGRATION_PATHS = [
+    PROJECT_ROOT / "migrations" / "001_platform_scoped_storage.sql",
+    PROJECT_ROOT / "migrations" / "003_object_artifact_metadata.sql",
+]
+KQAG_APP_METADATA_REQUIRED_COLUMNS = {
+    "kqag_profiles": {"workspace_id", "profile_id", "payload_json", "created_at", "updated_at"},
+    "kqag_pricing_references": {"workspace_id", "reference_id", "payload_json", "created_at", "updated_at"},
+    "kqag_quote_sessions": {"workspace_id", "session_id", "metadata_json", "draft_files_json", "created_at", "updated_at"},
+}
+KQAG_DATABASE_ARTIFACT_REQUIRED_COLUMNS = {
+    "kqag_quote_artifacts": {
+        "workspace_id",
+        "session_id",
+        "artifact_kind",
+        "filename",
+        "content_type",
+        "size_bytes",
+        "content_blob",
+        "created_at",
+        "updated_at",
+    },
+    "kqag_file_artifacts": {
+        "workspace_id",
+        "owner_type",
+        "owner_id",
+        "artifact_kind",
+        "filename",
+        "content_type",
+        "size_bytes",
+        "content_blob",
+        "created_at",
+        "updated_at",
+    },
+}
+KQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS = {
+    "kqag_object_artifacts": {
+        "artifact_id",
+        "workspace_id",
+        "owner_type",
+        "owner_id",
+        "platform_user_id",
+        "session_id",
+        "job_id",
+        "artifact_kind",
+        "filename",
+        "content_type",
+        "size_bytes",
+        "checksum_sha256",
+        "object_provider_type",
+        "object_key_ref",
+        "status",
+        "retention_status",
+        "created_at",
+        "updated_at",
+        "deleted_at",
+    },
+}
 KQAG_STORAGE_SQL = """
 create table if not exists kqag_profiles (
   workspace_id text not null,
@@ -7433,6 +7510,8 @@ create table if not exists kqag_file_artifacts (
   updated_at text not null,
   primary key (workspace_id, owner_type, owner_id, artifact_kind)
 );
+"""
+KQAG_OBJECT_ARTIFACT_METADATA_SQL = """
 create table if not exists kqag_object_artifacts (
   artifact_id text not null primary key,
   workspace_id text not null,
@@ -7484,6 +7563,69 @@ def sqlite_storage_connection(database_url: str):
         connection.close()
 
 
+def postgres_database_url_is_supported(database_url: str) -> bool:
+    return database_family_from_url(database_url) == "postgres_compatible"
+
+
+def postgres_query(sql: str) -> str:
+    converted = sql.replace("?", "%s")
+    converted = re.sub(r"order by ([A-Za-z_][A-Za-z0-9_]*) collate nocase", r"order by lower(\1)", converted, flags=re.IGNORECASE)
+    return converted
+
+
+class PostgresConnectionAdapter:
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+
+    def execute(self, sql: str, params: tuple[Any, ...] | list[Any] = ()) -> Any:
+        return self._connection.execute(postgres_query(sql), tuple(params or ()))
+
+    def commit(self) -> None:
+        self._connection.commit()
+
+    def close(self) -> None:
+        self._connection.close()
+
+
+def postgres_driver_connection_factory():
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+    except ImportError as exc:
+        raise KqagStorageAccessError(
+            "KQAG Postgres database driver is not available.",
+            status=503,
+            reason="storage_postgres_driver_unavailable",
+        ) from exc
+
+    def connect(database_url: str):
+        return psycopg.connect(database_url, row_factory=dict_row)
+
+    return connect
+
+
+@contextlib.contextmanager
+def postgres_storage_connection(database_url: str):
+    if not postgres_database_url_is_supported(database_url):
+        raise KqagStorageAccessError("KQAG database storage is not configured.", status=503, reason="storage_database_url_unsupported")
+    try:
+        connect = postgres_driver_connection_factory()
+        raw_connection = connect(database_url)
+    except KqagStorageAccessError:
+        raise
+    except Exception as exc:
+        raise KqagStorageAccessError(
+            "KQAG Postgres database storage is not reachable.",
+            status=503,
+            reason="storage_postgres_connection_failed",
+        ) from exc
+    connection = PostgresConnectionAdapter(raw_connection)
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
 def kqag_storage_migration_sql() -> str:
     sql_parts: list[str] = []
     for path in KQAG_STORAGE_MIGRATION_PATHS:
@@ -7493,15 +7635,43 @@ def kqag_storage_migration_sql() -> str:
             continue
     if sql_parts:
         return "\n".join(sql_parts)
-    return KQAG_STORAGE_SQL + "\n" + KQAG_ARTIFACT_STORAGE_SQL
+    return KQAG_STORAGE_SQL + "\n" + KQAG_ARTIFACT_STORAGE_SQL + "\n" + KQAG_OBJECT_ARTIFACT_METADATA_SQL
+
+
+def kqag_postgres_metadata_migration_sql() -> str:
+    sql_parts: list[str] = []
+    for path in KQAG_POSTGRES_METADATA_MIGRATION_PATHS:
+        try:
+            sql_parts.append(path.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+    if sql_parts:
+        return "\n".join(sql_parts)
+    return KQAG_STORAGE_SQL + "\n" + KQAG_OBJECT_ARTIFACT_METADATA_SQL
+
+
+def execute_sql_script(connection: Any, sql: str) -> None:
+    for statement in (part.strip() for part in sql.split(";")):
+        if statement:
+            connection.execute(statement)
+
 
 def apply_kqag_storage_migrations(database_url: str | None = None) -> None:
     url = clean_text(database_url) or configured_database_url()
     if not url:
         raise KqagStorageAccessError("KQAG database storage is not configured.", status=503, reason="storage_database_not_configured")
-    with sqlite_storage_connection(url) as connection:
-        connection.executescript(kqag_storage_migration_sql())
-        connection.commit()
+    family = database_family_from_url(url)
+    if family == "sqlite":
+        with sqlite_storage_connection(url) as connection:
+            connection.executescript(kqag_storage_migration_sql())
+            connection.commit()
+        return
+    if family == "postgres_compatible":
+        with postgres_storage_connection(url) as connection:
+            execute_sql_script(connection, kqag_postgres_metadata_migration_sql())
+            connection.commit()
+        return
+    raise KqagStorageAccessError("KQAG database storage is not configured.", status=503, reason="storage_database_url_unsupported")
 
 
 def platform_context_from_auth_session(session: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -7665,39 +7835,76 @@ class DatabaseKqagStorage:
 
     def __init__(self, database_url: str, workspace_id: str, role: str = "viewer", user_id: str = "") -> None:
         self.database_url = database_url
+        self.database_family = database_family_from_url(database_url)
         self.workspace_id = clean_text(workspace_id)
         self.role = role_permissions(role).get("role", "viewer")
         self.user_id = privacy_safe_tracking_id(user_id, "")
         if not self.workspace_id:
             raise KqagStorageAccessError("Platform workspace context is required for database storage.", status=403, reason="storage_platform_session_required")
+        if self.database_family == "missing":
+            raise KqagStorageAccessError("KQAG database storage is not configured.", status=503, reason="storage_database_not_configured")
+        if self.database_family == "unsupported":
+            raise KqagStorageAccessError("KQAG database storage is not configured.", status=503, reason="storage_database_url_unsupported")
 
     def connection(self):
+        if self.database_family == "postgres_compatible":
+            return postgres_storage_connection(self.database_url)
         return sqlite_storage_connection(self.database_url)
 
     def ensure_ready(self) -> None:
-        required = {"kqag_profiles", "kqag_pricing_references", "kqag_quote_sessions"}
-        self._ensure_tables(required, reason="storage_database_not_migrated")
+        self._ensure_schema(KQAG_APP_METADATA_REQUIRED_COLUMNS, reason="storage_database_not_migrated")
 
     def ensure_artifact_ready(self) -> None:
-        required = {"kqag_quote_artifacts", "kqag_file_artifacts"}
-        self._ensure_tables(required, reason="storage_artifact_database_not_migrated")
+        if self.database_family == "postgres_compatible":
+            raise KqagStorageAccessError(
+                "Database/BLOB artifact storage is not supported for Postgres metadata storage.",
+                status=503,
+                reason="storage_database_blob_artifacts_unsupported",
+            )
+        self._ensure_schema(KQAG_DATABASE_ARTIFACT_REQUIRED_COLUMNS, reason="storage_artifact_database_not_migrated")
 
     def ensure_object_artifact_ready(self) -> None:
-        self._ensure_tables({"kqag_object_artifacts"}, reason="storage_object_artifact_database_not_migrated")
+        self._ensure_schema(KQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS, reason="storage_object_artifact_database_not_migrated")
 
-    def _ensure_tables(self, required: set[str], *, reason: str) -> None:
-        placeholders = ", ".join("?" for _ in required)
+    def _ensure_schema(self, required: dict[str, set[str]], *, reason: str) -> None:
         with self.connection() as connection:
-            rows = connection.execute(
-                f"select name from sqlite_master where type = 'table' and name in ({placeholders})",
-                tuple(sorted(required)),
-            ).fetchall()
-        present = {clean_text(row["name"]) for row in rows}
-        if present != required:
+            if self.database_family == "postgres_compatible":
+                rows = self._postgres_schema_columns(connection, set(required))
+            else:
+                rows = self._sqlite_schema_columns(connection, set(required))
+        present: dict[str, set[str]] = {}
+        for row in rows:
+            table_name = clean_text(row["table_name"])
+            column_name = clean_text(row["column_name"])
+            if table_name and column_name:
+                present.setdefault(table_name, set()).add(column_name)
+        missing = {
+            table: sorted(columns - present.get(table, set()))
+            for table, columns in required.items()
+            if columns - present.get(table, set())
+        }
+        missing_tables = {table for table in required if table not in present}
+        if missing or missing_tables:
             message = "KQAG database storage migration has not been applied."
             if reason == "storage_artifact_database_not_migrated":
                 message = "KQAG artifact storage migration has not been applied."
+            if reason == "storage_object_artifact_database_not_migrated":
+                message = "KQAG object artifact metadata migration has not been applied."
             raise KqagStorageAccessError(message, status=503, reason=reason)
+
+    def _sqlite_schema_columns(self, connection: Any, tables: set[str]) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        for table in sorted(tables):
+            for row in connection.execute(f"pragma table_info({table})").fetchall():
+                rows.append({"table_name": table, "column_name": clean_text(row["name"])})
+        return rows
+
+    def _postgres_schema_columns(self, connection: Any, tables: set[str]) -> list[dict[str, str]]:
+        placeholders = ", ".join("?" for _ in tables)
+        return connection.execute(
+            f"select table_name, column_name from information_schema.columns where table_schema = current_schema() and table_name in ({placeholders})",
+            tuple(sorted(tables)),
+        ).fetchall()
 
     def workspace(self) -> dict[str, Any]:
         runtime = default_runtime_workspace()

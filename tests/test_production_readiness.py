@@ -471,7 +471,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
                 continue
             self.assertNotIn(value, text)
 
-    def test_postgres_database_url_keeps_readiness_blocked_until_runtime_and_live_evidence(self):
+    def test_postgres_database_url_drops_runtime_blocker_but_keeps_live_evidence_blocked(self):
         private_url = "postgres" + "ql://redacted-db-url"
         env = {
             "KQAG_STORAGE_MODE": "database",
@@ -493,16 +493,16 @@ class ProductionReadinessStatusTest(unittest.TestCase):
                 object_storage_evidence_status="passed",
                 object_artifact_lifecycle_evidence_status="passed",
                 live_object_storage_provider_evidence_status="passed",
-                production_database_evidence_status="passed",
+                production_database_evidence_status="failed",
             )
 
         text = json.dumps(status, sort_keys=True)
         production_blocker_ids = {item["id"] for item in status["production_blockers"]}
         self.assertEqual(status["database_family"], "postgres_compatible")
         self.assertEqual(status["production_database_evidence"]["database_family"], "postgres_compatible")
-        self.assertFalse(status["production_database_evidence"]["app_runtime_postgres_supported"])
+        self.assertTrue(status["production_database_evidence"]["app_runtime_postgres_supported"])
         self.assertFalse(status["production_database_evidence"]["production_database_evidence_supported"])
-        self.assertIn("postgres_neon_runtime_adapter_missing", production_blocker_ids)
+        self.assertNotIn("postgres_neon_runtime_adapter_missing", production_blocker_ids)
         self.assertIn("postgres_neon_database_evidence_missing", production_blocker_ids)
         self.assertNotIn("sqlite_not_final_production", production_blocker_ids)
         self.assertFalse(status["production_ready"])
@@ -559,7 +559,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         text = completed.stdout + completed.stderr
         production_blocker_ids = {item["id"] for item in status["production_blockers"]}
         self.assertEqual(status["production_database_evidence"]["status"], "failed")
-        self.assertIn("postgres_neon_runtime_adapter_missing", production_blocker_ids)
+        self.assertNotIn("postgres_neon_runtime_adapter_missing", production_blocker_ids)
         self.assertIn("postgres_neon_database_evidence_missing", production_blocker_ids)
         self.assertFalse(status["production_ready"])
         self.assertNotIn(private_url, text)
