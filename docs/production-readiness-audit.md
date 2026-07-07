@@ -105,12 +105,21 @@ Production database readiness is now a separate explicit gate. SQLite remains
 local-UAT/synthetic evidence only, while Neon/Postgres-compatible metadata
 storage is the intended production DB direction. `scripts/verify_production_database_provider.py`
 is a metadata-only checker that recognizes Postgres-compatible URL schemes
-without printing DB URL values, confirms the repo-declared metadata tables, and
-can perform an explicit opt-in read-only schema check through the Postgres
-metadata adapter. It still fails closed by default and does not credit
-production readiness without operator-run live DB evidence. Database rows are
-for workspace/session/profile/pricing and object-artifact metadata only;
-generated XLSX/PDF bytes remain in object storage.
+without printing DB URL values, confirms the repo-declared runtime-required
+metadata tables, and can run explicit opt-in live Postgres/Neon evidence through
+the metadata adapter. It still fails closed by default and does not credit
+production readiness without operator-run live DB evidence. With
+`SQAG_LIVE_DATABASE_EVIDENCE=1`, an operator supplies DB values outside Git/chat
+and the verifier uses synthetic namespaced metadata rows only to check schema,
+profile/pricing/session/object metadata CRUD, two-workspace isolation, object
+artifact metadata pairing, and cleanup. It does not require DB-BLOB artifact
+tables, does not store generated XLSX/PDF bytes in the DB, does not touch
+R2/object storage, and reports only sanitized booleans/counts/schema version.
+Passing this DB evidence can remove only the DB evidence blocker; production
+readiness remains false until live DB+object backup/restore, live retention/delete,
+hosted logging/monitoring, hosted smoke, production deployment operations, live
+Platform-to-SQAG launch smoke, session/business hardening, and final production
+audit are complete.
 
 Current expected posture in local mode:
 

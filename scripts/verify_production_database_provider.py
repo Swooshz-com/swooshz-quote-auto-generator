@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Metadata-only SQAG production database readiness boundary.
 
-This verifier is metadata-only by default. Read-only live database schema checks
-run only when SQAG_LIVE_DATABASE_EVIDENCE is explicitly enabled, and reports must
-not print database URL values, hostnames, usernames, passwords, or tenant data.
+This verifier is metadata-only by default. Live Postgres-compatible schema and
+synthetic metadata CRUD/isolation checks run only when SQAG_LIVE_DATABASE_EVIDENCE
+is explicitly enabled, and reports must not print database URL values, hostnames,
+usernames, passwords, provider values, object keys, artifact bytes, or tenant data.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import json
 import os
 import re
 import sys
+import uuid
 from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlparse
@@ -160,12 +162,242 @@ def postgres_schema_status(database_url: str) -> dict[str, object]:
     return schema_status_from_information_schema_rows(rows)
 
 
+def _empty_live_metadata_operations(*, cleanup_completed: bool = False) -> dict[str, object]:
+    return {
+        "workspace_count": 0,
+        "insert_count": 0,
+        "read_count": 0,
+        "update_count": 0,
+        "delete_count": 0,
+        "workspace_isolation": False,
+        "crud_verified": False,
+        "object_artifact_metadata_pairing": False,
+        "cleanup_completed": cleanup_completed,
+        "db_blob_artifact_rows_written": 0,
+    }
+
+
+def _synthetic_ids() -> dict[str, str]:
+    token = uuid.uuid4().hex[:12]
+    prefix = f"sqagldb-{token}"
+    return {
+        "workspace_a": f"{prefix}-workspace-a",
+        "workspace_b": f"{prefix}-workspace-b",
+        "profile_a": f"{prefix}-profile-a",
+        "profile_b": f"{prefix}-profile-b",
+        "pricing_a": f"{prefix}-pricing-a",
+        "pricing_b": f"{prefix}-pricing-b",
+        "session_a": f"quote-{token}a",
+        "session_b": f"quote-{token}b",
+    }
+
+
+def _contains_id(items: list[dict[str, object]], item_id: str, id_key: str = "id") -> bool:
+    return any(_clean(item.get(id_key)) == item_id for item in items if isinstance(item, dict))
+
+
+def _delete_synthetic_workspace_metadata(
+    storage: object,
+    *,
+    profile_id: str,
+    pricing_id: str,
+    session_id: str,
+) -> int:
+    """Delete only verifier-created synthetic metadata rows through DB SQL."""
+    deleted = 0
+    with storage.connection() as connection:
+        for sql, params in (
+            (
+                "delete from kqag_object_artifacts "
+                "where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+                (storage.workspace_id, "generated_quote", session_id, "xlsx"),
+            ),
+            (
+                "delete from kqag_quote_sessions where workspace_id = ? and session_id = ?",
+                (storage.workspace_id, session_id),
+            ),
+            (
+                "delete from kqag_pricing_references where workspace_id = ? and reference_id = ?",
+                (storage.workspace_id, pricing_id),
+            ),
+            (
+                "delete from kqag_profiles where workspace_id = ? and profile_id = ?",
+                (storage.workspace_id, profile_id),
+            ),
+        ):
+            cursor = connection.execute(sql, params)
+            deleted += int(getattr(cursor, "rowcount", 0) or 0)
+        connection.commit()
+    return deleted
+
+
+def _synthetic_object_artifact_row(storage: object, session_id: str, artifact_kind: str) -> object | None:
+    with storage.connection() as connection:
+        cursor = connection.execute(
+            "select artifact_id from kqag_object_artifacts "
+            "where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ? "
+            "and status = ? and retention_status = ? and deleted_at is null",
+            (storage.workspace_id, "generated_quote", session_id, artifact_kind, "active", "active"),
+        )
+        return cursor.fetchone()
+
+
+def _cleanup_synthetic_metadata(database_url: str, ids: dict[str, str]) -> bool:
+    cleanup_ok = True
+    for workspace_key, profile_key, pricing_key, session_key in (
+        ("workspace_a", "profile_a", "pricing_a", "session_a"),
+        ("workspace_b", "profile_b", "pricing_b", "session_b"),
+    ):
+        storage = webapp.DatabaseKqagStorage(database_url, ids[workspace_key], role="admin", user_id=f"{ids[workspace_key]}-user")
+        try:
+            _delete_synthetic_workspace_metadata(
+                storage,
+                profile_id=ids[profile_key],
+                pricing_id=ids[pricing_key],
+                session_id=ids[session_key],
+            )
+        except Exception:
+            cleanup_ok = False
+    return cleanup_ok
+
+
+def live_metadata_operations_status(database_url: str) -> dict[str, object]:
+    ids = _synthetic_ids()
+    operations = _empty_live_metadata_operations()
+    inserted = 0
+    reads = 0
+    updates = 0
+    deletes = 0
+    try:
+        storage_a = webapp.DatabaseKqagStorage(database_url, ids["workspace_a"], role="admin", user_id=f"{ids['workspace_a']}-user")
+        storage_b = webapp.DatabaseKqagStorage(database_url, ids["workspace_b"], role="admin", user_id=f"{ids['workspace_b']}-user")
+        storage_a.ensure_ready()
+        storage_a.ensure_object_artifact_ready()
+        storage_b.ensure_ready()
+        storage_b.ensure_object_artifact_ready()
+
+        storage_a.save_profile({"id": ids["profile_a"], "label": "SQAG live DB evidence profile A"})
+        storage_b.save_profile({"id": ids["profile_b"], "label": "SQAG live DB evidence profile B"})
+        inserted += 2
+        storage_a.save_pricing_reference({"id": ids["pricing_a"], "label": "SQAG live DB evidence pricing A", "items": []})
+        storage_b.save_pricing_reference({"id": ids["pricing_b"], "label": "SQAG live DB evidence pricing B", "items": []})
+        inserted += 2
+        storage_a.create_or_update_quote_session({"session_id": ids["session_a"], "customer_summary": {"name": "Synthetic DB Evidence A"}}, session_id=ids["session_a"])
+        storage_b.create_or_update_quote_session({"session_id": ids["session_b"], "customer_summary": {"name": "Synthetic DB Evidence B"}}, session_id=ids["session_b"])
+        inserted += 2
+
+        checksum = "a" * 64
+        for storage, workspace_key, session_key in (
+            (storage_a, "workspace_a", "session_a"),
+            (storage_b, "workspace_b", "session_b"),
+        ):
+            storage._upsert_object_quote_artifact(
+                ids[session_key],
+                "xlsx",
+                "quotation.xlsx",
+                webapp.QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"],
+                webapp.ObjectArtifactMetadata(
+                    workspace_id=ids[workspace_key],
+                    owner_type="generated_quote",
+                    owner_id=ids[session_key],
+                    artifact_kind="xlsx",
+                    filename="quotation.xlsx",
+                    content_type=webapp.QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"],
+                    size_bytes=12,
+                    checksum_sha256=checksum,
+                    storage_key="redacted-object-key-ref",
+                    created_at="2026-01-01T00:00:00Z",
+                    updated_at="2026-01-01T00:00:00Z",
+                ),
+            )
+            inserted += 1
+
+        profiles_a = storage_a.list_company_profiles()
+        profiles_b = storage_b.list_company_profiles()
+        pricing_a = storage_a.list_pricing_references()
+        pricing_b = storage_b.list_pricing_references()
+        sessions_a = storage_a.list_quote_sessions()
+        sessions_b = storage_b.list_quote_sessions()
+        reads += 6
+        workspace_isolation = all(
+            (
+                _contains_id(profiles_a, ids["profile_a"]),
+                not _contains_id(profiles_a, ids["profile_b"]),
+                _contains_id(profiles_b, ids["profile_b"]),
+                not _contains_id(profiles_b, ids["profile_a"]),
+                _contains_id(pricing_a, ids["pricing_a"]),
+                not _contains_id(pricing_a, ids["pricing_b"]),
+                _contains_id(pricing_b, ids["pricing_b"]),
+                not _contains_id(pricing_b, ids["pricing_a"]),
+                _contains_id(sessions_a, ids["session_a"], "session_id"),
+                not _contains_id(sessions_a, ids["session_b"], "session_id"),
+                _contains_id(sessions_b, ids["session_b"], "session_id"),
+                not _contains_id(sessions_b, ids["session_a"], "session_id"),
+            )
+        )
+
+        storage_a.save_profile({"id": ids["profile_a"], "label": "SQAG live DB evidence profile A updated"})
+        storage_a.save_pricing_reference({"id": ids["pricing_a"], "label": "SQAG live DB evidence pricing A updated", "items": []})
+        storage_a.create_or_update_quote_session({"session_id": ids["session_a"], "customer_summary": {"name": "Synthetic DB Evidence A Updated"}}, session_id=ids["session_a"])
+        updates += 3
+        profile_updated = _clean((storage_a.profile_detail(ids["profile_a"]) or {}).get("label")) == "SQAG live DB evidence profile A updated"
+        pricing_updated = _clean((storage_a.pricing_reference_detail(ids["pricing_a"]) or {}).get("label")) == "SQAG live DB evidence pricing A updated"
+        session_updated = bool(storage_a.get_quote_session(ids["session_a"]))
+        reads += 3
+
+        object_a = _synthetic_object_artifact_row(storage_a, ids["session_a"], "xlsx")
+        object_b = _synthetic_object_artifact_row(storage_b, ids["session_b"], "xlsx")
+        object_cross_a = _synthetic_object_artifact_row(storage_a, ids["session_b"], "xlsx")
+        object_cross_b = _synthetic_object_artifact_row(storage_b, ids["session_a"], "xlsx")
+        reads += 4
+        object_pairing = bool(object_a and object_b and not object_cross_a and not object_cross_b)
+
+        deleted_count = _delete_synthetic_workspace_metadata(
+            storage_a,
+            profile_id=ids["profile_a"],
+            pricing_id=ids["pricing_a"],
+            session_id=ids["session_a"],
+        )
+        deletes += deleted_count
+        deleted_rows_hidden = all(
+            (
+                storage_a.profile_detail(ids["profile_a"]) is None,
+                storage_a.pricing_reference_detail(ids["pricing_a"]) is None,
+                storage_a.get_quote_session(ids["session_a"]) is None,
+                _synthetic_object_artifact_row(storage_a, ids["session_a"], "xlsx") is None,
+            )
+        )
+        reads += 3
+        crud_verified = all((profile_updated, pricing_updated, session_updated, deleted_count >= 3, deleted_rows_hidden))
+
+        operations = {
+            "workspace_count": 2,
+            "insert_count": inserted,
+            "read_count": reads,
+            "update_count": updates,
+            "delete_count": deletes,
+            "workspace_isolation": workspace_isolation,
+            "crud_verified": crud_verified,
+            "object_artifact_metadata_pairing": object_pairing,
+            "cleanup_completed": False,
+            "db_blob_artifact_rows_written": 0,
+        }
+        return operations
+    except Exception:
+        operations["workspace_count"] = 2
+        return operations
+    finally:
+        cleanup_completed = _cleanup_synthetic_metadata(database_url, ids)
+        operations["cleanup_completed"] = cleanup_completed
+
 def run_verification(
     *,
     env: Mapping[str, str] | None = None,
     migration_paths: tuple[Path, ...] = PRODUCTION_METADATA_MIGRATION_PATHS,
     driver_available: bool | None = None,
     schema_validator=None,
+    live_operations_validator=None,
+    test_injected_backend: bool = False,
 ) -> dict[str, object]:
     effective_env = env or os.environ
     database_url = effective_env.get(webapp.KQAG_DATABASE_URL_ENV_NAME, "")
@@ -176,6 +408,7 @@ def run_verification(
     runtime_supported = webapp.postgres_metadata_storage_adapter_supported()
     connection_attempted = False
     runtime_schema_status: dict[str, object] | None = None
+    live_operations_status = _empty_live_metadata_operations()
 
     blockers: list[str] = []
     if family == "missing":
@@ -209,6 +442,22 @@ def run_verification(
             else:
                 if not runtime_schema_status.get("schema_available"):
                     blockers.append("postgres_schema_missing")
+                else:
+                    try:
+                        operation_validator = live_operations_validator or live_metadata_operations_status
+                        live_operations_status = operation_validator(database_url)
+                    except Exception:
+                        blockers.append("postgres_live_metadata_operations_failed")
+                        live_operations_status = _empty_live_metadata_operations()
+                    else:
+                        if not live_operations_status.get("workspace_isolation"):
+                            blockers.append("postgres_workspace_isolation_failed")
+                        if not live_operations_status.get("crud_verified"):
+                            blockers.append("postgres_metadata_crud_failed")
+                        if not live_operations_status.get("object_artifact_metadata_pairing"):
+                            blockers.append("postgres_object_artifact_metadata_failed")
+                        if not live_operations_status.get("cleanup_completed"):
+                            blockers.append("postgres_cleanup_failed")
 
     passed = family == "postgres_compatible" and live_evidence_enabled and not blockers
 
@@ -225,6 +474,8 @@ def run_verification(
         "postgres_driver_available": postgres_driver,
         "app_runtime_postgres_supported": runtime_supported,
         "connection_attempted": connection_attempted,
+        "test_injected_backend": bool(test_injected_backend),
+        "live_database_evidence_supported": passed,
         "production_database_evidence_supported": passed,
         "metadata_migrations": migration_status,
         "runtime_schema": runtime_schema_status
@@ -234,7 +485,8 @@ def run_verification(
             "missing_tables": [],
             "missing_columns": {},
         },
-        "workspace_isolation_check": "runtime_adapter_available" if runtime_supported else "not_run_runtime_adapter_missing",
+        "workspace_isolation_check": "validated" if live_operations_status.get("workspace_isolation") else ("runtime_adapter_available" if runtime_supported else "not_run_runtime_adapter_missing"),
+        "live_metadata_operations": live_operations_status,
         "object_artifact_metadata_check": "validated" if passed else ("declared" if migration_status["metadata_tables_declared"] else "missing"),
         "db_object_pairing": {
             "database_stores": "rows_and_metadata_only",

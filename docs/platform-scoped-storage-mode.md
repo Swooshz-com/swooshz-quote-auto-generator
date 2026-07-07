@@ -176,18 +176,29 @@ XLSX/PDF bytes stay in object storage.
 `scripts/verify_production_database_provider.py` is the current metadata-only
 production database boundary checker. It classifies the configured database URL
 family without printing the value, verifies the repo-declared metadata migration
-tables by file name only, and reports that SQAG now has a
-Postgres/Neon-compatible runtime adapter boundary for metadata rows. Live DB
-evidence remains a separate explicit opt-in gate: without
-`SQAG_LIVE_DATABASE_EVIDENCE`, the verifier does not connect to a live database
-and fails closed. With the opt-in, it performs a read-only schema check and
-still reports only sanitized metadata. Production readiness remains false until
-live DB evidence and the remaining operations gates pass.
+tables by file name only, and confirms the Postgres/Neon-compatible runtime
+adapter boundary for metadata rows. Live DB evidence remains a separate explicit
+opt-in gate: without `SQAG_LIVE_DATABASE_EVIDENCE`, the verifier does not
+connect to a live database and fails closed.
 
-Do not rerun the R2/S3-compatible live object-storage evidence for this database
-PR. That metadata-only provider evidence has already passed. DB+object
-backup/restore live evidence remains a later gate after production database
-runtime support has operator-run live evidence.
+With the opt-in, an operator supplies DB values outside Git/chat and the verifier
+runs sanitized live Postgres/Neon evidence using synthetic, namespaced metadata
+rows only. It checks the runtime-required workspace app metadata tables and
+object-artifact metadata table, inserts/reads/updates/deletes synthetic
+profile/pricing/session/object metadata for two workspaces, proves workspace
+isolation, and cleans up the synthetic rows. It does not require DB-BLOB artifact
+tables, does not store generated XLSX/PDF artifact bytes in the database, and
+does not touch R2/object storage. Output remains booleans/counts/schema version
+only and omits DB URLs, hostnames, usernames, provider values, object keys,
+artifact bytes, private paths, and tenant/customer/staff/profile/pricing data.
+
+Passing this DB evidence can drop only the `postgres_neon_database_evidence_missing`
+blocker. It does not make SQAG production-ready. Remaining blockers still include
+live DB+object backup/restore, live retention/delete, hosted logging/monitoring,
+hosted smoke, production deployment operations, live Platform-to-SQAG launch
+smoke, session/business hardening, and the final production audit. Do not rerun
+the R2/S3-compatible live object-storage evidence for this database PR; that
+metadata-only provider evidence has already passed.
 
 Object artifact lifecycle evidence is synthetic/stubbed only:
 
