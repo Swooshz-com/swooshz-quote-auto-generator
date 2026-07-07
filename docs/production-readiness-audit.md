@@ -101,6 +101,16 @@ Production readiness still remains false until the separate live DB+object
 backup/restore, retention/delete, operations, hosted logging/smoke, session
 hardening, and final audit gates are satisfied.
 
+Production database readiness is now a separate explicit gate. SQLite remains
+local-UAT/synthetic evidence only, while Neon/Postgres-compatible metadata
+storage is the intended production DB direction. `scripts/verify_production_database_provider.py`
+is a metadata-only checker that recognizes Postgres-compatible URL schemes
+without printing DB URL values, confirms the repo-declared metadata tables, and
+fails closed because SQAG does not yet have a Postgres runtime adapter or live
+operator-run DB evidence. Database rows are for workspace/session/profile/pricing
+and object-artifact metadata only; generated XLSX/PDF bytes remain in object
+storage.
+
 Current expected posture in local mode:
 
 - `local_uat_supported`: `true`
@@ -211,6 +221,14 @@ synthetic verifier coverage. It is not a hosted/protected/deploy launch posture
 and must not be treated as production-ready. Production generated XLSX/PDF bytes
 require object storage; database rows should store metadata, ownership,
 checksums, retention state, and audit data only.
+
+Neon/Postgres-compatible metadata storage is the production database direction,
+but it is not credited yet. `production_database_evidence` remains failed or
+not-run until a real operator-run verifier proves the app can use a
+Postgres-compatible database with the required workspace-scoped tables,
+object-artifact metadata, isolation behavior, and sanitized output. Live
+DB+object backup/restore evidence remains a later gate after that production DB
+support exists.
 
 `scripts/verify_live_object_storage_provider.py` is the opt-in live-provider
 evidence path. It uses the pinned S3-compatible SDK dependency set from
