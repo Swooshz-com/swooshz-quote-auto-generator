@@ -247,16 +247,21 @@ ownership or restore-window decisions report
 When enabled by an operator, the drill uses synthetic namespaced metadata rows
 and one tiny synthetic generated artifact payload only. It applies the existing
 guarded SQAG metadata migrations where needed, writes active DB metadata plus an
-active object, restores equivalent synthetic rows and bytes into isolated
-restore targets only, verifies checksum/content type/byte size and DB+object
-metadata pairing, proves workspace isolation, and then deletes the synthetic
-rows and objects from both active and restore targets. Cleanup failure, restore
-mismatch, non-isolated targets, missing env, missing decisions, DB write/read
-failure, or object write/read failure all fail closed. Reports contain only
-schema/status booleans, counts, blocker IDs, and privacy booleans; they must not
-include DB URLs, hostnames, usernames, passwords, provider values, bucket names,
-object keys, access keys, artifact bytes, private paths, tenant data, generated
-quote contents, backup dumps, or restore dumps.
+active object, then probes the restore DB and restore object backend before any
+restore writes. The restore DB must not see the active synthetic profile,
+pricing, session, or object metadata rows, and the restore object backend must
+not read the active synthetic object; either visibility fails closed with a
+sanitized blocker. Only after those live synthetic visibility checks pass does
+the drill restore equivalent synthetic rows and bytes into isolated restore
+targets, verify checksum/content type/byte size and DB+object metadata pairing,
+prove workspace isolation, and delete the synthetic rows and objects from both
+active and restore targets. Cleanup failure, restore mismatch, non-isolated
+targets, missing env, missing decisions, DB write/read failure, or object
+write/read failure all fail closed. Reports contain only schema/status booleans,
+counts, blocker IDs, and privacy booleans; they must not include DB URLs,
+hostnames, usernames, passwords, provider values, bucket names, object keys,
+access keys, artifact bytes, private paths, tenant data, generated quote
+contents, backup dumps, or restore dumps.
 
 A passing non-test-injected drill can remove only
 `db_object_backup_restore_live_evidence_missing`. `production_ready=false`

@@ -179,6 +179,8 @@ def _default_checks(
         "active_object_write_read_verified": False,
         "restore_db_write_read_verified": False,
         "restore_object_write_read_verified": False,
+        "restore_database_cannot_read_active_synthetic_rows": False,
+        "restore_object_cannot_read_active_synthetic_object": False,
         "checksum_match": False,
         "metadata_object_pairing_verified": False,
         "workspace_isolation_preserved": False,
@@ -394,6 +396,27 @@ def _metadata_object_pairing_ok(storage: object, session_id: str, metadata: Obje
     )
 
 
+def _restore_database_cannot_read_active_synthetic_rows(
+    *,
+    restore_storage_a: object,
+    restore_storage_b: object,
+    ids: Mapping[str, str],
+    active_metadata: ObjectArtifactMetadata,
+) -> bool:
+    visible = any(
+        (
+            restore_storage_a.profile_detail(ids["profile_a"]) is not None,
+            restore_storage_b.profile_detail(ids["profile_b"]) is not None,
+            restore_storage_a.pricing_reference_detail(ids["pricing_a"]) is not None,
+            restore_storage_b.pricing_reference_detail(ids["pricing_b"]) is not None,
+            restore_storage_a.get_quote_session(ids["session_a"]) is not None,
+            restore_storage_b.get_quote_session(ids["session_b"]) is not None,
+            _metadata_object_pairing_ok(restore_storage_a, ids["session_a"], active_metadata),
+        )
+    )
+    return not visible
+
+
 def _cleanup_storage(storage: object, *, profile_id: str, pricing_id: str, session_id: str) -> bool:
     if hasattr(storage, "connection"):
         with storage.connection() as connection:
@@ -544,6 +567,33 @@ def _run_drill(
             blockers.append("active_object_write_failed")
             return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
 
+        try:
+            checks["restore_database_cannot_read_active_synthetic_rows"] = _restore_database_cannot_read_active_synthetic_rows(
+                restore_storage_a=restore_storage_a,
+                restore_storage_b=restore_storage_b,
+                ids=ids,
+                active_metadata=active_metadata,
+            )
+        except Exception:
+            blockers.append("isolated_restore_target_live_check_failed")
+            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
+        if not checks["restore_database_cannot_read_active_synthetic_rows"]:
+            blockers.append("restore_database_can_read_active_synthetic_rows")
+            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
+
+        try:
+            restore_backend = restore_backend_factory(env)
+        except Exception:
+            blockers.append("restore_object_write_failed")
+            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
+        try:
+            restore_backend.retrieve_artifact(active_metadata, workspace_id=ids["workspace_a"])
+        except Exception:
+            checks["restore_object_cannot_read_active_synthetic_object"] = True
+        else:
+            blockers.append("restore_object_can_read_active_synthetic_object")
+            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
+
         checks["restore_attempted"] = True
         try:
             restore_db_rows += _write_metadata_rows(
@@ -561,7 +611,6 @@ def _run_drill(
             return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
 
         try:
-            restore_backend = restore_backend_factory(env)
             restore_metadata = restore_backend.store_artifact(
                 workspace_id=ids["workspace_a"],
                 owner_type="generated_quote",

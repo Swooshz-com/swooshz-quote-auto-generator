@@ -47,15 +47,29 @@ def complete_env() -> dict[str, str]:
 
 
 class FakeStorage:
-    def __init__(self, *, label: str, workspace_id: str, fail_on: str = "", pairing_mismatch: bool = False):
+    def __init__(
+        self,
+        *,
+        label: str,
+        workspace_id: str,
+        fail_on: str = "",
+        pairing_mismatch: bool = False,
+        state: dict[str, dict[object, dict[str, object]]] | None = None,
+    ):
         self.label = label
         self.workspace_id = workspace_id
         self.fail_on = fail_on
         self.pairing_mismatch = pairing_mismatch
-        self.profiles: dict[str, dict[str, object]] = {}
-        self.pricing: dict[str, dict[str, object]] = {}
-        self.sessions: dict[str, dict[str, object]] = {}
-        self.object_artifacts: dict[tuple[str, str], dict[str, object]] = {}
+        self._state = state or {
+            "profiles": {},
+            "pricing": {},
+            "sessions": {},
+            "object_artifacts": {},
+        }
+        self.profiles = self._state["profiles"]
+        self.pricing = self._state["pricing"]
+        self.sessions = self._state["sessions"]
+        self.object_artifacts = self._state["object_artifacts"]
 
     def _maybe_fail(self, step: str) -> None:
         if self.fail_on == step or self.fail_on == f"{self.label}_{step}":
@@ -142,14 +156,24 @@ class FakeStorage:
 
 
 class FakeBackend:
-    def __init__(self, metadata_cls, *, label: str, fail_on: str = "", tamper_retrieve: bool = False, cleanup_fails: bool = False):
+    def __init__(
+        self,
+        metadata_cls,
+        *,
+        label: str,
+        fail_on: str = "",
+        tamper_retrieve: bool = False,
+        cleanup_fails: bool = False,
+        state: dict[str, dict[str, object]] | None = None,
+    ):
         self.metadata_cls = metadata_cls
         self.label = label
         self.fail_on = fail_on
         self.tamper_retrieve = tamper_retrieve
         self.cleanup_fails = cleanup_fails
-        self.objects: dict[str, bytes] = {}
-        self.metadata: dict[str, object] = {}
+        self._state = state or {"objects": {}, "metadata": {}}
+        self.objects = self._state["objects"]
+        self.metadata = self._state["metadata"]
 
     def _maybe_fail(self, step: str) -> None:
         if self.fail_on == step or self.fail_on == f"{self.label}_{step}":
@@ -203,17 +227,33 @@ def run_injected_drill(
     tamper_restore_retrieve: bool = False,
     pairing_mismatch: bool = False,
     cleanup_fails: bool = False,
+    shared_storage_state: bool = False,
+    shared_backend_state: bool = False,
 ):
     storages: dict[tuple[str, str], FakeStorage] = {}
     backends: dict[str, FakeBackend] = {}
+    storage_states: dict[str, dict[str, dict[object, dict[str, object]]]] = {}
+    backend_state: dict[str, dict[str, object]] | None = {"objects": {}, "metadata": {}} if shared_backend_state else None
 
     def storage_factory(label: str):
         def factory(_database_url: str, workspace_id: str, **_kwargs):
+            state = None
+            if shared_storage_state:
+                state = storage_states.setdefault(
+                    workspace_id,
+                    {
+                        "profiles": {},
+                        "pricing": {},
+                        "sessions": {},
+                        "object_artifacts": {},
+                    },
+                )
             storage = FakeStorage(
                 label=label,
                 workspace_id=workspace_id,
                 fail_on=fail_storage,
                 pairing_mismatch=pairing_mismatch and label == "restore",
+                state=state,
             )
             storages[(label, workspace_id)] = storage
             return storage
@@ -228,6 +268,7 @@ def run_injected_drill(
                 fail_on=fail_backend,
                 tamper_retrieve=tamper_restore_retrieve and label == "restore",
                 cleanup_fails=cleanup_fails and label == "restore",
+                state=backend_state,
             )
             backends[label] = backend
             return backend
@@ -349,6 +390,8 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
         self.assertTrue(report["checks"]["checksum_match"])
         self.assertTrue(report["checks"]["metadata_object_pairing_verified"])
         self.assertTrue(report["checks"]["workspace_isolation_preserved"])
+        self.assertTrue(report["checks"]["restore_database_cannot_read_active_synthetic_rows"])
+        self.assertTrue(report["checks"]["restore_object_cannot_read_active_synthetic_object"])
         self.assertTrue(report["checks"]["cleanup_completed"])
         self.assertEqual(report["active_db_synthetic_rows_written"], 7)
         self.assertEqual(report["active_object_synthetic_objects_written"], 1)
@@ -365,6 +408,33 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
                 continue
             self.assertNotIn(value, text)
         self.assertNotIn("OPAQUE-STORAGE-REF", text)
+
+    def test_same_underlying_restore_database_fails_before_restore_write(self):
+        verifier = load_verifier()
+
+        report, _storages, backends = run_injected_drill(verifier, shared_storage_state=True)
+
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("restore_database_can_read_active_synthetic_rows", report["blockers"])
+        self.assertFalse(report["checks"]["restore_database_cannot_read_active_synthetic_rows"])
+        self.assertFalse(report["checks"]["restore_db_write_read_verified"])
+        self.assertEqual(report["restore_db_synthetic_rows_written"], 0)
+        self.assertNotIn("restore", backends)
+        self.assertFalse(report["live_db_object_backup_restore_evidence_supported"])
+
+    def test_same_underlying_restore_object_target_fails_before_restore_object_write(self):
+        verifier = load_verifier()
+
+        report, _storages, backends = run_injected_drill(verifier, shared_backend_state=True)
+
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("restore_object_can_read_active_synthetic_object", report["blockers"])
+        self.assertTrue(report["checks"]["restore_database_cannot_read_active_synthetic_rows"])
+        self.assertFalse(report["checks"]["restore_object_cannot_read_active_synthetic_object"])
+        self.assertFalse(report["checks"]["restore_object_write_read_verified"])
+        self.assertEqual(report["restore_object_synthetic_objects_written"], 0)
+        self.assertIn("restore", backends)
+        self.assertFalse(report["live_db_object_backup_restore_evidence_supported"])
 
     def test_active_db_write_failure_fails_closed(self):
         verifier = load_verifier()
