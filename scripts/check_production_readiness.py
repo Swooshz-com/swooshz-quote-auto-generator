@@ -87,7 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--with-production-database-evidence",
         action="store_true",
-        help="Run the metadata-only Postgres/Neon production database readiness checker; it fails closed until runtime support and live evidence exist.",
+        help="Run the metadata-only Postgres/Neon production database readiness checker; it fails closed unless explicit live DB evidence succeeds.",
     )
     return parser
 

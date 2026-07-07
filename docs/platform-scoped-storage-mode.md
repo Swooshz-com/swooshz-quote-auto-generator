@@ -38,12 +38,16 @@ $env:KQAG_ARTIFACT_STORAGE_MODE="object"
 $env:KQAG_DATABASE_URL="sqlite:///C:/path/to/local/kqag-storage.sqlite3"
 ```
 
-The first implementation supports the reviewed SQLite migration path. Unsupported
-database URL schemes fail closed with a generic app-facing storage error and
-privacy-safe logs. `KQAG_ARTIFACT_STORAGE_MODE=database` stores generated quote
-exports and file assets in workspace-scoped SQLite BLOB rows for local-UAT and
-synthetic verifier coverage only; it is not a hosted/protected/deploy readiness
-or production artifact path.
+SQLite remains the reviewed local-UAT migration path. The runtime also has a
+Postgres/Neon-compatible metadata adapter boundary for workspace-scoped
+profiles, pricing references, quote sessions, and object-artifact metadata.
+Unsupported database URL schemes, missing drivers, connection failures, missing
+schema, and missing workspace context fail closed with a generic app-facing
+storage error and privacy-safe logs. `KQAG_ARTIFACT_STORAGE_MODE=database`
+stores generated quote exports and file assets in workspace-scoped SQLite BLOB
+rows for local-UAT and synthetic verifier coverage only; it is not a
+hosted/protected/deploy readiness or production artifact path and is not part of
+the Postgres metadata adapter.
 `KQAG_ARTIFACT_STORAGE_MODE=object` requires database storage plus a configured
 S3-compatible object backend. Object mode stores generated artifact bytes in the
 object backend and safe workspace-owned metadata in the database; it must not
@@ -62,6 +66,12 @@ Review the migrations, then apply them explicitly:
 $env:KQAG_DATABASE_URL="sqlite:///C:/path/to/local/kqag-storage.sqlite3"
 python scripts/migrate_kqag_storage.py
 ```
+
+For Postgres/Neon-compatible metadata storage, apply only the metadata
+migrations that do not create DB-BLOB artifact tables:
+
+- `migrations/001_platform_scoped_storage.sql`
+- `migrations/003_object_artifact_metadata.sql`
 
 The app does not auto-run migrations on startup.
 
@@ -166,15 +176,18 @@ XLSX/PDF bytes stay in object storage.
 `scripts/verify_production_database_provider.py` is the current metadata-only
 production database boundary checker. It classifies the configured database URL
 family without printing the value, verifies the repo-declared metadata migration
-tables by file name only, and reports the current fail-closed gap:
-Postgres/Neon runtime adapter support and live operator-run DB evidence are
-missing. The checker does not connect to or mutate a live DB in this scaffolded
-state, and production readiness remains false.
+tables by file name only, and reports that SQAG now has a
+Postgres/Neon-compatible runtime adapter boundary for metadata rows. Live DB
+evidence remains a separate explicit opt-in gate: without
+`SQAG_LIVE_DATABASE_EVIDENCE`, the verifier does not connect to a live database
+and fails closed. With the opt-in, it performs a read-only schema check and
+still reports only sanitized metadata. Production readiness remains false until
+live DB evidence and the remaining operations gates pass.
 
 Do not rerun the R2/S3-compatible live object-storage evidence for this database
 PR. That metadata-only provider evidence has already passed. DB+object
 backup/restore live evidence remains a later gate after production database
-runtime support and evidence exist.
+runtime support has operator-run live evidence.
 
 Object artifact lifecycle evidence is synthetic/stubbed only:
 

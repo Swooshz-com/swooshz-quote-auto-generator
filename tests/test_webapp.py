@@ -19255,11 +19255,18 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertEqual(missing_migration.exception.reason, "storage_database_not_migrated")
 
         postgres_url = "postgres" + "ql://redacted-db-url"
-        with mock.patch.dict(os.environ, {"KQAG_STORAGE_MODE": "database", "KQAG_DATABASE_URL": postgres_url}, clear=True):
-            with self.assertRaises(webapp.KqagStorageAccessError) as unsupported_database:
+        with mock.patch.dict(os.environ, {"KQAG_STORAGE_MODE": "database", "KQAG_DATABASE_URL": postgres_url}, clear=True), mock.patch(
+            "webapp.server.postgres_driver_connection_factory",
+            side_effect=webapp.KqagStorageAccessError(
+                "KQAG Postgres database driver is not available.",
+                status=503,
+                reason="storage_postgres_driver_unavailable",
+            ),
+        ):
+            with self.assertRaises(webapp.KqagStorageAccessError) as missing_postgres_driver:
                 webapp.app_storage_for_auth_session(platform_session)
-        self.assertEqual(unsupported_database.exception.status, 503)
-        self.assertEqual(unsupported_database.exception.reason, "storage_database_url_unsupported")
+        self.assertEqual(missing_postgres_driver.exception.status, 503)
+        self.assertEqual(missing_postgres_driver.exception.reason, "storage_postgres_driver_unavailable")
 
     def test_database_storage_scopes_profiles_pricing_and_sessions_by_platform_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:
