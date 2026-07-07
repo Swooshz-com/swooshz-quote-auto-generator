@@ -581,6 +581,44 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertFalse(status["production_ready"])
         self.assertNotIn(private_url, text)
 
+    def test_live_retention_delete_evidence_drops_only_retention_delete_live_blocker(self):
+        private_url = "postgres" + "ql://redacted-db-url"
+        env = {
+            "KQAG_STORAGE_MODE": "database",
+            "KQAG_ARTIFACT_STORAGE_MODE": "object",
+            "KQAG_DATABASE_URL": private_url,
+            "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
+            "SQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
+            "SQAG_OBJECT_STORAGE_REGION": "<redacted-region>",
+            "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "<redacted-access-key-id>",
+            "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "<redacted-secret-access-key>",
+        }
+        with mock.patch("webapp.object_storage._optional_s3_sdk_available", return_value=True), mock.patch("webapp.server.postgres_driver_available", return_value=True):
+            status = self.readiness_status(
+                env,
+                backup_restore_evidence_status="passed",
+                hosted_observability_evidence_status="passed",
+                hosted_smoke_evidence_status="passed",
+                object_storage_evidence_status="passed",
+                object_artifact_lifecycle_evidence_status="passed",
+                live_object_storage_provider_evidence_status="passed",
+                production_database_evidence_status="passed",
+                live_db_object_backup_restore_evidence_status="passed",
+                live_retention_delete_evidence_status="passed",
+            )
+
+        text = json.dumps(status, sort_keys=True)
+        production_blocker_ids = {item["id"] for item in status["production_blockers"]}
+        self.assertEqual(status["live_retention_delete_evidence"]["status"], "passed")
+        self.assertTrue(status["live_retention_delete_evidence"]["live_retention_delete_evidence_supported"])
+        self.assertNotIn("object_retention_delete_live_evidence_missing", production_blocker_ids)
+        self.assertNotIn("db_object_backup_restore_live_evidence_missing", production_blocker_ids)
+        self.assertIn("session_business_hardening_incomplete", production_blocker_ids)
+        self.assertIn("production_deployment_operations_evidence_missing", production_blocker_ids)
+        self.assertFalse(status["production_ready"])
+        self.assertNotIn(private_url, text)
+
     def test_sqlite_database_url_also_reports_missing_postgres_neon_database_evidence(self):
         status = self.readiness_status(
             {
