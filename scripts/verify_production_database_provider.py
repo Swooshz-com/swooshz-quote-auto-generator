@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Metadata-only SQAG production database readiness boundary.
 
-This verifier intentionally does not connect to or mutate a live database while
-the app runtime remains SQLite-only. It reports the Postgres/Neon production DB
-gap without printing database URL values, hostnames, usernames, or passwords.
+This verifier is metadata-only by default. Read-only live database schema checks
+run only when SQAG_LIVE_DATABASE_EVIDENCE is explicitly enabled, and reports must
+not print database URL values, hostnames, usernames, passwords, or tenant data.
 """
 
 from __future__ import annotations
@@ -29,25 +29,12 @@ PRODUCTION_METADATA_MIGRATION_PATHS = (
     ROOT / "migrations" / "003_object_artifact_metadata.sql",
 )
 REQUIRED_METADATA_TABLES = {
-    "kqag_profiles": {"workspace_id", "profile_id", "payload_json"},
-    "kqag_pricing_references": {"workspace_id", "reference_id", "payload_json"},
-    "kqag_quote_sessions": {"workspace_id", "session_id", "metadata_json", "draft_files_json"},
-    "kqag_object_artifacts": {
-        "artifact_id",
-        "workspace_id",
-        "owner_type",
-        "owner_id",
-        "session_id",
-        "artifact_kind",
-        "filename",
-        "content_type",
-        "size_bytes",
-        "checksum_sha256",
-        "object_provider_type",
-        "object_key_ref",
-        "status",
-        "retention_status",
-    },
+    table: set(columns)
+    for required in (
+        webapp.KQAG_APP_METADATA_REQUIRED_COLUMNS,
+        webapp.KQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS,
+    )
+    for table, columns in required.items()
 }
 
 
@@ -74,6 +61,17 @@ def postgres_driver_available() -> bool:
     return webapp.postgres_driver_available()
 
 
+def _metadata_table_definition(sql: str, table: str) -> str | None:
+    match = re.search(
+        rf"\bcreate\s+table\s+if\s+not\s+exists\s+{re.escape(table)}\s*\((?P<body>.*?)\)\s*;",
+        sql,
+        flags=re.S,
+    )
+    if not match:
+        return None
+    return match.group("body")
+
+
 def metadata_migration_status(paths: tuple[Path, ...] = PRODUCTION_METADATA_MIGRATION_PATHS) -> dict[str, object]:
     sql_parts: list[str] = []
     source_files: list[str] = []
@@ -88,8 +86,13 @@ def metadata_migration_status(paths: tuple[Path, ...] = PRODUCTION_METADATA_MIGR
     sql = "\n".join(sql_parts).lower()
     table_status: dict[str, dict[str, object]] = {}
     for table, required_columns in REQUIRED_METADATA_TABLES.items():
-        table_present = bool(re.search(rf"\bcreate\s+table\s+if\s+not\s+exists\s+{re.escape(table)}\b", sql))
-        missing_columns = sorted(column for column in required_columns if not re.search(rf"\b{re.escape(column)}\b", sql))
+        table_definition = _metadata_table_definition(sql, table)
+        table_present = table_definition is not None
+        missing_columns = sorted(
+            column
+            for column in required_columns
+            if not table_definition or not re.search(rf"\b{re.escape(column)}\b", table_definition)
+        )
         table_status[table] = {
             "present": table_present,
             "missing_columns": missing_columns,

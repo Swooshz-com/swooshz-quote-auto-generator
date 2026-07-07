@@ -1,7 +1,9 @@
 import json
 import sys
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -9,6 +11,72 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import verify_production_database_provider as verifier
+
+POSTGRES_URL = "postgres" + "ql://redacted-db-url"
+
+
+class FakePostgresSchemaConnection:
+    def __init__(self, columns_by_table):
+        self.columns_by_table = {table: set(columns) for table, columns in columns_by_table.items()}
+
+    def execute(self, _sql, params=None):
+        requested_tables = set(params or ())
+        rows = []
+        for table in sorted(requested_tables):
+            for column in sorted(self.columns_by_table.get(table, set())):
+                rows.append({"table_name": table, "column_name": column})
+        return FakePostgresSchemaCursor(rows)
+
+
+class FakePostgresSchemaCursor:
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class FakePostgresSchemaContext:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def __enter__(self):
+        return self.connection
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        return False
+
+
+def runtime_required_metadata_tables():
+    return {
+        **verifier.webapp.KQAG_APP_METADATA_REQUIRED_COLUMNS,
+        **verifier.webapp.KQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS,
+    }
+
+
+def schema_status_for_runtime_columns(missing_columns=None):
+    columns_by_table = {
+        table: set(columns)
+        for table, columns in runtime_required_metadata_tables().items()
+    }
+    for table, columns in (missing_columns or {}).items():
+        columns_by_table[table] -= set(columns)
+    connection = FakePostgresSchemaConnection(columns_by_table)
+    with mock.patch(
+        "verify_production_database_provider.webapp.postgres_storage_connection",
+        return_value=FakePostgresSchemaContext(connection),
+    ):
+        return verifier.postgres_schema_status(POSTGRES_URL)
+
+
+def migration_status_for_sql(sql: str):
+    path = ROOT / "_tmp" / "tests" / f"production-db-migration-{time.time_ns()}.sql"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(sql, encoding="utf-8")
+    try:
+        return verifier.metadata_migration_status((path,))
+    finally:
+        path.unlink(missing_ok=True)
 
 
 class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
@@ -85,6 +153,82 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
         self.assertTrue(report["production_database_evidence_supported"])
         self.assertEqual(report["blockers"], [])
         self.assertNotIn(private_url, text)
+
+    def test_required_metadata_tables_match_runtime_metadata_schema_only(self):
+        self.assertEqual(verifier.REQUIRED_METADATA_TABLES, runtime_required_metadata_tables())
+        for db_blob_table in verifier.webapp.KQAG_DATABASE_ARTIFACT_REQUIRED_COLUMNS:
+            self.assertNotIn(db_blob_table, verifier.REQUIRED_METADATA_TABLES)
+
+    def test_live_schema_check_passes_with_all_runtime_required_metadata_columns(self):
+        report = schema_status_for_runtime_columns()
+
+        self.assertTrue(report["schema_available"])
+        self.assertEqual(report["missing_tables"], [])
+        self.assertEqual(report["missing_columns"], {})
+
+    def test_live_schema_check_fails_when_runtime_required_columns_are_missing(self):
+        cases = (
+            ("kqag_profiles", "created_at"),
+            ("kqag_quote_sessions", "updated_at"),
+            ("kqag_object_artifacts", "platform_user_id"),
+            ("kqag_object_artifacts", "deleted_at"),
+        )
+        for table, column in cases:
+            with self.subTest(table=table, column=column):
+                report = schema_status_for_runtime_columns({table: {column}})
+
+                self.assertFalse(report["schema_available"])
+                self.assertIn(column, report["missing_columns"][table])
+
+    def test_metadata_migration_check_fails_when_runtime_required_column_is_missing(self):
+        sql = """
+        create table if not exists kqag_profiles (
+          workspace_id text not null,
+          profile_id text not null,
+          payload_json text not null,
+          updated_at text not null
+        );
+        create table if not exists kqag_pricing_references (
+          workspace_id text not null,
+          reference_id text not null,
+          payload_json text not null,
+          created_at text not null,
+          updated_at text not null
+        );
+        create table if not exists kqag_quote_sessions (
+          workspace_id text not null,
+          session_id text not null,
+          metadata_json text not null,
+          draft_files_json text not null,
+          created_at text not null,
+          updated_at text not null
+        );
+        create table if not exists kqag_object_artifacts (
+          artifact_id text not null primary key,
+          workspace_id text not null,
+          owner_type text not null,
+          owner_id text not null,
+          platform_user_id text,
+          session_id text,
+          job_id text,
+          artifact_kind text not null,
+          filename text not null,
+          content_type text not null,
+          size_bytes integer not null,
+          checksum_sha256 text not null,
+          object_provider_type text not null,
+          object_key_ref text not null,
+          status text not null,
+          retention_status text not null,
+          created_at text not null,
+          updated_at text not null,
+          deleted_at text
+        );
+        """
+        status = migration_status_for_sql(sql)
+
+        self.assertFalse(status["metadata_tables_declared"])
+        self.assertEqual(status["missing_columns"], {"kqag_profiles": ["created_at"]})
 
     def test_live_opt_in_connection_failure_is_sanitized(self):
         private_url = "postgres" + "ql://redacted-db-url"
