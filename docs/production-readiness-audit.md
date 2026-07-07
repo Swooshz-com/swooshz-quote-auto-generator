@@ -90,6 +90,17 @@ python -m pip install --only-binary=:all: -r requirements.txt
 python scripts\check_production_readiness.py --with-object-storage-evidence --with-object-artifact-lifecycle-evidence --with-live-object-storage-provider-evidence
 ```
 
+Sanitized operator evidence from 2026-07-07 shows the live verifier can pass
+against a real S3-compatible provider when canonical `SQAG_*` env names are
+supplied outside Git: `status=passed`, `test_injected_backend=false`,
+`live_provider_evidence_supported=true`, and store/retrieve/checksum/content
+type/byte size/wrong-workspace/delete/tombstone/missing-object checks all true.
+No provider values, bucket names, object keys, artifact bytes, DB URLs, private
+paths, uploaded content, tenant data, or secrets were committed or printed.
+Production readiness still remains false until the separate live DB+object
+backup/restore, retention/delete, operations, hosted logging/smoke, session
+hardening, and final audit gates are satisfied.
+
 Current expected posture in local mode:
 
 - `local_uat_supported`: `true`
