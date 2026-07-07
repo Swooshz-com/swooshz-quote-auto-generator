@@ -270,6 +270,40 @@ alert delivery, hosted smoke evidence, production deployment operations
 evidence, live Platform-to-SQAG launch smoke, session/business hardening, and
 the final production audit are complete.
 
+Sanitized live DB+object backup/restore evidence was run by an operator on
+2026-07-07 after the verifier/runtime metadata pairing fix landed. The
+non-test-injected drill reported `status=passed`,
+`live_db_object_backup_restore_evidence_supported=true`,
+`test_injected_backend=false`, active DB write-read verified, active object
+write-read verified, restore DB write-read verified, restore object write-read
+verified, restore DB could not read active synthetic rows before restore,
+restore object target could not read the active synthetic object before
+restore, `checksum_match=true`, DB+object metadata pairing verified, workspace
+isolation preserved, content type and byte size matched, and
+`cleanup_completed=true`. It used synthetic
+namespaced DB rows and one tiny synthetic generated artifact object only:
+`active_db_synthetic_rows_written=7`,
+`active_object_synthetic_objects_written=1`,
+`restore_db_synthetic_rows_written=7`,
+`restore_object_synthetic_objects_written=1`, and
+`db_blob_artifact_rows_written=0`. The restore targets were isolated from the
+active targets, no destructive restore over active live targets occurred, and
+cleanup completed.
+
+The operator run and this documentation include only sanitized booleans,
+counts, schema/status fields, and blocker categories. No secrets, private
+values, provider values, DB URLs, hostnames, usernames, passwords, connection
+strings, endpoints, bucket names, object keys, access keys, secret keys, OAuth
+values, cookies/tokens, private paths, tenant/customer/staff/profile/pricing
+data, generated quote contents, artifact bytes, backup dumps, or restore dumps
+were printed or committed. This evidence may remove only
+`db_object_backup_restore_live_evidence_missing`; no unrelated production
+blocker is removed, and `production_ready=false` remains until live
+retention/delete evidence, hosted logging/monitoring and alert delivery,
+hosted smoke evidence, production deployment operations evidence, live
+Platform-to-SQAG launch smoke, session/business hardening, and the final
+production audit are complete.
+
 ## Workspace Scope
 
 Database rows are keyed by the platform workspace ID from the KQAG platform
