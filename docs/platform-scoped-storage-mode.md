@@ -144,6 +144,17 @@ verifier fails closed and production readiness remains false. A test-injected or
 synthetic backend can exercise verifier logic, but it is not live-provider
 evidence and cannot satisfy hosted/protected/deploy readiness.
 
+Sanitized live-provider evidence was run on 2026-07-07 with canonical `SQAG_*`
+env names supplied by the operator environment and no provider values committed
+or printed. The live verifier reported `status=passed`,
+`test_injected_backend=false`, `live_provider_evidence_supported=true`, and all
+store, retrieve, checksum, content type, byte size, wrong-workspace, delete,
+tombstone, and missing-object checks true. This proves only the metadata-only
+live S3-compatible provider path for synthetic generated XLSX/PDF bytes.
+Production readiness still requires live DB+object backup/restore, live
+retention/delete, operations evidence, hosted observability and smoke evidence,
+Platform smoke, and final audit.
+
 Object artifact lifecycle evidence is synthetic/stubbed only:
 
 ```powershell
