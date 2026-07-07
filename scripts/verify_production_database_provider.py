@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Metadata-only SQAG production database readiness boundary.
 
-This verifier is metadata-only by default. It performs live read-only
-Postgres/Neon-compatible schema checks only when explicitly enabled with
-SQAG_LIVE_DATABASE_EVIDENCE, and never prints database URL values, hostnames,
-usernames, or passwords.
+This verifier is metadata-only by default. Read-only live database schema checks
+run only when SQAG_LIVE_DATABASE_EVIDENCE is explicitly enabled, and reports must
+not print database URL values, hostnames, usernames, passwords, or tenant data.
 """
 
 from __future__ import annotations
@@ -68,6 +67,17 @@ def postgres_driver_available() -> bool:
     return webapp.postgres_driver_available()
 
 
+def _metadata_table_definition(sql: str, table: str) -> str | None:
+    match = re.search(
+        rf"\bcreate\s+table\s+if\s+not\s+exists\s+{re.escape(table.lower())}\s*\((?P<body>.*?)\)\s*;",
+        sql,
+        flags=re.S,
+    )
+    if not match:
+        return None
+    return match.group("body")
+
+
 def metadata_migration_status(paths: tuple[Path, ...] = PRODUCTION_METADATA_MIGRATION_PATHS) -> dict[str, object]:
     sql_parts: list[str] = []
     source_files: list[str] = []
@@ -82,10 +92,12 @@ def metadata_migration_status(paths: tuple[Path, ...] = PRODUCTION_METADATA_MIGR
     sql = "\n".join(sql_parts).lower()
     table_status: dict[str, dict[str, object]] = {}
     for table, required_columns in REQUIRED_METADATA_TABLES.items():
-        table_body = _metadata_table_declaration_body(sql, table)
-        table_present = table_body is not None
+        table_definition = _metadata_table_definition(sql, table)
+        table_present = table_definition is not None
         missing_columns = sorted(
-            column for column in required_columns if not table_body or not re.search(rf"\b{re.escape(column)}\b", table_body)
+            column
+            for column in required_columns
+            if not table_definition or not re.search(rf"\b{re.escape(column)}\b", table_definition)
         )
         table_status[table] = {
             "present": table_present,
@@ -107,17 +119,6 @@ def metadata_migration_status(paths: tuple[Path, ...] = PRODUCTION_METADATA_MIGR
         "missing_columns": missing_columns,
         "db_blob_tables_required_for_production": False,
     }
-
-
-def _metadata_table_declaration_body(sql: str, table: str) -> str | None:
-    match = re.search(
-        rf"\bcreate\s+table\s+if\s+not\s+exists\s+{re.escape(table.lower())}\s*\((?P<body>.*?)\)\s*;",
-        sql,
-        flags=re.DOTALL,
-    )
-    if not match:
-        return None
-    return match.group("body")
 
 
 def schema_status_from_information_schema_rows(
@@ -157,6 +158,7 @@ def postgres_schema_status(database_url: str) -> dict[str, object]:
             tuple(sorted(tables)),
         ).fetchall()
     return schema_status_from_information_schema_rows(rows)
+
 
 def run_verification(
     *,
