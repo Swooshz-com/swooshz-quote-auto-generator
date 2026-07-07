@@ -192,6 +192,20 @@ does not touch R2/object storage. Output remains booleans/counts/schema version
 only and omits DB URLs, hostnames, usernames, provider values, object keys,
 artifact bytes, private paths, and tenant/customer/staff/profile/pricing data.
 
+Sanitized live DB evidence was run on 2026-07-07 with the existing guarded
+SQAG metadata migrations applied through `scripts/migrate_kqag_storage.py` after
+the first verifier pass reported the runtime schema missing. The rerun reported
+`status=passed`, `database_family=postgres_compatible`,
+`live_database_evidence_enabled=true`, `test_injected_backend=false`,
+`live_database_evidence_supported=true`,
+`production_database_evidence_supported=true`, `connection_attempted=true`,
+runtime schema available for the required profile, pricing-reference,
+quote-session, and object-artifact metadata tables, synthetic metadata CRUD
+verified, two-workspace isolation verified, object artifact metadata pairing
+verified, `cleanup_completed=true`, and `db_blob_artifact_rows_written=0`.
+The readiness checker credited only `production_database_evidence=passed` for
+the DB path; it did not rerun or touch R2/S3-compatible object storage.
+
 Passing this DB evidence can drop only the `postgres_neon_database_evidence_missing`
 blocker. It does not make SQAG production-ready. Remaining blockers still include
 live DB+object backup/restore, live retention/delete, hosted logging/monitoring,
