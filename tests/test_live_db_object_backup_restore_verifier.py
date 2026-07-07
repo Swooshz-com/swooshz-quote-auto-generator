@@ -55,11 +55,13 @@ class FakeStorage:
         fail_on: str = "",
         pairing_mismatch: bool = False,
         state: dict[str, dict[object, dict[str, object]]] | None = None,
+        runtime_filename_gate: bool = False,
     ):
         self.label = label
         self.workspace_id = workspace_id
         self.fail_on = fail_on
         self.pairing_mismatch = pairing_mismatch
+        self.runtime_filename_gate = runtime_filename_gate
         self._state = state or {
             "profiles": {},
             "pricing": {},
@@ -110,12 +112,19 @@ class FakeStorage:
         if self.pairing_mismatch:
             checksum = "0" * 64
         self.object_artifacts[(session_id, kind)] = {
+            "workspace_id": self.workspace_id,
+            "owner_type": "generated_quote",
+            "owner_id": session_id,
             "session_id": session_id,
             "artifact_kind": kind,
             "filename": filename,
             "content_type": content_type,
             "size_bytes": metadata.size_bytes,
             "checksum_sha256": checksum,
+            "object_key_ref": metadata.storage_key,
+            "status": "active",
+            "retention_status": "active",
+            "deleted_at": None,
         }
 
     def list_company_profiles(self) -> list[dict[str, object]]:
@@ -137,7 +146,15 @@ class FakeStorage:
         return self.sessions.get(session_id)
 
     def object_artifact_row(self, session_id: str, kind: str):
-        return self.object_artifacts.get((session_id, kind))
+        row = self.object_artifacts.get((session_id, kind))
+        if (
+            self.runtime_filename_gate
+            and row
+            and kind == "xlsx"
+            and row.get("filename") != "quotation.xlsx"
+        ):
+            return None
+        return row
 
     def delete_profile(self, profile_id: str) -> bool:
         self._maybe_fail("cleanup")
@@ -229,6 +246,7 @@ def run_injected_drill(
     cleanup_fails: bool = False,
     shared_storage_state: bool = False,
     shared_backend_state: bool = False,
+    runtime_filename_gate: bool = False,
 ):
     storages: dict[tuple[str, str], FakeStorage] = {}
     backends: dict[str, FakeBackend] = {}
@@ -254,6 +272,7 @@ def run_injected_drill(
                 fail_on=fail_storage,
                 pairing_mismatch=pairing_mismatch and label == "restore",
                 state=state,
+                runtime_filename_gate=runtime_filename_gate,
             )
             storages[(label, workspace_id)] = storage
             return storage
@@ -285,6 +304,38 @@ def run_injected_drill(
         test_injected_backend=True,
     )
     return report, storages, backends
+
+
+class TupleArtifactRow:
+    FIELDS = (
+        "artifact_id",
+        "workspace_id",
+        "owner_type",
+        "owner_id",
+        "platform_user_id",
+        "session_id",
+        "job_id",
+        "artifact_kind",
+        "filename",
+        "content_type",
+        "size_bytes",
+        "checksum_sha256",
+        "object_provider_type",
+        "object_key_ref",
+        "status",
+        "retention_status",
+        "created_at",
+        "updated_at",
+        "deleted_at",
+    )
+
+    def __init__(self, **values):
+        self.values = tuple(values.get(field) for field in self.FIELDS)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self.values[key]
+        raise TypeError("tuple row indexes by integer only")
 
 
 class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
@@ -408,6 +459,121 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
                 continue
             self.assertNotIn(value, text)
         self.assertNotIn("OPAQUE-STORAGE-REF", text)
+
+    def test_runtime_filename_gate_does_not_break_active_object_pairing(self):
+        verifier = load_verifier()
+
+        report, _storages, _backends = run_injected_drill(verifier, runtime_filename_gate=True)
+
+        self.assertEqual(report["status"], "passed")
+        self.assertTrue(report["checks"]["active_object_write_read_verified"])
+        self.assertTrue(report["checks"]["metadata_object_pairing_verified"])
+
+    def test_metadata_pairing_requires_runtime_owner_session_kind_and_workspace(self):
+        verifier = load_verifier()
+        metadata = verifier.ObjectArtifactMetadata(
+            workspace_id="workspace-a",
+            owner_type="generated_quote",
+            owner_id="quote-session-a",
+            artifact_kind="xlsx",
+            filename="quotation.xlsx",
+            content_type=verifier.SYNTHETIC_CONTENT_TYPE,
+            size_bytes=24,
+            checksum_sha256="a" * 64,
+            storage_key="opaque-ref",
+            created_at="2026-01-01T00:00:00Z",
+            updated_at="2026-01-01T00:00:00Z",
+        )
+        base_row = {
+            "workspace_id": "workspace-a",
+            "owner_type": "generated_quote",
+            "owner_id": "quote-session-a",
+            "session_id": "quote-session-a",
+            "artifact_kind": "xlsx",
+            "filename": "quotation.xlsx",
+            "content_type": verifier.SYNTHETIC_CONTENT_TYPE,
+            "size_bytes": 24,
+            "checksum_sha256": "a" * 64,
+            "object_key_ref": "opaque-ref",
+            "status": "active",
+            "retention_status": "active",
+            "deleted_at": None,
+        }
+
+        class Storage:
+            workspace_id = "workspace-a"
+
+            def __init__(self, row):
+                self.row = row
+
+            def object_artifact_row(self, _session_id, _kind):
+                return self.row
+
+        self.assertTrue(verifier._metadata_object_pairing_ok(Storage(base_row), "quote-session-a", metadata))
+        for field, value in (
+            ("workspace_id", "workspace-b"),
+            ("owner_type", "uploaded_reference"),
+            ("owner_id", "quote-session-b"),
+            ("session_id", "quote-session-b"),
+            ("artifact_kind", "pdf"),
+            ("filename", "not-quotation.xlsx"),
+            ("content_type", "application/octet-stream"),
+            ("size_bytes", 25),
+            ("checksum_sha256", "b" * 64),
+            ("object_key_ref", ""),
+            ("status", "deleted"),
+            ("retention_status", "pending_delete"),
+            ("deleted_at", "2026-01-01T00:00:00Z"),
+        ):
+            with self.subTest(field=field):
+                row = dict(base_row)
+                row[field] = value
+                self.assertFalse(verifier._metadata_object_pairing_ok(Storage(row), "quote-session-a", metadata))
+
+    def test_metadata_pairing_accepts_tuple_row_with_runtime_select_order(self):
+        verifier = load_verifier()
+        metadata = verifier.ObjectArtifactMetadata(
+            workspace_id="workspace-a",
+            owner_type="generated_quote",
+            owner_id="quote-session-a",
+            artifact_kind="xlsx",
+            filename="quotation.xlsx",
+            content_type=verifier.SYNTHETIC_CONTENT_TYPE,
+            size_bytes=24,
+            checksum_sha256="a" * 64,
+            storage_key="opaque-ref",
+            created_at="2026-01-01T00:00:00Z",
+            updated_at="2026-01-01T00:00:00Z",
+        )
+        row = TupleArtifactRow(
+            artifact_id="obj-redacted",
+            workspace_id="workspace-a",
+            owner_type="generated_quote",
+            owner_id="quote-session-a",
+            platform_user_id="",
+            session_id="quote-session-a",
+            job_id="",
+            artifact_kind="xlsx",
+            filename="quotation.xlsx",
+            content_type=verifier.SYNTHETIC_CONTENT_TYPE,
+            size_bytes=24,
+            checksum_sha256="a" * 64,
+            object_provider_type="s3_compatible",
+            object_key_ref="opaque-ref",
+            status="active",
+            retention_status="active",
+            created_at="2026-01-01T00:00:00Z",
+            updated_at="2026-01-01T00:00:00Z",
+            deleted_at=None,
+        )
+
+        class Storage:
+            workspace_id = "workspace-a"
+
+            def object_artifact_row(self, _session_id, _kind):
+                return row
+
+        self.assertTrue(verifier._metadata_object_pairing_ok(Storage(), "quote-session-a", metadata))
 
     def test_same_underlying_restore_database_fails_before_restore_write(self):
         verifier = load_verifier()

@@ -84,7 +84,29 @@ REQUIRED_ENV_NAMES = [
 ]
 TRUE_VALUES = {"1", "true", "yes", "on", "run", "enabled"}
 SYNTHETIC_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-SYNTHETIC_FILENAME = "synthetic-live-db-object-restore.xlsx"
+SYNTHETIC_FILENAME = webapp.QUOTE_SESSION_EXPORT_KINDS["xlsx"]
+OBJECT_ARTIFACT_ROW_FIELDS = (
+    "artifact_id",
+    "workspace_id",
+    "owner_type",
+    "owner_id",
+    "platform_user_id",
+    "session_id",
+    "job_id",
+    "artifact_kind",
+    "filename",
+    "content_type",
+    "size_bytes",
+    "checksum_sha256",
+    "object_provider_type",
+    "object_key_ref",
+    "status",
+    "retention_status",
+    "created_at",
+    "updated_at",
+    "deleted_at",
+)
+OBJECT_ARTIFACT_ROW_FIELD_INDEX = {field: index for index, field in enumerate(OBJECT_ARTIFACT_ROW_FIELDS)}
 
 StorageFactory = Callable[[str, str], Any]
 BackendFactory = Callable[[Mapping[str, str]], ObjectStorageBackend]
@@ -315,7 +337,21 @@ def _row_value(row: object, key: str) -> object:
     try:
         return row[key]  # type: ignore[index]
     except Exception:
+        pass
+    index = OBJECT_ARTIFACT_ROW_FIELD_INDEX.get(key)
+    if index is None:
         return None
+    try:
+        return row[index]  # type: ignore[index]
+    except Exception:
+        return None
+
+
+def _row_int(row: object, key: str) -> int:
+    try:
+        return int(_row_value(row, key) or 0)
+    except Exception:
+        return 0
 
 
 def _object_artifact_row(storage: object, session_id: str, kind: str) -> object | None:
@@ -388,11 +424,22 @@ def _verify_db_rows(storage_a: object, storage_b: object, ids: Mapping[str, str]
 
 def _metadata_object_pairing_ok(storage: object, session_id: str, metadata: ObjectArtifactMetadata) -> bool:
     row = _object_artifact_row(storage, session_id, "xlsx")
+    expected_workspace = _clean(getattr(storage, "workspace_id", "")) or metadata.workspace_id
     return bool(
         row
+        and _clean(_row_value(row, "workspace_id")) == expected_workspace == metadata.workspace_id
+        and _clean(_row_value(row, "owner_type")) == metadata.owner_type == "generated_quote"
+        and _clean(_row_value(row, "owner_id")) == metadata.owner_id == session_id
+        and _clean(_row_value(row, "session_id")) == session_id
+        and _clean(_row_value(row, "artifact_kind")) == metadata.artifact_kind == "xlsx"
+        and _clean(_row_value(row, "filename")) == metadata.filename == SYNTHETIC_FILENAME
         and _clean(_row_value(row, "checksum_sha256")) == metadata.checksum_sha256
-        and int(_row_value(row, "size_bytes") or 0) == metadata.size_bytes
+        and _row_int(row, "size_bytes") == metadata.size_bytes
         and _clean(_row_value(row, "content_type")) == metadata.content_type
+        and _clean(_row_value(row, "object_key_ref")) == metadata.storage_key
+        and _clean(_row_value(row, "status")) == "active"
+        and _clean(_row_value(row, "retention_status")) == "active"
+        and not _clean(_row_value(row, "deleted_at"))
     )
 
 

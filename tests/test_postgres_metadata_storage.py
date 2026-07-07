@@ -147,9 +147,62 @@ class FakePostgresConnection:
             existed = self.quote_sessions.pop((workspace_id, session_id), None) is not None
             return FakePostgresCursor(rowcount=1 if existed else 0)
         if normalized.startswith("insert into kqag_object_artifacts"):
+            (
+                artifact_id,
+                workspace_id,
+                owner_type,
+                owner_id,
+                platform_user_id,
+                session_id,
+                job_id,
+                artifact_kind,
+                filename,
+                content_type,
+                size_bytes,
+                checksum_sha256,
+                object_provider_type,
+                object_key_ref,
+                status,
+                retention_status,
+                created_at,
+                updated_at,
+                deleted_at,
+            ) = params
+            self.object_artifacts[(workspace_id, owner_type, owner_id, artifact_kind)] = {
+                "artifact_id": artifact_id,
+                "workspace_id": workspace_id,
+                "owner_type": owner_type,
+                "owner_id": owner_id,
+                "platform_user_id": platform_user_id,
+                "session_id": session_id,
+                "job_id": job_id,
+                "artifact_kind": artifact_kind,
+                "filename": filename,
+                "content_type": content_type,
+                "size_bytes": size_bytes,
+                "checksum_sha256": checksum_sha256,
+                "object_provider_type": object_provider_type,
+                "object_key_ref": object_key_ref,
+                "status": status,
+                "retention_status": retention_status,
+                "created_at": created_at,
+                "updated_at": updated_at,
+                "deleted_at": deleted_at,
+            }
             return FakePostgresCursor(rowcount=1)
         if "from kqag_object_artifacts where workspace_id = %s" in normalized:
-            return FakePostgresCursor()
+            workspace_id, owner_type, owner_id, artifact_kind = params[:4]
+            status = params[4] if len(params) > 4 else None
+            retention_status = params[5] if len(params) > 5 else None
+            row = self.object_artifacts.get((workspace_id, owner_type, owner_id, artifact_kind))
+            if (
+                not row
+                or row["deleted_at"] is not None
+                or (status is not None and row["status"] != status)
+                or (retention_status is not None and row["retention_status"] != retention_status)
+            ):
+                return FakePostgresCursor()
+            return FakePostgresCursor([row])
         return FakePostgresCursor()
 
     def commit(self):
@@ -228,6 +281,80 @@ class PostgresMetadataStorageTest(unittest.TestCase):
         self.assertIn("insert into kqag_quote_sessions", executed_sql)
         self.assertIn("insert into kqag_object_artifacts", executed_sql)
         self.assertNotIn("content_blob", executed_sql)
+
+    def test_postgres_object_artifact_row_matches_runtime_mapping_contract(self):
+        connection = FakePostgresConnection()
+        with mock.patch.dict(os.environ, self.postgres_env(), clear=True), mock.patch(
+            "webapp.server.postgres_driver_connection_factory",
+            return_value=lambda _database_url: connection,
+        ):
+            storage = webapp.app_storage_for_auth_session(platform_session("workspace-alpha"))
+            storage._upsert_object_quote_artifact(
+                "quote-alpha123",
+                "xlsx",
+                webapp.QUOTE_SESSION_EXPORT_KINDS["xlsx"],
+                webapp.QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"],
+                webapp.ObjectArtifactMetadata(
+                    workspace_id="workspace-alpha",
+                    owner_type="generated_quote",
+                    owner_id="quote-alpha123",
+                    artifact_kind="xlsx",
+                    filename=webapp.QUOTE_SESSION_EXPORT_KINDS["xlsx"],
+                    content_type=webapp.QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"],
+                    size_bytes=12,
+                    checksum_sha256="a" * 64,
+                    storage_key="redacted-object-key-ref",
+                    created_at="2026-01-01T00:00:00Z",
+                    updated_at="2026-01-01T00:00:00Z",
+                ),
+            )
+            row = storage._object_quote_artifact_row("quote-alpha123", "xlsx")
+
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row["workspace_id"], "workspace-alpha")
+        self.assertEqual(row["owner_type"], "generated_quote")
+        self.assertEqual(row["owner_id"], "quote-alpha123")
+        self.assertEqual(row["session_id"], "quote-alpha123")
+        self.assertEqual(row["artifact_kind"], "xlsx")
+        self.assertEqual(row["filename"], webapp.QUOTE_SESSION_EXPORT_KINDS["xlsx"])
+        self.assertEqual(row["content_type"], webapp.QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"])
+        self.assertEqual(row["size_bytes"], 12)
+        self.assertEqual(row["checksum_sha256"], "a" * 64)
+        self.assertTrue(row["object_key_ref"])
+        self.assertEqual(row["status"], "active")
+        self.assertEqual(row["retention_status"], "active")
+        self.assertIsNone(row["deleted_at"])
+
+    def test_postgres_object_artifact_row_rejects_noncanonical_runtime_filename(self):
+        connection = FakePostgresConnection()
+        with mock.patch.dict(os.environ, self.postgres_env(), clear=True), mock.patch(
+            "webapp.server.postgres_driver_connection_factory",
+            return_value=lambda _database_url: connection,
+        ):
+            storage = webapp.app_storage_for_auth_session(platform_session("workspace-alpha"))
+            storage._upsert_object_quote_artifact(
+                "quote-alpha123",
+                "xlsx",
+                "synthetic-live-db-object-restore.xlsx",
+                webapp.QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"],
+                webapp.ObjectArtifactMetadata(
+                    workspace_id="workspace-alpha",
+                    owner_type="generated_quote",
+                    owner_id="quote-alpha123",
+                    artifact_kind="xlsx",
+                    filename="synthetic-live-db-object-restore.xlsx",
+                    content_type=webapp.QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"],
+                    size_bytes=12,
+                    checksum_sha256="a" * 64,
+                    storage_key="redacted-object-key-ref",
+                    created_at="2026-01-01T00:00:00Z",
+                    updated_at="2026-01-01T00:00:00Z",
+                ),
+            )
+            row = storage._object_quote_artifact_row("quote-alpha123", "xlsx")
+
+        self.assertIsNone(row)
 
     def test_postgres_storage_blocks_missing_driver_without_sqlite_fallback(self):
         with mock.patch.dict(os.environ, self.postgres_env(), clear=True), mock.patch(
