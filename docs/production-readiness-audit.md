@@ -330,19 +330,23 @@ session/business hardening, and final production audit. `production_ready=false`
 remains.
 
 `scripts/verify_live_retention_delete.py` is the opt-in live retention/delete
-drill path. It stays blocked unless `SQAG_LIVE_RETENTION_DELETE_EVIDENCE` is
-enabled and the active SQAG DB/object env names are present in the operator
-environment. When enabled, it uses synthetic namespaced DB metadata rows and
-one tiny synthetic generated artifact object only. The drill verifies active
-DB metadata, active object write/read, checksum/content type/byte size,
+drill path. It stays blocked unless `SQAG_LIVE_RETENTION_DELETE_EVIDENCE=1`,
+`SQAG_DATABASE_URL`, `KQAG_STORAGE_MODE=database`,
+`KQAG_ARTIFACT_STORAGE_MODE=object`, and the canonical
+`SQAG_OBJECT_STORAGE_*` env names are present in the operator environment. It
+validates those runtime modes before writing synthetic rows or objects. When
+enabled, it uses synthetic namespaced DB metadata rows and one tiny synthetic
+generated artifact object only. The drill verifies active DB metadata, active
+object write/read, checksum/content type/byte size,
 DB+object metadata pairing, and active runtime export download through
 `quote_session_export_artifact()` before tombstone/delete. It then verifies
 runtime tombstone/delete behavior, denied deleted downloads, missing object
 fail-closed behavior, wrong-workspace denial, repeated delete safety, and
-cleanup. It fails closed on missing env, DB/schema failure, object write/read
-failure, active runtime download failure, metadata/object mismatch,
-tombstone/delete mismatch, unsafe wrong-workspace behavior, missing-object
-handling failure, repeated delete safety failure, or cleanup failure.
+cleanup. It fails closed on missing env, wrong runtime mode, DB/schema failure,
+object write/read failure, active runtime download failure,
+metadata/object mismatch, tombstone/delete mismatch, unsafe wrong-workspace
+behavior, missing-object handling failure, repeated delete safety failure, or
+cleanup failure.
 
 The live retention/delete verifier reports sanitized booleans, counts, status
 fields, and blocker IDs only. It must not print DB URLs, hostnames, usernames,

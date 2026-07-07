@@ -2328,6 +2328,8 @@ def live_retention_delete_evidence_summary(
         "required_env_names": [
             "SQAG_LIVE_RETENTION_DELETE_EVIDENCE",
             SQAG_DATABASE_URL_ENV_NAME,
+            KQAG_STORAGE_MODE_ENV_NAME,
+            KQAG_ARTIFACT_STORAGE_MODE_ENV_NAME,
             OBJECT_STORAGE_PROVIDER_ENV_NAME,
             OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME,
             OBJECT_STORAGE_BUCKET_ENV_NAME,
@@ -2350,8 +2352,9 @@ def live_retention_delete_evidence_summary(
         ],
         "live_retention_delete_evidence_supported": supported,
         "notes": [
-            "Evidence is opt-in and uses synthetic namespaced rows and one tiny synthetic generated artifact object only.",
-            "It fails closed on missing env, metadata/object mismatch, tombstone/delete mismatch, wrong-workspace access, missing-object handling, or cleanup failure.",
+            "Evidence is opt-in and requires SQAG_LIVE_RETENTION_DELETE_EVIDENCE=1, SQAG_DATABASE_URL, KQAG_STORAGE_MODE=database, KQAG_ARTIFACT_STORAGE_MODE=object, and canonical SQAG_OBJECT_STORAGE_* env names.",
+            "It uses synthetic namespaced rows and one tiny synthetic generated artifact object only.",
+            "It fails closed on missing env or wrong runtime mode before synthetic writes, and also fails closed on metadata/object mismatch, tombstone/delete mismatch, wrong-workspace access, missing-object handling, or cleanup failure.",
             "It does not print DB URLs, provider values, bucket names, object keys, credentials, artifact bytes, tenant data, generated quote contents, backup dumps, or restore dumps.",
         ],
     }

@@ -2,8 +2,10 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from webapp import server as webapp
@@ -51,6 +53,7 @@ class FakeStorage:
         tombstone_returns_zero: bool = False,
         cleanup_fails: bool = False,
         runtime_export_available: bool = True,
+        require_runtime_env: bool = False,
     ):
         self.workspace_id = workspace_id
         self.fail_on = fail_on
@@ -58,6 +61,7 @@ class FakeStorage:
         self.tombstone_returns_zero = tombstone_returns_zero
         self.cleanup_fails = cleanup_fails
         self.runtime_export_available = runtime_export_available
+        self.require_runtime_env = require_runtime_env
         self.sessions = {}
         self.object_artifacts = {}
 
@@ -130,6 +134,13 @@ class FakeStorage:
         status = metadata.get("status", {}) if isinstance(metadata, dict) else {}
         if (
             self.runtime_export_available
+            and (
+                not self.require_runtime_env
+                or (
+                    os.environ.get("KQAG_STORAGE_MODE") == "database"
+                    and os.environ.get("KQAG_ARTIFACT_STORAGE_MODE") == "object"
+                )
+            )
             and self.object_artifact_row(session_id, kind)
             and isinstance(export, dict)
             and export.get("filename") == "quotation.xlsx"
@@ -223,7 +234,7 @@ class FakeBackend:
         return True
 
 
-def run_injected_drill(verifier, *, fail_storage="", fail_backend="", backend_factory_fails=False, pairing_mismatch=False, tombstone_returns_zero=False, tamper_retrieve=False, delete_fails=False, repeated_delete_unsafe=False, cleanup_fails=False, runtime_export_available=True):
+def run_injected_drill(verifier, *, fail_storage="", fail_backend="", backend_factory_fails=False, pairing_mismatch=False, tombstone_returns_zero=False, tamper_retrieve=False, delete_fails=False, repeated_delete_unsafe=False, cleanup_fails=False, runtime_export_available=True, require_runtime_env=False):
     storages = {}
     backend_holder = {}
 
@@ -235,6 +246,7 @@ def run_injected_drill(verifier, *, fail_storage="", fail_backend="", backend_fa
             tombstone_returns_zero=tombstone_returns_zero,
             cleanup_fails=cleanup_fails,
             runtime_export_available=runtime_export_available,
+            require_runtime_env=require_runtime_env,
         )
         storages[workspace_id] = storage
         return storage
@@ -286,6 +298,130 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
         self.assertEqual(report["status"], "blocked")
         self.assertIn("live_retention_delete_evidence_not_enabled_or_incomplete", report["blockers"])
         self.assertFalse(report["checks"]["live_evidence_opt_in_enabled"])
+
+    def test_missing_database_runtime_mode_blocks_before_writes(self):
+        verifier = load_verifier()
+        env = complete_env()
+        env.pop("KQAG_STORAGE_MODE")
+        called = {"storage": False, "backend": False}
+
+        def storage_factory(_database_url, _workspace_id, **_kwargs):
+            called["storage"] = True
+            raise AssertionError("storage factory should not be called")
+
+        def backend_factory(_env):
+            called["backend"] = True
+            raise AssertionError("backend factory should not be called")
+
+        report = verifier.run_verification(
+            env=env,
+            storage_factory=storage_factory,
+            backend_factory=backend_factory,
+            migration_applier=lambda _database_url: None,
+            test_injected_backend=True,
+        )
+
+        self.assertEqual(report["status"], "blocked")
+        self.assertIn("KQAG_STORAGE_MODE", report["missing_env_names"])
+        self.assertIn("runtime_database_mode_not_enabled", report["blockers"])
+        self.assertFalse(report["checks"]["write_attempted"])
+        self.assertEqual(report["active_db_synthetic_rows_written"], 0)
+        self.assertEqual(report["active_object_synthetic_objects_written"], 0)
+        self.assertEqual(report["active_object_synthetic_objects_deleted"], 0)
+        self.assertEqual(called, {"storage": False, "backend": False})
+
+    def test_local_database_runtime_mode_blocks_before_writes(self):
+        verifier = load_verifier()
+        env = complete_env()
+        env["KQAG_STORAGE_MODE"] = "local"
+
+        report = verifier.run_verification(
+            env=env,
+            storage_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("storage factory should not be called")),
+            backend_factory=lambda _env: (_ for _ in ()).throw(AssertionError("backend factory should not be called")),
+            migration_applier=lambda _database_url: None,
+            test_injected_backend=True,
+        )
+
+        self.assertEqual(report["status"], "blocked")
+        self.assertNotIn("KQAG_STORAGE_MODE", report["missing_env_names"])
+        self.assertIn("runtime_database_mode_not_enabled", report["blockers"])
+        self.assertFalse(report["checks"]["write_attempted"])
+        self.assertEqual(report["active_db_synthetic_rows_written"], 0)
+        self.assertEqual(report["active_object_synthetic_objects_written"], 0)
+
+    def test_missing_object_artifact_runtime_mode_blocks_before_writes(self):
+        verifier = load_verifier()
+        env = complete_env()
+        env.pop("KQAG_ARTIFACT_STORAGE_MODE")
+
+        report = verifier.run_verification(
+            env=env,
+            storage_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("storage factory should not be called")),
+            backend_factory=lambda _env: (_ for _ in ()).throw(AssertionError("backend factory should not be called")),
+            migration_applier=lambda _database_url: None,
+            test_injected_backend=True,
+        )
+
+        self.assertEqual(report["status"], "blocked")
+        self.assertIn("KQAG_ARTIFACT_STORAGE_MODE", report["missing_env_names"])
+        self.assertIn("runtime_object_artifact_mode_not_enabled", report["blockers"])
+        self.assertFalse(report["checks"]["write_attempted"])
+        self.assertEqual(report["active_db_synthetic_rows_written"], 0)
+        self.assertEqual(report["active_object_synthetic_objects_written"], 0)
+
+    def test_non_object_artifact_runtime_mode_blocks_before_writes(self):
+        verifier = load_verifier()
+        for mode in ("local", "database"):
+            env = complete_env()
+            env["KQAG_ARTIFACT_STORAGE_MODE"] = mode
+
+            report = verifier.run_verification(
+                env=env,
+                storage_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("storage factory should not be called")),
+                backend_factory=lambda _env: (_ for _ in ()).throw(AssertionError("backend factory should not be called")),
+                migration_applier=lambda _database_url: None,
+                test_injected_backend=True,
+            )
+
+            self.assertEqual(report["status"], "blocked")
+            self.assertIn("runtime_object_artifact_mode_not_enabled", report["blockers"])
+            self.assertFalse(report["checks"]["write_attempted"])
+            self.assertEqual(report["active_db_synthetic_rows_written"], 0)
+            self.assertEqual(report["active_object_synthetic_objects_written"], 0)
+
+    def test_kqag_database_url_alone_does_not_satisfy_database_requirement(self):
+        verifier = load_verifier()
+        env = complete_env()
+        env.pop("SQAG_DATABASE_URL")
+        env["KQAG_DATABASE_URL"] = "LEGACY_DB_TARGET_MARKER"
+
+        report = verifier.run_verification(env=env)
+        text = json.dumps(report, sort_keys=True)
+
+        self.assertEqual(report["status"], "blocked")
+        self.assertIn("SQAG_DATABASE_URL", report["missing_env_names"])
+        self.assertFalse(report["checks"]["active_database_target_present"])
+        self.assertEqual(report["active_db_synthetic_rows_written"], 0)
+        self.assertEqual(report["active_object_synthetic_objects_written"], 0)
+        self.assertNotIn("LEGACY_DB_TARGET_MARKER", text)
+
+    def test_runtime_download_uses_effective_env_instead_of_ambient_env(self):
+        verifier = load_verifier()
+
+        with mock.patch.dict(
+            os.environ,
+            {"KQAG_STORAGE_MODE": "local", "KQAG_ARTIFACT_STORAGE_MODE": "local"},
+            clear=True,
+        ):
+            report, _storages, _backend_holder = run_injected_drill(
+                verifier,
+                require_runtime_env=True,
+            )
+
+        self.assertEqual(report["status"], "passed")
+        self.assertTrue(report["checks"]["active_runtime_download_verified"])
+        self.assertTrue(report["checks"]["deleted_metadata_download_denied"])
 
     def test_mocked_successful_live_drill_passes_with_sanitized_counts(self):
         verifier = load_verifier()
