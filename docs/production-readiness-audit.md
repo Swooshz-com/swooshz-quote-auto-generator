@@ -39,7 +39,9 @@ Primary blockers:
 - No operator-run live object-storage provider evidence has been recorded for
   generated XLSX/PDF bytes, and uploaded/reference/profile assets still need
   final object-storage wiring.
-- Backup, restore, retention, and rollback have not been implemented or proven.
+- Backup/restore has live DB+object evidence, but live retention/delete has
+  only an opt-in verifier path and has not yet recorded passing operator
+  evidence.
 
 PR #88 update: database/platform pricing-reference list/detail/export/generation
 paths now resolve only workspace-owned database rows. Local and bundled pricing
@@ -326,6 +328,31 @@ evidence, hosted logging/monitoring and alert delivery, hosted smoke evidence,
 production deployment operations evidence, live Platform-to-SQAG launch smoke,
 session/business hardening, and final production audit. `production_ready=false`
 remains.
+
+`scripts/verify_live_retention_delete.py` is the opt-in live retention/delete
+drill path. It stays blocked unless `SQAG_LIVE_RETENTION_DELETE_EVIDENCE` is
+enabled and the active SQAG DB/object env names are present in the operator
+environment. When enabled, it uses synthetic namespaced DB metadata rows and
+one tiny synthetic generated artifact object only. The drill verifies active
+DB metadata, active object write/read, checksum/content type/byte size,
+DB+object metadata pairing, and active runtime export download through
+`quote_session_export_artifact()` before tombstone/delete. It then verifies
+runtime tombstone/delete behavior, denied deleted downloads, missing object
+fail-closed behavior, wrong-workspace denial, repeated delete safety, and
+cleanup. It fails closed on missing env, DB/schema failure, object write/read
+failure, active runtime download failure, metadata/object mismatch,
+tombstone/delete mismatch, unsafe wrong-workspace behavior, missing-object
+handling failure, repeated delete safety failure, or cleanup failure.
+
+The live retention/delete verifier reports sanitized booleans, counts, status
+fields, and blocker IDs only. It must not print DB URLs, hostnames, usernames,
+passwords, connection strings, endpoints, bucket names, provider values, object
+keys, access keys, secret keys, OAuth values, cookies/tokens, private paths,
+tenant/customer/staff/profile/pricing data, generated quote contents, artifact
+bytes, backup dumps, restore dumps, or secrets. Passing it may remove only
+`object_retention_delete_live_evidence_missing`; no unrelated blocker is
+removed. Until a non-test-injected operator run passes, live retention/delete
+evidence remains a production blocker and `production_ready=false` remains.
 
 The canonical object-storage provider and live-evidence env names use the
 `SQAG_` prefix. Legacy `KQAG_*` object-storage provider names are not aliases

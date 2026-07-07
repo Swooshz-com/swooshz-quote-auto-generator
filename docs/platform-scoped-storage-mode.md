@@ -304,6 +304,39 @@ hosted smoke evidence, production deployment operations evidence, live
 Platform-to-SQAG launch smoke, session/business hardening, and the final
 production audit are complete.
 
+Live retention/delete evidence now has an opt-in operator drill path:
+
+```powershell
+python scripts/verify_live_retention_delete.py
+```
+
+The drill remains fail-closed unless `SQAG_LIVE_RETENTION_DELETE_EVIDENCE` is
+enabled and the active SQAG DB/object env names are present in the execution
+environment. It uses the active SQAG Postgres-compatible metadata DB and active
+object backend only, with synthetic namespaced rows and one tiny synthetic
+generated artifact object. It verifies active DB metadata, object write/read,
+checksum/content type/byte size, DB+object metadata pairing, workspace-scoped
+access, and an active runtime export download through
+`quote_session_export_artifact()` before tombstone/delete. It then verifies
+runtime tombstone/delete behavior, denied deleted downloads, missing object
+fail-closed handling, wrong-workspace denial, repeated delete safety, and
+cleanup. Missing env, DB/schema failure, object write/read failure, active
+runtime download failure, metadata/object mismatch, tombstone/delete mismatch,
+wrong-workspace access, missing-object handling, repeated delete safety failure,
+or cleanup failure all fail closed.
+
+Reports contain only schema/status booleans, counts, blocker IDs, and privacy
+booleans. They must not include DB URLs, hostnames, usernames, passwords,
+connection strings, endpoints, bucket names, provider values, object keys,
+access keys, secret keys, OAuth values, cookies/tokens, private paths,
+tenant/customer/staff/profile/pricing data, generated quote contents, artifact
+bytes, backup dumps, restore dumps, or secrets. A passing non-test-injected
+run can remove only `object_retention_delete_live_evidence_missing`;
+`production_ready=false` remains until hosted logging/monitoring and alert
+delivery, hosted smoke evidence, production deployment operations evidence,
+live Platform-to-SQAG launch smoke, session/business hardening, and the final
+production audit are complete.
+
 ## Workspace Scope
 
 Database rows are keyed by the platform workspace ID from the KQAG platform

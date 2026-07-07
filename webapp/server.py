@@ -2296,6 +2296,63 @@ def live_db_object_backup_restore_evidence_summary(
     }
 
 
+def live_retention_delete_evidence_summary(
+    *,
+    status: str,
+    artifact_mode: str,
+    database_mode: bool,
+    database_configured: bool,
+    database_family: str,
+    provider_status: dict[str, Any],
+) -> dict[str, Any]:
+    normalized_status = clean_text(status).lower() or "not_run_by_checker"
+    if normalized_status not in {"passed", "failed", "not_run_by_checker"}:
+        normalized_status = "not_run_by_checker"
+    supported = bool(
+        normalized_status == "passed"
+        and artifact_mode == "object"
+        and database_mode
+        and database_configured
+        and database_family == "postgres_compatible"
+        and provider_status.get("provider") == "s3_compatible"
+        and provider_status.get("configured")
+        and provider_status.get("runtime_backend_available")
+    )
+    return {
+        "status": normalized_status,
+        "verifier": "scripts/verify_live_retention_delete.py",
+        "required_env_names": [
+            "SQAG_LIVE_RETENTION_DELETE_EVIDENCE",
+            KQAG_DATABASE_URL_ENV_NAME,
+            OBJECT_STORAGE_PROVIDER_ENV_NAME,
+            OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME,
+            OBJECT_STORAGE_BUCKET_ENV_NAME,
+            OBJECT_STORAGE_REGION_ENV_NAME,
+            OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME,
+            OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME,
+        ],
+        "covers": [
+            "synthetic_db_metadata",
+            "synthetic_object_bytes",
+            "db_object_metadata_pairing",
+            "active_runtime_export_download",
+            "tombstone_metadata",
+            "live_object_delete",
+            "deleted_download_denied",
+            "missing_object_fail_closed",
+            "wrong_workspace_denied",
+            "repeated_delete_safe",
+            "cleanup_completed",
+        ],
+        "live_retention_delete_evidence_supported": supported,
+        "notes": [
+            "Evidence is opt-in and uses synthetic namespaced rows and one tiny synthetic generated artifact object only.",
+            "It fails closed on missing env, metadata/object mismatch, tombstone/delete mismatch, wrong-workspace access, missing-object handling, or cleanup failure.",
+            "It does not print DB URLs, provider values, bucket names, object keys, credentials, artifact bytes, tenant data, generated quote contents, backup dumps, or restore dumps.",
+        ],
+    }
+
+
 def object_artifact_lifecycle_evidence_summary(*, status: str, artifact_mode: str, database_mode: bool, database_configured: bool) -> dict[str, Any]:
     normalized_status = clean_text(status).lower() or "not_run_by_checker"
     if normalized_status not in {"passed", "failed", "not_run_by_checker"}:
@@ -2350,6 +2407,7 @@ def production_readiness_status(
     live_object_storage_provider_evidence_status: str = "not_run_by_checker",
     production_database_evidence_status: str = "not_run_by_checker",
     live_db_object_backup_restore_evidence_status: str = "not_run_by_checker",
+    live_retention_delete_evidence_status: str = "not_run_by_checker",
 ) -> dict[str, Any]:
     storage_mode = configured_storage_mode()
     artifact_mode = configured_artifact_storage_mode()
@@ -2400,6 +2458,14 @@ def production_readiness_status(
     )
     live_db_object_backup_restore_evidence = live_db_object_backup_restore_evidence_summary(
         status=live_db_object_backup_restore_evidence_status,
+        artifact_mode=artifact_mode,
+        database_mode=database_mode,
+        database_configured=database_configured,
+        database_family=database_family,
+        provider_status=object_storage_provider,
+    )
+    live_retention_delete_evidence = live_retention_delete_evidence_summary(
+        status=live_retention_delete_evidence_status,
         artifact_mode=artifact_mode,
         database_mode=database_mode,
         database_configured=database_configured,
@@ -2582,7 +2648,8 @@ def production_readiness_status(
     if object_artifacts and not local_staging_cleanup_evidence["synthetic_local_staging_cleanup_supported"]:
         blockers.append(readiness_blocker("local_staging_cleanup_evidence_missing", "P1", "Object-mode generated artifact local staging cleanup evidence has not been verified.", gates=("production",)))
     if object_artifacts:
-        blockers.append(readiness_blocker("object_retention_delete_live_evidence_missing", "P1", "Live object provider retention/delete evidence is still missing for production.", gates=("production",)))
+        if not live_retention_delete_evidence["live_retention_delete_evidence_supported"]:
+            blockers.append(readiness_blocker("object_retention_delete_live_evidence_missing", "P1", "Live object provider retention/delete evidence is still missing for production.", gates=("production",)))
         if not live_db_object_backup_restore_evidence["live_db_object_backup_restore_evidence_supported"]:
             blockers.append(readiness_blocker("db_object_backup_restore_live_evidence_missing", "P1", "Live DB+object backup/restore evidence is still missing for production.", gates=("production",)))
     blockers.append(readiness_blocker("session_business_hardening_incomplete", "P1", "Immutable quote-session snapshot groundwork exists, but final session/business hardening and generated audit race coverage remain incomplete.", gates=("production",)))
@@ -2628,6 +2695,7 @@ def production_readiness_status(
         "live_object_storage_provider_evidence": live_object_storage_provider_evidence,
         "production_database_evidence": production_database_evidence,
         "live_db_object_backup_restore_evidence": live_db_object_backup_restore_evidence,
+        "live_retention_delete_evidence": live_retention_delete_evidence,
         "object_lifecycle_evidence": object_lifecycle_evidence,
         "object_retention_delete_evidence": object_retention_delete_evidence,
         "db_object_backup_restore_evidence": db_object_backup_restore_evidence,
