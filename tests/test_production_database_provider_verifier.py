@@ -445,6 +445,24 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
         self.assertNotIn("redacted-object-key-ref", text)
         self.assertNotIn("content_blob", "\n".join(query.lower() for query, _params in connection.queries))
 
+    def test_live_opt_in_does_not_touch_object_storage_when_object_mode_configured(self):
+        connection = FakeLivePostgresConnection()
+        backend = mock.Mock()
+        backend.delete_artifact.side_effect = AssertionError("object backend delete must not be called")
+
+        with mock.patch.dict(verifier.os.environ, {"KQAG_ARTIFACT_STORAGE_MODE": "object"}, clear=False), \
+            mock.patch.object(verifier.webapp, "configured_object_storage_backend", side_effect=AssertionError("object backend factory must not be called")) as configured_backend, \
+            mock.patch.object(verifier.webapp.DatabaseKqagStorage, "tombstone_object_quote_artifacts", side_effect=AssertionError("object tombstone must not be called")) as tombstone, \
+            mock.patch.object(verifier.webapp.DatabaseKqagStorage, "delete_quote_session", side_effect=AssertionError("runtime quote-session delete must not be called")) as delete_session:
+            report = run_live_database_report(connection)
+
+        self.assertEqual(report["status"], "passed")
+        self.assertTrue(report["live_database_evidence_supported"])
+        configured_backend.assert_not_called()
+        tombstone.assert_not_called()
+        delete_session.assert_not_called()
+        backend.delete_artifact.assert_not_called()
+
     def test_live_opt_in_workspace_isolation_failure_fails_closed(self):
         report = run_live_database_report(FakeLivePostgresConnection(leak_workspace_reads=True))
 

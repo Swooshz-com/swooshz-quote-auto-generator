@@ -196,6 +196,52 @@ def _contains_id(items: list[dict[str, object]], item_id: str, id_key: str = "id
     return any(_clean(item.get(id_key)) == item_id for item in items if isinstance(item, dict))
 
 
+def _delete_synthetic_workspace_metadata(
+    storage: object,
+    *,
+    profile_id: str,
+    pricing_id: str,
+    session_id: str,
+) -> int:
+    """Delete only verifier-created synthetic metadata rows through DB SQL."""
+    deleted = 0
+    with storage.connection() as connection:
+        for sql, params in (
+            (
+                "delete from kqag_object_artifacts "
+                "where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+                (storage.workspace_id, "generated_quote", session_id, "xlsx"),
+            ),
+            (
+                "delete from kqag_quote_sessions where workspace_id = ? and session_id = ?",
+                (storage.workspace_id, session_id),
+            ),
+            (
+                "delete from kqag_pricing_references where workspace_id = ? and reference_id = ?",
+                (storage.workspace_id, pricing_id),
+            ),
+            (
+                "delete from kqag_profiles where workspace_id = ? and profile_id = ?",
+                (storage.workspace_id, profile_id),
+            ),
+        ):
+            cursor = connection.execute(sql, params)
+            deleted += int(getattr(cursor, "rowcount", 0) or 0)
+        connection.commit()
+    return deleted
+
+
+def _synthetic_object_artifact_row(storage: object, session_id: str, artifact_kind: str) -> object | None:
+    with storage.connection() as connection:
+        cursor = connection.execute(
+            "select artifact_id from kqag_object_artifacts "
+            "where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ? "
+            "and status = ? and retention_status = ? and deleted_at is null",
+            (storage.workspace_id, "generated_quote", session_id, artifact_kind, "active", "active"),
+        )
+        return cursor.fetchone()
+
+
 def _cleanup_synthetic_metadata(database_url: str, ids: dict[str, str]) -> bool:
     cleanup_ok = True
     for workspace_key, profile_key, pricing_key, session_key in (
@@ -204,18 +250,12 @@ def _cleanup_synthetic_metadata(database_url: str, ids: dict[str, str]) -> bool:
     ):
         storage = webapp.DatabaseKqagStorage(database_url, ids[workspace_key], role="admin", user_id=f"{ids[workspace_key]}-user")
         try:
-            storage.delete_profile(ids[profile_key])
-            storage.delete_pricing_reference(ids[pricing_key])
-            storage.delete_quote_session(ids[session_key])
-        except Exception:
-            cleanup_ok = False
-        try:
-            with storage.connection() as connection:
-                connection.execute(
-                    "delete from kqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ?",
-                    (ids[workspace_key], "generated_quote", ids[session_key]),
-                )
-                connection.commit()
+            _delete_synthetic_workspace_metadata(
+                storage,
+                profile_id=ids[profile_key],
+                pricing_id=ids[pricing_key],
+                session_id=ids[session_key],
+            )
         except Exception:
             cleanup_ok = False
     return cleanup_ok
@@ -305,26 +345,30 @@ def live_metadata_operations_status(database_url: str) -> dict[str, object]:
         session_updated = bool(storage_a.get_quote_session(ids["session_a"]))
         reads += 3
 
-        object_a = storage_a._object_quote_artifact_row(ids["session_a"], "xlsx")
-        object_b = storage_b._object_quote_artifact_row(ids["session_b"], "xlsx")
-        object_cross_a = storage_a._object_quote_artifact_row(ids["session_b"], "xlsx")
-        object_cross_b = storage_b._object_quote_artifact_row(ids["session_a"], "xlsx")
+        object_a = _synthetic_object_artifact_row(storage_a, ids["session_a"], "xlsx")
+        object_b = _synthetic_object_artifact_row(storage_b, ids["session_b"], "xlsx")
+        object_cross_a = _synthetic_object_artifact_row(storage_a, ids["session_b"], "xlsx")
+        object_cross_b = _synthetic_object_artifact_row(storage_b, ids["session_a"], "xlsx")
         reads += 4
         object_pairing = bool(object_a and object_b and not object_cross_a and not object_cross_b)
 
-        deleted_profile = storage_a.delete_profile(ids["profile_a"])
-        deleted_pricing = storage_a.delete_pricing_reference(ids["pricing_a"])
-        deleted_session = storage_a.delete_quote_session(ids["session_a"])
-        deletes += int(bool(deleted_profile)) + int(bool(deleted_pricing)) + int(bool(deleted_session))
+        deleted_count = _delete_synthetic_workspace_metadata(
+            storage_a,
+            profile_id=ids["profile_a"],
+            pricing_id=ids["pricing_a"],
+            session_id=ids["session_a"],
+        )
+        deletes += deleted_count
         deleted_rows_hidden = all(
             (
                 storage_a.profile_detail(ids["profile_a"]) is None,
                 storage_a.pricing_reference_detail(ids["pricing_a"]) is None,
                 storage_a.get_quote_session(ids["session_a"]) is None,
+                _synthetic_object_artifact_row(storage_a, ids["session_a"], "xlsx") is None,
             )
         )
         reads += 3
-        crud_verified = all((profile_updated, pricing_updated, session_updated, deleted_profile, deleted_pricing, deleted_session, deleted_rows_hidden))
+        crud_verified = all((profile_updated, pricing_updated, session_updated, deleted_count >= 3, deleted_rows_hidden))
 
         operations = {
             "workspace_count": 2,
