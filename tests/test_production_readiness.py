@@ -471,6 +471,99 @@ class ProductionReadinessStatusTest(unittest.TestCase):
                 continue
             self.assertNotIn(value, text)
 
+    def test_postgres_database_url_keeps_readiness_blocked_until_runtime_and_live_evidence(self):
+        private_url = "postgres" + "ql://redacted-db-url"
+        env = {
+            "KQAG_STORAGE_MODE": "database",
+            "KQAG_ARTIFACT_STORAGE_MODE": "object",
+            "KQAG_DATABASE_URL": private_url,
+            "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
+            "SQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
+            "SQAG_OBJECT_STORAGE_REGION": "<redacted-region>",
+            "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "<redacted-access-key-id>",
+            "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "<redacted-secret-access-key>",
+        }
+        with mock.patch("webapp.object_storage._optional_s3_sdk_available", return_value=True):
+            status = self.readiness_status(
+                env,
+                backup_restore_evidence_status="passed",
+                hosted_observability_evidence_status="passed",
+                hosted_smoke_evidence_status="passed",
+                object_storage_evidence_status="passed",
+                object_artifact_lifecycle_evidence_status="passed",
+                live_object_storage_provider_evidence_status="passed",
+                production_database_evidence_status="passed",
+            )
+
+        text = json.dumps(status, sort_keys=True)
+        production_blocker_ids = {item["id"] for item in status["production_blockers"]}
+        self.assertEqual(status["database_family"], "postgres_compatible")
+        self.assertEqual(status["production_database_evidence"]["database_family"], "postgres_compatible")
+        self.assertFalse(status["production_database_evidence"]["app_runtime_postgres_supported"])
+        self.assertFalse(status["production_database_evidence"]["production_database_evidence_supported"])
+        self.assertIn("postgres_neon_runtime_adapter_missing", production_blocker_ids)
+        self.assertIn("postgres_neon_database_evidence_missing", production_blocker_ids)
+        self.assertNotIn("sqlite_not_final_production", production_blocker_ids)
+        self.assertFalse(status["production_ready"])
+        self.assertNotIn(private_url, text)
+
+    def test_sqlite_database_url_also_reports_missing_postgres_neon_database_evidence(self):
+        status = self.readiness_status(
+            {
+                "KQAG_STORAGE_MODE": "database",
+                "KQAG_ARTIFACT_STORAGE_MODE": "object",
+                "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            },
+            object_storage_evidence_status="passed",
+            object_artifact_lifecycle_evidence_status="passed",
+        )
+
+        production_blocker_ids = {item["id"] for item in status["production_blockers"]}
+        self.assertEqual(status["database_family"], "sqlite")
+        self.assertIn("sqlite_not_final_production", production_blocker_ids)
+        self.assertIn("postgres_neon_database_evidence_missing", production_blocker_ids)
+        self.assertFalse(status["production_database_evidence"]["production_database_evidence_supported"])
+        self.assertFalse(status["production_ready"])
+
+    def test_readiness_command_can_include_production_database_evidence_without_printing_url(self):
+        private_url = "postgres" + "ql://redacted-db-url"
+        command_env = {
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONPATH": str(ROOT),
+            "KQAG_STORAGE_MODE": "database",
+            "KQAG_ARTIFACT_STORAGE_MODE": "object",
+            "KQAG_DATABASE_URL": private_url,
+            "SQAG_LIVE_DATABASE_EVIDENCE": "1",
+        }
+        for name in ("COMSPEC", "SystemRoot", "TEMP", "TMP"):
+            if os.environ.get(name):
+                command_env[name] = os.environ[name]
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "check_production_readiness.py"),
+                "--with-production-database-evidence",
+            ],
+            cwd=ROOT,
+            env=command_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        status = json.loads(completed.stdout)
+        text = completed.stdout + completed.stderr
+        production_blocker_ids = {item["id"] for item in status["production_blockers"]}
+        self.assertEqual(status["production_database_evidence"]["status"], "failed")
+        self.assertIn("postgres_neon_runtime_adapter_missing", production_blocker_ids)
+        self.assertIn("postgres_neon_database_evidence_missing", production_blocker_ids)
+        self.assertFalse(status["production_ready"])
+        self.assertNotIn(private_url, text)
+
     def test_object_storage_provider_config_status_is_metadata_only(self):
         env = {
             "KQAG_STORAGE_MODE": "database",

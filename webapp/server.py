@@ -281,6 +281,9 @@ QUOTE_DATA_ROOT_ENV_NAME = "QUOTE_DATA_ROOT"
 KQAG_STORAGE_MODE_ENV_NAME = "KQAG_STORAGE_MODE"
 KQAG_ARTIFACT_STORAGE_MODE_ENV_NAME = "KQAG_ARTIFACT_STORAGE_MODE"
 KQAG_DATABASE_URL_ENV_NAME = "KQAG_DATABASE_URL"
+SQAG_LIVE_DATABASE_EVIDENCE_ENV_NAME = "SQAG_LIVE_DATABASE_EVIDENCE"
+POSTGRES_COMPATIBLE_DATABASE_SCHEMES = {"postgres", "postgresql"}
+SQLITE_DATABASE_SCHEMES = {"sqlite"}
 USER_TYPE_ENV_NAME = "USER_TYPE"
 LOCAL_USER_ROLE_ENV_NAME = "LOCAL_USER_ROLE"
 SESSION_COOKIE_NAME = "swooshz_quote_session"
@@ -1943,6 +1946,17 @@ def configured_database_scheme() -> str:
     return clean_text(urlparse(raw).scheme).lower()
 
 
+def configured_database_family() -> str:
+    scheme = configured_database_scheme()
+    if not scheme:
+        return "missing"
+    if scheme in SQLITE_DATABASE_SCHEMES:
+        return "sqlite"
+    if scheme in POSTGRES_COMPATIBLE_DATABASE_SCHEMES:
+        return "postgres_compatible"
+    return "unsupported"
+
+
 def readiness_surface(
     *,
     mode: str,
@@ -2150,6 +2164,57 @@ def live_object_storage_provider_evidence_summary(
     }
 
 
+def production_database_evidence_summary(
+    *,
+    status: str,
+    database_mode: bool,
+    database_configured: bool,
+    database_family: str,
+) -> dict[str, Any]:
+    normalized_status = clean_text(status).lower() or "not_run_by_checker"
+    if normalized_status not in {"passed", "failed", "not_run_by_checker"}:
+        normalized_status = "not_run_by_checker"
+    app_runtime_postgres_supported = False
+    supported = bool(
+        normalized_status == "passed"
+        and database_mode
+        and database_configured
+        and database_family == "postgres_compatible"
+        and app_runtime_postgres_supported
+    )
+    return {
+        "status": normalized_status,
+        "verifier": "scripts/verify_production_database_provider.py",
+        "required_env_names": [
+            KQAG_DATABASE_URL_ENV_NAME,
+            SQAG_LIVE_DATABASE_EVIDENCE_ENV_NAME,
+        ],
+        "database_family": database_family,
+        "intended_production_family": "postgres_neon_compatible",
+        "app_runtime_postgres_supported": app_runtime_postgres_supported,
+        "production_database_evidence_supported": supported,
+        "stores": [
+            "workspace_scoped_rows",
+            "quote_session_metadata",
+            "profile_metadata",
+            "pricing_reference_metadata",
+            "object_artifact_metadata",
+        ],
+        "does_not_store": [
+            "generated_xlsx_pdf_bytes",
+            "object_bytes",
+            "object_keys_in_output",
+            "provider_credentials",
+            "database_url_values",
+        ],
+        "notes": [
+            "Evidence is opt-in and metadata-only.",
+            "SQLite remains local-UAT/synthetic evidence only.",
+            "Postgres/Neon-compatible runtime support and live DB evidence are not yet implemented by the app.",
+        ],
+    }
+
+
 def object_artifact_lifecycle_evidence_summary(*, status: str, artifact_mode: str, database_mode: bool, database_configured: bool) -> dict[str, Any]:
     normalized_status = clean_text(status).lower() or "not_run_by_checker"
     if normalized_status not in {"passed", "failed", "not_run_by_checker"}:
@@ -2202,10 +2267,12 @@ def production_readiness_status(
     object_storage_evidence_status: str = "not_run_by_checker",
     object_artifact_lifecycle_evidence_status: str = "not_run_by_checker",
     live_object_storage_provider_evidence_status: str = "not_run_by_checker",
+    production_database_evidence_status: str = "not_run_by_checker",
 ) -> dict[str, Any]:
     storage_mode = configured_storage_mode()
     artifact_mode = configured_artifact_storage_mode()
     database_scheme = configured_database_scheme()
+    database_family = configured_database_family()
     database_configured = bool(database_scheme)
     database_mode = storage_mode == "database"
     database_artifacts = artifact_mode == "database"
@@ -2242,6 +2309,12 @@ def production_readiness_status(
         database_mode=database_mode,
         database_configured=database_configured,
         provider_status=object_storage_provider,
+    )
+    production_database_evidence = production_database_evidence_summary(
+        status=production_database_evidence_status,
+        database_mode=database_mode,
+        database_configured=database_configured,
+        database_family=database_family,
     )
     object_retention_delete_evidence = derived_object_artifact_evidence_summary(
         source=object_lifecycle_evidence,
@@ -2390,6 +2463,8 @@ def production_readiness_status(
         blockers.append(readiness_blocker("local_artifact_storage", "P1", "Generated quote artifacts, saved exports, and profile layout assets are still using local filesystem storage."))
     if (database_mode or database_artifacts or object_artifacts) and not database_configured:
         blockers.append(readiness_blocker("database_url_missing", "P1", "Database-backed storage mode is selected but no database URL is configured."))
+    if database_mode and database_configured and database_family == "unsupported":
+        blockers.append(readiness_blocker("database_url_unsupported_for_production", "P1", "Configured database URL scheme is not supported for hosted, protected, deploy, or production storage.", gates=("production",)))
     if database_artifacts:
         blockers.append(readiness_blocker(
             "database_blob_artifact_storage_not_launch_ready",
@@ -2398,6 +2473,10 @@ def production_readiness_status(
         ))
     if database_scheme == "sqlite":
         blockers.append(readiness_blocker("sqlite_not_final_production", "P1", "SQLite is acceptable only for local-UAT/dev database evidence, not hosted, protected, deploy, or production storage.", gates=("production",)))
+    if database_mode and database_family == "postgres_compatible":
+        blockers.append(readiness_blocker("postgres_neon_runtime_adapter_missing", "P1", "Postgres/Neon-compatible database storage is the intended production direction, but the app runtime adapter is not implemented yet.", gates=("production",)))
+    if database_mode and database_configured and not production_database_evidence["production_database_evidence_supported"]:
+        blockers.append(readiness_blocker("postgres_neon_database_evidence_missing", "P1", "Live Postgres/Neon-compatible metadata database evidence is missing; SQLite remains local-UAT evidence only.", gates=("production",)))
     if not object_storage_evidence["production_object_storage_contract_supported"]:
         blockers.append(readiness_blocker("object_storage_missing", "P1", "No verified object-storage-backed asset/artifact contract exists for production XLSX/PDF and uploaded reference assets.", gates=("production",)))
     if object_artifacts and not live_object_storage_provider_evidence["live_provider_evidence_supported"]:
@@ -2436,6 +2515,7 @@ def production_readiness_status(
         "schema": "swooshz.kqag.production-readiness.v1",
         "kqag_storage_mode": storage_mode,
         "kqag_artifact_storage_mode": artifact_mode,
+        "database_family": database_family,
         "profiles_storage": profiles,
         "pricing_references_storage": pricing_references,
         "quote_sessions_storage": quote_sessions,
@@ -2453,6 +2533,7 @@ def production_readiness_status(
         "hosted_smoke_evidence": hosted_smoke_evidence,
         "object_storage_evidence": object_storage_evidence,
         "live_object_storage_provider_evidence": live_object_storage_provider_evidence,
+        "production_database_evidence": production_database_evidence,
         "object_lifecycle_evidence": object_lifecycle_evidence,
         "object_retention_delete_evidence": object_retention_delete_evidence,
         "db_object_backup_restore_evidence": db_object_backup_restore_evidence,

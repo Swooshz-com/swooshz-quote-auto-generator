@@ -155,6 +155,27 @@ Production readiness still requires live DB+object backup/restore, live
 retention/delete, operations evidence, hosted observability and smoke evidence,
 Platform smoke, and final audit.
 
+## Production Database Readiness Boundary
+
+SQLite remains local-UAT and synthetic verifier storage only. The intended
+production database direction is Neon/Postgres-compatible metadata storage for
+workspace-scoped profiles, pricing references, quote sessions, and object
+artifact metadata. The database stores rows and metadata only; generated
+XLSX/PDF bytes stay in object storage.
+
+`scripts/verify_production_database_provider.py` is the current metadata-only
+production database boundary checker. It classifies the configured database URL
+family without printing the value, verifies the repo-declared metadata migration
+tables by file name only, and reports the current fail-closed gap:
+Postgres/Neon runtime adapter support and live operator-run DB evidence are
+missing. The checker does not connect to or mutate a live DB in this scaffolded
+state, and production readiness remains false.
+
+Do not rerun the R2/S3-compatible live object-storage evidence for this database
+PR. That metadata-only provider evidence has already passed. DB+object
+backup/restore live evidence remains a later gate after production database
+runtime support and evidence exist.
+
 Object artifact lifecycle evidence is synthetic/stubbed only:
 
 ```powershell
