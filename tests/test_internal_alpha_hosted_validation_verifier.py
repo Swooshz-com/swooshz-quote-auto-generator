@@ -62,7 +62,7 @@ class InternalAlphaHostedValidationVerifierTest(unittest.TestCase):
         self.assertEqual(report["evidence"]["backup_restore"], "passed")
         self.assertEqual(report["evidence"]["hosted_observability"], "passed")
         self.assertEqual(report["evidence"]["hosted_smoke"], "passed")
-        self.assertIn("KQAG_DATABASE_URL", report["host_secret_manager_only_env_names"])
+        self.assertIn("SQAG_DATABASE_URL", report["host_secret_manager_only_env_names"])
         self.assertIn("KQAG_STORAGE_MODE", report["required_env_names"])
         self.assertEqual(report["health"]["path"], "/api/health")
         self.assertEqual(report["privacy"]["output"], "metadata-only")

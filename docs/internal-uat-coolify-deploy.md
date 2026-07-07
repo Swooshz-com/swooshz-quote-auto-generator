@@ -19,7 +19,7 @@ The former DB/BLOB artifact posture is no longer a launch target:
 - `APP_MODE=deploy`.
 - `KQAG_STORAGE_MODE=database`.
 - `KQAG_ARTIFACT_STORAGE_MODE=database`.
-- `KQAG_DATABASE_URL` is configured only through the host secret manager.
+- `SQAG_DATABASE_URL` is configured only through the host secret manager.
 - Platform/workspace launch context is required for protected hosted use.
 - Readiness remains blocked because generated XLSX/PDF bytes require object
   storage. Database rows store metadata and workspace-owned app records only.
@@ -52,7 +52,7 @@ Required names for any future hosted validation environment:
 | Area | Names |
 | --- | --- |
 | App/auth | `APP_MODE`, `AUTH_REQUIRED`, `SESSION_SECRET` |
-| Storage | `KQAG_STORAGE_MODE`, `KQAG_ARTIFACT_STORAGE_MODE`, `KQAG_DATABASE_URL` |
+| Storage | `KQAG_STORAGE_MODE`, `KQAG_ARTIFACT_STORAGE_MODE`, `SQAG_DATABASE_URL` |
 | Platform launch | `KQAG_PLATFORM_LAUNCH_MODE`, `KQAG_PLATFORM_BASE_URL` |
 | Optional OIDC fallback/checklist | `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI`, `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL`, `OIDC_USERINFO_URL`, `OIDC_LOGOUT_URL` |
 | Tester policy | `AUTH_ALLOWED_EMAILS`, `AUTH_ALLOWED_DOMAINS`, `AUTH_ALLOW_ANY_AUTHENTICATED_USER`, `AUTH_APPROVED_TESTER_ROLE` |

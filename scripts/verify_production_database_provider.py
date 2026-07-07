@@ -400,7 +400,7 @@ def run_verification(
     test_injected_backend: bool = False,
 ) -> dict[str, object]:
     effective_env = env or os.environ
-    database_url = effective_env.get(webapp.KQAG_DATABASE_URL_ENV_NAME, "")
+    database_url = effective_env.get(webapp.SQAG_DATABASE_URL_ENV_NAME, "")
     family = database_family(database_url)
     migration_status = metadata_migration_status(migration_paths)
     postgres_driver = postgres_driver_available() if driver_available is None else bool(driver_available)
@@ -467,7 +467,7 @@ def run_verification(
         "database_family": family,
         "intended_production_family": "postgres_neon_compatible",
         "required_env_names": [
-            webapp.KQAG_DATABASE_URL_ENV_NAME,
+            webapp.SQAG_DATABASE_URL_ENV_NAME,
             webapp.SQAG_LIVE_DATABASE_EVIDENCE_ENV_NAME,
         ],
         "live_database_evidence_enabled": live_evidence_enabled,

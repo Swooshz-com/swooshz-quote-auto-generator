@@ -35,7 +35,7 @@ $env:KQAG_PLATFORM_LAUNCH_MODE="platform"
 $env:KQAG_PLATFORM_BASE_URL="https://platform.example.test"
 $env:KQAG_STORAGE_MODE="database"
 $env:KQAG_ARTIFACT_STORAGE_MODE="object"
-$env:KQAG_DATABASE_URL="sqlite:///C:/path/to/local/kqag-storage.sqlite3"
+$env:SQAG_DATABASE_URL="sqlite:///C:/path/to/local/kqag-storage.sqlite3"
 ```
 
 SQLite remains the reviewed local-UAT migration path. The runtime also has a
@@ -63,7 +63,7 @@ Review the migrations, then apply them explicitly:
 - `migrations/003_object_artifact_metadata.sql` for generated object-artifact metadata
 
 ```powershell
-$env:KQAG_DATABASE_URL="sqlite:///C:/path/to/local/kqag-storage.sqlite3"
+$env:SQAG_DATABASE_URL="sqlite:///C:/path/to/local/kqag-storage.sqlite3"
 python scripts/migrate_kqag_storage.py
 ```
 

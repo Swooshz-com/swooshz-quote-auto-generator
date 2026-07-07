@@ -101,7 +101,7 @@ def object_mode_env(database_path: Path) -> dict[str, str]:
     return {
         "KQAG_STORAGE_MODE": "database",
         "KQAG_ARTIFACT_STORAGE_MODE": "object",
-        "KQAG_DATABASE_URL": sqlite_url(database_path),
+        "SQAG_DATABASE_URL": sqlite_url(database_path),
         "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
         "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
         "SQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",

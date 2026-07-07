@@ -221,7 +221,7 @@ def run_live_database_report(connection: FakeLivePostgresConnection):
     ):
         return verifier.run_verification(
             env={
-                "KQAG_DATABASE_URL": POSTGRES_URL,
+                "SQAG_DATABASE_URL": POSTGRES_URL,
                 "SQAG_LIVE_DATABASE_EVIDENCE": "1",
             },
             driver_available=True,
@@ -232,7 +232,7 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
         runtime_schema = schema_status_for_runtime_columns(missing_columns)
         return verifier.run_verification(
             env={
-                "KQAG_DATABASE_URL": POSTGRES_URL,
+                "SQAG_DATABASE_URL": POSTGRES_URL,
                 "SQAG_LIVE_DATABASE_EVIDENCE": "1",
             },
             driver_available=True,
@@ -262,7 +262,7 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
 
     def test_sqlite_database_url_is_local_uat_only(self):
         report = verifier.run_verification(
-            env={"KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3"},
+            env={"SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3"},
             driver_available=False,
         )
 
@@ -273,7 +273,7 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
     def test_unsupported_database_scheme_fails_closed(self):
         unsupported_url = "my" + "sql://redacted-db-url"
         report = verifier.run_verification(
-            env={"KQAG_DATABASE_URL": unsupported_url},
+            env={"SQAG_DATABASE_URL": unsupported_url},
             driver_available=True,
         )
 
@@ -285,7 +285,7 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
     def test_postgres_compatible_url_reports_adapter_available_without_live_evidence(self):
         report = verifier.run_verification(
             env={
-                "KQAG_DATABASE_URL": POSTGRES_URL,
+                "SQAG_DATABASE_URL": POSTGRES_URL,
             },
             driver_available=True,
         )
@@ -489,7 +489,7 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
 
         report = verifier.run_verification(
             env={
-                "KQAG_DATABASE_URL": POSTGRES_URL,
+                "SQAG_DATABASE_URL": POSTGRES_URL,
                 "SQAG_LIVE_DATABASE_EVIDENCE": "1",
             },
             driver_available=True,
@@ -509,7 +509,7 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
         private_url = "postgres" + "://redacted-db-url"
         report = verifier.run_verification(
             env={
-                "KQAG_DATABASE_URL": private_url,
+                "SQAG_DATABASE_URL": private_url,
                 "SQAG_LIVE_DATABASE_EVIDENCE": "1",
             },
             migration_paths=(missing_path,),

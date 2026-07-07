@@ -100,7 +100,7 @@ $env:KQAG_PLATFORM_LAUNCH_MODE="platform"
 $env:KQAG_PLATFORM_BASE_URL="<platform-base-url>"
 $env:KQAG_STORAGE_MODE="database"
 $env:KQAG_ARTIFACT_STORAGE_MODE="database"
-$env:KQAG_DATABASE_URL="<kqag-local-database-url>"
+$env:SQAG_DATABASE_URL="<kqag-local-database-url>"
 ```
 
 Apply the reviewed KQAG storage migrations only against a disposable local

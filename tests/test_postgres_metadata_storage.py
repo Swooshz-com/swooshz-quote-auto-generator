@@ -217,7 +217,7 @@ class PostgresMetadataStorageTest(unittest.TestCase):
         return {
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "KQAG_DATABASE_URL": POSTGRES_URL,
+            "SQAG_DATABASE_URL": POSTGRES_URL,
         }
 
     def test_postgres_storage_uses_workspace_scoped_metadata_queries(self):
