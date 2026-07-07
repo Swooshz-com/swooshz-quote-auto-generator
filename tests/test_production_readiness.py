@@ -37,7 +37,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
                 "QUOTE_OUTPUT_ROOT": private_root + "/output",
                 "QUOTE_TMP_ROOT": private_root + "/tmp",
                 "QUOTE_LOG_ROOT": private_root + "/logs",
-                "KQAG_DATABASE_URL": database_url,
+                "SQAG_DATABASE_URL": database_url,
                 "OIDC_CLIENT_SECRET": "super-secret",
             }
         )
@@ -93,7 +93,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             "QUOTE_OUTPUT_ROOT": "C:/Users/Private/Koncept Runtime/output",
             "QUOTE_TMP_ROOT": "C:/Users/Private/Koncept Runtime/tmp",
             "QUOTE_LOG_ROOT": "C:/Users/Private/Koncept Runtime/logs",
-            "KQAG_DATABASE_URL": "sqlite:///C:/Users/Private/kqag-storage.sqlite3?token=secret",
+            "SQAG_DATABASE_URL": "sqlite:///C:/Users/Private/kqag-storage.sqlite3?token=secret",
             "OIDC_CLIENT_SECRET": "oauth-client-secret-value",
             "OIDC_REDIRECT_URI": "https://auth.example.test/callback?code=private-code&state=private-state",
             "SESSION_SECRET": "swooshz_private_session_cookie",
@@ -131,7 +131,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             "PYTHONPATH": str(ROOT),
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "database",
-            "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
         }
         for name in ("COMSPEC", "SystemRoot", "TEMP", "TMP"):
             if os.environ.get(name):
@@ -168,7 +168,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         database_url = "sqlite:///tmp/kqag-storage.sqlite3"
         with mock.patch.dict(
             webapp.os.environ,
-            {"KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "local", "KQAG_DATABASE_URL": database_url},
+            {"KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "local", "SQAG_DATABASE_URL": database_url},
             clear=True,
         ):
             mixed_status = webapp.production_readiness_status()
@@ -182,7 +182,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
 
         with mock.patch.dict(
             webapp.os.environ,
-            {"KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "database", "KQAG_DATABASE_URL": database_url},
+            {"KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url},
             clear=True,
         ):
             database_status = webapp.production_readiness_status()
@@ -200,7 +200,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             {
                 "KQAG_STORAGE_MODE": "database",
                 "KQAG_ARTIFACT_STORAGE_MODE": "database",
-                "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+                "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
             },
             backup_restore_evidence_status="passed",
             hosted_observability_evidence_status="passed",
@@ -227,7 +227,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             {
                 "KQAG_STORAGE_MODE": "database",
                 "KQAG_ARTIFACT_STORAGE_MODE": "object",
-                "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+                "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
             },
             backup_restore_evidence_status="passed",
             hosted_observability_evidence_status="passed",
@@ -252,7 +252,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             {
                 "KQAG_STORAGE_MODE": "database",
                 "KQAG_ARTIFACT_STORAGE_MODE": "database",
-                "KQAG_DATABASE_URL": database_url,
+                "SQAG_DATABASE_URL": database_url,
             },
             backup_restore_evidence_status="passed",
             hosted_observability_evidence_status="passed",
@@ -287,7 +287,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             {
                 "KQAG_STORAGE_MODE": "database",
                 "KQAG_ARTIFACT_STORAGE_MODE": "object",
-                "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+                "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
             },
             backup_restore_evidence_status="passed",
             hosted_observability_evidence_status="passed",
@@ -306,7 +306,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             {
                 "KQAG_STORAGE_MODE": "database",
                 "KQAG_ARTIFACT_STORAGE_MODE": "object",
-                "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+                "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
             },
             backup_restore_evidence_status="passed",
             hosted_observability_evidence_status="passed",
@@ -331,7 +331,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             {
                 "KQAG_STORAGE_MODE": "database",
                 "KQAG_ARTIFACT_STORAGE_MODE": "object",
-                "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+                "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
             },
             backup_restore_evidence_status="passed",
             hosted_observability_evidence_status="passed",
@@ -359,7 +359,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             {
                 "KQAG_STORAGE_MODE": "database",
                 "KQAG_ARTIFACT_STORAGE_MODE": "object",
-                "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+                "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
             },
             backup_restore_evidence_status="passed",
             hosted_observability_evidence_status="passed",
@@ -384,7 +384,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             {
                 "KQAG_STORAGE_MODE": "database",
                 "KQAG_ARTIFACT_STORAGE_MODE": "object",
-                "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+                "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
                 "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
                 "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
                 "KQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
@@ -410,7 +410,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         env = {
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
             "SQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
@@ -439,7 +439,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         env = {
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
             "SQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
@@ -476,7 +476,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         env = {
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "KQAG_DATABASE_URL": private_url,
+            "SQAG_DATABASE_URL": private_url,
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
             "SQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
@@ -513,7 +513,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         env = {
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "KQAG_DATABASE_URL": private_url,
+            "SQAG_DATABASE_URL": private_url,
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
             "SQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
@@ -549,7 +549,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         env = {
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "KQAG_DATABASE_URL": private_url,
+            "SQAG_DATABASE_URL": private_url,
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
             "SQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
@@ -586,7 +586,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         env = {
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "KQAG_DATABASE_URL": private_url,
+            "SQAG_DATABASE_URL": private_url,
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
             "SQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
@@ -624,7 +624,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             {
                 "KQAG_STORAGE_MODE": "database",
                 "KQAG_ARTIFACT_STORAGE_MODE": "object",
-                "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+                "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
             },
             object_storage_evidence_status="passed",
             object_artifact_lifecycle_evidence_status="passed",
@@ -645,7 +645,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             "PYTHONPATH": str(ROOT),
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "KQAG_DATABASE_URL": private_url,
+            "SQAG_DATABASE_URL": private_url,
             "SQAG_LIVE_DATABASE_EVIDENCE": "1",
         }
         for name in ("COMSPEC", "SystemRoot", "TEMP", "TMP"):
@@ -679,7 +679,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         env = {
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test/path",
             "SQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
@@ -706,7 +706,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             {
                 "KQAG_STORAGE_MODE": "database",
                 "KQAG_ARTIFACT_STORAGE_MODE": "object",
-                "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+                "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
                 "SQAG_OBJECT_STORAGE_PROVIDER": "synthetic",
             },
             backup_restore_evidence_status="passed",
@@ -730,7 +730,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             "PYTHONPATH": str(ROOT),
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
         }
         for name in ("COMSPEC", "SystemRoot", "TEMP", "TMP"):
             if os.environ.get(name):
@@ -773,7 +773,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             "PYTHONPATH": str(ROOT),
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
         }
         for name in ("COMSPEC", "SystemRoot", "TEMP", "TMP"):
             if os.environ.get(name):
@@ -825,7 +825,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             {
                 "KQAG_STORAGE_MODE": "database",
                 "KQAG_ARTIFACT_STORAGE_MODE": "database",
-                "KQAG_DATABASE_URL": database_url,
+                "SQAG_DATABASE_URL": database_url,
             },
             backup_restore_evidence_status="passed",
             hosted_observability_evidence_status="passed",
@@ -843,7 +843,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             {
                 "KQAG_STORAGE_MODE": "database",
                 "KQAG_ARTIFACT_STORAGE_MODE": "database",
-                "KQAG_DATABASE_URL": database_url,
+                "SQAG_DATABASE_URL": database_url,
             },
             backup_restore_evidence_status="passed",
             hosted_observability_evidence_status="passed",
@@ -877,7 +877,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             {
                 "KQAG_STORAGE_MODE": "database",
                 "KQAG_ARTIFACT_STORAGE_MODE": "database",
-                "KQAG_DATABASE_URL": database_url,
+                "SQAG_DATABASE_URL": database_url,
             },
             backup_restore_evidence_status="passed",
             hosted_observability_evidence_status="passed",
@@ -901,7 +901,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             "PYTHONPATH": str(ROOT),
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "database",
-            "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
         }
         for name in ("COMSPEC", "SystemRoot", "TEMP", "TMP"):
             if os.environ.get(name):
@@ -946,7 +946,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             "PYTHONPATH": str(ROOT),
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "database",
-            "KQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
         }
         for name in ("COMSPEC", "SystemRoot", "TEMP", "TMP"):
             if os.environ.get(name):
@@ -996,7 +996,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             {
                 "KQAG_STORAGE_MODE": "database",
                 "KQAG_ARTIFACT_STORAGE_MODE": "database",
-                "KQAG_DATABASE_URL": database_url,
+                "SQAG_DATABASE_URL": database_url,
             }
         )
 

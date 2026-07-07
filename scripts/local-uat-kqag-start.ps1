@@ -115,7 +115,7 @@ Set-ProcessEnv -Name "KQAG_PLATFORM_LAUNCH_MODE" -Value "platform"
 Set-ProcessEnv -Name "KQAG_PLATFORM_BASE_URL" -Value $PlatformBaseUrl
 Set-ProcessEnv -Name "KQAG_STORAGE_MODE" -Value "database"
 Set-ProcessEnv -Name "KQAG_ARTIFACT_STORAGE_MODE" -Value "database"
-Set-ProcessEnv -Name "KQAG_DATABASE_URL" -Value $KqagDatabaseUrl
+Set-ProcessEnv -Name "SQAG_DATABASE_URL" -Value $KqagDatabaseUrl
 Set-ProcessEnv -Name "QUOTE_DATA_ROOT" -Value $dataRoot
 Set-ProcessEnv -Name "QUOTE_OUTPUT_ROOT" -Value $outputRoot
 Set-ProcessEnv -Name "QUOTE_TMP_ROOT" -Value $tmpRoot

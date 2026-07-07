@@ -39,7 +39,7 @@ class LocalUatHelperTest(unittest.TestCase):
             "KQAG_PLATFORM_BASE_URL",
             "KQAG_STORAGE_MODE",
             "KQAG_ARTIFACT_STORAGE_MODE",
-            "KQAG_DATABASE_URL",
+            "SQAG_DATABASE_URL",
             "QUOTE_DATA_ROOT",
             "QUOTE_OUTPUT_ROOT",
             "QUOTE_TMP_ROOT",
@@ -56,7 +56,7 @@ class LocalUatHelperTest(unittest.TestCase):
         self.assertIn("PLATFORM_KQAG_APP_BASE_URL=http://127.0.0.1:", script)
 
         self.assertNotRegex(script, r"Write-(?:Host|Output).*SESSION_SECRET")
-        self.assertNotRegex(script, r"Write-(?:Host|Output).*KQAG_DATABASE_URL")
+        self.assertNotRegex(script, r"Write-(?:Host|Output).*SQAG_DATABASE_URL")
         self.assertNotRegex(script, re.compile(r"launch[_-]?token", re.IGNORECASE))
 
     def test_platform_uat_runbook_recommends_helper_without_removing_manual_fallback(self):

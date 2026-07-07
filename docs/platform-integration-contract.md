@@ -63,7 +63,7 @@ host secret manager or local UAT process environment and must not be committed.
 - `SESSION_SECRET`
 - `KQAG_STORAGE_MODE`
 - `KQAG_ARTIFACT_STORAGE_MODE`
-- `KQAG_DATABASE_URL`
+- `SQAG_DATABASE_URL`
 
 For hosted/protected/deploy readiness, KQAG expects workspace-owned database
 app records plus object storage for generated artifact bytes:

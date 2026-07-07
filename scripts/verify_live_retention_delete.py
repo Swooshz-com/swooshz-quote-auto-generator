@@ -56,7 +56,7 @@ ACTIVE_OBJECT_ENV_NAMES = [
 ]
 REQUIRED_ENV_NAMES = [
     LIVE_RETENTION_DELETE_ENV_NAME,
-    webapp.KQAG_DATABASE_URL_ENV_NAME,
+    webapp.SQAG_DATABASE_URL_ENV_NAME,
     *ACTIVE_OBJECT_ENV_NAMES,
 ]
 TRUE_VALUES = {"1", "true", "yes", "on", "run", "enabled"}
@@ -465,7 +465,7 @@ def _run_drill(
     migration_applier: MigrationApplier,
 ) -> tuple[dict[str, bool], list[str], int, int, int]:
     ids = _synthetic_ids()
-    database_url = _clean(env.get(webapp.KQAG_DATABASE_URL_ENV_NAME))
+    database_url = _clean(env.get(webapp.SQAG_DATABASE_URL_ENV_NAME))
     storage = None
     backend = None
     metadata = None
@@ -607,7 +607,7 @@ def run_verification(
     live_opt_in_enabled = _enabled(effective_env)
     checks = _default_checks(
         live_opt_in_enabled=live_opt_in_enabled,
-        database_present=_present(effective_env, webapp.KQAG_DATABASE_URL_ENV_NAME),
+        database_present=_present(effective_env, webapp.SQAG_DATABASE_URL_ENV_NAME),
         object_present=all(_present(effective_env, name) for name in ACTIVE_OBJECT_ENV_NAMES),
     )
 

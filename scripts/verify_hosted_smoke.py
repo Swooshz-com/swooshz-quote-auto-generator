@@ -354,7 +354,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
         "KQAG_PLATFORM_BASE_URL": "https://platform.example.test",
         "KQAG_STORAGE_MODE": "database",
         "KQAG_ARTIFACT_STORAGE_MODE": "database",
-        "KQAG_DATABASE_URL": database_url,
+        "SQAG_DATABASE_URL": database_url,
         "QUOTE_DATA_ROOT": str(run_root / "data"),
         "QUOTE_OUTPUT_ROOT": str(run_root / "output"),
         "QUOTE_TMP_ROOT": str(run_root / "tmp"),

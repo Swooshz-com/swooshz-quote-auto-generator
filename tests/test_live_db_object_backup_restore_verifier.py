@@ -27,7 +27,7 @@ def load_verifier():
 def complete_env() -> dict[str, str]:
     return {
         "SQAG_LIVE_DB_OBJECT_BACKUP_RESTORE_EVIDENCE": "1",
-        "KQAG_DATABASE_URL": "ACTIVE_DB_TARGET_MARKER_A",
+        "SQAG_DATABASE_URL": "ACTIVE_DB_TARGET_MARKER_A",
         "SQAG_OBJECT_STORAGE_PROVIDER": "ACTIVE_OBJECT_PROVIDER_MARKER_A",
         "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "ACTIVE_OBJECT_ENDPOINT_MARKER_A",
         "SQAG_OBJECT_STORAGE_BUCKET": "ACTIVE_OBJECT_BUCKET_MARKER_A",
@@ -346,7 +346,7 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
 
         self.assertEqual(report["status"], "blocked")
         self.assertFalse(report["live_db_object_backup_restore_evidence_supported"])
-        self.assertIn("KQAG_DATABASE_URL", report["missing_env_names"])
+        self.assertIn("SQAG_DATABASE_URL", report["missing_env_names"])
         self.assertIn("SQAG_RESTORE_DATABASE_URL", report["missing_env_names"])
         self.assertIn("blocked_isolated_restore_target_missing", report["blockers"])
         self.assertIn("blocked_backup_restore_decision_missing", report["blockers"])
@@ -359,7 +359,7 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
     def test_restore_targets_matching_active_targets_are_blocked(self):
         verifier = load_verifier()
         env = complete_env()
-        env["SQAG_RESTORE_DATABASE_URL"] = env["KQAG_DATABASE_URL"]
+        env["SQAG_RESTORE_DATABASE_URL"] = env["SQAG_DATABASE_URL"]
         env["SQAG_RESTORE_OBJECT_STORAGE_ENDPOINT_URL"] = env["SQAG_OBJECT_STORAGE_ENDPOINT_URL"]
         env["SQAG_RESTORE_OBJECT_STORAGE_BUCKET"] = env["SQAG_OBJECT_STORAGE_BUCKET"]
 
@@ -370,14 +370,14 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
         self.assertIn("blocked_isolated_restore_target_missing", report["blockers"])
         self.assertFalse(report["checks"]["isolated_restore_target_available"])
         self.assertFalse(report["live_db_object_backup_restore_evidence_supported"])
-        self.assertNotIn(env["KQAG_DATABASE_URL"], text)
+        self.assertNotIn(env["SQAG_DATABASE_URL"], text)
         self.assertNotIn(env["SQAG_OBJECT_STORAGE_BUCKET"], text)
         self.assertNotIn(env["SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY"], text)
 
     def test_restore_database_target_matching_active_target_is_blocked(self):
         verifier = load_verifier()
         env = complete_env()
-        env["SQAG_RESTORE_DATABASE_URL"] = env["KQAG_DATABASE_URL"]
+        env["SQAG_RESTORE_DATABASE_URL"] = env["SQAG_DATABASE_URL"]
 
         report = verifier.run_verification(env=env)
 
@@ -670,7 +670,7 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
         env = complete_env()
         env.update(
             {
-                "KQAG_DATABASE_URL": "PRIVATE_ACTIVE_DB_URL_MARKER",
+                "SQAG_DATABASE_URL": "PRIVATE_ACTIVE_DB_URL_MARKER",
                 "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "PRIVATE_ACTIVE_ENDPOINT_MARKER",
                 "SQAG_OBJECT_STORAGE_BUCKET": "PRIVATE_ACTIVE_BUCKET_MARKER",
                 "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "PRIVATE_ACTIVE_ACCESS_MARKER",

@@ -3424,7 +3424,7 @@ class WebappServerTest(unittest.TestCase):
             env = self.platform_launch_env(
                 KQAG_STORAGE_MODE="database",
                 KQAG_ARTIFACT_STORAGE_MODE="database",
-                KQAG_DATABASE_URL=database_url,
+                SQAG_DATABASE_URL=database_url,
                 QUOTE_DATA_ROOT=str(tmp_path / "data"),
                 QUOTE_OUTPUT_ROOT=str(tmp_path / "output"),
                 QUOTE_TMP_ROOT=str(tmp_path / "tmp"),
@@ -8694,7 +8694,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
             env = self.platform_launch_env(
                 KQAG_STORAGE_MODE="database",
                 KQAG_ARTIFACT_STORAGE_MODE="database",
-                KQAG_DATABASE_URL=database_url,
+                SQAG_DATABASE_URL=database_url,
                 QUOTE_OUTPUT_ROOT=str(output_root),
                 QUOTE_LOG_ROOT=str(root / "logs"),
             )
@@ -19248,14 +19248,14 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
 
         with tempfile.TemporaryDirectory() as tmp:
             database_url = f"sqlite:///{(Path(tmp) / 'missing-migration.sqlite3').as_posix()}"
-            with mock.patch.dict(os.environ, {"KQAG_STORAGE_MODE": "database", "KQAG_DATABASE_URL": database_url}, clear=True):
+            with mock.patch.dict(os.environ, {"KQAG_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}, clear=True):
                 with self.assertRaises(webapp.KqagStorageAccessError) as missing_migration:
                     webapp.app_storage_for_auth_session(platform_session)
         self.assertEqual(missing_migration.exception.status, 503)
         self.assertEqual(missing_migration.exception.reason, "storage_database_not_migrated")
 
         postgres_url = "postgres" + "ql://redacted-db-url"
-        with mock.patch.dict(os.environ, {"KQAG_STORAGE_MODE": "database", "KQAG_DATABASE_URL": postgres_url}, clear=True), mock.patch(
+        with mock.patch.dict(os.environ, {"KQAG_STORAGE_MODE": "database", "SQAG_DATABASE_URL": postgres_url}, clear=True), mock.patch(
             "webapp.server.postgres_driver_connection_factory",
             side_effect=webapp.KqagStorageAccessError(
                 "KQAG Postgres database driver is not available.",
@@ -19271,7 +19271,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
     def test_database_storage_scopes_profiles_pricing_and_sessions_by_platform_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:
             database_url = f"sqlite:///{(Path(tmp) / 'kqag-storage.sqlite3').as_posix()}"
-            env = {"KQAG_STORAGE_MODE": "database", "KQAG_DATABASE_URL": database_url}
+            env = {"KQAG_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
             with mock.patch.dict(os.environ, env, clear=True):
                 webapp.apply_kqag_storage_migrations(database_url)
                 workspace_a = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-a", membership_role="operator"))
@@ -19354,7 +19354,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             env = {
                 "KQAG_STORAGE_MODE": "database",
                 "KQAG_ARTIFACT_STORAGE_MODE": "database",
-                "KQAG_DATABASE_URL": database_url,
+                "SQAG_DATABASE_URL": database_url,
                 "QUOTE_DATA_ROOT": str(root / "data"),
                 "QUOTE_OUTPUT_ROOT": str(root / "output"),
                 "QUOTE_TMP_ROOT": str(root / "tmp"),
@@ -19399,7 +19399,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             env = {
                 "KQAG_STORAGE_MODE": "database",
                 "KQAG_ARTIFACT_STORAGE_MODE": "database",
-                "KQAG_DATABASE_URL": database_url,
+                "SQAG_DATABASE_URL": database_url,
             }
             with mock.patch.dict(os.environ, env, clear=True):
                 webapp.apply_kqag_storage_migrations(database_url)
@@ -19418,7 +19418,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             database_url = f"sqlite:///{(root / 'kqag-storage.sqlite3').as_posix()}"
             local_profiles_root = root / "local-profiles"
             write_test_profile_pack(local_profiles_root, "local-only-profile", "local-pricing")
-            env = {"KQAG_STORAGE_MODE": "database", "KQAG_DATABASE_URL": database_url}
+            env = {"KQAG_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
             with (
                 mock.patch.dict(os.environ, env, clear=True),
                 mock.patch.object(webapp, "profiles_root", return_value=local_profiles_root),
@@ -19451,7 +19451,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             env = {
                 "KQAG_STORAGE_MODE": "database",
                 "KQAG_ARTIFACT_STORAGE_MODE": "database",
-                "KQAG_DATABASE_URL": database_url,
+                "SQAG_DATABASE_URL": database_url,
                 "QUOTE_DATA_ROOT": str(root / "data"),
                 "QUOTE_OUTPUT_ROOT": str(root / "output"),
                 "QUOTE_TMP_ROOT": str(root / "tmp"),
@@ -19492,7 +19492,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             env = {
                 "KQAG_STORAGE_MODE": "database",
                 "KQAG_ARTIFACT_STORAGE_MODE": "database",
-                "KQAG_DATABASE_URL": database_url,
+                "SQAG_DATABASE_URL": database_url,
                 "QUOTE_DATA_ROOT": str(root / "data"),
                 "QUOTE_OUTPUT_ROOT": str(root / "output"),
                 "QUOTE_TMP_ROOT": str(root / "tmp"),
@@ -19551,7 +19551,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 "unit_hint": "sqm",
                 "sale_unit_price": 20,
             })])
-            env = {"KQAG_STORAGE_MODE": "database", "KQAG_DATABASE_URL": database_url}
+            env = {"KQAG_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
             with (
                 mock.patch.dict(os.environ, env, clear=True),
                 mock.patch.object(webapp, "pricing_references_root", return_value=local_root),
@@ -19596,7 +19596,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             payload = payload_with_workspace_pricing("deleted-pricing")
             env = {
                 "KQAG_STORAGE_MODE": "database",
-                "KQAG_DATABASE_URL": database_url,
+                "SQAG_DATABASE_URL": database_url,
                 "QUOTE_DATA_ROOT": str(root / "data"),
                 "QUOTE_OUTPUT_ROOT": str(root / "output"),
                 "QUOTE_TMP_ROOT": str(root / "tmp"),
@@ -19664,7 +19664,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 "USER_TYPE": "admin",
                 "SESSION_SECRET": "test-session-secret",
                 "KQAG_STORAGE_MODE": "database",
-                "KQAG_DATABASE_URL": database_url,
+                "SQAG_DATABASE_URL": database_url,
             }
 
             with (
@@ -19716,7 +19716,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
     def test_database_storage_filters_quote_sessions_by_owner_role_and_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:
             database_url = f"sqlite:///{(Path(tmp) / 'kqag-storage.sqlite3').as_posix()}"
-            env = {"KQAG_STORAGE_MODE": "database", "KQAG_DATABASE_URL": database_url}
+            env = {"KQAG_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
             with mock.patch.dict(os.environ, env, clear=True):
                 webapp.apply_kqag_storage_migrations(database_url)
                 owner_storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-team", membership_role="operator", user_id="owner-user"))
@@ -19804,7 +19804,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         env = {
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "database",
-            "KQAG_DATABASE_URL": database_url,
+            "SQAG_DATABASE_URL": database_url,
         }
         with mock.patch.dict(os.environ, env, clear=True):
             webapp.apply_kqag_storage_migrations(database_url)
@@ -19895,7 +19895,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         env = {
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "database",
-            "KQAG_DATABASE_URL": database_url,
+            "SQAG_DATABASE_URL": database_url,
         }
         with mock.patch.dict(os.environ, env, clear=True):
             webapp.apply_kqag_storage_migrations(database_url)
@@ -20005,7 +20005,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "kqag-storage.sqlite3"
             database_url = f"sqlite:///{db_path.as_posix()}"
-            env = {"KQAG_STORAGE_MODE": "database", "KQAG_DATABASE_URL": database_url}
+            env = {"KQAG_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
             with mock.patch.dict(os.environ, env, clear=True):
                 webapp.apply_kqag_storage_migrations(database_url)
                 storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-token-check"))
@@ -20047,7 +20047,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             payload = valid_payload()
             payload["quote_session"] = {"session_id": "quote-local-artifacts"}
             result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-local-artifacts/files/quotation.xlsx"}]}
-            env = {"KQAG_STORAGE_MODE": "database", "KQAG_DATABASE_URL": database_url}
+            env = {"KQAG_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
             with mock.patch.dict(os.environ, env, clear=True):
                 webapp.apply_kqag_storage_migrations(database_url)
                 storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-local-artifacts"))
@@ -20175,7 +20175,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             "APP_MODE": "deploy",
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "KQAG_DATABASE_URL": database_url,
+            "SQAG_DATABASE_URL": database_url,
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
             "SQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
@@ -20242,7 +20242,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
 
         with tempfile.TemporaryDirectory() as tmp:
             database_url = f"sqlite:///{(Path(tmp) / 'missing-artifact-migration.sqlite3').as_posix()}"
-            env = {"KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "database", "KQAG_DATABASE_URL": database_url}
+            env = {"KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
             with mock.patch.dict(os.environ, env, clear=True):
                 with webapp.sqlite_storage_connection(database_url) as connection:
                     connection.executescript(webapp.KQAG_STORAGE_SQL)
@@ -20264,7 +20264,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             payload = valid_payload()
             payload["quote_session"] = {"session_id": "quote-artifact"}
             result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-artifact/files/quotation.xlsx"}]}
-            env = {"KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "database", "KQAG_DATABASE_URL": database_url}
+            env = {"KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
             with mock.patch.dict(os.environ, env, clear=True):
                 webapp.apply_kqag_storage_migrations(database_url)
                 workspace_a = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-artifact-a"))
@@ -20293,7 +20293,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             payload = valid_payload()
             payload["quote_session"] = {"session_id": "quote-http-artifact"}
             result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-http-artifact/files/quotation.xlsx"}]}
-            env = {**self.deploy_auth_env(), "KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "database", "KQAG_DATABASE_URL": database_url}
+            env = {**self.deploy_auth_env(), "KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
             with mock.patch.dict(os.environ, env, clear=True):
                 webapp.apply_kqag_storage_migrations(database_url)
                 storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-http-artifact"))
@@ -20329,7 +20329,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         payload = valid_payload()
         payload["quote_session"] = {"session_id": "quote-db-delete"}
         result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-db-delete/files/quotation.xlsx"}]}
-        env = {**self.deploy_auth_env(), "KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "database", "KQAG_DATABASE_URL": database_url}
+        env = {**self.deploy_auth_env(), "KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
         with mock.patch.dict(os.environ, env, clear=True):
             webapp.apply_kqag_storage_migrations(database_url)
             storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-db-delete"))
@@ -20402,7 +20402,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         output_dir = tmp_path / "out" / "job-db-stale"
         output_dir.mkdir(parents=True)
         (output_dir / "quotation.xlsx").write_bytes(b"xlsx-db-stale")
-        env = {**self.deploy_auth_env(), "KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "database", "KQAG_DATABASE_URL": database_url}
+        env = {**self.deploy_auth_env(), "KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
         with mock.patch.dict(os.environ, env, clear=True):
             webapp.apply_kqag_storage_migrations(database_url)
             storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-db-stale"))
@@ -20470,7 +20470,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             **self.deploy_auth_env(),
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "KQAG_DATABASE_URL": database_url,
+            "SQAG_DATABASE_URL": database_url,
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
             "SQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
@@ -20554,7 +20554,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             **self.deploy_auth_env(),
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "KQAG_DATABASE_URL": database_url,
+            "SQAG_DATABASE_URL": database_url,
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
             "SQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
@@ -20597,7 +20597,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             **self.deploy_auth_env(),
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "KQAG_DATABASE_URL": database_url,
+            "SQAG_DATABASE_URL": database_url,
         }
         original_retrieve = backend.retrieve_artifact
 
@@ -20638,7 +20638,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             **self.deploy_auth_env(),
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "KQAG_DATABASE_URL": database_url,
+            "SQAG_DATABASE_URL": database_url,
         }
         with (
             mock.patch.dict(os.environ, env, clear=True),
@@ -20672,7 +20672,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             **self.deploy_auth_env(),
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "KQAG_DATABASE_URL": database_url,
+            "SQAG_DATABASE_URL": database_url,
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
             "SQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
@@ -20732,7 +20732,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             **self.deploy_auth_env(),
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "KQAG_DATABASE_URL": database_url,
+            "SQAG_DATABASE_URL": database_url,
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
             "SQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
@@ -20784,7 +20784,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             **self.deploy_auth_env(),
             "KQAG_STORAGE_MODE": "database",
             "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "KQAG_DATABASE_URL": database_url,
+            "SQAG_DATABASE_URL": database_url,
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
             "SQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
@@ -20812,7 +20812,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "kqag-storage.sqlite3"
             database_url = f"sqlite:///{db_path.as_posix()}"
-            env = {"KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "database", "KQAG_DATABASE_URL": database_url}
+            env = {"KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
             with mock.patch.dict(os.environ, env, clear=True):
                 webapp.apply_kqag_storage_migrations(database_url)
                 workspace_a = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-asset-a"))
@@ -20883,7 +20883,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 "draft_state": {"launchToken": raw_launch_token, "output_dir": "<private-output-root>", "safeNote": "retained"},
             }
             result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-token-artifact/files/quotation.xlsx"}]}
-            env = {"KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "database", "KQAG_DATABASE_URL": database_url}
+            env = {"KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
             with mock.patch.dict(os.environ, env, clear=True):
                 webapp.apply_kqag_storage_migrations(database_url)
                 storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-token-artifact"))
@@ -20947,7 +20947,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             env = {
                 "KQAG_STORAGE_MODE": "database",
                 "KQAG_ARTIFACT_STORAGE_MODE": "database",
-                "KQAG_DATABASE_URL": database_url,
+                "SQAG_DATABASE_URL": database_url,
                 "QUOTE_DATA_ROOT": str(tmp_path / "data"),
                 "QUOTE_OUTPUT_ROOT": str(tmp_path / "output"),
                 "QUOTE_TMP_ROOT": str(tmp_path / "tmp"),
@@ -22499,7 +22499,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         env = {
             "APP_MODE": "deploy",
             "KQAG_ARTIFACT_STORAGE_MODE": "database",
-            "KQAG_DATABASE_URL": database_url,
+            "SQAG_DATABASE_URL": database_url,
         }
         auth_session = self.platform_auth_session("workspace-deploy-redaction")
         with mock.patch.dict(os.environ, env, clear=False):

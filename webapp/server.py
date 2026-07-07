@@ -41,7 +41,7 @@ import zipfile
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import parse_qs, parse_qsl, quote, urlencode, unquote, urlparse
 from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
@@ -281,7 +281,7 @@ QUOTE_LOG_ROOT_ENV_NAME = "QUOTE_LOG_ROOT"
 QUOTE_DATA_ROOT_ENV_NAME = "QUOTE_DATA_ROOT"
 KQAG_STORAGE_MODE_ENV_NAME = "KQAG_STORAGE_MODE"
 KQAG_ARTIFACT_STORAGE_MODE_ENV_NAME = "KQAG_ARTIFACT_STORAGE_MODE"
-KQAG_DATABASE_URL_ENV_NAME = "KQAG_DATABASE_URL"
+SQAG_DATABASE_URL_ENV_NAME = "SQAG_DATABASE_URL"
 SQAG_LIVE_DATABASE_EVIDENCE_ENV_NAME = "SQAG_LIVE_DATABASE_EVIDENCE"
 POSTGRES_COMPATIBLE_DATABASE_SCHEMES = {"postgres", "postgresql"}
 SQLITE_DATABASE_SCHEMES = {"sqlite"}
@@ -1387,7 +1387,11 @@ def configured_object_storage_backend() -> ObjectStorageBackend:
 
 
 def configured_database_url() -> str:
-    return clean_text(read_dotenv_value(KQAG_DATABASE_URL_ENV_NAME))
+    return clean_text(read_dotenv_value(SQAG_DATABASE_URL_ENV_NAME))
+
+
+def database_url_from_env(env: Mapping[str, str]) -> str:
+    return clean_text(env.get(SQAG_DATABASE_URL_ENV_NAME) or "")
 
 
 def database_family_from_url(database_url: str) -> str:
@@ -1962,14 +1966,14 @@ def deploy_uat_preflight_status() -> dict[str, Any]:
 
 
 def configured_database_scheme() -> str:
-    raw = clean_text(read_dotenv_value(KQAG_DATABASE_URL_ENV_NAME))
+    raw = configured_database_url()
     if not raw:
         return ""
     return clean_text(urlparse(raw).scheme).lower()
 
 
 def configured_database_family() -> str:
-    return database_family_from_url(read_dotenv_value(KQAG_DATABASE_URL_ENV_NAME))
+    return database_family_from_url(configured_database_url())
 
 
 def readiness_surface(
@@ -2203,7 +2207,7 @@ def production_database_evidence_summary(
         "status": normalized_status,
         "verifier": "scripts/verify_production_database_provider.py",
         "required_env_names": [
-            KQAG_DATABASE_URL_ENV_NAME,
+            SQAG_DATABASE_URL_ENV_NAME,
             SQAG_LIVE_DATABASE_EVIDENCE_ENV_NAME,
         ],
         "database_family": database_family,
@@ -2260,7 +2264,7 @@ def live_db_object_backup_restore_evidence_summary(
         "verifier": "scripts/verify_live_db_object_backup_restore.py",
         "required_env_names": [
             "SQAG_LIVE_DB_OBJECT_BACKUP_RESTORE_EVIDENCE",
-            KQAG_DATABASE_URL_ENV_NAME,
+            SQAG_DATABASE_URL_ENV_NAME,
             OBJECT_STORAGE_PROVIDER_ENV_NAME,
             OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME,
             OBJECT_STORAGE_BUCKET_ENV_NAME,
@@ -2323,7 +2327,7 @@ def live_retention_delete_evidence_summary(
         "verifier": "scripts/verify_live_retention_delete.py",
         "required_env_names": [
             "SQAG_LIVE_RETENTION_DELETE_EVIDENCE",
-            KQAG_DATABASE_URL_ENV_NAME,
+            SQAG_DATABASE_URL_ENV_NAME,
             OBJECT_STORAGE_PROVIDER_ENV_NAME,
             OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME,
             OBJECT_STORAGE_BUCKET_ENV_NAME,

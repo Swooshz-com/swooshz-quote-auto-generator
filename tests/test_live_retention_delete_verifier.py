@@ -29,7 +29,7 @@ def load_verifier():
 def complete_env() -> dict[str, str]:
     return {
         "SQAG_LIVE_RETENTION_DELETE_EVIDENCE": "1",
-        "KQAG_DATABASE_URL": "REDACTED_DB_TARGET_MARKER",
+        "SQAG_DATABASE_URL": "REDACTED_DB_TARGET_MARKER",
         "SQAG_OBJECT_STORAGE_PROVIDER": "REDACTED_PROVIDER_MARKER",
         "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "REDACTED_ENDPOINT_MARKER",
         "SQAG_OBJECT_STORAGE_BUCKET": "REDACTED_BUCKET_MARKER",
@@ -271,7 +271,7 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
 
         self.assertEqual(report["status"], "blocked")
         self.assertIn("SQAG_LIVE_RETENTION_DELETE_EVIDENCE", report["missing_env_names"])
-        self.assertIn("KQAG_DATABASE_URL", report["missing_env_names"])
+        self.assertIn("SQAG_DATABASE_URL", report["missing_env_names"])
         self.assertFalse(report["live_retention_delete_evidence_supported"])
         self.assertEqual(report["privacy"]["output"], "metadata-only")
         self.assertNotIn("REDACTED_DB_TARGET_MARKER", text)

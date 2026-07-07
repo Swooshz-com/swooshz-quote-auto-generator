@@ -75,7 +75,7 @@ RESTORE_OBJECT_ENV_NAMES = [
 ]
 REQUIRED_ENV_NAMES = [
     LIVE_DB_OBJECT_BACKUP_RESTORE_ENV_NAME,
-    webapp.KQAG_DATABASE_URL_ENV_NAME,
+    webapp.SQAG_DATABASE_URL_ENV_NAME,
     *ACTIVE_OBJECT_ENV_NAMES,
     RESTORE_DATABASE_URL_ENV_NAME,
     *RESTORE_OBJECT_ENV_NAMES,
@@ -146,7 +146,7 @@ def _restore_object_target(env: Mapping[str, str]) -> tuple[str, str, str]:
 
 
 def _database_targets_distinct(env: Mapping[str, str]) -> bool:
-    active = _clean(env.get(webapp.KQAG_DATABASE_URL_ENV_NAME))
+    active = _clean(env.get(webapp.SQAG_DATABASE_URL_ENV_NAME))
     restore = _clean(env.get(RESTORE_DATABASE_URL_ENV_NAME))
     return bool(active and restore and active != restore)
 
@@ -547,7 +547,7 @@ def _run_drill(
     migration_applier: MigrationApplier,
 ) -> tuple[dict[str, bool], list[str], int, int, int, int]:
     ids = _synthetic_ids()
-    active_db_url = _clean(env.get(webapp.KQAG_DATABASE_URL_ENV_NAME))
+    active_db_url = _clean(env.get(webapp.SQAG_DATABASE_URL_ENV_NAME))
     restore_db_url = _clean(env.get(RESTORE_DATABASE_URL_ENV_NAME))
     active_storage_a = active_storage_b = restore_storage_a = restore_storage_b = None
     active_backend = restore_backend = None
@@ -746,7 +746,7 @@ def run_verification(
         live_opt_in_enabled=live_opt_in_enabled,
         decision_present=decision_present,
         window_present=window_present,
-        active_database_present=_present(effective_env, webapp.KQAG_DATABASE_URL_ENV_NAME),
+        active_database_present=_present(effective_env, webapp.SQAG_DATABASE_URL_ENV_NAME),
         restore_database_present=_present(effective_env, RESTORE_DATABASE_URL_ENV_NAME),
         database_targets_distinct=database_targets_distinct,
         active_object_present=all(_present(effective_env, name) for name in ACTIVE_OBJECT_ENV_NAMES),

@@ -46,7 +46,7 @@ The deploy/auth surface is already represented in `.env.example` and
   artifact/BLOB mode is local-UAT/synthetic evidence only and cannot satisfy
   hosted/protected/deploy readiness; generated XLSX/PDF bytes require object
   storage.
-- `KQAG_DATABASE_URL`: database connection configured through the host secret
+- `SQAG_DATABASE_URL`: database connection configured through the host secret
   manager only.
 - `KQAG_PLATFORM_LAUNCH_MODE` and `KQAG_PLATFORM_BASE_URL`: platform/workspace
   launch context for protected hosted use.
@@ -96,7 +96,7 @@ Use this shape only for local/offline validation of the gated UAT boundary:
 - `KQAG_STORAGE_MODE=database`.
 - `KQAG_ARTIFACT_STORAGE_MODE=object` for hosted/protected/deploy readiness
   evidence; `database` is allowed only for local-UAT/synthetic negative tests.
-- `KQAG_DATABASE_URL` set through the host secret manager only.
+- `SQAG_DATABASE_URL` set through the host secret manager only.
 - Platform/workspace launch context for protected hosted use.
 - OIDC configuration only when using the OIDC deploy-auth fallback path.
 - `AUTH_ALLOWED_EMAILS` and/or `AUTH_ALLOWED_DOMAINS` set when using OIDC.
@@ -179,7 +179,7 @@ while checking env values.
 
 - [ ] Confirm required env names are present without printing values:
       `APP_MODE`, `AUTH_REQUIRED`, `SESSION_SECRET`, `KQAG_STORAGE_MODE`,
-      `KQAG_ARTIFACT_STORAGE_MODE`, `KQAG_DATABASE_URL`,
+      `KQAG_ARTIFACT_STORAGE_MODE`, `SQAG_DATABASE_URL`,
       `KQAG_PLATFORM_LAUNCH_MODE`, `KQAG_PLATFORM_BASE_URL`, optional OIDC
       names if used, allowlist settings, tester role, and runtime
       housekeeping root envs.

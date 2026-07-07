@@ -34,7 +34,7 @@ REQUIRED_ENV_NAMES = [
     "SESSION_SECRET",
     "KQAG_STORAGE_MODE",
     "KQAG_ARTIFACT_STORAGE_MODE",
-    "KQAG_DATABASE_URL",
+    "SQAG_DATABASE_URL",
     "KQAG_PLATFORM_LAUNCH_MODE",
     "KQAG_PLATFORM_BASE_URL",
     "AUTH_ALLOWED_EMAILS",
@@ -50,7 +50,7 @@ REQUIRED_ENV_NAMES = [
 
 HOST_SECRET_MANAGER_ONLY_ENV_NAMES = [
     "SESSION_SECRET",
-    "KQAG_DATABASE_URL",
+    "SQAG_DATABASE_URL",
     "KQAG_PLATFORM_BASE_URL",
     "OIDC_ISSUER_URL",
     "OIDC_CLIENT_ID",
@@ -145,7 +145,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
         "APP_MODE": "deploy",
         "KQAG_STORAGE_MODE": "database",
         "KQAG_ARTIFACT_STORAGE_MODE": "database",
-        "KQAG_DATABASE_URL": f"sqlite:///{(run_root / 'readiness.sqlite3').as_posix()}",
+        "SQAG_DATABASE_URL": f"sqlite:///{(run_root / 'readiness.sqlite3').as_posix()}",
     }
     with temporary_env(readiness_env):
         readiness = webapp.production_readiness_status(

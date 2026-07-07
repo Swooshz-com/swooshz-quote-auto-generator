@@ -16,7 +16,7 @@ from webapp import server as webapp
 def main() -> int:
     database_url = webapp.configured_database_url()
     if not database_url:
-        print("KQAG_DATABASE_URL is required for the storage migration.", file=sys.stderr)
+        print("SQAG_DATABASE_URL is required for the storage migration.", file=sys.stderr)
         return 2
     webapp.apply_kqag_storage_migrations(database_url)
     print("KQAG storage migrations applied.")
