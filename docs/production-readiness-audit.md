@@ -108,18 +108,30 @@ is a metadata-only checker that recognizes Postgres-compatible URL schemes
 without printing DB URL values, confirms the repo-declared runtime-required
 metadata tables, and can run explicit opt-in live Postgres/Neon evidence through
 the metadata adapter. It still fails closed by default and does not credit
-production readiness without operator-run live DB evidence. With
+production readiness without operator-run live DB evidence. On 2026-07-07,
+the existing guarded SQAG metadata migrations were applied through
+`scripts/migrate_kqag_storage.py` after an initial sanitized verifier pass
+reported the runtime schema missing. The verifier rerun then passed with
+`status=passed`, `database_family=postgres_compatible`,
+`live_database_evidence_enabled=true`, `test_injected_backend=false`,
+`live_database_evidence_supported=true`,
+`production_database_evidence_supported=true`, `connection_attempted=true`,
+runtime schema available, synthetic metadata CRUD verified, two-workspace
+isolation verified, object artifact metadata pairing verified,
+`cleanup_completed=true`, and `db_blob_artifact_rows_written=0`. With
 `SQAG_LIVE_DATABASE_EVIDENCE=1`, an operator supplies DB values outside Git/chat
 and the verifier uses synthetic namespaced metadata rows only to check schema,
 profile/pricing/session/object metadata CRUD, two-workspace isolation, object
 artifact metadata pairing, and cleanup. It does not require DB-BLOB artifact
 tables, does not store generated XLSX/PDF bytes in the DB, does not touch
 R2/object storage, and reports only sanitized booleans/counts/schema version.
-Passing this DB evidence can remove only the DB evidence blocker; production
-readiness remains false until live DB+object backup/restore, live retention/delete,
-hosted logging/monitoring, hosted smoke, production deployment operations, live
-Platform-to-SQAG launch smoke, session/business hardening, and final production
-audit are complete.
+No DB URL, hostname, username, password, connection string, provider value,
+object key, private path, tenant data, generated quote contents, or artifact
+bytes were committed or printed. Passing this DB evidence removes only the DB
+evidence blocker; `production_ready=false` remains until live DB+object
+backup/restore, live retention/delete, hosted logging/monitoring, hosted smoke,
+production deployment operations, live Platform-to-SQAG launch smoke,
+session/business hardening, and final production audit are complete.
 
 Current expected posture in local mode:
 
@@ -234,13 +246,13 @@ checksums, retention state, and audit data only.
 
 Neon/Postgres-compatible metadata storage is the production database direction.
 The runtime adapter boundary now exists for workspace-scoped profiles, pricing
-references, quote sessions, and object-artifact metadata, but it is not
-production-credited yet. `production_database_evidence` remains failed or
-not-run until a real operator-run verifier proves the app can use a
+references, quote sessions, and object-artifact metadata. A sanitized
+operator-run verifier on 2026-07-07 proved the app can use a
 Postgres-compatible database with the required workspace-scoped tables,
-object-artifact metadata, isolation behavior, and sanitized output. Live
-DB+object backup/restore evidence remains a later gate after live production DB
-evidence exists.
+object-artifact metadata, isolation behavior, synthetic metadata CRUD, object
+metadata pairing, cleanup, and sanitized output. The database evidence now
+credits only `production_database_evidence=passed`; live DB+object
+backup/restore evidence remains a later gate after live production DB evidence.
 
 `scripts/verify_live_object_storage_provider.py` is the opt-in live-provider
 evidence path. It uses the pinned S3-compatible SDK dependency set from
