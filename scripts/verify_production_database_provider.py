@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Metadata-only SQAG production database readiness boundary.
 
-This verifier intentionally does not connect to or mutate a live database while
-the app runtime remains SQLite-only. It reports the Postgres/Neon production DB
-gap without printing database URL values, hostnames, usernames, or passwords.
+This verifier is metadata-only by default. It performs live read-only
+Postgres/Neon-compatible schema checks only when explicitly enabled with
+SQAG_LIVE_DATABASE_EVIDENCE, and never prints database URL values, hostnames,
+usernames, or passwords.
 """
 
 from __future__ import annotations
@@ -28,27 +29,20 @@ PRODUCTION_METADATA_MIGRATION_PATHS = (
     ROOT / "migrations" / "001_platform_scoped_storage.sql",
     ROOT / "migrations" / "003_object_artifact_metadata.sql",
 )
-REQUIRED_METADATA_TABLES = {
-    "kqag_profiles": {"workspace_id", "profile_id", "payload_json"},
-    "kqag_pricing_references": {"workspace_id", "reference_id", "payload_json"},
-    "kqag_quote_sessions": {"workspace_id", "session_id", "metadata_json", "draft_files_json"},
-    "kqag_object_artifacts": {
-        "artifact_id",
-        "workspace_id",
-        "owner_type",
-        "owner_id",
-        "session_id",
-        "artifact_kind",
-        "filename",
-        "content_type",
-        "size_bytes",
-        "checksum_sha256",
-        "object_provider_type",
-        "object_key_ref",
-        "status",
-        "retention_status",
-    },
-}
+
+
+def runtime_required_metadata_tables() -> dict[str, set[str]]:
+    required: dict[str, set[str]] = {}
+    for table_map in (
+        webapp.KQAG_APP_METADATA_REQUIRED_COLUMNS,
+        webapp.KQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS,
+    ):
+        for table, columns in table_map.items():
+            required.setdefault(table, set()).update(columns)
+    return {table: set(columns) for table, columns in required.items()}
+
+
+REQUIRED_METADATA_TABLES = runtime_required_metadata_tables()
 
 
 def _clean(value: object) -> str:
@@ -88,8 +82,11 @@ def metadata_migration_status(paths: tuple[Path, ...] = PRODUCTION_METADATA_MIGR
     sql = "\n".join(sql_parts).lower()
     table_status: dict[str, dict[str, object]] = {}
     for table, required_columns in REQUIRED_METADATA_TABLES.items():
-        table_present = bool(re.search(rf"\bcreate\s+table\s+if\s+not\s+exists\s+{re.escape(table)}\b", sql))
-        missing_columns = sorted(column for column in required_columns if not re.search(rf"\b{re.escape(column)}\b", sql))
+        table_body = _metadata_table_declaration_body(sql, table)
+        table_present = table_body is not None
+        missing_columns = sorted(
+            column for column in required_columns if not table_body or not re.search(rf"\b{re.escape(column)}\b", table_body)
+        )
         table_status[table] = {
             "present": table_present,
             "missing_columns": missing_columns,
@@ -112,37 +109,54 @@ def metadata_migration_status(paths: tuple[Path, ...] = PRODUCTION_METADATA_MIGR
     }
 
 
-def postgres_schema_status(database_url: str) -> dict[str, object]:
-    required = REQUIRED_METADATA_TABLES
-    tables = set(required)
-    placeholders = ", ".join("?" for _ in tables)
-    with webapp.postgres_storage_connection(database_url) as connection:
-        rows = connection.execute(
-            f"select table_name, column_name from information_schema.columns where table_schema = current_schema() and table_name in ({placeholders})",
-            tuple(sorted(tables)),
-        ).fetchall()
+def _metadata_table_declaration_body(sql: str, table: str) -> str | None:
+    match = re.search(
+        rf"\bcreate\s+table\s+if\s+not\s+exists\s+{re.escape(table.lower())}\s*\((?P<body>.*?)\)\s*;",
+        sql,
+        flags=re.DOTALL,
+    )
+    if not match:
+        return None
+    return match.group("body")
+
+
+def schema_status_from_information_schema_rows(
+    rows: object,
+    required: Mapping[str, set[str]] | None = None,
+) -> dict[str, object]:
+    required_tables = {table: set(columns) for table, columns in (required or REQUIRED_METADATA_TABLES).items()}
     present: dict[str, set[str]] = {}
     for row in rows:
         table_name = _clean(row["table_name"])
         column_name = _clean(row["column_name"])
         if table_name and column_name:
             present.setdefault(table_name, set()).add(column_name)
-    missing_tables = sorted(table for table in required if table not in present)
+    missing_tables = sorted(table for table in required_tables if table not in present)
     missing_columns = {
         table: sorted(columns - present.get(table, set()))
-        for table, columns in required.items()
+        for table, columns in required_tables.items()
         if columns - present.get(table, set())
     }
     return {
         "schema_available": not missing_tables and not missing_columns,
         "required_tables": {
             table: {"present": table in present, "missing_columns": missing_columns.get(table, [])}
-            for table in sorted(required)
+            for table in sorted(required_tables)
         },
         "missing_tables": missing_tables,
         "missing_columns": missing_columns,
     }
 
+
+def postgres_schema_status(database_url: str) -> dict[str, object]:
+    tables = set(REQUIRED_METADATA_TABLES)
+    placeholders = ", ".join("?" for _ in tables)
+    with webapp.postgres_storage_connection(database_url) as connection:
+        rows = connection.execute(
+            f"select table_name, column_name from information_schema.columns where table_schema = current_schema() and table_name in ({placeholders})",
+            tuple(sorted(tables)),
+        ).fetchall()
+    return schema_status_from_information_schema_rows(rows)
 
 def run_verification(
     *,
