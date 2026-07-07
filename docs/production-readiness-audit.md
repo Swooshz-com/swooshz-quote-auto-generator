@@ -263,6 +263,18 @@ customer data, uploaded content, or secrets. Without a successful operator-run
 live provider verifier and the remaining production gates, `production_ready`
 remains false.
 
+`scripts/verify_live_db_object_backup_restore.py` is only a metadata-only
+preflight scaffold for the live DB+object backup/restore gate. It does not run
+backup, restore, database writes, object writes, or destructive operations. It
+checks required env names by presence only, compares active and restore targets
+without printing values, and reports sanitized blockers. Until an isolated
+restore database and isolated restore object target exist, it reports
+`blocked_isolated_restore_target_missing`. Until backup ownership and restore
+window decisions are recorded outside Git, it reports
+`blocked_backup_restore_decision_missing`. Even with those prerequisites
+present, live restore execution remains unimplemented and the production
+blocker stays open.
+
 The canonical object-storage provider and live-evidence env names use the
 `SQAG_` prefix. Legacy `KQAG_*` object-storage provider names are not aliases
 and do not silently satisfy live-provider evidence or readiness checks. Existing
