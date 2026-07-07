@@ -19,6 +19,7 @@ import verify_hosted_smoke
 import verify_object_artifact_lifecycle
 import verify_object_storage_contract
 import verify_live_object_storage_provider
+import verify_live_db_object_backup_restore
 import verify_production_database_provider
 
 
@@ -88,6 +89,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--with-production-database-evidence",
         action="store_true",
         help="Run the metadata-only Postgres/Neon production database readiness checker; it fails closed unless explicit live DB evidence succeeds.",
+    )
+    parser.add_argument(
+        "--with-live-db-object-backup-restore-evidence",
+        action="store_true",
+        help="Run the opt-in live DB+object backup/restore drill; it fails closed unless isolated restore targets and decision markers are present.",
     )
     return parser
 
@@ -162,6 +168,16 @@ def production_database_evidence_status(*, enabled: bool) -> str:
     return "passed" if report.get("status") == "passed" and report.get("production_database_evidence_supported") else "failed"
 
 
+def live_db_object_backup_restore_evidence_status(*, enabled: bool) -> str:
+    if not enabled:
+        return "not_run_by_checker"
+    try:
+        report = verify_live_db_object_backup_restore.run_verification()
+    except Exception:
+        return "failed"
+    return "passed" if report.get("status") == "passed" and report.get("live_db_object_backup_restore_evidence_supported") else "failed"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     status = webapp.production_readiness_status(
@@ -190,6 +206,9 @@ def main(argv: list[str] | None = None) -> int:
         ),
         production_database_evidence_status=production_database_evidence_status(
             enabled=args.with_production_database_evidence,
+        ),
+        live_db_object_backup_restore_evidence_status=live_db_object_backup_restore_evidence_status(
+            enabled=args.with_live_db_object_backup_restore_evidence,
         ),
     )
     print(json.dumps(status, indent=2, ensure_ascii=True))

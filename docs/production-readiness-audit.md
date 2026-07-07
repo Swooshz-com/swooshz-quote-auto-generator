@@ -263,17 +263,34 @@ customer data, uploaded content, or secrets. Without a successful operator-run
 live provider verifier and the remaining production gates, `production_ready`
 remains false.
 
-`scripts/verify_live_db_object_backup_restore.py` is only a metadata-only
-preflight scaffold for the live DB+object backup/restore gate. It does not run
-backup, restore, database writes, object writes, or destructive operations. It
-checks required env names by presence only, compares active and restore targets
-without printing values, and reports sanitized blockers. Until an isolated
-restore database and isolated restore object target exist, it reports
-`blocked_isolated_restore_target_missing`. Until backup ownership and restore
-window decisions are recorded outside Git, it reports
-`blocked_backup_restore_decision_missing`. Even with those prerequisites
-present, live restore execution remains unimplemented and the production
-blocker stays open.
+`scripts/verify_live_db_object_backup_restore.py` is the opt-in live DB+object
+backup/restore drill path. It stays blocked unless all required env names are
+present, `SQAG_LIVE_DB_OBJECT_BACKUP_RESTORE_EVIDENCE` is enabled, active and
+restore DB/object targets are distinct, and backup ownership plus restore-window
+decision markers are present. Missing or non-isolated restore targets report
+`blocked_isolated_restore_target_missing`; missing decision markers report
+`blocked_backup_restore_decision_missing`.
+
+When the operator-run drill is enabled, it uses only synthetic namespaced
+profile, pricing, quote-session, and object-artifact metadata rows plus one tiny
+synthetic generated artifact payload. It applies the existing guarded SQAG
+metadata migrations where needed, writes active DB/object data, and then proves
+isolation with live synthetic visibility checks before restore writes. The
+restore DB must not read the active synthetic profile, pricing, quote-session,
+or object-artifact metadata rows, and the restore object backend must not read
+the active synthetic object. If either restore target can see active synthetic
+data, the drill fails closed before restore writes. Only after those checks pass
+does it restore equivalent synthetic rows and object bytes into isolated restore
+targets, verify checksum/content type/byte size, verify DB+object metadata
+pairing, preserve workspace isolation, and clean up synthetic rows and objects
+from both active and restore targets. Any missing env, non-isolated target,
+DB/object write or read failure, restore mismatch, metadata/object pairing
+mismatch, or cleanup failure fails closed. Reports are sanitized booleans,
+counts, and blocker IDs only, with no DB URLs, provider values, bucket names,
+object keys, artifact bytes, tenant data, generated quote contents, private
+paths, backup dumps, or restore dumps. A passing non-test-injected run can
+remove only the live DB+object backup/restore blocker; `production_ready=false`
+remains until the unrelated production blockers are complete.
 
 The canonical object-storage provider and live-evidence env names use the
 `SQAG_` prefix. Legacy `KQAG_*` object-storage provider names are not aliases
