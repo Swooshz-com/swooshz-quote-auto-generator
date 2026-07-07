@@ -230,24 +230,40 @@ host operations. Object mode must not fall back to local artifacts or database
 BLOB artifacts when object storage is unavailable, stale, deleted, corrupt,
 unauthorized, or failing.
 
-Live DB+object backup/restore evidence is not implemented yet. The next safe
-step is a metadata-only preflight scaffold:
+Live DB+object backup/restore evidence has an opt-in operator drill path:
 
 ```powershell
 python scripts/verify_live_db_object_backup_restore.py
 ```
 
-The preflight does not connect to the database, write objects, create backups,
-restore data, or delete data. It checks env presence by name only, confirms the
-restore database target and restore object target are isolated from the active
-targets without printing values, and requires operator backup-ownership and
-restore-window decision markers before any future live restore drill. Missing
-or non-isolated restore targets report `blocked_isolated_restore_target_missing`;
-missing backup ownership or restore-window decisions report
-`blocked_backup_restore_decision_missing`. Even when all preflight inputs are
-present and isolated, it reports
-`live_db_object_backup_restore_execution_not_implemented` and keeps
-`production_ready=false`.
+The drill remains fail-closed unless `SQAG_LIVE_DB_OBJECT_BACKUP_RESTORE_EVIDENCE`
+is enabled, the active DB/object env names and restore DB/object env names are
+present, active and restore targets are distinct, and backup ownership plus
+restore-window decision markers are present. Missing or non-isolated restore
+targets report `blocked_isolated_restore_target_missing`; missing backup
+ownership or restore-window decisions report
+`blocked_backup_restore_decision_missing`.
+
+When enabled by an operator, the drill uses synthetic namespaced metadata rows
+and one tiny synthetic generated artifact payload only. It applies the existing
+guarded SQAG metadata migrations where needed, writes active DB metadata plus an
+active object, restores equivalent synthetic rows and bytes into isolated
+restore targets only, verifies checksum/content type/byte size and DB+object
+metadata pairing, proves workspace isolation, and then deletes the synthetic
+rows and objects from both active and restore targets. Cleanup failure, restore
+mismatch, non-isolated targets, missing env, missing decisions, DB write/read
+failure, or object write/read failure all fail closed. Reports contain only
+schema/status booleans, counts, blocker IDs, and privacy booleans; they must not
+include DB URLs, hostnames, usernames, passwords, provider values, bucket names,
+object keys, access keys, artifact bytes, private paths, tenant data, generated
+quote contents, backup dumps, or restore dumps.
+
+A passing non-test-injected drill can remove only
+`db_object_backup_restore_live_evidence_missing`. `production_ready=false`
+remains until live retention/delete evidence, hosted logging/monitoring and
+alert delivery, hosted smoke evidence, production deployment operations
+evidence, live Platform-to-SQAG launch smoke, session/business hardening, and
+the final production audit are complete.
 
 ## Workspace Scope
 
