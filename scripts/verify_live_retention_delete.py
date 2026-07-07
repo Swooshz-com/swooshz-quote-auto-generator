@@ -54,9 +54,14 @@ ACTIVE_OBJECT_ENV_NAMES = [
     OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME,
     OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME,
 ]
+RUNTIME_MODE_ENV_NAMES = [
+    webapp.KQAG_STORAGE_MODE_ENV_NAME,
+    webapp.KQAG_ARTIFACT_STORAGE_MODE_ENV_NAME,
+]
 REQUIRED_ENV_NAMES = [
     LIVE_RETENTION_DELETE_ENV_NAME,
     webapp.SQAG_DATABASE_URL_ENV_NAME,
+    *RUNTIME_MODE_ENV_NAMES,
     *ACTIVE_OBJECT_ENV_NAMES,
 ]
 TRUE_VALUES = {"1", "true", "yes", "on", "run", "enabled"}
@@ -106,11 +111,28 @@ def _missing_env_names(env: Mapping[str, str]) -> list[str]:
     return [name for name in REQUIRED_ENV_NAMES if not _present(env, name)]
 
 
-def _default_checks(*, live_opt_in_enabled: bool, database_present: bool, object_present: bool) -> dict[str, bool]:
+def _runtime_database_mode_enabled(env: Mapping[str, str]) -> bool:
+    return _clean(env.get(webapp.KQAG_STORAGE_MODE_ENV_NAME)).lower() == "database"
+
+
+def _runtime_object_artifact_mode_enabled(env: Mapping[str, str]) -> bool:
+    return _clean(env.get(webapp.KQAG_ARTIFACT_STORAGE_MODE_ENV_NAME)).lower() == "object"
+
+
+def _default_checks(
+    *,
+    live_opt_in_enabled: bool,
+    database_present: bool,
+    object_present: bool,
+    runtime_database_mode_enabled: bool,
+    runtime_object_artifact_mode_enabled: bool,
+) -> dict[str, bool]:
     return {
         "live_evidence_opt_in_enabled": live_opt_in_enabled,
         "active_database_target_present": database_present,
         "active_object_target_present": object_present,
+        "runtime_database_mode_enabled": runtime_database_mode_enabled,
+        "runtime_object_artifact_mode_enabled": runtime_object_artifact_mode_enabled,
         "connection_attempted": False,
         "write_attempted": False,
         "read_attempted": False,
@@ -352,10 +374,46 @@ def _write_synthetic_metadata(storage: object, ids: Mapping[str, str], metadata:
     return rows
 
 
-def _runtime_download(storage: object, session_id: str, backend: ObjectStorageBackend) -> dict[str, object] | None:
+def _runtime_env_names() -> list[str]:
+    return [
+        webapp.SQAG_DATABASE_URL_ENV_NAME,
+        webapp.KQAG_STORAGE_MODE_ENV_NAME,
+        webapp.KQAG_ARTIFACT_STORAGE_MODE_ENV_NAME,
+        *ACTIVE_OBJECT_ENV_NAMES,
+    ]
+
+
+def _with_runtime_env(env: Mapping[str, str], callback: Callable[[], Any]) -> Any:
+    previous = {name: os.environ.get(name) for name in _runtime_env_names()}
+    previous_legacy_database_url = os.environ.get("KQAG_DATABASE_URL")
+    try:
+        for name in _runtime_env_names():
+            value = env.get(name)
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = str(value)
+        os.environ.pop("KQAG_DATABASE_URL", None)
+        return callback()
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        if previous_legacy_database_url is None:
+            os.environ.pop("KQAG_DATABASE_URL", None)
+        else:
+            os.environ["KQAG_DATABASE_URL"] = previous_legacy_database_url
+
+
+def _runtime_download(storage: object, session_id: str, backend: ObjectStorageBackend, env: Mapping[str, str]) -> dict[str, object] | None:
     if not hasattr(storage, "quote_session_export_artifact"):
         return None
-    return _with_configured_backend(backend, lambda: storage.quote_session_export_artifact(session_id, "xlsx"))
+    return _with_runtime_env(
+        env,
+        lambda: _with_configured_backend(backend, lambda: storage.quote_session_export_artifact(session_id, "xlsx")),
+    )
 
 
 def _runtime_download_verified(
@@ -363,11 +421,12 @@ def _runtime_download_verified(
     storage: object,
     session_id: str,
     backend: ObjectStorageBackend,
+    env: Mapping[str, str],
     metadata: ObjectArtifactMetadata,
     payload: bytes,
 ) -> bool:
     try:
-        artifact = _runtime_download(storage, session_id, backend)
+        artifact = _runtime_download(storage, session_id, backend, env)
     except Exception:
         return False
     content = artifact.get("content") if isinstance(artifact, Mapping) else None
@@ -382,11 +441,11 @@ def _runtime_download_verified(
     )
 
 
-def _runtime_download_denied(storage: object, session_id: str, backend: ObjectStorageBackend) -> bool:
+def _runtime_download_denied(storage: object, session_id: str, backend: ObjectStorageBackend, env: Mapping[str, str]) -> bool:
     if not hasattr(storage, "quote_session_export_artifact"):
         return _object_artifact_row(storage, session_id, "xlsx") is None
     try:
-        return _runtime_download(storage, session_id, backend) is None
+        return _runtime_download(storage, session_id, backend, env) is None
     except Exception:
         return True
 
@@ -528,6 +587,7 @@ def _run_drill(
             storage=storage,
             session_id=ids["session_a"],
             backend=backend,
+            env=env,
             metadata=metadata,
             payload=payload,
         )
@@ -550,7 +610,16 @@ def _run_drill(
 
         checks["tombstone_attempted"] = True
         try:
-            tombstoned = int(_with_configured_backend(backend, lambda: storage.tombstone_object_quote_artifacts(ids["session_a"])) or 0)
+            tombstoned = int(
+                _with_runtime_env(
+                    env,
+                    lambda: _with_configured_backend(
+                        backend,
+                        lambda: storage.tombstone_object_quote_artifacts(ids["session_a"]),
+                    ),
+                )
+                or 0
+            )
             checks["tombstone_metadata_verified"] = tombstoned > 0 and _tombstone_verified(storage, ids["session_a"])
         except Exception:
             blockers.append("tombstone_metadata_failed")
@@ -558,7 +627,7 @@ def _run_drill(
 
         checks["deleted_metadata_download_denied"] = bool(
             checks["active_runtime_download_verified"]
-            and _runtime_download_denied(storage, ids["session_a"], backend)
+            and _runtime_download_denied(storage, ids["session_a"], backend, env)
         )
 
         checks["delete_attempted"] = True
@@ -605,15 +674,23 @@ def run_verification(
     effective_env = dict(os.environ if env is None else env)
     missing = _missing_env_names(effective_env)
     live_opt_in_enabled = _enabled(effective_env)
+    runtime_database_mode_enabled = _runtime_database_mode_enabled(effective_env)
+    runtime_object_artifact_mode_enabled = _runtime_object_artifact_mode_enabled(effective_env)
     checks = _default_checks(
         live_opt_in_enabled=live_opt_in_enabled,
         database_present=_present(effective_env, webapp.SQAG_DATABASE_URL_ENV_NAME),
         object_present=all(_present(effective_env, name) for name in ACTIVE_OBJECT_ENV_NAMES),
+        runtime_database_mode_enabled=runtime_database_mode_enabled,
+        runtime_object_artifact_mode_enabled=runtime_object_artifact_mode_enabled,
     )
 
     blockers: list[str] = []
     if missing or not live_opt_in_enabled:
         blockers.append("live_retention_delete_evidence_not_enabled_or_incomplete")
+    if not runtime_database_mode_enabled:
+        blockers.append("runtime_database_mode_not_enabled")
+    if not runtime_object_artifact_mode_enabled:
+        blockers.append("runtime_object_artifact_mode_not_enabled")
     if not execute_live_drill and not blockers:
         blockers.append("live_retention_delete_execution_not_enabled")
     if blockers:

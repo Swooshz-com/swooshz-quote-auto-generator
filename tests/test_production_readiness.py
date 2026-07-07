@@ -610,8 +610,13 @@ class ProductionReadinessStatusTest(unittest.TestCase):
 
         text = json.dumps(status, sort_keys=True)
         production_blocker_ids = {item["id"] for item in status["production_blockers"]}
+        required_env_names = status["live_retention_delete_evidence"]["required_env_names"]
         self.assertEqual(status["live_retention_delete_evidence"]["status"], "passed")
         self.assertTrue(status["live_retention_delete_evidence"]["live_retention_delete_evidence_supported"])
+        self.assertIn("KQAG_STORAGE_MODE", required_env_names)
+        self.assertIn("KQAG_ARTIFACT_STORAGE_MODE", required_env_names)
+        self.assertIn("SQAG_DATABASE_URL", required_env_names)
+        self.assertNotIn("KQAG_DATABASE_URL", required_env_names)
         self.assertNotIn("object_retention_delete_live_evidence_missing", production_blocker_ids)
         self.assertNotIn("db_object_backup_restore_live_evidence_missing", production_blocker_ids)
         self.assertIn("session_business_hardening_incomplete", production_blocker_ids)
