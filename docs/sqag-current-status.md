@@ -8,14 +8,14 @@ SQAG is now the canonical runtime/repo/product namespace. Active runtime
 configuration uses `SQAG_STORAGE_MODE`, `SQAG_ARTIFACT_STORAGE_MODE`,
 `SQAG_DATABASE_URL`, `SQAG_PLATFORM_LAUNCH_MODE`, `SQAG_PLATFORM_BASE_URL`, and
 canonical `SQAG_OBJECT_STORAGE_*` names. SQAG expects Platform launches with
-`appKey=sqag` only; the separate Swooshz Platform app-key migration remains
-pending and is tracked by `platform_app_key_migration_pending`.
+`appKey=sqag` only; Swooshz Platform PR #79 migrated Platform-owned app-key
+surfaces to `sqag`, while hosted Platform-to-SQAG smoke remains pending.
 
 Earlier live database and DB+object evidence is historical/pre-namespace
 evidence after the SQAG table/object-metadata/app-key cleanup. Post-rename live
 production database evidence, live DB+object backup/restore evidence, live
-retention/delete evidence, and live Platform-to-SQAG smoke after the Platform
-app-key migration remain required. `production_ready=false` remains correct.
+retention/delete evidence, and live Platform-to-SQAG hosted smoke remain
+required. `production_ready=false` remains correct.
 
 ## Executive Verdict
 

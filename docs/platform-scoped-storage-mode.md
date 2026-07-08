@@ -217,8 +217,7 @@ Passing this DB evidence can drop only the `postgres_neon_database_evidence_miss
 blocker. It does not make SQAG production-ready. Remaining blockers still include
 live DB+object backup/restore, live retention/delete, hosted logging/monitoring,
 hosted smoke, production deployment operations, live Platform-to-SQAG launch
-smoke after Platform app-key migration, `platform_app_key_migration_pending`,
-session/business hardening, and the final production audit.
+smoke, session/business hardening, and the final production audit.
 
 Object artifact lifecycle evidence is synthetic/stubbed only:
 
@@ -273,9 +272,8 @@ A passing non-test-injected drill can remove only
 `db_object_backup_restore_live_evidence_missing`. `production_ready=false`
 remains until live retention/delete evidence, hosted logging/monitoring and
 alert delivery, hosted smoke evidence, production deployment operations
-evidence, live Platform-to-SQAG launch smoke after Platform app-key migration,
-`platform_app_key_migration_pending`, session/business hardening, and the final
-production audit are complete.
+evidence, live Platform-to-SQAG launch smoke, session/business hardening, and
+the final production audit are complete.
 
 Sanitized live DB+object backup/restore evidence was run by an operator on
 2026-07-07 after the verifier/runtime metadata pairing fix landed. The
@@ -311,8 +309,7 @@ can receive live backup/restore readiness credit. This evidence may remove only
 blocker is removed, and `production_ready=false` remains until live
 retention/delete evidence, hosted logging/monitoring and alert delivery,
 hosted smoke evidence, production deployment operations evidence, live
-Platform-to-SQAG launch smoke after Platform app-key migration,
-`platform_app_key_migration_pending`, session/business hardening, and the final
+Platform-to-SQAG launch smoke, session/business hardening, and the final
 production audit are complete.
 
 Live retention/delete evidence now has an opt-in operator drill path:
@@ -348,8 +345,7 @@ bytes, backup dumps, restore dumps, or secrets. A passing non-test-injected
 run can remove only `object_retention_delete_live_evidence_missing`;
 `production_ready=false` remains until hosted logging/monitoring and alert
 delivery, hosted smoke evidence, production deployment operations evidence,
-live Platform-to-SQAG launch smoke after Platform app-key migration,
-`platform_app_key_migration_pending`, session/business hardening, and the final
+live Platform-to-SQAG launch smoke, session/business hardening, and the final
 production audit are complete. No live retention/delete pass evidence is claimed
 in this PR; post-rename live retention/delete evidence remains required.
 

@@ -773,20 +773,19 @@ rename, earlier live evidence rows in this audit are historical/pre-namespace
 evidence. They remain useful provenance, but they must not be treated as
 post-rename proof. Post-rename live production database evidence, live DB+object
 backup/restore evidence, live retention/delete evidence, and live
-Platform-to-SQAG smoke after the separate Swooshz Platform `appKey=sqag`
-migration remain required. The readiness blocker
-`platform_app_key_migration_pending` remains until that Platform-owned
-migration and smoke evidence are complete. `production_ready=false` remains.
+Platform-to-SQAG hosted smoke remain required. The Swooshz Platform
+`appKey=sqag` migration has landed in Platform PR #79; hosted smoke evidence is
+still pending. `production_ready=false` remains.
 
 ## What Was Not Verified
 
-- Live deployed Swooshz Platform behavior, platform token service, platform app-key migration, or platform workspace membership enforcement; this audit checked source-contract surfaces only, and `scripts/verify_hosted_smoke.py` uses only synthetic platform/workspace context.
+- Live deployed Swooshz Platform behavior, platform token service, hosted SQAG handoff, or platform workspace membership enforcement; this audit checked source-contract surfaces only, and `scripts/verify_hosted_smoke.py` uses only synthetic platform/workspace context.
 - Live OIDC provider behavior.
 - Live AI provider privacy posture, data retention, or rate limits.
 - Real private Koncept pricing/profile/layout data import.
 - Generated customer quote contents.
 - Production-grade object-storage readiness beyond historical/pre-namespace live-provider and live DB+object backup/restore verifier passes. Those runs prove synthetic generated XLSX/PDF object behavior and paired DB+object restore behavior against operator-supplied targets before the SQAG namespace cleanup, but post-rename reruns remain required and they do not prove live retention/delete policy, uploaded/reference/profile asset wiring, hosted operations, alert delivery, or final production audit.
-- Production-grade live Neon/Postgres-compatible database evidence beyond the historical/pre-namespace opt-in metadata verifier and paired DB+object drill. The DB verifier remains fail-closed by default, connects only under explicit `SQAG_LIVE_DATABASE_EVIDENCE` operator opt-in with DB values supplied outside Git/chat, uses synthetic namespaced metadata rows only, checks schema plus profile/pricing/session/object metadata CRUD, two-workspace isolation, object artifact metadata pairing, and cleanup, does not store generated artifact bytes in DB, does not touch R2/object storage, and reports only sanitized booleans/counts/schema version. Passing post-rename evidence gates can remove only their matching evidence blockers; production readiness still needs live retention/delete, hosted logging/monitoring, hosted smoke, production deployment operations, live Platform-to-SQAG launch smoke after Platform app-key migration, session/business hardening, and final production audit.
+- Production-grade live Neon/Postgres-compatible database evidence beyond the historical/pre-namespace opt-in metadata verifier and paired DB+object drill. The DB verifier remains fail-closed by default, connects only under explicit `SQAG_LIVE_DATABASE_EVIDENCE` operator opt-in with DB values supplied outside Git/chat, uses synthetic namespaced metadata rows only, checks schema plus profile/pricing/session/object metadata CRUD, two-workspace isolation, object artifact metadata pairing, and cleanup, does not store generated artifact bytes in DB, does not touch R2/object storage, and reports only sanitized booleans/counts/schema version. Passing post-rename evidence gates can remove only their matching evidence blockers; production readiness still needs live retention/delete, hosted logging/monitoring, hosted smoke, production deployment operations, live Platform-to-SQAG launch smoke, session/business hardening, and final production audit.
 - Production rollback/runbook evidence for a real hosted incident remains unproven; the operator-run live DB+object drill proves synthetic backup/restore pairing and isolated restore target behavior, but it is not hosted operations, alert delivery, retention/delete, or final production audit evidence.
 - Hosted backup/restore evidence against a real host; PR #95 verifies only synthetic SQLite database/database-artifact drills.
 - External hosted observability vendor/export wiring and alert delivery; PR #96 verifies only synthetic structured log and health metadata properties.

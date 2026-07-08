@@ -66,7 +66,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         blocker_ids = {item["id"] for item in status["blockers"]}
         production_blocker_ids = {item["id"] for item in status["production_blockers"]}
         self.assertIn("local_runtime_storage", blocker_ids)
-        self.assertIn("platform_app_key_migration_pending", production_blocker_ids)
+        self.assertNotIn("platform_app_key_migration_pending", production_blocker_ids)
         self.assertIn("hosted_logging_monitoring_missing", blocker_ids)
         self.assertIn("hosted_smoke_evidence_missing", blocker_ids)
         self.assertNotIn("pricing_reference_local_pack_isolation", blocker_ids)
@@ -623,7 +623,8 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertNotIn("K" + "QAG_DATABASE_URL", required_env_names)
         self.assertNotIn("object_retention_delete_live_evidence_missing", production_blocker_ids)
         self.assertNotIn("db_object_backup_restore_live_evidence_missing", production_blocker_ids)
-        self.assertIn("platform_app_key_migration_pending", production_blocker_ids)
+        self.assertNotIn("platform_app_key_migration_pending", production_blocker_ids)
+        self.assertNotIn("hosted_smoke_evidence_missing", production_blocker_ids)
         self.assertIn("session_business_hardening_incomplete", production_blocker_ids)
         self.assertIn("production_deployment_operations_evidence_missing", production_blocker_ids)
         self.assertFalse(status["production_ready"])
