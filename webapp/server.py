@@ -2659,12 +2659,6 @@ def production_readiness_status(
             blockers.append(readiness_blocker("object_retention_delete_live_evidence_missing", "P1", "Live object provider retention/delete evidence is still missing for production.", gates=("production",)))
         if not live_db_object_backup_restore_evidence["live_db_object_backup_restore_evidence_supported"]:
             blockers.append(readiness_blocker("db_object_backup_restore_live_evidence_missing", "P1", "Live DB+object backup/restore evidence is still missing for production.", gates=("production",)))
-    blockers.append(readiness_blocker(
-        "platform_app_key_migration_pending",
-        "P1",
-        "SQAG now expects Platform appKey=sqag; Swooshz Platform app registry, entitlement, launch, consume, seed, and admin surfaces must be migrated in a separate Platform PR before live Platform-to-SQAG smoke can pass.",
-        gates=("production",),
-    ))
     blockers.append(readiness_blocker("session_business_hardening_incomplete", "P1", "Immutable quote-session snapshot groundwork exists, but final session/business hardening and generated audit race coverage remain incomplete.", gates=("production",)))
     blockers.append(readiness_blocker("production_deployment_operations_evidence_missing", "P1", "Production deployment, operations, alert delivery, and live host evidence are not verified by this command.", gates=("production",)))
     if backup_restore_evidence["status"] != "passed":

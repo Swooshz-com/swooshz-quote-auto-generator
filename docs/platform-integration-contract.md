@@ -181,17 +181,18 @@ already cover the SQAG-side fail-closed and isolation behavior. The new docs
 regression test keeps this audit document tied to the expected source evidence
 and privacy posture.
 
-## Platform app-key migration pending
+## Platform app-key migration complete
 
-This SQAG PR changes the SQAG-side runtime contract to `appKey=sqag` only. It
-does not modify Swooshz Platform and does not prove the current Platform main
-branch has migrated its app whitelist, entitlement, launch/open, consume, seed,
-tests, docs, or admin UI surfaces to the canonical SQAG app key.
+This SQAG-side runtime contract accepts `appKey=sqag` only. Platform PR #79
+landed the Platform-owned app registry, entitlement, launch/open, consume,
+seed, tests, docs, and admin-surface migration to the canonical SQAG app key.
+The current Platform `origin/main` contract matches SQAG's adapter assumptions
+for `appKey=sqag`.
 
-The readiness blocker `platform_app_key_migration_pending` remains until a
-separate Swooshz Platform PR migrates those Platform-owned surfaces and a live
-Platform-to-SQAG smoke proves the deployed handoff. SQAG source tests cover the
-fail-closed behavior for non-`sqag` app keys; they are not live Platform
+Hosted Platform-to-SQAG smoke remains pending until an operator runs it against
+the deployed Platform and SQAG environments. SQAG source tests cover the
+fail-closed behavior for non-`sqag` app keys, and Platform source tests cover
+the migrated app-key surfaces; neither is live hosted Platform-to-SQAG
 evidence.
 
 The expected post-migration Platform contract remains:
@@ -233,8 +234,6 @@ blocked until at least:
 
 - Live Platform-to-SQAG end-to-end evidence is captured against the deployed
   Platform contract.
-- The separate Platform app-key migration is complete and
-  `platform_app_key_migration_pending` is removed by evidence, not assumption.
 - Production object storage is fully wired for generated artifacts and uploaded
   reference/profile/pricing assets.
 - Real DB+object backup/restore, retention/delete, and rollback evidence exists.

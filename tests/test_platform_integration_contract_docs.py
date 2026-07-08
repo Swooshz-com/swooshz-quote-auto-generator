@@ -38,17 +38,20 @@ class PlatformIntegrationContractDocsTest(unittest.TestCase):
             "launchTokenExpiresAt",
             "Unsupported roles fail closed",
             "Missing Platform workspace context blocks database storage access.",
-            "platform_app_key_migration_pending",
+            "Platform PR #79",
+            "landed the Platform-owned",
+            "Hosted Platform-to-SQAG smoke remains pending",
             "Missing workspace-owned profile/pricing/layout data does not fall back",
             "Production remains blocked",
         ):
             self.assertIn(expected, text)
 
-    def test_contract_doc_marks_platform_app_key_migration_pending(self):
+    def test_contract_doc_marks_platform_app_key_migration_complete_but_hosted_smoke_pending(self):
         text = self.text
-        self.assertIn("Platform app-key migration pending", text)
-        self.assertIn("separate Swooshz Platform PR", text)
-        self.assertNotIn("The current Platform `origin/main` contract matches SQAG's adapter assumptions", text)
+        self.assertIn("Platform app-key migration complete", text)
+        self.assertIn("Hosted Platform-to-SQAG smoke remains pending", text)
+        self.assertIn("The current Platform `origin/main` contract matches SQAG's adapter assumptions", text)
+        self.assertNotIn("platform_app_key_migration_pending", text)
 
     def test_contract_doc_is_metadata_only(self):
         text = self.text

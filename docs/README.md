@@ -36,7 +36,7 @@ platform concerns belong in `Swooshz-com/swooshz-platform`.
   deferral.
 - `docs/platform-integration-contract.md`: SQAG-side audit of the expected
   Swooshz Platform launch/auth/workspace contract, canonical `appKey=sqag`,
-  Platform app-key migration pending blocker, fail-closed behavior, and live
+  completed Platform app-key migration, fail-closed behavior, and live hosted
   integration gaps.
 - `docs/platform-scoped-storage-mode.md`: platform-workspace-scoped SQAG app
   data storage boundary, migration command, and local-vs-database mode notes.
