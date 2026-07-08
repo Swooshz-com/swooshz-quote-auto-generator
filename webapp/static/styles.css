@@ -4657,6 +4657,20 @@ h3 {
 .rich-text-editor:empty::before {
   content: attr(data-placeholder);
   color: #8896a6;
+  opacity: 0.82;
+  pointer-events: none;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: #8896a6;
+  opacity: 0.82;
+}
+
+.rich-text-editor:focus:empty::before,
+input:focus::placeholder,
+textarea:focus::placeholder {
+  opacity: 0.62;
 }
 
 label,
