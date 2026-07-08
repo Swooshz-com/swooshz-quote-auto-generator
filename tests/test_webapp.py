@@ -10455,11 +10455,21 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertIn('editor.classList.toggle("is-empty"', js)
         self.assertIn(".rich-text-editor.is-empty::before", css)
         self.assertIn(".rich-text-editor:focus.is-empty::before", css)
+        rich_text_editor_css = css.split(".rich-text-editor {", 1)[1].split("}", 1)[0]
+        self.assertIn("position: relative;", rich_text_editor_css)
         rich_text_placeholder_css = css.split(".rich-text-editor.is-empty::before {", 1)[1].split("}", 1)[0]
         self.assertIn("display: block;", rich_text_placeholder_css)
+        self.assertIn("position: absolute;", rich_text_placeholder_css)
+        self.assertIn("left: 12px;", rich_text_placeholder_css)
         self.assertIn("white-space: nowrap;", rich_text_placeholder_css)
         self.assertIn("text-overflow: ellipsis;", rich_text_placeholder_css)
         self.assertIn("overflow: hidden;", rich_text_placeholder_css)
+        self.assertIn(".rich-text-editor.is-single-line.is-empty::before", css)
+        single_line_placeholder_css = css.split(".rich-text-editor.is-single-line.is-empty::before {", 1)[1].split("}", 1)[0]
+        self.assertIn("top: 50%;", single_line_placeholder_css)
+        self.assertIn("transform: translateY(-50%);", single_line_placeholder_css)
+        self.assertIn(".rich-text-field:focus-within .rich-text-editor.is-single-line.is-empty::before", css)
+        self.assertIn("right: 128px;", css)
         single_line_editor_css = css.split(".rich-text-editor.is-single-line {", 1)[1].split("}", 1)[0]
         self.assertIn("box-sizing: border-box;", single_line_editor_css)
         self.assertIn("height: 44px;", single_line_editor_css)
