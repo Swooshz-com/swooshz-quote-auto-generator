@@ -12,17 +12,19 @@ ecommerce or public SaaS. Koncept profile, pricing, and layout packs are
 workspace-imported tenant data only. A new workspace starts with no real
 Koncept pack until an authorized import or seed action targets that workspace.
 
-## Blocked DB/BLOB Posture
+## Hosted Object Artifact Posture
 
-The former DB/BLOB artifact posture is no longer a launch target:
+The hosted internal-alpha deploy scaffold uses database metadata plus object
+storage for generated artifact bytes:
 
 - `APP_MODE=deploy`.
 - `SQAG_STORAGE_MODE=database`.
-- `SQAG_ARTIFACT_STORAGE_MODE=database`.
+- `SQAG_ARTIFACT_STORAGE_MODE=object`.
 - `SQAG_DATABASE_URL` is configured only through the host secret manager.
+- The canonical `SQAG_OBJECT_STORAGE_*` names are configured only through the
+  host secret manager.
 - Platform/workspace launch context is required for protected hosted use.
-- Readiness remains blocked because generated XLSX/PDF bytes require object
-  storage. Database rows store metadata and workspace-owned app records only.
+- Database rows store metadata and workspace-owned app records only.
 
 Database/BLOB artifact mode is local-UAT/synthetic evidence only. It must not
 satisfy hosted, protected, deploy, or production readiness.
@@ -52,7 +54,7 @@ Required names for any future hosted validation environment:
 | Area | Names |
 | --- | --- |
 | App/auth | `APP_MODE`, `AUTH_REQUIRED`, `SESSION_SECRET` |
-| Storage | `SQAG_STORAGE_MODE`, `SQAG_ARTIFACT_STORAGE_MODE`, `SQAG_DATABASE_URL` |
+| Storage | `SQAG_STORAGE_MODE`, `SQAG_ARTIFACT_STORAGE_MODE`, `SQAG_DATABASE_URL`, `SQAG_OBJECT_STORAGE_PROVIDER`, `SQAG_OBJECT_STORAGE_ENDPOINT_URL`, `SQAG_OBJECT_STORAGE_BUCKET`, `SQAG_OBJECT_STORAGE_REGION`, `SQAG_OBJECT_STORAGE_ACCESS_KEY_ID`, `SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY` |
 | Platform launch | `SQAG_PLATFORM_LAUNCH_MODE`, `SQAG_PLATFORM_BASE_URL` |
 | Optional OIDC fallback/checklist | `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI`, `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL`, `OIDC_USERINFO_URL`, `OIDC_LOGOUT_URL` |
 | Tester policy | `AUTH_ALLOWED_EMAILS`, `AUTH_ALLOWED_DOMAINS`, `AUTH_ALLOW_ANY_AUTHENTICATED_USER`, `AUTH_APPROVED_TESTER_ROLE` |
@@ -85,16 +87,16 @@ python scripts\verify_hosted_observability.py --work-dir _tmp\validation\hosted-
 python scripts\verify_hosted_smoke.py --work-dir _tmp\validation\hosted-smoke
 ```
 
-Run the readiness checker for the same DB + DB-artifact negative posture:
+Run the readiness checker with database metadata plus object artifact mode:
 
 ```powershell
-python scripts\check_production_readiness.py --with-backup-restore-evidence --with-hosted-observability-evidence --with-hosted-smoke-evidence
+python scripts\check_production_readiness.py --with-backup-restore-evidence --with-hosted-observability-evidence --with-hosted-smoke-evidence --with-object-storage-evidence --with-object-artifact-lifecycle-evidence
 ```
 
 The readiness checker is expected to keep both `internal_alpha_ready=false` and
-`production_ready=false`. It should report
-`database_blob_artifact_storage_not_launch_ready` when DB/BLOB artifact mode is
-selected.
+`production_ready=false` until live object provider, live retention/delete,
+DB+object backup/restore, hosted operations, and hosted smoke evidence are
+actually available.
 
 ## Hosted Smoke Checklist
 
