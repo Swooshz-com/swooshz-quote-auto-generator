@@ -10437,7 +10437,35 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertIn('placeholder="${escapeHtml(clarificationAnswerPlaceholder(question))}"', js)
 
         self.assertIn("input::placeholder,\ntextarea::placeholder", css)
-        self.assertIn(".rich-text-editor:focus:empty::before", css)
+        self.assertIn("function updateRichTextPlaceholderState", js)
+        self.assertIn('editor.classList.toggle("is-empty"', js)
+        self.assertIn(".rich-text-editor.is-empty::before", css)
+        self.assertIn(".rich-text-editor:focus.is-empty::before", css)
+        for source_id in (
+            "clientName",
+            "clientAddress",
+            "clientAttention",
+            "clientTitle",
+            "projectTitle",
+            "projectNumber",
+            "headerDetails",
+            "termsHeading",
+            "paymentTerms",
+            "notesHeading",
+            "standardNotes",
+            "quoteCompanyName",
+            "companySignatory",
+            "companyTitle",
+            "companyDateLabel",
+            "acceptanceText",
+            "personLabel",
+            "stampLabel",
+            "dateLabel",
+        ):
+            marker = f'data-rich-text-source="{source_id}"'
+            self.assertIn(marker, html_text)
+            field_markup = html_text.split(marker, 1)[1].split("</div>", 1)[0]
+            self.assertIn("data-placeholder=", field_markup, source_id)
         self.assertNotIn('value="ABC Events', html_text)
         self.assertNotIn('value="Corporate dinner setup"', html_text)
         self.assertNotIn('value="AV rental reference"', html_text)
@@ -10738,6 +10766,18 @@ assert.strictEqual(
   startAnalysisBlockReason(),
   "Complete Customer details before starting analysis: Client address."
 );
+state.outputRows = [{ description: "Restored output row", quantity: 1 }];
+state.originalOutputRows = [{ description: "Original restored output row", quantity: 1 }];
+state.workflowStage = "completed";
+state.basisConfirmed = true;
+assert.strictEqual(sidePanelBlockReason("customer"), "");
+assert.strictEqual(sidePanelBlockReason("quote_company"), "");
+assert.strictEqual(sidePanelBlockReason("basis"), "");
+assert.strictEqual(sidePanelBlockReason("output"), "");
+state.outputRows = [];
+state.originalOutputRows = [];
+state.workflowStage = "needs_images";
+state.basisConfirmed = false;
 assert.ok(syncCalls > 0, "missing detail checks should sync rich-text sources first");
 elements.clientAddress.value = "10 Sample Street\nSingapore 000010";
 elements.showName.value = "";

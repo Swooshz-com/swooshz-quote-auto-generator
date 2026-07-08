@@ -4654,7 +4654,7 @@ h3 {
   padding-bottom: 11px;
 }
 
-.rich-text-editor:empty::before {
+.rich-text-editor.is-empty::before {
   content: attr(data-placeholder);
   color: #8896a6;
   opacity: 0.82;
@@ -4667,7 +4667,7 @@ textarea::placeholder {
   opacity: 0.82;
 }
 
-.rich-text-editor:focus:empty::before,
+.rich-text-editor:focus.is-empty::before,
 input:focus::placeholder,
 textarea:focus::placeholder {
   opacity: 0.62;

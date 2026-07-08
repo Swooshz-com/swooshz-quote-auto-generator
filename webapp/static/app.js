@@ -2097,11 +2097,17 @@ function richTextEditorPlainText(editor) {
   return normalizeTextNewlines(Array.from(editor.childNodes).map(readNode).join("")).replace(/\n+$/g, "");
 }
 
+function updateRichTextPlaceholderState(editor) {
+  if (!editor) return;
+  editor.classList.toggle("is-empty", !richTextEditorPlainText(editor).trim());
+}
+
 function syncRichTextSource(editor) {
   if (!editor) return;
   const input = qs(`#${editor.dataset.richTextSource}`);
   if (!input) return;
   input.value = richTextEditorPlainText(editor).trimEnd();
+  updateRichTextPlaceholderState(editor);
 }
 
 function syncRichTextSources() {
@@ -2113,9 +2119,11 @@ function syncRichTextEditor(input, richHtml = "") {
   if (!editor || document.activeElement === editor) return;
   if (richHtml) {
     editor.innerHTML = sanitizeRichTextHtml(richHtml);
+    updateRichTextPlaceholderState(editor);
     return;
   }
   editor.innerHTML = richTextPlainHtml(input.value ?? "");
+  updateRichTextPlaceholderState(editor);
 }
 
 function collectRichTextDetails() {
@@ -11289,6 +11297,7 @@ function isSensitiveChatRequest(normalizedText) {
 function sidePanelBlockReason(panelName) {
   if (panelName === "images") return "";
   if (!hasReferenceFilesForNavigation()) return "Add reference files before opening this step.";
+  if (quoteOutputProgressForNavigation()) return "";
   if (panelName === "quote_company") {
     return customerDetailsBlockReason("Complete Customer details before opening Quote Company");
   }
