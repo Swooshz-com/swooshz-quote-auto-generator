@@ -9873,6 +9873,14 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertLess(html.index('class="pricing-reference-control-group pricing-reference-card"'), html.index('class="quote-commercial-card pricing-reference-card"'))
         self.assertLess(html.index('<span>Currency</span>'), html.index('id="quoteExchangeRate"'))
         self.assertLess(html.index('<span>Tax</span>'), html.index('id="quoteTaxRate"'))
+        quote_currency_select = html.split('id="quoteCurrency"', 1)[1].split("</select>", 1)[0]
+        quote_tax_select = html.split('id="quoteTaxLabel"', 1)[1].split("</select>", 1)[0]
+        self.assertNotIn('<option value=""></option>', quote_currency_select)
+        self.assertNotIn('<option value=""></option>', quote_tax_select)
+        self.assertIn('<option value="__CUSTOM__">Custom - Enter currency code</option>', quote_currency_select)
+        self.assertIn('id="quoteCurrencyCustom"', html)
+        self.assertIn("setQuoteCurrencyControls", js)
+        self.assertIn("syncQuoteCurrencyCustomInput", js)
         self.assertIn('id="quoteExchangeRateField"', html)
         self.assertNotIn('id="quoteExchangeRateField" hidden', html)
         self.assertIn('class="pricing-reference-baseline"', html)
@@ -9887,13 +9895,17 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertIn("exchange_rate: collectQuoteExchangeRate()", collect_quote_details_body)
         apply_quote_details_body = js.split("function applyQuoteDetails", 1)[1].split("function applyDefaultQuoteCompanyFields", 1)[0]
         self.assertIn('hasOwnValue(details, "currency")', apply_quote_details_body)
-        self.assertIn("setInputValue(elements.quoteCurrency", apply_quote_details_body)
+        self.assertIn("setQuoteCurrencyControls", apply_quote_details_body)
         self.assertIn('hasOwnValue(details, "exchange_rate")', apply_quote_details_body)
         self.assertIn("setInputValue(elements.quoteExchangeRate", apply_quote_details_body)
         quote_commercial_fields_css = css.split(".quote-commercial-fields {", 1)[1].split("}", 1)[0]
         self.assertIn("display: grid;", quote_commercial_fields_css)
         self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr));", quote_commercial_fields_css)
         self.assertIn(".quote-commercial-row {\n  display: contents;", css)
+        single_line_rich_text_css = css.split(".rich-text-editor.is-single-line {", 1)[1].split("}", 1)[0]
+        self.assertIn("height: 40px;", single_line_rich_text_css)
+        self.assertIn("min-height: 40px;", single_line_rich_text_css)
+        self.assertIn("max-height: 40px;", single_line_rich_text_css)
         customer_panel = html.split('id="customerDetailsPanel"', 1)[1].split('class="section-band first-band quote-form-section"', 1)[0]
         self.assertNotIn("pricing-reference-pill-row", customer_panel)
         self.assertNotIn("GST/VAT", customer_panel)
@@ -15925,12 +15937,16 @@ function extractFunction(name) {
 }
 
 const quoteCurrency = {};
+const quoteCurrencyCustom = { value: "" };
 const projectTitle = {};
+const CUSTOM_CURRENCY_VALUE = "__CUSTOM__";
+const CURRENCY_OPTIONS = [["SGD"], ["AUD"], ["CNY"], ["EUR"], ["GBP"], ["IDR"], ["MYR"], ["THB"], ["USD"]];
 const QUOTE_COMMERCIAL_FIELD_KEYS = ["quoteCurrency", "quoteExchangeRate", "quoteTaxLabel", "quoteTaxRate"];
 const elements = {
   taxLabel: {},
   taxRate: {},
   quoteCurrency,
+  quoteCurrencyCustom,
   quoteTaxLabel: {},
   quoteTaxRate: {},
   quoteExchangeRate: {},
@@ -15958,6 +15974,11 @@ eval([
   "markOutputRowsDirty",
   "emptyQuoteCommercialTouched",
   "normalizeQuoteCommercialTouched",
+  "normalizeCurrencyLabel",
+  "isStandardCurrencyCode",
+  "normalizedCustomCurrencyInput",
+  "customCurrencyInputIsValid",
+  "syncQuoteCurrencyCustomInput",
   "quoteCommercialFieldKeyForElement",
   "markQuoteCommercialFieldTouched",
   "quoteCommercialFieldChanged",
@@ -16012,9 +16033,12 @@ function extractFunction(name) {
 const DEFAULT_TAX_LABEL = "GST";
 const DEFAULT_TAX_RATE = 0.09;
 const DEFAULT_CURRENCY_LABEL = "SGD";
+const CUSTOM_CURRENCY_VALUE = "__CUSTOM__";
+const CURRENCY_OPTIONS = [["SGD"], ["AUD"], ["CNY"], ["EUR"], ["GBP"], ["IDR"], ["MYR"], ["THB"], ["USD"]];
 const QUOTE_COMMERCIAL_FIELD_KEYS = ["quoteCurrency", "quoteExchangeRate", "quoteTaxLabel", "quoteTaxRate"];
 const elements = {
   quoteCurrency: { value: "" },
+  quoteCurrencyCustom: { value: "", hidden: true, required: false },
   quoteExchangeRate: { value: "" },
   quoteExchangeRateField: { hidden: true },
   quoteTaxLabel: { value: "" },
@@ -16063,6 +16087,12 @@ eval([
   "taxRatePercentText",
   "taxRateFromPercentInput",
   "normalizeCurrencyLabel",
+  "isStandardCurrencyCode",
+  "normalizedCustomCurrencyInput",
+  "customCurrencyInputIsValid",
+  "setQuoteCurrencyControls",
+  "syncQuoteCurrencyCustomInput",
+  "quoteCurrencyControlValue",
   "emptyQuoteCommercialTouched",
   "normalizeQuoteCommercialTouched",
   "resetQuoteCommercialTouched",
@@ -16194,6 +16224,8 @@ const DEFAULT_TAX_LABEL = "GST";
 const DEFAULT_TAX_RATE = 0.09;
 const DEFAULT_CURRENCY_LABEL = "SGD";
 const DEFAULT_BOOTH_DIMENSIONS = { booth_width: "6", booth_depth: "6", booth_size: "6m x 6m", dimension_source: "default" };
+const CUSTOM_CURRENCY_VALUE = "__CUSTOM__";
+const CURRENCY_OPTIONS = [["SGD"], ["AUD"], ["CNY"], ["EUR"], ["GBP"], ["IDR"], ["MYR"], ["THB"], ["USD"]];
 const QUOTE_COMMERCIAL_FIELD_KEYS = ["quoteCurrency", "quoteExchangeRate", "quoteTaxLabel", "quoteTaxRate"];
 const elements = {
   clientName: { value: "Client" },
@@ -16205,6 +16237,7 @@ const elements = {
   quoteDate: { value: "" },
   projectNumber: { value: "P-1" },
   quoteCurrency: { value: "AUD" },
+  quoteCurrencyCustom: { value: "", hidden: true, required: false },
   quoteExchangeRate: { value: "2" },
   quoteExchangeRateField: { hidden: true },
   quoteTaxLabel: { value: "VAT" },
@@ -16256,6 +16289,12 @@ eval([
   "taxRatePercentText",
   "taxRateFromPercentInput",
   "normalizeCurrencyLabel",
+  "isStandardCurrencyCode",
+  "normalizedCustomCurrencyInput",
+  "customCurrencyInputIsValid",
+  "setQuoteCurrencyControls",
+  "syncQuoteCurrencyCustomInput",
+  "quoteCurrencyControlValue",
   "emptyQuoteCommercialTouched",
   "normalizeQuoteCommercialTouched",
   "resetQuoteCommercialTouched",
@@ -16483,9 +16522,12 @@ const DEFAULT_DATE_LABEL = "Date:";
 const DEFAULT_PERSON_LABEL = "Person in charge";
 const DEFAULT_STAMP_LABEL = "Company name & stamp";
 const DEFAULT_QUOTE_COMPANY_RICH_TEXT = {};
+const CUSTOM_CURRENCY_VALUE = "__CUSTOM__";
+const CURRENCY_OPTIONS = [["SGD"], ["AUD"], ["CNY"], ["EUR"], ["GBP"], ["IDR"], ["MYR"], ["THB"], ["USD"]];
 const QUOTE_COMMERCIAL_FIELD_KEYS = ["quoteCurrency", "quoteExchangeRate", "quoteTaxLabel", "quoteTaxRate"];
 const elements = {
   quoteCurrency: { value: "" },
+  quoteCurrencyCustom: { value: "", hidden: true, required: false },
   quoteExchangeRate: { value: "" },
   quoteExchangeRateField: { hidden: true },
   quoteTaxLabel: { value: "" },
@@ -16553,6 +16595,12 @@ eval([
   "taxRatePercentText",
   "taxRateFromPercentInput",
   "normalizeCurrencyLabel",
+  "isStandardCurrencyCode",
+  "normalizedCustomCurrencyInput",
+  "customCurrencyInputIsValid",
+  "setQuoteCurrencyControls",
+  "syncQuoteCurrencyCustomInput",
+  "quoteCurrencyControlValue",
   "emptyQuoteCommercialTouched",
   "normalizeQuoteCommercialTouched",
   "resetQuoteCommercialTouched",
@@ -16610,6 +16658,7 @@ assert.deepStrictEqual(snapshot.values, {
   quoteExchangeRate: "2",
   quoteTaxLabel: "VAT",
   quoteTaxRate: "8",
+  quoteCurrencyCustom: "",
 });
 
 applyQuoteDetails({}, { clearLogo: true });
@@ -16637,6 +16686,23 @@ assert.deepStrictEqual(state.quoteCommercialTouched, {
 assert.strictEqual(pillNodes.currency.textContent, "AUD");
 assert.strictEqual(pillNodes.tax.textContent, "VAT 8%");
 assert.strictEqual(pillNodes.exchangeRate.textContent, "2");
+
+elements.quoteCurrency.value = CUSTOM_CURRENCY_VALUE;
+handleQuoteDetailFieldChange({ target: elements.quoteCurrency });
+elements.quoteCurrencyCustom.value = "jpy";
+handleQuoteDetailFieldChange({ target: elements.quoteCurrencyCustom });
+assert.strictEqual(elements.quoteCurrencyCustom.value, "JPY");
+assert.strictEqual(collectQuoteCurrency(), "JPY");
+const customSnapshot = quoteCommercialOverrideSnapshot();
+assert.strictEqual(customSnapshot.values.quoteCurrency, CUSTOM_CURRENCY_VALUE);
+assert.strictEqual(customSnapshot.values.quoteCurrencyCustom, "JPY");
+elements.quoteCurrency.value = "SGD";
+elements.quoteCurrencyCustom.value = "";
+restoreQuoteCommercialOverrideSnapshot(customSnapshot, { reason: "custom_currency_restore" });
+assert.strictEqual(elements.quoteCurrency.value, CUSTOM_CURRENCY_VALUE);
+assert.strictEqual(elements.quoteCurrencyCustom.value, "JPY");
+assert.strictEqual(elements.quoteCurrencyCustom.hidden, false);
+assert.strictEqual(collectQuoteCurrency(), "JPY");
 """
         completed = subprocess.run(
             [node, "-e", script],

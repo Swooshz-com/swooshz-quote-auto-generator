@@ -4749,8 +4749,10 @@ select:focus {
 }
 
 .rich-text-editor.is-single-line {
+  height: 40px;
   min-height: 40px;
-  max-height: 84px;
+  max-height: 40px;
+  overflow-y: hidden;
 }
 
 .primary-button:active:not(:disabled):not([aria-disabled="true"]) {
@@ -6751,6 +6753,21 @@ td input {
 }
 
 .currency-control-row input[hidden] {
+  display: none;
+}
+
+.currency-control-stack {
+  display: grid;
+  gap: 8px;
+}
+
+.currency-control-stack select,
+.currency-control-stack input {
+  width: 100%;
+  min-width: 0;
+}
+
+.currency-control-stack input[hidden] {
   display: none;
 }
 

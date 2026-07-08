@@ -365,6 +365,7 @@ const elements = {
   taxLabel: qs("#taxLabel"),
   taxRate: qs("#taxRate"),
   quoteCurrency: qs("#quoteCurrency"),
+  quoteCurrencyCustom: qs("#quoteCurrencyCustom"),
   quoteTaxLabel: qs("#quoteTaxLabel"),
   quoteTaxRate: qs("#quoteTaxRate"),
   quoteExchangeRate: qs("#quoteExchangeRate"),
@@ -1659,16 +1660,47 @@ function isValidCurrencyCode(value = "") {
   return /^[A-Z]{3}$/.test(String(value || "").trim().toUpperCase());
 }
 
-function normalizedCustomCurrencyInput() {
-  return String(elements.pricingReferenceCurrencyCustom?.value || "")
+function normalizedCustomCurrencyInput(input = elements.pricingReferenceCurrencyCustom) {
+  return String(input?.value || "")
     .trim()
     .toUpperCase()
     .replace(/[^A-Z]/g, "")
     .slice(0, 3);
 }
 
-function customCurrencyInputIsValid() {
-  return /^[A-Z]{3}$/.test(normalizedCustomCurrencyInput());
+function customCurrencyInputIsValid(input = elements.pricingReferenceCurrencyCustom) {
+  return /^[A-Z]{3}$/.test(normalizedCustomCurrencyInput(input));
+}
+
+function setQuoteCurrencyControls(value = DEFAULT_CURRENCY_LABEL) {
+  const normalized = normalizeCurrencyLabel(value);
+  const isSupported = isStandardCurrencyCode(normalized);
+  if (elements.quoteCurrency) {
+    elements.quoteCurrency.value = isSupported ? normalized : CUSTOM_CURRENCY_VALUE;
+  }
+  if (elements.quoteCurrencyCustom) {
+    elements.quoteCurrencyCustom.hidden = isSupported;
+    elements.quoteCurrencyCustom.required = !isSupported;
+    elements.quoteCurrencyCustom.value = isSupported ? "" : normalized;
+  }
+}
+
+function syncQuoteCurrencyCustomInput() {
+  const isCustom = elements.quoteCurrency?.value === CUSTOM_CURRENCY_VALUE;
+  if (!elements.quoteCurrencyCustom) return;
+  elements.quoteCurrencyCustom.hidden = !isCustom;
+  elements.quoteCurrencyCustom.required = isCustom;
+  if (!isCustom) elements.quoteCurrencyCustom.value = "";
+}
+
+function quoteCurrencyControlValue() {
+  const selected = elements.quoteCurrency?.value;
+  if (selected === CUSTOM_CURRENCY_VALUE) {
+    return customCurrencyInputIsValid(elements.quoteCurrencyCustom)
+      ? normalizedCustomCurrencyInput(elements.quoteCurrencyCustom)
+      : "";
+  }
+  return normalizeCurrencyLabel(selected || selectedPricingReferenceCurrency());
 }
 
 function setPricingReferenceCurrencyControls(value = DEFAULT_CURRENCY_LABEL) {
@@ -1723,6 +1755,7 @@ function resetQuoteCommercialTouched() {
 }
 
 function quoteCommercialFieldKeyForElement(target = null) {
+  if (target && elements.quoteCurrencyCustom && target === elements.quoteCurrencyCustom) return "quoteCurrency";
   return QUOTE_COMMERCIAL_FIELD_KEYS.find((key) => elements[key] && elements[key] === target) || "";
 }
 
@@ -1742,6 +1775,9 @@ function markQuoteCommercialFieldTouched(target = null) {
 
 function quoteCommercialFieldHasValue(field = "") {
   const key = typeof field === "string" ? field : quoteCommercialFieldKeyForElement(field);
+  if (key === "quoteCurrency" && elements.quoteCurrency?.value === CUSTOM_CURRENCY_VALUE) {
+    return customCurrencyInputIsValid(elements.quoteCurrencyCustom);
+  }
   return Boolean(key && String(elements[key]?.value || "").trim());
 }
 
@@ -1767,10 +1803,13 @@ function quoteDetailsCommercialTouched(details = {}) {
 
 function quoteCommercialOverrideSnapshot() {
   return {
-    values: QUOTE_COMMERCIAL_FIELD_KEYS.reduce((snapshot, key) => {
-      snapshot[key] = String(elements[key]?.value || "");
-      return snapshot;
-    }, {}),
+    values: {
+      ...QUOTE_COMMERCIAL_FIELD_KEYS.reduce((snapshot, key) => {
+        snapshot[key] = String(elements[key]?.value || "");
+        return snapshot;
+      }, {}),
+      quoteCurrencyCustom: String(elements.quoteCurrencyCustom?.value || ""),
+    },
     quoteCommercialTouched: normalizeQuoteCommercialTouched(state.quoteCommercialTouched || {}),
   };
 }
@@ -1794,6 +1833,10 @@ function restoreQuoteCommercialOverrideSnapshot(snapshot = {}, options = {}) {
       elements[key].value = value;
     }
   });
+  if (elements.quoteCurrencyCustom && String(values.quoteCurrencyCustom || "").trim()) {
+    elements.quoteCurrencyCustom.value = normalizedCustomCurrencyInput({ value: values.quoteCurrencyCustom });
+  }
+  syncQuoteCurrencyCustomInput();
   syncQuoteExchangeRateField();
   syncQuoteCommercialContextPills();
   updateOutputHeader();
@@ -1813,7 +1856,7 @@ function collectTaxDetails() {
 }
 
 function collectQuoteCurrency() {
-  return normalizeCurrencyLabel(elements.quoteCurrency?.value || selectedPricingReferenceCurrency());
+  return normalizeCurrencyLabel(quoteCurrencyControlValue() || selectedPricingReferenceCurrency());
 }
 
 function collectQuoteExchangeRate() {
@@ -1868,7 +1911,7 @@ function applyPricingReferenceCommercialDefaults() {
   const tax = selectedPricingReferenceTax();
   const currency = selectedPricingReferenceCurrency();
   if (elements.quoteCurrency && !String(elements.quoteCurrency.value || "").trim() && !quoteCommercialFieldIsTouched("quoteCurrency")) {
-    elements.quoteCurrency.value = currency;
+    setQuoteCurrencyControls(currency);
   }
   if (elements.quoteTaxLabel && !String(elements.quoteTaxLabel.value || "").trim() && !quoteCommercialFieldIsTouched("quoteTaxLabel")) {
     elements.quoteTaxLabel.value = tax.label;
@@ -1885,7 +1928,7 @@ function resetQuoteCommercialFieldsToSelectedPricingReference() {
   resetQuoteCommercialTouched();
   if (elements.taxLabel) elements.taxLabel.value = normalizeTaxLabel(tax.label || DEFAULT_TAX_LABEL);
   setInputValue(elements.taxRate, taxRatePercentText(tax.rate ?? DEFAULT_TAX_RATE));
-  setInputValue(elements.quoteCurrency, currency);
+  setQuoteCurrencyControls(currency);
   setInputValue(elements.quoteExchangeRate, "1");
   setInputValue(elements.quoteTaxLabel, normalizeTaxLabel(tax.label || DEFAULT_TAX_LABEL));
   setInputValue(elements.quoteTaxRate, taxRatePercentText(tax.rate ?? DEFAULT_TAX_RATE));
@@ -2340,7 +2383,7 @@ function applyQuoteDetails(details = {}, options = {}) {
     }
   }
   if (shouldApplyQuoteCommercialField("quoteCurrency", hasOwnValue(details, "currency"), partial, options)) {
-    setInputValue(elements.quoteCurrency, normalizeCurrencyLabel(details.currency || selectedPricingReferenceCurrency()));
+    setQuoteCurrencyControls(normalizeCurrencyLabel(details.currency || selectedPricingReferenceCurrency()));
   }
   if (shouldApplyQuoteCommercialField("quoteExchangeRate", hasOwnValue(details, "exchange_rate"), partial, options)) {
     setInputValue(elements.quoteExchangeRate, quoteExchangeRateText(details.exchange_rate ?? 1));
@@ -9256,6 +9299,7 @@ function quoteCommercialFieldChanged(target = null) {
     elements.taxLabel,
     elements.taxRate,
     elements.quoteCurrency,
+    elements.quoteCurrencyCustom,
     elements.quoteTaxLabel,
     elements.quoteTaxRate,
     elements.quoteExchangeRate,
@@ -9264,6 +9308,15 @@ function quoteCommercialFieldChanged(target = null) {
 
 function handleQuoteDetailFieldChange(event = {}) {
   const commercialChanged = quoteCommercialFieldChanged(event.target);
+  if (event.target === elements.quoteCurrency) {
+    syncQuoteCurrencyCustomInput();
+  }
+  if (event.target === elements.quoteCurrencyCustom) {
+    const normalizedValue = normalizedCustomCurrencyInput(elements.quoteCurrencyCustom);
+    if (elements.quoteCurrencyCustom.value !== normalizedValue) {
+      elements.quoteCurrencyCustom.value = normalizedValue;
+    }
+  }
   markQuoteCommercialFieldTouched(event.target);
   syncQuoteExchangeRateField();
   if (commercialChanged && (state.outputRows.length || state.downloadFile || state.pdfFile)) {
@@ -11952,6 +12005,7 @@ function wireEvents() {
     elements.taxLabel,
     elements.taxRate,
     elements.quoteCurrency,
+    elements.quoteCurrencyCustom,
     elements.quoteTaxLabel,
     elements.quoteTaxRate,
     elements.quoteExchangeRate,
