@@ -1910,10 +1910,14 @@ function syncQuoteCommercialContextPills() {
 function applyPricingReferenceCommercialDefaults() {
   const tax = selectedPricingReferenceTax();
   const currency = selectedPricingReferenceCurrency();
-  if (elements.quoteCurrency && !String(elements.quoteCurrency.value || "").trim() && !quoteCommercialFieldIsTouched("quoteCurrency")) {
+  const selectedQuoteCurrency = String(elements.quoteCurrency?.value || "").trim();
+  const selectedQuoteTaxLabel = String(elements.quoteTaxLabel?.value || "").trim();
+  const quoteCurrencyCanUseReferenceDefault = !selectedQuoteCurrency || selectedQuoteCurrency === DEFAULT_CURRENCY_LABEL;
+  const quoteTaxLabelCanUseReferenceDefault = !selectedQuoteTaxLabel || selectedQuoteTaxLabel === DEFAULT_TAX_LABEL;
+  if (elements.quoteCurrency && quoteCurrencyCanUseReferenceDefault && !quoteCommercialFieldIsTouched("quoteCurrency")) {
     setQuoteCurrencyControls(currency);
   }
-  if (elements.quoteTaxLabel && !String(elements.quoteTaxLabel.value || "").trim() && !quoteCommercialFieldIsTouched("quoteTaxLabel")) {
+  if (elements.quoteTaxLabel && quoteTaxLabelCanUseReferenceDefault && !quoteCommercialFieldIsTouched("quoteTaxLabel")) {
     elements.quoteTaxLabel.value = tax.label;
   }
   if (elements.quoteTaxRate && !String(elements.quoteTaxRate.value || "").trim() && !quoteCommercialFieldIsTouched("quoteTaxRate")) {

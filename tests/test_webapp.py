@@ -10453,6 +10453,14 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertIn('editor.classList.toggle("is-empty"', js)
         self.assertIn(".rich-text-editor.is-empty::before", css)
         self.assertIn(".rich-text-editor:focus.is-empty::before", css)
+        rich_text_placeholder_css = css.split(".rich-text-editor.is-empty::before {", 1)[1].split("}", 1)[0]
+        self.assertIn("display: block;", rich_text_placeholder_css)
+        self.assertIn("white-space: nowrap;", rich_text_placeholder_css)
+        self.assertIn("text-overflow: ellipsis;", rich_text_placeholder_css)
+        self.assertIn("overflow: hidden;", rich_text_placeholder_css)
+        single_line_editor_css = css.split(".rich-text-editor.is-single-line {", 1)[1].split("}", 1)[0]
+        self.assertIn("white-space: nowrap;", single_line_editor_css)
+        self.assertIn("overflow-x: hidden;", single_line_editor_css)
         for source_id in (
             "clientName",
             "clientAddress",
@@ -15585,11 +15593,12 @@ assert.ok(source.includes("refreshOutputRowsFromLineItems();"));
         self.assertIn('data-quote-currency', html)
         self.assertIn('data-quote-tax', html)
         self.assertNotIn("pricing-reference-pill-row", html)
-        self.assertIn("SGD - Singapore Dollar", html)
-        self.assertLess(html.index("SGD - Singapore Dollar"), html.index("AUD - Australian Dollar"))
-        self.assertLess(html.index("AUD - Australian Dollar"), html.index("CNY - Chinese Yuan"))
-        self.assertLess(html.index("THB - Thai Baht"), html.index("USD - US Dollar"))
-        self.assertLess(html.index("USD - US Dollar"), html.index("Custom - Enter currency code"))
+        pricing_reference_currency_select = html.split('id="pricingReferenceCurrency"', 1)[1].split("</select>", 1)[0]
+        self.assertIn("SGD - Singapore Dollar", pricing_reference_currency_select)
+        self.assertLess(pricing_reference_currency_select.index("SGD - Singapore Dollar"), pricing_reference_currency_select.index("AUD - Australian Dollar"))
+        self.assertLess(pricing_reference_currency_select.index("AUD - Australian Dollar"), pricing_reference_currency_select.index("CNY - Chinese Yuan"))
+        self.assertLess(pricing_reference_currency_select.index("THB - Thai Baht"), pricing_reference_currency_select.index("USD - US Dollar"))
+        self.assertLess(pricing_reference_currency_select.index("USD - US Dollar"), pricing_reference_currency_select.index("Custom - Enter currency code"))
         self.assertIn("CUSTOM_CURRENCY_VALUE", js)
         self.assertIn("CURRENCY_OPTIONS", js)
         self.assertIn("supportedCurrencyLabel", js)
@@ -16054,7 +16063,7 @@ const state = {
   pricingReferenceSource: "bundled",
   pricingReferences: [
     { id: "sgd-ref", source: "bundled", label: "SGD Ref", currency: "SGD", tax: { label: "GST", rate: 0.09 } },
-    { id: "aud-ref", source: "local", label: "AUD Ref", currency: "AUD", tax: { label: "GST", rate: 0.09 } },
+    { id: "aud-ref", source: "local", label: "AUD Ref", currency: "AUD", tax: { label: "VAT", rate: 0.08 } },
   ],
   outputRows: [],
   downloadFile: null,
@@ -16181,8 +16190,19 @@ elements.quoteTaxRate.value = "";
 renderSelectedPricingReferenceSummary();
 assert.strictEqual(elements.quoteCurrency.value, "AUD");
 assert.strictEqual(elements.quoteExchangeRate.value, "1");
-assert.strictEqual(elements.quoteTaxLabel.value, "GST");
-assert.strictEqual(elements.quoteTaxRate.value, "9");
+assert.strictEqual(elements.quoteTaxLabel.value, "VAT");
+assert.strictEqual(elements.quoteTaxRate.value, "8");
+
+resetQuoteCommercialTouched();
+elements.quoteCurrency.value = "SGD";
+elements.quoteExchangeRate.value = "";
+elements.quoteTaxLabel.value = "GST";
+elements.quoteTaxRate.value = "";
+renderSelectedPricingReferenceSummary();
+assert.strictEqual(elements.quoteCurrency.value, "AUD");
+assert.strictEqual(elements.quoteExchangeRate.value, "1");
+assert.strictEqual(elements.quoteTaxLabel.value, "VAT");
+assert.strictEqual(elements.quoteTaxRate.value, "8");
 """
         completed = subprocess.run(
             [node, "-e", script],
@@ -16379,10 +16399,13 @@ function extractFunction(name) {
 const DEFAULT_TAX_LABEL = "GST";
 const DEFAULT_TAX_RATE = 0.09;
 const DEFAULT_CURRENCY_LABEL = "SGD";
+const CUSTOM_CURRENCY_VALUE = "__CUSTOM__";
+const CURRENCY_OPTIONS = [["SGD"], ["AUD"], ["CNY"], ["EUR"], ["GBP"], ["IDR"], ["MYR"], ["THB"], ["USD"]];
 const SIDE_PANEL_SEQUENCE = ["images", "customer", "quote_company", "basis", "output"];
 const QUOTE_COMMERCIAL_FIELD_KEYS = ["quoteCurrency", "quoteExchangeRate", "quoteTaxLabel", "quoteTaxRate"];
 const elements = {
   quoteCurrency: { value: "SGD" },
+  quoteCurrencyCustom: { value: "", hidden: true, required: false },
   quoteExchangeRate: { value: "1" },
   quoteExchangeRateField: { hidden: true },
   quoteTaxLabel: { value: "GST" },
@@ -16440,6 +16463,12 @@ eval([
   "taxRatePercentText",
   "taxRateFromPercentInput",
   "normalizeCurrencyLabel",
+  "isStandardCurrencyCode",
+  "normalizedCustomCurrencyInput",
+  "customCurrencyInputIsValid",
+  "setQuoteCurrencyControls",
+  "syncQuoteCurrencyCustomInput",
+  "quoteCurrencyControlValue",
   "emptyQuoteCommercialTouched",
   "normalizeQuoteCommercialTouched",
   "resetQuoteCommercialTouched",

@@ -4656,9 +4656,13 @@ h3 {
 
 .rich-text-editor.is-empty::before {
   content: attr(data-placeholder);
+  display: block;
   color: #8896a6;
   opacity: 0.82;
+  overflow: hidden;
   pointer-events: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 input::placeholder,
@@ -4752,7 +4756,9 @@ select:focus {
   height: 40px;
   min-height: 40px;
   max-height: 40px;
+  overflow-x: hidden;
   overflow-y: hidden;
+  white-space: nowrap;
 }
 
 .primary-button:active:not(:disabled):not([aria-disabled="true"]) {
