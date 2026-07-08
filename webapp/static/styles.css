@@ -1705,7 +1705,7 @@ h3 {
   color: #ffffff;
 }
 
-/* Compact dashboard pass: keeps KQAG tokens while matching the Stitch master-detail proportions. */
+/* Compact dashboard pass: keeps SQAG tokens while matching the Stitch master-detail proportions. */
 .quote-dashboard-panel.is-active {
   padding: 18px 0;
 }
@@ -2107,7 +2107,7 @@ h3 {
   font-size: 12px;
 }
 
-/* Stitch-proportioned dashboard refinement. Layout only; colors stay on KQAG tokens. */
+/* Stitch-proportioned dashboard refinement. Layout only; colors stay on SQAG tokens. */
 .quote-dashboard-panel.is-active {
   padding: 10px 0 18px;
 }

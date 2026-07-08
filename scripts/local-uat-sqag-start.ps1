@@ -1,11 +1,11 @@
 [CmdletBinding()]
 param(
     [string]$PlatformBaseUrl = "http://127.0.0.1:4317",
-    [string]$KqagDatabaseUrl = "",
+    [string]$SqagDatabaseUrl = "",
     [string]$UatRoot = "",
     [switch]$SkipMigrations,
-    [string]$KqagHost = "127.0.0.1",
-    [int]$KqagPort = 8765
+    [string]$SqagHost = "127.0.0.1",
+    [int]$SqagPort = 8765
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,7 +19,7 @@ function Resolve-RepoRoot {
     $scriptDirectory = Split-Path -Parent $scriptPath
     $root = Resolve-Path (Join-Path $scriptDirectory "..")
     if (-not (Test-Path (Join-Path $root "webapp/server.py"))) {
-        throw "This helper must run from the KQAG repo checkout; webapp/server.py was not found."
+        throw "This helper must run from the SQAG repo checkout; webapp/server.py was not found."
     }
     return $root.Path
 }
@@ -86,7 +86,7 @@ $python = Resolve-PythonCommand
 
 $usingDefaultUatRoot = $false
 if ([string]::IsNullOrWhiteSpace($UatRoot)) {
-    $UatRoot = Join-Path ([System.IO.Path]::GetTempPath()) "kqag-platform-uat"
+    $UatRoot = Join-Path ([System.IO.Path]::GetTempPath()) "sqag-platform-uat"
     $usingDefaultUatRoot = $true
 }
 
@@ -100,9 +100,9 @@ foreach ($path in @($resolvedUatRoot, $dataRoot, $outputRoot, $tmpRoot, $logRoot
     New-Item -ItemType Directory -Path $path -Force | Out-Null
 }
 
-if ([string]::IsNullOrWhiteSpace($KqagDatabaseUrl)) {
-    $databasePath = [System.IO.Path]::GetFullPath((Join-Path $resolvedUatRoot "kqag-platform-uat.sqlite3"))
-    $KqagDatabaseUrl = "sqlite:///" + $databasePath.Replace("\", "/")
+if ([string]::IsNullOrWhiteSpace($SqagDatabaseUrl)) {
+    $databasePath = [System.IO.Path]::GetFullPath((Join-Path $resolvedUatRoot "sqag-platform-uat.sqlite3"))
+    $SqagDatabaseUrl = "sqlite:///" + $databasePath.Replace("\", "/")
 }
 
 if ([string]::IsNullOrWhiteSpace($env:SESSION_SECRET)) {
@@ -111,40 +111,40 @@ if ([string]::IsNullOrWhiteSpace($env:SESSION_SECRET)) {
 
 Set-ProcessEnv -Name "APP_MODE" -Value "deploy"
 Set-ProcessEnv -Name "AUTH_REQUIRED" -Value "true"
-Set-ProcessEnv -Name "KQAG_PLATFORM_LAUNCH_MODE" -Value "platform"
-Set-ProcessEnv -Name "KQAG_PLATFORM_BASE_URL" -Value $PlatformBaseUrl
-Set-ProcessEnv -Name "KQAG_STORAGE_MODE" -Value "database"
-Set-ProcessEnv -Name "KQAG_ARTIFACT_STORAGE_MODE" -Value "database"
-Set-ProcessEnv -Name "SQAG_DATABASE_URL" -Value $KqagDatabaseUrl
+Set-ProcessEnv -Name "SQAG_PLATFORM_LAUNCH_MODE" -Value "platform"
+Set-ProcessEnv -Name "SQAG_PLATFORM_BASE_URL" -Value $PlatformBaseUrl
+Set-ProcessEnv -Name "SQAG_STORAGE_MODE" -Value "database"
+Set-ProcessEnv -Name "SQAG_ARTIFACT_STORAGE_MODE" -Value "database"
+Set-ProcessEnv -Name "SQAG_DATABASE_URL" -Value $SqagDatabaseUrl
 Set-ProcessEnv -Name "QUOTE_DATA_ROOT" -Value $dataRoot
 Set-ProcessEnv -Name "QUOTE_OUTPUT_ROOT" -Value $outputRoot
 Set-ProcessEnv -Name "QUOTE_TMP_ROOT" -Value $tmpRoot
 Set-ProcessEnv -Name "QUOTE_LOG_ROOT" -Value $logRoot
 
-$kqagBaseUrl = "http://${KqagHost}:${KqagPort}"
+$sqagBaseUrl = "http://${SqagHost}:${SqagPort}"
 
 if ($usingDefaultUatRoot) {
-    Write-Host "KQAG local UAT root: $resolvedUatRoot"
+    Write-Host "SQAG local UAT root: $resolvedUatRoot"
 } else {
-    Write-Host "KQAG local UAT root: custom path configured"
+    Write-Host "SQAG local UAT root: custom path configured"
 }
 Write-Host "Python command: $($python.Display)"
-Write-Host "KQAG URL: $kqagBaseUrl/"
+Write-Host "SQAG URL: $sqagBaseUrl/"
 Write-Host ""
 Write-Host "Set these in the Platform shell before npm run platform:start:"
-Write-Host '$env:PLATFORM_KQAG_LAUNCH_MODE="server_handoff"'
-# Default line shape: PLATFORM_KQAG_APP_BASE_URL=http://127.0.0.1:<port>
-Write-Host "`$env:PLATFORM_KQAG_APP_BASE_URL=`"$kqagBaseUrl`""
+Write-Host '$env:PLATFORM_SQAG_LAUNCH_MODE="server_handoff"'
+# Default line shape: PLATFORM_SQAG_APP_BASE_URL=http://127.0.0.1:<port>
+Write-Host "`$env:PLATFORM_SQAG_APP_BASE_URL=`"$sqagBaseUrl`""
 Write-Host ""
 
 if (-not $SkipMigrations) {
-    Write-Host "Applying KQAG storage migrations to the disposable local database..."
-    & $python.FilePath @($python.Arguments + @("scripts/migrate_kqag_storage.py"))
+    Write-Host "Applying SQAG storage migrations to the disposable local database..."
+    & $python.FilePath @($python.Arguments + @("scripts/migrate_sqag_storage.py"))
     if ($LASTEXITCODE -ne 0) {
-        throw "KQAG storage migrations failed."
+        throw "SQAG storage migrations failed."
     }
 }
 
-Write-Host "Starting KQAG for Platform UAT..."
-& $python.FilePath @($python.Arguments + @("-m", "webapp.server", "--host", $KqagHost, "--port", [string]$KqagPort))
+Write-Host "Starting SQAG for Platform UAT..."
+& $python.FilePath @($python.Arguments + @("-m", "webapp.server", "--host", $SqagHost, "--port", [string]$SqagPort))
 exit $LASTEXITCODE

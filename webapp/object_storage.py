@@ -245,11 +245,11 @@ class S3CompatibleObjectStorageBackend:
         checksum_sha256: str,
     ) -> dict[str, str]:
         return {
-            "kqag-workspace-id": safe_segment(workspace_id, ""),
-            "kqag-owner-type": normalize_owner_type(owner_type),
-            "kqag-owner-id": safe_segment(owner_id, ""),
-            "kqag-artifact-kind": safe_segment(artifact_kind, ""),
-            "kqag-checksum-sha256": checksum_sha256,
+            "sqag-workspace-id": safe_segment(workspace_id, ""),
+            "sqag-owner-type": normalize_owner_type(owner_type),
+            "sqag-owner-id": safe_segment(owner_id, ""),
+            "sqag-artifact-kind": safe_segment(artifact_kind, ""),
+            "sqag-checksum-sha256": checksum_sha256,
         }
 
     def _validate_remote_metadata(self, metadata: ObjectArtifactMetadata, response: Mapping[str, object]) -> None:

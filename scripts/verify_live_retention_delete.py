@@ -55,8 +55,8 @@ ACTIVE_OBJECT_ENV_NAMES = [
     OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME,
 ]
 RUNTIME_MODE_ENV_NAMES = [
-    webapp.KQAG_STORAGE_MODE_ENV_NAME,
-    webapp.KQAG_ARTIFACT_STORAGE_MODE_ENV_NAME,
+    webapp.SQAG_STORAGE_MODE_ENV_NAME,
+    webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME,
 ]
 REQUIRED_ENV_NAMES = [
     LIVE_RETENTION_DELETE_ENV_NAME,
@@ -112,11 +112,11 @@ def _missing_env_names(env: Mapping[str, str]) -> list[str]:
 
 
 def _runtime_database_mode_enabled(env: Mapping[str, str]) -> bool:
-    return _clean(env.get(webapp.KQAG_STORAGE_MODE_ENV_NAME)).lower() == "database"
+    return _clean(env.get(webapp.SQAG_STORAGE_MODE_ENV_NAME)).lower() == "database"
 
 
 def _runtime_object_artifact_mode_enabled(env: Mapping[str, str]) -> bool:
-    return _clean(env.get(webapp.KQAG_ARTIFACT_STORAGE_MODE_ENV_NAME)).lower() == "object"
+    return _clean(env.get(webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME)).lower() == "object"
 
 
 def _default_checks(
@@ -216,7 +216,7 @@ def _report(
 
 
 def _build_default_storage(database_url: str, workspace_id: str) -> Any:
-    return webapp.DatabaseKqagStorage(
+    return webapp.DatabaseSqagStorage(
         database_url,
         workspace_id,
         role="admin",
@@ -299,7 +299,7 @@ def _object_artifact_rows_for_session(storage: object, session_id: str) -> list[
         with storage.connection() as connection:
             return connection.execute(
                 "select artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at "
-                "from kqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and session_id = ?",
+                "from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and session_id = ?",
                 (storage.workspace_id, "generated_quote", session_id, session_id),
             ).fetchall()
     if hasattr(storage, "_object_quote_artifact_rows_for_session"):
@@ -377,15 +377,14 @@ def _write_synthetic_metadata(storage: object, ids: Mapping[str, str], metadata:
 def _runtime_env_names() -> list[str]:
     return [
         webapp.SQAG_DATABASE_URL_ENV_NAME,
-        webapp.KQAG_STORAGE_MODE_ENV_NAME,
-        webapp.KQAG_ARTIFACT_STORAGE_MODE_ENV_NAME,
+        webapp.SQAG_STORAGE_MODE_ENV_NAME,
+        webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME,
         *ACTIVE_OBJECT_ENV_NAMES,
     ]
 
 
 def _with_runtime_env(env: Mapping[str, str], callback: Callable[[], Any]) -> Any:
     previous = {name: os.environ.get(name) for name in _runtime_env_names()}
-    previous_legacy_database_url = os.environ.get("KQAG_DATABASE_URL")
     try:
         for name in _runtime_env_names():
             value = env.get(name)
@@ -393,7 +392,6 @@ def _with_runtime_env(env: Mapping[str, str], callback: Callable[[], Any]) -> An
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = str(value)
-        os.environ.pop("KQAG_DATABASE_URL", None)
         return callback()
     finally:
         for name, value in previous.items():
@@ -401,10 +399,6 @@ def _with_runtime_env(env: Mapping[str, str], callback: Callable[[], Any]) -> An
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
-        if previous_legacy_database_url is None:
-            os.environ.pop("KQAG_DATABASE_URL", None)
-        else:
-            os.environ["KQAG_DATABASE_URL"] = previous_legacy_database_url
 
 
 def _runtime_download(storage: object, session_id: str, backend: ObjectStorageBackend, env: Mapping[str, str]) -> dict[str, object] | None:
@@ -475,11 +469,11 @@ def _cleanup_storage(storage: object, session_id: str) -> bool:
     if hasattr(storage, "connection"):
         with storage.connection() as connection:
             connection.execute(
-                "delete from kqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+                "delete from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
                 (storage.workspace_id, "generated_quote", session_id, "xlsx"),
             )
             connection.execute(
-                "delete from kqag_quote_sessions where workspace_id = ? and session_id = ?",
+                "delete from sqag_quote_sessions where workspace_id = ? and session_id = ?",
                 (storage.workspace_id, session_id),
             )
             connection.commit()
@@ -708,7 +702,7 @@ def run_verification(
         blockers=blockers,
         storage_factory=storage_factory or _build_default_storage,
         backend_factory=backend_factory or _build_s3_backend,
-        migration_applier=migration_applier or webapp.apply_kqag_storage_migrations,
+        migration_applier=migration_applier or webapp.apply_sqag_storage_migrations,
     )
     status = "passed" if not blockers else "failed"
     return _report(

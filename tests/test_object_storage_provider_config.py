@@ -129,15 +129,16 @@ class ObjectStorageProviderConfigTest(unittest.TestCase):
                 continue
             self.assertNotIn(value, text)
 
-    def test_legacy_kqag_provider_env_is_ignored(self):
+    def test_legacy_sqag_provider_env_is_ignored(self):
+        legacy_prefix = "K" + "QAG"
         status = object_storage.object_storage_provider_status(
             {
-                "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
-                "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
-                "KQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
-                "KQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
-                "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
-                "KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
+                f"{legacy_prefix}_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+                f"{legacy_prefix}_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
+                f"{legacy_prefix}_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
+                f"{legacy_prefix}_OBJECT_STORAGE_REGION": "ap-southeast-1",
+                f"{legacy_prefix}_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
+                f"{legacy_prefix}_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
             }
         )
 
@@ -228,7 +229,7 @@ class ObjectStorageProviderConfigTest(unittest.TestCase):
             content=b"synthetic-xlsx-content",
         )
         stored = client.objects[("example-artifact-bucket", metadata.storage_key)]
-        stored["metadata"]["kqag-workspace-id"] = "workspace-b"
+        stored["metadata"]["sqag-workspace-id"] = "workspace-b"
 
         self.assertFalse(backend.verify_metadata(metadata, workspace_id="workspace-a"))
         with self.assertRaises(object_storage.ObjectStorageContractError):

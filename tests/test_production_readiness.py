@@ -30,7 +30,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
 
     def test_readiness_status_redacts_private_values_and_lists_storage_surfaces(self):
         private_root = "C:/Users/Private/Koncept Runtime"
-        database_url = "sqlite:///C:/Users/Private/kqag-storage.sqlite3?token=secret"
+        database_url = "sqlite:///C:/Users/Private/sqag-storage.sqlite3?token=secret"
         text = self.readiness_json(
             {
                 "QUOTE_DATA_ROOT": private_root,
@@ -57,14 +57,16 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         with mock.patch.dict(webapp.os.environ, {}, clear=True):
             status = webapp.production_readiness_status()
 
-        self.assertEqual(status["kqag_storage_mode"], "local")
-        self.assertEqual(status["kqag_artifact_storage_mode"], "local")
+        self.assertEqual(status["sqag_storage_mode"], "local")
+        self.assertEqual(status["sqag_artifact_storage_mode"], "local")
         self.assertTrue(status["local_uat_supported"])
         self.assertFalse(status["internal_alpha_ready"])
         self.assertFalse(status["production_ready"])
         self.assertFalse(status["internal_alpha_future_exception"]["possible"])
         blocker_ids = {item["id"] for item in status["blockers"]}
+        production_blocker_ids = {item["id"] for item in status["production_blockers"]}
         self.assertIn("local_runtime_storage", blocker_ids)
+        self.assertIn("platform_app_key_migration_pending", production_blocker_ids)
         self.assertIn("hosted_logging_monitoring_missing", blocker_ids)
         self.assertIn("hosted_smoke_evidence_missing", blocker_ids)
         self.assertNotIn("pricing_reference_local_pack_isolation", blocker_ids)
@@ -73,7 +75,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
     def test_readiness_command_redacts_sensitive_runtime_values(self):
         private_values = {
             "C:/Users/Private/Koncept Runtime",
-            "sqlite:///C:/Users/Private/kqag-storage.sqlite3?token=secret",
+            "sqlite:///C:/Users/Private/sqag-storage.sqlite3?token=secret",
             "oauth-client-secret-value",
             "https://auth.example.test/callback?code=private-code&state=private-state",
             "swooshz_private_session_cookie",
@@ -87,13 +89,13 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             "PATH": os.environ.get("PATH", ""),
             "PYTHONIOENCODING": "utf-8",
             "PYTHONPATH": str(ROOT),
-            "KQAG_STORAGE_MODE": "database",
-            "KQAG_ARTIFACT_STORAGE_MODE": "database",
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "database",
             "QUOTE_DATA_ROOT": "C:/Users/Private/Koncept Runtime",
             "QUOTE_OUTPUT_ROOT": "C:/Users/Private/Koncept Runtime/output",
             "QUOTE_TMP_ROOT": "C:/Users/Private/Koncept Runtime/tmp",
             "QUOTE_LOG_ROOT": "C:/Users/Private/Koncept Runtime/logs",
-            "SQAG_DATABASE_URL": "sqlite:///C:/Users/Private/kqag-storage.sqlite3?token=secret",
+            "SQAG_DATABASE_URL": "sqlite:///C:/Users/Private/sqag-storage.sqlite3?token=secret",
             "OIDC_CLIENT_SECRET": "oauth-client-secret-value",
             "OIDC_REDIRECT_URI": "https://auth.example.test/callback?code=private-code&state=private-state",
             "SESSION_SECRET": "swooshz_private_session_cookie",
@@ -129,9 +131,9 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             "PATH": os.environ.get("PATH", ""),
             "PYTHONIOENCODING": "utf-8",
             "PYTHONPATH": str(ROOT),
-            "KQAG_STORAGE_MODE": "database",
-            "KQAG_ARTIFACT_STORAGE_MODE": "database",
-            "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "database",
+            "SQAG_DATABASE_URL": "sqlite:///tmp/sqag-storage.sqlite3",
         }
         for name in ("COMSPEC", "SystemRoot", "TEMP", "TMP"):
             if os.environ.get(name):
@@ -165,10 +167,10 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertNotIn(str(work_dir), completed.stdout + completed.stderr)
 
     def test_database_and_artifact_modes_are_evaluated_separately(self):
-        database_url = "sqlite:///tmp/kqag-storage.sqlite3"
+        database_url = "sqlite:///tmp/sqag-storage.sqlite3"
         with mock.patch.dict(
             webapp.os.environ,
-            {"KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "local", "SQAG_DATABASE_URL": database_url},
+            {"SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "local", "SQAG_DATABASE_URL": database_url},
             clear=True,
         ):
             mixed_status = webapp.production_readiness_status()
@@ -182,7 +184,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
 
         with mock.patch.dict(
             webapp.os.environ,
-            {"KQAG_STORAGE_MODE": "database", "KQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url},
+            {"SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url},
             clear=True,
         ):
             database_status = webapp.production_readiness_status()
@@ -198,9 +200,9 @@ class ProductionReadinessStatusTest(unittest.TestCase):
     def test_readiness_reports_immutable_quote_session_snapshot_groundwork(self):
         status = self.readiness_status(
             {
-                "KQAG_STORAGE_MODE": "database",
-                "KQAG_ARTIFACT_STORAGE_MODE": "database",
-                "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": "database",
+                "SQAG_DATABASE_URL": "sqlite:///tmp/sqag-storage.sqlite3",
             },
             backup_restore_evidence_status="passed",
             hosted_observability_evidence_status="passed",
@@ -208,7 +210,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         )
 
         snapshots = status["quote_session_snapshots"]
-        self.assertEqual(snapshots["schema"], "swooshz.kqag.quote-generation-snapshot.v1")
+        self.assertEqual(snapshots["schema"], "swooshz.sqag.quote-generation-snapshot.v1")
         self.assertTrue(snapshots["workspace_scoped"])
         self.assertTrue(snapshots["privacy_minimized"])
         self.assertFalse(snapshots["production_suitable"])
@@ -225,9 +227,9 @@ class ProductionReadinessStatusTest(unittest.TestCase):
     def test_readiness_reports_stale_deleted_artifact_route_and_race_evidence_without_overclaim(self):
         status = self.readiness_status(
             {
-                "KQAG_STORAGE_MODE": "database",
-                "KQAG_ARTIFACT_STORAGE_MODE": "object",
-                "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": "object",
+                "SQAG_DATABASE_URL": "sqlite:///tmp/sqag-storage.sqlite3",
             },
             backup_restore_evidence_status="passed",
             hosted_observability_evidence_status="passed",
@@ -247,11 +249,11 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertFalse(status["production_ready"])
 
     def test_database_backup_restore_evidence_can_be_reported_without_readiness_overclaim(self):
-        database_url = "sqlite:///tmp/kqag-storage.sqlite3"
+        database_url = "sqlite:///tmp/sqag-storage.sqlite3"
         status = self.readiness_status(
             {
-                "KQAG_STORAGE_MODE": "database",
-                "KQAG_ARTIFACT_STORAGE_MODE": "database",
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": "database",
                 "SQAG_DATABASE_URL": database_url,
             },
             backup_restore_evidence_status="passed",
@@ -285,9 +287,9 @@ class ProductionReadinessStatusTest(unittest.TestCase):
     def test_object_storage_contract_evidence_is_not_assumed_when_not_run(self):
         status = self.readiness_status(
             {
-                "KQAG_STORAGE_MODE": "database",
-                "KQAG_ARTIFACT_STORAGE_MODE": "object",
-                "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": "object",
+                "SQAG_DATABASE_URL": "sqlite:///tmp/sqag-storage.sqlite3",
             },
             backup_restore_evidence_status="passed",
             hosted_observability_evidence_status="passed",
@@ -295,7 +297,7 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         )
 
         blocker_ids = {item["id"] for item in status["blockers"]}
-        self.assertEqual(status["kqag_artifact_storage_mode"], "object")
+        self.assertEqual(status["sqag_artifact_storage_mode"], "object")
         self.assertEqual(status["object_storage_evidence"]["status"], "not_run_by_checker")
         self.assertFalse(status["object_storage_evidence"]["production_object_storage_contract_supported"])
         self.assertIn("object_storage_missing", blocker_ids)
@@ -304,9 +306,9 @@ class ProductionReadinessStatusTest(unittest.TestCase):
     def test_object_storage_contract_evidence_drops_only_object_missing_blocker(self):
         status = self.readiness_status(
             {
-                "KQAG_STORAGE_MODE": "database",
-                "KQAG_ARTIFACT_STORAGE_MODE": "object",
-                "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": "object",
+                "SQAG_DATABASE_URL": "sqlite:///tmp/sqag-storage.sqlite3",
             },
             backup_restore_evidence_status="passed",
             hosted_observability_evidence_status="passed",
@@ -329,9 +331,9 @@ class ProductionReadinessStatusTest(unittest.TestCase):
     def test_object_mode_surfaces_lifecycle_backup_retention_and_staging_evidence(self):
         status = self.readiness_status(
             {
-                "KQAG_STORAGE_MODE": "database",
-                "KQAG_ARTIFACT_STORAGE_MODE": "object",
-                "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": "object",
+                "SQAG_DATABASE_URL": "sqlite:///tmp/sqag-storage.sqlite3",
             },
             backup_restore_evidence_status="passed",
             hosted_observability_evidence_status="passed",
@@ -357,9 +359,9 @@ class ProductionReadinessStatusTest(unittest.TestCase):
     def test_live_object_storage_provider_evidence_is_not_assumed_when_not_run(self):
         status = self.readiness_status(
             {
-                "KQAG_STORAGE_MODE": "database",
-                "KQAG_ARTIFACT_STORAGE_MODE": "object",
-                "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": "object",
+                "SQAG_DATABASE_URL": "sqlite:///tmp/sqag-storage.sqlite3",
             },
             backup_restore_evidence_status="passed",
             hosted_observability_evidence_status="passed",
@@ -374,23 +376,25 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         required_env_names = status["live_object_storage_provider_evidence"]["required_env_names"]
         self.assertIn("SQAG_LIVE_OBJECT_STORAGE_EVIDENCE", required_env_names)
         self.assertIn("SQAG_OBJECT_STORAGE_PROVIDER", required_env_names)
-        self.assertNotIn("KQAG_LIVE_OBJECT_STORAGE_EVIDENCE", required_env_names)
-        self.assertNotIn("KQAG_OBJECT_STORAGE_PROVIDER", required_env_names)
+        legacy_prefix = "K" + "QAG"
+        self.assertNotIn(f"{legacy_prefix}_LIVE_OBJECT_STORAGE_EVIDENCE", required_env_names)
+        self.assertNotIn(f"{legacy_prefix}_OBJECT_STORAGE_PROVIDER", required_env_names)
         self.assertIn("object_storage_provider_unavailable", production_blocker_ids)
         self.assertFalse(status["production_ready"])
 
-    def test_legacy_kqag_object_storage_env_does_not_enable_provider_readiness(self):
+    def test_legacy_sqag_object_storage_env_does_not_enable_provider_readiness(self):
+        legacy_prefix = "K" + "QAG"
         status = self.readiness_status(
             {
-                "KQAG_STORAGE_MODE": "database",
-                "KQAG_ARTIFACT_STORAGE_MODE": "object",
-                "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
-                "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
-                "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
-                "KQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
-                "KQAG_OBJECT_STORAGE_REGION": "<redacted-region>",
-                "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "<redacted-access-key-id>",
-                "KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "<redacted-secret-access-key>",
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": "object",
+                "SQAG_DATABASE_URL": "sqlite:///tmp/sqag-storage.sqlite3",
+                f"{legacy_prefix}_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+                f"{legacy_prefix}_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
+                f"{legacy_prefix}_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
+                f"{legacy_prefix}_OBJECT_STORAGE_REGION": "<redacted-region>",
+                f"{legacy_prefix}_OBJECT_STORAGE_ACCESS_KEY_ID": "<redacted-access-key-id>",
+                f"{legacy_prefix}_OBJECT_STORAGE_SECRET_ACCESS_KEY": "<redacted-secret-access-key>",
             },
             backup_restore_evidence_status="passed",
             hosted_observability_evidence_status="passed",
@@ -408,9 +412,9 @@ class ProductionReadinessStatusTest(unittest.TestCase):
 
     def test_failed_live_object_storage_provider_evidence_keeps_production_blocked(self):
         env = {
-            "KQAG_STORAGE_MODE": "database",
-            "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "object",
+            "SQAG_DATABASE_URL": "sqlite:///tmp/sqag-storage.sqlite3",
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
             "SQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
@@ -437,9 +441,9 @@ class ProductionReadinessStatusTest(unittest.TestCase):
 
     def test_live_object_storage_provider_evidence_drops_only_provider_blocker(self):
         env = {
-            "KQAG_STORAGE_MODE": "database",
-            "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "object",
+            "SQAG_DATABASE_URL": "sqlite:///tmp/sqag-storage.sqlite3",
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
             "SQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
@@ -474,8 +478,8 @@ class ProductionReadinessStatusTest(unittest.TestCase):
     def test_postgres_database_url_drops_runtime_blocker_but_keeps_live_evidence_blocked(self):
         private_url = "postgres" + "ql://redacted-db-url"
         env = {
-            "KQAG_STORAGE_MODE": "database",
-            "KQAG_ARTIFACT_STORAGE_MODE": "object",
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "object",
             "SQAG_DATABASE_URL": private_url,
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
@@ -511,8 +515,8 @@ class ProductionReadinessStatusTest(unittest.TestCase):
     def test_postgres_database_live_evidence_drops_only_database_blocker(self):
         private_url = "postgres" + "ql://redacted-db-url"
         env = {
-            "KQAG_STORAGE_MODE": "database",
-            "KQAG_ARTIFACT_STORAGE_MODE": "object",
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "object",
             "SQAG_DATABASE_URL": private_url,
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
@@ -547,8 +551,8 @@ class ProductionReadinessStatusTest(unittest.TestCase):
     def test_live_db_object_backup_restore_evidence_drops_only_backup_restore_live_blocker(self):
         private_url = "postgres" + "ql://redacted-db-url"
         env = {
-            "KQAG_STORAGE_MODE": "database",
-            "KQAG_ARTIFACT_STORAGE_MODE": "object",
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "object",
             "SQAG_DATABASE_URL": private_url,
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
@@ -584,8 +588,8 @@ class ProductionReadinessStatusTest(unittest.TestCase):
     def test_live_retention_delete_evidence_drops_only_retention_delete_live_blocker(self):
         private_url = "postgres" + "ql://redacted-db-url"
         env = {
-            "KQAG_STORAGE_MODE": "database",
-            "KQAG_ARTIFACT_STORAGE_MODE": "object",
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "object",
             "SQAG_DATABASE_URL": private_url,
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
@@ -613,12 +617,13 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         required_env_names = status["live_retention_delete_evidence"]["required_env_names"]
         self.assertEqual(status["live_retention_delete_evidence"]["status"], "passed")
         self.assertTrue(status["live_retention_delete_evidence"]["live_retention_delete_evidence_supported"])
-        self.assertIn("KQAG_STORAGE_MODE", required_env_names)
-        self.assertIn("KQAG_ARTIFACT_STORAGE_MODE", required_env_names)
+        self.assertIn("SQAG_STORAGE_MODE", required_env_names)
+        self.assertIn("SQAG_ARTIFACT_STORAGE_MODE", required_env_names)
         self.assertIn("SQAG_DATABASE_URL", required_env_names)
-        self.assertNotIn("KQAG_DATABASE_URL", required_env_names)
+        self.assertNotIn("K" + "QAG_DATABASE_URL", required_env_names)
         self.assertNotIn("object_retention_delete_live_evidence_missing", production_blocker_ids)
         self.assertNotIn("db_object_backup_restore_live_evidence_missing", production_blocker_ids)
+        self.assertIn("platform_app_key_migration_pending", production_blocker_ids)
         self.assertIn("session_business_hardening_incomplete", production_blocker_ids)
         self.assertIn("production_deployment_operations_evidence_missing", production_blocker_ids)
         self.assertFalse(status["production_ready"])
@@ -627,9 +632,9 @@ class ProductionReadinessStatusTest(unittest.TestCase):
     def test_sqlite_database_url_also_reports_missing_postgres_neon_database_evidence(self):
         status = self.readiness_status(
             {
-                "KQAG_STORAGE_MODE": "database",
-                "KQAG_ARTIFACT_STORAGE_MODE": "object",
-                "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": "object",
+                "SQAG_DATABASE_URL": "sqlite:///tmp/sqag-storage.sqlite3",
             },
             object_storage_evidence_status="passed",
             object_artifact_lifecycle_evidence_status="passed",
@@ -648,8 +653,8 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             "PATH": os.environ.get("PATH", ""),
             "PYTHONIOENCODING": "utf-8",
             "PYTHONPATH": str(ROOT),
-            "KQAG_STORAGE_MODE": "database",
-            "KQAG_ARTIFACT_STORAGE_MODE": "object",
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "object",
             "SQAG_DATABASE_URL": private_url,
             "SQAG_LIVE_DATABASE_EVIDENCE": "1",
         }
@@ -682,9 +687,9 @@ class ProductionReadinessStatusTest(unittest.TestCase):
 
     def test_object_storage_provider_config_status_is_metadata_only(self):
         env = {
-            "KQAG_STORAGE_MODE": "database",
-            "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "object",
+            "SQAG_DATABASE_URL": "sqlite:///tmp/sqag-storage.sqlite3",
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test/path",
             "SQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
@@ -709,9 +714,9 @@ class ProductionReadinessStatusTest(unittest.TestCase):
     def test_synthetic_object_storage_provider_is_not_production_credited(self):
         status = self.readiness_status(
             {
-                "KQAG_STORAGE_MODE": "database",
-                "KQAG_ARTIFACT_STORAGE_MODE": "object",
-                "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": "object",
+                "SQAG_DATABASE_URL": "sqlite:///tmp/sqag-storage.sqlite3",
                 "SQAG_OBJECT_STORAGE_PROVIDER": "synthetic",
             },
             backup_restore_evidence_status="passed",
@@ -733,9 +738,9 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             "PATH": os.environ.get("PATH", ""),
             "PYTHONIOENCODING": "utf-8",
             "PYTHONPATH": str(ROOT),
-            "KQAG_STORAGE_MODE": "database",
-            "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "object",
+            "SQAG_DATABASE_URL": "sqlite:///tmp/sqag-storage.sqlite3",
         }
         for name in ("COMSPEC", "SystemRoot", "TEMP", "TMP"):
             if os.environ.get(name):
@@ -776,9 +781,9 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             "PATH": os.environ.get("PATH", ""),
             "PYTHONIOENCODING": "utf-8",
             "PYTHONPATH": str(ROOT),
-            "KQAG_STORAGE_MODE": "database",
-            "KQAG_ARTIFACT_STORAGE_MODE": "object",
-            "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "object",
+            "SQAG_DATABASE_URL": "sqlite:///tmp/sqag-storage.sqlite3",
         }
         for name in ("COMSPEC", "SystemRoot", "TEMP", "TMP"):
             if os.environ.get(name):
@@ -825,11 +830,11 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertNotIn("sqlite:///", text)
 
     def test_hosted_smoke_evidence_is_not_assumed_when_not_run(self):
-        database_url = "sqlite:///tmp/kqag-storage.sqlite3"
+        database_url = "sqlite:///tmp/sqag-storage.sqlite3"
         status = self.readiness_status(
             {
-                "KQAG_STORAGE_MODE": "database",
-                "KQAG_ARTIFACT_STORAGE_MODE": "database",
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": "database",
                 "SQAG_DATABASE_URL": database_url,
             },
             backup_restore_evidence_status="passed",
@@ -843,11 +848,11 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertFalse(status["internal_alpha_ready"])
 
     def test_hosted_smoke_evidence_drops_only_smoke_blocker(self):
-        database_url = "sqlite:///tmp/kqag-storage.sqlite3"
+        database_url = "sqlite:///tmp/sqag-storage.sqlite3"
         status = self.readiness_status(
             {
-                "KQAG_STORAGE_MODE": "database",
-                "KQAG_ARTIFACT_STORAGE_MODE": "database",
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": "database",
                 "SQAG_DATABASE_URL": database_url,
             },
             backup_restore_evidence_status="passed",
@@ -877,11 +882,11 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertIn("hosted_logging_monitoring_missing", blocker_ids)
 
     def test_hosted_observability_evidence_drops_only_logging_blocker(self):
-        database_url = "sqlite:///tmp/kqag-storage.sqlite3"
+        database_url = "sqlite:///tmp/sqag-storage.sqlite3"
         status = self.readiness_status(
             {
-                "KQAG_STORAGE_MODE": "database",
-                "KQAG_ARTIFACT_STORAGE_MODE": "database",
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": "database",
                 "SQAG_DATABASE_URL": database_url,
             },
             backup_restore_evidence_status="passed",
@@ -904,9 +909,9 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             "PATH": os.environ.get("PATH", ""),
             "PYTHONIOENCODING": "utf-8",
             "PYTHONPATH": str(ROOT),
-            "KQAG_STORAGE_MODE": "database",
-            "KQAG_ARTIFACT_STORAGE_MODE": "database",
-            "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "database",
+            "SQAG_DATABASE_URL": "sqlite:///tmp/sqag-storage.sqlite3",
         }
         for name in ("COMSPEC", "SystemRoot", "TEMP", "TMP"):
             if os.environ.get(name):
@@ -949,9 +954,9 @@ class ProductionReadinessStatusTest(unittest.TestCase):
             "PATH": os.environ.get("PATH", ""),
             "PYTHONIOENCODING": "utf-8",
             "PYTHONPATH": str(ROOT),
-            "KQAG_STORAGE_MODE": "database",
-            "KQAG_ARTIFACT_STORAGE_MODE": "database",
-            "SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3",
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "database",
+            "SQAG_DATABASE_URL": "sqlite:///tmp/sqag-storage.sqlite3",
         }
         for name in ("COMSPEC", "SystemRoot", "TEMP", "TMP"):
             if os.environ.get(name):
@@ -996,11 +1001,11 @@ class ProductionReadinessStatusTest(unittest.TestCase):
         self.assertNotIn("sqlite:///", completed.stdout + completed.stderr)
 
     def test_database_backup_restore_evidence_is_not_assumed_when_not_run(self):
-        database_url = "sqlite:///tmp/kqag-storage.sqlite3"
+        database_url = "sqlite:///tmp/sqag-storage.sqlite3"
         status = self.readiness_status(
             {
-                "KQAG_STORAGE_MODE": "database",
-                "KQAG_ARTIFACT_STORAGE_MODE": "database",
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": "database",
                 "SQAG_DATABASE_URL": database_url,
             }
         )

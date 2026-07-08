@@ -36,12 +36,15 @@ Primary blockers:
 
 - Runtime data can still depend on local filesystem storage.
 - Generated quote artifacts can still depend on local filesystem storage.
-- No operator-run live object-storage provider evidence has been recorded for
-  generated XLSX/PDF bytes, and uploaded/reference/profile assets still need
-  final object-storage wiring.
-- Backup/restore has live DB+object evidence, but live retention/delete has
-  only an opt-in verifier path and has not yet recorded passing operator
-  evidence.
+- Earlier live object-provider, database, and DB+object backup/restore evidence
+  is now historical/pre-namespace evidence after the SQAG env/table/object
+  metadata/app-key cleanup. Post-rename reruns are required before those live
+  gates can count for the current SQAG namespace.
+- Live retention/delete has only an opt-in verifier path and has not recorded
+  passing post-rename operator evidence.
+- Swooshz Platform app-key migration is pending in a separate Platform PR; SQAG
+  now expects `appKey=sqag`, but this repo does not migrate Platform-owned
+  whitelist, entitlement, launch, consume, seed, docs, tests, or admin surfaces.
 
 PR #88 update: database/platform pricing-reference list/detail/export/generation
 paths now resolve only workspace-owned database rows. Local and bundled pricing
@@ -92,17 +95,19 @@ python -m pip install --only-binary=:all: -r requirements.txt
 python scripts\check_production_readiness.py --with-object-storage-evidence --with-object-artifact-lifecycle-evidence --with-live-object-storage-provider-evidence
 ```
 
-Sanitized operator evidence from 2026-07-07 shows the live verifier can pass
-against a real S3-compatible provider when canonical `SQAG_*` env names are
-supplied outside Git: `status=passed`, `test_injected_backend=false`,
+Sanitized operator evidence from 2026-07-07 shows the live verifier could pass
+against a real S3-compatible provider when env names were supplied outside Git:
+`status=passed`, `test_injected_backend=false`,
 `live_provider_evidence_supported=true`, and store/retrieve/checksum/content
 type/byte size/wrong-workspace/delete/tombstone/missing-object checks all true.
 No provider values, bucket names, object keys, artifact bytes, DB URLs, private
 paths, uploaded content, tenant data, or secrets were committed or printed.
-Production readiness still remains false. The separate live DB+object
-backup/restore gate now has sanitized passing evidence, but live
-retention/delete, operations, hosted logging/smoke, session hardening, and final
-audit gates remain unsatisfied.
+After the SQAG namespace cleanup, this run is historical/pre-namespace evidence
+and must not be treated as post-rename proof. Production readiness still remains
+false. The separate live DB+object backup/restore gate also has only
+historical/pre-namespace sanitized passing evidence; post-rename live database,
+DB+object backup/restore, live retention/delete, and live Platform-to-SQAG smoke
+reruns remain required.
 
 Production database readiness is now a separate explicit gate. SQLite remains
 local-UAT/synthetic evidence only, while Neon/Postgres-compatible metadata
@@ -113,7 +118,7 @@ metadata tables, and can run explicit opt-in live Postgres/Neon evidence through
 the metadata adapter. It still fails closed by default and does not credit
 production readiness without operator-run live DB evidence. On 2026-07-07,
 the existing guarded SQAG metadata migrations were applied through
-`scripts/migrate_kqag_storage.py` after an initial sanitized verifier pass
+`scripts/migrate_sqag_storage.py` after an initial sanitized verifier pass
 reported the runtime schema missing. The verifier rerun then passed with
 `status=passed`, `database_family=postgres_compatible`,
 `live_database_evidence_enabled=true`, `test_injected_backend=false`,
@@ -131,11 +136,15 @@ R2/object storage, and reports only sanitized booleans/counts/schema version.
 No DB URL, hostname, username, password, connection string, provider value,
 object key, private path, tenant data, generated quote contents, or artifact
 bytes were committed or printed. Passing this DB evidence removes only the DB
-evidence blocker. The later operator-run live DB+object backup/restore drill
-has also passed with sanitized evidence, but `production_ready=false` remains
-until live retention/delete, hosted logging/monitoring, hosted smoke,
-production deployment operations, live Platform-to-SQAG launch smoke,
-session/business hardening, and final production audit are complete.
+evidence blocker for the pre-namespace runtime only. The later operator-run live
+DB+object backup/restore drill also passed with sanitized pre-namespace
+evidence. After the SQAG namespace cleanup, post-rename live production database
+evidence and post-rename live DB+object backup/restore evidence must be rerun.
+`production_ready=false` remains until live retention/delete, hosted
+logging/monitoring, hosted smoke, production deployment operations, live
+Platform-to-SQAG launch smoke after Platform app-key migration,
+`platform_app_key_migration_pending`, session/business hardening, and final
+production audit are complete.
 
 Current expected posture in local mode:
 
@@ -144,16 +153,18 @@ Current expected posture in local mode:
 - `production_ready`: `false`
 - Expected blockers include `local_runtime_storage`,
   `local_artifact_storage`, `object_storage_missing`, and
-  `backup_restore_unverified`.
+  `backup_restore_unverified`. Production blockers also include
+  `platform_app_key_migration_pending` until the separate Platform PR migrates
+  Platform-owned app-key surfaces and a live smoke passes.
 
 ## Storage Surface Audit
 
 | Surface | Current local mode path/source | Database/platform support | Workspace-scoped today | Restart-persistent today | Redeploy-persistent today | Hosted/protected/deploy suitability | Production suitability | Blocker or follow-up PR |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Profiles | `QUOTE_DATA_ROOT/{company_id}/profiles.json` and `profile-packs/{profile_id}` | `kqag_profiles` rows plus profile file artifacts exist; PR #89 uses DB rows/artifacts for DB-mode generation | Yes in DB row/artifact mode; no in local mode | Only if mounted local roots or DB mode are configured | DB rows survive; local mode requires mounted volume | No until the remaining non-profile blockers are resolved | No | Keep profile defaults/layouts workspace-owned; move uploaded profile assets to object storage for production. |
-| Pricing references | `KQAG_LOCAL_PRICING_REFERENCES_ROOT` or `_pricing-references/{reference_id}` plus bundled references | `kqag_pricing_references` rows with runtime catalog JSON | Yes in DB mode; local/bundled packs are local-UAT only | Only if mounted local roots or DB mode are configured | DB rows survive; local mode requires mounted volume | No until the remaining non-pricing blockers are resolved | No | Keep pricing references imported or seeded as workspace-owned database rows; move uploaded/reference assets to object storage for production. |
-| Quote sessions | `QUOTE_DATA_ROOT/quote-sessions/{session_id}` | `kqag_quote_sessions` rows keyed by `workspace_id` | Yes in DB mode; no in local mode | Only if mounted local roots or DB mode are configured | DB rows survive; local mode requires mounted volume | Backup/restore live evidence has passed for synthetic namespaced DB rows plus one generated artifact object; retention, hosted smoke, and operations gates remain | No | Complete live retention/delete, hosted smoke, operations, and final audit evidence. |
-| Generated artifacts | `QUOTE_OUTPUT_ROOT/{job_id}` and quote-session `exports` folders | `kqag_quote_artifacts` and `kqag_file_artifacts` DB BLOBs exist for local-UAT/synthetic coverage; object mode stores generated bytes in a configured object backend with `kqag_object_artifacts` metadata | Workspace-scoped only when storage is database-backed and artifact metadata is database/object-backed | Local mode requires mounted output root; DB artifact mode can survive restart but is not launch posture; object mode requires provider evidence | DB artifact mode survives, but cannot satisfy hosted/protected/deploy readiness; object mode has live provider evidence and live DB+object backup/restore evidence but remains blocked without live retention/delete and operations evidence | Blocked | No | Complete live retention/delete, uploaded/reference/profile object wiring as needed, hosted smoke, operations, and final audit evidence. |
+| Profiles | `QUOTE_DATA_ROOT/{company_id}/profiles.json` and `profile-packs/{profile_id}` | `sqag_profiles` rows plus profile file artifacts exist; PR #89 uses DB rows/artifacts for DB-mode generation | Yes in DB row/artifact mode; no in local mode | Only if mounted local roots or DB mode are configured | DB rows survive; local mode requires mounted volume | No until the remaining non-profile blockers are resolved | No | Keep profile defaults/layouts workspace-owned; move uploaded profile assets to object storage for production. |
+| Pricing references | `SQAG_LOCAL_PRICING_REFERENCES_ROOT` or `_pricing-references/{reference_id}` plus bundled references | `sqag_pricing_references` rows with runtime catalog JSON | Yes in DB mode; local/bundled packs are local-UAT only | Only if mounted local roots or DB mode are configured | DB rows survive; local mode requires mounted volume | No until the remaining non-pricing blockers are resolved | No | Keep pricing references imported or seeded as workspace-owned database rows; move uploaded/reference assets to object storage for production. |
+| Quote sessions | `QUOTE_DATA_ROOT/quote-sessions/{session_id}` | `sqag_quote_sessions` rows keyed by `workspace_id` | Yes in DB mode; no in local mode | Only if mounted local roots or DB mode are configured | DB rows survive; local mode requires mounted volume | Backup/restore live evidence has passed for synthetic namespaced DB rows plus one generated artifact object; retention, hosted smoke, and operations gates remain | No | Complete live retention/delete, hosted smoke, operations, and final audit evidence. |
+| Generated artifacts | `QUOTE_OUTPUT_ROOT/{job_id}` and quote-session `exports` folders | `sqag_quote_artifacts` and `sqag_file_artifacts` DB BLOBs exist for local-UAT/synthetic coverage; object mode stores generated bytes in a configured object backend with `sqag_object_artifacts` metadata | Workspace-scoped only when storage is database-backed and artifact metadata is database/object-backed | Local mode requires mounted output root; DB artifact mode can survive restart but is not launch posture; object mode requires post-rename provider evidence | DB artifact mode survives, but cannot satisfy hosted/protected/deploy readiness; object mode has only historical/pre-namespace live provider and live DB+object backup/restore evidence and remains blocked without post-rename live reruns, live retention/delete, Platform app-key migration, and operations evidence | Blocked | No | Complete post-rename live evidence reruns, live retention/delete, uploaded/reference/profile object wiring as needed, hosted smoke, operations, Platform app-key migration, and final audit evidence. |
 | Temp uploads/intermediates | `QUOTE_TMP_ROOT/{job_id}` | No durable production storage expected | No | No | No | Local/single-job only | No | Keep temp data ephemeral, but ensure generated durable artifacts are copied to owned artifact storage before download. |
 | Runtime logs | `_logs/app/` or configured log root | External log backend not implemented | N/A | Only if configured | Depends on host | Local UAT only | No | Add privacy-minimized hosted logging/monitoring before production. |
 
@@ -168,7 +179,7 @@ source of truth.
 
 Evidence:
 
-- `DatabaseKqagStorage.list_profiles()` now returns only current-workspace DB
+- `DatabaseSqagStorage.list_profiles()` now returns only current-workspace DB
   profile rows.
 - DB/platform generation now blocks when the selected profile row or stored
   quotation-layout artifact is missing.
@@ -181,7 +192,7 @@ retention, and hosted monitoring evidence.
 
 ## Pricing References Audit
 
-Database pricing references are stored in `kqag_pricing_references`. PR #88
+Database pricing references are stored in `sqag_pricing_references`. PR #88
 removes the database-mode fallback that previously merged workspace rows with
 local and bundled pricing references. Detail/export/generation now fail safely
 when the selected pricing reference is missing, deleted, or not owned by the
@@ -189,9 +200,9 @@ current workspace.
 
 Evidence:
 
-- `DatabaseKqagStorage.list_pricing_references()` returns only public summaries
-  for `kqag_pricing_references` rows in the current workspace.
-- `DatabaseKqagStorage.pricing_reference_detail()` returns `None` for local or
+- `DatabaseSqagStorage.list_pricing_references()` returns only public summaries
+  for `sqag_pricing_references` rows in the current workspace.
+- `DatabaseSqagStorage.pricing_reference_detail()` returns `None` for local or
   bundled sources in database mode.
 - Generation validation and runtime catalog creation use the authenticated
   workspace storage in database mode.
@@ -331,8 +342,8 @@ remains.
 
 `scripts/verify_live_retention_delete.py` is the opt-in live retention/delete
 drill path. It stays blocked unless `SQAG_LIVE_RETENTION_DELETE_EVIDENCE=1`,
-`SQAG_DATABASE_URL`, `KQAG_STORAGE_MODE=database`,
-`KQAG_ARTIFACT_STORAGE_MODE=object`, and the canonical
+`SQAG_DATABASE_URL`, `SQAG_STORAGE_MODE=database`,
+`SQAG_ARTIFACT_STORAGE_MODE=object`, and the canonical
 `SQAG_OBJECT_STORAGE_*` env names are present in the operator environment. It
 validates those runtime modes before writing synthetic rows or objects. When
 enabled, it uses synthetic namespaced DB metadata rows and one tiny synthetic
@@ -359,7 +370,7 @@ removed. Until a non-test-injected operator run passes, live retention/delete
 evidence remains a production blocker and `production_ready=false` remains.
 
 The canonical object-storage provider and live-evidence env names use the
-`SQAG_` prefix. Legacy `KQAG_*` object-storage provider names are not aliases
+`SQAG_` prefix. Legacy `SQAG_*` object-storage provider names are not aliases
 and do not silently satisfy live-provider evidence or readiness checks. Existing
 database table names and non-object storage compatibility env names remain
 unchanged by this cleanup PR.
@@ -391,7 +402,7 @@ exhaustive line-by-line security review of every source-like file.
 
 ## Final Readiness Checklist
 
-PR #84 does not make KQAG production-ready. KQAG should not move beyond local
+PR #84 does not make SQAG production-ready. SQAG should not move beyond local
 UAT until these are true:
 
 - `python scripts\check_production_readiness.py` reports no P1 blockers.
@@ -436,5 +447,5 @@ UAT until these are true:
    requirements.
 
 Do not combine these with public deployment, billing, Stripe, production auth
-redesign, customer data migration, or any claim that PR #84 alone makes KQAG
+redesign, customer data migration, or any claim that PR #84 alone makes SQAG
 production-ready.

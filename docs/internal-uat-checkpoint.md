@@ -4,16 +4,16 @@
 
 Date: 2026-07-02
 
-Status: Local UAT passed for the current Platform-to-KQAG local baseline.
+Status: Local UAT passed for the current Platform-to-SQAG local baseline.
 
-This checkpoint records the local manual baseline after the recent KQAG fixes
+This checkpoint records the local manual baseline after the recent SQAG fixes
 through PR #82. It is a documentation-only UAT note, not a deployment approval
 or production readiness sign-off.
 
 ## Scope
 
 The passed local UAT scope covered Platform local login and launch into the
-KQAG quote generation and dashboard flow.
+SQAG quote generation and dashboard flow.
 
 Repos involved:
 
@@ -23,7 +23,7 @@ Repos involved:
 Current local URLs:
 
 - Platform: `http://127.0.0.1:4317`
-- KQAG: `http://127.0.0.1:8765`
+- SQAG: `http://127.0.0.1:8765`
 
 Recent fixes included in this baseline:
 
@@ -40,7 +40,7 @@ Recent fixes included in this baseline:
 ## Tested Flow
 
 - Platform Google login.
-- Launch KQAG from Platform.
+- Launch SQAG from Platform.
 - Seeded local reference fixture flow, now superseded by the PR #86 direction:
   real operator UAT should use workspace-shaped setup with private profile,
   pricing, layout, and booth/render image imports kept outside Git.

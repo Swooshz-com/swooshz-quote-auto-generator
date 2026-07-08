@@ -1,12 +1,27 @@
-# KQAG Current Status And RC Audit
+# SQAG Current Status And RC Audit
 
 Last updated: 2026-06-21 Singapore local time
+
+## Namespace Cleanup Update
+
+SQAG is now the canonical runtime/repo/product namespace. Active runtime
+configuration uses `SQAG_STORAGE_MODE`, `SQAG_ARTIFACT_STORAGE_MODE`,
+`SQAG_DATABASE_URL`, `SQAG_PLATFORM_LAUNCH_MODE`, `SQAG_PLATFORM_BASE_URL`, and
+canonical `SQAG_OBJECT_STORAGE_*` names. SQAG expects Platform launches with
+`appKey=sqag` only; the separate Swooshz Platform app-key migration remains
+pending and is tracked by `platform_app_key_migration_pending`.
+
+Earlier live database and DB+object evidence is historical/pre-namespace
+evidence after the SQAG table/object-metadata/app-key cleanup. Post-rename live
+production database evidence, live DB+object backup/restore evidence, live
+retention/delete evidence, and live Platform-to-SQAG smoke after the Platform
+app-key migration remain required. `production_ready=false` remains correct.
 
 ## Executive Verdict
 
 Verdict: RC-ready with minor follow-ups.
 
-KQAG can proceed to owner-run private real-data smoke testing using private
+SQAG can proceed to owner-run private real-data smoke testing using private
 profile and pricing files kept outside this repository. The audit did not find
 a product-code blocker for internal RC testing. Hosting, public exposure, login,
 database-backed history, billing, credits, and platform-shell work should wait
@@ -23,7 +38,7 @@ Minor follow-ups before wider internal rollout:
 
 ## Current Product Scope
 
-KQAG owns the quote-generator module only:
+SQAG owns the quote-generator module only:
 
 - booth/render image intake
 - quote-company profile import, export, selection, and runtime reuse
@@ -35,7 +50,7 @@ KQAG owns the quote-generator module only:
 
 ## Current Non-Goals
 
-These are intentionally out of scope for KQAG RC:
+These are intentionally out of scope for SQAG RC:
 
 - public launch or hosted staging
 - login, accounts, users, roles, company membership, or app access
@@ -234,7 +249,7 @@ Results:
 
 Docs kept current:
 
-- `docs/kqag-current-status.md`
+- `docs/sqag-current-status.md`
 - `docs/README.md`
 - `docs/testing-plan.md`
 - `docs/pricing-catalog-import.md`

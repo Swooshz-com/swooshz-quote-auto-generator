@@ -11,17 +11,17 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_TEMPLATE = ROOT / "deploy" / "internal-uat" / "coolify" / "kqag.uat.env.example"
+DEFAULT_TEMPLATE = ROOT / "deploy" / "internal-uat" / "coolify" / "sqag.uat.env.example"
 
 REQUIRED_KEYS = (
     "APP_MODE",
     "AUTH_REQUIRED",
     "SESSION_SECRET",
-    "KQAG_STORAGE_MODE",
-    "KQAG_ARTIFACT_STORAGE_MODE",
+    "SQAG_STORAGE_MODE",
+    "SQAG_ARTIFACT_STORAGE_MODE",
     "SQAG_DATABASE_URL",
-    "KQAG_PLATFORM_LAUNCH_MODE",
-    "KQAG_PLATFORM_BASE_URL",
+    "SQAG_PLATFORM_LAUNCH_MODE",
+    "SQAG_PLATFORM_BASE_URL",
     "OIDC_ISSUER_URL",
     "OIDC_CLIENT_ID",
     "OIDC_CLIENT_SECRET",
@@ -44,7 +44,7 @@ REQUIRED_KEYS = (
 PLACEHOLDER_KEYS = {
     "SESSION_SECRET",
     "SQAG_DATABASE_URL",
-    "KQAG_PLATFORM_BASE_URL",
+    "SQAG_PLATFORM_BASE_URL",
     "OIDC_ISSUER_URL",
     "OIDC_CLIENT_ID",
     "OIDC_CLIENT_SECRET",
@@ -65,9 +65,9 @@ PLACEHOLDER_KEYS = {
 EXPECTED_VALUES = {
     "APP_MODE": "deploy",
     "AUTH_REQUIRED": "true",
-    "KQAG_STORAGE_MODE": "database",
-    "KQAG_ARTIFACT_STORAGE_MODE": "database",
-    "KQAG_PLATFORM_LAUNCH_MODE": "platform",
+    "SQAG_STORAGE_MODE": "database",
+    "SQAG_ARTIFACT_STORAGE_MODE": "database",
+    "SQAG_PLATFORM_LAUNCH_MODE": "platform",
     "AUTH_ALLOW_ANY_AUTHENTICATED_USER": "false",
 }
 
@@ -167,7 +167,7 @@ def finding_to_dict(finding: Finding) -> dict[str, str]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("template", nargs="?", default=str(DEFAULT_TEMPLATE), help="Path to kqag.uat.env.example")
+    parser.add_argument("template", nargs="?", default=str(DEFAULT_TEMPLATE), help="Path to sqag.uat.env.example")
     args = parser.parse_args(argv)
     status = verify_template(Path(args.template))
     findings = [finding_to_dict(finding) for finding in status["findings"]]

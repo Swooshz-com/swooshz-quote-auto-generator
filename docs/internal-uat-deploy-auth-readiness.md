@@ -3,13 +3,13 @@
 ## Purpose
 
 This document explains the existing single-instance gated internal UAT path for
-KQAG/SAQG deploy/auth scaffolding. It is a repo-specific readiness guide for
+SQAG/SAQG deploy/auth scaffolding. It is a repo-specific readiness guide for
 Koncept/Swooshz internal testing only.
 
 This document does not approve a production launch, public SaaS access,
 customer portal access, ecommerce, billing, DB-backed multi-user mode, or full
 Swooshz platform integration. It also does not move platform-owned account,
-membership, legal, billing, or app-whitelist work into KQAG.
+membership, legal, billing, or app-whitelist work into SQAG.
 
 ## Current Repo-Supported Knobs
 
@@ -40,15 +40,15 @@ The deploy/auth surface is already represented in `.env.example` and
   identity from the configured OIDC provider.
 - `AUTH_APPROVED_TESTER_ROLE`: shared role for approved internal testers:
   `admin`, `management`, `operator`, or `viewer`.
-- `KQAG_STORAGE_MODE`: storage mode. Hosted/protected/deploy validation must
-  use workspace-owned database rows for KQAG app records.
-- `KQAG_ARTIFACT_STORAGE_MODE`: generated artifact storage mode. Database
+- `SQAG_STORAGE_MODE`: storage mode. Hosted/protected/deploy validation must
+  use workspace-owned database rows for SQAG app records.
+- `SQAG_ARTIFACT_STORAGE_MODE`: generated artifact storage mode. Database
   artifact/BLOB mode is local-UAT/synthetic evidence only and cannot satisfy
   hosted/protected/deploy readiness; generated XLSX/PDF bytes require object
   storage.
 - `SQAG_DATABASE_URL`: database connection configured through the host secret
   manager only.
-- `KQAG_PLATFORM_LAUNCH_MODE` and `KQAG_PLATFORM_BASE_URL`: platform/workspace
+- `SQAG_PLATFORM_LAUNCH_MODE` and `SQAG_PLATFORM_BASE_URL`: platform/workspace
   launch context for protected hosted use.
 - `QUOTE_DATA_ROOT`: runtime housekeeping root; not the hosted source of truth
   for profile/pricing/session data.
@@ -93,8 +93,8 @@ Use this shape only for local/offline validation of the gated UAT boundary:
 - Single app instance.
 - `APP_MODE=deploy`.
 - `AUTH_REQUIRED=true`.
-- `KQAG_STORAGE_MODE=database`.
-- `KQAG_ARTIFACT_STORAGE_MODE=object` for hosted/protected/deploy readiness
+- `SQAG_STORAGE_MODE=database`.
+- `SQAG_ARTIFACT_STORAGE_MODE=object` for hosted/protected/deploy readiness
   evidence; `database` is allowed only for local-UAT/synthetic negative tests.
 - `SQAG_DATABASE_URL` set through the host secret manager only.
 - Platform/workspace launch context for protected hosted use.
@@ -110,7 +110,7 @@ Use this shape only for local/offline validation of the gated UAT boundary:
 For quote workflow coverage that does not depend on deploy auth, keep using the
 local internal UAT checklist in `docs/internal-uat.md`.
 
-For an already-prepared Coolify host, use the KQAG-specific adapter in
+For an already-prepared Coolify host, use the SQAG-specific adapter in
 `docs/internal-uat-coolify-deploy.md`. Generic Hostinger/VPS/Coolify setup,
 SSH, firewall, DNS, TLS, and server maintenance guidance belongs to the
 toolkit/infrastructure workflow, not this repo.
@@ -122,7 +122,7 @@ and safe synthetic deploy preflight.
 
 ## Explicitly Not Ready
 
-The current KQAG repo is not ready for:
+The current SQAG repo is not ready for:
 
 - Production launch.
 - Public SaaS.
@@ -178,9 +178,9 @@ Use this checklist for the gated internal UAT deploy path. Do not print secrets
 while checking env values.
 
 - [ ] Confirm required env names are present without printing values:
-      `APP_MODE`, `AUTH_REQUIRED`, `SESSION_SECRET`, `KQAG_STORAGE_MODE`,
-      `KQAG_ARTIFACT_STORAGE_MODE`, `SQAG_DATABASE_URL`,
-      `KQAG_PLATFORM_LAUNCH_MODE`, `KQAG_PLATFORM_BASE_URL`, optional OIDC
+      `APP_MODE`, `AUTH_REQUIRED`, `SESSION_SECRET`, `SQAG_STORAGE_MODE`,
+      `SQAG_ARTIFACT_STORAGE_MODE`, `SQAG_DATABASE_URL`,
+      `SQAG_PLATFORM_LAUNCH_MODE`, `SQAG_PLATFORM_BASE_URL`, optional OIDC
       names if used, allowlist settings, tester role, and runtime
       housekeeping root envs.
 - [ ] Run `python webapp\server.py --check-deploy-uat-env`.

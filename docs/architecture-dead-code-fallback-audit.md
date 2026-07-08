@@ -1,4 +1,4 @@
-# KQAG Architecture, Dead-Code, And Fallback Audit
+# SQAG Architecture, Dead-Code, And Fallback Audit
 
 Audit date: 2026-07-02
 
@@ -11,7 +11,7 @@ change quote math.
 
 ## Executive Summary
 
-SAQG/KQAG is moving from local UAT toward workspace-owned tenant data and
+SAQG/SQAG is moving from local UAT toward workspace-owned tenant data and
 sellable production readiness. Product-visible local/demo/sample shortcuts
 should not be preserved as normal app behavior.
 
@@ -31,7 +31,7 @@ Core direction:
 
 Current conclusion:
 
-KQAG remains local-UAT capable, but it is not ready for hosted, protected,
+SQAG remains local-UAT capable, but it is not ready for hosted, protected,
 deploy, or production use. The biggest product-shape blockers are Load Sample
 product surfaces, local/bundled profile and pricing fallbacks, local artifact
 download paths, broad exception fallback behavior, and docs that still describe
@@ -48,8 +48,8 @@ Required search families covered:
   `except Exception`, `catch`, `pass`
 - local storage terms: `local`, `local mode`, `local pack`,
   `QUOTE_DATA_ROOT`, `QUOTE_OUTPUT_ROOT`, `QUOTE_TMP_ROOT`,
-  `KQAG_LOCAL_PRICING_REFERENCES_ROOT`, `KQAG_STORAGE_MODE`,
-  `KQAG_ARTIFACT_STORAGE_MODE`
+  `SQAG_LOCAL_PRICING_REFERENCES_ROOT`, `SQAG_STORAGE_MODE`,
+  `SQAG_ARTIFACT_STORAGE_MODE`
 - profile and pricing terms: `profile pack`, `pricing reference`,
   `load_profile_pack`, `list_local_pricing_references`,
   `list_bundled_pricing_references`, `pricing_reference_pack_detail`
@@ -88,9 +88,9 @@ High-signal pattern totals from that snapshot:
 
 | Pattern | Hits |
 | --- | ---: |
-| `KQAG_STORAGE_MODE` | 26 |
-| `KQAG_ARTIFACT_STORAGE_MODE` | 22 |
-| `KQAG_LOCAL_PRICING_REFERENCES_ROOT` | 3 |
+| `SQAG_STORAGE_MODE` | 26 |
+| `SQAG_ARTIFACT_STORAGE_MODE` | 22 |
+| `SQAG_LOCAL_PRICING_REFERENCES_ROOT` | 3 |
 | `QUOTE_DATA_ROOT` | 37 |
 | `QUOTE_OUTPUT_ROOT` | 19 |
 | `QUOTE_TMP_ROOT` | 17 |
@@ -176,14 +176,14 @@ Required sellable-product posture:
 | Playwright smoke | `scripts/playwright-smoke.mjs` sample button clicks and sample restore expectations. | Historical smoke depended on product-visible Load Sample. | Replaced with test-only seeded fixture helper. | Done in this follow-up; no product-visible Load Sample dependency. |
 | Playwright stress | `scripts/playwright-ai-basis-chat-stress.mjs` sample button click. | Historical stress setup used product sample path. | Replaced with test-only seeded fixture helper. | Done in this follow-up; no product sample CTA/API. |
 | Live seeded AI check | `scripts/playwright-live-seeded-ai-check.mjs` seeded reference setup. | Historical live smoke depended on sample path. | Rewritten as seeded test tooling; private-data import smoke remains a separate future path. | Done in this follow-up for bundled sample dependence; private-data import smoke remains follow-up work outside Git. |
-| Docs | `docs/internal-uat*.md`, `docs/platform-uat-smoke-runbook.md`, `docs/kqag-current-status.md`, and related indexes | Some docs presented sample/local/demo flow as normal UAT or smoke path. | Outdated docs to delete/rewrite. | Current follow-up removes known product-visible sample guidance; broader platform/storage doc alignment remains in the cleanup inventory. |
+| Docs | `docs/internal-uat*.md`, `docs/platform-uat-smoke-runbook.md`, `docs/sqag-current-status.md`, and related indexes | Some docs presented sample/local/demo flow as normal UAT or smoke path. | Outdated docs to delete/rewrite. | Current follow-up removes known product-visible sample guidance; broader platform/storage doc alignment remains in the cleanup inventory. |
 
 ## Fallback Inventory
 
 | File/function/route | Trigger | Falls back from | Falls back to | Local/private file risk | Cross-workspace risk | Quote/pricing/profile/session/artifact impact | Mode gating today | Verdict |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `DatabaseKqagStorage.list_pricing_references` | DB pricing list requested. | Workspace DB pricing rows. | Local saved packs and bundled packs. | Yes, if host has local private packs. | Yes, list/detail can expose non-workspace packs in DB/platform mode. | Pricing reference list and generated quote basis. | Not strict enough. | Must be removed before hosted/protected/deploy use. |
-| `DatabaseKqagStorage.pricing_reference_detail` | DB detail lookup misses or falls through. | Workspace DB reference detail. | `pricing_reference_pack_detail()` local/bundled resolver. | Yes. | Yes. | Pricing detail and quote generation. | Not strict enough. | Must be removed before hosted/protected/deploy use. |
+| `DatabaseSqagStorage.list_pricing_references` | DB pricing list requested. | Workspace DB pricing rows. | Local saved packs and bundled packs. | Yes, if host has local private packs. | Yes, list/detail can expose non-workspace packs in DB/platform mode. | Pricing reference list and generated quote basis. | Not strict enough. | Must be removed before hosted/protected/deploy use. |
+| `DatabaseSqagStorage.pricing_reference_detail` | DB detail lookup misses or falls through. | Workspace DB reference detail. | `pricing_reference_pack_detail()` local/bundled resolver. | Yes. | Yes. | Pricing detail and quote generation. | Not strict enough. | Must be removed before hosted/protected/deploy use. |
 | `load_profile_pack` and `ProfilePack.resolve` | Profile ID/default path requested during generation. | Workspace profile row/artifact expectation. | Local profile pack, bundled/default layout template. | Yes, layout/profile assets can be local. | Possible if IDs/defaults are shared outside workspace storage. | Profile defaults, layout rules, XLSX generation. | Not strict enough. | Must be removed before hosted/protected/deploy use. |
 | `PricingReferencePack.resolve` | Pricing reference ID requested outside DB rows. | Selected workspace pricing reference. | Local pack then bundled default. | Yes. | Possible in hosted mode. | Pricing catalog used for quote basis and line items. | Not strict enough. | Must be removed before hosted/protected/deploy use in database/platform/deploy mode. |
 | `/api/samples`, `/api/samples/{id}` | Historical product API request. | Real workspace data/imports. | Repo sample fixture. | No private-file read by default, but trained product toward fake data. | Shared across all sessions. | Details, images, profile, pricing setup. | Removed from product code in this follow-up. | No product route/API in hosted/protected/deploy or production. |
@@ -261,7 +261,7 @@ architecture blockers are tracked below and should not be hidden by sample data.
 | `QUOTE_DATA_ROOT` | Local profiles, quote sessions, runtime app data. | Acceptable. | Blocked for hosted/protected/deploy readiness. | Not acceptable. | Move workspace data to DB/object storage. |
 | `QUOTE_OUTPUT_ROOT` | Local generated artifacts by job id. | Acceptable. | Blocked unless DB/object-backed and authorized. | Not acceptable. | Store generated XLSX/PDF in object storage with DB metadata. |
 | `QUOTE_TMP_ROOT` | Temporary uploads/intermediates. | Acceptable for ephemeral work. | Acceptable only as ephemeral temp, not durable. | Acceptable only as ephemeral temp. | Ensure durable artifacts are copied to owned storage before download. |
-| `KQAG_LOCAL_PRICING_REFERENCES_ROOT` | Local mutable pricing packs. | Acceptable for local UAT imports outside Git. | Not acceptable as product fallback. | Not acceptable. | Import into workspace-scoped DB/object storage. |
+| `SQAG_LOCAL_PRICING_REFERENCES_ROOT` | Local mutable pricing packs. | Acceptable for local UAT imports outside Git. | Not acceptable as product fallback. | Not acceptable. | Import into workspace-scoped DB/object storage. |
 | Bundled profile/pricing assets | Defaults and sample-like references. | Test/local only if explicitly selected. | Not acceptable as hidden fallback. | Not acceptable as hidden fallback. | Replace with workspace-owned imported assets or explicit public allowlist. |
 | Local logs under `_logs/` | Local diagnostics. | Acceptable. | Needs hosted privacy-minimized logging. | Needs hosted privacy-minimized logging. | Add logging backend/runbook before production. |
 
@@ -286,8 +286,8 @@ production-blocking fallback paths.
 
 | Doc | Current issue | Classification | Required cleanup |
 | --- | --- | --- | --- |
-| `docs/README.md` | Index still frames KQAG as quote-specific local workflow and points operators to local/runtime storage. | Rewrite after architecture follow-ups. | Add this audit, then update ownership language as platform/workspace storage lands. |
-| `docs/kqag-current-status.md` | References sample fixtures and local RC posture. | Outdated sections to rewrite. | Remove sample/demo happy path and align with Koncept Images workspace/private import path. |
+| `docs/README.md` | Index still frames SQAG as quote-specific local workflow and points operators to local/runtime storage. | Rewrite after architecture follow-ups. | Add this audit, then update ownership language as platform/workspace storage lands. |
+| `docs/sqag-current-status.md` | References sample fixtures and local RC posture. | Outdated sections to rewrite. | Remove sample/demo happy path and align with Koncept Images workspace/private import path. |
 | `docs/testing-plan.md` | Broadly valid, but should not allow demo-only smoke as product validation. | Keep, minor follow-up. | Add rule that product smoke cannot depend on product-visible sample/demo controls. |
 | `docs/internal-uat.md` | Local runtime and sample-oriented UAT flow can be read as operator happy path. | Outdated doc to rewrite. | Replace with real workspace/private import UAT instructions. |
 | `docs/internal-uat-deploy-auth-readiness.md` | Single-instance local runtime/OIDC scaffold does not match final platform-owned auth/workspace direction. | Outdated doc to rewrite. | Reframe as historical/local-UAT only or replace with platform-scoped launch checks. |

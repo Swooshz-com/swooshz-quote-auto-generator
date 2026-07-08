@@ -25,7 +25,7 @@ def test_temp_root() -> Path:
 class DatabaseBackupRestoreVerifierTest(unittest.TestCase):
     def test_synthetic_backup_restore_and_rollback_report_metadata_only(self):
         private_root = "C:/Users/Private/Koncept Runtime"
-        private_db_url = "sqlite:///C:/Users/Private/kqag-storage.sqlite3?token=secret"
+        private_db_url = "sqlite:///C:/Users/Private/sqag-storage.sqlite3?token=secret"
         private_values = {
             private_root,
             private_db_url,
@@ -97,7 +97,7 @@ class DatabaseBackupRestoreVerifierTest(unittest.TestCase):
         self.assertNotIn(str(work_dir), output)
 
     def test_cli_failure_output_remains_metadata_only(self):
-        private_path = "C:/Users/Private/Koncept Runtime/kqag-storage.sqlite3"
+        private_path = "C:/Users/Private/Koncept Runtime/sqag-storage.sqlite3"
         stdout = io.StringIO()
         with mock.patch.object(verifier, "run_verification", side_effect=RuntimeError(private_path)):
             with contextlib.redirect_stdout(stdout):
@@ -113,7 +113,7 @@ class DatabaseBackupRestoreVerifierTest(unittest.TestCase):
         policy = verifier.load_retention_policy()
         covered = {item["data_class"] for item in policy["data_classes"]}
 
-        self.assertEqual(policy["schema"], "swooshz.kqag.internal-alpha-retention-policy.v1")
+        self.assertEqual(policy["schema"], "swooshz.sqag.internal-alpha-retention-policy.v1")
         self.assertTrue(policy["non_destructive_verifier_only"])
         self.assertGreaterEqual(
             covered,

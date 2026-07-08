@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Synthetic hosted observability readiness verifier.
 
-The verifier exercises KQAG's structured log sanitizer, event allowlist,
+The verifier exercises SQAG's structured log sanitizer, event allowlist,
 support error references, and health/readiness metadata with synthetic values
 only. It emits metadata-only JSON and does not configure an external vendor.
 """
@@ -34,7 +34,7 @@ REQUIRED_POLICY_KEYS = {
 }
 SENSITIVE_SYNTHETIC_VALUES = (
     "C:/Users/Private/Koncept Runtime",
-    "sqlite:///C:/Users/Private/kqag-storage.sqlite3?token=secret",
+    "sqlite:///C:/Users/Private/sqag-storage.sqlite3?token=secret",
     "Acme Private Customer",
     "Generated quote private line item",
     "Private pricing catalog contents",
@@ -51,7 +51,7 @@ SENSITIVE_SYNTHETIC_VALUES = (
 def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
     policy = json.loads(path.read_text(encoding="utf-8"))
     missing = sorted(REQUIRED_POLICY_KEYS - set(policy))
-    if policy.get("schema") != "swooshz.kqag.hosted-observability-policy.v1" or missing:
+    if policy.get("schema") != "swooshz.sqag.hosted-observability-policy.v1" or missing:
         raise ValueError("Hosted observability policy is incomplete.")
     if not policy.get("synthetic_verifier_only"):
         raise ValueError("Hosted observability policy must be synthetic-verifier-only.")
@@ -100,7 +100,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
             "error_reference": error_reference,
             "customer_name": "Acme Private Customer",
             "staff_email": "staff.member@example.test",
-            "db_url": "sqlite:///C:/Users/Private/kqag-storage.sqlite3?token=secret",
+            "db_url": "sqlite:///C:/Users/Private/sqag-storage.sqlite3?token=secret",
             "private_path": "C:/Users/Private/Koncept Runtime",
             "generated_quote": "Generated quote private line item",
             "pricing_payload": "Private pricing catalog contents",
@@ -178,7 +178,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
     ) else "failed"
 
     return {
-        "schema": "swooshz.kqag.hosted-observability-verification.v1",
+        "schema": "swooshz.sqag.hosted-observability-verification.v1",
         "status": status,
         "synthetic_only": True,
         "policy": {
@@ -233,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
         report = run_verification(work_dir=args.work_dir)
     except Exception:
         report = {
-            "schema": "swooshz.kqag.hosted-observability-verification.v1",
+            "schema": "swooshz.sqag.hosted-observability-verification.v1",
             "status": "failed",
             "synthetic_only": True,
             "privacy": {

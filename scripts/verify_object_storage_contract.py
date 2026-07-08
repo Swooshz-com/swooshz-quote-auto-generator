@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the synthetic KQAG object-storage artifact contract.
+"""Verify the synthetic SQAG object-storage artifact contract.
 
 The verifier uses only an in-memory backend and synthetic artifact bytes. It
 emits metadata-only JSON and does not configure any real cloud provider.
@@ -156,7 +156,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
         "pricing_visual_assets",
     }
     return {
-        "schema": "swooshz.kqag.object-storage-contract-evidence.v1",
+        "schema": "swooshz.sqag.object-storage-contract-evidence.v1",
         "status": "passed" if passed else "failed",
         "synthetic_only": True,
         "contract": {
@@ -190,7 +190,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
 
 def failed_report() -> dict[str, Any]:
     return {
-        "schema": "swooshz.kqag.object-storage-contract-evidence.v1",
+        "schema": "swooshz.sqag.object-storage-contract-evidence.v1",
         "status": "failed",
         "synthetic_only": True,
         "checks": {},

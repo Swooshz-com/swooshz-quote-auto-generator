@@ -85,14 +85,14 @@ NS_MAIN = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 PACKAGE_RELATIONSHIPS_XMLNS = "http://schemas.openxmlformats.org/package/2006/relationships"
 NS_PACKAGE_REL = f"{{{PACKAGE_RELATIONSHIPS_XMLNS}}}"
 CUSTOM_XML_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml"
-LAYOUT_RULES_CUSTOM_XML_PATH = "customXml/kqag-layout-rules.xml"
-LAYOUT_RULES_CUSTOM_XML_NAMESPACE = "https://swooshz.com/kqag/layout-rules/v1"
+LAYOUT_RULES_CUSTOM_XML_PATH = "customXml/sqag-layout-rules.xml"
+LAYOUT_RULES_CUSTOM_XML_NAMESPACE = "https://swooshz.com/sqag/layout-rules/v1"
 NS_LAYOUT_RULES = f"{{{LAYOUT_RULES_CUSTOM_XML_NAMESPACE}}}"
 PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 PROFILES_ROOT = PROJECT_ROOT / "profiles"
 BUNDLED_PRICING_REFERENCES_ROOT = PROJECT_ROOT / "pricing-references"
 LOCAL_PRICING_REFERENCES_ROOT = PROJECT_ROOT / "_pricing-references"
-LOCAL_PRICING_REFERENCES_ROOT_ENV_NAME = "KQAG_LOCAL_PRICING_REFERENCES_ROOT"
+LOCAL_PRICING_REFERENCES_ROOT_ENV_NAME = "SQAG_LOCAL_PRICING_REFERENCES_ROOT"
 PRICING_REFERENCES_ROOT = BUNDLED_PRICING_REFERENCES_ROOT
 COMPANY_PROFILE_EXPORT_SCHEMA = "swooshz.quote-company-profile.v1"
 RUNTIME_WORKSPACE_SCHEMA = "swooshz.local-runtime-workspace.v1"
@@ -269,8 +269,8 @@ OIDC_AUTHORIZE_URL_ENV_NAME = "OIDC_AUTHORIZE_URL"
 OIDC_TOKEN_URL_ENV_NAME = "OIDC_TOKEN_URL"
 OIDC_USERINFO_URL_ENV_NAME = "OIDC_USERINFO_URL"
 OIDC_LOGOUT_URL_ENV_NAME = "OIDC_LOGOUT_URL"
-PLATFORM_LAUNCH_MODE_ENV_NAME = "KQAG_PLATFORM_LAUNCH_MODE"
-PLATFORM_BASE_URL_ENV_NAME = "KQAG_PLATFORM_BASE_URL"
+PLATFORM_LAUNCH_MODE_ENV_NAME = "SQAG_PLATFORM_LAUNCH_MODE"
+PLATFORM_BASE_URL_ENV_NAME = "SQAG_PLATFORM_BASE_URL"
 AUTH_ALLOWED_EMAILS_ENV_NAME = "AUTH_ALLOWED_EMAILS"
 AUTH_ALLOWED_DOMAINS_ENV_NAME = "AUTH_ALLOWED_DOMAINS"
 AUTH_ALLOW_ANY_AUTHENTICATED_USER_ENV_NAME = "AUTH_ALLOW_ANY_AUTHENTICATED_USER"
@@ -279,8 +279,8 @@ QUOTE_OUTPUT_ROOT_ENV_NAME = "QUOTE_OUTPUT_ROOT"
 QUOTE_TMP_ROOT_ENV_NAME = "QUOTE_TMP_ROOT"
 QUOTE_LOG_ROOT_ENV_NAME = "QUOTE_LOG_ROOT"
 QUOTE_DATA_ROOT_ENV_NAME = "QUOTE_DATA_ROOT"
-KQAG_STORAGE_MODE_ENV_NAME = "KQAG_STORAGE_MODE"
-KQAG_ARTIFACT_STORAGE_MODE_ENV_NAME = "KQAG_ARTIFACT_STORAGE_MODE"
+SQAG_STORAGE_MODE_ENV_NAME = "SQAG_STORAGE_MODE"
+SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME = "SQAG_ARTIFACT_STORAGE_MODE"
 SQAG_DATABASE_URL_ENV_NAME = "SQAG_DATABASE_URL"
 SQAG_LIVE_DATABASE_EVIDENCE_ENV_NAME = "SQAG_LIVE_DATABASE_EVIDENCE"
 POSTGRES_COMPATIBLE_DATABASE_SCHEMES = {"postgres", "postgresql"}
@@ -294,7 +294,7 @@ SESSION_COOKIE_MAX_AGE_SECONDS = 8 * 60 * 60
 OIDC_PROVIDER_TIMEOUT_SECONDS = 15
 OIDC_PROVIDER_MAX_RESPONSE_BYTES = 128 * 1024
 PLATFORM_LAUNCH_ENDPOINT = "/api/platform/launch"
-PLATFORM_APP_KEY = "kqag"
+PLATFORM_APP_KEY = "sqag"
 PLATFORM_LAUNCH_TOKEN_HEADER = "X-App-Launch-Token"
 PLATFORM_LAUNCH_PROVIDER_TIMEOUT_SECONDS = 15
 PLATFORM_LAUNCH_PROVIDER_MAX_RESPONSE_BYTES = 64 * 1024
@@ -530,7 +530,7 @@ class PlatformLaunchError(RuntimeError):
         self.status = status
         self.reason = reason
 
-class KqagStorageAccessError(RuntimeError):
+class SqagStorageAccessError(RuntimeError):
     def __init__(self, message: str, *, status: int = 503, reason: str = "storage_unavailable") -> None:
         super().__init__(message)
         self.status = status
@@ -1338,12 +1338,12 @@ def configured_data_root() -> Path:
     return configured_path(QUOTE_DATA_ROOT_ENV_NAME, Path("/data/swooshz/company-data"))
 
 def configured_storage_mode() -> str:
-    mode = clean_text(read_dotenv_value(KQAG_STORAGE_MODE_ENV_NAME)).lower()
+    mode = clean_text(read_dotenv_value(SQAG_STORAGE_MODE_ENV_NAME)).lower()
     return "database" if mode == "database" else "local"
 
 
 def configured_artifact_storage_mode() -> str:
-    mode = clean_text(read_dotenv_value(KQAG_ARTIFACT_STORAGE_MODE_ENV_NAME)).lower()
+    mode = clean_text(read_dotenv_value(SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME)).lower()
     if mode in {"database", "object"}:
         return mode
     return "local"
@@ -1771,7 +1771,7 @@ def parse_platform_expiry(value: Any) -> dt.datetime | None:
         parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError as exc:
         raise PlatformLaunchError(
-            "Platform launch context is not valid for KQAG.",
+            "Platform launch context is not valid for SQAG.",
             status=403,
             reason="platform_launch_invalid_expiry",
         ) from exc
@@ -1798,19 +1798,19 @@ def safe_platform_launch_context(payload: dict[str, Any]) -> dict[str, Any]:
     expiry = parse_platform_expiry(expires_at)
     if expiry and expiry <= dt.datetime.now(dt.timezone.utc):
         raise PlatformLaunchError(
-            "Platform launch context is not valid for KQAG.",
+            "Platform launch context is not valid for SQAG.",
             status=403,
             reason="platform_launch_expired",
         )
     if not user_id or not workspace_id or app_key != PLATFORM_APP_KEY:
         raise PlatformLaunchError(
-            "Platform launch context is not valid for KQAG.",
+            "Platform launch context is not valid for SQAG.",
             status=403,
             reason="platform_launch_context_mismatch",
         )
     if membership_role not in PLATFORM_MEMBERSHIP_ROLE_TO_LOCAL_ROLE:
         raise PlatformLaunchError(
-            "Platform launch context is not valid for KQAG.",
+            "Platform launch context is not valid for SQAG.",
             status=403,
             reason="platform_launch_unsupported_role",
         )
@@ -2328,8 +2328,8 @@ def live_retention_delete_evidence_summary(
         "required_env_names": [
             "SQAG_LIVE_RETENTION_DELETE_EVIDENCE",
             SQAG_DATABASE_URL_ENV_NAME,
-            KQAG_STORAGE_MODE_ENV_NAME,
-            KQAG_ARTIFACT_STORAGE_MODE_ENV_NAME,
+            SQAG_STORAGE_MODE_ENV_NAME,
+            SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME,
             OBJECT_STORAGE_PROVIDER_ENV_NAME,
             OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME,
             OBJECT_STORAGE_BUCKET_ENV_NAME,
@@ -2352,7 +2352,7 @@ def live_retention_delete_evidence_summary(
         ],
         "live_retention_delete_evidence_supported": supported,
         "notes": [
-            "Evidence is opt-in and requires SQAG_LIVE_RETENTION_DELETE_EVIDENCE=1, SQAG_DATABASE_URL, KQAG_STORAGE_MODE=database, KQAG_ARTIFACT_STORAGE_MODE=object, and canonical SQAG_OBJECT_STORAGE_* env names.",
+            "Evidence is opt-in and requires SQAG_LIVE_RETENTION_DELETE_EVIDENCE=1, SQAG_DATABASE_URL, SQAG_STORAGE_MODE=database, SQAG_ARTIFACT_STORAGE_MODE=object, and canonical SQAG_OBJECT_STORAGE_* env names.",
             "It uses synthetic namespaced rows and one tiny synthetic generated artifact object only.",
             "It fails closed on missing env or wrong runtime mode before synthetic writes, and also fails closed on metadata/object mismatch, tombstone/delete mismatch, wrong-workspace access, missing-object handling, or cleanup failure.",
             "It does not print DB URLs, provider values, bucket names, object keys, credentials, artifact bytes, tenant data, generated quote contents, backup dumps, or restore dumps.",
@@ -2498,7 +2498,7 @@ def production_readiness_status(
     profiles = readiness_surface(
         mode=storage_mode,
         source=(
-            "kqag_profiles table plus kqag_file_artifacts for imported layout assets"
+            "sqag_profiles table plus sqag_file_artifacts for imported layout assets"
             if database_mode
             else "QUOTE_DATA_ROOT/{company_id}/profiles.json and QUOTE_DATA_ROOT/{company_id}/profile-packs/{profile_id}"
         ),
@@ -2516,9 +2516,9 @@ def production_readiness_status(
     pricing_references = readiness_surface(
         mode=storage_mode,
         source=(
-            "kqag_pricing_references table with request-time runtime catalog JSON"
+            "sqag_pricing_references table with request-time runtime catalog JSON"
             if database_mode
-            else "KQAG_LOCAL_PRICING_REFERENCES_ROOT or _pricing-references/{reference_id}"
+            else "SQAG_LOCAL_PRICING_REFERENCES_ROOT or _pricing-references/{reference_id}"
         ),
         workspace_scoped=database_mode,
         persistent_across_restart=database_mode or bool(clean_text(read_dotenv_value(QUOTE_DATA_ROOT_ENV_NAME))),
@@ -2533,7 +2533,7 @@ def production_readiness_status(
     )
     quote_sessions = readiness_surface(
         mode=storage_mode,
-        source="kqag_quote_sessions table" if database_mode else "QUOTE_DATA_ROOT/quote-sessions/{session_id}",
+        source="sqag_quote_sessions table" if database_mode else "QUOTE_DATA_ROOT/quote-sessions/{session_id}",
         workspace_scoped=database_mode,
         persistent_across_restart=database_mode or bool(clean_text(read_dotenv_value(QUOTE_DATA_ROOT_ENV_NAME))),
         persistent_across_redeploy=database_mode,
@@ -2546,9 +2546,9 @@ def production_readiness_status(
         ),
     )
     quote_session_snapshots = {
-        "schema": "swooshz.kqag.quote-generation-snapshot.v1",
+        "schema": "swooshz.sqag.quote-generation-snapshot.v1",
         "mode": storage_mode,
-        "source": "kqag_quote_sessions.metadata_json.generation_snapshot",
+        "source": "sqag_quote_sessions.metadata_json.generation_snapshot",
         "workspace_scoped": database_mode,
         "privacy_minimized": True,
         "immutable_on_draft_edit": True,
@@ -2592,7 +2592,7 @@ def production_readiness_status(
     generated_artifacts = readiness_surface(
         mode=artifact_mode,
         source=(
-            "kqag_quote_artifacts and kqag_file_artifacts tables"
+            "sqag_quote_artifacts and sqag_file_artifacts tables"
             if database_artifacts
             else (
                 "provider-neutral object storage contract with workspace-owned database metadata"
@@ -2659,6 +2659,12 @@ def production_readiness_status(
             blockers.append(readiness_blocker("object_retention_delete_live_evidence_missing", "P1", "Live object provider retention/delete evidence is still missing for production.", gates=("production",)))
         if not live_db_object_backup_restore_evidence["live_db_object_backup_restore_evidence_supported"]:
             blockers.append(readiness_blocker("db_object_backup_restore_live_evidence_missing", "P1", "Live DB+object backup/restore evidence is still missing for production.", gates=("production",)))
+    blockers.append(readiness_blocker(
+        "platform_app_key_migration_pending",
+        "P1",
+        "SQAG now expects Platform appKey=sqag; Swooshz Platform app registry, entitlement, launch, consume, seed, and admin surfaces must be migrated in a separate Platform PR before live Platform-to-SQAG smoke can pass.",
+        gates=("production",),
+    ))
     blockers.append(readiness_blocker("session_business_hardening_incomplete", "P1", "Immutable quote-session snapshot groundwork exists, but final session/business hardening and generated audit race coverage remain incomplete.", gates=("production",)))
     blockers.append(readiness_blocker("production_deployment_operations_evidence_missing", "P1", "Production deployment, operations, alert delivery, and live host evidence are not verified by this command.", gates=("production",)))
     if backup_restore_evidence["status"] != "passed":
@@ -2679,9 +2685,9 @@ def production_readiness_status(
         item for item in blockers if "production" in item.get("gates", []) and item["severity"] in {"P0", "P1"}
     ]
     return {
-        "schema": "swooshz.kqag.production-readiness.v1",
-        "kqag_storage_mode": storage_mode,
-        "kqag_artifact_storage_mode": artifact_mode,
+        "schema": "swooshz.sqag.production-readiness.v1",
+        "sqag_storage_mode": storage_mode,
+        "sqag_artifact_storage_mode": artifact_mode,
         "database_family": database_family,
         "profiles_storage": profiles,
         "pricing_references_storage": pricing_references,
@@ -5537,10 +5543,10 @@ def ensure_layout_rules_relationship(parts: dict[str, bytes]) -> None:
         for relationship in root.findall(f"{NS_PACKAGE_REL}Relationship")
     }
     index = 1
-    rel_id = "rIdKqagLayoutRules"
+    rel_id = "rIdSqagLayoutRules"
     while rel_id in used_ids:
         index += 1
-        rel_id = f"rIdKqagLayoutRules{index}"
+        rel_id = f"rIdSqagLayoutRules{index}"
     ET.SubElement(
         root,
         f"{NS_PACKAGE_REL}Relationship",
@@ -7544,22 +7550,22 @@ class CompanyConfigStore:
         return deleted
 
 
-KQAG_STORAGE_MIGRATION_PATHS = [
+SQAG_STORAGE_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "001_platform_scoped_storage.sql",
     PROJECT_ROOT / "migrations" / "002_platform_scoped_artifacts.sql",
     PROJECT_ROOT / "migrations" / "003_object_artifact_metadata.sql",
 ]
-KQAG_POSTGRES_METADATA_MIGRATION_PATHS = [
+SQAG_POSTGRES_METADATA_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "001_platform_scoped_storage.sql",
     PROJECT_ROOT / "migrations" / "003_object_artifact_metadata.sql",
 ]
-KQAG_APP_METADATA_REQUIRED_COLUMNS = {
-    "kqag_profiles": {"workspace_id", "profile_id", "payload_json", "created_at", "updated_at"},
-    "kqag_pricing_references": {"workspace_id", "reference_id", "payload_json", "created_at", "updated_at"},
-    "kqag_quote_sessions": {"workspace_id", "session_id", "metadata_json", "draft_files_json", "created_at", "updated_at"},
+SQAG_APP_METADATA_REQUIRED_COLUMNS = {
+    "sqag_profiles": {"workspace_id", "profile_id", "payload_json", "created_at", "updated_at"},
+    "sqag_pricing_references": {"workspace_id", "reference_id", "payload_json", "created_at", "updated_at"},
+    "sqag_quote_sessions": {"workspace_id", "session_id", "metadata_json", "draft_files_json", "created_at", "updated_at"},
 }
-KQAG_DATABASE_ARTIFACT_REQUIRED_COLUMNS = {
-    "kqag_quote_artifacts": {
+SQAG_DATABASE_ARTIFACT_REQUIRED_COLUMNS = {
+    "sqag_quote_artifacts": {
         "workspace_id",
         "session_id",
         "artifact_kind",
@@ -7570,7 +7576,7 @@ KQAG_DATABASE_ARTIFACT_REQUIRED_COLUMNS = {
         "created_at",
         "updated_at",
     },
-    "kqag_file_artifacts": {
+    "sqag_file_artifacts": {
         "workspace_id",
         "owner_type",
         "owner_id",
@@ -7583,8 +7589,8 @@ KQAG_DATABASE_ARTIFACT_REQUIRED_COLUMNS = {
         "updated_at",
     },
 }
-KQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS = {
-    "kqag_object_artifacts": {
+SQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS = {
+    "sqag_object_artifacts": {
         "artifact_id",
         "workspace_id",
         "owner_type",
@@ -7606,8 +7612,8 @@ KQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS = {
         "deleted_at",
     },
 }
-KQAG_STORAGE_SQL = """
-create table if not exists kqag_profiles (
+SQAG_STORAGE_SQL = """
+create table if not exists sqag_profiles (
   workspace_id text not null,
   profile_id text not null,
   payload_json text not null,
@@ -7615,7 +7621,7 @@ create table if not exists kqag_profiles (
   updated_at text not null,
   primary key (workspace_id, profile_id)
 );
-create table if not exists kqag_pricing_references (
+create table if not exists sqag_pricing_references (
   workspace_id text not null,
   reference_id text not null,
   payload_json text not null,
@@ -7623,7 +7629,7 @@ create table if not exists kqag_pricing_references (
   updated_at text not null,
   primary key (workspace_id, reference_id)
 );
-create table if not exists kqag_quote_sessions (
+create table if not exists sqag_quote_sessions (
   workspace_id text not null,
   session_id text not null,
   metadata_json text not null,
@@ -7633,8 +7639,8 @@ create table if not exists kqag_quote_sessions (
   primary key (workspace_id, session_id)
 );
 """
-KQAG_ARTIFACT_STORAGE_SQL = """
-create table if not exists kqag_quote_artifacts (
+SQAG_ARTIFACT_STORAGE_SQL = """
+create table if not exists sqag_quote_artifacts (
   workspace_id text not null,
   session_id text not null,
   artifact_kind text not null,
@@ -7646,7 +7652,7 @@ create table if not exists kqag_quote_artifacts (
   updated_at text not null,
   primary key (workspace_id, session_id, artifact_kind)
 );
-create table if not exists kqag_file_artifacts (
+create table if not exists sqag_file_artifacts (
   workspace_id text not null,
   owner_type text not null,
   owner_id text not null,
@@ -7660,8 +7666,8 @@ create table if not exists kqag_file_artifacts (
   primary key (workspace_id, owner_type, owner_id, artifact_kind)
 );
 """
-KQAG_OBJECT_ARTIFACT_METADATA_SQL = """
-create table if not exists kqag_object_artifacts (
+SQAG_OBJECT_ARTIFACT_METADATA_SQL = """
+create table if not exists sqag_object_artifacts (
   artifact_id text not null primary key,
   workspace_id text not null,
   owner_type text not null,
@@ -7684,13 +7690,79 @@ create table if not exists kqag_object_artifacts (
   unique (workspace_id, owner_type, owner_id, artifact_kind)
 );
 """
+SQAG_TABLE_SUFFIXES = (
+    "profiles",
+    "pricing_references",
+    "quote_sessions",
+    "quote_artifacts",
+    "file_artifacts",
+    "object_artifacts",
+)
+LEGACY_STORAGE_PREFIX = "k" + "qag"
+
+
+def legacy_storage_table_name(suffix: str) -> str:
+    return f"{LEGACY_STORAGE_PREFIX}_{suffix}"
+
+
+def sqag_storage_table_name(suffix: str) -> str:
+    return f"sqag_{suffix}"
+
+
+def sqlite_table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
+    row = connection.execute(
+        "select 1 from sqlite_master where type = 'table' and name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def sqlite_table_columns(connection: sqlite3.Connection, table_name: str) -> list[str]:
+    return [row["name"] for row in connection.execute(f'pragma table_info("{table_name}")').fetchall()]
+
+
+def migrate_legacy_sqag_tables_sqlite(connection: sqlite3.Connection) -> None:
+    for suffix in SQAG_TABLE_SUFFIXES:
+        legacy_table = legacy_storage_table_name(suffix)
+        sqag_table = sqag_storage_table_name(suffix)
+        legacy_exists = sqlite_table_exists(connection, legacy_table)
+        sqag_exists = sqlite_table_exists(connection, sqag_table)
+        if legacy_exists and not sqag_exists:
+            connection.execute(f'alter table "{legacy_table}" rename to "{sqag_table}"')
+        elif legacy_exists and sqag_exists:
+            columns = sqlite_table_columns(connection, sqag_table)
+            if columns:
+                column_list = ", ".join(f'"{column}"' for column in columns)
+                connection.execute(
+                    f'insert or ignore into "{sqag_table}" ({column_list}) select {column_list} from "{legacy_table}"'
+                )
+            connection.execute(f'drop table "{legacy_table}"')
+
+
+def migrate_legacy_sqag_tables_postgres(connection: Any) -> None:
+    for suffix in SQAG_TABLE_SUFFIXES:
+        legacy_table = legacy_storage_table_name(suffix)
+        sqag_table = sqag_storage_table_name(suffix)
+        connection.execute(
+            f"""
+do $$
+begin
+  if to_regclass('public.{legacy_table}') is not null and to_regclass('public.{sqag_table}') is null then
+    alter table public.{legacy_table} rename to {sqag_table};
+  elsif to_regclass('public.{legacy_table}') is not null and to_regclass('public.{sqag_table}') is not null then
+    execute format('insert into public.%I select * from public.%I on conflict do nothing', '{sqag_table}', '{legacy_table}');
+    execute format('drop table public.%I', '{legacy_table}');
+  end if;
+end $$;
+"""
+        )
 
 def sqlite_database_path_from_url(database_url: str) -> str:
     parsed = urlparse(clean_text(database_url))
     if parsed.scheme != "sqlite" or parsed.netloc not in {"", "localhost"} or parsed.query or parsed.fragment:
-        raise KqagStorageAccessError("KQAG database storage is not configured.", status=503, reason="storage_database_url_unsupported")
+        raise SqagStorageAccessError("SQAG database storage is not configured.", status=503, reason="storage_database_url_unsupported")
     if parsed.path in {"", "/"}:
-        raise KqagStorageAccessError("KQAG database storage is not configured.", status=503, reason="storage_database_not_configured")
+        raise SqagStorageAccessError("SQAG database storage is not configured.", status=503, reason="storage_database_not_configured")
     if parsed.path == "/:memory:":
         return ":memory:"
     path = unquote(parsed.path)
@@ -7741,8 +7813,8 @@ def postgres_driver_connection_factory():
         import psycopg
         from psycopg.rows import dict_row
     except ImportError as exc:
-        raise KqagStorageAccessError(
-            "KQAG Postgres database driver is not available.",
+        raise SqagStorageAccessError(
+            "SQAG Postgres database driver is not available.",
             status=503,
             reason="storage_postgres_driver_unavailable",
         ) from exc
@@ -7756,15 +7828,15 @@ def postgres_driver_connection_factory():
 @contextlib.contextmanager
 def postgres_storage_connection(database_url: str):
     if not postgres_database_url_is_supported(database_url):
-        raise KqagStorageAccessError("KQAG database storage is not configured.", status=503, reason="storage_database_url_unsupported")
+        raise SqagStorageAccessError("SQAG database storage is not configured.", status=503, reason="storage_database_url_unsupported")
     try:
         connect = postgres_driver_connection_factory()
         raw_connection = connect(database_url)
-    except KqagStorageAccessError:
+    except SqagStorageAccessError:
         raise
     except Exception as exc:
-        raise KqagStorageAccessError(
-            "KQAG Postgres database storage is not reachable.",
+        raise SqagStorageAccessError(
+            "SQAG Postgres database storage is not reachable.",
             status=503,
             reason="storage_postgres_connection_failed",
         ) from exc
@@ -7775,28 +7847,28 @@ def postgres_storage_connection(database_url: str):
         connection.close()
 
 
-def kqag_storage_migration_sql() -> str:
+def sqag_storage_migration_sql() -> str:
     sql_parts: list[str] = []
-    for path in KQAG_STORAGE_MIGRATION_PATHS:
+    for path in SQAG_STORAGE_MIGRATION_PATHS:
         try:
             sql_parts.append(path.read_text(encoding="utf-8"))
         except OSError:
             continue
     if sql_parts:
         return "\n".join(sql_parts)
-    return KQAG_STORAGE_SQL + "\n" + KQAG_ARTIFACT_STORAGE_SQL + "\n" + KQAG_OBJECT_ARTIFACT_METADATA_SQL
+    return SQAG_STORAGE_SQL + "\n" + SQAG_ARTIFACT_STORAGE_SQL + "\n" + SQAG_OBJECT_ARTIFACT_METADATA_SQL
 
 
-def kqag_postgres_metadata_migration_sql() -> str:
+def sqag_postgres_metadata_migration_sql() -> str:
     sql_parts: list[str] = []
-    for path in KQAG_POSTGRES_METADATA_MIGRATION_PATHS:
+    for path in SQAG_POSTGRES_METADATA_MIGRATION_PATHS:
         try:
             sql_parts.append(path.read_text(encoding="utf-8"))
         except OSError:
             continue
     if sql_parts:
         return "\n".join(sql_parts)
-    return KQAG_STORAGE_SQL + "\n" + KQAG_OBJECT_ARTIFACT_METADATA_SQL
+    return SQAG_STORAGE_SQL + "\n" + SQAG_OBJECT_ARTIFACT_METADATA_SQL
 
 
 def execute_sql_script(connection: Any, sql: str) -> None:
@@ -7805,22 +7877,24 @@ def execute_sql_script(connection: Any, sql: str) -> None:
             connection.execute(statement)
 
 
-def apply_kqag_storage_migrations(database_url: str | None = None) -> None:
+def apply_sqag_storage_migrations(database_url: str | None = None) -> None:
     url = clean_text(database_url) or configured_database_url()
     if not url:
-        raise KqagStorageAccessError("KQAG database storage is not configured.", status=503, reason="storage_database_not_configured")
+        raise SqagStorageAccessError("SQAG database storage is not configured.", status=503, reason="storage_database_not_configured")
     family = database_family_from_url(url)
     if family == "sqlite":
         with sqlite_storage_connection(url) as connection:
-            connection.executescript(kqag_storage_migration_sql())
+            migrate_legacy_sqag_tables_sqlite(connection)
+            connection.executescript(sqag_storage_migration_sql())
             connection.commit()
         return
     if family == "postgres_compatible":
         with postgres_storage_connection(url) as connection:
-            execute_sql_script(connection, kqag_postgres_metadata_migration_sql())
+            migrate_legacy_sqag_tables_postgres(connection)
+            execute_sql_script(connection, sqag_postgres_metadata_migration_sql())
             connection.commit()
         return
-    raise KqagStorageAccessError("KQAG database storage is not configured.", status=503, reason="storage_database_url_unsupported")
+    raise SqagStorageAccessError("SQAG database storage is not configured.", status=503, reason="storage_database_url_unsupported")
 
 
 def platform_context_from_auth_session(session: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -7853,7 +7927,7 @@ def safe_auth_session_for_async(session: dict[str, Any] | None) -> dict[str, Any
     return {"user": user_from_platform_launch_context(context)}
 
 
-def storage_access_error_payload(exc: KqagStorageAccessError) -> dict[str, Any]:
+def storage_access_error_payload(exc: SqagStorageAccessError) -> dict[str, Any]:
     error_reference = new_error_reference()
     write_local_log("server_error", {"error_reference": error_reference, "reason": exc.reason, "status": exc.status, "errors": safe_error_messages([str(exc)])})
     message = (
@@ -7862,7 +7936,7 @@ def storage_access_error_payload(exc: KqagStorageAccessError) -> dict[str, Any]:
         else (
             QUOTE_SESSION_STORAGE_UNAVAILABLE_MESSAGE
             if exc.reason == "protected_local_quote_session_storage_unavailable"
-            else "KQAG storage is not available for this workspace."
+            else "SQAG storage is not available for this workspace."
         )
     )
     return {"status": "blocked" if exc.status < 500 else "failed", "errors": [message], "error_reference": error_reference}
@@ -7878,13 +7952,13 @@ def safe_platform_session_context(platform: dict[str, Any]) -> dict[str, Any]:
     membership_role = clean_text(platform.get("membershipRole")).lower()
     if clean_text(platform.get("outcome")) != "consumed" or not user_id or not workspace_id or app_key != PLATFORM_APP_KEY:
         raise PlatformLaunchError(
-            "Platform session context is not valid for KQAG.",
+            "Platform session context is not valid for SQAG.",
             status=403,
             reason="platform_session_context_mismatch",
         )
     if membership_role not in PLATFORM_MEMBERSHIP_ROLE_TO_LOCAL_ROLE:
         raise PlatformLaunchError(
-            "Platform session context is not valid for KQAG.",
+            "Platform session context is not valid for SQAG.",
             status=403,
             reason="platform_session_unsupported_role",
         )
@@ -7910,7 +7984,7 @@ def safe_platform_session_context(platform: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-class LocalKqagStorage:
+class LocalSqagStorage:
     storage_backend = "local-runtime-json"
 
     def workspace(self) -> dict[str, Any]:
@@ -7979,7 +8053,7 @@ class LocalKqagStorage:
         return path if path.exists() and path.is_file() else None
 
 
-class DatabaseKqagStorage:
+class DatabaseSqagStorage:
     storage_backend = "database"
 
     def __init__(self, database_url: str, workspace_id: str, role: str = "viewer", user_id: str = "") -> None:
@@ -7989,11 +8063,11 @@ class DatabaseKqagStorage:
         self.role = role_permissions(role).get("role", "viewer")
         self.user_id = privacy_safe_tracking_id(user_id, "")
         if not self.workspace_id:
-            raise KqagStorageAccessError("Platform workspace context is required for database storage.", status=403, reason="storage_platform_session_required")
+            raise SqagStorageAccessError("Platform workspace context is required for database storage.", status=403, reason="storage_platform_session_required")
         if self.database_family == "missing":
-            raise KqagStorageAccessError("KQAG database storage is not configured.", status=503, reason="storage_database_not_configured")
+            raise SqagStorageAccessError("SQAG database storage is not configured.", status=503, reason="storage_database_not_configured")
         if self.database_family == "unsupported":
-            raise KqagStorageAccessError("KQAG database storage is not configured.", status=503, reason="storage_database_url_unsupported")
+            raise SqagStorageAccessError("SQAG database storage is not configured.", status=503, reason="storage_database_url_unsupported")
 
     def connection(self):
         if self.database_family == "postgres_compatible":
@@ -8001,19 +8075,19 @@ class DatabaseKqagStorage:
         return sqlite_storage_connection(self.database_url)
 
     def ensure_ready(self) -> None:
-        self._ensure_schema(KQAG_APP_METADATA_REQUIRED_COLUMNS, reason="storage_database_not_migrated")
+        self._ensure_schema(SQAG_APP_METADATA_REQUIRED_COLUMNS, reason="storage_database_not_migrated")
 
     def ensure_artifact_ready(self) -> None:
         if self.database_family == "postgres_compatible":
-            raise KqagStorageAccessError(
+            raise SqagStorageAccessError(
                 "Database/BLOB artifact storage is not supported for Postgres metadata storage.",
                 status=503,
                 reason="storage_database_blob_artifacts_unsupported",
             )
-        self._ensure_schema(KQAG_DATABASE_ARTIFACT_REQUIRED_COLUMNS, reason="storage_artifact_database_not_migrated")
+        self._ensure_schema(SQAG_DATABASE_ARTIFACT_REQUIRED_COLUMNS, reason="storage_artifact_database_not_migrated")
 
     def ensure_object_artifact_ready(self) -> None:
-        self._ensure_schema(KQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS, reason="storage_object_artifact_database_not_migrated")
+        self._ensure_schema(SQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS, reason="storage_object_artifact_database_not_migrated")
 
     def _ensure_schema(self, required: dict[str, set[str]], *, reason: str) -> None:
         with self.connection() as connection:
@@ -8034,12 +8108,12 @@ class DatabaseKqagStorage:
         }
         missing_tables = {table for table in required if table not in present}
         if missing or missing_tables:
-            message = "KQAG database storage migration has not been applied."
+            message = "SQAG database storage migration has not been applied."
             if reason == "storage_artifact_database_not_migrated":
-                message = "KQAG artifact storage migration has not been applied."
+                message = "SQAG artifact storage migration has not been applied."
             if reason == "storage_object_artifact_database_not_migrated":
-                message = "KQAG object artifact metadata migration has not been applied."
-            raise KqagStorageAccessError(message, status=503, reason=reason)
+                message = "SQAG object artifact metadata migration has not been applied."
+            raise SqagStorageAccessError(message, status=503, reason=reason)
 
     def _sqlite_schema_columns(self, connection: Any, tables: set[str]) -> list[dict[str, str]]:
         rows: list[dict[str, str]] = []
@@ -8059,8 +8133,8 @@ class DatabaseKqagStorage:
         runtime = default_runtime_workspace()
         runtime["workspace"].update({"id": self.workspace_id, "slug": self.workspace_id, "display_name": self.workspace_id, "storage_backend": self.storage_backend})
         runtime["company"].update({"id": self.workspace_id, "slug": self.workspace_id, "display_name": self.workspace_id})
-        runtime["profile_presets"]["storage_path_template"] = "kqag_profiles[platform_workspace_id]"
-        runtime["pricing_references"]["storage_path_template"] = "kqag_pricing_references[platform_workspace_id]"
+        runtime["profile_presets"]["storage_path_template"] = "sqag_profiles[platform_workspace_id]"
+        runtime["pricing_references"]["storage_path_template"] = "sqag_pricing_references[platform_workspace_id]"
         return runtime
 
     def _read_payloads(self, table: str, id_column: str) -> list[dict[str, Any]]:
@@ -8113,7 +8187,7 @@ class DatabaseKqagStorage:
         return sorted(profiles, key=lambda item: (clean_text(item.get("label") or item.get("id")).casefold(), clean_text(item.get("id")).casefold()))
 
     def list_company_profiles(self) -> list[dict[str, Any]]:
-        return self._read_payloads("kqag_profiles", "profile_id")
+        return self._read_payloads("sqag_profiles", "profile_id")
 
     def profile_detail(self, profile_id: str, source: str = "") -> dict[str, Any] | None:
         safe_id = safe_resource_id(profile_id, "")
@@ -8122,7 +8196,7 @@ class DatabaseKqagStorage:
         requested_source = clean_text(source).lower()
         if requested_source not in {"", "company"}:
             return None
-        profile = self._read_payload("kqag_profiles", "profile_id", safe_id)
+        profile = self._read_payload("sqag_profiles", "profile_id", safe_id)
         if profile is None:
             return None
         detail = copy.deepcopy(profile)
@@ -8138,26 +8212,26 @@ class DatabaseKqagStorage:
             self._store_profile_pack_artifacts(profile_id, profile)
         stored = {key: copy.deepcopy(value) for key, value in profile.items() if key not in {"_pack_assets", "pack", "profile_pack"}}
         stored["id"] = profile_id
-        self._upsert_payload("kqag_profiles", "profile_id", profile_id, stored)
+        self._upsert_payload("sqag_profiles", "profile_id", profile_id, stored)
         return stored
 
     def delete_profile(self, profile_id: str) -> bool:
         safe_id = safe_resource_id(profile_id, "")
         if not safe_id:
             raise ValueError("Profile id is required and may only contain letters, numbers, dashes, or underscores.")
-        return self._delete_payload("kqag_profiles", "profile_id", safe_id)
+        return self._delete_payload("sqag_profiles", "profile_id", safe_id)
 
     def company_profile_export_payload(self, profile_id: str) -> dict[str, Any] | None:
         safe_id = safe_resource_id(profile_id, "")
         if not safe_id:
             return None
-        profile = self._read_payload("kqag_profiles", "profile_id", safe_id)
+        profile = self._read_payload("sqag_profiles", "profile_id", safe_id)
         if profile is None:
             return None
         return {"schema": COMPANY_PROFILE_EXPORT_SCHEMA, "exported_at": utc_timestamp(), "profile": {"id": safe_id, "label": clean_text(profile.get("label")) or safe_id, "description": clean_text(profile.get("description")), "defaults": copy.deepcopy(profile.get("defaults")) if isinstance(profile.get("defaults"), dict) else {}}}
 
     def list_pricing_references(self) -> list[dict[str, Any]]:
-        company_references = [public_company_pricing_reference(reference) for reference in self._read_payloads("kqag_pricing_references", "reference_id")]
+        company_references = [public_company_pricing_reference(reference) for reference in self._read_payloads("sqag_pricing_references", "reference_id")]
         return sorted(company_references, key=lambda item: (clean_text(item.get("label") or item.get("id")).casefold(), clean_text(item.get("source")).casefold(), clean_text(item.get("id")).casefold()))
 
     def save_pricing_reference(self, reference: dict[str, Any]) -> dict[str, Any]:
@@ -8168,7 +8242,7 @@ class DatabaseKqagStorage:
         stored["id"] = reference_id
         if configured_artifact_storage_mode() == "database":
             stored = self._store_pricing_visual_artifacts(reference_id, stored)
-        self._upsert_payload("kqag_pricing_references", "reference_id", reference_id, stored)
+        self._upsert_payload("sqag_pricing_references", "reference_id", reference_id, stored)
         return public_company_pricing_reference(stored)
 
     def delete_pricing_reference(self, reference_id: str, source: str = "company") -> bool:
@@ -8177,7 +8251,7 @@ class DatabaseKqagStorage:
             raise ValueError("Pricing reference id is required and may only contain letters, numbers, dashes, or underscores.")
         if clean_text(source or "company").lower() not in {"company", ""}:
             raise ValueError("Only workspace pricing references can be deleted in database storage mode.")
-        return self._delete_payload("kqag_pricing_references", "reference_id", safe_id)
+        return self._delete_payload("sqag_pricing_references", "reference_id", safe_id)
 
     def pricing_reference_detail(self, reference_id: str, source: str = "") -> dict[str, Any] | None:
         safe_id = safe_resource_id(reference_id, "")
@@ -8186,7 +8260,7 @@ class DatabaseKqagStorage:
         requested_source = clean_text(source).lower()
         if requested_source not in {"", "company"}:
             return None
-        reference = self._read_payload("kqag_pricing_references", "reference_id", safe_id)
+        reference = self._read_payload("sqag_pricing_references", "reference_id", safe_id)
         if reference is None:
             return None
         detail = public_company_pricing_reference(reference)
@@ -8216,7 +8290,7 @@ class DatabaseKqagStorage:
         now = utc_timestamp()
         with self.connection() as connection:
             connection.execute(
-                "insert into kqag_file_artifacts (workspace_id, owner_type, owner_id, artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "insert into sqag_file_artifacts (workspace_id, owner_type, owner_id, artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "on conflict(workspace_id, owner_type, owner_id, artifact_kind) do update set filename = excluded.filename, content_type = excluded.content_type, size_bytes = excluded.size_bytes, content_blob = excluded.content_blob, updated_at = excluded.updated_at",
                 (self.workspace_id, safe_owner_type, safe_owner_id, safe_kind, safe_filename, clean_text(content_type) or "application/octet-stream", len(content), sqlite3.Binary(content), now, now),
             )
@@ -8230,7 +8304,7 @@ class DatabaseKqagStorage:
             return None
         with self.connection() as connection:
             row = connection.execute(
-                "select filename, content_type, size_bytes, content_blob from kqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+                "select filename, content_type, size_bytes, content_blob from sqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
                 (self.workspace_id, safe_owner_type, safe_owner_id, safe_kind),
             ).fetchone()
         if not row:
@@ -8335,7 +8409,7 @@ class DatabaseKqagStorage:
             }
         with self.connection() as connection:
             row = connection.execute(
-                "select filename, content_type, size_bytes, created_at, updated_at from kqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
+                "select filename, content_type, size_bytes, created_at, updated_at from sqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
                 (self.workspace_id, safe_id, safe_kind),
             ).fetchone()
         if not row or clean_text(row["filename"]) != expected_filename:
@@ -8351,7 +8425,7 @@ class DatabaseKqagStorage:
         with self.connection() as connection:
             row = connection.execute(
                 "select artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at "
-                "from kqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ? and status = ? and retention_status = ? and deleted_at is null",
+                "from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ? and status = ? and retention_status = ? and deleted_at is null",
                 (self.workspace_id, "generated_quote", safe_id, safe_kind, "active", "active"),
             ).fetchone()
         if not row or clean_text(row["filename"]) != expected_filename or clean_text(row["session_id"]) != safe_id:
@@ -8367,7 +8441,7 @@ class DatabaseKqagStorage:
         with self.connection() as connection:
             return connection.execute(
                 "select artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at "
-                "from kqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and session_id = ? and deleted_at is null",
+                "from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and session_id = ? and deleted_at is null",
                 (self.workspace_id, "generated_quote", safe_id, safe_id),
             ).fetchall()
 
@@ -8404,7 +8478,7 @@ class DatabaseKqagStorage:
             return False
         with self.connection() as connection:
             current = connection.execute(
-                "select filename, content_type, size_bytes, updated_at from kqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
+                "select filename, content_type, size_bytes, updated_at from sqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
                 (self.workspace_id, safe_id, safe_kind),
             ).fetchone()
         if not current:
@@ -8421,7 +8495,7 @@ class DatabaseKqagStorage:
         now = utc_timestamp()
         with self.connection() as connection:
             connection.execute(
-                "insert into kqag_object_artifacts (artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at) "
+                "insert into sqag_object_artifacts (artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at) "
                 "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "on conflict(workspace_id, owner_type, owner_id, artifact_kind) do update set artifact_id = excluded.artifact_id, platform_user_id = excluded.platform_user_id, session_id = excluded.session_id, job_id = excluded.job_id, filename = excluded.filename, content_type = excluded.content_type, size_bytes = excluded.size_bytes, checksum_sha256 = excluded.checksum_sha256, object_provider_type = excluded.object_provider_type, object_key_ref = excluded.object_key_ref, status = excluded.status, retention_status = excluded.retention_status, updated_at = excluded.updated_at, deleted_at = excluded.deleted_at",
                 (
@@ -8470,7 +8544,7 @@ class DatabaseKqagStorage:
             try:
                 object_backend = configured_object_storage_backend()
             except ObjectStorageContractError as exc:
-                raise KqagStorageAccessError(
+                raise SqagStorageAccessError(
                     QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
                     status=503,
                     reason="object_artifact_storage_unavailable",
@@ -8500,7 +8574,7 @@ class DatabaseKqagStorage:
                     )
                     self._upsert_object_quote_artifact(session_id, kind, filename, content_type, object_metadata)
                 except ObjectStorageContractError as exc:
-                    raise KqagStorageAccessError(
+                    raise SqagStorageAccessError(
                         QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
                         status=503,
                         reason="object_artifact_storage_unavailable",
@@ -8511,7 +8585,7 @@ class DatabaseKqagStorage:
                 continue
             with self.connection() as connection:
                 connection.execute(
-                    "insert into kqag_quote_artifacts (workspace_id, session_id, artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "insert into sqag_quote_artifacts (workspace_id, session_id, artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "on conflict(workspace_id, session_id, artifact_kind) do update set filename = excluded.filename, content_type = excluded.content_type, size_bytes = excluded.size_bytes, content_blob = excluded.content_blob, updated_at = excluded.updated_at",
                     (self.workspace_id, session_id, kind, filename, content_type, size, sqlite3.Binary(content), now, now),
                 )
@@ -8550,7 +8624,7 @@ class DatabaseKqagStorage:
             return {"filename": row["filename"], "content_type": row["content_type"], "size_bytes": object_metadata.size_bytes, "content": content}
         with self.connection() as connection:
             row = connection.execute(
-                "select filename, content_type, size_bytes, content_blob, updated_at from kqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
+                "select filename, content_type, size_bytes, content_blob, updated_at from sqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
                 (self.workspace_id, safe_id, safe_kind),
             ).fetchone()
         if not row or clean_text(row["filename"]) != expected_filename:
@@ -8583,7 +8657,7 @@ class DatabaseKqagStorage:
         now = utc_timestamp()
         with self.connection() as connection:
             cursor = connection.execute(
-                "update kqag_object_artifacts set status = ?, retention_status = ?, updated_at = ?, deleted_at = ? "
+                "update sqag_object_artifacts set status = ?, retention_status = ?, updated_at = ?, deleted_at = ? "
                 "where workspace_id = ? and owner_type = ? and owner_id = ? and session_id = ? and deleted_at is null",
                 ("deleted", "deleted", now, now, self.workspace_id, "generated_quote", safe_id, safe_id),
             )
@@ -8664,7 +8738,7 @@ class DatabaseKqagStorage:
             return {}, []
         with self.connection() as connection:
             row = connection.execute(
-                "select metadata_json, draft_files_json from kqag_quote_sessions where workspace_id = ? and session_id = ?",
+                "select metadata_json, draft_files_json from sqag_quote_sessions where workspace_id = ? and session_id = ?",
                 (self.workspace_id, safe_id),
             ).fetchone()
         if not row:
@@ -8729,7 +8803,7 @@ class DatabaseKqagStorage:
         draft_files = quote_session_draft_files(patch) if isinstance(patch.get("draft_files"), list) else []
         with self.connection() as connection:
             connection.execute(
-                "insert into kqag_quote_sessions (workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at) values (?, ?, ?, ?, ?, ?) on conflict(workspace_id, session_id) do update set metadata_json = excluded.metadata_json, draft_files_json = excluded.draft_files_json, updated_at = excluded.updated_at",
+                "insert into sqag_quote_sessions (workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at) values (?, ?, ?, ?, ?, ?) on conflict(workspace_id, session_id) do update set metadata_json = excluded.metadata_json, draft_files_json = excluded.draft_files_json, updated_at = excluded.updated_at",
                 (self.workspace_id, normalized["session_id"], json.dumps(normalized, ensure_ascii=True, sort_keys=True), json.dumps(draft_files, ensure_ascii=True, sort_keys=True), normalized.get("created_at") or now, normalized.get("updated_at") or now),
             )
             connection.commit()
@@ -8737,7 +8811,7 @@ class DatabaseKqagStorage:
 
     def list_quote_sessions(self) -> list[dict[str, Any]]:
         with self.connection() as connection:
-            rows = connection.execute("select metadata_json from kqag_quote_sessions where workspace_id = ?", (self.workspace_id,)).fetchall()
+            rows = connection.execute("select metadata_json from sqag_quote_sessions where workspace_id = ?", (self.workspace_id,)).fetchall()
         sessions: list[dict[str, Any]] = []
         for row in rows:
             try:
@@ -8770,7 +8844,7 @@ class DatabaseKqagStorage:
         if configured_artifact_storage_mode() == "object":
             self.tombstone_object_quote_artifacts(safe_id)
         with self.connection() as connection:
-            cursor = connection.execute("delete from kqag_quote_sessions where workspace_id = ? and session_id = ?", (self.workspace_id, safe_id))
+            cursor = connection.execute("delete from sqag_quote_sessions where workspace_id = ? and session_id = ?", (self.workspace_id, safe_id))
             connection.commit()
             return cursor.rowcount > 0
 
@@ -8779,29 +8853,29 @@ class DatabaseKqagStorage:
         return None
 
 
-def artifact_storage_for_auth_session(session: dict[str, Any] | None) -> DatabaseKqagStorage | None:
+def artifact_storage_for_auth_session(session: dict[str, Any] | None) -> DatabaseSqagStorage | None:
     artifact_mode = configured_artifact_storage_mode()
     if artifact_mode not in {"database", "object"}:
         return None
     workspace_id = platform_workspace_id_from_auth_session(session)
     if not workspace_id:
-        raise KqagStorageAccessError("Platform workspace context is required for database storage.", status=403, reason="storage_platform_session_required")
+        raise SqagStorageAccessError("Platform workspace context is required for database storage.", status=403, reason="storage_platform_session_required")
     database_url = configured_database_url()
     if not database_url:
         if artifact_mode == "object":
-            raise KqagStorageAccessError(
+            raise SqagStorageAccessError(
                 QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
                 status=503,
                 reason="object_artifact_storage_unavailable",
             )
-        raise KqagStorageAccessError("KQAG database storage is not configured.", status=503, reason="storage_database_not_configured")
-    storage = DatabaseKqagStorage(database_url, workspace_id, permissions_for_auth_session(session).get("role", "viewer"), platform_user_id_from_auth_session(session))
+        raise SqagStorageAccessError("SQAG database storage is not configured.", status=503, reason="storage_database_not_configured")
+    storage = DatabaseSqagStorage(database_url, workspace_id, permissions_for_auth_session(session).get("role", "viewer"), platform_user_id_from_auth_session(session))
     if artifact_mode == "object":
         storage.ensure_object_artifact_ready()
         try:
             configured_object_storage_backend()
         except ObjectStorageContractError as exc:
-            raise KqagStorageAccessError(
+            raise SqagStorageAccessError(
                 QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
                 status=503,
                 reason="object_artifact_storage_unavailable",
@@ -8811,16 +8885,16 @@ def artifact_storage_for_auth_session(session: dict[str, Any] | None) -> Databas
     return storage
 
 
-def app_storage_for_auth_session(session: dict[str, Any] | None) -> LocalKqagStorage | DatabaseKqagStorage:
+def app_storage_for_auth_session(session: dict[str, Any] | None) -> LocalSqagStorage | DatabaseSqagStorage:
     if configured_storage_mode() != "database":
-        return LocalKqagStorage()
+        return LocalSqagStorage()
     workspace_id = platform_workspace_id_from_auth_session(session)
     if not workspace_id:
-        raise KqagStorageAccessError("Platform workspace context is required for database storage.", status=403, reason="storage_platform_session_required")
+        raise SqagStorageAccessError("Platform workspace context is required for database storage.", status=403, reason="storage_platform_session_required")
     database_url = configured_database_url()
     if not database_url:
-        raise KqagStorageAccessError("KQAG database storage is not configured.", status=503, reason="storage_database_not_configured")
-    storage = DatabaseKqagStorage(database_url, workspace_id, permissions_for_auth_session(session).get("role", "viewer"), platform_user_id_from_auth_session(session))
+        raise SqagStorageAccessError("SQAG database storage is not configured.", status=503, reason="storage_database_not_configured")
+    storage = DatabaseSqagStorage(database_url, workspace_id, permissions_for_auth_session(session).get("role", "viewer"), platform_user_id_from_auth_session(session))
     storage.ensure_ready()
     if configured_artifact_storage_mode() == "database":
         storage.ensure_artifact_ready()
@@ -8888,9 +8962,9 @@ def database_pricing_reference_detail_for_payload(payload: dict[str, Any], auth_
         return None
     try:
         storage = app_storage_for_auth_session(auth_session)
-    except KqagStorageAccessError:
+    except SqagStorageAccessError:
         return None
-    if not isinstance(storage, DatabaseKqagStorage):
+    if not isinstance(storage, DatabaseSqagStorage):
         return None
     return storage.pricing_reference_detail(reference_id, source="company")
 
@@ -8898,14 +8972,14 @@ def database_pricing_reference_detail_for_payload(payload: dict[str, Any], auth_
 PROFILE_SELECTION_ERROR_MESSAGE = "Select a valid company profile before generating a quote."
 
 
-def database_profile_storage_for_auth_session(auth_session: dict[str, Any] | None = None) -> DatabaseKqagStorage | None:
+def database_profile_storage_for_auth_session(auth_session: dict[str, Any] | None = None) -> DatabaseSqagStorage | None:
     if configured_storage_mode() != "database":
         return None
     try:
         storage = app_storage_for_auth_session(auth_session)
-    except KqagStorageAccessError:
+    except SqagStorageAccessError:
         return None
-    return storage if isinstance(storage, DatabaseKqagStorage) else None
+    return storage if isinstance(storage, DatabaseSqagStorage) else None
 
 
 def database_profile_detail_for_payload(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -9576,8 +9650,8 @@ def pricing_reference_payload_matches_existing_pack(payload: dict[str, Any], exi
     return payload_signature == existing_signature
 
 
-def pricing_reference_unchanged_save_summary(storage: KqagStorage, reference_id: str, source: str, existing: dict[str, Any]) -> dict[str, Any]:
-    if isinstance(storage, DatabaseKqagStorage):
+def pricing_reference_unchanged_save_summary(storage: SqagStorage, reference_id: str, source: str, existing: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(storage, DatabaseSqagStorage):
         return public_company_pricing_reference(existing)
     return load_pricing_reference_pack(reference_id, source=source).public_summary()
 
@@ -14085,7 +14159,7 @@ def quote_session_generation_snapshot(
         "artifact_storage_mode": configured_artifact_storage_mode(),
     }
     snapshot: dict[str, Any] = {
-        "schema": "swooshz.kqag.quote-generation-snapshot.v1",
+        "schema": "swooshz.sqag.quote-generation-snapshot.v1",
         "created_at": dashboard_safe_text(created_at),
         "profile": profile,
         "pricing_reference": pricing_reference,
@@ -14109,7 +14183,7 @@ def normalized_quote_session_generation_snapshot(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     schema = dashboard_safe_text(value.get("schema"), 120)
-    if schema != "swooshz.kqag.quote-generation-snapshot.v1":
+    if schema != "swooshz.sqag.quote-generation-snapshot.v1":
         return {}
     snapshot = {
         "schema": schema,
@@ -14784,17 +14858,17 @@ def log_protected_local_quote_session_storage_block(reason: str = "protected_loc
     )
 
 
-def quote_session_storage_for_auth_session(session: dict[str, Any] | None) -> LocalKqagStorage | DatabaseKqagStorage:
+def quote_session_storage_for_auth_session(session: dict[str, Any] | None) -> LocalSqagStorage | DatabaseSqagStorage:
     if configured_storage_mode() == "database":
         return app_storage_for_auth_session(session)
     if protected_job_routes_enabled(session):
         log_protected_local_quote_session_storage_block()
-        raise KqagStorageAccessError(
+        raise SqagStorageAccessError(
             QUOTE_SESSION_STORAGE_UNAVAILABLE_MESSAGE,
             status=503,
             reason="protected_local_quote_session_storage_unavailable",
         )
-    return LocalKqagStorage()
+    return LocalSqagStorage()
 
 
 def job_owner_context_from_auth_session(session: dict[str, Any] | None) -> dict[str, str]:
@@ -14851,7 +14925,7 @@ def ensure_quote_artifact_storage_available_for_auth_session(session: dict[str, 
         return
     if protected_job_routes_enabled(session):
         log_protected_local_artifact_storage_block()
-        raise KqagStorageAccessError(
+        raise SqagStorageAccessError(
             QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
             status=503,
             reason="protected_local_artifact_storage_unavailable",
@@ -15086,15 +15160,15 @@ def run_quote_job(
         return {"status": "blocked", "errors": [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE]}
     payload = resolved_payload
 
-    quote_session_storage: LocalKqagStorage | DatabaseKqagStorage | None = None
+    quote_session_storage: LocalSqagStorage | DatabaseSqagStorage | None = None
     if isinstance(payload.get("quote_session"), dict):
         try:
             quote_session_storage = quote_session_storage_for_auth_session(auth_session)
-        except KqagStorageAccessError as exc:
+        except SqagStorageAccessError as exc:
             return storage_access_error_payload(exc)
     elif configured_artifact_storage_mode() == "object":
         return storage_access_error_payload(
-            KqagStorageAccessError(
+            SqagStorageAccessError(
                 QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
                 status=503,
                 reason="object_artifact_storage_unavailable",
@@ -15103,7 +15177,7 @@ def run_quote_job(
 
     try:
         ensure_quote_artifact_storage_available_for_auth_session(auth_session)
-    except KqagStorageAccessError as exc:
+    except SqagStorageAccessError as exc:
         return storage_access_error_payload(exc)
 
     output_root = output_root or configured_output_root()
@@ -15207,7 +15281,7 @@ def run_quote_job(
             result["quote_session"] = storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
             if configured_artifact_storage_mode() in {"database", "object"}:
                 result["files"] = quote_session_result_files(result.get("quote_session"))
-        except KqagStorageAccessError as exc:
+        except SqagStorageAccessError as exc:
             storage_error = storage_access_error_payload(exc)
             result.update(storage_error)
             if configured_artifact_storage_mode() in {"database", "object"}:
@@ -15517,7 +15591,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 if pricing_reference_payload_has_visual_artifacts(reference):
                     try:
                         ensure_quote_artifact_storage_available_for_auth_session(self.current_auth_session())
-                    except KqagStorageAccessError as exc:
+                    except SqagStorageAccessError as exc:
                         self.send_json(storage_access_error_payload(exc), status=exc.status)
                         return
                 with ai_log_tracking_scope(request_ai_tracking):
@@ -15543,7 +15617,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 if profile_payload_has_layout_artifact(profile):
                     try:
                         ensure_quote_artifact_storage_available_for_auth_session(self.current_auth_session())
-                    except KqagStorageAccessError as exc:
+                    except SqagStorageAccessError as exc:
                         self.send_json(storage_access_error_payload(exc), status=exc.status)
                         return
                 storage = self.current_app_storage()
@@ -15759,17 +15833,17 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
     def current_permissions(self) -> dict[str, bool]:
         return permissions_for_auth_session(self.current_auth_session())
 
-    def current_app_storage(self) -> LocalKqagStorage | DatabaseKqagStorage | None:
+    def current_app_storage(self) -> LocalSqagStorage | DatabaseSqagStorage | None:
         try:
             return app_storage_for_auth_session(self.current_auth_session())
-        except KqagStorageAccessError as exc:
+        except SqagStorageAccessError as exc:
             self.send_json(storage_access_error_payload(exc), status=exc.status)
             return None
 
-    def current_quote_session_storage(self) -> LocalKqagStorage | DatabaseKqagStorage | None:
+    def current_quote_session_storage(self) -> LocalSqagStorage | DatabaseSqagStorage | None:
         try:
             return quote_session_storage_for_auth_session(self.current_auth_session())
-        except KqagStorageAccessError as exc:
+        except SqagStorageAccessError as exc:
             self.send_json(storage_access_error_payload(exc), status=exc.status)
             return None
 
@@ -16142,7 +16216,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def send_quote_session_download(self, session_id: str, kind: str, storage: LocalKqagStorage | DatabaseKqagStorage) -> None:
+    def send_quote_session_download(self, session_id: str, kind: str, storage: LocalSqagStorage | DatabaseSqagStorage) -> None:
         safe_id = safe_quote_session_id(session_id, "")
         normalized_kind = clean_text(kind).lower()
         expected_filename = QUOTE_SESSION_EXPORT_KINDS.get(normalized_kind)
@@ -16219,7 +16293,7 @@ def main() -> int:
     if deploy_requires_auth_guard():
         safe_stderr(
             "Refusing deploy mode without a complete auth boundary. Configure SESSION_SECRET with OIDC_* "
-            "settings or KQAG_PLATFORM_LAUNCH_MODE=platform with KQAG_PLATFORM_BASE_URL, or run APP_MODE=local "
+            "settings or SQAG_PLATFORM_LAUNCH_MODE=platform with SQAG_PLATFORM_BASE_URL, or run APP_MODE=local "
             "for localhost-only use.\n"
         )
         return 2

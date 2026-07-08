@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run metadata-only blocked hosted-validation evidence.
 
-This verifier composes existing synthetic KQAG evidence checks and verifies
+This verifier composes existing synthetic SQAG evidence checks and verifies
 that database/BLOB artifact mode remains blocked for hosted, protected, deploy,
 and production readiness. It does not deploy, contact a live host, read
 committed secrets, or prove hosted or production readiness.
@@ -32,11 +32,11 @@ REQUIRED_ENV_NAMES = [
     "APP_MODE",
     "AUTH_REQUIRED",
     "SESSION_SECRET",
-    "KQAG_STORAGE_MODE",
-    "KQAG_ARTIFACT_STORAGE_MODE",
+    "SQAG_STORAGE_MODE",
+    "SQAG_ARTIFACT_STORAGE_MODE",
     "SQAG_DATABASE_URL",
-    "KQAG_PLATFORM_LAUNCH_MODE",
-    "KQAG_PLATFORM_BASE_URL",
+    "SQAG_PLATFORM_LAUNCH_MODE",
+    "SQAG_PLATFORM_BASE_URL",
     "AUTH_ALLOWED_EMAILS",
     "AUTH_ALLOWED_DOMAINS",
     "AUTH_ALLOW_ANY_AUTHENTICATED_USER",
@@ -51,7 +51,7 @@ REQUIRED_ENV_NAMES = [
 HOST_SECRET_MANAGER_ONLY_ENV_NAMES = [
     "SESSION_SECRET",
     "SQAG_DATABASE_URL",
-    "KQAG_PLATFORM_BASE_URL",
+    "SQAG_PLATFORM_BASE_URL",
     "OIDC_ISSUER_URL",
     "OIDC_CLIENT_ID",
     "OIDC_CLIENT_SECRET",
@@ -67,8 +67,8 @@ HOST_SECRET_MANAGER_ONLY_ENV_NAMES = [
 PROHIBITED_OUTPUT_MARKERS = (
     "sqlite:///",
     "C:/Users/Private",
-    "/var/lib/kqag",
-    "/var/log/kqag",
+    "/var/lib/sqag",
+    "/var/log/sqag",
     "Generated quote private line item",
     "Private pricing catalog contents",
     "Private profile layout contents",
@@ -104,7 +104,7 @@ def evidence_status(report: dict[str, Any]) -> str:
 
 def safe_failure_report(stage: str) -> dict[str, Any]:
     return {
-        "schema": "swooshz.kqag.internal-alpha-hosted-validation.v1",
+        "schema": "swooshz.sqag.internal-alpha-hosted-validation.v1",
         "status": "failed",
         "failed_stage": stage,
         "synthetic_only": True,
@@ -143,8 +143,8 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
 
     readiness_env = {
         "APP_MODE": "deploy",
-        "KQAG_STORAGE_MODE": "database",
-        "KQAG_ARTIFACT_STORAGE_MODE": "database",
+        "SQAG_STORAGE_MODE": "database",
+        "SQAG_ARTIFACT_STORAGE_MODE": "database",
         "SQAG_DATABASE_URL": f"sqlite:///{(run_root / 'readiness.sqlite3').as_posix()}",
     }
     with temporary_env(readiness_env):
@@ -170,7 +170,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
     ) else "failed"
 
     report = {
-        "schema": "swooshz.kqag.internal-alpha-hosted-validation.v1",
+        "schema": "swooshz.sqag.internal-alpha-hosted-validation.v1",
         "status": status,
         "synthetic_only": True,
         "live_deployment_evidence": False,
@@ -229,7 +229,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Verify metadata-only KQAG blocked hosted validation evidence.")
+    parser = argparse.ArgumentParser(description="Verify metadata-only SQAG blocked hosted validation evidence.")
     parser.add_argument("--work-dir", type=Path, default=None, help="Synthetic verifier workspace. The path is never printed.")
     return parser
 
