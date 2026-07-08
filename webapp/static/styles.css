@@ -4624,6 +4624,7 @@ h3 {
 }
 
 .rich-text-editor {
+  position: relative;
   min-height: 96px;
   max-height: 240px;
   padding: 11px 12px;
@@ -4654,11 +4655,28 @@ h3 {
   padding-bottom: 11px;
 }
 
-.rich-text-editor:empty::before {
+.rich-text-editor.is-empty::before {
   content: attr(data-placeholder);
+  display: block;
+  position: absolute;
+  top: 11px;
+  right: 12px;
+  left: 12px;
   color: #8896a6;
   opacity: 0.82;
+  overflow: hidden;
   pointer-events: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rich-text-editor.is-single-line.is-empty::before {
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.rich-text-field:focus-within .rich-text-editor.is-single-line.is-empty::before {
+  right: 128px;
 }
 
 input::placeholder,
@@ -4667,7 +4685,7 @@ textarea::placeholder {
   opacity: 0.82;
 }
 
-.rich-text-editor:focus:empty::before,
+.rich-text-editor:focus.is-empty::before,
 input:focus::placeholder,
 textarea:focus::placeholder {
   opacity: 0.62;
@@ -4749,8 +4767,16 @@ select:focus {
 }
 
 .rich-text-editor.is-single-line {
-  min-height: 40px;
-  max-height: 84px;
+  box-sizing: border-box;
+  height: 44px;
+  min-height: 44px;
+  max-height: 44px;
+  line-height: 20px;
+  overflow-x: hidden;
+  overflow-y: hidden;
+  padding-bottom: 11px;
+  padding-top: 11px;
+  white-space: nowrap;
 }
 
 .primary-button:active:not(:disabled):not([aria-disabled="true"]) {
@@ -6751,6 +6777,21 @@ td input {
 }
 
 .currency-control-row input[hidden] {
+  display: none;
+}
+
+.currency-control-stack {
+  display: grid;
+  gap: 8px;
+}
+
+.currency-control-stack select,
+.currency-control-stack input {
+  width: 100%;
+  min-width: 0;
+}
+
+.currency-control-stack input[hidden] {
   display: none;
 }
 

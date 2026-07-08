@@ -330,20 +330,23 @@
                     <div class="quote-commercial-card pricing-reference-card">
                       <div class="quote-commercial-fields">
                         <div class="quote-commercial-row">
-                          <label class="field-control currency-field">
-                            <span>Currency</span>
-                            <select id="quoteCurrency">
-                              <option value=""></option>
-                              <option value="SGD">SGD</option>
-                              <option value="AUD">AUD</option>
-                              <option value="CNY">CNY</option>
-                              <option value="EUR">EUR</option>
-                              <option value="GBP">GBP</option>
-                              <option value="IDR">IDR</option>
-                              <option value="MYR">MYR</option>
-                              <option value="THB">THB</option>
-                              <option value="USD">USD</option>
-                            </select>
+                           <label class="field-control currency-field">
+                             <span>Currency</span>
+                            <div class="currency-control-stack">
+                              <select id="quoteCurrency">
+                                <option value="SGD">SGD</option>
+                                <option value="AUD">AUD</option>
+                                <option value="CNY">CNY</option>
+                                <option value="EUR">EUR</option>
+                                <option value="GBP">GBP</option>
+                                <option value="IDR">IDR</option>
+                                <option value="MYR">MYR</option>
+                                <option value="THB">THB</option>
+                                <option value="USD">USD</option>
+                                <option value="__CUSTOM__">Custom - Enter currency code</option>
+                              </select>
+                              <input id="quoteCurrencyCustom" class="currency-custom-input" type="text" maxlength="3" pattern="[A-Za-z]{3}" autocomplete="off" placeholder="e.g. JPY" hidden>
+                            </div>
                           </label>
                           <label class="field-control quote-exchange-rate-field" id="quoteExchangeRateField">
                             <span>Exchange rate</span>
@@ -351,10 +354,9 @@
                           </label>
                         </div>
                         <div class="quote-commercial-row">
-                          <label class="field-control">
-                            <span>Tax</span>
-                            <select id="quoteTaxLabel">
-                              <option value=""></option>
+                           <label class="field-control">
+                             <span>Tax</span>
+                             <select id="quoteTaxLabel">
                               <option value="GST">GST</option>
                               <option value="VAT">VAT</option>
                             </select>
