@@ -10622,12 +10622,17 @@ def normalize_line_items(payload: dict[str, Any], use_catalog: bool = True) -> l
             else:
                 pricing_keyword = ""
         raw_unit = normalize_pricing_unit(raw.get("unit"))
+        output_unit_locked = raw.get("output_unit_locked") is True
         quantity_parts = normalized_line_text_quantity_parts(raw.get("description"), raw.get("quantity"), raw_unit)
         quantity = parse_float_or_none(quantity_parts["quantity"])
         unit = (
             quantity_parts["unit"]
             if quantity_parts.get("from_text_prefix")
-            else ((catalog_item_unit_hint(catalog_item) or raw_unit) if catalog_item else raw_unit)
+            else (
+                raw_unit
+                if output_unit_locked and raw_unit
+                else ((catalog_item_unit_hint(catalog_item) or raw_unit) if catalog_item else raw_unit)
+            )
         )
         raw_description = clean_customer_quote_line_text(quantity_parts["text"])
         if (
