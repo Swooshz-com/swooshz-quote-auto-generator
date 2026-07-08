@@ -9903,9 +9903,11 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr));", quote_commercial_fields_css)
         self.assertIn(".quote-commercial-row {\n  display: contents;", css)
         single_line_rich_text_css = css.split(".rich-text-editor.is-single-line {", 1)[1].split("}", 1)[0]
-        self.assertIn("height: 40px;", single_line_rich_text_css)
-        self.assertIn("min-height: 40px;", single_line_rich_text_css)
-        self.assertIn("max-height: 40px;", single_line_rich_text_css)
+        self.assertIn("box-sizing: border-box;", single_line_rich_text_css)
+        self.assertIn("height: 44px;", single_line_rich_text_css)
+        self.assertIn("min-height: 44px;", single_line_rich_text_css)
+        self.assertIn("max-height: 44px;", single_line_rich_text_css)
+        self.assertIn("line-height: 20px;", single_line_rich_text_css)
         customer_panel = html.split('id="customerDetailsPanel"', 1)[1].split('class="section-band first-band quote-form-section"', 1)[0]
         self.assertNotIn("pricing-reference-pill-row", customer_panel)
         self.assertNotIn("GST/VAT", customer_panel)
@@ -10459,6 +10461,9 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertIn("text-overflow: ellipsis;", rich_text_placeholder_css)
         self.assertIn("overflow: hidden;", rich_text_placeholder_css)
         single_line_editor_css = css.split(".rich-text-editor.is-single-line {", 1)[1].split("}", 1)[0]
+        self.assertIn("box-sizing: border-box;", single_line_editor_css)
+        self.assertIn("height: 44px;", single_line_editor_css)
+        self.assertIn("line-height: 20px;", single_line_editor_css)
         self.assertIn("white-space: nowrap;", single_line_editor_css)
         self.assertIn("overflow-x: hidden;", single_line_editor_css)
         for source_id in (
