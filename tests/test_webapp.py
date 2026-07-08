@@ -10417,6 +10417,35 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertIn("Saved from the Quote Company panel.", js)
         self.assertIn("Exported from the Swooshz Quote Company panel.", js)
 
+    def test_static_sqag_placeholders_are_guidance_only(self):
+        static_dir = ROOT / "webapp" / "static"
+        html_text = (static_dir / "index.html").read_text(encoding="utf-8")
+        css = (static_dir / "styles.css").read_text(encoding="utf-8")
+        js = (static_dir / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('data-placeholder="e.g. ABC Events Pte Ltd"', html_text)
+        self.assertIn('data-placeholder="e.g. Marina Bay, Singapore"', html_text)
+        self.assertIn('data-placeholder="e.g. Include delivery, setup, and teardown notes"', html_text)
+        self.assertIn('placeholder="e.g. Corporate dinner setup"', html_text)
+        self.assertIn('placeholder="e.g. AV rental reference"', html_text)
+        self.assertIn('placeholder="e.g. Standard quote layout"', html_text)
+        self.assertIn("PRICING_REFERENCE_PREVIEW_PLACEHOLDERS", js)
+        self.assertIn('placeholder="${escapeHtml(PRICING_REFERENCE_PREVIEW_PLACEHOLDERS[field] || "")}"', js)
+        self.assertIn("function outputEditorPlaceholder", js)
+        self.assertIn('placeholder="${escapeHtml(outputEditorPlaceholder(field))}"', js)
+        self.assertIn("function clarificationAnswerPlaceholder", js)
+        self.assertIn('placeholder="${escapeHtml(clarificationAnswerPlaceholder(question))}"', js)
+
+        self.assertIn("input::placeholder,\ntextarea::placeholder", css)
+        self.assertIn(".rich-text-editor:focus:empty::before", css)
+        self.assertNotIn('value="ABC Events', html_text)
+        self.assertNotIn('value="Corporate dinner setup"', html_text)
+        self.assertNotIn('value="AV rental reference"', html_text)
+        self.assertRegex(html_text, r'<textarea class="rich-text-source" id="clientName" rows="1" hidden></textarea>')
+        self.assertRegex(html_text, r'<textarea class="rich-text-source" id="standardNotes" rows="10" hidden></textarea>')
+        self.assertNotIn("ABC Events Pte Ltd</textarea>", html_text)
+        self.assertNotIn("LED screen, truss, projector, chairs</textarea>", js)
+
     def test_static_webapp_uses_simplified_setup_assistant_flow(self):
         static_dir = ROOT / "webapp" / "static"
         html = (static_dir / "index.html").read_text(encoding="utf-8")
@@ -15582,6 +15611,7 @@ eval([
   "quoteAmountValue",
   "recalculateOutputRow",
   "outputCellDisplayValue",
+  "outputEditorPlaceholder",
   "outputEditorHtml",
   "renderOutputEditCell",
   "commitOutputEditor",

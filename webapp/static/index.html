@@ -361,7 +361,7 @@
                           </label>
                           <label class="field-control">
                             <span>Rate (%)</span>
-                            <input id="quoteTaxRate" type="number" min="0" max="100" step="0.01" inputmode="decimal">
+                            <input id="quoteTaxRate" type="number" min="0" max="100" step="0.01" inputmode="decimal" placeholder="e.g. 9">
                           </label>
                         </div>
                       </div>
@@ -380,7 +380,7 @@
                            <button class="rich-text-tool is-italic" type="button" data-rich-command="italic" title="Italic (Ctrl+I)" aria-label="Italic">I</button>
                            <button class="rich-text-tool is-underline" type="button" data-rich-command="underline" title="Underline (Ctrl+U)" aria-label="Underline">U</button>
                          </div>
-                         <div class="rich-text-editor is-single-line" id="clientNameEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="clientName"></div>
+                         <div class="rich-text-editor is-single-line" id="clientNameEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="clientName" data-placeholder="e.g. ABC Events Pte Ltd"></div>
                          <textarea class="rich-text-source" id="clientName" rows="1" hidden></textarea>
                        </div>
                      </div>
@@ -392,7 +392,7 @@
                            <button class="rich-text-tool is-italic" type="button" data-rich-command="italic" title="Italic (Ctrl+I)" aria-label="Italic">I</button>
                            <button class="rich-text-tool is-underline" type="button" data-rich-command="underline" title="Underline (Ctrl+U)" aria-label="Underline">U</button>
                          </div>
-                         <div class="rich-text-editor" id="clientAddressEditor" contenteditable="true" role="textbox" aria-multiline="true" data-rich-text-source="clientAddress"></div>
+                         <div class="rich-text-editor" id="clientAddressEditor" contenteditable="true" role="textbox" aria-multiline="true" data-rich-text-source="clientAddress" data-placeholder="e.g. Marina Bay, Singapore"></div>
                          <textarea class="rich-text-source" id="clientAddress" rows="3" hidden></textarea>
                        </div>
                      </div>
@@ -404,7 +404,7 @@
                            <button class="rich-text-tool is-italic" type="button" data-rich-command="italic" title="Italic (Ctrl+I)" aria-label="Italic">I</button>
                            <button class="rich-text-tool is-underline" type="button" data-rich-command="underline" title="Underline (Ctrl+U)" aria-label="Underline">U</button>
                          </div>
-                         <div class="rich-text-editor is-single-line" id="clientAttentionEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="clientAttention"></div>
+                         <div class="rich-text-editor is-single-line" id="clientAttentionEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="clientAttention" data-placeholder="e.g. Jane Tan"></div>
                          <textarea class="rich-text-source" id="clientAttention" rows="1" hidden></textarea>
                        </div>
                      </div>
@@ -416,7 +416,7 @@
                            <button class="rich-text-tool is-italic" type="button" data-rich-command="italic" title="Italic (Ctrl+I)" aria-label="Italic">I</button>
                            <button class="rich-text-tool is-underline" type="button" data-rich-command="underline" title="Underline (Ctrl+U)" aria-label="Underline">U</button>
                          </div>
-                         <div class="rich-text-editor is-single-line" id="clientTitleEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="clientTitle"></div>
+                         <div class="rich-text-editor is-single-line" id="clientTitleEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="clientTitle" data-placeholder="e.g. Project lead"></div>
                          <textarea class="rich-text-source" id="clientTitle" rows="1" hidden></textarea>
                        </div>
                      </div>
@@ -445,13 +445,13 @@
                            <button class="rich-text-tool is-italic" type="button" data-rich-command="italic" title="Italic (Ctrl+I)" aria-label="Italic">I</button>
                            <button class="rich-text-tool is-underline" type="button" data-rich-command="underline" title="Underline (Ctrl+U)" aria-label="Underline">U</button>
                          </div>
-                         <div class="rich-text-editor is-single-line" id="projectTitleEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="projectTitle"></div>
+                         <div class="rich-text-editor is-single-line" id="projectTitleEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="projectTitle" data-placeholder="e.g. Corporate dinner setup"></div>
                          <textarea class="rich-text-source" id="projectTitle" rows="1" hidden></textarea>
                        </div>
                      </div>
                      <label class="field-control">
                        <span>Show name</span>
-                       <input id="showName" type="text" autocomplete="off">
+                       <input id="showName" type="text" autocomplete="off" placeholder="e.g. Corporate dinner setup">
                      </label>
                      <div class="field-control">
                        <span>Project number</span>
@@ -461,7 +461,7 @@
                            <button class="rich-text-tool is-italic" type="button" data-rich-command="italic" title="Italic (Ctrl+I)" aria-label="Italic">I</button>
                            <button class="rich-text-tool is-underline" type="button" data-rich-command="underline" title="Underline (Ctrl+U)" aria-label="Underline">U</button>
                          </div>
-                         <div class="rich-text-editor is-single-line" id="projectNumberEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="projectNumber"></div>
+                         <div class="rich-text-editor is-single-line" id="projectNumberEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="projectNumber" data-placeholder="e.g. SQ-2026-001"></div>
                          <textarea class="rich-text-source" id="projectNumber" rows="1" hidden></textarea>
                        </div>
                      </div>
@@ -569,7 +569,7 @@
                           <button class="rich-text-tool is-italic" type="button" data-rich-command="italic" title="Italic (Ctrl+I)" aria-label="Italic">I</button>
                           <button class="rich-text-tool is-underline" type="button" data-rich-command="underline" title="Underline (Ctrl+U)" aria-label="Underline">U</button>
                         </div>
-                        <div class="rich-text-editor" id="headerDetailsEditor" contenteditable="true" role="textbox" aria-multiline="true" data-rich-text-source="headerDetails"></div>
+                        <div class="rich-text-editor" id="headerDetailsEditor" contenteditable="true" role="textbox" aria-multiline="true" data-rich-text-source="headerDetails" data-placeholder="e.g. Add company address and contact lines"></div>
                         <textarea class="rich-text-source" id="headerDetails" rows="8" hidden></textarea>
                       </div>
                     </div>
@@ -587,7 +587,7 @@
                            <button class="rich-text-tool is-italic" type="button" data-rich-command="italic" title="Italic (Ctrl+I)" aria-label="Italic">I</button>
                            <button class="rich-text-tool is-underline" type="button" data-rich-command="underline" title="Underline (Ctrl+U)" aria-label="Underline">U</button>
                          </div>
-                         <div class="rich-text-editor is-single-line" id="termsHeadingEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="termsHeading"></div>
+                         <div class="rich-text-editor is-single-line" id="termsHeadingEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="termsHeading" data-placeholder="e.g. Terms &amp; Conditions:"></div>
                          <textarea class="rich-text-source" id="termsHeading" rows="1" hidden></textarea>
                        </div>
                      </div>
@@ -599,7 +599,7 @@
                           <button class="rich-text-tool is-italic" type="button" data-rich-command="italic" title="Italic (Ctrl+I)" aria-label="Italic">I</button>
                           <button class="rich-text-tool is-underline" type="button" data-rich-command="underline" title="Underline (Ctrl+U)" aria-label="Underline">U</button>
                         </div>
-                        <div class="rich-text-editor" id="paymentTermsEditor" contenteditable="true" role="textbox" aria-multiline="true" data-rich-text-source="paymentTerms" data-placeholder="Leave blank to omit payment-term rows. Loaded presets can fill this automatically."></div>
+                        <div class="rich-text-editor" id="paymentTermsEditor" contenteditable="true" role="textbox" aria-multiline="true" data-rich-text-source="paymentTerms" data-placeholder="e.g. 50% deposit, balance before delivery"></div>
                          <textarea class="rich-text-source" id="paymentTerms" rows="3" hidden></textarea>
                        </div>
                      </div>
@@ -617,7 +617,7 @@
                            <button class="rich-text-tool is-italic" type="button" data-rich-command="italic" title="Italic (Ctrl+I)" aria-label="Italic">I</button>
                            <button class="rich-text-tool is-underline" type="button" data-rich-command="underline" title="Underline (Ctrl+U)" aria-label="Underline">U</button>
                          </div>
-                         <div class="rich-text-editor is-single-line" id="notesHeadingEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="notesHeading"></div>
+                         <div class="rich-text-editor is-single-line" id="notesHeadingEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="notesHeading" data-placeholder="e.g. Notes:"></div>
                          <textarea class="rich-text-source" id="notesHeading" rows="1" hidden></textarea>
                        </div>
                      </div>
@@ -629,7 +629,7 @@
                           <button class="rich-text-tool is-italic" type="button" data-rich-command="italic" title="Italic (Ctrl+I)" aria-label="Italic">I</button>
                           <button class="rich-text-tool is-underline" type="button" data-rich-command="underline" title="Underline (Ctrl+U)" aria-label="Underline">U</button>
                         </div>
-                        <div class="rich-text-editor" id="standardNotesEditor" contenteditable="true" role="textbox" aria-multiline="true" data-rich-text-source="standardNotes"></div>
+                        <div class="rich-text-editor" id="standardNotesEditor" contenteditable="true" role="textbox" aria-multiline="true" data-rich-text-source="standardNotes" data-placeholder="e.g. Include delivery, setup, and teardown notes"></div>
                         <textarea class="rich-text-source" id="standardNotes" rows="10" hidden></textarea>
                       </div>
                     </div>
@@ -648,7 +648,7 @@
                             <button class="rich-text-tool is-italic" type="button" data-rich-command="italic" title="Italic (Ctrl+I)" aria-label="Italic">I</button>
                             <button class="rich-text-tool is-underline" type="button" data-rich-command="underline" title="Underline (Ctrl+U)" aria-label="Underline">U</button>
                           </div>
-                          <div class="rich-text-editor is-single-line" id="quoteCompanyNameEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="quoteCompanyName"></div>
+                          <div class="rich-text-editor is-single-line" id="quoteCompanyNameEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="quoteCompanyName" data-placeholder="e.g. Your quotation company name"></div>
                           <textarea class="rich-text-source" id="quoteCompanyName" rows="1" hidden></textarea>
                         </div>
                       </div>
@@ -660,7 +660,7 @@
                             <button class="rich-text-tool is-italic" type="button" data-rich-command="italic" title="Italic (Ctrl+I)" aria-label="Italic">I</button>
                             <button class="rich-text-tool is-underline" type="button" data-rich-command="underline" title="Underline (Ctrl+U)" aria-label="Underline">U</button>
                           </div>
-                          <div class="rich-text-editor is-single-line" id="companySignatoryEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="companySignatory"></div>
+                          <div class="rich-text-editor is-single-line" id="companySignatoryEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="companySignatory" data-placeholder="e.g. Authorized signatory"></div>
                           <textarea class="rich-text-source" id="companySignatory" rows="1" hidden></textarea>
                         </div>
                       </div>
@@ -672,7 +672,7 @@
                             <button class="rich-text-tool is-italic" type="button" data-rich-command="italic" title="Italic (Ctrl+I)" aria-label="Italic">I</button>
                             <button class="rich-text-tool is-underline" type="button" data-rich-command="underline" title="Underline (Ctrl+U)" aria-label="Underline">U</button>
                           </div>
-                          <div class="rich-text-editor is-single-line" id="companyTitleEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="companyTitle"></div>
+                          <div class="rich-text-editor is-single-line" id="companyTitleEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="companyTitle" data-placeholder="e.g. Sales Manager"></div>
                           <textarea class="rich-text-source" id="companyTitle" rows="1" hidden></textarea>
                         </div>
                       </div>
@@ -684,7 +684,7 @@
                             <button class="rich-text-tool is-italic" type="button" data-rich-command="italic" title="Italic (Ctrl+I)" aria-label="Italic">I</button>
                             <button class="rich-text-tool is-underline" type="button" data-rich-command="underline" title="Underline (Ctrl+U)" aria-label="Underline">U</button>
                           </div>
-                          <div class="rich-text-editor is-single-line" id="companyDateLabelEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="companyDateLabel"></div>
+                          <div class="rich-text-editor is-single-line" id="companyDateLabelEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="companyDateLabel" data-placeholder="e.g. Date:"></div>
                           <textarea class="rich-text-source" id="companyDateLabel" rows="1" hidden></textarea>
                         </div>
                       </div>
@@ -698,7 +698,7 @@
                             <button class="rich-text-tool is-italic" type="button" data-rich-command="italic" title="Italic (Ctrl+I)" aria-label="Italic">I</button>
                             <button class="rich-text-tool is-underline" type="button" data-rich-command="underline" title="Underline (Ctrl+U)" aria-label="Underline">U</button>
                           </div>
-                          <div class="rich-text-editor is-single-line" id="acceptanceTextEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="acceptanceText"></div>
+                          <div class="rich-text-editor is-single-line" id="acceptanceTextEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="acceptanceText" data-placeholder="e.g. We accept the quotation and terms"></div>
                           <textarea class="rich-text-source" id="acceptanceText" rows="1" hidden></textarea>
                         </div>
                       </div>
@@ -710,7 +710,7 @@
                             <button class="rich-text-tool is-italic" type="button" data-rich-command="italic" title="Italic (Ctrl+I)" aria-label="Italic">I</button>
                             <button class="rich-text-tool is-underline" type="button" data-rich-command="underline" title="Underline (Ctrl+U)" aria-label="Underline">U</button>
                           </div>
-                          <div class="rich-text-editor is-single-line" id="personLabelEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="personLabel"></div>
+                          <div class="rich-text-editor is-single-line" id="personLabelEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="personLabel" data-placeholder="e.g. Person in charge"></div>
                           <textarea class="rich-text-source" id="personLabel" rows="1" hidden></textarea>
                         </div>
                       </div>
@@ -722,7 +722,7 @@
                             <button class="rich-text-tool is-italic" type="button" data-rich-command="italic" title="Italic (Ctrl+I)" aria-label="Italic">I</button>
                             <button class="rich-text-tool is-underline" type="button" data-rich-command="underline" title="Underline (Ctrl+U)" aria-label="Underline">U</button>
                           </div>
-                          <div class="rich-text-editor is-single-line" id="stampLabelEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="stampLabel"></div>
+                          <div class="rich-text-editor is-single-line" id="stampLabelEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="stampLabel" data-placeholder="e.g. Company name &amp; stamp"></div>
                           <textarea class="rich-text-source" id="stampLabel" rows="1" hidden></textarea>
                         </div>
                       </div>
@@ -734,7 +734,7 @@
                             <button class="rich-text-tool is-italic" type="button" data-rich-command="italic" title="Italic (Ctrl+I)" aria-label="Italic">I</button>
                             <button class="rich-text-tool is-underline" type="button" data-rich-command="underline" title="Underline (Ctrl+U)" aria-label="Underline">U</button>
                           </div>
-                          <div class="rich-text-editor is-single-line" id="dateLabelEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="dateLabel"></div>
+                          <div class="rich-text-editor is-single-line" id="dateLabelEditor" contenteditable="true" role="textbox" aria-multiline="false" data-rich-text-source="dateLabel" data-placeholder="e.g. Date:"></div>
                           <textarea class="rich-text-source" id="dateLabel" rows="1" hidden></textarea>
                         </div>
                       </div>
@@ -875,7 +875,7 @@
             <button class="primary-button" type="button" id="basisChatApplyButton" disabled>Apply</button>
           </div>
           <form class="basis-chat-form" id="basisChatForm">
-            <textarea id="basisChatPrompt" rows="3" placeholder="Ask about this basis or describe a change..."></textarea>
+            <textarea id="basisChatPrompt" rows="3" placeholder="e.g. Add teardown notes or adjust LED screen size"></textarea>
             <button class="primary-button send-button" type="submit" id="basisChatSendButton" aria-label="Send basis question">
               <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
                 <path d="M5 12 20 5l-7 15-2-7-6-1Z"></path>
@@ -999,7 +999,7 @@
                   <div class="pricing-reference-metadata-setup" id="pricingReferenceMetadataSetup" hidden>
                     <label>
                       Pricing reference name
-                      <input id="pricingReferenceName" type="text" autocomplete="off">
+                      <input id="pricingReferenceName" type="text" autocomplete="off" placeholder="e.g. AV rental reference">
                     </label>
                     <div class="form-grid compact tax-settings-grid">
                       <label class="field-control">
@@ -1011,7 +1011,7 @@
                       </label>
                       <label class="field-control">
                         <span>Tax rate (%)</span>
-                        <input id="pricingReferenceTaxRate" type="number" min="0" max="100" step="0.01" inputmode="decimal" required>
+                        <input id="pricingReferenceTaxRate" type="number" min="0" max="100" step="0.01" inputmode="decimal" placeholder="e.g. 9" required>
                       </label>
                       <label class="field-control currency-field">
                         <span>Currency</span>
@@ -1118,7 +1118,7 @@
             <p id="profileNameText">Name this reusable quote company profile.</p>
             <label class="compact-control">
               Profile name
-              <input id="profileNameInput" type="text" autocomplete="off" aria-describedby="profileNameError">
+              <input id="profileNameInput" type="text" autocomplete="off" aria-describedby="profileNameError" placeholder="e.g. Standard quote layout">
             </label>
             <p class="profile-delete-error" id="profileNameError" hidden></p>
           </div>

@@ -4457,6 +4457,15 @@ const PRICING_REFERENCE_PREVIEW_FIELDS = [
   "remarks",
 ];
 
+const PRICING_REFERENCE_PREVIEW_PLACEHOLDERS = {
+  section: "e.g. AV equipment",
+  description: "e.g. LED screen, truss, projector, chairs",
+  unit_hint: "e.g. day",
+  internal_cost: "e.g. 150.00",
+  markup_multiplier: "e.g. 1.25",
+  remarks: "e.g. Delivery excluded",
+};
+
 const PRICING_REFERENCE_METADATA_STALE_FIELDS = new Set([
   "section",
   "description",
@@ -5319,7 +5328,7 @@ function pricingReferencePreviewTableRows(result = state.pendingPricingReference
   return items.map((item, index) => `
     <tr data-preview-row="${index}">
       ${PRICING_REFERENCE_PREVIEW_FIELDS.map((field) => `
-        <td><input class="pricing-preview-input" data-preview-field="${field}" data-preview-row="${index}" value="${escapeHtml(item[field] ?? "")}"></td>
+        <td><input class="pricing-preview-input" data-preview-field="${field}" data-preview-row="${index}" value="${escapeHtml(item[field] ?? "")}" placeholder="${escapeHtml(PRICING_REFERENCE_PREVIEW_PLACEHOLDERS[field] || "")}"></td>
       `).join("")}
       <td class="pricing-preview-status ${pricingReferenceStatusClass(item.warning || "OK")}">${escapeHtml(item.warning || "OK")}</td>
       <td class="pricing-reference-row-actions">
@@ -6910,6 +6919,21 @@ function outputCellDisplayValue(row = {}, field = "") {
   return String(row[field] ?? "").trim() || "???";
 }
 
+function outputEditorPlaceholder(field = "") {
+  const placeholders = {
+    section: "e.g. AV equipment",
+    description: "e.g. LED screen, truss, projector, chairs",
+    quantity: "e.g. 2",
+    unit: "e.g. unit",
+    unit_price_override: "e.g. 150.00",
+    amount: "e.g. 300.00",
+    pricing_reference: "e.g. AV rental reference",
+    note: "e.g. Internal notes, not shown to customer",
+    notes: "e.g. Internal notes, not shown to customer",
+  };
+  return placeholders[field] || "e.g. Returning client adjustment";
+}
+
 function outputEditorHtml(row = {}, index = 0, field = "") {
   const value = field === "unit_price_override"
     ? row.price_mode === "Included"
@@ -6917,7 +6941,7 @@ function outputEditorHtml(row = {}, index = 0, field = "") {
       : String(row.unit_price_override || row.catalog_unit_price || "")
     : String(row[field] ?? "");
   if (field === "description") {
-    return `<textarea class="output-cell-input output-description-input is-editing" data-output-editor-field="${field}" data-output-row="${index}" rows="3">${escapeHtml(value)}</textarea>`;
+    return `<textarea class="output-cell-input output-description-input is-editing" data-output-editor-field="${field}" data-output-row="${index}" rows="3" placeholder="${escapeHtml(outputEditorPlaceholder(field))}">${escapeHtml(value)}</textarea>`;
   }
   if (field === "price_mode") {
     return `
@@ -6933,13 +6957,13 @@ function outputEditorHtml(row = {}, index = 0, field = "") {
       : "";
     return `
       <span class="output-unit-price-editor">
-        <input class="output-cell-input is-editing" data-output-editor-field="${field}" data-output-row="${index}" value="${escapeHtml(value)}" inputmode="decimal">
+        <input class="output-cell-input is-editing" data-output-editor-field="${field}" data-output-row="${index}" value="${escapeHtml(value)}" inputmode="decimal" placeholder="${escapeHtml(outputEditorPlaceholder(field))}">
         ${includedButton}
       </span>
     `;
   }
   const inputMode = field === "quantity" ? "decimal" : "text";
-  return `<input class="output-cell-input is-editing" data-output-editor-field="${field}" data-output-row="${index}" value="${escapeHtml(value)}" inputmode="${inputMode}">`;
+  return `<input class="output-cell-input is-editing" data-output-editor-field="${field}" data-output-row="${index}" value="${escapeHtml(value)}" inputmode="${inputMode}" placeholder="${escapeHtml(outputEditorPlaceholder(field))}">`;
 }
 
 function renderOutputEditCell(row = {}, index = 0, field = "", extraClass = "") {
@@ -8106,7 +8130,7 @@ function openBasisChatOverlay(scope = "line", options = {}) {
       </span>
     </span>
   `;
-  elements.basisChatPrompt.placeholder = "Describe the change for this line...";
+  elements.basisChatPrompt.placeholder = "e.g. Add teardown notes or adjust LED screen size";
   elements.basisChatMessages.innerHTML = "";
   appendBasisChatMessage("assistant", basisChatIntroMessage());
   elements.basisChatPrompt.value = "";
@@ -8650,6 +8674,12 @@ function renderClarificationQuestionText(text = "") {
   `;
 }
 
+function clarificationAnswerPlaceholder(question = {}) {
+  return question.answer_type === "number"
+    ? "e.g. 2"
+    : "e.g. Confirm quantity, size, or requirement";
+}
+
 function renderClarificationQuestions() {
   const questions = state.blockingClarificationQuestions || [];
   elements.basisReviewSurface.innerHTML = `
@@ -8670,7 +8700,7 @@ function renderClarificationQuestions() {
                 <option value="">Choose...</option>
                 ${question.choices.map((choice) => `<option value="${escapeHtml(choice)}" ${question.answer === choice ? "selected" : ""}>${escapeHtml(choice)}</option>`).join("")}
               </select>
-            ` : `<input data-clarification-index="${index}" value="${escapeHtml(question.answer || "")}" inputmode="${question.answer_type === "number" ? "decimal" : "text"}">`}
+            ` : `<input data-clarification-index="${index}" value="${escapeHtml(question.answer || "")}" inputmode="${question.answer_type === "number" ? "decimal" : "text"}" placeholder="${escapeHtml(clarificationAnswerPlaceholder(question))}">`}
           </label>
         `).join("")}
         <button class="primary-button" type="submit">Generate final Quote Basis</button>
