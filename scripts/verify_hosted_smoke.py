@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Synthetic hosted-shape smoke verifier.
 
-The verifier exercises KQAG through local HTTP routes bound to 127.0.0.1
+The verifier exercises SQAG through local HTTP routes bound to 127.0.0.1
 with synthetic platform/workspace context, SQLite database storage, and database
 artifact storage. It emits metadata-only JSON and does not call Swooshz Platform,
 prove object storage, or make DB/BLOB artifact mode launch-ready.
@@ -180,8 +180,8 @@ def synthetic_platform_payload() -> dict[str, Any]:
             "workspaceName": "Hosted Smoke Workspace",
         },
         "app": {
-            "appKey": "kqag",
-            "appName": "KQAG",
+            "appKey": "sqag",
+            "appName": "SQAG",
         },
         "membershipRole": "owner",
         "launchTokenExpiresAt": "2999-01-01T00:00:00.000Z",
@@ -234,7 +234,7 @@ def synthetic_payload() -> dict[str, Any]:
         "confirmed": True,
         "view_pdf": True,
         "quote_date": "2026-06-06",
-        "project_number": "KQAG-SMOKE-001",
+        "project_number": "SQAG-SMOKE-001",
         "client": {
             "name": "Synthetic Client",
             "attention": "Synthetic Contact",
@@ -344,16 +344,16 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
     if run_root.exists():
         shutil.rmtree(run_root)
     run_root.mkdir(parents=True, exist_ok=True)
-    db_path = run_root / "kqag-hosted-smoke.sqlite3"
+    db_path = run_root / "sqag-hosted-smoke.sqlite3"
     database_url = f"sqlite:///{db_path.as_posix()}"
     env = {
         "APP_MODE": "deploy",
         "AUTH_REQUIRED": "true",
         "SESSION_SECRET": "synthetic-session-secret-with-enough-entropy",
-        "KQAG_PLATFORM_LAUNCH_MODE": "platform",
-        "KQAG_PLATFORM_BASE_URL": "https://platform.example.test",
-        "KQAG_STORAGE_MODE": "database",
-        "KQAG_ARTIFACT_STORAGE_MODE": "database",
+        "SQAG_PLATFORM_LAUNCH_MODE": "platform",
+        "SQAG_PLATFORM_BASE_URL": "https://platform.example.test",
+        "SQAG_STORAGE_MODE": "database",
+        "SQAG_ARTIFACT_STORAGE_MODE": "database",
         "SQAG_DATABASE_URL": database_url,
         "QUOTE_DATA_ROOT": str(run_root / "data"),
         "QUOTE_OUTPUT_ROOT": str(run_root / "output"),
@@ -380,7 +380,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
         return JsonResponse(synthetic_platform_payload())
 
     with mock.patch.dict(os.environ, env, clear=True):
-        webapp.apply_kqag_storage_migrations(database_url)
+        webapp.apply_sqag_storage_migrations(database_url)
         storage = webapp.app_storage_for_auth_session(synthetic_auth_session())
         storage.save_pricing_reference(synthetic_pricing_reference())
         storage.save_profile(synthetic_profile())
@@ -426,7 +426,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
             checks["workspace_pricing_saved_and_used"] = checks["workspace_pricing_saved_and_used"] and generate_result.get("status") == "completed"
             checks["quote_session_persisted"] = (
                 quote_session.get("session_id") == SYNTHETIC_SESSION_ID
-                and count_rows(db_path, "kqag_quote_sessions") == 1
+                and count_rows(db_path, "sqag_quote_sessions") == 1
             )
             download_results = {
                 kind: download_artifact(runner.base_url, session_cookie, kind)
@@ -441,7 +441,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
                 cookie=session_cookie,
                 headers={csrf_header: csrf_token},
             )
-            checks["quote_session_delete"] = delete_status == 200 and delete_body.get("status") == "deleted" and count_rows(db_path, "kqag_quote_sessions") == 0
+            checks["quote_session_delete"] = delete_status == 200 and delete_body.get("status") == "deleted" and count_rows(db_path, "sqag_quote_sessions") == 0
             checks["logout"] = logout_check(runner.base_url, session_cookie)
 
     serialized_checks = json.dumps(checks, sort_keys=True)
@@ -450,7 +450,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
     local_artifact_success_path_used = False if checks["legacy_job_file_lockdown"] else True
     passed = all(checks.values()) and no_sensitive_output and not local_quote_session_success_path_used and not local_artifact_success_path_used
     return {
-        "schema": "swooshz.kqag.hosted-smoke-verification.v1",
+        "schema": "swooshz.sqag.hosted-smoke-verification.v1",
         "status": "passed" if passed else "failed",
         "synthetic_only": True,
         "network": {"host": "127.0.0.1"},
@@ -559,7 +559,7 @@ def main(argv: list[str] | None = None) -> int:
         report = run_verification(work_dir=args.work_dir)
     except Exception:
         report = {
-            "schema": "swooshz.kqag.hosted-smoke-verification.v1",
+            "schema": "swooshz.sqag.hosted-smoke-verification.v1",
             "status": "failed",
             "synthetic_only": True,
             "privacy": {

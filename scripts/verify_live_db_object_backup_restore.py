@@ -269,7 +269,7 @@ def _report(
 
 
 def _build_default_storage(database_url: str, workspace_id: str) -> Any:
-    return webapp.DatabaseKqagStorage(
+    return webapp.DatabaseSqagStorage(
         database_url,
         workspace_id,
         role="admin",
@@ -468,19 +468,19 @@ def _cleanup_storage(storage: object, *, profile_id: str, pricing_id: str, sessi
     if hasattr(storage, "connection"):
         with storage.connection() as connection:
             connection.execute(
-                "delete from kqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+                "delete from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
                 (storage.workspace_id, "generated_quote", session_id, "xlsx"),
             )
             connection.execute(
-                "delete from kqag_quote_sessions where workspace_id = ? and session_id = ?",
+                "delete from sqag_quote_sessions where workspace_id = ? and session_id = ?",
                 (storage.workspace_id, session_id),
             )
             connection.execute(
-                "delete from kqag_pricing_references where workspace_id = ? and reference_id = ?",
+                "delete from sqag_pricing_references where workspace_id = ? and reference_id = ?",
                 (storage.workspace_id, pricing_id),
             )
             connection.execute(
-                "delete from kqag_profiles where workspace_id = ? and profile_id = ?",
+                "delete from sqag_profiles where workspace_id = ? and profile_id = ?",
                 (storage.workspace_id, profile_id),
             )
             connection.commit()
@@ -781,7 +781,7 @@ def run_verification(
         restore_storage_factory=restore_storage_factory or _build_default_storage,
         active_backend_factory=active_backend_factory or _active_backend_factory,
         restore_backend_factory=restore_backend_factory or _restore_backend_factory,
-        migration_applier=migration_applier or webapp.apply_kqag_storage_migrations,
+        migration_applier=migration_applier or webapp.apply_sqag_storage_migrations,
     )
     status = "passed" if not blockers else "failed"
     return _report(

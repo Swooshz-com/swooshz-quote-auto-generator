@@ -25,7 +25,7 @@ class HostedObservabilityVerifierTest(unittest.TestCase):
     def test_synthetic_observability_report_is_metadata_only(self):
         private_values = {
             "C:/Users/Private/Koncept Runtime",
-            "sqlite:///C:/Users/Private/kqag-storage.sqlite3?token=secret",
+            "sqlite:///C:/Users/Private/sqag-storage.sqlite3?token=secret",
             "Acme Private Customer",
             "Generated quote private line item",
             "Private pricing catalog contents",
@@ -85,7 +85,7 @@ class HostedObservabilityVerifierTest(unittest.TestCase):
         policy = verifier.load_policy()
         text = json.dumps(policy, sort_keys=True)
 
-        self.assertEqual(policy["schema"], "swooshz.kqag.hosted-observability-policy.v1")
+        self.assertEqual(policy["schema"], "swooshz.sqag.hosted-observability-policy.v1")
         self.assertTrue(policy["synthetic_verifier_only"])
         self.assertIn("allowed_event_categories", policy)
         self.assertIn("forbidden_content", policy)

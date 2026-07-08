@@ -1,7 +1,9 @@
 import json
 import os
+import sqlite3
 import sys
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -13,6 +15,15 @@ from webapp import server as webapp
 
 
 POSTGRES_URL = "postgres" + "ql://redacted-db-url"
+LEGACY_PREFIX = "k" + "qag"
+SQAG_TABLES = {
+    "sqag_profiles",
+    "sqag_pricing_references",
+    "sqag_quote_sessions",
+    "sqag_quote_artifacts",
+    "sqag_file_artifacts",
+    "sqag_object_artifacts",
+}
 
 
 def platform_session(workspace_id: str = "workspace-alpha", user_id: str = "user-alpha") -> dict:
@@ -23,7 +34,7 @@ def platform_session(workspace_id: str = "workspace-alpha", user_id: str = "user
                 "outcome": "consumed",
                 "user": {"userId": user_id},
                 "workspace": {"workspaceId": workspace_id},
-                "app": {"appKey": "kqag"},
+                "app": {"appKey": "sqag"},
                 "membershipRole": "owner",
             },
         }
@@ -44,10 +55,10 @@ class FakePostgresCursor:
 
 class FakePostgresConnection:
     required_tables = {
-        "kqag_profiles",
-        "kqag_pricing_references",
-        "kqag_quote_sessions",
-        "kqag_object_artifacts",
+        "sqag_profiles",
+        "sqag_pricing_references",
+        "sqag_quote_sessions",
+        "sqag_object_artifacts",
     }
 
     def __init__(self, *, missing_tables=None):
@@ -67,10 +78,10 @@ class FakePostgresConnection:
         if "information_schema.columns" in normalized:
             rows = []
             column_map = {
-                "kqag_profiles": {"workspace_id", "profile_id", "payload_json", "created_at", "updated_at"},
-                "kqag_pricing_references": {"workspace_id", "reference_id", "payload_json", "created_at", "updated_at"},
-                "kqag_quote_sessions": {"workspace_id", "session_id", "metadata_json", "draft_files_json", "created_at", "updated_at"},
-                "kqag_object_artifacts": {
+                "sqag_profiles": {"workspace_id", "profile_id", "payload_json", "created_at", "updated_at"},
+                "sqag_pricing_references": {"workspace_id", "reference_id", "payload_json", "created_at", "updated_at"},
+                "sqag_quote_sessions": {"workspace_id", "session_id", "metadata_json", "draft_files_json", "created_at", "updated_at"},
+                "sqag_object_artifacts": {
                     "artifact_id",
                     "workspace_id",
                     "owner_type",
@@ -97,7 +108,7 @@ class FakePostgresConnection:
                     continue
                 rows.extend({"table_name": table, "column_name": column} for column in sorted(column_map[table]))
             return FakePostgresCursor(rows)
-        if normalized.startswith("insert into kqag_profiles"):
+        if normalized.startswith("insert into sqag_profiles"):
             workspace_id, profile_id, payload_json, created_at, updated_at = params
             self.profiles[(workspace_id, profile_id)] = {
                 "payload_json": payload_json,
@@ -105,7 +116,7 @@ class FakePostgresConnection:
                 "updated_at": updated_at,
             }
             return FakePostgresCursor(rowcount=1)
-        if normalized.startswith("select payload_json from kqag_profiles"):
+        if normalized.startswith("select payload_json from sqag_profiles"):
             workspace_id = params[0]
             rows = [
                 {"payload_json": value["payload_json"]}
@@ -113,7 +124,7 @@ class FakePostgresConnection:
                 if stored_workspace == workspace_id
             ]
             return FakePostgresCursor(rows)
-        if normalized.startswith("insert into kqag_pricing_references"):
+        if normalized.startswith("insert into sqag_pricing_references"):
             workspace_id, reference_id, payload_json, created_at, updated_at = params
             self.pricing_references[(workspace_id, reference_id)] = {
                 "payload_json": payload_json,
@@ -121,7 +132,7 @@ class FakePostgresConnection:
                 "updated_at": updated_at,
             }
             return FakePostgresCursor(rowcount=1)
-        if normalized.startswith("insert into kqag_quote_sessions"):
+        if normalized.startswith("insert into sqag_quote_sessions"):
             workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at = params
             self.quote_sessions[(workspace_id, session_id)] = {
                 "metadata_json": metadata_json,
@@ -130,7 +141,7 @@ class FakePostgresConnection:
                 "updated_at": updated_at,
             }
             return FakePostgresCursor(rowcount=1)
-        if normalized.startswith("select metadata_json from kqag_quote_sessions where workspace_id = %s"):
+        if normalized.startswith("select metadata_json from sqag_quote_sessions where workspace_id = %s"):
             workspace_id = params[0]
             rows = [
                 {"metadata_json": value["metadata_json"]}
@@ -138,15 +149,15 @@ class FakePostgresConnection:
                 if stored_workspace == workspace_id
             ]
             return FakePostgresCursor(rows)
-        if "from kqag_quote_sessions where workspace_id = %s and session_id = %s" in normalized:
+        if "from sqag_quote_sessions where workspace_id = %s and session_id = %s" in normalized:
             workspace_id, session_id = params
             row = self.quote_sessions.get((workspace_id, session_id))
             return FakePostgresCursor([row] if row else [])
-        if normalized.startswith("delete from kqag_quote_sessions"):
+        if normalized.startswith("delete from sqag_quote_sessions"):
             workspace_id, session_id = params
             existed = self.quote_sessions.pop((workspace_id, session_id), None) is not None
             return FakePostgresCursor(rowcount=1 if existed else 0)
-        if normalized.startswith("insert into kqag_object_artifacts"):
+        if normalized.startswith("insert into sqag_object_artifacts"):
             (
                 artifact_id,
                 workspace_id,
@@ -190,7 +201,7 @@ class FakePostgresConnection:
                 "deleted_at": deleted_at,
             }
             return FakePostgresCursor(rowcount=1)
-        if "from kqag_object_artifacts where workspace_id = %s" in normalized:
+        if "from sqag_object_artifacts where workspace_id = %s" in normalized:
             workspace_id, owner_type, owner_id, artifact_kind = params[:4]
             status = params[4] if len(params) > 4 else None
             retention_status = params[5] if len(params) > 5 else None
@@ -212,11 +223,124 @@ class FakePostgresConnection:
         self.closed = True
 
 
+class RecordingConnection:
+    def __init__(self):
+        self.queries = []
+
+    def execute(self, sql, params=None):
+        self.queries.append((sql, tuple(params or ())))
+        return FakePostgresCursor()
+
+
+class SqliteSqagMigrationTest(unittest.TestCase):
+    def temp_path(self) -> Path:
+        root = ROOT / "_tmp" / "test-postgres-metadata-storage"
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f"case-{uuid.uuid4().hex}"
+        path.mkdir()
+        return path
+
+    def sqlite_url(self, path: Path) -> str:
+        return f"sqlite:///{path.as_posix()}"
+
+    def table_names(self, database_path: Path) -> set[str]:
+        with sqlite3.connect(database_path) as connection:
+            rows = connection.execute(
+                "select name from sqlite_master where type = 'table'"
+            ).fetchall()
+        return {row[0] for row in rows}
+
+    def test_sqag_storage_migration_creates_sqag_tables(self):
+        database_path = self.temp_path() / "sqag-storage.sqlite3"
+
+        webapp.apply_sqag_storage_migrations(self.sqlite_url(database_path))
+
+        tables = self.table_names(database_path)
+        self.assertTrue(SQAG_TABLES.issubset(tables))
+        self.assertFalse(any(table.startswith(f"{LEGACY_PREFIX}_") for table in tables))
+
+    def test_sqag_storage_migration_renames_existing_legacy_tables(self):
+        database_path = self.temp_path() / "sqag-storage.sqlite3"
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                f"create table {LEGACY_PREFIX}_profiles (workspace_id text not null, profile_id text not null, payload_json text not null, created_at text not null, updated_at text not null, primary key (workspace_id, profile_id))"
+            )
+            connection.execute(
+                f"insert into {LEGACY_PREFIX}_profiles values (?, ?, ?, ?, ?)",
+                ("workspace-a", "profile-a", '{"id":"profile-a"}', "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+            )
+            connection.commit()
+
+        webapp.apply_sqag_storage_migrations(self.sqlite_url(database_path))
+
+        tables = self.table_names(database_path)
+        self.assertIn("sqag_profiles", tables)
+        self.assertNotIn(f"{LEGACY_PREFIX}_profiles", tables)
+        with sqlite3.connect(database_path) as connection:
+            row = connection.execute(
+                "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
+                ("workspace-a", "profile-a"),
+            ).fetchone()
+        self.assertEqual(row[0], '{"id":"profile-a"}')
+
+    def test_sqag_storage_migration_merges_legacy_and_new_tables(self):
+        database_path = self.temp_path() / "sqag-storage.sqlite3"
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                "create table sqag_profiles (workspace_id text not null, profile_id text not null, payload_json text not null, created_at text not null, updated_at text not null, primary key (workspace_id, profile_id))"
+            )
+            connection.execute(
+                f"create table {LEGACY_PREFIX}_profiles (workspace_id text not null, profile_id text not null, payload_json text not null, created_at text not null, updated_at text not null, primary key (workspace_id, profile_id))"
+            )
+            connection.execute(
+                "insert into sqag_profiles values (?, ?, ?, ?, ?)",
+                ("workspace-a", "new-profile", '{"id":"new-profile"}', "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+            )
+            connection.execute(
+                f"insert into {LEGACY_PREFIX}_profiles values (?, ?, ?, ?, ?)",
+                ("workspace-a", "legacy-profile", '{"id":"legacy-profile"}', "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+            )
+            connection.commit()
+
+        webapp.apply_sqag_storage_migrations(self.sqlite_url(database_path))
+
+        tables = self.table_names(database_path)
+        self.assertIn("sqag_profiles", tables)
+        self.assertNotIn(f"{LEGACY_PREFIX}_profiles", tables)
+        with sqlite3.connect(database_path) as connection:
+            rows = connection.execute(
+                "select profile_id from sqag_profiles where workspace_id = ? order by profile_id",
+                ("workspace-a",),
+            ).fetchall()
+        self.assertEqual([row[0] for row in rows], ["legacy-profile", "new-profile"])
+
+    def test_sqag_storage_migration_is_idempotent(self):
+        database_path = self.temp_path() / "sqag-storage.sqlite3"
+
+        webapp.apply_sqag_storage_migrations(self.sqlite_url(database_path))
+        webapp.apply_sqag_storage_migrations(self.sqlite_url(database_path))
+
+        tables = self.table_names(database_path)
+        self.assertTrue(SQAG_TABLES.issubset(tables))
+        self.assertFalse(any(table.startswith(f"{LEGACY_PREFIX}_") for table in tables))
+
+    def test_postgres_legacy_table_migration_sql_uses_guarded_sqag_rename_merge(self):
+        connection = RecordingConnection()
+
+        webapp.migrate_legacy_sqag_tables_postgres(connection)
+
+        executed_sql = "\n".join(query for query, _params in connection.queries)
+        self.assertIn("public.sqag_profiles", executed_sql)
+        self.assertIn(f"public.{LEGACY_PREFIX}_profiles", executed_sql)
+        self.assertIn("on conflict do nothing", executed_sql.lower())
+        self.assertIn("drop table", executed_sql.lower())
+
+
 class PostgresMetadataStorageTest(unittest.TestCase):
     def postgres_env(self) -> dict[str, str]:
         return {
-            "KQAG_STORAGE_MODE": "database",
-            "KQAG_ARTIFACT_STORAGE_MODE": "object",
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "object",
             "SQAG_DATABASE_URL": POSTGRES_URL,
         }
 
@@ -277,9 +401,9 @@ class PostgresMetadataStorageTest(unittest.TestCase):
 
         self.assertEqual(session["session_id"], "quote-alpha123")
         executed_sql = "\n".join(query.lower() for query, _params in connection.queries)
-        self.assertIn("insert into kqag_pricing_references", executed_sql)
-        self.assertIn("insert into kqag_quote_sessions", executed_sql)
-        self.assertIn("insert into kqag_object_artifacts", executed_sql)
+        self.assertIn("insert into sqag_pricing_references", executed_sql)
+        self.assertIn("insert into sqag_quote_sessions", executed_sql)
+        self.assertIn("insert into sqag_object_artifacts", executed_sql)
         self.assertNotIn("content_blob", executed_sql)
 
     def test_postgres_object_artifact_row_matches_runtime_mapping_contract(self):
@@ -359,13 +483,13 @@ class PostgresMetadataStorageTest(unittest.TestCase):
     def test_postgres_storage_blocks_missing_driver_without_sqlite_fallback(self):
         with mock.patch.dict(os.environ, self.postgres_env(), clear=True), mock.patch(
             "webapp.server.postgres_driver_connection_factory",
-            side_effect=webapp.KqagStorageAccessError(
-                "KQAG Postgres database driver is not available.",
+            side_effect=webapp.SqagStorageAccessError(
+                "SQAG Postgres database driver is not available.",
                 status=503,
                 reason="storage_postgres_driver_unavailable",
             ),
         ), mock.patch("webapp.server.sqlite_storage_connection", side_effect=AssertionError("sqlite fallback used")):
-            with self.assertRaises(webapp.KqagStorageAccessError) as blocked:
+            with self.assertRaises(webapp.SqagStorageAccessError) as blocked:
                 webapp.app_storage_for_auth_session(platform_session())
 
         self.assertEqual(blocked.exception.reason, "storage_postgres_driver_unavailable")
@@ -375,7 +499,7 @@ class PostgresMetadataStorageTest(unittest.TestCase):
             "webapp.server.postgres_driver_connection_factory",
             return_value=lambda _database_url: (_ for _ in ()).throw(RuntimeError("private host value")),
         ):
-            with self.assertRaises(webapp.KqagStorageAccessError) as blocked:
+            with self.assertRaises(webapp.SqagStorageAccessError) as blocked:
                 webapp.app_storage_for_auth_session(platform_session())
 
         text = json.dumps({"message": str(blocked.exception), "reason": blocked.exception.reason})
@@ -384,12 +508,12 @@ class PostgresMetadataStorageTest(unittest.TestCase):
         self.assertNotIn("private host value", text)
 
     def test_postgres_storage_blocks_missing_required_schema(self):
-        connection = FakePostgresConnection(missing_tables={"kqag_quote_sessions"})
+        connection = FakePostgresConnection(missing_tables={"sqag_quote_sessions"})
         with mock.patch.dict(os.environ, self.postgres_env(), clear=True), mock.patch(
             "webapp.server.postgres_driver_connection_factory",
             return_value=lambda _database_url: connection,
         ):
-            with self.assertRaises(webapp.KqagStorageAccessError) as blocked:
+            with self.assertRaises(webapp.SqagStorageAccessError) as blocked:
                 webapp.app_storage_for_auth_session(platform_session())
 
         self.assertEqual(blocked.exception.reason, "storage_database_not_migrated")

@@ -9,11 +9,11 @@ database-backed file artifacts are enabled.
 ## Boundary
 
 Swooshz Platform owns users, login, platform sessions, workspaces, membership
-roles, app access, invites, and billing. KQAG stores only quote-generator app
-data scoped to the platform workspace ID present in the signed KQAG platform
+roles, app access, invites, and billing. SQAG stores only quote-generator app
+data scoped to the platform workspace ID present in the signed SQAG platform
 session.
 
-KQAG storage must not store raw platform launch tokens, provider tokens, raw
+SQAG storage must not store raw platform launch tokens, provider tokens, raw
 provider claims, auth codes, OIDC state, nonce, platform cookies, platform
 session secrets, database passwords in logs, private local paths, or private
 profile/pricing files in Git.
@@ -23,19 +23,19 @@ profile/pricing files in Git.
 Local mode is the default:
 
 ```powershell
-$env:KQAG_STORAGE_MODE="local"
-$env:KQAG_ARTIFACT_STORAGE_MODE="local"
+$env:SQAG_STORAGE_MODE="local"
+$env:SQAG_ARTIFACT_STORAGE_MODE="local"
 ```
 
-Database mode requires a valid platform-launched KQAG session and a configured
-KQAG database URL:
+Database mode requires a valid platform-launched SQAG session and a configured
+SQAG database URL:
 
 ```powershell
-$env:KQAG_PLATFORM_LAUNCH_MODE="platform"
-$env:KQAG_PLATFORM_BASE_URL="https://platform.example.test"
-$env:KQAG_STORAGE_MODE="database"
-$env:KQAG_ARTIFACT_STORAGE_MODE="object"
-$env:SQAG_DATABASE_URL="sqlite:///C:/path/to/local/kqag-storage.sqlite3"
+$env:SQAG_PLATFORM_LAUNCH_MODE="platform"
+$env:SQAG_PLATFORM_BASE_URL="https://platform.example.test"
+$env:SQAG_STORAGE_MODE="database"
+$env:SQAG_ARTIFACT_STORAGE_MODE="object"
+$env:SQAG_DATABASE_URL="sqlite:///C:/path/to/local/sqag-storage.sqlite3"
 ```
 
 SQLite remains the reviewed local-UAT migration path. The runtime also has a
@@ -43,12 +43,12 @@ Postgres/Neon-compatible metadata adapter boundary for workspace-scoped
 profiles, pricing references, quote sessions, and object-artifact metadata.
 Unsupported database URL schemes, missing drivers, connection failures, missing
 schema, and missing workspace context fail closed with a generic app-facing
-storage error and privacy-safe logs. `KQAG_ARTIFACT_STORAGE_MODE=database`
+storage error and privacy-safe logs. `SQAG_ARTIFACT_STORAGE_MODE=database`
 stores generated quote exports and file assets in workspace-scoped SQLite BLOB
 rows for local-UAT and synthetic verifier coverage only; it is not a
 hosted/protected/deploy readiness or production artifact path and is not part of
 the Postgres metadata adapter.
-`KQAG_ARTIFACT_STORAGE_MODE=object` requires database storage plus a configured
+`SQAG_ARTIFACT_STORAGE_MODE=object` requires database storage plus a configured
 S3-compatible object backend. Object mode stores generated artifact bytes in the
 object backend and safe workspace-owned metadata in the database; it must not
 fall back to local artifacts or database BLOB artifacts when the provider is
@@ -63,8 +63,8 @@ Review the migrations, then apply them explicitly:
 - `migrations/003_object_artifact_metadata.sql` for generated object-artifact metadata
 
 ```powershell
-$env:SQAG_DATABASE_URL="sqlite:///C:/path/to/local/kqag-storage.sqlite3"
-python scripts/migrate_kqag_storage.py
+$env:SQAG_DATABASE_URL="sqlite:///C:/path/to/local/sqag-storage.sqlite3"
+python scripts/migrate_sqag_storage.py
 ```
 
 For Postgres/Neon-compatible metadata storage, apply only the metadata
@@ -105,11 +105,12 @@ evidence for DB rows and objects together.
 
 ## Object Artifact Mode
 
-SQAG is the canonical operator-facing prefix for object-storage provider and
-live-provider evidence environment variables. The older `KQAG_*` object-storage
-provider names are not compatibility aliases and do not satisfy live-provider
-or production-readiness evidence. Existing non-object storage mode names such as
-`KQAG_STORAGE_MODE` remain out of scope for this compatibility-preserving PR.
+SQAG is the canonical operator-facing prefix for storage mode, object-storage
+provider, and live-evidence environment variables. Pre-rename storage names are
+not compatibility aliases and do not satisfy live-provider or
+production-readiness evidence. Active runtime configuration uses
+`SQAG_STORAGE_MODE`, `SQAG_ARTIFACT_STORAGE_MODE`, `SQAG_DATABASE_URL`, and
+canonical `SQAG_OBJECT_STORAGE_*` names only.
 
 Object artifact mode is production groundwork, not production readiness. The
 required environment variable names are:
@@ -154,16 +155,19 @@ verifier fails closed and production readiness remains false. A test-injected or
 synthetic backend can exercise verifier logic, but it is not live-provider
 evidence and cannot satisfy hosted/protected/deploy readiness.
 
-Sanitized live-provider evidence was run on 2026-07-07 with canonical `SQAG_*`
-env names supplied by the operator environment and no provider values committed
-or printed. The live verifier reported `status=passed`,
+Sanitized live-provider evidence was run on 2026-07-07 with operator-supplied
+env names and no provider values committed or printed. The live verifier
+reported `status=passed`,
 `test_injected_backend=false`, `live_provider_evidence_supported=true`, and all
 store, retrieve, checksum, content type, byte size, wrong-workspace, delete,
 tombstone, and missing-object checks true. This proves only the metadata-only
-live S3-compatible provider path for synthetic generated XLSX/PDF bytes.
-Production readiness still requires live DB+object backup/restore, live
-retention/delete, operations evidence, hosted observability and smoke evidence,
-Platform smoke, and final audit.
+live S3-compatible provider path for synthetic generated XLSX/PDF bytes. After
+the SQAG namespace cleanup, this evidence is historical/pre-namespace evidence
+and must not be treated as post-rename proof. Production readiness still
+requires post-rename live database evidence, post-rename live DB+object
+backup/restore evidence, post-rename live retention/delete evidence, Platform
+app-key migration plus live Platform-to-SQAG smoke, operations evidence, hosted
+observability and smoke evidence, session/business hardening, and final audit.
 
 ## Production Database Readiness Boundary
 
@@ -193,7 +197,7 @@ only and omits DB URLs, hostnames, usernames, provider values, object keys,
 artifact bytes, private paths, and tenant/customer/staff/profile/pricing data.
 
 Sanitized live DB evidence was run on 2026-07-07 with the existing guarded
-SQAG metadata migrations applied through `scripts/migrate_kqag_storage.py` after
+SQAG metadata migrations applied through `scripts/migrate_sqag_storage.py` after
 the first verifier pass reported the runtime schema missing. The rerun reported
 `status=passed`, `database_family=postgres_compatible`,
 `live_database_evidence_enabled=true`, `test_injected_backend=false`,
@@ -204,15 +208,17 @@ quote-session, and object-artifact metadata tables, synthetic metadata CRUD
 verified, two-workspace isolation verified, object artifact metadata pairing
 verified, `cleanup_completed=true`, and `db_blob_artifact_rows_written=0`.
 The readiness checker credited only `production_database_evidence=passed` for
-the DB path; it did not rerun or touch R2/S3-compatible object storage.
+the DB path; it did not rerun or touch R2/S3-compatible object storage. After
+the SQAG namespace cleanup and table rename, this run is historical/pre-namespace
+evidence. Post-rename live production database evidence must be rerun before the
+current SQAG namespace can receive live DB readiness credit.
 
 Passing this DB evidence can drop only the `postgres_neon_database_evidence_missing`
 blocker. It does not make SQAG production-ready. Remaining blockers still include
 live DB+object backup/restore, live retention/delete, hosted logging/monitoring,
 hosted smoke, production deployment operations, live Platform-to-SQAG launch
-smoke, session/business hardening, and the final production audit. Do not rerun
-the R2/S3-compatible live object-storage evidence for this database PR; that
-metadata-only provider evidence has already passed.
+smoke after Platform app-key migration, `platform_app_key_migration_pending`,
+session/business hardening, and the final production audit.
 
 Object artifact lifecycle evidence is synthetic/stubbed only:
 
@@ -267,8 +273,9 @@ A passing non-test-injected drill can remove only
 `db_object_backup_restore_live_evidence_missing`. `production_ready=false`
 remains until live retention/delete evidence, hosted logging/monitoring and
 alert delivery, hosted smoke evidence, production deployment operations
-evidence, live Platform-to-SQAG launch smoke, session/business hardening, and
-the final production audit are complete.
+evidence, live Platform-to-SQAG launch smoke after Platform app-key migration,
+`platform_app_key_migration_pending`, session/business hardening, and the final
+production audit are complete.
 
 Sanitized live DB+object backup/restore evidence was run by an operator on
 2026-07-07 after the verifier/runtime metadata pairing fix landed. The
@@ -296,12 +303,16 @@ values, provider values, DB URLs, hostnames, usernames, passwords, connection
 strings, endpoints, bucket names, object keys, access keys, secret keys, OAuth
 values, cookies/tokens, private paths, tenant/customer/staff/profile/pricing
 data, generated quote contents, artifact bytes, backup dumps, or restore dumps
-were printed or committed. This evidence may remove only
+were printed or committed. After the SQAG namespace cleanup and table/object
+metadata rename, this run is historical/pre-namespace evidence. Post-rename live
+DB+object backup/restore evidence must be rerun before the current SQAG namespace
+can receive live backup/restore readiness credit. This evidence may remove only
 `db_object_backup_restore_live_evidence_missing`; no unrelated production
 blocker is removed, and `production_ready=false` remains until live
 retention/delete evidence, hosted logging/monitoring and alert delivery,
 hosted smoke evidence, production deployment operations evidence, live
-Platform-to-SQAG launch smoke, session/business hardening, and the final
+Platform-to-SQAG launch smoke after Platform app-key migration,
+`platform_app_key_migration_pending`, session/business hardening, and the final
 production audit are complete.
 
 Live retention/delete evidence now has an opt-in operator drill path:
@@ -311,8 +322,8 @@ python scripts/verify_live_retention_delete.py
 ```
 
 The drill remains fail-closed unless `SQAG_LIVE_RETENTION_DELETE_EVIDENCE=1`,
-`SQAG_DATABASE_URL`, `KQAG_STORAGE_MODE=database`,
-`KQAG_ARTIFACT_STORAGE_MODE=object`, and the canonical
+`SQAG_DATABASE_URL`, `SQAG_STORAGE_MODE=database`,
+`SQAG_ARTIFACT_STORAGE_MODE=object`, and the canonical
 `SQAG_OBJECT_STORAGE_*` env names are present in the execution environment.
 It validates those runtime modes before writing synthetic rows or objects. It
 uses the active SQAG Postgres-compatible metadata DB and active object backend
@@ -337,12 +348,14 @@ bytes, backup dumps, restore dumps, or secrets. A passing non-test-injected
 run can remove only `object_retention_delete_live_evidence_missing`;
 `production_ready=false` remains until hosted logging/monitoring and alert
 delivery, hosted smoke evidence, production deployment operations evidence,
-live Platform-to-SQAG launch smoke, session/business hardening, and the final
-production audit are complete.
+live Platform-to-SQAG launch smoke after Platform app-key migration,
+`platform_app_key_migration_pending`, session/business hardening, and the final
+production audit are complete. No live retention/delete pass evidence is claimed
+in this PR; post-rename live retention/delete evidence remains required.
 
 ## Workspace Scope
 
-Database rows are keyed by the platform workspace ID from the KQAG platform
+Database rows are keyed by the platform workspace ID from the SQAG platform
 session. Profiles, pricing references, and quote sessions saved by workspace A
 must not list, read, export, or delete from workspace B.
 
@@ -370,7 +383,7 @@ uploaded reference files as permanent artifacts.
 ## Out Of Scope
 
 This does not add a platform admin dashboard, invites or member management,
-KQAG-owned login/auth, fake login, billing, Stripe, deployment, DNS/TLS, public
+SQAG-owned login/auth, fake login, billing, Stripe, deployment, DNS/TLS, public
 signup, live object-storage credentials or provider accounts, private
 profile/pricing files, arbitrary permanent uploads, or generated customer quotes
 in Git.

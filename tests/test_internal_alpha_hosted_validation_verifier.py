@@ -27,8 +27,8 @@ class InternalAlphaHostedValidationVerifierTest(unittest.TestCase):
         private_values = {
             "sqlite:///",
             "C:/Users/Private",
-            "/var/lib/kqag",
-            "/var/log/kqag",
+            "/var/lib/sqag",
+            "/var/log/sqag",
             "Synthetic Private Customer",
             "Generated quote private line item",
             "Private pricing catalog contents",
@@ -63,7 +63,7 @@ class InternalAlphaHostedValidationVerifierTest(unittest.TestCase):
         self.assertEqual(report["evidence"]["hosted_observability"], "passed")
         self.assertEqual(report["evidence"]["hosted_smoke"], "passed")
         self.assertIn("SQAG_DATABASE_URL", report["host_secret_manager_only_env_names"])
-        self.assertIn("KQAG_STORAGE_MODE", report["required_env_names"])
+        self.assertIn("SQAG_STORAGE_MODE", report["required_env_names"])
         self.assertEqual(report["health"]["path"], "/api/health")
         self.assertEqual(report["privacy"]["output"], "metadata-only")
         self.assertNotIn(str(work_dir), text)
@@ -84,11 +84,11 @@ class InternalAlphaHostedValidationVerifierTest(unittest.TestCase):
         self.assertEqual(report["status"], "passed")
         self.assertNotIn(str(work_dir), output)
         self.assertNotIn("sqlite:///", output)
-        self.assertNotIn("/var/lib/kqag", output)
+        self.assertNotIn("/var/lib/sqag", output)
         self.assertNotIn("Set-Cookie", output)
 
     def test_cli_failure_output_remains_metadata_only(self):
-        private_path = "C:/Users/Private/Koncept Runtime/kqag-storage.sqlite3"
+        private_path = "C:/Users/Private/Koncept Runtime/sqag-storage.sqlite3"
         stdout = io.StringIO()
         with mock.patch.object(verifier, "run_verification", side_effect=RuntimeError(private_path)):
             with contextlib.redirect_stdout(stdout):

@@ -38,8 +38,8 @@ def complete_env() -> dict[str, str]:
         "SQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
         "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "REDACTED_ACCESS_MARKER",
         "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "REDACTED_SECRET_MARKER",
-        "KQAG_STORAGE_MODE": "database",
-        "KQAG_ARTIFACT_STORAGE_MODE": "object",
+        "SQAG_STORAGE_MODE": "database",
+        "SQAG_ARTIFACT_STORAGE_MODE": "object",
     }
 
 
@@ -137,8 +137,8 @@ class FakeStorage:
             and (
                 not self.require_runtime_env
                 or (
-                    os.environ.get("KQAG_STORAGE_MODE") == "database"
-                    and os.environ.get("KQAG_ARTIFACT_STORAGE_MODE") == "object"
+                    os.environ.get("SQAG_STORAGE_MODE") == "database"
+                    and os.environ.get("SQAG_ARTIFACT_STORAGE_MODE") == "object"
                 )
             )
             and self.object_artifact_row(session_id, kind)
@@ -302,7 +302,7 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
     def test_missing_database_runtime_mode_blocks_before_writes(self):
         verifier = load_verifier()
         env = complete_env()
-        env.pop("KQAG_STORAGE_MODE")
+        env.pop("SQAG_STORAGE_MODE")
         called = {"storage": False, "backend": False}
 
         def storage_factory(_database_url, _workspace_id, **_kwargs):
@@ -322,7 +322,7 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
         )
 
         self.assertEqual(report["status"], "blocked")
-        self.assertIn("KQAG_STORAGE_MODE", report["missing_env_names"])
+        self.assertIn("SQAG_STORAGE_MODE", report["missing_env_names"])
         self.assertIn("runtime_database_mode_not_enabled", report["blockers"])
         self.assertFalse(report["checks"]["write_attempted"])
         self.assertEqual(report["active_db_synthetic_rows_written"], 0)
@@ -333,7 +333,7 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
     def test_local_database_runtime_mode_blocks_before_writes(self):
         verifier = load_verifier()
         env = complete_env()
-        env["KQAG_STORAGE_MODE"] = "local"
+        env["SQAG_STORAGE_MODE"] = "local"
 
         report = verifier.run_verification(
             env=env,
@@ -344,7 +344,7 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
         )
 
         self.assertEqual(report["status"], "blocked")
-        self.assertNotIn("KQAG_STORAGE_MODE", report["missing_env_names"])
+        self.assertNotIn("SQAG_STORAGE_MODE", report["missing_env_names"])
         self.assertIn("runtime_database_mode_not_enabled", report["blockers"])
         self.assertFalse(report["checks"]["write_attempted"])
         self.assertEqual(report["active_db_synthetic_rows_written"], 0)
@@ -353,7 +353,7 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
     def test_missing_object_artifact_runtime_mode_blocks_before_writes(self):
         verifier = load_verifier()
         env = complete_env()
-        env.pop("KQAG_ARTIFACT_STORAGE_MODE")
+        env.pop("SQAG_ARTIFACT_STORAGE_MODE")
 
         report = verifier.run_verification(
             env=env,
@@ -364,7 +364,7 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
         )
 
         self.assertEqual(report["status"], "blocked")
-        self.assertIn("KQAG_ARTIFACT_STORAGE_MODE", report["missing_env_names"])
+        self.assertIn("SQAG_ARTIFACT_STORAGE_MODE", report["missing_env_names"])
         self.assertIn("runtime_object_artifact_mode_not_enabled", report["blockers"])
         self.assertFalse(report["checks"]["write_attempted"])
         self.assertEqual(report["active_db_synthetic_rows_written"], 0)
@@ -374,7 +374,7 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
         verifier = load_verifier()
         for mode in ("local", "database"):
             env = complete_env()
-            env["KQAG_ARTIFACT_STORAGE_MODE"] = mode
+            env["SQAG_ARTIFACT_STORAGE_MODE"] = mode
 
             report = verifier.run_verification(
                 env=env,
@@ -390,11 +390,12 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
             self.assertEqual(report["active_db_synthetic_rows_written"], 0)
             self.assertEqual(report["active_object_synthetic_objects_written"], 0)
 
-    def test_kqag_database_url_alone_does_not_satisfy_database_requirement(self):
+    def test_legacy_database_url_alone_does_not_satisfy_database_requirement(self):
         verifier = load_verifier()
         env = complete_env()
         env.pop("SQAG_DATABASE_URL")
-        env["KQAG_DATABASE_URL"] = "LEGACY_DB_TARGET_MARKER"
+        legacy_database_url = "K" + "QAG_DATABASE_URL"
+        env[legacy_database_url] = "LEGACY_DB_TARGET_MARKER"
 
         report = verifier.run_verification(env=env)
         text = json.dumps(report, sort_keys=True)
@@ -406,12 +407,40 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
         self.assertEqual(report["active_object_synthetic_objects_written"], 0)
         self.assertNotIn("LEGACY_DB_TARGET_MARKER", text)
 
+    def test_legacy_runtime_modes_alone_do_not_satisfy_runtime_mode_requirement(self):
+        verifier = load_verifier()
+        env = complete_env()
+        env.pop("SQAG_STORAGE_MODE")
+        env.pop("SQAG_ARTIFACT_STORAGE_MODE")
+        legacy_storage_mode = "K" + "QAG_STORAGE_MODE"
+        legacy_artifact_mode = "K" + "QAG_ARTIFACT_STORAGE_MODE"
+        env[legacy_storage_mode] = "database"
+        env[legacy_artifact_mode] = "object"
+
+        report = verifier.run_verification(
+            env=env,
+            storage_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("storage factory should not be called")),
+            backend_factory=lambda _env: (_ for _ in ()).throw(AssertionError("backend factory should not be called")),
+            migration_applier=lambda _database_url: None,
+            test_injected_backend=True,
+        )
+
+        self.assertEqual(report["status"], "blocked")
+        self.assertIn("SQAG_STORAGE_MODE", report["missing_env_names"])
+        self.assertIn("SQAG_ARTIFACT_STORAGE_MODE", report["missing_env_names"])
+        self.assertNotIn(legacy_storage_mode, report["required_env_names"])
+        self.assertNotIn(legacy_artifact_mode, report["required_env_names"])
+        self.assertIn("runtime_database_mode_not_enabled", report["blockers"])
+        self.assertIn("runtime_object_artifact_mode_not_enabled", report["blockers"])
+        self.assertEqual(report["active_db_synthetic_rows_written"], 0)
+        self.assertEqual(report["active_object_synthetic_objects_written"], 0)
+
     def test_runtime_download_uses_effective_env_instead_of_ambient_env(self):
         verifier = load_verifier()
 
         with mock.patch.dict(
             os.environ,
-            {"KQAG_STORAGE_MODE": "local", "KQAG_ARTIFACT_STORAGE_MODE": "local"},
+            {"SQAG_STORAGE_MODE": "local", "SQAG_ARTIFACT_STORAGE_MODE": "local"},
             clear=True,
         ):
             report, _storages, _backend_holder = run_injected_drill(

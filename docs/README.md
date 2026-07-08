@@ -1,25 +1,25 @@
-# KQAG Documentation Index
+# SQAG Documentation Index
 
-This index describes the active documentation set for the internal KQAG/SAQG
-quote-generator module. KQAG owns the quote-specific local workflow. Future
+This index describes the active documentation set for the internal SQAG/SAQG
+quote-generator module. SQAG owns the quote-specific local workflow. Future
 platform concerns belong in `Swooshz-com/swooshz-platform`.
 
 ## Current Docs
 
-- `docs/kqag-current-status.md`: current RC verdict, module boundary, runtime
-  data model, private asset rules, owner smoke checklist, audit findings, and
-  docs cleanup summary.
+- `docs/sqag-current-status.md`: current RC verdict plus SQAG namespace cleanup
+  update, module boundary, runtime data model, private asset rules, owner smoke
+  checklist, audit findings, and docs cleanup summary.
 - `docs/testing-plan.md`: validation expectations for product, frontend,
   import/export, security, CI, and smoke-test changes.
 - `docs/internal-uat.md`: internal Koncept/Swooshz UAT checklist, smoke
   commands, known limits, bug-report format, and private-data guardrails.
 - `docs/internal-uat-checkpoint.md`: documentation-only local UAT passed
-  checkpoint for the Platform launch and KQAG quote/dashboard baseline through
+  checkpoint for the Platform launch and SQAG quote/dashboard baseline through
   PR #82.
 - `docs/internal-uat-deploy-auth-readiness.md`: existing gated single-instance
   internal UAT deploy/auth readiness notes, boundaries, smoke checks, and
   non-production limitations.
-- `docs/internal-uat-coolify-deploy.md`: KQAG-specific historical hosted
+- `docs/internal-uat-coolify-deploy.md`: SQAG-specific historical hosted
   validation notes; the DB/BLOB artifact path is now documented as blocked for
   hosted/protected/deploy/production readiness.
 - `docs/internal-uat-login-and-pre-vps-dry-run.md`: approved-tester login
@@ -31,13 +31,14 @@ platform concerns belong in `Swooshz-com/swooshz-platform`.
 - `docs/architecture-dead-code-fallback-audit.md`: whole-codebase architecture,
   dead-code, local-trace, removed sample-path, fallback, and docs-cleanup audit
   that defines the stricter no-product-visible-sample direction.
-- `docs/platform-launch-mode.md`: first KQAG-side Swooshz Platform launch
+- `docs/platform-launch-mode.md`: first SQAG-side Swooshz Platform launch
   consume adapter boundary, env flags, safe consume shape, and cloud-storage
   deferral.
-- `docs/platform-integration-contract.md`: KQAG-side audit of the expected
-  Swooshz Platform launch/auth/workspace contract, source evidence, fail-closed
-  behavior, and live integration gaps.
-- `docs/platform-scoped-storage-mode.md`: platform-workspace-scoped KQAG app
+- `docs/platform-integration-contract.md`: SQAG-side audit of the expected
+  Swooshz Platform launch/auth/workspace contract, canonical `appKey=sqag`,
+  Platform app-key migration pending blocker, fail-closed behavior, and live
+  integration gaps.
+- `docs/platform-scoped-storage-mode.md`: platform-workspace-scoped SQAG app
   data storage boundary, migration command, and local-vs-database mode notes.
 - `docs/pricing-catalog-import.md`: current pricing-reference import behavior,
   AI normalization/enrichment contracts, save behavior, ordering, and deferred
@@ -50,7 +51,7 @@ platform concerns belong in `Swooshz-com/swooshz-platform`.
 - `docs/current-cicd-status.md`: active GitHub Actions workflow, CI checks, and
   maintenance rule for CI/CD changes.
 - `docs/pr-checks/quote-generator-pr-checklist.md`: PR review checklist and
-  KQAG module boundary reminder.
+  SQAG module boundary reminder.
 - `docs/agent-playbooks/`: portable AI-agent playbooks referenced by `AGENTS.md`.
 
 ## Historical Or Archive Docs
@@ -61,21 +62,21 @@ old handoff notes were consolidated instead of archived.
 ## Removed Or Consolidated Docs
 
 - `docs/internal-team-test-handoff.md` was consolidated into
-  `docs/kqag-current-status.md` and removed.
+  `docs/sqag-current-status.md` and removed.
 
 No unique current RC requirements were deleted without being summarized in the
 current status/handoff doc.
 
 ## Future Platform Ownership
 
-The following topics should not be implemented in this repo as part of KQAG RC:
+The following topics should not be implemented in this repo as part of SQAG RC:
 
 - login, accounts, users, roles, company membership, and app access
 - Stripe, billing, credits, subscriptions, ledgers, and entitlement
 - Supabase or other hosted database design
 - DB-backed quote history and dashboards
 - generic Hostinger, Coolify, Docker, DNS, public hosting, or production
-  infrastructure setup; KQAG only keeps app-specific internal UAT adapter
+  infrastructure setup; SQAG only keeps app-specific internal UAT adapter
   notes under `docs/internal-uat-coolify-deploy.md`
 - Swooshz platform shell, navigation, app registry, app whitelist, and cross-app
   architecture
@@ -83,7 +84,7 @@ The following topics should not be implemented in this repo as part of KQAG RC:
 
 ## Runtime And Private Asset Reminder
 
-Internal KQAG testing should use clean local/runtime storage:
+Internal SQAG testing should use clean local/runtime storage:
 
 ```powershell
 QUOTE_DATA_ROOT=<local-runtime-data-root>

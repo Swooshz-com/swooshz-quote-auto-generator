@@ -2,12 +2,12 @@
 
 ## Purpose
 
-This guide is for internal Koncept/Swooshz testing of the local KQAG/SAQG quote
+This guide is for internal Koncept/Swooshz testing of the local SQAG/SAQG quote
 generator. It helps testers exercise the local quote workflow, imported company
 profiles, imported pricing references, generated quote output, exports, and
 dashboard session restore/delete behavior.
 
-KQAG/SAQG is not public SaaS, production deployment, ecommerce, a customer
+SQAG/SAQG is not public SaaS, production deployment, ecommerce, a customer
 portal, or DB-backed multi-user mode. Do not use this checklist as deployment,
 auth, billing, account, or hosted-platform readiness.
 

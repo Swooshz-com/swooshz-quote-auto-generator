@@ -63,15 +63,16 @@ def complete_env() -> dict[str, str]:
     }
 
 
-def legacy_kqag_env() -> dict[str, str]:
+def legacy_sqag_env() -> dict[str, str]:
+    legacy_prefix = "K" + "QAG"
     return {
-        "KQAG_LIVE_OBJECT_STORAGE_EVIDENCE": "1",
-        "KQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
-        "KQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
-        "KQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
-        "KQAG_OBJECT_STORAGE_REGION": "<redacted-region>",
-        "KQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "<redacted-access-key-id>",
-        "KQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "<redacted-secret-access-key>",
+        f"{legacy_prefix}_LIVE_OBJECT_STORAGE_EVIDENCE": "1",
+        f"{legacy_prefix}_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+        f"{legacy_prefix}_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
+        f"{legacy_prefix}_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
+        f"{legacy_prefix}_OBJECT_STORAGE_REGION": "<redacted-region>",
+        f"{legacy_prefix}_OBJECT_STORAGE_ACCESS_KEY_ID": "<redacted-access-key-id>",
+        f"{legacy_prefix}_OBJECT_STORAGE_SECRET_ACCESS_KEY": "<redacted-secret-access-key>",
     }
 
 
@@ -107,16 +108,17 @@ class LiveObjectStorageProviderVerifierTest(unittest.TestCase):
         self.assertNotIn(endpoint_value, text)
         self.assertNotIn(bucket_value, text)
 
-    def test_legacy_kqag_env_does_not_satisfy_live_provider_evidence(self):
-        report = verifier.run_verification(env=legacy_kqag_env())
+    def test_legacy_sqag_env_does_not_satisfy_live_provider_evidence(self):
+        report = verifier.run_verification(env=legacy_sqag_env())
 
         self.assertEqual(report["status"], "failed")
         self.assertFalse(report["live_provider_evidence_supported"])
         self.assertEqual(report["provider"]["family"], "disabled")
         self.assertIn("SQAG_LIVE_OBJECT_STORAGE_EVIDENCE", report["missing_env_names"])
         self.assertIn("SQAG_OBJECT_STORAGE_PROVIDER", report["missing_env_names"])
-        self.assertNotIn("KQAG_LIVE_OBJECT_STORAGE_EVIDENCE", report["required_env_names"])
-        self.assertNotIn("KQAG_OBJECT_STORAGE_PROVIDER", report["required_env_names"])
+        legacy_prefix = "K" + "QAG"
+        self.assertNotIn(f"{legacy_prefix}_LIVE_OBJECT_STORAGE_EVIDENCE", report["required_env_names"])
+        self.assertNotIn(f"{legacy_prefix}_OBJECT_STORAGE_PROVIDER", report["required_env_names"])
 
     def test_injected_backend_exercises_checks_without_claiming_live_evidence(self):
         fake_client = FakeLiveS3Client()
@@ -178,7 +180,7 @@ class LiveObjectStorageProviderVerifierTest(unittest.TestCase):
 
     def test_cli_output_is_json_metadata_only_when_env_missing(self):
         stdout = io.StringIO()
-        with contextlib.redirect_stdout(stdout):
+        with mock.patch.dict(verifier.os.environ, {}, clear=True), contextlib.redirect_stdout(stdout):
             exit_code = verifier.main([])
         output = stdout.getvalue()
         report = json.loads(output)

@@ -1,4 +1,4 @@
-"""Static architecture/fallback audit helper for KQAG.
+"""Static architecture/fallback audit helper for SQAG.
 
 The output is intentionally metadata-only: relative paths, line numbers,
 pattern names, and counts. It does not echo source lines, absolute roots, env
@@ -20,7 +20,7 @@ from typing import Iterable
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA = "swooshz.kqag.architecture-fallback-audit.v1"
+SCHEMA = "swooshz.sqag.architecture-fallback-audit.v1"
 
 SKIP_PARTS = {
     ".git",
@@ -73,9 +73,9 @@ PATTERNS = (
     "QUOTE_DATA_ROOT",
     "QUOTE_OUTPUT_ROOT",
     "QUOTE_TMP_ROOT",
-    "KQAG_LOCAL_PRICING_REFERENCES_ROOT",
-    "KQAG_STORAGE_MODE",
-    "KQAG_ARTIFACT_STORAGE_MODE",
+    "SQAG_LOCAL_PRICING_REFERENCES_ROOT",
+    "SQAG_STORAGE_MODE",
+    "SQAG_ARTIFACT_STORAGE_MODE",
     "load_profile_pack",
     "list_local_pricing_references",
     "list_bundled_pricing_references",
@@ -128,9 +128,9 @@ PATTERN_CATEGORIES = {
     "QUOTE_DATA_ROOT": "local_storage_dependency",
     "QUOTE_OUTPUT_ROOT": "local_storage_dependency",
     "QUOTE_TMP_ROOT": "local_storage_dependency",
-    "KQAG_LOCAL_PRICING_REFERENCES_ROOT": "local_storage_dependency",
-    "KQAG_STORAGE_MODE": "storage_mode_boundary",
-    "KQAG_ARTIFACT_STORAGE_MODE": "storage_mode_boundary",
+    "SQAG_LOCAL_PRICING_REFERENCES_ROOT": "local_storage_dependency",
+    "SQAG_STORAGE_MODE": "storage_mode_boundary",
+    "SQAG_ARTIFACT_STORAGE_MODE": "storage_mode_boundary",
     "load_profile_pack": "profile_boundary",
     "list_local_pricing_references": "pricing_reference_boundary",
     "list_bundled_pricing_references": "pricing_reference_boundary",

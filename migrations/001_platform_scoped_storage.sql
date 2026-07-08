@@ -1,8 +1,8 @@
--- KQAG platform-scoped app storage boundary.
+-- SQAG platform-scoped app storage boundary.
 -- Reviewed migration for local/operator-applied database setup only.
 -- Do not run against production without the platform storage runbook approval.
 
-create table if not exists kqag_profiles (
+create table if not exists sqag_profiles (
   workspace_id text not null,
   profile_id text not null,
   payload_json text not null,
@@ -11,7 +11,7 @@ create table if not exists kqag_profiles (
   primary key (workspace_id, profile_id)
 );
 
-create table if not exists kqag_pricing_references (
+create table if not exists sqag_pricing_references (
   workspace_id text not null,
   reference_id text not null,
   payload_json text not null,
@@ -20,7 +20,7 @@ create table if not exists kqag_pricing_references (
   primary key (workspace_id, reference_id)
 );
 
-create table if not exists kqag_quote_sessions (
+create table if not exists sqag_quote_sessions (
   workspace_id text not null,
   session_id text not null,
   metadata_json text not null,

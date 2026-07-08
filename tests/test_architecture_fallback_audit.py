@@ -35,7 +35,7 @@ class ArchitectureFallbackAuditTest(unittest.TestCase):
                         "        fallback_to = 'local'",
                         "    except Exception:",
                         "        pass",
-                        "KQAG_STORAGE_MODE = 'database'",
+                        "SQAG_STORAGE_MODE = 'database'",
                         "QUOTE_DATA_ROOT = 'redacted'",
                         "load_profile_pack('default')",
                         "loadSample('kent-group')",
@@ -48,7 +48,7 @@ class ArchitectureFallbackAuditTest(unittest.TestCase):
             report = audit_architecture_fallbacks.build_report(root, max_hits_per_pattern=10)
 
         self.assertGreater(report["pattern_totals"]["fallback_to"], 0)
-        self.assertGreater(report["pattern_totals"]["KQAG_STORAGE_MODE"], 0)
+        self.assertGreater(report["pattern_totals"]["SQAG_STORAGE_MODE"], 0)
         self.assertGreater(report["pattern_totals"]["QUOTE_DATA_ROOT"], 0)
         self.assertGreater(report["pattern_totals"]["load_profile_pack"], 0)
         self.assertGreater(report["pattern_totals"]["Load Sample"], 0)
@@ -91,8 +91,8 @@ class ArchitectureFallbackAuditTest(unittest.TestCase):
     def test_current_repo_reports_expected_architecture_markers(self):
         report = audit_architecture_fallbacks.build_report(Path.cwd(), max_hits_per_pattern=1)
 
-        self.assertGreater(report["pattern_totals"]["KQAG_STORAGE_MODE"], 0)
-        self.assertGreater(report["pattern_totals"]["KQAG_ARTIFACT_STORAGE_MODE"], 0)
+        self.assertGreater(report["pattern_totals"]["SQAG_STORAGE_MODE"], 0)
+        self.assertGreater(report["pattern_totals"]["SQAG_ARTIFACT_STORAGE_MODE"], 0)
         self.assertGreater(report["pattern_totals"]["send_download"], 0)
         self.assertGreater(report["pattern_totals"]["/api/jobs"], 0)
         self.assertGreater(report["pattern_totals"]["Load Sample"], 0)

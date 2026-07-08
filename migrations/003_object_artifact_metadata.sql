@@ -1,8 +1,8 @@
--- KQAG object-storage generated artifact metadata groundwork.
+-- SQAG object-storage generated artifact metadata groundwork.
 -- Reviewed migration for local/operator-applied database setup only.
 -- Do not run against production without the platform storage runbook approval.
 
-create table if not exists kqag_object_artifacts (
+create table if not exists sqag_object_artifacts (
   artifact_id text not null primary key,
   workspace_id text not null,
   owner_type text not null,

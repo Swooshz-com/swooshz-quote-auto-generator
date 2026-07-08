@@ -50,8 +50,8 @@ class FakePostgresSchemaContext:
 def runtime_required_metadata_tables():
     required = {}
     for table_map in (
-        verifier.webapp.KQAG_APP_METADATA_REQUIRED_COLUMNS,
-        verifier.webapp.KQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS,
+        verifier.webapp.SQAG_APP_METADATA_REQUIRED_COLUMNS,
+        verifier.webapp.SQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS,
     ):
         for table, columns in table_map.items():
             required.setdefault(table, set()).update(columns)
@@ -115,37 +115,37 @@ class FakeLivePostgresConnection:
             for table in sorted(set(params)):
                 rows.extend({"table_name": table, "column_name": column} for column in sorted(column_map.get(table, set())))
             return FakeLivePostgresCursor(rows)
-        if normalized.startswith("insert into kqag_profiles"):
+        if normalized.startswith("insert into sqag_profiles"):
             workspace_id, profile_id, payload_json, created_at, updated_at = params
             self.profiles[(workspace_id, profile_id)] = {"payload_json": payload_json, "created_at": created_at, "updated_at": updated_at}
             return FakeLivePostgresCursor(rowcount=1)
-        if normalized.startswith("select payload_json from kqag_profiles"):
+        if normalized.startswith("select payload_json from sqag_profiles"):
             workspace_id = params[0]
             if "profile_id" in normalized and len(params) > 1:
                 row = self.profiles.get((workspace_id, params[1]))
                 return FakeLivePostgresCursor([row] if row else [])
             rows = [value for (stored_workspace, _), value in sorted(self.profiles.items()) if self.leak_workspace_reads or stored_workspace == workspace_id]
             return FakeLivePostgresCursor(rows)
-        if normalized.startswith("delete from kqag_profiles"):
+        if normalized.startswith("delete from sqag_profiles"):
             workspace_id, profile_id = params[:2]
             existed = self.profiles.pop((workspace_id, profile_id), None) is not None
             return FakeLivePostgresCursor(rowcount=1 if existed else 0)
-        if normalized.startswith("insert into kqag_pricing_references"):
+        if normalized.startswith("insert into sqag_pricing_references"):
             workspace_id, reference_id, payload_json, created_at, updated_at = params
             self.pricing_references[(workspace_id, reference_id)] = {"payload_json": payload_json, "created_at": created_at, "updated_at": updated_at}
             return FakeLivePostgresCursor(rowcount=1)
-        if normalized.startswith("select payload_json from kqag_pricing_references"):
+        if normalized.startswith("select payload_json from sqag_pricing_references"):
             workspace_id = params[0]
             if "reference_id" in normalized and len(params) > 1:
                 row = self.pricing_references.get((workspace_id, params[1]))
                 return FakeLivePostgresCursor([row] if row else [])
             rows = [value for (stored_workspace, _), value in sorted(self.pricing_references.items()) if self.leak_workspace_reads or stored_workspace == workspace_id]
             return FakeLivePostgresCursor(rows)
-        if normalized.startswith("delete from kqag_pricing_references"):
+        if normalized.startswith("delete from sqag_pricing_references"):
             workspace_id, reference_id = params[:2]
             existed = self.pricing_references.pop((workspace_id, reference_id), None) is not None
             return FakeLivePostgresCursor(rowcount=1 if existed else 0)
-        if normalized.startswith("insert into kqag_quote_sessions"):
+        if normalized.startswith("insert into sqag_quote_sessions"):
             workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at = params
             self.quote_sessions[(workspace_id, session_id)] = {
                 "metadata_json": metadata_json,
@@ -154,19 +154,19 @@ class FakeLivePostgresConnection:
                 "updated_at": updated_at,
             }
             return FakeLivePostgresCursor(rowcount=1)
-        if normalized.startswith("select metadata_json, draft_files_json from kqag_quote_sessions"):
+        if normalized.startswith("select metadata_json, draft_files_json from sqag_quote_sessions"):
             workspace_id, session_id = params[:2]
             row = self.quote_sessions.get((workspace_id, session_id))
             return FakeLivePostgresCursor([row] if row else [])
-        if normalized.startswith("select metadata_json from kqag_quote_sessions"):
+        if normalized.startswith("select metadata_json from sqag_quote_sessions"):
             workspace_id = params[0]
             rows = [value for (stored_workspace, _), value in sorted(self.quote_sessions.items()) if self.leak_workspace_reads or stored_workspace == workspace_id]
             return FakeLivePostgresCursor(rows)
-        if normalized.startswith("delete from kqag_quote_sessions"):
+        if normalized.startswith("delete from sqag_quote_sessions"):
             workspace_id, session_id = params[:2]
             existed = self.quote_sessions.pop((workspace_id, session_id), None) is not None
             return FakeLivePostgresCursor(rowcount=1 if existed else 0)
-        if normalized.startswith("insert into kqag_object_artifacts"):
+        if normalized.startswith("insert into sqag_object_artifacts"):
             fields = (
                 "artifact_id", "workspace_id", "owner_type", "owner_id", "platform_user_id", "session_id", "job_id",
                 "artifact_kind", "filename", "content_type", "size_bytes", "checksum_sha256", "object_provider_type",
@@ -175,7 +175,7 @@ class FakeLivePostgresConnection:
             row = dict(zip(fields, params))
             self.object_artifacts[(row["workspace_id"], row["owner_type"], row["owner_id"], row["artifact_kind"])] = row
             return FakeLivePostgresCursor(rowcount=1)
-        if normalized.startswith("select artifact_id") and "from kqag_object_artifacts" in normalized:
+        if normalized.startswith("select artifact_id") and "from sqag_object_artifacts" in normalized:
             workspace_id = params[0]
             rows = []
             if len(params) >= 6:
@@ -188,7 +188,7 @@ class FakeLivePostgresConnection:
                     if self.leak_workspace_reads or stored_workspace == workspace_id:
                         rows.append(row)
             return FakeLivePostgresCursor(rows)
-        if normalized.startswith("delete from kqag_object_artifacts"):
+        if normalized.startswith("delete from sqag_object_artifacts"):
             if self.fail_object_cleanup:
                 raise RuntimeError("synthetic cleanup failed")
             workspace_ids = set(params)
@@ -262,7 +262,7 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
 
     def test_sqlite_database_url_is_local_uat_only(self):
         report = verifier.run_verification(
-            env={"SQAG_DATABASE_URL": "sqlite:///tmp/kqag-storage.sqlite3"},
+            env={"SQAG_DATABASE_URL": "sqlite:///tmp/sqag-storage.sqlite3"},
             driver_available=False,
         )
 
@@ -303,7 +303,7 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
 
     def test_required_metadata_tables_match_runtime_metadata_schema_only(self):
         self.assertEqual(verifier.REQUIRED_METADATA_TABLES, runtime_required_metadata_tables())
-        for db_blob_table in verifier.webapp.KQAG_DATABASE_ARTIFACT_REQUIRED_COLUMNS:
+        for db_blob_table in verifier.webapp.SQAG_DATABASE_ARTIFACT_REQUIRED_COLUMNS:
             self.assertNotIn(db_blob_table, verifier.REQUIRED_METADATA_TABLES)
 
     def test_metadata_migration_status_uses_runtime_required_columns(self):
@@ -313,10 +313,10 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
         self.assertEqual(status["missing_tables"], [])
         self.assertEqual(status["missing_columns"], {})
         self.assertFalse(status["db_blob_tables_required_for_production"])
-        self.assertIn("created_at", verifier.REQUIRED_METADATA_TABLES["kqag_profiles"])
-        self.assertIn("updated_at", verifier.REQUIRED_METADATA_TABLES["kqag_quote_sessions"])
-        self.assertIn("platform_user_id", verifier.REQUIRED_METADATA_TABLES["kqag_object_artifacts"])
-        self.assertIn("deleted_at", verifier.REQUIRED_METADATA_TABLES["kqag_object_artifacts"])
+        self.assertIn("created_at", verifier.REQUIRED_METADATA_TABLES["sqag_profiles"])
+        self.assertIn("updated_at", verifier.REQUIRED_METADATA_TABLES["sqag_quote_sessions"])
+        self.assertIn("platform_user_id", verifier.REQUIRED_METADATA_TABLES["sqag_object_artifacts"])
+        self.assertIn("deleted_at", verifier.REQUIRED_METADATA_TABLES["sqag_object_artifacts"])
 
     def test_live_schema_check_passes_with_all_runtime_required_metadata_columns(self):
         report = schema_status_for_runtime_columns()
@@ -324,7 +324,7 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
         self.assertTrue(report["schema_available"])
         self.assertEqual(report["missing_tables"], [])
         self.assertEqual(report["missing_columns"], {})
-        self.assertNotIn("kqag_quote_artifacts", report["required_tables"])
+        self.assertNotIn("sqag_quote_artifacts", report["required_tables"])
 
     def test_live_opt_in_validates_all_runtime_required_metadata_columns(self):
         report = self.live_schema_report()
@@ -335,17 +335,17 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
         self.assertTrue(report["production_database_evidence_supported"])
         self.assertEqual(report["blockers"], [])
         self.assertEqual(report["runtime_schema"]["missing_columns"], {})
-        self.assertIn("kqag_profiles", report["runtime_schema"]["required_tables"])
-        self.assertIn("kqag_object_artifacts", report["runtime_schema"]["required_tables"])
-        self.assertNotIn("kqag_quote_artifacts", report["runtime_schema"]["required_tables"])
+        self.assertIn("sqag_profiles", report["runtime_schema"]["required_tables"])
+        self.assertIn("sqag_object_artifacts", report["runtime_schema"]["required_tables"])
+        self.assertNotIn("sqag_quote_artifacts", report["runtime_schema"]["required_tables"])
         self.assertNotIn(POSTGRES_URL, text)
 
     def test_live_schema_check_fails_when_runtime_required_columns_are_missing(self):
         cases = (
-            ("kqag_profiles", "created_at"),
-            ("kqag_quote_sessions", "updated_at"),
-            ("kqag_object_artifacts", "platform_user_id"),
-            ("kqag_object_artifacts", "deleted_at"),
+            ("sqag_profiles", "created_at"),
+            ("sqag_quote_sessions", "updated_at"),
+            ("sqag_object_artifacts", "platform_user_id"),
+            ("sqag_object_artifacts", "deleted_at"),
         )
         for table, column in cases:
             with self.subTest(table=table, column=column):
@@ -356,10 +356,10 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
 
     def test_live_opt_in_fails_when_runtime_required_metadata_columns_are_missing(self):
         cases = (
-            ("kqag_profiles", "created_at"),
-            ("kqag_quote_sessions", "updated_at"),
-            ("kqag_object_artifacts", "platform_user_id"),
-            ("kqag_object_artifacts", "deleted_at"),
+            ("sqag_profiles", "created_at"),
+            ("sqag_quote_sessions", "updated_at"),
+            ("sqag_object_artifacts", "platform_user_id"),
+            ("sqag_object_artifacts", "deleted_at"),
         )
         for table, column in cases:
             with self.subTest(table=table, column=column):
@@ -372,20 +372,20 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
 
     def test_metadata_migration_check_fails_when_runtime_required_column_is_missing(self):
         sql = """
-        create table if not exists kqag_profiles (
+        create table if not exists sqag_profiles (
           workspace_id text not null,
           profile_id text not null,
           payload_json text not null,
           updated_at text not null
         );
-        create table if not exists kqag_pricing_references (
+        create table if not exists sqag_pricing_references (
           workspace_id text not null,
           reference_id text not null,
           payload_json text not null,
           created_at text not null,
           updated_at text not null
         );
-        create table if not exists kqag_quote_sessions (
+        create table if not exists sqag_quote_sessions (
           workspace_id text not null,
           session_id text not null,
           metadata_json text not null,
@@ -393,7 +393,7 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
           created_at text not null,
           updated_at text not null
         );
-        create table if not exists kqag_object_artifacts (
+        create table if not exists sqag_object_artifacts (
           artifact_id text not null primary key,
           workspace_id text not null,
           owner_type text not null,
@@ -418,7 +418,7 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
         status = migration_status_for_sql(sql)
 
         self.assertFalse(status["metadata_tables_declared"])
-        self.assertEqual(status["missing_columns"], {"kqag_profiles": ["created_at"]})
+        self.assertEqual(status["missing_columns"], {"sqag_profiles": ["created_at"]})
 
     def test_live_opt_in_runs_synthetic_metadata_crud_isolation_and_cleanup(self):
         connection = FakeLivePostgresConnection()
@@ -450,10 +450,10 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
         backend = mock.Mock()
         backend.delete_artifact.side_effect = AssertionError("object backend delete must not be called")
 
-        with mock.patch.dict(verifier.os.environ, {"KQAG_ARTIFACT_STORAGE_MODE": "object"}, clear=False), \
+        with mock.patch.dict(verifier.os.environ, {"SQAG_ARTIFACT_STORAGE_MODE": "object"}, clear=False), \
             mock.patch.object(verifier.webapp, "configured_object_storage_backend", side_effect=AssertionError("object backend factory must not be called")) as configured_backend, \
-            mock.patch.object(verifier.webapp.DatabaseKqagStorage, "tombstone_object_quote_artifacts", side_effect=AssertionError("object tombstone must not be called")) as tombstone, \
-            mock.patch.object(verifier.webapp.DatabaseKqagStorage, "delete_quote_session", side_effect=AssertionError("runtime quote-session delete must not be called")) as delete_session:
+            mock.patch.object(verifier.webapp.DatabaseSqagStorage, "tombstone_object_quote_artifacts", side_effect=AssertionError("object tombstone must not be called")) as tombstone, \
+            mock.patch.object(verifier.webapp.DatabaseSqagStorage, "delete_quote_session", side_effect=AssertionError("runtime quote-session delete must not be called")) as delete_session:
             report = run_live_database_report(connection)
 
         self.assertEqual(report["status"], "passed")

@@ -1,6 +1,6 @@
-# KQAG Internal-Alpha VPS/Coolify Scaffold
+# SQAG Internal-Alpha VPS/Coolify Scaffold
 
-This folder contains KQAG-specific placeholder templates for an
+This folder contains SQAG-specific placeholder templates for an
 already-prepared VPS/Coolify-style host. It intentionally does not describe
 generic VPS setup, Coolify installation, SSH, firewall, DNS, TLS, deployment,
 or server maintenance.
@@ -8,7 +8,7 @@ or server maintenance.
 Use with:
 
 - Docs: `docs/internal-uat-coolify-deploy.md`
-- Env template: `deploy/internal-uat/coolify/kqag.uat.env.example`
+- Env template: `deploy/internal-uat/coolify/sqag.uat.env.example`
 - Volume map: `deploy/internal-uat/coolify/volume-map.example.md`
 
 Recommended app settings:
@@ -18,8 +18,8 @@ Recommended app settings:
 - Port: value supplied by `PORT`
 - Healthcheck path: `/api/health`
 - Instance count: `1`
-- Storage posture: `KQAG_STORAGE_MODE=database` and
-  `KQAG_ARTIFACT_STORAGE_MODE=database`
+- Storage posture: `SQAG_STORAGE_MODE=database` and
+  `SQAG_ARTIFACT_STORAGE_MODE=database`
 
 Before starting deploy-mode UAT, set the env values in Coolify secrets or
 environment management and run:

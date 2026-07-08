@@ -1,13 +1,13 @@
-# KQAG Hosted Validation Notes
+# SQAG Hosted Validation Notes
 
 ## Purpose
 
-This note preserves the KQAG app-specific hosted validation checklist shape for
+This note preserves the SQAG app-specific hosted validation checklist shape for
 an already-prepared host. It is metadata-only local guidance only. It does not
 deploy anything, configure infrastructure, add secrets, prove live hosting, or
 claim hosted/protected/deploy/production readiness.
 
-KQAG is an internal Koncept Images Pte Ltd quote generator module, not
+SQAG is an internal Koncept Images Pte Ltd quote generator module, not
 ecommerce or public SaaS. Koncept profile, pricing, and layout packs are
 workspace-imported tenant data only. A new workspace starts with no real
 Koncept pack until an authorized import or seed action targets that workspace.
@@ -17,8 +17,8 @@ Koncept pack until an authorized import or seed action targets that workspace.
 The former DB/BLOB artifact posture is no longer a launch target:
 
 - `APP_MODE=deploy`.
-- `KQAG_STORAGE_MODE=database`.
-- `KQAG_ARTIFACT_STORAGE_MODE=database`.
+- `SQAG_STORAGE_MODE=database`.
+- `SQAG_ARTIFACT_STORAGE_MODE=database`.
 - `SQAG_DATABASE_URL` is configured only through the host secret manager.
 - Platform/workspace launch context is required for protected hosted use.
 - Readiness remains blocked because generated XLSX/PDF bytes require object
@@ -35,7 +35,7 @@ This repo owns only the app-specific shape:
 - Health path: `/api/health`.
 - Deploy-mode environment variable names.
 - Metadata-only validation commands.
-- KQAG private-data and tenant-import guardrails.
+- SQAG private-data and tenant-import guardrails.
 
 Infrastructure runbooks outside this repo own VPS purchase, Coolify
 installation, SSH access, DNS, TLS, firewall, reverse proxy, backups on the
@@ -43,7 +43,7 @@ host, and server maintenance.
 
 ## Environment Names
 
-Use `deploy/internal-uat/coolify/kqag.uat.env.example` as the placeholder
+Use `deploy/internal-uat/coolify/sqag.uat.env.example` as the placeholder
 checklist. Copy names into the host secret/environment manager and replace
 placeholders there. Do not commit populated values.
 
@@ -52,8 +52,8 @@ Required names for any future hosted validation environment:
 | Area | Names |
 | --- | --- |
 | App/auth | `APP_MODE`, `AUTH_REQUIRED`, `SESSION_SECRET` |
-| Storage | `KQAG_STORAGE_MODE`, `KQAG_ARTIFACT_STORAGE_MODE`, `SQAG_DATABASE_URL` |
-| Platform launch | `KQAG_PLATFORM_LAUNCH_MODE`, `KQAG_PLATFORM_BASE_URL` |
+| Storage | `SQAG_STORAGE_MODE`, `SQAG_ARTIFACT_STORAGE_MODE`, `SQAG_DATABASE_URL` |
+| Platform launch | `SQAG_PLATFORM_LAUNCH_MODE`, `SQAG_PLATFORM_BASE_URL` |
 | Optional OIDC fallback/checklist | `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI`, `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL`, `OIDC_USERINFO_URL`, `OIDC_LOGOUT_URL` |
 | Tester policy | `AUTH_ALLOWED_EMAILS`, `AUTH_ALLOWED_DOMAINS`, `AUTH_ALLOW_ANY_AUTHENTICATED_USER`, `AUTH_APPROVED_TESTER_ROLE` |
 | Runtime housekeeping | `QUOTE_DATA_ROOT`, `QUOTE_OUTPUT_ROOT`, `QUOTE_TMP_ROOT`, `QUOTE_LOG_ROOT`, `PORT` |

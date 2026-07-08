@@ -27,7 +27,7 @@ review.
 
 ## Required Review Notes
 
-- SAQG/KQAG solution UI is complete and final. Do not change visible UI, layout,
+- SAQG/SQAG solution UI is complete and final. Do not change visible UI, layout,
   DOM, CSS, workflow placement, cards, tabs, buttons, modals, spacing, component
   hierarchy, or visual status components unless the user explicitly approves UI
   work in the current turn. Text-only wording changes and backend/data mapping
@@ -46,11 +46,11 @@ review.
 - If import/export behavior is touched, state the export source, import target,
   validation path, and whether private data remains in ignored runtime storage.
 - If deleting repo-bundled assets, confirm tests are migrated and no active
-  guardrail or KQAG module doc is removed.
+  guardrail or SQAG module doc is removed.
 
 ## Module Boundary
 
-KQAG owns quote-specific workflow/settings, pricing references, quote-company
+SQAG owns quote-specific workflow/settings, pricing references, quote-company
 profiles, pricing review, and XLSX output. The main Swooshz platform should own
 login/accounts, billing, credits, app access, company membership, product
 navigation, and cross-app registry concerns in a future platform repository.

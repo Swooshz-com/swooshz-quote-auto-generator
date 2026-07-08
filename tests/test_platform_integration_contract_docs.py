@@ -11,7 +11,7 @@ class PlatformIntegrationContractDocsTest(unittest.TestCase):
     def setUpClass(cls):
         cls.text = CONTRACT_DOC.read_text(encoding="utf-8")
 
-    def test_contract_doc_cites_kqag_and_platform_evidence(self):
+    def test_contract_doc_cites_sqag_and_platform_evidence(self):
         text = self.text
         self.assertIn("5bce4d52e4273762375d97149b1d77e5716189b2", text)
         for expected in (
@@ -20,7 +20,7 @@ class PlatformIntegrationContractDocsTest(unittest.TestCase):
             "safe_platform_session_context()",
             "app_storage_for_auth_session()",
             "artifact_storage_for_auth_session()",
-            "docs/kqag-integration-contract.md",
+            "docs/sqag-integration-contract.md",
             "docs/app-access-contract.md",
             "src/http/route-contracts.ts",
             "src/platform/app-launch-token-consume-service.ts",
@@ -33,14 +33,22 @@ class PlatformIntegrationContractDocsTest(unittest.TestCase):
             "user.userId",
             "workspace.workspaceId",
             "app.appKey",
+            "appKey=sqag",
             "membershipRole",
             "launchTokenExpiresAt",
             "Unsupported roles fail closed",
             "Missing Platform workspace context blocks database storage access.",
+            "platform_app_key_migration_pending",
             "Missing workspace-owned profile/pricing/layout data does not fall back",
             "Production remains blocked",
         ):
             self.assertIn(expected, text)
+
+    def test_contract_doc_marks_platform_app_key_migration_pending(self):
+        text = self.text
+        self.assertIn("Platform app-key migration pending", text)
+        self.assertIn("separate Swooshz Platform PR", text)
+        self.assertNotIn("The current Platform `origin/main` contract matches SQAG's adapter assumptions", text)
 
     def test_contract_doc_is_metadata_only(self):
         text = self.text
@@ -67,7 +75,7 @@ class PlatformIntegrationContractDocsTest(unittest.TestCase):
         for forbidden in forbidden_fragments:
             self.assertNotIn(forbidden, text)
 
-    def test_contract_doc_points_to_existing_kqag_coverage(self):
+    def test_contract_doc_points_to_existing_sqag_coverage(self):
         text = self.text
         for expected in (
             "test_platform_launch_mode_consumes_header_token_and_sets_safe_session",

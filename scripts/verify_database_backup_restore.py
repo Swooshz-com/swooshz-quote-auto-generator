@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Synthetic KQAG SQLite backup/restore/rollback verifier.
+"""Synthetic SQAG SQLite backup/restore/rollback verifier.
 
 The verifier creates only synthetic rows and emits only metadata. It is local
 database + database-artifact evidence only; it does not make DB/BLOB artifact
@@ -26,12 +26,12 @@ from webapp import server as webapp
 
 
 RETENTION_POLICY_PATH = ROOT / "docs" / "internal-alpha-retention-policy.json"
-KQAG_TABLES = (
-    "kqag_profiles",
-    "kqag_pricing_references",
-    "kqag_quote_sessions",
-    "kqag_quote_artifacts",
-    "kqag_file_artifacts",
+SQAG_TABLES = (
+    "sqag_profiles",
+    "sqag_pricing_references",
+    "sqag_quote_sessions",
+    "sqag_quote_artifacts",
+    "sqag_file_artifacts",
 )
 REQUIRED_RETENTION_CLASSES = {
     "quote_sessions",
@@ -71,15 +71,15 @@ def table_digest(connection: sqlite3.Connection, table: str) -> str:
 
 
 def artifact_digest(connection: sqlite3.Connection, table: str) -> str:
-    if table == "kqag_quote_artifacts":
+    if table == "sqag_quote_artifacts":
         rows = connection.execute(
             "select workspace_id, session_id, artifact_kind, size_bytes, content_blob "
-            "from kqag_quote_artifacts order by workspace_id, session_id, artifact_kind"
+            "from sqag_quote_artifacts order by workspace_id, session_id, artifact_kind"
         ).fetchall()
     else:
         rows = connection.execute(
             "select workspace_id, owner_type, owner_id, artifact_kind, size_bytes, content_blob "
-            "from kqag_file_artifacts order by workspace_id, owner_type, owner_id, artifact_kind"
+            "from sqag_file_artifacts order by workspace_id, owner_type, owner_id, artifact_kind"
         ).fetchall()
     digest = hashlib.sha256()
     for row in rows:
@@ -97,22 +97,22 @@ def snapshot_database(path: Path) -> dict[str, Any]:
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
     try:
-        row_counts = {table: table_row_count(connection, table) for table in KQAG_TABLES}
-        table_checksums = {table: table_digest(connection, table) for table in KQAG_TABLES}
+        row_counts = {table: table_row_count(connection, table) for table in SQAG_TABLES}
+        table_checksums = {table: table_digest(connection, table) for table in SQAG_TABLES}
         artifact_checksums = {
-            "kqag_quote_artifacts": artifact_digest(connection, "kqag_quote_artifacts"),
-            "kqag_file_artifacts": artifact_digest(connection, "kqag_file_artifacts"),
+            "sqag_quote_artifacts": artifact_digest(connection, "sqag_quote_artifacts"),
+            "sqag_file_artifacts": artifact_digest(connection, "sqag_file_artifacts"),
         }
         workspaces = [
             row["workspace_id"]
             for row in connection.execute(
-                "select distinct workspace_id from kqag_quote_sessions order by workspace_id"
+                "select distinct workspace_id from sqag_quote_sessions order by workspace_id"
             ).fetchall()
         ]
         owners = [
             json.loads(row["metadata_json"]).get("owner", {}).get("user_id", "")
             for row in connection.execute(
-                "select metadata_json from kqag_quote_sessions order by workspace_id, session_id"
+                "select metadata_json from sqag_quote_sessions order by workspace_id, session_id"
             ).fetchall()
         ]
     finally:
@@ -137,12 +137,12 @@ def backup_sqlite_database(source: Path, backup: Path) -> None:
 
 
 def seed_synthetic_database(database_path: Path) -> None:
-    webapp.apply_kqag_storage_migrations(sqlite_url(database_path))
+    webapp.apply_sqag_storage_migrations(sqlite_url(database_path))
     now = "2026-07-03T00:00:00Z"
     quote_blob = b"synthetic-private-artifact-bytes"
     file_blob = b"synthetic-private-file-artifact-bytes"
     metadata = {
-        "schema": "swooshz.kqag.quote-session.v1",
+        "schema": "swooshz.sqag.quote-session.v1",
         "session_id": "quote-synthetic-alpha",
         "created_at": now,
         "updated_at": now,
@@ -157,27 +157,27 @@ def seed_synthetic_database(database_path: Path) -> None:
     connection = sqlite3.connect(database_path)
     try:
         connection.execute(
-            "insert into kqag_profiles (workspace_id, profile_id, payload_json, created_at, updated_at) values (?, ?, ?, ?, ?)",
+            "insert into sqag_profiles (workspace_id, profile_id, payload_json, created_at, updated_at) values (?, ?, ?, ?, ?)",
             ("workspace-alpha", "profile-alpha", json.dumps(profile_payload, sort_keys=True), now, now),
         )
         connection.execute(
-            "insert into kqag_pricing_references (workspace_id, reference_id, payload_json, created_at, updated_at) values (?, ?, ?, ?, ?)",
+            "insert into sqag_pricing_references (workspace_id, reference_id, payload_json, created_at, updated_at) values (?, ?, ?, ?, ?)",
             ("workspace-alpha", "pricing-alpha", json.dumps(pricing_payload, sort_keys=True), now, now),
         )
         connection.execute(
-            "insert into kqag_quote_sessions (workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at) values (?, ?, ?, ?, ?, ?)",
+            "insert into sqag_quote_sessions (workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at) values (?, ?, ?, ?, ?, ?)",
             ("workspace-alpha", "quote-synthetic-alpha", json.dumps(metadata, sort_keys=True), json.dumps(draft_files), now, now),
         )
         connection.execute(
-            "insert into kqag_quote_artifacts (workspace_id, session_id, artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "insert into sqag_quote_artifacts (workspace_id, session_id, artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             ("workspace-alpha", "quote-synthetic-alpha", "xlsx", "quotation.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", len(quote_blob), sqlite3.Binary(quote_blob), now, now),
         )
         connection.execute(
-            "insert into kqag_file_artifacts (workspace_id, owner_type, owner_id, artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "insert into sqag_file_artifacts (workspace_id, owner_type, owner_id, artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             ("workspace-alpha", "profile", "profile-alpha", "quotation_layout", "quotation-layout.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", len(file_blob), sqlite3.Binary(file_blob), now, now),
         )
         connection.execute(
-            "insert into kqag_quote_sessions (workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at) values (?, ?, ?, ?, ?, ?)",
+            "insert into sqag_quote_sessions (workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at) values (?, ?, ?, ?, ?, ?)",
             (
                 "workspace-beta",
                 "quote-synthetic-beta",
@@ -195,9 +195,9 @@ def seed_synthetic_database(database_path: Path) -> None:
 def mutate_database_after_known_good_backup(database_path: Path) -> None:
     connection = sqlite3.connect(database_path)
     try:
-        connection.execute("delete from kqag_quote_artifacts where workspace_id = ?", ("workspace-alpha",))
+        connection.execute("delete from sqag_quote_artifacts where workspace_id = ?", ("workspace-alpha",))
         connection.execute(
-            "insert into kqag_profiles (workspace_id, profile_id, payload_json, created_at, updated_at) values (?, ?, ?, ?, ?)",
+            "insert into sqag_profiles (workspace_id, profile_id, payload_json, created_at, updated_at) values (?, ?, ?, ?, ?)",
             ("workspace-alpha", "profile-mutated", json.dumps({"id": "profile-mutated"}, sort_keys=True), "2026-07-03T00:05:00Z", "2026-07-03T00:05:00Z"),
         )
         connection.commit()
@@ -210,7 +210,7 @@ def load_retention_policy(path: Path = RETENTION_POLICY_PATH) -> dict[str, Any]:
     data_classes = policy.get("data_classes") if isinstance(policy.get("data_classes"), list) else []
     covered = {item.get("data_class") for item in data_classes if isinstance(item, dict)}
     missing = sorted(REQUIRED_RETENTION_CLASSES - covered)
-    if policy.get("schema") != "swooshz.kqag.internal-alpha-retention-policy.v1" or missing:
+    if policy.get("schema") != "swooshz.sqag.internal-alpha-retention-policy.v1" or missing:
         raise ValueError("Internal-alpha retention policy is incomplete.")
     if not policy.get("non_destructive_verifier_only"):
         raise ValueError("Internal-alpha retention policy must be non-destructive for this verifier.")
@@ -260,7 +260,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
     status = "passed" if all((row_counts_match, table_checksums_match, artifact_checksums_match, ownership_preserved, rollback_ok)) else "failed"
 
     return {
-        "schema": "swooshz.kqag.database-backup-restore-verification.v1",
+        "schema": "swooshz.sqag.database-backup-restore-verification.v1",
         "status": status,
         "storage_modes": ["sqlite-database", "sqlite-database-artifacts"],
         "synthetic_only": True,
@@ -269,7 +269,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
             "table_checksums_match": table_checksums_match,
             "artifact_checksums_match": artifact_checksums_match,
             "workspace_ownership_preserved": ownership_preserved,
-            "tables_verified": list(KQAG_TABLES),
+            "tables_verified": list(SQAG_TABLES),
         },
         "rollback": {
             "restored_prior_known_good_state": rollback_ok,
@@ -293,7 +293,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Verify synthetic KQAG SQLite backup/restore/rollback evidence.")
+    parser = argparse.ArgumentParser(description="Verify synthetic SQAG SQLite backup/restore/rollback evidence.")
     parser.add_argument("--work-dir", type=Path, default=None, help="Synthetic drill workspace. The path is never printed.")
     return parser
 
@@ -304,7 +304,7 @@ def main(argv: list[str] | None = None) -> int:
         report = run_verification(work_dir=args.work_dir)
     except Exception:
         report = {
-            "schema": "swooshz.kqag.database-backup-restore-verification.v1",
+            "schema": "swooshz.sqag.database-backup-restore-verification.v1",
             "status": "failed",
             "synthetic_only": True,
             "privacy": {

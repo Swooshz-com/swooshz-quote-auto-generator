@@ -7,7 +7,7 @@ bounded internal UAT login and deploy-auth path that can be verified locally
 with synthetic values only.
 
 This is not an account system, public SaaS launch, customer portal, billing
-flow, database-backed user model, or production deployment plan. KQAG uses the
+flow, database-backed user model, or production deployment plan. SQAG uses the
 existing deploy-auth OIDC gate only for approved internal testers.
 
 ## Approved Tester Login Flow
@@ -18,9 +18,9 @@ In deploy mode, unauthenticated browser requests redirect to `/login`, and
 Approved testers should expect:
 
 - A normal provider sign-in page from the configured internal OIDC provider.
-- Return to KQAG after a successful provider callback.
+- Return to SQAG after a successful provider callback.
 - A privacy-safe dashboard state such as `Signed in as approved tester`.
-- A logout action that clears the KQAG session and temporary OIDC state cookie.
+- A logout action that clears the SQAG session and temporary OIDC state cookie.
 
 The app must not show raw OIDC claims, auth codes, access tokens, ID tokens,
 refresh tokens, provider responses, session secrets, or OIDC client secrets.
@@ -91,11 +91,11 @@ be temporary folders outside the repository and should not be reported.
 $env:APP_MODE="<deploy>"
 $env:AUTH_REQUIRED="<true>"
 $env:SESSION_SECRET="<synthetic-session-secret>"
-$env:KQAG_STORAGE_MODE="<database>"
-$env:KQAG_ARTIFACT_STORAGE_MODE="<object-for-readiness-or-database-for-negative-test>"
+$env:SQAG_STORAGE_MODE="<database>"
+$env:SQAG_ARTIFACT_STORAGE_MODE="<object-for-readiness-or-database-for-negative-test>"
 $env:SQAG_DATABASE_URL="<synthetic-database-url>"
-$env:KQAG_PLATFORM_LAUNCH_MODE="<platform>"
-$env:KQAG_PLATFORM_BASE_URL="<synthetic-platform-base-url>"
+$env:SQAG_PLATFORM_LAUNCH_MODE="<platform>"
+$env:SQAG_PLATFORM_BASE_URL="<synthetic-platform-base-url>"
 $env:AUTH_ALLOWED_EMAILS="<synthetic-allowlist>"
 $env:AUTH_ALLOWED_DOMAINS="<synthetic-allowlist-domain>"
 $env:AUTH_ALLOW_ANY_AUTHENTICATED_USER="<false>"

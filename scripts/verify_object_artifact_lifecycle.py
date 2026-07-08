@@ -58,7 +58,7 @@ def object_metadata_digest(database_path: Path) -> str:
     try:
         rows = connection.execute(
             "select workspace_id, owner_type, owner_id, session_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, status, retention_status, deleted_at "
-            "from kqag_object_artifacts order by workspace_id, owner_type, owner_id, artifact_kind"
+            "from sqag_object_artifacts order by workspace_id, owner_type, owner_id, artifact_kind"
         ).fetchall()
     finally:
         connection.close()
@@ -93,14 +93,14 @@ def seed_matching_backend() -> InMemoryObjectStorageBackend:
     return backend
 
 
-def storage_for(database_path: Path, workspace_id: str = WORKSPACE_ID) -> webapp.DatabaseKqagStorage:
-    return webapp.DatabaseKqagStorage(sqlite_url(database_path), workspace_id, "admin", USER_ID)
+def storage_for(database_path: Path, workspace_id: str = WORKSPACE_ID) -> webapp.DatabaseSqagStorage:
+    return webapp.DatabaseSqagStorage(sqlite_url(database_path), workspace_id, "admin", USER_ID)
 
 
 def object_mode_env(database_path: Path) -> dict[str, str]:
     return {
-        "KQAG_STORAGE_MODE": "database",
-        "KQAG_ARTIFACT_STORAGE_MODE": "object",
+        "SQAG_STORAGE_MODE": "database",
+        "SQAG_ARTIFACT_STORAGE_MODE": "object",
         "SQAG_DATABASE_URL": sqlite_url(database_path),
         "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
         "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
@@ -113,7 +113,7 @@ def object_mode_env(database_path: Path) -> dict[str, str]:
 
 def seed_source_database(database_path: Path, staging_root: Path) -> dict[str, bool]:
     backend = InMemoryObjectStorageBackend()
-    webapp.apply_kqag_storage_migrations(sqlite_url(database_path))
+    webapp.apply_sqag_storage_migrations(sqlite_url(database_path))
     output_dir = staging_root / "job-object-lifecycle"
     output_dir.mkdir(parents=True, exist_ok=True)
     staging_file = output_dir / "quotation.xlsx"
@@ -149,7 +149,7 @@ def mark_tombstoned(database_path: Path) -> None:
     connection = sqlite3.connect(database_path)
     try:
         connection.execute(
-            "update kqag_object_artifacts set status = ?, retention_status = ?, updated_at = ?, deleted_at = ? where workspace_id = ? and session_id = ?",
+            "update sqag_object_artifacts set status = ?, retention_status = ?, updated_at = ?, deleted_at = ? where workspace_id = ? and session_id = ?",
             ("deleted", "deleted", now, now, WORKSPACE_ID, SESSION_ID),
         )
         connection.commit()
@@ -161,7 +161,7 @@ def corrupt_checksum(database_path: Path) -> None:
     connection = sqlite3.connect(database_path)
     try:
         connection.execute(
-            "update kqag_object_artifacts set checksum_sha256 = ? where workspace_id = ? and session_id = ?",
+            "update sqag_object_artifacts set checksum_sha256 = ? where workspace_id = ? and session_id = ?",
             ("0" * 64, WORKSPACE_ID, SESSION_ID),
         )
         connection.commit()
@@ -199,7 +199,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
     wrong_workspace = restored_artifact(restored, seed_matching_backend(), workspace_id=OTHER_WORKSPACE_ID)
 
     checks = {
-        "db_metadata_backup_restore_preserved": before_digest == after_digest and row_count(restored, "kqag_object_artifacts") == 1,
+        "db_metadata_backup_restore_preserved": before_digest == after_digest and row_count(restored, "sqag_object_artifacts") == 1,
         "restored_metadata_retrieves_object": bool(restored_content and restored_content.get("content") == ARTIFACT_CONTENT),
         "missing_object_detected": missing_object is None,
         "checksum_mismatch_detected": checksum_mismatch is None,
@@ -209,14 +209,14 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
     }
     status = "passed" if all(checks.values()) and seed_checks["stored_artifact_retrieved"] else "failed"
     return {
-        "schema": "swooshz.kqag.object-artifact-lifecycle-verification.v1",
+        "schema": "swooshz.sqag.object-artifact-lifecycle-verification.v1",
         "status": status,
         "storage_modes": ["sqlite-database", "stubbed-object-artifacts"],
         "synthetic_only": True,
         "checks": checks,
         "row_counts": {
-            "object_artifacts": row_count(restored, "kqag_object_artifacts"),
-            "quote_artifacts_blob_rows": row_count(restored, "kqag_quote_artifacts"),
+            "object_artifacts": row_count(restored, "sqag_object_artifacts"),
+            "quote_artifacts_blob_rows": row_count(restored, "sqag_quote_artifacts"),
         },
         "privacy": {
             "output": "metadata-only",
@@ -236,7 +236,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
 
 def failed_report() -> dict[str, Any]:
     return {
-        "schema": "swooshz.kqag.object-artifact-lifecycle-verification.v1",
+        "schema": "swooshz.sqag.object-artifact-lifecycle-verification.v1",
         "status": "failed",
         "synthetic_only": True,
         "checks": {},

@@ -35,8 +35,8 @@ PRODUCTION_METADATA_MIGRATION_PATHS = (
 def runtime_required_metadata_tables() -> dict[str, set[str]]:
     required: dict[str, set[str]] = {}
     for table_map in (
-        webapp.KQAG_APP_METADATA_REQUIRED_COLUMNS,
-        webapp.KQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS,
+        webapp.SQAG_APP_METADATA_REQUIRED_COLUMNS,
+        webapp.SQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS,
     ):
         for table, columns in table_map.items():
             required.setdefault(table, set()).update(columns)
@@ -208,20 +208,20 @@ def _delete_synthetic_workspace_metadata(
     with storage.connection() as connection:
         for sql, params in (
             (
-                "delete from kqag_object_artifacts "
+                "delete from sqag_object_artifacts "
                 "where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
                 (storage.workspace_id, "generated_quote", session_id, "xlsx"),
             ),
             (
-                "delete from kqag_quote_sessions where workspace_id = ? and session_id = ?",
+                "delete from sqag_quote_sessions where workspace_id = ? and session_id = ?",
                 (storage.workspace_id, session_id),
             ),
             (
-                "delete from kqag_pricing_references where workspace_id = ? and reference_id = ?",
+                "delete from sqag_pricing_references where workspace_id = ? and reference_id = ?",
                 (storage.workspace_id, pricing_id),
             ),
             (
-                "delete from kqag_profiles where workspace_id = ? and profile_id = ?",
+                "delete from sqag_profiles where workspace_id = ? and profile_id = ?",
                 (storage.workspace_id, profile_id),
             ),
         ):
@@ -234,7 +234,7 @@ def _delete_synthetic_workspace_metadata(
 def _synthetic_object_artifact_row(storage: object, session_id: str, artifact_kind: str) -> object | None:
     with storage.connection() as connection:
         cursor = connection.execute(
-            "select artifact_id from kqag_object_artifacts "
+            "select artifact_id from sqag_object_artifacts "
             "where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ? "
             "and status = ? and retention_status = ? and deleted_at is null",
             (storage.workspace_id, "generated_quote", session_id, artifact_kind, "active", "active"),
@@ -248,7 +248,7 @@ def _cleanup_synthetic_metadata(database_url: str, ids: dict[str, str]) -> bool:
         ("workspace_a", "profile_a", "pricing_a", "session_a"),
         ("workspace_b", "profile_b", "pricing_b", "session_b"),
     ):
-        storage = webapp.DatabaseKqagStorage(database_url, ids[workspace_key], role="admin", user_id=f"{ids[workspace_key]}-user")
+        storage = webapp.DatabaseSqagStorage(database_url, ids[workspace_key], role="admin", user_id=f"{ids[workspace_key]}-user")
         try:
             _delete_synthetic_workspace_metadata(
                 storage,
@@ -269,8 +269,8 @@ def live_metadata_operations_status(database_url: str) -> dict[str, object]:
     updates = 0
     deletes = 0
     try:
-        storage_a = webapp.DatabaseKqagStorage(database_url, ids["workspace_a"], role="admin", user_id=f"{ids['workspace_a']}-user")
-        storage_b = webapp.DatabaseKqagStorage(database_url, ids["workspace_b"], role="admin", user_id=f"{ids['workspace_b']}-user")
+        storage_a = webapp.DatabaseSqagStorage(database_url, ids["workspace_a"], role="admin", user_id=f"{ids['workspace_a']}-user")
+        storage_b = webapp.DatabaseSqagStorage(database_url, ids["workspace_b"], role="admin", user_id=f"{ids['workspace_b']}-user")
         storage_a.ensure_ready()
         storage_a.ensure_object_artifact_ready()
         storage_b.ensure_ready()

@@ -1,4 +1,4 @@
-# KQAG Internal-Alpha Runtime Housekeeping Map
+# SQAG Internal-Alpha Runtime Housekeeping Map
 
 The current internal-alpha posture uses database quote-session storage and
 database artifact storage. The runtime roots below are housekeeping surfaces
@@ -11,7 +11,7 @@ Do not commit populated paths.
 | Purpose | Env var | Hosted posture |
 | --- | --- | --- |
 | Runtime housekeeping | `QUOTE_DATA_ROOT` | Required by deploy preflight; not a profile/pricing/session source of truth. |
-| Output staging | `QUOTE_OUTPUT_ROOT` | Required by deploy preflight; generated artifacts must persist through `KQAG_ARTIFACT_STORAGE_MODE=database`. |
+| Output staging | `QUOTE_OUTPUT_ROOT` | Required by deploy preflight; generated artifacts must persist through `SQAG_ARTIFACT_STORAGE_MODE=database`. |
 | Temporary work files | `QUOTE_TMP_ROOT` | Temporary lifecycle only. |
 | Runtime logs | `QUOTE_LOG_ROOT` | Metadata-only logs only. |
 
