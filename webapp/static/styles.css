@@ -6785,6 +6785,11 @@ td input {
   gap: 8px;
 }
 
+.currency-control-stack:has(.currency-custom-input:not([hidden])) {
+  grid-template-columns: minmax(0, 3fr) minmax(72px, 2fr);
+  align-items: center;
+}
+
 .currency-control-stack select,
 .currency-control-stack input {
   width: 100%;

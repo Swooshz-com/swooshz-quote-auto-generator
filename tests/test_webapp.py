@@ -1040,6 +1040,25 @@ class WebappServerTest(unittest.TestCase):
         )
         self.assertNotIn("unit_price_override", items[0])
 
+    def test_normalize_line_items_preserves_output_table_unit_when_locked(self):
+        items = webapp.normalize_line_items({
+            "profile_id": "synthetic-exhibition-fixture-template",
+            "line_items": [
+                {
+                    "section": "Synthetic Floors",
+                    "quantity": "36",
+                    "unit": "lot",
+                    "description": "AI paraphrased green carpet wording",
+                    "pricing_keyword": "synthetic-floors.synthetic-carpet-tile",
+                    "output_unit_locked": True,
+                }
+            ],
+        })
+
+        self.assertEqual(items[0]["pricing_keyword"], "synthetic-floors-synthetic-carpet-tile")
+        self.assertEqual(items[0]["unit"], "lot")
+        self.assertEqual(items[0]["catalog_unit_price"], koncept_catalog_sale_unit_price("synthetic-floors-synthetic-carpet-tile"))
+
     def test_normalize_line_items_infers_catalog_match_from_high_analysis_description(self):
         items = webapp.normalize_line_items({
             "pricing_reference_id": "synthetic-exhibition-fixture-pricing",
@@ -9877,10 +9896,12 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         quote_tax_select = html.split('id="quoteTaxLabel"', 1)[1].split("</select>", 1)[0]
         self.assertNotIn('<option value=""></option>', quote_currency_select)
         self.assertNotIn('<option value=""></option>', quote_tax_select)
-        self.assertIn('<option value="__CUSTOM__">Custom - Enter currency code</option>', quote_currency_select)
+        self.assertIn('<option value="__CUSTOM__">Custom</option>', quote_currency_select)
         self.assertIn('id="quoteCurrencyCustom"', html)
         self.assertIn("setQuoteCurrencyControls", js)
         self.assertIn("syncQuoteCurrencyCustomInput", js)
+        self.assertIn(".currency-control-stack:has(.currency-custom-input:not([hidden]))", css)
+        self.assertIn("grid-template-columns: minmax(0, 3fr) minmax(72px, 2fr);", css)
         self.assertIn('id="quoteExchangeRateField"', html)
         self.assertNotIn('id="quoteExchangeRateField" hidden', html)
         self.assertIn('class="pricing-reference-baseline"', html)
@@ -11131,6 +11152,8 @@ eval([
   "errorReferenceFrom",
   "genericFailureMessage",
   "genericFailureMessages",
+  "aiAnalysisInvalidReferenceMessage",
+  "aiAnalysisFailureMessage",
   "handleInterruptedJobPoll",
 ].map(extractFunction).join("\n"));
 
@@ -11143,6 +11166,14 @@ handleInterruptedJobPoll("generate_pdf", failedPoll);
 assert.deepStrictEqual(renderedMessages, ["Failed. Please try again. Contact support if this keeps happening. Reference: ERR-1234ABCD."]);
 assert.strictEqual(state.isGenerating, false);
 assert.strictEqual(synced, true);
+assert.strictEqual(
+  aiAnalysisFailureMessage({ provider_errors: ["OpenAI returned no usable quote basis."], error_reference: "ERR-616E06A8" }),
+  "The uploaded reference is not a valid quote reference for AI analysis. Upload a valid booth render, plan, or scope reference, then run analysis again. Reference: ERR-616E06A8."
+);
+assert.strictEqual(
+  aiAnalysisFailureMessage({ failure_kind: "model_output_invalid", provider_errors: ["Openai returned output that could not be used"] }),
+  "The uploaded reference is not a valid quote reference for AI analysis. Upload a valid booth render, plan, or scope reference, then run analysis again."
+);
 """
         completed = subprocess.run(
             [node, "-e", script],
@@ -15407,6 +15438,7 @@ assert.strictEqual(selectedConfirmPayload[0].catalog_description, "sqm 100mm rai
 assert.strictEqual(selectedConfirmPayload[0].pricing_reference_description, "m2 100mm raised platform with aluminum edging");
 assert.strictEqual(selectedConfirmPayload[0].pricing_keyword, "floor-design-100mm-raised-platform-with-aluminum-edging");
 assert.strictEqual(selectedConfirmPayload[0].source_basis_line_id, "raised-platform");
+assert.strictEqual(selectedConfirmPayload[0].output_unit_locked, true);
 state.quoteBasisSections = originalBasisSections;
 
 state.quoteBasisSections = [{

@@ -1149,6 +1149,37 @@ function genericFailureMessages(data = {}) {
   return [genericFailureMessage(data)];
 }
 
+function aiAnalysisInvalidReferenceMessage(data = {}) {
+  const sources = [];
+  if (typeof data === "string") sources.push(data);
+  if (data && typeof data === "object") {
+    ["message", "error", "failure_kind"].forEach((key) => sources.push(data[key]));
+    ["errors", "provider_errors", "warnings"].forEach((key) => {
+      const value = data[key];
+      if (Array.isArray(value)) sources.push(...value);
+      else sources.push(value);
+    });
+  }
+  const joined = sources.map((value) => String(value || "").toLowerCase()).join(" ");
+  if (
+    joined.includes("no usable quote basis")
+    || joined.includes("model_output_invalid")
+    || joined.includes("returned output that could not be used")
+  ) {
+    return "The uploaded reference is not a valid quote reference for AI analysis. Upload a valid booth render, plan, or scope reference, then run analysis again.";
+  }
+  return "";
+}
+
+function aiAnalysisFailureMessage(data = {}) {
+  const invalidReferenceMessage = aiAnalysisInvalidReferenceMessage(data);
+  if (invalidReferenceMessage) {
+    const reference = typeof data === "string" ? "" : errorReferenceFrom(data);
+    return reference ? `${invalidReferenceMessage} Reference: ${reference}.` : invalidReferenceMessage;
+  }
+  return genericFailureMessage(data);
+}
+
 function fetchFailureLogDetails(url, details = {}) {
   return { url, reason: "fetch_failed", ...details };
 }
@@ -7072,6 +7103,7 @@ function outputRowsToLineItems(rows = state.outputRows) {
       description: String(row.description || "").trim(),
       quantity: row.quantity,
       unit: normalizeUnit(row.unit || ""),
+      output_unit_locked: true,
       pricing_keyword: row.pricing_keyword || "",
       price_mode: row.price_mode === "Included" ? "Included" : "Priced",
       source_basis_line_id: row.source_basis_line_id || "",
@@ -8805,7 +8837,7 @@ function showAiFailedDraftState(data = {}) {
   state.aiFailed = true;
   state.draftSource = data.source || "local";
   state.lastAnalysisMode = normalizeAnalysisMode(data.analysis_mode || state.lastAnalysisMode);
-  const message = genericFailureMessage(data);
+  const message = aiAnalysisFailureMessage(data);
   setWorkflowStage("basis_review");
   showAiFailureBanner(message);
   renderBasisFailureState(message);
