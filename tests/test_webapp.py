@@ -3804,6 +3804,18 @@ class WebappServerTest(unittest.TestCase):
         result = deploy_template.verify_template(ROOT / "deploy" / "internal-uat" / "coolify" / "sqag.uat.env.example")
 
         self.assertEqual(result["status"], "ready", [deploy_template.finding_to_dict(finding) for finding in result["findings"]])
+        values, _ = deploy_template.parse_env_template(ROOT / "deploy" / "internal-uat" / "coolify" / "sqag.uat.env.example")
+        self.assertEqual(values["SQAG_ARTIFACT_STORAGE_MODE"], "object")
+        for key in (
+            "SQAG_OBJECT_STORAGE_PROVIDER",
+            "SQAG_OBJECT_STORAGE_ENDPOINT_URL",
+            "SQAG_OBJECT_STORAGE_BUCKET",
+            "SQAG_OBJECT_STORAGE_REGION",
+            "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID",
+            "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY",
+        ):
+            self.assertIn(key, values)
+            self.assertTrue(deploy_template.is_placeholder(values[key]), key)
 
     def test_internal_uat_coolify_env_template_blocks_real_values_and_bad_roots(self):
         source = ROOT / "deploy" / "internal-uat" / "coolify" / "sqag.uat.env.example"
