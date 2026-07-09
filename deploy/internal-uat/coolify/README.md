@@ -21,6 +21,9 @@ Recommended app settings:
 - Storage posture: `SQAG_STORAGE_MODE=database` and
   `SQAG_ARTIFACT_STORAGE_MODE=object` with the canonical
   `SQAG_OBJECT_STORAGE_*` names supplied through the host secret manager
+- Auth posture: `AUTH_REQUIRED=true`, a host-secret-managed `SESSION_SECRET`
+  of at least 32 characters, and HTTPS auth/platform upstream URLs except for
+  explicit loopback-only local smoke endpoints
 
 Before starting deploy-mode UAT, set the env values in Coolify secrets or
 environment management and run:
