@@ -291,6 +291,7 @@ LOCAL_USER_ROLE_ENV_NAME = "LOCAL_USER_ROLE"
 SESSION_COOKIE_NAME = "swooshz_quote_session"
 OIDC_STATE_COOKIE_NAME = "swooshz_quote_oidc_state"
 SESSION_COOKIE_MAX_AGE_SECONDS = 8 * 60 * 60
+MIN_DEPLOY_SESSION_SECRET_CHARS = 32
 OIDC_PROVIDER_TIMEOUT_SECONDS = 15
 OIDC_PROVIDER_MAX_RESPONSE_BYTES = 128 * 1024
 PLATFORM_LAUNCH_ENDPOINT = "/api/platform/launch"
@@ -913,6 +914,8 @@ def sanitize_log_value(value: Any) -> Any:
                 sanitized[key] = "[omitted]"
             elif "api_key" in key_text or "authorization" in key_text or key_text in {"token", "secret"}:
                 sanitized[key] = SECRET_REDACTION
+            elif key_text in {"path", "url", "request_target"} and isinstance(item, str):
+                sanitized[key] = scrub_sensitive_text(redact_request_target_for_log(item))[:5000]
             else:
                 sanitized[key] = sanitize_log_value(item)
         return sanitized
@@ -1448,6 +1451,8 @@ def configured_platform_base_url() -> str:
     parsed = urlparse(base_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment:
         return ""
+    if not url_uses_https_or_loopback_http(base_url):
+        return ""
     return base_url
 
 
@@ -1462,7 +1467,7 @@ def platform_launch_consume_url() -> str:
 
 
 def platform_launch_config_complete() -> bool:
-    return bool(platform_launch_mode_enabled() and session_secret() and configured_platform_base_url())
+    return bool(platform_launch_mode_enabled() and deploy_session_secret_ready() and configured_platform_base_url())
 
 
 def allowed_auth_emails() -> set[str]:
@@ -1489,7 +1494,7 @@ def auth_allowlist_configured() -> bool:
 def oidc_config_complete() -> bool:
     config = oidc_config()
     return bool(
-        clean_text(read_dotenv_value(SESSION_SECRET_ENV_NAME))
+        deploy_session_secret_ready()
         and config["issuer_url"]
         and config["client_id"]
         and config["client_secret"]
@@ -1497,6 +1502,7 @@ def oidc_config_complete() -> bool:
         and config["authorize_url"]
         and config["token_url"]
         and config["userinfo_url"]
+        and oidc_config_urls_secure(config)
         and auth_allowlist_configured()
     )
 
@@ -1508,9 +1514,11 @@ def auth_required() -> bool:
 
 
 def deploy_requires_auth_guard() -> bool:
-    return configured_app_mode() == "deploy" and auth_required() and not (
-        oidc_config_complete() or platform_launch_config_complete()
-    )
+    if configured_app_mode() != "deploy":
+        return False
+    if not auth_required():
+        return True
+    return not (oidc_config_complete() or platform_launch_config_complete())
 
 
 def email_domain(email: str) -> str:
@@ -1542,6 +1550,40 @@ def b64url_decode(value: str) -> bytes:
 
 def session_secret() -> str:
     return clean_text(read_dotenv_value(SESSION_SECRET_ENV_NAME))
+
+
+def deploy_session_secret_ready() -> bool:
+    if configured_app_mode() != "deploy":
+        return bool(session_secret())
+    return len(session_secret()) >= MIN_DEPLOY_SESSION_SECRET_CHARS
+
+
+def url_hostname(value: str) -> str:
+    return clean_text(urlparse(value).hostname).lower().rstrip(".")
+
+
+def is_loopback_url(value: str) -> bool:
+    return url_hostname(value) in ALLOWED_LOCAL_HOSTS
+
+
+def url_uses_https_or_loopback_http(value: str) -> bool:
+    parsed = urlparse(clean_text(value))
+    if not parsed.scheme or not parsed.netloc:
+        return False
+    if parsed.scheme == "https":
+        return True
+    return parsed.scheme == "http" and is_loopback_url(value)
+
+
+def oidc_config_urls_secure(config: dict[str, str]) -> bool:
+    required_urls = (
+        "issuer_url",
+        "redirect_uri",
+        "authorize_url",
+        "token_url",
+        "userinfo_url",
+    )
+    return all(url_uses_https_or_loopback_http(config.get(name, "")) for name in required_urls)
 
 
 def signed_cookie_value(payload: dict[str, Any], *, max_age_seconds: int = SESSION_COOKIE_MAX_AGE_SECONDS) -> str:
@@ -1934,10 +1976,14 @@ def deploy_uat_preflight_status() -> dict[str, Any]:
 
     add(APP_MODE_ENV_NAME, configured_app_mode() == "deploy", "must be set to deploy")
     add(AUTH_REQUIRED_ENV_NAME, configured_bool(AUTH_REQUIRED_ENV_NAME, False), "must be explicitly true")
-    add(SESSION_SECRET_ENV_NAME, bool(clean_text(read_dotenv_value(SESSION_SECRET_ENV_NAME))), "must be present")
+    add(
+        SESSION_SECRET_ENV_NAME,
+        deploy_session_secret_ready(),
+        f"must be at least {MIN_DEPLOY_SESSION_SECRET_CHARS} characters",
+    )
     if platform_launch_mode_enabled():
         add(PLATFORM_LAUNCH_MODE_ENV_NAME, configured_platform_launch_mode() == "platform", "must be set to platform")
-        add(PLATFORM_BASE_URL_ENV_NAME, bool(configured_platform_base_url()), "must be an http(s) platform base URL")
+        add(PLATFORM_BASE_URL_ENV_NAME, bool(configured_platform_base_url()), "must be an https or loopback http platform base URL")
     else:
         for name in (
             OIDC_ISSUER_URL_ENV_NAME,
@@ -1949,6 +1995,14 @@ def deploy_uat_preflight_status() -> dict[str, Any]:
             OIDC_USERINFO_URL_ENV_NAME,
         ):
             add(name, bool(clean_text(read_dotenv_value(name))), "must be present")
+        for name in (
+            OIDC_ISSUER_URL_ENV_NAME,
+            OIDC_REDIRECT_URI_ENV_NAME,
+            OIDC_AUTHORIZE_URL_ENV_NAME,
+            OIDC_TOKEN_URL_ENV_NAME,
+            OIDC_USERINFO_URL_ENV_NAME,
+        ):
+            add(name, url_uses_https_or_loopback_http(read_dotenv_value(name)), "must be https or loopback http")
         add(
             f"{AUTH_ALLOWED_EMAILS_ENV_NAME} or {AUTH_ALLOWED_DOMAINS_ENV_NAME}",
             auth_allowlist_configured(),
@@ -15651,6 +15705,10 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/jobs":
             job_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
             job_type = clean_text(payload.get("type") or payload.get("job_type"))
+            allowed, error = self.require_permission("canGenerateQuote")
+            if not allowed:
+                self.send_json(error, status=403)
+                return
             result = create_job(job_type, job_payload, ai_tracking_context=request_ai_tracking, auth_session=self.current_auth_session())
             if result.get("status") == "blocked":
                 self.send_json(result, status=400)
@@ -15689,6 +15747,10 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/draft":
+            allowed, error = self.require_permission("canGenerateQuote")
+            if not allowed:
+                self.send_json(error, status=403)
+                return
             with ai_log_tracking_scope(request_ai_tracking):
                 if not image_entries(payload):
                     errors = safe_error_messages([MISSING_IMAGES_MESSAGE])
@@ -15736,6 +15798,10 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/generate":
+            allowed, error = self.require_permission("canGenerateQuote")
+            if not allowed:
+                self.send_json(error, status=403)
+                return
             try:
                 result = run_quote_job(payload, auth_session=self.current_auth_session())
             except Exception as exc:  # pragma: no cover - defensive HTTP boundary
@@ -15881,6 +15947,12 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         return False
 
     def handle_platform_launch(self) -> None:
+        if deploy_requires_auth_guard():
+            self.send_json({
+                "status": "blocked",
+                "errors": ["Deploy mode requires a complete auth boundary before serving the app."],
+            }, status=503)
+            return
         if not platform_launch_mode_enabled():
             self.send_json({"error": "Not found"}, status=404)
             return
@@ -15923,8 +15995,6 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         )
 
     def block_unauthenticated_request(self, path: str) -> bool:
-        if not auth_required():
-            return False
         if path.startswith("/static/") or path in {"/api/health", "/privacy"}:
             return False
         if deploy_requires_auth_guard():
@@ -15933,6 +16003,8 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 "errors": ["Deploy mode requires a complete auth boundary before serving the app."],
             }, status=503)
             return True
+        if not auth_required():
+            return False
         if self.current_auth_session():
             return False
         if self.command == "GET" and not path.startswith("/api/"):
@@ -15946,6 +16018,12 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         return True
 
     def handle_login(self) -> None:
+        if deploy_requires_auth_guard():
+            self.send_json({
+                "status": "blocked",
+                "errors": ["Deploy mode requires a complete auth boundary before serving the app."],
+            }, status=503)
+            return
         if not auth_required():
             self.send_redirect("/")
             return
@@ -15973,6 +16051,12 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         self.send_redirect(oidc_authorize_url(state), extra_headers=[("Set-Cookie", state_cookie)])
 
     def handle_oidc_callback(self, query: str) -> None:
+        if deploy_requires_auth_guard():
+            self.send_json({
+                "status": "blocked",
+                "errors": ["Deploy mode requires a complete auth boundary before serving the app."],
+            }, status=503)
+            return
         if not auth_required():
             self.send_redirect("/")
             return
@@ -16304,9 +16388,9 @@ def main() -> int:
         return 0 if status["production_ready"] else 2
     if deploy_requires_auth_guard():
         safe_stderr(
-            "Refusing deploy mode without a complete auth boundary. Configure SESSION_SECRET with OIDC_* "
-            "settings or SQAG_PLATFORM_LAUNCH_MODE=platform with SQAG_PLATFORM_BASE_URL, or run APP_MODE=local "
-            "for localhost-only use.\n"
+            "Refusing deploy mode without a complete auth boundary. Set AUTH_REQUIRED=true, configure a strong "
+            "SESSION_SECRET with HTTPS OIDC_* settings or SQAG_PLATFORM_LAUNCH_MODE=platform with an HTTPS "
+            "SQAG_PLATFORM_BASE_URL, or run APP_MODE=local for localhost-only use.\n"
         )
         return 2
     if not is_safe_bind_host(args.host):

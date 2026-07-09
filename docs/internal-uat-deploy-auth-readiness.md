@@ -22,9 +22,11 @@ The deploy/auth surface is already represented in `.env.example` and
 - `APP_MODE=deploy`: gated deploy mode. The server defaults to a deploy bind
   host and `AUTH_REQUIRED=true`.
 - `AUTH_REQUIRED`: explicit auth gate toggle. In deploy mode, leaving this
-  unset still defaults to auth required.
+  unset still defaults to auth required. Setting it to `false` is treated as an
+  incomplete auth boundary and must not be used for hosted UAT.
 - `SESSION_SECRET`: required for signed session and OIDC state cookies when
-  deploy auth is enabled. Never print or commit the value.
+  deploy auth is enabled. It must be at least 32 characters. Never print or
+  commit the value.
 - `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`,
   `OIDC_REDIRECT_URI`, `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL`,
   `OIDC_USERINFO_URL`, and `OIDC_LOGOUT_URL`: OIDC settings used by the deploy
@@ -32,7 +34,8 @@ The deploy/auth surface is already represented in `.env.example` and
   `OIDC_USERINFO_URL` are explicit provider endpoints; the app does not guess
   the authorize endpoint from the issuer. `OIDC_LOGOUT_URL` is optional; the
   other OIDC fields plus `SESSION_SECRET` are required for a complete auth
-  boundary.
+  boundary. OIDC URL fields must use HTTPS, except loopback HTTP is allowed for
+  local smoke-only endpoints.
 - `AUTH_ALLOWED_EMAILS`: comma-separated exact tester email allowlist.
 - `AUTH_ALLOWED_DOMAINS`: comma-separated tester email-domain allowlist.
 - `AUTH_ALLOW_ANY_AUTHENTICATED_USER`: internal UAT escape hatch only. Keep it
@@ -49,7 +52,8 @@ The deploy/auth surface is already represented in `.env.example` and
 - `SQAG_DATABASE_URL`: database connection configured through the host secret
   manager only.
 - `SQAG_PLATFORM_LAUNCH_MODE` and `SQAG_PLATFORM_BASE_URL`: platform/workspace
-  launch context for protected hosted use.
+  launch context for protected hosted use. The platform base URL must use
+  HTTPS, except loopback HTTP is allowed for local smoke-only endpoints.
 - `QUOTE_DATA_ROOT`: runtime housekeeping root; not the hosted source of truth
   for profile/pricing/session data.
 - `QUOTE_OUTPUT_ROOT`: output staging root; not durable hosted artifact storage.
@@ -93,6 +97,7 @@ Use this shape only for local/offline validation of the gated UAT boundary:
 - Single app instance.
 - `APP_MODE=deploy`.
 - `AUTH_REQUIRED=true`.
+- `SESSION_SECRET` is at least 32 characters.
 - `SQAG_STORAGE_MODE=database`.
 - `SQAG_ARTIFACT_STORAGE_MODE=object` for hosted/protected/deploy readiness
   evidence; `database` is allowed only for local-UAT/synthetic negative tests.
@@ -151,13 +156,14 @@ Pass means:
 
 - `APP_MODE=deploy`.
 - `AUTH_REQUIRED=true`.
-- `SESSION_SECRET` is present.
+- `SESSION_SECRET` is at least 32 characters.
 - Database storage is selected, and database artifact/BLOB mode is not treated
   as hosted/protected/deploy readiness evidence.
 - Required platform launch settings are present, or required OIDC
   endpoint/client settings are present for the OIDC fallback path.
 - `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL`, and `OIDC_USERINFO_URL` are provided
-  explicitly when OIDC is used.
+  explicitly when OIDC is used and use HTTPS except for loopback-only local
+  smoke endpoints.
 - An internal allowlist or explicit internal escape hatch is configured.
 - `AUTH_APPROVED_TESTER_ROLE` is valid.
 - Runtime housekeeping roots are set and outside the repository.

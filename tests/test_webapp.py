@@ -3074,6 +3074,10 @@ class WebappServerTest(unittest.TestCase):
             self.assertTrue(webapp.is_allowed_host_header("127.0.0.1:8765"))
             self.assertFalse(webapp.is_safe_bind_host("0.0.0.0"))
 
+        with mock.patch.dict(os.environ, self.deploy_auth_env(AUTH_REQUIRED="false"), clear=True):
+            self.assertTrue(webapp.deploy_requires_auth_guard())
+            self.assertFalse(webapp.is_allowed_host_header("quote.example"))
+
     def test_deploy_auth_scaffold_signs_sessions_and_maps_oidc_claims(self):
         env = self.deploy_auth_env()
         with mock.patch.dict(os.environ, env, clear=True):
@@ -3121,6 +3125,32 @@ class WebappServerTest(unittest.TestCase):
             ),
             clear=True,
         ):
+            self.assertFalse(webapp.deploy_requires_auth_guard())
+
+    def test_deploy_auth_requires_strong_secret_and_secure_upstream_urls(self):
+        with mock.patch.dict(os.environ, self.deploy_auth_env(SESSION_SECRET="short"), clear=True):
+            status = webapp.deploy_uat_preflight_status()
+
+            self.assertFalse(webapp.oidc_config_complete())
+            self.assertTrue(webapp.deploy_requires_auth_guard())
+        self.assertTrue(any(check["name"] == "SESSION_SECRET" and not check["ok"] for check in status["checks"]))
+
+        with mock.patch.dict(os.environ, self.deploy_auth_env(OIDC_TOKEN_URL="http://identity.example/token"), clear=True):
+            status = webapp.deploy_uat_preflight_status()
+
+            self.assertFalse(webapp.oidc_config_complete())
+            self.assertTrue(webapp.deploy_requires_auth_guard())
+        self.assertTrue(any(check["name"] == "OIDC_TOKEN_URL" and not check["ok"] for check in status["checks"]))
+
+        with mock.patch.dict(os.environ, self.platform_launch_env(SQAG_PLATFORM_BASE_URL="http://platform.example.test"), clear=True):
+            self.assertEqual(webapp.configured_platform_base_url(), "")
+            self.assertFalse(webapp.platform_launch_config_complete())
+            self.assertTrue(webapp.deploy_requires_auth_guard())
+
+        loopback_platform_url = "http://127.0.0.1:4317"
+        with mock.patch.dict(os.environ, self.platform_launch_env(SQAG_PLATFORM_BASE_URL=loopback_platform_url), clear=True):
+            self.assertEqual(webapp.configured_platform_base_url(), loopback_platform_url)
+            self.assertTrue(webapp.platform_launch_config_complete())
             self.assertFalse(webapp.deploy_requires_auth_guard())
 
     def test_deploy_auth_routes_block_unauthenticated_access_and_redirect_login(self):
@@ -3813,7 +3843,10 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(safe_logout_redirect.exception.headers["Location"], "/signed-out")
 
     def test_deploy_uat_preflight_reports_missing_config_without_values(self):
-        env = self.deploy_auth_env(OIDC_CLIENT_SECRET="client-secret-sensitive", SESSION_SECRET="session-secret-sensitive")
+        env = self.deploy_auth_env(
+            OIDC_CLIENT_SECRET="client-secret-sensitive",
+            SESSION_SECRET="session-secret-sensitive-with-enough-length",
+        )
         env.update(self.hosted_storage_env(SQAG_DATABASE_URL="sqlite:///sensitive-preflight.sqlite3"))
         tmp = Path(tempfile.gettempdir()) / f"sqag-deploy-preflight-{time.time_ns()}"
         env.update({
@@ -8581,6 +8614,28 @@ class WebappServerTest(unittest.TestCase):
             )
             response = json.loads(urllib.request.urlopen(valid, timeout=3).read().decode("utf-8"))
             self.assertEqual(response["status"], "logged")
+
+    def test_structured_security_log_redacts_sensitive_request_targets(self):
+        log_root = test_temp_root() / f"security-log-redaction-{time.time_ns()}"
+        self.assertTrue(webapp.write_local_log(
+            "security_event",
+            {
+                "reason": "untrusted_host",
+                "path": "/callback?code=raw-auth-code&state=raw-state&safe=visible",
+                "status": 403,
+            },
+            log_root=log_root,
+        ))
+        log_files = list((log_root / "security").glob("*.jsonl"))
+        self.assertEqual(len(log_files), 1)
+        log_text = log_files[0].read_text(encoding="utf-8")
+
+        self.assertIn("code=redacted", log_text)
+        self.assertIn("state=redacted", log_text)
+        self.assertIn("safe=redacted", log_text)
+        self.assertNotIn("raw-auth-code", log_text)
+        self.assertNotIn("raw-state", log_text)
+        self.assertNotIn("visible", log_text)
 
     def test_run_quote_job_failed_response_uses_generic_reference(self):
         completed = mock.Mock(
@@ -22507,6 +22562,34 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertEqual(error.exception.code, 403)
         self.assertIn("You do not have permission to perform this action.", body_text)
         self.assertNotIn("10.5", body_text)
+
+    def test_quote_generation_endpoints_require_quote_permission(self):
+        cases = [
+            ("/api/jobs", {"type": "generate", "payload": valid_payload()}),
+            ("/api/draft", valid_payload()),
+            ("/api/generate", valid_payload()),
+        ]
+
+        with mock.patch.dict(os.environ, {"APP_MODE": "local", "USER_TYPE": "viewer"}, clear=False):
+            with LocalRunnerServer() as runner:
+                session = json.loads(urllib.request.urlopen(f"{runner.base_url}/api/session", timeout=3).read().decode("utf-8"))
+                for path, payload in cases:
+                    with self.subTest(path=path):
+                        request = urllib.request.Request(
+                            f"{runner.base_url}{path}",
+                            data=json.dumps(payload).encode("utf-8"),
+                            headers={
+                                "Content-Type": "application/json",
+                                session["csrf_header"]: session["csrf_token"],
+                            },
+                            method="POST",
+                        )
+                        with self.assertRaises(urllib.error.HTTPError) as error:
+                            urllib.request.urlopen(request, timeout=3)
+                        body_text = error.exception.read().decode("utf-8")
+
+                        self.assertEqual(error.exception.code, 403)
+                        self.assertIn("You do not have permission to perform this action.", body_text)
 
     def test_line_item_normalize_endpoint_uses_selected_basis_catalog_match_on_first_confirm(self):
         payload = {
