@@ -10,9 +10,11 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import importlib.util
+import ipaddress
 import re
 from dataclasses import asdict, dataclass
 from typing import Mapping, Protocol
+from urllib.parse import urlparse
 
 
 SAFE_SEGMENT_RE = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -131,6 +133,23 @@ def _optional_s3_sdk_available() -> bool:
     return importlib.util.find_spec("boto3") is not None
 
 
+def _endpoint_uses_https_or_loopback_http(value: object) -> bool:
+    parsed = urlparse(_clean_config_value(value))
+    if not parsed.scheme or not parsed.netloc:
+        return False
+    if parsed.scheme == "https":
+        return True
+    if parsed.scheme != "http":
+        return False
+    hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+    if hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
 def object_storage_provider_status(env: Mapping[str, str] | None) -> dict[str, object]:
     """Return metadata-only provider configuration status.
 
@@ -174,16 +193,20 @@ def object_storage_provider_status(env: Mapping[str, str] | None) -> dict[str, o
         )
         return base
 
+    endpoint_url = _clean_config_value((env or {}).get(OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME))
+    endpoint_transport_ok = _endpoint_uses_https_or_loopback_http(endpoint_url)
     missing_fields = [
         name
         for name in S3_COMPATIBLE_REQUIRED_ENV_NAMES
         if not _clean_config_value((env or {}).get(name))
     ]
     sdk_available = _optional_s3_sdk_available()
-    configured = not missing_fields
+    configured = not missing_fields and endpoint_transport_ok
     blockers = []
     if missing_fields:
         blockers.append("missing_provider_config")
+    if endpoint_url and not endpoint_transport_ok:
+        blockers.append("insecure_endpoint_url")
     if not sdk_available:
         blockers.append("optional_s3_sdk_missing")
     if configured and sdk_available:

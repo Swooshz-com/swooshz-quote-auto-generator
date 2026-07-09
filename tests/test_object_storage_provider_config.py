@@ -129,6 +129,42 @@ class ObjectStorageProviderConfigTest(unittest.TestCase):
                 continue
             self.assertNotIn(value, text)
 
+    def test_s3_compatible_provider_accepts_loopback_http_endpoint_for_local_smoke(self):
+        env = {
+            "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "http://127.0.0.1:9000",
+            "SQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
+            "SQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
+            "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
+            "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
+        }
+
+        with mock.patch.object(object_storage, "_optional_s3_sdk_available", return_value=True):
+            status = object_storage.object_storage_provider_status(env)
+
+        self.assertTrue(status["configured"])
+        self.assertTrue(status["runtime_backend_available"])
+        self.assertNotIn("insecure_endpoint_url", status["blockers"])
+
+    def test_s3_compatible_provider_rejects_remote_plain_http_endpoint(self):
+        env = {
+            "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "http://object-store.example.test",
+            "SQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
+            "SQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
+            "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
+            "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
+        }
+
+        with mock.patch.object(object_storage, "_optional_s3_sdk_available", return_value=True):
+            status = object_storage.object_storage_provider_status(env)
+        text = json.dumps(status, sort_keys=True)
+
+        self.assertFalse(status["configured"])
+        self.assertFalse(status["runtime_backend_available"])
+        self.assertIn("insecure_endpoint_url", status["blockers"])
+        self.assertNotIn(env["SQAG_OBJECT_STORAGE_ENDPOINT_URL"], text)
+
     def test_legacy_sqag_provider_env_is_ignored(self):
         legacy_prefix = "K" + "QAG"
         status = object_storage.object_storage_provider_status(

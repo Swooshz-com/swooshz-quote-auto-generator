@@ -584,6 +584,38 @@ def scrub_sensitive_text(text: str) -> str:
             rf"\1{redaction}",
             scrubbed,
         )
+    for env_name in (
+        SQAG_DATABASE_URL_ENV_NAME,
+        OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME,
+        OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME,
+        OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME,
+        OBJECT_STORAGE_BUCKET_ENV_NAME,
+    ):
+        scrubbed = re.sub(
+            rf"(?i)({re.escape(env_name)}\s*=\s*)([^\s,;]+)",
+            rf"\1{SECRET_REDACTION}",
+            scrubbed,
+        )
+    scrubbed = re.sub(
+        r"(?i)\b((?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|sqlite)://)([^\s\"'<>]+)",
+        rf"\1{SECRET_REDACTION}",
+        scrubbed,
+    )
+    scrubbed = re.sub(
+        r"(?i)\b((?:password|secret|token|api[_ -]?key|access[_ -]?key|secret[_ -]?key|credential|dsn)\s*[:=]\s*)([^\s,;]+)",
+        rf"\1{SECRET_REDACTION}",
+        scrubbed,
+    )
+    scrubbed = re.sub(
+        r"(?i)\b[A-Z]:\\Users\\[^ \r\n\t\"'<>]+",
+        LOCAL_SECRET_REDACTION,
+        scrubbed,
+    )
+    scrubbed = re.sub(
+        r"(?i)(?<![\w.-])/(?:home|users)/[^ \r\n\t\"'<>]+",
+        LOCAL_SECRET_REDACTION,
+        scrubbed,
+    )
     scrubbed = re.sub(r"sk-[A-Za-z0-9_-]+", SECRET_REDACTION, scrubbed)
     return scrubbed
 
@@ -1521,6 +1553,28 @@ def deploy_requires_auth_guard() -> bool:
     return not (oidc_config_complete() or platform_launch_config_complete())
 
 
+def deploy_storage_posture_ready() -> bool:
+    if configured_storage_mode() != "database":
+        return False
+    if configured_database_family() != "postgres_compatible":
+        return False
+    if not postgres_metadata_storage_adapter_supported() or not postgres_driver_available():
+        return False
+    if configured_artifact_storage_mode() != "object":
+        return False
+    object_status = configured_object_storage_status()
+    return bool(
+        object_status.get("provider") == "s3_compatible"
+        and object_status.get("configured")
+        and object_status.get("runtime_backend_available")
+        and "insecure_endpoint_url" not in set(object_status.get("blockers") or [])
+    )
+
+
+def deploy_requires_storage_guard() -> bool:
+    return configured_app_mode() == "deploy" and not deploy_storage_posture_ready()
+
+
 def email_domain(email: str) -> str:
     normalized = clean_text(email).lower()
     if "@" not in normalized:
@@ -2016,8 +2070,12 @@ def deploy_uat_preflight_status() -> dict[str, Any]:
     add(SQAG_STORAGE_MODE_ENV_NAME, configured_storage_mode() == "database", "must be database for hosted/deploy validation")
     add(SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME, configured_artifact_storage_mode() == "object", "must be object for hosted/deploy validation")
     add(SQAG_DATABASE_URL_ENV_NAME, bool(clean_text(read_dotenv_value(SQAG_DATABASE_URL_ENV_NAME))), "must be present")
+    add(f"{SQAG_DATABASE_URL_ENV_NAME} provider", configured_database_family() == "postgres_compatible", "must be Postgres-compatible for hosted/deploy validation")
+    add("psycopg", postgres_driver_available(), "must be available for Postgres-compatible hosted storage")
     object_storage_status = configured_object_storage_status()
     add(OBJECT_STORAGE_PROVIDER_ENV_NAME, object_storage_status.get("provider") == "s3_compatible", "must be s3_compatible")
+    add(f"{OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME} transport", "insecure_endpoint_url" not in set(object_storage_status.get("blockers") or []), "must be https or loopback http")
+    add("object storage runtime backend", bool(object_storage_status.get("runtime_backend_available")), "must be available for hosted/deploy artifact storage")
     for name in (
         OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME,
         OBJECT_STORAGE_BUCKET_ENV_NAME,
@@ -8269,7 +8327,7 @@ class DatabaseSqagStorage:
         profile_id = safe_resource_id(profile.get("id") or profile.get("label"), "")
         if not profile_id:
             raise ValueError("Profile id is required and may only contain letters, numbers, dashes, or underscores.")
-        if configured_artifact_storage_mode() == "database":
+        if configured_artifact_storage_mode() in {"database", "object"}:
             self._store_profile_pack_artifacts(profile_id, profile)
         stored = {key: copy.deepcopy(value) for key, value in profile.items() if key not in {"_pack_assets", "pack", "profile_pack"}}
         stored["id"] = profile_id
@@ -8301,7 +8359,7 @@ class DatabaseSqagStorage:
             raise ValueError("Pricing reference id is required and may only contain letters, numbers, dashes, or underscores.")
         stored = copy.deepcopy(reference)
         stored["id"] = reference_id
-        if configured_artifact_storage_mode() == "database":
+        if configured_artifact_storage_mode() in {"database", "object"}:
             stored = self._store_pricing_visual_artifacts(reference_id, stored)
         self._upsert_payload("sqag_pricing_references", "reference_id", reference_id, stored)
         return public_company_pricing_reference(stored)
@@ -8381,13 +8439,129 @@ class DatabaseSqagStorage:
             "content": content,
         }
 
+    def _object_artifact_row(self, owner_type: str, owner_id: str, artifact_kind: str) -> sqlite3.Row | None:
+        safe_owner_type = safe_resource_id(owner_type, "")
+        safe_owner_id = safe_resource_id(owner_id, "")
+        safe_kind = safe_resource_id(artifact_kind, "")
+        if not safe_owner_type or not safe_owner_id or not safe_kind:
+            return None
+        with self.connection() as connection:
+            row = connection.execute(
+                "select artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at "
+                "from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ? and status = ? and retention_status = ? and deleted_at is null",
+                (self.workspace_id, safe_owner_type, safe_owner_id, safe_kind, "active", "active"),
+            ).fetchone()
+        if not row or len(clean_text(row["checksum_sha256"])) != 64 or not clean_text(row["object_key_ref"]):
+            return None
+        return row
+
+    def _upsert_object_file_artifact(
+        self,
+        owner_type: str,
+        owner_id: str,
+        artifact_kind: str,
+        filename: str,
+        content_type: str,
+        metadata: ObjectArtifactMetadata,
+    ) -> None:
+        safe_owner_type = safe_resource_id(owner_type, "")
+        safe_owner_id = safe_resource_id(owner_id, "")
+        safe_kind = safe_resource_id(artifact_kind, "")
+        safe_filename = safe_segment(filename, safe_kind or "artifact")
+        if not safe_owner_type or not safe_owner_id or not safe_kind or not safe_filename:
+            raise ObjectStorageContractError("Artifact metadata is incomplete.")
+        artifact_id = f"obj-{secrets.token_hex(12)}"
+        now = utc_timestamp()
+        with self.connection() as connection:
+            connection.execute(
+                "insert into sqag_object_artifacts (artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at) "
+                "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "on conflict(workspace_id, owner_type, owner_id, artifact_kind) do update set artifact_id = excluded.artifact_id, platform_user_id = excluded.platform_user_id, session_id = excluded.session_id, job_id = excluded.job_id, filename = excluded.filename, content_type = excluded.content_type, size_bytes = excluded.size_bytes, checksum_sha256 = excluded.checksum_sha256, object_provider_type = excluded.object_provider_type, object_key_ref = excluded.object_key_ref, status = excluded.status, retention_status = excluded.retention_status, updated_at = excluded.updated_at, deleted_at = excluded.deleted_at",
+                (
+                    artifact_id,
+                    self.workspace_id,
+                    safe_owner_type,
+                    safe_owner_id,
+                    self.user_id,
+                    "",
+                    "",
+                    safe_kind,
+                    safe_filename,
+                    clean_text(content_type) or "application/octet-stream",
+                    metadata.size_bytes,
+                    metadata.checksum_sha256,
+                    "s3_compatible",
+                    metadata.storage_key,
+                    "active",
+                    "active",
+                    metadata.created_at or now,
+                    now,
+                    None,
+                ),
+            )
+            connection.commit()
+
+    def _store_object_file_artifact(
+        self,
+        owner_type: str,
+        owner_id: str,
+        artifact_kind: str,
+        filename: str,
+        content_type: str,
+        content: bytes,
+    ) -> None:
+        try:
+            backend = configured_object_storage_backend()
+            metadata = backend.store_artifact(
+                workspace_id=self.workspace_id,
+                owner_type=owner_type,
+                owner_id=owner_id,
+                artifact_kind=artifact_kind,
+                filename=filename,
+                content_type=content_type,
+                content=content,
+            )
+            self._upsert_object_file_artifact(owner_type, owner_id, artifact_kind, filename, content_type, metadata)
+        except ObjectStorageContractError as exc:
+            raise SqagStorageAccessError(
+                QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                status=503,
+                reason="object_artifact_storage_unavailable",
+            ) from exc
+
+    def _read_object_file_artifact(self, owner_type: str, owner_id: str, artifact_kind: str) -> dict[str, Any] | None:
+        row = self._object_artifact_row(owner_type, owner_id, artifact_kind)
+        if not row:
+            return None
+        object_metadata = self._object_metadata_from_row(row)
+        try:
+            content = configured_object_storage_backend().retrieve_artifact(object_metadata, workspace_id=self.workspace_id)
+        except ObjectStorageContractError:
+            return None
+        if not content or len(content) != object_metadata.size_bytes:
+            return None
+        current = self._object_artifact_row(owner_type, owner_id, artifact_kind)
+        if not current or clean_text(current["artifact_id"]) != clean_text(row["artifact_id"]):
+            return None
+        return {
+            "filename": row["filename"],
+            "content_type": row["content_type"],
+            "size_bytes": object_metadata.size_bytes,
+            "content": content,
+        }
+
     def profile_layout_artifact(self, profile_id: str) -> dict[str, Any] | None:
-        if configured_artifact_storage_mode() != "database":
+        artifact_mode = configured_artifact_storage_mode()
+        if artifact_mode not in {"database", "object"}:
             return None
         safe_id = safe_resource_id(profile_id, "")
         if not safe_id:
             return None
-        artifact = self._read_file_artifact("profile", safe_id, "quotation_layout")
+        artifact = (
+            self._read_object_file_artifact("profile", safe_id, "quotation_layout")
+            if artifact_mode == "object"
+            else self._read_file_artifact("profile", safe_id, "quotation_layout")
+        )
         if not artifact:
             return None
         content = artifact.get("content") if isinstance(artifact.get("content"), bytes) else b""
@@ -8407,14 +8581,25 @@ class DatabaseSqagStorage:
         layout = pack_assets.get("quotation_layout") if isinstance(pack_assets.get("quotation_layout"), dict) else {}
         layout_bytes = layout.get("bytes") if isinstance(layout.get("bytes"), bytes) else b""
         if layout_bytes:
-            self._upsert_file_artifact(
-                "profile",
-                profile_id,
-                "quotation_layout",
-                safe_profile_pack_filename(layout.get("filename"), "quotation-layout.xlsx", {".xlsx"}),
-                QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"],
-                layout_bytes,
-            )
+            filename = safe_profile_pack_filename(layout.get("filename"), "quotation-layout.xlsx", {".xlsx"})
+            if configured_artifact_storage_mode() == "object":
+                self._store_object_file_artifact(
+                    "profile",
+                    profile_id,
+                    "quotation_layout",
+                    filename,
+                    QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"],
+                    layout_bytes,
+                )
+            else:
+                self._upsert_file_artifact(
+                    "profile",
+                    profile_id,
+                    "quotation_layout",
+                    filename,
+                    QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"],
+                    layout_bytes,
+                )
 
     def _store_pricing_visual_artifacts(self, reference_id: str, reference: dict[str, Any]) -> dict[str, Any]:
         stored = copy.deepcopy(reference)
@@ -8440,7 +8625,10 @@ class DatabaseSqagStorage:
                     fallback = f"{safe_section_id(item.get('id'), f'item-{item_index}')}-{ref_index}"
                     filename = unique_visual_asset_filename(ref.get("source"), fallback, inline.get("mime_type", "image/png"), used_names)
                     artifact_kind = f"visual_{item_index}_{ref_index}"
-                    self._upsert_file_artifact("pricing_reference", reference_id, artifact_kind, filename, inline.get("mime_type", "image/png"), image_bytes)
+                    if configured_artifact_storage_mode() == "object":
+                        self._store_object_file_artifact("pricing_reference", reference_id, artifact_kind, filename, inline.get("mime_type", "image/png"), image_bytes)
+                    else:
+                        self._upsert_file_artifact("pricing_reference", reference_id, artifact_kind, filename, inline.get("mime_type", "image/png"), image_bytes)
                     next_ref["path"] = f"artifact://pricing-reference/{reference_id}/{artifact_kind}/{filename}"
                 if next_ref.get("path") or next_ref.get("source"):
                     next_refs.append(next_ref)
@@ -10933,10 +11121,41 @@ def payload_to_brief(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def default_quote_basis(payload: dict[str, Any]) -> dict[str, str]:
+def profile_defaults_source_for_payload(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> ProfilePack | dict[str, Any]:
+    if configured_storage_mode() == "database":
+        profile = database_profile_detail_for_payload(payload, auth_session=auth_session)
+        if not profile:
+            raise SqagStorageAccessError(
+                PROFILE_SELECTION_ERROR_MESSAGE,
+                status=400,
+                reason="workspace_profile_missing_or_unavailable",
+            )
+        return profile
+    return load_profile_pack(profile_id_from_payload(payload))
+
+
+def profile_defaults_blocked_result() -> dict[str, Any]:
+    return {"status": "blocked", "errors": [PROFILE_SELECTION_ERROR_MESSAGE]}
+
+
+def profile_default_quote_basis(profile: ProfilePack | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(profile, ProfilePack):
+        return profile.default_quote_basis
+    value = profile.get("default_quote_basis")
+    return value if isinstance(value, dict) else {}
+
+
+def profile_default_line_items(profile: ProfilePack | dict[str, Any]) -> list[Any]:
+    if isinstance(profile, ProfilePack):
+        return profile.fallback_line_items
+    value = profile.get("fallback_line_items")
+    return value if isinstance(value, list) else []
+
+
+def default_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, str]:
     basis = payload.get("quote_basis") if isinstance(payload.get("quote_basis"), dict) else {}
-    profile = load_profile_pack(profile_id_from_payload(payload))
-    profile_basis = profile.default_quote_basis
+    profile = profile_defaults_source_for_payload(payload, auth_session=auth_session)
+    profile_basis = profile_default_quote_basis(profile)
     defaults = {
         "surfaces": clean_multiline(basis.get("surfaces")) or clean_multiline(profile_basis.get("surfaces")) or "Confirm: Please confirm visible walls, fascia, arches, beams, columns, and painted finishes.",
         "counters": clean_multiline(basis.get("counters")) or clean_multiline(profile_basis.get("counters")) or "Confirm: Please confirm counter, cabinet, and countertop material/finish.",
@@ -10948,7 +11167,7 @@ def default_quote_basis(payload: dict[str, Any]) -> dict[str, str]:
     return quote_basis_with_default_dimension_confirmation(defaults, booth_dimensions_from_payload(payload))
 
 
-def default_line_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+def default_line_items(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     dimensions = booth_dimensions_from_payload(payload)
     width = parse_float_or_none(dimensions.get("booth_width"))
     depth = parse_float_or_none(dimensions.get("booth_depth"))
@@ -10958,8 +11177,8 @@ def default_line_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
     area = round(width * depth, 2)
     graphics_area = round(max(1.0, area / 2), 2)
     formula_values = {"area": area, "half_area_min_1": graphics_area}
-    profile = load_profile_pack(profile_id_from_payload(payload))
-    profile_items = profile.fallback_line_items
+    profile = profile_defaults_source_for_payload(payload, auth_session=auth_session)
+    profile_items = profile_default_line_items(profile)
     items: list[dict[str, Any]] = []
     for raw in profile_items:
         if not isinstance(raw, dict):
@@ -13758,6 +13977,13 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
     missing_env = OPENAI_API_KEY_ENV_NAME
     remote_errors: list[str] = []
 
+    if configured_storage_mode() == "database" or protected_job_routes_enabled(auth_session):
+        try:
+            profile_defaults_source_for_payload(payload, auth_session=auth_session)
+        except SqagStorageAccessError:
+            log_database_profile_resolution_block(payload)
+            return profile_defaults_blocked_result()
+
     openai_key = read_dotenv_value(OPENAI_API_KEY_ENV_NAME)
     image_count, pdf_count = ai_payload_media_counts(payload)
     analysis_mode = draft_analysis_mode(payload)
@@ -13789,7 +14015,11 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
         attempt_started_at = time.perf_counter()
         try:
             ai_basis = request_openai_quote_basis(payload, openai_key)
-            fallback_line_items = normalize_line_items(payload) or default_line_items(payload)
+            try:
+                fallback_line_items = normalize_line_items(payload) or default_line_items(payload, auth_session=auth_session)
+            except SqagStorageAccessError:
+                log_database_profile_resolution_block(payload)
+                return profile_defaults_blocked_result()
             fallback_project = booth_dimensions_from_payload(payload)
             result = finalized_remote_draft_result(
                 payload,
@@ -13856,9 +14086,13 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
             write_local_log("openai_draft_failed", {"errors": safe_error_messages([openai_error])})
 
     if remote_errors:
-        fallback_line_items = normalize_line_items(payload) or default_line_items(payload)
+        try:
+            fallback_line_items = normalize_line_items(payload) or default_line_items(payload, auth_session=auth_session)
+            fallback, fallback_sections = confirm_only_basis_from_basis(default_quote_basis(payload, auth_session=auth_session))
+        except SqagStorageAccessError:
+            log_database_profile_resolution_block(payload)
+            return profile_defaults_blocked_result()
         fallback_project = booth_dimensions_from_payload(payload)
-        fallback, fallback_sections = confirm_only_basis_from_basis(default_quote_basis(payload))
         error_reference = new_error_reference()
         warning_messages = [
             "Remote AI analysis was unavailable, so I used a local starter draft from the current quote details. Review it carefully or regenerate later.",
@@ -13891,9 +14125,13 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
         }
 
     error_reference = new_error_reference()
-    fallback_line_items = normalize_line_items(payload) or default_line_items(payload)
+    try:
+        fallback_line_items = normalize_line_items(payload) or default_line_items(payload, auth_session=auth_session)
+        fallback, fallback_sections = confirm_only_basis_from_basis(default_quote_basis(payload, auth_session=auth_session))
+    except SqagStorageAccessError:
+        log_database_profile_resolution_block(payload)
+        return profile_defaults_blocked_result()
     fallback_project = booth_dimensions_from_payload(payload)
-    fallback, fallback_sections = confirm_only_basis_from_basis(default_quote_basis(payload))
     warnings = safe_error_messages([
         f"Remote AI is not configured on this PC. Selected provider is {provider_label}. Add {missing_env} to .env, restart the local server, then regenerate analysis.",
     ])
@@ -16391,6 +16629,13 @@ def main() -> int:
             "Refusing deploy mode without a complete auth boundary. Set AUTH_REQUIRED=true, configure a strong "
             "SESSION_SECRET with HTTPS OIDC_* settings or SQAG_PLATFORM_LAUNCH_MODE=platform with an HTTPS "
             "SQAG_PLATFORM_BASE_URL, or run APP_MODE=local for localhost-only use.\n"
+        )
+        return 2
+    if deploy_requires_storage_guard():
+        safe_stderr(
+            "Refusing deploy mode without hosted storage. Set SQAG_STORAGE_MODE=database with a Postgres-compatible "
+            "SQAG_DATABASE_URL, set SQAG_ARTIFACT_STORAGE_MODE=object, and configure secure SQAG_OBJECT_STORAGE_* "
+            "provider settings before starting APP_MODE=deploy.\n"
         )
         return 2
     if not is_safe_bind_host(args.host):
