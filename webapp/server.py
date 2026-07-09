@@ -1959,6 +1959,19 @@ def deploy_uat_preflight_status() -> dict[str, Any]:
             bool(user_type_role(read_dotenv_value(AUTH_APPROVED_TESTER_ROLE_ENV_NAME))),
             "must be admin, management, operator, or viewer",
         )
+    add(SQAG_STORAGE_MODE_ENV_NAME, configured_storage_mode() == "database", "must be database for hosted/deploy validation")
+    add(SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME, configured_artifact_storage_mode() == "object", "must be object for hosted/deploy validation")
+    add(SQAG_DATABASE_URL_ENV_NAME, bool(clean_text(read_dotenv_value(SQAG_DATABASE_URL_ENV_NAME))), "must be present")
+    object_storage_status = configured_object_storage_status()
+    add(OBJECT_STORAGE_PROVIDER_ENV_NAME, object_storage_status.get("provider") == "s3_compatible", "must be s3_compatible")
+    for name in (
+        OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME,
+        OBJECT_STORAGE_BUCKET_ENV_NAME,
+        OBJECT_STORAGE_REGION_ENV_NAME,
+        OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME,
+        OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME,
+    ):
+        add(name, bool(clean_text(read_dotenv_value(name))), "must be present")
     for name in (QUOTE_DATA_ROOT_ENV_NAME, QUOTE_OUTPUT_ROOT_ENV_NAME, QUOTE_TMP_ROOT_ENV_NAME, QUOTE_LOG_ROOT_ENV_NAME):
         raw = clean_text(read_dotenv_value(name))
         add(name, bool(raw) and path_is_outside_project(Path(raw).expanduser()), "must be present and outside the repository")

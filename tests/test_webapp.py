@@ -630,6 +630,21 @@ class WebappServerTest(unittest.TestCase):
         env.update(overrides)
         return env
 
+    def hosted_storage_env(self, **overrides):
+        env = {
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "object",
+            "SQAG_DATABASE_URL": "sqlite:///synthetic-preflight.sqlite3",
+            "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
+            "SQAG_OBJECT_STORAGE_BUCKET": "synthetic-preflight-bucket",
+            "SQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
+            "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "synthetic-access-key-id",
+            "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "synthetic-secret-access-key",
+        }
+        env.update(overrides)
+        return env
+
     def synthetic_platform_launch_token(self):
         return "-".join(("synthetic", "launch", "token", "reference"))
 
@@ -3560,6 +3575,7 @@ class WebappServerTest(unittest.TestCase):
     def test_platform_launch_mode_satisfies_deploy_guard_without_oidc(self):
         runtime_root = Path(tempfile.gettempdir()) / "sqag-platform-launch-test"
         env = self.platform_launch_env(
+            **self.hosted_storage_env(),
             QUOTE_DATA_ROOT=str(runtime_root / "data"),
             QUOTE_OUTPUT_ROOT=str(runtime_root / "output"),
             QUOTE_TMP_ROOT=str(runtime_root / "tmp"),
@@ -3574,6 +3590,26 @@ class WebappServerTest(unittest.TestCase):
         self.assertIn("SQAG_PLATFORM_LAUNCH_MODE", check_names)
         self.assertIn("SQAG_PLATFORM_BASE_URL", check_names)
         self.assertNotIn("OIDC_CLIENT_SECRET", check_names)
+
+    def test_deploy_uat_preflight_blocks_local_storage_modes(self):
+        runtime_root = Path(tempfile.gettempdir()) / "sqag-deploy-local-storage-block"
+        env = self.platform_launch_env(
+            **self.hosted_storage_env(
+                SQAG_STORAGE_MODE="local",
+                SQAG_ARTIFACT_STORAGE_MODE="local",
+            ),
+            QUOTE_DATA_ROOT=str(runtime_root / "data"),
+            QUOTE_OUTPUT_ROOT=str(runtime_root / "output"),
+            QUOTE_TMP_ROOT=str(runtime_root / "tmp"),
+            QUOTE_LOG_ROOT=str(runtime_root / "logs"),
+        )
+        with mock.patch.dict(os.environ, env, clear=True):
+            status = webapp.deploy_uat_preflight_status()
+
+        checks = {check["name"]: check for check in status["checks"]}
+        self.assertEqual(status["status"], "blocked")
+        self.assertFalse(checks["SQAG_STORAGE_MODE"]["ok"])
+        self.assertFalse(checks["SQAG_ARTIFACT_STORAGE_MODE"]["ok"])
 
     def test_platform_launch_rejects_missing_token_without_platform_call(self):
         env = self.platform_launch_env()
@@ -3778,17 +3814,18 @@ class WebappServerTest(unittest.TestCase):
 
     def test_deploy_uat_preflight_reports_missing_config_without_values(self):
         env = self.deploy_auth_env(OIDC_CLIENT_SECRET="client-secret-sensitive", SESSION_SECRET="session-secret-sensitive")
-        with tempfile.TemporaryDirectory() as tmp:
-            env.update({
-                "QUOTE_DATA_ROOT": str(Path(tmp) / "data"),
-                "QUOTE_OUTPUT_ROOT": str(Path(tmp) / "out"),
-                "QUOTE_TMP_ROOT": str(Path(tmp) / "tmp"),
-                "QUOTE_LOG_ROOT": str(Path(tmp) / "logs"),
-            })
-            with mock.patch.dict(os.environ, env, clear=True):
-                ready = webapp.deploy_uat_preflight_status()
-            with mock.patch.dict(os.environ, {**env, "OIDC_AUTHORIZE_URL": "", "AUTH_ALLOWED_EMAILS": ""}, clear=True):
-                blocked = webapp.deploy_uat_preflight_status()
+        env.update(self.hosted_storage_env(SQAG_DATABASE_URL="sqlite:///sensitive-preflight.sqlite3"))
+        tmp = Path(tempfile.gettempdir()) / f"sqag-deploy-preflight-{time.time_ns()}"
+        env.update({
+            "QUOTE_DATA_ROOT": str(tmp / "data"),
+            "QUOTE_OUTPUT_ROOT": str(tmp / "out"),
+            "QUOTE_TMP_ROOT": str(tmp / "tmp"),
+            "QUOTE_LOG_ROOT": str(tmp / "logs"),
+        })
+        with mock.patch.dict(os.environ, env, clear=True):
+            ready = webapp.deploy_uat_preflight_status()
+        with mock.patch.dict(os.environ, {**env, "OIDC_AUTHORIZE_URL": "", "AUTH_ALLOWED_EMAILS": ""}, clear=True):
+            blocked = webapp.deploy_uat_preflight_status()
 
         ready_text = json.dumps(ready)
         blocked_text = json.dumps(blocked)
@@ -3799,6 +3836,7 @@ class WebappServerTest(unittest.TestCase):
         for text in (ready_text, blocked_text):
             self.assertNotIn("client-secret-sensitive", text)
             self.assertNotIn("session-secret-sensitive", text)
+            self.assertNotIn("sensitive-preflight.sqlite3", text)
 
     def test_internal_uat_coolify_env_template_is_offline_verifiable(self):
         result = deploy_template.verify_template(ROOT / "deploy" / "internal-uat" / "coolify" / "sqag.uat.env.example")
