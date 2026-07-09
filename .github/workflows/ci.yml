@@ -79,6 +79,10 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --only-binary=:all: -r requirements.txt
+          python -m pip install --only-binary=:all: pip-audit==2.9.0
+
+      - name: Audit Python dependencies
+        run: python -m pip_audit -r requirements.txt --strict
 
       - name: Install Playwright Chromium
         run: npx playwright install --with-deps chromium
@@ -97,6 +101,9 @@ jobs:
 
       - name: Guard dynamic pricing reference rules
         run: python scripts/validate_dynamic_pricing_reference_rules.py
+
+      - name: Guard sensitive fixtures
+        run: python scripts/scan_sensitive_fixtures.py --fail-on-review
 
       - name: Run Python tests
         run: python -m unittest discover -s tests

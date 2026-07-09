@@ -634,7 +634,7 @@ class WebappServerTest(unittest.TestCase):
         env = {
             "SQAG_STORAGE_MODE": "database",
             "SQAG_ARTIFACT_STORAGE_MODE": "object",
-            "SQAG_DATABASE_URL": "sqlite:///synthetic-preflight.sqlite3",
+            "SQAG_DATABASE_URL": "postgresql://sqag_user@db.example.test/sqag",
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
             "SQAG_OBJECT_STORAGE_BUCKET": "synthetic-preflight-bucket",
@@ -1557,6 +1557,86 @@ class WebappServerTest(unittest.TestCase):
         self.assertNotEqual(result.get("source"), "local")
         self.assertNotIn("quote_basis", result)
         self.assertNotIn("quote_basis_sections", result)
+        self.assertNotIn("line_items", result)
+
+    def test_hosted_draft_success_uses_workspace_profile_defaults_not_bundled_pack(self):
+        tmp_path = test_temp_root() / f"hosted-draft-workspace-defaults-{time.time_ns()}"
+        database_url = f"sqlite:///{(tmp_path / 'sqag-storage.sqlite3').as_posix()}"
+        env = isolated_env(
+            APP_MODE="deploy",
+            SQAG_STORAGE_MODE="database",
+            SQAG_DATABASE_URL=database_url,
+            OPENAI_API_KEY="sk-test-redacted",
+        )
+        payload = valid_payload()
+        payload["profile_id"] = "hosted-draft-profile"
+        payload.pop("line_items", None)
+        auth_session = self.platform_auth_session("workspace-hosted-draft-defaults")
+        ai_draft = {
+            "quote_basis_sections": [
+                {"title": "Workspace Section", "lines": [{"tag": "Confirm", "text": "Confirm workspace-scoped item.", "confidence_pct": 95}]}
+            ],
+            "line_items": [],
+        }
+        workspace_profile = {
+            "id": "hosted-draft-profile",
+            "label": "Hosted Draft Profile",
+            "default_quote_basis": {"surfaces": "Confirm: Workspace-specific walling."},
+            "fallback_line_items": [
+                {
+                    "section": "Workspace Section",
+                    "quantity_formula": "area",
+                    "unit": "sqm",
+                    "description": "Workspace fallback item",
+                    "pricing_keyword": "workspace-fallback",
+                }
+            ],
+        }
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "load_profile_pack", side_effect=AssertionError("bundled profile pack should not load")),
+            mock.patch.object(webapp, "request_openai_quote_basis", return_value=ai_draft),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(auth_session)
+            storage.save_profile(workspace_profile)
+            result = webapp.draft_quote_basis(payload, auth_session=auth_session)
+
+        self.assertEqual(result["status"], "drafted")
+        self.assertEqual(result["source"], "openai")
+        self.assertEqual(result["line_items"][0]["description"], "Workspace fallback item")
+        self.assertEqual(result["line_items"][0]["quantity"], 36)
+
+    def test_hosted_draft_missing_workspace_profile_fails_closed_without_bundled_defaults(self):
+        tmp_path = test_temp_root() / f"hosted-draft-missing-profile-{time.time_ns()}"
+        database_url = f"sqlite:///{(tmp_path / 'sqag-storage.sqlite3').as_posix()}"
+        env = isolated_env(
+            APP_MODE="deploy",
+            SQAG_STORAGE_MODE="database",
+            SQAG_DATABASE_URL=database_url,
+            OPENAI_API_KEY="sk-test-redacted",
+        )
+        payload = valid_payload()
+        payload["profile_id"] = "missing-hosted-draft-profile"
+        payload.pop("line_items", None)
+        ai_draft = {
+            "quote_basis_sections": [
+                {"title": "Workspace Section", "lines": [{"tag": "Confirm", "text": "Confirm workspace-scoped item.", "confidence_pct": 95}]}
+            ],
+            "line_items": [],
+        }
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "load_profile_pack", side_effect=AssertionError("bundled profile pack should not load")),
+            mock.patch.object(webapp, "request_openai_quote_basis", return_value=ai_draft),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            result = webapp.draft_quote_basis(payload, auth_session=self.platform_auth_session("workspace-hosted-draft-missing"))
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["errors"], [webapp.PROFILE_SELECTION_ERROR_MESSAGE])
         self.assertNotIn("line_items", result)
 
     def test_protected_draft_job_missing_remote_ai_is_blocked_not_degraded(self):
@@ -3611,7 +3691,10 @@ class WebappServerTest(unittest.TestCase):
             QUOTE_TMP_ROOT=str(runtime_root / "tmp"),
             QUOTE_LOG_ROOT=str(runtime_root / "logs"),
         )
-        with mock.patch.dict(os.environ, env, clear=True):
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch("webapp.server.path_is_outside_project", return_value=True),
+        ):
             status = webapp.deploy_uat_preflight_status()
 
             self.assertFalse(webapp.deploy_requires_auth_guard())
@@ -3640,6 +3723,76 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(status["status"], "blocked")
         self.assertFalse(checks["SQAG_STORAGE_MODE"]["ok"])
         self.assertFalse(checks["SQAG_ARTIFACT_STORAGE_MODE"]["ok"])
+
+    def test_deploy_startup_blocks_invalid_hosted_storage_posture(self):
+        cases = [
+            ("missing-storage-mode", self.deploy_auth_env()),
+            (
+                "misspelled-storage-mode",
+                self.deploy_auth_env(**self.hosted_storage_env(SQAG_STORAGE_MODE="databse")),
+            ),
+            (
+                "local-storage-mode",
+                self.deploy_auth_env(**self.hosted_storage_env(SQAG_STORAGE_MODE="local")),
+            ),
+            (
+                "sqlite-database-url",
+                self.deploy_auth_env(**self.hosted_storage_env(SQAG_DATABASE_URL="sqlite:///synthetic-local.sqlite3")),
+            ),
+            (
+                "database-artifact-mode",
+                self.deploy_auth_env(**self.hosted_storage_env(SQAG_ARTIFACT_STORAGE_MODE="database")),
+            ),
+        ]
+
+        for label, env in cases:
+            with self.subTest(label=label):
+                with (
+                    mock.patch.dict(os.environ, env, clear=True),
+                    mock.patch.object(sys, "argv", ["server.py"]),
+                    mock.patch.object(webapp.ThreadingHTTPServer, "__init__", side_effect=AssertionError("server should not start")),
+                ):
+                    self.assertTrue(webapp.deploy_requires_storage_guard())
+                    self.assertEqual(webapp.main(), 2)
+
+    def test_local_mode_does_not_require_hosted_storage_posture(self):
+        with mock.patch.dict(os.environ, {"APP_MODE": "local"}, clear=True):
+            self.assertFalse(webapp.deploy_requires_storage_guard())
+
+    def test_deploy_storage_posture_enforces_object_endpoint_transport(self):
+        runtime_root = Path(tempfile.gettempdir()) / "sqag-deploy-object-endpoint-transport"
+        base = self.deploy_auth_env(
+            **self.hosted_storage_env(),
+            QUOTE_DATA_ROOT=str(runtime_root / "data"),
+            QUOTE_OUTPUT_ROOT=str(runtime_root / "output"),
+            QUOTE_TMP_ROOT=str(runtime_root / "tmp"),
+            QUOTE_LOG_ROOT=str(runtime_root / "logs"),
+        )
+
+        for endpoint, ready in (
+            ("https://object-store.example.test", True),
+            ("http://127.0.0.1:9000", True),
+            ("http://object-store.example.test", False),
+        ):
+            with self.subTest(endpoint=endpoint):
+                env = {**base, "SQAG_OBJECT_STORAGE_ENDPOINT_URL": endpoint}
+                with (
+                    mock.patch.dict(os.environ, env, clear=True),
+                    mock.patch("webapp.server.path_is_outside_project", return_value=True),
+                ):
+                    status = webapp.deploy_uat_preflight_status()
+                    transport_checks = [
+                        check for check in status["checks"]
+                        if check["name"] == "SQAG_OBJECT_STORAGE_ENDPOINT_URL transport"
+                    ]
+                    self.assertEqual(bool(transport_checks and transport_checks[0]["ok"]), ready)
+                    self.assertEqual(webapp.deploy_requires_storage_guard(), not ready)
+                    if ready:
+                        self.assertEqual(status["status"], "ready")
+                    else:
+                        self.assertEqual(status["status"], "blocked")
+                        with self.assertRaises(webapp.ObjectStorageConfigurationError):
+                            webapp.configured_object_storage_backend()
 
     def test_platform_launch_rejects_missing_token_without_platform_call(self):
         env = self.platform_launch_env()
@@ -3847,7 +4000,7 @@ class WebappServerTest(unittest.TestCase):
             OIDC_CLIENT_SECRET="client-secret-sensitive",
             SESSION_SECRET="session-secret-sensitive-with-enough-length",
         )
-        env.update(self.hosted_storage_env(SQAG_DATABASE_URL="sqlite:///sensitive-preflight.sqlite3"))
+        env.update(self.hosted_storage_env())
         tmp = Path(tempfile.gettempdir()) / f"sqag-deploy-preflight-{time.time_ns()}"
         env.update({
             "QUOTE_DATA_ROOT": str(tmp / "data"),
@@ -3855,10 +4008,13 @@ class WebappServerTest(unittest.TestCase):
             "QUOTE_TMP_ROOT": str(tmp / "tmp"),
             "QUOTE_LOG_ROOT": str(tmp / "logs"),
         })
-        with mock.patch.dict(os.environ, env, clear=True):
-            ready = webapp.deploy_uat_preflight_status()
-        with mock.patch.dict(os.environ, {**env, "OIDC_AUTHORIZE_URL": "", "AUTH_ALLOWED_EMAILS": ""}, clear=True):
-            blocked = webapp.deploy_uat_preflight_status()
+        for key in ("QUOTE_DATA_ROOT", "QUOTE_OUTPUT_ROOT", "QUOTE_TMP_ROOT", "QUOTE_LOG_ROOT"):
+            Path(env[key]).mkdir(parents=True, exist_ok=True)
+        with mock.patch("webapp.server.path_is_outside_project", return_value=True):
+            with mock.patch.dict(os.environ, env, clear=True):
+                ready = webapp.deploy_uat_preflight_status()
+            with mock.patch.dict(os.environ, {**env, "OIDC_AUTHORIZE_URL": "", "AUTH_ALLOWED_EMAILS": ""}, clear=True):
+                blocked = webapp.deploy_uat_preflight_status()
 
         ready_text = json.dumps(ready)
         blocked_text = json.dumps(blocked)
@@ -3869,7 +4025,6 @@ class WebappServerTest(unittest.TestCase):
         for text in (ready_text, blocked_text):
             self.assertNotIn("client-secret-sensitive", text)
             self.assertNotIn("session-secret-sensitive", text)
-            self.assertNotIn("sensitive-preflight.sqlite3", text)
 
     def test_internal_uat_coolify_env_template_is_offline_verifiable(self):
         result = deploy_template.verify_template(ROOT / "deploy" / "internal-uat" / "coolify" / "sqag.uat.env.example")
@@ -8636,6 +8791,27 @@ class WebappServerTest(unittest.TestCase):
         self.assertNotIn("raw-auth-code", log_text)
         self.assertNotIn("raw-state", log_text)
         self.assertNotIn("visible", log_text)
+
+    def test_scrub_sensitive_text_redacts_connection_strings_paths_and_credentials(self):
+        message = (
+            "database=postgresql://sqag_user@db.example.test/sqag "
+            "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID=SYNTHETIC_ACCESS_KEY_ID "
+            "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY=SYNTHETIC_SECRET_KEY "
+            "credential: SYNTHETIC_PROVIDER_TOKEN "
+            "windows C:\\Users\\SyntheticUser\\private\\quote.xlsx "
+            "unix /home/synthetic/private/quote.xlsx"
+        )
+
+        scrubbed = webapp.scrub_sensitive_text(message)
+
+        self.assertNotIn("postgresql://sqag_user@db.example.test/sqag", scrubbed)
+        self.assertNotIn("SYNTHETIC_ACCESS_KEY_ID", scrubbed)
+        self.assertNotIn("SYNTHETIC_SECRET_KEY", scrubbed)
+        self.assertNotIn("SYNTHETIC_PROVIDER_TOKEN", scrubbed)
+        self.assertNotIn("C:\\Users\\SyntheticUser", scrubbed)
+        self.assertNotIn("/home/synthetic", scrubbed)
+        self.assertIn(webapp.SECRET_REDACTION, scrubbed)
+        self.assertIn(webapp.LOCAL_SECRET_REDACTION, scrubbed)
 
     def test_run_quote_job_failed_response_uses_generic_reference(self):
         completed = mock.Mock(
@@ -20495,7 +20671,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             "SQAG_ARTIFACT_STORAGE_MODE": "object",
             "SQAG_DATABASE_URL": database_url,
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
-            "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "<redacted-endpoint-url>",
+            "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
             "SQAG_OBJECT_STORAGE_BUCKET": "<redacted-bucket-name>",
             "SQAG_OBJECT_STORAGE_REGION": "<redacted-region>",
             "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "<redacted-access-key-id>",
@@ -20517,7 +20693,10 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         ):
             webapp.apply_sqag_storage_migrations(database_url)
             storage = webapp.app_storage_for_auth_session(platform_session)
-            storage.save_profile(workspace_profile_with_layout("object-store-failure-profile"))
+            profile = workspace_profile_with_layout("object-store-failure-profile")
+            profile.pop("pack", None)
+            profile.pop("_pack_assets", None)
+            storage.save_profile(profile)
             storage.save_pricing_reference(workspace_pricing_reference("object-store-failure-pricing"))
             result = webapp.run_quote_job(
                 payload,
@@ -21186,6 +21365,168 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertEqual(rows_b, [])
         self.assertNotIn("data:image", stored_reference)
         self.assertIn("artifact://pricing-reference/pricing-assets/visual_1_1/image4.png", stored_reference)
+
+    def test_object_artifact_storage_saves_profile_and_pricing_assets_by_workspace(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        layout_bytes = KONCEPT_LAYOUT.read_bytes()
+        layout_data_url = "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + base64.b64encode(layout_bytes).decode("ascii")
+        visual_data_url = "data:image/png;base64," + base64.b64encode(b"synthetic-object-visual").decode("ascii")
+        tmp_path = test_temp_root() / f"object-profile-pricing-assets-{time.time_ns()}"
+        tmp_path.mkdir(parents=True)
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = {
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "object",
+            "SQAG_DATABASE_URL": database_url,
+            "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
+            "SQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
+            "SQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
+            "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
+            "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
+        }
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            workspace_a = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-asset-a"))
+            workspace_b = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-asset-b"))
+            profile = webapp.normalize_profile_payload({
+                "id": "object-profile-assets",
+                "label": "Object Profile Assets",
+                "pack": {"quotation_layout": {"filename": "quotation-layout.xlsx", "data_url": layout_data_url}},
+            })
+            reference = webapp.normalize_pricing_reference_payload({
+                "id": "object-pricing-assets",
+                "label": "Object Pricing Assets",
+                "items": [with_required_pricing_metadata({
+                    "id": "object-visual-row",
+                    "section": "Graphics",
+                    "description": "Printed graphics",
+                    "unit_hint": "sqm",
+                    "internal_cost": 10,
+                    "markup_multiplier": 2,
+                    "visual_references": [{"source": "xl/media/image7.png", "anchor_row": 7, "data_url": visual_data_url}],
+                })],
+            })
+            workspace_a.save_profile(profile)
+            workspace_a.save_pricing_reference(reference)
+            profile_artifact = workspace_a.profile_layout_artifact("object-profile-assets")
+            blocked_profile_artifact = workspace_b.profile_layout_artifact("object-profile-assets")
+
+        with sqlite3.connect(db_path) as connection:
+            object_rows = connection.execute(
+                "select owner_type, owner_id, artifact_kind, filename, size_bytes from sqag_object_artifacts where workspace_id = ? order by owner_type, artifact_kind",
+                ("workspace-object-asset-a",),
+            ).fetchall()
+            object_rows_b = connection.execute(
+                "select owner_type from sqag_object_artifacts where workspace_id = ?",
+                ("workspace-object-asset-b",),
+            ).fetchall()
+            blob_rows = connection.execute("select count(*) from sqag_file_artifacts").fetchone()[0]
+            stored_reference = connection.execute(
+                "select payload_json from sqag_pricing_references where workspace_id = ? and reference_id = ?",
+                ("workspace-object-asset-a", "object-pricing-assets"),
+            ).fetchone()[0]
+
+        self.assertIsNotNone(profile_artifact)
+        self.assertEqual(profile_artifact["filename"], "quotation-layout.xlsx")
+        self.assertGreater(profile_artifact["size_bytes"], 0)
+        webapp.validate_profile_layout_xlsx(profile_artifact["content"])
+        self.assertIsNone(blocked_profile_artifact)
+        self.assertEqual(
+            [(row[0], row[1], row[2], row[3]) for row in object_rows],
+            [
+                ("pricing_reference", "object-pricing-assets", "visual_1_1", "image7.png"),
+                ("profile", "object-profile-assets", "quotation_layout", "quotation-layout.xlsx"),
+            ],
+        )
+        self.assertGreater(object_rows[0][4], 0)
+        self.assertGreater(object_rows[1][4], 0)
+        self.assertEqual(object_rows_b, [])
+        self.assertEqual(blob_rows, 0)
+        self.assertNotIn("data:image", stored_reference)
+        self.assertIn("artifact://pricing-reference/object-pricing-assets/visual_1_1/image7.png", stored_reference)
+
+    def test_object_profile_layout_missing_remote_object_fails_closed(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        layout_data_url = "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + base64.b64encode(KONCEPT_LAYOUT.read_bytes()).decode("ascii")
+        tmp_path = test_temp_root() / f"object-profile-missing-layout-{time.time_ns()}"
+        tmp_path.mkdir(parents=True)
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = {
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": "object",
+                "SQAG_DATABASE_URL": database_url,
+                "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+                "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
+                "SQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
+                "SQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
+                "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
+                "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
+        }
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-missing-layout"))
+            storage.save_profile(webapp.normalize_profile_payload({
+                "id": "missing-object-layout",
+                "label": "Missing Object Layout",
+                "pack": {"quotation_layout": {"filename": "quotation-layout.xlsx", "data_url": layout_data_url}},
+            }))
+            backend._objects.clear()
+            artifact = storage.profile_layout_artifact("missing-object-layout")
+
+        self.assertIsNone(artifact)
+
+    def test_object_profile_layout_store_failure_does_not_fallback_to_db_blob(self):
+        class StoreFailingBackend(webapp.InMemoryObjectStorageBackend):
+            def store_artifact(self, **kwargs):
+                raise webapp.ObjectStorageContractError("synthetic object store failure")
+
+        layout_data_url = "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + base64.b64encode(KONCEPT_LAYOUT.read_bytes()).decode("ascii")
+        tmp_path = test_temp_root() / f"object-profile-store-failure-{time.time_ns()}"
+        tmp_path.mkdir(parents=True)
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = {
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": "object",
+                "SQAG_DATABASE_URL": database_url,
+                "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+                "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
+                "SQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
+                "SQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
+                "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
+                "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
+        }
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=StoreFailingBackend()),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-store-fail-layout"))
+            with self.assertRaises(webapp.SqagStorageAccessError) as error:
+                storage.save_profile(webapp.normalize_profile_payload({
+                    "id": "store-fail-layout",
+                    "label": "Store Fail Layout",
+                    "pack": {"quotation_layout": {"filename": "quotation-layout.xlsx", "data_url": layout_data_url}},
+                }))
+
+        with sqlite3.connect(db_path) as connection:
+            profile_rows = connection.execute("select count(*) from sqag_profiles").fetchone()[0]
+            object_rows = connection.execute("select count(*) from sqag_object_artifacts").fetchone()[0]
+            blob_rows = connection.execute("select count(*) from sqag_file_artifacts").fetchone()[0]
+
+        self.assertEqual(error.exception.reason, "object_artifact_storage_unavailable")
+        self.assertEqual(profile_rows, 0)
+        self.assertEqual(object_rows, 0)
+        self.assertEqual(blob_rows, 0)
 
     def test_database_artifact_storage_does_not_persist_raw_platform_launch_token(self):
         raw_launch_token = self.synthetic_platform_launch_token()

@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-06-18
+Last updated: 2026-07-09
 
 Source of truth: `.github/workflows/ci.yml`
 
@@ -24,11 +24,13 @@ Source of truth: `.github/workflows/ci.yml`
 
 - Installs Python 3.12 and Node 22.
 - Installs pinned Python dependencies with `python -m pip install --only-binary=:all: -r requirements.txt`.
+- Installs `pip-audit` and runs `python -m pip_audit -r requirements.txt --strict` against pinned Python dependencies.
 - Installs Playwright Chromium.
 - Checks JavaScript syntax for `webapp/static/app.js`, `scripts/playwright-smoke.mjs`, and `scripts/playwright-ai-basis-chat-stress.mjs`.
 - Checks Python syntax for `webapp/server.py`, quote/pricing scripts, and validation guard scripts.
 - Runs `python scripts/validate_local_pdf_dependency_usage.py` to keep `pypdfium2` and `Pillow` usage on the local PDF rendering path only.
 - Runs `python scripts/validate_dynamic_pricing_reference_rules.py` to keep pricing-reference matching data-driven and block source-code semantic family/synonym packs.
+- Runs `python scripts/scan_sensitive_fixtures.py --fail-on-review` so review-level sensitive fixture findings fail CI.
 - Runs `python -m unittest discover -s tests`.
 - Runs `npm run playwright:ai-stress`.
 - Runs `npm run playwright:smoke`.
