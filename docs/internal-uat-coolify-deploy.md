@@ -24,6 +24,8 @@ storage for generated artifact bytes:
 - The canonical `SQAG_OBJECT_STORAGE_*` names are configured only through the
   host secret manager.
 - Platform/workspace launch context is required for protected hosted use.
+- The object-storage credential must permit the read-only bucket probe used by
+  startup and `/api/health`, in addition to the runtime object operations.
 - Database rows store metadata and workspace-owned app records only.
 
 Database/BLOB artifact mode is local-UAT/synthetic evidence only. It must not
@@ -34,7 +36,9 @@ satisfy hosted, protected, deploy, or production readiness.
 This repo owns only the app-specific shape:
 
 - Start command: `python webapp/server.py`.
-- Health path: `/api/health`.
+- Health/readiness path: `/api/health`. It returns HTTP 200 only after the
+  generator, required database schemas, and read-only object bucket probe pass;
+  required dependency failure returns metadata-only HTTP 503.
 - Deploy-mode environment variable names.
 - Metadata-only validation commands.
 - SQAG private-data and tenant-import guardrails.
@@ -56,8 +60,6 @@ Required names for any future hosted validation environment:
 | App/auth | `APP_MODE`, `AUTH_REQUIRED`, `SESSION_SECRET` |
 | Storage | `SQAG_STORAGE_MODE`, `SQAG_ARTIFACT_STORAGE_MODE`, `SQAG_DATABASE_URL`, `SQAG_OBJECT_STORAGE_PROVIDER`, `SQAG_OBJECT_STORAGE_ENDPOINT_URL`, `SQAG_OBJECT_STORAGE_BUCKET`, `SQAG_OBJECT_STORAGE_REGION`, `SQAG_OBJECT_STORAGE_ACCESS_KEY_ID`, `SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY` |
 | Platform launch | `SQAG_PLATFORM_LAUNCH_MODE`, `SQAG_PLATFORM_BASE_URL` |
-| Optional OIDC fallback/checklist | `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI`, `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL`, `OIDC_USERINFO_URL`, `OIDC_LOGOUT_URL` |
-| Tester policy | `AUTH_ALLOWED_EMAILS`, `AUTH_ALLOWED_DOMAINS`, `AUTH_ALLOW_ANY_AUTHENTICATED_USER`, `AUTH_APPROVED_TESTER_ROLE` |
 | Runtime housekeeping | `QUOTE_DATA_ROOT`, `QUOTE_OUTPUT_ROOT`, `QUOTE_TMP_ROOT`, `QUOTE_LOG_ROOT`, `PORT` |
 
 `QUOTE_DATA_ROOT` and `QUOTE_OUTPUT_ROOT` are not durable product-visible
@@ -106,7 +108,8 @@ bytes, host IPs, or private paths into issue/PR output.
 
 - App build completes.
 - App starts with the documented start command.
-- `/api/health` returns metadata-only JSON.
+- `/api/health` returns metadata-only JSON and HTTP 200 only while the database
+  schema, object-artifact metadata schema, and object bucket are usable.
 - Unauthenticated protected routes block or redirect.
 - Platform/workspace launch reaches the app.
 - Intended workspace starts without a Koncept pack until import.

@@ -6,6 +6,51 @@ Branch: `codex/release-security-audit`
 
 Base evidence ref: `origin/main` at `29de611ee1723ae1e9d1755c32b013efdbc4511e`
 
+## 2026-07-10 Independent Launch-Blocker Remediation Addendum
+
+Remediation base: `origin/main` at
+`7a6de268a0a6fe84fcb052d4d757f6b4a2704443`.
+
+Production readiness remains false. This focused remediation closes three
+independently confirmed High launch blockers without using live credentials,
+calling live providers, applying migrations, or changing the visible product
+UI.
+
+| Severity | Confirmed blocker | Closure |
+| --- | --- | --- |
+| High | Deploy startup accepted standalone OIDC authentication even though every hosted database and object-storage operation requires a trusted Swooshz Platform workspace. Login could succeed, but all workspace-backed workflows then failed closed at runtime. | Deploy startup and deploy preflight now require complete Platform launch configuration. Standalone OIDC remains available only for local component testing; OIDC claims are not promoted into Platform workspace authority. |
+| High | After switching startup to Platform-only, an unexpired signed OIDC session cookie from before the upgrade could still be accepted as authenticated and inherit the configured deploy tester role. It could reach unpermissioned and AI import-preview routes without Platform workspace or entitlement provenance. | Deploy sessions now require complete signed Platform provenance: consumed outcome, Platform user, workspace, SQAG app key, and supported membership role. Legacy or malformed cookies are treated as unauthenticated and receive blocked permissions; Platform mode rejects the OIDC callback before provider calls, while logout still clears cookies and returns to the validated Platform URL. |
+| High | Startup and `/api/health` could report success without proving the configured database schema, object-artifact metadata schema, or object-storage bucket was reachable. Coolify could route traffic to an operationally unusable replica. | Deploy startup now performs fresh, read-only dependency probes before binding. Readiness checks cover both database schemas and a read-only object bucket probe; `/api/health` returns HTTP 503 when blocked and uses a short, lock-protected cache for runtime probes. No startup migration or object write is performed. |
+
+Focused validation evidence on the remediation branch:
+
+- The pre-fix regression set reproduced the defects with two assertion failures
+  and six errors across eight focused tests.
+- The same eight focused tests pass after the repair.
+- A second five-test provenance set reproduced the legacy-cookie path with four
+  failures and one unaffected local-mode control before the repair; all five
+  pass afterward.
+- Independent post-fix adversarial checks reject legacy and malformed Platform
+  cookies on session, validation, logging, and AI import-preview routes while
+  preserving valid Platform sessions and session-bound CSRF.
+- Twenty-two adjacent deploy, OIDC, Platform, and storage tests pass.
+- The complete `tests.test_webapp` module passes: 467 tests.
+- The complete Python suite passes: 706 tests.
+- Python syntax compilation, the dynamic-pricing source guard, the
+  internal-UAT deploy-template verifier, the sensitive-fixture scan, and the
+  architecture-fallback audit pass.
+- Synthetic hosted observability and hosted smoke verifiers pass with all 11
+  smoke checks true; both retain `synthetic_only=true` and
+  `production_ready=false`.
+- The production-readiness checker remains intentionally blocked with
+  `internal_alpha_ready=false`, `production_ready=false`, and eight remaining
+  hosted/live evidence blockers.
+
+Hosted/live evidence remains a separate gate. The synthetic readiness probes
+and tests do not claim live Swooshz Platform, database, object-provider,
+Coolify, TLS/proxy, monitoring, backup/restore, retention/delete, or graceful
+shutdown evidence.
+
 ## Executive Verdict
 
 Swooshz Quote Auto Generator (SQAG) remains suitable for local UAT by default. The readiness checker now

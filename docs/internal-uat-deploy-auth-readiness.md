@@ -29,8 +29,10 @@ The deploy/auth surface is already represented in `.env.example` and
   commit the value.
 - `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`,
   `OIDC_REDIRECT_URI`, `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL`,
-  `OIDC_USERINFO_URL`, and `OIDC_LOGOUT_URL`: OIDC settings used by the deploy
-  auth scaffold. `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL`, and
+  `OIDC_USERINFO_URL`, and `OIDC_LOGOUT_URL`: retained OIDC component-test
+  settings for localhost/local mode only. They do not establish a trusted
+  Platform workspace and cannot satisfy deploy startup. `OIDC_AUTHORIZE_URL`,
+  `OIDC_TOKEN_URL`, and
   `OIDC_USERINFO_URL` are explicit provider endpoints; the app does not guess
   the authorize endpoint from the issuer. `OIDC_LOGOUT_URL` is optional; the
   other OIDC fields plus `SESSION_SECRET` are required for a complete auth
@@ -38,10 +40,9 @@ The deploy/auth surface is already represented in `.env.example` and
   local smoke-only endpoints.
 - `AUTH_ALLOWED_EMAILS`: comma-separated exact tester email allowlist.
 - `AUTH_ALLOWED_DOMAINS`: comma-separated tester email-domain allowlist.
-- `AUTH_ALLOW_ANY_AUTHENTICATED_USER`: internal UAT escape hatch only. Keep it
-  `false` unless the UAT owner has explicitly accepted any authenticated
-  identity from the configured OIDC provider.
-- `AUTH_APPROVED_TESTER_ROLE`: shared role for approved internal testers:
+- `AUTH_ALLOW_ANY_AUTHENTICATED_USER`: local OIDC component-test escape hatch
+  only. It does not grant deploy or Platform workspace access.
+- `AUTH_APPROVED_TESTER_ROLE`: local OIDC component-test role:
   `admin`, `management`, `operator`, or `viewer`.
 - `SQAG_STORAGE_MODE`: storage mode. Hosted/protected/deploy validation must
   use workspace-owned database rows for SQAG app records.
@@ -51,9 +52,10 @@ The deploy/auth surface is already represented in `.env.example` and
   storage.
 - `SQAG_DATABASE_URL`: database connection configured through the host secret
   manager only.
-- `SQAG_PLATFORM_LAUNCH_MODE` and `SQAG_PLATFORM_BASE_URL`: platform/workspace
-  launch context for protected hosted use. The platform base URL must use
-  HTTPS, except loopback HTTP is allowed for local smoke-only endpoints.
+- `SQAG_PLATFORM_LAUNCH_MODE` and `SQAG_PLATFORM_BASE_URL`: mandatory
+  platform/workspace launch context for protected hosted/deploy use. The
+  platform base URL must use HTTPS, except loopback HTTP is allowed for local
+  smoke-only endpoints.
 - `QUOTE_DATA_ROOT`: runtime housekeeping root; not the hosted source of truth
   for profile/pricing/session data.
 - `QUOTE_OUTPUT_ROOT`: output staging root; not durable hosted artifact storage.
@@ -70,9 +72,20 @@ state cookies are emitted with `Secure`, `HttpOnly`, and `SameSite=Lax`.
 - Deploy mode is intended to require authentication by default.
 - Deploy mode refuses to start when auth is required and the auth boundary is
   incomplete.
-- OIDC configuration completeness is checked before serving authenticated
-  deploy traffic.
-- `/login` redirects to `OIDC_AUTHORIZE_URL` with the configured client,
+- Deploy mode also refuses to start without a complete Swooshz Platform launch
+  boundary because database and object-storage records require the consumed
+  Platform workspace identity. Standalone OIDC claims are never converted into
+  a workspace, membership role, or entitlement.
+- Deploy request authentication accepts only a signed session containing the
+  consumed Platform user, workspace, SQAG app key, and supported membership
+  role. A still-valid pre-upgrade OIDC-only cookie is rejected as
+  unauthenticated and receives no deploy permissions.
+- Platform mode does not process the legacy OIDC callback. Logout remains
+  available to clear both session and OIDC-state cookies and returns to the
+  validated Platform base URL rather than a stale OIDC logout setting.
+- OIDC configuration and route behavior remain testable in local/component
+  checks, but OIDC-only configuration cannot start `APP_MODE=deploy`.
+- In local OIDC component mode, `/login` redirects to `OIDC_AUTHORIZE_URL` with the configured client,
   redirect URI, response type, scope, and signed state when the auth boundary
   is complete.
 - `/callback` validates state, handles provider errors generically, requires an
@@ -102,9 +115,9 @@ Use this shape only for local/offline validation of the gated UAT boundary:
 - `SQAG_ARTIFACT_STORAGE_MODE=object` for hosted/protected/deploy readiness
   evidence; `database` is allowed only for local-UAT/synthetic negative tests.
 - `SQAG_DATABASE_URL` set through the host secret manager only.
-- Platform/workspace launch context for protected hosted use.
-- OIDC configuration only when using the OIDC deploy-auth fallback path.
-- `AUTH_ALLOWED_EMAILS` and/or `AUTH_ALLOWED_DOMAINS` set when using OIDC.
+- Platform/workspace launch context for every protected hosted/deploy use.
+- No standalone OIDC fallback in the hosted SQAG process. Platform owns login,
+  workspace membership, role, entitlement, and launch authorization.
 - Runtime housekeeping roots outside the repository.
 - Approved tester access only.
 - No public/customer access.
@@ -159,13 +172,8 @@ Pass means:
 - `SESSION_SECRET` is at least 32 characters.
 - Database storage is selected, and database artifact/BLOB mode is not treated
   as hosted/protected/deploy readiness evidence.
-- Required platform launch settings are present, or required OIDC
-  endpoint/client settings are present for the OIDC fallback path.
-- `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL`, and `OIDC_USERINFO_URL` are provided
-  explicitly when OIDC is used and use HTTPS except for loopback-only local
-  smoke endpoints.
-- An internal allowlist or explicit internal escape hatch is configured.
-- `AUTH_APPROVED_TESTER_ROLE` is valid.
+- Required Platform launch settings are present. OIDC-only settings may appear
+  as local component-test diagnostics but never make deploy preflight ready.
 - Runtime housekeeping roots are set and outside the repository.
 
 Fail means fix the env shape before starting the UAT app. Do not paste secret
@@ -186,8 +194,7 @@ while checking env values.
 - [ ] Confirm required env names are present without printing values:
       `APP_MODE`, `AUTH_REQUIRED`, `SESSION_SECRET`, `SQAG_STORAGE_MODE`,
       `SQAG_ARTIFACT_STORAGE_MODE`, `SQAG_DATABASE_URL`,
-      `SQAG_PLATFORM_LAUNCH_MODE`, `SQAG_PLATFORM_BASE_URL`, optional OIDC
-      names if used, allowlist settings, tester role, and runtime
+      `SQAG_PLATFORM_LAUNCH_MODE`, `SQAG_PLATFORM_BASE_URL`, and runtime
       housekeeping root envs.
 - [ ] Run `python webapp\server.py --check-deploy-uat-env`.
 - [ ] Run `python scripts\verify_internal_alpha_hosted_validation.py --work-dir _tmp\validation\hosted-blocked`.
@@ -198,14 +205,12 @@ while checking env values.
 - [ ] Confirm generated artifact bytes require object storage for
       hosted/protected/deploy readiness and are not credited from DB/BLOB mode.
 - [ ] Confirm the app refuses unsafe or incomplete deploy-auth configuration.
-- [ ] Confirm the health endpoint responds.
+- [ ] Confirm `/api/health` returns HTTP 200 only after the generator, required
+      database schema, object-artifact metadata schema, and object-storage
+      bucket probe pass; dependency failure must return metadata-only HTTP 503.
 - [ ] Confirm unauthenticated users are blocked or redirected.
-- [ ] Confirm OIDC login redirects to the exact configured
-      `OIDC_AUTHORIZE_URL`.
-- [ ] Confirm OIDC callback completes for an approved tester and redirects to
-      `/`.
-- [ ] Confirm OIDC callback blocks a non-allowlisted tester with a generic
-      forbidden response.
+- [ ] Confirm Swooshz Platform launch consume creates a session containing the
+      intended workspace and membership role without returning the launch token.
 - [ ] Confirm an authenticated approved tester can reach the dashboard.
 - [ ] Confirm New Quote works.
 - [ ] Confirm profile/pricing import works with authorised private local files.
@@ -247,10 +252,10 @@ For each internal deploy-auth UAT run, record only non-secret evidence:
 - Date/time and app version or commit.
 - `APP_MODE` value.
 - Whether `AUTH_REQUIRED` is enabled.
-- Whether required OIDC env names are set, without values.
+- Whether required Platform launch env names are set, without values.
 - Runtime root category, such as `outside repo`, without private paths.
 - Health endpoint result.
 - Auth redirect/block result.
-- OIDC callback result.
+- Platform launch consume and workspace-session result.
 - Quote workflow smoke result if authenticated dashboard access is available.
 - Confirmation that no private runtime/output files appear in `git status`.

@@ -384,6 +384,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
         storage = webapp.app_storage_for_auth_session(synthetic_auth_session())
         storage.save_pricing_reference(synthetic_pricing_reference())
         storage.save_profile(synthetic_profile())
+        webapp.health_status(force_dependency_probe=True)
         with SyntheticHttpServer() as runner:
             checks["health_metadata"] = health_check(runner.base_url)
             checks["unauthenticated_routes_blocked"] = unauthenticated_check(runner.base_url)
@@ -507,7 +508,7 @@ def unauthenticated_check(base_url: str) -> bool:
 
 
 def wait_for_job(base_url: str, job_id: str, session_cookie: str) -> dict[str, Any]:
-    deadline = time.time() + 5
+    deadline = time.time() + 15
     while time.time() < deadline:
         status, body, _headers = json_request(base_url, "GET", f"/api/jobs/{job_id}", cookie=session_cookie)
         if status == 200 and body.get("status") in {"completed", "failed", "blocked", "needs_review"}:

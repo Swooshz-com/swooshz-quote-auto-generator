@@ -7,24 +7,28 @@ bounded internal UAT login and deploy-auth path that can be verified locally
 with synthetic values only.
 
 This is not an account system, public SaaS launch, customer portal, billing
-flow, database-backed user model, or production deployment plan. SQAG uses the
-existing deploy-auth OIDC gate only for approved internal testers.
+flow, database-backed user model, or production deployment plan. Hosted SQAG
+uses only the Swooshz Platform launch boundary so the authenticated session
+includes the trusted workspace, membership role, and entitlement.
 
-## Approved Tester Login Flow
+## Approved Tester Launch Flow
 
-In deploy mode, unauthenticated browser requests redirect to `/login`, and
-`/login` redirects to the configured `OIDC_AUTHORIZE_URL`.
+In deploy mode, unauthenticated browser requests redirect to `/login`, which
+shows a Platform-launch-required page linking to the configured Swooshz
+Platform base URL. The Platform owns provider login, workspace selection,
+membership, entitlement, and launch-token issuance. SQAG consumes the one-time
+launch token server-side and creates only its own signed session.
 
 Approved testers should expect:
 
-- A normal provider sign-in page from the configured internal OIDC provider.
-- Return to SQAG after a successful provider callback.
+- A normal sign-in and workspace-selection flow owned by Swooshz Platform.
+- Return to SQAG after a successful Platform launch consume.
 - A privacy-safe dashboard state such as `Signed in as approved tester`.
-- A logout action that clears the SQAG session and temporary OIDC state cookie.
+- A logout action that clears the SQAG session and returns to Platform.
 
-The app must not show raw OIDC claims, auth codes, access tokens, ID tokens,
-refresh tokens, provider responses, session secrets, or OIDC client secrets.
-Denied users see a generic approved-tester access message.
+The app must not show raw launch tokens, Platform responses, OIDC claims, auth
+codes, access tokens, ID tokens, refresh tokens, provider responses, or session
+secrets. Denied users see a generic approved-tester access message.
 
 ## What Can Be Tested Before VPS
 
@@ -43,16 +47,16 @@ python scripts\verify_internal_alpha_hosted_validation.py --work-dir _tmp\valida
 ```
 
 ```powershell
-python -m unittest tests.test_webapp.WebappServerTest.test_deploy_auth_routes_block_unauthenticated_access_and_redirect_login
-python -m unittest tests.test_webapp.WebappServerTest.test_deploy_oidc_callback_exchanges_code_fetches_userinfo_and_sets_session_cookie
+python -m unittest tests.test_webapp.WebappServerTest.test_platform_launch_mode_consumes_header_token_and_sets_safe_session
+python -m unittest tests.test_webapp.WebappServerTest.test_deploy_logout_clears_session_and_state_cookies
+python -m unittest tests.test_webapp.WebappServerTest.test_deploy_rejects_oidc_identity_without_platform_workspace_context
 python -m unittest tests.test_webapp.WebappServerTest.test_internal_uat_coolify_env_template_is_offline_verifiable
 ```
 
 These checks verify:
 
-- The Coolify env template has the required deploy-auth keys.
+- The Coolify env template has the required Platform launch keys.
 - Template secret/provider-specific fields remain placeholders.
-- `AUTH_ALLOW_ANY_AUTHENTICATED_USER=false`.
 - Runtime roots remain placeholders in committed templates and must be
   host-managed housekeeping paths, not durable quote-session or artifact
   storage for hosted use.
@@ -62,22 +66,29 @@ These checks verify:
 - Deploy preflight can reach `ready` with synthetic env and temporary runtime
   roots outside the repo.
 - Missing deploy-auth config blocks without printing secret values.
-- `/api/health` stays reachable.
+- `/api/health` returns HTTP 200 only after the required generator, database
+  schemas, and object-storage bucket probe pass; dependency failure returns
+  metadata-only HTTP 503.
 - Unauthenticated browser requests redirect to login.
 - Unauthenticated API requests return `auth_required`.
-- `/login` redirects to the configured fake authorize URL.
-- Mocked callback success sets a signed session cookie.
-- Missing state, provider error, missing `sub`, and unapproved testers are
-  blocked without leaking private values.
+- `/login` redirects to the configured synthetic Platform URL.
+- Mocked Platform consume success sets a signed session containing only trusted
+  workspace, membership, entitlement, and privacy-minimized user metadata.
+- Missing, replayed, malformed, or denied launch tokens are blocked without
+  leaking private values.
 
-## What Still Requires Real VPS/OIDC
+Standalone OIDC helpers remain covered as localhost/local component tests only.
+They do not establish Platform workspace authority and cannot start
+`APP_MODE=deploy`.
+
+## What Still Requires Real VPS/Platform
 
 These items cannot be completed before live infrastructure exists:
 
 - DNS, TLS, firewall, VPS, Coolify host, reverse proxy, and public network
   reachability.
-- Real OIDC application registration and redirect URI validation.
-- Real provider login, logout, and tester allowlist confirmation.
+- Real Platform login, workspace membership, entitlement, launch consume,
+  replay denial, and logout confirmation.
 - Coolify secret entry, volume mounting, app start, and healthcheck evidence on
   the prepared host.
 - Authenticated quote workflow smoke testing through the real deployed URL.
@@ -96,10 +107,6 @@ $env:SQAG_ARTIFACT_STORAGE_MODE="<object-for-readiness-or-database-for-negative-
 $env:SQAG_DATABASE_URL="<synthetic-database-url>"
 $env:SQAG_PLATFORM_LAUNCH_MODE="<platform>"
 $env:SQAG_PLATFORM_BASE_URL="<synthetic-platform-base-url>"
-$env:AUTH_ALLOWED_EMAILS="<synthetic-allowlist>"
-$env:AUTH_ALLOWED_DOMAINS="<synthetic-allowlist-domain>"
-$env:AUTH_ALLOW_ANY_AUTHENTICATED_USER="<false>"
-$env:AUTH_APPROVED_TESTER_ROLE="<role>"
 ```
 
 Do not commit populated env files, real provider values, private local paths,
@@ -109,8 +116,8 @@ data.
 
 ## Pass/Fail Interpretation
 
-Pass means the repo artifacts, deploy-auth env shape, and mocked OIDC route
-behavior are ready for a later real UAT host.
+Pass means the repo artifacts, deploy-auth env shape, and mocked Platform
+launch behavior are ready for a later real UAT host.
 
 Fail means fix the reported key/category before buying or touching a VPS. Report
 only key names, check names, status, and generic messages. Do not paste secret

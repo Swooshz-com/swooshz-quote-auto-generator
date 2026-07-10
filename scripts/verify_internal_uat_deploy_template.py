@@ -28,18 +28,6 @@ REQUIRED_KEYS = (
     "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY",
     "SQAG_PLATFORM_LAUNCH_MODE",
     "SQAG_PLATFORM_BASE_URL",
-    "OIDC_ISSUER_URL",
-    "OIDC_CLIENT_ID",
-    "OIDC_CLIENT_SECRET",
-    "OIDC_REDIRECT_URI",
-    "OIDC_AUTHORIZE_URL",
-    "OIDC_TOKEN_URL",
-    "OIDC_USERINFO_URL",
-    "OIDC_LOGOUT_URL",
-    "AUTH_ALLOWED_EMAILS",
-    "AUTH_ALLOWED_DOMAINS",
-    "AUTH_ALLOW_ANY_AUTHENTICATED_USER",
-    "AUTH_APPROVED_TESTER_ROLE",
     "QUOTE_DATA_ROOT",
     "QUOTE_OUTPUT_ROOT",
     "QUOTE_TMP_ROOT",
@@ -57,16 +45,6 @@ PLACEHOLDER_KEYS = {
     "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID",
     "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY",
     "SQAG_PLATFORM_BASE_URL",
-    "OIDC_ISSUER_URL",
-    "OIDC_CLIENT_ID",
-    "OIDC_CLIENT_SECRET",
-    "OIDC_REDIRECT_URI",
-    "OIDC_AUTHORIZE_URL",
-    "OIDC_TOKEN_URL",
-    "OIDC_USERINFO_URL",
-    "OIDC_LOGOUT_URL",
-    "AUTH_ALLOWED_EMAILS",
-    "AUTH_ALLOWED_DOMAINS",
     "QUOTE_DATA_ROOT",
     "QUOTE_OUTPUT_ROOT",
     "QUOTE_TMP_ROOT",
@@ -80,7 +58,6 @@ EXPECTED_VALUES = {
     "SQAG_STORAGE_MODE": "database",
     "SQAG_ARTIFACT_STORAGE_MODE": "object",
     "SQAG_PLATFORM_LAUNCH_MODE": "platform",
-    "AUTH_ALLOW_ANY_AUTHENTICATED_USER": "false",
 }
 
 FORBIDDEN_MARKERS = {
@@ -156,8 +133,6 @@ def verify_template(path: Path = DEFAULT_TEMPLATE) -> dict[str, object]:
 
     for key in PLACEHOLDER_KEYS:
         value = values.get(key, "")
-        if value and key == "OIDC_LOGOUT_URL" and value == "<optional-placeholder>":
-            continue
         if value and not is_placeholder(value):
             findings.append(Finding(key, "non-placeholder-value", "provider-specific or secret value must remain a placeholder"))
 

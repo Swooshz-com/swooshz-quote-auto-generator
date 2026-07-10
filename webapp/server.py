@@ -1557,6 +1557,10 @@ def deploy_requires_auth_guard() -> bool:
     return not (oidc_config_complete() or platform_launch_config_complete())
 
 
+def deploy_requires_platform_workspace_guard() -> bool:
+    return configured_app_mode() == "deploy" and not platform_launch_config_complete()
+
+
 def deploy_storage_posture_ready() -> bool:
     if configured_storage_mode() != "database":
         return False
@@ -1690,7 +1694,11 @@ def cookies_from_header(cookie_header: str) -> dict[str, str]:
 def session_from_cookie_header(cookie_header: str) -> dict[str, Any] | None:
     cookies = cookies_from_header(cookie_header)
     payload = verified_cookie_payload(cookies.get(SESSION_COOKIE_NAME, ""))
-    return payload if payload and isinstance(payload.get("user"), dict) else None
+    if not payload or not isinstance(payload.get("user"), dict):
+        return None
+    if configured_app_mode() == "deploy" and not platform_auth_session_complete(payload):
+        return None
+    return payload
 
 
 def csrf_token_for_cookie_header(cookie_header: str) -> str:
@@ -1977,7 +1985,23 @@ def user_from_platform_launch_context(context: dict[str, Any]) -> dict[str, Any]
     }
 
 
+def platform_auth_session_complete(session: dict[str, Any] | None) -> bool:
+    platform = platform_context_from_auth_session(session) or {}
+    user = platform.get("user") if isinstance(platform, dict) and isinstance(platform.get("user"), dict) else {}
+    workspace = platform.get("workspace") if isinstance(platform, dict) and isinstance(platform.get("workspace"), dict) else {}
+    app = platform.get("app") if isinstance(platform, dict) and isinstance(platform.get("app"), dict) else {}
+    return bool(
+        clean_text(platform.get("outcome")) == "consumed"
+        and clean_text(user.get("userId"))
+        and clean_text(workspace.get("workspaceId"))
+        and clean_text(app.get("appKey")) == PLATFORM_APP_KEY
+        and platform_membership_role_to_local_role(platform.get("membershipRole"))
+    )
+
+
 def permissions_for_auth_session(session: dict[str, Any] | None) -> dict[str, bool]:
+    if configured_app_mode() == "deploy" and not platform_auth_session_complete(session):
+        return blocked_platform_permissions()
     user = session.get("user") if isinstance(session, dict) else None
     platform = user.get("platform") if isinstance(user, dict) and isinstance(user.get("platform"), dict) else None
     if platform:
@@ -2052,10 +2076,9 @@ def deploy_uat_preflight_status() -> dict[str, Any]:
         deploy_session_secret_ready(),
         f"must be at least {MIN_DEPLOY_SESSION_SECRET_CHARS} characters",
     )
-    if platform_launch_mode_enabled():
-        add(PLATFORM_LAUNCH_MODE_ENV_NAME, configured_platform_launch_mode() == "platform", "must be set to platform")
-        add(PLATFORM_BASE_URL_ENV_NAME, bool(configured_platform_base_url()), "must be an https or loopback http platform base URL")
-    else:
+    add(PLATFORM_LAUNCH_MODE_ENV_NAME, configured_platform_launch_mode() == "platform", "must be set to platform")
+    add(PLATFORM_BASE_URL_ENV_NAME, bool(configured_platform_base_url()), "must be an https or loopback http platform base URL")
+    if not platform_launch_mode_enabled():
         for name in (
             OIDC_ISSUER_URL_ENV_NAME,
             OIDC_CLIENT_ID_ENV_NAME,
@@ -15601,18 +15624,105 @@ def failed_result_payload(error_reference: str) -> dict[str, Any]:
     }
 
 
-def health_status() -> dict[str, Any]:
+RUNTIME_DEPENDENCY_HEALTH_CACHE_TTL_SECONDS = 5.0
+RUNTIME_DEPENDENCY_HEALTH_CACHE_LOCK = threading.Lock()
+RUNTIME_DEPENDENCY_HEALTH_CACHE: dict[str, Any] = {
+    "key": "",
+    "expires_at": 0.0,
+    "status": None,
+}
+
+
+def runtime_dependency_health_cache_key() -> str:
+    env_names = (
+        APP_MODE_ENV_NAME,
+        SQAG_STORAGE_MODE_ENV_NAME,
+        SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME,
+        SQAG_DATABASE_URL_ENV_NAME,
+        OBJECT_STORAGE_PROVIDER_ENV_NAME,
+        OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME,
+        OBJECT_STORAGE_BUCKET_ENV_NAME,
+        OBJECT_STORAGE_REGION_ENV_NAME,
+        OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME,
+        OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME,
+    )
+    material = "\0".join(read_dotenv_value(name) for name in env_names).encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def uncached_health_status() -> dict[str, Any]:
     generator_available = GENERATOR_PATH.is_file()
+    checks = [{"name": "quote_generator_script", "ok": bool(generator_available)}]
+    storage_mode = configured_storage_mode()
+    artifact_mode = configured_artifact_storage_mode()
+    database_storage: DatabaseSqagStorage | None = None
+    database_metadata_ready = storage_mode != "database"
+
+    if storage_mode == "database":
+        try:
+            database_storage = DatabaseSqagStorage(
+                configured_database_url(),
+                "sqag-readiness-probe",
+                "viewer",
+                "",
+            )
+            database_storage.ensure_ready()
+            database_metadata_ready = True
+        except Exception:
+            database_storage = None
+            database_metadata_ready = False
+        checks.append({"name": "database_metadata_schema", "ok": database_metadata_ready})
+
+    if artifact_mode in {"database", "object"}:
+        artifact_metadata_ready = False
+        if database_storage is not None and database_metadata_ready:
+            try:
+                if artifact_mode == "database":
+                    database_storage.ensure_artifact_ready()
+                else:
+                    database_storage.ensure_object_artifact_ready()
+                artifact_metadata_ready = True
+            except Exception:
+                artifact_metadata_ready = False
+        checks.append({
+            "name": "database_artifact_schema" if artifact_mode == "database" else "object_artifact_metadata_schema",
+            "ok": artifact_metadata_ready,
+        })
+
+    if artifact_mode == "object":
+        object_storage_ready = False
+        try:
+            object_storage_ready = bool(configured_object_storage_backend().readiness_probe())
+        except Exception:
+            object_storage_ready = False
+        checks.append({"name": "object_storage_bucket", "ok": object_storage_ready})
+
     return {
-        "status": "ok" if generator_available else "blocked",
+        "status": "ok" if all(check["ok"] for check in checks) else "blocked",
         "generator_available": bool(generator_available),
-        "checks": [
-            {
-                "name": "quote_generator_script",
-                "ok": bool(generator_available),
-            }
-        ],
+        "checks": checks,
     }
+
+
+def health_status(*, force_dependency_probe: bool = False) -> dict[str, Any]:
+    cache_key = runtime_dependency_health_cache_key()
+    now = time.monotonic()
+    with RUNTIME_DEPENDENCY_HEALTH_CACHE_LOCK:
+        cached_status = RUNTIME_DEPENDENCY_HEALTH_CACHE.get("status")
+        if (
+            not force_dependency_probe
+            and RUNTIME_DEPENDENCY_HEALTH_CACHE.get("key") == cache_key
+            and now < float(RUNTIME_DEPENDENCY_HEALTH_CACHE.get("expires_at") or 0.0)
+            and isinstance(cached_status, dict)
+        ):
+            return copy.deepcopy(cached_status)
+        status = uncached_health_status()
+        RUNTIME_DEPENDENCY_HEALTH_CACHE.update({
+            "key": cache_key,
+            "expires_at": now + RUNTIME_DEPENDENCY_HEALTH_CACHE_TTL_SECONDS,
+            "status": copy.deepcopy(status),
+        })
+        return status
 
 
 def unexpected_error_log_details(error_reference: str, exc: BaseException | None = None, **details: Any) -> dict[str, Any]:
@@ -16153,7 +16263,8 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             self.send_static_file(STATIC_DIR / relative)
             return
         if path == "/api/health":
-            self.send_json(health_status())
+            status = health_status()
+            self.send_json(status, status=200 if status.get("status") == "ok" else 503)
             return
         if path == "/api/session":
             session = self.current_auth_session()
@@ -16806,6 +16917,9 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 "errors": ["Deploy mode requires a complete auth boundary before serving the app."],
             }, status=503)
             return
+        if platform_launch_mode_enabled():
+            self.send_json({"error": "Not found"}, status=404)
+            return
         if not auth_required():
             self.send_redirect("/")
             return
@@ -16869,7 +16983,11 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         )
 
     def handle_logout(self) -> None:
-        logout_url = safe_logout_redirect_url(oidc_config().get("logout_url") or "")
+        logout_url = (
+            configured_platform_home_url() or "/signed-out"
+            if platform_launch_mode_enabled()
+            else safe_logout_redirect_url(oidc_config().get("logout_url") or "")
+        )
         headers = [
             ("Set-Cookie", clear_cookie_header_value(SESSION_COOKIE_NAME)),
             ("Set-Cookie", clear_cookie_header_value(OIDC_STATE_COOKIE_NAME)),
@@ -17137,11 +17255,17 @@ def main() -> int:
         status = production_readiness_status()
         safe_stdout(json.dumps(status, indent=2, ensure_ascii=True) + "\n")
         return 0 if status["production_ready"] else 2
+    if deploy_requires_platform_workspace_guard():
+        safe_stderr(
+            "Refusing deploy mode without Swooshz Platform workspace context. Set "
+            "SQAG_PLATFORM_LAUNCH_MODE=platform with an HTTPS SQAG_PLATFORM_BASE_URL and a strong SESSION_SECRET, "
+            "or run APP_MODE=local for localhost-only OIDC component testing.\n"
+        )
+        return 2
     if deploy_requires_auth_guard():
         safe_stderr(
             "Refusing deploy mode without a complete auth boundary. Set AUTH_REQUIRED=true, configure a strong "
-            "SESSION_SECRET with HTTPS OIDC_* settings or SQAG_PLATFORM_LAUNCH_MODE=platform with an HTTPS "
-            "SQAG_PLATFORM_BASE_URL, or run APP_MODE=local for localhost-only use.\n"
+            "SESSION_SECRET and Swooshz Platform launch settings, or run APP_MODE=local for localhost-only use.\n"
         )
         return 2
     if deploy_requires_storage_guard():
@@ -17149,6 +17273,12 @@ def main() -> int:
             "Refusing deploy mode without hosted storage. Set SQAG_STORAGE_MODE=database with a Postgres-compatible "
             "SQAG_DATABASE_URL, set SQAG_ARTIFACT_STORAGE_MODE=object, and configure secure SQAG_OBJECT_STORAGE_* "
             "provider settings before starting APP_MODE=deploy.\n"
+        )
+        return 2
+    if configured_app_mode() == "deploy" and health_status(force_dependency_probe=True).get("status") != "ok":
+        safe_stderr(
+            "Refusing deploy mode because required runtime dependencies are not ready. Verify the SQAG database "
+            "schema and object-storage bucket access before starting the service.\n"
         )
         return 2
     if not is_safe_bind_host(args.host):
