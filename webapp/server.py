@@ -1693,6 +1693,19 @@ def session_from_cookie_header(cookie_header: str) -> dict[str, Any] | None:
     return payload if payload and isinstance(payload.get("user"), dict) else None
 
 
+def csrf_token_for_cookie_header(cookie_header: str) -> str:
+    base_token = configured_csrf_token()
+    cookies = cookies_from_header(cookie_header)
+    raw_session_cookie = clean_text(cookies.get(SESSION_COOKIE_NAME))
+    if not raw_session_cookie or session_from_cookie_header(cookie_header) is None:
+        return base_token
+    csrf_key = session_secret()
+    if not csrf_key:
+        return base_token
+    material = b"sqag-session-csrf-v1\0" + raw_session_cookie.encode("utf-8")
+    return hmac.new(csrf_key.encode("utf-8"), material, hashlib.sha256).hexdigest()
+
+
 def cookie_header_value(name: str, value: str, *, max_age: int, path: str = "/", http_only: bool = True) -> str:
     cookie = http.cookies.SimpleCookie()
     cookie[name] = value
@@ -8504,6 +8517,32 @@ def platform_user_id_from_auth_session(session: dict[str, Any] | None) -> str:
     platform = platform_context_from_auth_session(session)
     platform_user = platform.get("user") if isinstance(platform, dict) and isinstance(platform.get("user"), dict) else {}
     return privacy_safe_tracking_id(platform_user.get("userId") or user.get("subject"), "")
+
+
+def browser_recovery_scope(session: dict[str, Any] | None) -> str:
+    user = session.get("user") if isinstance(session, dict) and isinstance(session.get("user"), dict) else {}
+    platform_workspace = platform_workspace_id_from_auth_session(session)
+    platform_user = platform_user_id_from_auth_session(session)
+    subject = privacy_safe_tracking_id(user.get("subject"), "")
+    if platform_workspace and platform_user:
+        boundary = "platform"
+        user_scope = platform_user
+        workspace_scope = platform_workspace
+    elif subject:
+        boundary = "protected"
+        user_scope = subject
+        workspace_scope = privacy_safe_tracking_id(user.get("account"), "") or "protected-workspace"
+    else:
+        boundary = "local"
+        user_scope = "local-user"
+        workspace_scope = "local-workspace"
+    material = json.dumps(
+        [boundary, user_scope, workspace_scope],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    scope_key = (session_secret() or "sqag-local-browser-recovery-v1").encode("utf-8")
+    return hmac.new(scope_key, b"sqag-browser-recovery-v1\0" + material, hashlib.sha256).hexdigest()
 
 
 def safe_auth_session_for_async(session: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -16120,11 +16159,12 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             session = self.current_auth_session()
             self.send_json({
                 "csrf_header": configured_csrf_header_name(),
-                "csrf_token": configured_csrf_token(),
+                "csrf_token": csrf_token_for_cookie_header(self.headers.get("Cookie", "")),
                 "auth_required": auth_required(),
                 "authenticated": bool(session),
                 "permissions": self.current_permissions(),
                 "user": session.get("user") if session else None,
+                "browser_recovery_scope": browser_recovery_scope(session),
             })
             return
         if path == "/api/quote-sessions":
@@ -16833,6 +16873,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         headers = [
             ("Set-Cookie", clear_cookie_header_value(SESSION_COOKIE_NAME)),
             ("Set-Cookie", clear_cookie_header_value(OIDC_STATE_COOKIE_NAME)),
+            ("Clear-Site-Data", '"storage"'),
         ]
         self.send_redirect(logout_url, extra_headers=headers)
 
@@ -16855,7 +16896,8 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             self.send_json({"status": "blocked", "errors": ["Cross-origin requests are not allowed."]}, status=403)
             return True
         supplied_token = self.headers.get(configured_csrf_header_name(), "")
-        if not secrets.compare_digest(supplied_token, configured_csrf_token()):
+        expected_token = csrf_token_for_cookie_header(self.headers.get("Cookie", ""))
+        if not secrets.compare_digest(supplied_token, expected_token):
             write_local_log("security_event", {"reason": "invalid_csrf", "path": path, "status": 403})
             self.send_json({"status": "blocked", "errors": ["Missing or invalid local session token."]}, status=403)
             return True

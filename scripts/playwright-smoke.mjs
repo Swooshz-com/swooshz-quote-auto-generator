@@ -417,6 +417,222 @@ async function currentQuoteSessionId(page) {
   });
 }
 
+async function verifyBrowserRecoveryScopeIsolation(page) {
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
+  await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+  const seeded = await page.evaluate(async () => {
+    clearQuoteSessionDraftSaveTimer();
+    state.isBooting = true;
+    state.activeAppView = "quote";
+    state.quoteSessionId = "quote-workspace-a-private";
+    state.quoteSessionDraftSaveStarted = true;
+    elements.clientName.value = "Workspace A Private Customer";
+    state.images = [{
+      name: "workspace-a-private.png",
+      type: "image/png",
+      size: 1,
+      session_file_key: "workspace-a-private-file",
+      data_url: "data:image/png;base64,AA==",
+    }];
+    const snapshot = buildSessionSnapshot();
+    snapshot.browserRecoveryScope = "workspace-a-recovery-scope";
+    window.localStorage.setItem("swooshz_quote_session_v1", JSON.stringify(snapshot));
+    const db = await openSessionFileDb();
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(QUOTE_SESSION_FILE_STORE_NAME, "readwrite");
+      transaction.objectStore(QUOTE_SESSION_FILE_STORE_NAME).put({
+        name: "workspace-a-private.png",
+        type: "image/png",
+        size: 1,
+        session_file_key: "workspace-a-private-file",
+        file_role: "reference",
+        data_url: "data:image/png;base64,AA==",
+        browserRecoveryScope: "workspace-a-recovery-scope",
+      });
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error || new Error("Could not seed foreign session file"));
+      transaction.onabort = () => reject(transaction.error || new Error("Foreign session file seeding aborted"));
+    });
+    return {
+      currentScope: state.browserRecoveryScope || "",
+      seededScope: snapshot.browserRecoveryScope,
+    };
+  });
+  if (!seeded.currentScope || seeded.currentScope === seeded.seededScope) {
+    throw new Error(`Browser recovery test requires distinct current and seeded scopes, found ${JSON.stringify(seeded)}.`);
+  }
+
+  const recoveryPage = await page.context().newPage();
+  const recoveryProblems = [];
+  recoveryPage.on("console", (message) => {
+    if (["error", "warning"].includes(message.type())) recoveryProblems.push(`${message.type()}: ${message.text()}`);
+  });
+  recoveryPage.on("pageerror", (error) => recoveryProblems.push(`pageerror: ${error.message}`));
+  recoveryPage.on("response", (response) => {
+    if (response.status() >= 400) recoveryProblems.push(`${response.status()} ${response.url()}`);
+  });
+  let result;
+  try {
+    await recoveryPage.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    await recoveryPage.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
+    await recoveryPage.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+    result = await recoveryPage.evaluate(async () => {
+      const db = await openSessionFileDb();
+      const indexedDbCount = await new Promise((resolve, reject) => {
+        const transaction = db.transaction(QUOTE_SESSION_FILE_STORE_NAME, "readonly");
+        const request = transaction.objectStore(QUOTE_SESSION_FILE_STORE_NAME).count();
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error || new Error("Could not count session files"));
+      });
+      return {
+        currentScope: state.browserRecoveryScope || "",
+        clientName: elements.clientName.value,
+        quoteSessionId: state.quoteSessionId,
+        storedSnapshot: window.localStorage.getItem("swooshz_quote_session_v1"),
+        indexedDbCount,
+      };
+    });
+  } finally {
+    await recoveryPage.close();
+  }
+  if (result.currentScope !== seeded.currentScope) {
+    throw new Error(`Recovery page booted with an unexpected scope: ${JSON.stringify({ seeded, result })}.`);
+  }
+  if (recoveryProblems.length) {
+    throw new Error(`Recovery page reported failures: ${JSON.stringify(recoveryProblems)}.`);
+  }
+  if (result.clientName.includes("Workspace A") || result.quoteSessionId === "quote-workspace-a-private") {
+    throw new Error(`Mismatched browser recovery state crossed scope: ${JSON.stringify(result)}.`);
+  }
+  if (result.storedSnapshot !== null || result.indexedDbCount !== 0) {
+    throw new Error(`Mismatched browser recovery state was not purged: ${JSON.stringify(result)}.`);
+  }
+}
+
+async function verifyStaleTabMutationIsRejected(page) {
+  const stalePage = await page.context().newPage();
+  const unexpectedProblems = [];
+  stalePage.on("console", (message) => {
+    const text = message.text();
+    const expectedRejection = message.type() === "error"
+      && text.includes("Failed to load resource")
+      && text.includes("403");
+    if (["error", "warning"].includes(message.type()) && !expectedRejection) unexpectedProblems.push(message.type() + ": " + text);
+  });
+  stalePage.on("pageerror", (error) => unexpectedProblems.push("pageerror: " + error.message));
+  stalePage.on("response", (response) => {
+    const expectedRejection = response.status() === 403 && response.url().endsWith("/api/quote-sessions");
+    if (response.status() >= 400 && !expectedRejection) {
+      unexpectedProblems.push(response.status() + " " + response.url());
+    }
+  });
+
+  try {
+    await stalePage.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    await stalePage.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
+    await stalePage.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+    const initialSession = await stalePage.evaluate(async () => {
+      const response = await fetch("/api/session");
+      return response.json();
+    });
+    if (!initialSession.browser_recovery_scope || !initialSession.csrf_token) {
+      throw new Error("Stale-tab regression requires a complete initial browser session.");
+    }
+
+    const nextScope = initialSession.browser_recovery_scope + "-next-workspace";
+    const nextSession = {
+      ...initialSession,
+      browser_recovery_scope: nextScope,
+      csrf_token: "next-workspace-csrf-token-0123456789abcdef",
+    };
+    const interceptedPosts = [];
+    await stalePage.route("**/api/quote-sessions", async (route) => {
+      if (route.request().method() !== "POST") {
+        await route.fallback();
+        return;
+      }
+      interceptedPosts.push({
+        headers: route.request().headers(),
+        payload: JSON.parse(route.request().postData() || "{}"),
+      });
+      await route.fulfill({
+        status: 403,
+        contentType: "application/json",
+        body: JSON.stringify({
+          status: "blocked",
+          errors: ["Missing or invalid local session token."],
+        }),
+      });
+    });
+    await stalePage.route("**/api/session", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(nextSession),
+      });
+    });
+
+    const staleSessionId = "quote-stale-workspace-a-private";
+    const navigation = stalePage.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 });
+    await stalePage.evaluate((sessionId) => {
+      clearQuoteSessionDraftSaveTimer();
+      state.activeAppView = "quote";
+      state.quoteSessionId = sessionId;
+      state.quoteSessionDraftSaveStarted = true;
+      elements.clientName.value = "Workspace A Private Customer";
+      saveSessionState();
+      void saveQuoteSessionDraftState({ quoteGenerated: false }).catch(() => {});
+    }, staleSessionId);
+    await navigation;
+    await stalePage.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
+    await stalePage.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+
+    const result = await stalePage.evaluate(async () => {
+      const db = await openSessionFileDb();
+      const indexedDbCount = await new Promise((resolve, reject) => {
+        const transaction = db.transaction(QUOTE_SESSION_FILE_STORE_NAME, "readonly");
+        const request = transaction.objectStore(QUOTE_SESSION_FILE_STORE_NAME).count();
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error || new Error("Could not count stale-tab session files"));
+      });
+      return {
+        currentScope: state.browserRecoveryScope,
+        isTransitioning: state.isRecoveryScopeTransitioning,
+        quoteSessionId: state.quoteSessionId,
+        storedSnapshot: window.localStorage.getItem("swooshz_quote_session_v1"),
+        indexedDbCount,
+      };
+    });
+
+    if (interceptedPosts.length !== 1) {
+      throw new Error("Stale tab must issue exactly one rejected mutation: " + JSON.stringify(interceptedPosts));
+    }
+    const stalePost = interceptedPosts[0];
+    if (stalePost.payload.session_id !== staleSessionId) {
+      throw new Error("Stale-tab regression did not exercise the intended private draft: " + JSON.stringify(stalePost.payload));
+    }
+    const csrfHeader = String(initialSession.csrf_header || "").toLowerCase();
+    if (!csrfHeader || stalePost.headers[csrfHeader] !== initialSession.csrf_token) {
+      throw new Error("Stale-tab mutation did not carry the original session-bound CSRF token.");
+    }
+    if (
+      result.currentScope !== nextScope
+      || result.isTransitioning
+      || result.quoteSessionId === staleSessionId
+      || result.storedSnapshot !== null
+      || result.indexedDbCount !== 0
+    ) {
+      throw new Error("Stale-tab scope transition did not purge before reload: " + JSON.stringify(result));
+    }
+    if (unexpectedProblems.length) {
+      throw new Error("Stale-tab regression reported unexpected failures: " + JSON.stringify(unexpectedProblems));
+    }
+  } finally {
+    await stalePage.close();
+  }
+}
+
 async function dashboardQuoteSessionDetail(page, sessionId) {
   return page.evaluate(async (safeSessionId) => {
     const response = await fetch(`/api/quote-sessions/${encodeURIComponent(safeSessionId)}`);
@@ -732,7 +948,8 @@ async function main() {
   }
 
   const browser = await chromium.launch({ headless: !options.headed });
-  const page = await browser.newPage({ viewport: { width: 1365, height: 768 } });
+  const context = await browser.newContext({ viewport: { width: 1365, height: 768 } });
+  const page = await context.newPage();
   const consoleProblems = [];
   const networkProblems = [];
   page.on("console", (message) => {
@@ -745,6 +962,8 @@ async function main() {
 
   try {
     await installMockProfiles(page);
+    await verifyBrowserRecoveryScopeIsolation(page);
+    await verifyStaleTabMutationIsRejected(page);
     await verifyConcurrentInitialDraftSaveUsesSingleSession(page);
     await verifyInitialDraftSaveReservesSessionIdBeforeNetwork(page);
     await verifyDashboardNewQuoteDoesNotSaveHiddenDraft(page);
