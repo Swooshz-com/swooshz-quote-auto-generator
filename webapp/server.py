@@ -167,6 +167,10 @@ MAX_JOB_REQUEST_BYTES = (((MAX_REFERENCE_IMAGES * max(MAX_IMAGE_BYTES, MAX_PDF_B
 MAX_PRICING_REFERENCE_BYTES = 10 * 1024 * 1024
 MAX_PROFILE_LAYOUT_BYTES = 10 * 1024 * 1024
 MAX_PROFILE_LAYOUT_RULES_BYTES = 256 * 1024
+MAX_PROFILE_LAYOUT_XLSX_MEMBERS = 1024
+MAX_PROFILE_LAYOUT_XLSX_ENTRY_BYTES = 16 * 1024 * 1024
+MAX_PROFILE_LAYOUT_XLSX_TOTAL_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
+PROFILE_LAYOUT_XLSX_READ_CHUNK_BYTES = 64 * 1024
 MAX_PRICING_REFERENCE_ROWS = 500
 MAX_PRICING_REFERENCE_XLSX_ENTRY_BYTES = 8 * 1024 * 1024
 MAX_PRICING_REFERENCE_XLSX_TOTAL_UNCOMPRESSED_BYTES = 32 * 1024 * 1024
@@ -5558,14 +5562,481 @@ def safe_profile_pack_filename(value: Any, fallback: str, allowed_suffixes: set[
     return f"{safe_stem or Path(fallback).stem}{suffix}"
 
 
-def validate_profile_layout_xlsx(raw: bytes) -> None:
+PROFILE_LAYOUT_WORKBOOK_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
+)
+PROFILE_LAYOUT_ALLOWED_DEFINED_NAMES = {"_xlnm.print_area", "_xlnm.print_titles"}
+PROFILE_LAYOUT_PRINT_REFERENCE_RE = re.compile(
+    r"^\$?(?:[A-Z]{1,3}\$?\d+|\d+|[A-Z]{1,3})"
+    r"(?::\$?(?:[A-Z]{1,3}\$?\d+|\d+|[A-Z]{1,3}))?$"
+)
+PROFILE_LAYOUT_ALLOWED_PARTS = {
+    "[content_types].xml",
+    "_rels/.rels",
+    "customxml/sqag-layout-rules.xml",
+    "xl/_rels/workbook.xml.rels",
+    "xl/drawings/_rels/drawing1.xml.rels",
+    "xl/drawings/drawing1.xml",
+    "xl/printersettings/printersettings1.bin",
+    "xl/styles.xml",
+    "xl/theme/theme1.xml",
+    "xl/workbook.xml",
+    "xl/worksheets/_rels/sheet1.xml.rels",
+    "xl/worksheets/sheet1.xml",
+}
+PROFILE_LAYOUT_MEDIA_PART_RE = re.compile(
+    r"^xl/media/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\.(?:jpe?g|png)$",
+    re.IGNORECASE,
+)
+PROFILE_LAYOUT_ALLOWED_RELATIONSHIP_TYPES = {
+    "_rels/.rels": {"customxml", "officedocument"},
+    "xl/_rels/workbook.xml.rels": {"styles", "theme", "worksheet"},
+    "xl/drawings/_rels/drawing1.xml.rels": {"image"},
+    "xl/worksheets/_rels/sheet1.xml.rels": {"drawing", "printersettings"},
+}
+PROFILE_LAYOUT_FORMULA_ELEMENT_NAMES = {
+    "calculatedcolumnformula",
+    "f",
+    "formula",
+    "formula1",
+    "formula2",
+    "totalsrowformula",
+}
+PROFILE_LAYOUT_ALLOWED_WORKSHEET_ELEMENTS = {
+    "colbreaks",
+    "cols",
+    "dimension",
+    "drawing",
+    "headerfooter",
+    "mergecells",
+    "pagemargins",
+    "pagesetup",
+    "printoptions",
+    "rowbreaks",
+    "sheetdata",
+    "sheetformatpr",
+    "sheetpr",
+    "sheetviews",
+}
+PROFILE_LAYOUT_ALLOWED_CONTENT_TYPE_DEFAULTS = {
+    "bin": "application/vnd.openxmlformats-officedocument.spreadsheetml.printersettings",
+    "jpeg": "image/jpeg",
+    "jpg": "image/jpeg",
+    "png": "image/png",
+    "rels": "application/vnd.openxmlformats-package.relationships+xml",
+    "xml": "application/xml",
+}
+PROFILE_LAYOUT_ALLOWED_CONTENT_TYPE_OVERRIDES = {
+    "/customxml/sqag-layout-rules.xml": {"application/xml"},
+    "/xl/drawings/drawing1.xml": {
+        "application/vnd.openxmlformats-officedocument.drawing+xml",
+    },
+    "/xl/printersettings/printersettings1.bin": {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.printersettings",
+    },
+    "/xl/styles.xml": {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml",
+    },
+    "/xl/theme/theme1.xml": {
+        "application/vnd.openxmlformats-officedocument.theme+xml",
+    },
+    "/xl/workbook.xml": {PROFILE_LAYOUT_WORKBOOK_CONTENT_TYPE.casefold()},
+    "/xl/worksheets/sheet1.xml": {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+    },
+}
+
+
+def safe_profile_layout_member_name(info: zipfile.ZipInfo) -> str:
+    raw_name = str(info.filename or "")
+    candidate = raw_name[:-1] if info.is_dir() and raw_name.endswith("/") else raw_name
+    if (
+        not candidate
+        or len(candidate) > 512
+        or "\x00" in candidate
+        or "\\" in candidate
+        or candidate.startswith("/")
+        or re.match(r"^[A-Za-z]:", candidate)
+        or posixpath.normpath(candidate) != candidate
+        or any(part in {"", ".", ".."} for part in candidate.split("/"))
+    ):
+        raise ValueError("Quotation layout contains an unsafe archive member.")
+    return candidate
+
+
+def validate_profile_layout_zip_safety(zf: zipfile.ZipFile) -> set[str]:
+    infos = zf.infolist()
+    if len(infos) > MAX_PROFILE_LAYOUT_XLSX_MEMBERS:
+        raise ValueError("Quotation layout expands beyond safe limits.")
+
+    names: set[str] = set()
+    casefold_names: set[str] = set()
+    declared_total = 0
+    for info in infos:
+        name = safe_profile_layout_member_name(info)
+        comparison_name = name.casefold()
+        if comparison_name in casefold_names:
+            raise ValueError("Quotation layout contains an unsafe archive member.")
+        casefold_names.add(comparison_name)
+        if info.flag_bits & 0x1 or info.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
+            raise ValueError("Quotation layout contains an unsafe archive member.")
+        if info.is_dir():
+            if info.file_size != 0:
+                raise ValueError("Quotation layout contains an unsafe archive member.")
+            continue
+        names.add(name)
+        if info.file_size < 0 or info.file_size > MAX_PROFILE_LAYOUT_XLSX_ENTRY_BYTES:
+            raise ValueError("Quotation layout expands beyond safe limits.")
+        declared_total += info.file_size
+        if declared_total > MAX_PROFILE_LAYOUT_XLSX_TOTAL_UNCOMPRESSED_BYTES:
+            raise ValueError("Quotation layout expands beyond safe limits.")
+
+    actual_total = 0
     try:
-        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-            names = set(zf.namelist())
-    except zipfile.BadZipFile as exc:
+        for info in infos:
+            if info.is_dir():
+                continue
+            actual_size = 0
+            with zf.open(info, "r") as member:
+                while True:
+                    chunk = member.read(PROFILE_LAYOUT_XLSX_READ_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    actual_size += len(chunk)
+                    actual_total += len(chunk)
+                    if (
+                        actual_size > MAX_PROFILE_LAYOUT_XLSX_ENTRY_BYTES
+                        or actual_total > MAX_PROFILE_LAYOUT_XLSX_TOTAL_UNCOMPRESSED_BYTES
+                    ):
+                        raise ValueError("Quotation layout expands beyond safe limits.")
+            if actual_size != info.file_size:
+                raise ValueError("Quotation layout contains an unsafe archive member.")
+    except ValueError:
+        raise
+    except (OSError, RuntimeError, NotImplementedError, EOFError, zipfile.BadZipFile) as exc:
+        raise ValueError("Quotation layout contains an unsafe archive member.") from exc
+    return names
+
+
+def profile_layout_xml_root(zf: zipfile.ZipFile, name: str) -> ET.Element:
+    try:
+        return ET.fromstring(zf.read(name))
+    except (KeyError, ET.ParseError, OSError, RuntimeError, zipfile.BadZipFile) as exc:
         raise ValueError("Quotation layout must be a valid .xlsx workbook.") from exc
-    if "[Content_Types].xml" not in names or "xl/workbook.xml" not in names:
+
+
+def profile_layout_relationship_nodes(root: ET.Element) -> list[ET.Element]:
+    if root.tag.rsplit("}", 1)[-1] != "Relationships":
         raise ValueError("Quotation layout must be a valid .xlsx workbook.")
+    nodes = list(root)
+    if any(node.tag.rsplit("}", 1)[-1] != "Relationship" for node in nodes):
+        raise ValueError("Quotation layout must be a valid .xlsx workbook.")
+    return nodes
+
+
+def profile_layout_relationship_source(rels_name: str) -> str:
+    if rels_name == "_rels/.rels":
+        return ""
+    directory = posixpath.dirname(rels_name)
+    if not directory.endswith("/_rels"):
+        raise ValueError("Quotation layout contains an unsafe archive member.")
+    source_directory = directory[: -len("/_rels")]
+    source_name = posixpath.basename(rels_name).removesuffix(".rels")
+    return posixpath.join(source_directory, source_name)
+
+
+def resolved_profile_layout_relationship_target(rels_name: str, target: str) -> str:
+    clean_target = clean_text(target)
+    if (
+        not clean_target
+        or "\x00" in clean_target
+        or "\\" in clean_target
+        or clean_target.startswith("//")
+        or urlparse(clean_target).scheme
+    ):
+        raise ValueError("Quotation layout contains unsupported active or external content.")
+    if clean_target.startswith("/"):
+        resolved = posixpath.normpath(clean_target.lstrip("/"))
+    else:
+        source = profile_layout_relationship_source(rels_name)
+        resolved = posixpath.normpath(posixpath.join(posixpath.dirname(source), clean_target))
+    if resolved.startswith("../") or resolved in {"", ".", ".."}:
+        raise ValueError("Quotation layout contains an unsafe archive member.")
+    return resolved
+
+
+def profile_layout_part_allowed(name: str) -> bool:
+    lowered = name.casefold()
+    return lowered in PROFILE_LAYOUT_ALLOWED_PARTS or PROFILE_LAYOUT_MEDIA_PART_RE.fullmatch(name) is not None
+
+
+def profile_layout_relationship_target_allowed(
+    rels_name: str,
+    rel_suffix: str,
+    resolved: str,
+) -> bool:
+    key = (rels_name.casefold(), rel_suffix)
+    exact_targets = {
+        ("_rels/.rels", "customxml"): "customXml/sqag-layout-rules.xml",
+        ("_rels/.rels", "officedocument"): "xl/workbook.xml",
+        ("xl/_rels/workbook.xml.rels", "styles"): "xl/styles.xml",
+        ("xl/_rels/workbook.xml.rels", "theme"): "xl/theme/theme1.xml",
+        ("xl/_rels/workbook.xml.rels", "worksheet"): "xl/worksheets/sheet1.xml",
+        ("xl/worksheets/_rels/sheet1.xml.rels", "drawing"): "xl/drawings/drawing1.xml",
+        (
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            "printersettings",
+        ): "xl/printerSettings/printerSettings1.bin",
+    }
+    if key == ("xl/drawings/_rels/drawing1.xml.rels", "image"):
+        return PROFILE_LAYOUT_MEDIA_PART_RE.fullmatch(resolved) is not None
+    return exact_targets.get(key) == resolved
+
+
+def validate_profile_layout_content_types(zf: zipfile.ZipFile, names: set[str]) -> None:
+    root = profile_layout_xml_root(zf, "[Content_Types].xml")
+    if root.tag.rsplit("}", 1)[-1] != "Types":
+        raise ValueError("Quotation layout must be a valid .xlsx workbook.")
+
+    seen: set[tuple[str, str]] = set()
+    workbook_types: list[str] = []
+    for node in list(root):
+        local_name = node.tag.rsplit("}", 1)[-1]
+        content_type = clean_text(node.attrib.get("ContentType")).casefold()
+        if local_name == "Default":
+            extension = clean_text(node.attrib.get("Extension")).casefold()
+            key = ("default", extension)
+            if (
+                key in seen
+                or set(node.attrib) != {"Extension", "ContentType"}
+                or PROFILE_LAYOUT_ALLOWED_CONTENT_TYPE_DEFAULTS.get(extension) != content_type
+            ):
+                raise ValueError("Quotation layout contains unsupported active or external content.")
+        elif local_name == "Override":
+            part_name = clean_text(node.attrib.get("PartName")).casefold()
+            key = ("override", part_name)
+            resolved = part_name.lstrip("/")
+            expected = PROFILE_LAYOUT_ALLOWED_CONTENT_TYPE_OVERRIDES.get(part_name)
+            if PROFILE_LAYOUT_MEDIA_PART_RE.fullmatch(resolved):
+                suffix = Path(resolved).suffix.casefold()
+                expected = {"image/png"} if suffix == ".png" else {"image/jpeg"}
+            if (
+                key in seen
+                or set(node.attrib) != {"PartName", "ContentType"}
+                or not part_name.startswith("/")
+                or resolved not in {name.casefold() for name in names}
+                or expected is None
+                or content_type not in expected
+            ):
+                raise ValueError("Quotation layout contains unsupported active or external content.")
+            if part_name == "/xl/workbook.xml":
+                workbook_types.append(content_type)
+        else:
+            raise ValueError("Quotation layout must be a valid .xlsx workbook.")
+        seen.add(key)
+
+    if workbook_types != [PROFILE_LAYOUT_WORKBOOK_CONTENT_TYPE.casefold()]:
+        raise ValueError("Quotation layout must be a standard .xlsx workbook.")
+
+
+def validate_profile_layout_rules_part(zf: zipfile.ZipFile, names: set[str]) -> None:
+    if LAYOUT_RULES_CUSTOM_XML_PATH not in names:
+        return
+    raw = zf.read(LAYOUT_RULES_CUSTOM_XML_PATH)
+    if len(raw) > MAX_PROFILE_LAYOUT_RULES_BYTES:
+        raise ValueError("Quotation layout expands beyond safe limits.")
+    root = profile_layout_xml_root(zf, LAYOUT_RULES_CUSTOM_XML_PATH)
+    children = list(root)
+    if (
+        root.tag != f"{NS_LAYOUT_RULES}layoutRules"
+        or root.attrib != {"schema": "swooshz.quote-layout-rules.v1"}
+        or clean_text(root.text)
+        or len(children) != 1
+        or children[0].tag != f"{NS_LAYOUT_RULES}json"
+        or children[0].attrib
+        or list(children[0])
+        or clean_text(children[0].tail)
+    ):
+        raise ValueError("Quotation layout contains unsupported active or external content.")
+    try:
+        parsed = json.loads(children[0].text or "")
+    except json.JSONDecodeError as exc:
+        raise ValueError("Quotation layout contains unsupported active or external content.") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("Quotation layout contains unsupported active or external content.")
+
+
+def validate_profile_layout_formula_elements(zf: zipfile.ZipFile, names: set[str]) -> None:
+    for name in sorted(item for item in names if item.casefold().endswith(".xml")):
+        root = profile_layout_xml_root(zf, name)
+        if any(
+            node.tag.rsplit("}", 1)[-1].casefold() in PROFILE_LAYOUT_FORMULA_ELEMENT_NAMES
+            for node in root.iter()
+        ):
+            raise ValueError("Quotation layout must not contain formulas.")
+
+
+def validate_profile_layout_relationships(
+    zf: zipfile.ZipFile,
+    names: set[str],
+) -> tuple[dict[str, ET.Element], set[str]]:
+    roots: dict[str, ET.Element] = {}
+    referenced_targets: set[str] = set()
+    for name in sorted(item for item in names if item.casefold().endswith(".rels")):
+        allowed_types = PROFILE_LAYOUT_ALLOWED_RELATIONSHIP_TYPES.get(name.casefold())
+        source = profile_layout_relationship_source(name)
+        if allowed_types is None or (source and source not in names):
+            raise ValueError("Quotation layout contains unsupported active or external content.")
+        root = profile_layout_xml_root(zf, name)
+        roots[name] = root
+        relationship_ids: set[str] = set()
+        relationships = profile_layout_relationship_nodes(root)
+        for relationship in relationships:
+            rel_id = clean_text(relationship.attrib.get("Id"))
+            rel_type = clean_text(relationship.attrib.get("Type"))
+            rel_suffix = rel_type.rstrip("/").rsplit("/", 1)[-1].casefold()
+            if (
+                set(relationship.attrib) != {"Id", "Type", "Target"}
+                or not rel_id
+                or rel_id in relationship_ids
+                or not rel_type
+                or rel_suffix not in allowed_types
+            ):
+                raise ValueError("Quotation layout contains unsupported active or external content.")
+            relationship_ids.add(rel_id)
+            resolved = resolved_profile_layout_relationship_target(
+                name,
+                clean_text(relationship.attrib.get("Target")),
+            )
+            if (
+                resolved not in names
+                or not profile_layout_relationship_target_allowed(name, rel_suffix, resolved)
+            ):
+                raise ValueError("Quotation layout contains unsupported active or external content.")
+            referenced_targets.add(resolved)
+
+    data_parts = {
+        name
+        for name in names
+        if name != "[Content_Types].xml" and not name.casefold().endswith(".rels")
+    }
+    if data_parts != referenced_targets:
+        raise ValueError("Quotation layout contains unsupported active or external content.")
+    return roots, referenced_targets
+
+
+def validate_profile_layout_package(zf: zipfile.ZipFile, names: set[str]) -> None:
+    required_parts = {
+        "[Content_Types].xml",
+        "_rels/.rels",
+        "xl/_rels/workbook.xml.rels",
+        "xl/styles.xml",
+        "xl/workbook.xml",
+        "xl/worksheets/sheet1.xml",
+    }
+    if not required_parts.issubset(names):
+        raise ValueError("Quotation layout must be a valid .xlsx workbook.")
+
+    if any(not profile_layout_part_allowed(name) for name in names):
+        raise ValueError("Quotation layout contains unsupported active or external content.")
+
+    validate_profile_layout_content_types(zf, names)
+    validate_profile_layout_rules_part(zf, names)
+    validate_profile_layout_formula_elements(zf, names)
+
+    relationship_roots, _ = validate_profile_layout_relationships(zf, names)
+    root_relationships = profile_layout_relationship_nodes(relationship_roots["_rels/.rels"])
+    office_document_targets = [
+        resolved_profile_layout_relationship_target(
+            "_rels/.rels",
+            clean_text(relationship.attrib.get("Target")),
+        )
+        for relationship in root_relationships
+        if clean_text(relationship.attrib.get("Type")).rstrip("/").rsplit("/", 1)[-1].casefold()
+        == "officedocument"
+    ]
+    if office_document_targets != ["xl/workbook.xml"]:
+        raise ValueError("Quotation layout must be a valid .xlsx workbook.")
+
+    workbook = profile_layout_xml_root(zf, "xl/workbook.xml")
+    if workbook.find(f"{NS_MAIN}externalReferences") is not None:
+        raise ValueError("Quotation layout contains unsupported active or external content.")
+    sheets = workbook.findall(f"{NS_MAIN}sheets/{NS_MAIN}sheet")
+    worksheet_names = xlsx_worksheet_names(zf)
+    if (
+        len(sheets) != 1
+        or clean_text(sheets[0].attrib.get("state")).casefold() not in {"", "visible"}
+        or not clean_text(sheets[0].attrib.get("name"))
+        or worksheet_names != ["xl/worksheets/sheet1.xml"]
+    ):
+        raise ValueError("Quotation layout must contain exactly one visible worksheet.")
+
+    rel_id = clean_text(
+        sheets[0].attrib.get(
+            "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+        )
+    )
+    workbook_relationships = {
+        clean_text(relationship.attrib.get("Id")): relationship
+        for relationship in profile_layout_relationship_nodes(
+            relationship_roots["xl/_rels/workbook.xml.rels"]
+        )
+    }
+    sheet_relationship = workbook_relationships.get(rel_id)
+    if (
+        sheet_relationship is None
+        or clean_text(sheet_relationship.attrib.get("Type")).rstrip("/").rsplit("/", 1)[-1].casefold()
+        != "worksheet"
+        or resolved_profile_layout_relationship_target(
+            "xl/_rels/workbook.xml.rels",
+            clean_text(sheet_relationship.attrib.get("Target")),
+        )
+        != "xl/worksheets/sheet1.xml"
+    ):
+        raise ValueError("Quotation layout must be a valid .xlsx workbook.")
+
+    for defined_name in workbook.findall(f"{NS_MAIN}definedNames/{NS_MAIN}definedName"):
+        name = clean_text(defined_name.attrib.get("name")).casefold()
+        value = clean_text(defined_name.text)
+        if (
+            name not in PROFILE_LAYOUT_ALLOWED_DEFINED_NAMES
+            or any(marker in value.casefold() for marker in ("[", "]", "://", "\\", "dde"))
+            or not value
+            or "|" in value
+            or any(
+                "!" not in area
+                or PROFILE_LAYOUT_PRINT_REFERENCE_RE.fullmatch(area.rsplit("!", 1)[1].strip()) is None
+                for area in value.split(",")
+            )
+        ):
+            raise ValueError("Quotation layout contains unsupported active or external content.")
+
+    worksheet = profile_layout_xml_root(zf, "xl/worksheets/sheet1.xml")
+    if any(
+        child.tag.rsplit("}", 1)[-1].casefold()
+        not in PROFILE_LAYOUT_ALLOWED_WORKSHEET_ELEMENTS
+        for child in list(worksheet)
+    ):
+        raise ValueError("Quotation layout contains unsupported active or external content.")
+
+
+def validate_profile_layout_xlsx(raw: bytes) -> None:
+    if not isinstance(raw, (bytes, bytearray)) or not raw or len(raw) > MAX_PROFILE_LAYOUT_BYTES:
+        raise ValueError("Quotation layout expands beyond safe limits.")
+    try:
+        with zipfile.ZipFile(io.BytesIO(bytes(raw))) as zf:
+            names = validate_profile_layout_zip_safety(zf)
+            validate_profile_layout_package(zf, names)
+    except ValueError:
+        raise
+    except (
+        OSError,
+        RuntimeError,
+        NotImplementedError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ) as exc:
+        raise ValueError("Quotation layout must be a valid .xlsx workbook.") from exc
 
 
 def normalize_profile_layout_rules_payload(value: Any) -> dict[str, Any]:
