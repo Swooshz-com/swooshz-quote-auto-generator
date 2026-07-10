@@ -8,7 +8,7 @@ const QUOTE_SESSION_STORAGE_KEY = "swooshz_quote_session_v1";
 const QUOTE_SESSION_FILE_DB_NAME = "swooshz_quote_session_files_v1";
 const QUOTE_SESSION_FILE_STORE_NAME = "reference_files";
 const QUOTE_SESSION_FILE_DB_VERSION = 1;
-const QUOTE_SESSION_STATE_VERSION = 4;
+const QUOTE_SESSION_STATE_VERSION = 5;
 const OUTPUT_SORT_MODES = ["pricing_reference", "category", "name", "category_name"];
 const ANALYSIS_MODE_STANDARD = "standard";
 const ANALYSIS_MODE_HIGH_QUALITY = "high_quality";
@@ -205,6 +205,8 @@ const state = {
   authRequired: false,
   authenticated: false,
   authUser: null,
+  browserRecoveryScope: "",
+  isRecoveryScopeTransitioning: false,
   pendingFeedback: "",
   activeSidePanel: "images",
   downloadFile: null,
@@ -948,21 +950,40 @@ function currentPricingReference() {
     || null;
 }
 
+function currentBrowserRecoveryScope() {
+  return String(state.browserRecoveryScope || "").trim();
+}
+
 function safeLastSelectionJson() {
+  const currentScope = currentBrowserRecoveryScope();
+  if (!currentScope) return {};
   try {
     const parsed = JSON.parse(window.localStorage.getItem(LAST_SELECTION_STORAGE_KEY) || "null");
-    return parsed && typeof parsed === "object" ? parsed : {};
+    if (!parsed || typeof parsed !== "object") return {};
+    if (String(parsed.browserRecoveryScope || "") !== currentScope) return {};
+    return parsed;
   } catch {
     return {};
   }
 }
 
+function clearLastSelectionState() {
+  try {
+    window.localStorage.removeItem(LAST_SELECTION_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures; the quote flow does not depend on last-used defaults.
+  }
+}
+
 function saveLastSelectionPatch(patch = {}) {
+  const currentScope = currentBrowserRecoveryScope();
+  if (!currentScope) return;
   try {
     window.localStorage.setItem(LAST_SELECTION_STORAGE_KEY, JSON.stringify({
       ...safeLastSelectionJson(),
       ...patch,
       version: 1,
+      browserRecoveryScope: currentScope,
       savedAt: new Date().toISOString(),
     }));
   } catch {
@@ -2590,7 +2611,11 @@ function sessionFileRecordsFromDraft() {
 }
 
 function persistSessionFiles(records = []) {
-  const validRecords = records.filter((record) => record?.session_file_key && record?.data_url);
+  const currentScope = currentBrowserRecoveryScope();
+  if (!currentScope) return Promise.resolve();
+  const validRecords = records
+    .filter((record) => record?.session_file_key && record?.data_url)
+    .map((record) => ({ ...record, browserRecoveryScope: currentScope }));
   if (!validRecords.length) return Promise.resolve();
   return openSessionFileDb().then((db) => new Promise((resolve, reject) => {
     const transaction = db.transaction(QUOTE_SESSION_FILE_STORE_NAME, "readwrite");
@@ -2603,8 +2628,9 @@ function persistSessionFiles(records = []) {
 }
 
 function loadSessionFileMap(keys = []) {
+  const currentScope = currentBrowserRecoveryScope();
   const uniqueKeys = [...new Set(keys.map((key) => String(key || "").trim()).filter(Boolean))];
-  if (!uniqueKeys.length) return Promise.resolve(new Map());
+  if (!currentScope || !uniqueKeys.length) return Promise.resolve(new Map());
   return openSessionFileDb().then((db) => new Promise((resolve, reject) => {
     const found = new Map();
     const transaction = db.transaction(QUOTE_SESSION_FILE_STORE_NAME, "readonly");
@@ -2612,7 +2638,9 @@ function loadSessionFileMap(keys = []) {
     uniqueKeys.forEach((key) => {
       const request = store.get(key);
       request.onsuccess = () => {
-        if (request.result?.data_url) found.set(key, request.result);
+        if (request.result?.data_url && request.result.browserRecoveryScope === currentScope) {
+          found.set(key, request.result);
+        }
       };
     });
     transaction.oncomplete = () => resolve(found);
@@ -2634,6 +2662,7 @@ function clearSessionFiles() {
 function buildSessionSnapshot() {
   return {
     version: QUOTE_SESSION_STATE_VERSION,
+    browserRecoveryScope: currentBrowserRecoveryScope(),
     savedAt: new Date().toISOString(),
     activeAppView: state.activeAppView,
     profileId: state.profileId,
@@ -2684,8 +2713,18 @@ function clearSessionState() {
   clearSessionFiles().catch(() => {});
 }
 
+async function purgeBrowserRecoveryState() {
+  try {
+    window.localStorage.removeItem(QUOTE_SESSION_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures; scope mismatches still remain blocked from restoration.
+  }
+  clearLastSelectionState();
+  await clearSessionFiles().catch(() => {});
+}
+
 function saveSessionState() {
-  if (state.isBooting) return;
+  if (state.isBooting || !currentBrowserRecoveryScope()) return;
   try {
     if (state.activeAppView === "dashboard" && !safeQuoteSessionId(state.quoteSessionId) && !quoteDraftShouldPersistToDashboard()) {
       window.localStorage.removeItem(QUOTE_SESSION_STORAGE_KEY);
@@ -2887,8 +2926,9 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
 
 async function restoreSessionState() {
   const saved = safeSessionJson();
-  if (!saved || saved.version !== QUOTE_SESSION_STATE_VERSION) {
-    clearSessionState();
+  const currentScope = currentBrowserRecoveryScope();
+  if (!saved || saved.version !== QUOTE_SESSION_STATE_VERSION || saved.browserRecoveryScope !== currentScope) {
+    await purgeBrowserRecoveryState();
     return false;
   }
   return applyQuoteSessionSnapshot(saved);
@@ -8919,13 +8959,28 @@ async function jsonFromResponse(response) {
   }
 }
 
-function applySessionData(data = {}) {
-  if (!data.csrf_token) return false;
+
+async function applySessionData(data = {}) {
+  const nextRecoveryScope = String(data.browser_recovery_scope || "").trim();
+  if (!data.csrf_token || !nextRecoveryScope) return false;
+  const previousRecoveryScope = currentBrowserRecoveryScope();
+  if (previousRecoveryScope && previousRecoveryScope !== nextRecoveryScope) {
+    state.isRecoveryScopeTransitioning = true;
+    state.isBooting = true;
+    state.csrfToken = "";
+    clearQuoteSessionDraftSaveTimer();
+    markPageUnloading();
+    await purgeBrowserRecoveryState();
+    window.location.reload();
+    return false;
+  }
+  state.isRecoveryScopeTransitioning = false;
   state.csrfHeaderName = data.csrf_header || CSRF_HEADER_NAME;
   state.csrfToken = data.csrf_token;
   state.authRequired = Boolean(data.auth_required);
   state.authenticated = Boolean(data.authenticated);
   state.authUser = data.user && typeof data.user === "object" ? data.user : null;
+  state.browserRecoveryScope = nextRecoveryScope;
   if (data.permissions && typeof data.permissions === "object") {
     state.permissions = { ...state.permissions, ...data.permissions };
   }
@@ -8955,7 +9010,7 @@ function renderAuthState() {
 
 async function refreshSessionToken() {
   const { ok, data } = await getJson("/api/session", { logFetchFailure: false });
-  return ok && applySessionData(data);
+  return ok && await applySessionData(data);
 }
 
 async function postJson(url, payload) {
@@ -9123,7 +9178,10 @@ function quoteDraftHasOutputState() {
 }
 
 function quoteSessionDraftStateCanSave() {
-  return Boolean(state.quoteSessionDraftSaveStarted);
+  return Boolean(
+    state.quoteSessionDraftSaveStarted
+    && !state.isRecoveryScopeTransitioning,
+  );
 }
 
 function quoteSessionDraftReachedCustomerStep() {
@@ -10862,7 +10920,7 @@ function logClientEvent(event, details = {}) {
 
 async function initializeSession() {
   const { ok, data } = await getJson("/api/session");
-  if (ok && applySessionData(data)) {
+  if (ok && await applySessionData(data)) {
     return;
   }
   if (elements.healthText) elements.healthText.textContent = "Local session unavailable";
@@ -11628,6 +11686,10 @@ function pricingReferenceShouldWarnBeforeUnload() {
 }
 
 function handleBeforeUnload(event) {
+  if (state.isRecoveryScopeTransitioning) {
+    markPageUnloading();
+    return undefined;
+  }
   if (!pricingReferenceShouldWarnBeforeUnload()) {
     markPageUnloading();
     return undefined;
@@ -11638,6 +11700,14 @@ function handleBeforeUnload(event) {
 }
 
 function wireEvents() {
+  if (elements.topbarLogoutLink) {
+    elements.topbarLogoutLink.addEventListener("click", async (event) => {
+      event.preventDefault();
+      const href = elements.topbarLogoutLink.getAttribute("href") || "/logout";
+      await purgeBrowserRecoveryState();
+      window.location.assign(href);
+    });
+  }
   wireRichTextEditors();
   if (elements.pricingReferenceFile) {
     elements.pricingReferenceFile.accept = PRICING_REFERENCE_FILE_ACCEPT;

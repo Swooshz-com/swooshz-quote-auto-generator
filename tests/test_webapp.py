@@ -3986,6 +3986,7 @@ class WebappServerTest(unittest.TestCase):
 
         self.assertEqual(logout_redirect.exception.code, 302)
         self.assertEqual(logout_redirect.exception.headers["Location"], env["OIDC_LOGOUT_URL"])
+        self.assertEqual(logout_redirect.exception.headers["Clear-Site-Data"], '"storage"')
         self.assertTrue(any(cookie.startswith(f"{webapp.SESSION_COOKIE_NAME}=") and "Max-Age=0" in cookie for cookie in set_cookies))
         self.assertTrue(any(cookie.startswith(f"{webapp.OIDC_STATE_COOKIE_NAME}=") and "Max-Age=0" in cookie for cookie in set_cookies))
 
@@ -3994,6 +3995,43 @@ class WebappServerTest(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError) as safe_logout_redirect:
                     opener.open(f"{runner.base_url}/logout", timeout=3)
         self.assertEqual(safe_logout_redirect.exception.headers["Location"], "/signed-out")
+    def test_stale_platform_tab_cannot_mutate_after_workspace_cookie_switch(self):
+        env = self.platform_launch_env()
+        stored = mock.Mock()
+        stored.create_or_update_quote_session.return_value = {"session_id": "workspace-a-private"}
+
+        with mock.patch.dict(os.environ, env, clear=True):
+            cookie_a = (
+                f"{webapp.SESSION_COOKIE_NAME}="
+                f"{webapp.signed_cookie_value(self.platform_auth_session('workspace-a', user_id='user-a'))}"
+            )
+            cookie_b = (
+                f"{webapp.SESSION_COOKIE_NAME}="
+                f"{webapp.signed_cookie_value(self.platform_auth_session('workspace-b', user_id='user-b'))}"
+            )
+            with mock.patch.object(webapp.QuoteRunnerHandler, "current_quote_session_storage", return_value=stored):
+                with LocalRunnerServer() as runner:
+                    session_a = self.http_json(runner, "GET", "/api/session", cookie=cookie_a)
+                    session_b = self.http_json(runner, "GET", "/api/session", cookie=cookie_b)
+                    stale_write = self.http_json(
+                        runner,
+                        "POST",
+                        "/api/quote-sessions",
+                        cookie=cookie_b,
+                        body={
+                            "session_id": "workspace-a-private",
+                            "customer_summary": {"customer_name": "Workspace A Private Customer"},
+                        },
+                        headers={
+                            "Origin": runner.base_url,
+                            session_a["body"]["csrf_header"]: session_a["body"]["csrf_token"],
+                        },
+                    )
+
+        self.assertNotEqual(session_a["body"]["browser_recovery_scope"], session_b["body"]["browser_recovery_scope"])
+        self.assertNotEqual(session_a["body"]["csrf_token"], session_b["body"]["csrf_token"])
+        self.assertEqual(stale_write["status"], 403)
+        stored.create_or_update_quote_session.assert_not_called()
 
     def test_deploy_uat_preflight_reports_missing_config_without_values(self):
         env = self.deploy_auth_env(
@@ -9720,7 +9758,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertIn("payload.draft_files = sessionFileRecordsFromDraft()", js)
         self.assertIn("quoteSessionDraftSaveStarted", js)
         self.assertIn("quoteSessionDraftStateCanSave", js)
-        self.assertIn("return Boolean(state.quoteSessionDraftSaveStarted);", js)
+        self.assertIn("&& !state.isRecoveryScopeTransitioning", js)
         self.assertIn("quoteSessionHasFreshOutputExports", js)
         self.assertIn("&& quoteSessionHasFreshOutputExports()", js)
         self.assertIn("markQuoteSessionDraftSaveStartedAfterCustomerStep", js)
@@ -10475,7 +10513,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertIn("syncRichTextSources", js)
         self.assertIn("startAnalysisBlockReason", js)
         self.assertIn("state.isBooting", js)
-        self.assertIn("if (state.isBooting) return;", js)
+        self.assertIn("if (state.isBooting || !currentBrowserRecoveryScope()) return;", js)
         self.assertIn("if (appIsBusy()) return;", js)
         self.assertIn("state.isPreparingOutput", js)
         self.assertIn("await loadProfiles();", js)
@@ -11954,13 +11992,17 @@ const DEFAULT_PROFILE_ID = "quote-layout";
 const PROFILE_PRESET_PREFIX = "profile:";
 const COMPANY_PROFILE_PRESET_PREFIX = "company:";
 const LAST_SELECTION_STORAGE_KEY = "swooshz_last_selection_v1";
-let savedSelection = JSON.stringify({ presetValue: "company:saved-profile" });
+let savedSelection = JSON.stringify({
+  browserRecoveryScope: "scope-a",
+  presetValue: "company:saved-profile",
+});
 const window = {
   localStorage: {
     getItem(key) { return key === LAST_SELECTION_STORAGE_KEY ? savedSelection : null; },
   },
 };
 const state = {
+  browserRecoveryScope: "scope-a",
   profileId: "quote-layout",
   selectedPresetValue: "",
   profiles: [{
@@ -11992,6 +12034,7 @@ eval([
   "defaultProfilePresetId",
   "defaultPresetOptionValue",
   "safeLastSelectionJson",
+  "currentBrowserRecoveryScope",
   "availablePresetValues",
   "lastSelectedPresetValue",
   "renderPresetOptions",
@@ -12002,14 +12045,14 @@ assert.strictEqual(state.selectedPresetValue, "company:saved-profile");
 assert.strictEqual(elements.presetSelect.value, "company:saved-profile");
 assert.ok(!elements.presetSelect.innerHTML.includes("Default Profile"));
 
-savedSelection = JSON.stringify({ presetValue: "company:missing-profile" });
+savedSelection = JSON.stringify({ browserRecoveryScope: "scope-a", presetValue: "company:missing-profile" });
 state.selectedPresetValue = "";
 elements.presetSelect.value = "";
 renderPresetOptions();
 assert.strictEqual(state.selectedPresetValue, "");
 assert.strictEqual(elements.presetSelect.value, "");
 
-savedSelection = JSON.stringify({ presetValue: "profile:trade-show" });
+savedSelection = JSON.stringify({ browserRecoveryScope: "scope-a", presetValue: "profile:trade-show" });
 state.selectedPresetValue = "";
 elements.presetSelect.value = "";
 renderPresetOptions();
@@ -13697,6 +13740,7 @@ const window = {
 };
 const state = {
   activeSidePanel: "customer",
+  browserRecoveryScope: "scope-a",
   profileId: "",
   pricingReferenceId: "",
   pricingReferenceSource: "",
@@ -13766,6 +13810,7 @@ function hasReferenceFilesForAnalysis() { return state.images.some((image) => im
 eval([
   "pricingReferenceSelectValue",
   "pricingReferenceSelectionFromValue",
+  "currentBrowserRecoveryScope",
   "sortedPricingReferencesForDisplay",
   "currentProfile",
   "defaultPricingReference",
@@ -13804,6 +13849,7 @@ state.pricingReferences = [
   { id: "runtime-ref", label: "Runtime Ref", source: "local", tax: { label: "GST", rate: 0.09 }, currency: "SGD" },
 ];
 savedSelection = JSON.stringify({
+  browserRecoveryScope: "scope-a",
   pricingReferenceValue: "local::runtime-ref",
   pricingReferenceId: "runtime-ref",
   pricingReferenceSource: "local",
@@ -13815,6 +13861,7 @@ assert.strictEqual(state.pricingReferenceSource, "local");
 assert.strictEqual(currentPricingReference().label, "Runtime Ref");
 
 savedSelection = JSON.stringify({
+  browserRecoveryScope: "scope-a",
   pricingReferenceValue: "local::missing-ref",
   pricingReferenceId: "missing-ref",
   pricingReferenceSource: "local",
@@ -14728,11 +14775,12 @@ function extractFunction(name) {
   throw new Error(`Unclosed function ${name}`);
 }
 
-const QUOTE_SESSION_STATE_VERSION = 4;
+const QUOTE_SESSION_STATE_VERSION = 5;
 const QUOTE_SESSION_STORAGE_KEY = "swooshz_quote_session_v1";
 const MAX_REFERENCE_IMAGES = 8;
 const state = {
   isBooting: false,
+  browserRecoveryScope: "test-recovery-scope",
   profileId: "synthetic-exhibition-fixture-template",
   pricingReferenceId: "synthetic-exhibition-fixture-pricing",
   pricingReferenceSource: "bundled",
@@ -14813,12 +14861,14 @@ eval([
   "emptyQuoteCommercialTouched",
   "normalizeQuoteCommercialTouched",
   "buildSessionSnapshot",
+  "currentBrowserRecoveryScope",
   "saveSessionState",
 ].map(extractFunction).join("\n"));
 
 saveSessionState();
 
 const saved = JSON.parse(savedPayload);
+assert.strictEqual(saved.browserRecoveryScope, "test-recovery-scope");
 assert.strictEqual(saved.quoteDetails.project.title, "Persistent project");
 assert.strictEqual(saved.quoteDetails.company.name, "Persistent Company");
 assert.strictEqual(saved.quoteDetails.company.logo_data_url, undefined);
@@ -20187,7 +20237,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                             headers={
                                 "Content-Type": "application/json",
                                 "Cookie": session_cookie,
-                                webapp.configured_csrf_header_name(): webapp.configured_csrf_token(),
+                                webapp.configured_csrf_header_name(): webapp.csrf_token_for_cookie_header(session_cookie),
                             },
                         )
                         response = connection.getresponse()
