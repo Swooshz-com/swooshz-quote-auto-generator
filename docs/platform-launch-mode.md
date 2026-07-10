@@ -14,6 +14,27 @@ SQAG must not store provider tokens, raw provider claims, auth codes, OIDC
 state, nonce, platform session cookies, raw launch tokens, or platform database
 details.
 
+## Deploy Invariant
+
+`APP_MODE=deploy` requires a complete Platform launch configuration. A
+standalone OIDC session has no Platform workspace, membership role, or app
+entitlement and therefore cannot start the hosted SQAG process. OIDC helpers
+remain available only for localhost/local component testing; SQAG must not
+manufacture a workspace from OIDC tenant or account claims.
+
+Every authenticated deploy request also requires complete signed Platform
+session provenance: consumed outcome, Platform user id, workspace id, SQAG app
+key, and a supported membership role. Legacy OIDC-only cookies remain
+cryptographically valid only until their original expiry, but deploy mode
+treats them as unauthenticated and grants no permissions. Platform mode rejects
+the OIDC callback before provider calls; logout still clears the rejected
+cookie and returns to the validated Platform base URL.
+
+Before binding a deploy server, SQAG also performs read-only checks for the
+required database schema, object-artifact metadata schema, and configured
+object-storage bucket. `/api/health` returns HTTP 503 with metadata-only check
+results while any required dependency is unavailable.
+
 ## Enable Platform Launch Mode
 
 Use placeholders for local smoke setup:

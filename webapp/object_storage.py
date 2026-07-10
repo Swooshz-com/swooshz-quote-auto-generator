@@ -70,6 +70,9 @@ class ObjectArtifactMetadata:
 class ObjectStorageBackend(Protocol):
     backend_name: str
 
+    def readiness_probe(self) -> bool:
+        ...
+
     def store_artifact(
         self,
         *,
@@ -254,6 +257,13 @@ class S3CompatibleObjectStorageBackend:
         if not self.bucket or self.client is None:
             raise ObjectStorageConfigurationError("Object storage backend is not available.")
 
+    def readiness_probe(self) -> bool:
+        try:
+            self.client.head_bucket(Bucket=self.bucket)
+        except Exception:
+            return False
+        return True
+
     def _require_workspace(self, metadata: ObjectArtifactMetadata, workspace_id: str) -> None:
         if metadata.workspace_id != safe_segment(workspace_id, ""):
             raise ObjectStorageContractError("Artifact is not available for this workspace.")
@@ -417,6 +427,9 @@ class InMemoryObjectStorageBackend:
     def __init__(self) -> None:
         self._objects: dict[str, bytes] = {}
         self._metadata: dict[str, ObjectArtifactMetadata] = {}
+
+    def readiness_probe(self) -> bool:
+        return True
 
     def store_artifact(
         self,

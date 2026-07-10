@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-07-09
+Last updated: 2026-07-10
 
 Source of truth: `.github/workflows/ci.yml`
 
@@ -40,6 +40,24 @@ Source of truth: `.github/workflows/ci.yml`
 - `.env.example` must contain placeholders only.
 - Local `.env` files stay ignored and must not be committed.
 - CI must stay free of production/customer secrets unless a future deployment design explicitly documents the new boundary and approval path.
+
+## Deploy Runtime Gate
+
+- CI still performs no deployment.
+- `APP_MODE=deploy` now requires Swooshz Platform launch configuration; a
+  standalone OIDC session cannot satisfy the workspace identity boundary.
+- Deploy requests accept only signed sessions containing the consumed Platform
+  user, workspace, app, and supported membership-role context. Pre-existing
+  OIDC-only cookies are treated as unauthenticated and cannot inherit a tester
+  role or reach AI/import routes.
+- Before binding the deploy server, SQAG performs read-only checks for the
+  required database schema, object-artifact metadata schema, and configured
+  object-storage bucket. It never applies migrations from startup.
+- `/api/health` returns HTTP 200 only while required dependencies are ready and
+  returns metadata-only HTTP 503 otherwise. A short cache bounds repeated
+  unauthenticated health probes.
+- CI exercises these boundaries with synthetic/mocked dependencies only and
+  requires no database, object-storage, Platform, OIDC, or deployment secrets.
 
 ## Not Configured
 

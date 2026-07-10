@@ -148,11 +148,19 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
     error_reference_present = any(
         record.get("details", {}).get("error_reference") == error_reference for record in records
     )
-    health_status = webapp.health_status()
+    health_status = webapp.health_status(force_dependency_probe=True)
     health_text = json.dumps(health_status, sort_keys=True)
+    health_checks = health_status.get("checks") if isinstance(health_status.get("checks"), list) else []
     health_safe = (
-        health_status.get("status") == "ok"
+        health_status.get("status") in {"ok", "blocked"}
         and isinstance(health_status.get("generator_available"), bool)
+        and bool(health_checks)
+        and all(
+            isinstance(check, dict)
+            and isinstance(check.get("name"), str)
+            and isinstance(check.get("ok"), bool)
+            for check in health_checks
+        )
         and "generator" not in health_status
         and not contains_sensitive_value(health_text)
         and "scripts/generate_quote.py" not in health_text

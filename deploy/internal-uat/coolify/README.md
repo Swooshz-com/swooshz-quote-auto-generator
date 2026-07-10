@@ -22,8 +22,10 @@ Recommended app settings:
   `SQAG_ARTIFACT_STORAGE_MODE=object` with the canonical
   `SQAG_OBJECT_STORAGE_*` names supplied through the host secret manager
 - Auth posture: `AUTH_REQUIRED=true`, a host-secret-managed `SESSION_SECRET`
-  of at least 32 characters, and HTTPS auth/platform upstream URLs except for
-  explicit loopback-only local smoke endpoints
+  of at least 32 characters, `SQAG_PLATFORM_LAUNCH_MODE=platform`, and an HTTPS
+  `SQAG_PLATFORM_BASE_URL` except for explicit loopback-only local smoke
+  endpoints. Standalone OIDC does not establish a workspace and cannot start
+  deploy mode.
 
 Before starting deploy-mode UAT, set the env values in Coolify secrets or
 environment management and run:
@@ -36,6 +38,6 @@ python scripts\verify_internal_uat_deploy_template.py
 python scripts\verify_internal_alpha_hosted_validation.py --work-dir _tmp\validation\internal-alpha-hosted
 ```
 
-Keep populated env files, real OIDC/platform values, database URLs, private
+Keep populated env files, real Platform values, database URLs, private
 profile/pricing files, runtime data, generated quote exports, object-provider
 values, hostnames, and server addresses out of git and PR output.

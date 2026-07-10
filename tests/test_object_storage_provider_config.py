@@ -11,6 +11,11 @@ class FakeS3Client:
     def __init__(self):
         self.objects = {}
         self.deleted = []
+        self.head_bucket_calls = []
+
+    def head_bucket(self, **kwargs):
+        self.head_bucket_calls.append(kwargs["Bucket"])
+        return {"ResponseMetadata": {"HTTPStatusCode": 200}}
 
     def put_object(self, **kwargs):
         key = (kwargs["Bucket"], kwargs["Key"])
@@ -194,6 +199,20 @@ class ObjectStorageProviderConfigTest(unittest.TestCase):
         self.assertFalse(status["runtime_backend_available"])
         self.assertFalse(status["production_provider_ready"])
         self.assertIn("synthetic_provider_test_only", status["blockers"])
+
+    def test_s3_compatible_readiness_probe_is_read_only_and_fails_closed(self):
+        client = FakeS3Client()
+        backend = object_storage.S3CompatibleObjectStorageBackend(
+            bucket="example-artifact-bucket",
+            client=client,
+        )
+
+        self.assertTrue(backend.readiness_probe())
+        self.assertEqual(client.head_bucket_calls, ["example-artifact-bucket"])
+        self.assertEqual(client.objects, {})
+
+        client.head_bucket = mock.Mock(side_effect=RuntimeError("private-provider-response"))
+        self.assertFalse(backend.readiness_probe())
 
     def test_s3_compatible_adapter_stores_retrieves_and_deletes_with_checksum(self):
         client = FakeS3Client()
