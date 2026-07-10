@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from webapp import server as webapp
@@ -65,6 +66,17 @@ class BrowserRecoveryScopeTest(unittest.TestCase):
 
         self.assertEqual(first, second)
         self.assertRegex(first, r"^[a-f0-9]{64}$")
+
+    def test_client_logging_stops_after_recovery_scope_transition_begins_unload(self):
+        app_js = Path(__file__).resolve().parents[1] / "webapp" / "static" / "app.js"
+        source = app_js.read_text(encoding="utf-8")
+        body = source.split("function logClientEvent(event, details = {}) {", 1)[1].split(
+            "async function initializeSession", 1
+        )[0]
+
+        guard = "if (state.isPageUnloading) return;"
+        self.assertIn(guard, body)
+        self.assertLess(body.index(guard), body.index('fetch("/api/log"'))
 
 if __name__ == "__main__":
     unittest.main()

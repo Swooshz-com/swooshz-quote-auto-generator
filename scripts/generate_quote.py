@@ -1457,14 +1457,31 @@ def strip_stale_workbook_parts(parts: dict[str, bytes]) -> None:
     sanitize_core_properties(parts)
     remove_workbook_absolute_paths(parts)
     parts.pop("xl/sharedStrings.xml", None)
+    for name in list(parts):
+        if name.casefold().startswith("customxml/"):
+            parts.pop(name, None)
     parts.pop("xl/calcChain.xml", None)
     if "[Content_Types].xml" in parts:
         root = ET.fromstring(parts["[Content_Types].xml"])
         for child in list(root):
             part_name = child.attrib.get("PartName")
-            if part_name in {"/xl/sharedStrings.xml", "/xl/calcChain.xml"}:
+            if (
+                part_name in {"/xl/sharedStrings.xml", "/xl/calcChain.xml"}
+                or (part_name or "").casefold().startswith("/customxml/")
+            ):
                 root.remove(child)
         parts["[Content_Types].xml"] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    if "_rels/.rels" in parts:
+        root = ET.fromstring(parts["_rels/.rels"])
+        for child in list(root):
+            target = child.attrib.get("Target", "")
+            rel_type = child.attrib.get("Type", "")
+            if (
+                target.lstrip("/").casefold().startswith("customxml/")
+                or rel_type.rstrip("/").casefold().endswith("/customxml")
+            ):
+                root.remove(child)
+        parts["_rels/.rels"] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
     if "xl/_rels/workbook.xml.rels" in parts:
         root = ET.fromstring(parts["xl/_rels/workbook.xml.rels"])
         for child in list(root):

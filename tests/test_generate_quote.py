@@ -876,10 +876,11 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertEqual([font_size(font) for font in fonts if font_name(font) == "Arial"], [])
 
     def test_layout_workbook_scrubs_customer_visible_template_metadata(self):
-        tmp, path = generate_layout_workbook()
+        tmp, path = generate_layout_workbook(layout_template=REPO_DEFAULT_LAYOUT)
         self.addCleanup(tmp.cleanup)
 
         with zipfile.ZipFile(path) as zf:
+            package_names = set(zf.namelist())
             core_xml = zf.read("docProps/core.xml").decode("utf-8")
             core = ET.fromstring(core_xml)
             root_rels = ET.fromstring(zf.read("_rels/.rels"))
@@ -914,6 +915,15 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertNotIn("Dropbox", workbook_xml)
         self.assertEqual([prefix for prefix in ignorable if prefix not in declared], [])
         self.assertNotIn("<mc:Choice Requires=\"x15\" />", workbook_xml)
+        self.assertNotIn("customXml/sqag-layout-rules.xml", package_names)
+        self.assertEqual(
+            [
+                rel
+                for rel in root_relationships
+                if (rel[0] or "").rstrip("/").endswith("/customXml")
+            ],
+            [],
+        )
 
     def test_default_generation_removes_stale_pdf_output(self):
         brief = {
