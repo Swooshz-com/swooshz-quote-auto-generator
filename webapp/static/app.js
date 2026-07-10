@@ -10907,6 +10907,7 @@ function handleInterruptedJobPoll(jobType = "draft", polled = {}) {
 }
 
 function logClientEvent(event, details = {}) {
+  if (state.isPageUnloading) return;
   const allowedEvents = new Set(["client_error", "server_error", "security_event", "abuse_signal"]);
   if (!allowedEvents.has(event)) return;
   const headers = { "Content-Type": "application/json" };
