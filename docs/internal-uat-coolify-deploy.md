@@ -28,7 +28,10 @@ storage for generated artifact bytes:
   only the exact Coolify/Traefik proxy network CIDRs that connect directly to
   SQAG. A trust-all network is not permitted.
 - The object-storage credential must permit the read-only bucket probe used by
-  startup and `/api/health`, in addition to the runtime object operations.
+  startup and `/api/health`, plus runtime read, write, and delete operations.
+  A provider delete failure returns HTTP 503 and keeps the profile, pricing
+  reference, or quote session available for a later retry instead of reporting
+  false deletion.
 - Database rows store metadata and workspace-owned app records only.
 
 Database/BLOB artifact mode is local-UAT/synthetic evidence only. It must not

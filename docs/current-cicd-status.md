@@ -67,6 +67,17 @@ Source of truth: `.github/workflows/ci.yml`
 - Before binding the deploy server, SQAG performs read-only checks for the
   required database schema, object-artifact metadata schema, and configured
   object-storage bucket. It never applies migrations from startup.
+- Object-backed profile, pricing-reference, and quote-session deletion removes
+  provider objects before deleting owner records. Provider deletion failure
+  returns a generic HTTP 503 and preserves the owner plus failed artifact for a
+  retry; confirmed deletions are tombstoned individually. Superseded profile,
+  pricing, and generated-quote objects, including artifact kinds omitted from
+  a replacement payload, use the same fail-closed replacement guard. Quote
+  reconciliation requires a persisted XLSX, so confirmation-only outcomes
+  retain prior bytes as stale instead of deleting them. Object-mode Postgres
+  deletes do not query the unsupported database/BLOB artifact tables. CI
+  covers these paths with synthetic in-memory objects, SQLite, and a Postgres
+  query adapter only.
 - `/api/health` returns HTTP 200 only while required dependencies are ready and
   returns metadata-only HTTP 503 otherwise. A short cache bounds repeated
   unauthenticated health probes.

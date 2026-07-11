@@ -22122,7 +22122,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         with self.assertRaises(webapp.ObjectStorageContractError):
             backend.retrieve_artifact(metadata_before, workspace_id="workspace-object-delete-session")
 
-    def test_object_artifact_delete_failure_tombstones_metadata_without_db_blob_or_local_fallback(self):
+    def test_object_artifact_delete_failure_preserves_session_and_active_metadata(self):
         class DeleteFailingBackend(webapp.InMemoryObjectStorageBackend):
             def delete_artifact(self, metadata, *, workspace_id):
                 self._require_workspace(metadata, workspace_id)
@@ -22160,7 +22160,8 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
             row_before = storage._object_quote_artifact_row("quote-object-delete-failure", "xlsx")
             metadata_before = storage._object_metadata_from_row(row_before)
-            self.assertTrue(storage.delete_quote_session("quote-object-delete-failure"))
+            with self.assertRaises(webapp.SqagStorageAccessError) as raised:
+                storage.delete_quote_session("quote-object-delete-failure")
             session = storage.get_quote_session("quote-object-delete-failure")
             artifact = storage.quote_session_export_artifact("quote-object-delete-failure", "xlsx")
 
@@ -22171,14 +22172,830 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             ).fetchone()
             blob_rows = connection.execute("select count(*) from sqag_quote_artifacts").fetchone()[0]
 
-        self.assertIsNone(session)
-        self.assertIsNone(artifact)
-        self.assertEqual(tombstone[0], "deleted")
-        self.assertEqual(tombstone[1], "deleted")
-        self.assertTrue(tombstone[2])
+        self.assertEqual(raised.exception.status, 503)
+        self.assertIsNotNone(session)
+        self.assertEqual(artifact["content"], xlsx_bytes)
+        self.assertEqual(tombstone[0], "active")
+        self.assertEqual(tombstone[1], "active")
+        self.assertIsNone(tombstone[2])
         self.assertEqual(blob_rows, 0)
         self.assertFalse((output_dir / "quotation.xlsx").exists())
         self.assertEqual(backend.retrieve_artifact(metadata_before, workspace_id="workspace-object-delete-failure"), xlsx_bytes)
+
+    def test_object_profile_and_pricing_deletes_remove_remote_artifacts_before_owner_records(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        layout_bytes = KONCEPT_LAYOUT.read_bytes()
+        layout_data_url = "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + base64.b64encode(layout_bytes).decode("ascii")
+        visual_data_url = "data:image/png;base64," + base64.b64encode(b"synthetic-delete-visual").decode("ascii")
+        tmp_path = test_temp_root() / f"object-owner-delete-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-owner-delete"))
+            storage.save_profile(webapp.normalize_profile_payload({
+                "id": "reusable-profile-id",
+                "label": "Profile Before Delete",
+                "pack": {"quotation_layout": {"filename": "quotation-layout.xlsx", "data_url": layout_data_url}},
+            }))
+            storage.save_pricing_reference(webapp.normalize_pricing_reference_payload({
+                "id": "reusable-pricing-id",
+                "label": "Pricing Before Delete",
+                "items": [with_required_pricing_metadata({
+                    "id": "delete-visual-row",
+                    "section": "Graphics",
+                    "description": "Printed graphics",
+                    "unit_hint": "sqm",
+                    "internal_cost": 10,
+                    "markup_multiplier": 2,
+                    "visual_references": [{"source": "xl/media/delete-visual.png", "anchor_row": 7, "data_url": visual_data_url}],
+                })],
+            }))
+            profile_metadata = storage._object_metadata_from_row(
+                storage._object_artifact_row("profile", "reusable-profile-id", "quotation_layout")
+            )
+            pricing_metadata = storage._object_metadata_from_row(
+                storage._object_artifact_row("pricing_reference", "reusable-pricing-id", "visual_1_1")
+            )
+
+            self.assertTrue(storage.delete_profile("reusable-profile-id"))
+            self.assertTrue(storage.delete_pricing_reference("reusable-pricing-id"))
+            storage.save_profile(webapp.normalize_profile_payload({
+                "id": "reusable-profile-id",
+                "label": "Profile After Delete",
+            }))
+            resurrected_layout = storage.profile_layout_artifact("reusable-profile-id")
+            pricing_after_delete = storage.pricing_reference_detail("reusable-pricing-id", source="company")
+
+        with sqlite3.connect(db_path) as connection:
+            rows = connection.execute(
+                "select owner_type, status, retention_status, deleted_at from sqag_object_artifacts "
+                "where workspace_id = ? order by owner_type",
+                ("workspace-object-owner-delete",),
+            ).fetchall()
+
+        self.assertIsNone(resurrected_layout)
+        self.assertIsNone(pricing_after_delete)
+        self.assertEqual(
+            [(row[0], row[1], row[2], bool(row[3])) for row in rows],
+            [
+                ("pricing_reference", "deleted", "deleted", True),
+                ("profile", "deleted", "deleted", True),
+            ],
+        )
+        with self.assertRaises(webapp.ObjectStorageContractError):
+            backend.retrieve_artifact(profile_metadata, workspace_id="workspace-object-owner-delete")
+        with self.assertRaises(webapp.ObjectStorageContractError):
+            backend.retrieve_artifact(pricing_metadata, workspace_id="workspace-object-owner-delete")
+
+    def test_object_owner_delete_and_replacement_fail_closed_when_remote_delete_fails(self):
+        class ToggleDeleteFailingBackend(webapp.InMemoryObjectStorageBackend):
+            fail_deletes = False
+
+            def delete_artifact(self, metadata, *, workspace_id):
+                if self.fail_deletes:
+                    self._require_workspace(metadata, workspace_id)
+                    raise webapp.ObjectStorageContractError("synthetic delete failure")
+                return super().delete_artifact(metadata, workspace_id=workspace_id)
+
+        backend = ToggleDeleteFailingBackend()
+        layout_bytes = KONCEPT_LAYOUT.read_bytes()
+        layout_data_url = "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + base64.b64encode(layout_bytes).decode("ascii")
+        visual_data_url = "data:image/png;base64," + base64.b64encode(b"synthetic-failed-delete-visual").decode("ascii")
+        tmp_path = test_temp_root() / f"object-owner-delete-failure-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-owner-delete-failure"))
+            storage.save_profile(webapp.normalize_profile_payload({
+                "id": "protected-profile",
+                "label": "Original Profile",
+                "pack": {"quotation_layout": {"filename": "original-layout.xlsx", "data_url": layout_data_url}},
+            }))
+            storage.save_pricing_reference(webapp.normalize_pricing_reference_payload({
+                "id": "protected-pricing",
+                "label": "Original Pricing",
+                "items": [with_required_pricing_metadata({
+                    "id": "protected-visual-row",
+                    "section": "Graphics",
+                    "description": "Printed graphics",
+                    "unit_hint": "sqm",
+                    "internal_cost": 10,
+                    "markup_multiplier": 2,
+                    "visual_references": [{"source": "xl/media/protected-visual.png", "anchor_row": 7, "data_url": visual_data_url}],
+                })],
+            }))
+            original_profile_row = storage._object_artifact_row("profile", "protected-profile", "quotation_layout")
+            original_profile_key = original_profile_row["object_key_ref"]
+            backend.fail_deletes = True
+
+            with self.assertRaises(webapp.SqagStorageAccessError) as profile_delete:
+                storage.delete_profile("protected-profile")
+            with self.assertRaises(webapp.SqagStorageAccessError) as pricing_delete:
+                storage.delete_pricing_reference("protected-pricing")
+            with self.assertRaises(webapp.SqagStorageAccessError) as profile_replace:
+                storage.save_profile(webapp.normalize_profile_payload({
+                    "id": "protected-profile",
+                    "label": "Replacement Profile",
+                    "pack": {"quotation_layout": {"filename": "replacement-layout.xlsx", "data_url": layout_data_url}},
+                }))
+
+            current_profile_row = storage._object_artifact_row("profile", "protected-profile", "quotation_layout")
+            profiles = storage.list_company_profiles()
+            pricing = storage.pricing_reference_detail("protected-pricing", source="company")
+
+        self.assertEqual(profile_delete.exception.status, 503)
+        self.assertEqual(pricing_delete.exception.status, 503)
+        self.assertEqual(profile_replace.exception.status, 503)
+        self.assertEqual(current_profile_row["object_key_ref"], original_profile_key)
+        self.assertEqual(profiles[0]["label"], "Original Profile")
+        self.assertIsNotNone(pricing)
+        self.assertEqual(len(backend._objects), 2)
+        with sqlite3.connect(db_path) as connection:
+            active_rows = connection.execute(
+                "select count(*) from sqag_object_artifacts where workspace_id = ? and status = ? and deleted_at is null",
+                ("workspace-object-owner-delete-failure", "active"),
+            ).fetchone()[0]
+        self.assertEqual(active_rows, 2)
+
+    def test_object_owner_delete_records_partial_success_and_retries_remaining_artifacts(self):
+        class FailSecondArtifactOnceBackend(webapp.InMemoryObjectStorageBackend):
+            failed_once = False
+
+            def delete_artifact(self, metadata, *, workspace_id):
+                if metadata.artifact_kind == "visual_1_2" and not self.failed_once:
+                    self.failed_once = True
+                    self._require_workspace(metadata, workspace_id)
+                    raise webapp.ObjectStorageContractError("synthetic second artifact delete failure")
+                return super().delete_artifact(metadata, workspace_id=workspace_id)
+
+        backend = FailSecondArtifactOnceBackend()
+        first_visual = "data:image/png;base64," + base64.b64encode(b"synthetic-first-visual").decode("ascii")
+        second_visual = "data:image/png;base64," + base64.b64encode(b"synthetic-second-visual").decode("ascii")
+        tmp_path = test_temp_root() / f"object-owner-partial-delete-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-partial-delete"))
+            storage.save_pricing_reference(webapp.normalize_pricing_reference_payload({
+                "id": "partial-delete-pricing",
+                "label": "Partial Delete Pricing",
+                "items": [with_required_pricing_metadata({
+                    "id": "partial-delete-row",
+                    "section": "Graphics",
+                    "description": "Printed graphics",
+                    "unit_hint": "sqm",
+                    "internal_cost": 10,
+                    "markup_multiplier": 2,
+                    "visual_references": [
+                        {"source": "xl/media/first.png", "anchor_row": 7, "data_url": first_visual},
+                        {"source": "xl/media/second.png", "anchor_row": 8, "data_url": second_visual},
+                    ],
+                })],
+            }))
+
+            with self.assertRaises(webapp.SqagStorageAccessError):
+                storage.delete_pricing_reference("partial-delete-pricing")
+            reference_after_failure = storage.pricing_reference_detail("partial-delete-pricing", source="company")
+            with sqlite3.connect(db_path) as connection:
+                rows_after_failure = connection.execute(
+                    "select artifact_kind, status, retention_status, deleted_at from sqag_object_artifacts "
+                    "where workspace_id = ? and owner_id = ? order by artifact_kind",
+                    ("workspace-object-partial-delete", "partial-delete-pricing"),
+                ).fetchall()
+
+            self.assertTrue(storage.delete_pricing_reference("partial-delete-pricing"))
+            reference_after_retry = storage.pricing_reference_detail("partial-delete-pricing", source="company")
+
+        self.assertIsNotNone(reference_after_failure)
+        self.assertEqual(
+            [(row[0], row[1], row[2], bool(row[3])) for row in rows_after_failure],
+            [
+                ("visual_1_1", "deleted", "deleted", True),
+                ("visual_1_2", "active", "active", False),
+            ],
+        )
+        self.assertIsNone(reference_after_retry)
+        self.assertEqual(backend._objects, {})
+        with sqlite3.connect(db_path) as connection:
+            deleted_rows = connection.execute(
+                "select count(*) from sqag_object_artifacts where workspace_id = ? and owner_id = ? and status = ? and deleted_at is not null",
+                ("workspace-object-partial-delete", "partial-delete-pricing", "deleted"),
+            ).fetchone()[0]
+        self.assertEqual(deleted_rows, 2)
+
+    def test_object_replacement_store_failure_restores_prior_object_and_owner_payload(self):
+        class FailNextStoreBackend(webapp.InMemoryObjectStorageBackend):
+            fail_next_store = False
+
+            def store_artifact(self, **kwargs):
+                if self.fail_next_store:
+                    self.fail_next_store = False
+                    raise webapp.ObjectStorageContractError("synthetic replacement store failure")
+                return super().store_artifact(**kwargs)
+
+        backend = FailNextStoreBackend()
+        layout_data_url = "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + base64.b64encode(KONCEPT_LAYOUT.read_bytes()).decode("ascii")
+        tmp_path = test_temp_root() / f"object-replacement-restore-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-replacement-restore"))
+            storage.save_profile(webapp.normalize_profile_payload({
+                "id": "restored-profile",
+                "label": "Original Restored Profile",
+                "pack": {"quotation_layout": {"filename": "original-layout.xlsx", "data_url": layout_data_url}},
+            }))
+            original_row = storage._object_artifact_row("profile", "restored-profile", "quotation_layout")
+            original_metadata = storage._object_metadata_from_row(original_row)
+            original_content = backend.retrieve_artifact(
+                original_metadata,
+                workspace_id="workspace-object-replacement-restore",
+            )
+            backend.fail_next_store = True
+
+            with self.assertRaises(webapp.SqagStorageAccessError):
+                storage.save_profile(webapp.normalize_profile_payload({
+                    "id": "restored-profile",
+                    "label": "Failed Replacement Profile",
+                    "pack": {"quotation_layout": {"filename": "replacement-layout.xlsx", "data_url": layout_data_url}},
+                }))
+            current_row = storage._object_artifact_row("profile", "restored-profile", "quotation_layout")
+            current_profiles = storage.list_company_profiles()
+
+        self.assertEqual(current_row["object_key_ref"], original_metadata.storage_key)
+        self.assertEqual(current_profiles[0]["label"], "Original Restored Profile")
+        self.assertEqual(len(backend._objects), 1)
+        self.assertEqual(
+            backend.retrieve_artifact(
+                original_metadata,
+                workspace_id="workspace-object-replacement-restore",
+            ),
+            original_content,
+        )
+
+    def test_object_profile_and_pricing_replacements_delete_superseded_objects(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        layout_bytes = KONCEPT_LAYOUT.read_bytes()
+        layout_data_url = "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + base64.b64encode(layout_bytes).decode("ascii")
+        old_visual_data_url = "data:image/png;base64," + base64.b64encode(b"synthetic-old-visual").decode("ascii")
+        new_visual_data_url = "data:image/png;base64," + base64.b64encode(b"synthetic-new-visual").decode("ascii")
+        tmp_path = test_temp_root() / f"object-owner-replacement-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+
+        def profile(filename, label):
+            return webapp.normalize_profile_payload({
+                "id": "replacement-profile",
+                "label": label,
+                "pack": {"quotation_layout": {"filename": filename, "data_url": layout_data_url}},
+            })
+
+        def pricing(source, data_url, label):
+            return webapp.normalize_pricing_reference_payload({
+                "id": "replacement-pricing",
+                "label": label,
+                "items": [with_required_pricing_metadata({
+                    "id": "replacement-visual-row",
+                    "section": "Graphics",
+                    "description": "Printed graphics",
+                    "unit_hint": "sqm",
+                    "internal_cost": 10,
+                    "markup_multiplier": 2,
+                    "visual_references": [{"source": source, "anchor_row": 7, "data_url": data_url}],
+                })],
+            })
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-replacement"))
+            storage.save_profile(profile("old-layout.xlsx", "Old Profile"))
+            storage.save_pricing_reference(pricing("xl/media/old-visual.png", old_visual_data_url, "Old Pricing"))
+            old_profile_metadata = storage._object_metadata_from_row(
+                storage._object_artifact_row("profile", "replacement-profile", "quotation_layout")
+            )
+            old_pricing_metadata = storage._object_metadata_from_row(
+                storage._object_artifact_row("pricing_reference", "replacement-pricing", "visual_1_1")
+            )
+            old_output_dir = tmp_path / "out" / "old-quote"
+            old_output_dir.mkdir(parents=True)
+            (old_output_dir / "quotation.xlsx").write_bytes(b"synthetic-old-quote")
+            quote_payload = valid_payload()
+            quote_payload["quote_session"] = {"session_id": "quote-replacement"}
+            quote_result = {"status": "completed", "files": [{"name": "quotation.xlsx"}]}
+            storage.create_or_update_quote_session(quote_payload, result=quote_result, output_dir=old_output_dir)
+            old_quote_metadata = storage._object_metadata_from_row(
+                storage._object_quote_artifact_row("quote-replacement", "xlsx")
+            )
+
+            storage.save_profile(profile("new-layout.xlsx", "New Profile"))
+            storage.save_pricing_reference(pricing("xl/media/new-visual.png", new_visual_data_url, "New Pricing"))
+            new_output_dir = tmp_path / "out" / "new-quote"
+            new_output_dir.mkdir(parents=True)
+            (new_output_dir / "quotation.xlsx").write_bytes(b"synthetic-new-quote")
+            storage.create_or_update_quote_session(quote_payload, result=quote_result, output_dir=new_output_dir)
+            new_profile_metadata = storage._object_metadata_from_row(
+                storage._object_artifact_row("profile", "replacement-profile", "quotation_layout")
+            )
+            new_pricing_metadata = storage._object_metadata_from_row(
+                storage._object_artifact_row("pricing_reference", "replacement-pricing", "visual_1_1")
+            )
+            new_quote_metadata = storage._object_metadata_from_row(
+                storage._object_quote_artifact_row("quote-replacement", "xlsx")
+            )
+
+        self.assertNotEqual(old_profile_metadata.storage_key, new_profile_metadata.storage_key)
+        self.assertNotEqual(old_pricing_metadata.storage_key, new_pricing_metadata.storage_key)
+        self.assertNotEqual(old_quote_metadata.storage_key, new_quote_metadata.storage_key)
+        self.assertEqual(len(backend._objects), 3)
+        with self.assertRaises(webapp.ObjectStorageContractError):
+            backend.retrieve_artifact(old_profile_metadata, workspace_id="workspace-object-replacement")
+        with self.assertRaises(webapp.ObjectStorageContractError):
+            backend.retrieve_artifact(old_pricing_metadata, workspace_id="workspace-object-replacement")
+        with self.assertRaises(webapp.ObjectStorageContractError):
+            backend.retrieve_artifact(old_quote_metadata, workspace_id="workspace-object-replacement")
+        webapp.validate_profile_layout_xlsx(
+            backend.retrieve_artifact(new_profile_metadata, workspace_id="workspace-object-replacement")
+        )
+        self.assertEqual(
+            backend.retrieve_artifact(new_pricing_metadata, workspace_id="workspace-object-replacement"),
+            b"synthetic-new-visual",
+        )
+        self.assertEqual(
+            backend.retrieve_artifact(new_quote_metadata, workspace_id="workspace-object-replacement"),
+            b"synthetic-new-quote",
+        )
+
+    def test_object_replacements_remove_omitted_pricing_visuals_and_quote_exports(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        tmp_path = test_temp_root() / f"object-omitted-replacement-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+
+        def pricing(visuals, label):
+            return webapp.normalize_pricing_reference_payload({
+                "id": "omitted-object-pricing",
+                "label": label,
+                "items": [with_required_pricing_metadata({
+                    "id": "omitted-object-row",
+                    "section": "Graphics",
+                    "description": "Printed graphics",
+                    "unit_hint": "sqm",
+                    "internal_cost": 10,
+                    "markup_multiplier": 2,
+                    "visual_references": [
+                        {
+                            "source": f"xl/media/visual-{index}.png",
+                            "anchor_row": 6 + index,
+                            "data_url": "data:image/png;base64," + base64.b64encode(content).decode("ascii"),
+                        }
+                        for index, content in enumerate(visuals, start=1)
+                    ],
+                })],
+            })
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-omitted"))
+            storage.save_pricing_reference(pricing([b"old-visual-one", b"old-visual-two"], "Old Pricing"))
+            omitted_visual = storage._object_metadata_from_row(
+                storage._object_artifact_row("pricing_reference", "omitted-object-pricing", "visual_1_2")
+            )
+
+            old_output = tmp_path / "out" / "old"
+            old_output.mkdir(parents=True)
+            (old_output / "quotation.xlsx").write_bytes(b"old-xlsx")
+            (old_output / "quotation.pdf").write_bytes(b"old-pdf")
+            old_payload = valid_payload()
+            old_payload["quote_session"] = {"session_id": "quote-object-omitted"}
+            storage.create_or_update_quote_session(
+                old_payload,
+                result={"status": "completed", "files": [{"name": "quotation.xlsx"}, {"name": "quotation.pdf"}]},
+                output_dir=old_output,
+            )
+            omitted_pdf = storage._object_metadata_from_row(
+                storage._object_quote_artifact_row("quote-object-omitted", "pdf")
+            )
+
+            storage.save_pricing_reference(pricing([b"new-visual-one"], "New Pricing"))
+            new_output = tmp_path / "out" / "new"
+            new_output.mkdir(parents=True)
+            (new_output / "quotation.xlsx").write_bytes(b"new-xlsx")
+            new_payload = copy.deepcopy(old_payload)
+            new_payload["client"]["name"] = "Replacement Client"
+            storage.create_or_update_quote_session(
+                new_payload,
+                result={"status": "completed", "files": [{"name": "quotation.xlsx"}]},
+                output_dir=new_output,
+            )
+            pricing_kinds = [
+                row["artifact_kind"]
+                for row in storage._active_object_artifact_rows("pricing_reference", "omitted-object-pricing")
+            ]
+            quote_kinds = [
+                row["artifact_kind"]
+                for row in storage._active_object_artifact_rows("generated_quote", "quote-object-omitted")
+            ]
+            session = storage.get_quote_session("quote-object-omitted")
+
+        self.assertEqual(pricing_kinds, ["visual_1_1"])
+        self.assertEqual(quote_kinds, ["xlsx"])
+        self.assertEqual(len(backend._objects), 2)
+        self.assertTrue(session["exports"]["xlsx"]["exists"])
+        self.assertFalse(session["exports"]["pdf"]["exists"])
+        self.assertIsNone(session["exports"]["pdf"]["url"])
+        with self.assertRaises(webapp.ObjectStorageContractError):
+            backend.retrieve_artifact(omitted_visual, workspace_id="workspace-object-omitted")
+        with self.assertRaises(webapp.ObjectStorageContractError):
+            backend.retrieve_artifact(omitted_pdf, workspace_id="workspace-object-omitted")
+
+    def test_object_omitted_artifact_delete_failures_preserve_owner_payloads(self):
+        class KindDeleteFailingBackend(webapp.InMemoryObjectStorageBackend):
+            fail_kind = ""
+
+            def delete_artifact(self, metadata, *, workspace_id):
+                if metadata.artifact_kind == self.fail_kind:
+                    self._require_workspace(metadata, workspace_id)
+                    raise webapp.ObjectStorageContractError("synthetic omitted artifact delete failure")
+                return super().delete_artifact(metadata, workspace_id=workspace_id)
+
+        backend = KindDeleteFailingBackend()
+        tmp_path = test_temp_root() / f"object-omitted-delete-failure-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+
+        def pricing(visual_count, label):
+            return webapp.normalize_pricing_reference_payload({
+                "id": "protected-omitted-pricing",
+                "label": label,
+                "items": [with_required_pricing_metadata({
+                    "id": "protected-omitted-row",
+                    "section": "Graphics",
+                    "description": "Printed graphics",
+                    "unit_hint": "sqm",
+                    "internal_cost": 10,
+                    "markup_multiplier": 2,
+                    "visual_references": [
+                        {
+                            "source": f"xl/media/protected-{index}.png",
+                            "anchor_row": 6 + index,
+                            "data_url": "data:image/png;base64,"
+                            + base64.b64encode(f"visual-{index}".encode()).decode("ascii"),
+                        }
+                        for index in range(1, visual_count + 1)
+                    ],
+                })],
+            })
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session("workspace-object-omitted-failure")
+            )
+            storage.save_pricing_reference(pricing(2, "Original Pricing"))
+            old_output = tmp_path / "out" / "old"
+            old_output.mkdir(parents=True)
+            (old_output / "quotation.xlsx").write_bytes(b"old-xlsx")
+            (old_output / "quotation.pdf").write_bytes(b"old-pdf")
+            payload = valid_payload()
+            payload["quote_session"] = {"session_id": "quote-object-omitted-failure"}
+            storage.create_or_update_quote_session(
+                payload,
+                result={"status": "completed", "files": [{"name": "quotation.xlsx"}, {"name": "quotation.pdf"}]},
+                output_dir=old_output,
+            )
+
+            backend.fail_kind = "visual_1_2"
+            with self.assertRaises(webapp.SqagStorageAccessError) as pricing_failure:
+                storage.save_pricing_reference(pricing(1, "Failed Pricing"))
+            backend.fail_kind = "pdf"
+            new_output = tmp_path / "out" / "new"
+            new_output.mkdir(parents=True)
+            (new_output / "quotation.xlsx").write_bytes(b"new-xlsx")
+            with self.assertRaises(webapp.SqagStorageAccessError) as quote_failure:
+                storage.create_or_update_quote_session(
+                    payload,
+                    result={"status": "completed", "files": [{"name": "quotation.xlsx"}]},
+                    output_dir=new_output,
+                )
+
+            reference = storage.pricing_reference_detail("protected-omitted-pricing", source="company")
+            session = storage.get_quote_session("quote-object-omitted-failure")
+            pricing_kinds = [
+                row["artifact_kind"]
+                for row in storage._active_object_artifact_rows(
+                    "pricing_reference",
+                    "protected-omitted-pricing",
+                )
+            ]
+            quote_kinds = [
+                row["artifact_kind"]
+                for row in storage._active_object_artifact_rows(
+                    "generated_quote",
+                    "quote-object-omitted-failure",
+                )
+            ]
+
+        self.assertEqual(pricing_failure.exception.status, 503)
+        self.assertEqual(quote_failure.exception.status, 503)
+        self.assertEqual(reference["label"], "Original Pricing")
+        self.assertEqual(pricing_kinds, ["visual_1_1", "visual_1_2"])
+        self.assertEqual(quote_kinds, ["pdf", "xlsx"])
+        self.assertTrue(session["exports"]["pdf"]["exists"])
+        self.assertEqual(len(backend._objects), 4)
+
+    def test_database_replacements_remove_omitted_pricing_visuals_and_quote_exports(self):
+        tmp_path = test_temp_root() / f"database-omitted-replacement-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = {
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "database",
+            "SQAG_DATABASE_URL": database_url,
+        }
+
+        def pricing(visual_count):
+            return webapp.normalize_pricing_reference_payload({
+                "id": "database-omitted-pricing",
+                "label": "Database Omitted Pricing",
+                "items": [with_required_pricing_metadata({
+                    "id": "database-omitted-row",
+                    "section": "Graphics",
+                    "description": "Printed graphics",
+                    "unit_hint": "sqm",
+                    "internal_cost": 10,
+                    "markup_multiplier": 2,
+                    "visual_references": [
+                        {
+                            "source": f"xl/media/database-{index}.png",
+                            "anchor_row": 6 + index,
+                            "data_url": "data:image/png;base64,"
+                            + base64.b64encode(f"database-{index}".encode()).decode("ascii"),
+                        }
+                        for index in range(1, visual_count + 1)
+                    ],
+                })],
+            })
+
+        with mock.patch.dict(os.environ, env, clear=True):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session("workspace-database-omitted")
+            )
+            storage.save_pricing_reference(pricing(2))
+            first_output = tmp_path / "out" / "first"
+            first_output.mkdir(parents=True)
+            (first_output / "quotation.xlsx").write_bytes(b"first-xlsx")
+            (first_output / "quotation.pdf").write_bytes(b"first-pdf")
+            payload = valid_payload()
+            payload["quote_session"] = {"session_id": "quote-database-omitted"}
+            storage.create_or_update_quote_session(
+                payload,
+                result={"status": "completed", "files": [{"name": "quotation.xlsx"}, {"name": "quotation.pdf"}]},
+                output_dir=first_output,
+            )
+
+            storage.save_pricing_reference(pricing(1))
+            second_output = tmp_path / "out" / "second"
+            second_output.mkdir(parents=True)
+            (second_output / "quotation.xlsx").write_bytes(b"second-xlsx")
+            storage.create_or_update_quote_session(
+                payload,
+                result={"status": "completed", "files": [{"name": "quotation.xlsx"}]},
+                output_dir=second_output,
+            )
+            session = storage.get_quote_session("quote-database-omitted")
+
+        with sqlite3.connect(db_path) as connection:
+            pricing_kinds = [
+                row[0]
+                for row in connection.execute(
+                    "select artifact_kind from sqag_file_artifacts "
+                    "where workspace_id = ? and owner_id = ? order by artifact_kind",
+                    ("workspace-database-omitted", "database-omitted-pricing"),
+                ).fetchall()
+            ]
+            quote_kinds = [
+                row[0]
+                for row in connection.execute(
+                    "select artifact_kind from sqag_quote_artifacts "
+                    "where workspace_id = ? and session_id = ? order by artifact_kind",
+                    ("workspace-database-omitted", "quote-database-omitted"),
+                ).fetchall()
+            ]
+
+        self.assertEqual(pricing_kinds, ["visual_1_1"])
+        self.assertEqual(quote_kinds, ["xlsx"])
+        self.assertFalse(session["exports"]["pdf"]["exists"])
+        self.assertIsNone(session["exports"]["pdf"]["url"])
+
+    def test_object_needs_confirmation_preserves_prior_quote_artifact_as_stale(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        tmp_path = test_temp_root() / f"object-needs-confirmation-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session("workspace-object-confirmation")
+            )
+            generated_output = tmp_path / "out" / "generated"
+            generated_output.mkdir(parents=True)
+            prior_bytes = b"prior-customer-ready-xlsx"
+            (generated_output / "quotation.xlsx").write_bytes(prior_bytes)
+            payload = valid_payload()
+            payload["quote_session"] = {"session_id": "quote-object-confirmation"}
+            storage.create_or_update_quote_session(
+                payload,
+                result={"status": "completed", "files": [{"name": "quotation.xlsx"}]},
+                output_dir=generated_output,
+            )
+            prior_metadata = storage._object_metadata_from_row(
+                storage._object_quote_artifact_row("quote-object-confirmation", "xlsx")
+            )
+
+            confirmation_output = tmp_path / "out" / "needs-confirmation"
+            confirmation_output.mkdir(parents=True)
+            confirmation_payload = copy.deepcopy(payload)
+            confirmation_payload["client"]["name"] = "Needs Confirmation Client"
+            session = storage.create_or_update_quote_session(
+                confirmation_payload,
+                result={"status": "needs_confirmation", "files": []},
+                output_dir=confirmation_output,
+            )
+            active_kinds = [
+                row["artifact_kind"]
+                for row in storage._active_object_artifact_rows(
+                    "generated_quote",
+                    "quote-object-confirmation",
+                )
+            ]
+
+        self.assertEqual(active_kinds, ["xlsx"])
+        self.assertEqual(len(backend._objects), 1)
+        self.assertFalse(session["status"]["quote_generated"])
+        self.assertFalse(session["exports"]["xlsx"]["exists"])
+        self.assertTrue(session["exports"]["xlsx"]["stale"])
+        self.assertIsNone(session["exports"]["xlsx"]["url"])
+        self.assertEqual(
+            backend.retrieve_artifact(
+                prior_metadata,
+                workspace_id="workspace-object-confirmation",
+            ),
+            prior_bytes,
+        )
+
+    def test_object_mode_postgres_deletes_do_not_query_blob_artifact_tables(self):
+        class RecordingConnection:
+            def __init__(self):
+                self.queries = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def execute(self, sql, params=()):
+                self.queries.append((sql, tuple(params)))
+                return types.SimpleNamespace(rowcount=1)
+
+            def commit(self):
+                return None
+
+        storage = webapp.DatabaseSqagStorage(
+            "postgresql://sqag-user@db.example.test/sqag",
+            "workspace-object-postgres-delete",
+            role="owner",
+            user_id="postgres-delete-user",
+        )
+        connection = RecordingConnection()
+        metadata = webapp.blank_quote_session_metadata(
+            "quote-object-postgres-delete",
+            "2026-07-11T00:00:00Z",
+        )
+        with (
+            mock.patch.object(webapp, "configured_artifact_storage_mode", return_value="object"),
+            mock.patch.object(storage, "connection", return_value=connection),
+            mock.patch.object(storage, "_delete_object_owner_artifacts", return_value=1),
+            mock.patch.object(storage, "tombstone_object_quote_artifacts", return_value=1),
+            mock.patch.object(
+                storage,
+                "_read_quote_session_metadata_for_workspace",
+                return_value=(metadata, []),
+            ),
+            mock.patch.object(storage, "_quote_session_editable_by_current_user", return_value=True),
+        ):
+            self.assertTrue(storage.delete_profile("postgres-object-profile"))
+            self.assertTrue(storage.delete_pricing_reference("postgres-object-pricing"))
+            self.assertTrue(storage.delete_quote_session("quote-object-postgres-delete"))
+
+        executed_sql = " ".join(sql.lower() for sql, _params in connection.queries)
+        self.assertNotIn("sqag_file_artifacts", executed_sql)
+        self.assertNotIn("sqag_quote_artifacts", executed_sql)
+        self.assertIn("sqag_profiles", executed_sql)
+        self.assertIn("sqag_pricing_references", executed_sql)
+        self.assertIn("sqag_quote_sessions", executed_sql)
+
+    def test_database_owner_deletes_remove_artifacts_and_prevent_same_id_rebinding(self):
+        layout_bytes = KONCEPT_LAYOUT.read_bytes()
+        layout_data_url = "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + base64.b64encode(layout_bytes).decode("ascii")
+        visual_data_url = "data:image/png;base64," + base64.b64encode(b"synthetic-database-delete-visual").decode("ascii")
+        tmp_path = test_temp_root() / f"database-owner-delete-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        output_dir = tmp_path / "out" / "job-database-owner-delete"
+        output_dir.mkdir(parents=True)
+        (output_dir / "quotation.xlsx").write_bytes(b"synthetic-database-quote")
+        env = {
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "database",
+            "SQAG_DATABASE_URL": database_url,
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-database-owner-delete"))
+            storage.save_profile(webapp.normalize_profile_payload({
+                "id": "reusable-database-profile",
+                "label": "Database Profile Before Delete",
+                "pack": {"quotation_layout": {"filename": "quotation-layout.xlsx", "data_url": layout_data_url}},
+            }))
+            storage.save_pricing_reference(webapp.normalize_pricing_reference_payload({
+                "id": "reusable-database-pricing",
+                "label": "Database Pricing Before Delete",
+                "items": [with_required_pricing_metadata({
+                    "id": "database-delete-visual-row",
+                    "section": "Graphics",
+                    "description": "Printed graphics",
+                    "unit_hint": "sqm",
+                    "internal_cost": 10,
+                    "markup_multiplier": 2,
+                    "visual_references": [{"source": "xl/media/database-delete-visual.png", "anchor_row": 7, "data_url": visual_data_url}],
+                })],
+            }))
+            payload = valid_payload()
+            payload["quote_session"] = {"session_id": "database-session-delete"}
+            quote_session = storage.create_or_update_quote_session(
+                payload,
+                result={"status": "completed", "files": [{"name": "quotation.xlsx"}]},
+                output_dir=output_dir,
+            )
+
+            self.assertTrue(storage.delete_profile("reusable-database-profile"))
+            self.assertTrue(storage.delete_pricing_reference("reusable-database-pricing"))
+            self.assertTrue(storage.delete_quote_session(quote_session["session_id"]))
+            storage.save_profile(webapp.normalize_profile_payload({
+                "id": "reusable-database-profile",
+                "label": "Database Profile After Delete",
+            }))
+            resurrected_layout = storage.profile_layout_artifact("reusable-database-profile")
+
+        with sqlite3.connect(db_path) as connection:
+            file_artifacts = connection.execute("select count(*) from sqag_file_artifacts").fetchone()[0]
+            quote_artifacts = connection.execute("select count(*) from sqag_quote_artifacts").fetchone()[0]
+            pricing_rows = connection.execute("select count(*) from sqag_pricing_references").fetchone()[0]
+            quote_session_rows = connection.execute("select count(*) from sqag_quote_sessions").fetchone()[0]
+
+        self.assertIsNone(resurrected_layout)
+        self.assertEqual(file_artifacts, 0)
+        self.assertEqual(quote_artifacts, 0)
+        self.assertEqual(pricing_rows, 0)
+        self.assertEqual(quote_session_rows, 0)
 
     def test_object_artifact_storage_cleans_local_staging_files_after_persist(self):
         backend = webapp.InMemoryObjectStorageBackend()
