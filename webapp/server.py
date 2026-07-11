@@ -39,7 +39,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
@@ -8597,6 +8597,9 @@ class PostgresConnectionAdapter:
     def commit(self) -> None:
         self._connection.commit()
 
+    def rollback(self) -> None:
+        self._connection.rollback()
+
     def close(self) -> None:
         self._connection.close()
 
@@ -8872,6 +8875,28 @@ class LocalSqagStorage:
         return path if path.exists() and path.is_file() else None
 
 
+@dataclass(frozen=True)
+class ArtifactBatchItem:
+    artifact_kind: str
+    filename: str
+    content_type: str
+    content: bytes
+    source: Path | None = None
+
+
+@dataclass
+class ObjectArtifactBatchPlan:
+    backend: ObjectStorageBackend
+    owner_type: str
+    owner_id: str
+    items: list[ArtifactBatchItem]
+    desired_metadata: dict[str, ObjectArtifactMetadata] = field(default_factory=dict)
+    omitted_rows: list[dict[str, Any]] = field(default_factory=list)
+    previous_backups: list[tuple[ObjectArtifactMetadata, bytes]] = field(default_factory=list)
+    new_objects: list[ObjectArtifactMetadata] = field(default_factory=list)
+    deleted_previous: list[tuple[ObjectArtifactMetadata, bytes]] = field(default_factory=list)
+
+
 class DatabaseSqagStorage:
     storage_backend = "database"
 
@@ -8980,14 +9005,30 @@ class DatabaseSqagStorage:
             return None
         return payload if isinstance(payload, dict) else None
 
-    def _upsert_payload(self, table: str, id_column: str, item_id: str, payload: dict[str, Any]) -> None:
+    def _execute_upsert_payload(
+        self,
+        connection: Any,
+        table: str,
+        id_column: str,
+        item_id: str,
+        payload: dict[str, Any],
+    ) -> None:
         now = utc_timestamp()
         payload_json = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+        connection.execute(
+            f"insert into {table} (workspace_id, {id_column}, payload_json, created_at, updated_at) values (?, ?, ?, ?, ?) "
+            f"on conflict(workspace_id, {id_column}) do update set payload_json = excluded.payload_json, updated_at = excluded.updated_at",
+            (self.workspace_id, item_id, payload_json, now, now),
+        )
+
+    def _upsert_payload(self, table: str, id_column: str, item_id: str, payload: dict[str, Any]) -> None:
         with self.connection() as connection:
-            connection.execute(
-                f"insert into {table} (workspace_id, {id_column}, payload_json, created_at, updated_at) values (?, ?, ?, ?, ?) "
-                f"on conflict(workspace_id, {id_column}) do update set payload_json = excluded.payload_json, updated_at = excluded.updated_at",
-                (self.workspace_id, item_id, payload_json, now, now),
+            self._execute_upsert_payload(
+                connection,
+                table,
+                id_column,
+                item_id,
+                payload,
             )
             connection.commit()
 
@@ -9073,9 +9114,88 @@ class DatabaseSqagStorage:
             raise ValueError("Pricing reference id is required and may only contain letters, numbers, dashes, or underscores.")
         stored = copy.deepcopy(reference)
         stored["id"] = reference_id
-        if configured_artifact_storage_mode() in {"database", "object"}:
-            stored = self._store_pricing_visual_artifacts(reference_id, stored)
-        self._upsert_payload("sqag_pricing_references", "reference_id", reference_id, stored)
+        artifact_mode = configured_artifact_storage_mode()
+        if artifact_mode not in {"database", "object"}:
+            self._upsert_payload("sqag_pricing_references", "reference_id", reference_id, stored)
+            return public_company_pricing_reference(stored)
+
+        stored, items, retained_kinds = self._prepare_pricing_visual_artifacts(
+            reference_id,
+            stored,
+        )
+        object_plan: ObjectArtifactBatchPlan | None = None
+        if artifact_mode == "object":
+            managed_kinds = set(retained_kinds)
+            managed_kinds.update(
+                clean_text(row["artifact_kind"])
+                for row in self._active_object_artifact_rows(
+                    "pricing_reference",
+                    reference_id,
+                )
+                if re.fullmatch(
+                    r"visual_[1-9][0-9]*_[1-9][0-9]*",
+                    clean_text(row["artifact_kind"]),
+                )
+            )
+            if managed_kinds:
+                object_plan = self._prepare_object_artifact_batch(
+                    "pricing_reference",
+                    reference_id,
+                    items,
+                    managed_kinds,
+                    retained_kinds,
+                )
+
+        connection: Any | None = None
+        try:
+            with self.connection() as connection:
+                if artifact_mode == "object":
+                    if object_plan is not None:
+                        self._execute_object_artifact_batch_metadata(
+                            connection,
+                            object_plan,
+                            quote_session=False,
+                        )
+                else:
+                    self._execute_delete_database_pricing_visuals_except(
+                        connection,
+                        reference_id,
+                        retained_kinds,
+                    )
+                    for item in items:
+                        self._execute_upsert_file_artifact(
+                            connection,
+                            "pricing_reference",
+                            reference_id,
+                            item.artifact_kind,
+                            item.filename,
+                            item.content_type,
+                            item.content,
+                        )
+                self._execute_upsert_payload(
+                    connection,
+                    "sqag_pricing_references",
+                    "reference_id",
+                    reference_id,
+                    stored,
+                )
+                connection.commit()
+        except Exception as exc:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+            if object_plan is not None:
+                try:
+                    self._compensate_object_artifact_batch(object_plan)
+                except ObjectStorageContractError as recovery_exc:
+                    exc = recovery_exc
+            raise SqagStorageAccessError(
+                QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                status=503,
+                reason="object_artifact_storage_unavailable",
+            ) from exc
         return public_company_pricing_reference(stored)
 
     def delete_pricing_reference(self, reference_id: str, source: str = "company") -> bool:
@@ -9125,7 +9245,16 @@ class DatabaseSqagStorage:
         pack = PricingReferencePack(safe_id, PROJECT_ROOT, pricing_reference_pack_config(detail), source=clean_text(detail.get("source")) or "company")
         return f"{filename_base}-pricing-reference.xlsx", generated_pricing_reference_export_xlsx_bytes(detail, pack)
 
-    def _upsert_file_artifact(self, owner_type: str, owner_id: str, artifact_kind: str, filename: str, content_type: str, content: bytes) -> None:
+    def _execute_upsert_file_artifact(
+        self,
+        connection: Any,
+        owner_type: str,
+        owner_id: str,
+        artifact_kind: str,
+        filename: str,
+        content_type: str,
+        content: bytes,
+    ) -> None:
         safe_owner_type = safe_resource_id(owner_type, "")
         safe_owner_id = safe_resource_id(owner_id, "")
         safe_kind = safe_resource_id(artifact_kind, "")
@@ -9135,11 +9264,22 @@ class DatabaseSqagStorage:
         if len(content) > MAX_QUOTE_ARTIFACT_BYTES:
             raise ValueError("Artifact is larger than the database artifact limit.")
         now = utc_timestamp()
+        connection.execute(
+            "insert into sqag_file_artifacts (workspace_id, owner_type, owner_id, artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "on conflict(workspace_id, owner_type, owner_id, artifact_kind) do update set filename = excluded.filename, content_type = excluded.content_type, size_bytes = excluded.size_bytes, content_blob = excluded.content_blob, updated_at = excluded.updated_at",
+            (self.workspace_id, safe_owner_type, safe_owner_id, safe_kind, safe_filename, clean_text(content_type) or "application/octet-stream", len(content), sqlite3.Binary(content), now, now),
+        )
+
+    def _upsert_file_artifact(self, owner_type: str, owner_id: str, artifact_kind: str, filename: str, content_type: str, content: bytes) -> None:
         with self.connection() as connection:
-            connection.execute(
-                "insert into sqag_file_artifacts (workspace_id, owner_type, owner_id, artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "on conflict(workspace_id, owner_type, owner_id, artifact_kind) do update set filename = excluded.filename, content_type = excluded.content_type, size_bytes = excluded.size_bytes, content_blob = excluded.content_blob, updated_at = excluded.updated_at",
-                (self.workspace_id, safe_owner_type, safe_owner_id, safe_kind, safe_filename, clean_text(content_type) or "application/octet-stream", len(content), sqlite3.Binary(content), now, now),
+            self._execute_upsert_file_artifact(
+                connection,
+                owner_type,
+                owner_id,
+                artifact_kind,
+                filename,
+                content_type,
+                content,
             )
             connection.commit()
 
@@ -9198,8 +9338,9 @@ class DatabaseSqagStorage:
             return None
         return row
 
-    def _upsert_object_file_artifact(
+    def _execute_upsert_object_file_artifact(
         self,
+        connection: Any,
         owner_type: str,
         owner_id: str,
         artifact_kind: str,
@@ -9215,32 +9356,51 @@ class DatabaseSqagStorage:
             raise ObjectStorageContractError("Artifact metadata is incomplete.")
         artifact_id = f"obj-{secrets.token_hex(12)}"
         now = utc_timestamp()
+        connection.execute(
+            "insert into sqag_object_artifacts (artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at) "
+            "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "on conflict(workspace_id, owner_type, owner_id, artifact_kind) do update set artifact_id = excluded.artifact_id, platform_user_id = excluded.platform_user_id, session_id = excluded.session_id, job_id = excluded.job_id, filename = excluded.filename, content_type = excluded.content_type, size_bytes = excluded.size_bytes, checksum_sha256 = excluded.checksum_sha256, object_provider_type = excluded.object_provider_type, object_key_ref = excluded.object_key_ref, status = excluded.status, retention_status = excluded.retention_status, updated_at = excluded.updated_at, deleted_at = excluded.deleted_at",
+            (
+                artifact_id,
+                self.workspace_id,
+                safe_owner_type,
+                safe_owner_id,
+                self.user_id,
+                "",
+                "",
+                safe_kind,
+                safe_filename,
+                clean_text(content_type) or "application/octet-stream",
+                metadata.size_bytes,
+                metadata.checksum_sha256,
+                "s3_compatible",
+                metadata.storage_key,
+                "active",
+                "active",
+                metadata.created_at or now,
+                now,
+                None,
+            ),
+        )
+
+    def _upsert_object_file_artifact(
+        self,
+        owner_type: str,
+        owner_id: str,
+        artifact_kind: str,
+        filename: str,
+        content_type: str,
+        metadata: ObjectArtifactMetadata,
+    ) -> None:
         with self.connection() as connection:
-            connection.execute(
-                "insert into sqag_object_artifacts (artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at) "
-                "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "on conflict(workspace_id, owner_type, owner_id, artifact_kind) do update set artifact_id = excluded.artifact_id, platform_user_id = excluded.platform_user_id, session_id = excluded.session_id, job_id = excluded.job_id, filename = excluded.filename, content_type = excluded.content_type, size_bytes = excluded.size_bytes, checksum_sha256 = excluded.checksum_sha256, object_provider_type = excluded.object_provider_type, object_key_ref = excluded.object_key_ref, status = excluded.status, retention_status = excluded.retention_status, updated_at = excluded.updated_at, deleted_at = excluded.deleted_at",
-                (
-                    artifact_id,
-                    self.workspace_id,
-                    safe_owner_type,
-                    safe_owner_id,
-                    self.user_id,
-                    "",
-                    "",
-                    safe_kind,
-                    safe_filename,
-                    clean_text(content_type) or "application/octet-stream",
-                    metadata.size_bytes,
-                    metadata.checksum_sha256,
-                    "s3_compatible",
-                    metadata.storage_key,
-                    "active",
-                    "active",
-                    metadata.created_at or now,
-                    now,
-                    None,
-                ),
+            self._execute_upsert_object_file_artifact(
+                connection,
+                owner_type,
+                owner_id,
+                artifact_kind,
+                filename,
+                content_type,
+                metadata,
             )
             connection.commit()
 
@@ -9265,6 +9425,259 @@ class DatabaseSqagStorage:
             or restored.size_bytes != metadata.size_bytes
         ):
             raise ObjectStorageContractError("Artifact replacement recovery failed.")
+
+    def _compensate_object_artifact_batch(
+        self,
+        plan: ObjectArtifactBatchPlan,
+    ) -> None:
+        recovery_errors: list[Exception] = []
+        for metadata in reversed(plan.new_objects):
+            try:
+                if not plan.backend.delete_artifact(
+                    metadata,
+                    workspace_id=self.workspace_id,
+                ):
+                    recovery_errors.append(
+                        ObjectStorageContractError(
+                            "Replacement artifact cleanup failed."
+                        )
+                    )
+            except Exception as exc:
+                recovery_errors.append(exc)
+        for metadata, content in plan.deleted_previous:
+            try:
+                self._restore_object_artifact(
+                    plan.backend,
+                    metadata,
+                    content,
+                )
+            except Exception as exc:
+                recovery_errors.append(exc)
+        if recovery_errors:
+            raise ObjectStorageContractError(
+                "Artifact batch recovery failed."
+            ) from recovery_errors[0]
+
+    def _prepare_object_artifact_batch(
+        self,
+        owner_type: str,
+        owner_id: str,
+        items: list[ArtifactBatchItem],
+        managed_kinds: set[str],
+        retained_kinds: set[str] | None = None,
+    ) -> ObjectArtifactBatchPlan:
+        safe_owner_type = safe_resource_id(owner_type, "")
+        safe_owner_id = safe_resource_id(owner_id, "")
+        item_by_kind = {item.artifact_kind: item for item in items}
+        desired_kinds = (
+            set(retained_kinds)
+            if retained_kinds is not None
+            else set(item_by_kind)
+        )
+        if (
+            not safe_owner_type
+            or not safe_owner_id
+            or len(item_by_kind) != len(items)
+            or not set(item_by_kind).issubset(desired_kinds)
+            or not desired_kinds.issubset(managed_kinds)
+        ):
+            raise SqagStorageAccessError(
+                QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                status=503,
+                reason="object_artifact_storage_unavailable",
+            )
+        try:
+            backend = configured_object_storage_backend()
+        except ObjectStorageContractError as exc:
+            raise SqagStorageAccessError(
+                QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                status=503,
+                reason="object_artifact_storage_unavailable",
+            ) from exc
+
+        previous_rows: dict[str, dict[str, Any]] = {}
+        for row in self._active_object_artifact_rows(
+            safe_owner_type,
+            safe_owner_id,
+        ):
+            artifact_kind = clean_text(row["artifact_kind"])
+            if artifact_kind not in managed_kinds:
+                continue
+            if artifact_kind in previous_rows:
+                raise SqagStorageAccessError(
+                    QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                    status=503,
+                    reason="object_artifact_storage_unavailable",
+                )
+            previous_rows[artifact_kind] = dict(row)
+
+        plan = ObjectArtifactBatchPlan(
+            backend=backend,
+            owner_type=safe_owner_type,
+            owner_id=safe_owner_id,
+            items=items,
+            omitted_rows=[
+                row
+                for kind, row in previous_rows.items()
+                if kind not in desired_kinds
+            ],
+        )
+        try:
+            for artifact_kind, row in previous_rows.items():
+                item = item_by_kind.get(artifact_kind)
+                previous = self._object_metadata_from_row(row)
+                if (
+                    len(previous.checksum_sha256) != 64
+                    or not previous.storage_key
+                ):
+                    raise ObjectStorageContractError(
+                        "Artifact metadata is incomplete."
+                    )
+                desired_key = (
+                    object_artifact_key(
+                        workspace_id=self.workspace_id,
+                        owner_type=safe_owner_type,
+                        owner_id=safe_owner_id,
+                        artifact_kind=item.artifact_kind,
+                        filename=item.filename,
+                        checksum_sha256=artifact_checksum(item.content),
+                    )
+                    if item is not None
+                    else ""
+                )
+                if artifact_kind not in desired_kinds or (
+                    item is not None
+                    and previous.storage_key != desired_key
+                ):
+                    previous_content = backend.retrieve_artifact(
+                        previous,
+                        workspace_id=self.workspace_id,
+                    )
+                    plan.previous_backups.append(
+                        (previous, previous_content)
+                    )
+
+            for item in items:
+                previous_row = previous_rows.get(item.artifact_kind)
+                previous = (
+                    self._object_metadata_from_row(previous_row)
+                    if previous_row is not None
+                    else None
+                )
+                checksum = artifact_checksum(item.content)
+                desired_key = object_artifact_key(
+                    workspace_id=self.workspace_id,
+                    owner_type=safe_owner_type,
+                    owner_id=safe_owner_id,
+                    artifact_kind=item.artifact_kind,
+                    filename=item.filename,
+                    checksum_sha256=checksum,
+                )
+                if previous is not None and previous.storage_key == desired_key:
+                    current_content = backend.retrieve_artifact(
+                        previous,
+                        workspace_id=self.workspace_id,
+                    )
+                    if current_content != item.content:
+                        raise ObjectStorageContractError(
+                            "Artifact content does not match metadata."
+                        )
+                    plan.desired_metadata[item.artifact_kind] = (
+                        ObjectArtifactMetadata(
+                            workspace_id=self.workspace_id,
+                            owner_type=safe_owner_type,
+                            owner_id=safe_owner_id,
+                            artifact_kind=item.artifact_kind,
+                            filename=item.filename,
+                            content_type=item.content_type,
+                            size_bytes=len(item.content),
+                            checksum_sha256=checksum,
+                            storage_key=desired_key,
+                            created_at=previous.created_at,
+                            updated_at=previous.updated_at,
+                        )
+                    )
+                    continue
+
+                stored = backend.store_artifact(
+                    workspace_id=self.workspace_id,
+                    owner_type=safe_owner_type,
+                    owner_id=safe_owner_id,
+                    artifact_kind=item.artifact_kind,
+                    filename=item.filename,
+                    content_type=item.content_type,
+                    content=item.content,
+                )
+                plan.new_objects.append(stored)
+                if (
+                    stored.workspace_id != self.workspace_id
+                    or stored.owner_type != safe_owner_type
+                    or stored.owner_id != safe_owner_id
+                    or stored.artifact_kind != item.artifact_kind
+                    or stored.storage_key != desired_key
+                    or stored.checksum_sha256 != checksum
+                    or stored.size_bytes != len(item.content)
+                ):
+                    raise ObjectStorageContractError(
+                        "Artifact storage metadata is inconsistent."
+                    )
+                plan.desired_metadata[item.artifact_kind] = stored
+
+            for backup in plan.previous_backups:
+                previous, _content = backup
+                if not backend.delete_artifact(
+                    previous,
+                    workspace_id=self.workspace_id,
+                ):
+                    raise ObjectStorageContractError(
+                        "Superseded artifact could not be deleted."
+                    )
+                plan.deleted_previous.append(backup)
+            return plan
+        except Exception as exc:
+            try:
+                self._compensate_object_artifact_batch(plan)
+            except ObjectStorageContractError as recovery_exc:
+                exc = recovery_exc
+            raise SqagStorageAccessError(
+                QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                status=503,
+                reason="object_artifact_storage_unavailable",
+            ) from exc
+
+    def _execute_object_artifact_batch_metadata(
+        self,
+        connection: Any,
+        plan: ObjectArtifactBatchPlan,
+        *,
+        quote_session: bool,
+    ) -> None:
+        for row in plan.omitted_rows:
+            self._execute_mark_object_artifact_deleted(
+                connection,
+                clean_text(row["artifact_id"]),
+            )
+        for item in plan.items:
+            metadata = plan.desired_metadata[item.artifact_kind]
+            if quote_session:
+                self._execute_upsert_object_quote_artifact(
+                    connection,
+                    plan.owner_id,
+                    item.artifact_kind,
+                    item.filename,
+                    item.content_type,
+                    metadata,
+                )
+            else:
+                self._execute_upsert_object_file_artifact(
+                    connection,
+                    plan.owner_type,
+                    plan.owner_id,
+                    item.artifact_kind,
+                    item.filename,
+                    item.content_type,
+                    metadata,
+                )
 
     def _store_object_artifact(
         self,
@@ -9356,20 +9769,30 @@ class DatabaseSqagStorage:
             content,
         )
 
-    def _mark_object_artifact_deleted(self, artifact_id: str) -> None:
+    def _execute_mark_object_artifact_deleted(
+        self,
+        connection: Any,
+        artifact_id: str,
+    ) -> None:
         safe_artifact_id = clean_text(artifact_id)
         if not safe_artifact_id:
             raise ObjectStorageContractError("Artifact metadata is incomplete.")
         now = utc_timestamp()
-        with self.connection() as connection:
-            cursor = connection.execute(
-                "update sqag_object_artifacts set status = ?, retention_status = ?, updated_at = ?, deleted_at = ? "
-                "where workspace_id = ? and artifact_id = ? and status = ? and retention_status = ? and deleted_at is null",
-                ("deleted", "deleted", now, now, self.workspace_id, safe_artifact_id, "active", "active"),
-            )
-            connection.commit()
+        cursor = connection.execute(
+            "update sqag_object_artifacts set status = ?, retention_status = ?, updated_at = ?, deleted_at = ? "
+            "where workspace_id = ? and artifact_id = ? and status = ? and retention_status = ? and deleted_at is null",
+            ("deleted", "deleted", now, now, self.workspace_id, safe_artifact_id, "active", "active"),
+        )
         if cursor.rowcount != 1:
             raise ObjectStorageContractError("Artifact metadata changed during deletion.")
+
+    def _mark_object_artifact_deleted(self, artifact_id: str) -> None:
+        with self.connection() as connection:
+            self._execute_mark_object_artifact_deleted(
+                connection,
+                artifact_id,
+            )
+            connection.commit()
 
     def _delete_object_artifact_rows(self, rows: list[sqlite3.Row]) -> int:
         if not rows:
@@ -9403,40 +9826,40 @@ class DatabaseSqagStorage:
             self._active_object_artifact_rows(owner_type, owner_id)
         )
 
-    def _delete_database_pricing_visuals_except(
+    def _execute_delete_database_pricing_visuals_except(
         self,
+        connection: Any,
         reference_id: str,
         retained_kinds: set[str],
     ) -> int:
         safe_id = safe_resource_id(reference_id, "")
         if not safe_id:
             return 0
-        with self.connection() as connection:
-            rows = connection.execute(
-                "select artifact_kind from sqag_file_artifacts "
-                "where workspace_id = ? and owner_type = ? and owner_id = ?",
-                (self.workspace_id, "pricing_reference", safe_id),
-            ).fetchall()
-            stale_kinds = sorted({
-                clean_text(row["artifact_kind"])
-                for row in rows
-                if re.fullmatch(r"visual_[1-9][0-9]*_[1-9][0-9]*", clean_text(row["artifact_kind"]))
-                and clean_text(row["artifact_kind"]) not in retained_kinds
-            })
-            if not stale_kinds:
-                return 0
-            placeholders = ", ".join("?" for _ in stale_kinds)
-            cursor = connection.execute(
-                "delete from sqag_file_artifacts "
-                "where workspace_id = ? and owner_type = ? and owner_id = ? "
-                f"and artifact_kind in ({placeholders})",
-                (self.workspace_id, "pricing_reference", safe_id, *stale_kinds),
-            )
-            connection.commit()
-            return cursor.rowcount
+        rows = connection.execute(
+            "select artifact_kind from sqag_file_artifacts "
+            "where workspace_id = ? and owner_type = ? and owner_id = ?",
+            (self.workspace_id, "pricing_reference", safe_id),
+        ).fetchall()
+        stale_kinds = sorted({
+            clean_text(row["artifact_kind"])
+            for row in rows
+            if re.fullmatch(r"visual_[1-9][0-9]*_[1-9][0-9]*", clean_text(row["artifact_kind"]))
+            and clean_text(row["artifact_kind"]) not in retained_kinds
+        })
+        if not stale_kinds:
+            return 0
+        placeholders = ", ".join("?" for _ in stale_kinds)
+        cursor = connection.execute(
+            "delete from sqag_file_artifacts "
+            "where workspace_id = ? and owner_type = ? and owner_id = ? "
+            f"and artifact_kind in ({placeholders})",
+            (self.workspace_id, "pricing_reference", safe_id, *stale_kinds),
+        )
+        return cursor.rowcount
 
-    def _delete_database_quote_exports_except(
+    def _execute_delete_database_quote_exports_except(
         self,
+        connection: Any,
         session_id: str,
         retained_kinds: set[str],
     ) -> int:
@@ -9445,15 +9868,13 @@ class DatabaseSqagStorage:
         if not safe_id or not stale_kinds:
             return 0
         placeholders = ", ".join("?" for _ in stale_kinds)
-        with self.connection() as connection:
-            cursor = connection.execute(
-                "delete from sqag_quote_artifacts "
-                "where workspace_id = ? and session_id = ? "
-                f"and artifact_kind in ({placeholders})",
-                (self.workspace_id, safe_id, *stale_kinds),
-            )
-            connection.commit()
-            return cursor.rowcount
+        cursor = connection.execute(
+            "delete from sqag_quote_artifacts "
+            "where workspace_id = ? and session_id = ? "
+            f"and artifact_kind in ({placeholders})",
+            (self.workspace_id, safe_id, *stale_kinds),
+        )
+        return cursor.rowcount
 
     def _read_object_file_artifact(self, owner_type: str, owner_id: str, artifact_kind: str) -> dict[str, Any] | None:
         row = self._object_artifact_row(owner_type, owner_id, artifact_kind)
@@ -9527,12 +9948,16 @@ class DatabaseSqagStorage:
                     layout_bytes,
                 )
 
-    def _store_pricing_visual_artifacts(self, reference_id: str, reference: dict[str, Any]) -> dict[str, Any]:
+    def _prepare_pricing_visual_artifacts(
+        self,
+        reference_id: str,
+        reference: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[ArtifactBatchItem], set[str]]:
         stored = copy.deepcopy(reference)
         items = stored.get("items") if isinstance(stored.get("items"), list) else []
         used_names: set[str] = set()
         retained_kinds: set[str] = set()
-        pending_artifacts: list[tuple[str, str, str, bytes]] = []
+        pending_artifacts: list[ArtifactBatchItem] = []
         for item_index, item in enumerate(items, start=1):
             if not isinstance(item, dict):
                 continue
@@ -9554,9 +9979,12 @@ class DatabaseSqagStorage:
                     filename = unique_visual_asset_filename(ref.get("source"), fallback, inline.get("mime_type", "image/png"), used_names)
                     artifact_kind = f"visual_{item_index}_{ref_index}"
                     next_ref["path"] = f"artifact://pricing-reference/{reference_id}/{artifact_kind}/{filename}"
-                    pending_artifacts.append(
-                        (artifact_kind, filename, inline.get("mime_type", "image/png"), image_bytes)
-                    )
+                    pending_artifacts.append(ArtifactBatchItem(
+                        artifact_kind=artifact_kind,
+                        filename=filename,
+                        content_type=inline.get("mime_type", "image/png"),
+                        content=image_bytes,
+                    ))
                 artifact_path = clean_text(next_ref.get("path"))
                 artifact_prefix = f"artifact://pricing-reference/{reference_id}/"
                 if artifact_path.startswith(artifact_prefix):
@@ -9577,39 +10005,8 @@ class DatabaseSqagStorage:
             else:
                 item.pop("visual_references", None)
 
-        artifact_mode = configured_artifact_storage_mode()
-        if artifact_mode == "object":
-            stale_rows = [
-                row
-                for row in self._active_object_artifact_rows("pricing_reference", reference_id)
-                if re.fullmatch(r"visual_[1-9][0-9]*_[1-9][0-9]*", clean_text(row["artifact_kind"]))
-                and clean_text(row["artifact_kind"]) not in retained_kinds
-            ]
-            self._delete_object_artifact_rows(stale_rows)
-        elif artifact_mode == "database":
-            self._delete_database_pricing_visuals_except(reference_id, retained_kinds)
-
-        for artifact_kind, filename, content_type, image_bytes in pending_artifacts:
-            if artifact_mode == "object":
-                self._store_object_file_artifact(
-                    "pricing_reference",
-                    reference_id,
-                    artifact_kind,
-                    filename,
-                    content_type,
-                    image_bytes,
-                )
-            elif artifact_mode == "database":
-                self._upsert_file_artifact(
-                    "pricing_reference",
-                    reference_id,
-                    artifact_kind,
-                    filename,
-                    content_type,
-                    image_bytes,
-                )
         stored["items"] = items
-        return stored
+        return stored, pending_artifacts, retained_kinds
 
     def _quote_artifact_metadata(self, session_id: str, kind: str) -> dict[str, Any] | None:
         safe_id = safe_quote_session_id(session_id, "")
@@ -9710,35 +10107,53 @@ class DatabaseSqagStorage:
             and clean_text(current["updated_at"]) == clean_text(row["updated_at"])
         )
 
-    def _upsert_object_quote_artifact(self, session_id: str, kind: str, filename: str, content_type: str, metadata: ObjectArtifactMetadata) -> None:
+    def _execute_upsert_object_quote_artifact(
+        self,
+        connection: Any,
+        session_id: str,
+        kind: str,
+        filename: str,
+        content_type: str,
+        metadata: ObjectArtifactMetadata,
+    ) -> None:
         artifact_id = f"obj-{secrets.token_hex(12)}"
         now = utc_timestamp()
+        connection.execute(
+            "insert into sqag_object_artifacts (artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at) "
+            "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "on conflict(workspace_id, owner_type, owner_id, artifact_kind) do update set artifact_id = excluded.artifact_id, platform_user_id = excluded.platform_user_id, session_id = excluded.session_id, job_id = excluded.job_id, filename = excluded.filename, content_type = excluded.content_type, size_bytes = excluded.size_bytes, checksum_sha256 = excluded.checksum_sha256, object_provider_type = excluded.object_provider_type, object_key_ref = excluded.object_key_ref, status = excluded.status, retention_status = excluded.retention_status, updated_at = excluded.updated_at, deleted_at = excluded.deleted_at",
+            (
+                artifact_id,
+                self.workspace_id,
+                "generated_quote",
+                session_id,
+                self.user_id,
+                session_id,
+                "",
+                kind,
+                filename,
+                content_type,
+                metadata.size_bytes,
+                metadata.checksum_sha256,
+                "s3_compatible",
+                metadata.storage_key,
+                "active",
+                "active",
+                metadata.created_at or now,
+                now,
+                None,
+            ),
+        )
+
+    def _upsert_object_quote_artifact(self, session_id: str, kind: str, filename: str, content_type: str, metadata: ObjectArtifactMetadata) -> None:
         with self.connection() as connection:
-            connection.execute(
-                "insert into sqag_object_artifacts (artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at) "
-                "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "on conflict(workspace_id, owner_type, owner_id, artifact_kind) do update set artifact_id = excluded.artifact_id, platform_user_id = excluded.platform_user_id, session_id = excluded.session_id, job_id = excluded.job_id, filename = excluded.filename, content_type = excluded.content_type, size_bytes = excluded.size_bytes, checksum_sha256 = excluded.checksum_sha256, object_provider_type = excluded.object_provider_type, object_key_ref = excluded.object_key_ref, status = excluded.status, retention_status = excluded.retention_status, updated_at = excluded.updated_at, deleted_at = excluded.deleted_at",
-                (
-                    artifact_id,
-                    self.workspace_id,
-                    "generated_quote",
-                    session_id,
-                    self.user_id,
-                    session_id,
-                    "",
-                    kind,
-                    filename,
-                    content_type,
-                    metadata.size_bytes,
-                    metadata.checksum_sha256,
-                    "s3_compatible",
-                    metadata.storage_key,
-                    "active",
-                    "active",
-                    metadata.created_at or now,
-                    now,
-                    None,
-                ),
+            self._execute_upsert_object_quote_artifact(
+                connection,
+                session_id,
+                kind,
+                filename,
+                content_type,
+                metadata,
             )
             connection.commit()
 
@@ -9756,10 +10171,39 @@ class DatabaseSqagStorage:
         except OSError:
             return
 
-    def _store_quote_export_artifacts(self, session_id: str, metadata: dict[str, Any], result: dict[str, Any] | None, output_dir: Path | None) -> bool:
+    def _execute_upsert_quote_artifact(
+        self,
+        connection: Any,
+        session_id: str,
+        item: ArtifactBatchItem,
+        now: str,
+    ) -> None:
+        connection.execute(
+            "insert into sqag_quote_artifacts (workspace_id, session_id, artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "on conflict(workspace_id, session_id, artifact_kind) do update set filename = excluded.filename, content_type = excluded.content_type, size_bytes = excluded.size_bytes, content_blob = excluded.content_blob, updated_at = excluded.updated_at",
+            (
+                self.workspace_id,
+                session_id,
+                item.artifact_kind,
+                item.filename,
+                item.content_type,
+                len(item.content),
+                sqlite3.Binary(item.content),
+                now,
+                now,
+            ),
+        )
+
+    def _prepare_quote_export_artifacts(
+        self,
+        session_id: str,
+        metadata: dict[str, Any],
+        result: dict[str, Any] | None,
+        output_dir: Path | None,
+    ) -> tuple[bool, list[ArtifactBatchItem], ObjectArtifactBatchPlan | None]:
         if not result_has_generated_quote(result) or output_dir is None:
-            return False
-        pending_artifacts: list[tuple[str, str, int, bytes, str, Path]] = []
+            return False, [], None
+        pending_artifacts: list[ArtifactBatchItem] = []
         for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
             source = output_dir / filename
             if not source.exists() or not source.is_file() or source.name != filename:
@@ -9771,32 +10215,17 @@ class DatabaseSqagStorage:
             if len(content) != size:
                 continue
             content_type = QUOTE_SESSION_EXPORT_CONTENT_TYPES.get(kind, mimetypes.guess_type(filename)[0] or "application/octet-stream")
-            pending_artifacts.append((kind, filename, size, content, content_type, source))
+            pending_artifacts.append(ArtifactBatchItem(
+                artifact_kind=kind,
+                filename=filename,
+                content_type=content_type,
+                content=content,
+                source=source,
+            ))
 
-        retained_kinds = {kind for kind, _filename, _size, _content, _content_type, _source in pending_artifacts}
+        retained_kinds = {item.artifact_kind for item in pending_artifacts}
         if "xlsx" not in retained_kinds:
-            return False
-
-        object_backend: ObjectStorageBackend | None = None
-        if configured_artifact_storage_mode() == "object":
-            try:
-                object_backend = configured_object_storage_backend()
-            except ObjectStorageContractError as exc:
-                raise SqagStorageAccessError(
-                    QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
-                    status=503,
-                    reason="object_artifact_storage_unavailable",
-                ) from exc
-        if object_backend is not None:
-            stale_rows = [
-                row
-                for row in self._active_object_artifact_rows("generated_quote", session_id)
-                if clean_text(row["artifact_kind"]) in QUOTE_SESSION_EXPORT_KINDS
-                and clean_text(row["artifact_kind"]) not in retained_kinds
-            ]
-            self._delete_object_artifact_rows(stale_rows)
-        else:
-            self._delete_database_quote_exports_except(session_id, retained_kinds)
+            return False, [], None
 
         if not isinstance(metadata.get("exports"), dict):
             metadata["exports"] = {}
@@ -9810,33 +10239,26 @@ class DatabaseSqagStorage:
             }
             metadata["status"][f"{omitted_kind}_exported"] = False
 
-        for kind, filename, size, content, content_type, source in pending_artifacts:
+        for item in pending_artifacts:
             now = utc_timestamp()
-            if object_backend is not None:
-                self._store_object_artifact(
-                    "generated_quote",
-                    session_id,
-                    kind,
-                    filename,
-                    content_type,
-                    content,
-                    backend=object_backend,
-                    quote_session=True,
-                )
-                metadata["exports"][kind] = {"filename": filename, "created_at": now, "size_bytes": size, "stale": False}
-                metadata["status"][f"{kind}_exported"] = True
-                self._cleanup_object_staging_file(source, output_dir)
-                continue
-            with self.connection() as connection:
-                connection.execute(
-                    "insert into sqag_quote_artifacts (workspace_id, session_id, artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                    "on conflict(workspace_id, session_id, artifact_kind) do update set filename = excluded.filename, content_type = excluded.content_type, size_bytes = excluded.size_bytes, content_blob = excluded.content_blob, updated_at = excluded.updated_at",
-                    (self.workspace_id, session_id, kind, filename, content_type, size, sqlite3.Binary(content), now, now),
-                )
-                connection.commit()
-            metadata["exports"][kind] = {"filename": filename, "created_at": now, "size_bytes": size, "stale": False}
-            metadata["status"][f"{kind}_exported"] = True
-        return True
+            metadata["exports"][item.artifact_kind] = {
+                "filename": item.filename,
+                "created_at": now,
+                "size_bytes": len(item.content),
+                "stale": False,
+            }
+            metadata["status"][f"{item.artifact_kind}_exported"] = True
+
+        object_plan = None
+        if configured_artifact_storage_mode() == "object":
+            object_plan = self._prepare_object_artifact_batch(
+                "generated_quote",
+                session_id,
+                pending_artifacts,
+                set(QUOTE_SESSION_EXPORT_KINDS),
+                retained_kinds,
+            )
+        return True, pending_artifacts, object_plan
 
     def quote_session_export_artifact(self, session_id: str, kind: str) -> dict[str, Any] | None:
         artifact_mode = configured_artifact_storage_mode()
@@ -10007,40 +10429,94 @@ class DatabaseSqagStorage:
         if isinstance(patch.get("draft_state"), dict):
             metadata["draft_state"] = quote_session_draft_state(patch)
         stored_generated_quote = False
+        pending_artifacts: list[ArtifactBatchItem] = []
+        object_plan: ObjectArtifactBatchPlan | None = None
         if (
             result_has_generated_quote(result)
             and configured_artifact_storage_mode() in {"database", "object"}
         ):
-            stored_generated_quote = self._store_quote_export_artifacts(
+            (
+                stored_generated_quote,
+                pending_artifacts,
+                object_plan,
+            ) = self._prepare_quote_export_artifacts(
                 resolved_session_id,
                 metadata,
                 result,
                 output_dir,
             )
-        if stored_generated_quote:
-            metadata["status"]["quote_generated"] = True
-            profile_id = safe_resource_id(payload.get("profile_id"), "")
-            pricing_reference_id = pricing_reference_id_from_payload(payload) or safe_resource_id(payload.get("pricing_reference_id"), "")
-            metadata["generation_snapshot"] = quote_session_generation_snapshot(
-                payload,
-                patch,
-                created_at=now,
-                workspace_id=self.workspace_id,
-                profile_detail=self.profile_detail(profile_id, source="company") if profile_id else None,
-                pricing_reference_detail=self.pricing_reference_detail(pricing_reference_id, source="company") if pricing_reference_id else None,
-            )
-        else:
-            mark_quote_session_exports_stale(metadata, quote_session_current_draft_export_kinds(patch))
-        normalized = normalized_quote_session_metadata(metadata)
-        if not normalized:
-            raise ValueError("Quote session metadata is not valid.")
-        draft_files = quote_session_draft_files(patch) if isinstance(patch.get("draft_files"), list) else []
-        with self.connection() as connection:
-            connection.execute(
-                "insert into sqag_quote_sessions (workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at) values (?, ?, ?, ?, ?, ?) on conflict(workspace_id, session_id) do update set metadata_json = excluded.metadata_json, draft_files_json = excluded.draft_files_json, updated_at = excluded.updated_at",
-                (self.workspace_id, normalized["session_id"], json.dumps(normalized, ensure_ascii=True, sort_keys=True), json.dumps(draft_files, ensure_ascii=True, sort_keys=True), normalized.get("created_at") or now, normalized.get("updated_at") or now),
-            )
-            connection.commit()
+        connection: Any | None = None
+        try:
+            if stored_generated_quote:
+                metadata["status"]["quote_generated"] = True
+                profile_id = safe_resource_id(payload.get("profile_id"), "")
+                pricing_reference_id = pricing_reference_id_from_payload(payload) or safe_resource_id(payload.get("pricing_reference_id"), "")
+                metadata["generation_snapshot"] = quote_session_generation_snapshot(
+                    payload,
+                    patch,
+                    created_at=now,
+                    workspace_id=self.workspace_id,
+                    profile_detail=self.profile_detail(profile_id, source="company") if profile_id else None,
+                    pricing_reference_detail=self.pricing_reference_detail(pricing_reference_id, source="company") if pricing_reference_id else None,
+                )
+            else:
+                mark_quote_session_exports_stale(metadata, quote_session_current_draft_export_kinds(patch))
+            normalized = normalized_quote_session_metadata(metadata)
+            if not normalized:
+                raise ValueError("Quote session metadata is not valid.")
+            draft_files = quote_session_draft_files(patch) if isinstance(patch.get("draft_files"), list) else []
+            with self.connection() as connection:
+                if stored_generated_quote:
+                    retained_kinds = {
+                        item.artifact_kind
+                        for item in pending_artifacts
+                    }
+                    if object_plan is not None:
+                        self._execute_object_artifact_batch_metadata(
+                            connection,
+                            object_plan,
+                            quote_session=True,
+                        )
+                    else:
+                        self._execute_delete_database_quote_exports_except(
+                            connection,
+                            resolved_session_id,
+                            retained_kinds,
+                        )
+                        for item in pending_artifacts:
+                            self._execute_upsert_quote_artifact(
+                                connection,
+                                resolved_session_id,
+                                item,
+                                now,
+                            )
+                connection.execute(
+                    "insert into sqag_quote_sessions (workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at) values (?, ?, ?, ?, ?, ?) on conflict(workspace_id, session_id) do update set metadata_json = excluded.metadata_json, draft_files_json = excluded.draft_files_json, updated_at = excluded.updated_at",
+                    (self.workspace_id, normalized["session_id"], json.dumps(normalized, ensure_ascii=True, sort_keys=True), json.dumps(draft_files, ensure_ascii=True, sort_keys=True), normalized.get("created_at") or now, normalized.get("updated_at") or now),
+                )
+                connection.commit()
+        except Exception as exc:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+            if object_plan is not None:
+                try:
+                    self._compensate_object_artifact_batch(object_plan)
+                except ObjectStorageContractError as recovery_exc:
+                    exc = recovery_exc
+            if stored_generated_quote:
+                raise SqagStorageAccessError(
+                    QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                    status=503,
+                    reason="object_artifact_storage_unavailable",
+                ) from exc
+            raise
+        if object_plan is not None and output_dir is not None:
+            for item in pending_artifacts:
+                if item.source is not None:
+                    self._cleanup_object_staging_file(item.source, output_dir)
         return self._public_quote_session(normalized)
 
     def list_quote_sessions(self) -> list[dict[str, Any]]:

@@ -72,7 +72,17 @@ Source of truth: `.github/workflows/ci.yml`
   returns a generic HTTP 503 and preserves the owner plus failed artifact for a
   retry; confirmed deletions are tombstoned individually. Superseded profile,
   pricing, and generated-quote objects, including artifact kinds omitted from
-  a replacement payload, use the same fail-closed replacement guard. Quote
+  a replacement payload, use the same fail-closed replacement guard. Pricing
+  visual and generated-quote export replacements are batch-scoped: all new
+  provider objects are staged, every old object that may be removed is backed
+  up, and provider changes are compensated if a later provider or database
+  step fails. Artifact metadata and the pricing-owner or quote-session payload
+  then commit in one database transaction; database/BLOB mode performs its
+  omitted-kind deletes, artifact upserts, and owner/session update in that same
+  transaction. Quote staging files are removed only after the batch commits.
+  CI injects later-step object-store and database failures and requires the
+  complete prior owner payload, artifact rows, provider bytes, availability,
+  and stale state to survive unchanged. Quote
   reconciliation requires a persisted XLSX, so confirmation-only outcomes
   retain prior bytes as stale instead of deleting them. Object-mode Postgres
   deletes do not query the unsupported database/BLOB artifact tables. CI

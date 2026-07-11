@@ -933,6 +933,25 @@ Platform-to-SQAG hosted smoke remain required. The Swooshz Platform
 `appKey=sqag` migration has landed in Platform PR #79; hosted smoke evidence is
 still pending. `production_ready=false` remains.
 
+### PR #134 batch replacement addendum
+
+The object-lifecycle remediation now treats each pricing-reference visual set
+and generated-quote export set as one replacement batch. New provider objects
+are staged before any old object is removed; all old objects that may be
+removed are retained for compensation. Artifact metadata and the owning
+pricing payload or quote-session payload are written in one database
+transaction only after provider work succeeds. A later provider or database
+failure deletes all newly written objects, restores every old object deleted
+by the attempt, rolls back all metadata and owner/session writes, preserves
+prior export availability and stale state, and returns the existing generic
+storage HTTP 503. Database/BLOB mode performs omitted-kind deletion, artifact
+upserts, and owner/session update in one transaction. Focused injected-failure
+coverage proves rollback for quote XLSX success followed by PDF failure,
+omitted-PDF deletion followed by XLSX failure, pricing visual 1 success
+followed by visual 2 failure, and equivalent multi-artifact database/BLOB
+failures. No live provider or customer data is used, and production readiness
+remains false.
+
 ## What Was Not Verified
 
 - Live deployed Swooshz Platform behavior, platform token service, hosted SQAG handoff, or platform workspace membership enforcement; this audit checked source-contract surfaces only, and `scripts/verify_hosted_smoke.py` uses only synthetic platform/workspace context.

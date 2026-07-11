@@ -22880,6 +22880,423 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             prior_bytes,
         )
 
+    def test_object_quote_batch_restores_xlsx_when_later_pdf_store_fails(self):
+        class FailPdfStoreBackend(webapp.InMemoryObjectStorageBackend):
+            fail_pdf = False
+
+            def store_artifact(self, **kwargs):
+                if self.fail_pdf and kwargs.get("artifact_kind") == "pdf":
+                    raise webapp.ObjectStorageContractError("synthetic PDF store failure")
+                return super().store_artifact(**kwargs)
+
+        backend = FailPdfStoreBackend()
+        tmp_path = test_temp_root() / f"object-quote-batch-pdf-failure-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+        payload = valid_payload()
+        payload["quote_session"] = {"session_id": "quote-batch-pdf-failure"}
+
+        def snapshot(storage):
+            rows = storage._active_object_artifact_rows(
+                "generated_quote",
+                "quote-batch-pdf-failure",
+            )
+            return (
+                {row["artifact_kind"]: dict(row) for row in rows},
+                copy.deepcopy(backend._objects),
+                copy.deepcopy(
+                    storage._read_quote_session_metadata_for_workspace(
+                        "quote-batch-pdf-failure"
+                    )[0]
+                ),
+            )
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session("workspace-object-quote-batch-pdf-failure")
+            )
+            old_output = tmp_path / "out" / "old"
+            old_output.mkdir(parents=True)
+            (old_output / "quotation.xlsx").write_bytes(b"old-batch-xlsx")
+            (old_output / "quotation.pdf").write_bytes(b"old-batch-pdf")
+            storage.create_or_update_quote_session(
+                payload,
+                result={
+                    "status": "completed",
+                    "files": [{"name": "quotation.xlsx"}, {"name": "quotation.pdf"}],
+                },
+                output_dir=old_output,
+            )
+            before = snapshot(storage)
+
+            new_output = tmp_path / "out" / "new"
+            new_output.mkdir(parents=True)
+            (new_output / "quotation.xlsx").write_bytes(b"new-batch-xlsx")
+            (new_output / "quotation.pdf").write_bytes(b"new-batch-pdf")
+            backend.fail_pdf = True
+            with self.assertRaises(webapp.SqagStorageAccessError) as raised:
+                storage.create_or_update_quote_session(
+                    payload,
+                    result={
+                        "status": "completed",
+                        "files": [{"name": "quotation.xlsx"}, {"name": "quotation.pdf"}],
+                    },
+                    output_dir=new_output,
+                )
+            after = snapshot(storage)
+            public_after = storage.get_quote_session("quote-batch-pdf-failure")
+
+        self.assertEqual(raised.exception.status, 503)
+        self.assertEqual(after, before)
+        self.assertTrue(public_after["exports"]["xlsx"]["exists"])
+        self.assertTrue(public_after["exports"]["pdf"]["exists"])
+        self.assertTrue((new_output / "quotation.xlsx").is_file())
+        self.assertTrue((new_output / "quotation.pdf").is_file())
+
+    def test_object_quote_batch_restores_omitted_pdf_when_later_xlsx_store_fails(self):
+        class FailXlsxStoreBackend(webapp.InMemoryObjectStorageBackend):
+            fail_xlsx = False
+
+            def store_artifact(self, **kwargs):
+                if self.fail_xlsx and kwargs.get("artifact_kind") == "xlsx":
+                    raise webapp.ObjectStorageContractError("synthetic XLSX store failure")
+                return super().store_artifact(**kwargs)
+
+        backend = FailXlsxStoreBackend()
+        tmp_path = test_temp_root() / f"object-quote-batch-omitted-pdf-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+        payload = valid_payload()
+        payload["quote_session"] = {"session_id": "quote-batch-omitted-pdf"}
+
+        def snapshot(storage):
+            rows = storage._active_object_artifact_rows(
+                "generated_quote",
+                "quote-batch-omitted-pdf",
+            )
+            return (
+                {row["artifact_kind"]: dict(row) for row in rows},
+                copy.deepcopy(backend._objects),
+                copy.deepcopy(
+                    storage._read_quote_session_metadata_for_workspace(
+                        "quote-batch-omitted-pdf"
+                    )[0]
+                ),
+            )
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session("workspace-object-quote-batch-omitted-pdf")
+            )
+            old_output = tmp_path / "out" / "old"
+            old_output.mkdir(parents=True)
+            (old_output / "quotation.xlsx").write_bytes(b"old-omitted-xlsx")
+            (old_output / "quotation.pdf").write_bytes(b"old-omitted-pdf")
+            storage.create_or_update_quote_session(
+                payload,
+                result={
+                    "status": "completed",
+                    "files": [{"name": "quotation.xlsx"}, {"name": "quotation.pdf"}],
+                },
+                output_dir=old_output,
+            )
+            before = snapshot(storage)
+
+            new_output = tmp_path / "out" / "new"
+            new_output.mkdir(parents=True)
+            (new_output / "quotation.xlsx").write_bytes(b"new-omitted-xlsx")
+            backend.fail_xlsx = True
+            with self.assertRaises(webapp.SqagStorageAccessError) as raised:
+                storage.create_or_update_quote_session(
+                    payload,
+                    result={"status": "completed", "files": [{"name": "quotation.xlsx"}]},
+                    output_dir=new_output,
+                )
+            after = snapshot(storage)
+            public_after = storage.get_quote_session("quote-batch-omitted-pdf")
+
+        self.assertEqual(raised.exception.status, 503)
+        self.assertEqual(after, before)
+        self.assertTrue(public_after["exports"]["xlsx"]["exists"])
+        self.assertTrue(public_after["exports"]["pdf"]["exists"])
+        self.assertTrue((new_output / "quotation.xlsx").is_file())
+
+    def test_object_pricing_batch_restores_first_visual_when_second_store_fails(self):
+        class FailSecondVisualStoreBackend(webapp.InMemoryObjectStorageBackend):
+            fail_second_visual = False
+
+            def store_artifact(self, **kwargs):
+                if (
+                    self.fail_second_visual
+                    and kwargs.get("artifact_kind") == "visual_1_2"
+                ):
+                    raise webapp.ObjectStorageContractError(
+                        "synthetic second visual store failure"
+                    )
+                return super().store_artifact(**kwargs)
+
+        backend = FailSecondVisualStoreBackend()
+        tmp_path = test_temp_root() / f"object-pricing-batch-failure-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+
+        def pricing(label, first_bytes, second_bytes):
+            return webapp.normalize_pricing_reference_payload({
+                "id": "pricing-batch-failure",
+                "label": label,
+                "items": [with_required_pricing_metadata({
+                    "id": "pricing-batch-row",
+                    "section": "Graphics",
+                    "description": "Printed graphics",
+                    "unit_hint": "sqm",
+                    "internal_cost": 10,
+                    "markup_multiplier": 2,
+                    "visual_references": [
+                        {
+                            "source": "xl/media/pricing-batch-first.png",
+                            "anchor_row": 7,
+                            "data_url": "data:image/png;base64,"
+                            + base64.b64encode(first_bytes).decode("ascii"),
+                        },
+                        {
+                            "source": "xl/media/pricing-batch-second.png",
+                            "anchor_row": 8,
+                            "data_url": "data:image/png;base64,"
+                            + base64.b64encode(second_bytes).decode("ascii"),
+                        },
+                    ],
+                })],
+            })
+
+        def snapshot(storage):
+            rows = storage._active_object_artifact_rows(
+                "pricing_reference",
+                "pricing-batch-failure",
+            )
+            return (
+                {row["artifact_kind"]: dict(row) for row in rows},
+                copy.deepcopy(backend._objects),
+                copy.deepcopy(
+                    storage._read_payload(
+                        "sqag_pricing_references",
+                        "reference_id",
+                        "pricing-batch-failure",
+                    )
+                ),
+            )
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session("workspace-object-pricing-batch-failure")
+            )
+            storage.save_pricing_reference(
+                pricing("Original Pricing Batch", b"old-first", b"old-second")
+            )
+            before = snapshot(storage)
+
+            backend.fail_second_visual = True
+            with self.assertRaises(webapp.SqagStorageAccessError) as raised:
+                storage.save_pricing_reference(
+                    pricing("Replacement Pricing Batch", b"new-first", b"new-second")
+                )
+            after = snapshot(storage)
+
+        self.assertEqual(raised.exception.status, 503)
+        self.assertEqual(after, before)
+
+    def test_database_multi_artifact_batches_roll_back_pricing_and_quote_state(self):
+        tmp_path = test_temp_root() / f"database-artifact-batch-rollback-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = {
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "database",
+            "SQAG_DATABASE_URL": database_url,
+        }
+
+        def pricing(label, first_bytes, second_bytes):
+            return webapp.normalize_pricing_reference_payload({
+                "id": "database-batch-pricing",
+                "label": label,
+                "items": [with_required_pricing_metadata({
+                    "id": "database-batch-row",
+                    "section": "Graphics",
+                    "description": "Printed graphics",
+                    "unit_hint": "sqm",
+                    "internal_cost": 10,
+                    "markup_multiplier": 2,
+                    "visual_references": [
+                        {
+                            "source": "xl/media/database-batch-first.png",
+                            "anchor_row": 7,
+                            "data_url": "data:image/png;base64,"
+                            + base64.b64encode(first_bytes).decode("ascii"),
+                        },
+                        {
+                            "source": "xl/media/database-batch-second.png",
+                            "anchor_row": 8,
+                            "data_url": "data:image/png;base64,"
+                            + base64.b64encode(second_bytes).decode("ascii"),
+                        },
+                    ],
+                })],
+            })
+
+        def pricing_snapshot():
+            with sqlite3.connect(db_path) as connection:
+                owner = connection.execute(
+                    "select payload_json, created_at, updated_at "
+                    "from sqag_pricing_references where workspace_id = ? and reference_id = ?",
+                    ("workspace-database-batch", "database-batch-pricing"),
+                ).fetchone()
+                artifacts = connection.execute(
+                    "select artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at "
+                    "from sqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? "
+                    "order by artifact_kind",
+                    (
+                        "workspace-database-batch",
+                        "pricing_reference",
+                        "database-batch-pricing",
+                    ),
+                ).fetchall()
+            return owner, artifacts
+
+        def quote_snapshot():
+            with sqlite3.connect(db_path) as connection:
+                owner = connection.execute(
+                    "select metadata_json, draft_files_json, created_at, updated_at "
+                    "from sqag_quote_sessions where workspace_id = ? and session_id = ?",
+                    ("workspace-database-batch", "quote-database-batch"),
+                ).fetchone()
+                artifacts = connection.execute(
+                    "select artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at "
+                    "from sqag_quote_artifacts where workspace_id = ? and session_id = ? "
+                    "order by artifact_kind",
+                    ("workspace-database-batch", "quote-database-batch"),
+                ).fetchall()
+            return owner, artifacts
+
+        with mock.patch.dict(os.environ, env, clear=True):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session("workspace-database-batch")
+            )
+            storage.save_pricing_reference(
+                pricing("Original Database Batch", b"old-first", b"old-second")
+            )
+            pricing_before = pricing_snapshot()
+            with sqlite3.connect(db_path) as connection:
+                connection.executescript(
+                    """
+                    create trigger fail_pricing_batch_insert
+                    before insert on sqag_file_artifacts
+                    when NEW.artifact_kind = 'visual_1_2'
+                    begin
+                      select raise(abort, 'synthetic pricing batch failure');
+                    end;
+                    create trigger fail_pricing_batch_update
+                    before update on sqag_file_artifacts
+                    when NEW.artifact_kind = 'visual_1_2'
+                    begin
+                      select raise(abort, 'synthetic pricing batch failure');
+                    end;
+                    """
+                )
+            try:
+                storage.save_pricing_reference(
+                    pricing("Replacement Database Batch", b"new-first", b"new-second")
+                )
+                pricing_error = None
+            except Exception as exc:
+                pricing_error = exc
+            with sqlite3.connect(db_path) as connection:
+                connection.executescript(
+                    """
+                    drop trigger fail_pricing_batch_insert;
+                    drop trigger fail_pricing_batch_update;
+                    """
+                )
+            pricing_after = pricing_snapshot()
+
+            old_output = tmp_path / "out" / "old"
+            old_output.mkdir(parents=True)
+            (old_output / "quotation.xlsx").write_bytes(b"old-database-xlsx")
+            (old_output / "quotation.pdf").write_bytes(b"old-database-pdf")
+            payload = valid_payload()
+            payload["quote_session"] = {"session_id": "quote-database-batch"}
+            storage.create_or_update_quote_session(
+                payload,
+                result={
+                    "status": "completed",
+                    "files": [{"name": "quotation.xlsx"}, {"name": "quotation.pdf"}],
+                },
+                output_dir=old_output,
+            )
+            quote_before = quote_snapshot()
+            with sqlite3.connect(db_path) as connection:
+                connection.executescript(
+                    """
+                    create trigger fail_quote_batch_insert
+                    before insert on sqag_quote_artifacts
+                    when NEW.artifact_kind = 'pdf'
+                    begin
+                      select raise(abort, 'synthetic quote batch failure');
+                    end;
+                    create trigger fail_quote_batch_update
+                    before update on sqag_quote_artifacts
+                    when NEW.artifact_kind = 'pdf'
+                    begin
+                      select raise(abort, 'synthetic quote batch failure');
+                    end;
+                    """
+                )
+            new_output = tmp_path / "out" / "new"
+            new_output.mkdir(parents=True)
+            (new_output / "quotation.xlsx").write_bytes(b"new-database-xlsx")
+            (new_output / "quotation.pdf").write_bytes(b"new-database-pdf")
+            try:
+                storage.create_or_update_quote_session(
+                    payload,
+                    result={
+                        "status": "completed",
+                        "files": [{"name": "quotation.xlsx"}, {"name": "quotation.pdf"}],
+                    },
+                    output_dir=new_output,
+                )
+                quote_error = None
+            except Exception as exc:
+                quote_error = exc
+            with sqlite3.connect(db_path) as connection:
+                connection.executescript(
+                    """
+                    drop trigger fail_quote_batch_insert;
+                    drop trigger fail_quote_batch_update;
+                    """
+                )
+            quote_after = quote_snapshot()
+
+        self.assertIsInstance(pricing_error, webapp.SqagStorageAccessError)
+        self.assertEqual(pricing_error.status, 503)
+        self.assertEqual(pricing_after, pricing_before)
+        self.assertIsInstance(quote_error, webapp.SqagStorageAccessError)
+        self.assertEqual(quote_error.status, 503)
+        self.assertEqual(quote_after, quote_before)
+
     def test_object_mode_postgres_deletes_do_not_query_blob_artifact_tables(self):
         class RecordingConnection:
             def __init__(self):
