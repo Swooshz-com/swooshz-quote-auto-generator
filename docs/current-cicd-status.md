@@ -70,7 +70,14 @@ Source of truth: `.github/workflows/ci.yml`
 - Object-backed profile, pricing-reference, and quote-session deletion removes
   provider objects before deleting owner records. Provider deletion failure
   returns a generic HTTP 503 and preserves the owner plus failed artifact for a
-  retry; confirmed deletions are tombstoned individually. Superseded profile,
+  retry. Before each provider deletion SQAG retains verified prior bytes;
+  confirmed deletion is counted only after the exact active metadata row is
+  tombstoned and committed. Tombstone execution or commit failure rolls back
+  the row and restores the provider object with identity, key, checksum, and
+  size verification. Earlier committed artifacts in a multi-artifact deletion
+  remain tombstoned, the failing artifact remains active, and retry processes
+  only active rows. Owner deletion verifies that no active object metadata
+  remains. Superseded profile,
   pricing, and generated-quote objects, including artifact kinds omitted from
   a replacement payload, use the same fail-closed replacement guard. Pricing
   visual and generated-quote export replacements are batch-scoped: all new
@@ -82,7 +89,11 @@ Source of truth: `.github/workflows/ci.yml`
   transaction. Quote staging files are removed only after the batch commits.
   CI injects later-step object-store and database failures and requires the
   complete prior owner payload, artifact rows, provider bytes, availability,
-  and stale state to survive unchanged. Quote
+  and stale state to survive unchanged. Profile layout replacement uses the
+  same prepared provider batch: layout metadata and the profile payload commit
+  in one database transaction, while database/BLOB mode writes layout bytes
+  and profile payload in one transaction. Metadata-only profile updates retain
+  the active layout without contacting object storage. Quote
   reconciliation requires a persisted XLSX, so confirmation-only outcomes
   retain prior bytes as stale instead of deleting them. Object-mode Postgres
   deletes do not query the unsupported database/BLOB artifact tables. CI

@@ -933,7 +933,7 @@ Platform-to-SQAG hosted smoke remain required. The Swooshz Platform
 `appKey=sqag` migration has landed in Platform PR #79; hosted smoke evidence is
 still pending. `production_ready=false` remains.
 
-### PR #134 batch replacement addendum
+### PR #134 artifact transaction and recovery addendum
 
 The object-lifecycle remediation now treats each pricing-reference visual set
 and generated-quote export set as one replacement batch. New provider objects
@@ -951,6 +951,23 @@ omitted-PDF deletion followed by XLSX failure, pricing visual 1 success
 followed by visual 2 failure, and equivalent multi-artifact database/BLOB
 failures. No live provider or customer data is used, and production readiness
 remains false.
+
+Profile quotation-layout replacement now uses the same logical batch boundary.
+Object mode stages and validates the new layout, retains the prior object for
+compensation, then commits exact object metadata and the profile payload in one
+database transaction. Database/BLOB mode upserts the layout and profile payload
+through one connection and commit. Metadata-only updates retain the current
+layout and do not initialize or contact the provider.
+
+Provider-backed owner deletion now retrieves and verifies bounded prior bytes
+before deleting each object. The exact workspace-scoped active row is
+tombstoned and committed before that artifact counts as deleted. If tombstone
+execution or commit fails, SQAG rolls back before restoring the exact prior
+object and verifies restored workspace, owner, kind, key, checksum, and byte
+size. Earlier committed deletions remain committed; the failing artifact stays
+active, the owner remains, and retry processes only active rows. Exact snapshot
+predicates and single-use batch plans fail closed on stale concurrent metadata
+instead of overwriting a newer committed artifact.
 
 ## What Was Not Verified
 
