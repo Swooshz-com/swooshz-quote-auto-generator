@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TEMPLATE = ROOT / "deploy" / "internal-uat" / "coolify" / "sqag.uat.env.example"
 
 REQUIRED_KEYS = (
+    'SQAG_TRUSTED_PROXY_CIDRS',
     "APP_MODE",
     "AUTH_REQUIRED",
     "SESSION_SECRET",
@@ -36,6 +37,7 @@ REQUIRED_KEYS = (
 )
 
 PLACEHOLDER_KEYS = {
+    'SQAG_TRUSTED_PROXY_CIDRS',
     "SESSION_SECRET",
     "SQAG_DATABASE_URL",
     "SQAG_OBJECT_STORAGE_PROVIDER",

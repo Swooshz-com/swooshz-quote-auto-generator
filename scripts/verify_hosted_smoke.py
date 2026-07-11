@@ -347,6 +347,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
     db_path = run_root / "sqag-hosted-smoke.sqlite3"
     database_url = f"sqlite:///{db_path.as_posix()}"
     env = {
+        'SQAG_TRUSTED_PROXY_CIDRS': '127.0.0.1/32',
         "APP_MODE": "deploy",
         "AUTH_REQUIRED": "true",
         "SESSION_SECRET": "synthetic-session-secret-with-enough-entropy",

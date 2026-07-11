@@ -601,8 +601,18 @@ class WebappServerTest(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
+    def reset_rate_limit_state(self):
+        with webapp.RATE_LIMIT_LOCK:
+            webapp.RATE_LIMIT_BUCKETS.clear()
+            overflow_buckets = getattr(webapp, "RATE_LIMIT_OVERFLOW_BUCKETS", None)
+            if overflow_buckets is not None:
+                overflow_buckets.clear()
+            if hasattr(webapp, "RATE_LIMIT_LAST_PRUNE_AT"):
+                webapp.RATE_LIMIT_LAST_PRUNE_AT = 0.0
+
     def deploy_auth_env(self, **overrides):
         env = {
+            'SQAG_TRUSTED_PROXY_CIDRS': '127.0.0.1/32',
             "APP_MODE": "deploy",
             "AUTH_REQUIRED": "true",
             "SESSION_SECRET": "test-session-secret-with-enough-entropy",
@@ -621,6 +631,7 @@ class WebappServerTest(unittest.TestCase):
 
     def platform_launch_env(self, **overrides):
         env = {
+            'SQAG_TRUSTED_PROXY_CIDRS': '127.0.0.1/32',
             "APP_MODE": "deploy",
             "AUTH_REQUIRED": "true",
             "SESSION_SECRET": "test-session-secret-with-enough-entropy",
@@ -3229,6 +3240,86 @@ class WebappServerTest(unittest.TestCase):
         ):
             self.assertEqual(webapp.main(), 2)
 
+    def test_deploy_preflight_and_startup_require_trusted_proxy_boundary(self):
+        runtime_root = Path(tempfile.gettempdir()) / 'sqag-trusted-proxy-startup-block'
+        env = self.platform_launch_env(
+            **self.hosted_storage_env(),
+            SQAG_TRUSTED_PROXY_CIDRS='',
+            QUOTE_DATA_ROOT=str(runtime_root / 'data'),
+            QUOTE_OUTPUT_ROOT=str(runtime_root / 'output'),
+            QUOTE_TMP_ROOT=str(runtime_root / 'tmp'),
+            QUOTE_LOG_ROOT=str(runtime_root / 'logs'),
+        )
+        fake_server = mock.Mock()
+
+        with mock.patch.dict(os.environ, env, clear=True):
+            status = webapp.deploy_uat_preflight_status()
+
+        checks = {check['name']: check for check in status['checks']}
+        self.assertIn('SQAG_TRUSTED_PROXY_CIDRS', checks)
+        self.assertFalse(checks['SQAG_TRUSTED_PROXY_CIDRS']['ok'])
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(sys, 'argv', ['server.py']),
+            mock.patch.object(webapp, 'deploy_requires_storage_guard', return_value=False),
+            mock.patch.object(webapp, 'health_status', return_value={'status': 'ok'}),
+            mock.patch.object(webapp, 'ThreadingHTTPServer', return_value=fake_server),
+        ):
+            result = webapp.main()
+
+        self.assertEqual(result, 2)
+        fake_server.serve_forever.assert_not_called()
+
+        with mock.patch.dict(
+            os.environ,
+            self.platform_launch_env(SQAG_TRUSTED_PROXY_CIDRS='not-a-network'),
+            clear=True,
+        ):
+            malformed = webapp.deploy_uat_preflight_status()
+        malformed_checks = {check['name']: check for check in malformed['checks']}
+        self.assertFalse(malformed_checks['SQAG_TRUSTED_PROXY_CIDRS']['ok'])
+
+    def test_trusted_proxy_config_rejects_empty_segments_and_catch_all_networks(self):
+        invalid_values = (
+            '127.0.0.1/32,',
+            ',127.0.0.1/32',
+            '127.0.0.1/32,,192.0.2.0/24',
+            '0.0.0.0/0',
+            '::/0',
+        )
+
+        for value in invalid_values:
+            with self.subTest(value=value):
+                with mock.patch.dict(
+                    os.environ,
+                    self.platform_launch_env(SQAG_TRUSTED_PROXY_CIDRS=value),
+                    clear=True,
+                ):
+                    self.assertFalse(webapp.trusted_proxy_config_complete())
+
+    def test_deploy_handlers_fail_closed_without_trusted_proxy_boundary(self):
+        env = self.platform_launch_env(SQAG_TRUSTED_PROXY_CIDRS='')
+        webapp.RATE_LIMIT_BUCKETS.clear()
+        self.addCleanup(webapp.RATE_LIMIT_BUCKETS.clear)
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, 'health_status', return_value={'status': 'ok'}),
+        ):
+            with LocalRunnerServer() as runner:
+                launch = self.http_json(
+                    runner,
+                    'POST',
+                    webapp.PLATFORM_LAUNCH_ENDPOINT,
+                )
+                app = self.http_json(runner, 'GET', '/')
+                health = self.http_json(runner, 'GET', '/api/health')
+
+        self.assertEqual(launch['status'], 503)
+        self.assertEqual(app['status'], 503)
+        self.assertEqual(health['status'], 200)
+
     def test_local_oidc_component_mode_does_not_require_platform_workspace_launch(self):
         with mock.patch.dict(os.environ, self.deploy_auth_env(APP_MODE="local"), clear=True):
             self.assertFalse(webapp.deploy_requires_platform_workspace_guard())
@@ -3595,6 +3686,321 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(session_body["user"]["account"], "workspace-123")
         self.assertEqual(session_body["user"]["platform"]["app"]["appKey"], "sqag")
         self.assertEqual(session_body["permissions"]["role"], "admin")
+
+    def test_platform_launch_rate_limit_isolates_clients_behind_trusted_proxy(self):
+        env = self.platform_launch_env()
+        captured_requests: list[urllib.request.Request] = []
+
+        def fake_urlopen(request, timeout=0):
+            captured_requests.append(request)
+            return JsonResponseMock(self.platform_consume_payload())
+
+        webapp.RATE_LIMIT_BUCKETS.clear()
+        self.addCleanup(webapp.RATE_LIMIT_BUCKETS.clear)
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.object(webapp.urllib.request, 'urlopen', side_effect=fake_urlopen):
+                with LocalRunnerServer() as runner:
+                    for index in range(webapp.POST_RATE_LIMITS[webapp.PLATFORM_LAUNCH_ENDPOINT]):
+                        missing_token = self.http_json(
+                            runner,
+                            'POST',
+                            webapp.PLATFORM_LAUNCH_ENDPOINT,
+                            headers={'X-Forwarded-For': f'198.51.100.{index + 1}'},
+                        )
+                        self.assertEqual(missing_token['status'], 400)
+
+                    valid = self.http_json(
+                        runner,
+                        'POST',
+                        webapp.PLATFORM_LAUNCH_ENDPOINT,
+                        headers={
+                            webapp.PLATFORM_LAUNCH_TOKEN_HEADER: self.synthetic_platform_launch_token(),
+                            'X-Forwarded-For': '203.0.113.250',
+                        },
+                    )
+
+        self.assertEqual(valid['status'], 200)
+        self.assertEqual(valid['body']['status'], 'platform_session_created')
+        self.assertEqual(len(captured_requests), 1)
+
+    def test_platform_launch_rate_limit_state_is_bounded_and_fail_closed(self):
+        env = self.platform_launch_env()
+        captured_requests: list[urllib.request.Request] = []
+
+        def fake_urlopen(request, timeout=0):
+            captured_requests.append(request)
+            return JsonResponseMock(self.platform_consume_payload())
+
+        self.reset_rate_limit_state()
+        self.addCleanup(self.reset_rate_limit_state)
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "MAX_RATE_LIMIT_BUCKETS", 4),
+            mock.patch.object(webapp.urllib.request, "urlopen", side_effect=fake_urlopen),
+        ):
+            with LocalRunnerServer() as runner:
+                for index in range(3):
+                    missing_token = self.http_json(
+                        runner,
+                        "POST",
+                        webapp.PLATFORM_LAUNCH_ENDPOINT,
+                        headers={"X-Forwarded-For": f"198.51.100.{index + 1}"},
+                    )
+                    self.assertEqual(missing_token["status"], 400)
+
+                valid = self.http_json(
+                    runner,
+                    "POST",
+                    webapp.PLATFORM_LAUNCH_ENDPOINT,
+                    headers={
+                        webapp.PLATFORM_LAUNCH_TOKEN_HEADER: self.synthetic_platform_launch_token(),
+                        "X-Forwarded-For": "203.0.113.40",
+                    },
+                )
+                self.assertEqual(valid["status"], 200)
+
+                overflow_statuses = []
+                for index in range(webapp.POST_RATE_LIMITS[webapp.PLATFORM_LAUNCH_ENDPOINT]):
+                    response = self.http_json(
+                        runner,
+                        "POST",
+                        webapp.PLATFORM_LAUNCH_ENDPOINT,
+                        headers={"X-Forwarded-For": f"2001:db8::{index + 1}"},
+                    )
+                    overflow_statuses.append(response["status"])
+
+                saturated_valid = self.http_json(
+                    runner,
+                    "POST",
+                    webapp.PLATFORM_LAUNCH_ENDPOINT,
+                    headers={
+                        webapp.PLATFORM_LAUNCH_TOKEN_HEADER: self.synthetic_platform_launch_token(),
+                        "X-Forwarded-For": "2001:db8::ffff",
+                    },
+                )
+
+        self.assertEqual(overflow_statuses, [400] * webapp.POST_RATE_LIMITS[webapp.PLATFORM_LAUNCH_ENDPOINT])
+        self.assertEqual(saturated_valid["status"], 429)
+        self.assertEqual(len(captured_requests), 1)
+        self.assertEqual(len(webapp.RATE_LIMIT_BUCKETS), 4)
+        self.assertEqual(
+            set(webapp.RATE_LIMIT_OVERFLOW_BUCKETS),
+            {webapp.PLATFORM_LAUNCH_ENDPOINT},
+        )
+        self.assertEqual(
+            len(webapp.RATE_LIMIT_OVERFLOW_BUCKETS[webapp.PLATFORM_LAUNCH_ENDPOINT]),
+            webapp.POST_RATE_LIMITS[webapp.PLATFORM_LAUNCH_ENDPOINT],
+        )
+
+    def test_platform_launch_rate_limit_does_not_trust_forwarded_ip_from_direct_client(self):
+        env = self.platform_launch_env(SQAG_TRUSTED_PROXY_CIDRS='192.0.2.0/24')
+        webapp.RATE_LIMIT_BUCKETS.clear()
+        self.addCleanup(webapp.RATE_LIMIT_BUCKETS.clear)
+
+        with mock.patch.dict(os.environ, env, clear=True):
+            with LocalRunnerServer() as runner:
+                statuses = []
+                for index in range(webapp.POST_RATE_LIMITS[webapp.PLATFORM_LAUNCH_ENDPOINT] + 1):
+                    response = self.http_json(
+                        runner,
+                        'POST',
+                        webapp.PLATFORM_LAUNCH_ENDPOINT,
+                        headers={'X-Forwarded-For': f'198.51.100.{index + 1}'},
+                    )
+                    statuses.append(response['status'])
+
+        self.assertEqual(statuses[-1], 429)
+
+    def test_platform_launch_rate_limit_uses_first_untrusted_hop_from_right(self):
+        env = self.platform_launch_env(
+            SQAG_TRUSTED_PROXY_CIDRS='127.0.0.1/32,192.0.2.0/24',
+        )
+        seen_clients: list[str] = []
+
+        def capture_rate_limit(client_id, path, now=None):
+            seen_clients.append(client_id)
+            return False
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, 'is_rate_limited', side_effect=capture_rate_limit),
+        ):
+            with LocalRunnerServer() as runner:
+                response = self.http_json(
+                    runner,
+                    'POST',
+                    webapp.PLATFORM_LAUNCH_ENDPOINT,
+                    headers={
+                        'X-Forwarded-For': '198.51.100.99, 203.0.113.25, 192.0.2.10',
+                    },
+                )
+
+        self.assertEqual(response['status'], 400)
+        self.assertEqual(seen_clients, ['203.0.113.25'])
+
+    def test_effective_rate_limit_client_falls_back_for_invalid_forwarding_data(self):
+        resolver = getattr(webapp, 'effective_rate_limit_client_id', None)
+        self.assertIsNotNone(resolver)
+        max_header_bytes = getattr(webapp, 'MAX_FORWARDED_FOR_HEADER_BYTES', 0)
+        self.assertEqual(max_header_bytes, 4096)
+        env = self.platform_launch_env(SQAG_TRUSTED_PROXY_CIDRS='127.0.0.1/32')
+        over_hop_header = ','.join(
+            f'198.51.100.{(index % 254) + 1}'
+            for index in range(webapp.MAX_FORWARDED_FOR_HOPS + 1)
+        )
+        cases = (
+            ('127.0.0.1', '', '127.0.0.1'),
+            ('127.0.0.1', 'not-an-ip', '127.0.0.1'),
+            ('127.0.0.1', 'x' * (max_header_bytes + 1), '127.0.0.1'),
+            ('127.0.0.1', (' ' * max_header_bytes) + '203.0.113.9', '127.0.0.1'),
+            ('127.0.0.1', over_hop_header, '127.0.0.1'),
+            ('127.0.0.1', 'fe80::1%attacker-one', '127.0.0.1'),
+            ('127.0.0.1', 'fe80::1%attacker-two', '127.0.0.1'),
+            ('203.0.113.8', '198.51.100.12', '203.0.113.8'),
+            ('not-an-ip', '198.51.100.12', 'unknown'),
+        )
+
+        with mock.patch.dict(os.environ, env, clear=True):
+            for socket_peer, forwarded_for, expected in cases:
+                with self.subTest(socket_peer=socket_peer, forwarded_for=forwarded_for[:40]):
+                    self.assertEqual(resolver(socket_peer, forwarded_for), expected)
+
+    def test_rate_limit_handlers_reject_duplicate_forwarded_for_fields(self):
+        handler = object.__new__(webapp.QuoteRunnerHandler)
+        handler.client_address = ('127.0.0.1', 12345)
+        handler.headers = http.client.HTTPMessage()
+        handler.headers.add_header('Host', '127.0.0.1:8765')
+        handler.headers.add_header('Origin', 'http://127.0.0.1:8765')
+        handler.headers.add_header(
+            webapp.configured_csrf_header_name(),
+            webapp.csrf_token_for_cookie_header(''),
+        )
+        handler.headers.add_header('X-Forwarded-For', '198.51.100.11')
+        handler.headers.add_header('X-Forwarded-For', '203.0.113.22')
+        seen_clients: list[tuple[str, str]] = []
+
+        def capture_rate_limit(client_id, path, now=None):
+            seen_clients.append((client_id, path))
+            return False
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    'APP_MODE': 'local',
+                    'AUTH_REQUIRED': 'false',
+                    'SQAG_TRUSTED_PROXY_CIDRS': '127.0.0.1/32',
+                },
+                clear=True,
+            ),
+            mock.patch.object(webapp, 'is_rate_limited', side_effect=capture_rate_limit),
+        ):
+            self.assertFalse(handler.block_platform_launch_rate_limit())
+            self.assertFalse(handler.block_unsafe_post('/api/draft'))
+
+        self.assertEqual(
+            seen_clients,
+            [
+                ('127.0.0.1', webapp.PLATFORM_LAUNCH_ENDPOINT),
+                ('127.0.0.1', '/api/draft'),
+            ],
+        )
+
+    def test_platform_launch_rate_limit_still_limits_same_forwarded_client(self):
+        env = self.platform_launch_env()
+        webapp.RATE_LIMIT_BUCKETS.clear()
+        self.addCleanup(webapp.RATE_LIMIT_BUCKETS.clear)
+
+        with mock.patch.dict(os.environ, env, clear=True):
+            with LocalRunnerServer() as runner:
+                statuses = []
+                for _ in range(webapp.POST_RATE_LIMITS[webapp.PLATFORM_LAUNCH_ENDPOINT] + 1):
+                    response = self.http_json(
+                        runner,
+                        'POST',
+                        webapp.PLATFORM_LAUNCH_ENDPOINT,
+                        headers={'X-Forwarded-For': '203.0.113.44'},
+                    )
+                    statuses.append(response['status'])
+
+        self.assertEqual(statuses[:-1], [400] * webapp.POST_RATE_LIMITS[webapp.PLATFORM_LAUNCH_ENDPOINT])
+        self.assertEqual(statuses[-1], 429)
+
+    def test_mutable_route_rate_limit_isolates_clients_behind_trusted_proxy(self):
+        path = '/api/settings/pricing-references/import-preview'
+        env = {
+            'APP_MODE': 'local',
+            'AUTH_REQUIRED': 'false',
+            'SQAG_TRUSTED_PROXY_CIDRS': '127.0.0.1/32',
+        }
+        seen_clients: list[str] = []
+
+        def capture_rate_limit(client_id, requested_path, now=None):
+            seen_clients.append(client_id)
+            return True
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, 'is_rate_limited', side_effect=capture_rate_limit),
+        ):
+            with LocalRunnerServer() as runner:
+                session = self.http_json(runner, 'GET', '/api/session')
+                response = self.http_json(
+                    runner,
+                    'POST',
+                    path,
+                    headers={
+                        'Origin': runner.base_url,
+                        session['body']['csrf_header']: session['body']['csrf_token'],
+                        'X-Forwarded-For': '198.51.100.77',
+                    },
+                )
+
+        self.assertEqual(response['status'], 429)
+        self.assertEqual(seen_clients, ['198.51.100.77'])
+
+    def test_mutable_route_rate_limit_uses_bounded_normalized_bucket(self):
+        handler = object.__new__(webapp.QuoteRunnerHandler)
+        handler.client_address = ("127.0.0.1", 12345)
+        handler.headers = http.client.HTTPMessage()
+        handler.headers.add_header("Host", "127.0.0.1:8765")
+        handler.headers.add_header("Origin", "http://127.0.0.1:8765")
+        handler.headers.add_header(
+            webapp.configured_csrf_header_name(),
+            webapp.csrf_token_for_cookie_header(""),
+        )
+        handler.headers.add_header("X-Forwarded-For", "198.51.100.77")
+        handler.send_json = mock.Mock()
+        normalized_path = "/api/settings/profiles/:id"
+        limit = webapp.POST_RATE_LIMITS[normalized_path]
+        self.reset_rate_limit_state()
+        self.addCleanup(self.reset_rate_limit_state)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "APP_MODE": "local",
+                    "AUTH_REQUIRED": "false",
+                    "SQAG_TRUSTED_PROXY_CIDRS": "127.0.0.1/32",
+                },
+                clear=True,
+            ),
+            mock.patch.object(webapp, "MAX_RATE_LIMIT_BUCKETS", 1),
+            mock.patch.object(webapp.time, "time", return_value=5000),
+        ):
+            self.assertFalse(webapp.is_rate_limited("198.51.100.10", "/api/jobs", now=5000))
+            for index in range(limit):
+                self.assertFalse(handler.block_unsafe_post(f"/api/settings/profiles/profile-{index}"))
+            self.assertTrue(handler.block_unsafe_post("/api/settings/profiles/profile-over-limit"))
+
+        self.assertEqual(
+            set(webapp.RATE_LIMIT_BUCKETS),
+            {("198.51.100.10", "/api/jobs")},
+        )
+        self.assertEqual(set(webapp.RATE_LIMIT_OVERFLOW_BUCKETS), {normalized_path})
+        self.assertEqual(len(webapp.RATE_LIMIT_OVERFLOW_BUCKETS[normalized_path]), limit)
+        handler.send_json.assert_called_once()
 
     def test_platform_deploy_rejects_legacy_oidc_session_cookie_and_permissions(self):
         env = self.platform_launch_env(AUTH_APPROVED_TESTER_ROLE="admin")
@@ -4396,6 +4802,11 @@ class WebappServerTest(unittest.TestCase):
             self.assertNotIn("session-secret-sensitive", text)
 
     def test_internal_uat_coolify_env_template_is_offline_verifiable(self):
+        proxy_values, _ = deploy_template.parse_env_template(
+            ROOT / 'deploy' / 'internal-uat' / 'coolify' / 'sqag.uat.env.example'
+        )
+        self.assertIn('SQAG_TRUSTED_PROXY_CIDRS', proxy_values)
+        self.assertTrue(deploy_template.is_placeholder(proxy_values['SQAG_TRUSTED_PROXY_CIDRS']))
         result = deploy_template.verify_template(ROOT / "deploy" / "internal-uat" / "coolify" / "sqag.uat.env.example")
 
         self.assertEqual(result["status"], "ready", [deploy_template.finding_to_dict(finding) for finding in result["findings"]])
@@ -4411,6 +4822,45 @@ class WebappServerTest(unittest.TestCase):
         ):
             self.assertIn(key, values)
             self.assertTrue(deploy_template.is_placeholder(values[key]), key)
+
+    def test_internal_uat_coolify_env_template_requires_placeholder_proxy_cidrs(self):
+        source = ROOT / 'deploy' / 'internal-uat' / 'coolify' / 'sqag.uat.env.example'
+        source_text = source.read_text(encoding='utf-8')
+        trusted_proxy_line = next(
+            (line for line in source_text.splitlines() if line.startswith('SQAG_TRUSTED_PROXY_CIDRS=')),
+            '',
+        )
+        without_proxy = source_text.replace(f'{trusted_proxy_line}\n', '') if trusted_proxy_line else source_text
+        with_proxy_value = (
+            source_text.replace(trusted_proxy_line, 'SQAG_TRUSTED_PROXY_CIDRS=192.0.2.0/24')
+            if trusted_proxy_line
+            else source_text + '\nSQAG_TRUSTED_PROXY_CIDRS=192.0.2.0/24\n'
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_template = Path(tmp) / 'missing-proxy.env.example'
+            value_template = Path(tmp) / 'proxy-value.env.example'
+            missing_template.write_text(without_proxy, encoding='utf-8')
+            value_template.write_text(with_proxy_value, encoding='utf-8')
+            missing_result = deploy_template.verify_template(missing_template)
+            value_result = deploy_template.verify_template(value_template)
+
+        missing_findings = [deploy_template.finding_to_dict(finding) for finding in missing_result['findings']]
+        value_findings = [deploy_template.finding_to_dict(finding) for finding in value_result['findings']]
+        self.assertEqual(missing_result['status'], 'blocked')
+        self.assertIn(
+            {'key': 'SQAG_TRUSTED_PROXY_CIDRS', 'category': 'missing-key', 'message': 'required key is missing'},
+            missing_findings,
+        )
+        self.assertEqual(value_result['status'], 'blocked')
+        self.assertIn(
+            {
+                'key': 'SQAG_TRUSTED_PROXY_CIDRS',
+                'category': 'non-placeholder-value',
+                'message': 'provider-specific or secret value must remain a placeholder',
+            },
+            value_findings,
+        )
 
     def test_internal_uat_coolify_env_template_blocks_real_values_and_bad_roots(self):
         source = ROOT / "deploy" / "internal-uat" / "coolify" / "sqag.uat.env.example"
@@ -9025,7 +9475,8 @@ class WebappServerTest(unittest.TestCase):
         self.assertFalse(webapp.is_safe_bind_host("0.0.0.0"))
 
     def test_local_api_rate_limits_state_changing_paths(self):
-        webapp.RATE_LIMIT_BUCKETS.clear()
+        self.reset_rate_limit_state()
+        self.addCleanup(self.reset_rate_limit_state)
         for _ in range(webapp.POST_RATE_LIMITS["/api/jobs"]):
             self.assertFalse(webapp.is_rate_limited("127.0.0.1", "/api/jobs", now=1000))
 
@@ -9054,6 +9505,83 @@ class WebappServerTest(unittest.TestCase):
         for _ in range(webapp.POST_RATE_LIMITS[dynamic_key]):
             self.assertFalse(webapp.is_rate_limited("127.0.0.1", dynamic_path, now=2000))
         self.assertTrue(webapp.is_rate_limited("127.0.0.1", "/api/settings/pricing-references/other-pack", now=2001))
+
+    def test_rate_limit_state_prunes_stale_unique_clients_globally(self):
+        self.reset_rate_limit_state()
+        self.addCleanup(self.reset_rate_limit_state)
+        initial_time = 1000.0
+        stale_clients = [f"2001:db8::{index + 1}" for index in range(12)]
+
+        for client_id in stale_clients:
+            self.assertFalse(webapp.is_rate_limited(client_id, "/api/draft", now=initial_time))
+        self.assertEqual(len(webapp.RATE_LIMIT_BUCKETS), len(stale_clients))
+
+        prune_time = initial_time + webapp.RATE_LIMIT_WINDOW_SECONDS + 1
+        self.assertFalse(webapp.is_rate_limited("203.0.113.90", "/api/draft", now=prune_time))
+
+        self.assertEqual(
+            set(webapp.RATE_LIMIT_BUCKETS),
+            {("203.0.113.90", "/api/draft")},
+        )
+
+    def test_rate_limit_state_enforces_hard_cap_and_fail_closed_overflow(self):
+        self.reset_rate_limit_state()
+        self.addCleanup(self.reset_rate_limit_state)
+        normal_cap = 3
+        path = "/api/draft"
+        route_limit = webapp.POST_RATE_LIMITS[path]
+
+        with mock.patch.object(webapp, "MAX_RATE_LIMIT_BUCKETS", normal_cap):
+            for index in range(normal_cap):
+                self.assertFalse(webapp.is_rate_limited(f"198.51.100.{index + 1}", path, now=2000))
+
+            overflow_results = []
+            for index in range(route_limit + 1):
+                overflow_results.append(
+                    webapp.is_rate_limited(f"2001:db8::{index + 1}", path, now=2001)
+                )
+
+        self.assertEqual(len(webapp.RATE_LIMIT_BUCKETS), normal_cap)
+        self.assertEqual(overflow_results[:-1], [False] * route_limit)
+        self.assertTrue(overflow_results[-1])
+        self.assertEqual(set(webapp.RATE_LIMIT_OVERFLOW_BUCKETS), {path})
+        self.assertEqual(len(webapp.RATE_LIMIT_OVERFLOW_BUCKETS[path]), route_limit)
+
+    def test_rate_limit_overflow_state_has_hard_route_cap(self):
+        self.reset_rate_limit_state()
+        self.addCleanup(self.reset_rate_limit_state)
+
+        with (
+            mock.patch.object(webapp, "MAX_RATE_LIMIT_BUCKETS", 0),
+            mock.patch.object(webapp, "MAX_RATE_LIMIT_OVERFLOW_BUCKETS", 2),
+        ):
+            self.assertFalse(webapp.is_rate_limited("198.51.100.1", "/api/draft", now=3000))
+            self.assertFalse(webapp.is_rate_limited("198.51.100.2", "/api/jobs", now=3000))
+            self.assertTrue(webapp.is_rate_limited("198.51.100.3", "/api/generate", now=3000))
+
+        self.assertEqual(webapp.RATE_LIMIT_BUCKETS, {})
+        self.assertEqual(len(webapp.RATE_LIMIT_OVERFLOW_BUCKETS), 2)
+
+    def test_rate_limit_distinct_clients_remain_isolated_before_capacity(self):
+        self.reset_rate_limit_state()
+        self.addCleanup(self.reset_rate_limit_state)
+        path = "/api/draft"
+        route_limit = webapp.POST_RATE_LIMITS[path]
+
+        with mock.patch.object(webapp, "MAX_RATE_LIMIT_BUCKETS", 2):
+            for _ in range(route_limit):
+                self.assertFalse(webapp.is_rate_limited("198.51.100.10", path, now=4000))
+            self.assertTrue(webapp.is_rate_limited("198.51.100.10", path, now=4001))
+            self.assertFalse(webapp.is_rate_limited("198.51.100.11", path, now=4001))
+
+        self.assertEqual(
+            set(webapp.RATE_LIMIT_BUCKETS),
+            {
+                ("198.51.100.10", path),
+                ("198.51.100.11", path),
+            },
+        )
+        self.assertEqual(webapp.RATE_LIMIT_OVERFLOW_BUCKETS, {})
 
     def test_http_post_requires_allowed_host_csrf_and_json_content_type(self):
         with LocalRunnerServer() as runner:

@@ -24,6 +24,9 @@ storage for generated artifact bytes:
 - The canonical `SQAG_OBJECT_STORAGE_*` names are configured only through the
   host secret manager.
 - Platform/workspace launch context is required for protected hosted use.
+- `SQAG_TRUSTED_PROXY_CIDRS` is configured in the host environment manager with
+  only the exact Coolify/Traefik proxy network CIDRs that connect directly to
+  SQAG. A trust-all network is not permitted.
 - The object-storage credential must permit the read-only bucket probe used by
   startup and `/api/health`, in addition to the runtime object operations.
 - Database rows store metadata and workspace-owned app records only.
@@ -45,7 +48,9 @@ This repo owns only the app-specific shape:
 
 Infrastructure runbooks outside this repo own VPS purchase, Coolify
 installation, SSH access, DNS, TLS, firewall, reverse proxy, backups on the
-host, and server maintenance.
+host, and server maintenance. They also own discovering the actual
+Coolify/Traefik proxy CIDRs. SQAG owns the application-side rule that only a
+configured direct proxy peer may supply forwarding metadata.
 
 ## Environment Names
 
@@ -60,7 +65,26 @@ Required names for any future hosted validation environment:
 | App/auth | `APP_MODE`, `AUTH_REQUIRED`, `SESSION_SECRET` |
 | Storage | `SQAG_STORAGE_MODE`, `SQAG_ARTIFACT_STORAGE_MODE`, `SQAG_DATABASE_URL`, `SQAG_OBJECT_STORAGE_PROVIDER`, `SQAG_OBJECT_STORAGE_ENDPOINT_URL`, `SQAG_OBJECT_STORAGE_BUCKET`, `SQAG_OBJECT_STORAGE_REGION`, `SQAG_OBJECT_STORAGE_ACCESS_KEY_ID`, `SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY` |
 | Platform launch | `SQAG_PLATFORM_LAUNCH_MODE`, `SQAG_PLATFORM_BASE_URL` |
+| Reverse proxy | `SQAG_TRUSTED_PROXY_CIDRS` |
 | Runtime housekeeping | `QUOTE_DATA_ROOT`, `QUOTE_OUTPUT_ROOT`, `QUOTE_TMP_ROOT`, `QUOTE_LOG_ROOT`, `PORT` |
+
+`SQAG_TRUSTED_PROXY_CIDRS` is mandatory in deploy mode. Set it to the exact
+CIDR or comma-separated CIDRs for direct Coolify/Traefik peers, not public
+client ranges and never a catch-all network. SQAG ignores `X-Forwarded-For`
+from an untrusted socket peer. For a trusted peer, it accepts only a bounded
+chain of valid IP addresses, walks right-to-left past trusted proxy hops, and
+uses the first untrusted address for both Platform-launch and normal mutable
+route rate limits. Missing, malformed, oversized, or overlong forwarding data
+falls back to the socket peer. Missing or malformed trusted-proxy
+configuration blocks deploy preflight and startup.
+
+Rate-limit state is also bounded per SQAG process. The ordinary map holds at
+most 4,096 client/normalized-route buckets. At capacity, unseen identities
+share one overflow bucket per normalized configured route instead of evicting
+an active ordinary client; the overflow map is capped at the 14 configured
+rate-limited routes and fails closed if that finite state is unavailable.
+Traffic triggers global stale-bucket pruning at most once every 15 seconds.
+This is a per-process availability guard, not a cross-replica global throttle.
 
 `QUOTE_DATA_ROOT` and `QUOTE_OUTPUT_ROOT` are not durable product-visible
 storage in this posture. Quote-domain records must use workspace-owned database
@@ -112,6 +136,12 @@ bytes, host IPs, or private paths into issue/PR output.
   schema, object-artifact metadata schema, and object bucket are usable.
 - Unauthenticated protected routes block or redirect.
 - Platform/workspace launch reaches the app.
+- Distinct clients behind the trusted proxy receive independent Platform
+  launch and mutable-route rate-limit buckets, while repeated requests from
+  the same effective client still receive HTTP 429.
+- A direct client cannot select its rate-limit identity by supplying
+  `X-Forwarded-For`, and an attacker-prepended address cannot override the
+  first untrusted hop nearest the trusted proxy side of the chain.
 - Intended workspace starts without a Koncept pack until import.
 - Workspace-owned profile pack import/save/use works.
 - Workspace-owned pricing reference import/save/use works.
@@ -131,6 +161,8 @@ This scaffold does not prove:
 
 - Live VPS/Coolify host health.
 - DNS, TLS, firewall, reverse proxy, or server operations.
+- The live Coolify/Traefik network CIDRs or forwarded-header behavior; those
+  remain hosted evidence and must not be copied into repository or PR output.
 - Real OIDC provider behavior.
 - Live Swooshz Platform integration.
 - Real object-storage provider wiring.

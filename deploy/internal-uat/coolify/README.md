@@ -26,6 +26,17 @@ Recommended app settings:
   `SQAG_PLATFORM_BASE_URL` except for explicit loopback-only local smoke
   endpoints. Standalone OIDC does not establish a workspace and cannot start
   deploy mode.
+- Proxy posture: `SQAG_TRUSTED_PROXY_CIDRS` contains only the exact CIDR or
+  comma-separated CIDRs of the Coolify/Traefik proxy peers that connect
+  directly to SQAG. Do not use a trust-all network. Missing or malformed proxy
+  configuration blocks deploy preflight and startup.
+
+SQAG accepts `X-Forwarded-For` only when the direct socket peer belongs to one
+of those configured proxy networks. It validates and bounds the forwarded
+chain, walks it from the proxy side, and falls back to the socket peer when the
+header cannot be trusted. Discover and enter the actual proxy CIDRs only in the
+host environment manager; keep them out of this placeholder template and PR
+output.
 
 Before starting deploy-mode UAT, set the env values in Coolify secrets or
 environment management and run:

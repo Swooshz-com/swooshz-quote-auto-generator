@@ -1060,6 +1060,7 @@ async function main() {
     await page.locator("#backToDashboardButton", { hasText: "Dashboard" }).click();
     await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
     await expectTopbarPrimaryAction(page, "new-quote");
+    await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 15000 });
     await page.evaluate((storageKey) => {
       const saved = JSON.parse(window.localStorage.getItem(storageKey) || "{}");
       saved.quoteSessionId = "quote-unrelated-regression";
