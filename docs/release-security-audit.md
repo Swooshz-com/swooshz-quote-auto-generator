@@ -6,18 +6,19 @@ Branch: `codex/release-security-audit`
 
 Base evidence ref: `origin/main` at `29de611ee1723ae1e9d1755c32b013efdbc4511e`
 
-## 2026-07-11 Coolify Proxy Rate-Limit Isolation Addendum
+## 2026-07-11 Coolify Proxy And Bounded Rate-Limit State Addendum
 
 Remediation base: `origin/main` at
 `ae6738263292507da6113301793848ef0ad3c274`.
 
-Production readiness remains false. This focused remediation closes one
-independently confirmed High launch blocker without live credentials, live
+Production readiness remains false. This focused remediation closes two
+independently confirmed High launch blockers without live credentials, live
 provider calls, customer data, deployment, or visible product UI changes.
 
 | Severity | Confirmed blocker | Closure |
 | --- | --- | --- |
 | High | Behind Coolify/Traefik, Platform launch rate limiting used only the direct socket peer and charged the bucket before launch-token validation. Twenty cheap missing-token requests could consume the shared proxy bucket and make a legitimate launch return HTTP 429 before Platform consume was called. | Deploy mode now requires an explicit trusted-proxy CIDR boundary. Forwarding data is accepted only from a trusted direct peer, parsed as valid unscoped IP addresses, bounded by raw size and hop count, and resolved right-to-left to the first untrusted hop. Missing, malformed, duplicate, oversized, over-hop, scoped, or untrusted forwarding data falls back to the socket peer. The same effective client identity is used for Platform launch and normal mutable-route rate limiting, while same-client limits remain enforced. |
+| High | The process-global normal rate-limit dictionary retained every unique client/route key indefinitely; only timestamps for the currently accessed key were filtered. Rotating proxied IPv4 or IPv6 identities could therefore grow process memory without a cardinality bound. | Each process now caps ordinary client/normalized-route buckets at 4,096. Global stale pruning runs at most once every 15 seconds under the existing lock. At capacity, unseen identities share one fixed-window overflow bucket per normalized configured route; overflow is capped at the 14 configured routes and fails closed rather than evicting active ordinary clients or disabling throttling. |
 
 Deploy preflight, normal deploy startup, and handler-level deploy paths fail
 closed when `SQAG_TRUSTED_PROXY_CIDRS` is missing or malformed. Catch-all
@@ -33,12 +34,16 @@ Focused validation evidence on the remediation branch:
   pass after the repair.
 - Expanded RED coverage reproduced trusted-proxy isolation and configuration
   failures, including duplicate forwarding fields and scoped IPv6 forms.
+- The bounded-state RED set produced one stale-cleanup assertion failure and
+  four missing-cap/overflow errors across seven tests while two preserved
+  behavior controls passed. The tightened mutable-route bounded-state test also
+  failed before the implementation existed.
 - Right-to-left spoof-chain resolution, malformed and bounded-header fallback,
   direct-client spoof denial, same-forwarded-client throttling, and mutable-route
   isolation controls pass.
-- Twenty adjacent deploy, Platform, and rate-limit tests pass.
-- The complete `tests.test_webapp` module passes: 478 tests.
-- The complete Python suite passes: 717 tests.
+- The combined bounded-state and trusted-proxy adversarial set passes: 17 tests.
+- The complete `tests.test_webapp` module passes: 484 tests.
+- The complete Python suite passes: 723 tests.
 - Python syntax compilation, the internal-UAT deploy-template verifier, the
   sensitive-fixture fail-on-review scan, dynamic-pricing guard, local-PDF
   dependency guard, `npm audit`, and `pip-audit` pass.

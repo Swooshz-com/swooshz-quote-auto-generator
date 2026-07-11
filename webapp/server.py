@@ -318,6 +318,10 @@ PROCESS_CSRF_TOKEN = secrets.token_urlsafe(32)
 SGT = dt.timezone(dt.timedelta(hours=8), "SGT")
 ALLOWED_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMIT_PRUNE_INTERVAL_SECONDS = 15
+# A single SQAG process may retain at most this many ordinary client/route
+# windows; saturation uses the bounded per-route overflow state below.
+MAX_RATE_LIMIT_BUCKETS = 4096
 POST_RATE_LIMITS = {
     PLATFORM_LAUNCH_ENDPOINT: 20,
     "/api/jobs": 30,
@@ -334,7 +338,12 @@ POST_RATE_LIMITS = {
     "/api/quote-sessions/:id": 30,
     "/api/log": 180,
 }
+MAX_RATE_LIMIT_OVERFLOW_BUCKETS = len(POST_RATE_LIMITS)
 RATE_LIMIT_BUCKETS: dict[tuple[str, str], list[float]] = {}
+# Once normal client cardinality is saturated, new identities share one
+# fail-closed bucket per normalized route instead of creating attacker-owned keys.
+RATE_LIMIT_OVERFLOW_BUCKETS: dict[str, list[float]] = {}
+RATE_LIMIT_LAST_PRUNE_AT = 0.0
 RATE_LIMIT_LOCK = threading.Lock()
 AI_LOG_TRACKING_CONTEXT = threading.local()
 ALLOWED_LOG_EVENTS = {
@@ -7846,6 +7855,49 @@ def effective_rate_limit_client_id(socket_peer: Any, forwarded_for: Any) -> str:
     return fallback
 
 
+def _prune_rate_limit_state_locked(timestamp: float) -> None:
+    global RATE_LIMIT_LAST_PRUNE_AT
+
+    elapsed = timestamp - RATE_LIMIT_LAST_PRUNE_AT
+    if RATE_LIMIT_LAST_PRUNE_AT and 0 <= elapsed < RATE_LIMIT_PRUNE_INTERVAL_SECONDS:
+        return
+
+    stale_normal_keys = [
+        key
+        for key, bucket in RATE_LIMIT_BUCKETS.items()
+        if not any(timestamp - item < RATE_LIMIT_WINDOW_SECONDS for item in bucket)
+    ]
+    for key in stale_normal_keys:
+        del RATE_LIMIT_BUCKETS[key]
+
+    stale_overflow_keys = [
+        key
+        for key, bucket in RATE_LIMIT_OVERFLOW_BUCKETS.items()
+        if not any(timestamp - item < RATE_LIMIT_WINDOW_SECONDS for item in bucket)
+    ]
+    for key in stale_overflow_keys:
+        del RATE_LIMIT_OVERFLOW_BUCKETS[key]
+
+    RATE_LIMIT_LAST_PRUNE_AT = timestamp
+
+
+def _updated_rate_limit_bucket(
+    bucket: list[float],
+    *,
+    timestamp: float,
+    limit: int,
+) -> tuple[list[float], bool]:
+    active = [
+        item
+        for item in bucket
+        if timestamp - item < RATE_LIMIT_WINDOW_SECONDS
+    ]
+    if len(active) >= limit:
+        return active, True
+    active.append(timestamp)
+    return active, False
+
+
 def is_rate_limited(client_id: str, path: str, now: float | None = None) -> bool:
     limit_path = rate_limit_path_key(path)
     limit = POST_RATE_LIMITS.get(limit_path)
@@ -7854,17 +7906,36 @@ def is_rate_limited(client_id: str, path: str, now: float | None = None) -> bool
     timestamp = time.time() if now is None else now
     key = (client_id or "unknown", limit_path)
     with RATE_LIMIT_LOCK:
-        bucket = [
-            item
-            for item in RATE_LIMIT_BUCKETS.get(key, [])
-            if timestamp - item < RATE_LIMIT_WINDOW_SECONDS
-        ]
-        if len(bucket) >= limit:
+        _prune_rate_limit_state_locked(timestamp)
+        if key in RATE_LIMIT_BUCKETS:
+            bucket, limited = _updated_rate_limit_bucket(
+                RATE_LIMIT_BUCKETS[key],
+                timestamp=timestamp,
+                limit=limit,
+            )
             RATE_LIMIT_BUCKETS[key] = bucket
-            return True
-        bucket.append(timestamp)
-        RATE_LIMIT_BUCKETS[key] = bucket
-    return False
+            return limited
+
+        if len(RATE_LIMIT_BUCKETS) < MAX_RATE_LIMIT_BUCKETS:
+            bucket, limited = _updated_rate_limit_bucket(
+                [],
+                timestamp=timestamp,
+                limit=limit,
+            )
+            RATE_LIMIT_BUCKETS[key] = bucket
+            return limited
+
+        if limit_path not in RATE_LIMIT_OVERFLOW_BUCKETS:
+            if len(RATE_LIMIT_OVERFLOW_BUCKETS) >= MAX_RATE_LIMIT_OVERFLOW_BUCKETS:
+                return True
+            RATE_LIMIT_OVERFLOW_BUCKETS[limit_path] = []
+        bucket, limited = _updated_rate_limit_bucket(
+            RATE_LIMIT_OVERFLOW_BUCKETS[limit_path],
+            timestamp=timestamp,
+            limit=limit,
+        )
+        RATE_LIMIT_OVERFLOW_BUCKETS[limit_path] = bucket
+        return limited
 
 
 def safe_resource_id(value: Any, fallback: str = DEFAULT_PROFILE_ID) -> str:

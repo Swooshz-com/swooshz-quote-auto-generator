@@ -57,6 +57,13 @@ Source of truth: `.github/workflows/ci.yml`
   socket peer. Platform-launch and normal mutable routes use the same client
   resolver, so direct spoofing cannot split buckets and distinct proxied
   clients do not share Traefik socket identity.
+- Each process retains at most 4,096 ordinary client/normalized-route
+  rate-limit buckets. When that map is full, previously unseen identities share
+  one fail-closed overflow bucket per normalized configured route; overflow
+  cardinality is therefore capped at the 14 configured rate-limited routes.
+  Traffic-triggered global pruning runs at most once every 15 seconds under the
+  rate-limit lock and removes fully expired ordinary and overflow buckets.
+  Active ordinary buckets are not evicted to admit rotating attacker identities.
 - Before binding the deploy server, SQAG performs read-only checks for the
   required database schema, object-artifact metadata schema, and configured
   object-storage bucket. It never applies migrations from startup.

@@ -78,6 +78,14 @@ route rate limits. Missing, malformed, oversized, or overlong forwarding data
 falls back to the socket peer. Missing or malformed trusted-proxy
 configuration blocks deploy preflight and startup.
 
+Rate-limit state is also bounded per SQAG process. The ordinary map holds at
+most 4,096 client/normalized-route buckets. At capacity, unseen identities
+share one overflow bucket per normalized configured route instead of evicting
+an active ordinary client; the overflow map is capped at the 14 configured
+rate-limited routes and fails closed if that finite state is unavailable.
+Traffic triggers global stale-bucket pruning at most once every 15 seconds.
+This is a per-process availability guard, not a cross-replica global throttle.
+
 `QUOTE_DATA_ROOT` and `QUOTE_OUTPUT_ROOT` are not durable product-visible
 storage in this posture. Quote-domain records must use workspace-owned database
 rows. Production generated artifact bytes must use object storage, not database
