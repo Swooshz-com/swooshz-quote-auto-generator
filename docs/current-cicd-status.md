@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-07-10
+Last updated: 2026-07-11
 
 Source of truth: `.github/workflows/ci.yml`
 
@@ -50,6 +50,13 @@ Source of truth: `.github/workflows/ci.yml`
   user, workspace, app, and supported membership-role context. Pre-existing
   OIDC-only cookies are treated as unauthenticated and cannot inherit a tester
   role or reach AI/import routes.
+- Deploy preflight and startup require a valid, nonempty
+  `SQAG_TRUSTED_PROXY_CIDRS` boundary. SQAG accepts bounded, valid
+  `X-Forwarded-For` chains only from a configured direct proxy peer, resolves
+  the first untrusted hop from right to left, and otherwise rate-limits by the
+  socket peer. Platform-launch and normal mutable routes use the same client
+  resolver, so direct spoofing cannot split buckets and distinct proxied
+  clients do not share Traefik socket identity.
 - Before binding the deploy server, SQAG performs read-only checks for the
   required database schema, object-artifact metadata schema, and configured
   object-storage bucket. It never applies migrations from startup.

@@ -6,6 +6,54 @@ Branch: `codex/release-security-audit`
 
 Base evidence ref: `origin/main` at `29de611ee1723ae1e9d1755c32b013efdbc4511e`
 
+## 2026-07-11 Coolify Proxy Rate-Limit Isolation Addendum
+
+Remediation base: `origin/main` at
+`ae6738263292507da6113301793848ef0ad3c274`.
+
+Production readiness remains false. This focused remediation closes one
+independently confirmed High launch blocker without live credentials, live
+provider calls, customer data, deployment, or visible product UI changes.
+
+| Severity | Confirmed blocker | Closure |
+| --- | --- | --- |
+| High | Behind Coolify/Traefik, Platform launch rate limiting used only the direct socket peer and charged the bucket before launch-token validation. Twenty cheap missing-token requests could consume the shared proxy bucket and make a legitimate launch return HTTP 429 before Platform consume was called. | Deploy mode now requires an explicit trusted-proxy CIDR boundary. Forwarding data is accepted only from a trusted direct peer, parsed as valid unscoped IP addresses, bounded by raw size and hop count, and resolved right-to-left to the first untrusted hop. Missing, malformed, duplicate, oversized, over-hop, scoped, or untrusted forwarding data falls back to the socket peer. The same effective client identity is used for Platform launch and normal mutable-route rate limiting, while same-client limits remain enforced. |
+
+Deploy preflight, normal deploy startup, and handler-level deploy paths fail
+closed when `SQAG_TRUSTED_PROXY_CIDRS` is missing or malformed. Catch-all
+networks and empty CIDR entries are rejected. Deployment examples use a
+placeholder only; operators must configure the exact direct Coolify/Traefik
+proxy networks in the host environment. Raw forwarding headers and client IP
+values are not added to logs.
+
+Focused validation evidence on the remediation branch:
+
+- The original three-test pre-fix regression reproduced the blocker with two
+  failures and one unaffected direct-client spoof control; the same three tests
+  pass after the repair.
+- Expanded RED coverage reproduced trusted-proxy isolation and configuration
+  failures, including duplicate forwarding fields and scoped IPv6 forms.
+- Right-to-left spoof-chain resolution, malformed and bounded-header fallback,
+  direct-client spoof denial, same-forwarded-client throttling, and mutable-route
+  isolation controls pass.
+- Twenty adjacent deploy, Platform, and rate-limit tests pass.
+- The complete `tests.test_webapp` module passes: 478 tests.
+- The complete Python suite passes: 717 tests.
+- Python syntax compilation, the internal-UAT deploy-template verifier, the
+  sensitive-fixture fail-on-review scan, dynamic-pricing guard, local-PDF
+  dependency guard, `npm audit`, and `pip-audit` pass.
+- A fresh local backend restart returned HTTP 200 from `/api/health`; the mocked
+  Playwright AI stress and full smoke suites pass with no console or network
+  problems. The smoke harness now waits for dashboard refresh completion before
+  changing its local draft identity, removing a reproducible test-only race.
+- The production-readiness checker remains intentionally blocked with
+  `internal_alpha_ready=false`, `production_ready=false`, eight blockers, and
+  its blocked exit code.
+
+Hosted/live evidence remains a separate gate. These local and synthetic checks
+do not claim live Platform, proxy-network, TLS, database, object-provider,
+monitoring, backup/restore, retention/delete, or deployment evidence.
+
 ## 2026-07-10 Independent Launch-Blocker Remediation Addendum
 
 Remediation base: `origin/main` at

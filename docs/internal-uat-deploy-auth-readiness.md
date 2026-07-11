@@ -56,6 +56,13 @@ The deploy/auth surface is already represented in `.env.example` and
   platform/workspace launch context for protected hosted/deploy use. The
   platform base URL must use HTTPS, except loopback HTTP is allowed for local
   smoke-only endpoints.
+- `SQAG_TRUSTED_PROXY_CIDRS`: mandatory deploy-mode comma-separated CIDRs for
+  only the reverse-proxy peers that connect directly to SQAG. SQAG accepts a
+  bounded, valid `X-Forwarded-For` chain only from those peers, walks the chain
+  right-to-left past trusted proxies, and uses the first untrusted address for
+  Platform-launch and mutable-route rate limits. Missing, malformed,
+  oversized, overlong, or untrusted forwarding data falls back to the socket
+  peer. Never configure a trust-all network.
 - `QUOTE_DATA_ROOT`: runtime housekeeping root; not the hosted source of truth
   for profile/pricing/session data.
 - `QUOTE_OUTPUT_ROOT`: output staging root; not durable hosted artifact storage.
@@ -76,6 +83,10 @@ state cookies are emitted with `Secure`, `HttpOnly`, and `SameSite=Lax`.
   boundary because database and object-storage records require the consumed
   Platform workspace identity. Standalone OIDC claims are never converted into
   a workspace, membership role, or entitlement.
+- Deploy preflight, startup, Platform launch, and protected request handling
+  fail closed when the trusted-proxy CIDR boundary is missing or malformed.
+  Forwarded headers are not logged and cannot be used by a direct untrusted
+  client to select a rate-limit bucket.
 - Deploy request authentication accepts only a signed session containing the
   consumed Platform user, workspace, SQAG app key, and supported membership
   role. A still-valid pre-upgrade OIDC-only cookie is rejected as
@@ -116,6 +127,8 @@ Use this shape only for local/offline validation of the gated UAT boundary:
   evidence; `database` is allowed only for local-UAT/synthetic negative tests.
 - `SQAG_DATABASE_URL` set through the host secret manager only.
 - Platform/workspace launch context for every protected hosted/deploy use.
+- Exact direct Coolify/Traefik proxy CIDRs set through the host environment
+  manager only; no trust-all proxy range.
 - No standalone OIDC fallback in the hosted SQAG process. Platform owns login,
   workspace membership, role, entitlement, and launch authorization.
 - Runtime housekeeping roots outside the repository.
@@ -174,6 +187,8 @@ Pass means:
   as hosted/protected/deploy readiness evidence.
 - Required Platform launch settings are present. OIDC-only settings may appear
   as local component-test diagnostics but never make deploy preflight ready.
+- `SQAG_TRUSTED_PROXY_CIDRS` contains a valid, nonempty trusted direct-proxy
+  boundary.
 - Runtime housekeeping roots are set and outside the repository.
 
 Fail means fix the env shape before starting the UAT app. Do not paste secret
@@ -194,8 +209,8 @@ while checking env values.
 - [ ] Confirm required env names are present without printing values:
       `APP_MODE`, `AUTH_REQUIRED`, `SESSION_SECRET`, `SQAG_STORAGE_MODE`,
       `SQAG_ARTIFACT_STORAGE_MODE`, `SQAG_DATABASE_URL`,
-      `SQAG_PLATFORM_LAUNCH_MODE`, `SQAG_PLATFORM_BASE_URL`, and runtime
-      housekeeping root envs.
+      `SQAG_PLATFORM_LAUNCH_MODE`, `SQAG_PLATFORM_BASE_URL`,
+      `SQAG_TRUSTED_PROXY_CIDRS`, and runtime housekeeping root envs.
 - [ ] Run `python webapp\server.py --check-deploy-uat-env`.
 - [ ] Run `python scripts\verify_internal_alpha_hosted_validation.py --work-dir _tmp\validation\hosted-blocked`.
 - [ ] Confirm `APP_MODE=deploy`.
@@ -211,6 +226,12 @@ while checking env values.
 - [ ] Confirm unauthenticated users are blocked or redirected.
 - [ ] Confirm Swooshz Platform launch consume creates a session containing the
       intended workspace and membership role without returning the launch token.
+- [ ] Confirm distinct forwarded clients behind the configured trusted proxy do
+      not share one Platform-launch or mutable-route rate-limit bucket, while
+      repeated requests from the same effective client still receive HTTP 429.
+- [ ] Confirm direct clients cannot spoof `X-Forwarded-For`, and attacker-added
+      leftmost addresses do not override the first untrusted hop nearest the
+      trusted proxy side of the chain.
 - [ ] Confirm an authenticated approved tester can reach the dashboard.
 - [ ] Confirm New Quote works.
 - [ ] Confirm profile/pricing import works with authorised private local files.
@@ -253,6 +274,7 @@ For each internal deploy-auth UAT run, record only non-secret evidence:
 - `APP_MODE` value.
 - Whether `AUTH_REQUIRED` is enabled.
 - Whether required Platform launch env names are set, without values.
+- Whether the trusted-proxy CIDR env name is set and valid, without values.
 - Runtime root category, such as `outside repo`, without private paths.
 - Health endpoint result.
 - Auth redirect/block result.

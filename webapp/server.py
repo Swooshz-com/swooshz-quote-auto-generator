@@ -22,6 +22,7 @@ import http.cookies
 import importlib
 import importlib.util
 import io
+import ipaddress
 import json
 import math
 import mimetypes
@@ -296,6 +297,9 @@ SESSION_COOKIE_NAME = "swooshz_quote_session"
 OIDC_STATE_COOKIE_NAME = "swooshz_quote_oidc_state"
 SESSION_COOKIE_MAX_AGE_SECONDS = 8 * 60 * 60
 MIN_DEPLOY_SESSION_SECRET_CHARS = 32
+TRUSTED_PROXY_CIDRS_ENV_NAME = 'SQAG_TRUSTED_PROXY_CIDRS'
+MAX_FORWARDED_FOR_HEADER_BYTES = 4096
+MAX_FORWARDED_FOR_HOPS = 32
 OIDC_PROVIDER_TIMEOUT_SECONDS = 15
 OIDC_PROVIDER_MAX_RESPONSE_BYTES = 128 * 1024
 PLATFORM_LAUNCH_ENDPOINT = "/api/platform/launch"
@@ -1458,6 +1462,31 @@ def comma_separated_env_values(name: str) -> list[str]:
     return [clean_text(item) for item in raw.split(",") if clean_text(item)]
 
 
+def configured_trusted_proxy_networks() -> tuple[Any, ...]:
+    raw = read_dotenv_value(TRUSTED_PROXY_CIDRS_ENV_NAME)
+    if not clean_text(raw):
+        return ()
+    networks = []
+    for raw_value in raw.split(','):
+        value = clean_text(raw_value)
+        if not value:
+            return ()
+        try:
+            network = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            return ()
+        if network.prefixlen == 0:
+            return ()
+        networks.append(network)
+    return tuple(networks)
+
+
+def trusted_proxy_config_complete() -> bool:
+    return bool(clean_text(read_dotenv_value(TRUSTED_PROXY_CIDRS_ENV_NAME))) and bool(
+        configured_trusted_proxy_networks()
+    )
+
+
 def oidc_config() -> dict[str, str]:
     return {
         "issuer_url": clean_text(read_dotenv_value(OIDC_ISSUER_URL_ENV_NAME)),
@@ -1559,6 +1588,10 @@ def deploy_requires_auth_guard() -> bool:
 
 def deploy_requires_platform_workspace_guard() -> bool:
     return configured_app_mode() == "deploy" and not platform_launch_config_complete()
+
+
+def deploy_requires_trusted_proxy_guard() -> bool:
+    return configured_app_mode() == 'deploy' and not trusted_proxy_config_complete()
 
 
 def deploy_storage_posture_ready() -> bool:
@@ -2078,6 +2111,11 @@ def deploy_uat_preflight_status() -> dict[str, Any]:
     )
     add(PLATFORM_LAUNCH_MODE_ENV_NAME, configured_platform_launch_mode() == "platform", "must be set to platform")
     add(PLATFORM_BASE_URL_ENV_NAME, bool(configured_platform_base_url()), "must be an https or loopback http platform base URL")
+    add(
+        TRUSTED_PROXY_CIDRS_ENV_NAME,
+        trusted_proxy_config_complete(),
+        'must contain valid CIDRs for reverse proxies allowed to supply X-Forwarded-For',
+    )
     if not platform_launch_mode_enabled():
         for name in (
             OIDC_ISSUER_URL_ENV_NAME,
@@ -7750,6 +7788,62 @@ def rate_limit_path_key(path: str) -> str:
     if re.fullmatch(r"/api/settings/profiles/[A-Za-z0-9_-]+", normalized_path):
         return "/api/settings/profiles/:id"
     return normalized_path
+
+
+def rate_limit_ip_address(value: Any) -> Any | None:
+    try:
+        address = ipaddress.ip_address(clean_text(value))
+    except ValueError:
+        return None
+    if getattr(address, 'scope_id', None) is not None:
+        return None
+    return address
+
+
+def single_forwarded_for_header_value(headers: Any) -> str:
+    values = headers.get_all('X-Forwarded-For', [])
+    if len(values) != 1:
+        return ''
+    return str(values[0] or '')
+
+
+def effective_rate_limit_client_id(socket_peer: Any, forwarded_for: Any) -> str:
+    peer_address = rate_limit_ip_address(socket_peer)
+    if peer_address is None:
+        return 'unknown'
+    fallback = str(peer_address)
+    trusted_networks = configured_trusted_proxy_networks()
+    if not any(
+        peer_address.version == network.version and peer_address in network
+        for network in trusted_networks
+    ):
+        return fallback
+    forwarded_raw = str(forwarded_for or '')
+    if len(forwarded_raw.encode('utf-8')) > MAX_FORWARDED_FOR_HEADER_BYTES:
+        return fallback
+    forwarded_text = clean_text(forwarded_raw)
+    if not forwarded_text:
+        return fallback
+    raw_hops = forwarded_text.split(',')
+    if len(raw_hops) > MAX_FORWARDED_FOR_HOPS:
+        return fallback
+    hops = []
+    for raw_hop in raw_hops:
+        hop_text = clean_text(raw_hop)
+        if not hop_text:
+            return fallback
+        hop = rate_limit_ip_address(hop_text)
+        if hop is None:
+            return fallback
+        hops.append(hop)
+    for hop in reversed(hops):
+        if any(
+            hop.version == network.version and hop in network
+            for network in trusted_networks
+        ):
+            continue
+        return str(hop)
+    return fallback
 
 
 def is_rate_limited(client_id: str, path: str, now: float | None = None) -> bool:
@@ -16800,13 +16894,25 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
 
     def block_platform_launch_rate_limit(self) -> bool:
         client_id = self.client_address[0] if self.client_address else "unknown"
-        if is_rate_limited(client_id, PLATFORM_LAUNCH_ENDPOINT):
+        if is_rate_limited(
+            effective_rate_limit_client_id(
+                client_id,
+                single_forwarded_for_header_value(self.headers),
+            ),
+            PLATFORM_LAUNCH_ENDPOINT,
+        ):
             write_local_log("abuse_signal", {"reason": "rate_limit", "path": PLATFORM_LAUNCH_ENDPOINT, "status": 429})
             self.send_json({"status": "blocked", "errors": ["Too many platform launch requests. Wait a moment and retry."]}, status=429)
             return True
         return False
 
     def handle_platform_launch(self) -> None:
+        if deploy_requires_trusted_proxy_guard():
+            self.send_json({
+                'status': 'blocked',
+                'errors': ['Deploy mode requires a trusted reverse-proxy boundary before serving the app.'],
+            }, status=503)
+            return
         if deploy_requires_auth_guard():
             self.send_json({
                 "status": "blocked",
@@ -16855,6 +16961,16 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         )
 
     def block_unauthenticated_request(self, path: str) -> bool:
+        if (
+            deploy_requires_trusted_proxy_guard()
+            and not path.startswith('/static/')
+            and path not in {'/api/health', '/privacy'}
+        ):
+            self.send_json({
+                'status': 'blocked',
+                'errors': ['Deploy mode requires a trusted reverse-proxy boundary before serving the app.'],
+            }, status=503)
+            return True
         if path.startswith("/static/") or path in {"/api/health", "/privacy"}:
             return False
         if deploy_requires_auth_guard():
@@ -17020,7 +17136,13 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             self.send_json({"status": "blocked", "errors": ["Missing or invalid local session token."]}, status=403)
             return True
         client_id = self.client_address[0] if self.client_address else "unknown"
-        if is_rate_limited(client_id, path):
+        if is_rate_limited(
+            effective_rate_limit_client_id(
+                client_id,
+                single_forwarded_for_header_value(self.headers),
+            ),
+            path,
+        ):
             write_local_log("abuse_signal", {"reason": "rate_limit", "path": path, "status": 429})
             self.send_json({"status": "blocked", "errors": ["Too many local runner requests. Wait a moment and retry."]}, status=429)
             return True
@@ -17266,6 +17388,13 @@ def main() -> int:
         safe_stderr(
             "Refusing deploy mode without a complete auth boundary. Set AUTH_REQUIRED=true, configure a strong "
             "SESSION_SECRET and Swooshz Platform launch settings, or run APP_MODE=local for localhost-only use.\n"
+        )
+        return 2
+    if deploy_requires_trusted_proxy_guard():
+        safe_stderr(
+            'Refusing deploy mode without a trusted reverse-proxy boundary. Set '
+            'SQAG_TRUSTED_PROXY_CIDRS to the explicit CIDRs of proxies allowed to supply X-Forwarded-For, '
+            'or run APP_MODE=local for localhost-only use.\n'
         )
         return 2
     if deploy_requires_storage_guard():
