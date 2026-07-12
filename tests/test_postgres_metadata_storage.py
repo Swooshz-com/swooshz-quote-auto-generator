@@ -75,6 +75,8 @@ class FakePostgresConnection:
         params = tuple(params or ())
         self.queries.append((sql, params))
         normalized = " ".join(sql.lower().split())
+        if "pg_try_advisory_xact_lock" in normalized:
+            return FakePostgresCursor([{"lock_acquired": True}])
         if "information_schema.columns" in normalized:
             rows = []
             column_map = {
@@ -218,6 +220,9 @@ class FakePostgresConnection:
 
     def commit(self):
         self.commits += 1
+
+    def rollback(self):
+        return None
 
     def close(self):
         self.closed = True
@@ -406,6 +411,43 @@ class PostgresMetadataStorageTest(unittest.TestCase):
         self.assertIn("insert into sqag_object_artifacts", executed_sql)
         self.assertNotIn("content_blob", executed_sql)
 
+    def test_postgres_object_artifact_upsert_requires_workspace_owner(self):
+        connection = FakePostgresConnection()
+        with mock.patch.dict(os.environ, self.postgres_env(), clear=True), mock.patch(
+            "webapp.server.postgres_driver_connection_factory",
+            return_value=lambda _database_url: connection,
+        ):
+            storage = webapp.app_storage_for_auth_session(
+                platform_session("workspace-alpha")
+            )
+            with self.assertRaises(webapp.ObjectStorageContractError):
+                storage._upsert_object_quote_artifact(
+                    "quote-ownerless123",
+                    "xlsx",
+                    webapp.QUOTE_SESSION_EXPORT_KINDS["xlsx"],
+                    webapp.QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"],
+                    webapp.ObjectArtifactMetadata(
+                        workspace_id="workspace-alpha",
+                        owner_type="generated_quote",
+                        owner_id="quote-ownerless123",
+                        artifact_kind="xlsx",
+                        filename=webapp.QUOTE_SESSION_EXPORT_KINDS["xlsx"],
+                        content_type=webapp.QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"],
+                        size_bytes=12,
+                        checksum_sha256="a" * 64,
+                        storage_key="redacted-object-key-ref",
+                        created_at="2026-01-01T00:00:00Z",
+                        updated_at="2026-01-01T00:00:00Z",
+                    ),
+                )
+
+        self.assertFalse(
+            any(
+                query.lower().startswith("insert into sqag_object_artifacts")
+                for query, _params in connection.queries
+            )
+        )
+
     def test_postgres_object_artifact_row_matches_runtime_mapping_contract(self):
         connection = FakePostgresConnection()
         with mock.patch.dict(os.environ, self.postgres_env(), clear=True), mock.patch(
@@ -413,6 +455,10 @@ class PostgresMetadataStorageTest(unittest.TestCase):
             return_value=lambda _database_url: connection,
         ):
             storage = webapp.app_storage_for_auth_session(platform_session("workspace-alpha"))
+            storage.create_or_update_quote_session(
+                {"session_id": "quote-alpha123"},
+                session_id="quote-alpha123",
+            )
             storage._upsert_object_quote_artifact(
                 "quote-alpha123",
                 "xlsx",
@@ -457,6 +503,10 @@ class PostgresMetadataStorageTest(unittest.TestCase):
             return_value=lambda _database_url: connection,
         ):
             storage = webapp.app_storage_for_auth_session(platform_session("workspace-alpha"))
+            storage.create_or_update_quote_session(
+                {"session_id": "quote-alpha123"},
+                session_id="quote-alpha123",
+            )
             storage._upsert_object_quote_artifact(
                 "quote-alpha123",
                 "xlsx",

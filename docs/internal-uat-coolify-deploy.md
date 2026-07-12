@@ -152,6 +152,9 @@ bytes, host IPs, or private paths into issue/PR output.
 - XLSX/PDF artifacts require object storage before hosted/protected/deploy or
   production readiness can be claimed.
 - Delete makes the session and artifacts inaccessible.
+- Concurrent save/delete probes for the same profile, pricing reference, and
+  quote session resolve to a consistent save-wins, delete-wins, or generic-503
+  outcome; no active object metadata remains without its workspace owner.
 - Logout/sign-out behaves safely.
 - Legacy direct job file downloads remain disabled in deploy/database/platform
   paths.
@@ -170,5 +173,8 @@ This scaffold does not prove:
 - Live Swooshz Platform integration.
 - Real object-storage provider wiring.
 - DB+object backup/restore or live object retention/delete evidence.
+- Live Postgres advisory-lock behavior under concurrent SQAG replicas; local
+  tests cover deterministic SQLite interleavings and synthetic Postgres SQL
+  ordering only.
 - Production observability export or alert delivery.
 - Production readiness.

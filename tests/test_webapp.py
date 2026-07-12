@@ -11,6 +11,7 @@ import inspect
 import io
 import json
 import os
+import queue
 import re
 import shutil
 import sqlite3
@@ -50,6 +51,62 @@ import verify_internal_uat_deploy_template as deploy_template
 from webapp import server as webapp
 
 AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE = "AI draft generation is not available in this environment."
+
+
+class CoordinatedStorageConnection:
+    def __init__(self, connection, events, commit_gate, state):
+        self.connection = connection
+        self.events = events
+        self.commit_gate = commit_gate
+        self.state = state
+
+    def execute(self, sql, params=()):
+        if clean_sql(sql).startswith("begin immediate"):
+            self.events.put("lock_attempt")
+        return self.connection.execute(sql, params)
+
+    def commit(self):
+        if not self.state["commit_announced"]:
+            self.state["commit_announced"] = True
+            self.events.put("commit_ready")
+            if not self.commit_gate.wait(5):
+                raise AssertionError("Timed out waiting to release coordinated commit.")
+        return self.connection.commit()
+
+    def rollback(self):
+        return self.connection.rollback()
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+
+def clean_sql(value):
+    return " ".join(str(value).strip().lower().split())
+
+
+def coordinated_connection_factory(original_connection, events, commit_gate):
+    state = {"commit_announced": False}
+
+    @contextlib.contextmanager
+    def coordinated_connection():
+        with original_connection() as connection:
+            yield CoordinatedStorageConnection(
+                connection,
+                events,
+                commit_gate,
+                state,
+            )
+
+    return coordinated_connection
+
+
+def run_thread_operation(results, key, done, operation):
+    try:
+        results[key] = operation()
+    except Exception as exc:
+        results[key] = exc
+    finally:
+        done.set()
 
 
 def require_node(test_case: unittest.TestCase) -> str:
@@ -710,6 +767,99 @@ class WebappServerTest(unittest.TestCase):
                 return None
 
         return urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
+
+    def _run_object_delete_save_race(
+        self,
+        *,
+        delete_storage,
+        save_storage,
+        delete_operation,
+        save_operation,
+    ):
+        boundary_entered = threading.Event()
+        boundary_release = threading.Event()
+        commit_gate = threading.Event()
+        delete_done = threading.Event()
+        save_done = threading.Event()
+        events = queue.Queue()
+        results = {}
+        original_assert = delete_storage._assert_no_active_object_owner_artifacts
+
+        def pause_after_zero_active(connection, owner_type, owner_id):
+            original_assert(connection, owner_type, owner_id)
+            boundary_entered.set()
+            if not boundary_release.wait(5):
+                raise AssertionError(
+                    'Timed out waiting to release the owner-delete boundary.'
+                )
+
+        coordinated_connection = coordinated_connection_factory(
+            save_storage.connection,
+            events,
+            commit_gate,
+        )
+        delete_thread = threading.Thread(
+            target=run_thread_operation,
+            args=(results, 'delete', delete_done, delete_operation),
+            daemon=True,
+        )
+        save_thread = threading.Thread(
+            target=run_thread_operation,
+            args=(results, 'save', save_done, save_operation),
+            daemon=True,
+        )
+        first_event = ''
+        try:
+            with (
+                mock.patch.object(
+                    delete_storage,
+                    '_assert_no_active_object_owner_artifacts',
+                    side_effect=pause_after_zero_active,
+                ),
+                mock.patch.object(
+                    save_storage,
+                    'connection',
+                    new=coordinated_connection,
+                ),
+            ):
+                delete_thread.start()
+                self.assertTrue(
+                    boundary_entered.wait(5),
+                    'Delete did not reach the final owner boundary.',
+                )
+                save_thread.start()
+                first_event = events.get(timeout=5)
+                if first_event == 'commit_ready':
+                    commit_gate.set()
+                    self.assertTrue(
+                        save_done.wait(5),
+                        'Concurrent save did not reach a committed state.',
+                    )
+                    boundary_release.set()
+                elif first_event == 'lock_attempt':
+                    boundary_release.set()
+                    self.assertTrue(
+                        delete_done.wait(5),
+                        'Serialized delete did not finish.',
+                    )
+                    self.assertEqual(events.get(timeout=5), 'commit_ready')
+                    commit_gate.set()
+                else:
+                    self.fail(f'Unexpected lifecycle event: {first_event}')
+                self.assertTrue(delete_done.wait(5), 'Delete thread did not finish.')
+                self.assertTrue(save_done.wait(5), 'Save thread did not finish.')
+        finally:
+            boundary_release.set()
+            commit_gate.set()
+            delete_thread.join(timeout=5)
+            save_thread.join(timeout=5)
+        self.assertFalse(delete_thread.is_alive(), 'Delete thread remained blocked.')
+        self.assertFalse(save_thread.is_alive(), 'Save thread remained blocked.')
+        for operation_name in ('delete', 'save'):
+            outcome = results.get(operation_name)
+            if isinstance(outcome, Exception):
+                self.fail(f'{operation_name} unexpectedly failed: {outcome}')
+        return results, first_event
 
     def http_json(self, runner, method: str, path: str, *, cookie: str = "", body: dict | None = None, headers: dict | None = None) -> dict:
         parsed = urllib.parse.urlparse(runner.base_url)
@@ -22069,6 +22219,912 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertIsNone(corrupt)
         self.assertIsNone(missing)
 
+    def test_object_profile_delete_and_concurrent_save_are_serialized(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        tmp_path = test_temp_root() / f'object-profile-delete-save-race-{time.time_ns()}'
+        db_path = tmp_path / 'sqag-storage.sqlite3'
+        database_url = f'sqlite:///{db_path.as_posix()}'
+        workspace_id = 'workspace-object-profile-delete-save-race'
+        profile_id = 'concurrent-profile'
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+
+        initial = workspace_profile_with_layout(profile_id)
+        initial['label'] = 'Initial Concurrent Profile'
+        replacement = workspace_profile_with_layout(profile_id)
+        replacement['label'] = 'Replacement Concurrent Profile'
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(
+                webapp,
+                'configured_object_storage_backend',
+                return_value=backend,
+            ),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            seed_storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session(workspace_id)
+            )
+            seed_storage.save_profile(initial)
+            delete_storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session(workspace_id)
+            )
+            save_storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session(workspace_id)
+            )
+
+            results, first_event = self._run_object_delete_save_race(
+                delete_storage=delete_storage,
+                save_storage=save_storage,
+                delete_operation=lambda: delete_storage.delete_profile(profile_id),
+                save_operation=lambda: save_storage.save_profile(replacement),
+            )
+            owner = seed_storage.profile_detail(profile_id, source='company')
+            active_rows = seed_storage._active_object_artifact_rows(
+                'profile',
+                profile_id,
+            )
+            active_contents = [
+                backend.retrieve_artifact(
+                    seed_storage._object_metadata_from_row(row),
+                    workspace_id=workspace_id,
+                )
+                for row in active_rows
+            ]
+
+        self.assertFalse(
+            owner is None and bool(active_rows),
+            f'Profile owner was deleted with active layout metadata; first event={first_event}',
+        )
+        self.assertEqual(first_event, 'lock_attempt')
+        self.assertTrue(results['delete'])
+        self.assertEqual(results['save']['label'], 'Replacement Concurrent Profile')
+        self.assertIsNotNone(owner)
+        self.assertEqual(
+            [row['artifact_kind'] for row in active_rows],
+            ['quotation_layout'],
+        )
+        self.assertEqual(len(active_contents), 1)
+        webapp.validate_profile_layout_xlsx(active_contents[0])
+        self.assertEqual(len(backend._objects), 1)
+
+    def test_object_pricing_delete_and_concurrent_save_are_serialized(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        tmp_path = test_temp_root() / f'object-pricing-delete-save-race-{time.time_ns()}'
+        db_path = tmp_path / 'sqag-storage.sqlite3'
+        database_url = f'sqlite:///{db_path.as_posix()}'
+        workspace_id = 'workspace-object-pricing-delete-save-race'
+        reference_id = 'concurrent-pricing'
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+
+        def pricing(label, marker):
+            visual_one = (
+                'data:image/png;base64,'
+                + base64.b64encode(marker + b'-one').decode('ascii')
+            )
+            visual_two = (
+                'data:image/png;base64,'
+                + base64.b64encode(marker + b'-two').decode('ascii')
+            )
+            return webapp.normalize_pricing_reference_payload({
+                'id': reference_id,
+                'label': label,
+                'items': [with_required_pricing_metadata({
+                    'id': 'concurrent-pricing-row',
+                    'section': 'Graphics',
+                    'description': 'Concurrent printed graphics',
+                    'unit_hint': 'sqm',
+                    'internal_cost': 10,
+                    'markup_multiplier': 2,
+                    'visual_references': [
+                        {
+                            'source': 'xl/media/visual-one.png',
+                            'anchor_row': 7,
+                            'data_url': visual_one,
+                        },
+                        {
+                            'source': 'xl/media/visual-two.png',
+                            'anchor_row': 8,
+                            'data_url': visual_two,
+                        },
+                    ],
+                })],
+            })
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(
+                webapp,
+                'configured_object_storage_backend',
+                return_value=backend,
+            ),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            seed_storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session(workspace_id)
+            )
+            seed_storage.save_pricing_reference(
+                pricing('Initial Concurrent Pricing', b'initial')
+            )
+            delete_storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session(workspace_id)
+            )
+            save_storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session(workspace_id)
+            )
+
+            results, first_event = self._run_object_delete_save_race(
+                delete_storage=delete_storage,
+                save_storage=save_storage,
+                delete_operation=lambda: delete_storage.delete_pricing_reference(
+                    reference_id
+                ),
+                save_operation=lambda: save_storage.save_pricing_reference(
+                    pricing('Replacement Concurrent Pricing', b'replacement')
+                ),
+            )
+            owner = seed_storage.pricing_reference_detail(
+                reference_id,
+                source='company',
+            )
+            active_rows = seed_storage._active_object_artifact_rows(
+                'pricing_reference',
+                reference_id,
+            )
+            active_contents = {
+                backend.retrieve_artifact(
+                    seed_storage._object_metadata_from_row(row),
+                    workspace_id=workspace_id,
+                )
+                for row in active_rows
+            }
+
+        self.assertFalse(
+            owner is None and bool(active_rows),
+            f'Pricing owner was deleted with active visuals; first event={first_event}',
+        )
+        self.assertEqual(first_event, 'lock_attempt')
+        self.assertTrue(results['delete'])
+        self.assertEqual(
+            results['save']['label'],
+            'Replacement Concurrent Pricing',
+        )
+        self.assertIsNotNone(owner)
+        self.assertEqual(
+            [row['artifact_kind'] for row in active_rows],
+            ['visual_1_1', 'visual_1_2'],
+        )
+        self.assertEqual(
+            active_contents,
+            {b'replacement-one', b'replacement-two'},
+        )
+        self.assertEqual(len(backend._objects), 2)
+
+    def test_object_quote_delete_and_concurrent_export_save_are_serialized(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        tmp_path = test_temp_root() / f'object-quote-delete-save-race-{time.time_ns()}'
+        db_path = tmp_path / 'sqag-storage.sqlite3'
+        database_url = f'sqlite:///{db_path.as_posix()}'
+        workspace_id = 'workspace-object-quote-delete-save-race'
+        session_id = 'quote-concurrent-delete-save'
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+        initial_output = tmp_path / 'out' / 'initial'
+        replacement_output = tmp_path / 'out' / 'replacement'
+        initial_output.mkdir(parents=True)
+        replacement_output.mkdir(parents=True)
+        (initial_output / 'quotation.xlsx').write_bytes(b'initial-concurrent-xlsx')
+        (initial_output / 'quotation.pdf').write_bytes(b'initial-concurrent-pdf')
+        (replacement_output / 'quotation.xlsx').write_bytes(
+            b'replacement-concurrent-xlsx'
+        )
+        (replacement_output / 'quotation.pdf').write_bytes(
+            b'replacement-concurrent-pdf'
+        )
+        payload = valid_payload()
+        payload['quote_session'] = {'session_id': session_id}
+        result = {
+            'status': 'completed',
+            'files': [
+                {
+                    'name': 'quotation.xlsx',
+                    'url': '/api/jobs/concurrent/files/quotation.xlsx',
+                },
+                {
+                    'name': 'quotation.pdf',
+                    'url': '/api/jobs/concurrent/files/quotation.pdf',
+                },
+            ],
+        }
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(
+                webapp,
+                'configured_object_storage_backend',
+                return_value=backend,
+            ),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            seed_storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session(workspace_id)
+            )
+            seed_storage.create_or_update_quote_session(
+                payload,
+                result=result,
+                output_dir=initial_output,
+            )
+            delete_storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session(workspace_id)
+            )
+            save_storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session(workspace_id)
+            )
+
+            results, first_event = self._run_object_delete_save_race(
+                delete_storage=delete_storage,
+                save_storage=save_storage,
+                delete_operation=lambda: delete_storage.delete_quote_session(
+                    session_id
+                ),
+                save_operation=lambda: save_storage.create_or_update_quote_session(
+                    payload,
+                    result=result,
+                    output_dir=replacement_output,
+                ),
+            )
+            owner = seed_storage.get_quote_session(session_id)
+            active_rows = seed_storage._active_object_artifact_rows(
+                'generated_quote',
+                session_id,
+            )
+            active_contents = {
+                backend.retrieve_artifact(
+                    seed_storage._object_metadata_from_row(row),
+                    workspace_id=workspace_id,
+                )
+                for row in active_rows
+            }
+
+        self.assertFalse(
+            owner is None and bool(active_rows),
+            f'Quote owner was deleted with active exports; first event={first_event}',
+        )
+        self.assertEqual(first_event, 'lock_attempt')
+        self.assertTrue(results['delete'])
+        self.assertEqual(results['save']['session_id'], session_id)
+        self.assertIsNotNone(owner)
+        self.assertEqual(
+            [row['artifact_kind'] for row in active_rows],
+            ['pdf', 'xlsx'],
+        )
+        self.assertEqual(
+            active_contents,
+            {b'replacement-concurrent-pdf', b'replacement-concurrent-xlsx'},
+        )
+        self.assertEqual(len(backend._objects), 2)
+        self.assertFalse((replacement_output / 'quotation.xlsx').exists())
+        self.assertFalse((replacement_output / 'quotation.pdf').exists())
+
+    def test_object_save_in_progress_blocks_same_owner_delete_until_commit(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        tmp_path = test_temp_root() / f'object-save-first-delete-race-{time.time_ns()}'
+        db_path = tmp_path / 'sqag-storage.sqlite3'
+        database_url = f'sqlite:///{db_path.as_posix()}'
+        workspace_id = 'workspace-object-save-first-delete-race'
+        profile_id = 'save-first-profile'
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+        layout_data_url = (
+            'data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,'
+            + base64.b64encode(KONCEPT_LAYOUT.read_bytes()).decode('ascii')
+        )
+
+        def profile(label, filename):
+            return webapp.normalize_profile_payload({
+                'id': profile_id,
+                'label': label,
+                'pack': {
+                    'quotation_layout': {
+                        'filename': filename,
+                        'data_url': layout_data_url,
+                    }
+                },
+            })
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(
+                webapp,
+                'configured_object_storage_backend',
+                return_value=backend,
+            ),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            seed_storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session(workspace_id)
+            )
+            seed_storage.save_profile(
+                profile('Initial Save-First Profile', 'initial-layout.xlsx')
+            )
+            save_storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session(workspace_id)
+            )
+            delete_storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session(workspace_id)
+            )
+            prepare_entered = threading.Event()
+            prepare_release = threading.Event()
+            save_done = threading.Event()
+            delete_done = threading.Event()
+            delete_commit_gate = threading.Event()
+            delete_commit_gate.set()
+            events = queue.Queue()
+            results = {}
+            original_prepare = save_storage._prepare_object_artifact_batch
+
+            def pause_after_provider_staging(*args, **kwargs):
+                plan = original_prepare(*args, **kwargs)
+                prepare_entered.set()
+                if not prepare_release.wait(5):
+                    raise AssertionError(
+                        'Timed out waiting to release staged profile save.'
+                    )
+                return plan
+
+            coordinated_delete_connection = coordinated_connection_factory(
+                delete_storage.connection,
+                events,
+                delete_commit_gate,
+            )
+
+            def run_delete():
+                run_thread_operation(
+                    results,
+                    'delete',
+                    delete_done,
+                    lambda: delete_storage.delete_profile(profile_id),
+                )
+                events.put('delete_done')
+
+            save_thread = threading.Thread(
+                target=run_thread_operation,
+                args=(
+                    results,
+                    'save',
+                    save_done,
+                    lambda: save_storage.save_profile(
+                        profile(
+                            'Replacement Save-First Profile',
+                            'replacement-layout.xlsx',
+                        )
+                    ),
+                ),
+                daemon=True,
+            )
+            delete_thread = threading.Thread(target=run_delete, daemon=True)
+            first_event = ''
+            try:
+                with (
+                    mock.patch.object(
+                        save_storage,
+                        '_prepare_object_artifact_batch',
+                        side_effect=pause_after_provider_staging,
+                    ),
+                    mock.patch.object(
+                        delete_storage,
+                        'connection',
+                        new=coordinated_delete_connection,
+                    ),
+                ):
+                    save_thread.start()
+                    self.assertTrue(
+                        prepare_entered.wait(5),
+                        'Save did not pause after provider staging.',
+                    )
+                    delete_thread.start()
+                    first_event = events.get(timeout=5)
+                    prepare_release.set()
+                    self.assertTrue(save_done.wait(5), 'Save thread did not finish.')
+                    self.assertTrue(delete_done.wait(5), 'Delete thread did not finish.')
+            finally:
+                prepare_release.set()
+                delete_commit_gate.set()
+                save_thread.join(timeout=5)
+                delete_thread.join(timeout=5)
+
+            owner = seed_storage.profile_detail(profile_id, source='company')
+            active_rows = seed_storage._active_object_artifact_rows(
+                'profile',
+                profile_id,
+            )
+
+        self.assertFalse(save_thread.is_alive(), 'Save thread remained blocked.')
+        self.assertFalse(delete_thread.is_alive(), 'Delete thread remained blocked.')
+        self.assertFalse(
+            owner is None and bool(active_rows),
+            'Save-first interleaving produced an ownerless active artifact.',
+        )
+        self.assertEqual(
+            first_event,
+            'lock_attempt',
+            'Delete reached storage work while a same-owner save was staged.',
+        )
+        self.assertNotIsInstance(results.get('save'), Exception)
+        delete_outcome = results.get('delete')
+        if isinstance(delete_outcome, Exception):
+            self.assertIsInstance(delete_outcome, webapp.SqagStorageAccessError)
+            self.assertEqual(delete_outcome.status, 503)
+            self.assertEqual(
+                str(delete_outcome),
+                webapp.QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+            )
+
+    def test_object_lifecycle_lock_identity_is_workspace_type_and_owner_scoped(self):
+        profile_storage = webapp.DatabaseSqagStorage(
+            'postgresql://synthetic@database.test/sqag',
+            'workspace-lifecycle-a',
+            'owner',
+        )
+        other_workspace = webapp.DatabaseSqagStorage(
+            'postgresql://synthetic@database.test/sqag',
+            'workspace-lifecycle-b',
+            'owner',
+        )
+        profile_key = profile_storage._object_lifecycle_lock_key(
+            'profile',
+            'quote-shared-id',
+        )
+        keys = {
+            profile_key,
+            profile_storage._object_lifecycle_lock_key('profile', 'other-id'),
+            profile_storage._object_lifecycle_lock_key(
+                'pricing_reference',
+                'quote-shared-id',
+            ),
+            profile_storage._object_lifecycle_lock_key(
+                'generated_quote',
+                'quote-shared-id',
+            ),
+            other_workspace._object_lifecycle_lock_key(
+                'profile',
+                'quote-shared-id',
+            ),
+        }
+
+        self.assertEqual(len(keys), 5)
+        self.assertEqual(
+            profile_key,
+            profile_storage._object_lifecycle_lock_key(
+                'profile',
+                'quote-shared-id',
+            ),
+        )
+        self.assertGreaterEqual(profile_key, -(2**63))
+        self.assertLess(profile_key, 2**63)
+
+    def test_postgres_object_lifecycle_locks_keep_unrelated_owners_independent(self):
+        class LockResult:
+            rowcount = 1
+
+            def __init__(self, acquired):
+                self.acquired = acquired
+
+            def fetchone(self):
+                return {'lock_acquired': self.acquired}
+
+        class SyntheticLockManager:
+            def __init__(self):
+                self.held = set()
+
+            def connection(self):
+                manager = self
+
+                class Connection:
+                    def __init__(self):
+                        self.keys = set()
+
+                    def execute(self, sql, params=()):
+                        self_key = int(params[0])
+                        acquired = self_key not in manager.held
+                        if acquired:
+                            manager.held.add(self_key)
+                            self.keys.add(self_key)
+                        return LockResult(acquired)
+
+                    def rollback(self):
+                        manager.held.difference_update(self.keys)
+                        self.keys.clear()
+
+                    def commit(self):
+                        self.rollback()
+
+                return Connection()
+
+        database_url = 'postgresql://synthetic@database.test/sqag'
+        workspace_a = webapp.DatabaseSqagStorage(
+            database_url,
+            'workspace-lock-manager-a',
+            'owner',
+        )
+        workspace_b = webapp.DatabaseSqagStorage(
+            database_url,
+            'workspace-lock-manager-b',
+            'owner',
+        )
+        manager = SyntheticLockManager()
+        held_connections = [manager.connection() for _index in range(4)]
+
+        workspace_a._begin_object_lifecycle_transaction(
+            held_connections[0],
+            'profile',
+            'quote-shared-id',
+        )
+        workspace_a._begin_object_lifecycle_transaction(
+            held_connections[1],
+            'profile',
+            'other-profile',
+        )
+        workspace_a._begin_object_lifecycle_transaction(
+            held_connections[2],
+            'pricing_reference',
+            'quote-shared-id',
+        )
+        workspace_b._begin_object_lifecycle_transaction(
+            held_connections[3],
+            'profile',
+            'quote-shared-id',
+        )
+        duplicate_connection = manager.connection()
+        with self.assertRaises(webapp.ObjectStorageContractError):
+            workspace_a._begin_object_lifecycle_transaction(
+                duplicate_connection,
+                'profile',
+                'quote-shared-id',
+            )
+
+        self.assertEqual(len(manager.held), 4)
+        for connection in held_connections:
+            connection.rollback()
+        self.assertEqual(manager.held, set())
+
+    def test_postgres_object_lifecycle_lock_precedes_owner_save_and_commit(self):
+        class RecordingResult:
+            rowcount = 1
+
+            def __init__(self, row=None):
+                self.row = row
+
+            def fetchone(self):
+                return self.row
+
+            def fetchall(self):
+                return []
+
+        class RecordingConnection:
+            def __init__(self, acquired=True, fail_owner=False):
+                self.acquired = acquired
+                self.fail_owner = fail_owner
+                self.actions = []
+                self.closed = False
+
+            def execute(self, sql, params=()):
+                normalized = clean_sql(sql)
+                self.actions.append(('execute', normalized, tuple(params)))
+                if 'pg_try_advisory_xact_lock' in normalized:
+                    return RecordingResult({'lock_acquired': self.acquired})
+                if self.fail_owner and normalized.startswith('insert into sqag_profiles'):
+                    raise sqlite3.OperationalError('synthetic owner transaction failure')
+                return RecordingResult()
+
+            def commit(self):
+                self.actions.append(('commit',))
+
+            def rollback(self):
+                self.actions.append(('rollback',))
+
+        def connection_factory(connection):
+            @contextlib.contextmanager
+            def open_connection():
+                try:
+                    yield connection
+                finally:
+                    connection.closed = True
+
+            return open_connection
+
+        env = {
+            'SQAG_STORAGE_MODE': 'database',
+            'SQAG_ARTIFACT_STORAGE_MODE': 'object',
+            'SQAG_DATABASE_URL': 'postgresql://synthetic@database.test/sqag',
+        }
+        storage = webapp.DatabaseSqagStorage(
+            env['SQAG_DATABASE_URL'],
+            'workspace-postgres-lifecycle-order',
+            'owner',
+        )
+        profile = webapp.normalize_profile_payload({
+            'id': 'postgres-lifecycle-profile',
+            'label': 'Postgres Lifecycle Profile',
+        })
+        connection = RecordingConnection()
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(
+                storage,
+                'connection',
+                new=connection_factory(connection),
+            ),
+        ):
+            saved = storage.save_profile(profile)
+
+        pricing_connection = RecordingConnection()
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(
+                storage,
+                'connection',
+                new=connection_factory(pricing_connection),
+            ),
+        ):
+            storage.save_pricing_reference({
+                'id': 'postgres-lifecycle-pricing',
+                'label': 'Postgres Lifecycle Pricing',
+                'items': [],
+            })
+
+        statements = [
+            action[1]
+            for action in connection.actions
+            if action[0] == 'execute'
+        ]
+        lock_index = next(
+            index
+            for index, statement in enumerate(statements)
+            if 'pg_try_advisory_xact_lock' in statement
+        )
+        savepoint_index = next(
+            index
+            for index, statement in enumerate(statements)
+            if statement.startswith('savepoint ')
+        )
+        owner_index = next(
+            index
+            for index, statement in enumerate(statements)
+            if statement.startswith('insert into sqag_profiles')
+        )
+
+        self.assertEqual(saved['id'], 'postgres-lifecycle-profile')
+        self.assertLess(lock_index, savepoint_index)
+        self.assertLess(savepoint_index, owner_index)
+        self.assertEqual(connection.actions[-1], ('commit',))
+        self.assertTrue(connection.closed)
+        self.assertFalse(
+            any('pg_advisory_unlock' in statement for statement in statements)
+        )
+        pricing_statements = [
+            action[1]
+            for action in pricing_connection.actions
+            if action[0] == 'execute'
+        ]
+        pricing_lock_index = next(
+            index
+            for index, statement in enumerate(pricing_statements)
+            if 'pg_try_advisory_xact_lock' in statement
+        )
+        snapshot_index = next(
+            index
+            for index, statement in enumerate(pricing_statements)
+            if 'from sqag_object_artifacts' in statement
+        )
+        pricing_owner_index = next(
+            index
+            for index, statement in enumerate(pricing_statements)
+            if statement.startswith('insert into sqag_pricing_references')
+        )
+        self.assertLess(pricing_lock_index, snapshot_index)
+        self.assertLess(snapshot_index, pricing_owner_index)
+
+    def test_postgres_object_lifecycle_lock_failure_and_rollback_are_fail_closed(self):
+        class RecordingResult:
+            rowcount = 1
+
+            def __init__(self, row=None):
+                self.row = row
+
+            def fetchone(self):
+                return self.row
+
+        class RecordingConnection:
+            def __init__(self, acquired=True, fail_owner=False):
+                self.acquired = acquired
+                self.fail_owner = fail_owner
+                self.actions = []
+
+            def execute(self, sql, params=()):
+                normalized = clean_sql(sql)
+                self.actions.append(('execute', normalized, tuple(params)))
+                if 'pg_try_advisory_xact_lock' in normalized:
+                    return RecordingResult({'lock_acquired': self.acquired})
+                if self.fail_owner and normalized.startswith('insert into sqag_profiles'):
+                    raise sqlite3.OperationalError('synthetic transaction failure')
+                return RecordingResult()
+
+            def commit(self):
+                self.actions.append(('commit',))
+
+            def rollback(self):
+                self.actions.append(('rollback',))
+
+        def connection_factory(connection):
+            @contextlib.contextmanager
+            def open_connection():
+                yield connection
+
+            return open_connection
+
+        env = {
+            'SQAG_STORAGE_MODE': 'database',
+            'SQAG_ARTIFACT_STORAGE_MODE': 'object',
+            'SQAG_DATABASE_URL': 'postgresql://synthetic@database.test/sqag',
+        }
+        profile = webapp.normalize_profile_payload({
+            'id': 'postgres-lock-failure-profile',
+            'label': 'Postgres Lock Failure Profile',
+        })
+        for connection in (
+            RecordingConnection(acquired=False),
+            RecordingConnection(acquired=True, fail_owner=True),
+        ):
+            with self.subTest(
+                acquired=connection.acquired,
+                fail_owner=connection.fail_owner,
+            ):
+                storage = webapp.DatabaseSqagStorage(
+                    env['SQAG_DATABASE_URL'],
+                    'workspace-postgres-lock-failure',
+                    'owner',
+                )
+                with (
+                    mock.patch.dict(os.environ, env, clear=True),
+                    mock.patch.object(
+                        storage,
+                        'connection',
+                        new=connection_factory(connection),
+                    ),
+                    self.assertRaises(webapp.SqagStorageAccessError) as raised,
+                ):
+                    storage.save_profile(profile)
+
+                self.assertEqual(raised.exception.status, 503)
+                self.assertEqual(
+                    str(raised.exception),
+                    webapp.QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                )
+                self.assertNotIn('workspace-postgres-lock-failure', str(raised.exception))
+                self.assertNotIn('postgres-lock-failure-profile', str(raised.exception))
+                self.assertIn(('rollback',), connection.actions)
+
+    def test_object_quote_lifecycle_lock_failure_is_generic_and_retains_staging(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        tmp_path = test_temp_root() / f'object-quote-lock-failure-{time.time_ns()}'
+        db_path = tmp_path / 'sqag-storage.sqlite3'
+        database_url = f'sqlite:///{db_path.as_posix()}'
+        workspace_id = 'workspace-object-quote-lock-failure'
+        session_id = 'quote-object-lock-failure'
+        output_dir = tmp_path / 'out' / 'lock-failure'
+        output_dir.mkdir(parents=True)
+        (output_dir / 'quotation.xlsx').write_bytes(b'lock-failure-xlsx')
+        (output_dir / 'quotation.pdf').write_bytes(b'lock-failure-pdf')
+        payload = valid_payload()
+        payload['quote_session'] = {'session_id': session_id}
+        result = {
+            'status': 'completed',
+            'files': [
+                {'name': 'quotation.xlsx'},
+                {'name': 'quotation.pdf'},
+            ],
+        }
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(
+                webapp,
+                'configured_object_storage_backend',
+                return_value=backend,
+            ),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session(workspace_id)
+            )
+            with (
+                mock.patch.object(
+                    storage,
+                    '_begin_object_lifecycle_transaction',
+                    side_effect=webapp.ObjectStorageContractError(
+                        'synthetic private lock identity'
+                    ),
+                ),
+                self.assertRaises(webapp.SqagStorageAccessError) as raised,
+            ):
+                storage.create_or_update_quote_session(
+                    payload,
+                    result=result,
+                    output_dir=output_dir,
+                )
+            owner_after_failure = storage.get_quote_session(session_id)
+            active_after_failure = storage._active_object_artifact_rows(
+                'generated_quote',
+                session_id,
+            )
+            objects_after_failure = copy.deepcopy(backend._objects)
+            retry = storage.create_or_update_quote_session(
+                payload,
+                result=result,
+                output_dir=output_dir,
+            )
+
+        self.assertEqual(raised.exception.status, 503)
+        self.assertEqual(
+            str(raised.exception),
+            webapp.QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+        )
+        self.assertNotIn('private lock identity', str(raised.exception))
+        self.assertIsNone(owner_after_failure)
+        self.assertEqual(active_after_failure, [])
+        self.assertEqual(objects_after_failure, {})
+        self.assertEqual(retry['session_id'], session_id)
+        self.assertFalse((output_dir / 'quotation.xlsx').exists())
+        self.assertFalse((output_dir / 'quotation.pdf').exists())
+        self.assertEqual(len(backend._objects), 2)
+
+    def test_object_quote_tombstone_helper_uses_serialized_lifecycle_boundary(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        tmp_path = test_temp_root() / f'object-quote-direct-tombstone-{time.time_ns()}'
+        db_path = tmp_path / 'sqag-storage.sqlite3'
+        database_url = f'sqlite:///{db_path.as_posix()}'
+        workspace_id = 'workspace-object-quote-direct-tombstone'
+        session_id = 'quote-object-direct-tombstone'
+        output_dir = tmp_path / 'out' / 'direct-tombstone'
+        output_dir.mkdir(parents=True)
+        (output_dir / 'quotation.xlsx').write_bytes(b'direct-tombstone-xlsx')
+        payload = valid_payload()
+        payload['quote_session'] = {'session_id': session_id}
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(
+                webapp,
+                'configured_object_storage_backend',
+                return_value=backend,
+            ),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session(workspace_id)
+            )
+            storage.create_or_update_quote_session(
+                payload,
+                result={
+                    'status': 'completed',
+                    'files': [{'name': 'quotation.xlsx'}],
+                },
+                output_dir=output_dir,
+            )
+            tombstoned = storage.tombstone_object_quote_artifacts(session_id)
+            owner = storage.get_quote_session(session_id)
+            active_rows = storage._active_object_artifact_rows(
+                'generated_quote',
+                session_id,
+            )
+
+        self.assertEqual(tombstoned, 1)
+        self.assertIsNotNone(owner)
+        self.assertEqual(active_rows, [])
+        self.assertEqual(backend._objects, {})
+
     def test_object_artifact_storage_delete_session_tombstones_metadata_and_backend_object(self):
         backend = webapp.InMemoryObjectStorageBackend()
         tmp_path = test_temp_root() / f"object-artifact-delete-session-{time.time_ns()}"
@@ -24025,7 +25081,11 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             def execute(self, sql, params=()):
                 self.queries.append((sql, tuple(params)))
                 result = types.SimpleNamespace(rowcount=1)
-                result.fetchone = lambda: {"active_count": 0}
+                if "pg_try_advisory_xact_lock" in sql.lower():
+                    result.fetchone = lambda: {"lock_acquired": True}
+                else:
+                    result.fetchone = lambda: {"active_count": 0}
+                result.fetchall = lambda: []
                 return result
 
             def commit(self):
@@ -24048,11 +25108,14 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         with (
             mock.patch.object(webapp, "configured_artifact_storage_mode", return_value="object"),
             mock.patch.object(storage, "connection", return_value=connection),
-            mock.patch.object(storage, "_delete_object_owner_artifacts", return_value=1),
-            mock.patch.object(storage, "tombstone_object_quote_artifacts", return_value=1),
             mock.patch.object(
                 storage,
                 "_read_quote_session_metadata_for_workspace",
+                return_value=(metadata, []),
+            ),
+            mock.patch.object(
+                storage,
+                "_read_quote_session_metadata_for_workspace_on_connection",
                 return_value=(metadata, []),
             ),
             mock.patch.object(storage, "_quote_session_editable_by_current_user", return_value=True),

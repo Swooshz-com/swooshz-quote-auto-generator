@@ -99,6 +99,24 @@ Source of truth: `.github/workflows/ci.yml`
   deletes do not query the unsupported database/BLOB artifact tables. CI
   covers these paths with synthetic in-memory objects, SQLite, and a Postgres
   query adapter only.
+- Object-backed profile, pricing-reference, and generated-quote saves and
+  deletes now acquire one database-backed lifecycle boundary keyed by the
+  canonical workspace ID, owner type, and validated owner ID before reading
+  snapshots or mutating provider objects. Postgres uses a transaction-scoped,
+  non-blocking advisory lock derived from that canonical identity; contention
+  fails closed with the generic storage HTTP 503 before provider mutation, and
+  commit or rollback releases the lock. The signed 64-bit digest has a
+  theoretical collision boundary that can only serialize unrelated owners or
+  fail them closed, not merge their workspace-scoped SQL predicates. SQLite
+  uses `BEGIN IMMEDIATE`, which intentionally serializes local/test writers
+  more broadly. The fresh zero-active assertion and owner delete occur in the
+  same transaction as artifact tombstones, so a save cannot commit active
+  metadata after deletion has passed a stale check. Per-artifact savepoints
+  preserve confirmed partial deletion and retry semantics; savepoint rollback
+  keeps provider compensation inside the lifecycle boundary. This design adds
+  no schema or external lock service. CI proves the SQL order and deterministic
+  SQLite interleavings with synthetic adapters only; live Postgres concurrency
+  remains hosted evidence.
 - `/api/health` returns HTTP 200 only while required dependencies are ready and
   returns metadata-only HTTP 503 otherwise. A short cache bounds repeated
   unauthenticated health probes.

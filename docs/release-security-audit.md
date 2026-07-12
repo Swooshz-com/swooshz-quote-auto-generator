@@ -969,6 +969,41 @@ active, the owner remains, and retry processes only active rows. Exact snapshot
 predicates and single-use batch plans fail closed on stale concurrent metadata
 instead of overwriting a newer committed artifact.
 
+The final owner-deletion race is closed with one shared lifecycle identity:
+workspace ID, canonical owner type (`profile`, `pricing_reference`, or
+`generated_quote`), and validated owner ID. Every object-backed save acquires
+that database boundary before its fresh metadata/owner snapshot, provider
+staging, prior-object backup/deletion, metadata plus owner transaction, and any
+compensation. Every object-backed delete acquires the same boundary before its
+fresh artifact set, provider deletion, exact tombstones, zero-active assertion,
+and owner deletion. Postgres uses `pg_try_advisory_xact_lock` with a stable
+signed 64-bit digest of the canonical identity. Contention returns the generic
+storage HTTP 503 before provider mutation, while commit, rollback, or connection
+closure releases the transaction-scoped lock. A theoretical digest collision
+can only cause unrelated work to serialize or fail closed. SQLite uses
+`BEGIN IMMEDIATE`; this intentionally gives local/test databases a broader
+writer boundary without relying on unsupported row-lock syntax. Per-artifact
+savepoints preserve earlier successful tombstones when a later artifact fails,
+while a root savepoint keeps full rollback and provider restoration available
+for final owner-delete or commit failure. No migration, process-local lock, or
+external lock service was added.
+
+The corrected seven-test pre-fix concurrency set failed all seven expected
+guards (five assertion failures and two missing-lock errors). Deterministic
+profile, pricing, and quote interleavings each reproduced an absent owner with
+active replacement metadata after the concurrent save reached commit first;
+the opposite ordering showed delete reaching storage while a replacement save
+was staged. After remediation, the final 11-test concurrency, identity,
+synthetic Postgres SQL/lock-manager, generic-error, staging-retention, and retry
+set passes, including serialized operator tombstoning and rejection of
+ownerless low-level object metadata. The cumulative lifecycle/compensation
+coverage and the full 518-test `tests.test_webapp` module also pass. The
+complete repository suite passes 758 tests after the synthetic Postgres
+metadata and production-database
+verifier adapters were updated to model advisory-lock rows and rollback. These
+are local SQLite and synthetic Postgres adapter results only; no live provider
+or live Postgres concurrency evidence is claimed.
+
 ## What Was Not Verified
 
 - Live deployed Swooshz Platform behavior, platform token service, hosted SQAG handoff, or platform workspace membership enforcement; this audit checked source-contract surfaces only, and `scripts/verify_hosted_smoke.py` uses only synthetic platform/workspace context.
