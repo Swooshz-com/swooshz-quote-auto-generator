@@ -109,6 +109,8 @@ class FakeLivePostgresConnection:
         params = tuple(params or ())
         self.queries.append((sql, params))
         normalized = " ".join(sql.lower().split())
+        if "pg_try_advisory_xact_lock" in normalized:
+            return FakeLivePostgresCursor([{"lock_acquired": True}])
         if "information_schema.columns" in normalized:
             column_map = runtime_required_metadata_tables()
             rows = []
@@ -158,6 +160,12 @@ class FakeLivePostgresConnection:
             workspace_id, session_id = params[:2]
             row = self.quote_sessions.get((workspace_id, session_id))
             return FakeLivePostgresCursor([row] if row else [])
+        if normalized.startswith("select session_id from sqag_quote_sessions"):
+            workspace_id, session_id = params[:2]
+            row = self.quote_sessions.get((workspace_id, session_id))
+            return FakeLivePostgresCursor(
+                [{"session_id": session_id}] if row else []
+            )
         if normalized.startswith("select metadata_json from sqag_quote_sessions"):
             workspace_id = params[0]
             rows = [value for (stored_workspace, _), value in sorted(self.quote_sessions.items()) if self.leak_workspace_reads or stored_workspace == workspace_id]
@@ -201,6 +209,9 @@ class FakeLivePostgresConnection:
 
     def commit(self):
         self.commits += 1
+
+    def rollback(self):
+        return None
 
 
 class FakeLivePostgresContext:

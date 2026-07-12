@@ -28,7 +28,10 @@ storage for generated artifact bytes:
   only the exact Coolify/Traefik proxy network CIDRs that connect directly to
   SQAG. A trust-all network is not permitted.
 - The object-storage credential must permit the read-only bucket probe used by
-  startup and `/api/health`, in addition to the runtime object operations.
+  startup and `/api/health`, plus runtime read, write, and delete operations.
+  A provider delete failure returns HTTP 503 and keeps the profile, pricing
+  reference, or quote session available for a later retry instead of reporting
+  false deletion.
 - Database rows store metadata and workspace-owned app records only.
 
 Database/BLOB artifact mode is local-UAT/synthetic evidence only. It must not
@@ -149,6 +152,9 @@ bytes, host IPs, or private paths into issue/PR output.
 - XLSX/PDF artifacts require object storage before hosted/protected/deploy or
   production readiness can be claimed.
 - Delete makes the session and artifacts inaccessible.
+- Concurrent save/delete probes for the same profile, pricing reference, and
+  quote session resolve to a consistent save-wins, delete-wins, or generic-503
+  outcome; no active object metadata remains without its workspace owner.
 - Logout/sign-out behaves safely.
 - Legacy direct job file downloads remain disabled in deploy/database/platform
   paths.
@@ -167,5 +173,8 @@ This scaffold does not prove:
 - Live Swooshz Platform integration.
 - Real object-storage provider wiring.
 - DB+object backup/restore or live object retention/delete evidence.
+- Live Postgres advisory-lock behavior under concurrent SQAG replicas; local
+  tests cover deterministic SQLite interleavings and synthetic Postgres SQL
+  ordering only.
 - Production observability export or alert delivery.
 - Production readiness.

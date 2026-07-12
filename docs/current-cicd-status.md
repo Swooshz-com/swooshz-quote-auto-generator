@@ -67,6 +67,56 @@ Source of truth: `.github/workflows/ci.yml`
 - Before binding the deploy server, SQAG performs read-only checks for the
   required database schema, object-artifact metadata schema, and configured
   object-storage bucket. It never applies migrations from startup.
+- Object-backed profile, pricing-reference, and quote-session deletion removes
+  provider objects before deleting owner records. Provider deletion failure
+  returns a generic HTTP 503 and preserves the owner plus failed artifact for a
+  retry. Before each provider deletion SQAG retains verified prior bytes;
+  confirmed deletion is counted only after the exact active metadata row is
+  tombstoned and committed. Tombstone execution or commit failure rolls back
+  the row and restores the provider object with identity, key, checksum, and
+  size verification. Earlier committed artifacts in a multi-artifact deletion
+  remain tombstoned, the failing artifact remains active, and retry processes
+  only active rows. Owner deletion verifies that no active object metadata
+  remains. Superseded profile,
+  pricing, and generated-quote objects, including artifact kinds omitted from
+  a replacement payload, use the same fail-closed replacement guard. Pricing
+  visual and generated-quote export replacements are batch-scoped: all new
+  provider objects are staged, every old object that may be removed is backed
+  up, and provider changes are compensated if a later provider or database
+  step fails. Artifact metadata and the pricing-owner or quote-session payload
+  then commit in one database transaction; database/BLOB mode performs its
+  omitted-kind deletes, artifact upserts, and owner/session update in that same
+  transaction. Quote staging files are removed only after the batch commits.
+  CI injects later-step object-store and database failures and requires the
+  complete prior owner payload, artifact rows, provider bytes, availability,
+  and stale state to survive unchanged. Profile layout replacement uses the
+  same prepared provider batch: layout metadata and the profile payload commit
+  in one database transaction, while database/BLOB mode writes layout bytes
+  and profile payload in one transaction. Metadata-only profile updates retain
+  the active layout without contacting object storage. Quote
+  reconciliation requires a persisted XLSX, so confirmation-only outcomes
+  retain prior bytes as stale instead of deleting them. Object-mode Postgres
+  deletes do not query the unsupported database/BLOB artifact tables. CI
+  covers these paths with synthetic in-memory objects, SQLite, and a Postgres
+  query adapter only.
+- Object-backed profile, pricing-reference, and generated-quote saves and
+  deletes now acquire one database-backed lifecycle boundary keyed by the
+  canonical workspace ID, owner type, and validated owner ID before reading
+  snapshots or mutating provider objects. Postgres uses a transaction-scoped,
+  non-blocking advisory lock derived from that canonical identity; contention
+  fails closed with the generic storage HTTP 503 before provider mutation, and
+  commit or rollback releases the lock. The signed 64-bit digest has a
+  theoretical collision boundary that can only serialize unrelated owners or
+  fail them closed, not merge their workspace-scoped SQL predicates. SQLite
+  uses `BEGIN IMMEDIATE`, which intentionally serializes local/test writers
+  more broadly. The fresh zero-active assertion and owner delete occur in the
+  same transaction as artifact tombstones, so a save cannot commit active
+  metadata after deletion has passed a stale check. Per-artifact savepoints
+  preserve confirmed partial deletion and retry semantics; savepoint rollback
+  keeps provider compensation inside the lifecycle boundary. This design adds
+  no schema or external lock service. CI proves the SQL order and deterministic
+  SQLite interleavings with synthetic adapters only; live Postgres concurrency
+  remains hosted evidence.
 - `/api/health` returns HTTP 200 only while required dependencies are ready and
   returns metadata-only HTTP 503 otherwise. A short cache bounds repeated
   unauthenticated health probes.

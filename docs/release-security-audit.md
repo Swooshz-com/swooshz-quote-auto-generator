@@ -6,6 +6,64 @@ Branch: `codex/release-security-audit`
 
 Base evidence ref: `origin/main` at `29de611ee1723ae1e9d1755c32b013efdbc4511e`
 
+## 2026-07-11 Object Lifecycle And Delete Integrity Addendum
+
+Remediation base: `origin/main` at
+`ddc973aad5b1bb680624c0543ff616994471c44e`.
+
+Production readiness remains false. This focused remediation closes one
+independently confirmed High launch blocker without live credentials, live
+provider calls, customer data, deployment, migrations, or visible product UI
+changes.
+
+| Severity | Confirmed blocker | Closure |
+| --- | --- | --- |
+| High | Object-provider deletion errors were swallowed while quote-session metadata was tombstoned and the session delete returned success. Profile and pricing-reference deletes removed only owner rows, leaving active artifact metadata and bytes; recreating a profile with the same ID could therefore inherit its deleted layout. Content-addressed replacements also overwrote the metadata pointer without deleting the superseded object, and successful replacements retained artifact kinds omitted from the new pricing/quote payload. | Object-backed owner deletion now deletes each remote object first, tombstones that exact metadata row only after confirmed provider success, and stops with a generic HTTP 503 while preserving the owner and failed artifact on any provider/configuration error. Database-backed profile, pricing, and quote artifacts are deleted with their owner records. Profile, pricing, and generated-quote replacements share a guarded path that removes superseded and omitted objects and restores the prior same-kind object if the replacement write or metadata update fails. |
+
+Successful partial object deletion is recorded one artifact at a time. If a
+later artifact fails, the owner remains and a retry processes only the still
+active artifacts; already confirmed deletions are not falsely reactivated.
+Object-mode Postgres deletion never queries the SQLite-only BLOB artifact
+tables. Quote replacement reconciliation starts only after a valid XLSX is
+available to persist, so a routine `needs_confirmation` result keeps prior
+bytes but marks the prior export stale and unavailable.
+Delete/replacement failures do not log provider values, object keys, artifact
+bytes, or customer content.
+
+Focused validation evidence on the remediation branch:
+
+- The five-test pre-fix lifecycle set failed all five vulnerable assertions:
+  quote deletion did not fail closed, profile/pricing artifacts survived owner
+  deletion, same-ID layouts rebound, superseded objects remained, and
+  database-backed artifacts survived owner deletion.
+- Four independent follow-up regressions then failed all four omitted-kind and
+  object/Postgres assertions before the final repair. A fifth follow-up RED
+  regression proved that `needs_confirmation` without an XLSX could otherwise
+  delete the last customer-ready quote.
+- The final focused lifecycle matrix passes: 12 tests. An independent reviewer
+  separately reran the five follow-up edge cases and found no remaining
+  confirmed High/Critical issue in scope.
+- The adjacent database/object lifecycle and workspace-isolation set passes:
+  24 tests.
+- The complete `tests.test_webapp` module passes: 495 tests.
+- The complete Python suite passes: 734 tests. Initial runs encountered
+  Windows-only 10-second worker/HTTP timing failures while synthetic workbook
+  preparation was slow; the named worker test passed unchanged in isolation,
+  and the final fail-fast full-suite runner completed all 734 tests with `OK`.
+- Python syntax compilation, the internal-UAT deploy-template verifier, the
+  sensitive-fixture fail-on-review scan, dynamic-pricing guard, local-PDF
+  dependency guard, `pip-audit`, and `npm audit` pass.
+- A fresh local backend with isolated synthetic runtime roots returned HTTP 200
+  and `status=ok` from `/api/health`. The mocked Playwright AI stress and
+  full smoke suites pass with no console or network problems.
+- The production-readiness checker was run with local/provider-disabled values,
+  contacted no live service, and remained intentionally blocked with
+  `internal_alpha_ready=false`, `production_ready=false`, and eight blockers.
+
+Hosted/live evidence remains a separate gate. These local SQLite and synthetic
+in-memory object checks do not claim live provider retention/delete evidence,
+and `production_ready=false` remains unchanged.
+
 ## 2026-07-11 Coolify Proxy And Bounded Rate-Limit State Addendum
 
 Remediation base: `origin/main` at
@@ -837,7 +895,7 @@ Severity summary from plugin: unavailable because the scan did not start. This a
 | `python -m pip install --dry-run --ignore-installed --only-binary=:all: -r requirements.txt --disable-pip-version-check` | Passed. Resolver would install the pinned repo dependency set: `pypdfium2-5.9.0`, `Pillow-12.2.0`, `boto3-1.43.40`, `botocore-1.43.40`, `jmespath-1.1.0`, `python-dateutil-2.9.0.post0`, `s3transfer-0.19.0`, `six-1.17.0`, and `urllib3-2.7.0`. |
 | `python -m pip install --only-binary=:all: -r requirements.txt --disable-pip-version-check` | Passed. Installed/confirmed the repo-pinned Python dependency set locally, including `boto3-1.43.40` and `botocore-1.43.40`, without provider credentials, endpoints, bucket names, object keys, or live evidence values. |
 | `python -m unittest tests.test_live_object_storage_provider_verifier tests.test_object_storage_provider_config tests.test_production_readiness` | Passed: 41 tests OK, covering live-provider verifier no-env/incomplete/test-injected behavior, simulated real-provider metadata cleanup, object provider metadata-only status, readiness credit boundaries, and legacy `SQAG_*` object-storage env names not satisfying SQAG live evidence. |
-| `python -m unittest tests.test_webapp.WebappServerTest.test_object_artifact_store_failure_does_not_fallback_to_local_links_or_db_blob tests.test_webapp.WebappServerTest.test_object_artifact_storage_mode_fails_closed_without_runtime_backend tests.test_webapp.WebappServerTest.test_object_artifact_storage_mode_with_incomplete_provider_config_fails_closed tests.test_webapp.WebappServerTest.test_object_artifact_storage_saves_db_metadata_and_downloads_through_authorized_route tests.test_webapp.WebappServerTest.test_object_artifact_storage_deleted_metadata_fails_closed tests.test_webapp.WebappServerTest.test_object_artifact_storage_tombstone_during_retrieve_fails_closed tests.test_webapp.WebappServerTest.test_object_artifact_storage_corrupt_or_missing_remote_object_fails_closed tests.test_webapp.WebappServerTest.test_object_artifact_storage_delete_session_tombstones_metadata_and_backend_object tests.test_webapp.WebappServerTest.test_object_artifact_delete_failure_tombstones_metadata_without_db_blob_or_local_fallback tests.test_webapp.WebappServerTest.test_object_artifact_storage_cleans_local_staging_files_after_persist` | Passed: 10 tests OK, covering object-mode fail-closed runtime behavior, no local job-file link fallback after store failure, no DB/BLOB fallback, wrong-workspace/corrupt/missing/tombstoned denial, tombstone-on-delete, and local staging cleanup. |
+| `python -m unittest tests.test_webapp.WebappServerTest.test_object_artifact_store_failure_does_not_fallback_to_local_links_or_db_blob tests.test_webapp.WebappServerTest.test_object_artifact_storage_mode_fails_closed_without_runtime_backend tests.test_webapp.WebappServerTest.test_object_artifact_storage_mode_with_incomplete_provider_config_fails_closed tests.test_webapp.WebappServerTest.test_object_artifact_storage_saves_db_metadata_and_downloads_through_authorized_route tests.test_webapp.WebappServerTest.test_object_artifact_storage_deleted_metadata_fails_closed tests.test_webapp.WebappServerTest.test_object_artifact_storage_tombstone_during_retrieve_fails_closed tests.test_webapp.WebappServerTest.test_object_artifact_storage_corrupt_or_missing_remote_object_fails_closed tests.test_webapp.WebappServerTest.test_object_artifact_storage_delete_session_tombstones_metadata_and_backend_object tests.test_webapp.WebappServerTest.test_object_artifact_delete_failure_preserves_session_and_active_metadata tests.test_webapp.WebappServerTest.test_object_artifact_storage_cleans_local_staging_files_after_persist` | Passed: 10 tests OK, covering object-mode fail-closed runtime behavior, no local job-file link fallback after store failure, no DB/BLOB fallback, wrong-workspace/corrupt/missing/tombstoned denial, tombstone-on-delete, and local staging cleanup. |
 | `python -m py_compile webapp/server.py webapp/object_storage.py scripts/check_production_readiness.py scripts/verify_live_object_storage_provider.py scripts/verify_object_artifact_lifecycle.py` | Passed. |
 | `python scripts/verify_live_object_storage_provider.py` | Expected nonzero exit 1. Reported `status=failed`, `live_provider_evidence_supported=false`, provider family `disabled`, missing env names `SQAG_LIVE_OBJECT_STORAGE_EVIDENCE` and `SQAG_OBJECT_STORAGE_PROVIDER`, all checks false, and metadata-only privacy booleans true. |
 | `SQAG_LIVE_OBJECT_STORAGE_EVIDENCE=1 SQAG_OBJECT_STORAGE_PROVIDER=s3_compatible SQAG_OBJECT_STORAGE_ENDPOINT_URL=<redacted> SQAG_OBJECT_STORAGE_BUCKET=<redacted> SQAG_OBJECT_STORAGE_REGION=<redacted> SQAG_OBJECT_STORAGE_ACCESS_KEY_ID=<redacted> python scripts/verify_live_object_storage_provider.py` | Expected nonzero exit 1. Reported `status=failed`, `live_provider_evidence_supported=false`, provider family `s3_compatible`, missing env name `SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY`, provider blocker `missing_provider_config`, and no provider values, object keys, artifact bytes, or secrets in output. |
@@ -874,6 +932,77 @@ backup/restore evidence, live retention/delete evidence, and live
 Platform-to-SQAG hosted smoke remain required. The Swooshz Platform
 `appKey=sqag` migration has landed in Platform PR #79; hosted smoke evidence is
 still pending. `production_ready=false` remains.
+
+### PR #134 artifact transaction and recovery addendum
+
+The object-lifecycle remediation now treats each pricing-reference visual set
+and generated-quote export set as one replacement batch. New provider objects
+are staged before any old object is removed; all old objects that may be
+removed are retained for compensation. Artifact metadata and the owning
+pricing payload or quote-session payload are written in one database
+transaction only after provider work succeeds. A later provider or database
+failure deletes all newly written objects, restores every old object deleted
+by the attempt, rolls back all metadata and owner/session writes, preserves
+prior export availability and stale state, and returns the existing generic
+storage HTTP 503. Database/BLOB mode performs omitted-kind deletion, artifact
+upserts, and owner/session update in one transaction. Focused injected-failure
+coverage proves rollback for quote XLSX success followed by PDF failure,
+omitted-PDF deletion followed by XLSX failure, pricing visual 1 success
+followed by visual 2 failure, and equivalent multi-artifact database/BLOB
+failures. No live provider or customer data is used, and production readiness
+remains false.
+
+Profile quotation-layout replacement now uses the same logical batch boundary.
+Object mode stages and validates the new layout, retains the prior object for
+compensation, then commits exact object metadata and the profile payload in one
+database transaction. Database/BLOB mode upserts the layout and profile payload
+through one connection and commit. Metadata-only updates retain the current
+layout and do not initialize or contact the provider.
+
+Provider-backed owner deletion now retrieves and verifies bounded prior bytes
+before deleting each object. The exact workspace-scoped active row is
+tombstoned and committed before that artifact counts as deleted. If tombstone
+execution or commit fails, SQAG rolls back before restoring the exact prior
+object and verifies restored workspace, owner, kind, key, checksum, and byte
+size. Earlier committed deletions remain committed; the failing artifact stays
+active, the owner remains, and retry processes only active rows. Exact snapshot
+predicates and single-use batch plans fail closed on stale concurrent metadata
+instead of overwriting a newer committed artifact.
+
+The final owner-deletion race is closed with one shared lifecycle identity:
+workspace ID, canonical owner type (`profile`, `pricing_reference`, or
+`generated_quote`), and validated owner ID. Every object-backed save acquires
+that database boundary before its fresh metadata/owner snapshot, provider
+staging, prior-object backup/deletion, metadata plus owner transaction, and any
+compensation. Every object-backed delete acquires the same boundary before its
+fresh artifact set, provider deletion, exact tombstones, zero-active assertion,
+and owner deletion. Postgres uses `pg_try_advisory_xact_lock` with a stable
+signed 64-bit digest of the canonical identity. Contention returns the generic
+storage HTTP 503 before provider mutation, while commit, rollback, or connection
+closure releases the transaction-scoped lock. A theoretical digest collision
+can only cause unrelated work to serialize or fail closed. SQLite uses
+`BEGIN IMMEDIATE`; this intentionally gives local/test databases a broader
+writer boundary without relying on unsupported row-lock syntax. Per-artifact
+savepoints preserve earlier successful tombstones when a later artifact fails,
+while a root savepoint keeps full rollback and provider restoration available
+for final owner-delete or commit failure. No migration, process-local lock, or
+external lock service was added.
+
+The corrected seven-test pre-fix concurrency set failed all seven expected
+guards (five assertion failures and two missing-lock errors). Deterministic
+profile, pricing, and quote interleavings each reproduced an absent owner with
+active replacement metadata after the concurrent save reached commit first;
+the opposite ordering showed delete reaching storage while a replacement save
+was staged. After remediation, the final 11-test concurrency, identity,
+synthetic Postgres SQL/lock-manager, generic-error, staging-retention, and retry
+set passes, including serialized operator tombstoning and rejection of
+ownerless low-level object metadata. The cumulative lifecycle/compensation
+coverage and the full 518-test `tests.test_webapp` module also pass. The
+complete repository suite passes 758 tests after the synthetic Postgres
+metadata and production-database
+verifier adapters were updated to model advisory-lock rows and rollback. These
+are local SQLite and synthetic Postgres adapter results only; no live provider
+or live Postgres concurrency evidence is claimed.
 
 ## What Was Not Verified
 
