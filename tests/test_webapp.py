@@ -25101,12 +25101,14 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             user_id="postgres-delete-user",
         )
         connection = RecordingConnection()
+        backend = webapp.InMemoryObjectStorageBackend()
         metadata = webapp.blank_quote_session_metadata(
             "quote-object-postgres-delete",
             "2026-07-11T00:00:00Z",
         )
         with (
             mock.patch.object(webapp, "configured_artifact_storage_mode", return_value="object"),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
             mock.patch.object(storage, "connection", return_value=connection),
             mock.patch.object(
                 storage,
