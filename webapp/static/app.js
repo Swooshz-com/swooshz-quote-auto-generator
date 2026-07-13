@@ -6805,8 +6805,7 @@ function matchingAllowedBasisLineForOutputRow(row = {}) {
   return matchingAllowedBasisEntryForOutputRow(row)?.line || null;
 }
 
-function inheritBasisOutputFields(row = {}) {
-  const basisEntry = matchingAllowedBasisEntryForOutputRow(row);
+function inheritBasisOutputFieldsForEntry(row = {}, basisEntry = null) {
   const line = basisEntry?.line;
   if (!line) return row;
   const next = { ...row };
@@ -6817,7 +6816,7 @@ function inheritBasisOutputFields(row = {}) {
   if (normalizeUnit(line.unit || "")) {
     next.unit = normalizeUnit(line.unit);
   }
-  if (!next.source_basis_line_id && (line.id || line.source_line_item_id)) {
+  if (line.id || line.source_line_item_id) {
     next.source_basis_line_id = line.id || line.source_line_item_id;
   }
   if ((next.catalog_unit_price === "" || next.catalog_unit_price === null || next.catalog_unit_price === undefined) && line.catalog_unit_price !== undefined && line.catalog_unit_price !== null && String(line.catalog_unit_price).trim() !== "") {
@@ -6835,6 +6834,10 @@ function inheritBasisOutputFields(row = {}) {
     next.pricing_reference_description = line.pricing_reference_description;
   }
   return normalizeOutputRow(next);
+}
+
+function inheritBasisOutputFields(row = {}) {
+  return inheritBasisOutputFieldsForEntry(row, matchingAllowedBasisEntryForOutputRow(row));
 }
 
 function outputRowDedupeKey(row = {}) {
@@ -6861,40 +6864,88 @@ function dedupeOutputRows(rows = []) {
   return deduped;
 }
 
+function outputRowBasisMatchRank(row = {}, basisEntry = null, basisSourceIds = new Set()) {
+  const line = basisEntry?.line;
+  const sectionTitle = basisEntry?.section?.title || basisEntry?.section?.id || "";
+  if (!line || !outputRowSectionMatchesBasis(row, sectionTitle)) return 0;
+  const lineIds = [line.id, line.source_line_item_id].map((value) => String(value || "").trim()).filter(Boolean);
+  const sourceId = String(row.source_basis_line_id || "").trim();
+  if (sourceId && lineIds.includes(sourceId)) return 4;
+  if (sourceId && basisSourceIds.has(sourceId)) return 0;
+  const keywordMatch = row.pricing_keyword && line.pricing_keyword && String(row.pricing_keyword) === String(line.pricing_keyword);
+  if (keywordMatch) return 3;
+  if (outputRowCoversBasisLine(row, line.text || "", sectionTitle)
+    || outputRowCoversBasisLine(row, line.catalog_description || "", sectionTitle)) return 2;
+  return 0;
+}
+
+function outputRowFromBasisEntry(basisEntry = null) {
+  const line = basisEntry?.line;
+  const section = basisEntry?.section;
+  if (!line || !section) return null;
+  const customPricing = isCustomPricingBasisLine(line);
+  const text = String(line.text || "").trim();
+  if (!text) return null;
+  const description = customPricing ? text : outputCatalogDescription(line);
+  return normalizeOutputRow({
+    section: normalizeCategoryTitle(section.title || section.id || "Quote Basis"),
+    description,
+    quantity: line.quantity ?? "",
+    unit: normalizeUnit(line.unit || ""),
+    price_mode: "Priced",
+    unit_price_override: "",
+    catalog_unit_price: line.catalog_unit_price ?? "",
+    catalog_description: line.catalog_description || "",
+    pricing_reference_description: line.pricing_reference_description || "",
+    pricing_keyword: line.pricing_keyword || "",
+    source_basis_line_id: line.id || line.source_line_item_id || "",
+    category_order: line.category_order ?? "",
+    item_order: line.item_order ?? "",
+    basis_order: basisEntry.basis_order,
+    status: customPricing ? "custom" : "needs-pricing",
+  });
+}
+
+function outputRowsAlignedToBasis(generatedRows = []) {
+  const normalizedSections = normalizeQuoteBasisSections(state.quoteBasisSections);
+  const hasReviewedBasis = normalizedSections.some((section) => (section.lines || []).length > 0);
+  if (!hasReviewedBasis) {
+    return dedupeOutputRows(generatedRows.filter(outputRowAllowedByBasis).map(inheritBasisOutputFields));
+  }
+  const entries = quoteBasisOutputEntries(normalizedSections);
+  const basisSourceIds = new Set(entries.flatMap(({ line }) => [line.id, line.source_line_item_id])
+    .map((value) => String(value || "").trim())
+    .filter(Boolean));
+  const usedIndexes = new Set();
+  return entries.map((basisEntry) => {
+    let bestIndex = -1;
+    let bestRank = 0;
+    generatedRows.forEach((row, index) => {
+      if (usedIndexes.has(index)) return;
+      const rank = outputRowBasisMatchRank(row, basisEntry, basisSourceIds);
+      if (rank > bestRank) {
+        bestIndex = index;
+        bestRank = rank;
+      }
+    });
+    if (bestIndex >= 0) {
+      usedIndexes.add(bestIndex);
+      return inheritBasisOutputFieldsForEntry(generatedRows[bestIndex], basisEntry);
+    }
+    return outputRowFromBasisEntry(basisEntry);
+  }).filter(Boolean);
+}
+
 function includedBasisOutputRows(existingRows = []) {
   const rows = [];
-  basisSections(state.quoteBasisSections).forEach((section, sectionIndex) => {
-    (section.lines || []).forEach((line, lineIndex) => {
-      const customPricing = isCustomPricingBasisLine(line);
-      if (!basisLineAllowsOutput(line)) return;
-      if (basisLineIsInformationalDimension(line)) return;
-      const text = String(line.text || "").trim();
-      if (!text) return;
-      const description = customPricing ? text : outputCatalogDescription(line);
-      const isBoothSizeInfo = /\bbooth size\b/i.test(text) && !line.pricing_keyword;
-      if (isBoothSizeInfo && !customPricing) return;
-      const sectionTitle = section.title || section.id || "";
-      const duplicate = existingRows.some((row) => outputRowCoversBasisEntry(row, line, sectionTitle))
-        || rows.some((row) => outputRowCoversBasisEntry(row, line, sectionTitle));
-      if (duplicate) return;
-      rows.push(normalizeOutputRow({
-        section: normalizeCategoryTitle(section.title || section.id || "Quote Basis"),
-        description,
-        quantity: line.quantity || (isBoothSizeInfo ? 1 : ""),
-        unit: normalizeUnit(line.unit || (isBoothSizeInfo ? "lot" : "")),
-        price_mode: isBoothSizeInfo ? "Included" : "Priced",
-        unit_price_override: "",
-        catalog_unit_price: line.catalog_unit_price ?? "",
-        catalog_description: line.catalog_description || "",
-        pricing_reference_description: line.pricing_reference_description || "",
-        pricing_keyword: line.pricing_keyword || "",
-        source_basis_line_id: line.id || line.source_line_item_id || "",
-        category_order: line.category_order ?? "",
-        item_order: line.item_order ?? "",
-        basis_order: basisOrderValue(sectionIndex, lineIndex),
-        status: customPricing ? "custom" : "needs-pricing",
-      }));
-    });
+  quoteBasisOutputEntries().forEach((basisEntry) => {
+    const { line, section } = basisEntry;
+    const sectionTitle = section.title || section.id || "";
+    const duplicate = existingRows.some((row) => outputRowCoversBasisEntry(row, line, sectionTitle))
+      || rows.some((row) => outputRowCoversBasisEntry(row, line, sectionTitle));
+    if (duplicate) return;
+    const row = outputRowFromBasisEntry(basisEntry);
+    if (row) rows.push(row);
   });
   return rows;
 }
@@ -7128,8 +7179,7 @@ function ensureOutputRowsFromLineItems() {
 function refreshOutputRowsFromLineItems() {
   resetOutputSortModeToPricingReference();
   const generatedRows = state.lineItems.map(outputRowFromLineItem);
-  const allowedRows = dedupeOutputRows(generatedRows.filter(outputRowAllowedByBasis).map(inheritBasisOutputFields));
-  state.outputRows = sortOutputRows([...allowedRows, ...includedBasisOutputRows(allowedRows)]);
+  state.outputRows = sortOutputRows(outputRowsAlignedToBasis(generatedRows));
 }
 
 function snapshotOutputRows(rows = state.outputRows) {
@@ -7726,6 +7776,23 @@ function basisTotalLineCount(sections = []) {
   }, 0);
 }
 
+function quoteBasisOutputEntries(sections = state.quoteBasisSections) {
+  return normalizeQuoteBasisSections(Array.isArray(sections) ? sections : [])
+    .flatMap((section, sectionIndex) => (section.lines || [])
+      .map((line, lineIndex) => ({
+        line,
+        section,
+        sectionIndex,
+        lineIndex,
+        basis_order: basisOrderValue(sectionIndex, lineIndex),
+      }))
+      .filter((entry) => basisLineAllowsOutput(entry.line) && !basisLineIsInformationalDimension(entry.line)));
+}
+
+function basisOutputLineCount(sections = state.quoteBasisSections) {
+  return quoteBasisOutputEntries(sections).length;
+}
+
 function basisTotalLineLabel(count = 0) {
   return `Total lines: ${Math.max(0, Number(count) || 0)}`;
 }
@@ -7889,6 +7956,7 @@ function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
     `
     : "";
   const reviewLineCount = basisTotalLineCount(reviewSections);
+  const outputLineCount = basisOutputLineCount(sections);
   return `
     <div class="assistant-card quote-basis-card ${aiFailed ? "quote-basis-card-failed" : ""}">
       <div class="quote-basis-header">
@@ -7906,6 +7974,8 @@ function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
             ${aiFailed ? "" : quoteCommercialContextPillsHtml()}
             <span class="pricing-reference-divider" aria-hidden="true"></span>
             <span class="pricing-reference-line-count"><strong>${reviewLineCount}</strong> review line${reviewLineCount === 1 ? "" : "s"}</span>
+            <span class="pricing-reference-divider" aria-hidden="true"></span>
+            <span class="pricing-reference-line-count"><strong>${outputLineCount}</strong> output line${outputLineCount === 1 ? "" : "s"}</span>
           </span>
         </div>
       </div>
@@ -8731,13 +8801,13 @@ function applyDraftLineItems(lineItems = []) {
 }
 
 async function refreshLineItemsFromServer() {
-  if (!state.lineItems.length) return true;
-  const { ok, data } = await postJson("/api/line-items/normalize", buildLineItemNormalizePayload());
-  if (!ok || !Array.isArray(data.line_items)) return false;
-  state.lineItems = data.line_items.map(normalizeLineItem);
+  if (!state.lineItems.length) return { ok: true, data: { status: "normalized", line_items: [] } };
+  const result = await postJson("/api/line-items/normalize", buildLineItemNormalizePayload());
+  if (!result.ok || !Array.isArray(result.data.line_items)) return result;
+  state.lineItems = result.data.line_items.map(normalizeLineItem);
   state.outputRows = [];
   state.outputErrors = [];
-  return true;
+  return result;
 }
 
 function captureOriginalAnalysisSnapshot(data = {}) {
@@ -10748,7 +10818,8 @@ function handleDashboardEnterKey(event) {
 function handleDashboardDeleteKey(event) {
   if (event.key !== "Delete" || event.defaultPrevented) return false;
   if (state.activeAppView !== "dashboard") return false;
-  if (event.target?.closest?.("input, select, textarea, [contenteditable='true']")) return false;
+  const selectionControl = event.target?.closest?.("[data-dashboard-select], [data-dashboard-select-control]");
+  if (event.target?.closest?.("input, select, textarea, [contenteditable='true']") && !selectionControl) return false;
   if (elements.quoteSessionDeleteModal && !elements.quoteSessionDeleteModal.hidden) return false;
   const selectedIds = dashboardSelectedSessionIds();
   const activeId = safeQuoteSessionId(state.dashboardActiveSessionId || "");
@@ -11126,6 +11197,13 @@ async function confirmBasis() {
   await waitForUiPaint();
   try {
     const refreshed = await refreshLineItemsFromServer();
+    if (!refreshed.ok) {
+      state.basisConfirmed = false;
+      setWorkflowStage("basis_review");
+      setResultStatus("Failed", "is-bad");
+      showBlockedBasisAction(genericFailureMessage(refreshed.data));
+      return;
+    }
     state.basisConfirmed = true;
     refreshOutputRowsFromLineItems();
     state.originalOutputRows = snapshotOutputRows(state.outputRows);
@@ -11134,7 +11212,7 @@ async function confirmBasis() {
     await saveQuoteSessionDraftState({ quoteGenerated: true });
     renderPricingMatches(state.outputRows);
     renderMatchSummary({ pricing_matches: state.outputRows });
-    setResultStatus(refreshed ? "Ready for pricing review" : "Pricing refresh unavailable", "is-warn");
+    setResultStatus("Ready for pricing review", "is-warn");
     renderOutputValidationMessages(outputRowsValid().errors);
     setSidePanel("output", { force: true });
   } finally {

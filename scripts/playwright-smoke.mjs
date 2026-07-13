@@ -235,6 +235,14 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
     setSidePanel("basis", { force: true });
   });
   await page.locator(".basis-tag-legend").waitFor({ state: "visible", timeout: 15000 });
+  const basisLineCounts = await page.locator("#basisReviewSurface .quote-basis-source .pricing-reference-line-count").evaluateAll((items) => (
+    items.map((item) => (item.textContent || "").replace(/\s+/g, " ").trim())
+  ));
+  if (basisLineCounts.length !== 2
+    || basisLineCounts[0] !== "4 review lines"
+    || basisLineCounts[1] !== "2 output lines") {
+    throw new Error(`Quote Basis review/output counts are incorrect: ${JSON.stringify(basisLineCounts)}.`);
+  }
   const legendMetrics = await page.locator(".basis-tag-legend").evaluate((legend) => {
     const items = Array.from(legend.querySelectorAll(".basis-tag-legend-item")).map((item) => {
       const rect = item.getBoundingClientRect();
@@ -1463,6 +1471,7 @@ async function main() {
       panel.scrollTop = 0;
     });
     const dashboardSelectedShot = await screenshot(page, "dashboard-selected.png");
+    await page.locator("[data-dashboard-select]").first().focus();
     await page.keyboard.press("Delete");
     await page.locator("#quoteSessionDeleteModal").waitFor({ state: "visible", timeout: 15000 });
     await expectQuoteSessionDeleteButtonFocused(page);
