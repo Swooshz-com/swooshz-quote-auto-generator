@@ -214,6 +214,112 @@ class ObjectStorageProviderConfigTest(unittest.TestCase):
         client.head_bucket = mock.Mock(side_effect=RuntimeError("private-provider-response"))
         self.assertFalse(backend.readiness_probe())
 
+    def test_object_artifact_key_preserves_existing_short_safe_shape(self):
+        key = object_storage.object_artifact_key(
+            workspace_id="workspace-a",
+            owner_type="profile",
+            owner_id="profile-a",
+            artifact_kind="layout",
+            filename="layout.json",
+            checksum_sha256="a" * 64,
+        )
+
+        self.assertEqual(
+            key,
+            "workspaces/workspace-a/profile/profile-a/layout/"
+            "aaaaaaaaaaaaaaaa-layout.json",
+        )
+
+    def test_object_artifact_key_hashes_sanitization_collisions(self):
+        shared = {
+            "workspace_id": "workspace-a",
+            "owner_type": "profile",
+            "artifact_kind": "layout",
+            "filename": "layout.json",
+            "checksum_sha256": "a" * 64,
+        }
+
+        slash_key = object_storage.object_artifact_key(
+            owner_id="profile/a",
+            **shared,
+        )
+        question_key = object_storage.object_artifact_key(
+            owner_id="profile?a",
+            **shared,
+        )
+
+        self.assertNotEqual(slash_key, question_key)
+        self.assertIn("profile-a-", slash_key)
+        self.assertIn("profile-a-", question_key)
+
+    def test_in_memory_backend_keeps_long_common_prefix_owners_isolated(self):
+        backend = object_storage.InMemoryObjectStorageBackend()
+        common_prefix = "profile-" + ("a" * 112)
+        owner_a = common_prefix + "x"
+        owner_b = common_prefix + "y"
+        shared = {
+            "workspace_id": "workspace-a",
+            "owner_type": "profile",
+            "artifact_kind": "layout",
+            "filename": "layout.json",
+            "content_type": "application/json",
+            "content": b"synthetic-layout-content",
+        }
+
+        first = backend.store_artifact(owner_id=owner_a, **shared)
+        second = backend.store_artifact(owner_id=owner_b, **shared)
+
+        self.assertEqual(first.owner_id, owner_a)
+        self.assertEqual(second.owner_id, owner_b)
+        self.assertNotEqual(first.storage_key, second.storage_key)
+        self.assertTrue(
+            backend.delete_artifact(second, workspace_id="workspace-a")
+        )
+        self.assertEqual(
+            backend.retrieve_artifact(first, workspace_id="workspace-a"),
+            b"synthetic-layout-content",
+        )
+        self.assertFalse(
+            backend.verify_metadata(second, workspace_id="workspace-a")
+        )
+
+    def test_s3_adapter_preserves_canonical_identities_in_provider_metadata(self):
+        client = FakeS3Client()
+        backend = object_storage.S3CompatibleObjectStorageBackend(
+            bucket="example-artifact-bucket",
+            client=client,
+        )
+        workspace_id = "workspace/alpha"
+        owner_id = ("profile-" + ("a" * 112)) + "x"
+
+        metadata = backend.store_artifact(
+            workspace_id=workspace_id,
+            owner_type="profile",
+            owner_id=owner_id,
+            artifact_kind="layout",
+            filename="layout.json",
+            content_type="application/json",
+            content=b"synthetic-layout-content",
+        )
+
+        stored = client.objects[
+            ("example-artifact-bucket", metadata.storage_key)
+        ]
+        self.assertEqual(metadata.workspace_id, workspace_id)
+        self.assertEqual(metadata.owner_id, owner_id)
+        self.assertEqual(
+            stored["metadata"]["sqag-workspace-id"],
+            workspace_id,
+        )
+        self.assertEqual(
+            stored["metadata"]["sqag-owner-id"],
+            owner_id,
+        )
+        self.assertEqual(
+            backend.retrieve_artifact(metadata, workspace_id=workspace_id),
+            b"synthetic-layout-content",
+        )
+
     def test_s3_compatible_adapter_stores_retrieves_and_deletes_with_checksum(self):
         client = FakeS3Client()
         backend = object_storage.S3CompatibleObjectStorageBackend(

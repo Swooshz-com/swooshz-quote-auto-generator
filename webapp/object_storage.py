@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 
 
 SAFE_SEGMENT_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+SAFE_SEGMENT_MAX_LENGTH = 120
 ALLOWED_OWNER_TYPES = {
     "generated_quote",
     "uploaded_reference",
@@ -103,7 +104,26 @@ def utc_timestamp() -> str:
 def safe_segment(value: object, fallback: str) -> str:
     text = str(value or "").strip()
     text = SAFE_SEGMENT_RE.sub("-", text).strip(".-_")
-    return text[:120] if text else fallback
+    return text[:SAFE_SEGMENT_MAX_LENGTH] if text else fallback
+
+
+def canonical_identity(value: object) -> str:
+    return str(value or "").strip()
+
+
+def identity_segment(value: object, fallback: str) -> str:
+    canonical = canonical_identity(value)
+    if not canonical:
+        return fallback
+    readable = safe_segment(canonical, fallback)
+    if readable == canonical:
+        return readable
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    prefix_max_length = SAFE_SEGMENT_MAX_LENGTH - len(digest) - 1
+    prefix = readable[:prefix_max_length].rstrip(".-_")
+    if not prefix:
+        prefix = safe_segment(fallback, "identity")[:prefix_max_length]
+    return f"{prefix}-{digest}"
 
 
 def normalize_owner_type(value: object) -> str:
@@ -265,7 +285,7 @@ class S3CompatibleObjectStorageBackend:
         return True
 
     def _require_workspace(self, metadata: ObjectArtifactMetadata, workspace_id: str) -> None:
-        if metadata.workspace_id != safe_segment(workspace_id, ""):
+        if metadata.workspace_id != canonical_identity(workspace_id):
             raise ObjectStorageContractError("Artifact is not available for this workspace.")
 
     def _object_metadata(
@@ -278,9 +298,9 @@ class S3CompatibleObjectStorageBackend:
         checksum_sha256: str,
     ) -> dict[str, str]:
         return {
-            "sqag-workspace-id": safe_segment(workspace_id, ""),
+            "sqag-workspace-id": canonical_identity(workspace_id),
             "sqag-owner-type": normalize_owner_type(owner_type),
-            "sqag-owner-id": safe_segment(owner_id, ""),
+            "sqag-owner-id": canonical_identity(owner_id),
             "sqag-artifact-kind": safe_segment(artifact_kind, ""),
             "sqag-checksum-sha256": checksum_sha256,
         }
@@ -323,9 +343,9 @@ class S3CompatibleObjectStorageBackend:
         )
         now = utc_timestamp()
         metadata = ObjectArtifactMetadata(
-            workspace_id=safe_segment(workspace_id, ""),
+            workspace_id=canonical_identity(workspace_id),
             owner_type=normalize_owner_type(owner_type),
-            owner_id=safe_segment(owner_id, ""),
+            owner_id=canonical_identity(owner_id),
             artifact_kind=safe_segment(artifact_kind, ""),
             filename=safe_segment(filename, "artifact.bin"),
             content_type=str(content_type or "application/octet-stream").strip() or "application/octet-stream",
@@ -399,9 +419,9 @@ def object_artifact_key(
     filename: str,
     checksum_sha256: str,
 ) -> str:
-    safe_workspace = safe_segment(workspace_id, "")
+    safe_workspace = identity_segment(workspace_id, "")
     safe_owner_type = normalize_owner_type(owner_type)
-    safe_owner_id = safe_segment(owner_id, "")
+    safe_owner_id = identity_segment(owner_id, "")
     safe_kind = safe_segment(artifact_kind, "")
     safe_filename = safe_segment(filename, "artifact.bin")
     safe_checksum = checksum_sha256 if re.fullmatch(r"[a-f0-9]{64}", checksum_sha256) else ""
@@ -455,9 +475,9 @@ class InMemoryObjectStorageBackend:
         )
         now = utc_timestamp()
         metadata = ObjectArtifactMetadata(
-            workspace_id=safe_segment(workspace_id, ""),
+            workspace_id=canonical_identity(workspace_id),
             owner_type=normalize_owner_type(owner_type),
-            owner_id=safe_segment(owner_id, ""),
+            owner_id=canonical_identity(owner_id),
             artifact_kind=safe_segment(artifact_kind, ""),
             filename=safe_segment(filename, "artifact.bin"),
             content_type=str(content_type or "application/octet-stream").strip() or "application/octet-stream",
@@ -472,7 +492,7 @@ class InMemoryObjectStorageBackend:
         return metadata
 
     def _require_workspace(self, metadata: ObjectArtifactMetadata, workspace_id: str) -> None:
-        if metadata.workspace_id != safe_segment(workspace_id, ""):
+        if metadata.workspace_id != canonical_identity(workspace_id):
             raise ObjectStorageContractError("Artifact is not available for this workspace.")
 
     def retrieve_artifact(self, metadata: ObjectArtifactMetadata, *, workspace_id: str) -> bytes:
