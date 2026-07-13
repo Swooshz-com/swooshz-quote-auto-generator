@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 
 SAFE_SEGMENT_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 SAFE_SEGMENT_MAX_LENGTH = 120
+TRANSFORMED_IDENTITY_MARKER = "~"
 ALLOWED_OWNER_TYPES = {
     "generated_quote",
     "uploaded_reference",
@@ -119,11 +120,17 @@ def identity_segment(value: object, fallback: str) -> str:
     if readable == canonical:
         return readable
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    prefix_max_length = SAFE_SEGMENT_MAX_LENGTH - len(digest) - 1
+    fixed_length = (
+        len(TRANSFORMED_IDENTITY_MARKER)
+        + 1
+        + len(digest)
+    )
+    prefix_max_length = SAFE_SEGMENT_MAX_LENGTH - fixed_length
     prefix = readable[:prefix_max_length].rstrip(".-_")
     if not prefix:
         prefix = safe_segment(fallback, "identity")[:prefix_max_length]
-    return f"{prefix}-{digest}"
+        prefix = prefix.rstrip(".-_") or "identity"
+    return f"{TRANSFORMED_IDENTITY_MARKER}{prefix}-{digest}"
 
 
 def normalize_owner_type(value: object) -> str:
