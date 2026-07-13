@@ -795,7 +795,10 @@ function bracketedCatalogReferenceParts(value = "") {
 
 function outputCatalogDescription(value = {}) {
   const reference = pricingReferenceLineText(value.pricing_reference_description || value.catalog_description || "");
-  if (reference) return cleanCustomerQuoteLineText(reference);
+  if (reference) {
+    const bracketedReference = bracketedCatalogReferenceParts(reference);
+    return bracketedReference?.reference || cleanCustomerQuoteLineText(reference);
+  }
   if (value.pricing_keyword) {
     const bracketed = bracketedCatalogReferenceParts(value.text || value.description || "");
     if (bracketed?.reference) return bracketed.reference;
@@ -5097,9 +5100,12 @@ function normalizeOutputRow(row = {}) {
   const priceMode = row.price_mode === "Included" || String(row.display_price || "").toLowerCase() === "included"
     ? "Included"
     : "Priced";
+  const description = row.pricing_keyword
+    ? outputCatalogDescription({ ...row, text: row.description || row.text || "" })
+    : cleanCustomerQuoteLineText(row.description || "");
   return recalculateOutputRow({
     section: normalizeCategoryTitle(row.section || ""),
-    description: cleanCustomerQuoteLineText(row.description || ""),
+    description,
     quantity: row.quantity ?? "",
     unit: normalizeUnit(row.unit || ""),
     price_mode: priceMode,
@@ -6565,6 +6571,25 @@ function hideExcelGeneratingModal() {
   if (!elements.excelGeneratingModal) return;
   elements.excelGeneratingModal.classList.remove("is-open");
   elements.excelGeneratingModal.hidden = true;
+}
+
+function generationLoadingModalOptions(viewPdf = false) {
+  return viewPdf
+    ? {
+        eyebrow: "Quotation export",
+        title: "Generating PDF",
+        message: "Building the workbook first, then opening its PDF export.",
+      }
+    : {
+        eyebrow: "Quotation export",
+        title: "Regenerating Excel",
+        message: "Building the workbook from the current reviewed rows.",
+      };
+}
+
+function clearActiveJob() {
+  state.activeJob = null;
+  saveSessionState();
 }
 
 function downloadCurrentExcelFile(file = state.downloadFile) {
@@ -11291,7 +11316,7 @@ async function handleGenerate(options = {}) {
     return;
   }
   state.isGenerating = false;
-  state.activeJob = null;
+  clearActiveJob();
 
   const data = polled.data.result || polled.data || {};
   if (data.quote_session?.session_id) {
@@ -11374,7 +11399,7 @@ async function resumeSavedJob() {
       return;
     }
     state.isAnalysisRunning = false;
-    state.activeJob = null;
+    clearActiveJob();
 
     if (!polled.ok || ["blocked", "failed"].includes(polled.data.status)) {
       setWorkflowStage("ready_to_analyze");
@@ -11415,16 +11440,18 @@ async function resumeSavedJob() {
     setWorkflowStage("generating");
     setResultStatus(viewPdf ? "Checking PDF" : "Checking Excel", "is-warn");
     setSidePanel("output", { force: true });
+    showExcelGeneratingModal(generationLoadingModalOptions(viewPdf));
     syncControlStates();
 
     const polled = await pollJob(activeJob.id);
     if (polled.aborted) return;
+    hideExcelGeneratingModal();
     if (isInterruptedJobPoll(polled)) {
       handleInterruptedJobPoll(activeJob.type, polled);
       return;
     }
     state.isGenerating = false;
-    state.activeJob = null;
+    clearActiveJob();
 
     const data = polled.data.result || polled.data || {};
     if (data.quote_session?.session_id) {
@@ -11465,7 +11492,7 @@ async function resumeSavedJob() {
     return;
   }
 
-  state.activeJob = null;
+  clearActiveJob();
   syncControlStates();
 }
 
@@ -11870,11 +11897,7 @@ function wireEvents() {
       return;
     }
     commitActiveOutputEditor();
-    showExcelGeneratingModal({
-      eyebrow: "Quotation export",
-      title: "Regenerating Excel",
-      message: "Building the workbook from the current reviewed rows.",
-    });
+    showExcelGeneratingModal(generationLoadingModalOptions(false));
     await waitForUiPaint();
     try {
       await handleGenerate();
@@ -11891,11 +11914,7 @@ function wireEvents() {
       return;
     }
     commitActiveOutputEditor();
-    showExcelGeneratingModal({
-      eyebrow: "Quotation export",
-      title: "Generating PDF",
-      message: "Building the workbook first, then opening its PDF export.",
-    });
+    showExcelGeneratingModal(generationLoadingModalOptions(true));
     await waitForUiPaint();
     try {
       const generated = await handleGenerate({ viewPdf: true });

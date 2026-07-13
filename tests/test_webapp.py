@@ -12319,19 +12319,22 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertIn('elements.sideViewPdfButton.addEventListener("click", async (event) => {', js)
         download_handler = js.split('elements.sideDownloadButton.addEventListener("click", async (event) => {', 1)[1].split('  document.addEventListener("keydown"', 1)[0]
         pdf_handler = js.split('elements.sideViewPdfButton.addEventListener("click", async (event) => {', 1)[1].split('  document.addEventListener("keydown"', 1)[0]
+        loading_options_body = js.split("function generationLoadingModalOptions", 1)[1].split("function clearActiveJob", 1)[0]
         self.assertIn("event.preventDefault();", download_handler)
         self.assertIn("await handleGenerate();", js)
         self.assertIn("downloadCurrentExcelFile();", js)
         self.assertIn("await waitForUiPaint();", download_handler)
         self.assertIn("commitActiveOutputEditor();", download_handler)
-        self.assertIn("title: \"Regenerating Excel\"", download_handler)
+        self.assertIn("showExcelGeneratingModal(generationLoadingModalOptions(false));", download_handler)
+        self.assertIn('title: "Regenerating Excel"', loading_options_body)
         self.assertIn("await handleGenerate();", download_handler)
         self.assertIn("downloadCurrentExcelFile();", download_handler)
         self.assertIn("hideExcelGeneratingModal();", download_handler)
         self.assertIn("await handleGenerate({ viewPdf: true });", pdf_handler)
         self.assertIn("viewCurrentPdfFile();", pdf_handler)
         self.assertLess(pdf_handler.index("await handleGenerate({ viewPdf: true });"), pdf_handler.index("viewCurrentPdfFile();"))
-        self.assertIn("title: \"Generating PDF\"", pdf_handler)
+        self.assertIn("showExcelGeneratingModal(generationLoadingModalOptions(true));", pdf_handler)
+        self.assertIn('title: "Generating PDF"', loading_options_body)
         self.assertIn(".workspace-pane-footer.is-output-step {\n  grid-template-columns: repeat(4, minmax(0, 1fr));", css)
         self.assertIn(".workspace-pane-footer.is-output-step #sideBackButton", css)
         self.assertIn("grid-column: span 2;", css)
@@ -20747,10 +20750,27 @@ const row = outputRowFromLineItem({
   quantity: 1,
   unit: "m length",
   pricing_keyword: "booth-structure-single-side-partition-wall-at-height-2-4m",
-  pricing_reference_description: "m length single side partition wall at height 2.4m",
+  pricing_reference_description: "[ m length single side partition wall at height 2.4m ]",
   status: "quantity-review",
 });
 assert.strictEqual(row.description, "m length single side partition wall at height 2.4m");
+const restoredBracketedRow = normalizeOutputRow({
+  section: "Floor Design",
+  description: "[ sqm 100mm raised platform with aluminum edging ]",
+  quantity: 36,
+  unit: "sqm",
+  catalog_unit_price: 60,
+  pricing_keyword: "floor-design-100mm-raised-platform-with-aluminum-edging",
+  pricing_reference_description: "[ sqm 100mm raised platform with aluminum edging ]",
+});
+assert.strictEqual(restoredBracketedRow.description, "sqm 100mm raised platform with aluminum edging");
+const literalBracketRow = normalizeOutputRow({
+  section: "Custom",
+  description: "Customer note with [optional] wording",
+  quantity: 1,
+  unit: "lot",
+});
+assert.strictEqual(literalBracketRow.description, "Customer note with [optional] wording");
 assert.strictEqual(row.status, "quantity-review");
 assert.strictEqual(row.catalog_unit_price, "");
 assert.strictEqual(row.amount, "");
