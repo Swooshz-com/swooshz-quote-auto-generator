@@ -272,16 +272,18 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
   await page.evaluate(() => {
     state.basisConfirmed = true;
     state.outputRows = [
-      {
+      normalizeOutputRow({
         section: "Graphics",
-        description: "Printed wall graphics",
+        description: "[ sqm of printed wall graphics ]",
         quantity: 12,
         unit: "sqm",
         price_mode: "Priced",
         unit_price_override: 45,
         catalog_unit_price: 45,
+        pricing_keyword: "graphics-vinyl-printed-graphics",
+        pricing_reference_description: "[ sqm of printed wall graphics ]",
         amount: 540,
-      },
+      }),
       {
         section: "Custom",
         description: "Curved service counter",
@@ -298,6 +300,10 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
     setSidePanel("output", { force: true });
   });
   await page.locator("#pricingMatchesBody tr").first().waitFor({ state: "visible", timeout: 15000 });
+  const renderedDescription = (await page.locator('#pricingMatchesBody tr:first-child [data-output-label="Description"]').innerText()).trim();
+  if (renderedDescription !== "sqm of printed wall graphics") {
+    throw new Error(`Output should show the customer-facing bracket-free description, found ${JSON.stringify(renderedDescription)}.`);
+  }
   const outputMetrics = await page.locator("#pricingMatchesBody tr").first().evaluate((row) => {
     const cells = Array.from(row.querySelectorAll("td")).map((cell) => ({
       label: cell.getAttribute("data-output-label") || "",
@@ -331,6 +337,69 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
   await page.locator("#outputDeleteModal").waitFor({ state: "visible", timeout: 15000 });
   await page.locator("#cancelOutputDeleteButton").click();
   await page.locator("#outputDeleteModal").waitFor({ state: "hidden", timeout: 15000 });
+}
+
+async function verifyGenerationLoadingModalSurvivesRefresh(page) {
+  const cases = [
+    { id: "job-refresh-excel", type: "generate", viewPdf: false, title: "Regenerating Excel" },
+    { id: "job-refresh-pdf", type: "generate_pdf", viewPdf: true, title: "Generating PDF" },
+  ];
+
+  for (const testCase of cases) {
+    let finishJob = false;
+    const routePattern = `**/api/jobs/${testCase.id}*`;
+    await page.route(routePattern, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(finishJob
+          ? {
+              job_id: testCase.id,
+              type: testCase.type,
+              status: "failed",
+              result: { status: "failed", message: "Synthetic terminal state for refresh recovery smoke." },
+            }
+          : {
+              job_id: testCase.id,
+              type: testCase.type,
+              status: "running",
+              created_at: "2026-01-01T00:00:00Z",
+            }),
+      });
+    });
+
+    try {
+      await page.evaluate((activeJob) => {
+        state.activeAppView = "quote";
+        state.activeSidePanel = "output";
+        state.workflowStage = "generating";
+        state.activeJob = activeJob;
+        saveSessionState();
+      }, { id: testCase.id, type: testCase.type, viewPdf: testCase.viewPdf });
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.locator("#excelGeneratingModal").waitFor({ state: "visible", timeout: 15000 });
+      const restoredTitle = (await page.locator("#excelGeneratingTitle").innerText()).trim();
+      if (restoredTitle !== testCase.title) {
+        throw new Error(`Expected refreshed ${testCase.type} overlay title ${testCase.title}, found ${restoredTitle}.`);
+      }
+      const restoredJobId = await page.evaluate(() => {
+        const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
+        return saved.activeJob?.id || "";
+      });
+      if (restoredJobId !== testCase.id) {
+        throw new Error(`Expected refreshed ${testCase.type} job ${testCase.id}, found ${restoredJobId}.`);
+      }
+
+      finishJob = true;
+      await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 15000 });
+      await page.waitForFunction(() => {
+        const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
+        return !saved.activeJob;
+      }, null, { timeout: 15000 });
+    } finally {
+      await page.unroute(routePattern);
+    }
+  }
 }
 
 async function installMockProfiles(page) {
@@ -1516,6 +1585,7 @@ async function main() {
     await page.locator("#imageIntake").waitFor({ state: "visible", timeout: 15000 });
     await verifyMobileHeaderOrder(page);
     await verifyMobileBasisLegendAndOutputCards(page);
+    await verifyGenerationLoadingModalSurvivesRefresh(page);
 
     console.log(JSON.stringify({
       status: "ok",
