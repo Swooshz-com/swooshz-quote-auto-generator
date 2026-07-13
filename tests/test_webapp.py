@@ -13228,7 +13228,7 @@ assert.strictEqual(elements.profileLoadModal.hidden, true);
         self.assertNotIn("PROFILE_PRESET_ACTION_DELETE", js)
         self.assertIn('id="profileNameInput"', html)
 
-    def test_static_dashboard_delete_key_uses_active_single_selection(self):
+    def test_static_dashboard_delete_key_uses_active_or_multi_selection(self):
         node = require_node(self)
 
         script = r"""
@@ -13286,6 +13286,29 @@ assert.strictEqual(prevented, true);
 assert.deepStrictEqual(deleteRequest, {
   ids: ["quote-active123"],
   options: { bulk: false },
+});
+
+state.dashboardSelectedSessionIds = ["quote-one", "quote-two"];
+state.dashboardActiveSessionId = "";
+deleteRequest = null;
+prevented = false;
+const checkboxFocusedEvent = {
+  key: "Delete",
+  defaultPrevented: false,
+  target: {
+    closest(selector) {
+      if (selector === "[data-dashboard-select], [data-dashboard-select-control]") return {};
+      if (selector.includes("input")) return {};
+      return null;
+    },
+  },
+  preventDefault() { prevented = true; },
+};
+assert.strictEqual(handleDashboardDeleteKey(checkboxFocusedEvent), true);
+assert.strictEqual(prevented, true);
+assert.deepStrictEqual(deleteRequest, {
+  ids: ["quote-one", "quote-two"],
+  options: { bulk: true },
 });
 """
         completed = subprocess.run(
@@ -16710,11 +16733,17 @@ eval([
   "basisLineAllowsOutput",
   "outputRowAllowedByBasis",
   "basisOrderValue",
+  "quoteBasisOutputEntries",
+  "basisOutputLineCount",
   "matchingAllowedBasisEntryForOutputRow",
   "matchingAllowedBasisLineForOutputRow",
+  "inheritBasisOutputFieldsForEntry",
   "inheritBasisOutputFields",
   "outputRowDedupeKey",
   "dedupeOutputRows",
+  "outputRowBasisMatchRank",
+  "outputRowFromBasisEntry",
+  "outputRowsAlignedToBasis",
   "includedBasisOutputRows",
   "outputRowFromLineItem",
   "categoryOrderValue",
@@ -16918,6 +16947,107 @@ assert.strictEqual(state.outputRows.length, 1);
 assert.strictEqual(String(state.outputRows[0].quantity), "2");
 assert.strictEqual(state.outputRows[0].unit, "sqm");
 assert.strictEqual(state.outputRows[0].amount, 120);
+
+state.quoteBasisSections = [{
+  id: "synthetic-counters",
+  title: "Synthetic Counters",
+  lines: [{
+    id: "basis-counter",
+    tag: "Include",
+    text: "[ nos. synthetic counter ] - Main counter.",
+    quantity: 2,
+    unit: "nos",
+    pricing_keyword: "synthetic-counter",
+    catalog_unit_price: 100,
+    catalog_description: "nos. synthetic counter",
+  }, {
+    id: "basis-glass-a",
+    tag: "Include",
+    text: "[ nos. synthetic glass counter ] - Reception counter.",
+    quantity: 1,
+    unit: "nos",
+    pricing_keyword: "synthetic-glass-counter",
+    catalog_description: "nos. synthetic glass counter",
+  }, {
+    id: "basis-glass-b",
+    tag: "Include",
+    text: "[ nos. synthetic glass counter ] - Storage counter.",
+    quantity: 1,
+    unit: "nos",
+    pricing_keyword: "synthetic-glass-counter",
+    catalog_description: "nos. synthetic glass counter",
+  }],
+}, {
+  id: "synthetic-rentals",
+  title: "Synthetic Rentals",
+  lines: [{
+    id: "basis-chair",
+    tag: "Include",
+    text: "[ nos. synthetic chair ] - Presentation seating.",
+    quantity: 6,
+    unit: "nos",
+    pricing_keyword: "synthetic-chair",
+    catalog_unit_price: 75,
+    catalog_description: "nos. synthetic chair",
+  }],
+}];
+state.lineItems = [{
+  section: "Synthetic Counters",
+  description: "nos. synthetic counter",
+  quantity: 2,
+  unit: "nos",
+  pricing_keyword: "synthetic-counter",
+  catalog_unit_price: 100,
+  source_basis_line_id: "basis-counter",
+}, {
+  section: "Synthetic Counters",
+  description: "nos. synthetic counter",
+  quantity: 2,
+  unit: "nos",
+  pricing_keyword: "synthetic-counter",
+  catalog_unit_price: 210,
+  source_basis_line_id: "stale-counter-copy",
+}, {
+  section: "Synthetic Counters",
+  description: "nos. synthetic glass counter",
+  quantity: 1,
+  unit: "nos",
+  pricing_keyword: "synthetic-glass-counter",
+  source_basis_line_id: "basis-glass-a",
+}, {
+  section: "Synthetic Counters",
+  description: "nos. synthetic glass counter",
+  quantity: 1,
+  unit: "nos",
+  pricing_keyword: "synthetic-glass-counter",
+  source_basis_line_id: "basis-glass-b",
+}, {
+  section: "Synthetic Rentals",
+  description: "nos. synthetic chair",
+  quantity: 6,
+  unit: "nos",
+  pricing_keyword: "synthetic-chair",
+  catalog_unit_price: 75,
+  source_basis_line_id: "basis-chair",
+}, {
+  section: "Synthetic Rentals",
+  description: "nos. synthetic chair",
+  quantity: 6,
+  unit: "nos",
+  pricing_keyword: "synthetic-chair",
+  source_basis_line_id: "stale-chair-copy",
+}];
+state.outputRows = [];
+assert.strictEqual(basisOutputLineCount(state.quoteBasisSections), 4);
+refreshOutputRowsFromLineItems();
+assert.strictEqual(state.outputRows.length, 4);
+assert.deepStrictEqual(
+  state.outputRows.map((row) => row.source_basis_line_id),
+  ["basis-counter", "basis-glass-a", "basis-glass-b", "basis-chair"]
+);
+assert.strictEqual(state.outputRows.filter((row) => row.description === "nos. synthetic counter").length, 1);
+assert.strictEqual(state.outputRows.filter((row) => row.description === "nos. synthetic chair").length, 1);
+assert.strictEqual(state.outputRows.filter((row) => row.catalog_unit_price === "").length, 2);
 state.quoteBasisSections = originalBasisSections;
 
 refreshOutputRowsFromLineItems();
@@ -19376,6 +19506,7 @@ function quoteCommercialContextPillsHtml() { return '<span class="pricing-refere
 function basisSections() { return state.quoteBasisSections; }
 function renderAnalysisFindings() { return ""; }
 function basisTotalLineCount(sections = []) { return sections.reduce((total, section) => total + (section.lines || []).length, 0); }
+function basisOutputLineCount() { return 1; }
 function basisTotalLineLabel(count = 0) { return `Total lines: ${count}`; }
 function renderBasisConfirmSummary() { return ""; }
 function renderBasisTagLegend() { return ""; }
@@ -19538,6 +19669,10 @@ eval([
   "basisSections",
   "isInformationalDimensionText",
   "basisLineIsInformationalDimension",
+  "basisLineAllowsOutput",
+  "basisOrderValue",
+  "quoteBasisOutputEntries",
+  "basisOutputLineCount",
   "unresolvedConfirmLines",
   "quoteOutputProgressForNavigation",
   "basisConfirmBlockReason",
@@ -19673,6 +19808,9 @@ assert.strictEqual(basisConfidenceLabel({ tag: "Confirm" }), "50%");
 assert.strictEqual(basisConfidenceLabel({ tag: "Include", confidence: 92 }), "92%");
 assert.strictEqual(basisLinePillLabel({ tag: "Custom" }), "AI Confirm");
 assert.strictEqual(basisTotalLineCount(state.quoteBasisSections), 3);
+const initialBasisHtml = renderQuoteBasisMessage(state.quoteBasis, "edited");
+assert.ok(initialBasisHtml.includes("<strong>3</strong> review lines"));
+assert.ok(initialBasisHtml.includes("<strong>1</strong> output line"));
 assert.strictEqual(basisTotalLineLabel(3), "Total lines: 3");
 assert.strictEqual(basisTotalLineLabel(1), "Total lines: 1");
 const summaryHtml = renderBasisConfirmSummary(state.quoteBasisSections);
@@ -20678,9 +20816,13 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertNotIn("rich_text:", normalize_body)
         self.assertNotIn("logo_data_url", normalize_body)
         self.assertLess(
-            confirm_body.index("await refreshLineItemsFromServer();"),
+            confirm_body.index("const refreshed = await refreshLineItemsFromServer();"),
             confirm_body.index("refreshOutputRowsFromLineItems();"),
         )
+        self.assertIn("if (!refreshed.ok)", confirm_body)
+        self.assertIn("state.basisConfirmed = false;", confirm_body)
+        self.assertIn("showBlockedBasisAction(genericFailureMessage(refreshed.data));", confirm_body)
+        self.assertNotIn("Pricing refresh unavailable", confirm_body)
         missing_branch = confirm_body.split("if (missing.length)", 1)[1].split("state.isPreparingOutput", 1)[0]
         confirm_block_branch = confirm_body.split("if (confirmBlockReason)", 1)[1].split("if (state.aiFailed)", 1)[0]
         empty_items_branch = confirm_body.split("if (!state.lineItems.length)", 1)[1].split("const missing", 1)[0]
@@ -26913,6 +27055,53 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertEqual(item["catalog_unit_price"], koncept_catalog_sale_unit_price("synthetic-rentals-synthetic-round-table"))
         self.assertEqual(item["source_basis_line_id"], "basis-high-top-table")
         self.assertEqual(item["description"], "nos. synthetic round table")
+
+    def test_line_item_normalize_excludes_unapproved_generated_extras(self):
+        table_keyword = "synthetic-rentals-synthetic-round-table"
+        chair_keyword = "synthetic-rentals-synthetic-cafe-chair"
+        payload = {
+            "profile_id": "synthetic-exhibition-fixture-template",
+            "pricing_reference_id": webapp.DEFAULT_PRICING_REFERENCE_ID,
+            "quote_basis_sections": [{
+                "id": "synthetic-rentals",
+                "title": "Synthetic Rentals",
+                "lines": [{
+                    "id": "basis-table",
+                    "tag": "Include",
+                    "text": "[ nos. synthetic round table ] - Approved consultation table.",
+                    "quantity": 1,
+                    "unit": "nos",
+                    "pricing_keyword": table_keyword,
+                    "catalog_description": "nos. synthetic round table",
+                    "pricing_reference_description": "nos. synthetic round table",
+                }],
+            }],
+            "line_items": [{
+                "section": "Synthetic Rentals",
+                "quantity": 1,
+                "unit": "nos",
+                "description": "Approved consultation table.",
+                "pricing_keyword": table_keyword,
+                "source_basis_line_id": "basis-table",
+            }, {
+                "section": "Synthetic Rentals",
+                "quantity": 4,
+                "unit": "nos",
+                "description": "Synthetic cafe chairs from stale generated output.",
+                "pricing_keyword": chair_keyword,
+                "source_basis_line_id": "stale-chair-copy",
+            }],
+        }
+
+        items = webapp.normalize_line_items_for_quote_basis_review(payload)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["pricing_keyword"], table_keyword)
+        self.assertEqual(items[0]["source_basis_line_id"], "basis-table")
+        self.assertEqual(items[0]["description"], "nos. synthetic round table")
+
+        payload["quote_basis_sections"][0]["lines"][0]["tag"] = "Exclude"
+        self.assertEqual(webapp.normalize_line_items_for_quote_basis_review(payload), [])
 
     def test_line_item_normalize_endpoint_prices_accepted_ai_confirm_bracketed_catalog_line(self):
         partition_keyword = "synthetic-structures-synthetic-double-side-partition"

@@ -3697,6 +3697,19 @@ def is_informational_dimension_basis_line(line: dict[str, Any]) -> bool:
     return is_informational_dimension_text(line.get("text") or line.get("description"))
 
 
+def basis_line_allows_quote_output(line: dict[str, Any]) -> bool:
+    if not isinstance(line, dict) or is_informational_dimension_basis_line(line):
+        return False
+    tag = normalize_basis_tag(line.get("tag"))
+    if tag == "Include":
+        return True
+    return (
+        tag == "Custom"
+        and bool(line.get("custom_pricing"))
+        and bool(line.get("custom_confirmed"))
+    )
+
+
 def normalize_confidence_percent(value: Any) -> int | None:
     if value in (None, ""):
         return None
@@ -3776,6 +3789,8 @@ def normalize_basis_lines(value: Any) -> list[dict[str, Any]]:
                 line["catalog_unit_price"] = catalog_unit_price
             if has_custom_pricing or normalize_basis_tag(line.get("tag")) == "Custom":
                 line["custom_pricing"] = True
+                if bool(value.get("custom_confirmed")):
+                    line["custom_confirmed"] = True
             lines.append(line)
         return lines
 
@@ -15153,12 +15168,13 @@ def quote_basis_sections_with_catalog_exact_lines(
         has_catalog_reference = item_has_catalog_reference(item)
         catalog_id = clean_text(item.get("pricing_keyword") or item.get("id"))
         was_custom = normalize_basis_tag(line.get("tag")) == "Custom" or bool(line.get("custom_pricing"))
+        was_custom_confirmed = was_custom and bool(line.get("custom_confirmed"))
         original_quantity = line.get("quantity")
         original_unit = line.get("unit")
         if catalog_id:
             line["pricing_keyword"] = catalog_id
             if has_catalog_reference and normalize_basis_tag(line.get("tag")) == "Custom":
-                line["tag"] = "Confirm"
+                line["tag"] = "Include" if was_custom_confirmed else "Confirm"
             if has_catalog_reference:
                 line.pop("custom_pricing", None)
                 line.pop("custom_confirmed", None)
@@ -15461,6 +15477,8 @@ def line_items_aligned_to_quote_basis(
     line_items: list[dict[str, Any]],
     sections: list[dict[str, Any]],
     catalog_lookup: dict[str, dict[str, Any]],
+    *,
+    approved_only: bool = False,
 ) -> list[dict[str, Any]]:
     if not sections:
         return line_items
@@ -15587,7 +15605,11 @@ def line_items_aligned_to_quote_basis(
         for line in section.get("lines") or []:
             if not isinstance(line, dict):
                 continue
-            if normalize_basis_tag(line.get("tag")) == "Exclude":
+            line_tag = normalize_basis_tag(line.get("tag"))
+            if approved_only:
+                if not basis_line_allows_quote_output(line):
+                    continue
+            elif line_tag == "Exclude":
                 continue
             pricing_keyword = clean_text(line.get("pricing_keyword"))
             catalog_item = catalog_lookup.get(pricing_keyword) if pricing_keyword else None
@@ -15661,7 +15683,7 @@ def line_items_aligned_to_quote_basis(
                 else:
                     next_item.pop(order_key, None)
             aligned.append(next_item)
-    return aligned or line_items
+    return aligned if approved_only else (aligned or line_items)
 
 
 def normalize_line_items_for_quote_basis_review(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -15677,7 +15699,12 @@ def normalize_line_items_for_quote_basis_review(payload: dict[str, Any]) -> list
         list(catalog_lookup.values()),
     )
     line_items = line_items_with_resolved_basis_catalog(line_items, sections, catalog_lookup)
-    line_items = line_items_aligned_to_quote_basis(line_items, sections, catalog_lookup)
+    line_items = line_items_aligned_to_quote_basis(
+        line_items,
+        sections,
+        catalog_lookup,
+        approved_only=True,
+    )
     return sort_line_items_by_pricing_reference_order(payload, line_items)
 
 
