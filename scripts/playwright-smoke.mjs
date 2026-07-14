@@ -1291,6 +1291,28 @@ async function main() {
     if (refreshedActiveRailTexts.length !== 1 || refreshedActiveRailTexts[0] !== "Quote Company") {
       throw new Error(`Expected refresh to restore the last quote menu, found ${JSON.stringify(refreshedActiveRailTexts)}.`);
     }
+    await page.evaluate(() => {
+      state.outputRows = [normalizeOutputRow({
+        section: "Refresh regression",
+        description: "Completed quote row",
+        quantity: 1,
+        unit: "lot",
+        unit_price: 100,
+        amount: 100,
+      })];
+      state.originalOutputRows = state.outputRows.map((row) => ({ ...row }));
+      state.basisConfirmed = true;
+      setWorkflowStage("completed");
+      setSidePanel("customer", { force: true });
+      saveSessionState();
+    });
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
+    await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+    const completedQuoteRefreshPanel = await page.locator(".rail-button.is-active").innerText();
+    if (completedQuoteRefreshPanel.trim() !== "Customer") {
+      throw new Error(`Completed quote refresh should preserve Customer, found ${completedQuoteRefreshPanel}.`);
+    }
     const restoredQuoteSessionId = await currentQuoteSessionId(page);
     if (!restoredQuoteSessionId) {
       throw new Error("Expected refresh recovery to keep the current quote session id.");
@@ -1328,8 +1350,8 @@ async function main() {
     const restoredActiveRailTexts = await page.locator(".rail-button.is-active").evaluateAll((buttons) => (
       buttons.map((button) => button.textContent?.trim() || "")
     ));
-    if (restoredActiveRailTexts.length !== 1 || !["Upload", "Customer", "Quote Company"].includes(restoredActiveRailTexts[0])) {
-      throw new Error(`Expected Modify quote to restore a usable quote panel, found ${JSON.stringify(restoredActiveRailTexts)}.`);
+    if (restoredActiveRailTexts.length !== 1 || restoredActiveRailTexts[0] !== "Output") {
+      throw new Error(`Expected Modify quote to open the furthest completed panel Output, found ${JSON.stringify(restoredActiveRailTexts)}.`);
     }
     const restoredFiles = await page.locator("#fileList .file-item").evaluateAll((items) => (
       items.map((item) => item.textContent?.trim() || "")
@@ -1415,6 +1437,15 @@ async function main() {
     await page.locator("#settingsButton").click();
     await page.locator("#pricingReferenceModal").waitFor({ state: "visible" });
     await page.getByRole("heading", { name: "Pricing Reference Settings" }).waitFor();
+    await page.locator("#pricingReferenceImportTab").click();
+    await page.locator("#pricingReferenceImportPanel").waitFor({ state: "visible" });
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
+    await page.locator("#pricingReferenceModal").waitFor({ state: "visible", timeout: 15000 });
+    await page.locator("#pricingReferenceImportPanel").waitFor({ state: "visible" });
+    if ((await page.locator("#pricingReferenceImportTab").getAttribute("aria-selected")) !== "true") {
+      throw new Error("Pricing Reference refresh should preserve the Import tab instead of returning to Manage.");
+    }
     await page.keyboard.press("Escape");
     await page.locator("#pricingReferenceModal").waitFor({ state: "hidden" });
     await page.locator("#quoteDate").waitFor({ state: "visible" });
@@ -1493,7 +1524,7 @@ async function main() {
     const currentDashboardCard = page.locator(`.dashboard-session-card[data-quote-session-id="${currentDashboardSessionId}"]`);
     await currentDashboardCard.waitFor({ state: "visible", timeout: 15000 });
     const savedStepPills = await currentDashboardCard.locator(".dashboard-status-pill.is-progress").allTextContents();
-    if (!savedStepPills.some((text) => /Saved at Customer/i.test(text))) {
+    if (!savedStepPills.some((text) => /Saved at Output/i.test(text))) {
       throw new Error(`Expected dashboard card to show saved step pill for the current draft, found ${JSON.stringify(savedStepPills)}.`);
     }
     const modifiedDateMetrics = await currentDashboardCard.locator(".dashboard-session-meta-zone div").nth(1).locator("dd").evaluate((element) => {
@@ -1519,6 +1550,54 @@ async function main() {
     if (JSON.stringify(currentDraftState).includes("data:application/pdf")) {
       throw new Error("Dashboard session draft state should not store raw PDF data URLs.");
     }
+    let duplicateDetailRequestCount = 0;
+    let releaseInitialDuplicateRequest = null;
+    const duplicateDetailPattern = `**/api/quote-sessions/${currentDashboardSessionId}`;
+    const duplicateDetailRoute = async (route) => {
+      if (route.request().method() !== "GET") {
+        await route.continue();
+        return;
+      }
+      duplicateDetailRequestCount += 1;
+      if (duplicateDetailRequestCount === 1) {
+        await new Promise((resolve) => { releaseInitialDuplicateRequest = resolve; });
+        await route.abort("aborted");
+        return;
+      }
+      await route.continue();
+    };
+    await page.route(duplicateDetailPattern, duplicateDetailRoute);
+    await currentDashboardCard.click();
+    await page.locator('[data-dashboard-panel-action="duplicate-session"]', { hasText: "Duplicate Quote" }).click();
+    await page.locator("#dashboardLoadingTitle", { hasText: "Duplicating quote" }).waitFor({ state: "visible", timeout: 15000 });
+    const interruptedDuplicateOperation = await page.evaluate(() => JSON.parse(
+      window.localStorage.getItem("swooshz_dashboard_operation_v1") || "null"
+    ));
+    if (!interruptedDuplicateOperation?.targetSessionId) {
+      throw new Error(`Expected duplicate operation recovery state before refresh, found ${JSON.stringify(interruptedDuplicateOperation)}.`);
+    }
+    const duplicateReload = page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(100);
+    if (typeof releaseInitialDuplicateRequest !== "function") {
+      throw new Error("Initial duplicate detail request was not paused before refresh.");
+    }
+    releaseInitialDuplicateRequest();
+    await duplicateReload;
+    await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
+    await page.locator("#dashboardLoadingTitle", { hasText: "Duplicating quote" }).waitFor({ state: "visible", timeout: 15000 });
+    const duplicatedTargetCard = page.locator(`.dashboard-session-card[data-quote-session-id="${interruptedDuplicateOperation.targetSessionId}"]`);
+    await duplicatedTargetCard.waitFor({ state: "visible", timeout: 15000 });
+    await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 15000 });
+    await page.waitForFunction(() => !window.localStorage.getItem("swooshz_dashboard_operation_v1"));
+    if (await duplicatedTargetCard.count() !== 1) {
+      throw new Error(`Duplicate refresh should create exactly one target ${interruptedDuplicateOperation.targetSessionId}.`);
+    }
+    await page.unroute(duplicateDetailPattern, duplicateDetailRoute);
+    await duplicatedTargetCard.click();
+    await page.locator('[data-dashboard-panel-action="delete-session"]').click();
+    await page.locator("#confirmQuoteSessionDeleteButton").click();
+    await duplicatedTargetCard.waitFor({ state: "detached", timeout: 15000 });
+
     await currentDashboardCard.click();
     await page.keyboard.press("Delete");
     await page.locator("#quoteSessionDeleteModal").waitFor({ state: "visible", timeout: 15000 });

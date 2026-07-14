@@ -15247,6 +15247,11 @@ let shownQuoteFlow = false;
 let rememberedBaseline = "";
 let controlsSynced = 0;
 let persistedRecords = [];
+function saveDashboardOperation(operation) { return { ...operation, browserRecoveryScope: "test-scope", startedAt: new Date().toISOString() }; }
+function dashboardOperationLoadingOptions() { return {}; }
+function setDashboardLoadingState() { syncControlStates(); }
+function clearDashboardOperation() {}
+function finishDashboardOperation() {}
 
 function appIsBusy() { return false; }
 function clearQuoteSessionDraftSaveTimer() {}
@@ -15374,6 +15379,11 @@ const state = {
   images: [],
 };
 let appliedSnapshot = null;
+function saveDashboardOperation(operation) { return { ...operation, browserRecoveryScope: "test-scope", startedAt: new Date().toISOString() }; }
+function dashboardOperationLoadingOptions() { return {}; }
+function setDashboardLoadingState() {}
+function clearDashboardOperation() {}
+function finishDashboardOperation() {}
 
 function appIsBusy() { return false; }
 function clearQuoteSessionDraftSaveTimer() {}
@@ -15784,6 +15794,111 @@ assert.strictEqual(result.unique[0].name, "b.jpg");
 
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
 
+    def test_static_refresh_restores_exact_screen_while_modify_uses_furthest_progress(self):
+        static_dir = ROOT / "webapp" / "static"
+        js = (static_dir / "app.js").read_text(encoding="utf-8")
+
+        node = require_node(self)
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const marker = `function ${name}`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  if (bodyStart < 2) throw new Error(`Missing body for function ${name}`);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const SIDE_PANEL_SEQUENCE = ["images", "customer", "quote_company", "basis", "output"];
+eval([
+  "furthestQuoteSessionSidePanel",
+  "restoredQuoteSessionSidePanel",
+].map(extractFunction).join("\n"));
+
+const completedQuoteViewedFromCustomer = {
+  activeSidePanel: "customer",
+  workflowStage: "completed",
+  outputRows: [{ description: "Completed row" }],
+};
+assert.strictEqual(restoredQuoteSessionSidePanel(completedQuoteViewedFromCustomer), "customer");
+assert.strictEqual(
+  restoredQuoteSessionSidePanel(completedQuoteViewedFromCustomer, { restoreFurthestPanel: true }),
+  "output",
+);
+assert.strictEqual(restoredQuoteSessionSidePanel({ activeSidePanel: "quote_company" }), "quote_company");
+
+const DASHBOARD_OPERATION_MAX_AGE_MS = 15 * 60 * 1000;
+const state = { dashboardOperation: null, quoteSessions: [], dashboardActiveSessionId: "" };
+function safeQuoteSessionId(value = "") {
+  const text = String(value || "").trim();
+  return /^quote-[A-Za-z0-9_-]{3,64}$/.test(text) ? text : "";
+}
+function currentBrowserRecoveryScope() { return "test-scope"; }
+function setDashboardLoadingState(isLoading, options = {}) { state.loading = isLoading; state.loadingTitle = options.title || ""; }
+function showDashboard() { state.dashboardShown = true; }
+async function loadQuoteDashboard() {}
+function renderQuoteDashboard() { state.rendered = true; }
+function scrollDashboardSessionIntoView(sessionId) { state.scrolledSessionId = sessionId; }
+function clearDashboardOperation() { state.dashboardOperation = null; state.cleared = true; }
+let duplicateOptions = null;
+async function duplicateDashboardQuote(sourceSessionId, options) { duplicateOptions = { sourceSessionId, ...options }; return true; }
+async function modifyDashboardQuote() { throw new Error("Unexpected modify recovery"); }
+eval([
+  extractFunction("normalizeDashboardOperation"),
+  extractFunction("dashboardOperationLoadingOptions"),
+  `async ${extractFunction("resumeDashboardOperation")}`,
+].join("\n"));
+
+(async () => {
+  const operation = {
+    type: "duplicate",
+    sourceSessionId: "quote-source123",
+    targetSessionId: "quote-target123",
+    browserRecoveryScope: "test-scope",
+    startedAt: new Date().toISOString(),
+  };
+  state.quoteSessions = [{ session_id: "quote-target123" }];
+  assert.strictEqual(await resumeDashboardOperation(operation), true);
+  assert.strictEqual(duplicateOptions, null);
+  assert.strictEqual(state.dashboardActiveSessionId, "quote-target123");
+  assert.strictEqual(state.loading, false);
+
+  state.quoteSessions = [];
+  state.cleared = false;
+  assert.strictEqual(await resumeDashboardOperation(operation), true);
+  assert.strictEqual(duplicateOptions.sourceSessionId, "quote-source123");
+  assert.strictEqual(duplicateOptions.targetSessionId, "quote-target123");
+  assert.strictEqual(duplicateOptions.resume, true);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn("pricingReferenceSettingsMode: state.pricingReferenceSettingsMode", js)
+        self.assertIn("saveDashboardOperation", js)
+        self.assertIn("resumeDashboardOperation", js)
     def test_static_session_state_does_not_store_reference_payloads_in_local_storage(self):
         static_dir = ROOT / "webapp" / "static"
         js = (static_dir / "app.js").read_text(encoding="utf-8")

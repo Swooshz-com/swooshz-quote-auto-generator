@@ -5,6 +5,8 @@ const CSRF_HEADER_NAME = "X-Swooshz-CSRF";
 const LEGACY_QUOTE_PRESETS_STORAGE_KEY = "swooshz_quote_detail_presets_v1";
 const LAST_SELECTION_STORAGE_KEY = "swooshz_last_selection_v1";
 const QUOTE_SESSION_STORAGE_KEY = "swooshz_quote_session_v1";
+const DASHBOARD_OPERATION_STORAGE_KEY = "swooshz_dashboard_operation_v1";
+const DASHBOARD_OPERATION_MAX_AGE_MS = 15 * 60 * 1000;
 const QUOTE_SESSION_FILE_DB_NAME = "swooshz_quote_session_files_v1";
 const QUOTE_SESSION_FILE_STORE_NAME = "reference_files";
 const QUOTE_SESSION_FILE_DB_VERSION = 1;
@@ -155,6 +157,8 @@ const state = {
   headerLogo: null,
   workflowStage: "needs_images",
   activeAppView: "dashboard",
+  restorableOverlay: "",
+  dashboardOperation: null,
   quoteSessionId: "",
   quoteSessions: [],
   quoteSessionLoadError: "",
@@ -448,6 +452,10 @@ const elements = {
   excelGeneratingEyebrow: qs("#excelGeneratingEyebrow"),
   excelGeneratingTitle: qs("#excelGeneratingTitle"),
   excelGeneratingMessage: qs("#excelGeneratingMessage"),
+  excelGeneratingSpinner: qs("#excelGeneratingSpinner"),
+  excelGeneratingActions: qs("#excelGeneratingActions"),
+  excelGeneratingActionButton: qs("#excelGeneratingActionButton"),
+  excelGeneratingCloseButton: qs("#excelGeneratingCloseButton"),
   basisChatOverlay: qs("#basisChatOverlay"),
   basisChatTitle: qs("#basisChatTitle"),
   basisChatContext: qs("#basisChatContext"),
@@ -2668,6 +2676,8 @@ function buildSessionSnapshot() {
     browserRecoveryScope: currentBrowserRecoveryScope(),
     savedAt: new Date().toISOString(),
     activeAppView: state.activeAppView,
+    restorableOverlay: state.restorableOverlay,
+    pricingReferenceSettingsMode: state.pricingReferenceSettingsMode,
     profileId: state.profileId,
     pricingReferenceId: state.pricingReferenceId,
     pricingReferenceSource: state.pricingReferenceSource,
@@ -2847,6 +2857,13 @@ function furthestQuoteSessionSidePanel(saved = {}) {
   return SIDE_PANEL_SEQUENCE[Math.max(0, furthestIndex)] || "images";
 }
 
+function restoredQuoteSessionSidePanel(saved = {}, options = {}) {
+  if (options.restoreFurthestPanel === true) return furthestQuoteSessionSidePanel(saved);
+  return SIDE_PANEL_SEQUENCE.includes(saved.activeSidePanel)
+    ? saved.activeSidePanel
+    : furthestQuoteSessionSidePanel(saved);
+}
+
 async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   if (!saved || typeof saved !== "object" || saved.version !== QUOTE_SESSION_STATE_VERSION) {
     return false;
@@ -2860,6 +2877,10 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.quoteSessionRestoredSessionId = restoredSessionId && restoredSessionId === state.quoteSessionId ? restoredSessionId : "";
   state.quoteSessionRestoredDraftKey = state.quoteSessionRestoredSessionId ? String(saved.quoteSessionRestoredDraftKey || "") : "";
   state.activeAppView = saved.activeAppView === "quote" || options.forceQuoteView ? "quote" : "dashboard";
+  state.restorableOverlay = saved.restorableOverlay === "pricing_reference_settings" ? "pricing_reference_settings" : "";
+  state.pricingReferenceSettingsMode = state.restorableOverlay
+    ? normalizePricingReferenceSettingsMode(saved.pricingReferenceSettingsMode)
+    : PRICING_REFERENCE_SETTINGS_MODE_MANAGE;
   state.selectedPresetValue = saved.selectedPresetValue || presetValueFromQuoteDetails(saved.quoteDetails || {}) || lastSelectedPresetValue();
   state.quoteCommercialTouched = normalizeQuoteCommercialTouched(
     saved.quoteCommercialTouched || quoteDetailsCommercialTouched(saved.quoteDetails || {})
@@ -2922,7 +2943,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   } else {
     clearAiFailureBanner();
   }
-  const restoredPanel = furthestQuoteSessionSidePanel(saved);
+  const restoredPanel = restoredQuoteSessionSidePanel(saved, options);
   setSidePanel(restoredPanel, { force: true });
   return true;
 }
@@ -4435,6 +4456,7 @@ function setPricingReferenceSettingsMode(mode = PRICING_REFERENCE_SETTINGS_MODE_
     hidePricingReferenceDeleteConfirm();
   }
   syncPricingReferenceSettingsMode();
+  if (state.restorableOverlay === "pricing_reference_settings") saveSessionState();
   if (options.focus) {
     const target = state.pricingReferenceSettingsMode === PRICING_REFERENCE_SETTINGS_MODE_IMPORT
       ? elements.pricingReferenceFile
@@ -5945,12 +5967,12 @@ function exportSelectedPricingReference(event) {
   }
 }
 
-function openPricingReferenceModal() {
+function openPricingReferenceModal(options = {}) {
   stopElapsedTimer("pricingReferenceImportElapsed");
   stopElapsedTimer("pricingReferenceSaveElapsed");
   state.pendingPricingReference = null;
   state.editingPricingReferenceId = "";
-  state.pricingReferenceSettingsMode = PRICING_REFERENCE_SETTINGS_MODE_MANAGE;
+  if (!options.preserveMode) state.pricingReferenceSettingsMode = PRICING_REFERENCE_SETTINGS_MODE_MANAGE;
   state.pricingReferenceImportFileSelected = false;
   state.pricingReferenceImportBusy = false;
   state.pricingReferenceSaveBusy = false;
@@ -5972,9 +5994,14 @@ function openPricingReferenceModal() {
   syncPricingReferenceSettingsMode();
   elements.pricingReferenceModal.hidden = false;
   elements.pricingReferenceModal.classList.add("is-open");
+  state.restorableOverlay = "pricing_reference_settings";
+  saveSessionState();
   const canManage = setPricingReferenceModalAccessState();
-  if (canManage) editSelectedPricingReference({ openTable: false });
-  window.setTimeout(() => (canManage ? elements.deletePricingReferenceSelect : elements.pricingReferenceCancelButton)?.focus(), 0);
+  if (canManage && state.pricingReferenceSettingsMode === PRICING_REFERENCE_SETTINGS_MODE_MANAGE) editSelectedPricingReference({ openTable: false });
+  const focusTarget = state.pricingReferenceSettingsMode === PRICING_REFERENCE_SETTINGS_MODE_IMPORT
+    ? elements.pricingReferenceFile
+    : canManage ? elements.deletePricingReferenceSelect : elements.pricingReferenceCancelButton;
+  window.setTimeout(() => focusTarget?.focus(), 0);
 }
 
 function closePricingReferenceModal() {
@@ -6002,7 +6029,13 @@ function closePricingReferenceModal() {
   state.pricingReferenceAutoLoadToken = "";
   state.pricingReferenceSavedNotice = "";
   hidePricingReferenceDeleteConfirm();
+  state.restorableOverlay = "";
+  saveSessionState();
   syncPricingReferenceSettingsMode();
+}
+
+function restoreRestorableOverlay() {
+  if (state.restorableOverlay === "pricing_reference_settings") openPricingReferenceModal({ preserveMode: true });
 }
 
 async function editSelectedPricingReference(options = {}) {
@@ -6576,15 +6609,49 @@ function showExcelGeneratingModal(options = {}) {
   if (!elements.excelGeneratingModal) return;
   elements.excelGeneratingEyebrow.textContent = options.eyebrow || "Quotation export";
   elements.excelGeneratingTitle.textContent = options.title || "Generating Excel";
-  elements.excelGeneratingMessage.textContent = options.message || "Preparing the quotation workbook. The download starts automatically when ready.";
+  elements.excelGeneratingMessage.textContent = options.message || "Preparing the quotation workbook.";
+  if (elements.excelGeneratingSpinner) elements.excelGeneratingSpinner.hidden = false;
+  if (elements.excelGeneratingActions) elements.excelGeneratingActions.hidden = true;
+  if (elements.excelGeneratingActionButton) elements.excelGeneratingActionButton.dataset.exportAction = "";
+  elements.excelGeneratingModal.classList.remove("is-ready");
   elements.excelGeneratingModal.hidden = false;
   elements.excelGeneratingModal.classList.add("is-open");
 }
 
 function hideExcelGeneratingModal() {
   if (!elements.excelGeneratingModal) return;
-  elements.excelGeneratingModal.classList.remove("is-open");
+  elements.excelGeneratingModal.classList.remove("is-open", "is-ready");
   elements.excelGeneratingModal.hidden = true;
+  if (elements.excelGeneratingActions) elements.excelGeneratingActions.hidden = true;
+  if (elements.excelGeneratingActionButton) elements.excelGeneratingActionButton.dataset.exportAction = "";
+}
+
+function showGeneratedExportReadyModal(viewPdf = false) {
+  const file = viewPdf
+    ? (pdfFileIsFresh(state.pdfFile) ? state.pdfFile : null)
+    : (downloadFileIsFresh(state.downloadFile) ? state.downloadFile : null);
+  if (!file?.url || !elements.excelGeneratingModal) return false;
+  elements.excelGeneratingEyebrow.textContent = "Quotation export";
+  elements.excelGeneratingTitle.textContent = viewPdf ? "PDF ready" : "Excel ready";
+  elements.excelGeneratingMessage.textContent = viewPdf
+    ? "Your PDF is ready. Click Open PDF to view it in a new tab."
+    : "Your workbook is ready. Click Download Excel to save it.";
+  if (elements.excelGeneratingSpinner) elements.excelGeneratingSpinner.hidden = true;
+  if (elements.excelGeneratingActions) elements.excelGeneratingActions.hidden = false;
+  if (elements.excelGeneratingActionButton) {
+    elements.excelGeneratingActionButton.textContent = viewPdf ? "Open PDF" : "Download Excel";
+    elements.excelGeneratingActionButton.dataset.exportAction = viewPdf ? "pdf" : "excel";
+  }
+  elements.excelGeneratingModal.hidden = false;
+  elements.excelGeneratingModal.classList.add("is-open", "is-ready");
+  elements.excelGeneratingActionButton?.focus();
+  return true;
+}
+
+function handleGeneratedExportReadyAction() {
+  const action = elements.excelGeneratingActionButton?.dataset.exportAction || "";
+  const handled = action === "pdf" ? viewCurrentPdfFile() : action === "excel" ? downloadCurrentExcelFile() : false;
+  if (handled) hideExcelGeneratingModal();
 }
 
 function generationLoadingModalOptions(viewPdf = false) {
@@ -6592,7 +6659,7 @@ function generationLoadingModalOptions(viewPdf = false) {
     ? {
         eyebrow: "Quotation export",
         title: "Generating PDF",
-        message: "Building the workbook first, then opening its PDF export.",
+        message: "Building the workbook first, then preparing its PDF export.",
       }
     : {
         eyebrow: "Quotation export",
@@ -10130,24 +10197,106 @@ function dashboardRestoreError(message) {
   renderQuoteDashboard();
 }
 
-async function modifyDashboardQuote(sessionId) {
+function normalizeDashboardOperation(operation = {}) {
+  if (!operation || typeof operation !== "object") return null;
+  const type = operation.type === "modify" || operation.type === "duplicate" ? operation.type : "";
+  const sourceSessionId = safeQuoteSessionId(operation.sourceSessionId || "");
+  const targetSessionId = type === "duplicate" ? safeQuoteSessionId(operation.targetSessionId || "") : "";
+  const browserRecoveryScope = String(operation.browserRecoveryScope || "").trim();
+  const startedAt = String(operation.startedAt || "").trim();
+  const startedMs = Date.parse(startedAt);
+  if (!type || !sourceSessionId || (type === "duplicate" && !targetSessionId) || !browserRecoveryScope) return null;
+  if (!Number.isFinite(startedMs) || Date.now() - startedMs > DASHBOARD_OPERATION_MAX_AGE_MS) return null;
+  return { type, sourceSessionId, targetSessionId, browserRecoveryScope, startedAt };
+}
+
+function saveDashboardOperation(operation = {}) {
+  const normalized = normalizeDashboardOperation({ ...operation, browserRecoveryScope: currentBrowserRecoveryScope(), startedAt: operation.startedAt || new Date().toISOString() });
+  state.dashboardOperation = normalized;
+  try {
+    if (normalized) window.localStorage.setItem(DASHBOARD_OPERATION_STORAGE_KEY, JSON.stringify(normalized));
+  } catch {
+    // Refresh recovery is best-effort; the active operation still continues in this page.
+  }
+  return normalized;
+}
+
+function clearDashboardOperation() {
+  state.dashboardOperation = null;
+  try {
+    window.localStorage.removeItem(DASHBOARD_OPERATION_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures after a terminal dashboard operation.
+  }
+}
+
+function restoredDashboardOperation() {
+  let parsed = null;
+  try {
+    parsed = JSON.parse(window.localStorage.getItem(DASHBOARD_OPERATION_STORAGE_KEY) || "null");
+  } catch {
+    parsed = null;
+  }
+  const normalized = normalizeDashboardOperation(parsed || {});
+  if (!normalized || normalized.browserRecoveryScope !== currentBrowserRecoveryScope()) {
+    clearDashboardOperation();
+    return null;
+  }
+  state.dashboardOperation = normalized;
+  return normalized;
+}
+
+function dashboardOperationLoadingOptions(operation = state.dashboardOperation) {
+  return operation?.type === "duplicate"
+    ? { title: "Duplicating quote", message: "Copying the saved quote, files, and pricing state into a new draft." }
+    : { title: "Opening quote", message: "Loading the saved quote, files, and pricing state for editing." };
+}
+
+function finishDashboardOperation() {
+  if (!state.isPageUnloading) clearDashboardOperation();
+}
+
+async function resumeDashboardOperation(operation = restoredDashboardOperation()) {
+  const normalized = normalizeDashboardOperation(operation || {});
+  if (!normalized || normalized.browserRecoveryScope !== currentBrowserRecoveryScope()) return false;
+  state.dashboardOperation = normalized;
+  setDashboardLoadingState(true, dashboardOperationLoadingOptions(normalized));
+  showDashboard({ load: false });
+  if (normalized.type === "duplicate") {
+    await loadQuoteDashboard({ showLoading: false });
+    const existingTarget = state.quoteSessions.find((session) => safeQuoteSessionId(session.session_id || "") === normalized.targetSessionId);
+    if (existingTarget) {
+      state.dashboardActiveSessionId = normalized.targetSessionId;
+      renderQuoteDashboard();
+      scrollDashboardSessionIntoView(normalized.targetSessionId);
+      clearDashboardOperation();
+      setDashboardLoadingState(false);
+      return true;
+    }
+    return duplicateDashboardQuote(normalized.sourceSessionId, { resume: true, targetSessionId: normalized.targetSessionId, operation: normalized });
+  }
+  return modifyDashboardQuote(normalized.sourceSessionId, { resume: true, operation: normalized });
+}
+
+async function modifyDashboardQuote(sessionId, options = {}) {
   const safeSessionId = safeQuoteSessionId(sessionId || "");
-  if (!safeSessionId || appIsBusy() || state.quoteSessionRestoreBusy) return;
+  const isResume = options.resume === true;
+  if (!safeSessionId || (!isResume && appIsBusy()) || state.quoteSessionRestoreBusy) return false;
+  const operation = isResume ? normalizeDashboardOperation(options.operation || state.dashboardOperation || {}) : saveDashboardOperation({ type: "modify", sourceSessionId: safeSessionId });
+  if (!operation) return false;
+  state.dashboardOperation = operation;
   clearQuoteSessionDraftSaveTimer();
   state.quoteSessionRestoreBusy = true;
-  syncControlStates();
+  setDashboardLoadingState(true, dashboardOperationLoadingOptions(operation));
   try {
     const detailedSession = await loadQuoteSessionDetail(safeSessionId);
-    let draftState = detailedSession?.draft_state && typeof detailedSession.draft_state === "object"
-      ? detailedSession.draft_state
-      : {};
-    if (!Object.keys(draftState).length && safeSessionId === safeQuoteSessionId(state.quoteSessionId) && quoteDraftShouldPersistToDashboard()) {
-      draftState = currentQuoteSessionDraftState();
-    }
+    let draftState = detailedSession?.draft_state && typeof detailedSession.draft_state === "object" ? detailedSession.draft_state : {};
+    if (!Object.keys(draftState).length && safeSessionId === safeQuoteSessionId(state.quoteSessionId) && quoteDraftShouldPersistToDashboard()) draftState = currentQuoteSessionDraftState();
     if (!Object.keys(draftState).length) {
       mergeDashboardQuoteSession({ ...(detailedSession || {}), session_id: safeSessionId, has_draft_state: false });
+      finishDashboardOperation();
       dashboardRestoreError("This quote session does not have saved draft data to modify.");
-      return;
+      return false;
     }
     const draftFiles = Array.isArray(detailedSession?.draft_files) ? detailedSession.draft_files : [];
     if (draftFiles.length) {
@@ -10156,44 +10305,46 @@ async function modifyDashboardQuote(sessionId) {
     }
     draftState = mergeDashboardDraftSummaryDetails(draftState, detailedSession || {});
     draftState = hydrateDashboardDraftImagePayloads(draftState, safeSessionId);
-    const restored = await applyQuoteSessionSnapshot(
-      { ...draftState, quoteSessionId: safeSessionId },
-      { sessionId: safeSessionId, forceQuoteView: true }
-    );
+    const restored = await applyQuoteSessionSnapshot({ ...draftState, quoteSessionId: safeSessionId }, { sessionId: safeSessionId, forceQuoteView: true, restoreFurthestPanel: true });
     if (!restored) {
+      finishDashboardOperation();
       dashboardRestoreError("This quote session was saved with an incompatible draft format.");
-      return;
+      return false;
     }
     state.dashboardSelectionMode = false;
     state.dashboardSelectedSessionIds = [];
     state.dashboardActiveSessionId = safeSessionId;
     mergeDashboardQuoteSession({ ...detailedSession, has_draft_state: true });
     rememberRestoredQuoteSessionBaseline(safeSessionId);
+    clearDashboardOperation();
     showQuoteFlow();
+    return true;
   } finally {
     state.quoteSessionRestoreBusy = false;
-    syncControlStates();
+    setDashboardLoadingState(false);
   }
 }
 
-async function duplicateDashboardQuote(sessionId) {
+async function duplicateDashboardQuote(sessionId, options = {}) {
   const sourceSessionId = safeQuoteSessionId(sessionId || "");
-  if (!sourceSessionId || appIsBusy() || state.quoteSessionRestoreBusy) return;
+  const isResume = options.resume === true;
+  if (!sourceSessionId || (!isResume && appIsBusy()) || state.quoteSessionRestoreBusy) return false;
+  const targetSessionId = safeQuoteSessionId(options.targetSessionId || "") || newClientQuoteSessionId();
+  const operation = isResume ? normalizeDashboardOperation(options.operation || state.dashboardOperation || {}) : saveDashboardOperation({ type: "duplicate", sourceSessionId, targetSessionId });
+  if (!operation) return false;
+  state.dashboardOperation = operation;
   clearQuoteSessionDraftSaveTimer();
   state.quoteSessionRestoreBusy = true;
-  syncControlStates();
+  setDashboardLoadingState(true, dashboardOperationLoadingOptions(operation));
   try {
     const detailedSession = await loadQuoteSessionDetail(sourceSessionId);
-    let draftState = detailedSession?.draft_state && typeof detailedSession.draft_state === "object"
-      ? detailedSession.draft_state
-      : {};
-    if (!Object.keys(draftState).length && sourceSessionId === safeQuoteSessionId(state.quoteSessionId) && quoteDraftShouldPersistToDashboard()) {
-      draftState = currentQuoteSessionDraftState();
-    }
+    let draftState = detailedSession?.draft_state && typeof detailedSession.draft_state === "object" ? detailedSession.draft_state : {};
+    if (!Object.keys(draftState).length && sourceSessionId === safeQuoteSessionId(state.quoteSessionId) && quoteDraftShouldPersistToDashboard()) draftState = currentQuoteSessionDraftState();
     if (!Object.keys(draftState).length) {
       mergeDashboardQuoteSession({ ...(detailedSession || {}), session_id: sourceSessionId, has_draft_state: false });
+      finishDashboardOperation();
       dashboardRestoreError("This quote session does not have saved draft data to duplicate.");
-      return;
+      return false;
     }
     const draftFiles = Array.isArray(detailedSession?.draft_files) ? detailedSession.draft_files : [];
     if (draftFiles.length) {
@@ -10202,28 +10353,34 @@ async function duplicateDashboardQuote(sessionId) {
     }
     draftState = mergeDashboardDraftSummaryDetails(draftState, detailedSession || {});
     draftState = hydrateDashboardDraftImagePayloads(draftState, sourceSessionId);
-    const duplicatedSessionId = newClientQuoteSessionId();
-    const restored = await applyQuoteSessionSnapshot(
-      { ...draftState, quoteSessionId: duplicatedSessionId, quoteSessionDraftSaveStarted: true },
-      { sessionId: duplicatedSessionId, forceQuoteView: false }
-    );
+    const restored = await applyQuoteSessionSnapshot({ ...draftState, quoteSessionId: operation.targetSessionId, quoteSessionDraftSaveStarted: true }, { sessionId: operation.targetSessionId, forceQuoteView: false });
     if (!restored) {
+      finishDashboardOperation();
       dashboardRestoreError("This quote session was saved with an incompatible draft format.");
-      return;
+      return false;
     }
     state.quoteSessionDraftSaveStarted = true;
     state.quoteSessionRestoredSessionId = "";
     state.quoteSessionRestoredDraftKey = "";
-    const duplicatedSession = await saveCurrentQuoteSession({ sessionId: duplicatedSessionId, includeDraftState: true });
+    const duplicatedSession = await saveCurrentQuoteSession({ sessionId: operation.targetSessionId, includeDraftState: true });
+    if (!duplicatedSession) {
+      if (!state.isPageUnloading) {
+        clearDashboardOperation();
+        dashboardRestoreError(state.quoteSessionLoadError || "The duplicated quote could not be saved.");
+      }
+      return false;
+    }
     state.dashboardSelectionMode = false;
     state.dashboardSelectedSessionIds = [];
-    state.dashboardActiveSessionId = safeQuoteSessionId(duplicatedSession?.session_id || duplicatedSessionId);
+    state.dashboardActiveSessionId = safeQuoteSessionId(duplicatedSession.session_id || operation.targetSessionId);
     state.activeAppView = "dashboard";
+    clearDashboardOperation();
     renderQuoteDashboard();
     scrollDashboardSessionIntoView(state.dashboardActiveSessionId);
+    return true;
   } finally {
     state.quoteSessionRestoreBusy = false;
-    syncControlStates();
+    setDashboardLoadingState(false);
   }
 }
 function dashboardExportAvailabilityItem(session = {}, kind = "xlsx", label = "XLSX") {
@@ -12282,29 +12439,40 @@ async function setInitialValues() {
 }
 
 async function boot() {
+  let dashboardOperation = null;
+  setDashboardLoadingState(true, { title: "Restoring workspace", message: "Loading your saved quote and returning to the last open menu." });
   wireEvents();
   clearLegacyLocalCompanyPresets();
   try {
     await initializeSession();
+    dashboardOperation = restoredDashboardOperation();
+    if (dashboardOperation) setDashboardLoadingState(true, dashboardOperationLoadingOptions(dashboardOperation));
     await loadProfiles();
     await setInitialValues();
-    if (state.activeAppView === "quote") {
-      showQuoteFlow();
-    } else {
-      showDashboard({ load: false });
-    }
+    if (state.activeAppView === "quote") showQuoteFlow();
+    else showDashboard({ load: false });
     checkHealth();
   } finally {
     state.isBooting = false;
     syncControlStates();
   }
+  if (state.activeJob?.id) setDashboardLoadingState(false);
   await resumeSavedJob();
+  if (dashboardOperation && !state.activeJob?.id) {
+    const resumed = await resumeDashboardOperation(dashboardOperation);
+    if (resumed) {
+      restoreRestorableOverlay();
+      return;
+    }
+  }
   if (state.activeAppView === "quote") {
     showQuoteFlow();
+    setDashboardLoadingState(false);
   } else {
     showDashboard({ load: false });
     await loadQuoteDashboard();
   }
+  restoreRestorableOverlay();
 }
 
 boot();
