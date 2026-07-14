@@ -10760,7 +10760,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertIn('id="dashboardEmptyEyebrow"', html)
         self.assertNotIn("Quote sessions saved in the active local runtime.", html)
         self.assertNotIn(">Recent Quotes</h3>", html)
-        self.assertIn('placeholder="Search quote sessionsâ€¦"', html)
+        self.assertIn('placeholder="Search quote sessions…"', html)
         self.assertIn("No session selected", html)
         self.assertIn("Select a quote session to view downloads, delete actions, and any available draft controls.", html)
         topbar_controls = html.split('<div class="topbar-controls">', 1)[1].split('</div>', 1)[0]
