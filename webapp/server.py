@@ -154,6 +154,7 @@ DEFAULT_PRICING_REFERENCE_ID = BUNDLED_DEFAULT_PRICING_REFERENCE_ID
 PRICING_REFERENCE_TEMPLATE_PATH = TEMPLATES_ROOT / "pricing-reference" / "pricing-reference-template.xlsx"
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "_output" / "webapp"
 DEFAULT_TMP_ROOT = PROJECT_ROOT / "_tmp" / "webapp"
+DEFAULT_DATA_ROOT = PROJECT_ROOT / "_tmp" / "company-data"
 DEFAULT_LOG_ROOT = PROJECT_ROOT / "_logs" / "app"
 DEFAULT_TAX_LABEL = "GST"
 DEFAULT_TAX_RATE = 0.09
@@ -1389,7 +1390,7 @@ def configured_log_root() -> Path:
 
 
 def configured_data_root() -> Path:
-    return configured_path(QUOTE_DATA_ROOT_ENV_NAME, Path("/data/swooshz/company-data"))
+    return configured_path(QUOTE_DATA_ROOT_ENV_NAME, DEFAULT_DATA_ROOT)
 
 def configured_storage_mode() -> str:
     mode = clean_text(read_dotenv_value(SQAG_STORAGE_MODE_ENV_NAME)).lower()
@@ -17895,10 +17896,21 @@ def create_job(
     *,
     ai_tracking_context: dict[str, Any] | None = None,
     auth_session: dict[str, Any] | None = None,
+    requested_job_id: str | None = None,
 ) -> dict[str, Any]:
     normalized_type = clean_text(job_type).lower()
     if normalized_type not in {"draft", "generate", "generate_pdf", "basis_chat"}:
         return {"status": "blocked", "errors": ["Job type must be draft, basis_chat, generate, or generate_pdf."]}
+    requested_job_id = clean_text(requested_job_id)
+    if requested_job_id and not re.fullmatch(r"job-[A-Za-z0-9_-]{8,80}", requested_job_id):
+        return {"status": "blocked", "errors": ["Job request could not be resumed."]}
+    if requested_job_id:
+        with JOBS_LOCK:
+            existing = JOBS.get(requested_job_id)
+            if existing:
+                if existing.get("type") != normalized_type or not job_visible_to_auth_session(existing, auth_session):
+                    return {"status": "blocked", "errors": ["Job request could not be resumed."]}
+                return public_job(existing)
     if not image_entries(payload):
         return {"status": "blocked", "errors": [MISSING_IMAGES_MESSAGE]}
     image_error = image_limit_error(payload)
@@ -17930,7 +17942,7 @@ def create_job(
         return {"status": "blocked", "errors": [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE]}
     payload = resolved_payload
 
-    job_id = f"job-{secrets.token_hex(6)}"
+    job_id = requested_job_id or f"job-{secrets.token_hex(6)}"
     now = utc_timestamp()
     job = {
         "job_id": job_id,
@@ -17943,6 +17955,11 @@ def create_job(
         "owner": job_owner_context_from_auth_session(auth_session),
     }
     with JOBS_LOCK:
+        existing = JOBS.get(job_id)
+        if existing:
+            if existing.get("type") != normalized_type or not job_visible_to_auth_session(existing, auth_session):
+                return {"status": "blocked", "errors": ["Job request could not be resumed."]}
+            return public_job(existing)
         JOBS[job_id] = job
 
     worker = {
@@ -18483,7 +18500,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             if not allowed:
                 self.send_json(error, status=403)
                 return
-            result = create_job(job_type, job_payload, ai_tracking_context=request_ai_tracking, auth_session=self.current_auth_session())
+            result = create_job(job_type, job_payload, ai_tracking_context=request_ai_tracking, auth_session=self.current_auth_session(), requested_job_id=payload.get("job_id"))
             if result.get("status") == "blocked":
                 self.send_json(result, status=400)
                 return

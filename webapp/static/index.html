@@ -888,25 +888,29 @@
           </form>
         </section>
       </div>
-      <div class="modal-overlay excel-generating-modal" id="excelGeneratingModal" role="dialog" aria-modal="true" aria-labelledby="excelGeneratingTitle" hidden>
+      <div class="modal-overlay excel-generating-modal" id="excelGeneratingModal" role="dialog" aria-modal="true" aria-labelledby="excelGeneratingTitle" aria-describedby="excelGeneratingMessage" hidden>
         <div class="modal-backdrop"></div>
         <section class="modal-panel excel-generating-panel" aria-live="polite">
-          <span class="pricing-reference-spinner" aria-hidden="true"></span>
+          <span class="pricing-reference-spinner" id="excelGeneratingSpinner" aria-hidden="true"></span>
           <div class="excel-generating-copy">
             <span class="basis-chat-eyebrow" id="excelGeneratingEyebrow">Quotation export</span>
             <h3 id="excelGeneratingTitle">Generating Excel</h3>
-            <p id="excelGeneratingMessage">Preparing the quotation workbook. The download starts automatically when ready.</p>
+            <p id="excelGeneratingMessage">Preparing the quotation workbook.</p>
+            <div class="excel-generating-actions" id="excelGeneratingActions" hidden>
+              <button class="primary-button" type="button" id="excelGeneratingActionButton">Download Excel</button>
+              <button class="secondary-button" type="button" id="excelGeneratingCloseButton">Close</button>
+            </div>
           </div>
         </section>
       </div>
-      <div class="modal-overlay dashboard-loading-modal" id="dashboardLoadingModal" role="dialog" aria-modal="true" aria-labelledby="dashboardLoadingTitle" hidden>
+      <div class="modal-overlay dashboard-loading-modal" id="dashboardLoadingModal" role="dialog" aria-modal="true" aria-labelledby="dashboardLoadingTitle" aria-describedby="dashboardLoadingMessage">
         <div class="modal-backdrop"></div>
         <section class="modal-panel excel-generating-panel dashboard-loading-panel" aria-live="polite">
           <span class="pricing-reference-spinner" aria-hidden="true"></span>
           <div class="excel-generating-copy">
-            <span class="basis-chat-eyebrow">Quote dashboard</span>
-            <h3 id="dashboardLoadingTitle">Opening dashboard</h3>
-            <p id="dashboardLoadingMessage">Saving the current quote and refreshing the session list.</p>
+            <span class="basis-chat-eyebrow">Quote workspace</span>
+            <h3 id="dashboardLoadingTitle">Restoring workspace</h3>
+            <p id="dashboardLoadingMessage">Loading your saved quote and returning to the last open menu.</p>
           </div>
         </section>
       </div>
@@ -1188,6 +1192,27 @@
           </div>
         </section>
       </div>
+      <div class="modal-overlay profile-load-modal" id="quoteDependencyConfirmModal" role="dialog" aria-modal="true" aria-labelledby="quoteDependencyConfirmTitle" aria-describedby="quoteDependencyConfirmText" hidden>
+        <div class="modal-backdrop" data-quote-dependency-confirm-close></div>
+        <section class="modal-panel profile-load-panel">
+          <header class="modal-header">
+            <div>
+              <span class="basis-chat-eyebrow">Update Quote Inputs</span>
+              <h3 id="quoteDependencyConfirmTitle">Replace existing quote results?</h3>
+            </div>
+          </header>
+          <div class="profile-load-body">
+            <div class="profile-load-warning" id="quoteDependencyConfirmText">
+              <strong>This change will clear the current Quote Basis and Output.</strong>
+              <span>Continue only if you want to rebuild the quote using the changed inputs.</span>
+            </div>
+          </div>
+          <div class="modal-actions profile-load-actions">
+            <button class="secondary-button" type="button" id="cancelQuoteDependencyConfirmButton">Cancel</button>
+            <button class="primary-button" type="button" id="confirmQuoteDependencyChangeButton">Continue and Clear</button>
+          </div>
+        </section>
+      </div>
       <div class="modal-overlay" id="analysisConfirmModal" role="dialog" aria-modal="true" aria-labelledby="analysisConfirmTitle" hidden>
         <div class="modal-backdrop" data-analysis-confirm-close></div>
         <section class="modal-panel analysis-confirm-panel">
@@ -1206,6 +1231,6 @@
         </section>
       </div>
     </div>
-    <script src="/static/app.js?v=76"></script>
+    <script src="/static/app.js?v=79"></script>
   </body>
 </html>

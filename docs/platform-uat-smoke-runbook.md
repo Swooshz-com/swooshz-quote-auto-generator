@@ -63,8 +63,8 @@ SQAG Platform launch mode is explicit and disabled by default:
 
 For Windows local UAT, the recommended Windows local path is the helper script
 `scripts/local-uat-sqag-start.ps1`. It detects `py -3`, then `python`, then
-`python3`; creates a disposable runtime root under
-`$env:TEMP\sqag-platform-uat`; applies SQAG storage migrations unless
+`python3`; creates a disposable, gitignored runtime root under
+`<repo>\_tmp\sqag-platform-uat`; applies SQAG storage migrations unless
 `-SkipMigrations` is passed; and starts SQAG in Platform launch mode without
 printing session secrets or database URLs.
 

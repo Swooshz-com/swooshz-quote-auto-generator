@@ -5,6 +5,21 @@ const CSRF_HEADER_NAME = "X-Swooshz-CSRF";
 const LEGACY_QUOTE_PRESETS_STORAGE_KEY = "swooshz_quote_detail_presets_v1";
 const LAST_SELECTION_STORAGE_KEY = "swooshz_last_selection_v1";
 const QUOTE_SESSION_STORAGE_KEY = "swooshz_quote_session_v1";
+const WORKSPACE_VIEW_STORAGE_KEY = "swooshz_workspace_view_v1";
+const DASHBOARD_OPERATION_STORAGE_KEY = "swooshz_dashboard_operation_v1";
+const DASHBOARD_OPERATION_MAX_AGE_MS = 15 * 60 * 1000;
+// Recovery windows are deliberately phase/type specific: a request that never received a
+// server acknowledgement is retried only briefly, while 10-15 minute draft analysis gets
+// a wider running window. Export and basis operations should finish much sooner.
+const ACTIVE_JOB_STARTING_MAX_AGE_MS = 5 * 60 * 1000;
+const ACTIVE_JOB_RUNNING_DRAFT_MAX_AGE_MS = 30 * 60 * 1000;
+const ACTIVE_JOB_RUNNING_BASIS_CHAT_MAX_AGE_MS = 10 * 60 * 1000;
+const ACTIVE_JOB_RUNNING_CONFIRM_BASIS_MAX_AGE_MS = 5 * 60 * 1000;
+const ACTIVE_JOB_RUNNING_GENERATION_MAX_AGE_MS = 15 * 60 * 1000;
+const ACTIVE_JOB_CLOCK_SKEW_MS = 60 * 1000;
+// Starting work should survive only an immediate refresh. Draft analysis gets 30 minutes
+// for the documented 10-15 minute AI window; chat, local normalization, and exports use
+// shorter limits that cover realistic completion without replaying abandoned work later.
 const QUOTE_SESSION_FILE_DB_NAME = "swooshz_quote_session_files_v1";
 const QUOTE_SESSION_FILE_STORE_NAME = "reference_files";
 const QUOTE_SESSION_FILE_DB_VERSION = 1;
@@ -20,6 +35,14 @@ const ANALYSIS_WAIT_ESTIMATE = "This will take about 10 to 15 mins.";
 const PRICING_REFERENCE_SETTINGS_MODE_MANAGE = "manage";
 const PRICING_REFERENCE_SETTINGS_MODE_IMPORT = "import";
 const FINAL_JOB_STATUSES = new Set(["completed", "degraded", "needs_review", "blocked", "failed"]);
+const SERVER_JOB_TYPES = new Set(["draft", "basis_chat", "generate", "generate_pdf"]);
+const RESTORABLE_OVERLAYS = new Set([
+  "pricing_reference_settings",
+  "basis_chat",
+  "analysis_confirm",
+  "excel_ready",
+  "pdf_ready",
+]);
 const PROFILE_PRESET_PREFIX = "profile:";
 const COMPANY_PROFILE_PRESET_PREFIX = "company:";
 const COMPANY_PROFILE_EXPORT_SCHEMA = "swooshz.quote-company-profile.v1";
@@ -155,6 +178,8 @@ const state = {
   headerLogo: null,
   workflowStage: "needs_images",
   activeAppView: "dashboard",
+  restorableOverlay: "",
+  dashboardOperation: null,
   quoteSessionId: "",
   quoteSessions: [],
   quoteSessionLoadError: "",
@@ -190,6 +215,7 @@ const state = {
   blockingClarificationQuestions: [],
   boothDimensions: { ...DEFAULT_BOOTH_DIMENSIONS },
   originalAnalysisSnapshot: null,
+  pendingQuoteDependencyChanges: [],
   basisConfirmed: false,
   isAnalysisRunning: false,
   isGenerating: false,
@@ -448,6 +474,10 @@ const elements = {
   excelGeneratingEyebrow: qs("#excelGeneratingEyebrow"),
   excelGeneratingTitle: qs("#excelGeneratingTitle"),
   excelGeneratingMessage: qs("#excelGeneratingMessage"),
+  excelGeneratingSpinner: qs("#excelGeneratingSpinner"),
+  excelGeneratingActions: qs("#excelGeneratingActions"),
+  excelGeneratingActionButton: qs("#excelGeneratingActionButton"),
+  excelGeneratingCloseButton: qs("#excelGeneratingCloseButton"),
   basisChatOverlay: qs("#basisChatOverlay"),
   basisChatTitle: qs("#basisChatTitle"),
   basisChatContext: qs("#basisChatContext"),
@@ -506,6 +536,11 @@ const elements = {
   pricingReferenceSaveButton: qs("#pricingReferenceSaveButton"),
   pricingReferenceCancelButton: qs("#pricingReferenceCancelButton"),
   pricingReferenceCloseButton: qs("#pricingReferenceCloseButton"),
+  quoteDependencyConfirmModal: qs("#quoteDependencyConfirmModal"),
+  quoteDependencyConfirmTitle: qs("#quoteDependencyConfirmTitle"),
+  quoteDependencyConfirmText: qs("#quoteDependencyConfirmText"),
+  cancelQuoteDependencyConfirmButton: qs("#cancelQuoteDependencyConfirmButton"),
+  confirmQuoteDependencyChangeButton: qs("#confirmQuoteDependencyChangeButton"),
   analysisConfirmModal: qs("#analysisConfirmModal"),
   analysisConfirmCancelButton: qs("#analysisConfirmCancelButton"),
   analysisConfirmHighQualityButton: qs("#analysisConfirmHighQualityButton"),
@@ -613,6 +648,81 @@ function randomQuoteSessionToken() {
 
 function newClientQuoteSessionId() {
   return safeQuoteSessionId(`quote-${randomQuoteSessionToken()}`);
+}
+
+function newClientJobId() {
+  return `job-${randomQuoteSessionToken()}`;
+}
+
+function newClientOperationId() {
+  return `operation-${randomQuoteSessionToken()}`;
+}
+
+function normalizeRestorableOverlay(value = "") {
+  const overlay = String(value || "").trim();
+  return RESTORABLE_OVERLAYS.has(overlay) ? overlay : "";
+}
+
+function activeJobMaxAgeMs(type = "", phase = "starting") {
+  if (phase === "starting") return ACTIVE_JOB_STARTING_MAX_AGE_MS;
+  if (type === "draft") return ACTIVE_JOB_RUNNING_DRAFT_MAX_AGE_MS;
+  if (type === "basis_chat") return ACTIVE_JOB_RUNNING_BASIS_CHAT_MAX_AGE_MS;
+  if (type === "confirm_basis") return ACTIVE_JOB_RUNNING_CONFIRM_BASIS_MAX_AGE_MS;
+  if (type === "generate" || type === "generate_pdf") return ACTIVE_JOB_RUNNING_GENERATION_MAX_AGE_MS;
+  return 0;
+}
+
+function normalizeActiveJob(job = {}, options = {}) {
+  if (!job || typeof job !== "object") return null;
+  const type = String(job.type || "").trim();
+  const id = String(job.id || "").trim();
+  if (![...SERVER_JOB_TYPES, "confirm_basis"].includes(type) || !id) return null;
+  if (SERVER_JOB_TYPES.has(type) && !/^job-[A-Za-z0-9_-]{8,80}$/.test(id)) return null;
+  if (type === "confirm_basis" && !/^operation-[A-Za-z0-9_-]{8,80}$/.test(id)) return null;
+  const phase = String(job.phase || "").trim();
+  if (!["starting", "running"].includes(phase)) return null;
+  const rawStartedAt = job.startedAt ?? job.created_at ?? job.createdAt;
+  if (typeof rawStartedAt !== "string") return null;
+  const startedAt = rawStartedAt.trim();
+  const timestampMatch = startedAt.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?Z$/);
+  if (!timestampMatch) return null;
+  const [, year, month, day, hour, minute, second, fraction = ""] = timestampMatch;
+  const startedMs = Date.UTC(
+    Number(year),
+    Number(month) - 1,
+    Number(day),
+    Number(hour),
+    Number(minute),
+    Number(second),
+    Number((fraction + "000").slice(0, 3)),
+  );
+  const parsedDate = new Date(startedMs);
+  if (
+    !Number.isFinite(startedMs)
+    || parsedDate.getUTCFullYear() !== Number(year)
+    || parsedDate.getUTCMonth() !== Number(month) - 1
+    || parsedDate.getUTCDate() !== Number(day)
+    || parsedDate.getUTCHours() !== Number(hour)
+    || parsedDate.getUTCMinutes() !== Number(minute)
+    || parsedDate.getUTCSeconds() !== Number(second)
+  ) return null;
+  const currentScope = currentBrowserRecoveryScope();
+  const browserRecoveryScope = String(job.browserRecoveryScope || (options.restoring === true ? "" : currentScope)).trim();
+  if (!currentScope || browserRecoveryScope !== currentScope) return null;
+  if (options.restoring === true) {
+    const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
+    const ageMs = nowMs - startedMs;
+    const maxAgeMs = activeJobMaxAgeMs(type, phase);
+    if (ageMs < -ACTIVE_JOB_CLOCK_SKEW_MS || !maxAgeMs || ageMs > maxAgeMs) return null;
+  }
+  return {
+    ...job,
+    id,
+    type,
+    phase,
+    startedAt: parsedDate.toISOString(),
+    browserRecoveryScope,
+  };
 }
 
 function ensureClientQuoteSessionId() {
@@ -1297,6 +1407,79 @@ function referenceFileType(entry = {}) {
   return String(entry.name || "").toLowerCase().endsWith(".pdf") ? "application/pdf" : "image";
 }
 
+function normalizedContentFingerprint(value = "") {
+  const text = String(value || "").trim().toLowerCase();
+  return /^sha256:[0-9a-f]{64}$/.test(text) ? text : "";
+}
+
+function dataUrlBytes(dataUrl = "") {
+  const text = String(dataUrl || "").trim();
+  const separatorIndex = text.indexOf(",");
+  if (!text.startsWith("data:") || separatorIndex < 0) return null;
+  const metadata = text.slice(0, separatorIndex);
+  const payload = text.slice(separatorIndex + 1);
+  try {
+    if (/;base64(?:;|$)/i.test(metadata)) {
+      const binary = window.atob ? window.atob(payload) : atob(payload);
+      return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    }
+    return new TextEncoder().encode(decodeURIComponent(payload));
+  } catch {
+    return null;
+  }
+}
+
+async function sha256ContentFingerprint(content) {
+  const subtle = window.crypto?.subtle;
+  if (!subtle || content === null || content === undefined) return "";
+  let bytes;
+  if (content instanceof ArrayBuffer) bytes = new Uint8Array(content);
+  else if (ArrayBuffer.isView(content)) bytes = new Uint8Array(content.buffer, content.byteOffset, content.byteLength);
+  else return "";
+  const digest = await subtle.digest("SHA-256", bytes);
+  const hex = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return normalizedContentFingerprint(`sha256:${hex}`);
+}
+
+async function contentFingerprintFromDataUrl(dataUrl = "") {
+  const bytes = dataUrlBytes(dataUrl);
+  return bytes ? sha256ContentFingerprint(bytes) : "";
+}
+
+async function ensureContentFingerprint(entry = {}) {
+  const existing = normalizedContentFingerprint(entry.content_fingerprint);
+  if (existing) return { ...entry, content_fingerprint: existing };
+  const fingerprint = await contentFingerprintFromDataUrl(entry.data_url || "");
+  return { ...entry, content_fingerprint: fingerprint };
+}
+
+function referenceFileDependencyKey(image = {}) {
+  const name = String(image.name || "").trim().toLowerCase();
+  const type = referenceFileType(image);
+  const size = Number.isFinite(Number(image.size)) ? Number(image.size) : 0;
+  const fingerprint = normalizedContentFingerprint(image.content_fingerprint);
+  if (!fingerprint) return "";
+  return `${name}:${type}:${size}:${fingerprint}`;
+}
+
+function referenceFilesDependencySignature(images = state.images) {
+  const entries = Array.isArray(images) ? images : [];
+  const keys = entries.map(referenceFileDependencyKey);
+  if (keys.some((key) => !key)) return "";
+  // File order is preserved because the ordered image array is sent to AI analysis.
+  return JSON.stringify(keys);
+}
+
+function referenceFileSignatureIsStrong(value = "") {
+  try {
+    const keys = JSON.parse(String(value || ""));
+    return Array.isArray(keys)
+      && keys.length > 0
+      && keys.every((key) => /:sha256:[0-9a-f]{64}$/.test(String(key || "")));
+  } catch {
+    return false;
+  }
+}
 function isPdfReference(entry = {}) {
   return referenceFileType(entry) === "application/pdf";
 }
@@ -1326,11 +1509,19 @@ async function filesToImageEntries(files, limit = MAX_REFERENCE_IMAGES) {
       .filter(isAcceptedReferenceFile)
       .slice(0, limit)
       .map(async (file) => {
-        const dataUrl = await fileToDataUrl(file);
+        const [dataUrl, arrayBuffer] = await Promise.all([
+          fileToDataUrl(file),
+          typeof file.arrayBuffer === "function" ? file.arrayBuffer() : Promise.resolve(null),
+        ]);
+        const contentFingerprint = arrayBuffer
+          ? await sha256ContentFingerprint(arrayBuffer)
+          : await contentFingerprintFromDataUrl(dataUrl);
+        if (!contentFingerprint) throw new Error("Reference file content could not be verified.");
         return {
           name: file.name,
           type: referenceFileType({ name: file.name, type: file.type, data_url: dataUrl }),
           size: file.size,
+          content_fingerprint: contentFingerprint,
           data_url: dataUrl,
         };
       })
@@ -1338,6 +1529,8 @@ async function filesToImageEntries(files, limit = MAX_REFERENCE_IMAGES) {
 }
 
 function imageDuplicateKey(image = {}) {
+  const fingerprint = normalizedContentFingerprint(image.content_fingerprint);
+  if (fingerprint) return `content:${fingerprint}`;
   const dataUrl = String(image.data_url || "").trim();
   if (dataUrl) return `data:${dataUrl}`;
   const name = String(image.name || "").trim().toLowerCase();
@@ -1382,7 +1575,13 @@ async function addImagesFromFiles(files) {
     return;
   }
   const overflowCount = Math.max(0, referenceFiles.length - capacity);
-  const images = await filesToImageEntries(referenceFiles, capacity);
+  let images;
+  try {
+    images = await filesToImageEntries(referenceFiles, capacity);
+  } catch {
+    setImageUploadStatus("The selected file could not be securely verified. Please try adding it again.");
+    return;
+  }
   if (!images.length) return;
   const { unique, duplicateCount } = uniqueImageEntries(images);
   if (!unique.length) {
@@ -1394,7 +1593,7 @@ async function addImagesFromFiles(files) {
   state.images = [...state.images, ...unique];
   await persistSessionFiles(sessionFileRecordsFromImages(state.images)).catch(() => {});
   renderFiles();
-  setWorkflowStage("ready_to_analyze");
+  if (!quoteHasDerivedResults()) setWorkflowStage("ready_to_analyze");
   const generator = currentGenerator();
   const duplicateMessage = duplicateCount ? ` ${duplicateCount} duplicate file${duplicateCount === 1 ? "" : "s"} skipped.` : "";
   const overflowMessage = overflowCount ? ` ${overflowCount} file${overflowCount === 1 ? "" : "s"} skipped because the maximum is ${MAX_REFERENCE_IMAGES}.` : "";
@@ -1406,7 +1605,7 @@ function removeImageAt(index) {
   state.images.splice(index, 1);
   renderFiles();
   if (!state.images.length) {
-    setWorkflowStage("needs_images");
+    if (!quoteHasDerivedResults()) setWorkflowStage("needs_images");
     setImageUploadStatus("");
   } else {
     setImageUploadStatus(`${state.images.length} reference file${state.images.length === 1 ? "" : "s"} loaded.`);
@@ -1636,6 +1835,45 @@ function selectedPricingReferenceCurrency() {
 function selectedPricingReferenceTaxText() {
   const tax = selectedPricingReferenceTax();
   return `${tax.label} ${taxRatePercentText(tax.rate)}%`;
+}
+
+function pricingReferenceFromSelectionValue(value = "") {
+  const selection = pricingReferenceSelectionFromValue(value);
+  if (!selection.pricingReferenceId) return null;
+  return state.pricingReferences.find((reference) => (
+    String(reference.id || "").trim() === selection.pricingReferenceId
+    && (!selection.source || pricingReferenceSelectValue(reference).startsWith(`${selection.source}::`))
+  )) || null;
+}
+
+function pendingPricingReference() {
+  return pricingReferenceFromSelectionValue(elements.profileSelect?.value || "");
+}
+
+function pricingReferenceBasisValues(reference = currentPricingReference()) {
+  const tax = {
+    label: normalizeTaxLabel(reference?.tax?.label),
+    rate: normalizeTaxRate(reference?.tax?.rate, DEFAULT_TAX_RATE),
+  };
+  return {
+    currency: normalizeCurrencyLabel(reference?.currency),
+    taxText: `${tax.label} ${taxRatePercentText(tax.rate)}%`,
+  };
+}
+
+function renderPendingPricingReferenceBasis() {
+  const basis = pricingReferenceBasisValues(pendingPricingReference() || currentPricingReference());
+  syncPricingReferenceContextPills(basis.currency, basis.taxText);
+}
+
+function resetPendingPricingReferenceSelection() {
+  if (!elements.profileSelect) return false;
+  const appliedValue = pricingReferenceSelectValue(currentPricingReference() || {});
+  const changed = elements.profileSelect.value !== appliedValue;
+  if (changed) elements.profileSelect.value = appliedValue;
+  renderPendingPricingReferenceBasis();
+  updateSidePanelNav();
+  return changed;
 }
 
 function pricingReferenceContextPillsHtml() {
@@ -2362,6 +2600,7 @@ function collectQuoteDetails() {
       logo_data_url: state.headerLogo ? state.headerLogo.data_url : "",
       logo_name: state.headerLogo ? state.headerLogo.name : "",
       logo_type: state.headerLogo ? state.headerLogo.type : "",
+      logo_content_fingerprint: normalizedContentFingerprint(state.headerLogo?.content_fingerprint),
     },
     currency: collectQuoteCurrency(),
     exchange_rate: collectQuoteExchangeRate(),
@@ -2464,7 +2703,9 @@ function applyQuoteDetails(details = {}, options = {}) {
     state.headerLogo = {
       name: company.logo_name || "preset-logo",
       type: company.logo_type || "image/png",
-      size: 0,
+      size: Number.isFinite(Number(company.logo_size)) ? Number(company.logo_size) : 0,
+      content_fingerprint: normalizedContentFingerprint(company.logo_content_fingerprint),
+      session_file_key: String(company.logo_session_file_key || "").trim(),
       data_url: company.logo_data_url,
     };
   } else if (options.clearLogo) {
@@ -2498,6 +2739,94 @@ function safeSessionJson() {
   } catch {
     return null;
   }
+}
+
+function buildWorkspaceViewSnapshot() {
+  return {
+    version: 1,
+    browserRecoveryScope: currentBrowserRecoveryScope(),
+    savedAt: new Date().toISOString(),
+    activeAppView: state.activeAppView === "quote" ? "quote" : "dashboard",
+    activeSidePanel: SIDE_PANEL_SEQUENCE.includes(state.activeSidePanel) ? state.activeSidePanel : "images",
+    restorableOverlay: normalizeRestorableOverlay(state.restorableOverlay),
+    pricingReferenceSettingsMode: normalizePricingReferenceSettingsMode(state.pricingReferenceSettingsMode),
+    pendingAnalysisMode: normalizeAnalysisMode(state.pendingAnalysisMode),
+    dashboardStatusFilter: String(state.dashboardStatusFilter || "all"),
+    dashboardDateFilter: String(state.dashboardDateFilter || "all"),
+    dashboardCustomDateStart: String(state.dashboardCustomDateStart || ""),
+    dashboardCustomDateEnd: String(state.dashboardCustomDateEnd || ""),
+    dashboardSortMode: String(state.dashboardSortMode || "created"),
+    dashboardSearch: String(state.dashboardSearch || ""),
+    dashboardPageSize: Number(state.dashboardPageSize),
+    dashboardPageIndex: Number(state.dashboardPageIndex),
+    dashboardSelectionMode: Boolean(state.dashboardSelectionMode),
+    dashboardSelectedSessionIds: (state.dashboardSelectedSessionIds || []).map(safeQuoteSessionId).filter(Boolean),
+    dashboardActiveSessionId: safeQuoteSessionId(state.dashboardActiveSessionId || ""),
+  };
+}
+
+function safeWorkspaceViewJson() {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(WORKSPACE_VIEW_STORAGE_KEY) || "null");
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveWorkspaceViewState() {
+  if (state.isBooting || !currentBrowserRecoveryScope()) return;
+  try {
+    window.localStorage.setItem(WORKSPACE_VIEW_STORAGE_KEY, JSON.stringify(buildWorkspaceViewSnapshot()));
+  } catch {
+    // Exact screen recovery is best-effort; quote data remains in its separate recovery record.
+  }
+}
+
+function clearWorkspaceViewState() {
+  try {
+    window.localStorage.removeItem(WORKSPACE_VIEW_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures during logout or recovery-scope changes.
+  }
+}
+
+function restoredWorkspaceViewState() {
+  const saved = safeWorkspaceViewJson();
+  if (!saved || saved.version !== 1 || saved.browserRecoveryScope !== currentBrowserRecoveryScope()) {
+    clearWorkspaceViewState();
+    return null;
+  }
+  return saved;
+}
+
+function applyWorkspaceViewState(saved = {}, options = {}) {
+  if (!saved || typeof saved !== "object") return false;
+  const quoteRestored = options.quoteRestored === true;
+  state.activeAppView = saved.activeAppView === "quote" && quoteRestored ? "quote" : "dashboard";
+  if (state.activeAppView === "quote" && SIDE_PANEL_SEQUENCE.includes(saved.activeSidePanel)) {
+    setSidePanel(saved.activeSidePanel, { force: true });
+  }
+  const overlay = normalizeRestorableOverlay(saved.restorableOverlay);
+  state.restorableOverlay = quoteRestored || overlay === "pricing_reference_settings" ? overlay : "";
+  state.pricingReferenceSettingsMode = normalizePricingReferenceSettingsMode(saved.pricingReferenceSettingsMode);
+  state.pendingAnalysisMode = normalizeAnalysisMode(saved.pendingAnalysisMode);
+  state.dashboardStatusFilter = String(saved.dashboardStatusFilter || "all");
+  state.dashboardDateFilter = String(saved.dashboardDateFilter || "all");
+  state.dashboardCustomDateStart = String(saved.dashboardCustomDateStart || "");
+  state.dashboardCustomDateEnd = String(saved.dashboardCustomDateEnd || "");
+  state.dashboardSortMode = String(saved.dashboardSortMode || "created");
+  state.dashboardSearch = String(saved.dashboardSearch || "");
+  state.dashboardPageSize = DASHBOARD_PAGE_SIZE_OPTIONS.includes(Number(saved.dashboardPageSize))
+    ? Number(saved.dashboardPageSize)
+    : DASHBOARD_DEFAULT_PAGE_SIZE;
+  state.dashboardPageIndex = Math.max(0, Number(saved.dashboardPageIndex) || 0);
+  state.dashboardSelectionMode = Boolean(saved.dashboardSelectionMode);
+  state.dashboardSelectedSessionIds = Array.isArray(saved.dashboardSelectedSessionIds)
+    ? saved.dashboardSelectedSessionIds.map(safeQuoteSessionId).filter(Boolean)
+    : [];
+  state.dashboardActiveSessionId = safeQuoteSessionId(saved.dashboardActiveSessionId || "");
+  return true;
 }
 
 function openSessionFileDb() {
@@ -2556,6 +2885,7 @@ function sessionImageMetadata(image = {}, index = 0) {
     name: String(image.name || `reference-${index + 1}`).trim() || `reference-${index + 1}`,
     type: referenceFileType(image),
     size: Number.isFinite(Number(image.size)) ? Number(image.size) : 0,
+    content_fingerprint: normalizedContentFingerprint(image.content_fingerprint),
     session_file_key: sessionFileKey,
   };
 }
@@ -2569,6 +2899,7 @@ function quoteDetailsWithSessionLogoMetadata(details = collectQuoteDetails()) {
     name: company.logo_name || "header-logo",
     type: company.logo_type || "image/png",
     size: Number.isFinite(Number(company.logo_size)) ? Number(company.logo_size) : 0,
+    content_fingerprint: company.logo_content_fingerprint || "",
     data_url: logoDataUrl,
     session_file_key: company.logo_session_file_key || "",
   };
@@ -2576,6 +2907,7 @@ function quoteDetailsWithSessionLogoMetadata(details = collectQuoteDetails()) {
   company.logo_name = logoSource.name || company.logo_name || "header-logo";
   company.logo_type = logoSource.type || company.logo_type || "image/png";
   company.logo_size = Number.isFinite(Number(logoSource.size)) ? Number(logoSource.size) : 0;
+  company.logo_content_fingerprint = normalizedContentFingerprint(logoSource.content_fingerprint);
   company.logo_session_file_key = sessionFileKey;
   delete company.logo_data_url;
   return { ...details, company };
@@ -2600,6 +2932,7 @@ function sessionFileRecordFromHeaderLogo(logo = state.headerLogo) {
     name: String(logo.name || "header-logo").trim() || "header-logo",
     type: String(logo.type || "image/png").trim() || "image/png",
     size: Number.isFinite(Number(logo.size)) ? Number(logo.size) : 0,
+    content_fingerprint: normalizedContentFingerprint(logo.content_fingerprint),
     session_file_key: sessionFileKey,
     file_role: "quote_company_logo",
     data_url: dataUrl,
@@ -2668,6 +3001,8 @@ function buildSessionSnapshot() {
     browserRecoveryScope: currentBrowserRecoveryScope(),
     savedAt: new Date().toISOString(),
     activeAppView: state.activeAppView,
+    restorableOverlay: normalizeRestorableOverlay(state.restorableOverlay),
+    pricingReferenceSettingsMode: state.pricingReferenceSettingsMode,
     profileId: state.profileId,
     pricingReferenceId: state.pricingReferenceId,
     pricingReferenceSource: state.pricingReferenceSource,
@@ -2695,6 +3030,9 @@ function buildSessionSnapshot() {
     aiFailed: state.aiFailed,
     draftSource: state.draftSource,
     lastAnalysisMode: state.lastAnalysisMode,
+    pendingAnalysisMode: state.pendingAnalysisMode,
+    pendingFeedback: state.pendingFeedback,
+    basisChat: state.basisChat,
     activeSidePanel: state.activeSidePanel,
     downloadFile: state.downloadFile,
     pdfFile: state.pdfFile,
@@ -2703,7 +3041,7 @@ function buildSessionSnapshot() {
     pdfFileRevision: state.pdfFileRevision,
     pricingMatches: state.pricingMatches,
     pricingIssues: state.pricingIssues,
-    activeJob: state.activeJob,
+    activeJob: normalizeActiveJob(state.activeJob || {}),
   };
 }
 
@@ -2722,6 +3060,7 @@ async function purgeBrowserRecoveryState() {
   } catch {
     // Ignore storage failures; scope mismatches still remain blocked from restoration.
   }
+  clearWorkspaceViewState();
   clearLastSelectionState();
   await clearSessionFiles().catch(() => {});
 }
@@ -2731,11 +3070,13 @@ function saveSessionState() {
   try {
     if (state.activeAppView === "dashboard" && !safeQuoteSessionId(state.quoteSessionId) && !quoteDraftShouldPersistToDashboard()) {
       window.localStorage.removeItem(QUOTE_SESSION_STORAGE_KEY);
+      saveWorkspaceViewState();
       return;
     }
     const fileRecords = sessionFileRecordsFromDraft();
     const snapshot = buildSessionSnapshot();
     window.localStorage.setItem(QUOTE_SESSION_STORAGE_KEY, JSON.stringify(snapshot));
+    saveWorkspaceViewState();
     persistSessionFiles(fileRecords).catch(() => {});
   } catch {
     // Refresh recovery is best-effort; the local workflow can continue without persisted state.
@@ -2748,7 +3089,7 @@ async function restoreSessionImages(savedImages = []) {
     .filter((image) => !String(image?.data_url || "").trim())
     .map((image) => image?.session_file_key);
   const fileMap = await loadSessionFileMap(keys).catch(() => new Map());
-  return images
+  const restoredImages = images
     .map((image) => {
       const key = String(image?.session_file_key || "").trim();
       const stored = key ? fileMap.get(key) : null;
@@ -2763,6 +3104,7 @@ async function restoreSessionImages(savedImages = []) {
       referenceFileHasPayload(image)
       || String(image.session_file_key || image.name || "").trim()
     ));
+  return Promise.all(restoredImages.map(ensureContentFingerprint));
 }
 
 function selectedPresetCompanyLogo() {
@@ -2772,9 +3114,47 @@ function selectedPresetCompanyLogo() {
   return String(company.logo_data_url || "").trim() ? company : null;
 }
 
+async function quoteDetailsWithStrongLogoFingerprint(details = {}) {
+  const company = details.company && typeof details.company === "object" ? details.company : {};
+  const dataUrl = String(company.logo_data_url || "").trim();
+  if (!dataUrl) return details;
+  const logo = await ensureContentFingerprint({
+    name: company.logo_name || "header-logo",
+    type: company.logo_type || "image/png",
+    size: Number.isFinite(Number(company.logo_size)) ? Number(company.logo_size) : 0,
+    content_fingerprint: company.logo_content_fingerprint || "",
+    data_url: dataUrl,
+    session_file_key: company.logo_session_file_key || "",
+  });
+  return {
+    ...details,
+    company: {
+      ...company,
+      logo_content_fingerprint: logo.content_fingerprint,
+    },
+  };
+}
+
+async function hydrateProfileLogoFingerprints() {
+  state.profiles = await Promise.all(state.profiles.map(async (profile) => ({
+    ...profile,
+    quote_detail_presets: await Promise.all(
+      (Array.isArray(profile.quote_detail_presets) ? profile.quote_detail_presets : [])
+        .map(async (preset) => ({ ...preset, details: await quoteDetailsWithStrongLogoFingerprint(preset.details || {}) }))
+    ),
+  })));
+  state.companyProfiles = await Promise.all(state.companyProfiles.map(async (profile) => ({
+    ...profile,
+    defaults: await quoteDetailsWithStrongLogoFingerprint(profile.defaults || {}),
+  })));
+}
+
 async function restoreQuoteDetailsLogo(details = {}) {
   const company = details.company && typeof details.company === "object" ? details.company : {};
-  if (String(company.logo_data_url || "").trim()) return details;
+  const directDataUrl = String(company.logo_data_url || "").trim();
+  if (directDataUrl) {
+    return quoteDetailsWithStrongLogoFingerprint(details);
+  }
   const sessionFileKey = String(company.logo_session_file_key || "").trim();
   let restoredLogo = null;
   if (sessionFileKey) {
@@ -2784,13 +3164,22 @@ async function restoreQuoteDetailsLogo(details = {}) {
   const presetLogo = restoredLogo ? null : selectedPresetCompanyLogo();
   const source = restoredLogo || presetLogo;
   if (!source?.data_url && !source?.logo_data_url) return details;
+  const restoredDataUrl = source.data_url || source.logo_data_url;
+  const fingerprintedLogo = await ensureContentFingerprint({
+    ...source,
+    content_fingerprint: source.content_fingerprint || source.logo_content_fingerprint || company.logo_content_fingerprint || "",
+    data_url: restoredDataUrl,
+  });
   return {
     ...details,
     company: {
       ...company,
-      logo_data_url: source.data_url || source.logo_data_url,
+      logo_data_url: restoredDataUrl,
       logo_name: source.name || source.logo_name || company.logo_name || "header-logo",
       logo_type: source.type || source.logo_type || company.logo_type || "image/png",
+      logo_size: Number.isFinite(Number(source.size ?? source.logo_size ?? company.logo_size)) ? Number(source.size ?? source.logo_size ?? company.logo_size) : 0,
+      logo_content_fingerprint: fingerprintedLogo.content_fingerprint,
+      logo_session_file_key: source.session_file_key || source.logo_session_file_key || company.logo_session_file_key || "",
     },
   };
 }
@@ -2847,10 +3236,18 @@ function furthestQuoteSessionSidePanel(saved = {}) {
   return SIDE_PANEL_SEQUENCE[Math.max(0, furthestIndex)] || "images";
 }
 
+function restoredQuoteSessionSidePanel(saved = {}, options = {}) {
+  if (options.restoreFurthestPanel === true) return furthestQuoteSessionSidePanel(saved);
+  return SIDE_PANEL_SEQUENCE.includes(saved.activeSidePanel)
+    ? saved.activeSidePanel
+    : furthestQuoteSessionSidePanel(saved);
+}
+
 async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   if (!saved || typeof saved !== "object" || saved.version !== QUOTE_SESSION_STATE_VERSION) {
     return false;
   }
+  let rejectedRestoredActiveJob = false;
   state.profileId = saved.profileId || "";
   state.pricingReferenceId = saved.pricingReferenceId || saved.profileId || "";
   state.pricingReferenceSource = saved.pricingReferenceSource || "";
@@ -2860,6 +3257,10 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.quoteSessionRestoredSessionId = restoredSessionId && restoredSessionId === state.quoteSessionId ? restoredSessionId : "";
   state.quoteSessionRestoredDraftKey = state.quoteSessionRestoredSessionId ? String(saved.quoteSessionRestoredDraftKey || "") : "";
   state.activeAppView = saved.activeAppView === "quote" || options.forceQuoteView ? "quote" : "dashboard";
+  state.restorableOverlay = normalizeRestorableOverlay(saved.restorableOverlay);
+  state.pricingReferenceSettingsMode = state.restorableOverlay
+    ? normalizePricingReferenceSettingsMode(saved.pricingReferenceSettingsMode)
+    : PRICING_REFERENCE_SETTINGS_MODE_MANAGE;
   state.selectedPresetValue = saved.selectedPresetValue || presetValueFromQuoteDetails(saved.quoteDetails || {}) || lastSelectedPresetValue();
   state.quoteCommercialTouched = normalizeQuoteCommercialTouched(
     saved.quoteCommercialTouched || quoteDetailsCommercialTouched(saved.quoteDetails || {})
@@ -2867,7 +3268,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   syncSelectedPricingReference();
   renderProfileOptions();
   renderPresetOptions();
-  state.pendingFeedback = "";
+  state.pendingFeedback = String(saved.pendingFeedback || "");
   const restoredQuoteDetails = await restoreQuoteDetailsLogo(
     quoteDetailsWithFallbackDefaults(selectedPreset()?.details || {}, saved.quoteDetails || {})
   );
@@ -2887,6 +3288,14 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.basisConfirmed = Boolean(saved.basisConfirmed);
   state.draftSource = saved.draftSource || "";
   state.lastAnalysisMode = normalizeAnalysisMode(saved.lastAnalysisMode || saved.originalAnalysisSnapshot?.analysis_mode);
+  state.pendingAnalysisMode = normalizeAnalysisMode(saved.pendingAnalysisMode || state.lastAnalysisMode);
+  const savedBasisChat = saved.basisChat && typeof saved.basisChat === "object" ? saved.basisChat : {};
+  state.basisChat = {
+    ...state.basisChat,
+    ...savedBasisChat,
+    lineIndex: Number.isInteger(Number(savedBasisChat.lineIndex)) ? Number(savedBasisChat.lineIndex) : -1,
+    proposal: savedBasisChat.proposal && typeof savedBasisChat.proposal === "object" ? savedBasisChat.proposal : null,
+  };
   state.aiFailed = Boolean(saved.aiFailed || state.draftSource === "local");
   state.downloadFile = saved.downloadFile || null;
   state.pdfFile = saved.pdfFile || null;
@@ -2901,7 +3310,14 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   );
   state.pricingMatches = Array.isArray(saved.pricingMatches) ? saved.pricingMatches : [];
   state.pricingIssues = [];
-  state.activeJob = saved.activeJob && saved.activeJob.id ? saved.activeJob : null;
+  state.activeJob = normalizeActiveJob(saved.activeJob || {}, { restoring: true });
+  rejectedRestoredActiveJob = Boolean(saved.activeJob && typeof saved.activeJob === "object" && !state.activeJob);
+  if (rejectedRestoredActiveJob) {
+    state.isAnalysisRunning = false;
+    state.isGenerating = false;
+    state.isPreparingOutput = false;
+    state.restorableOverlay = "";
+  }
   renderFiles();
   renderPricingMatches(state.outputRows.length ? state.outputRows : state.pricingMatches, { fromPricingMatches: !state.outputRows.length && state.pricingMatches.length });
   renderMatchSummary({ pricing_matches: state.pricingMatches });
@@ -2916,21 +3332,31 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   }
   updateDownloadButton();
   setResultStatus(state.aiFailed ? "No usable AI draft" : state.downloadFile ? "Completed" : "No job yet", state.aiFailed ? "is-bad" : state.downloadFile ? "is-ok" : "");
-  setWorkflowStage(restoredWorkflowStage(saved));
+  setWorkflowStage(restoredWorkflowStage(rejectedRestoredActiveJob ? { ...saved, workflowStage: "" } : saved));
   if (state.aiFailed) {
     showAiFailureBanner();
   } else {
     clearAiFailureBanner();
   }
-  const restoredPanel = furthestQuoteSessionSidePanel(saved);
+  const restoredPanel = restoredQuoteSessionSidePanel(saved, options);
   setSidePanel(restoredPanel, { force: true });
+  try {
+    window.localStorage.setItem(QUOTE_SESSION_STORAGE_KEY, JSON.stringify(buildSessionSnapshot()));
+    persistSessionFiles(sessionFileRecordsFromDraft()).catch(() => {});
+  } catch {
+    // Restored state remains valid in memory when upgraded metadata cannot be persisted.
+  }
   return true;
 }
 
 async function restoreSessionState() {
   const saved = safeSessionJson();
   const currentScope = currentBrowserRecoveryScope();
-  if (!saved || saved.version !== QUOTE_SESSION_STATE_VERSION || saved.browserRecoveryScope !== currentScope) {
+  if (!saved) {
+    await clearSessionFiles().catch(() => {});
+    return false;
+  }
+  if (saved.version !== QUOTE_SESSION_STATE_VERSION || saved.browserRecoveryScope !== currentScope) {
     await purgeBrowserRecoveryState();
     return false;
   }
@@ -3563,6 +3989,7 @@ async function saveNamedCompanyProfile(label = "", options = {}) {
       return;
     }
     const saved = normalizeCompanyProfile(data.profile || payload);
+    saved.defaults = await quoteDetailsWithStrongLogoFingerprint(saved.defaults || {});
     state.companyProfiles = [
       ...state.companyProfiles.filter((profile) => safeProfileId(profile.id || profile.label, "") !== saved.id),
       saved,
@@ -3684,6 +4111,7 @@ function loadSelectedPreset(options = {}) {
     renderPresetStatus("Choose a preset to load.");
     return;
   }
+  const presentationBeforeLoad = quoteCompanyPresentationSignature();
   state.selectedPresetValue = elements.presetSelect.value || presetOptionValue(preset);
   persistLastProfilePresetSelection(state.selectedPresetValue);
   clearPendingProfilePack();
@@ -3710,10 +4138,11 @@ function loadSelectedPreset(options = {}) {
       renderHeaderLogoPreview();
     }
   }
-  const shouldResetGeneratedState = options.resetGeneratedState !== false && !shouldPreserveExistingQuoteState && options.silent !== true;
-  if (shouldResetGeneratedState) {
-    clearGeneratedQuoteState();
-    setWorkflowStage(state.images.length ? "ready_to_analyze" : "needs_images");
+  const shouldInvalidateGeneratedExports = options.resetGeneratedState !== false
+    && !shouldPreserveExistingQuoteState
+    && options.silent !== true;
+  if (shouldInvalidateGeneratedExports) {
+    invalidateGeneratedExportsIfPresentationChanged(presentationBeforeLoad);
   }
   syncControlStates();
   renderPresetStatus(`Loaded "${preset.name}".`);
@@ -3769,6 +4198,7 @@ function clearCustomerDetails() {
 }
 
 function clearQuoteCompanyDetails() {
+  const presentationBeforeClear = quoteCompanyPresentationSignature();
   setInputValue(elements.headerDetails, "");
   setInputValue(elements.termsHeading, "");
   setInputValue(elements.paymentTerms, "");
@@ -3788,12 +4218,14 @@ function clearQuoteCompanyDetails() {
   state.selectedPresetValue = "";
   clearPendingProfilePack();
   hideProfileNameModal({ force: true });
-  clearGeneratedQuoteState();
-  setWorkflowStage(state.images.length ? "ready_to_analyze" : "needs_images");
   updatePresetButtons();
   renderHeaderLogoPreview();
   loadDefaultProfilePreset({ silent: true, preferLastSelection: false });
+  invalidateGeneratedExportsIfPresentationChanged(presentationBeforeClear);
   syncControlStates();
+  if (quoteSessionDraftStateCanSave()) {
+    queueQuoteSessionDraftStateSave({ quoteGenerated: quoteSessionHasFreshOutputExports() });
+  }
   renderPresetStatus("Quote-company defaults reset to the Default profile template.");
 }
 
@@ -4435,6 +4867,7 @@ function setPricingReferenceSettingsMode(mode = PRICING_REFERENCE_SETTINGS_MODE_
     hidePricingReferenceDeleteConfirm();
   }
   syncPricingReferenceSettingsMode();
+  if (state.restorableOverlay === "pricing_reference_settings") saveSessionState();
   if (options.focus) {
     const target = state.pricingReferenceSettingsMode === PRICING_REFERENCE_SETTINGS_MODE_IMPORT
       ? elements.pricingReferenceFile
@@ -4570,6 +5003,7 @@ function showPricingReferenceDeleteConfirm(reference) {
 
 function openSettingsModal() {
   if (!canManagePricingReferences()) return;
+  if (state.activeSidePanel === "customer") resetPendingPricingReferenceSelection();
   openPricingReferenceModal();
 }
 
@@ -5945,12 +6379,12 @@ function exportSelectedPricingReference(event) {
   }
 }
 
-function openPricingReferenceModal() {
+function openPricingReferenceModal(options = {}) {
   stopElapsedTimer("pricingReferenceImportElapsed");
   stopElapsedTimer("pricingReferenceSaveElapsed");
   state.pendingPricingReference = null;
   state.editingPricingReferenceId = "";
-  state.pricingReferenceSettingsMode = PRICING_REFERENCE_SETTINGS_MODE_MANAGE;
+  if (!options.preserveMode) state.pricingReferenceSettingsMode = PRICING_REFERENCE_SETTINGS_MODE_MANAGE;
   state.pricingReferenceImportFileSelected = false;
   state.pricingReferenceImportBusy = false;
   state.pricingReferenceSaveBusy = false;
@@ -5972,9 +6406,14 @@ function openPricingReferenceModal() {
   syncPricingReferenceSettingsMode();
   elements.pricingReferenceModal.hidden = false;
   elements.pricingReferenceModal.classList.add("is-open");
+  state.restorableOverlay = "pricing_reference_settings";
+  saveSessionState();
   const canManage = setPricingReferenceModalAccessState();
-  if (canManage) editSelectedPricingReference({ openTable: false });
-  window.setTimeout(() => (canManage ? elements.deletePricingReferenceSelect : elements.pricingReferenceCancelButton)?.focus(), 0);
+  if (canManage && state.pricingReferenceSettingsMode === PRICING_REFERENCE_SETTINGS_MODE_MANAGE) editSelectedPricingReference({ openTable: false });
+  const focusTarget = state.pricingReferenceSettingsMode === PRICING_REFERENCE_SETTINGS_MODE_IMPORT
+    ? elements.pricingReferenceFile
+    : canManage ? elements.deletePricingReferenceSelect : elements.pricingReferenceCancelButton;
+  window.setTimeout(() => focusTarget?.focus(), 0);
 }
 
 function closePricingReferenceModal() {
@@ -6002,7 +6441,26 @@ function closePricingReferenceModal() {
   state.pricingReferenceAutoLoadToken = "";
   state.pricingReferenceSavedNotice = "";
   hidePricingReferenceDeleteConfirm();
+  state.restorableOverlay = "";
+  saveSessionState();
   syncPricingReferenceSettingsMode();
+}
+
+function restoreRestorableOverlay() {
+  if (state.restorableOverlay === "pricing_reference_settings") {
+    openPricingReferenceModal({ preserveMode: true });
+    return;
+  }
+  if (state.restorableOverlay === "basis_chat") {
+    if (elements.basisChatOverlay?.hidden) restoreBasisChatOverlay();
+    return;
+  }
+  if (state.restorableOverlay === "analysis_confirm") {
+    requestStartAnalysis(state.pendingAnalysisMode);
+    return;
+  }
+  if (state.restorableOverlay === "excel_ready") showGeneratedExportReadyModal(false);
+  if (state.restorableOverlay === "pdf_ready") showGeneratedExportReadyModal(true);
 }
 
 async function editSelectedPricingReference(options = {}) {
@@ -6298,7 +6756,9 @@ async function loadProfiles() {
     }
   }
   await loadCompanyProfiles();
+  await hydrateProfileLogoFingerprints();
   renderProfileOptions();
+  renderPresetOptions();
 }
 
 async function loadCompanyProfiles() {
@@ -6317,6 +6777,142 @@ async function loadCompanyProfiles() {
   renderPresetOptions();
 }
 
+function quoteHasDerivedResults() {
+  return quoteDraftHasAiAnalysis() || quoteDraftHasOutputState();
+}
+
+function analyzedReferenceFileSignature() {
+  return String(state.originalAnalysisSnapshot?.reference_file_signature || "").trim();
+}
+
+function referenceFilesChangedSinceAnalysis() {
+  if (!quoteHasDerivedResults()) return false;
+  const baseline = analyzedReferenceFileSignature();
+  const current = referenceFilesDependencySignature();
+  if (!referenceFileSignatureIsStrong(baseline) || !current) return true;
+  return current !== baseline;
+}
+
+function pendingPricingReferenceSelectionChanged() {
+  const pending = pendingPricingReferenceSelection();
+  if (!pending.pricingReferenceId) return false;
+  return pending.pricingReferenceId !== state.pricingReferenceId
+    || pending.source !== state.pricingReferenceSource;
+}
+
+function quoteDependencyChangesForNext() {
+  if (!quoteHasDerivedResults()) return [];
+  const changes = [];
+  if (referenceFilesChangedSinceAnalysis()) changes.push("reference_files");
+  if (pendingPricingReferenceSelectionChanged()) changes.push("pricing_reference");
+  return changes;
+}
+
+function quoteDependencyChangeCopy(changes = state.pendingQuoteDependencyChanges) {
+  const normalized = new Set(Array.isArray(changes) ? changes : []);
+  const labels = [];
+  if (normalized.has("reference_files")) labels.push("reference files");
+  if (normalized.has("pricing_reference")) labels.push("pricing reference");
+  const subject = labels.length > 1 ? `${labels.slice(0, -1).join(", ")} and ${labels.at(-1)}` : labels[0] || "quote inputs";
+  return {
+    title: `Apply changed ${subject}?`,
+    strong: "This will clear the current Quote Basis and Output.",
+    detail: "Continue only if you want to rebuild the quote using these changed inputs.",
+  };
+}
+
+function hideQuoteDependencyConfirmModal(options = {}) {
+  state.pendingQuoteDependencyChanges = [];
+  if (elements.quoteDependencyConfirmModal) {
+    elements.quoteDependencyConfirmModal.classList.remove("is-open");
+    elements.quoteDependencyConfirmModal.hidden = true;
+  }
+  if (options.focusButton) elements.sideNextButton?.focus();
+}
+
+function requestQuoteDependencyChangeConfirmation(changes = []) {
+  const normalized = [...new Set((Array.isArray(changes) ? changes : []).filter(Boolean))];
+  if (!normalized.length || !elements.quoteDependencyConfirmModal) return false;
+  state.pendingQuoteDependencyChanges = normalized;
+  const copy = quoteDependencyChangeCopy(normalized);
+  elements.quoteDependencyConfirmModal.hidden = false;
+  elements.quoteDependencyConfirmModal.classList.add("is-open");
+  if (elements.quoteDependencyConfirmTitle) elements.quoteDependencyConfirmTitle.textContent = copy.title;
+  if (elements.quoteDependencyConfirmText) {
+    const strong = elements.quoteDependencyConfirmText.querySelector?.("strong");
+    const detail = elements.quoteDependencyConfirmText.querySelector?.("span");
+    if (strong) strong.textContent = copy.strong;
+    if (detail) detail.textContent = copy.detail;
+  }
+  window.setTimeout(() => elements.confirmQuoteDependencyChangeButton?.focus(), 0);
+  return true;
+}
+
+async function confirmQuoteDependencyChange() {
+  const changes = [...state.pendingQuoteDependencyChanges];
+  if (!changes.length) {
+    hideQuoteDependencyConfirmModal();
+    return;
+  }
+  const originPanel = state.activeSidePanel;
+  hideQuoteDependencyConfirmModal();
+  let generatedStateCleared = false;
+  if (changes.includes("pricing_reference")) {
+    generatedStateCleared = applyPendingPricingReferenceSelection();
+  }
+  if (changes.includes("reference_files") && !generatedStateCleared) {
+    clearGeneratedQuoteState();
+    generatedStateCleared = true;
+  }
+  if (generatedStateCleared) {
+    setWorkflowStage(hasReferenceFilesForNavigation() ? "ready_to_analyze" : "needs_images");
+  }
+  if (!hasReferenceFilesForNavigation()) {
+    if (generatedStateCleared) await saveQuoteSessionDraftState({ quoteGenerated: false });
+    updateSidePanelNav();
+    return;
+  }
+  const targetPanel = originPanel === "images" ? "customer" : "quote_company";
+  const moved = setSidePanel(targetPanel, { notify: true });
+  if (!moved) updateSidePanelNav();
+  if (generatedStateCleared || moved) {
+    await saveQuoteSessionDraftState({ quoteGenerated: false });
+  }
+}
+
+function quoteCompanyPresentationSignature() {
+  syncRichTextSources();
+  const logo = state.headerLogo || {};
+  const details = collectQuoteCompanyProfileDetails();
+  const company = { ...(details.company || {}) };
+  delete company.logo_data_url;
+  delete company.logo_content_fingerprint;
+  delete company.logo_session_file_key;
+  return JSON.stringify({
+    details: { ...details, company },
+    logo: {
+      name: String(logo.name || "").trim(),
+      type: String(logo.type || "").trim(),
+      size: Number.isFinite(Number(logo.size)) ? Number(logo.size) : 0,
+      fingerprint: normalizedContentFingerprint(logo.content_fingerprint),
+    },
+  });
+}
+
+function invalidateGeneratedExportsForPresentationChange() {
+  if (!state.downloadFile && !state.pdfFile) return false;
+  markOutputRowsDirty();
+  return true;
+}
+
+function invalidateGeneratedExportsIfPresentationChanged(previousSignature = "") {
+  const logoIsUnverifiable = Boolean(
+    String(state.headerLogo?.data_url || "").trim()
+    && !normalizedContentFingerprint(state.headerLogo?.content_fingerprint)
+  );
+  if (!logoIsUnverifiable && String(previousSignature || "") === quoteCompanyPresentationSignature()) return false;
+  return invalidateGeneratedExportsForPresentationChange();
+}
 function clearGeneratedQuoteState() {
   state.quoteBasis = { ...EMPTY_BASIS };
   state.quoteBasisSections = [];
@@ -6343,10 +6939,15 @@ function clearGeneratedQuoteState() {
   setResultStatus("No job yet");
 }
 
-function handleProfileSelectionChange() {
-  const nextSelection = pricingReferenceSelectionFromValue(elements.profileSelect.value || "");
+function pendingPricingReferenceSelection() {
+  return pricingReferenceSelectionFromValue(elements.profileSelect?.value || "");
+}
+
+function applyPendingPricingReferenceSelection() {
+  const nextSelection = pendingPricingReferenceSelection();
+  if (!nextSelection.pricingReferenceId) return false;
   if (nextSelection.pricingReferenceId === state.pricingReferenceId && nextSelection.source === state.pricingReferenceSource) {
-    return;
+    return false;
   }
   state.pricingReferenceId = nextSelection.pricingReferenceId;
   state.pricingReferenceSource = nextSelection.source;
@@ -6356,6 +6957,12 @@ function handleProfileSelectionChange() {
   clearGeneratedQuoteState();
   setWorkflowStage(state.images.length ? (canStartAnalysis() ? "ready_to_analyze" : "details_review") : "needs_images");
   syncControlStates();
+  return true;
+}
+
+function handleProfileSelectionChange() {
+  renderPendingPricingReferenceBasis();
+  updateSidePanelNav();
 }
 
 function buildPayload(options = {}) {
@@ -6576,15 +7183,73 @@ function showExcelGeneratingModal(options = {}) {
   if (!elements.excelGeneratingModal) return;
   elements.excelGeneratingEyebrow.textContent = options.eyebrow || "Quotation export";
   elements.excelGeneratingTitle.textContent = options.title || "Generating Excel";
-  elements.excelGeneratingMessage.textContent = options.message || "Preparing the quotation workbook. The download starts automatically when ready.";
+  elements.excelGeneratingMessage.textContent = options.message || "Preparing the quotation workbook.";
+  if (elements.excelGeneratingSpinner) elements.excelGeneratingSpinner.hidden = false;
+  if (elements.excelGeneratingActions) elements.excelGeneratingActions.hidden = true;
+  if (elements.excelGeneratingActionButton) elements.excelGeneratingActionButton.dataset.exportAction = "";
+  if (["excel_ready", "pdf_ready"].includes(state.restorableOverlay)) {
+    state.restorableOverlay = "";
+    saveWorkspaceViewState();
+  }
+  elements.excelGeneratingModal.classList.remove("is-ready");
   elements.excelGeneratingModal.hidden = false;
   elements.excelGeneratingModal.classList.add("is-open");
 }
 
 function hideExcelGeneratingModal() {
   if (!elements.excelGeneratingModal) return;
-  elements.excelGeneratingModal.classList.remove("is-open");
+  elements.excelGeneratingModal.classList.remove("is-open", "is-ready");
   elements.excelGeneratingModal.hidden = true;
+  if (elements.excelGeneratingActions) elements.excelGeneratingActions.hidden = true;
+  if (elements.excelGeneratingActionButton) elements.excelGeneratingActionButton.dataset.exportAction = "";
+  if (["excel_ready", "pdf_ready"].includes(state.restorableOverlay)) {
+    state.restorableOverlay = "";
+    saveSessionState();
+  }
+}
+
+function showGeneratedExportReadyModal(viewPdf = false) {
+  const file = viewPdf
+    ? (pdfFileIsFresh(state.pdfFile) ? state.pdfFile : null)
+    : (downloadFileIsFresh(state.downloadFile) ? state.downloadFile : null);
+  if (!file?.url || !elements.excelGeneratingModal) return false;
+  elements.excelGeneratingEyebrow.textContent = "Quotation export";
+  elements.excelGeneratingTitle.textContent = viewPdf ? "PDF ready" : "Excel ready";
+  elements.excelGeneratingMessage.textContent = viewPdf
+    ? "Your PDF is ready. Click Open PDF to view it in a new tab."
+    : "Your workbook is ready. Click Download Excel to save it.";
+  if (elements.excelGeneratingSpinner) elements.excelGeneratingSpinner.hidden = true;
+  if (elements.excelGeneratingActions) elements.excelGeneratingActions.hidden = false;
+  if (elements.excelGeneratingActionButton) {
+    elements.excelGeneratingActionButton.textContent = viewPdf ? "Open PDF" : "Download Excel";
+    elements.excelGeneratingActionButton.dataset.exportAction = viewPdf ? "pdf" : "excel";
+  }
+  elements.excelGeneratingModal.hidden = false;
+  elements.excelGeneratingModal.classList.add("is-open", "is-ready");
+  state.restorableOverlay = viewPdf ? "pdf_ready" : "excel_ready";
+  saveSessionState();
+  elements.excelGeneratingActionButton?.focus();
+  return true;
+}
+
+function handleGeneratedExportReadyAction() {
+  const action = elements.excelGeneratingActionButton?.dataset.exportAction || "";
+  const handled = action === "pdf" ? viewCurrentPdfFile() : action === "excel" ? downloadCurrentExcelFile() : false;
+  if (handled) hideExcelGeneratingModal();
+}
+
+function generatedExportReadyModalIsOpen() {
+  return Boolean(
+    elements.excelGeneratingModal
+    && !elements.excelGeneratingModal.hidden
+    && elements.excelGeneratingModal.classList.contains("is-ready")
+  );
+}
+
+function dismissGeneratedExportReadyModal() {
+  if (!generatedExportReadyModalIsOpen()) return false;
+  hideExcelGeneratingModal();
+  return true;
 }
 
 function generationLoadingModalOptions(viewPdf = false) {
@@ -6592,7 +7257,7 @@ function generationLoadingModalOptions(viewPdf = false) {
     ? {
         eyebrow: "Quotation export",
         title: "Generating PDF",
-        message: "Building the workbook first, then opening its PDF export.",
+        message: "Building the workbook first, then preparing its PDF export.",
       }
     : {
         eyebrow: "Quotation export",
@@ -6601,10 +7266,38 @@ function generationLoadingModalOptions(viewPdf = false) {
       };
 }
 
+function generationFinalizingModalOptions(viewPdf = false) {
+  return {
+    eyebrow: "Quotation export",
+    title: viewPdf ? "Finalizing PDF" : "Finalizing Excel",
+    message: viewPdf
+      ? "Saving the generated PDF to this quote before it is opened."
+      : "Saving the generated workbook to this quote before download.",
+  };
+}
+
 function clearActiveJob() {
   state.activeJob = null;
   saveSessionState();
 }
+
+function discardInvalidRestoredActiveJob() {
+  state.activeJob = null;
+  state.isAnalysisRunning = false;
+  state.isGenerating = false;
+  state.isPreparingOutput = false;
+  state.restorableOverlay = "";
+  if (elements.basisChatOverlay) {
+    elements.basisChatOverlay.classList.remove("is-open");
+    elements.basisChatOverlay.hidden = true;
+  }
+  document.body.classList.remove("basis-chat-open");
+  hideExcelGeneratingModal();
+  setWorkflowStage(restoredWorkflowStage({ workflowStage: "" }));
+  syncControlStates();
+  saveSessionState();
+}
+
 
 function downloadCurrentExcelFile(file = state.downloadFile) {
   if (!file?.url) return false;
@@ -8326,6 +9019,8 @@ function setBasisChatBusy(isBusy) {
 
 function openBasisChatOverlay(scope = "line", options = {}) {
   if (scope !== "line") return;
+  const preservedProposal = options.preserveState && state.basisChat?.proposal
+    ? state.basisChat.proposal : null;
   state.basisChat = {
     scope,
     field: options.sectionId || options.field || "",
@@ -8335,7 +9030,7 @@ function openBasisChatOverlay(scope = "line", options = {}) {
     quantity: options.quantity ?? "",
     unit: options.unit || "",
     quantityLabel: options.quantityLabel || "",
-    proposal: null,
+    proposal: preservedProposal,
   };
   resetBasisChatProposal();
   elements.basisChatTitle.textContent = "Revise basis line";
@@ -8369,11 +9064,30 @@ function openBasisChatOverlay(scope = "line", options = {}) {
   elements.basisChatPrompt.placeholder = "e.g. Add teardown notes or adjust LED screen size";
   elements.basisChatMessages.innerHTML = "";
   appendBasisChatMessage("assistant", basisChatIntroMessage());
+  if (preservedProposal) setBasisChatProposal(preservedProposal);
   elements.basisChatPrompt.value = "";
   elements.basisChatOverlay.hidden = false;
   elements.basisChatOverlay.classList.add("is-open");
   document.body.classList.add("basis-chat-open");
+  state.restorableOverlay = "basis_chat";
+  saveSessionState();
   window.setTimeout(() => elements.basisChatPrompt.focus(), 0);
+}
+
+function restoreBasisChatOverlay() {
+  const saved = { ...state.basisChat };
+  if (!saved.sectionId || !Number.isInteger(Number(saved.lineIndex))) return false;
+  openBasisChatOverlay("line", {
+    sectionId: saved.sectionId,
+    field: saved.field,
+    lineIndex: Number(saved.lineIndex),
+    line: saved.line,
+    quantity: saved.quantity,
+    unit: saved.unit,
+    quantityLabel: saved.quantityLabel,
+    preserveState: true,
+  });
+  return true;
 }
 
 function closeBasisChatOverlay() {
@@ -8381,6 +9095,10 @@ function closeBasisChatOverlay() {
   elements.basisChatOverlay.hidden = true;
   document.body.classList.remove("basis-chat-open");
   resetBasisChatProposal();
+  if (state.restorableOverlay === "basis_chat") {
+    state.restorableOverlay = "";
+    saveSessionState();
+  }
 }
 
 function basisChatPayload(text) {
@@ -8635,8 +9353,18 @@ function renderLiteralReplacementPreview(proposal) {
   `;
 }
 
-async function buildAiBasisChatResponse(text) {
-  if (!canStartAnalysis()) return null;
+async function buildAiBasisChatResponse(text, options = {}) {
+  const restoredOperation = options.resume === true ? normalizeActiveJob(options.operation || state.activeJob || {}, { restoring: true }) : null;
+  if (!restoredOperation && !canStartAnalysis()) return null;
+  const operation = restoredOperation?.type === "basis_chat" ? restoredOperation : normalizeActiveJob({
+    id: newClientJobId(),
+    type: "basis_chat",
+    phase: "starting",
+    startedAt: new Date().toISOString(),
+    text,
+  });
+  state.activeJob = operation;
+  saveSessionState();
   const previousRunning = state.isAnalysisRunning;
   state.isAnalysisRunning = true;
   setBasisChatBusy(true);
@@ -8645,13 +9373,28 @@ async function buildAiBasisChatResponse(text) {
   const typingMessage = appendBasisChatTyping();
   startElapsedTimer("basisChatElapsed", basisChatStartedAt);
   try {
-    const started = await startJob("basis_chat", basisChatPayload(text));
-    if (!started.ok) {
-      removeBasisChatTyping(typingMessage);
-      appendBasisChatMessage("assistant", basisChatFriendlyError(started.data));
-      return { errorDisplayed: true };
+    let jobId = operation.id;
+    if (operation.phase === "starting") {
+      const started = await startJob("basis_chat", basisChatPayload(text), { jobId });
+      if (!started.ok) {
+        if (started.data?.page_unloading) return { preserved: true };
+        clearActiveJob();
+        removeBasisChatTyping(typingMessage);
+        appendBasisChatMessage("assistant", basisChatFriendlyError(started.data));
+        return { errorDisplayed: true };
+      }
+      jobId = started.data.job_id || jobId;
+      state.activeJob = {
+        ...operation,
+        id: jobId,
+        phase: "running",
+        startedAt: started.data.created_at || operation.startedAt,
+      };
+      saveSessionState();
     }
-    const polled = await pollJob(started.data.job_id);
+    const polled = await pollJob(jobId);
+    if (polled.aborted || isInterruptedJobPoll(polled)) return { preserved: true };
+    clearActiveJob();
     const data = polled.data.result || {};
     if (!polled.ok || ["blocked", "failed"].includes(polled.data.status)) {
       removeBasisChatTyping(typingMessage);
@@ -8858,6 +9601,7 @@ function captureOriginalAnalysisSnapshot(data = {}) {
     boothDimensions: { ...state.boothDimensions },
     source: data.source || state.draftSource || "",
     analysis_mode: normalizeAnalysisMode(data.analysis_mode || state.lastAnalysisMode),
+    reference_file_signature: referenceFilesDependencySignature(),
     warnings: Array.isArray(data.warnings) ? [...data.warnings] : [],
   };
 }
@@ -9511,6 +10255,21 @@ function quoteCommercialFieldChanged(target = null) {
 
 function handleQuoteDetailFieldChange(event = {}) {
   const commercialChanged = quoteCommercialFieldChanged(event.target);
+  const quoteCompanyChanged = [
+    elements.headerDetails,
+    elements.termsHeading,
+    elements.paymentTerms,
+    elements.notesHeading,
+    elements.standardNotes,
+    elements.quoteCompanyName,
+    elements.acceptanceText,
+    elements.companySignatory,
+    elements.companyTitle,
+    elements.companyDateLabel,
+    elements.personLabel,
+    elements.stampLabel,
+    elements.dateLabel,
+  ].filter(Boolean).includes(event.target);
   if (event.target === elements.quoteCurrency) {
     syncQuoteCurrencyCustomInput();
   }
@@ -9524,6 +10283,8 @@ function handleQuoteDetailFieldChange(event = {}) {
   syncQuoteExchangeRateField();
   if (commercialChanged && (state.outputRows.length || state.downloadFile || state.pdfFile)) {
     markOutputRowsDirty();
+  } else if (quoteCompanyChanged) {
+    invalidateGeneratedExportsForPresentationChange();
   }
   updateOutputHeader();
   syncControlStates();
@@ -9593,6 +10354,7 @@ function showQuoteFlow() {
 }
 
 function showDashboard(options = {}) {
+  if (state.activeSidePanel === "customer") resetPendingPricingReferenceSelection();
   state.activeAppView = "dashboard";
   elements.quoteFlowPanel?.classList.remove("is-active");
   elements.quoteDashboardPanel?.classList.add("is-active");
@@ -9656,6 +10418,11 @@ async function loadQuoteDashboard(options = {}) {
   const loadId = (Number(state.quoteSessionDashboardLoadId) || 0) + 1;
   state.quoteSessionDashboardLoadId = loadId;
   const showLoading = options.showLoading !== false;
+  const preservedView = options.preserveViewState === true ? {
+    selectionMode: state.dashboardSelectionMode,
+    selectedSessionIds: dashboardSelectedSessionIds(),
+    activeSessionId: safeQuoteSessionId(state.dashboardActiveSessionId || ""),
+  } : null;
   if (showLoading) {
     setDashboardLoadingState(true, {
       title: "Loading quote sessions",
@@ -9675,6 +10442,12 @@ async function loadQuoteDashboard(options = {}) {
       state.quoteSessionLoadError = genericFailureMessage(data);
     } else {
       state.quoteSessions = Array.isArray(data.quote_sessions) ? data.quote_sessions : [];
+    }
+    if (preservedView) {
+      const availableIds = new Set(state.quoteSessions.map((session) => safeQuoteSessionId(session.session_id || "")).filter(Boolean));
+      state.dashboardSelectedSessionIds = preservedView.selectedSessionIds.filter((sessionId) => availableIds.has(sessionId));
+      state.dashboardActiveSessionId = availableIds.has(preservedView.activeSessionId) ? preservedView.activeSessionId : "";
+      state.dashboardSelectionMode = Boolean(preservedView.selectionMode && state.dashboardSelectedSessionIds.length);
     }
     renderQuoteDashboard();
   } finally {
@@ -9996,6 +10769,9 @@ function dashboardDraftImageFileFieldsMatch(candidate = {}, image = {}, options 
 }
 
 function dashboardDraftImagePayloadMatches(candidate = {}, image = {}) {
+  const candidateFingerprint = normalizedContentFingerprint(candidate.content_fingerprint);
+  const imageFingerprint = normalizedContentFingerprint(image.content_fingerprint);
+  if (candidateFingerprint && imageFingerprint) return candidateFingerprint === imageFingerprint;
   const candidateKey = String(candidate?.session_file_key || "").trim();
   const imageKey = String(image?.session_file_key || "").trim();
   if (candidateKey && imageKey) {
@@ -10064,6 +10840,7 @@ function mergeDashboardDraftImagesWithAvailablePayloads(draftState = {}, availab
       data_url: dataUrl,
       type: image?.type || payloadImage?.type || referenceFileType(payloadImage),
       size: Number.isFinite(size) ? size : 0,
+      content_fingerprint: normalizedContentFingerprint(image?.content_fingerprint || payloadImage?.content_fingerprint),
       session_file_key: image?.session_file_key || payloadImage?.session_file_key || "",
     };
   });
@@ -10130,24 +10907,106 @@ function dashboardRestoreError(message) {
   renderQuoteDashboard();
 }
 
-async function modifyDashboardQuote(sessionId) {
+function normalizeDashboardOperation(operation = {}) {
+  if (!operation || typeof operation !== "object") return null;
+  const type = operation.type === "modify" || operation.type === "duplicate" ? operation.type : "";
+  const sourceSessionId = safeQuoteSessionId(operation.sourceSessionId || "");
+  const targetSessionId = type === "duplicate" ? safeQuoteSessionId(operation.targetSessionId || "") : "";
+  const browserRecoveryScope = String(operation.browserRecoveryScope || "").trim();
+  const startedAt = String(operation.startedAt || "").trim();
+  const startedMs = Date.parse(startedAt);
+  if (!type || !sourceSessionId || (type === "duplicate" && !targetSessionId) || !browserRecoveryScope) return null;
+  if (!Number.isFinite(startedMs) || Date.now() - startedMs > DASHBOARD_OPERATION_MAX_AGE_MS) return null;
+  return { type, sourceSessionId, targetSessionId, browserRecoveryScope, startedAt };
+}
+
+function saveDashboardOperation(operation = {}) {
+  const normalized = normalizeDashboardOperation({ ...operation, browserRecoveryScope: currentBrowserRecoveryScope(), startedAt: operation.startedAt || new Date().toISOString() });
+  state.dashboardOperation = normalized;
+  try {
+    if (normalized) window.localStorage.setItem(DASHBOARD_OPERATION_STORAGE_KEY, JSON.stringify(normalized));
+  } catch {
+    // Refresh recovery is best-effort; the active operation still continues in this page.
+  }
+  return normalized;
+}
+
+function clearDashboardOperation() {
+  state.dashboardOperation = null;
+  try {
+    window.localStorage.removeItem(DASHBOARD_OPERATION_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures after a terminal dashboard operation.
+  }
+}
+
+function restoredDashboardOperation() {
+  let parsed = null;
+  try {
+    parsed = JSON.parse(window.localStorage.getItem(DASHBOARD_OPERATION_STORAGE_KEY) || "null");
+  } catch {
+    parsed = null;
+  }
+  const normalized = normalizeDashboardOperation(parsed || {});
+  if (!normalized || normalized.browserRecoveryScope !== currentBrowserRecoveryScope()) {
+    clearDashboardOperation();
+    return null;
+  }
+  state.dashboardOperation = normalized;
+  return normalized;
+}
+
+function dashboardOperationLoadingOptions(operation = state.dashboardOperation) {
+  return operation?.type === "duplicate"
+    ? { title: "Duplicating quote", message: "Copying the saved quote, files, and pricing state into a new draft." }
+    : { title: "Opening quote", message: "Loading the saved quote, files, and pricing state for editing." };
+}
+
+function finishDashboardOperation() {
+  if (!state.isPageUnloading) clearDashboardOperation();
+}
+
+async function resumeDashboardOperation(operation = restoredDashboardOperation()) {
+  const normalized = normalizeDashboardOperation(operation || {});
+  if (!normalized || normalized.browserRecoveryScope !== currentBrowserRecoveryScope()) return false;
+  state.dashboardOperation = normalized;
+  setDashboardLoadingState(true, dashboardOperationLoadingOptions(normalized));
+  showDashboard({ load: false });
+  if (normalized.type === "duplicate") {
+    await loadQuoteDashboard({ showLoading: false });
+    const existingTarget = state.quoteSessions.find((session) => safeQuoteSessionId(session.session_id || "") === normalized.targetSessionId);
+    if (existingTarget) {
+      state.dashboardActiveSessionId = normalized.targetSessionId;
+      renderQuoteDashboard();
+      scrollDashboardSessionIntoView(normalized.targetSessionId);
+      clearDashboardOperation();
+      setDashboardLoadingState(false);
+      return true;
+    }
+    return duplicateDashboardQuote(normalized.sourceSessionId, { resume: true, targetSessionId: normalized.targetSessionId, operation: normalized });
+  }
+  return modifyDashboardQuote(normalized.sourceSessionId, { resume: true, operation: normalized });
+}
+
+async function modifyDashboardQuote(sessionId, options = {}) {
   const safeSessionId = safeQuoteSessionId(sessionId || "");
-  if (!safeSessionId || appIsBusy() || state.quoteSessionRestoreBusy) return;
+  const isResume = options.resume === true;
+  if (!safeSessionId || (!isResume && appIsBusy()) || state.quoteSessionRestoreBusy) return false;
+  const operation = isResume ? normalizeDashboardOperation(options.operation || state.dashboardOperation || {}) : saveDashboardOperation({ type: "modify", sourceSessionId: safeSessionId });
+  if (!operation) return false;
+  state.dashboardOperation = operation;
   clearQuoteSessionDraftSaveTimer();
   state.quoteSessionRestoreBusy = true;
-  syncControlStates();
+  setDashboardLoadingState(true, dashboardOperationLoadingOptions(operation));
   try {
     const detailedSession = await loadQuoteSessionDetail(safeSessionId);
-    let draftState = detailedSession?.draft_state && typeof detailedSession.draft_state === "object"
-      ? detailedSession.draft_state
-      : {};
-    if (!Object.keys(draftState).length && safeSessionId === safeQuoteSessionId(state.quoteSessionId) && quoteDraftShouldPersistToDashboard()) {
-      draftState = currentQuoteSessionDraftState();
-    }
+    let draftState = detailedSession?.draft_state && typeof detailedSession.draft_state === "object" ? detailedSession.draft_state : {};
+    if (!Object.keys(draftState).length && safeSessionId === safeQuoteSessionId(state.quoteSessionId) && quoteDraftShouldPersistToDashboard()) draftState = currentQuoteSessionDraftState();
     if (!Object.keys(draftState).length) {
       mergeDashboardQuoteSession({ ...(detailedSession || {}), session_id: safeSessionId, has_draft_state: false });
+      finishDashboardOperation();
       dashboardRestoreError("This quote session does not have saved draft data to modify.");
-      return;
+      return false;
     }
     const draftFiles = Array.isArray(detailedSession?.draft_files) ? detailedSession.draft_files : [];
     if (draftFiles.length) {
@@ -10156,44 +11015,46 @@ async function modifyDashboardQuote(sessionId) {
     }
     draftState = mergeDashboardDraftSummaryDetails(draftState, detailedSession || {});
     draftState = hydrateDashboardDraftImagePayloads(draftState, safeSessionId);
-    const restored = await applyQuoteSessionSnapshot(
-      { ...draftState, quoteSessionId: safeSessionId },
-      { sessionId: safeSessionId, forceQuoteView: true }
-    );
+    const restored = await applyQuoteSessionSnapshot({ ...draftState, quoteSessionId: safeSessionId }, { sessionId: safeSessionId, forceQuoteView: true, restoreFurthestPanel: true });
     if (!restored) {
+      finishDashboardOperation();
       dashboardRestoreError("This quote session was saved with an incompatible draft format.");
-      return;
+      return false;
     }
     state.dashboardSelectionMode = false;
     state.dashboardSelectedSessionIds = [];
     state.dashboardActiveSessionId = safeSessionId;
     mergeDashboardQuoteSession({ ...detailedSession, has_draft_state: true });
     rememberRestoredQuoteSessionBaseline(safeSessionId);
+    clearDashboardOperation();
     showQuoteFlow();
+    return true;
   } finally {
     state.quoteSessionRestoreBusy = false;
-    syncControlStates();
+    setDashboardLoadingState(false);
   }
 }
 
-async function duplicateDashboardQuote(sessionId) {
+async function duplicateDashboardQuote(sessionId, options = {}) {
   const sourceSessionId = safeQuoteSessionId(sessionId || "");
-  if (!sourceSessionId || appIsBusy() || state.quoteSessionRestoreBusy) return;
+  const isResume = options.resume === true;
+  if (!sourceSessionId || (!isResume && appIsBusy()) || state.quoteSessionRestoreBusy) return false;
+  const targetSessionId = safeQuoteSessionId(options.targetSessionId || "") || newClientQuoteSessionId();
+  const operation = isResume ? normalizeDashboardOperation(options.operation || state.dashboardOperation || {}) : saveDashboardOperation({ type: "duplicate", sourceSessionId, targetSessionId });
+  if (!operation) return false;
+  state.dashboardOperation = operation;
   clearQuoteSessionDraftSaveTimer();
   state.quoteSessionRestoreBusy = true;
-  syncControlStates();
+  setDashboardLoadingState(true, dashboardOperationLoadingOptions(operation));
   try {
     const detailedSession = await loadQuoteSessionDetail(sourceSessionId);
-    let draftState = detailedSession?.draft_state && typeof detailedSession.draft_state === "object"
-      ? detailedSession.draft_state
-      : {};
-    if (!Object.keys(draftState).length && sourceSessionId === safeQuoteSessionId(state.quoteSessionId) && quoteDraftShouldPersistToDashboard()) {
-      draftState = currentQuoteSessionDraftState();
-    }
+    let draftState = detailedSession?.draft_state && typeof detailedSession.draft_state === "object" ? detailedSession.draft_state : {};
+    if (!Object.keys(draftState).length && sourceSessionId === safeQuoteSessionId(state.quoteSessionId) && quoteDraftShouldPersistToDashboard()) draftState = currentQuoteSessionDraftState();
     if (!Object.keys(draftState).length) {
       mergeDashboardQuoteSession({ ...(detailedSession || {}), session_id: sourceSessionId, has_draft_state: false });
+      finishDashboardOperation();
       dashboardRestoreError("This quote session does not have saved draft data to duplicate.");
-      return;
+      return false;
     }
     const draftFiles = Array.isArray(detailedSession?.draft_files) ? detailedSession.draft_files : [];
     if (draftFiles.length) {
@@ -10202,28 +11063,34 @@ async function duplicateDashboardQuote(sessionId) {
     }
     draftState = mergeDashboardDraftSummaryDetails(draftState, detailedSession || {});
     draftState = hydrateDashboardDraftImagePayloads(draftState, sourceSessionId);
-    const duplicatedSessionId = newClientQuoteSessionId();
-    const restored = await applyQuoteSessionSnapshot(
-      { ...draftState, quoteSessionId: duplicatedSessionId, quoteSessionDraftSaveStarted: true },
-      { sessionId: duplicatedSessionId, forceQuoteView: false }
-    );
+    const restored = await applyQuoteSessionSnapshot({ ...draftState, quoteSessionId: operation.targetSessionId, quoteSessionDraftSaveStarted: true }, { sessionId: operation.targetSessionId, forceQuoteView: false });
     if (!restored) {
+      finishDashboardOperation();
       dashboardRestoreError("This quote session was saved with an incompatible draft format.");
-      return;
+      return false;
     }
     state.quoteSessionDraftSaveStarted = true;
     state.quoteSessionRestoredSessionId = "";
     state.quoteSessionRestoredDraftKey = "";
-    const duplicatedSession = await saveCurrentQuoteSession({ sessionId: duplicatedSessionId, includeDraftState: true });
+    const duplicatedSession = await saveCurrentQuoteSession({ sessionId: operation.targetSessionId, includeDraftState: true });
+    if (!duplicatedSession) {
+      if (!state.isPageUnloading) {
+        clearDashboardOperation();
+        dashboardRestoreError(state.quoteSessionLoadError || "The duplicated quote could not be saved.");
+      }
+      return false;
+    }
     state.dashboardSelectionMode = false;
     state.dashboardSelectedSessionIds = [];
-    state.dashboardActiveSessionId = safeQuoteSessionId(duplicatedSession?.session_id || duplicatedSessionId);
+    state.dashboardActiveSessionId = safeQuoteSessionId(duplicatedSession.session_id || operation.targetSessionId);
     state.activeAppView = "dashboard";
+    clearDashboardOperation();
     renderQuoteDashboard();
     scrollDashboardSessionIntoView(state.dashboardActiveSessionId);
+    return true;
   } finally {
     state.quoteSessionRestoreBusy = false;
-    syncControlStates();
+    setDashboardLoadingState(false);
   }
 }
 function dashboardExportAvailabilityItem(session = {}, kind = "xlsx", label = "XLSX") {
@@ -10367,6 +11234,7 @@ function setDashboardSelection(sessionId, options = {}) {
     state.dashboardSelectionMode = false;
     state.dashboardActiveSessionId = "";
     renderQuoteDashboard();
+    saveWorkspaceViewState();
     return;
   }
   if (mode === "visible") {
@@ -10375,6 +11243,7 @@ function setDashboardSelection(sessionId, options = {}) {
     state.dashboardSelectedSessionIds = visibleIds;
     state.dashboardActiveSessionId = visibleIds.length === 1 ? visibleIds[0] : "";
     renderQuoteDashboard();
+    saveWorkspaceViewState();
     return;
   }
   if (!safeSessionId) return;
@@ -10391,12 +11260,14 @@ function setDashboardSelection(sessionId, options = {}) {
     state.dashboardActiveSessionId = nextSelected.length === 1 ? nextSelected[0] : "";
     state.dashboardSelectionMode = nextSelected.length > 0;
     renderQuoteDashboard();
+    saveWorkspaceViewState();
     return;
   }
   state.dashboardSelectionMode = false;
   state.dashboardSelectedSessionIds = [];
   state.dashboardActiveSessionId = safeSessionId;
   renderQuoteDashboard();
+  saveWorkspaceViewState();
 }
 
 function continueDashboardDraft(sessionId) {
@@ -10724,6 +11595,7 @@ function handleDashboardSelectModeButton() {
     state.dashboardSelectionMode = true;
     state.dashboardSelectedSessionIds = activeId && visibleIds.includes(activeId) ? [activeId] : [];
     renderQuoteDashboard();
+    saveWorkspaceViewState();
     return;
   }
   const visibleIds = dashboardVisibleSessionIds();
@@ -10734,6 +11606,7 @@ function handleDashboardSelectModeButton() {
     state.dashboardActiveSessionId = "";
     state.dashboardSelectionMode = false;
     renderQuoteDashboard();
+    saveWorkspaceViewState();
     return;
   }
   setDashboardSelection("", { mode: "visible" });
@@ -10964,8 +11837,12 @@ function delay(ms) {
   });
 }
 
-async function startJob(type, payload) {
-  return postJson("/api/jobs", { type, payload });
+async function startJob(type, payload, options = {}) {
+  return postJson("/api/jobs", {
+    type,
+    payload,
+    ...(options.jobId ? { job_id: options.jobId } : {}),
+  });
 }
 
 async function pollJob(jobId, onStatus) {
@@ -11094,7 +11971,19 @@ async function handleDraftBasis(options = {}) {
     return;
   }
 
+  const operation = normalizeActiveJob({
+    id: newClientJobId(),
+    type: "draft",
+    phase: "starting",
+    startedAt: analysisRequestedAt,
+    analysisMode,
+    includeBoothDimensions: state.boothDimensions.dimension_source !== "default",
+    includeDraftContext: hasFeedback,
+    finalAfterClarifications: options.finalAfterClarifications === true,
+  });
   const quoteCommercialSnapshot = quoteCommercialOverrideSnapshot();
+  state.activeJob = operation;
+  saveSessionState();
   state.isAnalysisRunning = true;
   state.aiFailed = false;
   state.draftSource = "";
@@ -11111,9 +12000,11 @@ async function handleDraftBasis(options = {}) {
     analysisMode,
     includeBoothDimensions: state.boothDimensions.dimension_source !== "default",
     includeDraftContext: hasFeedback,
-  }));
+  }), { jobId: operation.id });
   if (!started.ok) {
+    if (started.data?.page_unloading) return;
     state.isAnalysisRunning = false;
+    clearActiveJob();
     const errors = started.data.errors || ["Draft failed."];
     const wasBlocked = started.data.status === "blocked";
     setWorkflowStage(wasBlocked ? "details_review" : "ready_to_analyze");
@@ -11127,11 +12018,11 @@ async function handleDraftBasis(options = {}) {
     return;
   }
   const startedAt = started.data.created_at || analysisRequestedAt;
-  state.activeJob = { id: started.data.job_id, type: "draft", startedAt };
+  state.activeJob = { ...operation, id: started.data.job_id || operation.id, phase: "running", startedAt };
   showAiRunningBanner(runningMessage, startedAt);
   saveSessionState();
 
-  const polled = await pollJob(started.data.job_id);
+  const polled = await pollJob(state.activeJob.id);
   if (polled.aborted) {
     restoreQuoteCommercialOverrideSnapshot(quoteCommercialSnapshot, { reason: "draft_poll_aborted" });
     return;
@@ -11142,7 +12033,7 @@ async function handleDraftBasis(options = {}) {
     return;
   }
   state.isAnalysisRunning = false;
-  state.activeJob = null;
+  clearActiveJob();
 
   if (!polled.ok || ["blocked", "failed"].includes(polled.data.status)) {
     const errors = polled.data.errors || polled.data.result?.errors || ["Draft failed."];
@@ -11197,25 +12088,38 @@ async function handleDraftBasis(options = {}) {
   await saveQuoteSessionDraftState({ quoteGenerated: false });
 }
 
-async function confirmBasis() {
-  if (appIsBusy()) return;
+async function confirmBasis(options = {}) {
+  if (appIsBusy()) {
+    if (options.resume === true) clearActiveJob();
+    return;
+  }
+  const restoredOperation = options.resume === true ? normalizeActiveJob(options.operation || state.activeJob || {}, { restoring: true }) : null;
+  const operation = restoredOperation?.type === "confirm_basis" ? restoredOperation : normalizeActiveJob({
+    id: newClientOperationId(),
+    type: "confirm_basis",
+    phase: "running",
+    startedAt: new Date().toISOString(),
+  });
   const confirmBlockReason = basisConfirmBlockReason();
   if (confirmBlockReason) {
     setWorkflowStage("basis_review");
     showBlockedBasisAction(confirmBlockReason);
     syncControlStates();
+    if (restoredOperation) clearActiveJob();
     return;
   }
   if (state.aiFailed) {
     setWorkflowStage("basis_review");
     showAiFailureBanner();
     syncControlStates();
+    if (restoredOperation) clearActiveJob();
     return;
   }
   if (!state.lineItems.length) {
     setWorkflowStage("basis_review");
     showBlockedBasisAction("Quote basis has no line items ready for output. Re-run analysis or resolve the quote basis before confirming.");
     syncControlStates();
+    if (restoredOperation) clearActiveJob();
     return;
   }
   const missing = missingDetailFields();
@@ -11224,8 +12128,11 @@ async function confirmBasis() {
     await saveQuoteSessionDraftState({ quoteGenerated: false });
     showBlockedBasisAction(`Complete Customer and Quote Company details before confirming quotation basis: ${missing.join(", ")}.`);
     syncControlStates();
+    if (restoredOperation) clearActiveJob();
     return;
   }
+  state.activeJob = operation;
+  saveSessionState();
   state.isPreparingOutput = true;
   showExcelGeneratingModal({
     eyebrow: "Quotation output",
@@ -11237,6 +12144,10 @@ async function confirmBasis() {
   try {
     const refreshed = await refreshLineItemsFromServer();
     if (!refreshed.ok) {
+      if (refreshed.data?.page_unloading) {
+        return;
+      }
+      clearActiveJob();
       state.basisConfirmed = false;
       setWorkflowStage("basis_review");
       setResultStatus("Failed", "is-bad");
@@ -11249,6 +12160,7 @@ async function confirmBasis() {
     state.lineItems = outputRowsToLineItems();
     setWorkflowStage("completed");
     await saveQuoteSessionDraftState({ quoteGenerated: true });
+    clearActiveJob();
     renderPricingMatches(state.outputRows);
     renderMatchSummary({ pricing_matches: state.outputRows });
     setResultStatus("Ready for pricing review", "is-warn");
@@ -11256,7 +12168,7 @@ async function confirmBasis() {
     setSidePanel("output", { force: true });
   } finally {
     state.isPreparingOutput = false;
-    hideExcelGeneratingModal();
+    if (!state.isPageUnloading) hideExcelGeneratingModal();
     syncControlStates();
   }
 }
@@ -11301,6 +12213,16 @@ async function handleGenerate(options = {}) {
     return;
   }
 
+  const jobType = viewPdf ? "generate_pdf" : "generate";
+  const operation = normalizeActiveJob({
+    id: newClientJobId(),
+    type: jobType,
+    phase: "starting",
+    startedAt: new Date().toISOString(),
+    viewPdf,
+  });
+  state.activeJob = operation;
+  saveSessionState();
   state.isGenerating = true;
   setWorkflowStage("generating");
   setResultStatus(viewPdf ? "Generating PDF" : "Generating Excel", "is-warn");
@@ -11310,20 +12232,21 @@ async function handleGenerate(options = {}) {
   clearPricingReviewMessages();
   syncControlStates();
   await ensureQuoteSession({ quoteGenerated: true });
-  const jobType = viewPdf ? "generate_pdf" : "generate";
-  const started = await startJob(jobType, buildPayload({ viewPdf }));
+  const started = await startJob(jobType, buildPayload({ viewPdf }), { jobId: operation.id });
   if (!started.ok) {
+    if (started.data?.page_unloading) return;
     state.isGenerating = false;
+    clearActiveJob();
     setWorkflowStage(state.activeSidePanel === "output" ? "completed" : "details_review");
     setResultStatus(started.data.status || "Failed", "is-bad");
     renderMessages(started.data.status === "blocked" ? (started.data.errors || ["Generation blocked."]) : genericFailureMessages(started.data), "error");
     syncControlStates();
     return;
   }
-  state.activeJob = { id: started.data.job_id, type: jobType, viewPdf };
+  state.activeJob = { ...operation, id: started.data.job_id || operation.id, phase: "running" };
   saveSessionState();
 
-  const polled = await pollJob(started.data.job_id);
+  const polled = await pollJob(state.activeJob.id);
   if (polled.aborted) return;
   if (isInterruptedJobPoll(polled)) {
     handleInterruptedJobPoll(jobType, polled);
@@ -11382,10 +12305,63 @@ async function handleGenerate(options = {}) {
   return viewPdf ? Boolean(state.pdfFile) : Boolean(state.downloadFile);
 }
 
-async function resumeSavedJob() {
-  const activeJob = state.activeJob;
-  if (!activeJob || !activeJob.id) return;
+async function ensureSavedServerJobStarted(activeJob) {
+  if (activeJob.phase !== "starting") return { ok: true, data: { job_id: activeJob.id } };
+  const isDraft = activeJob.type === "draft";
+  const viewPdf = activeJob.type === "generate_pdf" || activeJob.viewPdf === true;
+  let payload;
+  if (isDraft) {
+    payload = buildPayload({
+      analysisMode: normalizeAnalysisMode(activeJob.analysisMode),
+      includeBoothDimensions: activeJob.includeBoothDimensions === true,
+      includeDraftContext: activeJob.includeDraftContext === true,
+    });
+  } else {
+    payload = buildPayload({ viewPdf });
+  }
+  await ensureQuoteSession({ quoteGenerated: !isDraft });
+  const started = await startJob(activeJob.type, payload, { jobId: activeJob.id });
+  if (!started.ok) return started;
+  state.activeJob = {
+    ...activeJob,
+    id: started.data.job_id || activeJob.id,
+    phase: "running",
+    startedAt: started.data.created_at || activeJob.startedAt,
+  };
+  saveSessionState();
+  return started;
+}
 
+async function resumeSavedJob() {
+  if (!state.activeJob) return;
+  const activeJob = normalizeActiveJob(state.activeJob, { restoring: true });
+  if (!activeJob) {
+    discardInvalidRestoredActiveJob();
+    return;
+  }
+  state.activeJob = activeJob;
+  if (activeJob.type === "confirm_basis") {
+    state.isPreparingOutput = false;
+    await confirmBasis({ resume: true, operation: activeJob });
+    return;
+  }
+
+  if (activeJob.type === "basis_chat") {
+    const restored = restoreBasisChatOverlay();
+    if (!restored) {
+      clearActiveJob();
+      return;
+    }
+    const text = String(activeJob.text || "").trim();
+    if (text) appendBasisChatMessage("user", text);
+    const aiResult = await buildAiBasisChatResponse(text, { resume: true, operation: activeJob });
+    if (aiResult?.proposal) setBasisChatProposal(aiResult.proposal);
+    else if (aiResult?.answer) appendBasisChatMessage("assistant", aiResult.answer);
+    else if (!aiResult?.errorDisplayed && !aiResult?.preserved) {
+      appendBasisChatMessage("assistant", "I could not produce a useful basis change. Please rephrase the request.");
+    }
+    return;
+  }
   if (activeJob.type === "draft") {
     const quoteCommercialSnapshot = quoteCommercialOverrideSnapshot();
     state.isAnalysisRunning = true;
@@ -11395,8 +12371,20 @@ async function resumeSavedJob() {
     clearBasisReviewSurface();
     setSidePanel("basis", { force: true });
     syncControlStates();
+    const restarted = await ensureSavedServerJobStarted(activeJob);
+    if (!restarted.ok) {
+      if (restarted.data?.page_unloading) return;
+      state.isAnalysisRunning = false;
+      clearActiveJob();
+      setWorkflowStage("ready_to_analyze");
+      showAiFailureBanner(genericFailureMessage(restarted.data));
+      restoreQuoteCommercialOverrideSnapshot(quoteCommercialSnapshot, { reason: "resume_draft_start_failed" });
+      syncControlStates();
+      return;
+    }
+    const resumedJob = state.activeJob || activeJob;
 
-    const polled = await pollJob(activeJob.id, (job) => {
+    const polled = await pollJob(resumedJob.id, (job) => {
       if (job.created_at && !state.activeJob?.startedAt) {
         state.activeJob = { ...state.activeJob, startedAt: job.created_at };
         showAiRunningBanner(ANALYSIS_WAIT_ESTIMATE, job.created_at);
@@ -11456,22 +12444,36 @@ async function resumeSavedJob() {
     setSidePanel("output", { force: true });
     showExcelGeneratingModal(generationLoadingModalOptions(viewPdf));
     syncControlStates();
+    const restarted = await ensureSavedServerJobStarted(activeJob);
+    if (!restarted.ok) {
+      if (restarted.data?.page_unloading) return;
+      state.isGenerating = false;
+      clearActiveJob();
+      hideExcelGeneratingModal();
+      setWorkflowStage("completed");
+      setResultStatus(restarted.data.status || "Failed", "is-bad");
+      renderMessages(genericFailureMessages(restarted.data), "error");
+      syncControlStates();
+      return;
+    }
+    const resumedJob = state.activeJob || activeJob;
 
-    const polled = await pollJob(activeJob.id);
+    const polled = await pollJob(resumedJob.id);
     if (polled.aborted) return;
-    hideExcelGeneratingModal();
     if (isInterruptedJobPoll(polled)) {
+      hideExcelGeneratingModal();
       handleInterruptedJobPoll(activeJob.type, polled);
       return;
     }
-    state.isGenerating = false;
-    clearActiveJob();
 
     const data = polled.data.result || polled.data || {};
     if (data.quote_session?.session_id) {
       state.quoteSessionId = safeQuoteSessionId(data.quote_session.session_id) || state.quoteSessionId;
     }
     if (!polled.ok || ["blocked", "failed"].includes(polled.data.status) || data.status === "blocked" || data.status === "failed") {
+      state.isGenerating = false;
+      clearActiveJob();
+      hideExcelGeneratingModal();
       setWorkflowStage("details_review");
       setResultStatus(data.status || "Failed", "is-bad");
       const blocked = polled.data.status === "blocked" || data.status === "blocked";
@@ -11484,6 +12486,7 @@ async function resumeSavedJob() {
 
     const needsPricingReview = polled.data.status === "needs_review"
       || data.status === "needs_confirmation";
+    showExcelGeneratingModal(generationFinalizingModalOptions(viewPdf));
     if (needsPricingReview) {
       setWorkflowStage("completed");
       setResultStatus("Needs pricing review", "is-warn");
@@ -11502,7 +12505,11 @@ async function resumeSavedJob() {
     if (data.pricing_matches?.length) renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
     renderMatchSummary(data);
     await saveQuoteSessionDraftState({ quoteGenerated: true });
+    state.isGenerating = false;
+    clearActiveJob();
     syncControlStates();
+    if (!needsPricingReview && showGeneratedExportReadyModal(viewPdf)) return;
+    hideExcelGeneratingModal();
     return;
   }
 
@@ -11531,14 +12538,20 @@ function requestStartAnalysis(mode = "standard") {
     return;
   }
   state.pendingAnalysisMode = normalizeAnalysisMode(mode);
+  state.restorableOverlay = "analysis_confirm";
   elements.analysisConfirmModal.hidden = false;
   elements.analysisConfirmModal.classList.add("is-open");
+  saveSessionState();
   window.setTimeout(() => elements.analysisConfirmStartButton?.focus(), 0);
 }
 
 function closeAnalysisConfirmModal() {
   elements.analysisConfirmModal.classList.remove("is-open");
   elements.analysisConfirmModal.hidden = true;
+  if (state.restorableOverlay === "analysis_confirm") {
+    state.restorableOverlay = "";
+    saveSessionState();
+  }
 }
 
 function confirmStartAnalysis(mode = state.pendingAnalysisMode) {
@@ -11612,6 +12625,9 @@ function setSidePanel(panelName, options = {}) {
     return false;
   }
   const previousPanel = state.activeSidePanel;
+  if (previousPanel === "customer" && nextPanel !== "customer") {
+    resetPendingPricingReferenceSelection();
+  }
   const [title, eyebrow, subtitle] = panelTitles[nextPanel] || panelTitles.images;
   state.activeSidePanel = nextPanel;
   if (
@@ -11688,7 +12704,13 @@ function updateSidePanelNav() {
   const nextLabels = {
     images: "Next: Customer",
     customer: "Next: Quote Company",
-    quote_company: currentGenerator().analyzeLabel,
+    quote_company: (
+      state.originalAnalysisSnapshot
+      || state.quoteBasisSections?.length
+      || state.lineItems?.length
+      || state.outputRows?.length
+      || state.originalOutputRows?.length
+    ) ? "Next: Quote Basis" : currentGenerator().analyzeLabel,
     basis: "Confirm Quotation Basis",
   };
   elements.sideNextButton.textContent = nextLabels[state.activeSidePanel] || "Next";
@@ -11720,7 +12742,7 @@ function goToPreviousSidePanel() {
   setSidePanel(SIDE_PANEL_SEQUENCE[index - 1]);
 }
 
-async function goToNextSidePanel() {
+async function goToNextSidePanel(options = {}) {
   const index = activeSidePanelIndex();
   if (elements.sideNextButton?.getAttribute("aria-disabled") === "true") {
     const reason = elements.sideNextButton.title || "This step is not ready yet.";
@@ -11730,8 +12752,19 @@ async function goToNextSidePanel() {
     if (state.activeSidePanel === "basis") showBlockedBasisAction(reason);
     return;
   }
+  if (!options.dependencyChangeConfirmed) {
+    const dependencyChanges = quoteDependencyChangesForNext();
+    if (dependencyChanges.length) {
+      requestQuoteDependencyChangeConfirmation(dependencyChanges);
+      return;
+    }
+  }
   if (state.activeSidePanel === "quote_company") {
-    await saveQuoteSessionDraftState({ quoteGenerated: false });
+    if (quoteHasDerivedResults()) {
+      const moved = setSidePanel("basis", { notify: true });
+      if (moved) await saveQuoteSessionDraftState({ quoteGenerated: quoteSessionHasFreshOutputExports() });
+      return;
+    }
     requestStartAnalysis();
     return;
   }
@@ -11740,6 +12773,7 @@ async function goToNextSidePanel() {
     return;
   }
   if (state.activeSidePanel === "output") return;
+  if (state.activeSidePanel === "customer") applyPendingPricingReferenceSelection();
   const nextPanel = SIDE_PANEL_SEQUENCE[index + 1];
   const moved = setSidePanel(nextPanel, { notify: true });
   if (moved && nextPanel === "customer") {
@@ -11843,18 +12877,38 @@ function wireEvents() {
   });
 
   elements.headerLogoInput.addEventListener("change", async (event) => {
+    const presentationBeforeLogoChange = quoteCompanyPresentationSignature();
     const file = (event.target.files || [])[0];
-    state.headerLogo = file
-      ? {
-          name: file.name,
-          type: file.type,
-          size: file.size,
-          data_url: await fileToDataUrl(file),
-        }
-      : null;
+    if (file) {
+      const [dataUrl, arrayBuffer] = await Promise.all([
+        fileToDataUrl(file),
+        typeof file.arrayBuffer === "function" ? file.arrayBuffer() : Promise.resolve(null),
+      ]);
+      const contentFingerprint = arrayBuffer
+        ? await sha256ContentFingerprint(arrayBuffer)
+        : await contentFingerprintFromDataUrl(dataUrl);
+      if (!contentFingerprint) {
+        renderPresetStatus("The selected logo could not be securely verified. Please try adding it again.");
+        event.target.value = "";
+        return;
+      }
+      state.headerLogo = {
+        name: file.name,
+        type: file.type,
+        size: file.size,
+        content_fingerprint: contentFingerprint,
+        data_url: dataUrl,
+      };
+    } else {
+      state.headerLogo = null;
+    }
     renderHeaderLogoPreview();
     renderPresetStatus();
+    invalidateGeneratedExportsIfPresentationChanged(presentationBeforeLogoChange);
     syncControlStates();
+    if (quoteSessionDraftStateCanSave()) {
+      queueQuoteSessionDraftStateSave({ quoteGenerated: quoteSessionHasFreshOutputExports() });
+    }
   });
   elements.headerLogoPreview.addEventListener("click", () => {
     elements.headerLogoInput.click();
@@ -11937,17 +12991,35 @@ function wireEvents() {
       hideExcelGeneratingModal();
     }
   });
+  elements.excelGeneratingActionButton?.addEventListener("click", () => {
+    handleGeneratedExportReadyAction();
+  });
+  elements.excelGeneratingCloseButton?.addEventListener("click", () => {
+    hideExcelGeneratingModal();
+  });
+  elements.excelGeneratingModal?.addEventListener("click", (event) => {
+    if (
+      event.target === elements.excelGeneratingModal
+      || event.target.classList?.contains("modal-backdrop")
+    ) {
+      dismissGeneratedExportReadyModal();
+    }
+  });
   document.addEventListener("keydown", (event) => {
     if (handleDashboardEnterKey(event)) return;
     if (handleDashboardListArrowKey(event)) return;
     if (handleDashboardDeleteKey(event)) return;
     if (event.key === "Escape") {
-      if (profileActionsMenuIsOpen()) {
+      if (dismissGeneratedExportReadyModal()) {
+        event.preventDefault();
+      } else if (profileActionsMenuIsOpen()) {
         closeProfileActionsMenu({ focusButton: true });
       } else if (elements.pricingReferenceTableOverlay && !elements.pricingReferenceTableOverlay.hidden) {
         closePricingReferenceTableOverlay();
       } else if (!elements.basisChatOverlay.hidden) {
         closeBasisChatOverlay();
+      } else if (elements.quoteDependencyConfirmModal && !elements.quoteDependencyConfirmModal.hidden) {
+        hideQuoteDependencyConfirmModal({ focusButton: true });
       } else if (elements.profileLoadModal && !elements.profileLoadModal.hidden) {
         hideProfileLoadModal({ focusButton: true });
       } else if (elements.profileOverwriteModal && !elements.profileOverwriteModal.hidden) {
@@ -11985,41 +13057,49 @@ function wireEvents() {
     state.dashboardStatusFilter = elements.dashboardStatusFilter.value || "all";
     state.dashboardPageIndex = 0;
     renderQuoteDashboard();
+    saveWorkspaceViewState();
   });
   elements.dashboardDateFilter?.addEventListener("change", () => {
     state.dashboardDateFilter = elements.dashboardDateFilter.value || "all";
     ensureDashboardCustomDateDefaults();
     state.dashboardPageIndex = 0;
     renderQuoteDashboard();
+    saveWorkspaceViewState();
   });
   elements.dashboardDateStartInput?.addEventListener("change", () => {
     state.dashboardCustomDateStart = elements.dashboardDateStartInput.value || "";
     state.dashboardPageIndex = 0;
     renderQuoteDashboard();
+    saveWorkspaceViewState();
   });
   elements.dashboardDateEndInput?.addEventListener("change", () => {
     state.dashboardCustomDateEnd = elements.dashboardDateEndInput.value || "";
     state.dashboardPageIndex = 0;
     renderQuoteDashboard();
+    saveWorkspaceViewState();
   });
   elements.dashboardSortSelect?.addEventListener("change", () => {
     state.dashboardSortMode = elements.dashboardSortSelect.value || "created";
     state.dashboardPageIndex = 0;
     renderQuoteDashboard();
+    saveWorkspaceViewState();
   });
   elements.dashboardSearchInput?.addEventListener("input", () => {
     state.dashboardSearch = elements.dashboardSearchInput.value || "";
     state.dashboardPageIndex = 0;
     renderQuoteDashboard();
+    saveWorkspaceViewState();
   });
   elements.dashboardPageSizeSelect?.addEventListener("change", () => {
     state.dashboardPageSize = Number(elements.dashboardPageSizeSelect.value);
     state.dashboardPageIndex = 0;
     renderQuoteDashboard();
+    saveWorkspaceViewState();
   });
   elements.dashboardRangeSelect?.addEventListener("change", () => {
     state.dashboardPageIndex = Number(elements.dashboardRangeSelect.value);
     renderQuoteDashboard();
+    saveWorkspaceViewState();
   });
   elements.settingsButton?.addEventListener("click", openSettingsModal);
   elements.profileSelect.addEventListener("change", handleProfileSelectionChange);
@@ -12109,6 +13189,13 @@ function wireEvents() {
   elements.pricingReferenceModal.addEventListener("click", (event) => {
     if (event.target === elements.pricingReferenceModal || event.target.closest("[data-pricing-reference-close]")) {
       closePricingReferenceModal();
+    }
+  });
+  elements.cancelQuoteDependencyConfirmButton?.addEventListener("click", () => hideQuoteDependencyConfirmModal({ focusButton: true }));
+  elements.confirmQuoteDependencyChangeButton?.addEventListener("click", confirmQuoteDependencyChange);
+  elements.quoteDependencyConfirmModal?.addEventListener("click", (event) => {
+    if (event.target === elements.quoteDependencyConfirmModal || event.target.closest("[data-quote-dependency-confirm-close]")) {
+      hideQuoteDependencyConfirmModal({ focusButton: true });
     }
   });
   elements.analysisConfirmCancelButton.addEventListener("click", closeAnalysisConfirmModal);
@@ -12267,7 +13354,7 @@ async function setInitialValues() {
   renderPresetStatus();
   if (await restoreSessionState()) {
     syncControlStates();
-    return;
+    return true;
   }
   applyDefaultQuoteDate();
   applyDefaultQuoteCompanyFields();
@@ -12279,35 +13366,47 @@ async function setInitialValues() {
   renderBasisEmptyState();
   syncControlStates();
   setSidePanel("images");
+  return false;
 }
 
 async function boot() {
+  let dashboardOperation = null;
+  let workspaceView = null;
+  setDashboardLoadingState(true, { title: "Restoring workspace", message: "Loading your saved quote and returning to the last open menu." });
   wireEvents();
   clearLegacyLocalCompanyPresets();
   try {
     await initializeSession();
+    workspaceView = restoredWorkspaceViewState();
+    dashboardOperation = restoredDashboardOperation();
+    if (dashboardOperation) setDashboardLoadingState(true, dashboardOperationLoadingOptions(dashboardOperation));
     await loadProfiles();
-    await setInitialValues();
-    if (state.activeAppView === "quote") {
-      showQuoteFlow();
-    } else {
-      showDashboard({ load: false });
-    }
+    const quoteRestored = await setInitialValues();
+    if (workspaceView) applyWorkspaceViewState(workspaceView, { quoteRestored });
+    if (state.activeAppView === "quote") showQuoteFlow();
+    else showDashboard({ load: false });
     checkHealth();
   } finally {
     state.isBooting = false;
     syncControlStates();
   }
+  if (state.activeJob) setDashboardLoadingState(false);
   await resumeSavedJob();
+  if (dashboardOperation && !state.activeJob) {
+    const resumed = await resumeDashboardOperation(dashboardOperation);
+    if (resumed) {
+      restoreRestorableOverlay();
+      return;
+    }
+  }
   if (state.activeAppView === "quote") {
     showQuoteFlow();
+    setDashboardLoadingState(false);
   } else {
     showDashboard({ load: false });
-    await loadQuoteDashboard();
+    await loadQuoteDashboard({ preserveViewState: true });
   }
+  restoreRestorableOverlay();
 }
 
 boot();
-
-
-

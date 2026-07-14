@@ -668,6 +668,27 @@ class WebappServerTest(unittest.TestCase):
             if hasattr(webapp, "RATE_LIMIT_LAST_PRUNE_AT"):
                 webapp.RATE_LIMIT_LAST_PRUNE_AT = 0.0
 
+    def test_local_mutable_storage_defaults_stay_inside_repo(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(webapp, "read_dotenv_value", return_value=""):
+                roots = {
+                    "company data": webapp.configured_data_root(),
+                    "generated output": webapp.configured_output_root(),
+                    "temporary work": webapp.configured_tmp_root(),
+                    "application logs": webapp.configured_log_root(),
+                    "local pricing references": webapp.pricing_references_root(),
+                }
+
+        self.assertEqual(roots["company data"], webapp.PROJECT_ROOT / "_tmp" / "company-data")
+        for label, root in roots.items():
+            with self.subTest(label=label):
+                self.assertTrue(root.is_relative_to(webapp.PROJECT_ROOT))
+
+    def test_configured_data_root_preserves_explicit_override(self):
+        configured_root = test_temp_root() / "explicit-company-data"
+        with mock.patch.dict(os.environ, {"QUOTE_DATA_ROOT": str(configured_root)}, clear=True):
+            self.assertEqual(webapp.configured_data_root(), configured_root)
+
     def deploy_auth_env(self, **overrides):
         env = {
             'SQAG_TRUSTED_PROXY_CIDRS': '127.0.0.1/32',
@@ -5271,7 +5292,7 @@ class WebappServerTest(unittest.TestCase):
         raw = (
             "Item,Cost,Markup\n"
             "\"nos. rigging point for Overhead Structure or Aluminium Box Truss\n"
-            "Ã¢â‚¬Â¢ Prices are not inclusive of truss\",300,1.5\n"
+            "ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¢ Prices are not inclusive of truss\",300,1.5\n"
         ).encode("utf-8")
         parsed = {
             "items": [{
@@ -5329,7 +5350,7 @@ class WebappServerTest(unittest.TestCase):
                         "row_index": 12,
                         "non_empty_cells": {
                             "A": "Hanging Structure",
-                            "B": "nos. RIGGING POINT for Overhead Structure or Aluminium Box Truss\nÃ¢â‚¬Â¢ Prices are not inclusive of truss",
+                            "B": "nos. RIGGING POINT for Overhead Structure or Aluminium Box Truss\nÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¢ Prices are not inclusive of truss",
                             "C": "nos",
                             "D": "300",
                             "E": "1.5",
@@ -6932,6 +6953,21 @@ class WebappServerTest(unittest.TestCase):
         self.assertIn(created["status"], {"running", "completed"})
         self.assertEqual(job["status"], "completed")
         self.assertEqual(job["result"]["source"], "openai")
+
+    def test_create_job_reuses_client_job_id_without_starting_duplicate_worker(self):
+        payload = valid_payload()
+        ai_draft = {"status": "drafted", "source": "openai", "quote_basis": {}, "line_items": []}
+        requested_job_id = "job-client-retry-12345678"
+
+        with mock.patch.object(webapp, "draft_quote_basis", return_value=ai_draft) as draft:
+            first = webapp.create_job("draft", payload, requested_job_id=requested_job_id)
+            second = webapp.create_job("draft", payload, requested_job_id=requested_job_id)
+            completed = wait_for_job(requested_job_id)
+
+        self.assertEqual(first["job_id"], requested_job_id)
+        self.assertEqual(second["job_id"], requested_job_id)
+        self.assertEqual(completed["status"], "completed")
+        draft.assert_called_once()
 
     def test_create_draft_job_marks_local_remote_failure_fallback_degraded(self):
         local_draft = {
@@ -9991,7 +10027,10 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertIn("view_pdf: options.viewPdf === true", js)
         self.assertIn("viewCurrentPdfFile", js)
         self.assertIn('const jobType = viewPdf ? "generate_pdf" : "generate";', js)
-        self.assertIn("startJob(jobType, buildPayload({ viewPdf }))", js)
+        self.assertIn(
+            "startJob(jobType, buildPayload({ viewPdf }), { jobId: operation.id })",
+            js,
+        )
         self.assertIn("quotation.pdf", webapp.DOWNLOADABLE_FILES)
         send_download_source = inspect.getsource(webapp.QuoteRunnerHandler.send_download)
         self.assertIn("Content-Disposition", send_download_source)
@@ -11659,15 +11698,569 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertNotIn(".side-workspace.is-open", css)
 
         initial_values_body = js.split("async function setInitialValues()", 1)[1].split("async function boot()", 1)[0]
+        apply_reference_body = js.split("function applyPendingPricingReferenceSelection()", 1)[1].split("function handleProfileSelectionChange()", 1)[0]
         profile_change_body = js.split("function handleProfileSelectionChange()", 1)[1].split("function buildPayload(options = {})", 1)[0]
+        next_panel_body = js.split("async function goToNextSidePanel", 1)[1].split("function handleQuoteBasisClick", 1)[0]
+        quote_company_next_body = next_panel_body.split('if (state.activeSidePanel === "quote_company") {', 1)[1].split('if (state.activeSidePanel === "basis") {', 1)[0]
         self.assertIn("loadDefaultProfilePreset({ silent: true })", initial_values_body)
-        self.assertIn("syncSelectedPricingReference();", profile_change_body)
-        self.assertIn("clearGeneratedQuoteState();", profile_change_body)
-        self.assertIn("syncControlStates();", profile_change_body)
+        self.assertNotIn("state.pricingReferenceId =", profile_change_body)
+        self.assertNotIn("clearGeneratedQuoteState();", profile_change_body)
+        self.assertNotIn("persistLastPricingReferenceSelection();", profile_change_body)
+        self.assertIn("renderPendingPricingReferenceBasis();", profile_change_body)
+        self.assertIn("syncSelectedPricingReference();", apply_reference_body)
+        self.assertIn("clearGeneratedQuoteState();", apply_reference_body)
+        self.assertIn("persistLastPricingReferenceSelection();", apply_reference_body)
+        self.assertIn('state.activeSidePanel === "customer"', next_panel_body)
+        self.assertIn("applyPendingPricingReferenceSelection();", next_panel_body)
+        self.assertIn("requestStartAnalysis();", quote_company_next_body)
+        self.assertIn("quoteHasDerivedResults()", quote_company_next_body)
+        self.assertIn('setSidePanel("basis"', quote_company_next_body)
+        self.assertIn("saveQuoteSessionDraftState", quote_company_next_body)
+        self.assertIn('id="quoteDependencyConfirmModal"', html)
+        self.assertIn("quoteDependencyChangesForNext()", next_panel_body)
         self.assertNotIn("loadDefaultProfilePreset", profile_change_body)
         self.assertNotIn("setSampleDetails", js)
         self.assertNotIn("DEFAULT_SAMPLE_ID", js)
         self.assertNotIn("/api/samples", js)
+
+    def test_static_dependency_change_detection_warns_only_for_effective_analysis_input_changes(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const marker = `function ${name}(`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const firstImage = {
+  name: "render.png",
+  type: "image/png",
+  size: 4,
+  data_url: "data:image/png;base64,AAAA",
+  content_fingerprint: `sha256:${"a".repeat(64)}`,
+  session_file_key: "first-key",
+};
+const state = {
+  images: [firstImage],
+  originalAnalysisSnapshot: null,
+  outputRows: [{ description: "Existing output" }],
+  pricingReferenceId: "reference-a",
+  pricingReferenceSource: "bundled",
+};
+const elements = { profileSelect: { value: "bundled::reference-a" } };
+function quoteDraftHasAiAnalysis() { return Boolean(state.originalAnalysisSnapshot); }
+function quoteDraftHasOutputState() { return Boolean(state.outputRows.length); }
+
+eval([
+  "normalizedContentFingerprint",
+  "referenceFileType",
+  "referenceFileDependencyKey",
+  "referenceFilesDependencySignature",
+  "referenceFileSignatureIsStrong",
+  "pricingReferenceSelectionFromValue",
+  "pendingPricingReferenceSelection",
+  "quoteHasDerivedResults",
+  "analyzedReferenceFileSignature",
+  "referenceFilesChangedSinceAnalysis",
+  "pendingPricingReferenceSelectionChanged",
+  "quoteDependencyChangesForNext",
+].map(extractFunction).join("\n"));
+
+state.originalAnalysisSnapshot = {
+  reference_file_signature: referenceFilesDependencySignature(state.images),
+};
+assert.deepStrictEqual(quoteDependencyChangesForNext(), []);
+
+elements.profileSelect.value = "bundled::reference-a";
+assert.strictEqual(pendingPricingReferenceSelectionChanged(), false);
+assert.deepStrictEqual(quoteDependencyChangesForNext(), []);
+
+elements.profileSelect.value = "local::reference-b";
+assert.deepStrictEqual(quoteDependencyChangesForNext(), ["pricing_reference"]);
+
+elements.profileSelect.value = "bundled::reference-a";
+state.images = [{ ...firstImage, session_file_key: "replacement-key" }];
+assert.deepStrictEqual(quoteDependencyChangesForNext(), []);
+
+state.images = [{
+  ...firstImage,
+  data_url: "data:image/png;base64,BBBB",
+  content_fingerprint: `sha256:${"b".repeat(64)}`,
+  session_file_key: "changed-key",
+}];
+assert.deepStrictEqual(quoteDependencyChangesForNext(), ["reference_files"]);
+
+state.outputRows = [];
+state.originalAnalysisSnapshot = null;
+elements.profileSelect.value = "local::reference-b";
+assert.deepStrictEqual(quoteDependencyChangesForNext(), []);
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_static_complete_sha256_fingerprints_close_sampled_collision_and_persist_identity(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const { webcrypto } = require("crypto");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const markers = [`async function ${name}(`, `function ${name}(`];
+  const starts = markers.map((marker) => source.indexOf(marker)).filter((index) => index >= 0);
+  const start = starts.length ? Math.min(...starts) : -1;
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  if (bodyStart < 2) throw new Error(`Missing body for function ${name}`);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+function legacySampledFingerprint(dataUrl = "") {
+  const text = String(dataUrl || "");
+  let hash = 2166136261;
+  const stride = Math.max(1, Math.floor(text.length / 4096));
+  for (let index = 0; index < text.length; index += stride) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${text.length}:${(hash >>> 0).toString(16)}`;
+}
+
+global.window = { crypto: webcrypto };
+const MAX_REFERENCE_IMAGES = 8;
+const SERVER_JOB_TYPES = new Set(["draft", "basis_chat", "generate", "generate_pdf"]);
+const state = {
+  images: [],
+  originalAnalysisSnapshot: null,
+  outputRows: [{ description: "Retained output" }],
+  headerLogo: null,
+  downloadFile: null,
+  pdfFile: null,
+  outputRevision: 0,
+};
+let quoteCompanyName = "Fingerprint Co";
+function quoteDraftHasAiAnalysis() { return Boolean(state.originalAnalysisSnapshot); }
+function quoteDraftHasOutputState() { return Boolean(state.outputRows.length); }
+function isAcceptedReferenceFile() { return true; }
+function fileToDataUrl(file) { return Promise.resolve(file.dataUrl); }
+function syncRichTextSources() {}
+function collectQuoteCompanyProfileDetails() { return { company: { name: quoteCompanyName } }; }
+function markOutputRowsDirty() {
+  state.outputRevision += 1;
+  state.downloadFile = null;
+  state.pdfFile = null;
+}
+
+eval([
+  "normalizedContentFingerprint",
+  "dataUrlBytes",
+  "sha256ContentFingerprint",
+  "contentFingerprintFromDataUrl",
+  "ensureContentFingerprint",
+  "referenceFileType",
+  "filesToImageEntries",
+  "referenceFileDependencyKey",
+  "referenceFilesDependencySignature",
+  "referenceFileSignatureIsStrong",
+  "quoteHasDerivedResults",
+  "analyzedReferenceFileSignature",
+  "referenceFilesChangedSinceAnalysis",
+  "quoteCompanyPresentationSignature",
+  "invalidateGeneratedExportsForPresentationChange",
+  "invalidateGeneratedExportsIfPresentationChanged",
+].map(extractFunction).join("\n"));
+
+(async () => {
+  const prefix = "data:image/png;base64,";
+  const payloadA = "A".repeat(8192);
+  const payloadB = `${payloadA[0]}B${payloadA.slice(2)}`;
+  const dataUrlA = prefix + payloadA;
+  const dataUrlB = prefix + payloadB;
+  const changedGlobalIndex = prefix.length + 1;
+  const oldStride = Math.max(1, Math.floor(dataUrlA.length / 4096));
+  assert.ok(dataUrlA.length > 4096);
+  assert.notStrictEqual(changedGlobalIndex % oldStride, 0);
+  assert.strictEqual(dataUrlA.length, dataUrlB.length);
+  assert.strictEqual(Buffer.from(payloadA, "base64").length, Buffer.from(payloadB, "base64").length);
+  assert.strictEqual(legacySampledFingerprint(dataUrlA), legacySampledFingerprint(dataUrlB));
+
+  const fingerprintA = await contentFingerprintFromDataUrl(dataUrlA);
+  const fingerprintB = await contentFingerprintFromDataUrl(dataUrlB);
+  assert.match(fingerprintA, /^sha256:[0-9a-f]{64}$/);
+  assert.match(fingerprintB, /^sha256:[0-9a-f]{64}$/);
+  assert.notStrictEqual(fingerprintA, fingerprintB);
+  assert.strictEqual(normalizedContentFingerprint(fingerprintA.toUpperCase()), fingerprintA);
+  assert.strictEqual(normalizedContentFingerprint("not-a-digest"), "");
+
+  const ingested = await filesToImageEntries([{
+    name: "render.png",
+    type: "image/png",
+    size: Buffer.from(payloadA, "base64").length,
+    dataUrl: dataUrlA,
+    async arrayBuffer() {
+      const bytes = Buffer.from(payloadA, "base64");
+      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    },
+  }]);
+  assert.strictEqual(ingested.length, 1);
+  assert.strictEqual(ingested[0].content_fingerprint, fingerprintA);
+
+  const baseImage = {
+    name: "render.png",
+    type: "image/png",
+    size: Buffer.from(payloadA, "base64").length,
+    data_url: dataUrlA,
+    content_fingerprint: fingerprintA,
+    session_file_key: "first-object",
+  };
+  state.images = [baseImage];
+  const baseline = referenceFilesDependencySignature(state.images);
+  assert.strictEqual(referenceFileSignatureIsStrong(baseline), true);
+  state.originalAnalysisSnapshot = { reference_file_signature: baseline };
+  assert.strictEqual(referenceFilesChangedSinceAnalysis(), false);
+
+  state.images = [{ ...baseImage, data_url: dataUrlB, content_fingerprint: fingerprintB, session_file_key: "second-object" }];
+  assert.strictEqual(referenceFilesChangedSinceAnalysis(), true);
+
+  state.images = [{ ...baseImage, session_file_key: "third-object" }];
+  assert.strictEqual(referenceFilesChangedSinceAnalysis(), false);
+
+  const legacyWithPayload = await ensureContentFingerprint({ ...baseImage, content_fingerprint: "" });
+  assert.strictEqual(legacyWithPayload.content_fingerprint, fingerprintA);
+  const legacyWithoutPayload = await ensureContentFingerprint({
+    name: baseImage.name,
+    type: baseImage.type,
+    size: baseImage.size,
+    session_file_key: "legacy-missing-payload",
+  });
+  assert.strictEqual(legacyWithoutPayload.content_fingerprint, "");
+  state.images = [legacyWithoutPayload];
+  assert.strictEqual(referenceFilesDependencySignature(state.images), "");
+  assert.strictEqual(referenceFilesChangedSinceAnalysis(), true);
+
+  const secondImage = { ...baseImage, name: "second.png", session_file_key: "second" };
+  assert.notStrictEqual(
+    referenceFilesDependencySignature([baseImage, secondImage]),
+    referenceFilesDependencySignature([secondImage, baseImage]),
+  );
+
+  state.headerLogo = { ...baseImage, name: "logo.png" };
+  const firstLogoSignature = quoteCompanyPresentationSignature();
+  assert.strictEqual(firstLogoSignature.includes("base64,"), false);
+  state.headerLogo = { ...baseImage, name: "logo.png", session_file_key: "different-logo-object" };
+  assert.strictEqual(quoteCompanyPresentationSignature(), firstLogoSignature);
+  state.headerLogo = { ...baseImage, name: "logo.png", data_url: dataUrlB, content_fingerprint: fingerprintB };
+  assert.notStrictEqual(quoteCompanyPresentationSignature(), firstLogoSignature);
+  state.downloadFile = { name: "quotation.xlsx", url: "/quotation.xlsx" };
+  state.pdfFile = { name: "quotation.pdf", url: "/quotation.pdf" };
+  assert.strictEqual(invalidateGeneratedExportsIfPresentationChanged(firstLogoSignature), true);
+  assert.strictEqual(state.downloadFile, null);
+  assert.strictEqual(state.pdfFile, null);
+
+  const changedLogoSignature = quoteCompanyPresentationSignature();
+  assert.strictEqual(invalidateGeneratedExportsIfPresentationChanged(changedLogoSignature), false);
+  quoteCompanyName = "Changed Fingerprint Co";
+  assert.notStrictEqual(quoteCompanyPresentationSignature(), changedLogoSignature);
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_static_restored_active_jobs_enforce_phase_specific_expiry_timestamp_and_scope(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const marker = `function ${name}(`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  if (bodyStart < 2) throw new Error(`Missing body for function ${name}`);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const ACTIVE_JOB_STARTING_MAX_AGE_MS = 5 * 60 * 1000;
+const ACTIVE_JOB_RUNNING_DRAFT_MAX_AGE_MS = 30 * 60 * 1000;
+const ACTIVE_JOB_RUNNING_BASIS_CHAT_MAX_AGE_MS = 10 * 60 * 1000;
+const ACTIVE_JOB_RUNNING_CONFIRM_BASIS_MAX_AGE_MS = 5 * 60 * 1000;
+const ACTIVE_JOB_RUNNING_GENERATION_MAX_AGE_MS = 15 * 60 * 1000;
+const ACTIVE_JOB_CLOCK_SKEW_MS = 60 * 1000;
+const SERVER_JOB_TYPES = new Set(["draft", "basis_chat", "generate", "generate_pdf"]);
+const state = { browserRecoveryScope: "scope-a" };
+
+eval([
+  "currentBrowserRecoveryScope",
+  "activeJobMaxAgeMs",
+  "normalizeActiveJob",
+].map(extractFunction).join("\n"));
+
+const nowMs = Date.parse("2026-07-14T12:00:00.000Z");
+const atAge = (ageMs) => new Date(nowMs - ageMs).toISOString();
+const futureBy = (offsetMs) => new Date(nowMs + offsetMs).toISOString();
+const job = (type, phase, startedAt, extra = {}) => ({
+  id: type === "confirm_basis" ? "operation-confirm123" : `job-${type.replace("_", "-")}-12345678`,
+  type,
+  phase,
+  startedAt,
+  browserRecoveryScope: "scope-a",
+  ...extra,
+});
+const restore = (value) => normalizeActiveJob(value, { restoring: true, nowMs });
+
+for (const type of ["draft", "basis_chat", "generate", "generate_pdf", "confirm_basis"]) {
+  assert.ok(restore(job(type, "starting", atAge(ACTIVE_JOB_STARTING_MAX_AGE_MS - 1))), `${type} fresh starting`);
+  assert.strictEqual(restore(job(type, "starting", atAge(ACTIVE_JOB_STARTING_MAX_AGE_MS + 1))), null, `${type} stale starting`);
+}
+
+const runningLimits = {
+  draft: ACTIVE_JOB_RUNNING_DRAFT_MAX_AGE_MS,
+  basis_chat: ACTIVE_JOB_RUNNING_BASIS_CHAT_MAX_AGE_MS,
+  confirm_basis: ACTIVE_JOB_RUNNING_CONFIRM_BASIS_MAX_AGE_MS,
+  generate: ACTIVE_JOB_RUNNING_GENERATION_MAX_AGE_MS,
+  generate_pdf: ACTIVE_JOB_RUNNING_GENERATION_MAX_AGE_MS,
+};
+for (const [type, limit] of Object.entries(runningLimits)) {
+  assert.ok(restore(job(type, "running", atAge(limit - 1))), `${type} fresh running`);
+  assert.strictEqual(restore(job(type, "running", atAge(limit + 1))), null, `${type} stale running`);
+}
+
+assert.ok(restore(job("draft", "running", futureBy(ACTIVE_JOB_CLOCK_SKEW_MS))));
+assert.strictEqual(restore(job("draft", "running", futureBy(ACTIVE_JOB_CLOCK_SKEW_MS + 1))), null);
+assert.strictEqual(restore(job("draft", "running", "")), null);
+assert.strictEqual(restore(job("draft", "running", "not-a-date")), null);
+assert.strictEqual(restore(job("draft", "running", "2026-02-31T00:00:00Z")), null);
+assert.strictEqual(restore(job("draft", "running", nowMs)), null);
+assert.strictEqual(restore(job("draft", "invalid", atAge(1000))), null);
+assert.strictEqual(restore(job("draft", "running", atAge(1000), { browserRecoveryScope: "scope-b" })), null);
+assert.strictEqual(restore(job("draft", "running", atAge(1000), { browserRecoveryScope: "" })), null);
+
+const newlyCreated = normalizeActiveJob({
+  id: "job-new-operation123",
+  type: "draft",
+  phase: "starting",
+  startedAt: new Date(nowMs).toISOString(),
+}, { nowMs });
+assert.ok(newlyCreated);
+assert.strictEqual(newlyCreated.browserRecoveryScope, "scope-a");
+assert.strictEqual(newlyCreated.startedAt, "2026-07-14T12:00:00.000Z");
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_static_pending_pricing_reference_previews_basis_and_resets_without_next(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const marker = `function ${name}(`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const state = {
+  pricingReferences: [
+    { id: "reference-a", source: "bundled", currency: "SGD", tax: { label: "GST", rate: 0.09 } },
+    { id: "reference-b", source: "local", currency: "USD", tax: { label: "VAT", rate: 0.2 } },
+  ],
+  pricingReferenceId: "reference-a",
+  pricingReferenceSource: "bundled",
+};
+const elements = { profileSelect: { value: "local::reference-b" } };
+const currencyNode = { textContent: "" };
+const taxNode = { textContent: "" };
+const document = {
+  querySelectorAll(selector) {
+    if (selector === "[data-reference-basis-currency]") return [currencyNode];
+    if (selector === "[data-reference-basis-tax]") return [taxNode];
+    return [];
+  },
+};
+const DEFAULT_TAX_RATE = 0.09;
+let navUpdates = 0;
+function normalizeTaxLabel(value) { return String(value || "GST").trim().toUpperCase(); }
+function normalizeTaxRate(value, fallback) { return Number.isFinite(Number(value)) ? Number(value) : fallback; }
+function normalizeCurrencyLabel(value) { return String(value || "SGD").trim().toUpperCase(); }
+function taxRatePercentText(value) { return String(Number(value) * 100).replace(/\.0+$/, ""); }
+function updateSidePanelNav() { navUpdates += 1; }
+
+eval([
+  "pricingReferenceSelectValue",
+  "pricingReferenceSelectionFromValue",
+  "currentPricingReference",
+  "pricingReferenceFromSelectionValue",
+  "pendingPricingReference",
+  "pricingReferenceBasisValues",
+  "syncPricingReferenceContextPills",
+  "renderPendingPricingReferenceBasis",
+  "resetPendingPricingReferenceSelection",
+  "handleProfileSelectionChange",
+].map(extractFunction).join("\n"));
+
+handleProfileSelectionChange();
+assert.strictEqual(state.pricingReferenceId, "reference-a");
+assert.strictEqual(state.pricingReferenceSource, "bundled");
+assert.strictEqual(currencyNode.textContent, "USD");
+assert.strictEqual(taxNode.textContent, "VAT 20%");
+
+assert.strictEqual(resetPendingPricingReferenceSelection(), true);
+assert.strictEqual(elements.profileSelect.value, "bundled::reference-a");
+assert.strictEqual(currencyNode.textContent, "SGD");
+assert.strictEqual(taxNode.textContent, "GST 9%");
+assert.strictEqual(navUpdates, 2);
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_static_dependency_confirmation_does_not_chain_start_analysis(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractAsyncFunction(name) {
+  const marker = `async function ${name}(`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const state = {
+  pendingQuoteDependencyChanges: ["pricing_reference"],
+  activeSidePanel: "quote_company",
+};
+let routedPanel = "";
+let nextCalls = 0;
+let saveCalls = 0;
+function hideQuoteDependencyConfirmModal() { state.pendingQuoteDependencyChanges = []; }
+function applyPendingPricingReferenceSelection() { return true; }
+function clearGeneratedQuoteState() {}
+function setWorkflowStage() {}
+function hasReferenceFilesForNavigation() { return true; }
+function updateSidePanelNav() {}
+function setSidePanel(panelName) { routedPanel = panelName; state.activeSidePanel = panelName; return true; }
+async function saveQuoteSessionDraftState() { saveCalls += 1; }
+async function goToNextSidePanel() { nextCalls += 1; }
+
+eval(extractAsyncFunction("confirmQuoteDependencyChange"));
+
+(async () => {
+  await confirmQuoteDependencyChange();
+  assert.strictEqual(routedPanel, "quote_company");
+  assert.strictEqual(state.activeSidePanel, "quote_company");
+  assert.strictEqual(nextCalls, 0);
+  assert.strictEqual(saveCalls, 1);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
 
     def test_static_mobile_ui_polish_has_responsive_header_legend_and_output_cards(self):
         static_dir = ROOT / "webapp" / "static"
@@ -12299,7 +12892,7 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertIn("viewCurrentPdfFile", js)
         self.assertIn("showExcelGeneratingModal", js)
         self.assertIn("hideExcelGeneratingModal", js)
-        self.assertIn('state.activeJob = { id: started.data.job_id, type: jobType, viewPdf };', js)
+        self.assertIn('state.activeJob = { ...operation, id: started.data.job_id || operation.id, phase: "running" };', js)
         self.assertIn('const jobType = viewPdf ? "generate_pdf" : "generate";', js)
         self.assertIn('activeJob.type === "generate" || activeJob.type === "generate_pdf"', js)
         self.assertIn('setResultStatus(viewPdf ? "Checking PDF" : "Checking Excel", "is-warn")', js)
@@ -12319,7 +12912,9 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertIn('elements.sideViewPdfButton.addEventListener("click", async (event) => {', js)
         download_handler = js.split('elements.sideDownloadButton.addEventListener("click", async (event) => {', 1)[1].split('  document.addEventListener("keydown"', 1)[0]
         pdf_handler = js.split('elements.sideViewPdfButton.addEventListener("click", async (event) => {', 1)[1].split('  document.addEventListener("keydown"', 1)[0]
-        loading_options_body = js.split("function generationLoadingModalOptions", 1)[1].split("function clearActiveJob", 1)[0]
+        loading_options_body = js.split("function generationLoadingModalOptions", 1)[1].split("function generationFinalizingModalOptions", 1)[0]
+        finalizing_options_body = js.split("function generationFinalizingModalOptions", 1)[1].split("function clearActiveJob", 1)[0]
+        resumed_generation_body = js.split('if (activeJob.type === "generate" || activeJob.type === "generate_pdf") {', 1)[1].split("async function checkHealth", 1)[0]
         self.assertIn("event.preventDefault();", download_handler)
         self.assertIn("await handleGenerate();", js)
         self.assertIn("downloadCurrentExcelFile();", js)
@@ -12335,6 +12930,29 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertLess(pdf_handler.index("await handleGenerate({ viewPdf: true });"), pdf_handler.index("viewCurrentPdfFile();"))
         self.assertIn("showExcelGeneratingModal(generationLoadingModalOptions(true));", pdf_handler)
         self.assertIn('title: "Generating PDF"', loading_options_body)
+        self.assertIn('title: viewPdf ? "Finalizing PDF" : "Finalizing Excel"', finalizing_options_body)
+        self.assertIn("showExcelGeneratingModal(generationFinalizingModalOptions(viewPdf));", resumed_generation_body)
+        post_poll_prefix = resumed_generation_body.split("const polled = await pollJob(resumedJob.id);", 1)[1].split("if (isInterruptedJobPoll(polled))", 1)[0]
+        self.assertNotIn("hideExcelGeneratingModal();", post_poll_prefix)
+        finalizing_index = resumed_generation_body.index("showExcelGeneratingModal(generationFinalizingModalOptions(viewPdf));")
+        save_index = resumed_generation_body.index("await saveQuoteSessionDraftState({ quoteGenerated: true });")
+        terminal_clear_index = resumed_generation_body.index("clearActiveJob();", save_index)
+        ready_index = resumed_generation_body.index("showGeneratedExportReadyModal(viewPdf)")
+        self.assertLess(finalizing_index, save_index)
+        self.assertLess(save_index, terminal_clear_index)
+        self.assertLess(terminal_clear_index, ready_index)
+        self.assertIn("showGeneratedExportReadyModal(viewPdf)", resumed_generation_body)
+        self.assertLess(
+            resumed_generation_body.index("setDownloadFiles(data.files || [])"),
+            resumed_generation_body.index("showGeneratedExportReadyModal(viewPdf)"),
+        )
+        self.assertIn("hideExcelGeneratingModal();", resumed_generation_body)
+        self.assertIn('elements.excelGeneratingActionButton?.addEventListener("click"', js)
+        self.assertIn('elements.excelGeneratingCloseButton?.addEventListener("click"', js)
+        self.assertIn('elements.excelGeneratingModal?.addEventListener("click"', js)
+        self.assertIn('event.target.classList?.contains("modal-backdrop")', js)
+        self.assertIn("generatedExportReadyModalIsOpen", js)
+        self.assertIn("dismissGeneratedExportReadyModal()", js)
         self.assertIn(".workspace-pane-footer.is-output-step {\n  grid-template-columns: repeat(4, minmax(0, 1fr));", css)
         self.assertIn(".workspace-pane-footer.is-output-step #sideBackButton", css)
         self.assertIn("grid-column: span 2;", css)
@@ -12711,7 +13329,7 @@ assert.strictEqual(rowNeedsManualInput(manualDisplayZeroRow), false);
         static_dir = ROOT / "webapp" / "static"
         js = (static_dir / "app.js").read_text(encoding="utf-8")
         css = (static_dir / "styles.css").read_text(encoding="utf-8")
-        draft_body = js.split("async function handleDraftBasis", 1)[1].split("async function confirmBasis()", 1)[0]
+        draft_body = js.split("async function handleDraftBasis", 1)[1].split("async function confirmBasis(options = {})", 1)[0]
 
         banner_index = draft_body.index("showAiRunningBanner(")
         clear_index = draft_body.index("clearBasisReviewSurface()")
@@ -12725,7 +13343,7 @@ assert.strictEqual(rowNeedsManualInput(manualDisplayZeroRow), false);
         self.assertLess(sync_index, job_index)
         self.assertIn("const analysisRequestedAt = new Date().toISOString()", draft_body)
         self.assertIn("started.data.created_at || analysisRequestedAt", draft_body)
-        self.assertIn('state.activeJob = { id: started.data.job_id, type: "draft", startedAt }', draft_body)
+        self.assertIn('state.activeJob = { ...operation, id: started.data.job_id || operation.id, phase: "running", startedAt }', draft_body)
         self.assertIn("const hasFeedback = Boolean(state.pendingFeedback.trim())", draft_body)
         self.assertIn("includeDraftContext: hasFeedback", draft_body)
         self.assertIn("const includeDraftContext = options.includeDraftContext !== false", js)
@@ -13656,6 +14274,7 @@ function profileActionsMenuIsOpen() { return false; }
 function appIsBusy() { return false; }
 let renderCount = 0;
 function renderQuoteDashboard() { renderCount += 1; }
+function saveWorkspaceViewState() {}
 
 eval([
   extractFunction("safeQuoteSessionId"),
@@ -14012,6 +14631,8 @@ const state = {
   }],
   companyProfiles: [],
   images: [],
+  quoteBasisSections: [],
+  outputRows: [],
 };
 const elements = {
   presetSelect: { value: "profile:default" },
@@ -14028,6 +14649,7 @@ let appliedDetails = null;
 let appliedOptions = null;
 let clearedPendingPack = false;
 let clearedGeneratedState = false;
+let invalidatedExports = false;
 let workflowStage = "";
 let statusMessage = "";
 
@@ -14039,6 +14661,11 @@ function applyQuoteDetails(details, options) { appliedDetails = details; applied
 function applyDefaultQuoteCompanyFields() { appliedDefaults = true; }
 function renderHeaderLogoPreview() {}
 function clearGeneratedQuoteState() { clearedGeneratedState = true; }
+function quoteCompanyPresentationSignature() { return `${elements.quoteCompanyName.value}|${elements.headerDetails.value}`; }
+function invalidateGeneratedExportsIfPresentationChanged(previousSignature) {
+  invalidatedExports = previousSignature !== quoteCompanyPresentationSignature();
+  return invalidatedExports;
+}
 function quoteDraftHasAiAnalysis() { return Boolean(state.quoteBasisSections.length); }
 function quoteDraftHasOutputState() { return Boolean(state.outputRows.length); }
 function setWorkflowStage(stage) { workflowStage = stage; }
@@ -14074,8 +14701,9 @@ assert.strictEqual(elements.quoteCompanyName.value, "");
 assert.strictEqual(elements.companySignatory.value, "");
 assert.strictEqual(elements.companyTitle.value, "");
 assert.strictEqual(elements.headerLogoInput.value, "");
-assert.strictEqual(clearedGeneratedState, true);
-assert.strictEqual(workflowStage, "needs_images");
+assert.strictEqual(clearedGeneratedState, false);
+assert.strictEqual(invalidatedExports, true);
+assert.strictEqual(workflowStage, "");
 assert.strictEqual(statusMessage, 'Loaded "Default".');
 clearedGeneratedState = false;
 workflowStage = "basis_review";
@@ -14454,6 +15082,7 @@ function persistLastProfilePresetSelection(value) { persistedSelection = value; 
 function appIsBusy() { return false; }
 function genericFailureMessages(value) { return value?.errors || ["Failed."]; }
 function selectedPreset() { return null; }
+async function quoteDetailsWithStrongLogoFingerprint(details) { return details; }
 const window = { setTimeout(callback) { callback(); } };
 async function postJson(url, payload) {
   posted.push({ url, payload });
@@ -14657,6 +15286,7 @@ function genericFailureMessages(value) { return value?.errors || ["Failed."]; }
 function applyQuoteDetails() { throw new Error("Import defaults should not apply for a normal save."); }
 function clearGeneratedQuoteState() {}
 function setWorkflowStage() {}
+async function quoteDetailsWithStrongLogoFingerprint(details) { return details; }
 const window = { setTimeout(callback) { callback(); } };
 async function postJson(url, payload) {
   posted.push({ url, payload });
@@ -15030,7 +15660,9 @@ assert.strictEqual(elements.analyseAgainButton.title, "Re-analyse the quote basi
         script = r"""
 const fs = require("fs");
 const assert = require("assert");
+const { webcrypto } = require("crypto");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
+global.window = { crypto: webcrypto };
 
 function extractFunction(name) {
   const functionMarker = `function ${name}(`;
@@ -15062,6 +15694,11 @@ function loadSessionFileMap(keys) {
 }
 
 eval([
+  "normalizedContentFingerprint",
+  "dataUrlBytes",
+  "sha256ContentFingerprint",
+  "contentFingerprintFromDataUrl",
+  "ensureContentFingerprint",
   "referenceFileHasPayload",
   "restoreSessionImages",
 ].map(extractFunction).join("\n"));
@@ -15102,7 +15739,9 @@ eval([
         script = r"""
 const fs = require("fs");
 const assert = require("assert");
+const { webcrypto } = require("crypto");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
+global.window = { crypto: webcrypto };
 
 function extractFunction(name) {
   const functionMarker = `function ${name}(`;
@@ -15137,6 +15776,12 @@ function selectedPreset() {
 }
 
 eval([
+  "normalizedContentFingerprint",
+  "dataUrlBytes",
+  "sha256ContentFingerprint",
+  "contentFingerprintFromDataUrl",
+  "ensureContentFingerprint",
+  "quoteDetailsWithStrongLogoFingerprint",
   "selectedPresetCompanyLogo",
   "restoreQuoteDetailsLogo",
 ].map(extractFunction).join("\n"));
@@ -15159,6 +15804,7 @@ eval([
   assert.strictEqual(restored.company.logo_data_url, "data:image/png;base64,U1RPUkVE");
   assert.strictEqual(restored.company.logo_name, "stored-logo.png");
   assert.strictEqual(restored.company.logo_type, "image/png");
+  assert.match(restored.company.logo_content_fingerprint, /^sha256:[0-9a-f]{64}$/);
 
   requestedKeys = [];
   fileMap = new Map();
@@ -15181,6 +15827,7 @@ eval([
   assert.strictEqual(fallback.company.logo_data_url, "data:image/png;base64,UFJPRklMRQ==");
   assert.strictEqual(fallback.company.logo_name, "profile-logo.png");
   assert.strictEqual(fallback.company.logo_type, "image/png");
+  assert.match(fallback.company.logo_content_fingerprint, /^sha256:[0-9a-f]{64}$/);
 })().catch((error) => {
   console.error(error);
   process.exit(1);
@@ -15247,6 +15894,11 @@ let shownQuoteFlow = false;
 let rememberedBaseline = "";
 let controlsSynced = 0;
 let persistedRecords = [];
+function saveDashboardOperation(operation) { return { ...operation, browserRecoveryScope: "test-scope", startedAt: new Date().toISOString() }; }
+function dashboardOperationLoadingOptions() { return {}; }
+function setDashboardLoadingState() { syncControlStates(); }
+function clearDashboardOperation() {}
+function finishDashboardOperation() {}
 
 function appIsBusy() { return false; }
 function clearQuoteSessionDraftSaveTimer() {}
@@ -15293,6 +15945,7 @@ function showQuoteFlow() { shownQuoteFlow = true; }
 
 eval([
   "safeQuoteSessionId",
+  "normalizedContentFingerprint",
   "referenceFileType",
   "dashboardDraftImageFileFieldsMatch",
   "dashboardDraftImagePayloadMatches",
@@ -15374,6 +16027,11 @@ const state = {
   images: [],
 };
 let appliedSnapshot = null;
+function saveDashboardOperation(operation) { return { ...operation, browserRecoveryScope: "test-scope", startedAt: new Date().toISOString() }; }
+function dashboardOperationLoadingOptions() { return {}; }
+function setDashboardLoadingState() {}
+function clearDashboardOperation() {}
+function finishDashboardOperation() {}
 
 function appIsBusy() { return false; }
 function clearQuoteSessionDraftSaveTimer() {}
@@ -15416,6 +16074,7 @@ function showQuoteFlow() {}
 
 eval([
   "safeQuoteSessionId",
+  "normalizedContentFingerprint",
   "referenceFileType",
   "dashboardDraftImageFileFieldsMatch",
   "dashboardDraftImagePayloadMatches",
@@ -15763,7 +16422,7 @@ function extractFunction(name) {
   throw new Error(`Unclosed function ${name}`);
 }
 
-eval(["imageDuplicateKey", "uniqueImageEntries"].map(extractFunction).join("\n"));
+eval(["normalizedContentFingerprint", "imageDuplicateKey", "uniqueImageEntries"].map(extractFunction).join("\n"));
 const existing = [{ name: "a.jpg", type: "image/jpeg", size: 10, data_url: "data:image/jpeg;base64,AAA" }];
 const result = uniqueImageEntries([
   { name: "copy.jpg", type: "image/jpeg", size: 10, data_url: "data:image/jpeg;base64,AAA" },
@@ -15784,6 +16443,111 @@ assert.strictEqual(result.unique[0].name, "b.jpg");
 
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
 
+    def test_static_refresh_restores_exact_screen_while_modify_uses_furthest_progress(self):
+        static_dir = ROOT / "webapp" / "static"
+        js = (static_dir / "app.js").read_text(encoding="utf-8")
+
+        node = require_node(self)
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const marker = `function ${name}`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  if (bodyStart < 2) throw new Error(`Missing body for function ${name}`);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const SIDE_PANEL_SEQUENCE = ["images", "customer", "quote_company", "basis", "output"];
+eval([
+  "furthestQuoteSessionSidePanel",
+  "restoredQuoteSessionSidePanel",
+].map(extractFunction).join("\n"));
+
+const completedQuoteViewedFromCustomer = {
+  activeSidePanel: "customer",
+  workflowStage: "completed",
+  outputRows: [{ description: "Completed row" }],
+};
+assert.strictEqual(restoredQuoteSessionSidePanel(completedQuoteViewedFromCustomer), "customer");
+assert.strictEqual(
+  restoredQuoteSessionSidePanel(completedQuoteViewedFromCustomer, { restoreFurthestPanel: true }),
+  "output",
+);
+assert.strictEqual(restoredQuoteSessionSidePanel({ activeSidePanel: "quote_company" }), "quote_company");
+
+const DASHBOARD_OPERATION_MAX_AGE_MS = 15 * 60 * 1000;
+const state = { dashboardOperation: null, quoteSessions: [], dashboardActiveSessionId: "" };
+function safeQuoteSessionId(value = "") {
+  const text = String(value || "").trim();
+  return /^quote-[A-Za-z0-9_-]{3,64}$/.test(text) ? text : "";
+}
+function currentBrowserRecoveryScope() { return "test-scope"; }
+function setDashboardLoadingState(isLoading, options = {}) { state.loading = isLoading; state.loadingTitle = options.title || ""; }
+function showDashboard() { state.dashboardShown = true; }
+async function loadQuoteDashboard() {}
+function renderQuoteDashboard() { state.rendered = true; }
+function scrollDashboardSessionIntoView(sessionId) { state.scrolledSessionId = sessionId; }
+function clearDashboardOperation() { state.dashboardOperation = null; state.cleared = true; }
+let duplicateOptions = null;
+async function duplicateDashboardQuote(sourceSessionId, options) { duplicateOptions = { sourceSessionId, ...options }; return true; }
+async function modifyDashboardQuote() { throw new Error("Unexpected modify recovery"); }
+eval([
+  extractFunction("normalizeDashboardOperation"),
+  extractFunction("dashboardOperationLoadingOptions"),
+  `async ${extractFunction("resumeDashboardOperation")}`,
+].join("\n"));
+
+(async () => {
+  const operation = {
+    type: "duplicate",
+    sourceSessionId: "quote-source123",
+    targetSessionId: "quote-target123",
+    browserRecoveryScope: "test-scope",
+    startedAt: new Date().toISOString(),
+  };
+  state.quoteSessions = [{ session_id: "quote-target123" }];
+  assert.strictEqual(await resumeDashboardOperation(operation), true);
+  assert.strictEqual(duplicateOptions, null);
+  assert.strictEqual(state.dashboardActiveSessionId, "quote-target123");
+  assert.strictEqual(state.loading, false);
+
+  state.quoteSessions = [];
+  state.cleared = false;
+  assert.strictEqual(await resumeDashboardOperation(operation), true);
+  assert.strictEqual(duplicateOptions.sourceSessionId, "quote-source123");
+  assert.strictEqual(duplicateOptions.targetSessionId, "quote-target123");
+  assert.strictEqual(duplicateOptions.resume, true);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn("pricingReferenceSettingsMode: state.pricingReferenceSettingsMode", js)
+        self.assertIn("saveDashboardOperation", js)
+        self.assertIn("resumeDashboardOperation", js)
     def test_static_session_state_does_not_store_reference_payloads_in_local_storage(self):
         static_dir = ROOT / "webapp" / "static"
         js = (static_dir / "app.js").read_text(encoding="utf-8")
@@ -15832,12 +16596,14 @@ const state = {
     name: "logo.png",
     type: "image/png",
     size: 512,
+    content_fingerprint: `sha256:${"c".repeat(64)}`,
     data_url: "data:image/png;base64,TE9HTw==",
   },
   images: [{
     name: "huge-reference.pdf",
     type: "application/pdf",
     size: 12_000_000,
+    content_fingerprint: `sha256:${"d".repeat(64)}`,
     data_url: `data:application/pdf;base64,${"A".repeat(1024)}`,
   }],
   workflowStage: "ready_to_analyze",
@@ -15893,7 +16659,12 @@ function persistSessionFiles(records) {
   return Promise.resolve();
 }
 
+function normalizeRestorableOverlay(value) { return value || ""; }
+function normalizeActiveJob(job) { return job?.id ? job : null; }
+function saveWorkspaceViewState() {}
+
 eval([
+  "normalizedContentFingerprint",
   "sessionFileKeyForImage",
   "sessionFileKeyForLogo",
   "sessionImageMetadata",
@@ -15917,16 +16688,20 @@ assert.strictEqual(saved.quoteDetails.company.name, "Persistent Company");
 assert.strictEqual(saved.quoteDetails.company.logo_data_url, undefined);
 assert.strictEqual(saved.quoteDetails.company.logo_name, "logo.png");
 assert.strictEqual(saved.quoteDetails.company.logo_type, "image/png");
+assert.strictEqual(saved.quoteDetails.company.logo_content_fingerprint, `sha256:${"c".repeat(64)}`);
 assert.ok(saved.quoteDetails.company.logo_session_file_key);
 assert.strictEqual(saved.images.length, 1);
 assert.strictEqual(saved.images[0].name, "huge-reference.pdf");
 assert.strictEqual(saved.images[0].data_url, undefined);
+assert.strictEqual(saved.images[0].content_fingerprint, `sha256:${"d".repeat(64)}`);
 assert.ok(saved.images[0].session_file_key);
 assert.strictEqual(persistedRecords.length, 2);
 assert.strictEqual(persistedRecords[0].data_url.startsWith("data:application/pdf;base64,"), true);
 assert.strictEqual(persistedRecords[0].file_role, "reference");
+assert.strictEqual(persistedRecords[0].content_fingerprint, `sha256:${"d".repeat(64)}`);
 assert.strictEqual(persistedRecords[1].data_url, "data:image/png;base64,TE9HTw==");
 assert.strictEqual(persistedRecords[1].file_role, "quote_company_logo");
+assert.strictEqual(persistedRecords[1].content_fingerprint, `sha256:${"c".repeat(64)}`);
 assert.strictEqual(persistedRecords[1].session_file_key, saved.quoteDetails.company.logo_session_file_key);
 assert.strictEqual(state.images[0].session_file_key, saved.images[0].session_file_key);
 assert.strictEqual(state.headerLogo.session_file_key, saved.quoteDetails.company.logo_session_file_key);
@@ -17479,6 +18254,7 @@ const projectTitle = {};
 const CUSTOM_CURRENCY_VALUE = "__CUSTOM__";
 const CURRENCY_OPTIONS = [["SGD"], ["AUD"], ["CNY"], ["EUR"], ["GBP"], ["IDR"], ["MYR"], ["THB"], ["USD"]];
 const QUOTE_COMMERCIAL_FIELD_KEYS = ["quoteCurrency", "quoteExchangeRate", "quoteTaxLabel", "quoteTaxRate"];
+const QUOTE_COMPANY_RICH_TEXT_IDS = [];
 const elements = {
   taxLabel: {},
   taxRate: {},
@@ -17501,6 +18277,7 @@ function setDownloadFiles(files = []) {
   state.pdfFile = null;
 }
 function syncQuoteExchangeRateField() {}
+function invalidateGeneratedExportsForPresentationChange() {}
 function updateOutputHeader() {}
 function syncControlStates() {}
 function quoteSessionDraftStateCanSave() { return false; }
@@ -20131,7 +20908,7 @@ assert.strictEqual(
 );
 assert.ok(!/AI basis chat|JSON|replacement line/i.test(friendlyError));
 assert.ok(source.includes("line_index: state.basisChat.lineIndex"));
-assert.ok(source.includes('startJob("basis_chat", basisChatPayload(text))'));
+assert.ok(source.includes('startJob("basis_chat", basisChatPayload(text), { jobId })'));
 assert.ok(!source.includes('startJob("draft", buildPayload())'));
 """
         completed = subprocess.run(
@@ -21019,7 +21796,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
 
     def test_static_confirm_basis_reprices_line_items_before_rendering_output_but_reset_uses_snapshot(self):
         js = (ROOT / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
-        confirm_body = js.split("async function confirmBasis()", 1)[1].split("async function handleGenerate()", 1)[0]
+        confirm_body = js.split("async function confirmBasis(options = {})", 1)[1].split("async function handleGenerate(options = {})", 1)[0]
         reset_body = js.split("async function resetOutputDraft()", 1)[1].split("async function postJson", 1)[0]
 
         self.assertIn("async function refreshLineItemsFromServer", js)

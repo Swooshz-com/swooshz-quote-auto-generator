@@ -426,7 +426,388 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
   await page.locator("#outputDeleteModal").waitFor({ state: "hidden", timeout: 15000 });
 }
 
+async function prepareRefreshRecoveryQuote(page) {
+  await page.evaluate(async () => {
+    const reference = state.pricingReferences.find((item) => Array.isArray(item.items) && item.items.length)
+      || state.pricingReferences[0];
+    if (!reference) throw new Error("Refresh recovery fixture needs a pricing reference.");
+    state.pricingReferenceId = reference.id;
+    state.pricingReferenceSource = reference.source || "bundled";
+    syncSelectedPricingReference();
+
+    [
+      [elements.clientName, "Refresh Recovery Client"],
+      [elements.clientAttention, "Test Contact"],
+      [elements.clientTitle, "Project Manager"],
+      [elements.clientAddress, "1 Test Street"],
+      [elements.projectTitle, "Refresh Recovery Quote"],
+      [elements.showName, "Refresh Recovery Expo"],
+      [elements.quoteDate, "2026-07-14"],
+      [elements.projectNumber, "RECOVERY-001"],
+      [elements.headerDetails, "Refresh Recovery Company"],
+      [elements.quoteCompanyName, "Refresh Recovery Company"],
+      [elements.acceptanceText, "Accepted for testing"],
+      [elements.companySignatory, "Test Signatory"],
+      [elements.companyTitle, "Director"],
+      [elements.companyDateLabel, "Date"],
+      [elements.personLabel, "Name"],
+      [elements.stampLabel, "Stamp"],
+      [elements.dateLabel, "Date"],
+    ].forEach(([input, value]) => setInputValue(input, value));
+
+    state.headerLogo = {
+      name: "refresh-recovery-logo.png",
+      type: "image/png",
+      size: 68,
+      data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nWQAAAAASUVORK5CYII=",
+    };
+    renderHeaderLogoPreview();
+    state.images = [{
+      name: "refresh-recovery-render.png",
+      type: "image/png",
+      size: 68,
+      data_url: state.headerLogo.data_url,
+    }];
+    state.quoteSessionId = state.quoteSessionId || newClientQuoteSessionId();
+    state.quoteSessionDraftSaveStarted = true;
+    state.activeAppView = "quote";
+    state.aiFailed = false;
+    state.basisConfirmed = false;
+    state.blockingClarificationQuestions = [];
+    state.downloadFile = null;
+    state.pdfFile = null;
+    state.outputRows = [];
+    state.originalOutputRows = [];
+    state.outputErrors = [];
+    state.lineItems = [normalizeLineItem({
+      section: "Floor Design",
+      description: "sqm refresh recovery flooring",
+      quantity: 1,
+      unit: "sqm",
+      price_mode: "Priced",
+      unit_price: 50,
+      unit_price_override: 50,
+      catalog_unit_price: 50,
+      amount: 50,
+      pricing_keyword: "floor-design-refresh-recovery-flooring",
+    })];
+    state.quoteBasisSections = [{
+      id: "floor-design",
+      title: "Floor Design",
+      lines: [{
+        tag: "Include",
+        text: "sqm refresh recovery flooring",
+        quantity: 1,
+        unit: "sqm",
+        include: true,
+        pricing_keyword: "floor-design-refresh-recovery-flooring",
+      }],
+    }];
+    state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
+    setWorkflowStage("basis_review");
+    showQuoteFlow();
+    setSidePanel("basis", { force: true });
+    syncControlStates();
+    await persistSessionFiles(sessionFileRecordsFromDraft());
+  });
+}
+
+async function verifyConfirmBasisSurvivesImmediateRefresh(page) {
+  await prepareRefreshRecoveryQuote(page);
+  const confirmReadiness = await page.evaluate(() => ({
+    busy: appIsBusy(),
+    blockReason: basisConfirmBlockReason(),
+    missing: missingDetailFields(),
+    lineItems: state.lineItems.length,
+    workflowStage: state.workflowStage,
+    activePanel: state.activeSidePanel,
+  }));
+  if (confirmReadiness.busy || confirmReadiness.blockReason || confirmReadiness.missing.length || !confirmReadiness.lineItems) {
+    throw new Error("Confirm Basis refresh fixture is not ready: " + JSON.stringify(confirmReadiness));
+  }
+  let normalizeCount = 0;
+  let releaseFirstRequest;
+  let releaseSecondRequest;
+  let firstRequestStartedResolve;
+  let secondRequestStartedResolve;
+  const firstRequestStarted = new Promise((resolve) => { firstRequestStartedResolve = resolve; });
+  const secondRequestStarted = new Promise((resolve) => { secondRequestStartedResolve = resolve; });
+  const normalizePattern = "**/api/line-items/normalize";
+
+  await page.route(normalizePattern, async (route) => {
+    normalizeCount += 1;
+    const requestPayload = route.request().postDataJSON();
+    if (normalizeCount === 1) {
+      firstRequestStartedResolve();
+      await new Promise((resolve) => { releaseFirstRequest = resolve; });
+      try {
+        await route.abort("aborted");
+      } catch {
+        // Navigation may already have disposed the interrupted request.
+      }
+      return;
+    }
+    secondRequestStartedResolve();
+    await new Promise((resolve) => { releaseSecondRequest = resolve; });
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "normalized",
+        line_items: Array.isArray(requestPayload.line_items) ? requestPayload.line_items : [],
+      }),
+    });
+  });
+
+  try {
+    await page.evaluate(() => { confirmBasis(); });
+    await firstRequestStarted;
+    await page.locator("#excelGeneratingTitle", { hasText: "Preparing Output" }).waitFor({ state: "visible", timeout: 15000 });
+    const savedBeforeRefresh = await page.evaluate(() => JSON.parse(
+      window.localStorage.getItem("swooshz_quote_session_v1") || "{}"
+    ));
+    if (savedBeforeRefresh.activeJob?.type !== "confirm_basis") {
+      throw new Error("Confirm Basis did not persist its pending recovery operation before the request completed.");
+    }
+
+    const reload = page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(100);
+    if (typeof releaseFirstRequest !== "function") {
+      throw new Error("Confirm Basis request was not paused before refresh.");
+    }
+    releaseFirstRequest();
+    await reload;
+    await secondRequestStarted;
+    await page.locator("#excelGeneratingTitle", { hasText: "Preparing Output" }).waitFor({ state: "visible", timeout: 15000 });
+    releaseSecondRequest();
+
+    try {
+      await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+    } catch (error) {
+      const diagnostic = await page.evaluate(() => {
+        const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
+        return {
+          basisConfirmed: state.basisConfirmed,
+          workflowStage: state.workflowStage,
+          activePanel: state.activeSidePanel,
+          preparingOutput: state.isPreparingOutput,
+          lineItems: state.lineItems.length,
+          outputRows: state.outputRows.length,
+          activeJob: saved.activeJob || null,
+          blockedText: document.querySelector("#blockedActionText")?.textContent || "",
+        };
+      });
+      throw new Error((error?.message || "Output did not open.") + " Diagnostic: " + JSON.stringify(diagnostic));
+    }
+    await page.waitForFunction(() => {
+      const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
+      return state.basisConfirmed === true
+        && state.activeSidePanel === "output"
+        && !saved.activeJob;
+    }, null, { timeout: 15000 });
+    if (normalizeCount !== 2) {
+      throw new Error("Confirm Basis refresh should resume exactly once; requests observed: " + normalizeCount + ".");
+    }
+  } finally {
+    if (typeof releaseFirstRequest === "function") releaseFirstRequest();
+    if (typeof releaseSecondRequest === "function") releaseSecondRequest();
+    await page.unroute(normalizePattern);
+  }
+}
+
 async function verifyGenerationLoadingModalSurvivesRefresh(page) {
+  const cases = [
+    { type: "generate", viewPdf: false, title: "Regenerating Excel", finalizingTitle: "Finalizing Excel", readyTitle: "Excel ready", action: "excel", button: "#sideDownloadButton" },
+    { type: "generate_pdf", viewPdf: true, title: "Generating PDF", finalizingTitle: "Finalizing PDF", readyTitle: "PDF ready", action: "pdf", button: "#sideViewPdfButton" },
+  ];
+
+  for (const testCase of cases) {
+    let finishJob = false;
+    let postCount = 0;
+    let releaseFirstPost;
+    let releaseFinalSave;
+    let finalSaveStartedResolve;
+    const finalSaveStarted = new Promise((resolve) => { finalSaveStartedResolve = resolve; });
+    let firstPostStartedResolve;
+    let secondPostStartedResolve;
+    const firstPostStarted = new Promise((resolve) => { firstPostStartedResolve = resolve; });
+    const secondPostStarted = new Promise((resolve) => { secondPostStartedResolve = resolve; });
+    const postedJobIds = [];
+    const postPattern = "**/api/jobs";
+    const getPattern = "**/api/jobs/job-*";
+    const savePattern = "**/api/quote-sessions";
+    const quoteSessionId = await currentQuoteSessionId(page);
+
+    await page.route(postPattern, async (route) => {
+      if (route.request().method() !== "POST") {
+        await route.continue();
+        return;
+      }
+      postCount += 1;
+      const payload = route.request().postDataJSON();
+      postedJobIds.push(payload.job_id || "");
+      if (postCount === 1) {
+        firstPostStartedResolve();
+        await new Promise((resolve) => { releaseFirstPost = resolve; });
+        try {
+          await route.abort("aborted");
+        } catch {
+          // Navigation may already have disposed the interrupted request.
+        }
+        return;
+      }
+      secondPostStartedResolve();
+      await route.fulfill({
+        status: 202,
+        contentType: "application/json",
+        body: JSON.stringify({
+          job_id: payload.job_id,
+          type: payload.type,
+          status: "running",
+          created_at: "2026-07-14T00:00:00Z",
+        }),
+      });
+    });
+
+    await page.route(getPattern, async (route) => {
+      const jobId = new URL(route.request().url()).pathname.split("/").pop() || "";
+      if (!postedJobIds.includes(jobId)) {
+        await route.continue();
+        return;
+      }
+      const files = [{
+        name: "quotation.xlsx",
+        url: "/api/quote-sessions/" + quoteSessionId + "/files/quotation.xlsx",
+      }];
+      if (testCase.viewPdf) {
+        files.push({
+          name: "quotation.pdf",
+          url: "/api/quote-sessions/" + quoteSessionId + "/files/quotation.pdf",
+        });
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(finishJob
+          ? {
+              job_id: jobId,
+              type: testCase.type,
+              status: "completed",
+              result: {
+                status: "completed",
+                files,
+                pricing_matches: [],
+                quote_session: { session_id: quoteSessionId },
+              },
+            }
+          : {
+              job_id: jobId,
+              type: testCase.type,
+              status: "running",
+              created_at: "2026-07-14T00:00:00Z",
+            }),
+      });
+    });
+
+    try {
+      await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+      await page.locator(testCase.button + ":not([disabled])").click();
+      await firstPostStarted;
+      const savedBeforeRefresh = await page.evaluate(() => JSON.parse(
+        window.localStorage.getItem("swooshz_quote_session_v1") || "{}"
+      ));
+      if (savedBeforeRefresh.activeJob?.type !== testCase.type || savedBeforeRefresh.activeJob?.phase !== "starting") {
+        throw new Error("Export click did not persist the pending " + testCase.type + " operation before the server response.");
+      }
+      if (!postedJobIds[0]) {
+        throw new Error("Export click did not send a client-generated job id.");
+      }
+
+      const reload = page.reload({ waitUntil: "domcontentloaded" });
+      await page.waitForTimeout(100);
+      if (typeof releaseFirstPost !== "function") {
+        throw new Error("Initial " + testCase.type + " request was not paused before refresh.");
+      }
+      releaseFirstPost();
+      await reload;
+      await secondPostStarted;
+      await page.locator("#excelGeneratingModal").waitFor({ state: "visible", timeout: 15000 });
+      const restoredTitle = (await page.locator("#excelGeneratingTitle").innerText()).trim();
+      if (restoredTitle !== testCase.title) {
+        throw new Error("Expected refreshed " + testCase.type + " overlay title " + testCase.title + ", found " + restoredTitle + ".");
+      }
+      if (postCount !== 2 || postedJobIds[0] !== postedJobIds[1]) {
+        throw new Error("Refresh should retry " + testCase.type + " with one stable idempotency key: " + JSON.stringify(postedJobIds) + ".");
+      }
+      const activePanel = (await page.locator(".rail-button.is-active").innerText()).trim();
+      if (activePanel !== "Output") {
+        throw new Error("Recovered " + testCase.type + " should remain tied to Output, found " + activePanel + ".");
+      }
+      await page.keyboard.press("Escape");
+      await page.locator("#excelGeneratingModal").waitFor({ state: "visible", timeout: 15000 });
+      await page.locator("#excelGeneratingModal > .modal-backdrop").click({ position: { x: 5, y: 5 } });
+      await page.locator("#excelGeneratingModal").waitFor({ state: "visible", timeout: 15000 });
+
+      let finalSaveSeen = false;
+      await page.route(savePattern, async (route) => {
+        if (route.request().method() !== "POST" || finalSaveSeen) {
+          await route.fallback();
+          return;
+        }
+        finalSaveSeen = true;
+        finalSaveStartedResolve();
+        await new Promise((resolve) => { releaseFinalSave = resolve; });
+        await route.fallback();
+      });
+
+      finishJob = true;
+      await Promise.race([
+        finalSaveStarted,
+        page.waitForTimeout(15000).then(() => {
+          throw new Error("Recovered " + testCase.type + " did not reach its final quote-session save.");
+        }),
+      ]);
+      await page.waitForFunction((expectedTitle) => {
+        const modal = document.querySelector("#excelGeneratingModal");
+        return modal
+          && !modal.hidden
+          && modal.classList.contains("is-open")
+          && !modal.classList.contains("is-ready")
+          && document.querySelector("#excelGeneratingTitle")?.textContent?.trim() === expectedTitle;
+      }, testCase.finalizingTitle, { timeout: 15000 });
+      const activeDuringFinalization = await page.evaluate(() => JSON.parse(
+        window.localStorage.getItem("swooshz_quote_session_v1") || "{}"
+      ).activeJob || null);
+      if (activeDuringFinalization?.type !== testCase.type) {
+        throw new Error("Recovered " + testCase.type + " cleared its active job before finalization completed.");
+      }
+      releaseFinalSave();
+      await page.waitForFunction(() => {
+        const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
+        return !saved.activeJob;
+      }, null, { timeout: 15000 });
+      await page.locator("#excelGeneratingModal.is-ready").waitFor({ state: "visible", timeout: 15000 });
+      const readyTitle = (await page.locator("#excelGeneratingTitle").innerText()).trim();
+      const readyAction = await page.locator("#excelGeneratingActionButton").getAttribute("data-export-action");
+      if (readyTitle !== testCase.readyTitle || readyAction !== testCase.action) {
+        throw new Error("Recovered " + testCase.type + " result was not attached to its restored splash.");
+      }
+      if (testCase.type === "generate") {
+        await page.keyboard.press("Escape");
+      } else {
+        await page.locator("#excelGeneratingModal > .modal-backdrop").click({ position: { x: 5, y: 5 } });
+      }
+      await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 15000 });
+    } finally {
+      if (typeof releaseFirstPost === "function") releaseFirstPost();
+      if (typeof releaseFinalSave === "function") releaseFinalSave();
+      await page.unroute(savePattern);
+      await page.unroute(postPattern);
+      await page.unroute(getPattern);
+    }
+  }
+}
+async function verifyGenerationTerminalRecoveryAfterRefresh(page) {
   const cases = [
     { id: "job-refresh-excel-completed", type: "generate", viewPdf: false, title: "Regenerating Excel", terminalStatus: "completed" },
     { id: "job-refresh-pdf-completed", type: "generate_pdf", viewPdf: true, title: "Generating PDF", terminalStatus: "completed" },
@@ -483,9 +864,13 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
         state.activeAppView = "quote";
         state.activeSidePanel = "output";
         state.workflowStage = "generating";
-        state.activeJob = activeJob;
+        state.activeJob = {
+          ...activeJob,
+          browserRecoveryScope: state.browserRecoveryScope,
+          startedAt: new Date().toISOString(),
+        };
         saveSessionState();
-      }, { id: testCase.id, type: testCase.type, viewPdf: testCase.viewPdf });
+      }, { id: testCase.id, type: testCase.type, viewPdf: testCase.viewPdf, phase: "running" });
       await page.reload({ waitUntil: "domcontentloaded" });
       await page.locator("#excelGeneratingModal").waitFor({ state: "visible", timeout: 15000 });
       const restoredTitle = (await page.locator("#excelGeneratingTitle").innerText()).trim();
@@ -504,7 +889,13 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       }
 
       finishJob = true;
-      await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 15000 });
+      if (testCase.terminalStatus === "completed") {
+        await page.locator("#excelGeneratingModal.is-ready").waitFor({ state: "visible", timeout: 15000 });
+        await page.locator("#excelGeneratingCloseButton").click();
+        await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 15000 });
+      } else {
+        await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 15000 });
+      }
       await page.waitForFunction(() => {
         const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
         return !saved.activeJob;
@@ -515,7 +906,7 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
     }
   }
 
-  const interruptedJob = { id: "job-refresh-interrupted", type: "generate", viewPdf: false };
+  const interruptedJob = { id: "job-refresh-interrupted", type: "generate", viewPdf: false, phase: "running" };
   const interruptedStartRoutePattern = "**/api/jobs";
   let interruptedDuplicateStarts = 0;
   await page.addInitScript((jobId) => {
@@ -541,7 +932,11 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       state.activeAppView = "quote";
       state.activeSidePanel = "output";
       state.workflowStage = "generating";
-      state.activeJob = activeJob;
+      state.activeJob = {
+        ...activeJob,
+        browserRecoveryScope: state.browserRecoveryScope,
+        startedAt: new Date().toISOString(),
+      };
       saveSessionState();
     }, interruptedJob);
     await page.reload({ waitUntil: "domcontentloaded" });
@@ -563,6 +958,351 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
   }
 }
 
+async function verifyExpiredQuoteJobsDoNotResume(page) {
+  const staleStartedAt = new Date(Date.now() - 31 * 60 * 1000).toISOString();
+  const freshStartedAt = new Date().toISOString();
+  const futureStartedAt = new Date(Date.now() + 2 * 60 * 1000).toISOString();
+  const cases = [
+    ...["draft", "basis_chat", "generate", "generate_pdf", "confirm_basis"].map((type, index) => ({
+      label: `stale starting ${type}`,
+      type,
+      phase: "starting",
+      id: type === "confirm_basis" ? `operation-stale-start-${index}` : `job-stale-start-${type}-${index}`,
+      startedAt: staleStartedAt,
+    })),
+    ...["draft", "generate", "generate_pdf"].map((type, index) => ({
+      label: `stale running ${type}`,
+      type,
+      phase: "running",
+      id: `job-stale-running-${type}-${index}`,
+      startedAt: staleStartedAt,
+    })),
+    { label: "future dated draft", type: "draft", phase: "running", id: "job-future-draft-1234", startedAt: futureStartedAt },
+    { label: "missing timestamp", type: "draft", phase: "starting", id: "job-missing-time-1234" },
+    { label: "empty timestamp", type: "generate", phase: "starting", id: "job-empty-time-123456", startedAt: "" },
+    { label: "malformed timestamp", type: "generate_pdf", phase: "running", id: "job-bad-time-12345678", startedAt: "not-a-date" },
+    { label: "non-string timestamp", type: "basis_chat", phase: "starting", id: "job-number-time-12345", startedAt: Date.now() },
+    { label: "impossible timestamp", type: "confirm_basis", phase: "running", id: "operation-impossible-date", startedAt: "2026-02-31T00:00:00Z" },
+    { label: "fresh wrong scope", type: "draft", phase: "running", id: "job-wrong-scope-fresh", startedAt: freshStartedAt, wrongScope: true },
+    { label: "stale wrong scope", type: "generate", phase: "starting", id: "job-wrong-scope-stale", startedAt: staleStartedAt, wrongScope: true },
+  ];
+
+  const observedRequests = [];
+  const jobsPattern = "**/api/jobs*";
+  const normalizePattern = "**/api/line-items/normalize";
+  await page.route(jobsPattern, async (route) => {
+    const request = route.request();
+    observedRequests.push(`${request.method()} ${new URL(request.url()).pathname}`);
+    if (request.method() === "POST") {
+      const payload = request.postDataJSON();
+      await route.fulfill({
+        status: 202,
+        contentType: "application/json",
+        body: JSON.stringify({
+          job_id: payload.job_id || "job-unexpected-recovery",
+          type: payload.type || "draft",
+          status: "running",
+          created_at: new Date().toISOString(),
+        }),
+      });
+      return;
+    }
+    const jobId = new URL(request.url()).pathname.split("/").pop() || "job-unexpected-recovery";
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ job_id: jobId, status: "failed", result: { status: "failed" } }),
+    });
+  });
+  await page.route(normalizePattern, async (route) => {
+    observedRequests.push(`${route.request().method()} /api/line-items/normalize`);
+    const payload = route.request().postDataJSON();
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ status: "normalized", line_items: payload.line_items || [] }),
+    });
+  });
+
+  try {
+    for (const testCase of cases) {
+      const before = await page.evaluate((candidate) => {
+        const storageKey = "swooshz_quote_session_v1";
+        const saved = JSON.parse(window.localStorage.getItem(storageKey) || "{}");
+        const currentScope = state.browserRecoveryScope;
+        const quoteState = JSON.stringify({
+          quoteBasis: saved.quoteBasis || {},
+          quoteBasisSections: saved.quoteBasisSections || [],
+          lineItems: saved.lineItems || [],
+          outputRows: saved.outputRows || [],
+          originalOutputRows: saved.originalOutputRows || [],
+          basisConfirmed: Boolean(saved.basisConfirmed),
+          downloadFile: saved.downloadFile || null,
+          pdfFile: saved.pdfFile || null,
+        });
+        saved.activeAppView = "quote";
+        saved.activeSidePanel = candidate.type === "draft" || candidate.type === "basis_chat" || candidate.type === "confirm_basis" ? "basis" : "output";
+        saved.workflowStage = candidate.type === "draft" ? "analyzing" : candidate.type === "confirm_basis" ? "basis_review" : "generating";
+        saved.restorableOverlay = candidate.type === "basis_chat" ? "basis_chat" : "";
+        saved.activeJob = {
+          id: candidate.id,
+          type: candidate.type,
+          phase: candidate.phase,
+          browserRecoveryScope: candidate.wrongScope ? `${currentScope}-other` : currentScope,
+          ...(Object.prototype.hasOwnProperty.call(candidate, "startedAt") ? { startedAt: candidate.startedAt } : {}),
+          ...(candidate.type === "basis_chat" ? { text: "Synthetic stale basis revision" } : {}),
+          ...(candidate.type === "generate_pdf" ? { viewPdf: true } : {}),
+        };
+        window.localStorage.setItem(storageKey, JSON.stringify(saved));
+        return { quoteState, currentScope };
+      }, testCase);
+      const requestCountBefore = observedRequests.length;
+
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+      await page.waitForFunction(() => {
+        const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
+        return !state.activeJob && !saved.activeJob;
+      }, null, { timeout: 15000 });
+      await page.waitForTimeout(150);
+
+      const after = await page.evaluate(() => {
+        const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
+        return {
+          quoteState: JSON.stringify({
+            quoteBasis: saved.quoteBasis || {},
+            quoteBasisSections: saved.quoteBasisSections || [],
+            lineItems: saved.lineItems || [],
+            outputRows: saved.outputRows || [],
+            originalOutputRows: saved.originalOutputRows || [],
+            basisConfirmed: Boolean(saved.basisConfirmed),
+            downloadFile: saved.downloadFile || null,
+            pdfFile: saved.pdfFile || null,
+          }),
+          activeJob: saved.activeJob || null,
+          busy: Boolean(state.isAnalysisRunning || state.isGenerating || state.isPreparingOutput),
+          workflowStage: state.workflowStage,
+          exportOverlayHidden: Boolean(document.querySelector("#excelGeneratingModal")?.hidden),
+          basisChatOverlayHidden: Boolean(document.querySelector("#basisChatOverlay")?.hidden),
+        };
+      });
+
+      const caseRequests = observedRequests.slice(requestCountBefore);
+      if (caseRequests.length) {
+        throw new Error(`${testCase.label} resumed unexpectedly: ${JSON.stringify(caseRequests)}.`);
+      }
+      if (after.activeJob || after.busy || !after.exportOverlayHidden || !after.basisChatOverlayHidden) {
+        throw new Error(`${testCase.label} left unsafe recovery state: ${JSON.stringify(after)}.`);
+      }
+      if (["analyzing", "generating"].includes(after.workflowStage)) {
+        throw new Error(`${testCase.label} restored an unsafe running stage ${after.workflowStage}.`);
+      }
+      if (after.quoteState !== before.quoteState) {
+        throw new Error(`${testCase.label} mutated saved quote data during stale cleanup.`);
+      }
+    }
+  } finally {
+    await page.unroute(normalizePattern);
+    await page.unroute(jobsPattern);
+  }
+}
+
+async function verifyPricingReferenceSelectionCommitsOnCustomerNext(page) {
+  const pendingValue = "local::pending-refresh-reference";
+  const applied = await page.evaluate(async () => {
+    const current = currentPricingReference();
+    if (!current) throw new Error("Pricing-reference regression needs an applied reference.");
+    state.quoteBasisSections = [{
+      id: "retained-basis",
+      title: "Retained basis",
+      lines: [{ tag: "Include", text: "Retained basis line", include: true }],
+    }];
+    state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
+    state.lineItems = [normalizeLineItem({
+      section: "Retained basis",
+      description: "Retained basis line",
+      quantity: 1,
+      unit: "lot",
+      unit_price: 100,
+      amount: 100,
+    })];
+    state.images = await Promise.all(state.images.map((image) => ensureContentFingerprint(image)));
+    captureOriginalAnalysisSnapshot({ source: "playwright-pricing-reference-regression" });
+    state.outputRows = [normalizeOutputRow({
+      section: "Retained basis",
+      description: "Retained output row",
+      quantity: 1,
+      unit: "lot",
+      unit_price: 100,
+      amount: 100,
+    })];
+    state.originalOutputRows = snapshotOutputRows(state.outputRows);
+    state.basisConfirmed = true;
+    setWorkflowStage("completed");
+    setSidePanel("customer", { force: true });
+    saveSessionState();
+    await saveQuoteSessionDraftState({ quoteGenerated: true });
+    state.pricingReferences.push({
+      ...current,
+      id: "pending-refresh-reference",
+      label: "Pending Refresh Reference",
+      source: "local",
+      currency: "USD",
+      tax: { label: "VAT", rate: 0.2 },
+    });
+    renderProfileOptions();
+    return {
+      value: pricingReferenceSelectValue(currentPricingReference()),
+      pricingReferenceId: state.pricingReferenceId,
+      currency: selectedPricingReferenceCurrency(),
+      tax: selectedPricingReferenceTaxText(),
+      basisCount: state.quoteBasisSections.length,
+      outputCount: state.outputRows.length,
+    };
+  });
+  if (!applied.basisCount || !applied.outputCount) {
+    throw new Error("Pricing-reference regression fixture did not seed retained basis and Output state.");
+  }
+
+  await page.locator("#profileSelect").selectOption(pendingValue);
+  const pendingState = await page.evaluate(() => ({
+    pricingReferenceId: state.pricingReferenceId,
+    basisCount: state.quoteBasisSections.length,
+    outputCount: state.outputRows.length,
+  }));
+  if (pendingState.pricingReferenceId !== applied.pricingReferenceId || pendingState.basisCount !== applied.basisCount || pendingState.outputCount !== applied.outputCount) {
+    throw new Error("Changing the pricing-reference dropdown applied or cleared quote state before Customer Next.");
+  }
+  const previewBasis = {
+    currency: await page.locator("#customerDetailsPanel [data-reference-basis-currency]").innerText(),
+    tax: await page.locator("#customerDetailsPanel [data-reference-basis-tax]").innerText(),
+  };
+  if (previewBasis.currency !== "USD" || previewBasis.tax !== "VAT 20%") {
+    throw new Error("Reference basis cards did not preview the pending pricing reference: " + JSON.stringify(previewBasis));
+  }
+
+  await page.locator("#sideBackButton").click();
+  await page.locator("#imageIntake.is-active").waitFor({ state: "visible", timeout: 15000 });
+  await page.locator('button[data-side-panel="customer"]').click();
+  await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+  const resetAfterLeaving = {
+    value: await page.locator("#profileSelect").inputValue(),
+    currency: await page.locator("#customerDetailsPanel [data-reference-basis-currency]").innerText(),
+    tax: await page.locator("#customerDetailsPanel [data-reference-basis-tax]").innerText(),
+  };
+  if (resetAfterLeaving.value !== applied.value || resetAfterLeaving.currency !== applied.currency || resetAfterLeaving.tax !== applied.tax) {
+    throw new Error("Leaving Customer without Next did not restore the applied pricing reference: " + JSON.stringify(resetAfterLeaving));
+  }
+
+  await page.locator("#profileSelect").selectOption(pendingValue);
+
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+  const restored = await page.evaluate(() => ({
+    pricingReferenceId: state.pricingReferenceId,
+    selectedValue: elements.profileSelect.value,
+    basisCount: state.quoteBasisSections.length,
+    outputCount: state.outputRows.length,
+  }));
+  if (restored.pricingReferenceId !== applied.pricingReferenceId || restored.selectedValue !== applied.value || restored.basisCount !== applied.basisCount || restored.outputCount !== applied.outputCount) {
+    throw new Error("Refresh persisted the pending pricing reference or lost retained quote state: " + JSON.stringify(restored));
+  }
+
+  await page.locator("#sideNextButton", { hasText: "Next: Quote Company" }).click();
+  await page.locator("#quoteCompanyPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+  if (await page.locator("#quoteDependencyConfirmModal").isVisible()) {
+    throw new Error("Unchanged pricing reference opened the destructive dependency warning.");
+  }
+  await page.locator("#sideNextButton", { hasText: "Next: Quote Basis" }).click();
+  await page.locator("#quoteBasisPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+  const retainedAfterNoChange = await page.evaluate(() => ({
+    basisCount: state.quoteBasisSections.length,
+    outputCount: state.outputRows.length,
+    analysisConfirmVisible: !elements.analysisConfirmModal.hidden,
+  }));
+  if (!retainedAfterNoChange.basisCount || !retainedAfterNoChange.outputCount || retainedAfterNoChange.analysisConfirmVisible) {
+    throw new Error("Unchanged inputs did not preserve existing Basis and Output: " + JSON.stringify(retainedAfterNoChange));
+  }
+
+  await page.evaluate(() => {
+    setSidePanel("customer", { force: true });
+    const current = currentPricingReference();
+    state.pricingReferences.push({
+      ...current,
+      id: "pending-refresh-reference",
+      label: "Pending Refresh Reference",
+      source: "local",
+      currency: "USD",
+      tax: { label: "VAT", rate: 0.2 },
+    });
+    renderProfileOptions();
+  });
+  await page.locator("#profileSelect").selectOption(pendingValue);
+  await page.locator("#sideNextButton", { hasText: "Next: Quote Company" }).click();
+  await page.locator("#quoteDependencyConfirmModal").waitFor({ state: "visible", timeout: 15000 });
+  const warningText = await page.locator("#quoteDependencyConfirmText").innerText();
+  if (!warningText.includes("clear the current Quote Basis and Output")) {
+    throw new Error("Dependency warning did not explain the destructive scope: " + warningText);
+  }
+  await page.keyboard.press("Escape");
+  await page.locator("#quoteDependencyConfirmModal").waitFor({ state: "hidden", timeout: 15000 });
+  const cancelled = await page.evaluate(() => ({
+    panel: state.activeSidePanel,
+    pricingReferenceId: state.pricingReferenceId,
+    basisCount: state.quoteBasisSections.length,
+    outputCount: state.outputRows.length,
+  }));
+  if (cancelled.panel !== "customer" || cancelled.pricingReferenceId !== applied.pricingReferenceId || !cancelled.basisCount || !cancelled.outputCount) {
+    throw new Error("Cancelling the dependency warning changed quote state: " + JSON.stringify(cancelled));
+  }
+
+  await page.locator("#sideNextButton", { hasText: "Next: Quote Company" }).click();
+  await page.locator("#quoteDependencyConfirmModal").waitFor({ state: "visible", timeout: 15000 });
+  await page.locator("#confirmQuoteDependencyChangeButton").click();
+  await page.locator("#quoteCompanyPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+  const committed = await page.evaluate(() => ({
+    pricingReferenceId: state.pricingReferenceId,
+    source: state.pricingReferenceSource,
+    basisCount: state.quoteBasisSections.length,
+    outputCount: state.outputRows.length,
+    analysisConfirmVisible: !elements.analysisConfirmModal.hidden,
+    dashboardSession: state.quoteSessions.find((session) => session.session_id === state.quoteSessionId) || null,
+  }));
+  if (committed.pricingReferenceId !== "pending-refresh-reference" || committed.source !== "local" || committed.basisCount !== 0 || committed.outputCount !== 0) {
+    throw new Error("Confirmed pricing-reference change did not invalidate old generated state: " + JSON.stringify(committed));
+  }
+  if (committed.analysisConfirmVisible) {
+    throw new Error("Confirmed pricing-reference invalidation unexpectedly opened Start Analysis.");
+  }
+  if (committed.dashboardSession?.status?.quote_generated) {
+    throw new Error("Dashboard latest state still reported a generated quote after dependency invalidation.");
+  }
+
+  let releaseSave;
+  let saveStarted = false;
+  const savePattern = "**/api/quote-sessions";
+  await page.route(savePattern, async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.fallback();
+      return;
+    }
+    saveStarted = true;
+    await new Promise((resolve) => { releaseSave = resolve; });
+    await route.fallback();
+  });
+  try {
+    await page.locator("#sideNextButton", { hasText: "Start Analysis" }).click();
+    await page.locator("#analysisConfirmModal").waitFor({ state: "visible", timeout: 2000 });
+    if (saveStarted) {
+      throw new Error("Start Analysis waited for a draft save before opening its confirmation dialog.");
+    }
+    await page.locator("#analysisConfirmCancelButton").click();
+    await page.locator("#analysisConfirmModal").waitFor({ state: "hidden", timeout: 15000 });
+  } finally {
+    if (typeof releaseSave === "function") releaseSave();
+    await page.unroute(savePattern);
+  }
+}
 async function installMockProfiles(page) {
   await page.route("**/api/settings/pricing-references/synthetic-exhibition-fixture-pricing**", async (route) => {
     await route.fulfill({
@@ -1200,6 +1940,23 @@ async function main() {
 
   try {
     await installMockProfiles(page);
+    if (args.includes("--recovery-only")) {
+      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+      await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
+      await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 15000 });
+      await verifyConfirmBasisSurvivesImmediateRefresh(page);
+      await verifyGenerationLoadingModalSurvivesRefresh(page);
+      await verifyGenerationTerminalRecoveryAfterRefresh(page);
+      await verifyExpiredQuoteJobsDoNotResume(page);
+      await verifyPricingReferenceSelectionCommitsOnCustomerNext(page);
+      console.log(JSON.stringify({
+        status: "ok",
+        mode: "recovery-only",
+        consoleProblems,
+        networkProblems,
+      }, null, 2));
+      return;
+    }
     await verifyBrowserRecoveryScopeIsolation(page);
     await verifyStaleTabMutationIsRejected(page);
     await verifyConcurrentInitialDraftSaveUsesSingleSession(page);
@@ -1291,6 +2048,28 @@ async function main() {
     if (refreshedActiveRailTexts.length !== 1 || refreshedActiveRailTexts[0] !== "Quote Company") {
       throw new Error(`Expected refresh to restore the last quote menu, found ${JSON.stringify(refreshedActiveRailTexts)}.`);
     }
+    await page.evaluate(() => {
+      state.outputRows = [normalizeOutputRow({
+        section: "Refresh regression",
+        description: "Completed quote row",
+        quantity: 1,
+        unit: "lot",
+        unit_price: 100,
+        amount: 100,
+      })];
+      state.originalOutputRows = state.outputRows.map((row) => ({ ...row }));
+      state.basisConfirmed = true;
+      setWorkflowStage("completed");
+      setSidePanel("customer", { force: true });
+      saveSessionState();
+    });
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
+    await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+    const completedQuoteRefreshPanel = await page.locator(".rail-button.is-active").innerText();
+    if (completedQuoteRefreshPanel.trim() !== "Customer") {
+      throw new Error(`Completed quote refresh should preserve Customer, found ${completedQuoteRefreshPanel}.`);
+    }
     const restoredQuoteSessionId = await currentQuoteSessionId(page);
     if (!restoredQuoteSessionId) {
       throw new Error("Expected refresh recovery to keep the current quote session id.");
@@ -1307,6 +2086,7 @@ async function main() {
     }, "swooshz_quote_session_v1");
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.getByRole("heading", { name: "Quote List" }).waitFor();
+    await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 15000 });
     const unrelatedLocalQuoteSessionId = await currentQuoteSessionId(page);
     if (unrelatedLocalQuoteSessionId === restoredQuoteSessionId) {
       throw new Error(`Expected Modify quote regression to use a non-current browser draft, found ${unrelatedLocalQuoteSessionId}.`);
@@ -1328,8 +2108,8 @@ async function main() {
     const restoredActiveRailTexts = await page.locator(".rail-button.is-active").evaluateAll((buttons) => (
       buttons.map((button) => button.textContent?.trim() || "")
     ));
-    if (restoredActiveRailTexts.length !== 1 || !["Upload", "Customer", "Quote Company"].includes(restoredActiveRailTexts[0])) {
-      throw new Error(`Expected Modify quote to restore a usable quote panel, found ${JSON.stringify(restoredActiveRailTexts)}.`);
+    if (restoredActiveRailTexts.length !== 1 || restoredActiveRailTexts[0] !== "Output") {
+      throw new Error(`Expected Modify quote to open the furthest completed panel Output, found ${JSON.stringify(restoredActiveRailTexts)}.`);
     }
     const restoredFiles = await page.locator("#fileList .file-item").evaluateAll((items) => (
       items.map((item) => item.textContent?.trim() || "")
@@ -1415,6 +2195,15 @@ async function main() {
     await page.locator("#settingsButton").click();
     await page.locator("#pricingReferenceModal").waitFor({ state: "visible" });
     await page.getByRole("heading", { name: "Pricing Reference Settings" }).waitFor();
+    await page.locator("#pricingReferenceImportTab").click();
+    await page.locator("#pricingReferenceImportPanel").waitFor({ state: "visible" });
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
+    await page.locator("#pricingReferenceModal").waitFor({ state: "visible", timeout: 15000 });
+    await page.locator("#pricingReferenceImportPanel").waitFor({ state: "visible" });
+    if ((await page.locator("#pricingReferenceImportTab").getAttribute("aria-selected")) !== "true") {
+      throw new Error("Pricing Reference refresh should preserve the Import tab instead of returning to Manage.");
+    }
     await page.keyboard.press("Escape");
     await page.locator("#pricingReferenceModal").waitFor({ state: "hidden" });
     await page.locator("#quoteDate").waitFor({ state: "visible" });
@@ -1493,7 +2282,7 @@ async function main() {
     const currentDashboardCard = page.locator(`.dashboard-session-card[data-quote-session-id="${currentDashboardSessionId}"]`);
     await currentDashboardCard.waitFor({ state: "visible", timeout: 15000 });
     const savedStepPills = await currentDashboardCard.locator(".dashboard-status-pill.is-progress").allTextContents();
-    if (!savedStepPills.some((text) => /Saved at Customer/i.test(text))) {
+    if (!savedStepPills.some((text) => /Saved at Output/i.test(text))) {
       throw new Error(`Expected dashboard card to show saved step pill for the current draft, found ${JSON.stringify(savedStepPills)}.`);
     }
     const modifiedDateMetrics = await currentDashboardCard.locator(".dashboard-session-meta-zone div").nth(1).locator("dd").evaluate((element) => {
@@ -1519,6 +2308,54 @@ async function main() {
     if (JSON.stringify(currentDraftState).includes("data:application/pdf")) {
       throw new Error("Dashboard session draft state should not store raw PDF data URLs.");
     }
+    let duplicateDetailRequestCount = 0;
+    let releaseInitialDuplicateRequest = null;
+    const duplicateDetailPattern = `**/api/quote-sessions/${currentDashboardSessionId}`;
+    const duplicateDetailRoute = async (route) => {
+      if (route.request().method() !== "GET") {
+        await route.continue();
+        return;
+      }
+      duplicateDetailRequestCount += 1;
+      if (duplicateDetailRequestCount === 1) {
+        await new Promise((resolve) => { releaseInitialDuplicateRequest = resolve; });
+        await route.abort("aborted");
+        return;
+      }
+      await route.continue();
+    };
+    await page.route(duplicateDetailPattern, duplicateDetailRoute);
+    await currentDashboardCard.click();
+    await page.locator('[data-dashboard-panel-action="duplicate-session"]', { hasText: "Duplicate Quote" }).click();
+    await page.locator("#dashboardLoadingTitle", { hasText: "Duplicating quote" }).waitFor({ state: "visible", timeout: 15000 });
+    const interruptedDuplicateOperation = await page.evaluate(() => JSON.parse(
+      window.localStorage.getItem("swooshz_dashboard_operation_v1") || "null"
+    ));
+    if (!interruptedDuplicateOperation?.targetSessionId) {
+      throw new Error(`Expected duplicate operation recovery state before refresh, found ${JSON.stringify(interruptedDuplicateOperation)}.`);
+    }
+    const duplicateReload = page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(100);
+    if (typeof releaseInitialDuplicateRequest !== "function") {
+      throw new Error("Initial duplicate detail request was not paused before refresh.");
+    }
+    releaseInitialDuplicateRequest();
+    await duplicateReload;
+    await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
+    await page.locator("#dashboardLoadingTitle", { hasText: "Duplicating quote" }).waitFor({ state: "visible", timeout: 15000 });
+    const duplicatedTargetCard = page.locator(`.dashboard-session-card[data-quote-session-id="${interruptedDuplicateOperation.targetSessionId}"]`);
+    await duplicatedTargetCard.waitFor({ state: "visible", timeout: 15000 });
+    await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 15000 });
+    await page.waitForFunction(() => !window.localStorage.getItem("swooshz_dashboard_operation_v1"));
+    if (await duplicatedTargetCard.count() !== 1) {
+      throw new Error(`Duplicate refresh should create exactly one target ${interruptedDuplicateOperation.targetSessionId}.`);
+    }
+    await page.unroute(duplicateDetailPattern, duplicateDetailRoute);
+    await duplicatedTargetCard.click();
+    await page.locator('[data-dashboard-panel-action="delete-session"]').click();
+    await page.locator("#confirmQuoteSessionDeleteButton").click();
+    await duplicatedTargetCard.waitFor({ state: "detached", timeout: 15000 });
+
     await currentDashboardCard.click();
     await page.keyboard.press("Delete");
     await page.locator("#quoteSessionDeleteModal").waitFor({ state: "visible", timeout: 15000 });
@@ -1548,11 +2385,16 @@ async function main() {
     await page.getByRole("button", { name: "Clear selected session", exact: true }).click();
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.getByRole("heading", { name: "Quote List" }).waitFor();
+    await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 15000 });
     await page.locator("#dashboardSearchInput").fill("Four Foxtrot Smoke Search");
     await page.locator(".dashboard-session-card").first().waitFor({ state: "visible", timeout: 15000 });
     const characterSearchRows = await page.locator(".dashboard-session-card").count();
     if (characterSearchRows !== 1) {
-      throw new Error(`Expected search for Four Foxtrot Smoke Search to match only the REF QUOTE-4F row, found ${characterSearchRows}.`);
+      const matchingCards = await page.locator(".dashboard-session-card").evaluateAll((cards) => cards.map((card) => ({
+        id: card.getAttribute("data-quote-session-id"),
+        text: card.innerText,
+      })));
+      throw new Error("Expected search for Four Foxtrot Smoke Search to match only the REF QUOTE-4F row, found " + characterSearchRows + ": " + JSON.stringify(matchingCards) + ".");
     }
     const characterSearchText = await page.locator(".dashboard-session-card").first().innerText();
     if (!characterSearchText.includes("REF QUOTE-4F")) {
@@ -1565,6 +2407,7 @@ async function main() {
     await createDashboardSmokeSession(page, "delta", { sessionIdPrefix: "quote-bulk-extra-2" });
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.getByRole("heading", { name: "Quote List" }).waitFor();
+    await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 15000 });
     await page.locator("#dashboardSearchInput").fill("7a");
     await page.locator(".dashboard-session-card").first().waitFor({ state: "visible", timeout: 15000 });
     const referenceSearchTexts = await page.locator(".dashboard-session-card").evaluateAll((cards) => (
@@ -1589,6 +2432,7 @@ async function main() {
     });
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.getByRole("heading", { name: "Quote List" }).waitFor();
+    await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 15000 });
     await page.locator("#dashboardSearchInput").fill("untitled customer");
     await page.locator(".dashboard-session-card").first().waitFor({ state: "visible", timeout: 15000 });
     const untitledCustomerTexts = await page.locator(".dashboard-session-card").evaluateAll((cards) => (
@@ -1746,7 +2590,9 @@ async function main() {
     await page.locator("#imageIntake").waitFor({ state: "visible", timeout: 15000 });
     await verifyMobileHeaderOrder(page);
     await verifyMobileBasisLegendAndOutputCards(page);
+    await verifyConfirmBasisSurvivesImmediateRefresh(page);
     await verifyGenerationLoadingModalSurvivesRefresh(page);
+    await verifyGenerationTerminalRecoveryAfterRefresh(page);
 
     console.log(JSON.stringify({
       status: "ok",
