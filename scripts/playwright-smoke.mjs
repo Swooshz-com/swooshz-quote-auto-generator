@@ -339,55 +339,317 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
   await page.locator("#outputDeleteModal").waitFor({ state: "hidden", timeout: 15000 });
 }
 
+async function prepareRefreshRecoveryQuote(page) {
+  await page.evaluate(async () => {
+    const reference = state.pricingReferences.find((item) => Array.isArray(item.items) && item.items.length)
+      || state.pricingReferences[0];
+    if (!reference) throw new Error("Refresh recovery fixture needs a pricing reference.");
+    state.pricingReferenceId = reference.id;
+    state.pricingReferenceSource = reference.source || "bundled";
+    syncSelectedPricingReference();
+
+    [
+      [elements.clientName, "Refresh Recovery Client"],
+      [elements.clientAttention, "Test Contact"],
+      [elements.clientTitle, "Project Manager"],
+      [elements.clientAddress, "1 Test Street"],
+      [elements.projectTitle, "Refresh Recovery Quote"],
+      [elements.showName, "Refresh Recovery Expo"],
+      [elements.quoteDate, "2026-07-14"],
+      [elements.projectNumber, "RECOVERY-001"],
+      [elements.headerDetails, "Refresh Recovery Company"],
+      [elements.quoteCompanyName, "Refresh Recovery Company"],
+      [elements.acceptanceText, "Accepted for testing"],
+      [elements.companySignatory, "Test Signatory"],
+      [elements.companyTitle, "Director"],
+      [elements.companyDateLabel, "Date"],
+      [elements.personLabel, "Name"],
+      [elements.stampLabel, "Stamp"],
+      [elements.dateLabel, "Date"],
+    ].forEach(([input, value]) => setInputValue(input, value));
+
+    state.headerLogo = {
+      name: "refresh-recovery-logo.png",
+      type: "image/png",
+      size: 68,
+      data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nWQAAAAASUVORK5CYII=",
+    };
+    renderHeaderLogoPreview();
+    state.images = [{
+      name: "refresh-recovery-render.png",
+      type: "image/png",
+      size: 68,
+      data_url: state.headerLogo.data_url,
+    }];
+    state.quoteSessionId = state.quoteSessionId || newClientQuoteSessionId();
+    state.activeAppView = "quote";
+    state.aiFailed = false;
+    state.basisConfirmed = false;
+    state.blockingClarificationQuestions = [];
+    state.downloadFile = null;
+    state.pdfFile = null;
+    state.outputRows = [];
+    state.originalOutputRows = [];
+    state.outputErrors = [];
+    state.lineItems = [normalizeLineItem({
+      section: "Floor Design",
+      description: "sqm refresh recovery flooring",
+      quantity: 1,
+      unit: "sqm",
+      price_mode: "Priced",
+      unit_price: 50,
+      unit_price_override: 50,
+      catalog_unit_price: 50,
+      amount: 50,
+      pricing_keyword: "floor-design-refresh-recovery-flooring",
+    })];
+    state.quoteBasisSections = [{
+      id: "floor-design",
+      title: "Floor Design",
+      lines: [{
+        tag: "Include",
+        text: "sqm refresh recovery flooring",
+        quantity: 1,
+        unit: "sqm",
+        include: true,
+        pricing_keyword: "floor-design-refresh-recovery-flooring",
+      }],
+    }];
+    state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
+    setWorkflowStage("basis_review");
+    showQuoteFlow();
+    setSidePanel("basis", { force: true });
+    syncControlStates();
+    await persistSessionFiles(sessionFileRecordsFromDraft());
+  });
+}
+
+async function verifyConfirmBasisSurvivesImmediateRefresh(page) {
+  await prepareRefreshRecoveryQuote(page);
+  const confirmReadiness = await page.evaluate(() => ({
+    busy: appIsBusy(),
+    blockReason: basisConfirmBlockReason(),
+    missing: missingDetailFields(),
+    lineItems: state.lineItems.length,
+    workflowStage: state.workflowStage,
+    activePanel: state.activeSidePanel,
+  }));
+  if (confirmReadiness.busy || confirmReadiness.blockReason || confirmReadiness.missing.length || !confirmReadiness.lineItems) {
+    throw new Error("Confirm Basis refresh fixture is not ready: " + JSON.stringify(confirmReadiness));
+  }
+  let normalizeCount = 0;
+  let releaseFirstRequest;
+  let releaseSecondRequest;
+  let firstRequestStartedResolve;
+  let secondRequestStartedResolve;
+  const firstRequestStarted = new Promise((resolve) => { firstRequestStartedResolve = resolve; });
+  const secondRequestStarted = new Promise((resolve) => { secondRequestStartedResolve = resolve; });
+  const normalizePattern = "**/api/line-items/normalize";
+
+  await page.route(normalizePattern, async (route) => {
+    normalizeCount += 1;
+    const requestPayload = route.request().postDataJSON();
+    if (normalizeCount === 1) {
+      firstRequestStartedResolve();
+      await new Promise((resolve) => { releaseFirstRequest = resolve; });
+      try {
+        await route.abort("aborted");
+      } catch {
+        // Navigation may already have disposed the interrupted request.
+      }
+      return;
+    }
+    secondRequestStartedResolve();
+    await new Promise((resolve) => { releaseSecondRequest = resolve; });
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "normalized",
+        line_items: Array.isArray(requestPayload.line_items) ? requestPayload.line_items : [],
+      }),
+    });
+  });
+
+  try {
+    await page.evaluate(() => { confirmBasis(); });
+    await firstRequestStarted;
+    await page.locator("#excelGeneratingTitle", { hasText: "Preparing Output" }).waitFor({ state: "visible", timeout: 15000 });
+    const savedBeforeRefresh = await page.evaluate(() => JSON.parse(
+      window.localStorage.getItem("swooshz_quote_session_v1") || "{}"
+    ));
+    if (savedBeforeRefresh.activeJob?.type !== "confirm_basis") {
+      throw new Error("Confirm Basis did not persist its pending recovery operation before the request completed.");
+    }
+
+    const reload = page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(100);
+    if (typeof releaseFirstRequest !== "function") {
+      throw new Error("Confirm Basis request was not paused before refresh.");
+    }
+    releaseFirstRequest();
+    await reload;
+    await secondRequestStarted;
+    await page.locator("#excelGeneratingTitle", { hasText: "Preparing Output" }).waitFor({ state: "visible", timeout: 15000 });
+    releaseSecondRequest();
+
+    try {
+      await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+    } catch (error) {
+      const diagnostic = await page.evaluate(() => {
+        const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
+        return {
+          basisConfirmed: state.basisConfirmed,
+          workflowStage: state.workflowStage,
+          activePanel: state.activeSidePanel,
+          preparingOutput: state.isPreparingOutput,
+          lineItems: state.lineItems.length,
+          outputRows: state.outputRows.length,
+          activeJob: saved.activeJob || null,
+          blockedText: document.querySelector("#blockedActionText")?.textContent || "",
+        };
+      });
+      throw new Error((error?.message || "Output did not open.") + " Diagnostic: " + JSON.stringify(diagnostic));
+    }
+    await page.waitForFunction(() => {
+      const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
+      return state.basisConfirmed === true
+        && state.activeSidePanel === "output"
+        && !saved.activeJob;
+    }, null, { timeout: 15000 });
+    if (normalizeCount !== 2) {
+      throw new Error("Confirm Basis refresh should resume exactly once; requests observed: " + normalizeCount + ".");
+    }
+  } finally {
+    if (typeof releaseFirstRequest === "function") releaseFirstRequest();
+    if (typeof releaseSecondRequest === "function") releaseSecondRequest();
+    await page.unroute(normalizePattern);
+  }
+}
+
 async function verifyGenerationLoadingModalSurvivesRefresh(page) {
   const cases = [
-    { id: "job-refresh-excel", type: "generate", viewPdf: false, title: "Regenerating Excel" },
-    { id: "job-refresh-pdf", type: "generate_pdf", viewPdf: true, title: "Generating PDF" },
+    { type: "generate", viewPdf: false, title: "Regenerating Excel", readyTitle: "Excel ready", action: "excel", button: "#sideDownloadButton" },
+    { type: "generate_pdf", viewPdf: true, title: "Generating PDF", readyTitle: "PDF ready", action: "pdf", button: "#sideViewPdfButton" },
   ];
 
   for (const testCase of cases) {
     let finishJob = false;
-    const routePattern = `**/api/jobs/${testCase.id}*`;
-    await page.route(routePattern, async (route) => {
+    let postCount = 0;
+    let releaseFirstPost;
+    let firstPostStartedResolve;
+    let secondPostStartedResolve;
+    const firstPostStarted = new Promise((resolve) => { firstPostStartedResolve = resolve; });
+    const secondPostStarted = new Promise((resolve) => { secondPostStartedResolve = resolve; });
+    const postedJobIds = [];
+    const postPattern = "**/api/jobs";
+    const getPattern = "**/api/jobs/job-*";
+    const quoteSessionId = await currentQuoteSessionId(page);
+
+    await page.route(postPattern, async (route) => {
+      if (route.request().method() !== "POST") {
+        await route.continue();
+        return;
+      }
+      postCount += 1;
+      const payload = route.request().postDataJSON();
+      postedJobIds.push(payload.job_id || "");
+      if (postCount === 1) {
+        firstPostStartedResolve();
+        await new Promise((resolve) => { releaseFirstPost = resolve; });
+        try {
+          await route.abort("aborted");
+        } catch {
+          // Navigation may already have disposed the interrupted request.
+        }
+        return;
+      }
+      secondPostStartedResolve();
+      await route.fulfill({
+        status: 202,
+        contentType: "application/json",
+        body: JSON.stringify({
+          job_id: payload.job_id,
+          type: payload.type,
+          status: "running",
+          created_at: "2026-07-14T00:00:00Z",
+        }),
+      });
+    });
+
+    await page.route(getPattern, async (route) => {
+      const jobId = new URL(route.request().url()).pathname.split("/").pop() || "";
+      if (!postedJobIds.includes(jobId)) {
+        await route.continue();
+        return;
+      }
+      const files = [{
+        name: "quotation.xlsx",
+        url: "/api/quote-sessions/" + quoteSessionId + "/files/quotation.xlsx",
+      }];
+      if (testCase.viewPdf) {
+        files.push({
+          name: "quotation.pdf",
+          url: "/api/quote-sessions/" + quoteSessionId + "/files/quotation.pdf",
+        });
+      }
       await route.fulfill({
         status: 200,
         contentType: "application/json",
         body: JSON.stringify(finishJob
           ? {
-              job_id: testCase.id,
+              job_id: jobId,
               type: testCase.type,
-              status: "failed",
-              result: { status: "failed", message: "Synthetic terminal state for refresh recovery smoke." },
+              status: "completed",
+              result: {
+                status: "completed",
+                files,
+                pricing_matches: [],
+                quote_session: { session_id: quoteSessionId },
+              },
             }
           : {
-              job_id: testCase.id,
+              job_id: jobId,
               type: testCase.type,
               status: "running",
-              created_at: "2026-01-01T00:00:00Z",
+              created_at: "2026-07-14T00:00:00Z",
             }),
       });
     });
 
     try {
-      await page.evaluate((activeJob) => {
-        state.activeAppView = "quote";
-        state.activeSidePanel = "output";
-        state.workflowStage = "generating";
-        state.activeJob = activeJob;
-        saveSessionState();
-      }, { id: testCase.id, type: testCase.type, viewPdf: testCase.viewPdf });
-      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+      await page.locator(testCase.button + ":not([disabled])").click();
+      await firstPostStarted;
+      const savedBeforeRefresh = await page.evaluate(() => JSON.parse(
+        window.localStorage.getItem("swooshz_quote_session_v1") || "{}"
+      ));
+      if (savedBeforeRefresh.activeJob?.type !== testCase.type || savedBeforeRefresh.activeJob?.phase !== "starting") {
+        throw new Error("Export click did not persist the pending " + testCase.type + " operation before the server response.");
+      }
+      if (!postedJobIds[0]) {
+        throw new Error("Export click did not send a client-generated job id.");
+      }
+
+      const reload = page.reload({ waitUntil: "domcontentloaded" });
+      await page.waitForTimeout(100);
+      if (typeof releaseFirstPost !== "function") {
+        throw new Error("Initial " + testCase.type + " request was not paused before refresh.");
+      }
+      releaseFirstPost();
+      await reload;
+      await secondPostStarted;
       await page.locator("#excelGeneratingModal").waitFor({ state: "visible", timeout: 15000 });
       const restoredTitle = (await page.locator("#excelGeneratingTitle").innerText()).trim();
       if (restoredTitle !== testCase.title) {
-        throw new Error(`Expected refreshed ${testCase.type} overlay title ${testCase.title}, found ${restoredTitle}.`);
+        throw new Error("Expected refreshed " + testCase.type + " overlay title " + testCase.title + ", found " + restoredTitle + ".");
       }
-      const restoredJobId = await page.evaluate(() => {
-        const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
-        return saved.activeJob?.id || "";
-      });
-      if (restoredJobId !== testCase.id) {
-        throw new Error(`Expected refreshed ${testCase.type} job ${testCase.id}, found ${restoredJobId}.`);
+      if (postCount !== 2 || postedJobIds[0] !== postedJobIds[1]) {
+        throw new Error("Refresh should retry " + testCase.type + " with one stable idempotency key: " + JSON.stringify(postedJobIds) + ".");
+      }
+      const activePanel = (await page.locator(".rail-button.is-active").innerText()).trim();
+      if (activePanel !== "Output") {
+        throw new Error("Recovered " + testCase.type + " should remain tied to Output, found " + activePanel + ".");
       }
 
       finishJob = true;
@@ -395,37 +657,21 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
         const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
         return !saved.activeJob;
       }, null, { timeout: 15000 });
-      if (testCase.terminalStatus === "completed") {
-        const expectedReadyTitle = testCase.viewPdf ? "PDF ready" : "Excel ready";
-        const expectedAction = testCase.viewPdf ? "pdf" : "excel";
-        const expectedButtonText = testCase.viewPdf ? "Open PDF" : "Download Excel";
-        await page.locator("#excelGeneratingModal.is-ready").waitFor({ state: "visible", timeout: 15000 });
-        const readyTitle = (await page.locator("#excelGeneratingTitle").innerText()).trim();
-        if (readyTitle !== expectedReadyTitle) {
-          throw new Error(`Expected refreshed ${testCase.type} ready title ${expectedReadyTitle}, found ${readyTitle}.`);
-        }
-        const readyAction = await page.locator("#excelGeneratingActionButton").getAttribute("data-export-action");
-        const readyButtonText = (await page.locator("#excelGeneratingActionButton").innerText()).trim();
-        if (readyAction !== expectedAction || readyButtonText !== expectedButtonText) {
-          throw new Error(`Expected refreshed ${testCase.type} action ${expectedAction}/${expectedButtonText}, found ${readyAction}/${readyButtonText}.`);
-        }
-        if (await page.locator("#excelGeneratingActions").isHidden()) {
-          throw new Error(`Expected refreshed ${testCase.type} ready actions to be visible.`);
-        }
-        if (!(await page.locator("#excelGeneratingSpinner").isHidden())) {
-          throw new Error(`Expected refreshed ${testCase.type} ready spinner to be hidden.`);
-        }
-        await page.locator("#excelGeneratingCloseButton").click();
-        await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 15000 });
-      } else {
-        await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 15000 });
+      await page.locator("#excelGeneratingModal.is-ready").waitFor({ state: "visible", timeout: 15000 });
+      const readyTitle = (await page.locator("#excelGeneratingTitle").innerText()).trim();
+      const readyAction = await page.locator("#excelGeneratingActionButton").getAttribute("data-export-action");
+      if (readyTitle !== testCase.readyTitle || readyAction !== testCase.action) {
+        throw new Error("Recovered " + testCase.type + " result was not attached to its restored splash.");
       }
+      await page.locator("#excelGeneratingCloseButton").click();
+      await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 15000 });
     } finally {
-      await page.unroute(routePattern);
+      if (typeof releaseFirstPost === "function") releaseFirstPost();
+      await page.unroute(postPattern);
+      await page.unroute(getPattern);
     }
   }
 }
-
 async function installMockProfiles(page) {
   await page.route("**/api/settings/pricing-references/synthetic-exhibition-fixture-pricing**", async (route) => {
     await route.fulfill({
@@ -1063,6 +1309,20 @@ async function main() {
 
   try {
     await installMockProfiles(page);
+    if (args.includes("--recovery-only")) {
+      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+      await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
+      await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 15000 });
+      await verifyConfirmBasisSurvivesImmediateRefresh(page);
+      await verifyGenerationLoadingModalSurvivesRefresh(page);
+      console.log(JSON.stringify({
+        status: "ok",
+        mode: "recovery-only",
+        consoleProblems,
+        networkProblems,
+      }, null, 2));
+      return;
+    }
     await verifyBrowserRecoveryScopeIsolation(page);
     await verifyStaleTabMutationIsRejected(page);
     await verifyConcurrentInitialDraftSaveUsesSingleSession(page);
@@ -1192,6 +1452,7 @@ async function main() {
     }, "swooshz_quote_session_v1");
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.getByRole("heading", { name: "Quote List" }).waitFor();
+    await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 15000 });
     const unrelatedLocalQuoteSessionId = await currentQuoteSessionId(page);
     if (unrelatedLocalQuoteSessionId === restoredQuoteSessionId) {
       throw new Error(`Expected Modify quote regression to use a non-current browser draft, found ${unrelatedLocalQuoteSessionId}.`);
@@ -1490,11 +1751,16 @@ async function main() {
     await page.getByRole("button", { name: "Clear selected session", exact: true }).click();
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.getByRole("heading", { name: "Quote List" }).waitFor();
+    await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 15000 });
     await page.locator("#dashboardSearchInput").fill("Four Foxtrot Smoke Search");
     await page.locator(".dashboard-session-card").first().waitFor({ state: "visible", timeout: 15000 });
     const characterSearchRows = await page.locator(".dashboard-session-card").count();
     if (characterSearchRows !== 1) {
-      throw new Error(`Expected search for Four Foxtrot Smoke Search to match only the REF QUOTE-4F row, found ${characterSearchRows}.`);
+      const matchingCards = await page.locator(".dashboard-session-card").evaluateAll((cards) => cards.map((card) => ({
+        id: card.getAttribute("data-quote-session-id"),
+        text: card.innerText,
+      })));
+      throw new Error("Expected search for Four Foxtrot Smoke Search to match only the REF QUOTE-4F row, found " + characterSearchRows + ": " + JSON.stringify(matchingCards) + ".");
     }
     const characterSearchText = await page.locator(".dashboard-session-card").first().innerText();
     if (!characterSearchText.includes("REF QUOTE-4F")) {
@@ -1507,6 +1773,7 @@ async function main() {
     await createDashboardSmokeSession(page, "delta", { sessionIdPrefix: "quote-bulk-extra-2" });
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.getByRole("heading", { name: "Quote List" }).waitFor();
+    await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 15000 });
     await page.locator("#dashboardSearchInput").fill("7a");
     await page.locator(".dashboard-session-card").first().waitFor({ state: "visible", timeout: 15000 });
     const referenceSearchTexts = await page.locator(".dashboard-session-card").evaluateAll((cards) => (
@@ -1531,6 +1798,7 @@ async function main() {
     });
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.getByRole("heading", { name: "Quote List" }).waitFor();
+    await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 15000 });
     await page.locator("#dashboardSearchInput").fill("untitled customer");
     await page.locator(".dashboard-session-card").first().waitFor({ state: "visible", timeout: 15000 });
     const untitledCustomerTexts = await page.locator(".dashboard-session-card").evaluateAll((cards) => (
@@ -1688,6 +1956,7 @@ async function main() {
     await page.locator("#imageIntake").waitFor({ state: "visible", timeout: 15000 });
     await verifyMobileHeaderOrder(page);
     await verifyMobileBasisLegendAndOutputCards(page);
+    await verifyConfirmBasisSurvivesImmediateRefresh(page);
     await verifyGenerationLoadingModalSurvivesRefresh(page);
 
     console.log(JSON.stringify({

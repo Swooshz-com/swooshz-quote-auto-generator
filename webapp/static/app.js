@@ -5,6 +5,7 @@ const CSRF_HEADER_NAME = "X-Swooshz-CSRF";
 const LEGACY_QUOTE_PRESETS_STORAGE_KEY = "swooshz_quote_detail_presets_v1";
 const LAST_SELECTION_STORAGE_KEY = "swooshz_last_selection_v1";
 const QUOTE_SESSION_STORAGE_KEY = "swooshz_quote_session_v1";
+const WORKSPACE_VIEW_STORAGE_KEY = "swooshz_workspace_view_v1";
 const DASHBOARD_OPERATION_STORAGE_KEY = "swooshz_dashboard_operation_v1";
 const DASHBOARD_OPERATION_MAX_AGE_MS = 15 * 60 * 1000;
 const QUOTE_SESSION_FILE_DB_NAME = "swooshz_quote_session_files_v1";
@@ -22,6 +23,14 @@ const ANALYSIS_WAIT_ESTIMATE = "This will take about 10 to 15 mins.";
 const PRICING_REFERENCE_SETTINGS_MODE_MANAGE = "manage";
 const PRICING_REFERENCE_SETTINGS_MODE_IMPORT = "import";
 const FINAL_JOB_STATUSES = new Set(["completed", "degraded", "needs_review", "blocked", "failed"]);
+const SERVER_JOB_TYPES = new Set(["draft", "basis_chat", "generate", "generate_pdf"]);
+const RESTORABLE_OVERLAYS = new Set([
+  "pricing_reference_settings",
+  "basis_chat",
+  "analysis_confirm",
+  "excel_ready",
+  "pdf_ready",
+]);
 const PROFILE_PRESET_PREFIX = "profile:";
 const COMPANY_PROFILE_PRESET_PREFIX = "company:";
 const COMPANY_PROFILE_EXPORT_SCHEMA = "swooshz.quote-company-profile.v1";
@@ -621,6 +630,35 @@ function randomQuoteSessionToken() {
 
 function newClientQuoteSessionId() {
   return safeQuoteSessionId(`quote-${randomQuoteSessionToken()}`);
+}
+
+function newClientJobId() {
+  return `job-${randomQuoteSessionToken()}`;
+}
+
+function newClientOperationId() {
+  return `operation-${randomQuoteSessionToken()}`;
+}
+
+function normalizeRestorableOverlay(value = "") {
+  const overlay = String(value || "").trim();
+  return RESTORABLE_OVERLAYS.has(overlay) ? overlay : "";
+}
+
+function normalizeActiveJob(job = {}) {
+  if (!job || typeof job !== "object") return null;
+  const type = String(job.type || "").trim();
+  const id = String(job.id || "").trim();
+  if (![...SERVER_JOB_TYPES, "confirm_basis"].includes(type) || !id) return null;
+  if (SERVER_JOB_TYPES.has(type) && !/^job-[A-Za-z0-9_-]{8,80}$/.test(id)) return null;
+  if (type === "confirm_basis" && !/^operation-[A-Za-z0-9_-]{8,80}$/.test(id)) return null;
+  return {
+    ...job,
+    id,
+    type,
+    phase: job.phase === "running" ? "running" : "starting",
+    startedAt: String(job.startedAt || job.created_at || job.createdAt || new Date().toISOString()),
+  };
 }
 
 function ensureClientQuoteSessionId() {
@@ -2508,6 +2546,94 @@ function safeSessionJson() {
   }
 }
 
+function buildWorkspaceViewSnapshot() {
+  return {
+    version: 1,
+    browserRecoveryScope: currentBrowserRecoveryScope(),
+    savedAt: new Date().toISOString(),
+    activeAppView: state.activeAppView === "quote" ? "quote" : "dashboard",
+    activeSidePanel: SIDE_PANEL_SEQUENCE.includes(state.activeSidePanel) ? state.activeSidePanel : "images",
+    restorableOverlay: normalizeRestorableOverlay(state.restorableOverlay),
+    pricingReferenceSettingsMode: normalizePricingReferenceSettingsMode(state.pricingReferenceSettingsMode),
+    pendingAnalysisMode: normalizeAnalysisMode(state.pendingAnalysisMode),
+    dashboardStatusFilter: String(state.dashboardStatusFilter || "all"),
+    dashboardDateFilter: String(state.dashboardDateFilter || "all"),
+    dashboardCustomDateStart: String(state.dashboardCustomDateStart || ""),
+    dashboardCustomDateEnd: String(state.dashboardCustomDateEnd || ""),
+    dashboardSortMode: String(state.dashboardSortMode || "created"),
+    dashboardSearch: String(state.dashboardSearch || ""),
+    dashboardPageSize: Number(state.dashboardPageSize),
+    dashboardPageIndex: Number(state.dashboardPageIndex),
+    dashboardSelectionMode: Boolean(state.dashboardSelectionMode),
+    dashboardSelectedSessionIds: (state.dashboardSelectedSessionIds || []).map(safeQuoteSessionId).filter(Boolean),
+    dashboardActiveSessionId: safeQuoteSessionId(state.dashboardActiveSessionId || ""),
+  };
+}
+
+function safeWorkspaceViewJson() {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(WORKSPACE_VIEW_STORAGE_KEY) || "null");
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveWorkspaceViewState() {
+  if (state.isBooting || !currentBrowserRecoveryScope()) return;
+  try {
+    window.localStorage.setItem(WORKSPACE_VIEW_STORAGE_KEY, JSON.stringify(buildWorkspaceViewSnapshot()));
+  } catch {
+    // Exact screen recovery is best-effort; quote data remains in its separate recovery record.
+  }
+}
+
+function clearWorkspaceViewState() {
+  try {
+    window.localStorage.removeItem(WORKSPACE_VIEW_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures during logout or recovery-scope changes.
+  }
+}
+
+function restoredWorkspaceViewState() {
+  const saved = safeWorkspaceViewJson();
+  if (!saved || saved.version !== 1 || saved.browserRecoveryScope !== currentBrowserRecoveryScope()) {
+    clearWorkspaceViewState();
+    return null;
+  }
+  return saved;
+}
+
+function applyWorkspaceViewState(saved = {}, options = {}) {
+  if (!saved || typeof saved !== "object") return false;
+  const quoteRestored = options.quoteRestored === true;
+  state.activeAppView = saved.activeAppView === "quote" && quoteRestored ? "quote" : "dashboard";
+  if (state.activeAppView === "quote" && SIDE_PANEL_SEQUENCE.includes(saved.activeSidePanel)) {
+    setSidePanel(saved.activeSidePanel, { force: true });
+  }
+  const overlay = normalizeRestorableOverlay(saved.restorableOverlay);
+  state.restorableOverlay = quoteRestored || overlay === "pricing_reference_settings" ? overlay : "";
+  state.pricingReferenceSettingsMode = normalizePricingReferenceSettingsMode(saved.pricingReferenceSettingsMode);
+  state.pendingAnalysisMode = normalizeAnalysisMode(saved.pendingAnalysisMode);
+  state.dashboardStatusFilter = String(saved.dashboardStatusFilter || "all");
+  state.dashboardDateFilter = String(saved.dashboardDateFilter || "all");
+  state.dashboardCustomDateStart = String(saved.dashboardCustomDateStart || "");
+  state.dashboardCustomDateEnd = String(saved.dashboardCustomDateEnd || "");
+  state.dashboardSortMode = String(saved.dashboardSortMode || "created");
+  state.dashboardSearch = String(saved.dashboardSearch || "");
+  state.dashboardPageSize = DASHBOARD_PAGE_SIZE_OPTIONS.includes(Number(saved.dashboardPageSize))
+    ? Number(saved.dashboardPageSize)
+    : DASHBOARD_DEFAULT_PAGE_SIZE;
+  state.dashboardPageIndex = Math.max(0, Number(saved.dashboardPageIndex) || 0);
+  state.dashboardSelectionMode = Boolean(saved.dashboardSelectionMode);
+  state.dashboardSelectedSessionIds = Array.isArray(saved.dashboardSelectedSessionIds)
+    ? saved.dashboardSelectedSessionIds.map(safeQuoteSessionId).filter(Boolean)
+    : [];
+  state.dashboardActiveSessionId = safeQuoteSessionId(saved.dashboardActiveSessionId || "");
+  return true;
+}
+
 function openSessionFileDb() {
   if (!window.indexedDB) return Promise.reject(new Error("IndexedDB unavailable"));
   if (sessionFileDbPromise) return sessionFileDbPromise;
@@ -2676,7 +2802,7 @@ function buildSessionSnapshot() {
     browserRecoveryScope: currentBrowserRecoveryScope(),
     savedAt: new Date().toISOString(),
     activeAppView: state.activeAppView,
-    restorableOverlay: state.restorableOverlay,
+    restorableOverlay: normalizeRestorableOverlay(state.restorableOverlay),
     pricingReferenceSettingsMode: state.pricingReferenceSettingsMode,
     profileId: state.profileId,
     pricingReferenceId: state.pricingReferenceId,
@@ -2705,6 +2831,9 @@ function buildSessionSnapshot() {
     aiFailed: state.aiFailed,
     draftSource: state.draftSource,
     lastAnalysisMode: state.lastAnalysisMode,
+    pendingAnalysisMode: state.pendingAnalysisMode,
+    pendingFeedback: state.pendingFeedback,
+    basisChat: state.basisChat,
     activeSidePanel: state.activeSidePanel,
     downloadFile: state.downloadFile,
     pdfFile: state.pdfFile,
@@ -2713,7 +2842,7 @@ function buildSessionSnapshot() {
     pdfFileRevision: state.pdfFileRevision,
     pricingMatches: state.pricingMatches,
     pricingIssues: state.pricingIssues,
-    activeJob: state.activeJob,
+    activeJob: normalizeActiveJob(state.activeJob || {}),
   };
 }
 
@@ -2732,6 +2861,7 @@ async function purgeBrowserRecoveryState() {
   } catch {
     // Ignore storage failures; scope mismatches still remain blocked from restoration.
   }
+  clearWorkspaceViewState();
   clearLastSelectionState();
   await clearSessionFiles().catch(() => {});
 }
@@ -2741,11 +2871,13 @@ function saveSessionState() {
   try {
     if (state.activeAppView === "dashboard" && !safeQuoteSessionId(state.quoteSessionId) && !quoteDraftShouldPersistToDashboard()) {
       window.localStorage.removeItem(QUOTE_SESSION_STORAGE_KEY);
+      saveWorkspaceViewState();
       return;
     }
     const fileRecords = sessionFileRecordsFromDraft();
     const snapshot = buildSessionSnapshot();
     window.localStorage.setItem(QUOTE_SESSION_STORAGE_KEY, JSON.stringify(snapshot));
+    saveWorkspaceViewState();
     persistSessionFiles(fileRecords).catch(() => {});
   } catch {
     // Refresh recovery is best-effort; the local workflow can continue without persisted state.
@@ -2877,7 +3009,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.quoteSessionRestoredSessionId = restoredSessionId && restoredSessionId === state.quoteSessionId ? restoredSessionId : "";
   state.quoteSessionRestoredDraftKey = state.quoteSessionRestoredSessionId ? String(saved.quoteSessionRestoredDraftKey || "") : "";
   state.activeAppView = saved.activeAppView === "quote" || options.forceQuoteView ? "quote" : "dashboard";
-  state.restorableOverlay = saved.restorableOverlay === "pricing_reference_settings" ? "pricing_reference_settings" : "";
+  state.restorableOverlay = normalizeRestorableOverlay(saved.restorableOverlay);
   state.pricingReferenceSettingsMode = state.restorableOverlay
     ? normalizePricingReferenceSettingsMode(saved.pricingReferenceSettingsMode)
     : PRICING_REFERENCE_SETTINGS_MODE_MANAGE;
@@ -2888,7 +3020,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   syncSelectedPricingReference();
   renderProfileOptions();
   renderPresetOptions();
-  state.pendingFeedback = "";
+  state.pendingFeedback = String(saved.pendingFeedback || "");
   const restoredQuoteDetails = await restoreQuoteDetailsLogo(
     quoteDetailsWithFallbackDefaults(selectedPreset()?.details || {}, saved.quoteDetails || {})
   );
@@ -2908,6 +3040,14 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.basisConfirmed = Boolean(saved.basisConfirmed);
   state.draftSource = saved.draftSource || "";
   state.lastAnalysisMode = normalizeAnalysisMode(saved.lastAnalysisMode || saved.originalAnalysisSnapshot?.analysis_mode);
+  state.pendingAnalysisMode = normalizeAnalysisMode(saved.pendingAnalysisMode || state.lastAnalysisMode);
+  const savedBasisChat = saved.basisChat && typeof saved.basisChat === "object" ? saved.basisChat : {};
+  state.basisChat = {
+    ...state.basisChat,
+    ...savedBasisChat,
+    lineIndex: Number.isInteger(Number(savedBasisChat.lineIndex)) ? Number(savedBasisChat.lineIndex) : -1,
+    proposal: savedBasisChat.proposal && typeof savedBasisChat.proposal === "object" ? savedBasisChat.proposal : null,
+  };
   state.aiFailed = Boolean(saved.aiFailed || state.draftSource === "local");
   state.downloadFile = saved.downloadFile || null;
   state.pdfFile = saved.pdfFile || null;
@@ -2922,7 +3062,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   );
   state.pricingMatches = Array.isArray(saved.pricingMatches) ? saved.pricingMatches : [];
   state.pricingIssues = [];
-  state.activeJob = saved.activeJob && saved.activeJob.id ? saved.activeJob : null;
+  state.activeJob = normalizeActiveJob(saved.activeJob || {});
   renderFiles();
   renderPricingMatches(state.outputRows.length ? state.outputRows : state.pricingMatches, { fromPricingMatches: !state.outputRows.length && state.pricingMatches.length });
   renderMatchSummary({ pricing_matches: state.pricingMatches });
@@ -2951,7 +3091,11 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
 async function restoreSessionState() {
   const saved = safeSessionJson();
   const currentScope = currentBrowserRecoveryScope();
-  if (!saved || saved.version !== QUOTE_SESSION_STATE_VERSION || saved.browserRecoveryScope !== currentScope) {
+  if (!saved) {
+    await clearSessionFiles().catch(() => {});
+    return false;
+  }
+  if (saved.version !== QUOTE_SESSION_STATE_VERSION || saved.browserRecoveryScope !== currentScope) {
     await purgeBrowserRecoveryState();
     return false;
   }
@@ -6021,7 +6165,20 @@ function closePricingReferenceModal() {
 }
 
 function restoreRestorableOverlay() {
-  if (state.restorableOverlay === "pricing_reference_settings") openPricingReferenceModal({ preserveMode: true });
+  if (state.restorableOverlay === "pricing_reference_settings") {
+    openPricingReferenceModal({ preserveMode: true });
+    return;
+  }
+  if (state.restorableOverlay === "basis_chat") {
+    if (elements.basisChatOverlay?.hidden) restoreBasisChatOverlay();
+    return;
+  }
+  if (state.restorableOverlay === "analysis_confirm") {
+    requestStartAnalysis(state.pendingAnalysisMode);
+    return;
+  }
+  if (state.restorableOverlay === "excel_ready") showGeneratedExportReadyModal(false);
+  if (state.restorableOverlay === "pdf_ready") showGeneratedExportReadyModal(true);
 }
 
 async function editSelectedPricingReference(options = {}) {
@@ -6599,6 +6756,10 @@ function showExcelGeneratingModal(options = {}) {
   if (elements.excelGeneratingSpinner) elements.excelGeneratingSpinner.hidden = false;
   if (elements.excelGeneratingActions) elements.excelGeneratingActions.hidden = true;
   if (elements.excelGeneratingActionButton) elements.excelGeneratingActionButton.dataset.exportAction = "";
+  if (["excel_ready", "pdf_ready"].includes(state.restorableOverlay)) {
+    state.restorableOverlay = "";
+    saveWorkspaceViewState();
+  }
   elements.excelGeneratingModal.classList.remove("is-ready");
   elements.excelGeneratingModal.hidden = false;
   elements.excelGeneratingModal.classList.add("is-open");
@@ -6610,6 +6771,10 @@ function hideExcelGeneratingModal() {
   elements.excelGeneratingModal.hidden = true;
   if (elements.excelGeneratingActions) elements.excelGeneratingActions.hidden = true;
   if (elements.excelGeneratingActionButton) elements.excelGeneratingActionButton.dataset.exportAction = "";
+  if (["excel_ready", "pdf_ready"].includes(state.restorableOverlay)) {
+    state.restorableOverlay = "";
+    saveSessionState();
+  }
 }
 
 function showGeneratedExportReadyModal(viewPdf = false) {
@@ -6630,6 +6795,8 @@ function showGeneratedExportReadyModal(viewPdf = false) {
   }
   elements.excelGeneratingModal.hidden = false;
   elements.excelGeneratingModal.classList.add("is-open", "is-ready");
+  state.restorableOverlay = viewPdf ? "pdf_ready" : "excel_ready";
+  saveSessionState();
   elements.excelGeneratingActionButton?.focus();
   return true;
 }
@@ -8379,6 +8546,8 @@ function setBasisChatBusy(isBusy) {
 
 function openBasisChatOverlay(scope = "line", options = {}) {
   if (scope !== "line") return;
+  const preservedProposal = options.preserveState && state.basisChat?.proposal
+    ? state.basisChat.proposal : null;
   state.basisChat = {
     scope,
     field: options.sectionId || options.field || "",
@@ -8388,7 +8557,7 @@ function openBasisChatOverlay(scope = "line", options = {}) {
     quantity: options.quantity ?? "",
     unit: options.unit || "",
     quantityLabel: options.quantityLabel || "",
-    proposal: null,
+    proposal: preservedProposal,
   };
   resetBasisChatProposal();
   elements.basisChatTitle.textContent = "Revise basis line";
@@ -8422,11 +8591,30 @@ function openBasisChatOverlay(scope = "line", options = {}) {
   elements.basisChatPrompt.placeholder = "e.g. Add teardown notes or adjust LED screen size";
   elements.basisChatMessages.innerHTML = "";
   appendBasisChatMessage("assistant", basisChatIntroMessage());
+  if (preservedProposal) setBasisChatProposal(preservedProposal);
   elements.basisChatPrompt.value = "";
   elements.basisChatOverlay.hidden = false;
   elements.basisChatOverlay.classList.add("is-open");
   document.body.classList.add("basis-chat-open");
+  state.restorableOverlay = "basis_chat";
+  saveSessionState();
   window.setTimeout(() => elements.basisChatPrompt.focus(), 0);
+}
+
+function restoreBasisChatOverlay() {
+  const saved = { ...state.basisChat };
+  if (!saved.sectionId || !Number.isInteger(Number(saved.lineIndex))) return false;
+  openBasisChatOverlay("line", {
+    sectionId: saved.sectionId,
+    field: saved.field,
+    lineIndex: Number(saved.lineIndex),
+    line: saved.line,
+    quantity: saved.quantity,
+    unit: saved.unit,
+    quantityLabel: saved.quantityLabel,
+    preserveState: true,
+  });
+  return true;
 }
 
 function closeBasisChatOverlay() {
@@ -8434,6 +8622,10 @@ function closeBasisChatOverlay() {
   elements.basisChatOverlay.hidden = true;
   document.body.classList.remove("basis-chat-open");
   resetBasisChatProposal();
+  if (state.restorableOverlay === "basis_chat") {
+    state.restorableOverlay = "";
+    saveSessionState();
+  }
 }
 
 function basisChatPayload(text) {
@@ -8688,8 +8880,17 @@ function renderLiteralReplacementPreview(proposal) {
   `;
 }
 
-async function buildAiBasisChatResponse(text) {
-  if (!canStartAnalysis()) return null;
+async function buildAiBasisChatResponse(text, options = {}) {
+  const restoredOperation = options.resume === true ? normalizeActiveJob(options.operation || state.activeJob || {}) : null;
+  if (!restoredOperation && !canStartAnalysis()) return null;
+  const operation = restoredOperation?.type === "basis_chat" ? restoredOperation : normalizeActiveJob({
+    id: newClientJobId(),
+    type: "basis_chat",
+    phase: "starting",
+    startedAt: new Date().toISOString(),
+    text,
+  });
+  state.activeJob = operation;
   const previousRunning = state.isAnalysisRunning;
   state.isAnalysisRunning = true;
   setBasisChatBusy(true);
@@ -8698,13 +8899,28 @@ async function buildAiBasisChatResponse(text) {
   const typingMessage = appendBasisChatTyping();
   startElapsedTimer("basisChatElapsed", basisChatStartedAt);
   try {
-    const started = await startJob("basis_chat", basisChatPayload(text));
-    if (!started.ok) {
-      removeBasisChatTyping(typingMessage);
-      appendBasisChatMessage("assistant", basisChatFriendlyError(started.data));
-      return { errorDisplayed: true };
+    let jobId = operation.id;
+    if (operation.phase === "starting") {
+      const started = await startJob("basis_chat", basisChatPayload(text), { jobId });
+      if (!started.ok) {
+        if (started.data?.page_unloading) return { preserved: true };
+        clearActiveJob();
+        removeBasisChatTyping(typingMessage);
+        appendBasisChatMessage("assistant", basisChatFriendlyError(started.data));
+        return { errorDisplayed: true };
+      }
+      jobId = started.data.job_id || jobId;
+      state.activeJob = {
+        ...operation,
+        id: jobId,
+        phase: "running",
+        startedAt: started.data.created_at || operation.startedAt,
+      };
+      saveSessionState();
     }
-    const polled = await pollJob(started.data.job_id);
+    const polled = await pollJob(jobId);
+    if (polled.aborted || isInterruptedJobPoll(polled)) return { preserved: true };
+    clearActiveJob();
     const data = polled.data.result || {};
     if (!polled.ok || ["blocked", "failed"].includes(polled.data.status)) {
       removeBasisChatTyping(typingMessage);
@@ -9709,6 +9925,11 @@ async function loadQuoteDashboard(options = {}) {
   const loadId = (Number(state.quoteSessionDashboardLoadId) || 0) + 1;
   state.quoteSessionDashboardLoadId = loadId;
   const showLoading = options.showLoading !== false;
+  const preservedView = options.preserveViewState === true ? {
+    selectionMode: state.dashboardSelectionMode,
+    selectedSessionIds: dashboardSelectedSessionIds(),
+    activeSessionId: safeQuoteSessionId(state.dashboardActiveSessionId || ""),
+  } : null;
   if (showLoading) {
     setDashboardLoadingState(true, {
       title: "Loading quote sessions",
@@ -9728,6 +9949,12 @@ async function loadQuoteDashboard(options = {}) {
       state.quoteSessionLoadError = genericFailureMessage(data);
     } else {
       state.quoteSessions = Array.isArray(data.quote_sessions) ? data.quote_sessions : [];
+    }
+    if (preservedView) {
+      const availableIds = new Set(state.quoteSessions.map((session) => safeQuoteSessionId(session.session_id || "")).filter(Boolean));
+      state.dashboardSelectedSessionIds = preservedView.selectedSessionIds.filter((sessionId) => availableIds.has(sessionId));
+      state.dashboardActiveSessionId = availableIds.has(preservedView.activeSessionId) ? preservedView.activeSessionId : "";
+      state.dashboardSelectionMode = Boolean(preservedView.selectionMode && state.dashboardSelectedSessionIds.length);
     }
     renderQuoteDashboard();
   } finally {
@@ -10510,6 +10737,7 @@ function setDashboardSelection(sessionId, options = {}) {
     state.dashboardSelectionMode = false;
     state.dashboardActiveSessionId = "";
     renderQuoteDashboard();
+    saveWorkspaceViewState();
     return;
   }
   if (mode === "visible") {
@@ -10518,6 +10746,7 @@ function setDashboardSelection(sessionId, options = {}) {
     state.dashboardSelectedSessionIds = visibleIds;
     state.dashboardActiveSessionId = visibleIds.length === 1 ? visibleIds[0] : "";
     renderQuoteDashboard();
+    saveWorkspaceViewState();
     return;
   }
   if (!safeSessionId) return;
@@ -10534,12 +10763,14 @@ function setDashboardSelection(sessionId, options = {}) {
     state.dashboardActiveSessionId = nextSelected.length === 1 ? nextSelected[0] : "";
     state.dashboardSelectionMode = nextSelected.length > 0;
     renderQuoteDashboard();
+    saveWorkspaceViewState();
     return;
   }
   state.dashboardSelectionMode = false;
   state.dashboardSelectedSessionIds = [];
   state.dashboardActiveSessionId = safeSessionId;
   renderQuoteDashboard();
+  saveWorkspaceViewState();
 }
 
 function continueDashboardDraft(sessionId) {
@@ -10867,6 +11098,7 @@ function handleDashboardSelectModeButton() {
     state.dashboardSelectionMode = true;
     state.dashboardSelectedSessionIds = activeId && visibleIds.includes(activeId) ? [activeId] : [];
     renderQuoteDashboard();
+    saveWorkspaceViewState();
     return;
   }
   const visibleIds = dashboardVisibleSessionIds();
@@ -10877,6 +11109,7 @@ function handleDashboardSelectModeButton() {
     state.dashboardActiveSessionId = "";
     state.dashboardSelectionMode = false;
     renderQuoteDashboard();
+    saveWorkspaceViewState();
     return;
   }
   setDashboardSelection("", { mode: "visible" });
@@ -11107,8 +11340,12 @@ function delay(ms) {
   });
 }
 
-async function startJob(type, payload) {
-  return postJson("/api/jobs", { type, payload });
+async function startJob(type, payload, options = {}) {
+  return postJson("/api/jobs", {
+    type,
+    payload,
+    ...(options.jobId ? { job_id: options.jobId } : {}),
+  });
 }
 
 async function pollJob(jobId, onStatus) {
@@ -11237,7 +11474,18 @@ async function handleDraftBasis(options = {}) {
     return;
   }
 
+  const operation = normalizeActiveJob({
+    id: newClientJobId(),
+    type: "draft",
+    phase: "starting",
+    startedAt: analysisRequestedAt,
+    analysisMode,
+    includeBoothDimensions: state.boothDimensions.dimension_source !== "default",
+    includeDraftContext: hasFeedback,
+    finalAfterClarifications: options.finalAfterClarifications === true,
+  });
   const quoteCommercialSnapshot = quoteCommercialOverrideSnapshot();
+  state.activeJob = operation;
   state.isAnalysisRunning = true;
   state.aiFailed = false;
   state.draftSource = "";
@@ -11254,9 +11502,11 @@ async function handleDraftBasis(options = {}) {
     analysisMode,
     includeBoothDimensions: state.boothDimensions.dimension_source !== "default",
     includeDraftContext: hasFeedback,
-  }));
+  }), { jobId: operation.id });
   if (!started.ok) {
+    if (started.data?.page_unloading) return;
     state.isAnalysisRunning = false;
+    clearActiveJob();
     const errors = started.data.errors || ["Draft failed."];
     const wasBlocked = started.data.status === "blocked";
     setWorkflowStage(wasBlocked ? "details_review" : "ready_to_analyze");
@@ -11270,11 +11520,11 @@ async function handleDraftBasis(options = {}) {
     return;
   }
   const startedAt = started.data.created_at || analysisRequestedAt;
-  state.activeJob = { id: started.data.job_id, type: "draft", startedAt };
+  state.activeJob = { ...operation, id: started.data.job_id || operation.id, phase: "running", startedAt };
   showAiRunningBanner(runningMessage, startedAt);
   saveSessionState();
 
-  const polled = await pollJob(started.data.job_id);
+  const polled = await pollJob(state.activeJob.id);
   if (polled.aborted) {
     restoreQuoteCommercialOverrideSnapshot(quoteCommercialSnapshot, { reason: "draft_poll_aborted" });
     return;
@@ -11285,7 +11535,7 @@ async function handleDraftBasis(options = {}) {
     return;
   }
   state.isAnalysisRunning = false;
-  state.activeJob = null;
+  clearActiveJob();
 
   if (!polled.ok || ["blocked", "failed"].includes(polled.data.status)) {
     const errors = polled.data.errors || polled.data.result?.errors || ["Draft failed."];
@@ -11340,25 +11590,38 @@ async function handleDraftBasis(options = {}) {
   await saveQuoteSessionDraftState({ quoteGenerated: false });
 }
 
-async function confirmBasis() {
-  if (appIsBusy()) return;
+async function confirmBasis(options = {}) {
+  if (appIsBusy()) {
+    if (options.resume === true) clearActiveJob();
+    return;
+  }
+  const restoredOperation = options.resume === true ? normalizeActiveJob(options.operation || state.activeJob || {}) : null;
+  const operation = restoredOperation?.type === "confirm_basis" ? restoredOperation : normalizeActiveJob({
+    id: newClientOperationId(),
+    type: "confirm_basis",
+    phase: "running",
+    startedAt: new Date().toISOString(),
+  });
   const confirmBlockReason = basisConfirmBlockReason();
   if (confirmBlockReason) {
     setWorkflowStage("basis_review");
     showBlockedBasisAction(confirmBlockReason);
     syncControlStates();
+    if (restoredOperation) clearActiveJob();
     return;
   }
   if (state.aiFailed) {
     setWorkflowStage("basis_review");
     showAiFailureBanner();
     syncControlStates();
+    if (restoredOperation) clearActiveJob();
     return;
   }
   if (!state.lineItems.length) {
     setWorkflowStage("basis_review");
     showBlockedBasisAction("Quote basis has no line items ready for output. Re-run analysis or resolve the quote basis before confirming.");
     syncControlStates();
+    if (restoredOperation) clearActiveJob();
     return;
   }
   const missing = missingDetailFields();
@@ -11367,8 +11630,10 @@ async function confirmBasis() {
     await saveQuoteSessionDraftState({ quoteGenerated: false });
     showBlockedBasisAction(`Complete Customer and Quote Company details before confirming quotation basis: ${missing.join(", ")}.`);
     syncControlStates();
+    if (restoredOperation) clearActiveJob();
     return;
   }
+  state.activeJob = operation;
   state.isPreparingOutput = true;
   showExcelGeneratingModal({
     eyebrow: "Quotation output",
@@ -11380,6 +11645,10 @@ async function confirmBasis() {
   try {
     const refreshed = await refreshLineItemsFromServer();
     if (!refreshed.ok) {
+      if (refreshed.data?.page_unloading) {
+        return;
+      }
+      clearActiveJob();
       state.basisConfirmed = false;
       setWorkflowStage("basis_review");
       setResultStatus("Failed", "is-bad");
@@ -11392,6 +11661,7 @@ async function confirmBasis() {
     state.lineItems = outputRowsToLineItems();
     setWorkflowStage("completed");
     await saveQuoteSessionDraftState({ quoteGenerated: true });
+    clearActiveJob();
     renderPricingMatches(state.outputRows);
     renderMatchSummary({ pricing_matches: state.outputRows });
     setResultStatus("Ready for pricing review", "is-warn");
@@ -11399,7 +11669,7 @@ async function confirmBasis() {
     setSidePanel("output", { force: true });
   } finally {
     state.isPreparingOutput = false;
-    hideExcelGeneratingModal();
+    if (!state.isPageUnloading) hideExcelGeneratingModal();
     syncControlStates();
   }
 }
@@ -11444,6 +11714,15 @@ async function handleGenerate(options = {}) {
     return;
   }
 
+  const jobType = viewPdf ? "generate_pdf" : "generate";
+  const operation = normalizeActiveJob({
+    id: newClientJobId(),
+    type: jobType,
+    phase: "starting",
+    startedAt: new Date().toISOString(),
+    viewPdf,
+  });
+  state.activeJob = operation;
   state.isGenerating = true;
   setWorkflowStage("generating");
   setResultStatus(viewPdf ? "Generating PDF" : "Generating Excel", "is-warn");
@@ -11453,20 +11732,21 @@ async function handleGenerate(options = {}) {
   clearPricingReviewMessages();
   syncControlStates();
   await ensureQuoteSession({ quoteGenerated: true });
-  const jobType = viewPdf ? "generate_pdf" : "generate";
-  const started = await startJob(jobType, buildPayload({ viewPdf }));
+  const started = await startJob(jobType, buildPayload({ viewPdf }), { jobId: operation.id });
   if (!started.ok) {
+    if (started.data?.page_unloading) return;
     state.isGenerating = false;
+    clearActiveJob();
     setWorkflowStage(state.activeSidePanel === "output" ? "completed" : "details_review");
     setResultStatus(started.data.status || "Failed", "is-bad");
     renderMessages(started.data.status === "blocked" ? (started.data.errors || ["Generation blocked."]) : genericFailureMessages(started.data), "error");
     syncControlStates();
     return;
   }
-  state.activeJob = { id: started.data.job_id, type: jobType, viewPdf };
+  state.activeJob = { ...operation, id: started.data.job_id || operation.id, phase: "running" };
   saveSessionState();
 
-  const polled = await pollJob(started.data.job_id);
+  const polled = await pollJob(state.activeJob.id);
   if (polled.aborted) return;
   if (isInterruptedJobPoll(polled)) {
     handleInterruptedJobPoll(jobType, polled);
@@ -11525,10 +11805,58 @@ async function handleGenerate(options = {}) {
   return viewPdf ? Boolean(state.pdfFile) : Boolean(state.downloadFile);
 }
 
+async function ensureSavedServerJobStarted(activeJob) {
+  if (activeJob.phase !== "starting") return { ok: true, data: { job_id: activeJob.id } };
+  const isDraft = activeJob.type === "draft";
+  const viewPdf = activeJob.type === "generate_pdf" || activeJob.viewPdf === true;
+  let payload;
+  if (isDraft) {
+    payload = buildPayload({
+      analysisMode: normalizeAnalysisMode(activeJob.analysisMode),
+      includeBoothDimensions: activeJob.includeBoothDimensions === true,
+      includeDraftContext: activeJob.includeDraftContext === true,
+    });
+  } else {
+    payload = buildPayload({ viewPdf });
+  }
+  await ensureQuoteSession({ quoteGenerated: !isDraft });
+  const started = await startJob(activeJob.type, payload, { jobId: activeJob.id });
+  if (!started.ok) return started;
+  state.activeJob = {
+    ...activeJob,
+    id: started.data.job_id || activeJob.id,
+    phase: "running",
+    startedAt: started.data.created_at || activeJob.startedAt,
+  };
+  saveSessionState();
+  return started;
+}
+
 async function resumeSavedJob() {
   const activeJob = state.activeJob;
   if (!activeJob || !activeJob.id) return;
+  if (activeJob.type === "confirm_basis") {
+    state.isPreparingOutput = false;
+    await confirmBasis({ resume: true, operation: activeJob });
+    return;
+  }
 
+  if (activeJob.type === "basis_chat") {
+    const restored = restoreBasisChatOverlay();
+    if (!restored) {
+      clearActiveJob();
+      return;
+    }
+    const text = String(activeJob.text || "").trim();
+    if (text) appendBasisChatMessage("user", text);
+    const aiResult = await buildAiBasisChatResponse(text, { resume: true, operation: activeJob });
+    if (aiResult?.proposal) setBasisChatProposal(aiResult.proposal);
+    else if (aiResult?.answer) appendBasisChatMessage("assistant", aiResult.answer);
+    else if (!aiResult?.errorDisplayed && !aiResult?.preserved) {
+      appendBasisChatMessage("assistant", "I could not produce a useful basis change. Please rephrase the request.");
+    }
+    return;
+  }
   if (activeJob.type === "draft") {
     const quoteCommercialSnapshot = quoteCommercialOverrideSnapshot();
     state.isAnalysisRunning = true;
@@ -11538,8 +11866,20 @@ async function resumeSavedJob() {
     clearBasisReviewSurface();
     setSidePanel("basis", { force: true });
     syncControlStates();
+    const restarted = await ensureSavedServerJobStarted(activeJob);
+    if (!restarted.ok) {
+      if (restarted.data?.page_unloading) return;
+      state.isAnalysisRunning = false;
+      clearActiveJob();
+      setWorkflowStage("ready_to_analyze");
+      showAiFailureBanner(genericFailureMessage(restarted.data));
+      restoreQuoteCommercialOverrideSnapshot(quoteCommercialSnapshot, { reason: "resume_draft_start_failed" });
+      syncControlStates();
+      return;
+    }
+    const resumedJob = state.activeJob || activeJob;
 
-    const polled = await pollJob(activeJob.id, (job) => {
+    const polled = await pollJob(resumedJob.id, (job) => {
       if (job.created_at && !state.activeJob?.startedAt) {
         state.activeJob = { ...state.activeJob, startedAt: job.created_at };
         showAiRunningBanner(ANALYSIS_WAIT_ESTIMATE, job.created_at);
@@ -11599,8 +11939,21 @@ async function resumeSavedJob() {
     setSidePanel("output", { force: true });
     showExcelGeneratingModal(generationLoadingModalOptions(viewPdf));
     syncControlStates();
+    const restarted = await ensureSavedServerJobStarted(activeJob);
+    if (!restarted.ok) {
+      if (restarted.data?.page_unloading) return;
+      state.isGenerating = false;
+      clearActiveJob();
+      hideExcelGeneratingModal();
+      setWorkflowStage("completed");
+      setResultStatus(restarted.data.status || "Failed", "is-bad");
+      renderMessages(genericFailureMessages(restarted.data), "error");
+      syncControlStates();
+      return;
+    }
+    const resumedJob = state.activeJob || activeJob;
 
-    const polled = await pollJob(activeJob.id);
+    const polled = await pollJob(resumedJob.id);
     if (polled.aborted) return;
     if (isInterruptedJobPoll(polled)) {
       hideExcelGeneratingModal();
@@ -11678,14 +12031,20 @@ function requestStartAnalysis(mode = "standard") {
     return;
   }
   state.pendingAnalysisMode = normalizeAnalysisMode(mode);
+  state.restorableOverlay = "analysis_confirm";
   elements.analysisConfirmModal.hidden = false;
   elements.analysisConfirmModal.classList.add("is-open");
+  saveSessionState();
   window.setTimeout(() => elements.analysisConfirmStartButton?.focus(), 0);
 }
 
 function closeAnalysisConfirmModal() {
   elements.analysisConfirmModal.classList.remove("is-open");
   elements.analysisConfirmModal.hidden = true;
+  if (state.restorableOverlay === "analysis_confirm") {
+    state.restorableOverlay = "";
+    saveSessionState();
+  }
 }
 
 function confirmStartAnalysis(mode = state.pendingAnalysisMode) {
@@ -12138,41 +12497,49 @@ function wireEvents() {
     state.dashboardStatusFilter = elements.dashboardStatusFilter.value || "all";
     state.dashboardPageIndex = 0;
     renderQuoteDashboard();
+    saveWorkspaceViewState();
   });
   elements.dashboardDateFilter?.addEventListener("change", () => {
     state.dashboardDateFilter = elements.dashboardDateFilter.value || "all";
     ensureDashboardCustomDateDefaults();
     state.dashboardPageIndex = 0;
     renderQuoteDashboard();
+    saveWorkspaceViewState();
   });
   elements.dashboardDateStartInput?.addEventListener("change", () => {
     state.dashboardCustomDateStart = elements.dashboardDateStartInput.value || "";
     state.dashboardPageIndex = 0;
     renderQuoteDashboard();
+    saveWorkspaceViewState();
   });
   elements.dashboardDateEndInput?.addEventListener("change", () => {
     state.dashboardCustomDateEnd = elements.dashboardDateEndInput.value || "";
     state.dashboardPageIndex = 0;
     renderQuoteDashboard();
+    saveWorkspaceViewState();
   });
   elements.dashboardSortSelect?.addEventListener("change", () => {
     state.dashboardSortMode = elements.dashboardSortSelect.value || "created";
     state.dashboardPageIndex = 0;
     renderQuoteDashboard();
+    saveWorkspaceViewState();
   });
   elements.dashboardSearchInput?.addEventListener("input", () => {
     state.dashboardSearch = elements.dashboardSearchInput.value || "";
     state.dashboardPageIndex = 0;
     renderQuoteDashboard();
+    saveWorkspaceViewState();
   });
   elements.dashboardPageSizeSelect?.addEventListener("change", () => {
     state.dashboardPageSize = Number(elements.dashboardPageSizeSelect.value);
     state.dashboardPageIndex = 0;
     renderQuoteDashboard();
+    saveWorkspaceViewState();
   });
   elements.dashboardRangeSelect?.addEventListener("change", () => {
     state.dashboardPageIndex = Number(elements.dashboardRangeSelect.value);
     renderQuoteDashboard();
+    saveWorkspaceViewState();
   });
   elements.settingsButton?.addEventListener("click", openSettingsModal);
   elements.profileSelect.addEventListener("change", handleProfileSelectionChange);
@@ -12420,7 +12787,7 @@ async function setInitialValues() {
   renderPresetStatus();
   if (await restoreSessionState()) {
     syncControlStates();
-    return;
+    return true;
   }
   applyDefaultQuoteDate();
   applyDefaultQuoteCompanyFields();
@@ -12432,19 +12799,23 @@ async function setInitialValues() {
   renderBasisEmptyState();
   syncControlStates();
   setSidePanel("images");
+  return false;
 }
 
 async function boot() {
   let dashboardOperation = null;
+  let workspaceView = null;
   setDashboardLoadingState(true, { title: "Restoring workspace", message: "Loading your saved quote and returning to the last open menu." });
   wireEvents();
   clearLegacyLocalCompanyPresets();
   try {
     await initializeSession();
+    workspaceView = restoredWorkspaceViewState();
     dashboardOperation = restoredDashboardOperation();
     if (dashboardOperation) setDashboardLoadingState(true, dashboardOperationLoadingOptions(dashboardOperation));
     await loadProfiles();
-    await setInitialValues();
+    const quoteRestored = await setInitialValues();
+    if (workspaceView) applyWorkspaceViewState(workspaceView, { quoteRestored });
     if (state.activeAppView === "quote") showQuoteFlow();
     else showDashboard({ load: false });
     checkHealth();
@@ -12452,9 +12823,9 @@ async function boot() {
     state.isBooting = false;
     syncControlStates();
   }
-  if (state.activeJob?.id) setDashboardLoadingState(false);
+  if (state.activeJob) setDashboardLoadingState(false);
   await resumeSavedJob();
-  if (dashboardOperation && !state.activeJob?.id) {
+  if (dashboardOperation && !state.activeJob) {
     const resumed = await resumeDashboardOperation(dashboardOperation);
     if (resumed) {
       restoreRestorableOverlay();
@@ -12466,7 +12837,7 @@ async function boot() {
     setDashboardLoadingState(false);
   } else {
     showDashboard({ load: false });
-    await loadQuoteDashboard();
+    await loadQuoteDashboard({ preserveViewState: true });
   }
   restoreRestorableOverlay();
 }

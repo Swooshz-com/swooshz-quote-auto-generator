@@ -6933,6 +6933,21 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(job["status"], "completed")
         self.assertEqual(job["result"]["source"], "openai")
 
+    def test_create_job_reuses_client_job_id_without_starting_duplicate_worker(self):
+        payload = valid_payload()
+        ai_draft = {"status": "drafted", "source": "openai", "quote_basis": {}, "line_items": []}
+        requested_job_id = "job-client-retry-12345678"
+
+        with mock.patch.object(webapp, "draft_quote_basis", return_value=ai_draft) as draft:
+            first = webapp.create_job("draft", payload, requested_job_id=requested_job_id)
+            second = webapp.create_job("draft", payload, requested_job_id=requested_job_id)
+            completed = wait_for_job(requested_job_id)
+
+        self.assertEqual(first["job_id"], requested_job_id)
+        self.assertEqual(second["job_id"], requested_job_id)
+        self.assertEqual(completed["status"], "completed")
+        draft.assert_called_once()
+
     def test_create_draft_job_marks_local_remote_failure_fallback_degraded(self):
         local_draft = {
             "status": "drafted",
@@ -9991,7 +10006,10 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertIn("view_pdf: options.viewPdf === true", js)
         self.assertIn("viewCurrentPdfFile", js)
         self.assertIn('const jobType = viewPdf ? "generate_pdf" : "generate";', js)
-        self.assertIn("startJob(jobType, buildPayload({ viewPdf }))", js)
+        self.assertIn(
+            "startJob(jobType, buildPayload({ viewPdf }), { jobId: operation.id })",
+            js,
+        )
         self.assertIn("quotation.pdf", webapp.DOWNLOADABLE_FILES)
         send_download_source = inspect.getsource(webapp.QuoteRunnerHandler.send_download)
         self.assertIn("Content-Disposition", send_download_source)
@@ -12299,7 +12317,7 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertIn("viewCurrentPdfFile", js)
         self.assertIn("showExcelGeneratingModal", js)
         self.assertIn("hideExcelGeneratingModal", js)
-        self.assertIn('state.activeJob = { id: started.data.job_id, type: jobType, viewPdf };', js)
+        self.assertIn('state.activeJob = { ...operation, id: started.data.job_id || operation.id, phase: "running" };', js)
         self.assertIn('const jobType = viewPdf ? "generate_pdf" : "generate";', js)
         self.assertIn('activeJob.type === "generate" || activeJob.type === "generate_pdf"', js)
         self.assertIn('setResultStatus(viewPdf ? "Checking PDF" : "Checking Excel", "is-warn")', js)
@@ -12718,7 +12736,7 @@ assert.strictEqual(rowNeedsManualInput(manualDisplayZeroRow), false);
         static_dir = ROOT / "webapp" / "static"
         js = (static_dir / "app.js").read_text(encoding="utf-8")
         css = (static_dir / "styles.css").read_text(encoding="utf-8")
-        draft_body = js.split("async function handleDraftBasis", 1)[1].split("async function confirmBasis()", 1)[0]
+        draft_body = js.split("async function handleDraftBasis", 1)[1].split("async function confirmBasis(options = {})", 1)[0]
 
         banner_index = draft_body.index("showAiRunningBanner(")
         clear_index = draft_body.index("clearBasisReviewSurface()")
@@ -12732,7 +12750,7 @@ assert.strictEqual(rowNeedsManualInput(manualDisplayZeroRow), false);
         self.assertLess(sync_index, job_index)
         self.assertIn("const analysisRequestedAt = new Date().toISOString()", draft_body)
         self.assertIn("started.data.created_at || analysisRequestedAt", draft_body)
-        self.assertIn('state.activeJob = { id: started.data.job_id, type: "draft", startedAt }', draft_body)
+        self.assertIn('state.activeJob = { ...operation, id: started.data.job_id || operation.id, phase: "running", startedAt }', draft_body)
         self.assertIn("const hasFeedback = Boolean(state.pendingFeedback.trim())", draft_body)
         self.assertIn("includeDraftContext: hasFeedback", draft_body)
         self.assertIn("const includeDraftContext = options.includeDraftContext !== false", js)
@@ -13663,6 +13681,7 @@ function profileActionsMenuIsOpen() { return false; }
 function appIsBusy() { return false; }
 let renderCount = 0;
 function renderQuoteDashboard() { renderCount += 1; }
+function saveWorkspaceViewState() {}
 
 eval([
   extractFunction("safeQuoteSessionId"),
@@ -16014,6 +16033,10 @@ function persistSessionFiles(records) {
   persistedRecords = records;
   return Promise.resolve();
 }
+
+function normalizeRestorableOverlay(value) { return value || ""; }
+function normalizeActiveJob(job) { return job?.id ? job : null; }
+function saveWorkspaceViewState() {}
 
 eval([
   "sessionFileKeyForImage",
@@ -20253,7 +20276,7 @@ assert.strictEqual(
 );
 assert.ok(!/AI basis chat|JSON|replacement line/i.test(friendlyError));
 assert.ok(source.includes("line_index: state.basisChat.lineIndex"));
-assert.ok(source.includes('startJob("basis_chat", basisChatPayload(text))'));
+assert.ok(source.includes('startJob("basis_chat", basisChatPayload(text), { jobId })'));
 assert.ok(!source.includes('startJob("draft", buildPayload())'));
 """
         completed = subprocess.run(
@@ -20946,7 +20969,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
 
     def test_static_confirm_basis_reprices_line_items_before_rendering_output_but_reset_uses_snapshot(self):
         js = (ROOT / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
-        confirm_body = js.split("async function confirmBasis()", 1)[1].split("async function handleGenerate()", 1)[0]
+        confirm_body = js.split("async function confirmBasis(options = {})", 1)[1].split("async function handleGenerate(options = {})", 1)[0]
         reset_body = js.split("async function resetOutputDraft()", 1)[1].split("async function postJson", 1)[0]
 
         self.assertIn("async function refreshLineItemsFromServer", js)
