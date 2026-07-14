@@ -12337,8 +12337,9 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertIn('elements.sideViewPdfButton.addEventListener("click", async (event) => {', js)
         download_handler = js.split('elements.sideDownloadButton.addEventListener("click", async (event) => {', 1)[1].split('  document.addEventListener("keydown"', 1)[0]
         pdf_handler = js.split('elements.sideViewPdfButton.addEventListener("click", async (event) => {', 1)[1].split('  document.addEventListener("keydown"', 1)[0]
-        loading_options_body = js.split("function generationLoadingModalOptions", 1)[1].split("function clearActiveJob", 1)[0]
-        resumed_generation_body = js.split('if (activeJob.type === "generate" || activeJob.type === "generate_pdf") {', 1)[1].split('if (activeJob.type === "email_quote") {', 1)[0]
+        loading_options_body = js.split("function generationLoadingModalOptions", 1)[1].split("function generationFinalizingModalOptions", 1)[0]
+        finalizing_options_body = js.split("function generationFinalizingModalOptions", 1)[1].split("function clearActiveJob", 1)[0]
+        resumed_generation_body = js.split('if (activeJob.type === "generate" || activeJob.type === "generate_pdf") {', 1)[1].split("async function checkHealth", 1)[0]
         self.assertIn("event.preventDefault();", download_handler)
         self.assertIn("await handleGenerate();", js)
         self.assertIn("downloadCurrentExcelFile();", js)
@@ -12354,6 +12355,17 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertLess(pdf_handler.index("await handleGenerate({ viewPdf: true });"), pdf_handler.index("viewCurrentPdfFile();"))
         self.assertIn("showExcelGeneratingModal(generationLoadingModalOptions(true));", pdf_handler)
         self.assertIn('title: "Generating PDF"', loading_options_body)
+        self.assertIn('title: viewPdf ? "Finalizing PDF" : "Finalizing Excel"', finalizing_options_body)
+        self.assertIn("showExcelGeneratingModal(generationFinalizingModalOptions(viewPdf));", resumed_generation_body)
+        post_poll_prefix = resumed_generation_body.split("const polled = await pollJob(resumedJob.id);", 1)[1].split("if (isInterruptedJobPoll(polled))", 1)[0]
+        self.assertNotIn("hideExcelGeneratingModal();", post_poll_prefix)
+        finalizing_index = resumed_generation_body.index("showExcelGeneratingModal(generationFinalizingModalOptions(viewPdf));")
+        save_index = resumed_generation_body.index("await saveQuoteSessionDraftState({ quoteGenerated: true });")
+        terminal_clear_index = resumed_generation_body.rindex("clearActiveJob();")
+        ready_index = resumed_generation_body.index("showGeneratedExportReadyModal(viewPdf)")
+        self.assertLess(finalizing_index, save_index)
+        self.assertLess(save_index, terminal_clear_index)
+        self.assertLess(terminal_clear_index, ready_index)
         self.assertIn("showGeneratedExportReadyModal(viewPdf)", resumed_generation_body)
         self.assertLess(
             resumed_generation_body.index("setDownloadFiles(data.files || [])"),

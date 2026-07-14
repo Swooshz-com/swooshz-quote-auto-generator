@@ -469,6 +469,7 @@ async function prepareRefreshRecoveryQuote(page) {
       data_url: state.headerLogo.data_url,
     }];
     state.quoteSessionId = state.quoteSessionId || newClientQuoteSessionId();
+    state.quoteSessionDraftSaveStarted = true;
     state.activeAppView = "quote";
     state.aiFailed = false;
     state.basisConfirmed = false;
@@ -616,14 +617,17 @@ async function verifyConfirmBasisSurvivesImmediateRefresh(page) {
 
 async function verifyGenerationLoadingModalSurvivesRefresh(page) {
   const cases = [
-    { type: "generate", viewPdf: false, title: "Regenerating Excel", readyTitle: "Excel ready", action: "excel", button: "#sideDownloadButton" },
-    { type: "generate_pdf", viewPdf: true, title: "Generating PDF", readyTitle: "PDF ready", action: "pdf", button: "#sideViewPdfButton" },
+    { type: "generate", viewPdf: false, title: "Regenerating Excel", finalizingTitle: "Finalizing Excel", readyTitle: "Excel ready", action: "excel", button: "#sideDownloadButton" },
+    { type: "generate_pdf", viewPdf: true, title: "Generating PDF", finalizingTitle: "Finalizing PDF", readyTitle: "PDF ready", action: "pdf", button: "#sideViewPdfButton" },
   ];
 
   for (const testCase of cases) {
     let finishJob = false;
     let postCount = 0;
     let releaseFirstPost;
+    let releaseFinalSave;
+    let finalSaveStartedResolve;
+    const finalSaveStarted = new Promise((resolve) => { finalSaveStartedResolve = resolve; });
     let firstPostStartedResolve;
     let secondPostStartedResolve;
     const firstPostStarted = new Promise((resolve) => { firstPostStartedResolve = resolve; });
@@ -631,6 +635,7 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
     const postedJobIds = [];
     const postPattern = "**/api/jobs";
     const getPattern = "**/api/jobs/job-*";
+    const savePattern = "**/api/quote-sessions";
     const quoteSessionId = await currentQuoteSessionId(page);
 
     await page.route(postPattern, async (route) => {
@@ -739,7 +744,40 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
         throw new Error("Recovered " + testCase.type + " should remain tied to Output, found " + activePanel + ".");
       }
 
+      let finalSaveSeen = false;
+      await page.route(savePattern, async (route) => {
+        if (route.request().method() !== "POST" || finalSaveSeen) {
+          await route.fallback();
+          return;
+        }
+        finalSaveSeen = true;
+        finalSaveStartedResolve();
+        await new Promise((resolve) => { releaseFinalSave = resolve; });
+        await route.fallback();
+      });
+
       finishJob = true;
+      await Promise.race([
+        finalSaveStarted,
+        page.waitForTimeout(15000).then(() => {
+          throw new Error("Recovered " + testCase.type + " did not reach its final quote-session save.");
+        }),
+      ]);
+      await page.waitForFunction((expectedTitle) => {
+        const modal = document.querySelector("#excelGeneratingModal");
+        return modal
+          && !modal.hidden
+          && modal.classList.contains("is-open")
+          && !modal.classList.contains("is-ready")
+          && document.querySelector("#excelGeneratingTitle")?.textContent?.trim() === expectedTitle;
+      }, testCase.finalizingTitle, { timeout: 15000 });
+      const activeDuringFinalization = await page.evaluate(() => JSON.parse(
+        window.localStorage.getItem("swooshz_quote_session_v1") || "{}"
+      ).activeJob || null);
+      if (activeDuringFinalization?.type !== testCase.type) {
+        throw new Error("Recovered " + testCase.type + " cleared its active job before finalization completed.");
+      }
+      releaseFinalSave();
       await page.waitForFunction(() => {
         const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
         return !saved.activeJob;
@@ -754,6 +792,8 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 15000 });
     } finally {
       if (typeof releaseFirstPost === "function") releaseFirstPost();
+      if (typeof releaseFinalSave === "function") releaseFinalSave();
+      await page.unroute(savePattern);
       await page.unroute(postPattern);
       await page.unroute(getPattern);
     }

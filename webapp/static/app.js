@@ -6835,6 +6835,16 @@ function generationLoadingModalOptions(viewPdf = false) {
       };
 }
 
+function generationFinalizingModalOptions(viewPdf = false) {
+  return {
+    eyebrow: "Quotation export",
+    title: viewPdf ? "Finalizing PDF" : "Finalizing Excel",
+    message: viewPdf
+      ? "Saving the generated PDF to this quote before it is opened."
+      : "Saving the generated workbook to this quote before download.",
+  };
+}
+
 function clearActiveJob() {
   state.activeJob = null;
   saveSessionState();
@@ -11970,20 +11980,19 @@ async function resumeSavedJob() {
 
     const polled = await pollJob(resumedJob.id);
     if (polled.aborted) return;
-    hideExcelGeneratingModal();
     if (isInterruptedJobPoll(polled)) {
       hideExcelGeneratingModal();
       handleInterruptedJobPoll(activeJob.type, polled);
       return;
     }
-    state.isGenerating = false;
-    clearActiveJob();
 
     const data = polled.data.result || polled.data || {};
     if (data.quote_session?.session_id) {
       state.quoteSessionId = safeQuoteSessionId(data.quote_session.session_id) || state.quoteSessionId;
     }
     if (!polled.ok || ["blocked", "failed"].includes(polled.data.status) || data.status === "blocked" || data.status === "failed") {
+      state.isGenerating = false;
+      clearActiveJob();
       hideExcelGeneratingModal();
       setWorkflowStage("details_review");
       setResultStatus(data.status || "Failed", "is-bad");
@@ -11997,8 +12006,8 @@ async function resumeSavedJob() {
 
     const needsPricingReview = polled.data.status === "needs_review"
       || data.status === "needs_confirmation";
+    showExcelGeneratingModal(generationFinalizingModalOptions(viewPdf));
     if (needsPricingReview) {
-      hideExcelGeneratingModal();
       setWorkflowStage("completed");
       setResultStatus("Needs pricing review", "is-warn");
       renderMessages([]);
@@ -12016,6 +12025,8 @@ async function resumeSavedJob() {
     if (data.pricing_matches?.length) renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
     renderMatchSummary(data);
     await saveQuoteSessionDraftState({ quoteGenerated: true });
+    state.isGenerating = false;
+    clearActiveJob();
     syncControlStates();
     if (!needsPricingReview && showGeneratedExportReadyModal(viewPdf)) return;
     hideExcelGeneratingModal();
