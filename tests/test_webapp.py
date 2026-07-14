@@ -11706,6 +11706,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertNotIn("state.pricingReferenceId =", profile_change_body)
         self.assertNotIn("clearGeneratedQuoteState();", profile_change_body)
         self.assertNotIn("persistLastPricingReferenceSelection();", profile_change_body)
+        self.assertIn("renderPendingPricingReferenceBasis();", profile_change_body)
         self.assertIn("syncSelectedPricingReference();", apply_reference_body)
         self.assertIn("clearGeneratedQuoteState();", apply_reference_body)
         self.assertIn("persistLastPricingReferenceSelection();", apply_reference_body)
@@ -11817,6 +11818,93 @@ assert.deepStrictEqual(quoteDependencyChangesForNext(), []);
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_static_pending_pricing_reference_previews_basis_and_resets_without_next(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const marker = `function ${name}(`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const state = {
+  pricingReferences: [
+    { id: "reference-a", source: "bundled", currency: "SGD", tax: { label: "GST", rate: 0.09 } },
+    { id: "reference-b", source: "local", currency: "USD", tax: { label: "VAT", rate: 0.2 } },
+  ],
+  pricingReferenceId: "reference-a",
+  pricingReferenceSource: "bundled",
+};
+const elements = { profileSelect: { value: "local::reference-b" } };
+const currencyNode = { textContent: "" };
+const taxNode = { textContent: "" };
+const document = {
+  querySelectorAll(selector) {
+    if (selector === "[data-reference-basis-currency]") return [currencyNode];
+    if (selector === "[data-reference-basis-tax]") return [taxNode];
+    return [];
+  },
+};
+const DEFAULT_TAX_RATE = 0.09;
+let navUpdates = 0;
+function normalizeTaxLabel(value) { return String(value || "GST").trim().toUpperCase(); }
+function normalizeTaxRate(value, fallback) { return Number.isFinite(Number(value)) ? Number(value) : fallback; }
+function normalizeCurrencyLabel(value) { return String(value || "SGD").trim().toUpperCase(); }
+function taxRatePercentText(value) { return String(Number(value) * 100).replace(/\.0+$/, ""); }
+function updateSidePanelNav() { navUpdates += 1; }
+
+eval([
+  "pricingReferenceSelectValue",
+  "pricingReferenceSelectionFromValue",
+  "currentPricingReference",
+  "pricingReferenceFromSelectionValue",
+  "pendingPricingReference",
+  "pricingReferenceBasisValues",
+  "syncPricingReferenceContextPills",
+  "renderPendingPricingReferenceBasis",
+  "resetPendingPricingReferenceSelection",
+  "handleProfileSelectionChange",
+].map(extractFunction).join("\n"));
+
+handleProfileSelectionChange();
+assert.strictEqual(state.pricingReferenceId, "reference-a");
+assert.strictEqual(state.pricingReferenceSource, "bundled");
+assert.strictEqual(currencyNode.textContent, "USD");
+assert.strictEqual(taxNode.textContent, "VAT 20%");
+
+assert.strictEqual(resetPendingPricingReferenceSelection(), true);
+assert.strictEqual(elements.profileSelect.value, "bundled::reference-a");
+assert.strictEqual(currencyNode.textContent, "SGD");
+assert.strictEqual(taxNode.textContent, "GST 9%");
+assert.strictEqual(navUpdates, 2);
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
     def test_static_mobile_ui_polish_has_responsive_header_legend_and_output_cards(self):
         static_dir = ROOT / "webapp" / "static"
         css = (static_dir / "styles.css").read_text(encoding="utf-8")

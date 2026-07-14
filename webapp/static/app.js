@@ -1718,6 +1718,45 @@ function selectedPricingReferenceTaxText() {
   return `${tax.label} ${taxRatePercentText(tax.rate)}%`;
 }
 
+function pricingReferenceFromSelectionValue(value = "") {
+  const selection = pricingReferenceSelectionFromValue(value);
+  if (!selection.pricingReferenceId) return null;
+  return state.pricingReferences.find((reference) => (
+    String(reference.id || "").trim() === selection.pricingReferenceId
+    && (!selection.source || pricingReferenceSelectValue(reference).startsWith(`${selection.source}::`))
+  )) || null;
+}
+
+function pendingPricingReference() {
+  return pricingReferenceFromSelectionValue(elements.profileSelect?.value || "");
+}
+
+function pricingReferenceBasisValues(reference = currentPricingReference()) {
+  const tax = {
+    label: normalizeTaxLabel(reference?.tax?.label),
+    rate: normalizeTaxRate(reference?.tax?.rate, DEFAULT_TAX_RATE),
+  };
+  return {
+    currency: normalizeCurrencyLabel(reference?.currency),
+    taxText: `${tax.label} ${taxRatePercentText(tax.rate)}%`,
+  };
+}
+
+function renderPendingPricingReferenceBasis() {
+  const basis = pricingReferenceBasisValues(pendingPricingReference() || currentPricingReference());
+  syncPricingReferenceContextPills(basis.currency, basis.taxText);
+}
+
+function resetPendingPricingReferenceSelection() {
+  if (!elements.profileSelect) return false;
+  const appliedValue = pricingReferenceSelectValue(currentPricingReference() || {});
+  const changed = elements.profileSelect.value !== appliedValue;
+  if (changed) elements.profileSelect.value = appliedValue;
+  renderPendingPricingReferenceBasis();
+  updateSidePanelNav();
+  return changed;
+}
+
 function pricingReferenceContextPillsHtml() {
   return `
     <span class="pricing-reference-context-pills" aria-label="Selected pricing reference currency and tax">
@@ -4782,6 +4821,7 @@ function showPricingReferenceDeleteConfirm(reference) {
 
 function openSettingsModal() {
   if (!canManagePricingReferences()) return;
+  if (state.activeSidePanel === "customer") resetPendingPricingReferenceSelection();
   openPricingReferenceModal();
 }
 
@@ -6720,6 +6760,7 @@ function applyPendingPricingReferenceSelection() {
 }
 
 function handleProfileSelectionChange() {
+  renderPendingPricingReferenceBasis();
   updateSidePanelNav();
 }
 
@@ -10094,6 +10135,7 @@ function showQuoteFlow() {
 }
 
 function showDashboard(options = {}) {
+  if (state.activeSidePanel === "customer") resetPendingPricingReferenceSelection();
   state.activeAppView = "dashboard";
   elements.quoteFlowPanel?.classList.remove("is-active");
   elements.quoteDashboardPanel?.classList.add("is-active");
@@ -12352,6 +12394,9 @@ function setSidePanel(panelName, options = {}) {
     return false;
   }
   const previousPanel = state.activeSidePanel;
+  if (previousPanel === "customer" && nextPanel !== "customer") {
+    resetPendingPricingReferenceSelection();
+  }
   const [title, eyebrow, subtitle] = panelTitles[nextPanel] || panelTitles.images;
   state.activeSidePanel = nextPanel;
   if (
@@ -13119,6 +13164,5 @@ async function boot() {
 }
 
 boot();
-
 
 

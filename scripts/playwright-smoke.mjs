@@ -995,6 +995,8 @@ async function verifyPricingReferenceSelectionCommitsOnCustomerNext(page) {
     return {
       value: pricingReferenceSelectValue(currentPricingReference()),
       pricingReferenceId: state.pricingReferenceId,
+      currency: selectedPricingReferenceCurrency(),
+      tax: selectedPricingReferenceTaxText(),
       basisCount: state.quoteBasisSections.length,
       outputCount: state.outputRows.length,
     };
@@ -1012,6 +1014,28 @@ async function verifyPricingReferenceSelectionCommitsOnCustomerNext(page) {
   if (pendingState.pricingReferenceId !== applied.pricingReferenceId || pendingState.basisCount !== applied.basisCount || pendingState.outputCount !== applied.outputCount) {
     throw new Error("Changing the pricing-reference dropdown applied or cleared quote state before Customer Next.");
   }
+  const previewBasis = {
+    currency: await page.locator("#customerDetailsPanel [data-reference-basis-currency]").innerText(),
+    tax: await page.locator("#customerDetailsPanel [data-reference-basis-tax]").innerText(),
+  };
+  if (previewBasis.currency !== "USD" || previewBasis.tax !== "VAT 20%") {
+    throw new Error("Reference basis cards did not preview the pending pricing reference: " + JSON.stringify(previewBasis));
+  }
+
+  await page.locator("#sideBackButton").click();
+  await page.locator("#imageIntake.is-active").waitFor({ state: "visible", timeout: 15000 });
+  await page.locator('button[data-side-panel="customer"]').click();
+  await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+  const resetAfterLeaving = {
+    value: await page.locator("#profileSelect").inputValue(),
+    currency: await page.locator("#customerDetailsPanel [data-reference-basis-currency]").innerText(),
+    tax: await page.locator("#customerDetailsPanel [data-reference-basis-tax]").innerText(),
+  };
+  if (resetAfterLeaving.value !== applied.value || resetAfterLeaving.currency !== applied.currency || resetAfterLeaving.tax !== applied.tax) {
+    throw new Error("Leaving Customer without Next did not restore the applied pricing reference: " + JSON.stringify(resetAfterLeaving));
+  }
+
+  await page.locator("#profileSelect").selectOption(pendingValue);
 
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
