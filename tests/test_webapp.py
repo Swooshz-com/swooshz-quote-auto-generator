@@ -11677,11 +11677,21 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertNotIn(".side-workspace.is-open", css)
 
         initial_values_body = js.split("async function setInitialValues()", 1)[1].split("async function boot()", 1)[0]
+        apply_reference_body = js.split("function applyPendingPricingReferenceSelection()", 1)[1].split("function handleProfileSelectionChange()", 1)[0]
         profile_change_body = js.split("function handleProfileSelectionChange()", 1)[1].split("function buildPayload(options = {})", 1)[0]
+        next_panel_body = js.split("async function goToNextSidePanel", 1)[1].split("function handleQuoteBasisClick", 1)[0]
+        quote_company_next_body = next_panel_body.split('if (state.activeSidePanel === "quote_company") {', 1)[1].split('if (state.activeSidePanel === "basis") {', 1)[0]
         self.assertIn("loadDefaultProfilePreset({ silent: true })", initial_values_body)
-        self.assertIn("syncSelectedPricingReference();", profile_change_body)
-        self.assertIn("clearGeneratedQuoteState();", profile_change_body)
-        self.assertIn("syncControlStates();", profile_change_body)
+        self.assertNotIn("state.pricingReferenceId =", profile_change_body)
+        self.assertNotIn("clearGeneratedQuoteState();", profile_change_body)
+        self.assertNotIn("persistLastPricingReferenceSelection();", profile_change_body)
+        self.assertIn("syncSelectedPricingReference();", apply_reference_body)
+        self.assertIn("clearGeneratedQuoteState();", apply_reference_body)
+        self.assertIn("persistLastPricingReferenceSelection();", apply_reference_body)
+        self.assertIn('state.activeSidePanel === "customer"', next_panel_body)
+        self.assertIn("applyPendingPricingReferenceSelection();", next_panel_body)
+        self.assertIn("requestStartAnalysis();", quote_company_next_body)
+        self.assertNotIn("saveQuoteSessionDraftState", quote_company_next_body)
         self.assertNotIn("loadDefaultProfilePreset", profile_change_body)
         self.assertNotIn("setSampleDetails", js)
         self.assertNotIn("DEFAULT_SAMPLE_ID", js)
@@ -12374,6 +12384,10 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertIn("hideExcelGeneratingModal();", resumed_generation_body)
         self.assertIn('elements.excelGeneratingActionButton?.addEventListener("click"', js)
         self.assertIn('elements.excelGeneratingCloseButton?.addEventListener("click"', js)
+        self.assertIn('elements.excelGeneratingModal?.addEventListener("click"', js)
+        self.assertIn('event.target.classList?.contains("modal-backdrop")', js)
+        self.assertIn("generatedExportReadyModalIsOpen", js)
+        self.assertIn("dismissGeneratedExportReadyModal()", js)
         self.assertIn(".workspace-pane-footer.is-output-step {\n  grid-template-columns: repeat(4, minmax(0, 1fr));", css)
         self.assertIn(".workspace-pane-footer.is-output-step #sideBackButton", css)
         self.assertIn("grid-column: span 2;", css)

@@ -6533,10 +6533,15 @@ function clearGeneratedQuoteState() {
   setResultStatus("No job yet");
 }
 
-function handleProfileSelectionChange() {
-  const nextSelection = pricingReferenceSelectionFromValue(elements.profileSelect.value || "");
+function pendingPricingReferenceSelection() {
+  return pricingReferenceSelectionFromValue(elements.profileSelect?.value || "");
+}
+
+function applyPendingPricingReferenceSelection() {
+  const nextSelection = pendingPricingReferenceSelection();
+  if (!nextSelection.pricingReferenceId) return false;
   if (nextSelection.pricingReferenceId === state.pricingReferenceId && nextSelection.source === state.pricingReferenceSource) {
-    return;
+    return false;
   }
   state.pricingReferenceId = nextSelection.pricingReferenceId;
   state.pricingReferenceSource = nextSelection.source;
@@ -6546,6 +6551,11 @@ function handleProfileSelectionChange() {
   clearGeneratedQuoteState();
   setWorkflowStage(state.images.length ? (canStartAnalysis() ? "ready_to_analyze" : "details_review") : "needs_images");
   syncControlStates();
+  return true;
+}
+
+function handleProfileSelectionChange() {
+  updateSidePanelNav();
 }
 
 function buildPayload(options = {}) {
@@ -6819,6 +6829,20 @@ function handleGeneratedExportReadyAction() {
   const action = elements.excelGeneratingActionButton?.dataset.exportAction || "";
   const handled = action === "pdf" ? viewCurrentPdfFile() : action === "excel" ? downloadCurrentExcelFile() : false;
   if (handled) hideExcelGeneratingModal();
+}
+
+function generatedExportReadyModalIsOpen() {
+  return Boolean(
+    elements.excelGeneratingModal
+    && !elements.excelGeneratingModal.hidden
+    && elements.excelGeneratingModal.classList.contains("is-ready")
+  );
+}
+
+function dismissGeneratedExportReadyModal() {
+  if (!generatedExportReadyModalIsOpen()) return false;
+  hideExcelGeneratingModal();
+  return true;
 }
 
 function generationLoadingModalOptions(viewPdf = false) {
@@ -12264,7 +12288,6 @@ async function goToNextSidePanel() {
     return;
   }
   if (state.activeSidePanel === "quote_company") {
-    await saveQuoteSessionDraftState({ quoteGenerated: false });
     requestStartAnalysis();
     return;
   }
@@ -12273,6 +12296,7 @@ async function goToNextSidePanel() {
     return;
   }
   if (state.activeSidePanel === "output") return;
+  if (state.activeSidePanel === "customer") applyPendingPricingReferenceSelection();
   const nextPanel = SIDE_PANEL_SEQUENCE[index + 1];
   const moved = setSidePanel(nextPanel, { notify: true });
   if (moved && nextPanel === "customer") {
@@ -12476,12 +12500,22 @@ function wireEvents() {
   elements.excelGeneratingCloseButton?.addEventListener("click", () => {
     hideExcelGeneratingModal();
   });
+  elements.excelGeneratingModal?.addEventListener("click", (event) => {
+    if (
+      event.target === elements.excelGeneratingModal
+      || event.target.classList?.contains("modal-backdrop")
+    ) {
+      dismissGeneratedExportReadyModal();
+    }
+  });
   document.addEventListener("keydown", (event) => {
     if (handleDashboardEnterKey(event)) return;
     if (handleDashboardListArrowKey(event)) return;
     if (handleDashboardDeleteKey(event)) return;
     if (event.key === "Escape") {
-      if (profileActionsMenuIsOpen()) {
+      if (dismissGeneratedExportReadyModal()) {
+        event.preventDefault();
+      } else if (profileActionsMenuIsOpen()) {
         closeProfileActionsMenu({ focusButton: true });
       } else if (elements.pricingReferenceTableOverlay && !elements.pricingReferenceTableOverlay.hidden) {
         closePricingReferenceTableOverlay();

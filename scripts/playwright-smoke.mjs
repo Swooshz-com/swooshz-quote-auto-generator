@@ -743,6 +743,10 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       if (activePanel !== "Output") {
         throw new Error("Recovered " + testCase.type + " should remain tied to Output, found " + activePanel + ".");
       }
+      await page.keyboard.press("Escape");
+      await page.locator("#excelGeneratingModal").waitFor({ state: "visible", timeout: 15000 });
+      await page.locator("#excelGeneratingModal > .modal-backdrop").click({ position: { x: 5, y: 5 } });
+      await page.locator("#excelGeneratingModal").waitFor({ state: "visible", timeout: 15000 });
 
       let finalSaveSeen = false;
       await page.route(savePattern, async (route) => {
@@ -788,7 +792,11 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       if (readyTitle !== testCase.readyTitle || readyAction !== testCase.action) {
         throw new Error("Recovered " + testCase.type + " result was not attached to its restored splash.");
       }
-      await page.locator("#excelGeneratingCloseButton").click();
+      if (testCase.type === "generate") {
+        await page.keyboard.press("Escape");
+      } else {
+        await page.locator("#excelGeneratingModal > .modal-backdrop").click({ position: { x: 5, y: 5 } });
+      }
       await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 15000 });
     } finally {
       if (typeof releaseFirstPost === "function") releaseFirstPost();
@@ -942,6 +950,131 @@ async function verifyGenerationTerminalRecoveryAfterRefresh(page) {
   }
 }
 
+async function verifyPricingReferenceSelectionCommitsOnCustomerNext(page) {
+  const pendingValue = "local::pending-refresh-reference";
+  const applied = await page.evaluate(async () => {
+    const current = currentPricingReference();
+    if (!current) throw new Error("Pricing-reference regression needs an applied reference.");
+    state.quoteBasisSections = [{
+      id: "retained-basis",
+      title: "Retained basis",
+      lines: [{ tag: "Include", text: "Retained basis line", include: true }],
+    }];
+    state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
+    state.lineItems = [normalizeLineItem({
+      section: "Retained basis",
+      description: "Retained basis line",
+      quantity: 1,
+      unit: "lot",
+      unit_price: 100,
+      amount: 100,
+    })];
+    state.outputRows = [normalizeOutputRow({
+      section: "Retained basis",
+      description: "Retained output row",
+      quantity: 1,
+      unit: "lot",
+      unit_price: 100,
+      amount: 100,
+    })];
+    state.originalOutputRows = snapshotOutputRows(state.outputRows);
+    state.basisConfirmed = true;
+    setWorkflowStage("completed");
+    setSidePanel("customer", { force: true });
+    saveSessionState();
+    await saveQuoteSessionDraftState({ quoteGenerated: true });
+    state.pricingReferences.push({
+      ...current,
+      id: "pending-refresh-reference",
+      label: "Pending Refresh Reference",
+      source: "local",
+      currency: "USD",
+      tax: { label: "VAT", rate: 0.2 },
+    });
+    renderProfileOptions();
+    return {
+      value: pricingReferenceSelectValue(currentPricingReference()),
+      pricingReferenceId: state.pricingReferenceId,
+      basisCount: state.quoteBasisSections.length,
+      outputCount: state.outputRows.length,
+    };
+  });
+  if (!applied.basisCount || !applied.outputCount) {
+    throw new Error("Pricing-reference regression fixture did not seed retained basis and Output state.");
+  }
+
+  await page.locator("#profileSelect").selectOption(pendingValue);
+  const pendingState = await page.evaluate(() => ({
+    pricingReferenceId: state.pricingReferenceId,
+    basisCount: state.quoteBasisSections.length,
+    outputCount: state.outputRows.length,
+  }));
+  if (pendingState.pricingReferenceId !== applied.pricingReferenceId || pendingState.basisCount !== applied.basisCount || pendingState.outputCount !== applied.outputCount) {
+    throw new Error("Changing the pricing-reference dropdown applied or cleared quote state before Customer Next.");
+  }
+
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+  const restored = await page.evaluate(() => ({
+    pricingReferenceId: state.pricingReferenceId,
+    selectedValue: elements.profileSelect.value,
+    basisCount: state.quoteBasisSections.length,
+    outputCount: state.outputRows.length,
+  }));
+  if (restored.pricingReferenceId !== applied.pricingReferenceId || restored.selectedValue !== applied.value || restored.basisCount !== applied.basisCount || restored.outputCount !== applied.outputCount) {
+    throw new Error("Refresh persisted the pending pricing reference or lost retained quote state: " + JSON.stringify(restored));
+  }
+
+  await page.evaluate(() => {
+    const current = currentPricingReference();
+    state.pricingReferences.push({
+      ...current,
+      id: "pending-refresh-reference",
+      label: "Pending Refresh Reference",
+      source: "local",
+      currency: "USD",
+      tax: { label: "VAT", rate: 0.2 },
+    });
+    renderProfileOptions();
+  });
+  await page.locator("#profileSelect").selectOption(pendingValue);
+  await page.locator("#sideNextButton", { hasText: "Next: Quote Company" }).click();
+  await page.locator("#quoteCompanyPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+  const committed = await page.evaluate(() => ({
+    pricingReferenceId: state.pricingReferenceId,
+    source: state.pricingReferenceSource,
+    basisCount: state.quoteBasisSections.length,
+    outputCount: state.outputRows.length,
+  }));
+  if (committed.pricingReferenceId !== "pending-refresh-reference" || committed.source !== "local" || committed.basisCount !== 0 || committed.outputCount !== 0) {
+    throw new Error("Customer Next did not commit the pending pricing reference and invalidate old generated state: " + JSON.stringify(committed));
+  }
+
+  let releaseSave;
+  let saveStarted = false;
+  const savePattern = "**/api/quote-sessions";
+  await page.route(savePattern, async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.fallback();
+      return;
+    }
+    saveStarted = true;
+    await new Promise((resolve) => { releaseSave = resolve; });
+    await route.fallback();
+  });
+  try {
+    await page.locator("#sideNextButton", { hasText: "Start Analysis" }).click();
+    await page.locator("#analysisConfirmModal").waitFor({ state: "visible", timeout: 2000 });
+    if (saveStarted) {
+      throw new Error("Start Analysis waited for a draft save before opening its confirmation dialog.");
+    }
+    await page.locator("#analysisConfirmCancelButton").click();
+    await page.locator("#analysisConfirmModal").waitFor({ state: "hidden", timeout: 15000 });
+  } finally {
+    if (typeof releaseSave === "function") releaseSave();
+    await page.unroute(savePattern);
+  }
+}
 async function installMockProfiles(page) {
   await page.route("**/api/settings/pricing-references/synthetic-exhibition-fixture-pricing**", async (route) => {
     await route.fulfill({
@@ -1586,6 +1719,7 @@ async function main() {
       await verifyConfirmBasisSurvivesImmediateRefresh(page);
       await verifyGenerationLoadingModalSurvivesRefresh(page);
       await verifyGenerationTerminalRecoveryAfterRefresh(page);
+      await verifyPricingReferenceSelectionCommitsOnCustomerNext(page);
       console.log(JSON.stringify({
         status: "ok",
         mode: "recovery-only",
