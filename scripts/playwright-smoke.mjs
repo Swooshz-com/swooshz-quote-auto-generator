@@ -1025,7 +1025,24 @@ async function verifyPricingReferenceSelectionCommitsOnCustomerNext(page) {
     throw new Error("Refresh persisted the pending pricing reference or lost retained quote state: " + JSON.stringify(restored));
   }
 
+  await page.locator("#sideNextButton", { hasText: "Next: Quote Company" }).click();
+  await page.locator("#quoteCompanyPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+  if (await page.locator("#quoteDependencyConfirmModal").isVisible()) {
+    throw new Error("Unchanged pricing reference opened the destructive dependency warning.");
+  }
+  await page.locator("#sideNextButton", { hasText: "Next: Quote Basis" }).click();
+  await page.locator("#quoteBasisPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+  const retainedAfterNoChange = await page.evaluate(() => ({
+    basisCount: state.quoteBasisSections.length,
+    outputCount: state.outputRows.length,
+    analysisConfirmVisible: !elements.analysisConfirmModal.hidden,
+  }));
+  if (!retainedAfterNoChange.basisCount || !retainedAfterNoChange.outputCount || retainedAfterNoChange.analysisConfirmVisible) {
+    throw new Error("Unchanged inputs did not preserve existing Basis and Output: " + JSON.stringify(retainedAfterNoChange));
+  }
+
   await page.evaluate(() => {
+    setSidePanel("customer", { force: true });
     const current = currentPricingReference();
     state.pricingReferences.push({
       ...current,
@@ -1039,15 +1056,39 @@ async function verifyPricingReferenceSelectionCommitsOnCustomerNext(page) {
   });
   await page.locator("#profileSelect").selectOption(pendingValue);
   await page.locator("#sideNextButton", { hasText: "Next: Quote Company" }).click();
+  await page.locator("#quoteDependencyConfirmModal").waitFor({ state: "visible", timeout: 15000 });
+  const warningText = await page.locator("#quoteDependencyConfirmText").innerText();
+  if (!warningText.includes("clear the current Quote Basis and Output")) {
+    throw new Error("Dependency warning did not explain the destructive scope: " + warningText);
+  }
+  await page.keyboard.press("Escape");
+  await page.locator("#quoteDependencyConfirmModal").waitFor({ state: "hidden", timeout: 15000 });
+  const cancelled = await page.evaluate(() => ({
+    panel: state.activeSidePanel,
+    pricingReferenceId: state.pricingReferenceId,
+    basisCount: state.quoteBasisSections.length,
+    outputCount: state.outputRows.length,
+  }));
+  if (cancelled.panel !== "customer" || cancelled.pricingReferenceId !== applied.pricingReferenceId || !cancelled.basisCount || !cancelled.outputCount) {
+    throw new Error("Cancelling the dependency warning changed quote state: " + JSON.stringify(cancelled));
+  }
+
+  await page.locator("#sideNextButton", { hasText: "Next: Quote Company" }).click();
+  await page.locator("#quoteDependencyConfirmModal").waitFor({ state: "visible", timeout: 15000 });
+  await page.locator("#confirmQuoteDependencyChangeButton").click();
   await page.locator("#quoteCompanyPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
   const committed = await page.evaluate(() => ({
     pricingReferenceId: state.pricingReferenceId,
     source: state.pricingReferenceSource,
     basisCount: state.quoteBasisSections.length,
     outputCount: state.outputRows.length,
+    dashboardSession: state.quoteSessions.find((session) => session.session_id === state.quoteSessionId) || null,
   }));
   if (committed.pricingReferenceId !== "pending-refresh-reference" || committed.source !== "local" || committed.basisCount !== 0 || committed.outputCount !== 0) {
-    throw new Error("Customer Next did not commit the pending pricing reference and invalidate old generated state: " + JSON.stringify(committed));
+    throw new Error("Confirmed pricing-reference change did not invalidate old generated state: " + JSON.stringify(committed));
+  }
+  if (committed.dashboardSession?.status?.quote_generated) {
+    throw new Error("Dashboard latest state still reported a generated quote after dependency invalidation.");
   }
 
   let releaseSave;

@@ -1192,6 +1192,27 @@
           </div>
         </section>
       </div>
+      <div class="modal-overlay profile-load-modal" id="quoteDependencyConfirmModal" role="dialog" aria-modal="true" aria-labelledby="quoteDependencyConfirmTitle" aria-describedby="quoteDependencyConfirmText" hidden>
+        <div class="modal-backdrop" data-quote-dependency-confirm-close></div>
+        <section class="modal-panel profile-load-panel">
+          <header class="modal-header">
+            <div>
+              <span class="basis-chat-eyebrow">Update Quote Inputs</span>
+              <h3 id="quoteDependencyConfirmTitle">Replace existing quote results?</h3>
+            </div>
+          </header>
+          <div class="profile-load-body">
+            <div class="profile-load-warning" id="quoteDependencyConfirmText">
+              <strong>This change will clear the current Quote Basis and Output.</strong>
+              <span>Continue only if you want to rebuild the quote using the changed inputs.</span>
+            </div>
+          </div>
+          <div class="modal-actions profile-load-actions">
+            <button class="secondary-button" type="button" id="cancelQuoteDependencyConfirmButton">Cancel</button>
+            <button class="primary-button" type="button" id="confirmQuoteDependencyChangeButton">Continue and Clear</button>
+          </div>
+        </section>
+      </div>
       <div class="modal-overlay" id="analysisConfirmModal" role="dialog" aria-modal="true" aria-labelledby="analysisConfirmTitle" hidden>
         <div class="modal-backdrop" data-analysis-confirm-close></div>
         <section class="modal-panel analysis-confirm-panel">
@@ -1210,6 +1231,6 @@
         </section>
       </div>
     </div>
-    <script src="/static/app.js?v=76"></script>
+    <script src="/static/app.js?v=77"></script>
   </body>
 </html>

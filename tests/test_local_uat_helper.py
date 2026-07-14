@@ -48,6 +48,8 @@ class LocalUatHelperTest(unittest.TestCase):
             self.assertIn(env_name, script)
 
         self.assertIn("sqag-platform-uat", script)
+        self.assertIn('$repoRoot "_tmp\\sqag-platform-uat"', script)
+        self.assertNotIn("GetTempPath", script)
         self.assertIn("custom path configured", script)
         self.assertIn("sqlite:///", script)
         self.assertIn("scripts/migrate_sqag_storage.py", script.replace("\\", "/"))
@@ -64,6 +66,8 @@ class LocalUatHelperTest(unittest.TestCase):
 
         self.assertIn("scripts/local-uat-sqag-start.ps1", runbook)
         self.assertIn("recommended Windows local path", runbook)
+        self.assertIn("<repo>\\_tmp\\sqag-platform-uat", runbook)
+        self.assertNotIn("$env:TEMP\\sqag-platform-uat", runbook)
         self.assertIn("Manual fallback", runbook)
         self.assertIn("python -m webapp.server", runbook)
         self.assertIn("X-App-Launch-Token", runbook)

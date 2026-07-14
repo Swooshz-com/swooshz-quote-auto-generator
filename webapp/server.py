@@ -154,6 +154,7 @@ DEFAULT_PRICING_REFERENCE_ID = BUNDLED_DEFAULT_PRICING_REFERENCE_ID
 PRICING_REFERENCE_TEMPLATE_PATH = TEMPLATES_ROOT / "pricing-reference" / "pricing-reference-template.xlsx"
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "_output" / "webapp"
 DEFAULT_TMP_ROOT = PROJECT_ROOT / "_tmp" / "webapp"
+DEFAULT_DATA_ROOT = PROJECT_ROOT / "_tmp" / "company-data"
 DEFAULT_LOG_ROOT = PROJECT_ROOT / "_logs" / "app"
 DEFAULT_TAX_LABEL = "GST"
 DEFAULT_TAX_RATE = 0.09
@@ -1389,7 +1390,7 @@ def configured_log_root() -> Path:
 
 
 def configured_data_root() -> Path:
-    return configured_path(QUOTE_DATA_ROOT_ENV_NAME, Path("/data/swooshz/company-data"))
+    return configured_path(QUOTE_DATA_ROOT_ENV_NAME, DEFAULT_DATA_ROOT)
 
 def configured_storage_mode() -> str:
     mode = clean_text(read_dotenv_value(SQAG_STORAGE_MODE_ENV_NAME)).lower()

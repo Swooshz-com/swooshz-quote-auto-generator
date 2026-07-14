@@ -203,6 +203,7 @@ const state = {
   blockingClarificationQuestions: [],
   boothDimensions: { ...DEFAULT_BOOTH_DIMENSIONS },
   originalAnalysisSnapshot: null,
+  pendingQuoteDependencyChanges: [],
   basisConfirmed: false,
   isAnalysisRunning: false,
   isGenerating: false,
@@ -523,6 +524,11 @@ const elements = {
   pricingReferenceSaveButton: qs("#pricingReferenceSaveButton"),
   pricingReferenceCancelButton: qs("#pricingReferenceCancelButton"),
   pricingReferenceCloseButton: qs("#pricingReferenceCloseButton"),
+  quoteDependencyConfirmModal: qs("#quoteDependencyConfirmModal"),
+  quoteDependencyConfirmTitle: qs("#quoteDependencyConfirmTitle"),
+  quoteDependencyConfirmText: qs("#quoteDependencyConfirmText"),
+  cancelQuoteDependencyConfirmButton: qs("#cancelQuoteDependencyConfirmButton"),
+  confirmQuoteDependencyChangeButton: qs("#confirmQuoteDependencyChangeButton"),
   analysisConfirmModal: qs("#analysisConfirmModal"),
   analysisConfirmCancelButton: qs("#analysisConfirmCancelButton"),
   analysisConfirmHighQualityButton: qs("#analysisConfirmHighQualityButton"),
@@ -1343,6 +1349,33 @@ function referenceFileType(entry = {}) {
   return String(entry.name || "").toLowerCase().endsWith(".pdf") ? "application/pdf" : "image";
 }
 
+function referenceFileContentFingerprint(dataUrl = "") {
+  const text = String(dataUrl || "");
+  if (!text) return "";
+  let hash = 2166136261;
+  const stride = Math.max(1, Math.floor(text.length / 4096));
+  for (let index = 0; index < text.length; index += stride) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${text.length}:${(hash >>> 0).toString(16)}`;
+}
+
+function referenceFileDependencyKey(image = {}) {
+  const name = String(image.name || "").trim().toLowerCase();
+  const type = referenceFileType(image);
+  const size = Number.isFinite(Number(image.size)) ? Number(image.size) : 0;
+  const fingerprint = String(image.content_fingerprint || "").trim()
+    || referenceFileContentFingerprint(image.data_url || "");
+  return `${name}:${type}:${size}:${fingerprint}`;
+}
+
+function referenceFilesDependencySignature(images = state.images) {
+  return JSON.stringify((Array.isArray(images) ? images : [])
+    .map(referenceFileDependencyKey)
+    .filter(Boolean)
+    .sort());
+}
 function isPdfReference(entry = {}) {
   return referenceFileType(entry) === "application/pdf";
 }
@@ -1377,6 +1410,7 @@ async function filesToImageEntries(files, limit = MAX_REFERENCE_IMAGES) {
           name: file.name,
           type: referenceFileType({ name: file.name, type: file.type, data_url: dataUrl }),
           size: file.size,
+          content_fingerprint: referenceFileContentFingerprint(dataUrl),
           data_url: dataUrl,
         };
       })
@@ -1440,7 +1474,7 @@ async function addImagesFromFiles(files) {
   state.images = [...state.images, ...unique];
   await persistSessionFiles(sessionFileRecordsFromImages(state.images)).catch(() => {});
   renderFiles();
-  setWorkflowStage("ready_to_analyze");
+  if (!quoteHasDerivedResults()) setWorkflowStage("ready_to_analyze");
   const generator = currentGenerator();
   const duplicateMessage = duplicateCount ? ` ${duplicateCount} duplicate file${duplicateCount === 1 ? "" : "s"} skipped.` : "";
   const overflowMessage = overflowCount ? ` ${overflowCount} file${overflowCount === 1 ? "" : "s"} skipped because the maximum is ${MAX_REFERENCE_IMAGES}.` : "";
@@ -1452,7 +1486,7 @@ function removeImageAt(index) {
   state.images.splice(index, 1);
   renderFiles();
   if (!state.images.length) {
-    setWorkflowStage("needs_images");
+    if (!quoteHasDerivedResults()) setWorkflowStage("needs_images");
     setImageUploadStatus("");
   } else {
     setImageUploadStatus(`${state.images.length} reference file${state.images.length === 1 ? "" : "s"} loaded.`);
@@ -2690,6 +2724,7 @@ function sessionImageMetadata(image = {}, index = 0) {
     name: String(image.name || `reference-${index + 1}`).trim() || `reference-${index + 1}`,
     type: referenceFileType(image),
     size: Number.isFinite(Number(image.size)) ? Number(image.size) : 0,
+    content_fingerprint: String(image.content_fingerprint || "").trim(),
     session_file_key: sessionFileKey,
   };
 }
@@ -3037,6 +3072,12 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.blockingClarificationQuestions = Array.isArray(saved.blockingClarificationQuestions) ? saved.blockingClarificationQuestions : [];
   state.boothDimensions = normalizeBoothDimensions(saved.boothDimensions || saved.quoteDetails?.project || {});
   state.originalAnalysisSnapshot = saved.originalAnalysisSnapshot || null;
+  if (state.originalAnalysisSnapshot && !String(state.originalAnalysisSnapshot.reference_file_signature || "").trim()) {
+    state.originalAnalysisSnapshot = {
+      ...state.originalAnalysisSnapshot,
+      reference_file_signature: referenceFilesDependencySignature(state.images),
+    };
+  }
   state.basisConfirmed = Boolean(saved.basisConfirmed);
   state.draftSource = saved.draftSource || "";
   state.lastAnalysisMode = normalizeAnalysisMode(saved.lastAnalysisMode || saved.originalAnalysisSnapshot?.analysis_mode);
@@ -3849,6 +3890,7 @@ function loadSelectedPreset(options = {}) {
     renderPresetStatus("Choose a preset to load.");
     return;
   }
+  const presentationBeforeLoad = quoteCompanyPresentationSignature();
   state.selectedPresetValue = elements.presetSelect.value || presetOptionValue(preset);
   persistLastProfilePresetSelection(state.selectedPresetValue);
   clearPendingProfilePack();
@@ -3875,10 +3917,11 @@ function loadSelectedPreset(options = {}) {
       renderHeaderLogoPreview();
     }
   }
-  const shouldResetGeneratedState = options.resetGeneratedState !== false && !shouldPreserveExistingQuoteState && options.silent !== true;
-  if (shouldResetGeneratedState) {
-    clearGeneratedQuoteState();
-    setWorkflowStage(state.images.length ? "ready_to_analyze" : "needs_images");
+  const shouldInvalidateGeneratedExports = options.resetGeneratedState !== false
+    && !shouldPreserveExistingQuoteState
+    && options.silent !== true;
+  if (shouldInvalidateGeneratedExports) {
+    invalidateGeneratedExportsIfPresentationChanged(presentationBeforeLoad);
   }
   syncControlStates();
   renderPresetStatus(`Loaded "${preset.name}".`);
@@ -3934,6 +3977,7 @@ function clearCustomerDetails() {
 }
 
 function clearQuoteCompanyDetails() {
+  const presentationBeforeClear = quoteCompanyPresentationSignature();
   setInputValue(elements.headerDetails, "");
   setInputValue(elements.termsHeading, "");
   setInputValue(elements.paymentTerms, "");
@@ -3953,12 +3997,14 @@ function clearQuoteCompanyDetails() {
   state.selectedPresetValue = "";
   clearPendingProfilePack();
   hideProfileNameModal({ force: true });
-  clearGeneratedQuoteState();
-  setWorkflowStage(state.images.length ? "ready_to_analyze" : "needs_images");
   updatePresetButtons();
   renderHeaderLogoPreview();
   loadDefaultProfilePreset({ silent: true, preferLastSelection: false });
+  invalidateGeneratedExportsIfPresentationChanged(presentationBeforeClear);
   syncControlStates();
+  if (quoteSessionDraftStateCanSave()) {
+    queueQuoteSessionDraftStateSave({ quoteGenerated: quoteSessionHasFreshOutputExports() });
+  }
   renderPresetStatus("Quote-company defaults reset to the Default profile template.");
 }
 
@@ -6507,6 +6553,125 @@ async function loadCompanyProfiles() {
   renderPresetOptions();
 }
 
+function quoteHasDerivedResults() {
+  return quoteDraftHasAiAnalysis() || quoteDraftHasOutputState();
+}
+
+function analyzedReferenceFileSignature() {
+  return String(state.originalAnalysisSnapshot?.reference_file_signature || "").trim();
+}
+
+function referenceFilesChangedSinceAnalysis() {
+  if (!quoteHasDerivedResults()) return false;
+  const baseline = analyzedReferenceFileSignature();
+  return Boolean(baseline && referenceFilesDependencySignature() !== baseline);
+}
+
+function pendingPricingReferenceSelectionChanged() {
+  const pending = pendingPricingReferenceSelection();
+  if (!pending.pricingReferenceId) return false;
+  return pending.pricingReferenceId !== state.pricingReferenceId
+    || pending.source !== state.pricingReferenceSource;
+}
+
+function quoteDependencyChangesForNext() {
+  if (!quoteHasDerivedResults()) return [];
+  const changes = [];
+  if (referenceFilesChangedSinceAnalysis()) changes.push("reference_files");
+  if (pendingPricingReferenceSelectionChanged()) changes.push("pricing_reference");
+  return changes;
+}
+
+function quoteDependencyChangeCopy(changes = state.pendingQuoteDependencyChanges) {
+  const normalized = new Set(Array.isArray(changes) ? changes : []);
+  const labels = [];
+  if (normalized.has("reference_files")) labels.push("reference files");
+  if (normalized.has("pricing_reference")) labels.push("pricing reference");
+  const subject = labels.length > 1 ? `${labels.slice(0, -1).join(", ")} and ${labels.at(-1)}` : labels[0] || "quote inputs";
+  return {
+    title: `Apply changed ${subject}?`,
+    strong: "This will clear the current Quote Basis and Output.",
+    detail: "Continue only if you want to rebuild the quote using these changed inputs.",
+  };
+}
+
+function hideQuoteDependencyConfirmModal(options = {}) {
+  state.pendingQuoteDependencyChanges = [];
+  if (elements.quoteDependencyConfirmModal) {
+    elements.quoteDependencyConfirmModal.classList.remove("is-open");
+    elements.quoteDependencyConfirmModal.hidden = true;
+  }
+  if (options.focusButton) elements.sideNextButton?.focus();
+}
+
+function requestQuoteDependencyChangeConfirmation(changes = []) {
+  const normalized = [...new Set((Array.isArray(changes) ? changes : []).filter(Boolean))];
+  if (!normalized.length || !elements.quoteDependencyConfirmModal) return false;
+  state.pendingQuoteDependencyChanges = normalized;
+  const copy = quoteDependencyChangeCopy(normalized);
+  elements.quoteDependencyConfirmModal.hidden = false;
+  elements.quoteDependencyConfirmModal.classList.add("is-open");
+  if (elements.quoteDependencyConfirmTitle) elements.quoteDependencyConfirmTitle.textContent = copy.title;
+  if (elements.quoteDependencyConfirmText) {
+    const strong = elements.quoteDependencyConfirmText.querySelector?.("strong");
+    const detail = elements.quoteDependencyConfirmText.querySelector?.("span");
+    if (strong) strong.textContent = copy.strong;
+    if (detail) detail.textContent = copy.detail;
+  }
+  window.setTimeout(() => elements.confirmQuoteDependencyChangeButton?.focus(), 0);
+  return true;
+}
+
+async function confirmQuoteDependencyChange() {
+  const changes = [...state.pendingQuoteDependencyChanges];
+  if (!changes.length) {
+    hideQuoteDependencyConfirmModal();
+    return;
+  }
+  hideQuoteDependencyConfirmModal();
+  let generatedStateCleared = false;
+  if (changes.includes("pricing_reference")) {
+    generatedStateCleared = applyPendingPricingReferenceSelection();
+  }
+  if (changes.includes("reference_files") && !generatedStateCleared) {
+    clearGeneratedQuoteState();
+    generatedStateCleared = true;
+  }
+  if (generatedStateCleared) {
+    setWorkflowStage(hasReferenceFilesForNavigation() ? "ready_to_analyze" : "needs_images");
+    await saveQuoteSessionDraftState({ quoteGenerated: false });
+  }
+  if (!hasReferenceFilesForNavigation()) {
+    updateSidePanelNav();
+    return;
+  }
+  await goToNextSidePanel({ dependencyChangeConfirmed: true });
+}
+
+function quoteCompanyPresentationSignature() {
+  syncRichTextSources();
+  const logo = state.headerLogo || {};
+  return JSON.stringify({
+    details: collectQuoteCompanyProfileDetails(),
+    logo: {
+      name: String(logo.name || "").trim(),
+      type: String(logo.type || "").trim(),
+      size: Number.isFinite(Number(logo.size)) ? Number(logo.size) : 0,
+      fingerprint: referenceFileContentFingerprint(logo.data_url || ""),
+    },
+  });
+}
+
+function invalidateGeneratedExportsForPresentationChange() {
+  if (!state.downloadFile && !state.pdfFile) return false;
+  markOutputRowsDirty();
+  return true;
+}
+
+function invalidateGeneratedExportsIfPresentationChanged(previousSignature = "") {
+  if (String(previousSignature || "") === quoteCompanyPresentationSignature()) return false;
+  return invalidateGeneratedExportsForPresentationChange();
+}
 function clearGeneratedQuoteState() {
   state.quoteBasis = { ...EMPTY_BASIS };
   state.quoteBasisSections = [];
@@ -9176,6 +9341,7 @@ function captureOriginalAnalysisSnapshot(data = {}) {
     boothDimensions: { ...state.boothDimensions },
     source: data.source || state.draftSource || "",
     analysis_mode: normalizeAnalysisMode(data.analysis_mode || state.lastAnalysisMode),
+    reference_file_signature: referenceFilesDependencySignature(),
     warnings: Array.isArray(data.warnings) ? [...data.warnings] : [],
   };
 }
@@ -9829,6 +9995,21 @@ function quoteCommercialFieldChanged(target = null) {
 
 function handleQuoteDetailFieldChange(event = {}) {
   const commercialChanged = quoteCommercialFieldChanged(event.target);
+  const quoteCompanyChanged = [
+    elements.headerDetails,
+    elements.termsHeading,
+    elements.paymentTerms,
+    elements.notesHeading,
+    elements.standardNotes,
+    elements.quoteCompanyName,
+    elements.acceptanceText,
+    elements.companySignatory,
+    elements.companyTitle,
+    elements.companyDateLabel,
+    elements.personLabel,
+    elements.stampLabel,
+    elements.dateLabel,
+  ].filter(Boolean).includes(event.target);
   if (event.target === elements.quoteCurrency) {
     syncQuoteCurrencyCustomInput();
   }
@@ -9842,6 +10023,8 @@ function handleQuoteDetailFieldChange(event = {}) {
   syncQuoteExchangeRateField();
   if (commercialChanged && (state.outputRows.length || state.downloadFile || state.pdfFile)) {
     markOutputRowsDirty();
+  } else if (quoteCompanyChanged) {
+    invalidateGeneratedExportsForPresentationChange();
   }
   updateOutputHeader();
   syncControlStates();
@@ -12245,7 +12428,13 @@ function updateSidePanelNav() {
   const nextLabels = {
     images: "Next: Customer",
     customer: "Next: Quote Company",
-    quote_company: currentGenerator().analyzeLabel,
+    quote_company: (
+      state.originalAnalysisSnapshot
+      || state.quoteBasisSections?.length
+      || state.lineItems?.length
+      || state.outputRows?.length
+      || state.originalOutputRows?.length
+    ) ? "Next: Quote Basis" : currentGenerator().analyzeLabel,
     basis: "Confirm Quotation Basis",
   };
   elements.sideNextButton.textContent = nextLabels[state.activeSidePanel] || "Next";
@@ -12277,7 +12466,7 @@ function goToPreviousSidePanel() {
   setSidePanel(SIDE_PANEL_SEQUENCE[index - 1]);
 }
 
-async function goToNextSidePanel() {
+async function goToNextSidePanel(options = {}) {
   const index = activeSidePanelIndex();
   if (elements.sideNextButton?.getAttribute("aria-disabled") === "true") {
     const reason = elements.sideNextButton.title || "This step is not ready yet.";
@@ -12287,7 +12476,19 @@ async function goToNextSidePanel() {
     if (state.activeSidePanel === "basis") showBlockedBasisAction(reason);
     return;
   }
+  if (!options.dependencyChangeConfirmed) {
+    const dependencyChanges = quoteDependencyChangesForNext();
+    if (dependencyChanges.length) {
+      requestQuoteDependencyChangeConfirmation(dependencyChanges);
+      return;
+    }
+  }
   if (state.activeSidePanel === "quote_company") {
+    if (quoteHasDerivedResults()) {
+      const moved = setSidePanel("basis", { notify: true });
+      if (moved) await saveQuoteSessionDraftState({ quoteGenerated: quoteSessionHasFreshOutputExports() });
+      return;
+    }
     requestStartAnalysis();
     return;
   }
@@ -12400,6 +12601,7 @@ function wireEvents() {
   });
 
   elements.headerLogoInput.addEventListener("change", async (event) => {
+    const presentationBeforeLogoChange = quoteCompanyPresentationSignature();
     const file = (event.target.files || [])[0];
     state.headerLogo = file
       ? {
@@ -12411,7 +12613,11 @@ function wireEvents() {
       : null;
     renderHeaderLogoPreview();
     renderPresetStatus();
+    invalidateGeneratedExportsIfPresentationChanged(presentationBeforeLogoChange);
     syncControlStates();
+    if (quoteSessionDraftStateCanSave()) {
+      queueQuoteSessionDraftStateSave({ quoteGenerated: quoteSessionHasFreshOutputExports() });
+    }
   });
   elements.headerLogoPreview.addEventListener("click", () => {
     elements.headerLogoInput.click();
@@ -12521,6 +12727,8 @@ function wireEvents() {
         closePricingReferenceTableOverlay();
       } else if (!elements.basisChatOverlay.hidden) {
         closeBasisChatOverlay();
+      } else if (elements.quoteDependencyConfirmModal && !elements.quoteDependencyConfirmModal.hidden) {
+        hideQuoteDependencyConfirmModal({ focusButton: true });
       } else if (elements.profileLoadModal && !elements.profileLoadModal.hidden) {
         hideProfileLoadModal({ focusButton: true });
       } else if (elements.profileOverwriteModal && !elements.profileOverwriteModal.hidden) {
@@ -12690,6 +12898,13 @@ function wireEvents() {
   elements.pricingReferenceModal.addEventListener("click", (event) => {
     if (event.target === elements.pricingReferenceModal || event.target.closest("[data-pricing-reference-close]")) {
       closePricingReferenceModal();
+    }
+  });
+  elements.cancelQuoteDependencyConfirmButton?.addEventListener("click", () => hideQuoteDependencyConfirmModal({ focusButton: true }));
+  elements.confirmQuoteDependencyChangeButton?.addEventListener("click", confirmQuoteDependencyChange);
+  elements.quoteDependencyConfirmModal?.addEventListener("click", (event) => {
+    if (event.target === elements.quoteDependencyConfirmModal || event.target.closest("[data-quote-dependency-confirm-close]")) {
+      hideQuoteDependencyConfirmModal({ focusButton: true });
     }
   });
   elements.analysisConfirmCancelButton.addEventListener("click", closeAnalysisConfirmModal);

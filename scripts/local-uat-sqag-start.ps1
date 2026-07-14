@@ -86,7 +86,7 @@ $python = Resolve-PythonCommand
 
 $usingDefaultUatRoot = $false
 if ([string]::IsNullOrWhiteSpace($UatRoot)) {
-    $UatRoot = Join-Path ([System.IO.Path]::GetTempPath()) "sqag-platform-uat"
+    $UatRoot = Join-Path $repoRoot "_tmp\sqag-platform-uat"
     $usingDefaultUatRoot = $true
 }
 

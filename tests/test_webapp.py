@@ -668,6 +668,27 @@ class WebappServerTest(unittest.TestCase):
             if hasattr(webapp, "RATE_LIMIT_LAST_PRUNE_AT"):
                 webapp.RATE_LIMIT_LAST_PRUNE_AT = 0.0
 
+    def test_local_mutable_storage_defaults_stay_inside_repo(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(webapp, "read_dotenv_value", return_value=""):
+                roots = {
+                    "company data": webapp.configured_data_root(),
+                    "generated output": webapp.configured_output_root(),
+                    "temporary work": webapp.configured_tmp_root(),
+                    "application logs": webapp.configured_log_root(),
+                    "local pricing references": webapp.pricing_references_root(),
+                }
+
+        self.assertEqual(roots["company data"], webapp.PROJECT_ROOT / "_tmp" / "company-data")
+        for label, root in roots.items():
+            with self.subTest(label=label):
+                self.assertTrue(root.is_relative_to(webapp.PROJECT_ROOT))
+
+    def test_configured_data_root_preserves_explicit_override(self):
+        configured_root = test_temp_root() / "explicit-company-data"
+        with mock.patch.dict(os.environ, {"QUOTE_DATA_ROOT": str(configured_root)}, clear=True):
+            self.assertEqual(webapp.configured_data_root(), configured_root)
+
     def deploy_auth_env(self, **overrides):
         env = {
             'SQAG_TRUSTED_PROXY_CIDRS': '127.0.0.1/32',
@@ -11691,12 +11712,111 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertIn('state.activeSidePanel === "customer"', next_panel_body)
         self.assertIn("applyPendingPricingReferenceSelection();", next_panel_body)
         self.assertIn("requestStartAnalysis();", quote_company_next_body)
-        self.assertNotIn("saveQuoteSessionDraftState", quote_company_next_body)
+        self.assertIn("quoteHasDerivedResults()", quote_company_next_body)
+        self.assertIn('setSidePanel("basis"', quote_company_next_body)
+        self.assertIn("saveQuoteSessionDraftState", quote_company_next_body)
+        self.assertIn('id="quoteDependencyConfirmModal"', html)
+        self.assertIn("quoteDependencyChangesForNext()", next_panel_body)
         self.assertNotIn("loadDefaultProfilePreset", profile_change_body)
         self.assertNotIn("setSampleDetails", js)
         self.assertNotIn("DEFAULT_SAMPLE_ID", js)
         self.assertNotIn("/api/samples", js)
 
+    def test_static_dependency_change_detection_warns_only_for_effective_analysis_input_changes(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const marker = `function ${name}(`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const firstImage = {
+  name: "render.png",
+  type: "image/png",
+  size: 4,
+  data_url: "data:image/png;base64,AAAA",
+  session_file_key: "first-key",
+};
+const state = {
+  images: [firstImage],
+  originalAnalysisSnapshot: null,
+  outputRows: [{ description: "Existing output" }],
+  pricingReferenceId: "reference-a",
+  pricingReferenceSource: "bundled",
+};
+const elements = { profileSelect: { value: "bundled::reference-a" } };
+function quoteDraftHasAiAnalysis() { return Boolean(state.originalAnalysisSnapshot); }
+function quoteDraftHasOutputState() { return Boolean(state.outputRows.length); }
+
+eval([
+  "referenceFileType",
+  "referenceFileContentFingerprint",
+  "referenceFileDependencyKey",
+  "referenceFilesDependencySignature",
+  "pricingReferenceSelectionFromValue",
+  "pendingPricingReferenceSelection",
+  "quoteHasDerivedResults",
+  "analyzedReferenceFileSignature",
+  "referenceFilesChangedSinceAnalysis",
+  "pendingPricingReferenceSelectionChanged",
+  "quoteDependencyChangesForNext",
+].map(extractFunction).join("\n"));
+
+state.originalAnalysisSnapshot = {
+  reference_file_signature: referenceFilesDependencySignature(state.images),
+};
+assert.deepStrictEqual(quoteDependencyChangesForNext(), []);
+
+elements.profileSelect.value = "bundled::reference-a";
+assert.strictEqual(pendingPricingReferenceSelectionChanged(), false);
+assert.deepStrictEqual(quoteDependencyChangesForNext(), []);
+
+elements.profileSelect.value = "local::reference-b";
+assert.deepStrictEqual(quoteDependencyChangesForNext(), ["pricing_reference"]);
+
+elements.profileSelect.value = "bundled::reference-a";
+state.images = [{ ...firstImage, session_file_key: "replacement-key" }];
+assert.deepStrictEqual(quoteDependencyChangesForNext(), []);
+
+state.images = [{
+  ...firstImage,
+  data_url: "data:image/png;base64,BBBB",
+  content_fingerprint: "",
+  session_file_key: "changed-key",
+}];
+assert.deepStrictEqual(quoteDependencyChangesForNext(), ["reference_files"]);
+
+state.outputRows = [];
+state.originalAnalysisSnapshot = null;
+elements.profileSelect.value = "local::reference-b";
+assert.deepStrictEqual(quoteDependencyChangesForNext(), []);
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
     def test_static_mobile_ui_polish_has_responsive_header_legend_and_output_cards(self):
         static_dir = ROOT / "webapp" / "static"
         css = (static_dir / "styles.css").read_text(encoding="utf-8")
@@ -14066,6 +14186,8 @@ const state = {
   }],
   companyProfiles: [],
   images: [],
+  quoteBasisSections: [],
+  outputRows: [],
 };
 const elements = {
   presetSelect: { value: "profile:default" },
@@ -14082,6 +14204,7 @@ let appliedDetails = null;
 let appliedOptions = null;
 let clearedPendingPack = false;
 let clearedGeneratedState = false;
+let invalidatedExports = false;
 let workflowStage = "";
 let statusMessage = "";
 
@@ -14093,6 +14216,11 @@ function applyQuoteDetails(details, options) { appliedDetails = details; applied
 function applyDefaultQuoteCompanyFields() { appliedDefaults = true; }
 function renderHeaderLogoPreview() {}
 function clearGeneratedQuoteState() { clearedGeneratedState = true; }
+function quoteCompanyPresentationSignature() { return `${elements.quoteCompanyName.value}|${elements.headerDetails.value}`; }
+function invalidateGeneratedExportsIfPresentationChanged(previousSignature) {
+  invalidatedExports = previousSignature !== quoteCompanyPresentationSignature();
+  return invalidatedExports;
+}
 function quoteDraftHasAiAnalysis() { return Boolean(state.quoteBasisSections.length); }
 function quoteDraftHasOutputState() { return Boolean(state.outputRows.length); }
 function setWorkflowStage(stage) { workflowStage = stage; }
@@ -14128,8 +14256,9 @@ assert.strictEqual(elements.quoteCompanyName.value, "");
 assert.strictEqual(elements.companySignatory.value, "");
 assert.strictEqual(elements.companyTitle.value, "");
 assert.strictEqual(elements.headerLogoInput.value, "");
-assert.strictEqual(clearedGeneratedState, true);
-assert.strictEqual(workflowStage, "needs_images");
+assert.strictEqual(clearedGeneratedState, false);
+assert.strictEqual(invalidatedExports, true);
+assert.strictEqual(workflowStage, "");
 assert.strictEqual(statusMessage, 'Loaded "Default".');
 clearedGeneratedState = false;
 workflowStage = "basis_review";
@@ -17652,6 +17781,7 @@ const projectTitle = {};
 const CUSTOM_CURRENCY_VALUE = "__CUSTOM__";
 const CURRENCY_OPTIONS = [["SGD"], ["AUD"], ["CNY"], ["EUR"], ["GBP"], ["IDR"], ["MYR"], ["THB"], ["USD"]];
 const QUOTE_COMMERCIAL_FIELD_KEYS = ["quoteCurrency", "quoteExchangeRate", "quoteTaxLabel", "quoteTaxRate"];
+const QUOTE_COMPANY_RICH_TEXT_IDS = [];
 const elements = {
   taxLabel: {},
   taxRate: {},
@@ -17674,6 +17804,7 @@ function setDownloadFiles(files = []) {
   state.pdfFile = null;
 }
 function syncQuoteExchangeRateField() {}
+function invalidateGeneratedExportsForPresentationChange() {}
 function updateOutputHeader() {}
 function syncControlStates() {}
 function quoteSessionDraftStateCanSave() { return false; }
