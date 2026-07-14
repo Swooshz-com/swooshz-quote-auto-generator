@@ -12319,19 +12319,22 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertIn('elements.sideViewPdfButton.addEventListener("click", async (event) => {', js)
         download_handler = js.split('elements.sideDownloadButton.addEventListener("click", async (event) => {', 1)[1].split('  document.addEventListener("keydown"', 1)[0]
         pdf_handler = js.split('elements.sideViewPdfButton.addEventListener("click", async (event) => {', 1)[1].split('  document.addEventListener("keydown"', 1)[0]
+        loading_options_body = js.split("function generationLoadingModalOptions", 1)[1].split("function clearActiveJob", 1)[0]
         self.assertIn("event.preventDefault();", download_handler)
         self.assertIn("await handleGenerate();", js)
         self.assertIn("downloadCurrentExcelFile();", js)
         self.assertIn("await waitForUiPaint();", download_handler)
         self.assertIn("commitActiveOutputEditor();", download_handler)
-        self.assertIn("title: \"Regenerating Excel\"", download_handler)
+        self.assertIn("showExcelGeneratingModal(generationLoadingModalOptions(false));", download_handler)
+        self.assertIn('title: "Regenerating Excel"', loading_options_body)
         self.assertIn("await handleGenerate();", download_handler)
         self.assertIn("downloadCurrentExcelFile();", download_handler)
         self.assertIn("hideExcelGeneratingModal();", download_handler)
         self.assertIn("await handleGenerate({ viewPdf: true });", pdf_handler)
         self.assertIn("viewCurrentPdfFile();", pdf_handler)
         self.assertLess(pdf_handler.index("await handleGenerate({ viewPdf: true });"), pdf_handler.index("viewCurrentPdfFile();"))
-        self.assertIn("title: \"Generating PDF\"", pdf_handler)
+        self.assertIn("showExcelGeneratingModal(generationLoadingModalOptions(true));", pdf_handler)
+        self.assertIn('title: "Generating PDF"', loading_options_body)
         self.assertIn(".workspace-pane-footer.is-output-step {\n  grid-template-columns: repeat(4, minmax(0, 1fr));", css)
         self.assertIn(".workspace-pane-footer.is-output-step #sideBackButton", css)
         self.assertIn("grid-column: span 2;", css)
@@ -12585,6 +12588,8 @@ function normalizeCategoryTitle(value = "") {
 eval(extractFunction("normalizeUnit"));
 eval(extractFunction("cleanCustomerQuoteLineText"));
 eval(extractFunction("pricingReferenceLineText"));
+eval(extractFunction("bracketedCatalogReferenceParts"));
+eval(extractFunction("outputCatalogDescription"));
 function outputCellDisplayValue(row, field) {
   if (field === "amount") return row.amount === "" || row.amount === undefined || row.amount === null ? "???" : String(row.amount);
   return String(row[field] || "");
@@ -20652,6 +20657,201 @@ assert.strictEqual(line.unit, "nos");
         self.assertIn('categoryOrderValue', js)
         self.assertIn('pricingReferenceOrder', js)
 
+    def test_static_catalog_output_description_edits_survive_normalize_render_snapshot_and_line_items(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const marker = `function ${name}`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  if (bodyStart < 2) throw new Error(`Missing body for function ${name}`);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+function escapeHtml(value = "") {
+  return String(value).replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[char]));
+}
+
+function normalizeCategoryTitle(value = "") {
+  return String(value || "").trim();
+}
+eval([
+  "normalizeUnit",
+  "cleanCustomerQuoteLineText",
+  "pricingReferenceLineText",
+  "bracketedCatalogReferenceParts",
+  "outputCatalogDescription",
+  "numberOrNull",
+  "orderNumber",
+  "unitPriceEditKind",
+  "effectiveOutputUnitPrice",
+  "formatAmount",
+  "quoteFxMultiplier",
+  "quoteAmountValue",
+  "recalculateOutputRow",
+  "normalizeOutputRow",
+  "categoryOrderValue",
+  "pricingReferenceOrder",
+  "compareOrderValues",
+  "sortOutputRows",
+  "outputCellDisplayValue",
+  "renderOutputEditCell",
+  "renderPricingMatches",
+  "snapshotOutputRows",
+  "outputRowsToLineItems",
+  "outputRowsValid",
+  "commitOutputEditor",
+].map(extractFunction).join("\n"));
+
+function selectedPricingReferenceCurrency() { return "SGD"; }
+function collectQuoteCurrency() { return "SGD"; }
+function collectQuoteExchangeRate() { return 1; }
+function updateOutputHeader() {}
+function updateDownloadButton() {}
+function renderOutputValidationMessages() {}
+function renderMatchSummary() {}
+function syncControlStates() {}
+function markOutputRowsDirty() {}
+
+const elements = {
+  outputSortMode: { value: "pricing_reference" },
+  pricingTableWrap: { hidden: false },
+  pricingEmptyState: { hidden: false },
+  pricingReviewMessages: { innerHTML: "" },
+  pricingMatchesBody: { innerHTML: "", textContent: "" },
+};
+const state = {
+  outputRows: [],
+  pricingMatches: [],
+  lineItems: [],
+  outputSortMode: "pricing_reference",
+};
+
+const catalogMetadata = {
+  section: "COUNTERS AND CABINETS",
+  quantity: 1,
+  unit: "nos",
+  price_mode: "Priced",
+  catalog_unit_price: 1200,
+  pricing_keyword: "counters-standard-reception-counter",
+  pricing_reference_description: "[ nos. standard reception counter ]",
+  catalog_description: "nos. standard reception counter",
+};
+const manualDescription = "Premium reception counter with lockable storage";
+
+const directlyNormalized = normalizeOutputRow({
+  ...catalogMetadata,
+  description: manualDescription,
+});
+assert.strictEqual(directlyNormalized.description, manualDescription);
+assert.strictEqual(directlyNormalized.pricing_keyword, catalogMetadata.pricing_keyword);
+assert.strictEqual(directlyNormalized.catalog_unit_price, 1200);
+
+const legacyWrapped = normalizeOutputRow({
+  ...catalogMetadata,
+  description: "[ nos. standard reception counter ]",
+});
+assert.strictEqual(legacyWrapped.description, "nos. standard reception counter");
+
+const blankCatalogDescription = normalizeOutputRow({
+  ...catalogMetadata,
+  description: "   ",
+});
+assert.strictEqual(blankCatalogDescription.description, "nos. standard reception counter");
+
+const literalCustomBrackets = normalizeOutputRow({
+  section: "Custom",
+  description: "Customer note with [optional] wording",
+  quantity: 1,
+  unit: "lot",
+});
+assert.strictEqual(literalCustomBrackets.description, "Customer note with [optional] wording");
+
+const fullyBracketedDistinctText = normalizeOutputRow({
+  ...catalogMetadata,
+  description: "[ client-authored custom counter package ]",
+});
+assert.strictEqual(fullyBracketedDistinctText.description, "[ client-authored custom counter package ]");
+
+const manualCatalogBrackets = normalizeOutputRow({
+  ...catalogMetadata,
+  description: "Counter package [client-selected finish]",
+});
+assert.strictEqual(manualCatalogBrackets.description, "Counter package [client-selected finish]");
+
+state.outputRows = [normalizeOutputRow({
+  ...catalogMetadata,
+  description: "nos. standard reception counter",
+})];
+commitOutputEditor({
+  dataset: { outputEditorField: "description", outputRow: "0" },
+  value: manualDescription,
+  isConnected: true,
+});
+assert.strictEqual(state.outputRows[0].description, manualDescription);
+assert.strictEqual(state.outputRows[0].pricing_keyword, catalogMetadata.pricing_keyword);
+assert.strictEqual(state.outputRows[0].catalog_unit_price, 1200);
+assert.ok(elements.pricingMatchesBody.innerHTML.includes(manualDescription));
+assert.ok(!elements.pricingMatchesBody.innerHTML.includes(">nos. standard reception counter<"));
+
+renderPricingMatches(state.outputRows);
+renderPricingMatches(state.outputRows);
+assert.strictEqual(state.outputRows[0].description, manualDescription);
+assert.ok(elements.pricingMatchesBody.innerHTML.includes(manualDescription));
+
+const snapshot = snapshotOutputRows(state.outputRows);
+assert.strictEqual(snapshot[0].description, manualDescription);
+assert.strictEqual(snapshot[0].pricing_keyword, catalogMetadata.pricing_keyword);
+
+const items = outputRowsToLineItems(state.outputRows);
+assert.strictEqual(items[0].description, manualDescription);
+assert.strictEqual(items[0].pricing_keyword, catalogMetadata.pricing_keyword);
+assert.strictEqual(items[0].catalog_unit_price, 1200);
+assert.strictEqual(items[0].pricing_reference_description, "[ nos. standard reception counter ]");
+
+const browserStoredRows = JSON.parse(JSON.stringify({ outputRows: snapshot })).outputRows;
+state.outputRows = browserStoredRows.map(normalizeOutputRow);
+renderPricingMatches(state.outputRows);
+assert.strictEqual(state.outputRows[0].description, manualDescription);
+assert.ok(elements.pricingMatchesBody.innerHTML.includes(manualDescription));
+
+const quoteSessionDraftRows = JSON.parse(JSON.stringify({ outputRows: snapshot })).outputRows;
+state.outputRows = quoteSessionDraftRows.map(normalizeOutputRow);
+renderPricingMatches(state.outputRows);
+assert.strictEqual(state.outputRows[0].description, manualDescription);
+assert.strictEqual(outputRowsToLineItems(state.outputRows)[0].description, manualDescription);
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
     def test_static_unresolved_pricing_stays_as_pending_output_row(self):
         static_dir = ROOT / "webapp" / "static"
         js = (static_dir / "app.js").read_text(encoding="utf-8")
@@ -20747,10 +20947,27 @@ const row = outputRowFromLineItem({
   quantity: 1,
   unit: "m length",
   pricing_keyword: "booth-structure-single-side-partition-wall-at-height-2-4m",
-  pricing_reference_description: "m length single side partition wall at height 2.4m",
+  pricing_reference_description: "[ m length single side partition wall at height 2.4m ]",
   status: "quantity-review",
 });
 assert.strictEqual(row.description, "m length single side partition wall at height 2.4m");
+const restoredBracketedRow = normalizeOutputRow({
+  section: "Floor Design",
+  description: "[ sqm 100mm raised platform with aluminum edging ]",
+  quantity: 36,
+  unit: "sqm",
+  catalog_unit_price: 60,
+  pricing_keyword: "floor-design-100mm-raised-platform-with-aluminum-edging",
+  pricing_reference_description: "[ sqm 100mm raised platform with aluminum edging ]",
+});
+assert.strictEqual(restoredBracketedRow.description, "sqm 100mm raised platform with aluminum edging");
+const literalBracketRow = normalizeOutputRow({
+  section: "Custom",
+  description: "Customer note with [optional] wording",
+  quantity: 1,
+  unit: "lot",
+});
+assert.strictEqual(literalBracketRow.description, "Customer note with [optional] wording");
 assert.strictEqual(row.status, "quantity-review");
 assert.strictEqual(row.catalog_unit_price, "");
 assert.strictEqual(row.amount, "");
