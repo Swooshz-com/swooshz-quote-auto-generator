@@ -5266,9 +5266,23 @@ function normalizeOutputRow(row = {}) {
   const priceMode = row.price_mode === "Included" || String(row.display_price || "").toLowerCase() === "included"
     ? "Included"
     : "Priced";
-  const description = row.pricing_keyword
-    ? outputCatalogDescription({ ...row, text: row.description || row.text || "" })
-    : cleanCustomerQuoteLineText(row.description || "");
+  const currentDescription = cleanCustomerQuoteLineText(row.description || "");
+  const trustedCatalogSource = pricingReferenceLineText(
+    row.pricing_reference_description || row.catalog_description || ""
+  );
+  const catalogDescription = row.pricing_keyword && trustedCatalogSource
+    ? outputCatalogDescription({ ...row, description: "", text: "" })
+    : "";
+  const legacyWrappedDescription = bracketedCatalogReferenceParts(row.description || "");
+  const description = !currentDescription
+    ? catalogDescription
+    : (
+      catalogDescription
+      && legacyWrappedDescription?.reference === catalogDescription
+      && !legacyWrappedDescription.detail
+        ? catalogDescription
+        : currentDescription
+    );
   return recalculateOutputRow({
     section: normalizeCategoryTitle(row.section || ""),
     description,
@@ -6825,6 +6839,7 @@ function clearActiveJob() {
   state.activeJob = null;
   saveSessionState();
 }
+
 
 function downloadCurrentExcelFile(file = state.downloadFile) {
   if (!file?.url) return false;
@@ -11955,6 +11970,7 @@ async function resumeSavedJob() {
 
     const polled = await pollJob(resumedJob.id);
     if (polled.aborted) return;
+    hideExcelGeneratingModal();
     if (isInterruptedJobPoll(polled)) {
       hideExcelGeneratingModal();
       handleInterruptedJobPoll(activeJob.type, polled);
