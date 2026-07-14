@@ -6668,6 +6668,7 @@ async function confirmQuoteDependencyChange() {
     hideQuoteDependencyConfirmModal();
     return;
   }
+  const originPanel = state.activeSidePanel;
   hideQuoteDependencyConfirmModal();
   let generatedStateCleared = false;
   if (changes.includes("pricing_reference")) {
@@ -6679,13 +6680,18 @@ async function confirmQuoteDependencyChange() {
   }
   if (generatedStateCleared) {
     setWorkflowStage(hasReferenceFilesForNavigation() ? "ready_to_analyze" : "needs_images");
-    await saveQuoteSessionDraftState({ quoteGenerated: false });
   }
   if (!hasReferenceFilesForNavigation()) {
+    if (generatedStateCleared) await saveQuoteSessionDraftState({ quoteGenerated: false });
     updateSidePanelNav();
     return;
   }
-  await goToNextSidePanel({ dependencyChangeConfirmed: true });
+  const targetPanel = originPanel === "images" ? "customer" : "quote_company";
+  const moved = setSidePanel(targetPanel, { notify: true });
+  if (!moved) updateSidePanelNav();
+  if (generatedStateCleared || moved) {
+    await saveQuoteSessionDraftState({ quoteGenerated: false });
+  }
 }
 
 function quoteCompanyPresentationSignature() {
@@ -13164,5 +13170,4 @@ async function boot() {
 }
 
 boot();
-
 

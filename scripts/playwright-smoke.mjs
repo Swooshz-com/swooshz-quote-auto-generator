@@ -1106,10 +1106,14 @@ async function verifyPricingReferenceSelectionCommitsOnCustomerNext(page) {
     source: state.pricingReferenceSource,
     basisCount: state.quoteBasisSections.length,
     outputCount: state.outputRows.length,
+    analysisConfirmVisible: !elements.analysisConfirmModal.hidden,
     dashboardSession: state.quoteSessions.find((session) => session.session_id === state.quoteSessionId) || null,
   }));
   if (committed.pricingReferenceId !== "pending-refresh-reference" || committed.source !== "local" || committed.basisCount !== 0 || committed.outputCount !== 0) {
     throw new Error("Confirmed pricing-reference change did not invalidate old generated state: " + JSON.stringify(committed));
+  }
+  if (committed.analysisConfirmVisible) {
+    throw new Error("Confirmed pricing-reference invalidation unexpectedly opened Start Analysis.");
   }
   if (committed.dashboardSession?.status?.quote_generated) {
     throw new Error("Dashboard latest state still reported a generated quote after dependency invalidation.");

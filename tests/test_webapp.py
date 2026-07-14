@@ -11905,6 +11905,71 @@ assert.strictEqual(navUpdates, 2);
 
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
 
+    def test_static_dependency_confirmation_does_not_chain_start_analysis(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractAsyncFunction(name) {
+  const marker = `async function ${name}(`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const state = {
+  pendingQuoteDependencyChanges: ["pricing_reference"],
+  activeSidePanel: "quote_company",
+};
+let routedPanel = "";
+let nextCalls = 0;
+let saveCalls = 0;
+function hideQuoteDependencyConfirmModal() { state.pendingQuoteDependencyChanges = []; }
+function applyPendingPricingReferenceSelection() { return true; }
+function clearGeneratedQuoteState() {}
+function setWorkflowStage() {}
+function hasReferenceFilesForNavigation() { return true; }
+function updateSidePanelNav() {}
+function setSidePanel(panelName) { routedPanel = panelName; state.activeSidePanel = panelName; return true; }
+async function saveQuoteSessionDraftState() { saveCalls += 1; }
+async function goToNextSidePanel() { nextCalls += 1; }
+
+eval(extractAsyncFunction("confirmQuoteDependencyChange"));
+
+(async () => {
+  await confirmQuoteDependencyChange();
+  assert.strictEqual(routedPanel, "quote_company");
+  assert.strictEqual(state.activeSidePanel, "quote_company");
+  assert.strictEqual(nextCalls, 0);
+  assert.strictEqual(saveCalls, 1);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
     def test_static_mobile_ui_polish_has_responsive_header_legend_and_output_cards(self):
         static_dir = ROOT / "webapp" / "static"
         css = (static_dir / "styles.css").read_text(encoding="utf-8")
