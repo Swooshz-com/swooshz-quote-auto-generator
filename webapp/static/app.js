@@ -11616,8 +11616,8 @@ async function resumeSavedJob() {
 
     const polled = await pollJob(activeJob.id);
     if (polled.aborted) return;
-    hideExcelGeneratingModal();
     if (isInterruptedJobPoll(polled)) {
+      hideExcelGeneratingModal();
       handleInterruptedJobPoll(activeJob.type, polled);
       return;
     }
@@ -11629,6 +11629,7 @@ async function resumeSavedJob() {
       state.quoteSessionId = safeQuoteSessionId(data.quote_session.session_id) || state.quoteSessionId;
     }
     if (!polled.ok || ["blocked", "failed"].includes(polled.data.status) || data.status === "blocked" || data.status === "failed") {
+      hideExcelGeneratingModal();
       setWorkflowStage("details_review");
       setResultStatus(data.status || "Failed", "is-bad");
       const blocked = polled.data.status === "blocked" || data.status === "blocked";
@@ -11642,6 +11643,7 @@ async function resumeSavedJob() {
     const needsPricingReview = polled.data.status === "needs_review"
       || data.status === "needs_confirmation";
     if (needsPricingReview) {
+      hideExcelGeneratingModal();
       setWorkflowStage("completed");
       setResultStatus("Needs pricing review", "is-warn");
       renderMessages([]);
@@ -11660,6 +11662,8 @@ async function resumeSavedJob() {
     renderMatchSummary(data);
     await saveQuoteSessionDraftState({ quoteGenerated: true });
     syncControlStates();
+    if (!needsPricingReview && showGeneratedExportReadyModal(viewPdf)) return;
+    hideExcelGeneratingModal();
     return;
   }
 
@@ -12093,6 +12097,12 @@ function wireEvents() {
     } finally {
       hideExcelGeneratingModal();
     }
+  });
+  elements.excelGeneratingActionButton?.addEventListener("click", () => {
+    handleGeneratedExportReadyAction();
+  });
+  elements.excelGeneratingCloseButton?.addEventListener("click", () => {
+    hideExcelGeneratingModal();
   });
   document.addEventListener("keydown", (event) => {
     if (handleDashboardEnterKey(event)) return;
