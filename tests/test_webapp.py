@@ -12361,7 +12361,7 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertNotIn("hideExcelGeneratingModal();", post_poll_prefix)
         finalizing_index = resumed_generation_body.index("showExcelGeneratingModal(generationFinalizingModalOptions(viewPdf));")
         save_index = resumed_generation_body.index("await saveQuoteSessionDraftState({ quoteGenerated: true });")
-        terminal_clear_index = resumed_generation_body.rindex("clearActiveJob();")
+        terminal_clear_index = resumed_generation_body.index("clearActiveJob();", save_index)
         ready_index = resumed_generation_body.index("showGeneratedExportReadyModal(viewPdf)")
         self.assertLess(finalizing_index, save_index)
         self.assertLess(save_index, terminal_clear_index)
