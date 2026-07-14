@@ -11753,6 +11753,7 @@ const firstImage = {
   type: "image/png",
   size: 4,
   data_url: "data:image/png;base64,AAAA",
+  content_fingerprint: `sha256:${"a".repeat(64)}`,
   session_file_key: "first-key",
 };
 const state = {
@@ -11767,10 +11768,11 @@ function quoteDraftHasAiAnalysis() { return Boolean(state.originalAnalysisSnapsh
 function quoteDraftHasOutputState() { return Boolean(state.outputRows.length); }
 
 eval([
+  "normalizedContentFingerprint",
   "referenceFileType",
-  "referenceFileContentFingerprint",
   "referenceFileDependencyKey",
   "referenceFilesDependencySignature",
+  "referenceFileSignatureIsStrong",
   "pricingReferenceSelectionFromValue",
   "pendingPricingReferenceSelection",
   "quoteHasDerivedResults",
@@ -11799,7 +11801,7 @@ assert.deepStrictEqual(quoteDependencyChangesForNext(), []);
 state.images = [{
   ...firstImage,
   data_url: "data:image/png;base64,BBBB",
-  content_fingerprint: "",
+  content_fingerprint: `sha256:${"b".repeat(64)}`,
   session_file_key: "changed-key",
 }];
 assert.deepStrictEqual(quoteDependencyChangesForNext(), ["reference_files"]);
@@ -11808,6 +11810,296 @@ state.outputRows = [];
 state.originalAnalysisSnapshot = null;
 elements.profileSelect.value = "local::reference-b";
 assert.deepStrictEqual(quoteDependencyChangesForNext(), []);
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_static_complete_sha256_fingerprints_close_sampled_collision_and_persist_identity(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const { webcrypto } = require("crypto");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const markers = [`async function ${name}(`, `function ${name}(`];
+  const starts = markers.map((marker) => source.indexOf(marker)).filter((index) => index >= 0);
+  const start = starts.length ? Math.min(...starts) : -1;
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  if (bodyStart < 2) throw new Error(`Missing body for function ${name}`);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+function legacySampledFingerprint(dataUrl = "") {
+  const text = String(dataUrl || "");
+  let hash = 2166136261;
+  const stride = Math.max(1, Math.floor(text.length / 4096));
+  for (let index = 0; index < text.length; index += stride) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${text.length}:${(hash >>> 0).toString(16)}`;
+}
+
+global.window = { crypto: webcrypto };
+const MAX_REFERENCE_IMAGES = 8;
+const SERVER_JOB_TYPES = new Set(["draft", "basis_chat", "generate", "generate_pdf"]);
+const state = {
+  images: [],
+  originalAnalysisSnapshot: null,
+  outputRows: [{ description: "Retained output" }],
+  headerLogo: null,
+  downloadFile: null,
+  pdfFile: null,
+  outputRevision: 0,
+};
+let quoteCompanyName = "Fingerprint Co";
+function quoteDraftHasAiAnalysis() { return Boolean(state.originalAnalysisSnapshot); }
+function quoteDraftHasOutputState() { return Boolean(state.outputRows.length); }
+function isAcceptedReferenceFile() { return true; }
+function fileToDataUrl(file) { return Promise.resolve(file.dataUrl); }
+function syncRichTextSources() {}
+function collectQuoteCompanyProfileDetails() { return { company: { name: quoteCompanyName } }; }
+function markOutputRowsDirty() {
+  state.outputRevision += 1;
+  state.downloadFile = null;
+  state.pdfFile = null;
+}
+
+eval([
+  "normalizedContentFingerprint",
+  "dataUrlBytes",
+  "sha256ContentFingerprint",
+  "contentFingerprintFromDataUrl",
+  "ensureContentFingerprint",
+  "referenceFileType",
+  "filesToImageEntries",
+  "referenceFileDependencyKey",
+  "referenceFilesDependencySignature",
+  "referenceFileSignatureIsStrong",
+  "quoteHasDerivedResults",
+  "analyzedReferenceFileSignature",
+  "referenceFilesChangedSinceAnalysis",
+  "quoteCompanyPresentationSignature",
+  "invalidateGeneratedExportsForPresentationChange",
+  "invalidateGeneratedExportsIfPresentationChanged",
+].map(extractFunction).join("\n"));
+
+(async () => {
+  const prefix = "data:image/png;base64,";
+  const payloadA = "A".repeat(8192);
+  const payloadB = `${payloadA[0]}B${payloadA.slice(2)}`;
+  const dataUrlA = prefix + payloadA;
+  const dataUrlB = prefix + payloadB;
+  const changedGlobalIndex = prefix.length + 1;
+  const oldStride = Math.max(1, Math.floor(dataUrlA.length / 4096));
+  assert.ok(dataUrlA.length > 4096);
+  assert.notStrictEqual(changedGlobalIndex % oldStride, 0);
+  assert.strictEqual(dataUrlA.length, dataUrlB.length);
+  assert.strictEqual(Buffer.from(payloadA, "base64").length, Buffer.from(payloadB, "base64").length);
+  assert.strictEqual(legacySampledFingerprint(dataUrlA), legacySampledFingerprint(dataUrlB));
+
+  const fingerprintA = await contentFingerprintFromDataUrl(dataUrlA);
+  const fingerprintB = await contentFingerprintFromDataUrl(dataUrlB);
+  assert.match(fingerprintA, /^sha256:[0-9a-f]{64}$/);
+  assert.match(fingerprintB, /^sha256:[0-9a-f]{64}$/);
+  assert.notStrictEqual(fingerprintA, fingerprintB);
+  assert.strictEqual(normalizedContentFingerprint(fingerprintA.toUpperCase()), fingerprintA);
+  assert.strictEqual(normalizedContentFingerprint("not-a-digest"), "");
+
+  const ingested = await filesToImageEntries([{
+    name: "render.png",
+    type: "image/png",
+    size: Buffer.from(payloadA, "base64").length,
+    dataUrl: dataUrlA,
+    async arrayBuffer() {
+      const bytes = Buffer.from(payloadA, "base64");
+      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    },
+  }]);
+  assert.strictEqual(ingested.length, 1);
+  assert.strictEqual(ingested[0].content_fingerprint, fingerprintA);
+
+  const baseImage = {
+    name: "render.png",
+    type: "image/png",
+    size: Buffer.from(payloadA, "base64").length,
+    data_url: dataUrlA,
+    content_fingerprint: fingerprintA,
+    session_file_key: "first-object",
+  };
+  state.images = [baseImage];
+  const baseline = referenceFilesDependencySignature(state.images);
+  assert.strictEqual(referenceFileSignatureIsStrong(baseline), true);
+  state.originalAnalysisSnapshot = { reference_file_signature: baseline };
+  assert.strictEqual(referenceFilesChangedSinceAnalysis(), false);
+
+  state.images = [{ ...baseImage, data_url: dataUrlB, content_fingerprint: fingerprintB, session_file_key: "second-object" }];
+  assert.strictEqual(referenceFilesChangedSinceAnalysis(), true);
+
+  state.images = [{ ...baseImage, session_file_key: "third-object" }];
+  assert.strictEqual(referenceFilesChangedSinceAnalysis(), false);
+
+  const legacyWithPayload = await ensureContentFingerprint({ ...baseImage, content_fingerprint: "" });
+  assert.strictEqual(legacyWithPayload.content_fingerprint, fingerprintA);
+  const legacyWithoutPayload = await ensureContentFingerprint({
+    name: baseImage.name,
+    type: baseImage.type,
+    size: baseImage.size,
+    session_file_key: "legacy-missing-payload",
+  });
+  assert.strictEqual(legacyWithoutPayload.content_fingerprint, "");
+  state.images = [legacyWithoutPayload];
+  assert.strictEqual(referenceFilesDependencySignature(state.images), "");
+  assert.strictEqual(referenceFilesChangedSinceAnalysis(), true);
+
+  const secondImage = { ...baseImage, name: "second.png", session_file_key: "second" };
+  assert.notStrictEqual(
+    referenceFilesDependencySignature([baseImage, secondImage]),
+    referenceFilesDependencySignature([secondImage, baseImage]),
+  );
+
+  state.headerLogo = { ...baseImage, name: "logo.png" };
+  const firstLogoSignature = quoteCompanyPresentationSignature();
+  assert.strictEqual(firstLogoSignature.includes("base64,"), false);
+  state.headerLogo = { ...baseImage, name: "logo.png", session_file_key: "different-logo-object" };
+  assert.strictEqual(quoteCompanyPresentationSignature(), firstLogoSignature);
+  state.headerLogo = { ...baseImage, name: "logo.png", data_url: dataUrlB, content_fingerprint: fingerprintB };
+  assert.notStrictEqual(quoteCompanyPresentationSignature(), firstLogoSignature);
+  state.downloadFile = { name: "quotation.xlsx", url: "/quotation.xlsx" };
+  state.pdfFile = { name: "quotation.pdf", url: "/quotation.pdf" };
+  assert.strictEqual(invalidateGeneratedExportsIfPresentationChanged(firstLogoSignature), true);
+  assert.strictEqual(state.downloadFile, null);
+  assert.strictEqual(state.pdfFile, null);
+
+  const changedLogoSignature = quoteCompanyPresentationSignature();
+  assert.strictEqual(invalidateGeneratedExportsIfPresentationChanged(changedLogoSignature), false);
+  quoteCompanyName = "Changed Fingerprint Co";
+  assert.notStrictEqual(quoteCompanyPresentationSignature(), changedLogoSignature);
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_static_restored_active_jobs_enforce_phase_specific_expiry_timestamp_and_scope(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const marker = `function ${name}(`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  if (bodyStart < 2) throw new Error(`Missing body for function ${name}`);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const ACTIVE_JOB_STARTING_MAX_AGE_MS = 5 * 60 * 1000;
+const ACTIVE_JOB_RUNNING_DRAFT_MAX_AGE_MS = 30 * 60 * 1000;
+const ACTIVE_JOB_RUNNING_BASIS_CHAT_MAX_AGE_MS = 10 * 60 * 1000;
+const ACTIVE_JOB_RUNNING_CONFIRM_BASIS_MAX_AGE_MS = 5 * 60 * 1000;
+const ACTIVE_JOB_RUNNING_GENERATION_MAX_AGE_MS = 15 * 60 * 1000;
+const ACTIVE_JOB_CLOCK_SKEW_MS = 60 * 1000;
+const SERVER_JOB_TYPES = new Set(["draft", "basis_chat", "generate", "generate_pdf"]);
+const state = { browserRecoveryScope: "scope-a" };
+
+eval([
+  "currentBrowserRecoveryScope",
+  "activeJobMaxAgeMs",
+  "normalizeActiveJob",
+].map(extractFunction).join("\n"));
+
+const nowMs = Date.parse("2026-07-14T12:00:00.000Z");
+const atAge = (ageMs) => new Date(nowMs - ageMs).toISOString();
+const futureBy = (offsetMs) => new Date(nowMs + offsetMs).toISOString();
+const job = (type, phase, startedAt, extra = {}) => ({
+  id: type === "confirm_basis" ? "operation-confirm123" : `job-${type.replace("_", "-")}-12345678`,
+  type,
+  phase,
+  startedAt,
+  browserRecoveryScope: "scope-a",
+  ...extra,
+});
+const restore = (value) => normalizeActiveJob(value, { restoring: true, nowMs });
+
+for (const type of ["draft", "basis_chat", "generate", "generate_pdf", "confirm_basis"]) {
+  assert.ok(restore(job(type, "starting", atAge(ACTIVE_JOB_STARTING_MAX_AGE_MS - 1))), `${type} fresh starting`);
+  assert.strictEqual(restore(job(type, "starting", atAge(ACTIVE_JOB_STARTING_MAX_AGE_MS + 1))), null, `${type} stale starting`);
+}
+
+const runningLimits = {
+  draft: ACTIVE_JOB_RUNNING_DRAFT_MAX_AGE_MS,
+  basis_chat: ACTIVE_JOB_RUNNING_BASIS_CHAT_MAX_AGE_MS,
+  confirm_basis: ACTIVE_JOB_RUNNING_CONFIRM_BASIS_MAX_AGE_MS,
+  generate: ACTIVE_JOB_RUNNING_GENERATION_MAX_AGE_MS,
+  generate_pdf: ACTIVE_JOB_RUNNING_GENERATION_MAX_AGE_MS,
+};
+for (const [type, limit] of Object.entries(runningLimits)) {
+  assert.ok(restore(job(type, "running", atAge(limit - 1))), `${type} fresh running`);
+  assert.strictEqual(restore(job(type, "running", atAge(limit + 1))), null, `${type} stale running`);
+}
+
+assert.ok(restore(job("draft", "running", futureBy(ACTIVE_JOB_CLOCK_SKEW_MS))));
+assert.strictEqual(restore(job("draft", "running", futureBy(ACTIVE_JOB_CLOCK_SKEW_MS + 1))), null);
+assert.strictEqual(restore(job("draft", "running", "")), null);
+assert.strictEqual(restore(job("draft", "running", "not-a-date")), null);
+assert.strictEqual(restore(job("draft", "running", "2026-02-31T00:00:00Z")), null);
+assert.strictEqual(restore(job("draft", "running", nowMs)), null);
+assert.strictEqual(restore(job("draft", "invalid", atAge(1000))), null);
+assert.strictEqual(restore(job("draft", "running", atAge(1000), { browserRecoveryScope: "scope-b" })), null);
+assert.strictEqual(restore(job("draft", "running", atAge(1000), { browserRecoveryScope: "" })), null);
+
+const newlyCreated = normalizeActiveJob({
+  id: "job-new-operation123",
+  type: "draft",
+  phase: "starting",
+  startedAt: new Date(nowMs).toISOString(),
+}, { nowMs });
+assert.ok(newlyCreated);
+assert.strictEqual(newlyCreated.browserRecoveryScope, "scope-a");
+assert.strictEqual(newlyCreated.startedAt, "2026-07-14T12:00:00.000Z");
 """
         completed = subprocess.run(
             [node, "-e", script],
@@ -14790,6 +15082,7 @@ function persistLastProfilePresetSelection(value) { persistedSelection = value; 
 function appIsBusy() { return false; }
 function genericFailureMessages(value) { return value?.errors || ["Failed."]; }
 function selectedPreset() { return null; }
+async function quoteDetailsWithStrongLogoFingerprint(details) { return details; }
 const window = { setTimeout(callback) { callback(); } };
 async function postJson(url, payload) {
   posted.push({ url, payload });
@@ -14993,6 +15286,7 @@ function genericFailureMessages(value) { return value?.errors || ["Failed."]; }
 function applyQuoteDetails() { throw new Error("Import defaults should not apply for a normal save."); }
 function clearGeneratedQuoteState() {}
 function setWorkflowStage() {}
+async function quoteDetailsWithStrongLogoFingerprint(details) { return details; }
 const window = { setTimeout(callback) { callback(); } };
 async function postJson(url, payload) {
   posted.push({ url, payload });
@@ -15366,7 +15660,9 @@ assert.strictEqual(elements.analyseAgainButton.title, "Re-analyse the quote basi
         script = r"""
 const fs = require("fs");
 const assert = require("assert");
+const { webcrypto } = require("crypto");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
+global.window = { crypto: webcrypto };
 
 function extractFunction(name) {
   const functionMarker = `function ${name}(`;
@@ -15398,6 +15694,11 @@ function loadSessionFileMap(keys) {
 }
 
 eval([
+  "normalizedContentFingerprint",
+  "dataUrlBytes",
+  "sha256ContentFingerprint",
+  "contentFingerprintFromDataUrl",
+  "ensureContentFingerprint",
   "referenceFileHasPayload",
   "restoreSessionImages",
 ].map(extractFunction).join("\n"));
@@ -15438,7 +15739,9 @@ eval([
         script = r"""
 const fs = require("fs");
 const assert = require("assert");
+const { webcrypto } = require("crypto");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
+global.window = { crypto: webcrypto };
 
 function extractFunction(name) {
   const functionMarker = `function ${name}(`;
@@ -15473,6 +15776,12 @@ function selectedPreset() {
 }
 
 eval([
+  "normalizedContentFingerprint",
+  "dataUrlBytes",
+  "sha256ContentFingerprint",
+  "contentFingerprintFromDataUrl",
+  "ensureContentFingerprint",
+  "quoteDetailsWithStrongLogoFingerprint",
   "selectedPresetCompanyLogo",
   "restoreQuoteDetailsLogo",
 ].map(extractFunction).join("\n"));
@@ -15495,6 +15804,7 @@ eval([
   assert.strictEqual(restored.company.logo_data_url, "data:image/png;base64,U1RPUkVE");
   assert.strictEqual(restored.company.logo_name, "stored-logo.png");
   assert.strictEqual(restored.company.logo_type, "image/png");
+  assert.match(restored.company.logo_content_fingerprint, /^sha256:[0-9a-f]{64}$/);
 
   requestedKeys = [];
   fileMap = new Map();
@@ -15517,6 +15827,7 @@ eval([
   assert.strictEqual(fallback.company.logo_data_url, "data:image/png;base64,UFJPRklMRQ==");
   assert.strictEqual(fallback.company.logo_name, "profile-logo.png");
   assert.strictEqual(fallback.company.logo_type, "image/png");
+  assert.match(fallback.company.logo_content_fingerprint, /^sha256:[0-9a-f]{64}$/);
 })().catch((error) => {
   console.error(error);
   process.exit(1);
@@ -15634,6 +15945,7 @@ function showQuoteFlow() { shownQuoteFlow = true; }
 
 eval([
   "safeQuoteSessionId",
+  "normalizedContentFingerprint",
   "referenceFileType",
   "dashboardDraftImageFileFieldsMatch",
   "dashboardDraftImagePayloadMatches",
@@ -15762,6 +16074,7 @@ function showQuoteFlow() {}
 
 eval([
   "safeQuoteSessionId",
+  "normalizedContentFingerprint",
   "referenceFileType",
   "dashboardDraftImageFileFieldsMatch",
   "dashboardDraftImagePayloadMatches",
@@ -16109,7 +16422,7 @@ function extractFunction(name) {
   throw new Error(`Unclosed function ${name}`);
 }
 
-eval(["imageDuplicateKey", "uniqueImageEntries"].map(extractFunction).join("\n"));
+eval(["normalizedContentFingerprint", "imageDuplicateKey", "uniqueImageEntries"].map(extractFunction).join("\n"));
 const existing = [{ name: "a.jpg", type: "image/jpeg", size: 10, data_url: "data:image/jpeg;base64,AAA" }];
 const result = uniqueImageEntries([
   { name: "copy.jpg", type: "image/jpeg", size: 10, data_url: "data:image/jpeg;base64,AAA" },
@@ -16283,12 +16596,14 @@ const state = {
     name: "logo.png",
     type: "image/png",
     size: 512,
+    content_fingerprint: `sha256:${"c".repeat(64)}`,
     data_url: "data:image/png;base64,TE9HTw==",
   },
   images: [{
     name: "huge-reference.pdf",
     type: "application/pdf",
     size: 12_000_000,
+    content_fingerprint: `sha256:${"d".repeat(64)}`,
     data_url: `data:application/pdf;base64,${"A".repeat(1024)}`,
   }],
   workflowStage: "ready_to_analyze",
@@ -16349,6 +16664,7 @@ function normalizeActiveJob(job) { return job?.id ? job : null; }
 function saveWorkspaceViewState() {}
 
 eval([
+  "normalizedContentFingerprint",
   "sessionFileKeyForImage",
   "sessionFileKeyForLogo",
   "sessionImageMetadata",
@@ -16372,16 +16688,20 @@ assert.strictEqual(saved.quoteDetails.company.name, "Persistent Company");
 assert.strictEqual(saved.quoteDetails.company.logo_data_url, undefined);
 assert.strictEqual(saved.quoteDetails.company.logo_name, "logo.png");
 assert.strictEqual(saved.quoteDetails.company.logo_type, "image/png");
+assert.strictEqual(saved.quoteDetails.company.logo_content_fingerprint, `sha256:${"c".repeat(64)}`);
 assert.ok(saved.quoteDetails.company.logo_session_file_key);
 assert.strictEqual(saved.images.length, 1);
 assert.strictEqual(saved.images[0].name, "huge-reference.pdf");
 assert.strictEqual(saved.images[0].data_url, undefined);
+assert.strictEqual(saved.images[0].content_fingerprint, `sha256:${"d".repeat(64)}`);
 assert.ok(saved.images[0].session_file_key);
 assert.strictEqual(persistedRecords.length, 2);
 assert.strictEqual(persistedRecords[0].data_url.startsWith("data:application/pdf;base64,"), true);
 assert.strictEqual(persistedRecords[0].file_role, "reference");
+assert.strictEqual(persistedRecords[0].content_fingerprint, `sha256:${"d".repeat(64)}`);
 assert.strictEqual(persistedRecords[1].data_url, "data:image/png;base64,TE9HTw==");
 assert.strictEqual(persistedRecords[1].file_role, "quote_company_logo");
+assert.strictEqual(persistedRecords[1].content_fingerprint, `sha256:${"c".repeat(64)}`);
 assert.strictEqual(persistedRecords[1].session_file_key, saved.quoteDetails.company.logo_session_file_key);
 assert.strictEqual(state.images[0].session_file_key, saved.images[0].session_file_key);
 assert.strictEqual(state.headerLogo.session_file_key, saved.quoteDetails.company.logo_session_file_key);

@@ -8,6 +8,18 @@ const QUOTE_SESSION_STORAGE_KEY = "swooshz_quote_session_v1";
 const WORKSPACE_VIEW_STORAGE_KEY = "swooshz_workspace_view_v1";
 const DASHBOARD_OPERATION_STORAGE_KEY = "swooshz_dashboard_operation_v1";
 const DASHBOARD_OPERATION_MAX_AGE_MS = 15 * 60 * 1000;
+// Recovery windows are deliberately phase/type specific: a request that never received a
+// server acknowledgement is retried only briefly, while 10-15 minute draft analysis gets
+// a wider running window. Export and basis operations should finish much sooner.
+const ACTIVE_JOB_STARTING_MAX_AGE_MS = 5 * 60 * 1000;
+const ACTIVE_JOB_RUNNING_DRAFT_MAX_AGE_MS = 30 * 60 * 1000;
+const ACTIVE_JOB_RUNNING_BASIS_CHAT_MAX_AGE_MS = 10 * 60 * 1000;
+const ACTIVE_JOB_RUNNING_CONFIRM_BASIS_MAX_AGE_MS = 5 * 60 * 1000;
+const ACTIVE_JOB_RUNNING_GENERATION_MAX_AGE_MS = 15 * 60 * 1000;
+const ACTIVE_JOB_CLOCK_SKEW_MS = 60 * 1000;
+// Starting work should survive only an immediate refresh. Draft analysis gets 30 minutes
+// for the documented 10-15 minute AI window; chat, local normalization, and exports use
+// shorter limits that cover realistic completion without replaying abandoned work later.
 const QUOTE_SESSION_FILE_DB_NAME = "swooshz_quote_session_files_v1";
 const QUOTE_SESSION_FILE_STORE_NAME = "reference_files";
 const QUOTE_SESSION_FILE_DB_VERSION = 1;
@@ -651,19 +663,65 @@ function normalizeRestorableOverlay(value = "") {
   return RESTORABLE_OVERLAYS.has(overlay) ? overlay : "";
 }
 
-function normalizeActiveJob(job = {}) {
+function activeJobMaxAgeMs(type = "", phase = "starting") {
+  if (phase === "starting") return ACTIVE_JOB_STARTING_MAX_AGE_MS;
+  if (type === "draft") return ACTIVE_JOB_RUNNING_DRAFT_MAX_AGE_MS;
+  if (type === "basis_chat") return ACTIVE_JOB_RUNNING_BASIS_CHAT_MAX_AGE_MS;
+  if (type === "confirm_basis") return ACTIVE_JOB_RUNNING_CONFIRM_BASIS_MAX_AGE_MS;
+  if (type === "generate" || type === "generate_pdf") return ACTIVE_JOB_RUNNING_GENERATION_MAX_AGE_MS;
+  return 0;
+}
+
+function normalizeActiveJob(job = {}, options = {}) {
   if (!job || typeof job !== "object") return null;
   const type = String(job.type || "").trim();
   const id = String(job.id || "").trim();
   if (![...SERVER_JOB_TYPES, "confirm_basis"].includes(type) || !id) return null;
   if (SERVER_JOB_TYPES.has(type) && !/^job-[A-Za-z0-9_-]{8,80}$/.test(id)) return null;
   if (type === "confirm_basis" && !/^operation-[A-Za-z0-9_-]{8,80}$/.test(id)) return null;
+  const phase = String(job.phase || "").trim();
+  if (!["starting", "running"].includes(phase)) return null;
+  const rawStartedAt = job.startedAt ?? job.created_at ?? job.createdAt;
+  if (typeof rawStartedAt !== "string") return null;
+  const startedAt = rawStartedAt.trim();
+  const timestampMatch = startedAt.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?Z$/);
+  if (!timestampMatch) return null;
+  const [, year, month, day, hour, minute, second, fraction = ""] = timestampMatch;
+  const startedMs = Date.UTC(
+    Number(year),
+    Number(month) - 1,
+    Number(day),
+    Number(hour),
+    Number(minute),
+    Number(second),
+    Number((fraction + "000").slice(0, 3)),
+  );
+  const parsedDate = new Date(startedMs);
+  if (
+    !Number.isFinite(startedMs)
+    || parsedDate.getUTCFullYear() !== Number(year)
+    || parsedDate.getUTCMonth() !== Number(month) - 1
+    || parsedDate.getUTCDate() !== Number(day)
+    || parsedDate.getUTCHours() !== Number(hour)
+    || parsedDate.getUTCMinutes() !== Number(minute)
+    || parsedDate.getUTCSeconds() !== Number(second)
+  ) return null;
+  const currentScope = currentBrowserRecoveryScope();
+  const browserRecoveryScope = String(job.browserRecoveryScope || (options.restoring === true ? "" : currentScope)).trim();
+  if (!currentScope || browserRecoveryScope !== currentScope) return null;
+  if (options.restoring === true) {
+    const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
+    const ageMs = nowMs - startedMs;
+    const maxAgeMs = activeJobMaxAgeMs(type, phase);
+    if (ageMs < -ACTIVE_JOB_CLOCK_SKEW_MS || !maxAgeMs || ageMs > maxAgeMs) return null;
+  }
   return {
     ...job,
     id,
     type,
-    phase: job.phase === "running" ? "running" : "starting",
-    startedAt: String(job.startedAt || job.created_at || job.createdAt || new Date().toISOString()),
+    phase,
+    startedAt: parsedDate.toISOString(),
+    browserRecoveryScope,
   };
 }
 
@@ -1349,32 +1407,78 @@ function referenceFileType(entry = {}) {
   return String(entry.name || "").toLowerCase().endsWith(".pdf") ? "application/pdf" : "image";
 }
 
-function referenceFileContentFingerprint(dataUrl = "") {
-  const text = String(dataUrl || "");
-  if (!text) return "";
-  let hash = 2166136261;
-  const stride = Math.max(1, Math.floor(text.length / 4096));
-  for (let index = 0; index < text.length; index += stride) {
-    hash ^= text.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
+function normalizedContentFingerprint(value = "") {
+  const text = String(value || "").trim().toLowerCase();
+  return /^sha256:[0-9a-f]{64}$/.test(text) ? text : "";
+}
+
+function dataUrlBytes(dataUrl = "") {
+  const text = String(dataUrl || "").trim();
+  const separatorIndex = text.indexOf(",");
+  if (!text.startsWith("data:") || separatorIndex < 0) return null;
+  const metadata = text.slice(0, separatorIndex);
+  const payload = text.slice(separatorIndex + 1);
+  try {
+    if (/;base64(?:;|$)/i.test(metadata)) {
+      const binary = window.atob ? window.atob(payload) : atob(payload);
+      return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    }
+    return new TextEncoder().encode(decodeURIComponent(payload));
+  } catch {
+    return null;
   }
-  return `${text.length}:${(hash >>> 0).toString(16)}`;
+}
+
+async function sha256ContentFingerprint(content) {
+  const subtle = window.crypto?.subtle;
+  if (!subtle || content === null || content === undefined) return "";
+  let bytes;
+  if (content instanceof ArrayBuffer) bytes = new Uint8Array(content);
+  else if (ArrayBuffer.isView(content)) bytes = new Uint8Array(content.buffer, content.byteOffset, content.byteLength);
+  else return "";
+  const digest = await subtle.digest("SHA-256", bytes);
+  const hex = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return normalizedContentFingerprint(`sha256:${hex}`);
+}
+
+async function contentFingerprintFromDataUrl(dataUrl = "") {
+  const bytes = dataUrlBytes(dataUrl);
+  return bytes ? sha256ContentFingerprint(bytes) : "";
+}
+
+async function ensureContentFingerprint(entry = {}) {
+  const existing = normalizedContentFingerprint(entry.content_fingerprint);
+  if (existing) return { ...entry, content_fingerprint: existing };
+  const fingerprint = await contentFingerprintFromDataUrl(entry.data_url || "");
+  return { ...entry, content_fingerprint: fingerprint };
 }
 
 function referenceFileDependencyKey(image = {}) {
   const name = String(image.name || "").trim().toLowerCase();
   const type = referenceFileType(image);
   const size = Number.isFinite(Number(image.size)) ? Number(image.size) : 0;
-  const fingerprint = String(image.content_fingerprint || "").trim()
-    || referenceFileContentFingerprint(image.data_url || "");
+  const fingerprint = normalizedContentFingerprint(image.content_fingerprint);
+  if (!fingerprint) return "";
   return `${name}:${type}:${size}:${fingerprint}`;
 }
 
 function referenceFilesDependencySignature(images = state.images) {
-  return JSON.stringify((Array.isArray(images) ? images : [])
-    .map(referenceFileDependencyKey)
-    .filter(Boolean)
-    .sort());
+  const entries = Array.isArray(images) ? images : [];
+  const keys = entries.map(referenceFileDependencyKey);
+  if (keys.some((key) => !key)) return "";
+  // File order is preserved because the ordered image array is sent to AI analysis.
+  return JSON.stringify(keys);
+}
+
+function referenceFileSignatureIsStrong(value = "") {
+  try {
+    const keys = JSON.parse(String(value || ""));
+    return Array.isArray(keys)
+      && keys.length > 0
+      && keys.every((key) => /:sha256:[0-9a-f]{64}$/.test(String(key || "")));
+  } catch {
+    return false;
+  }
 }
 function isPdfReference(entry = {}) {
   return referenceFileType(entry) === "application/pdf";
@@ -1405,12 +1509,19 @@ async function filesToImageEntries(files, limit = MAX_REFERENCE_IMAGES) {
       .filter(isAcceptedReferenceFile)
       .slice(0, limit)
       .map(async (file) => {
-        const dataUrl = await fileToDataUrl(file);
+        const [dataUrl, arrayBuffer] = await Promise.all([
+          fileToDataUrl(file),
+          typeof file.arrayBuffer === "function" ? file.arrayBuffer() : Promise.resolve(null),
+        ]);
+        const contentFingerprint = arrayBuffer
+          ? await sha256ContentFingerprint(arrayBuffer)
+          : await contentFingerprintFromDataUrl(dataUrl);
+        if (!contentFingerprint) throw new Error("Reference file content could not be verified.");
         return {
           name: file.name,
           type: referenceFileType({ name: file.name, type: file.type, data_url: dataUrl }),
           size: file.size,
-          content_fingerprint: referenceFileContentFingerprint(dataUrl),
+          content_fingerprint: contentFingerprint,
           data_url: dataUrl,
         };
       })
@@ -1418,6 +1529,8 @@ async function filesToImageEntries(files, limit = MAX_REFERENCE_IMAGES) {
 }
 
 function imageDuplicateKey(image = {}) {
+  const fingerprint = normalizedContentFingerprint(image.content_fingerprint);
+  if (fingerprint) return `content:${fingerprint}`;
   const dataUrl = String(image.data_url || "").trim();
   if (dataUrl) return `data:${dataUrl}`;
   const name = String(image.name || "").trim().toLowerCase();
@@ -1462,7 +1575,13 @@ async function addImagesFromFiles(files) {
     return;
   }
   const overflowCount = Math.max(0, referenceFiles.length - capacity);
-  const images = await filesToImageEntries(referenceFiles, capacity);
+  let images;
+  try {
+    images = await filesToImageEntries(referenceFiles, capacity);
+  } catch {
+    setImageUploadStatus("The selected file could not be securely verified. Please try adding it again.");
+    return;
+  }
   if (!images.length) return;
   const { unique, duplicateCount } = uniqueImageEntries(images);
   if (!unique.length) {
@@ -2481,6 +2600,7 @@ function collectQuoteDetails() {
       logo_data_url: state.headerLogo ? state.headerLogo.data_url : "",
       logo_name: state.headerLogo ? state.headerLogo.name : "",
       logo_type: state.headerLogo ? state.headerLogo.type : "",
+      logo_content_fingerprint: normalizedContentFingerprint(state.headerLogo?.content_fingerprint),
     },
     currency: collectQuoteCurrency(),
     exchange_rate: collectQuoteExchangeRate(),
@@ -2583,7 +2703,9 @@ function applyQuoteDetails(details = {}, options = {}) {
     state.headerLogo = {
       name: company.logo_name || "preset-logo",
       type: company.logo_type || "image/png",
-      size: 0,
+      size: Number.isFinite(Number(company.logo_size)) ? Number(company.logo_size) : 0,
+      content_fingerprint: normalizedContentFingerprint(company.logo_content_fingerprint),
+      session_file_key: String(company.logo_session_file_key || "").trim(),
       data_url: company.logo_data_url,
     };
   } else if (options.clearLogo) {
@@ -2763,7 +2885,7 @@ function sessionImageMetadata(image = {}, index = 0) {
     name: String(image.name || `reference-${index + 1}`).trim() || `reference-${index + 1}`,
     type: referenceFileType(image),
     size: Number.isFinite(Number(image.size)) ? Number(image.size) : 0,
-    content_fingerprint: String(image.content_fingerprint || "").trim(),
+    content_fingerprint: normalizedContentFingerprint(image.content_fingerprint),
     session_file_key: sessionFileKey,
   };
 }
@@ -2777,6 +2899,7 @@ function quoteDetailsWithSessionLogoMetadata(details = collectQuoteDetails()) {
     name: company.logo_name || "header-logo",
     type: company.logo_type || "image/png",
     size: Number.isFinite(Number(company.logo_size)) ? Number(company.logo_size) : 0,
+    content_fingerprint: company.logo_content_fingerprint || "",
     data_url: logoDataUrl,
     session_file_key: company.logo_session_file_key || "",
   };
@@ -2784,6 +2907,7 @@ function quoteDetailsWithSessionLogoMetadata(details = collectQuoteDetails()) {
   company.logo_name = logoSource.name || company.logo_name || "header-logo";
   company.logo_type = logoSource.type || company.logo_type || "image/png";
   company.logo_size = Number.isFinite(Number(logoSource.size)) ? Number(logoSource.size) : 0;
+  company.logo_content_fingerprint = normalizedContentFingerprint(logoSource.content_fingerprint);
   company.logo_session_file_key = sessionFileKey;
   delete company.logo_data_url;
   return { ...details, company };
@@ -2808,6 +2932,7 @@ function sessionFileRecordFromHeaderLogo(logo = state.headerLogo) {
     name: String(logo.name || "header-logo").trim() || "header-logo",
     type: String(logo.type || "image/png").trim() || "image/png",
     size: Number.isFinite(Number(logo.size)) ? Number(logo.size) : 0,
+    content_fingerprint: normalizedContentFingerprint(logo.content_fingerprint),
     session_file_key: sessionFileKey,
     file_role: "quote_company_logo",
     data_url: dataUrl,
@@ -2964,7 +3089,7 @@ async function restoreSessionImages(savedImages = []) {
     .filter((image) => !String(image?.data_url || "").trim())
     .map((image) => image?.session_file_key);
   const fileMap = await loadSessionFileMap(keys).catch(() => new Map());
-  return images
+  const restoredImages = images
     .map((image) => {
       const key = String(image?.session_file_key || "").trim();
       const stored = key ? fileMap.get(key) : null;
@@ -2979,6 +3104,7 @@ async function restoreSessionImages(savedImages = []) {
       referenceFileHasPayload(image)
       || String(image.session_file_key || image.name || "").trim()
     ));
+  return Promise.all(restoredImages.map(ensureContentFingerprint));
 }
 
 function selectedPresetCompanyLogo() {
@@ -2988,9 +3114,47 @@ function selectedPresetCompanyLogo() {
   return String(company.logo_data_url || "").trim() ? company : null;
 }
 
+async function quoteDetailsWithStrongLogoFingerprint(details = {}) {
+  const company = details.company && typeof details.company === "object" ? details.company : {};
+  const dataUrl = String(company.logo_data_url || "").trim();
+  if (!dataUrl) return details;
+  const logo = await ensureContentFingerprint({
+    name: company.logo_name || "header-logo",
+    type: company.logo_type || "image/png",
+    size: Number.isFinite(Number(company.logo_size)) ? Number(company.logo_size) : 0,
+    content_fingerprint: company.logo_content_fingerprint || "",
+    data_url: dataUrl,
+    session_file_key: company.logo_session_file_key || "",
+  });
+  return {
+    ...details,
+    company: {
+      ...company,
+      logo_content_fingerprint: logo.content_fingerprint,
+    },
+  };
+}
+
+async function hydrateProfileLogoFingerprints() {
+  state.profiles = await Promise.all(state.profiles.map(async (profile) => ({
+    ...profile,
+    quote_detail_presets: await Promise.all(
+      (Array.isArray(profile.quote_detail_presets) ? profile.quote_detail_presets : [])
+        .map(async (preset) => ({ ...preset, details: await quoteDetailsWithStrongLogoFingerprint(preset.details || {}) }))
+    ),
+  })));
+  state.companyProfiles = await Promise.all(state.companyProfiles.map(async (profile) => ({
+    ...profile,
+    defaults: await quoteDetailsWithStrongLogoFingerprint(profile.defaults || {}),
+  })));
+}
+
 async function restoreQuoteDetailsLogo(details = {}) {
   const company = details.company && typeof details.company === "object" ? details.company : {};
-  if (String(company.logo_data_url || "").trim()) return details;
+  const directDataUrl = String(company.logo_data_url || "").trim();
+  if (directDataUrl) {
+    return quoteDetailsWithStrongLogoFingerprint(details);
+  }
   const sessionFileKey = String(company.logo_session_file_key || "").trim();
   let restoredLogo = null;
   if (sessionFileKey) {
@@ -3000,13 +3164,22 @@ async function restoreQuoteDetailsLogo(details = {}) {
   const presetLogo = restoredLogo ? null : selectedPresetCompanyLogo();
   const source = restoredLogo || presetLogo;
   if (!source?.data_url && !source?.logo_data_url) return details;
+  const restoredDataUrl = source.data_url || source.logo_data_url;
+  const fingerprintedLogo = await ensureContentFingerprint({
+    ...source,
+    content_fingerprint: source.content_fingerprint || source.logo_content_fingerprint || company.logo_content_fingerprint || "",
+    data_url: restoredDataUrl,
+  });
   return {
     ...details,
     company: {
       ...company,
-      logo_data_url: source.data_url || source.logo_data_url,
+      logo_data_url: restoredDataUrl,
       logo_name: source.name || source.logo_name || company.logo_name || "header-logo",
       logo_type: source.type || source.logo_type || company.logo_type || "image/png",
+      logo_size: Number.isFinite(Number(source.size ?? source.logo_size ?? company.logo_size)) ? Number(source.size ?? source.logo_size ?? company.logo_size) : 0,
+      logo_content_fingerprint: fingerprintedLogo.content_fingerprint,
+      logo_session_file_key: source.session_file_key || source.logo_session_file_key || company.logo_session_file_key || "",
     },
   };
 }
@@ -3074,6 +3247,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   if (!saved || typeof saved !== "object" || saved.version !== QUOTE_SESSION_STATE_VERSION) {
     return false;
   }
+  let rejectedRestoredActiveJob = false;
   state.profileId = saved.profileId || "";
   state.pricingReferenceId = saved.pricingReferenceId || saved.profileId || "";
   state.pricingReferenceSource = saved.pricingReferenceSource || "";
@@ -3111,12 +3285,6 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.blockingClarificationQuestions = Array.isArray(saved.blockingClarificationQuestions) ? saved.blockingClarificationQuestions : [];
   state.boothDimensions = normalizeBoothDimensions(saved.boothDimensions || saved.quoteDetails?.project || {});
   state.originalAnalysisSnapshot = saved.originalAnalysisSnapshot || null;
-  if (state.originalAnalysisSnapshot && !String(state.originalAnalysisSnapshot.reference_file_signature || "").trim()) {
-    state.originalAnalysisSnapshot = {
-      ...state.originalAnalysisSnapshot,
-      reference_file_signature: referenceFilesDependencySignature(state.images),
-    };
-  }
   state.basisConfirmed = Boolean(saved.basisConfirmed);
   state.draftSource = saved.draftSource || "";
   state.lastAnalysisMode = normalizeAnalysisMode(saved.lastAnalysisMode || saved.originalAnalysisSnapshot?.analysis_mode);
@@ -3142,7 +3310,14 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   );
   state.pricingMatches = Array.isArray(saved.pricingMatches) ? saved.pricingMatches : [];
   state.pricingIssues = [];
-  state.activeJob = normalizeActiveJob(saved.activeJob || {});
+  state.activeJob = normalizeActiveJob(saved.activeJob || {}, { restoring: true });
+  rejectedRestoredActiveJob = Boolean(saved.activeJob && typeof saved.activeJob === "object" && !state.activeJob);
+  if (rejectedRestoredActiveJob) {
+    state.isAnalysisRunning = false;
+    state.isGenerating = false;
+    state.isPreparingOutput = false;
+    state.restorableOverlay = "";
+  }
   renderFiles();
   renderPricingMatches(state.outputRows.length ? state.outputRows : state.pricingMatches, { fromPricingMatches: !state.outputRows.length && state.pricingMatches.length });
   renderMatchSummary({ pricing_matches: state.pricingMatches });
@@ -3157,7 +3332,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   }
   updateDownloadButton();
   setResultStatus(state.aiFailed ? "No usable AI draft" : state.downloadFile ? "Completed" : "No job yet", state.aiFailed ? "is-bad" : state.downloadFile ? "is-ok" : "");
-  setWorkflowStage(restoredWorkflowStage(saved));
+  setWorkflowStage(restoredWorkflowStage(rejectedRestoredActiveJob ? { ...saved, workflowStage: "" } : saved));
   if (state.aiFailed) {
     showAiFailureBanner();
   } else {
@@ -3165,6 +3340,12 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   }
   const restoredPanel = restoredQuoteSessionSidePanel(saved, options);
   setSidePanel(restoredPanel, { force: true });
+  try {
+    window.localStorage.setItem(QUOTE_SESSION_STORAGE_KEY, JSON.stringify(buildSessionSnapshot()));
+    persistSessionFiles(sessionFileRecordsFromDraft()).catch(() => {});
+  } catch {
+    // Restored state remains valid in memory when upgraded metadata cannot be persisted.
+  }
   return true;
 }
 
@@ -3808,6 +3989,7 @@ async function saveNamedCompanyProfile(label = "", options = {}) {
       return;
     }
     const saved = normalizeCompanyProfile(data.profile || payload);
+    saved.defaults = await quoteDetailsWithStrongLogoFingerprint(saved.defaults || {});
     state.companyProfiles = [
       ...state.companyProfiles.filter((profile) => safeProfileId(profile.id || profile.label, "") !== saved.id),
       saved,
@@ -6574,7 +6756,9 @@ async function loadProfiles() {
     }
   }
   await loadCompanyProfiles();
+  await hydrateProfileLogoFingerprints();
   renderProfileOptions();
+  renderPresetOptions();
 }
 
 async function loadCompanyProfiles() {
@@ -6604,7 +6788,9 @@ function analyzedReferenceFileSignature() {
 function referenceFilesChangedSinceAnalysis() {
   if (!quoteHasDerivedResults()) return false;
   const baseline = analyzedReferenceFileSignature();
-  return Boolean(baseline && referenceFilesDependencySignature() !== baseline);
+  const current = referenceFilesDependencySignature();
+  if (!referenceFileSignatureIsStrong(baseline) || !current) return true;
+  return current !== baseline;
 }
 
 function pendingPricingReferenceSelectionChanged() {
@@ -6697,13 +6883,18 @@ async function confirmQuoteDependencyChange() {
 function quoteCompanyPresentationSignature() {
   syncRichTextSources();
   const logo = state.headerLogo || {};
+  const details = collectQuoteCompanyProfileDetails();
+  const company = { ...(details.company || {}) };
+  delete company.logo_data_url;
+  delete company.logo_content_fingerprint;
+  delete company.logo_session_file_key;
   return JSON.stringify({
-    details: collectQuoteCompanyProfileDetails(),
+    details: { ...details, company },
     logo: {
       name: String(logo.name || "").trim(),
       type: String(logo.type || "").trim(),
       size: Number.isFinite(Number(logo.size)) ? Number(logo.size) : 0,
-      fingerprint: referenceFileContentFingerprint(logo.data_url || ""),
+      fingerprint: normalizedContentFingerprint(logo.content_fingerprint),
     },
   });
 }
@@ -6715,7 +6906,11 @@ function invalidateGeneratedExportsForPresentationChange() {
 }
 
 function invalidateGeneratedExportsIfPresentationChanged(previousSignature = "") {
-  if (String(previousSignature || "") === quoteCompanyPresentationSignature()) return false;
+  const logoIsUnverifiable = Boolean(
+    String(state.headerLogo?.data_url || "").trim()
+    && !normalizedContentFingerprint(state.headerLogo?.content_fingerprint)
+  );
+  if (!logoIsUnverifiable && String(previousSignature || "") === quoteCompanyPresentationSignature()) return false;
   return invalidateGeneratedExportsForPresentationChange();
 }
 function clearGeneratedQuoteState() {
@@ -7083,6 +7278,23 @@ function generationFinalizingModalOptions(viewPdf = false) {
 
 function clearActiveJob() {
   state.activeJob = null;
+  saveSessionState();
+}
+
+function discardInvalidRestoredActiveJob() {
+  state.activeJob = null;
+  state.isAnalysisRunning = false;
+  state.isGenerating = false;
+  state.isPreparingOutput = false;
+  state.restorableOverlay = "";
+  if (elements.basisChatOverlay) {
+    elements.basisChatOverlay.classList.remove("is-open");
+    elements.basisChatOverlay.hidden = true;
+  }
+  document.body.classList.remove("basis-chat-open");
+  hideExcelGeneratingModal();
+  setWorkflowStage(restoredWorkflowStage({ workflowStage: "" }));
+  syncControlStates();
   saveSessionState();
 }
 
@@ -9142,7 +9354,7 @@ function renderLiteralReplacementPreview(proposal) {
 }
 
 async function buildAiBasisChatResponse(text, options = {}) {
-  const restoredOperation = options.resume === true ? normalizeActiveJob(options.operation || state.activeJob || {}) : null;
+  const restoredOperation = options.resume === true ? normalizeActiveJob(options.operation || state.activeJob || {}, { restoring: true }) : null;
   if (!restoredOperation && !canStartAnalysis()) return null;
   const operation = restoredOperation?.type === "basis_chat" ? restoredOperation : normalizeActiveJob({
     id: newClientJobId(),
@@ -9152,6 +9364,7 @@ async function buildAiBasisChatResponse(text, options = {}) {
     text,
   });
   state.activeJob = operation;
+  saveSessionState();
   const previousRunning = state.isAnalysisRunning;
   state.isAnalysisRunning = true;
   setBasisChatBusy(true);
@@ -10556,6 +10769,9 @@ function dashboardDraftImageFileFieldsMatch(candidate = {}, image = {}, options 
 }
 
 function dashboardDraftImagePayloadMatches(candidate = {}, image = {}) {
+  const candidateFingerprint = normalizedContentFingerprint(candidate.content_fingerprint);
+  const imageFingerprint = normalizedContentFingerprint(image.content_fingerprint);
+  if (candidateFingerprint && imageFingerprint) return candidateFingerprint === imageFingerprint;
   const candidateKey = String(candidate?.session_file_key || "").trim();
   const imageKey = String(image?.session_file_key || "").trim();
   if (candidateKey && imageKey) {
@@ -10624,6 +10840,7 @@ function mergeDashboardDraftImagesWithAvailablePayloads(draftState = {}, availab
       data_url: dataUrl,
       type: image?.type || payloadImage?.type || referenceFileType(payloadImage),
       size: Number.isFinite(size) ? size : 0,
+      content_fingerprint: normalizedContentFingerprint(image?.content_fingerprint || payloadImage?.content_fingerprint),
       session_file_key: image?.session_file_key || payloadImage?.session_file_key || "",
     };
   });
@@ -11766,6 +11983,7 @@ async function handleDraftBasis(options = {}) {
   });
   const quoteCommercialSnapshot = quoteCommercialOverrideSnapshot();
   state.activeJob = operation;
+  saveSessionState();
   state.isAnalysisRunning = true;
   state.aiFailed = false;
   state.draftSource = "";
@@ -11875,7 +12093,7 @@ async function confirmBasis(options = {}) {
     if (options.resume === true) clearActiveJob();
     return;
   }
-  const restoredOperation = options.resume === true ? normalizeActiveJob(options.operation || state.activeJob || {}) : null;
+  const restoredOperation = options.resume === true ? normalizeActiveJob(options.operation || state.activeJob || {}, { restoring: true }) : null;
   const operation = restoredOperation?.type === "confirm_basis" ? restoredOperation : normalizeActiveJob({
     id: newClientOperationId(),
     type: "confirm_basis",
@@ -11914,6 +12132,7 @@ async function confirmBasis(options = {}) {
     return;
   }
   state.activeJob = operation;
+  saveSessionState();
   state.isPreparingOutput = true;
   showExcelGeneratingModal({
     eyebrow: "Quotation output",
@@ -12003,6 +12222,7 @@ async function handleGenerate(options = {}) {
     viewPdf,
   });
   state.activeJob = operation;
+  saveSessionState();
   state.isGenerating = true;
   setWorkflowStage("generating");
   setResultStatus(viewPdf ? "Generating PDF" : "Generating Excel", "is-warn");
@@ -12113,8 +12333,13 @@ async function ensureSavedServerJobStarted(activeJob) {
 }
 
 async function resumeSavedJob() {
-  const activeJob = state.activeJob;
-  if (!activeJob || !activeJob.id) return;
+  if (!state.activeJob) return;
+  const activeJob = normalizeActiveJob(state.activeJob, { restoring: true });
+  if (!activeJob) {
+    discardInvalidRestoredActiveJob();
+    return;
+  }
+  state.activeJob = activeJob;
   if (activeJob.type === "confirm_basis") {
     state.isPreparingOutput = false;
     await confirmBasis({ resume: true, operation: activeJob });
@@ -12654,14 +12879,29 @@ function wireEvents() {
   elements.headerLogoInput.addEventListener("change", async (event) => {
     const presentationBeforeLogoChange = quoteCompanyPresentationSignature();
     const file = (event.target.files || [])[0];
-    state.headerLogo = file
-      ? {
-          name: file.name,
-          type: file.type,
-          size: file.size,
-          data_url: await fileToDataUrl(file),
-        }
-      : null;
+    if (file) {
+      const [dataUrl, arrayBuffer] = await Promise.all([
+        fileToDataUrl(file),
+        typeof file.arrayBuffer === "function" ? file.arrayBuffer() : Promise.resolve(null),
+      ]);
+      const contentFingerprint = arrayBuffer
+        ? await sha256ContentFingerprint(arrayBuffer)
+        : await contentFingerprintFromDataUrl(dataUrl);
+      if (!contentFingerprint) {
+        renderPresetStatus("The selected logo could not be securely verified. Please try adding it again.");
+        event.target.value = "";
+        return;
+      }
+      state.headerLogo = {
+        name: file.name,
+        type: file.type,
+        size: file.size,
+        content_fingerprint: contentFingerprint,
+        data_url: dataUrl,
+      };
+    } else {
+      state.headerLogo = null;
+    }
     renderHeaderLogoPreview();
     renderPresetStatus();
     invalidateGeneratedExportsIfPresentationChanged(presentationBeforeLogoChange);
@@ -13170,4 +13410,3 @@ async function boot() {
 }
 
 boot();
-

@@ -864,9 +864,13 @@ async function verifyGenerationTerminalRecoveryAfterRefresh(page) {
         state.activeAppView = "quote";
         state.activeSidePanel = "output";
         state.workflowStage = "generating";
-        state.activeJob = activeJob;
+        state.activeJob = {
+          ...activeJob,
+          browserRecoveryScope: state.browserRecoveryScope,
+          startedAt: new Date().toISOString(),
+        };
         saveSessionState();
-      }, { id: testCase.id, type: testCase.type, viewPdf: testCase.viewPdf, phase: "running", startedAt: "2026-01-01T00:00:00Z" });
+      }, { id: testCase.id, type: testCase.type, viewPdf: testCase.viewPdf, phase: "running" });
       await page.reload({ waitUntil: "domcontentloaded" });
       await page.locator("#excelGeneratingModal").waitFor({ state: "visible", timeout: 15000 });
       const restoredTitle = (await page.locator("#excelGeneratingTitle").innerText()).trim();
@@ -902,7 +906,7 @@ async function verifyGenerationTerminalRecoveryAfterRefresh(page) {
     }
   }
 
-  const interruptedJob = { id: "job-refresh-interrupted", type: "generate", viewPdf: false, phase: "running", startedAt: "2026-01-01T00:00:00Z" };
+  const interruptedJob = { id: "job-refresh-interrupted", type: "generate", viewPdf: false, phase: "running" };
   const interruptedStartRoutePattern = "**/api/jobs";
   let interruptedDuplicateStarts = 0;
   await page.addInitScript((jobId) => {
@@ -928,7 +932,11 @@ async function verifyGenerationTerminalRecoveryAfterRefresh(page) {
       state.activeAppView = "quote";
       state.activeSidePanel = "output";
       state.workflowStage = "generating";
-      state.activeJob = activeJob;
+      state.activeJob = {
+        ...activeJob,
+        browserRecoveryScope: state.browserRecoveryScope,
+        startedAt: new Date().toISOString(),
+      };
       saveSessionState();
     }, interruptedJob);
     await page.reload({ waitUntil: "domcontentloaded" });
@@ -947,6 +955,155 @@ async function verifyGenerationTerminalRecoveryAfterRefresh(page) {
       hideExcelGeneratingModal();
       clearActiveJob();
     });
+  }
+}
+
+async function verifyExpiredQuoteJobsDoNotResume(page) {
+  const staleStartedAt = new Date(Date.now() - 31 * 60 * 1000).toISOString();
+  const freshStartedAt = new Date().toISOString();
+  const futureStartedAt = new Date(Date.now() + 2 * 60 * 1000).toISOString();
+  const cases = [
+    ...["draft", "basis_chat", "generate", "generate_pdf", "confirm_basis"].map((type, index) => ({
+      label: `stale starting ${type}`,
+      type,
+      phase: "starting",
+      id: type === "confirm_basis" ? `operation-stale-start-${index}` : `job-stale-start-${type}-${index}`,
+      startedAt: staleStartedAt,
+    })),
+    ...["draft", "generate", "generate_pdf"].map((type, index) => ({
+      label: `stale running ${type}`,
+      type,
+      phase: "running",
+      id: `job-stale-running-${type}-${index}`,
+      startedAt: staleStartedAt,
+    })),
+    { label: "future dated draft", type: "draft", phase: "running", id: "job-future-draft-1234", startedAt: futureStartedAt },
+    { label: "missing timestamp", type: "draft", phase: "starting", id: "job-missing-time-1234" },
+    { label: "empty timestamp", type: "generate", phase: "starting", id: "job-empty-time-123456", startedAt: "" },
+    { label: "malformed timestamp", type: "generate_pdf", phase: "running", id: "job-bad-time-12345678", startedAt: "not-a-date" },
+    { label: "non-string timestamp", type: "basis_chat", phase: "starting", id: "job-number-time-12345", startedAt: Date.now() },
+    { label: "impossible timestamp", type: "confirm_basis", phase: "running", id: "operation-impossible-date", startedAt: "2026-02-31T00:00:00Z" },
+    { label: "fresh wrong scope", type: "draft", phase: "running", id: "job-wrong-scope-fresh", startedAt: freshStartedAt, wrongScope: true },
+    { label: "stale wrong scope", type: "generate", phase: "starting", id: "job-wrong-scope-stale", startedAt: staleStartedAt, wrongScope: true },
+  ];
+
+  const observedRequests = [];
+  const jobsPattern = "**/api/jobs*";
+  const normalizePattern = "**/api/line-items/normalize";
+  await page.route(jobsPattern, async (route) => {
+    const request = route.request();
+    observedRequests.push(`${request.method()} ${new URL(request.url()).pathname}`);
+    if (request.method() === "POST") {
+      const payload = request.postDataJSON();
+      await route.fulfill({
+        status: 202,
+        contentType: "application/json",
+        body: JSON.stringify({
+          job_id: payload.job_id || "job-unexpected-recovery",
+          type: payload.type || "draft",
+          status: "running",
+          created_at: new Date().toISOString(),
+        }),
+      });
+      return;
+    }
+    const jobId = new URL(request.url()).pathname.split("/").pop() || "job-unexpected-recovery";
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ job_id: jobId, status: "failed", result: { status: "failed" } }),
+    });
+  });
+  await page.route(normalizePattern, async (route) => {
+    observedRequests.push(`${route.request().method()} /api/line-items/normalize`);
+    const payload = route.request().postDataJSON();
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ status: "normalized", line_items: payload.line_items || [] }),
+    });
+  });
+
+  try {
+    for (const testCase of cases) {
+      const before = await page.evaluate((candidate) => {
+        const storageKey = "swooshz_quote_session_v1";
+        const saved = JSON.parse(window.localStorage.getItem(storageKey) || "{}");
+        const currentScope = state.browserRecoveryScope;
+        const quoteState = JSON.stringify({
+          quoteBasis: saved.quoteBasis || {},
+          quoteBasisSections: saved.quoteBasisSections || [],
+          lineItems: saved.lineItems || [],
+          outputRows: saved.outputRows || [],
+          originalOutputRows: saved.originalOutputRows || [],
+          basisConfirmed: Boolean(saved.basisConfirmed),
+          downloadFile: saved.downloadFile || null,
+          pdfFile: saved.pdfFile || null,
+        });
+        saved.activeAppView = "quote";
+        saved.activeSidePanel = candidate.type === "draft" || candidate.type === "basis_chat" || candidate.type === "confirm_basis" ? "basis" : "output";
+        saved.workflowStage = candidate.type === "draft" ? "analyzing" : candidate.type === "confirm_basis" ? "basis_review" : "generating";
+        saved.restorableOverlay = candidate.type === "basis_chat" ? "basis_chat" : "";
+        saved.activeJob = {
+          id: candidate.id,
+          type: candidate.type,
+          phase: candidate.phase,
+          browserRecoveryScope: candidate.wrongScope ? `${currentScope}-other` : currentScope,
+          ...(Object.prototype.hasOwnProperty.call(candidate, "startedAt") ? { startedAt: candidate.startedAt } : {}),
+          ...(candidate.type === "basis_chat" ? { text: "Synthetic stale basis revision" } : {}),
+          ...(candidate.type === "generate_pdf" ? { viewPdf: true } : {}),
+        };
+        window.localStorage.setItem(storageKey, JSON.stringify(saved));
+        return { quoteState, currentScope };
+      }, testCase);
+      const requestCountBefore = observedRequests.length;
+
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+      await page.waitForFunction(() => {
+        const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
+        return !state.activeJob && !saved.activeJob;
+      }, null, { timeout: 15000 });
+      await page.waitForTimeout(150);
+
+      const after = await page.evaluate(() => {
+        const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
+        return {
+          quoteState: JSON.stringify({
+            quoteBasis: saved.quoteBasis || {},
+            quoteBasisSections: saved.quoteBasisSections || [],
+            lineItems: saved.lineItems || [],
+            outputRows: saved.outputRows || [],
+            originalOutputRows: saved.originalOutputRows || [],
+            basisConfirmed: Boolean(saved.basisConfirmed),
+            downloadFile: saved.downloadFile || null,
+            pdfFile: saved.pdfFile || null,
+          }),
+          activeJob: saved.activeJob || null,
+          busy: Boolean(state.isAnalysisRunning || state.isGenerating || state.isPreparingOutput),
+          workflowStage: state.workflowStage,
+          exportOverlayHidden: Boolean(document.querySelector("#excelGeneratingModal")?.hidden),
+          basisChatOverlayHidden: Boolean(document.querySelector("#basisChatOverlay")?.hidden),
+        };
+      });
+
+      const caseRequests = observedRequests.slice(requestCountBefore);
+      if (caseRequests.length) {
+        throw new Error(`${testCase.label} resumed unexpectedly: ${JSON.stringify(caseRequests)}.`);
+      }
+      if (after.activeJob || after.busy || !after.exportOverlayHidden || !after.basisChatOverlayHidden) {
+        throw new Error(`${testCase.label} left unsafe recovery state: ${JSON.stringify(after)}.`);
+      }
+      if (["analyzing", "generating"].includes(after.workflowStage)) {
+        throw new Error(`${testCase.label} restored an unsafe running stage ${after.workflowStage}.`);
+      }
+      if (after.quoteState !== before.quoteState) {
+        throw new Error(`${testCase.label} mutated saved quote data during stale cleanup.`);
+      }
+    }
+  } finally {
+    await page.unroute(normalizePattern);
+    await page.unroute(jobsPattern);
   }
 }
 
@@ -969,6 +1126,8 @@ async function verifyPricingReferenceSelectionCommitsOnCustomerNext(page) {
       unit_price: 100,
       amount: 100,
     })];
+    state.images = await Promise.all(state.images.map((image) => ensureContentFingerprint(image)));
+    captureOriginalAnalysisSnapshot({ source: "playwright-pricing-reference-regression" });
     state.outputRows = [normalizeOutputRow({
       section: "Retained basis",
       description: "Retained output row",
@@ -1788,6 +1947,7 @@ async function main() {
       await verifyConfirmBasisSurvivesImmediateRefresh(page);
       await verifyGenerationLoadingModalSurvivesRefresh(page);
       await verifyGenerationTerminalRecoveryAfterRefresh(page);
+      await verifyExpiredQuoteJobsDoNotResume(page);
       await verifyPricingReferenceSelectionCommitsOnCustomerNext(page);
       console.log(JSON.stringify({
         status: "ok",

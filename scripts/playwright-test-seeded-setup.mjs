@@ -36,12 +36,12 @@ export async function seedQuoteDraftFromTestFixture(page, options = {}) {
     loadSelectedPreset({ silent: true });
     updateGeneratorCopy();
     applyQuoteDetails(details, { partial: true });
-    state.images = [{
+    state.images = [await ensureContentFingerprint({
       name: fileName,
       type: "application/pdf",
       size: 24,
       data_url: dataUrl,
-    }];
+    })];
     await persistSessionFiles(sessionFileRecordsFromDraft()).catch(() => {});
     saveSessionState();
     renderFiles();
