@@ -391,11 +391,35 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       }
 
       finishJob = true;
-      await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 15000 });
       await page.waitForFunction(() => {
         const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
         return !saved.activeJob;
       }, null, { timeout: 15000 });
+      if (testCase.terminalStatus === "completed") {
+        const expectedReadyTitle = testCase.viewPdf ? "PDF ready" : "Excel ready";
+        const expectedAction = testCase.viewPdf ? "pdf" : "excel";
+        const expectedButtonText = testCase.viewPdf ? "Open PDF" : "Download Excel";
+        await page.locator("#excelGeneratingModal.is-ready").waitFor({ state: "visible", timeout: 15000 });
+        const readyTitle = (await page.locator("#excelGeneratingTitle").innerText()).trim();
+        if (readyTitle !== expectedReadyTitle) {
+          throw new Error(`Expected refreshed ${testCase.type} ready title ${expectedReadyTitle}, found ${readyTitle}.`);
+        }
+        const readyAction = await page.locator("#excelGeneratingActionButton").getAttribute("data-export-action");
+        const readyButtonText = (await page.locator("#excelGeneratingActionButton").innerText()).trim();
+        if (readyAction !== expectedAction || readyButtonText !== expectedButtonText) {
+          throw new Error(`Expected refreshed ${testCase.type} action ${expectedAction}/${expectedButtonText}, found ${readyAction}/${readyButtonText}.`);
+        }
+        if (await page.locator("#excelGeneratingActions").isHidden()) {
+          throw new Error(`Expected refreshed ${testCase.type} ready actions to be visible.`);
+        }
+        if (!(await page.locator("#excelGeneratingSpinner").isHidden())) {
+          throw new Error(`Expected refreshed ${testCase.type} ready spinner to be hidden.`);
+        }
+        await page.locator("#excelGeneratingCloseButton").click();
+        await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 15000 });
+      } else {
+        await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 15000 });
+      }
     } finally {
       await page.unroute(routePattern);
     }

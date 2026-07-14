@@ -12320,6 +12320,7 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         download_handler = js.split('elements.sideDownloadButton.addEventListener("click", async (event) => {', 1)[1].split('  document.addEventListener("keydown"', 1)[0]
         pdf_handler = js.split('elements.sideViewPdfButton.addEventListener("click", async (event) => {', 1)[1].split('  document.addEventListener("keydown"', 1)[0]
         loading_options_body = js.split("function generationLoadingModalOptions", 1)[1].split("function clearActiveJob", 1)[0]
+        resumed_generation_body = js.split('if (activeJob.type === "generate" || activeJob.type === "generate_pdf") {', 1)[1].split('if (activeJob.type === "email_quote") {', 1)[0]
         self.assertIn("event.preventDefault();", download_handler)
         self.assertIn("await handleGenerate();", js)
         self.assertIn("downloadCurrentExcelFile();", js)
@@ -12335,6 +12336,14 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertLess(pdf_handler.index("await handleGenerate({ viewPdf: true });"), pdf_handler.index("viewCurrentPdfFile();"))
         self.assertIn("showExcelGeneratingModal(generationLoadingModalOptions(true));", pdf_handler)
         self.assertIn('title: "Generating PDF"', loading_options_body)
+        self.assertIn("showGeneratedExportReadyModal(viewPdf)", resumed_generation_body)
+        self.assertLess(
+            resumed_generation_body.index("setDownloadFiles(data.files || [])"),
+            resumed_generation_body.index("showGeneratedExportReadyModal(viewPdf)"),
+        )
+        self.assertIn("hideExcelGeneratingModal();", resumed_generation_body)
+        self.assertIn('elements.excelGeneratingActionButton?.addEventListener("click"', js)
+        self.assertIn('elements.excelGeneratingCloseButton?.addEventListener("click"', js)
         self.assertIn(".workspace-pane-footer.is-output-step {\n  grid-template-columns: repeat(4, minmax(0, 1fr));", css)
         self.assertIn(".workspace-pane-footer.is-output-step #sideBackButton", css)
         self.assertIn("grid-column: span 2;", css)
