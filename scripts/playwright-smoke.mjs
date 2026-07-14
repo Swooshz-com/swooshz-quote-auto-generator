@@ -304,6 +304,93 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
   if (renderedDescription !== "sqm of printed wall graphics") {
     throw new Error(`Output should show the customer-facing bracket-free description, found ${JSON.stringify(renderedDescription)}.`);
   }
+  const manualDescription = "Premium reception counter with lockable storage";
+  const descriptionCell = page.locator('#pricingMatchesBody tr:first-child [data-output-edit-field="description"]');
+  await descriptionCell.click();
+  const descriptionEditor = page.locator('[data-output-editor-field="description"]');
+  await descriptionEditor.waitFor({ state: "visible", timeout: 15000 });
+  await descriptionEditor.fill(manualDescription);
+  await page.locator('#pricingMatchesBody tr:first-child [data-output-edit-field="quantity"]').click();
+  await page.waitForFunction((expected) => (
+    state.outputRows[0]?.description === expected
+    && document.querySelector('#pricingMatchesBody tr:first-child [data-output-label="Description"]')?.textContent?.trim() === expected
+  ), manualDescription, { timeout: 15000 });
+  await page.evaluate(() => clearQuoteSessionDraftSaveTimer());
+
+  const editEvidence = await page.evaluate((expected) => {
+    renderPricingMatches(state.outputRows);
+    renderPricingMatches(state.outputRows);
+    const snapshot = snapshotOutputRows(state.outputRows);
+    const lineItems = outputRowsToLineItems(state.outputRows);
+    const payload = buildPayload();
+    return {
+      stateDescription: state.outputRows[0]?.description || "",
+      renderedDescription: document.querySelector('#pricingMatchesBody tr:first-child [data-output-label="Description"]')?.textContent?.trim() || "",
+      pricingKeyword: state.outputRows[0]?.pricing_keyword || "",
+      catalogUnitPrice: state.outputRows[0]?.catalog_unit_price,
+      snapshotDescription: snapshot[0]?.description || "",
+      lineItemDescription: lineItems[0]?.description || "",
+      lineItemPricingKeyword: lineItems[0]?.pricing_keyword || "",
+      payloadDescription: payload.line_items?.[0]?.description || "",
+      stable: state.outputRows[0]?.description === expected,
+    };
+  }, manualDescription);
+  if (!editEvidence.stable
+    || editEvidence.stateDescription !== manualDescription
+    || editEvidence.renderedDescription !== manualDescription
+    || editEvidence.snapshotDescription !== manualDescription
+    || editEvidence.lineItemDescription !== manualDescription
+    || editEvidence.payloadDescription !== manualDescription
+    || editEvidence.pricingKeyword !== "graphics-vinyl-printed-graphics"
+    || editEvidence.lineItemPricingKeyword !== "graphics-vinyl-printed-graphics"
+    || editEvidence.catalogUnitPrice !== 45) {
+    throw new Error(`Manual Output description did not survive edit, render, snapshot, or export payload creation: ${JSON.stringify(editEvidence)}.`);
+  }
+
+  const quoteRestoreEvidence = await page.evaluate(async (expected) => {
+    const snapshot = buildSessionSnapshot();
+    snapshot.quoteSessionId = "quote-manual-description-restore";
+    snapshot.quoteSessionDraftSaveStarted = true;
+    const restored = await applyQuoteSessionSnapshot(snapshot, {
+      forceQuoteView: true,
+      sessionId: snapshot.quoteSessionId,
+    });
+    return {
+      restored,
+      description: state.outputRows[0]?.description || "",
+      renderedDescription: document.querySelector('#pricingMatchesBody tr:first-child [data-output-label="Description"]')?.textContent?.trim() || "",
+      pricingKeyword: state.outputRows[0]?.pricing_keyword || "",
+      matchesExpected: state.outputRows[0]?.description === expected,
+    };
+  }, manualDescription);
+  if (!quoteRestoreEvidence.restored
+    || !quoteRestoreEvidence.matchesExpected
+    || quoteRestoreEvidence.renderedDescription !== manualDescription
+    || quoteRestoreEvidence.pricingKeyword !== "graphics-vinyl-printed-graphics") {
+    throw new Error(`Quote-session restore changed a manual Output description: ${JSON.stringify(quoteRestoreEvidence)}.`);
+  }
+
+  await page.evaluate(() => saveSessionState());
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+  await page.locator("#pricingMatchesBody tr").first().waitFor({ state: "visible", timeout: 15000 });
+  await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+  const browserRestoreEvidence = await page.evaluate((expected) => {
+    const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
+    return {
+      stateDescription: state.outputRows[0]?.description || "",
+      renderedDescription: document.querySelector('#pricingMatchesBody tr:first-child [data-output-label="Description"]')?.textContent?.trim() || "",
+      savedDescription: saved.outputRows?.[0]?.description || "",
+      pricingKeyword: state.outputRows[0]?.pricing_keyword || "",
+      matchesExpected: state.outputRows[0]?.description === expected,
+    };
+  }, manualDescription);
+  if (!browserRestoreEvidence.matchesExpected
+    || browserRestoreEvidence.renderedDescription !== manualDescription
+    || browserRestoreEvidence.savedDescription !== manualDescription
+    || browserRestoreEvidence.pricingKeyword !== "graphics-vinyl-printed-graphics") {
+    throw new Error(`Browser recovery changed a manual Output description: ${JSON.stringify(browserRestoreEvidence)}.`);
+  }
   const outputMetrics = await page.locator("#pricingMatchesBody tr").first().evaluate((row) => {
     const cells = Array.from(row.querySelectorAll("td")).map((cell) => ({
       label: cell.getAttribute("data-output-label") || "",
@@ -341,12 +428,25 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
 
 async function verifyGenerationLoadingModalSurvivesRefresh(page) {
   const cases = [
-    { id: "job-refresh-excel", type: "generate", viewPdf: false, title: "Regenerating Excel" },
-    { id: "job-refresh-pdf", type: "generate_pdf", viewPdf: true, title: "Generating PDF" },
+    { id: "job-refresh-excel-completed", type: "generate", viewPdf: false, title: "Regenerating Excel", terminalStatus: "completed" },
+    { id: "job-refresh-pdf-completed", type: "generate_pdf", viewPdf: true, title: "Generating PDF", terminalStatus: "completed" },
+    { id: "job-refresh-excel-needs-review", type: "generate", viewPdf: false, title: "Regenerating Excel", terminalStatus: "needs_review" },
+    { id: "job-refresh-excel-blocked", type: "generate", viewPdf: false, title: "Regenerating Excel", terminalStatus: "blocked" },
+    { id: "job-refresh-excel-failed", type: "generate", viewPdf: false, title: "Regenerating Excel", terminalStatus: "failed" },
   ];
 
   for (const testCase of cases) {
     let finishJob = false;
+    let duplicateGenerationStarts = 0;
+    const startRoutePattern = "**/api/jobs";
+    await page.route(startRoutePattern, async (route) => {
+      if (route.request().method() !== "POST") {
+        await route.fallback();
+        return;
+      }
+      duplicateGenerationStarts += 1;
+      await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ status: "failed" }) });
+    });
     const routePattern = `**/api/jobs/${testCase.id}*`;
     await page.route(routePattern, async (route) => {
       await route.fulfill({
@@ -356,8 +456,18 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
           ? {
               job_id: testCase.id,
               type: testCase.type,
-              status: "failed",
-              result: { status: "failed", message: "Synthetic terminal state for refresh recovery smoke." },
+              status: testCase.terminalStatus,
+              result: {
+                status: testCase.terminalStatus === "needs_review" ? "needs_confirmation" : testCase.terminalStatus,
+                ...(testCase.terminalStatus === "blocked" ? { errors: ["Synthetic blocked state for refresh recovery smoke."] } : {}),
+                ...(testCase.terminalStatus === "failed" ? { message: "Synthetic failed state for refresh recovery smoke." } : {}),
+                ...(testCase.terminalStatus === "completed" ? {
+                  files: [
+                    { name: "quotation.xlsx", url: `/api/jobs/${testCase.id}/files/quotation.xlsx` },
+                    ...(testCase.viewPdf ? [{ name: "quotation.pdf", url: `/api/jobs/${testCase.id}/files/quotation.pdf` }] : []),
+                  ],
+                } : {}),
+              },
             }
           : {
               job_id: testCase.id,
@@ -389,6 +499,9 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       if (restoredJobId !== testCase.id) {
         throw new Error(`Expected refreshed ${testCase.type} job ${testCase.id}, found ${restoredJobId}.`);
       }
+      if (duplicateGenerationStarts !== 0) {
+        throw new Error(`Refresh created ${duplicateGenerationStarts} duplicate ${testCase.type} job(s).`);
+      }
 
       finishJob = true;
       await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 15000 });
@@ -398,7 +511,55 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       }, null, { timeout: 15000 });
     } finally {
       await page.unroute(routePattern);
+      await page.unroute(startRoutePattern);
     }
+  }
+
+  const interruptedJob = { id: "job-refresh-interrupted", type: "generate", viewPdf: false };
+  const interruptedStartRoutePattern = "**/api/jobs";
+  let interruptedDuplicateStarts = 0;
+  await page.addInitScript((jobId) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = (input, init) => {
+      const url = typeof input === "string" ? input : input?.url || "";
+      if (url.includes(`/api/jobs/${jobId}`)) {
+        return Promise.reject(new TypeError("Synthetic interrupted job polling"));
+      }
+      return nativeFetch(input, init);
+    };
+  }, interruptedJob.id);
+  await page.route(interruptedStartRoutePattern, async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.fallback();
+      return;
+    }
+    interruptedDuplicateStarts += 1;
+    await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ status: "failed" }) });
+  });
+  try {
+    await page.evaluate((activeJob) => {
+      state.activeAppView = "quote";
+      state.activeSidePanel = "output";
+      state.workflowStage = "generating";
+      state.activeJob = activeJob;
+      saveSessionState();
+    }, interruptedJob);
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.locator("#excelGeneratingModal").waitFor({ state: "visible", timeout: 15000 });
+    await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 30000 });
+    await page.waitForFunction((jobId) => {
+      const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
+      return saved.activeJob?.id === jobId;
+    }, interruptedJob.id, { timeout: 15000 });
+    if (interruptedDuplicateStarts !== 0) {
+      throw new Error(`Interrupted refresh created ${interruptedDuplicateStarts} duplicate generation job(s).`);
+    }
+  } finally {
+    await page.unroute(interruptedStartRoutePattern);
+    await page.evaluate(() => {
+      hideExcelGeneratingModal();
+      clearActiveJob();
+    });
   }
 }
 
