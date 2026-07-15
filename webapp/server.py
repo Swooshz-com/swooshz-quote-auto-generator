@@ -344,6 +344,7 @@ POST_RATE_LIMITS = {
     "/api/quote-sessions/:id": 30,
     "/api/feedback": 10,
     "/api/support/feedback/:id/status": 30,
+    "/api/support/feedback/:id/evidence": 6,
     "/api/log": 180,
 }
 MAX_RATE_LIMIT_OVERFLOW_BUCKETS = len(POST_RATE_LIMITS)
@@ -8444,14 +8445,97 @@ SQAG_APP_METADATA_REQUIRED_COLUMNS = {
 }
 
 SQAG_FORENSIC_REQUIRED_COLUMNS = {
-    "sqag_generation_runs": {"run_id", "workspace_id", "actor_tracking_id", "actor_key_version", "job_id", "idempotency_key", "job_type", "status", "started_at", "completed_at", "retention_expires_at", "original_retention_expires_at", "deletion_state"},
-    "sqag_generation_evidence": {"evidence_id", "run_id", "workspace_id", "evidence_type", "evidence_json", "evidence_sha256", "created_at", "retention_expires_at", "original_retention_expires_at", "legal_hold"},
-    "sqag_audit_events": {"event_id", "run_id", "workspace_id", "actor_tracking_id", "actor_key_version", "event_type", "event_json", "event_sha256", "created_at", "retention_expires_at", "original_retention_expires_at"},
-    "sqag_feedback": {"feedback_id", "support_reference", "workspace_id", "reporter_tracking_id", "reporter_key_version", "run_id", "session_id", "category", "title", "message", "impact", "link_choice", "manual_reference_text", "manual_reference_status", "diagnostic_metadata_json", "status", "created_at", "updated_at", "closed_at", "retention_expires_at", "original_retention_expires_at", "submission_retention_expires_at", "retention_policy_version", "deletion_state"},
-    "sqag_feedback_status_history": {"history_id", "feedback_id", "workspace_id", "from_status", "to_status", "actor_tracking_id", "actor_key_version", "resolution_note", "created_at", "retention_expires_at", "original_retention_expires_at"},
-    "sqag_deletion_receipts": {"receipt_id", "workspace_id", "record_type", "record_id", "reason", "deleted_at", "original_retention_expires_at", "created_at"},
-    "sqag_legal_holds": {"hold_id", "workspace_id", "target_type", "target_id", "enabled", "reason_code", "actor_tracking_id", "actor_key_version", "created_at", "released_at"},
-    "sqag_retention_delete_authorizations": {"authorization_id", "workspace_id", "record_type", "record_id", "created_at"},
+    "sqag_generation_runs": {
+        "run_id", "workspace_id", "actor_tracking_id", "actor_key_version",
+        "job_id", "idempotency_key", "parent_run_id", "attempt_number",
+        "job_type", "status", "error_category", "quote_session_id",
+        "started_at", "completed_at", "app_revision", "evidence_schema_version",
+        "retention_expires_at", "original_retention_expires_at", "legal_hold",
+        "deletion_state", "deletion_error_code", "deletion_claimed_at",
+    },
+    "sqag_generation_evidence": {
+        "evidence_id", "run_id", "workspace_id", "evidence_type",
+        "evidence_schema_version", "evidence_json", "evidence_sha256",
+        "created_at", "retention_expires_at", "original_retention_expires_at",
+        "legal_hold",
+    },
+    "sqag_audit_events": {
+        "event_id", "run_id", "feedback_id", "session_id", "workspace_id",
+        "actor_tracking_id", "actor_key_version", "event_type", "event_json",
+        "event_sha256", "created_at", "retention_expires_at",
+        "original_retention_expires_at", "legal_hold",
+    },
+    "sqag_feedback": {
+        "feedback_id", "support_reference", "workspace_id",
+        "reporter_tracking_id", "reporter_key_version", "run_id", "session_id",
+        "category", "title", "message", "expected_result", "actual_result",
+        "reproduction_steps", "impact", "link_choice", "manual_reference_text",
+        "manual_reference_status", "resolved_reference_type",
+        "resolved_reference_id", "diagnostic_metadata_json", "status",
+        "created_at", "updated_at", "closed_at", "retention_expires_at",
+        "original_retention_expires_at", "submission_retention_expires_at",
+        "retention_policy_version", "legal_hold", "deletion_state",
+        "deletion_error_code", "deletion_claimed_at",
+    },
+    "sqag_feedback_status_history": {
+        "history_id", "feedback_id", "workspace_id", "from_status", "to_status",
+        "actor_tracking_id", "actor_key_version", "resolution_note", "created_at",
+        "retention_expires_at", "original_retention_expires_at", "legal_hold",
+    },
+    "sqag_deletion_receipts": {
+        "receipt_id", "workspace_id", "record_type", "record_id", "reason",
+        "deleted_at", "original_retention_expires_at", "created_at",
+        "retention_expires_at",
+    },
+    "sqag_legal_holds": {
+        "hold_id", "workspace_id", "target_type", "target_id", "enabled",
+        "reason_code", "case_reference", "actor_tracking_id", "actor_key_version",
+        "created_at", "released_by_tracking_id", "released_by_key_version",
+        "released_at",
+    },
+    "sqag_retention_delete_authorizations": {
+        "authorization_id", "workspace_id", "record_type", "record_id", "created_at",
+    },
+}
+
+SQAG_FORENSIC_REQUIRED_INDEXES = {
+    "sqag_generation_runs_workspace_job_uidx",
+    "sqag_generation_runs_workspace_idempotency_uidx",
+    "sqag_generation_runs_workspace_started_idx",
+    "sqag_generation_runs_retention_idx",
+    "sqag_generation_runs_actor_idx",
+    "sqag_generation_evidence_run_idx",
+    "sqag_generation_evidence_retention_idx",
+    "sqag_audit_events_run_idx",
+    "sqag_audit_events_actor_idx",
+    "sqag_audit_events_feedback_idx",
+    "sqag_audit_events_retention_idx",
+    "sqag_feedback_workspace_status_idx",
+    "sqag_feedback_support_idx",
+    "sqag_feedback_retention_idx",
+    "sqag_feedback_history_parent_idx",
+    "sqag_legal_holds_active_target_uidx",
+    "sqag_legal_holds_state_idx",
+    "sqag_deletion_receipts_retention_idx",
+}
+SQAG_FORENSIC_REQUIRED_UNIQUE_INDEXES = {
+    "sqag_generation_runs_workspace_job_uidx",
+    "sqag_generation_runs_workspace_idempotency_uidx",
+    "sqag_legal_holds_active_target_uidx",
+}
+SQAG_FORENSIC_REQUIRED_TRIGGERS = {
+    "sqag_generation_evidence_no_update",
+    "sqag_audit_events_no_update",
+    "sqag_generation_evidence_guard_delete",
+    "sqag_audit_events_guard_delete",
+}
+SQAG_FORENSIC_SQLITE_REQUIRED_TRIGGERS = SQAG_FORENSIC_REQUIRED_TRIGGERS | {
+    "sqag_generation_evidence_cleanup_delete_auth",
+    "sqag_audit_events_cleanup_delete_auth",
+}
+SQAG_FORENSIC_POSTGRES_REQUIRED_ROUTINES = {
+    "sqag_reject_immutable_change",
+    "sqag_require_retention_delete_authorization",
 }
 
 SQAG_DATABASE_ARTIFACT_REQUIRED_COLUMNS = {
@@ -8664,12 +8748,46 @@ def sqlite_database_path_from_url(database_url: str) -> str:
 def upgrade_legacy_local_forensic_schema(connection: sqlite3.Connection) -> None:
     """Add PR #140 columns before indexes/triggers are installed on an old local DB."""
     upgrades = {
-        "sqag_generation_runs": {"actor_key_version": "text not null default 'legacy-v1'", "job_id": "text", "idempotency_key": "text", "parent_run_id": "text", "attempt_number": "integer not null default 1", "app_revision": "text", "evidence_schema_version": "text not null default 'swooshz.sqag.generation-evidence.v2'", "deletion_state": "text not null default 'active'", "deletion_error_code": "text", "deletion_claimed_at": "text"},
-        "sqag_generation_evidence": {"evidence_schema_version": "text not null default 'swooshz.sqag.generation-evidence.v2'"},
-        "sqag_audit_events": {"actor_tracking_id": "text not null default 'legacy-actor'", "actor_key_version": "text not null default 'legacy-v1'", "event_sha256": "text not null default '0000000000000000000000000000000000000000000000000000000000000000'"},
-        "sqag_feedback": {"reporter_key_version": "text not null default 'legacy-v1'", "submission_retention_expires_at": "text", "retention_policy_version": "text not null default 'feedback-retention-v1'", "deletion_state": "text not null default 'active'", "deletion_error_code": "text", "deletion_claimed_at": "text"},
-        "sqag_feedback_status_history": {"actor_key_version": "text not null default 'legacy-v1'", "resolution_note": "text"},
+        "sqag_generation_runs": {
+            "actor_key_version": "text not null default 'legacy-v1'", "job_id": "text",
+            "idempotency_key": "text", "parent_run_id": "text",
+            "attempt_number": "integer not null default 1", "error_category": "text",
+            "quote_session_id": "text", "completed_at": "text", "app_revision": "text",
+            "evidence_schema_version": "text not null default 'swooshz.sqag.generation-evidence.v2'",
+            "legal_hold": "integer not null default 0",
+            "deletion_state": "text not null default 'active'", "deletion_error_code": "text",
+            "deletion_claimed_at": "text",
+        },
+        "sqag_generation_evidence": {
+            "evidence_schema_version": "text not null default 'swooshz.sqag.generation-evidence.v2'",
+            "legal_hold": "integer not null default 0",
+        },
+        "sqag_audit_events": {
+            "feedback_id": "text", "session_id": "text",
+            "actor_tracking_id": "text not null default 'legacy-actor'",
+            "actor_key_version": "text not null default 'legacy-v1'",
+            "event_sha256": "text not null default '0000000000000000000000000000000000000000000000000000000000000000'",
+            "legal_hold": "integer not null default 0",
+        },
+        "sqag_feedback": {
+            "reporter_key_version": "text not null default 'legacy-v1'",
+            "expected_result": "text", "actual_result": "text", "reproduction_steps": "text",
+            "resolved_reference_type": "text", "resolved_reference_id": "text",
+            "submission_retention_expires_at": "text",
+            "retention_policy_version": "text not null default 'feedback-retention-v1'",
+            "legal_hold": "integer not null default 0",
+            "deletion_state": "text not null default 'active'", "deletion_error_code": "text",
+            "deletion_claimed_at": "text",
+        },
+        "sqag_feedback_status_history": {
+            "actor_key_version": "text not null default 'legacy-v1'", "resolution_note": "text",
+            "legal_hold": "integer not null default 0",
+        },
         "sqag_deletion_receipts": {"retention_expires_at": "text"},
+        "sqag_legal_holds": {
+            "case_reference": "text", "released_by_tracking_id": "text",
+            "released_by_key_version": "text", "released_at": "text",
+        },
     }
     for table, columns in upgrades.items():
         exists = connection.execute("select 1 from sqlite_master where type = 'table' and name = ?", (table,)).fetchone()
@@ -8684,7 +8802,6 @@ def upgrade_legacy_local_forensic_schema(connection: sqlite3.Connection) -> None
     if connection.execute("select 1 from sqlite_master where type = 'table' and name = 'sqag_deletion_receipts'").fetchone():
         connection.execute("update sqag_deletion_receipts set retention_expires_at = original_retention_expires_at where retention_expires_at is null")
     connection.commit()
-
 
 @contextlib.contextmanager
 def sqlite_storage_connection(database_url: str):
@@ -9096,11 +9213,25 @@ class DatabaseSqagStorage:
         self._ensure_schema(SQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS, reason="storage_object_artifact_database_not_migrated")
 
     def _ensure_schema(self, required: dict[str, set[str]], *, reason: str) -> None:
-        with self.connection() as connection:
-            if self.database_family == "postgres_compatible":
-                rows = self._postgres_schema_columns(connection, set(required))
-            else:
-                rows = self._sqlite_schema_columns(connection, set(required))
+        objects: dict[str, set[str]] = {}
+        try:
+            with self.connection() as connection:
+                if self.database_family == "postgres_compatible":
+                    rows = self._postgres_schema_columns(connection, set(required))
+                    if reason == "storage_forensics_database_not_migrated":
+                        objects = self._postgres_forensic_schema_objects(connection)
+                else:
+                    rows = self._sqlite_schema_columns(connection, set(required))
+                    if reason == "storage_forensics_database_not_migrated":
+                        objects = self._sqlite_forensic_schema_objects(connection)
+        except SqagStorageAccessError:
+            raise
+        except Exception as exc:
+            raise SqagStorageAccessError(
+                "SQAG database storage migration has not been applied.",
+                status=503,
+                reason=reason,
+            ) from exc
         present: dict[str, set[str]] = {}
         for row in rows:
             table_name = clean_text(row["table_name"])
@@ -9113,7 +9244,24 @@ class DatabaseSqagStorage:
             if columns - present.get(table, set())
         }
         missing_tables = {table for table in required if table not in present}
-        if missing or missing_tables:
+        missing_objects = False
+        if reason == "storage_forensics_database_not_migrated":
+            required_triggers = (
+                SQAG_FORENSIC_REQUIRED_TRIGGERS
+                if self.database_family == "postgres_compatible"
+                else SQAG_FORENSIC_SQLITE_REQUIRED_TRIGGERS
+            )
+            missing_objects = bool(
+                SQAG_FORENSIC_REQUIRED_INDEXES - objects.get("indexes", set())
+                or SQAG_FORENSIC_REQUIRED_UNIQUE_INDEXES - objects.get("unique_indexes", set())
+                or required_triggers - objects.get("triggers", set())
+                or (
+                    self.database_family == "postgres_compatible"
+                    and SQAG_FORENSIC_POSTGRES_REQUIRED_ROUTINES
+                    - objects.get("routines", set())
+                )
+            )
+        if missing or missing_tables or missing_objects:
             message = "SQAG database storage migration has not been applied."
             if reason == "storage_artifact_database_not_migrated":
                 message = "SQAG artifact storage migration has not been applied."
@@ -9135,6 +9283,57 @@ class DatabaseSqagStorage:
             tuple(sorted(tables)),
         ).fetchall()
 
+    def _sqlite_forensic_schema_objects(self, connection: Any) -> dict[str, set[str]]:
+        rows = connection.execute(
+            "select name, type, coalesce(sql, '') as definition from sqlite_master "
+            "where type in ('index','trigger')"
+        ).fetchall()
+        indexes: set[str] = set()
+        unique_indexes: set[str] = set()
+        triggers: set[str] = set()
+        for row in rows:
+            item = dict(row)
+            name = clean_text(item.get("name"))
+            object_type = clean_text(item.get("type")).lower()
+            definition = clean_text(item.get("definition")).lower()
+            if object_type == "index":
+                indexes.add(name)
+                if definition.startswith("create unique index"):
+                    unique_indexes.add(name)
+            elif object_type == "trigger":
+                triggers.add(name)
+        return {
+            "indexes": indexes,
+            "unique_indexes": unique_indexes,
+            "triggers": triggers,
+            "routines": set(),
+        }
+
+    def _postgres_forensic_schema_objects(self, connection: Any) -> dict[str, set[str]]:
+        index_rows = connection.execute(
+            "select indexname as name, indexdef as definition from pg_indexes "
+            "where schemaname = current_schema()"
+        ).fetchall()
+        trigger_rows = connection.execute(
+            "select distinct trigger_name as name from information_schema.triggers "
+            "where trigger_schema = current_schema()"
+        ).fetchall()
+        routine_rows = connection.execute(
+            "select routine_name as name from information_schema.routines "
+            "where routine_schema = current_schema()"
+        ).fetchall()
+        indexes = {clean_text(row["name"]) for row in index_rows}
+        unique_indexes = {
+            clean_text(row["name"])
+            for row in index_rows
+            if "create unique index" in clean_text(row["definition"]).lower()
+        }
+        return {
+            "indexes": indexes,
+            "unique_indexes": unique_indexes,
+            "triggers": {clean_text(row["name"]) for row in trigger_rows},
+            "routines": {clean_text(row["name"]) for row in routine_rows},
+        }
     def workspace(self) -> dict[str, Any]:
         runtime = default_runtime_workspace()
         runtime["workspace"].update({"id": self.workspace_id, "slug": self.workspace_id, "display_name": self.workspace_id, "storage_backend": self.storage_backend})
@@ -11126,6 +11325,79 @@ class DatabaseSqagStorage:
             )
         return True, pending_artifacts, object_plan
 
+    def _support_forensic_export_artifact(
+        self,
+        session_id: str,
+        run_id: str,
+        kind: str,
+    ) -> dict[str, Any] | None:
+        """Read one published artifact for a pre-authorised forensic graph only."""
+        artifact_mode = configured_artifact_storage_mode()
+        if artifact_mode not in {"database", "object"}:
+            return None
+        safe_id = safe_quote_session_id(session_id, "")
+        safe_run_id = safe_reference(run_id, "run-")
+        safe_kind = clean_text(kind).lower()
+        expected_filename = QUOTE_SESSION_EXPORT_KINDS.get(safe_kind)
+        if not safe_id or not safe_run_id or not expected_filename:
+            return None
+        metadata, _draft_files = self._read_quote_session_metadata_for_workspace(safe_id)
+        publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
+        if (
+            not quote_session_is_published(metadata)
+            or safe_reference(publication.get("run_id"), "run-") != safe_run_id
+        ):
+            return None
+        export = metadata.get("exports", {}).get(safe_kind) if metadata else None
+        if not isinstance(export, dict) or clean_text(export.get("filename")) != expected_filename:
+            return None
+        if quote_session_export_is_stale(metadata, export):
+            return None
+        if artifact_mode == "object":
+            row = self._object_quote_artifact_row(safe_id, safe_kind)
+            if not row:
+                return None
+            object_metadata = self._object_metadata_from_row(row)
+            try:
+                content = configured_object_storage_backend().retrieve_artifact(
+                    object_metadata,
+                    workspace_id=self.workspace_id,
+                )
+            except ObjectStorageContractError:
+                return None
+            if not content or len(content) != object_metadata.size_bytes:
+                return None
+            if not self._object_quote_artifact_row_is_current(safe_id, safe_kind, row):
+                return None
+            return {
+                "filename": row["filename"],
+                "content_type": row["content_type"],
+                "size_bytes": object_metadata.size_bytes,
+                "sha256": object_metadata.checksum_sha256,
+                "content": content,
+            }
+        with self.connection() as connection:
+            row = connection.execute(
+                "select filename, content_type, size_bytes, content_blob, updated_at "
+                "from sqag_quote_artifacts where workspace_id = ? "
+                "and session_id = ? and artifact_kind = ?",
+                (self.workspace_id, safe_id, safe_kind),
+            ).fetchone()
+        if not row or clean_text(row["filename"]) != expected_filename:
+            return None
+        content = bytes(row["content_blob"] or b"")
+        if not content or len(content) != int(row["size_bytes"] or 0):
+            return None
+        if not self._database_quote_artifact_row_is_current(safe_id, safe_kind, row):
+            return None
+        return {
+            "filename": row["filename"],
+            "content_type": row["content_type"],
+            "size_bytes": int(row["size_bytes"] or 0),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "content": content,
+        }
+
     def quote_session_export_artifact(self, session_id: str, kind: str) -> dict[str, Any] | None:
         artifact_mode = configured_artifact_storage_mode()
         if artifact_mode not in {"database", "object"}:
@@ -11677,23 +11949,42 @@ class DatabaseSqagStorage:
                 raise ValueError("Staged artifact evidence does not match publication metadata.")
             if artifact_mode == "object":
                 artifact = connection.execute(
-                    "select filename, size_bytes, checksum_sha256, object_key_ref from sqag_object_artifacts "
-                    "where workspace_id = ? and owner_type = ? and owner_id = ? and session_id = ? and artifact_kind = ? and status = ? and retention_status = ? and deleted_at is null",
+                    "select * from sqag_object_artifacts "
+                    "where workspace_id = ? and owner_type = ? and owner_id = ? "
+                    "and session_id = ? and artifact_kind = ? and status = ? "
+                    "and retention_status = ? and deleted_at is null",
                     (self.workspace_id, "generated_quote", safe_id, safe_id, kind, "active", "active"),
                 ).fetchone()
-                durable_digest = clean_text(artifact["checksum_sha256"]).lower() if artifact else ""
                 durable_key = clean_text(artifact["object_key_ref"]) if artifact else ""
+                durable_content = b""
+                if artifact:
+                    try:
+                        object_metadata = self._object_metadata_from_row(artifact)
+                        durable_content = configured_object_storage_backend().retrieve_artifact(
+                            object_metadata,
+                            workspace_id=self.workspace_id,
+                        )
+                    except ObjectStorageContractError as exc:
+                        raise ValueError(
+                            "Staged durable artifact could not be verified."
+                        ) from exc
+                durable_digest = hashlib.sha256(durable_content).hexdigest() if durable_content else ""
+                durable_size = len(durable_content)
             else:
                 artifact = connection.execute(
-                    "select filename, size_bytes from sqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
+                    "select filename, size_bytes, content_blob from sqag_quote_artifacts "
+                    "where workspace_id = ? and session_id = ? and artifact_kind = ?",
                     (self.workspace_id, safe_id, kind),
                 ).fetchone()
-                durable_digest = digest if artifact else ""
+                durable_content = bytes(artifact["content_blob"] or b"") if artifact else b""
+                durable_digest = hashlib.sha256(durable_content).hexdigest() if durable_content else ""
+                durable_size = len(durable_content)
                 durable_key = "database" if artifact else ""
             if (
                 not artifact
                 or clean_text(artifact["filename"]) != filename
                 or int(artifact["size_bytes"] or -1) != size_bytes
+                or durable_size != size_bytes
                 or durable_digest != digest
                 or not durable_key
             ):
@@ -18454,14 +18745,10 @@ def finish_generation_forensics(
     except Exception as exc:
         error_reference = new_error_reference()
         write_local_log("forensic_persistence_failed", unexpected_error_log_details(error_reference, exc, job_id=clean_text(result.get("job_id"))))
-        if configured_app_mode() == "deploy":
-            return storage_access_error_payload(
-                SqagStorageAccessError(
-                    "Generation evidence storage is unavailable.",
-                    status=503,
-                    reason="forensic_persistence_unavailable",
-                )
-            ) | {"generation_run_id": run_id}
+        if atomic_publication or configured_app_mode() == "deploy":
+            failure = failed_result_payload(error_reference)
+            failure["generation_run_id"] = run_id
+            return failure
     return enriched
 
 
@@ -18567,6 +18854,67 @@ def forensic_artifact_verifier_for_session(storage: Any, session_id: str) -> Any
     return verify
 
 
+class SupportForensicArtifactReader:
+    """Capability-limited reader for one authorised feedback/session graph."""
+
+    def __init__(self, storage: DatabaseSqagStorage, *, feedback_id: str, session_id: str, reason_code: str) -> None:
+        self._storage = storage
+        self.feedback_id = safe_reference(feedback_id, "feedback-")
+        self.session_id = safe_quote_session_id(session_id, "")
+        self.reason_code = safe_reference(reason_code)
+        self.run_id = ""
+        if not self.feedback_id or not self.session_id or not self.reason_code:
+            raise LookupError("Forensic evidence is not available.")
+
+    def publication_context(self) -> dict[str, str]:
+        metadata, _draft_files = self._storage._read_quote_session_metadata_for_workspace(self.session_id)
+        if not metadata:
+            raise LookupError("Forensic evidence is not available.")
+        publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
+        return {"state": clean_text(publication.get("state")).lower(), "run_id": safe_reference(publication.get("run_id"), "run-")}
+
+    def bind_run(self, run_id: str) -> None:
+        safe_run_id = safe_reference(run_id, "run-")
+        if not safe_run_id:
+            raise LookupError("Forensic evidence is not available.")
+        self.run_id = safe_run_id
+
+    def verify_artifact(self, expected: dict[str, Any]) -> bool:
+        filename = clean_text(expected.get("name"))
+        kind = next((candidate for candidate, expected_filename in QUOTE_SESSION_EXPORT_KINDS.items() if expected_filename.casefold() == filename.casefold()), "")
+        if not self.run_id or not kind:
+            return False
+        artifact = self._storage._support_forensic_export_artifact(self.session_id, self.run_id, kind)
+        if not isinstance(artifact, dict):
+            return False
+        content = artifact.get("content")
+        if not isinstance(content, bytes):
+            return False
+        expected_digest = clean_text(expected.get("sha256")).lower()
+        return bool(
+            re.fullmatch(r"[0-9a-f]{64}", expected_digest)
+            and hashlib.sha256(content).hexdigest() == expected_digest
+            and clean_text(artifact.get("sha256")).lower() == expected_digest
+            and len(content) == int(expected.get("size_bytes") or -1)
+            and int(artifact.get("size_bytes") or -1) == len(content)
+        )
+
+
+def support_forensic_artifact_reader_for_auth_session(report: dict[str, Any], reason_code: str, auth_session: dict[str, Any] | None = None) -> SupportForensicArtifactReader:
+    require_support_forensics(auth_session)
+    reason = safe_reference(reason_code)
+    if not reason or not isinstance(report, dict):
+        raise LookupError("Forensic evidence is not available.")
+    feedback_id = safe_reference(report.get("feedback_id"), "feedback-")
+    session_id = safe_quote_session_id(report.get("session_id"), "")
+    if not feedback_id or not session_id or configured_storage_mode() != "database":
+        raise LookupError("Forensic evidence is not available.")
+    storage = app_storage_for_auth_session(auth_session)
+    if not isinstance(storage, DatabaseSqagStorage):
+        raise LookupError("Forensic evidence is not available.")
+    return SupportForensicArtifactReader(storage, feedback_id=feedback_id, session_id=session_id, reason_code=reason)
+
+
 def support_feedback_evidence_for_auth_session(reference: str, reason_code: str, auth_session: dict[str, Any] | None = None) -> dict[str, Any]:
     require_support_forensics(auth_session)
     with forensic_store_for_auth_session(auth_session) as store:
@@ -18574,25 +18922,62 @@ def support_feedback_evidence_for_auth_session(reference: str, reason_code: str,
         report = feedback.get("report") if isinstance(feedback, dict) else None
         if not isinstance(report, dict):
             raise LookupError("Feedback report is not available.")
-        run_id = safe_reference(report.get("run_id"), "run-")
         session_id = safe_quote_session_id(report.get("session_id"), "")
-        if not run_id:
-            raise LookupError("Forensic evidence is not available.")
+        reader: SupportForensicArtifactReader | None = None
+
+        def support_reader() -> SupportForensicArtifactReader:
+            nonlocal reader
+            if reader is None:
+                reader = support_forensic_artifact_reader_for_auth_session(report, reason_code, auth_session)
+            return reader
+
+        try:
+            run_id = store.resolve_feedback_evidence_run(
+                report,
+                publication_context_factory=(
+                    lambda: support_reader().publication_context()
+                )
+                if session_id
+                else None,
+            )
+        except LookupError:
+            store.append_audit(
+                "forensic_evidence_resolution_failed",
+                {
+                    "feedback_id": report["feedback_id"],
+                    "reason_code": safe_reference(reason_code),
+                    "linked_session": bool(session_id),
+                },
+                feedback_id=report["feedback_id"],
+                session_id=session_id,
+            )
+            raise
+
         def artifact_verifier_factory() -> Any:
             if not session_id:
                 raise LookupError("Forensic evidence is not available.")
-            artifact_storage = quote_session_storage_for_auth_session(auth_session)
-            return forensic_artifact_verifier_for_session(
-                artifact_storage,
-                session_id,
-            )
+            active_reader = support_reader()
+            active_reader.bind_run(run_id)
+            return active_reader.verify_artifact
 
-        return store.verify_run_evidence(
+        result = store.verify_run_evidence(
             run_id,
             reason_code=reason_code,
             privileged=True,
             artifact_verifier_factory=artifact_verifier_factory,
         )
+        manifest = result.get("manifest") if isinstance(result, dict) else None
+        artifacts = manifest.get("artifacts") if isinstance(manifest, dict) else None
+        if result.get("integrity_ok") is True and isinstance(artifacts, list) and artifacts:
+            store.append_audit(
+                "support_forensic_artifact_accessed",
+                {"feedback_id": report["feedback_id"], "reason_code": safe_reference(reason_code), "artifact_count": min(len(artifacts), len(QUOTE_SESSION_EXPORT_KINDS))},
+                run_id=run_id,
+                feedback_id=report["feedback_id"],
+                session_id=session_id,
+            )
+        return result
+
 def create_job(
     job_type: str,
     payload: dict[str, Any],
@@ -20006,7 +20391,14 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             ),
             path,
         ):
-            write_local_log("abuse_signal", {"reason": "rate_limit", "path": path, "status": 429})
+            write_local_log(
+                "abuse_signal",
+                {
+                    "reason": "rate_limit",
+                    "path": rate_limit_path_key(path),
+                    "status": 429,
+                },
+            )
             self.send_json({"status": "blocked", "errors": ["Too many local runner requests. Wait a moment and retry."]}, status=429)
             return True
         return False

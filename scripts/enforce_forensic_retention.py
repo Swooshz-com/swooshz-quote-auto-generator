@@ -125,6 +125,8 @@ def _main() -> int:
         "held": result.held,
         "deletion_receipts_created": result.deleted,
         "parents_processed": result.parents_processed,
+        "standalone_audits_examined": result.standalone_examined,
+        "standalone_audits_deleted": result.standalone_deleted,
         "failed": result.failed,
         "review_required": result.review_required,
         "batch_size": batch_size,

@@ -743,7 +743,7 @@ class WebappServerTest(unittest.TestCase):
                         "category": "bug",
                         "title": "Synthetic linked report",
                         "message": "Synthetic support evidence route fixture.",
-                        "run_id": run_id,
+                        "validated_session_id": "quote-support123",
                     }
                 )
                 unlinked = store.submit_feedback(
@@ -837,6 +837,52 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(successful_access_events, 1)
         open_artifact_storage.assert_not_called()
 
+    def test_support_feedback_evidence_http_route_rate_limits_before_lookup(self):
+        self.reset_rate_limit_state()
+        self.addCleanup(self.reset_rate_limit_state)
+        root = test_temp_root() / f"support-evidence-rate-{time.time_ns()}"
+        database_url = f"sqlite:///{(root / 'sqag.sqlite3').as_posix()}"
+        env = self.deploy_auth_env(
+            SQAG_STORAGE_MODE="database",
+            SQAG_ARTIFACT_STORAGE_MODE="database",
+            SQAG_DATABASE_URL=database_url,
+            QUOTE_DATA_ROOT=str(root / "data"),
+            QUOTE_LOG_ROOT=str(root / "logs"),
+        )
+        admin_session = self.platform_auth_session(
+            "workspace-evidence-rate", membership_role="owner", user_id="support-rate"
+        )
+        integrity = {"integrity_ok": True, "run_id": "run-rate123"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            webapp.apply_sqag_storage_migrations(database_url)
+            cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(admin_session)}"
+            headers = {
+                webapp.configured_csrf_header_name(): webapp.csrf_token_for_cookie_header(cookie)
+            }
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(
+                webapp,
+                "support_feedback_evidence_for_auth_session",
+                return_value=integrity,
+            ) as evidence_lookup,
+            LocalRunnerServer() as runner,
+        ):
+            responses = [
+                self.http_json(
+                    runner,
+                    "GET",
+                    "/api/support/feedback/SUP-REDACTED/evidence?reason=support_investigation",
+                    cookie=cookie,
+                    headers=headers,
+                )
+                for _ in range(
+                    webapp.POST_RATE_LIMITS["/api/support/feedback/:id/evidence"] + 1
+                )
+            ]
+        self.assertEqual([item["status"] for item in responses[:-1]], [200] * 6)
+        self.assertEqual(responses[-1]["status"], 429)
+        self.assertEqual(evidence_lookup.call_count, 6)
 
     def test_support_feedback_detail_route_returns_bounded_storage_error(self):
         storage_error = webapp.SqagStorageAccessError(

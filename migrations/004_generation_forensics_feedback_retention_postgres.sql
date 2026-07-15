@@ -21,7 +21,7 @@ create table if not exists sqag_generation_evidence (
 )
 -- SQAG_STATEMENT_BOUNDARY
 create table if not exists sqag_audit_events (
-  event_id text primary key, run_id text, workspace_id text not null, actor_tracking_id text not null, actor_key_version text not null,
+  event_id text primary key, run_id text, feedback_id text, session_id text, workspace_id text not null, actor_tracking_id text not null, actor_key_version text not null,
   event_type text not null, event_json text not null, event_sha256 text not null check (length(event_sha256) = 64), created_at text not null,
   retention_expires_at text not null, original_retention_expires_at text not null, legal_hold integer not null default 0,
   foreign key (run_id, workspace_id) references sqag_generation_runs(run_id, workspace_id)
@@ -71,7 +71,15 @@ create index if not exists sqag_generation_runs_actor_idx on sqag_generation_run
 -- SQAG_STATEMENT_BOUNDARY
 create index if not exists sqag_generation_evidence_run_idx on sqag_generation_evidence (workspace_id, run_id, created_at)
 -- SQAG_STATEMENT_BOUNDARY
+create index if not exists sqag_generation_evidence_retention_idx on sqag_generation_evidence (workspace_id, retention_expires_at)
+-- SQAG_STATEMENT_BOUNDARY
 create index if not exists sqag_audit_events_run_idx on sqag_audit_events (workspace_id, run_id, created_at)
+-- SQAG_STATEMENT_BOUNDARY
+create index if not exists sqag_audit_events_actor_idx on sqag_audit_events (workspace_id, actor_tracking_id, created_at)
+-- SQAG_STATEMENT_BOUNDARY
+create index if not exists sqag_audit_events_feedback_idx on sqag_audit_events (workspace_id, feedback_id, created_at)
+-- SQAG_STATEMENT_BOUNDARY
+create index if not exists sqag_audit_events_retention_idx on sqag_audit_events (workspace_id, retention_expires_at, event_id)
 -- SQAG_STATEMENT_BOUNDARY
 create index if not exists sqag_feedback_workspace_status_idx on sqag_feedback (workspace_id, status, created_at)
 -- SQAG_STATEMENT_BOUNDARY
@@ -82,6 +90,8 @@ create index if not exists sqag_feedback_retention_idx on sqag_feedback (workspa
 create index if not exists sqag_feedback_history_parent_idx on sqag_feedback_status_history (workspace_id, feedback_id, created_at)
 -- SQAG_STATEMENT_BOUNDARY
 create index if not exists sqag_legal_holds_state_idx on sqag_legal_holds (workspace_id, enabled, target_type, target_id)
+-- SQAG_STATEMENT_BOUNDARY
+create index if not exists sqag_deletion_receipts_retention_idx on sqag_deletion_receipts (workspace_id, retention_expires_at)
 -- SQAG_STATEMENT_BOUNDARY
 create or replace function sqag_reject_immutable_change() returns trigger language plpgsql as $$ begin raise exception 'SQAG immutable record cannot be changed'; end $$
 -- SQAG_STATEMENT_BOUNDARY

@@ -868,7 +868,7 @@ class Pr140RegressionTest(unittest.TestCase):
             ),
             mock.patch.object(
                 webapp,
-                "quote_session_storage_for_auth_session",
+                "support_forensic_artifact_reader_for_auth_session",
                 side_effect=outage,
             ) as open_artifact_storage,
         ):
@@ -1367,11 +1367,16 @@ class Pr140RegressionTest(unittest.TestCase):
                 self.audit_access = audit_access
                 return {
                     "report": {
+                        "feedback_id": "feedback-linked123",
                         "run_id": "run-linked123",
                         "session_id": "quote-linked123",
                     },
                     "status_history": [],
                 }
+
+            def resolve_feedback_evidence_run(self, report, **_kwargs):
+                self.resolved_report = report
+                return report["run_id"]
 
             def verify_run_evidence(self, run_id, **kwargs):
                 verifier = kwargs["artifact_verifier_factory"]()
@@ -1379,8 +1384,8 @@ class Pr140RegressionTest(unittest.TestCase):
                 return {"integrity_ok": True, "run_id": run_id}
 
         store = Store()
-        storage = mock.Mock()
-        verifier = object()
+        reader = mock.Mock()
+        reader.verify_artifact = object()
         with (
             mock.patch.object(webapp, "require_support_forensics"),
             mock.patch.object(
@@ -1390,24 +1395,20 @@ class Pr140RegressionTest(unittest.TestCase):
             ),
             mock.patch.object(
                 webapp,
-                "quote_session_storage_for_auth_session",
-                return_value=storage,
-            ),
-            mock.patch.object(
-                webapp,
-                "forensic_artifact_verifier_for_session",
-                return_value=verifier,
-            ) as make_verifier,
+                "support_forensic_artifact_reader_for_auth_session",
+                return_value=reader,
+            ) as make_reader,
         ):
             result = webapp.support_feedback_evidence_for_auth_session(
                 "SUP-123", "support_investigation", {"synthetic": True}
             )
 
         self.assertTrue(result["integrity_ok"])
-        make_verifier.assert_called_once_with(storage, "quote-linked123")
+        make_reader.assert_called_once()
+        reader.bind_run.assert_called_once_with("run-linked123")
+        self.assertEqual(store.resolved_report["session_id"], "quote-linked123")
         self.assertEqual(store.verified[0], "run-linked123")
         self.assertEqual(store.verified[1]["reason_code"], "support_investigation")
-
     def test_direct_generation_validation_block_starts_and_finishes_one_run(self):
         with (
             mock.patch.object(
@@ -1721,6 +1722,69 @@ class Pr140RegressionTest(unittest.TestCase):
     def test_object_artifact_publication_is_atomic_with_terminal_forensics(self):
         self._assert_atomic_publication("object")
 
+    def _assert_tampered_staged_bytes_block_publication(self, artifact_mode):
+        content = f"synthetic-{artifact_mode}-durable-content".encode("ascii")
+        tampered = b"x" * len(content)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{(root / 'sqag.sqlite3').as_posix()}"
+            output_dir = root / "out"
+            output_dir.mkdir(parents=True)
+            (output_dir / "quotation.xlsx").write_bytes(content)
+            env = {
+                "APP_MODE": "internal-uat",
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": artifact_mode,
+                "SQAG_DATABASE_URL": database_url,
+            }
+            backend = webapp.InMemoryObjectStorageBackend()
+            backend_context = (
+                mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend)
+                if artifact_mode == "object"
+                else contextlib.nullcontext()
+            )
+            with mock.patch.dict(os.environ, env, clear=False), backend_context:
+                webapp.apply_sqag_storage_migrations(database_url)
+                storage = webapp.DatabaseSqagStorage(
+                    database_url, "workspace-tamper", role="admin", user_id="synthetic-user"
+                )
+                with storage.connection() as connection:
+                    store = ForensicStore(connection, "workspace-tamper", "pid-test-v1-" + "t" * 24)
+                    run_id = store.record_run_started("generate", {"synthetic": True})
+                storage.create_or_update_quote_session(
+                    {"quote_session": {"session_id": "quote-tamper123"}},
+                    result={"status": "completed"},
+                    output_dir=output_dir,
+                    publish=False,
+                    generation_run_id=run_id,
+                    generation_job_id="job-tamper123",
+                )
+                evidence_files = storage.quote_session_evidence_files("quote-tamper123")
+                if artifact_mode == "object":
+                    key = next(iter(backend._objects))
+                    backend._objects[key] = tampered
+                else:
+                    with storage.connection() as connection:
+                        connection.execute(
+                            "update sqag_quote_artifacts set content_blob = ? where workspace_id = ? and session_id = ? and artifact_kind = 'xlsx'",
+                            (tampered, "workspace-tamper", "quote-tamper123"),
+                        )
+                        connection.commit()
+                with storage.connection() as connection:
+                    with self.assertRaises(ValueError):
+                        storage.publish_quote_session_forensic_transaction(
+                            connection, "quote-tamper123", run_id, evidence_files
+                        )
+                    connection.rollback()
+                session = storage.get_quote_session("quote-tamper123")
+                self.assertFalse(session["status"]["quote_generated"])
+                self.assertIsNone(storage.quote_session_export_artifact("quote-tamper123", "xlsx"))
+
+    def test_database_publication_rehashes_staged_durable_bytes(self):
+        self._assert_tampered_staged_bytes_block_publication("database")
+
+    def test_object_publication_rehashes_staged_durable_bytes(self):
+        self._assert_tampered_staged_bytes_block_publication("object")
     def test_manifest_and_terminal_audit_failures_roll_back_publication(self):
         for failure_point in ("manifest", "audit"):
             with self.subTest(failure_point=failure_point), tempfile.TemporaryDirectory() as tmp:

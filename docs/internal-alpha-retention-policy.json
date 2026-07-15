@@ -43,6 +43,7 @@
       "data_class": "generation_evidence_and_audit",
       "storage": "sqag_generation_runs, sqag_generation_evidence, sqag_audit_events",
       "retention_calendar_years": 3,
+      "lifecycle_note": "Run-linked audit rows are deleted with their run graph; explicitly feedback-linked audit rows are deleted with their feedback graph; standalone audit rows use their own indexed three-calendar-year expiry, controlled-delete authorization, legal-hold check, receipt, bounded batch metrics, fair cross-kind progress, and retry-safe transaction. A held generation run also preserves feedback linked only through that run's exact quote session.",
       "rollback_note": "Restore the immutable run, evidence, and audit rows from the same workspace-scoped backup set and verify evidence digests before access is restored."
     },
     {

@@ -152,6 +152,8 @@ class RetentionResult:
     review_required: int = 0
     scan_limit: int = 0
     scan_exhausted: bool = False
+    standalone_examined: int = 0
+    standalone_deleted: int = 0
 
 
 class RetentionGraphHeld(RuntimeError):
@@ -343,14 +345,44 @@ class ForensicStore:
             self.connection.commit()
         return evidence_id
 
-    def append_audit(self, event_type: str, details: dict[str, Any], *, run_id: str = "", now: dt.datetime | None = None, commit: bool = True) -> str:
+    def append_audit(
+        self,
+        event_type: str,
+        details: dict[str, Any],
+        *,
+        run_id: str = "",
+        feedback_id: str = "",
+        session_id: str = "",
+        now: dt.datetime | None = None,
+        commit: bool = True,
+    ) -> str:
         now = now or utc_now()
         event_id = self.new_id("audit")
         body, digest = digest_json(details)
         expiry, original = self._retention(now)
         self.connection.execute(
-            "insert into sqag_audit_events (event_id, run_id, workspace_id, actor_tracking_id, actor_key_version, event_type, event_json, event_sha256, created_at, retention_expires_at, original_retention_expires_at, legal_hold) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (event_id, safe_reference(run_id, "run-") or None, self.workspace_id, self.actor_tracking_id, self.actor_key_version, safe_feedback_text(event_type, 80), body, digest, iso_timestamp(now), expiry, original, 0),
+            "insert into sqag_audit_events "
+            "(event_id, run_id, feedback_id, session_id, workspace_id, "
+            "actor_tracking_id, actor_key_version, event_type, event_json, "
+            "event_sha256, created_at, retention_expires_at, "
+            "original_retention_expires_at, legal_hold) "
+            "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event_id,
+                safe_reference(run_id, "run-") or None,
+                safe_reference(feedback_id, "feedback-") or None,
+                safe_reference(session_id) or None,
+                self.workspace_id,
+                self.actor_tracking_id,
+                self.actor_key_version,
+                safe_feedback_text(event_type, 80),
+                body,
+                digest,
+                iso_timestamp(now),
+                expiry,
+                original,
+                0,
+            ),
         )
         if commit:
             self.connection.commit()
@@ -535,7 +567,7 @@ class ForensicStore:
             "insert into sqag_feedback_status_history (history_id, feedback_id, workspace_id, from_status, to_status, actor_tracking_id, actor_key_version, resolution_note, created_at, retention_expires_at, original_retention_expires_at, legal_hold) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (self.new_id("feedback-history"), feedback_id, self.workspace_id, "", "open", self.actor_tracking_id, self.actor_key_version, None, iso_timestamp(now), expiry, original, 0),
         )
-        self.append_audit("feedback_submitted", {"feedback_id": feedback_id, "support_reference": support_reference, "category": category, "linked_run": bool(run_id), "linked_session": bool(session_id), "manual_reference_status": manual_status}, run_id=run_id, now=now, commit=False)
+        self.append_audit("feedback_submitted", {"feedback_id": feedback_id, "support_reference": support_reference, "category": category, "linked_run": bool(run_id), "linked_session": bool(session_id), "manual_reference_status": manual_status}, run_id=run_id, feedback_id=feedback_id, session_id=session_id, now=now, commit=False)
         self.connection.commit()
         return {"feedback_id": feedback_id, "feedback_report_id": feedback_id, "support_reference": support_reference, "manual_reference_status": manual_status, "status": "open"}
 
@@ -560,8 +592,91 @@ class ForensicStore:
             raise LookupError("Feedback report is not available.")
         history = [row_dict(row) for row in self.connection.execute("select * from sqag_feedback_status_history where workspace_id = ? and feedback_id = ? order by created_at, history_id", (self.workspace_id, report["feedback_id"])).fetchall()]
         if audit_access:
-            self.append_audit("feedback_report_accessed", {"feedback_id": report["feedback_id"]})
+            self.append_audit(
+                "feedback_report_accessed",
+                {"feedback_id": report["feedback_id"]},
+                feedback_id=report["feedback_id"],
+                session_id=safe_reference(report.get("session_id")),
+            )
         return {"report": report, "status_history": history}
+
+    def resolve_feedback_evidence_run(
+        self,
+        report: dict[str, Any],
+        *,
+        publication_context_factory: Callable[[], dict[str, str]] | None = None,
+    ) -> str:
+        """Resolve one authorised report to one same-workspace evidence run."""
+        if not isinstance(report, dict):
+            raise LookupError("Forensic evidence is not available.")
+        direct_run_id = safe_reference(report.get("run_id"), "run-")
+        session_id = safe_reference(report.get("session_id"))
+        if direct_run_id:
+            direct = row_dict(
+                self.connection.execute(
+                    "select run_id, quote_session_id from sqag_generation_runs "
+                    "where workspace_id = ? and run_id = ? limit 1",
+                    (self.workspace_id, direct_run_id),
+                ).fetchone()
+            )
+            if not direct:
+                raise LookupError("Forensic evidence is not available.")
+            linked_session = safe_reference(direct.get("quote_session_id"))
+            if session_id and linked_session and session_id != linked_session:
+                raise LookupError("Forensic evidence is not available.")
+            return direct_run_id
+        if not session_id:
+            raise LookupError("Forensic evidence is not available.")
+        rows = self.connection.execute(
+            "select run.run_id, run.status, evidence.evidence_json, "
+            "evidence.evidence_sha256 from sqag_generation_runs run "
+            "join sqag_generation_evidence evidence "
+            "on evidence.workspace_id = run.workspace_id "
+            "and evidence.run_id = run.run_id "
+            "and evidence.evidence_type = 'generation_manifest' "
+            "where run.workspace_id = ? and run.quote_session_id = ? "
+            "and run.status not in ('received','queued','running','abandoned','superseded') "
+            "order by run.completed_at, run.run_id",
+            (self.workspace_id, session_id),
+        ).fetchall()
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            item = row_dict(row)
+            raw = str(item.get("evidence_json") or "")
+            if hashlib.sha256(raw.encode("utf-8")).hexdigest() != str(
+                item.get("evidence_sha256") or ""
+            ):
+                continue
+            try:
+                manifest = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(manifest, dict):
+                continue
+            if safe_reference(manifest.get("generation_run_id"), "run-") != item.get("run_id"):
+                continue
+            if manifest.get("workspace_id") != self.workspace_id:
+                continue
+            artifacts = manifest.get("artifacts")
+            if not isinstance(artifacts, list):
+                continue
+            candidates.append({"run_id": item["run_id"], "artifacts": artifacts})
+        if len(candidates) == 1 and not candidates[0]["artifacts"]:
+            return str(candidates[0]["run_id"])
+        if not candidates or publication_context_factory is None:
+            raise LookupError("Forensic evidence is not available.")
+        publication = publication_context_factory()
+        if not isinstance(publication, dict):
+            raise LookupError("Forensic evidence is not available.")
+        if safe_feedback_text(publication.get("state"), 20).lower() != "published":
+            raise LookupError("Forensic evidence is not available.")
+        published_run_id = safe_reference(publication.get("run_id"), "run-")
+        selected = [
+            item for item in candidates if item.get("run_id") == published_run_id
+        ]
+        if len(selected) != 1:
+            raise LookupError("Forensic evidence is not available.")
+        return published_run_id
 
     def update_feedback_status(
         self,
@@ -677,6 +792,8 @@ class ForensicStore:
                 "retention_policy_version": FEEDBACK_RETENTION_POLICY_VERSION,
             },
             run_id=safe_reference(report.get("run_id"), "run-"),
+            feedback_id=report["feedback_id"],
+            session_id=safe_reference(report.get("session_id")),
             now=now,
             commit=False,
         )
@@ -780,11 +897,25 @@ class ForensicStore:
         return bool(self.connection.execute("select 1 from sqag_legal_holds where workspace_id = ? and target_type = ? and target_id = ? and enabled = 1 limit 1", (self.workspace_id, target_type, target_id)).fetchone())
 
     def _run_graph_held(self, run_id: str) -> bool:
-        if self._active_hold("generation_run", run_id):
+        direct = row_dict(
+            self.connection.execute(
+                "select legal_hold from sqag_generation_runs "
+                "where workspace_id = ? and run_id = ? limit 1",
+                (self.workspace_id, run_id),
+            ).fetchone()
+        )
+        if bool(direct.get("legal_hold")) or self._active_hold("generation_run", run_id):
             return True
         queries = (("sqag_generation_evidence", "evidence_id", "generation_evidence"), ("sqag_audit_events", "event_id", "audit_event"))
         for table, column, target in queries:
-            row = self.connection.execute(f"select 1 from {table} child join sqag_legal_holds hold on hold.workspace_id = child.workspace_id and hold.target_type = ? and hold.target_id = child.{column} and hold.enabled = 1 where child.workspace_id = ? and child.run_id = ? limit 1", (target, self.workspace_id, run_id)).fetchone()
+            row = self.connection.execute(
+                f"select 1 from {table} child where child.workspace_id = ? "
+                "and child.run_id = ? and (child.legal_hold = 1 or exists ("
+                "select 1 from sqag_legal_holds hold where hold.workspace_id = child.workspace_id "
+                f"and hold.target_type = ? and hold.target_id = child.{column} "
+                "and hold.enabled = 1)) limit 1",
+                (self.workspace_id, run_id, target),
+            ).fetchone()
             if row:
                 return True
         return False
@@ -794,24 +925,52 @@ class ForensicStore:
             return True
         child_held = self.connection.execute(
             "select 1 from sqag_feedback_status_history child "
-            "join sqag_legal_holds hold on hold.workspace_id = child.workspace_id "
+            "where child.workspace_id = ? and child.feedback_id = ? "
+            "and (child.legal_hold = 1 or exists (select 1 from sqag_legal_holds hold "
+            "where hold.workspace_id = child.workspace_id "
             "and hold.target_type = 'feedback_status_history' "
-            "and hold.target_id = child.history_id and hold.enabled = 1 "
-            "where child.workspace_id = ? and child.feedback_id = ? limit 1",
+            "and hold.target_id = child.history_id and hold.enabled = 1)) limit 1",
             (self.workspace_id, feedback_id),
         ).fetchone()
         if child_held:
             return True
+        linked_audit_held = self.connection.execute(
+            "select 1 from sqag_audit_events child "
+            "where child.workspace_id = ? and child.feedback_id = ? "
+            "and (child.legal_hold = 1 or exists (select 1 from sqag_legal_holds hold "
+            "where hold.workspace_id = child.workspace_id "
+            "and hold.target_type = 'audit_event' "
+            "and hold.target_id = child.event_id and hold.enabled = 1)) limit 1",
+            (self.workspace_id, feedback_id),
+        ).fetchone()
+        if linked_audit_held:
+            return True
         report = row_dict(
             self.connection.execute(
-                "select run_id from sqag_feedback "
+                "select run_id, session_id, legal_hold from sqag_feedback "
                 "where workspace_id = ? and feedback_id = ? limit 1",
                 (self.workspace_id, feedback_id),
             ).fetchone()
         )
+        if bool(report.get("legal_hold")):
+            return True
         linked_run_id = safe_reference(report.get("run_id"), "run-")
-        return bool(linked_run_id and self._run_graph_held(linked_run_id))
-
+        if linked_run_id and self._run_graph_held(linked_run_id):
+            return True
+        session_id = safe_reference(report.get("session_id"))
+        if not session_id:
+            return False
+        linked_runs = self.connection.execute(
+            "select run_id from sqag_generation_runs where workspace_id = ? "
+            "and quote_session_id = ? order by run_id limit 501",
+            (self.workspace_id, session_id),
+        ).fetchall()
+        if len(linked_runs) > 500:
+            return True
+        return any(
+            self._run_graph_held(safe_reference(row_dict(row).get("run_id"), "run-"))
+            for row in linked_runs
+        )
     def _authorize_delete(self, record_type: str, record_id: str) -> None:
         self.connection.execute("insert into sqag_retention_delete_authorizations (authorization_id, workspace_id, record_type, record_id, created_at) values (?, ?, ?, ?, ?)", (self.new_id("retention-auth"), self.workspace_id, record_type, record_id, iso_timestamp(utc_now())))
 
@@ -911,6 +1070,20 @@ class ForensicStore:
                     removed.append((record_type, str(child[column]), str(child["original_retention_expires_at"])))
             cursor = self.connection.execute("delete from sqag_generation_runs where workspace_id = ? and run_id = ?", (self.workspace_id, record_id))
         else:
+            audit_rows = self.connection.execute(
+                "select event_id, original_retention_expires_at "
+                "from sqag_audit_events where workspace_id = ? "
+                "and feedback_id = ? and run_id is null",
+                (self.workspace_id, record_id),
+            ).fetchall()
+            for row in audit_rows:
+                child = row_dict(row)
+                self._authorize_delete("sqag_audit_events", str(child["event_id"]))
+                self.connection.execute(
+                    "delete from sqag_audit_events where workspace_id = ? and event_id = ?",
+                    (self.workspace_id, child["event_id"]),
+                )
+                removed.append(("sqag_audit_events", str(child["event_id"]), str(child["original_retention_expires_at"])))
             rows = self.connection.execute("select history_id, original_retention_expires_at from sqag_feedback_status_history where workspace_id = ? and feedback_id = ?", (self.workspace_id, record_id)).fetchall()
             for row in rows:
                 child = row_dict(row)
@@ -959,35 +1132,55 @@ class ForensicStore:
                 (self.workspace_id, now_text, query_limit),
             ).fetchall()
         ]
+        standalone_audits = [
+            dict(row_dict(row), _kind="standalone_audit")
+            for row in self.connection.execute(
+                "select * from sqag_audit_events where workspace_id = ? "
+                "and run_id is null and feedback_id is null "
+                "and retention_expires_at <= ? "
+                "order by retention_expires_at, event_id limit ?",
+                (self.workspace_id, now_text, query_limit),
+            ).fetchall()
+        ]
 
         def candidate_key(row: dict[str, Any]) -> tuple[Any, ...]:
-            claimed_at = str(row.get("deletion_claimed_at") or "")
             kind = str(row.get("_kind") or "")
-            record_id = str(row.get("run_id") or row.get("feedback_id") or "")
+            record_id = str(
+                row.get("feedback_id")
+                if kind == "feedback"
+                else row.get("run_id")
+                if kind == "generation_run"
+                else row.get("event_id")
+                or ""
+            )
             return (
-                0 if not claimed_at else 1,
-                claimed_at,
-                0 if kind == "feedback" else 1,
+                0 if not row.get("deletion_claimed_at") else 1,
+                str(row.get("deletion_claimed_at") or ""),
                 str(row.get("retention_expires_at") or ""),
                 record_id,
             )
 
-        merged = sorted(runs + feedback, key=candidate_key)
-        has_more = (
+        groups = tuple(
+            sorted(group, key=candidate_key)
+            for group in (feedback, runs, standalone_audits)
+        )
+        merged: list[dict[str, Any]] = []
+        for offset in range(max((len(group) for group in groups), default=0)):
+            for group in groups:
+                if offset < len(group):
+                    merged.append(group[offset])
+        has_more = bool(
             len(runs) > scan_limit
             or len(feedback) > scan_limit
+            or len(standalone_audits) > scan_limit
             or len(merged) > scan_limit
         )
         candidates = merged[:scan_limit]
-        examined = deleted = held = failed = review_required = parents = 0
+        examined = deleted = held = failed = review_required = parents = actions = 0
+        standalone_examined = standalone_deleted = 0
 
-        def mark_examined(
-            kind: str,
-            record_id: str,
-            *,
-            state: str = "",
-        ) -> None:
-            if not apply:
+        def mark_examined(kind: str, record_id: str, *, state: str = "") -> None:
+            if not apply or kind == "standalone_audit":
                 return
             table = "sqag_generation_runs" if kind == "generation_run" else "sqag_feedback"
             id_column = "run_id" if kind == "generation_run" else "feedback_id"
@@ -1006,14 +1199,73 @@ class ForensicStore:
             self.connection.commit()
 
         for candidate in candidates:
-            if parents >= batch_size:
+            if actions >= batch_size:
                 break
             examined += 1
             item = dict(candidate)
             kind = str(item.pop("_kind"))
             record_id = str(
-                item["run_id"] if kind == "generation_run" else item["feedback_id"]
+                item.get("feedback_id")
+                if kind == "feedback"
+                else item.get("run_id")
+                if kind == "generation_run"
+                else item.get("event_id")
+                or ""
             )
+            if kind == "standalone_audit":
+                standalone_examined += 1
+                if bool(item.get("legal_hold")) or self._active_hold(
+                    "audit_event", record_id
+                ):
+                    held += 1
+                    continue
+                actions += 1
+                if not apply:
+                    continue
+                try:
+                    self._acquire_transaction_locks(("audit_event", record_id))
+                    current = row_dict(
+                        self.connection.execute(
+                            "select * from sqag_audit_events where workspace_id = ? "
+                            "and event_id = ? and run_id is null and feedback_id is null",
+                            (self.workspace_id, record_id),
+                        ).fetchone()
+                    )
+                    current_expiry = parse_timestamp(current.get("retention_expires_at"))
+                    retention_now = parse_timestamp(now_text)
+                    if (
+                        not current
+                        or bool(current.get("legal_hold"))
+                        or self._active_hold("audit_event", record_id)
+                        or current_expiry is None
+                        or retention_now is None
+                        or current_expiry > retention_now
+                    ):
+                        raise RetentionGraphHeld("standalone_audit_became_protected")
+                    self._authorize_delete("sqag_audit_events", record_id)
+                    cursor = self.connection.execute(
+                        "delete from sqag_audit_events where workspace_id = ? and event_id = ?",
+                        (self.workspace_id, record_id),
+                    )
+                    if getattr(cursor, "rowcount", 0) != 1:
+                        raise RuntimeError("standalone_audit_delete_incomplete")
+                    self._receipt(
+                        "sqag_audit_events",
+                        record_id,
+                        str(current["original_retention_expires_at"]),
+                        now_text,
+                    )
+                    self.connection.commit()
+                    deleted += 1
+                    standalone_deleted += 1
+                except RetentionGraphHeld:
+                    self.connection.rollback()
+                    actions -= 1
+                    held += 1
+                except Exception:
+                    self.connection.rollback()
+                    failed += 1
+                continue
             if kind == "feedback" and item.get("status") not in FEEDBACK_CLOSED_STATES:
                 review_required += 1
                 mark_examined(kind, record_id, state="review_required")
@@ -1033,6 +1285,7 @@ class ForensicStore:
                 mark_examined(kind, record_id)
                 continue
             parents += 1
+            actions += 1
             if not apply:
                 continue
             try:
@@ -1077,16 +1330,13 @@ class ForensicStore:
             except RetentionGraphHeld:
                 self.connection.rollback()
                 parents -= 1
+                actions -= 1
                 held += 1
                 mark_examined(kind, record_id)
             except Exception:
                 self.connection.rollback()
                 failed += 1
-                table = (
-                    "sqag_generation_runs"
-                    if kind == "generation_run"
-                    else "sqag_feedback"
-                )
+                table = "sqag_generation_runs" if kind == "generation_run" else "sqag_feedback"
                 id_column = "run_id" if kind == "generation_run" else "feedback_id"
                 self.connection.execute(
                     f"update {table} set deletion_state = 'delete_failed', "
@@ -1096,7 +1346,7 @@ class ForensicStore:
                 )
                 self.connection.commit()
         scan_exhausted = bool(
-            parents < batch_size and has_more and examined >= scan_limit
+            actions < batch_size and has_more and examined >= scan_limit
         )
         return RetentionResult(
             examined,
@@ -1107,8 +1357,9 @@ class ForensicStore:
             review_required,
             scan_limit,
             scan_exhausted,
+            standalone_examined,
+            standalone_deleted,
         )
-
     def reconcile_non_terminal_runs(self, *, active_job_ids: Iterable[str] = (), now: dt.datetime | None = None, stale_after_seconds: int = 900, batch_size: int = 100) -> int:
         now = now or utc_now()
         cutoff = iso_timestamp(now - dt.timedelta(seconds=max(60, int(stale_after_seconds))))

@@ -25,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Apply the exact SQAG routine-log retention window.")
     parser.add_argument("--mode", choices=sorted(RETENTION_DAYS), required=True)
     parser.add_argument("--log-root", type=Path)
+    parser.add_argument("--expected-log-root", type=Path, help="Required exact confirmation when --log-root overrides the configured root.")
     parser.add_argument("--legal-hold-manifest", type=Path, help="Optional JSON object with a held_relative_paths string list.")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--now", help="Optional timezone-aware ISO timestamp for deterministic testing.")
@@ -51,7 +52,18 @@ def main() -> int:
     if now.tzinfo is None:
         raise ValueError("--now must include a timezone.")
     cutoff = now.astimezone(dt.timezone.utc) - dt.timedelta(days=retention_days)
-    root = (args.log_root or webapp.configured_log_root()).resolve()
+    configured_root = webapp.configured_log_root().resolve()
+    root = (args.log_root or configured_root).resolve()
+    if args.log_root is not None:
+        expected_root = args.expected_log_root.resolve() if args.expected_log_root else None
+        if expected_root != root:
+            print(json.dumps({
+                "status": "blocked",
+                "reason": "custom_log_root_confirmation_required",
+                "retention_days": retention_days,
+                "production_ready": False,
+            }, sort_keys=True))
+            return 2
     root.mkdir(parents=True, exist_ok=True)
     holds = load_holds(args.legal_hold_manifest)
     examined = deleted = held = skipped = 0

@@ -55,6 +55,8 @@ create table if not exists sqag_generation_evidence (
 create table if not exists sqag_audit_events (
   event_id text not null primary key,
   run_id text,
+  feedback_id text,
+  session_id text,
   workspace_id text not null,
   actor_tracking_id text not null,
   actor_key_version text not null,
@@ -170,6 +172,8 @@ create index if not exists sqag_generation_evidence_run_idx on sqag_generation_e
 create index if not exists sqag_generation_evidence_retention_idx on sqag_generation_evidence (workspace_id, retention_expires_at);
 create index if not exists sqag_audit_events_run_idx on sqag_audit_events (workspace_id, run_id, created_at);
 create index if not exists sqag_audit_events_actor_idx on sqag_audit_events (workspace_id, actor_tracking_id, created_at);
+create index if not exists sqag_audit_events_feedback_idx on sqag_audit_events (workspace_id, feedback_id, created_at);
+create index if not exists sqag_audit_events_retention_idx on sqag_audit_events (workspace_id, retention_expires_at, event_id);
 create index if not exists sqag_feedback_workspace_status_idx on sqag_feedback (workspace_id, status, created_at);
 create index if not exists sqag_feedback_support_idx on sqag_feedback (workspace_id, support_reference);
 create index if not exists sqag_feedback_retention_idx on sqag_feedback (workspace_id, deletion_state, retention_expires_at, feedback_id);
@@ -182,7 +186,7 @@ before update of evidence_json, evidence_sha256, evidence_type, evidence_schema_
   select raise(abort, 'generation evidence is immutable');
 end;
 create trigger if not exists sqag_audit_events_no_update
-before update of event_json, event_sha256, event_type, run_id, workspace_id, actor_tracking_id, actor_key_version, created_at on sqag_audit_events begin
+before update of event_json, event_sha256, event_type, run_id, feedback_id, session_id, workspace_id, actor_tracking_id, actor_key_version, created_at on sqag_audit_events begin
   select raise(abort, 'audit events are immutable');
 end;
 create trigger if not exists sqag_generation_evidence_guard_delete

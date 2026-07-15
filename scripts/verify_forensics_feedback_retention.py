@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import inspect
 import json
@@ -90,6 +91,48 @@ def run_verification(work_dir: Path | None = None) -> dict[str, object]:
         editor = webapp.DatabaseSqagStorage("sqlite:///:memory:", "workspace-synthetic", role="editor", user_id="user-editor")
         with mock.patch.dict(os.environ, {webapp.TRACKING_HMAC_KEY_ENV_NAME: "synthetic-tracking-key-with-enough-entropy", webapp.TRACKING_HMAC_KEY_VERSION_ENV_NAME: "synthetic-v1"}):
             tracking_identifier = webapp.privacy_safe_audit_tracking_id("user-editor")
+        schema_storage = object.__new__(webapp.DatabaseSqagStorage)
+        schema_storage.database_family = "sqlite"
+        schema_storage.connection = lambda: contextlib.nullcontext(connection)
+        sqlite_schema_ready = True
+        try:
+            schema_storage._ensure_schema(
+                webapp.SQAG_FORENSIC_REQUIRED_COLUMNS,
+                reason="storage_forensics_database_not_migrated",
+            )
+        except webapp.SqagStorageAccessError:
+            sqlite_schema_ready = False
+        postgres_sql = "\n".join(
+            path.read_text(encoding="utf-8").lower()
+            for path in (
+                ROOT / "migrations" / "004_generation_forensics_feedback_retention_postgres.sql",
+                ROOT / "migrations" / "005_forensic_postgres_delete_guards.sql",
+            )
+        )
+        postgres_schema_contract_ready = all(
+            name.lower() in postgres_sql
+            for name in (
+                set(webapp.SQAG_FORENSIC_REQUIRED_INDEXES)
+                | set(webapp.SQAG_FORENSIC_REQUIRED_TRIGGERS)
+                | set(webapp.SQAG_FORENSIC_POSTGRES_REQUIRED_ROUTINES)
+            )
+        ) and all(
+            table.lower() in postgres_sql
+            and all(column.lower() in postgres_sql for column in columns)
+            for table, columns in webapp.SQAG_FORENSIC_REQUIRED_COLUMNS.items()
+        )
+        standalone_id = store.append_audit(
+            "synthetic_standalone_retention",
+            {"synthetic": True},
+            now=dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc),
+        )
+        standalone_result = store.enforce_retention(
+            now=dt.datetime(2024, 1, 2, tzinfo=dt.timezone.utc)
+        )
+        standalone_deleted = connection.execute(
+            "select count(*) from sqag_audit_events where event_id = ?",
+            (standalone_id,),
+        ).fetchone()[0] == 0
         checks = {
             "blocked_attempt_is_durable": run_row["status"] == "blocked" and run_row["error_category"] == "images_missing",
             "canonical_evidence_is_hashed": len(evidence_rows) == 2 and all(len(row["evidence_sha256"]) == 64 for row in evidence_rows),
@@ -101,6 +144,9 @@ def run_verification(work_dir: Path | None = None) -> dict[str, object]:
             "sqlite_delete_authorizations_are_consumed": sqlite_authorizations_consumed,
             "postgres_delete_authorization_contract_is_single_use": postgres_authorization_is_consumed,
             "retention_graph_lock_contract_is_transaction_scoped": postgres_retention_lock_contract,
+            "complete_sqlite_forensic_schema_is_ready": sqlite_schema_ready,
+            "complete_postgres_forensic_contract_is_declared": postgres_schema_contract_ready,
+            "standalone_audit_retention_is_enforced": standalone_result.standalone_deleted == 1 and standalone_deleted,
             "ownerless_sessions_fail_closed": not editor._quote_session_visible_to_current_user(ownerless) and not editor._quote_session_editable_by_current_user(ownerless),
             "tracking_identifier_is_keyed_and_versioned": tracking_identifier.startswith("pid-synthetic-v1-") and tracking_identifier != "user-editor",
             "xlsx_column_bound_is_enforced": False,

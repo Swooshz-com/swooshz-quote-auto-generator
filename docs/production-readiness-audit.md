@@ -657,3 +657,51 @@ UAT until these are true:
 Do not combine these with public deployment, billing, Stripe, production auth
 redesign, customer data migration, or any claim that PR #84 alone makes SQAG
 production-ready.
+### PR #140 six-blocker review closure (2026-07-15)
+
+The remaining review blockers are repaired without changing visible UI or
+promoting readiness. Support evidence now resolves a direct run first and can
+resolve session-only feedback only through an exact workspace/session evidence
+graph. Multiple historical runs require the exact currently published run;
+staged, ambiguous, missing, and cross-workspace candidates fail closed.
+Artifact-bearing verification uses a capability-limited support reader bound to
+one authorised feedback/session/run and reads only canonical-manifest artifacts;
+ordinary quote ownership filters remain unchanged.
+
+Database and object publication finalisation now fails closed in every app mode
+when the atomic terminal transaction fails. The response cannot retain completed
+status, files, or download URLs. Pure filesystem local development keeps its
+non-atomic semantics. Existing transaction compensation, staged-artifact
+invisibility, retry, and prior-published-version protections remain covered by
+the PR #140 regression suite.
+
+Forensic readiness now checks the exhaustive runtime column contract plus
+material indexes, unique indexes, immutability triggers, controlled-delete
+triggers, and Postgres single-use delete-authorisation routines through metadata
+catalogs. The legacy local SQLite upgrader is additive and covers every current
+runtime-required forensic column before the migration installs indexes and
+triggers. Synthetic partial-schema fixtures fail with the bounded database-not-
+migrated posture.
+
+Audit events have explicit nullable feedback/session linkage. Run-linked events
+follow the run graph, feedback-linked events follow the feedback graph, and
+standalone events follow their own indexed expiry. Standalone deletion is
+workspace-scoped, bounded, legal-hold-aware, controlled-delete authorised,
+receipt-backed, rollback-safe, retryable, and separately reported by the
+retention CLI. The privileged evidence route normalises to
+`/api/support/feedback/:id/evidence` and is limited to six requests per 60-second
+window before report or artifact access; abuse logging records only the
+normalised route and bounded signal.
+
+The diff-focused security review also reproduced and closed four adjacent issues.
+Retention candidates now interleave feedback, run, and standalone kinds without
+breaking feedback-before-run dependency cleanup; held runs protect feedback
+linked only through the same bounded session graph. Atomic publication re-reads
+and SHA-256 verifies durable database/object bytes rather than trusting metadata
+alone. The log-retention CLI requires `--expected-log-root` to exactly match any
+custom `--log-root` before deletion, in addition to `--apply`; neither path is
+printed in its bounded result.
+Synthetic current-head verification covers the complete SQLite and declared
+Postgres forensic contracts plus standalone audit expiry. `internal_alpha_ready`
+and `production_ready` remain false; hosted migration, provider, retention,
+backup/restore, observability, and owner/counsel evidence remain outstanding.
