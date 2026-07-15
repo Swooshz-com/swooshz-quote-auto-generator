@@ -63,7 +63,7 @@ class Pr140RegressionTest(unittest.TestCase):
         )
 
     def test_retention_and_legal_hold_are_serialized_without_orphaned_hold(self):
-        with tempfile.TemporaryDirectory(dir=Path("C:/tmp")) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "forensics.sqlite3"
             retention_connection = sqlite3.connect(path, timeout=5, check_same_thread=False)
             retention_connection.row_factory = sqlite3.Row
@@ -794,7 +794,7 @@ class Pr140RegressionTest(unittest.TestCase):
     def _assert_atomic_publication(self, artifact_mode):
         content = f"synthetic-{artifact_mode}-published-xlsx".encode("ascii")
         digest = hashlib.sha256(content).hexdigest()
-        with tempfile.TemporaryDirectory(dir=Path("C:/tmp")) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             database_url = f"sqlite:///{(root / 'sqag.sqlite3').as_posix()}"
             output_dir = root / "out"
@@ -966,9 +966,7 @@ class Pr140RegressionTest(unittest.TestCase):
 
     def test_manifest_and_terminal_audit_failures_roll_back_publication(self):
         for failure_point in ("manifest", "audit"):
-            with self.subTest(failure_point=failure_point), tempfile.TemporaryDirectory(
-                dir=Path("C:/tmp")
-            ) as tmp:
+            with self.subTest(failure_point=failure_point), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 database_url = f"sqlite:///{(root / 'sqag.sqlite3').as_posix()}"
                 output_dir = root / "out"
@@ -1115,7 +1113,7 @@ class Pr140RegressionTest(unittest.TestCase):
                 raise RuntimeError("synthetic compensation failure")
 
         storage = SyntheticStorage()
-        with tempfile.TemporaryDirectory(dir=Path("C:/tmp")) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             layout = root / "layout.xlsx"
             layout.write_bytes(b"synthetic-layout")
