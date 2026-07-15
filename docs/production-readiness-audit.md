@@ -62,12 +62,36 @@ authorised or used.
 
 `production_ready=false`
 
+### PR #140 Blocker Repair Closure
+
+- Privileged feedback evidence retrieval now unwraps the workspace-scoped
+  feedback `report`, verifies its linked run in the same workspace, and re-reads
+  durable artifact bytes. The route preserves non-disclosing denials and a
+  separate reason-coded access audit.
+- Database and object artifacts are staged as non-published. The quote-session
+  visibility transition, canonical manifest, terminal run state, and terminal
+  audit commit in one metadata transaction. Object bytes are uploaded before
+  that transaction, so the guarantee is atomic customer visibility rather than
+  an atomic cross-provider byte write; failed finalisation leaves a fail-closed
+  staged/failed tombstone with bounded recovery logging.
+- Accepted direct and asynchronous generation paths share one run lifecycle.
+  Direct validation blocks are terminally recorded, while an existing async or
+  idempotency-key run is reused instead of duplicated.
+- The Postgres delete guard consumes one exact workspace/type/record retention
+  authorisation with `DELETE ... RETURNING` in the deletion transaction. Rollback
+  restores both the protected row and its capability; committed deletion cannot
+  reuse it.
+- The current Feedback, Privacy, and Terms topbar surfaces were explicitly
+  approved as the new direction and are frozen; this repair makes no further
+  visible UI, DOM, layout, or CSS change.
+
 ### 2026-07-15 Validation Record
 
 - `git diff --check`: passed.
 - JavaScript syntax checks: `webapp/static/app.js`, `scripts/playwright-smoke.mjs`, `scripts/playwright-ai-basis-chat-stress.mjs`, `scripts/playwright-download-excel-confirm-regression.mjs`, and `scripts/playwright-forensics-feedback.mjs` passed.
 - Python syntax checks: server, generator, forensics, retention, observability, production DB, and live retention verifier modules passed.
-- `python -m unittest discover -s tests`: 791 tests passed.
+- `python -m unittest tests.test_forensics_pr140_regressions`: 29 tests passed.
+- `python -m unittest discover -s tests`: 842 tests passed.
 - `python -m pip check`: passed.
 - `python -m pip_audit -r requirements.txt --strict`: passed, no known vulnerabilities found.
 - `npm ci`: passed, installed/audited 3 packages.

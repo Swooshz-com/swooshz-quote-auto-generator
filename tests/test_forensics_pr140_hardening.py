@@ -154,10 +154,17 @@ class Pr140HardeningTest(unittest.TestCase):
         past = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
         run_id = self.a.record_run_started("generate", {"synthetic": True}, now=past)
         self.a.finish_run(run_id, "failed", result_summary={"synthetic": True}, now=past)
-        failed = self.a.enforce_retention(now=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc), artifact_delete=lambda _row: False)
+        failed = self.a.enforce_retention(now=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc), artifact_delete=lambda _row, _finalize: False)
         self.assertEqual(failed.failed, 1)
         self.assertEqual(self.connection.execute("select count(*) from sqag_deletion_receipts where record_id = ?", (run_id,)).fetchone()[0], 0)
-        retried = self.a.enforce_retention(now=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc), artifact_delete=lambda _row: True)
+        def delete_on_retry(_row, finalize):
+            finalize(self.connection, require_session_exclusive=True)
+            return True
+
+        retried = self.a.enforce_retention(
+            now=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+            artifact_delete=delete_on_retry,
+        )
         self.assertEqual(retried.parents_processed, 1)
 
     def test_retention_deletes_artifacts_before_parent_and_creates_receipt_after_success(self):
@@ -166,8 +173,9 @@ class Pr140HardeningTest(unittest.TestCase):
         self.a.finish_run(run_id, "completed", quote_session_id="quote-retention", now=past)
         calls = []
 
-        def delete_artifacts(row):
+        def delete_artifacts(row, finalize):
             calls.append((row["run_id"], row["quote_session_id"]))
+            finalize(self.connection, require_session_exclusive=True)
             return True
 
         result = self.a.enforce_retention(
@@ -208,6 +216,61 @@ class Pr140HardeningTest(unittest.TestCase):
             self.assertTrue(storage.delete_quote_session_for_retention("quote-retention"))
         self.assertEqual(self.connection.execute("select count(*) from sqag_quote_sessions").fetchone()[0], 0)
         self.assertEqual(self.connection.execute("select count(*) from sqag_quote_artifacts").fetchone()[0], 0)
+
+    def test_retention_receipt_failure_rolls_back_database_artifact_and_graph(self):
+        past = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+        now = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+        run_id = self.a.record_run_started("generate", {"synthetic": True}, now=past)
+        self.a.finish_run(
+            run_id,
+            "completed",
+            quote_session_id="quote-atomic-retention",
+            now=past,
+        )
+        self.connection.executescript(
+            """
+            create table sqag_quote_sessions (
+              workspace_id text not null, session_id text not null, primary key (workspace_id, session_id)
+            );
+            create table sqag_quote_artifacts (
+              workspace_id text not null, session_id text not null, artifact_kind text not null
+            );
+            """
+        )
+        self.connection.execute(
+            "insert into sqag_quote_sessions (workspace_id, session_id) values (?, ?)",
+            ("tenant:acme", "quote-atomic-retention"),
+        )
+        self.connection.execute(
+            "insert into sqag_quote_artifacts (workspace_id, session_id, artifact_kind) values (?, ?, ?)",
+            ("tenant:acme", "quote-atomic-retention", "xlsx"),
+        )
+        self.connection.commit()
+        storage = webapp.DatabaseSqagStorage(
+            "sqlite:///synthetic",
+            "tenant:acme",
+            role="admin",
+            user_id="retention-worker",
+        )
+        storage.connection = lambda: contextlib.nullcontext(self.connection)
+
+        def delete_artifacts(item, finalize):
+            return storage.delete_quote_session_for_retention(
+                item["quote_session_id"],
+                finalize_graph=finalize,
+            )
+
+        with (
+            mock.patch.dict(os.environ, {"SQAG_ARTIFACT_STORAGE_MODE": "database"}, clear=True),
+            mock.patch.object(self.a, "_receipt", side_effect=RuntimeError("synthetic receipt failure")),
+        ):
+            result = self.a.enforce_retention(now=now, artifact_delete=delete_artifacts)
+
+        self.assertEqual(result.failed, 1)
+        self.assertEqual(self.connection.execute("select count(*) from sqag_generation_runs where run_id = ?", (run_id,)).fetchone()[0], 1)
+        self.assertEqual(self.connection.execute("select count(*) from sqag_quote_sessions where session_id = 'quote-atomic-retention'").fetchone()[0], 1)
+        self.assertEqual(self.connection.execute("select count(*) from sqag_quote_artifacts where session_id = 'quote-atomic-retention'").fetchone()[0], 1)
+        self.assertEqual(self.connection.execute("select count(*) from sqag_deletion_receipts where record_id = ?", (run_id,)).fetchone()[0], 0)
 
     def test_manifest_round_trip_preserves_order_and_dependency_checksums(self):
         manifest = {

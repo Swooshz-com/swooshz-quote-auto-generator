@@ -38,6 +38,24 @@ def parsed_now(value: str | None) -> dt.datetime | None:
         raise ValueError("--now must include a timezone.")
     return parsed.astimezone(dt.timezone.utc)
 
+def session_has_retained_forensic_links(
+    connection,
+    workspace_id: str,
+    session_id: str,
+    deleting_run_id: str,
+) -> bool:
+    retained_feedback = connection.execute(
+        "select 1 from sqag_feedback where workspace_id = ? and session_id = ? limit 1",
+        (workspace_id, session_id),
+    ).fetchone()
+    if retained_feedback:
+        return True
+    sibling = connection.execute(
+        "select 1 from sqag_generation_runs where workspace_id = ? and quote_session_id = ? and run_id <> ? limit 1",
+        (workspace_id, session_id, deleting_run_id),
+    ).fetchone()
+    return bool(sibling)
+
 
 def blocked(reason: str) -> dict[str, object]:
     return {
@@ -48,7 +66,7 @@ def blocked(reason: str) -> dict[str, object]:
     }
 
 
-def main() -> int:
+def _main() -> int:
     args = parse_args()
     if args.apply == args.dry_run:
         print(json.dumps(blocked("choose_exactly_one_of_apply_or_dry_run"), indent=2, sort_keys=True))
@@ -65,18 +83,21 @@ def main() -> int:
         storage.ensure_ready()
         storage._ensure_schema(webapp.SQAG_FORENSIC_REQUIRED_COLUMNS, reason="storage_forensics_database_not_migrated")
         with storage.connection() as connection:
-            def delete_artifacts(item: dict[str, object]) -> bool:
+            def delete_artifacts(item: dict[str, object], finalize_graph) -> bool:
                 session_id = webapp.safe_quote_session_id(item.get("quote_session_id"), "")
                 run_id = str(item.get("run_id") or "")
                 if not session_id:
+                    finalize_graph(connection)
                     return True
-                sibling = connection.execute(
-                    "select 1 from sqag_generation_runs where workspace_id = ? and quote_session_id = ? and run_id <> ? limit 1",
-                    (args.workspace_id, session_id, run_id),
-                ).fetchone()
-                if sibling:
+                if session_has_retained_forensic_links(
+                    connection, args.workspace_id, session_id, run_id
+                ):
+                    finalize_graph(connection)
                     return True
-                return storage.delete_quote_session_for_retention(session_id)
+                return storage.delete_quote_session_for_retention(
+                    session_id,
+                    finalize_graph=finalize_graph,
+                )
 
             result = ForensicStore(connection, args.workspace_id, "retention-worker").enforce_retention(
                 now=now,
@@ -110,6 +131,14 @@ def main() -> int:
     }
     print(json.dumps(report, indent=2, sort_keys=True))
     return 1 if result.failed else 0
+
+
+def main() -> int:
+    try:
+        return _main()
+    except Exception:
+        print(json.dumps(blocked("retention_storage_unavailable"), indent=2, sort_keys=True))
+        return 1
 
 
 if __name__ == "__main__":

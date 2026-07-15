@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import inspect
 import json
 import os
 import sqlite3
@@ -63,6 +64,25 @@ def run_verification(work_dir: Path | None = None) -> dict[str, object]:
         deletion_result = store.enforce_retention(now=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc))
         deleted = connection.execute("select count(*) from sqag_generation_runs where run_id = ?", (run_id,)).fetchone()[0] == 0
         receipt_exists = connection.execute("select count(*) from sqag_deletion_receipts where record_id = ?", (run_id,)).fetchone()[0] == 1
+        sqlite_authorizations_consumed = connection.execute(
+            "select count(*) from sqag_retention_delete_authorizations"
+        ).fetchone()[0] == 0
+        postgres_guard_sql = (
+            ROOT / "migrations" / "005_forensic_postgres_delete_guards.sql"
+        ).read_text(encoding="utf-8").lower()
+        postgres_authorization_is_consumed = all(
+            token in postgres_guard_sql
+            for token in ("delete from sqag_retention_delete_authorizations", "returning authorization_id", "workspace_id = old.workspace_id", "record_type = expected_type", "record_id = expected_id")
+        ) and "if not exists (" not in postgres_guard_sql
+        lock_source = inspect.getsource(ForensicStore._acquire_transaction_locks)
+        postgres_retention_lock_contract = all(
+            token in lock_source
+            for token in (
+                "pg_advisory_xact_lock",
+                "begin immediate",
+                "self.workspace_id",
+            )
+        )
 
         leap_start = dt.datetime(2024, 2, 29, tzinfo=dt.timezone.utc)
         calendar_expiry = add_calendar_years(leap_start)
@@ -78,6 +98,9 @@ def run_verification(work_dir: Path | None = None) -> dict[str, object]:
             "three_calendar_year_rule_handles_leap_day": calendar_expiry == dt.datetime(2027, 2, 28, tzinfo=dt.timezone.utc),
             "legal_hold_preserves_expired_record": hold_set and held_result.held >= 1 and held_exists,
             "release_makes_expired_record_eligible": hold_released and deletion_result.deleted >= 1 and deleted and receipt_exists,
+            "sqlite_delete_authorizations_are_consumed": sqlite_authorizations_consumed,
+            "postgres_delete_authorization_contract_is_single_use": postgres_authorization_is_consumed,
+            "retention_graph_lock_contract_is_transaction_scoped": postgres_retention_lock_contract,
             "ownerless_sessions_fail_closed": not editor._quote_session_visible_to_current_user(ownerless) and not editor._quote_session_editable_by_current_user(ownerless),
             "tracking_identifier_is_keyed_and_versioned": tracking_identifier.startswith("pid-synthetic-v1-") and tracking_identifier != "user-editor",
             "xlsx_column_bound_is_enforced": False,

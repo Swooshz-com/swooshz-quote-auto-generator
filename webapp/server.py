@@ -57,7 +57,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 import pricing_reference_cleanup
 import pricing_reference_enrichment
-from webapp.forensics import ForensicStore, trusted_workspace_id
+from webapp.forensics import ForensicStore, safe_reference, trusted_workspace_id
 from webapp.object_storage import (
     ALLOWED_OWNER_TYPES,
     InMemoryObjectStorageBackend,
@@ -368,6 +368,10 @@ ALLOWED_LOG_EVENTS = {
     "draft_blocked",
     "draft_failed",
     "draft_worker_failed",
+    "feedback_context_failed",
+    "feedback_submission_failed",
+    "forensic_persistence_failed",
+    "forensic_reconciliation_failed",
     "generate_failed",
     "generate_needs_review",
     "legacy_job_route_blocked",
@@ -380,6 +384,8 @@ ALLOWED_LOG_EVENTS = {
     "profile_export_failed",
     "profile_export_not_found",
     "quote_artifact_storage_blocked",
+    "quote_publication_compensation_failed",
+    "quote_session_update_failed",
     "quote_session_runtime_storage_blocked",
     "security_event",
     "server_pricing_reference_import_timing",
@@ -561,6 +567,16 @@ class SqagStorageAccessError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.reason = reason
+
+
+class GenerationRunReplay(RuntimeError):
+    def __init__(self, run_id: str, status: str) -> None:
+        super().__init__("Generation request has already been accepted.")
+        self.run_id = safe_reference(run_id, "run-")
+        self.status = clean_text(status).lower()
+
+
+GENERATION_REQUEST_ALREADY_ACCEPTED_MESSAGE = "This generation request has already been accepted. Refresh the quote session before retrying."
 
 
 def request_body_limit(path: str) -> int:
@@ -7851,6 +7867,10 @@ def rate_limit_path_key(path: str) -> str:
     normalized_path = urlparse(path).path
     if re.fullmatch(r"/api/support/feedback/[A-Za-z0-9_-]+/status", normalized_path):
         return "/api/support/feedback/:id/status"
+    if re.fullmatch(r"/api/support/feedback/[A-Za-z0-9_-]+/evidence", normalized_path):
+        return "/api/support/feedback/:id/evidence"
+    if re.fullmatch(r"/api/support/feedback/[A-Za-z0-9_-]+", normalized_path):
+        return "/api/support/feedback/:id"
     if re.fullmatch(r"/api/settings/pricing-references/[A-Za-z0-9_-]+", normalized_path):
         return "/api/settings/pricing-references/:id"
     if re.fullmatch(r"/api/quote-sessions/[A-Za-z0-9_-]+", normalized_path):
@@ -9040,6 +9060,7 @@ class ObjectArtifactDeletionPlan:
 
 class DatabaseSqagStorage:
     storage_backend = "database"
+    supports_atomic_forensic_publication = True
 
     def __init__(self, database_url: str, workspace_id: str, role: str = "viewer", user_id: str = "") -> None:
         self.database_url = database_url
@@ -10834,12 +10855,24 @@ class DatabaseSqagStorage:
             }
         with self.connection() as connection:
             row = connection.execute(
-                "select filename, content_type, size_bytes, content_blob, created_at, updated_at from sqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
+                "select artifact.filename, artifact.content_type, artifact.size_bytes, artifact.created_at, artifact.updated_at, session.metadata_json "
+                "from sqag_quote_artifacts artifact join sqag_quote_sessions session on session.workspace_id = artifact.workspace_id and session.session_id = artifact.session_id "
+                "where artifact.workspace_id = ? and artifact.session_id = ? and artifact.artifact_kind = ?",
                 (self.workspace_id, safe_id, safe_kind),
             ).fetchone()
         if not row or clean_text(row["filename"]) != expected_filename:
             return None
-        return {"filename": row["filename"], "content_type": row["content_type"], "size_bytes": int(row["size_bytes"] or 0), "sha256": hashlib.sha256(bytes(row["content_blob"] or b"")).hexdigest(), "created_at": row["created_at"], "updated_at": row["updated_at"]}
+        try:
+            metadata = json.loads(row["metadata_json"])
+        except (TypeError, json.JSONDecodeError):
+            return None
+        export = metadata.get("exports", {}).get(safe_kind) if isinstance(metadata, dict) else None
+        digest = clean_text(export.get("sha256")).lower() if isinstance(export, dict) else ""
+        recorded_size = int(export.get("size_bytes") or -1) if isinstance(export, dict) else -1
+        size_bytes = int(row["size_bytes"] or 0)
+        if not re.fullmatch(r"[0-9a-f]{64}", digest) or recorded_size != size_bytes:
+            return None
+        return {"filename": row["filename"], "content_type": row["content_type"], "size_bytes": size_bytes, "sha256": digest, "created_at": row["created_at"], "updated_at": row["updated_at"]}
 
     def _object_quote_artifact_row(self, session_id: str, kind: str) -> sqlite3.Row | None:
         safe_id = safe_quote_session_id(session_id, "")
@@ -11103,6 +11136,8 @@ class DatabaseSqagStorage:
         if not safe_id or not expected_filename:
             return None
         metadata, _draft_files = self._read_quote_session_metadata(safe_id)
+        if not quote_session_is_published(metadata):
+            return None
         export = metadata.get("exports", {}).get(safe_kind) if metadata else None
         if not isinstance(export, dict) or clean_text(export.get("filename")) != expected_filename:
             return None
@@ -11153,6 +11188,7 @@ class DatabaseSqagStorage:
         public = public_quote_session(metadata, include_draft_state=False)
         if not public:
             return {}
+        published = quote_session_is_published(metadata)
         if include_draft_state:
             public["draft_state"] = copy.deepcopy(metadata.get("draft_state")) if isinstance(metadata.get("draft_state"), dict) else {}
             public["draft_files"] = copy.deepcopy(draft_files or [])
@@ -11166,7 +11202,7 @@ class DatabaseSqagStorage:
             raw_export = metadata_export if isinstance(metadata_export, dict) else export
             recorded_filename = clean_text(raw_export.get("filename"))
             safe_recorded = recorded_filename if recorded_filename == filename else ""
-            artifact = self._quote_artifact_metadata(public["session_id"], kind) if configured_artifact_storage_mode() in {"database", "object"} and safe_recorded else None
+            artifact = self._quote_artifact_metadata(public["session_id"], kind) if published and configured_artifact_storage_mode() in {"database", "object"} and safe_recorded else None
             artifact_exists = bool(artifact)
             stale = bool(artifact_exists and quote_session_export_is_stale(metadata, raw_export))
             exists = bool(artifact_exists and not stale)
@@ -11280,6 +11316,10 @@ class DatabaseSqagStorage:
         output_dir: Path | None,
         resolved_session_id: str,
         patch: dict[str, Any],
+        *,
+        publish: bool,
+        generation_run_id: str,
+        generation_job_id: str,
     ) -> dict[str, Any]:
         def prepare_object_quote(connection: Any):
             existing, _draft_files = (
@@ -11337,6 +11377,18 @@ class DatabaseSqagStorage:
                 output_dir,
                 connection=connection,
             )
+            if stored_generated_quote:
+                metadata["publication"] = {
+                    "state": "published" if publish else "staged",
+                    "run_id": safe_reference(generation_run_id, "run-"),
+                    "job_id": safe_reference(generation_job_id, "job-"),
+                    "error_code": "",
+                }
+                metadata["status"]["quote_generated"] = bool(publish)
+                for kind in QUOTE_SESSION_EXPORT_KINDS:
+                    metadata["status"][f"{kind}_exported"] = bool(
+                        publish and metadata["exports"].get(kind, {}).get("filename")
+                    )
             state = {
                 "metadata": metadata,
                 "now": now,
@@ -11353,7 +11405,7 @@ class DatabaseSqagStorage:
             pending_artifacts = state["pending_artifacts"]
             object_plan = state["object_plan"]
             if stored_generated_quote:
-                metadata["status"]["quote_generated"] = True
+                metadata["status"]["quote_generated"] = bool(publish)
                 profile_id = safe_resource_id(payload.get("profile_id"), "")
                 pricing_reference_id = (
                     pricing_reference_id_from_payload(payload)
@@ -11439,7 +11491,7 @@ class DatabaseSqagStorage:
                     self._cleanup_object_staging_file(item.source, output_dir)
         return self._public_quote_session(state["normalized"])
 
-    def create_or_update_quote_session(self, payload: dict[str, Any], result: dict[str, Any] | None = None, output_dir: Path | None = None, session_id: str | None = None) -> dict[str, Any]:
+    def create_or_update_quote_session(self, payload: dict[str, Any], result: dict[str, Any] | None = None, output_dir: Path | None = None, session_id: str | None = None, *, publish: bool = True, generation_run_id: str = "", generation_job_id: str = "") -> dict[str, Any]:
         patch = quote_session_patch_payload(payload)
         resolved_session_id = safe_quote_session_id(session_id or patch.get("session_id") or payload.get("session_id"), "") or new_quote_session_id()
         existing, _draft_files = self._read_quote_session_metadata_for_workspace(resolved_session_id)
@@ -11453,6 +11505,9 @@ class DatabaseSqagStorage:
                 output_dir,
                 resolved_session_id,
                 patch,
+                publish=publish,
+                generation_run_id=generation_run_id,
+                generation_job_id=generation_job_id,
             )
         now = utc_timestamp()
         metadata = normalized_quote_session_metadata(existing) if existing else blank_quote_session_metadata(resolved_session_id, now)
@@ -11484,9 +11539,19 @@ class DatabaseSqagStorage:
                 result,
                 output_dir,
             )
+        if stored_generated_quote:
+            metadata["publication"] = {
+                "state": "published" if publish else "staged",
+                "run_id": safe_reference(generation_run_id, "run-"),
+                "job_id": safe_reference(generation_job_id, "job-"),
+                "error_code": "",
+            }
+            metadata["status"]["quote_generated"] = bool(publish)
+            for kind in QUOTE_SESSION_EXPORT_KINDS:
+                metadata["status"][f"{kind}_exported"] = bool(publish and metadata["exports"].get(kind, {}).get("filename"))
         try:
             if stored_generated_quote:
-                metadata["status"]["quote_generated"] = True
+                metadata["status"]["quote_generated"] = bool(publish)
                 profile_id = safe_resource_id(payload.get("profile_id"), "")
                 pricing_reference_id = pricing_reference_id_from_payload(payload) or safe_resource_id(payload.get("pricing_reference_id"), "")
                 metadata["generation_snapshot"] = quote_session_generation_snapshot(
@@ -11532,6 +11597,151 @@ class DatabaseSqagStorage:
                 raise self._storage_unavailable_error(exc) from exc
             raise
         return self._public_quote_session(normalized)
+
+    def quote_session_evidence_files(self, session_id: str) -> list[dict[str, Any]]:
+        safe_id = safe_quote_session_id(session_id, "")
+        metadata, _draft_files = self._read_quote_session_metadata_for_workspace(safe_id)
+        if not metadata:
+            return []
+        publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
+        if clean_text(publication.get("state")).lower() not in {"staged", "published"}:
+            return []
+        files: list[dict[str, Any]] = []
+        for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
+            export = metadata.get("exports", {}).get(kind) if isinstance(metadata.get("exports"), dict) else None
+            if not isinstance(export, dict) or clean_text(export.get("filename")) != filename:
+                continue
+            artifact = self._quote_artifact_metadata(safe_id, kind)
+            if not artifact:
+                continue
+            digest = clean_text(export.get("sha256")).lower()
+            size_bytes = int(export.get("size_bytes") or -1)
+            if digest != clean_text(artifact.get("sha256")).lower() or size_bytes != int(artifact.get("size_bytes") or -1):
+                continue
+            files.append({"name": filename, "bytes": size_bytes, "sha256": digest})
+        return files
+
+    def publish_quote_session_forensic_transaction(
+        self,
+        connection: Any,
+        session_id: str,
+        run_id: str,
+        expected_files: list[dict[str, Any]],
+    ) -> None:
+        safe_id = safe_quote_session_id(session_id, "")
+        safe_run_id = safe_reference(run_id, "run-")
+        if not safe_id or not safe_run_id:
+            raise ValueError("Quote publication identity is invalid.")
+        row = connection.execute(
+            "select metadata_json from sqag_quote_sessions where workspace_id = ? and session_id = ?",
+            (self.workspace_id, safe_id),
+        ).fetchone()
+        if not row:
+            raise ValueError("Staged quote session is not available.")
+        raw_metadata = str(row["metadata_json"] or "")
+        try:
+            metadata = json.loads(raw_metadata)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Staged quote session is not valid.") from exc
+        metadata = normalized_quote_session_metadata(metadata if isinstance(metadata, dict) else {})
+        publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
+        state = clean_text(publication.get("state")).lower()
+        if safe_reference(publication.get("run_id"), "run-") != safe_run_id:
+            raise ValueError("Staged quote session belongs to another generation run.")
+        if state == "published":
+            return
+        if state != "staged":
+            raise ValueError("Quote session is not staged for publication.")
+
+        expected_by_name = {
+            clean_text(item.get("name")): item
+            for item in expected_files
+            if isinstance(item, dict) and clean_text(item.get("name"))
+        }
+        if "quotation.xlsx" not in expected_by_name:
+            raise ValueError("Staged quotation artifact is missing.")
+        artifact_mode = configured_artifact_storage_mode()
+        published_kinds: set[str] = set()
+        for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
+            export = metadata.get("exports", {}).get(kind) if isinstance(metadata.get("exports"), dict) else None
+            if not isinstance(export, dict) or clean_text(export.get("filename")) != filename:
+                continue
+            expected = expected_by_name.get(filename)
+            digest = clean_text(export.get("sha256")).lower()
+            size_bytes = int(export.get("size_bytes") or -1)
+            if (
+                not expected
+                or digest != clean_text(expected.get("sha256")).lower()
+                or size_bytes != int(expected.get("bytes") or -1)
+            ):
+                raise ValueError("Staged artifact evidence does not match publication metadata.")
+            if artifact_mode == "object":
+                artifact = connection.execute(
+                    "select filename, size_bytes, checksum_sha256, object_key_ref from sqag_object_artifacts "
+                    "where workspace_id = ? and owner_type = ? and owner_id = ? and session_id = ? and artifact_kind = ? and status = ? and retention_status = ? and deleted_at is null",
+                    (self.workspace_id, "generated_quote", safe_id, safe_id, kind, "active", "active"),
+                ).fetchone()
+                durable_digest = clean_text(artifact["checksum_sha256"]).lower() if artifact else ""
+                durable_key = clean_text(artifact["object_key_ref"]) if artifact else ""
+            else:
+                artifact = connection.execute(
+                    "select filename, size_bytes from sqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
+                    (self.workspace_id, safe_id, kind),
+                ).fetchone()
+                durable_digest = digest if artifact else ""
+                durable_key = "database" if artifact else ""
+            if (
+                not artifact
+                or clean_text(artifact["filename"]) != filename
+                or int(artifact["size_bytes"] or -1) != size_bytes
+                or durable_digest != digest
+                or not durable_key
+            ):
+                raise ValueError("Staged durable artifact does not match publication evidence.")
+            published_kinds.add(kind)
+
+        if "xlsx" not in published_kinds:
+            raise ValueError("Staged quotation artifact is missing.")
+        metadata["publication"]["state"] = "published"
+        metadata["publication"]["error_code"] = ""
+        metadata["status"]["quote_generated"] = True
+        for kind in QUOTE_SESSION_EXPORT_KINDS:
+            metadata["status"][f"{kind}_exported"] = kind in published_kinds
+        normalized = normalized_quote_session_metadata(metadata)
+        cursor = connection.execute(
+            "update sqag_quote_sessions set metadata_json = ? where workspace_id = ? and session_id = ? and metadata_json = ?",
+            (json.dumps(normalized, ensure_ascii=True, sort_keys=True), self.workspace_id, safe_id, raw_metadata),
+        )
+        if getattr(cursor, "rowcount", 0) != 1:
+            raise ValueError("Quote publication state changed concurrently.")
+
+    def mark_quote_session_publication_failed(self, session_id: str, run_id: str, error_code: str) -> bool:
+        safe_id = safe_quote_session_id(session_id, "")
+        safe_run_id = safe_reference(run_id, "run-")
+        if not safe_id or not safe_run_id:
+            return False
+        changed = False
+
+        def mark_failed(connection: Any) -> None:
+            nonlocal changed
+            metadata, draft_files = self._read_quote_session_metadata_for_workspace_on_connection(connection, safe_id)
+            publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
+            if clean_text(publication.get("state")).lower() != "staged" or safe_reference(publication.get("run_id"), "run-") != safe_run_id:
+                return
+            metadata["publication"]["state"] = "failed"
+            metadata["publication"]["error_code"] = safe_resource_id(error_code, "publication_failed")
+            metadata["status"]["quote_generated"] = False
+            for kind in QUOTE_SESSION_EXPORT_KINDS:
+                metadata["status"][f"{kind}_exported"] = False
+            normalized = normalized_quote_session_metadata(metadata)
+            connection.execute(
+                "update sqag_quote_sessions set metadata_json = ?, draft_files_json = ? where workspace_id = ? and session_id = ?",
+                (json.dumps(normalized, ensure_ascii=True, sort_keys=True), json.dumps(draft_files, ensure_ascii=True, sort_keys=True), self.workspace_id, safe_id),
+            )
+            changed = True
+
+        self._run_storage_transaction(mark_failed)
+        return changed
 
     def list_quote_sessions(self) -> list[dict[str, Any]]:
         with self.connection() as connection:
@@ -11616,7 +11826,12 @@ class DatabaseSqagStorage:
                 raise
             raise self._storage_unavailable_error(exc) from exc
 
-    def delete_quote_session_for_retention(self, session_id: str) -> bool:
+    def delete_quote_session_for_retention(
+        self,
+        session_id: str,
+        *,
+        finalize_graph: Callable[[Any], Any] | None = None,
+    ) -> bool:
         """Delete one workspace-scoped session and its durable artifacts as an admin worker."""
         safe_id = safe_quote_session_id(session_id, "")
         if self.role != "admin" or not safe_id:
@@ -11624,6 +11839,11 @@ class DatabaseSqagStorage:
         artifact_mode = configured_artifact_storage_mode()
         if artifact_mode == "object":
             def delete_owner(connection: Any) -> bool:
+                if finalize_graph is not None:
+                    finalize_graph(
+                        connection,
+                        require_session_exclusive=True,
+                    )
                 connection.execute(
                     "delete from sqag_quote_sessions where workspace_id = ? and session_id = ?",
                     (self.workspace_id, safe_id),
@@ -11651,6 +11871,11 @@ class DatabaseSqagStorage:
             )
 
         def delete_database_owner(connection: Any) -> bool:
+            if finalize_graph is not None:
+                finalize_graph(
+                    connection,
+                    require_session_exclusive=True,
+                )
             connection.execute(
                 "delete from sqag_quote_artifacts where workspace_id = ? and session_id = ?",
                 (self.workspace_id, safe_id),
@@ -17298,6 +17523,12 @@ def blank_quote_session_metadata(session_id: str, created_at: str) -> dict[str, 
         },
         "draft_state": {},
         "generation_snapshot": {},
+        "publication": {
+            "state": "",
+            "run_id": "",
+            "job_id": "",
+            "error_code": "",
+        },
     }
 
 
@@ -17308,7 +17539,7 @@ def normalized_quote_session_metadata(metadata: dict[str, Any]) -> dict[str, Any
     created_at = dashboard_safe_text(metadata.get("created_at")) or utc_timestamp()
     normalized = blank_quote_session_metadata(session_id, created_at)
     normalized["updated_at"] = dashboard_safe_text(metadata.get("updated_at")) or created_at
-    for key in ("customer_summary", "quote_company_profile", "pricing_reference", "commercials", "status", "exports", "owner", "draft_state"):
+    for key in ("customer_summary", "quote_company_profile", "pricing_reference", "commercials", "status", "exports", "owner", "draft_state", "publication"):
         if isinstance(metadata.get(key), dict):
             normalized[key].update(copy.deepcopy(metadata[key]))
     snapshot = normalized_quote_session_generation_snapshot(metadata.get("generation_snapshot"))
@@ -17316,6 +17547,17 @@ def normalized_quote_session_metadata(metadata: dict[str, Any]) -> dict[str, Any
         normalized["generation_snapshot"] = snapshot
     quote_session_apply_draft_summary_fallbacks(normalized)
     return normalized
+
+
+def quote_session_is_published(metadata: dict[str, Any]) -> bool:
+    publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
+    state = clean_text(publication.get("state")).lower()
+    if state == "published":
+        return True
+    if state in {"staged", "failed"}:
+        return False
+    exports = metadata.get("exports") if isinstance(metadata.get("exports"), dict) else {}
+    return any(clean_text(item.get("filename")) for item in exports.values() if isinstance(item, dict))
 
 
 def quote_session_apply_draft_summary_fallbacks(metadata: dict[str, Any]) -> None:
@@ -17570,6 +17812,8 @@ def public_quote_session(metadata: dict[str, Any], *, include_draft_state: bool 
         return {}
     session_id = normalized["session_id"]
     public = copy.deepcopy(normalized)
+    published = quote_session_is_published(normalized)
+    public.pop("publication", None)
     public.pop("owner", None)
     draft_state = normalized.get("draft_state") if isinstance(normalized.get("draft_state"), dict) else {}
     public["has_draft_state"] = bool(draft_state)
@@ -17588,7 +17832,7 @@ def public_quote_session(metadata: dict[str, Any], *, include_draft_state: bool 
         recorded_filename = clean_text(raw_export.get("filename"))
         safe_recorded = recorded_filename if recorded_filename == filename else ""
         export_path = quote_session_export_path(session_id, kind) if safe_recorded else None
-        file_exists = bool(export_path and export_path.exists() and export_path.is_file())
+        file_exists = bool(published and export_path and export_path.exists() and export_path.is_file())
         stale = bool(file_exists and quote_session_export_is_stale(normalized, raw_export))
         exists = bool(file_exists and not stale)
         has_stale_export = has_stale_export or stale
@@ -18132,10 +18376,29 @@ def forensic_result_summary(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def begin_generation_forensics(job_type: str, payload: dict[str, Any], auth_session: dict[str, Any] | None = None, *, job_id: str = "") -> str:
+def begin_generation_forensics(
+    job_type: str,
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+    *,
+    job_id: str = "",
+    claim_status: str = "",
+) -> str:
     try:
         with forensic_store_for_auth_session(auth_session) as store:
-            return store.record_run_started(job_type, forensic_request_summary(payload), job_id=job_id, idempotency_key=job_id, app_revision=clean_text(os.getenv("GIT_REVISION") or os.getenv("COMMIT_SHA")))
+            run_id = store.record_run_started(job_type, forensic_request_summary(payload), job_id=job_id, idempotency_key=job_id, app_revision=clean_text(os.getenv("GIT_REVISION") or os.getenv("COMMIT_SHA")))
+            if claim_status:
+                run = store.run_for_job(job_id)
+                current_status = clean_text(run.get("status")).lower()
+                if current_status != "received" or not store.set_run_state(
+                    run_id,
+                    claim_status,
+                    expected_status="received",
+                ):
+                    raise GenerationRunReplay(run_id, current_status)
+            return run_id
+    except GenerationRunReplay:
+        raise
     except Exception as exc:
         error_reference = new_error_reference()
         write_local_log("forensic_persistence_failed", unexpected_error_log_details(error_reference, exc))
@@ -18155,6 +18418,9 @@ def finish_generation_forensics(
     *,
     error_category: str = "",
     canonical_manifest: dict[str, Any] | None = None,
+    publication_storage: DatabaseSqagStorage | None = None,
+    publication_session_id: str = "",
+    publication_files: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if not run_id:
         return result
@@ -18163,14 +18429,28 @@ def finish_generation_forensics(
     try:
         quote_session = result.get("quote_session") if isinstance(result.get("quote_session"), dict) else {}
         with forensic_store_for_auth_session(auth_session) as store:
-            store.finish_run(
-                run_id,
-                clean_text(result.get("status")) or "failed",
-                error_category=error_category,
-                quote_session_id=safe_quote_session_id(quote_session.get("session_id"), ""),
-                result_summary=forensic_result_summary(result),
-                canonical_manifest=canonical_manifest,
-            )
+            atomic_publication = bool(publication_storage and safe_quote_session_id(publication_session_id, ""))
+            try:
+                store.finish_run(
+                    run_id,
+                    clean_text(result.get("status")) or "failed",
+                    error_category=error_category,
+                    quote_session_id=safe_quote_session_id(quote_session.get("session_id"), ""),
+                    result_summary=forensic_result_summary(result),
+                    canonical_manifest=canonical_manifest,
+                    commit=not atomic_publication,
+                )
+                if atomic_publication and publication_storage is not None:
+                    publication_storage.publish_quote_session_forensic_transaction(
+                        store.connection,
+                        publication_session_id,
+                        run_id,
+                        publication_files or [],
+                    )
+                    store.connection.commit()
+            except Exception:
+                store.connection.rollback()
+                raise
     except Exception as exc:
         error_reference = new_error_reference()
         write_local_log("forensic_persistence_failed", unexpected_error_log_details(error_reference, exc, job_id=clean_text(result.get("job_id"))))
@@ -18290,11 +18570,18 @@ def forensic_artifact_verifier_for_session(storage: Any, session_id: str) -> Any
 def support_feedback_evidence_for_auth_session(reference: str, reason_code: str, auth_session: dict[str, Any] | None = None) -> dict[str, Any]:
     require_support_forensics(auth_session)
     with forensic_store_for_auth_session(auth_session) as store:
-        report = store.get_feedback(reference, audit_access=True)
+        feedback = store.get_feedback(reference, audit_access=True)
+        report = feedback.get("report") if isinstance(feedback, dict) else None
+        if not isinstance(report, dict):
+            raise LookupError("Feedback report is not available.")
+        run_id = safe_reference(report.get("run_id"), "run-")
+        session_id = safe_quote_session_id(report.get("session_id"), "")
+        if not run_id:
+            raise LookupError("Forensic evidence is not available.")
         artifact_storage = quote_session_storage_for_auth_session(auth_session)
-        verifier = forensic_artifact_verifier_for_session(artifact_storage, clean_text(report.get("session_id")))
+        verifier = forensic_artifact_verifier_for_session(artifact_storage, session_id)
         return store.verify_run_evidence(
-            clean_text(report.get("run_id")),
+            run_id,
             reason_code=reason_code,
             privileged=True,
             artifact_verifier=verifier,
@@ -18308,6 +18595,8 @@ def create_job(
     requested_job_id: str | None = None,
 ) -> dict[str, Any]:
     normalized_type = clean_text(job_type).lower()
+    payload = dict(payload)
+    payload.pop("_generation_run_id", None)
     if normalized_type not in {"draft", "generate", "generate_pdf", "basis_chat"}:
         return {"status": "blocked", "errors": ["Job type must be draft, basis_chat, generate, or generate_pdf."]}
     generation_run_id = ""
@@ -18324,7 +18613,23 @@ def create_job(
                     return {"status": "blocked", "errors": ["Job request could not be resumed."]}
                 return public_job(existing)
     job_id = requested_job_id or f"job-{secrets.token_hex(6)}"
-    generation_run_id = begin_generation_forensics(normalized_type, payload, auth_session, job_id=job_id) if normalized_type in {"generate", "generate_pdf"} else ""
+    if normalized_type in {"generate", "generate_pdf"}:
+        try:
+            generation_run_id = begin_generation_forensics(
+                normalized_type,
+                payload,
+                auth_session,
+                job_id=job_id,
+                claim_status="queued",
+            )
+        except GenerationRunReplay as replay:
+            return {
+                "job_id": job_id,
+                "status": "blocked",
+                "errors": [GENERATION_REQUEST_ALREADY_ACCEPTED_MESSAGE],
+                "generation_run_id": replay.run_id,
+                "idempotent_replay": True,
+            }
     if not image_entries(payload):
         return blocked([MISSING_IMAGES_MESSAGE], "images_missing")
     image_error = image_limit_error(payload)
@@ -18413,13 +18718,47 @@ def run_quote_job(
     pdf_mode: str = "none",
     auth_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-
     generation_run_id = clean_text(payload.get("_generation_run_id"))
+    job_id = safe_resource_id(job_id, f"job-{secrets.token_hex(6)}")
+
+    if not generation_run_id:
+        try:
+            generation_run_id = begin_generation_forensics(
+                "generate_pdf" if clean_text(pdf_mode).lower() != "none" else "generate",
+                payload,
+                auth_session,
+                job_id=job_id,
+                claim_status="running",
+            )
+        except GenerationRunReplay as replay:
+            return {
+                "job_id": job_id,
+                "status": "blocked",
+                "errors": [GENERATION_REQUEST_ALREADY_ACCEPTED_MESSAGE],
+                "generation_run_id": replay.run_id,
+                "idempotent_replay": True,
+            }
+        except SqagStorageAccessError as exc:
+            try:
+                if isinstance(payload.get("quote_session"), dict):
+                    quote_session_storage_for_auth_session(auth_session)
+                ensure_quote_artifact_storage_available_for_auth_session(auth_session)
+            except SqagStorageAccessError as posture_exc:
+                return storage_access_error_payload(posture_exc)
+            if configured_artifact_storage_mode() == "object":
+                return storage_access_error_payload(
+                    SqagStorageAccessError(
+                        QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                        status=503,
+                        reason="object_artifact_storage_unavailable",
+                    )
+                )
+            return storage_access_error_payload(exc)
 
     def blocked(errors: list[str], category: str) -> dict[str, Any]:
         return finish_generation_forensics(
             generation_run_id,
-            {"status": "blocked", "errors": errors},
+            {"job_id": job_id, "status": "blocked", "errors": errors},
             auth_session,
             error_category=category,
         )
@@ -18458,15 +18797,8 @@ def run_quote_job(
     except SqagStorageAccessError as exc:
         return finish_generation_forensics(generation_run_id, storage_access_error_payload(exc), auth_session, error_category=exc.reason)
 
-    if not generation_run_id:
-        try:
-            generation_run_id = begin_generation_forensics("generate_pdf" if clean_text(pdf_mode).lower() != "none" else "generate", payload, auth_session, job_id=clean_text(job_id))
-        except SqagStorageAccessError as exc:
-            return storage_access_error_payload(exc)
-
     output_root = output_root or configured_output_root()
     tmp_root = tmp_root or configured_tmp_root()
-    job_id = safe_resource_id(job_id, f"job-{secrets.token_hex(6)}")
     job_tmp = tmp_root / job_id
     output_dir = output_root / job_id
     job_tmp.mkdir(parents=True, exist_ok=True)
@@ -18569,11 +18901,37 @@ def run_quote_job(
     }
     if error_reference:
         result["error_reference"] = error_reference
+    publication_storage: DatabaseSqagStorage | None = None
+    publication_session_id = ""
+    publication_files: list[dict[str, Any]] = []
     if isinstance(payload.get("quote_session"), dict):
         try:
             storage = quote_session_storage or quote_session_storage_for_auth_session(auth_session)
-            result["quote_session"] = storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
-            if configured_artifact_storage_mode() in {"database", "object"}:
+            artifact_mode = configured_artifact_storage_mode()
+            atomic_publication = bool(
+                result_has_generated_quote(result)
+                and artifact_mode in {"database", "object"}
+                and isinstance(storage, DatabaseSqagStorage)
+            )
+            if atomic_publication:
+                result["quote_session"] = storage.create_or_update_quote_session(
+                    payload,
+                    result=result,
+                    output_dir=output_dir,
+                    publish=False,
+                    generation_run_id=generation_run_id,
+                    generation_job_id=job_id,
+                )
+            else:
+                result["quote_session"] = storage.create_or_update_quote_session(
+                    payload, result=result, output_dir=output_dir
+                )
+            if atomic_publication:
+                publication_storage = storage
+                publication_session_id = safe_quote_session_id(result["quote_session"].get("session_id"), "")
+                publication_files = storage.quote_session_evidence_files(publication_session_id)
+                result["files"] = publication_files
+            elif artifact_mode in {"database", "object"}:
                 result["files"] = quote_session_result_files(result.get("quote_session"))
         except SqagStorageAccessError as exc:
             storage_error = storage_access_error_payload(exc)
@@ -18629,13 +18987,59 @@ def run_quote_job(
             "brief_path": str(brief_path),
             "output_dir": str(output_dir),
         })
-    return finish_generation_forensics(
+    finalized = finish_generation_forensics(
         generation_run_id,
         result,
         auth_session,
         error_category="" if result.get("status") == "completed" else "generation_not_completed",
         canonical_manifest=canonical_manifest,
+        publication_storage=publication_storage,
+        publication_session_id=publication_session_id,
+        publication_files=publication_files,
     )
+    if publication_storage is not None and publication_session_id:
+        if clean_text(finalized.get("status")) == clean_text(result.get("status")):
+            published_session = copy.deepcopy(result.get("quote_session"))
+            if isinstance(published_session, dict):
+                if not isinstance(published_session.get("status"), dict):
+                    published_session["status"] = {}
+                published_session["status"]["quote_generated"] = True
+                available_names = {
+                    clean_text(item.get("name")): item
+                    for item in publication_files
+                    if isinstance(item, dict)
+                }
+                exports = published_session.get("exports") if isinstance(published_session.get("exports"), dict) else {}
+                for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
+                    export = exports.get(kind) if isinstance(exports.get(kind), dict) else {}
+                    available = available_names.get(filename)
+                    exists = bool(available)
+                    export["exists"] = exists
+                    export["missing"] = False
+                    export["stale"] = False
+                    export["url"] = f"/api/quote-sessions/{publication_session_id}/download/{kind}" if exists else None
+                    if available:
+                        export["sha256"] = clean_text(available.get("sha256"))
+                        export["size_bytes"] = int(available.get("bytes") or 0)
+                    exports[kind] = export
+                    published_session["status"][f"{kind}_exported"] = exists
+                published_session["exports"] = exports
+                finalized["quote_session"] = published_session
+                finalized["files"] = quote_session_result_files(published_session)
+        else:
+            try:
+                publication_storage.mark_quote_session_publication_failed(
+                    publication_session_id,
+                    generation_run_id,
+                    "forensic_finalization_failed",
+                )
+            except Exception as exc:
+                compensation_reference = new_error_reference()
+                write_local_log(
+                    "quote_publication_compensation_failed",
+                    unexpected_error_log_details(compensation_reference, exc, job_id=job_id),
+                )
+    return finalized
 
 
 class QuoteRunnerHandler(BaseHTTPRequestHandler):
@@ -18705,20 +19109,40 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             return
         support_evidence_match = re.fullmatch(r"/api/support/feedback/([A-Za-z0-9_-]+)/evidence", path)
         if support_evidence_match:
+            auth_session = self.current_auth_session()
+            try:
+                require_support_forensics(auth_session)
+            except PermissionError:
+                self.send_json({"error": "Not found"}, status=404)
+                return
+            if self.block_unsafe_post(path):
+                return
             try:
                 reason = (parse_qs(parsed.query).get("reason") or [""])[0]
-                self.send_json({"integrity": support_feedback_evidence_for_auth_session(support_evidence_match.group(1), reason, self.current_auth_session())})
+                self.send_json({"integrity": support_feedback_evidence_for_auth_session(support_evidence_match.group(1), reason, auth_session)})
             except (PermissionError, LookupError):
                 self.send_json({"error": "Not found"}, status=404)
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
             except ValueError as exc:
                 self.send_json({"status": "blocked", "errors": safe_error_messages([str(exc)])}, status=400)
             return
         support_detail_match = re.fullmatch(r"/api/support/feedback/([A-Za-z0-9_-]+)", path)
         if support_detail_match:
+            auth_session = self.current_auth_session()
             try:
-                self.send_json({"report": support_feedback_detail_for_auth_session(support_detail_match.group(1), self.current_auth_session())})
+                require_support_forensics(auth_session)
+            except PermissionError:
+                self.send_json({"error": "Not found"}, status=404)
+                return
+            if self.block_unsafe_post(path):
+                return
+            try:
+                self.send_json({"report": support_feedback_detail_for_auth_session(support_detail_match.group(1), auth_session)})
             except (PermissionError, LookupError):
                 self.send_json({"error": "Not found"}, status=404)
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
             return
         query = parse_qs(parsed.query, keep_blank_values=True)
         if path == "/api/feedback/context":
@@ -19167,8 +19591,17 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             if not allowed:
                 self.send_json(error, status=403)
                 return
+            requested_job_id = clean_text(self.headers.get("Idempotency-Key"))
+            if requested_job_id and not re.fullmatch(r"job-[A-Za-z0-9_-]{8,80}", requested_job_id):
+                self.send_json(
+                    {"status": "blocked", "errors": ["Generation request identity is invalid."]},
+                    status=400,
+                )
+                return
+            payload = dict(payload)
+            payload.pop("_generation_run_id", None)
             try:
-                result = run_quote_job(payload, auth_session=self.current_auth_session())
+                result = run_quote_job(payload, job_id=requested_job_id or None, auth_session=self.current_auth_session())
             except SqagStorageAccessError as exc:
                 self.send_json(storage_access_error_payload(exc), status=exc.status)
                 return
