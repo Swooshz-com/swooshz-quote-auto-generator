@@ -49,6 +49,8 @@
       "data_class": "feedback_and_status_history",
       "storage": "sqag_feedback, sqag_feedback_status_history",
       "retention_calendar_years": 3,
+      "lifecycle_policy_version": "sqag.feedback-retention.v3",
+      "lifecycle_note": "First closure expires three calendar years from closure. Reopening clears the current closed_at without shortening submission or current lifecycle expiry. Reclosure records a new current closed_at and expiry while prior closures remain in status history. Reopen transitions require a bounded reason; every transition is audited with a derived reopen count and unusual repeated reopening is flagged for support review. Legal holds suspend deletion without rewriting lifecycle dates or extending linked runs or artifacts. Status transitions and retention deletion share the workspace-scoped feedback transaction lock, and deletion rechecks current status, expiry, and hold state after locking.",
       "rollback_note": "Restore feedback records together with their status history and linked run/session identifiers; do not duplicate canonical generation evidence."
     },
     {

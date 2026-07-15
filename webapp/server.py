@@ -18578,13 +18578,20 @@ def support_feedback_evidence_for_auth_session(reference: str, reason_code: str,
         session_id = safe_quote_session_id(report.get("session_id"), "")
         if not run_id:
             raise LookupError("Forensic evidence is not available.")
-        artifact_storage = quote_session_storage_for_auth_session(auth_session)
-        verifier = forensic_artifact_verifier_for_session(artifact_storage, session_id)
+        def artifact_verifier_factory() -> Any:
+            if not session_id:
+                raise LookupError("Forensic evidence is not available.")
+            artifact_storage = quote_session_storage_for_auth_session(auth_session)
+            return forensic_artifact_verifier_for_session(
+                artifact_storage,
+                session_id,
+            )
+
         return store.verify_run_evidence(
             run_id,
             reason_code=reason_code,
             privileged=True,
-            artifact_verifier=verifier,
+            artifact_verifier_factory=artifact_verifier_factory,
         )
 def create_job(
     job_type: str,

@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from webapp.forensics import ForensicStore, iso_timestamp
+from webapp.forensics import ForensicStore, RetentionGraphHeld, iso_timestamp
 from webapp import server as webapp
 from scripts import enforce_forensic_retention
 
@@ -62,6 +62,83 @@ class Pr140RegressionTest(unittest.TestCase):
             0,
         )
 
+    def test_expired_feedback_linked_to_held_run_preserves_report_and_history(self):
+        store = self.store()
+        opened = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+        closed = dt.datetime(2020, 2, 1, tzinfo=dt.timezone.utc)
+        run_id = store.record_run_started("generate", {"synthetic": True}, now=opened)
+        store.finish_run(run_id, "failed", canonical_manifest={"artifacts": []}, now=opened)
+        feedback = store.submit_feedback(
+            {
+                "category": "bug",
+                "title": "Synthetic held-run feedback",
+                "message": "Synthetic held-run feedback.",
+                "run_id": run_id,
+            }
+        )
+        store.update_feedback_status(
+            feedback["feedback_id"],
+            "resolved",
+            resolution_note="Synthetic closure.",
+            now=closed,
+        )
+        store.set_legal_hold("sqag_generation_runs", "run_id", run_id, True)
+
+        result = store.enforce_retention(
+            now=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+        )
+
+        self.assertGreaterEqual(result.held, 1)
+        self.assertEqual(
+            self.connection.execute(
+                "select count(*) from sqag_feedback where feedback_id = ?",
+                (feedback["feedback_id"],),
+            ).fetchone()[0],
+            1,
+            "feedback linked to a legally held run was deleted",
+        )
+        self.assertGreater(
+            self.connection.execute(
+                "select count(*) from sqag_feedback_status_history where feedback_id = ?",
+                (feedback["feedback_id"],),
+            ).fetchone()[0],
+            0,
+            "status history linked to held-run feedback was deleted",
+        )
+
+    def test_batch_size_one_reaches_feedback_behind_dependency_blocked_run(self):
+        store = self.store()
+        run_time = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+        close_time = dt.datetime(2021, 1, 1, tzinfo=dt.timezone.utc)
+        now = dt.datetime(2025, 1, 1, tzinfo=dt.timezone.utc)
+        run_id = store.record_run_started("generate", {"synthetic": True}, now=run_time)
+        store.finish_run(run_id, "failed", canonical_manifest={"artifacts": []}, now=run_time)
+        feedback = store.submit_feedback(
+            {
+                "category": "bug",
+                "title": "Synthetic progress feedback",
+                "message": "Synthetic progress feedback.",
+                "run_id": run_id,
+            }
+        )
+        store.update_feedback_status(
+            feedback["feedback_id"],
+            "resolved",
+            resolution_note="Synthetic closure.",
+            now=close_time,
+        )
+
+        first = store.enforce_retention(now=now, batch_size=1)
+        second = store.enforce_retention(now=now, batch_size=1)
+
+        self.assertEqual(
+            self.connection.execute(
+                "select count(*) from sqag_feedback where feedback_id = ?",
+                (feedback["feedback_id"],),
+            ).fetchone()[0],
+            0,
+            f"bounded passes made no progress: first={first}, second={second}",
+        )
     def test_retention_and_legal_hold_are_serialized_without_orphaned_hold(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "forensics.sqlite3"
@@ -258,6 +335,692 @@ class Pr140RegressionTest(unittest.TestCase):
         self.assertEqual(row["closed_at"], "2024-02-29T00:00:00Z")
         self.assertEqual(row["retention_expires_at"], "2027-02-28T00:00:00Z")
 
+    def test_reopen_then_reclose_sets_a_fresh_closure_and_expiry(self):
+        store = self.store()
+        feedback = store.submit_feedback(
+            {
+                "category": "bug",
+                "title": "Synthetic reopen lifecycle",
+                "message": "Synthetic reopen lifecycle.",
+            }
+        )
+        first_close = dt.datetime(2020, 2, 29, tzinfo=dt.timezone.utc)
+        reopen = dt.datetime(2023, 3, 1, tzinfo=dt.timezone.utc)
+        second_close = dt.datetime(2024, 2, 29, tzinfo=dt.timezone.utc)
+        store.update_feedback_status(
+            feedback["feedback_id"],
+            "resolved",
+            resolution_note="Synthetic first closure.",
+            now=first_close,
+        )
+        reopened = store.update_feedback_status(
+            feedback["feedback_id"],
+            "in_progress",
+            resolution_note="Synthetic reopen reason.",
+            now=reopen,
+        )
+        self.assertIsNone(
+            reopened["closed_at"],
+            "reopening left the prior closure active on the current report",
+        )
+        reclosed = store.update_feedback_status(
+            feedback["feedback_id"],
+            "resolved",
+            resolution_note="Synthetic second closure.",
+            now=second_close,
+        )
+
+        self.assertEqual(reclosed["closed_at"], "2024-02-29T00:00:00Z")
+        self.assertEqual(reclosed["retention_expires_at"], "2027-02-28T00:00:00Z")
+        closure_history = self.connection.execute(
+            "select created_at from sqag_feedback_status_history "
+            "where feedback_id = ? and to_status = 'resolved' order by created_at",
+            (feedback["feedback_id"],),
+        ).fetchall()
+        self.assertEqual(
+            [row["created_at"] for row in closure_history],
+            ["2020-02-29T00:00:00Z", "2024-02-29T00:00:00Z"],
+        )
+
+    def test_feedback_transition_lock_precedes_authoritative_status_read(self):
+        store = self.store()
+        feedback = store.submit_feedback(
+            {
+                "category": "bug",
+                "title": "Synthetic transition serialization",
+                "message": "Synthetic transition serialization.",
+            }
+        )
+        events = []
+        acquire_locks = store._acquire_transaction_locks
+        read_feedback = store._feedback
+
+        def record_lock(*identities):
+            events.append(("lock", identities))
+            return acquire_locks(*identities)
+
+        def record_read(reference):
+            events.append(("read", reference))
+            return read_feedback(reference)
+
+        with mock.patch.object(store, "_acquire_transaction_locks", side_effect=record_lock), mock.patch.object(
+            store, "_feedback", side_effect=record_read
+        ):
+            updated = store.update_feedback_status(
+                feedback["support_reference"],
+                "triaged",
+                now=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+            )
+
+        self.assertEqual(updated["status"], "triaged")
+        self.assertEqual(events[0], ("lock", (("feedback", feedback["feedback_id"]),)))
+        self.assertEqual(events[1], ("read", feedback["feedback_id"]))
+
+    def test_retention_rechecks_reopened_feedback_after_transaction_lock(self):
+        store = self.store()
+        feedback = store.submit_feedback(
+            {
+                "category": "bug",
+                "title": "Synthetic deletion race",
+                "message": "Synthetic deletion race.",
+            }
+        )
+        store.update_feedback_status(
+            feedback["feedback_id"],
+            "resolved",
+            resolution_note="Synthetic closure.",
+            now=dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc),
+        )
+        stale = dict(
+            self.connection.execute(
+                "select * from sqag_feedback where feedback_id = ?",
+                (feedback["feedback_id"],),
+            ).fetchone()
+        )
+        self.connection.execute(
+            "update sqag_feedback set status = 'in_progress', closed_at = null, "
+            "retention_expires_at = ? where feedback_id = ?",
+            ("2030-01-01T00:00:00Z", feedback["feedback_id"]),
+        )
+        self.connection.commit()
+
+        with self.assertRaises(RetentionGraphHeld):
+            store._delete_retention_graph(
+                "feedback",
+                stale,
+                feedback["feedback_id"],
+                "2025-01-01T00:00:00Z",
+            )
+        self.connection.rollback()
+
+        current = self.connection.execute(
+            "select status, retention_expires_at from sqag_feedback where feedback_id = ?",
+            (feedback["feedback_id"],),
+        ).fetchone()
+        self.assertEqual(
+            dict(current),
+            {
+                "status": "in_progress",
+                "retention_expires_at": "2030-01-01T00:00:00Z",
+            },
+        )
+
+    def test_artifact_free_support_evidence_does_not_open_artifact_storage(self):
+        store = self.store()
+        run_id = store.record_run_started("generate", {"synthetic": True})
+        store.finish_run(run_id, "blocked", canonical_manifest={"artifacts": []})
+        feedback = store.submit_feedback(
+            {
+                "category": "failed_process",
+                "title": "Synthetic artifact-free run",
+                "message": "Synthetic artifact-free run.",
+                "run_id": run_id,
+            }
+        )
+        with (
+            mock.patch.object(webapp, "require_support_forensics"),
+            mock.patch.object(
+                webapp,
+                "forensic_store_for_auth_session",
+                return_value=contextlib.nullcontext(store),
+            ),
+            mock.patch.object(
+                webapp,
+                "quote_session_storage_for_auth_session",
+                side_effect=AssertionError(
+                    "artifact-free verification opened artifact storage"
+                ),
+            ) as open_artifact_storage,
+        ):
+            result = webapp.support_feedback_evidence_for_auth_session(
+                feedback["support_reference"],
+                "support_investigation",
+                {"synthetic": True},
+            )
+
+        self.assertTrue(result["integrity_ok"])
+        open_artifact_storage.assert_not_called()
+        self.assertEqual(
+            self.connection.execute(
+                "select count(*) from sqag_audit_events "
+                "where run_id = ? and event_type = 'forensic_evidence_accessed'",
+                (run_id,),
+            ).fetchone()[0],
+            1,
+        )
+    def test_run_hold_release_and_independent_feedback_hold_are_separate(self):
+        store = self.store()
+        opened = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+        closed = dt.datetime(2020, 2, 1, tzinfo=dt.timezone.utc)
+        now = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+        run_id = store.record_run_started("generate", {"synthetic": True}, now=opened)
+        store.finish_run(run_id, "failed", canonical_manifest={"artifacts": []}, now=opened)
+        feedback = store.submit_feedback(
+            {
+                "category": "bug",
+                "title": "Synthetic independent hold",
+                "message": "Synthetic independent hold.",
+                "run_id": run_id,
+            }
+        )
+        store.update_feedback_status(
+            feedback["feedback_id"],
+            "resolved",
+            resolution_note="Synthetic closure.",
+            now=closed,
+        )
+        feedback_dates = self.connection.execute(
+            "select closed_at, original_retention_expires_at, "
+            "submission_retention_expires_at, retention_expires_at "
+            "from sqag_feedback where feedback_id = ?",
+            (feedback["feedback_id"],),
+        ).fetchone()
+        run_expiry = self.connection.execute(
+            "select retention_expires_at from sqag_generation_runs where run_id = ?",
+            (run_id,),
+        ).fetchone()[0]
+        store.set_legal_hold("sqag_generation_runs", "run_id", run_id, True)
+        store.set_legal_hold("sqag_feedback", "feedback_id", feedback["feedback_id"], True)
+        self.assertGreaterEqual(store.enforce_retention(now=now).held, 1)
+
+        store.set_legal_hold("sqag_generation_runs", "run_id", run_id, False)
+        self.assertGreaterEqual(store.enforce_retention(now=now).held, 1)
+        retained_dates = self.connection.execute(
+            "select closed_at, original_retention_expires_at, "
+            "submission_retention_expires_at, retention_expires_at "
+            "from sqag_feedback where feedback_id = ?",
+            (feedback["feedback_id"],),
+        ).fetchone()
+        self.assertEqual(tuple(retained_dates), tuple(feedback_dates))
+        self.assertEqual(
+            self.connection.execute(
+                "select retention_expires_at from sqag_generation_runs where run_id = ?",
+                (run_id,),
+            ).fetchone()[0],
+            run_expiry,
+        )
+
+        store.set_legal_hold("sqag_feedback", "feedback_id", feedback["feedback_id"], False)
+        store.enforce_retention(now=now)
+        self.assertEqual(
+            self.connection.execute(
+                "select count(*) from sqag_feedback where feedback_id = ?",
+                (feedback["feedback_id"],),
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_linked_run_hold_added_after_selection_blocks_feedback_delete(self):
+        store = self.store()
+        opened = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+        run_id = store.record_run_started("generate", {"synthetic": True}, now=opened)
+        store.finish_run(run_id, "failed", canonical_manifest={"artifacts": []}, now=opened)
+        feedback = store.submit_feedback(
+            {
+                "category": "bug",
+                "title": "Synthetic late hold",
+                "message": "Synthetic late hold.",
+                "run_id": run_id,
+            }
+        )
+        store.update_feedback_status(
+            feedback["feedback_id"],
+            "resolved",
+            resolution_note="Synthetic closure.",
+            now=opened,
+        )
+        original_delete = store._delete_retention_graph
+        inserted_hold = False
+
+        def add_hold_then_delete(kind, item, record_id, now_text, **kwargs):
+            nonlocal inserted_hold
+            if kind == "feedback" and not inserted_hold:
+                inserted_hold = True
+                store.set_legal_hold("sqag_generation_runs", "run_id", run_id, True)
+            return original_delete(kind, item, record_id, now_text, **kwargs)
+
+        store._delete_retention_graph = add_hold_then_delete
+        result = store.enforce_retention(
+            now=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+        )
+
+        self.assertTrue(inserted_hold)
+        self.assertGreaterEqual(result.held, 1)
+        self.assertEqual(result.parents_processed, 0)
+        self.assertEqual(
+            self.connection.execute(
+                "select count(*) from sqag_feedback where feedback_id = ?",
+                (feedback["feedback_id"],),
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_retention_metrics_distinguish_review_held_and_actionable_parents(self):
+        store = self.store()
+        past = "2020-01-01T00:00:00Z"
+        open_feedback = store.submit_feedback(
+            {
+                "category": "bug",
+                "title": "Synthetic review required",
+                "message": "Synthetic review required.",
+            }
+        )
+        closed_feedback = store.submit_feedback(
+            {
+                "category": "bug",
+                "title": "Synthetic eligible feedback",
+                "message": "Synthetic eligible feedback.",
+            }
+        )
+        store.update_feedback_status(
+            closed_feedback["feedback_id"],
+            "resolved",
+            resolution_note="Synthetic closure.",
+            now=dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc),
+        )
+        held_run = store.record_run_started(
+            "generate",
+            {"synthetic": True},
+            now=dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc),
+        )
+        store.finish_run(
+            held_run,
+            "failed",
+            canonical_manifest={"artifacts": []},
+            now=dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc),
+        )
+        store.set_legal_hold("sqag_generation_runs", "run_id", held_run, True)
+        self.connection.execute(
+            "update sqag_feedback set retention_expires_at = ? where feedback_id = ?",
+            (past, open_feedback["feedback_id"]),
+        )
+        self.connection.commit()
+
+        result = store.enforce_retention(
+            now=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+            batch_size=2,
+        )
+
+        self.assertGreaterEqual(result.examined, 3)
+        self.assertEqual(result.review_required, 1)
+        self.assertEqual(result.held, 1)
+        self.assertEqual(result.parents_processed, 1)
+        self.assertEqual(result.failed, 0)
+        self.assertFalse(result.scan_exhausted)
+
+    def test_failed_retention_candidate_rotates_behind_unexamined_work(self):
+        store = self.store()
+        first_time = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+        second_time = dt.datetime(2020, 1, 2, tzinfo=dt.timezone.utc)
+        now = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+        first_run = store.record_run_started("generate", {"index": 1}, now=first_time)
+        store.finish_run(
+            first_run,
+            "failed",
+            quote_session_id="quote-failure-rotation-one",
+            canonical_manifest={"artifacts": []},
+            now=first_time,
+        )
+        second_run = store.record_run_started("generate", {"index": 2}, now=second_time)
+        store.finish_run(
+            second_run,
+            "failed",
+            quote_session_id="quote-failure-rotation-two",
+            canonical_manifest={"artifacts": []},
+            now=second_time,
+        )
+
+        def delete_artifacts(item, finalize):
+            if item["run_id"] == first_run:
+                raise RuntimeError("synthetic temporary deletion failure")
+            finalize(self.connection, require_session_exclusive=True)
+            return True
+
+        first = store.enforce_retention(
+            now=now,
+            batch_size=1,
+            artifact_delete=delete_artifacts,
+        )
+        second = store.enforce_retention(
+            now=now,
+            batch_size=1,
+            artifact_delete=delete_artifacts,
+        )
+
+        self.assertEqual(first.parents_processed, 1)
+        self.assertEqual(first.failed, 1)
+        self.assertEqual(second.parents_processed, 1)
+        self.assertEqual(second.failed, 0)
+        self.assertEqual(
+            self.connection.execute(
+                "select count(*) from sqag_generation_runs where run_id = ?",
+                (first_run,),
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "select count(*) from sqag_generation_runs where run_id = ?",
+                (second_run,),
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_bounded_scan_cursor_reaches_work_beyond_review_required_rows(self):
+        store = self.store()
+        past = "2020-01-01T00:00:00Z"
+        for index in range(17):
+            feedback = store.submit_feedback(
+                {
+                    "category": "bug",
+                    "title": f"Synthetic open {index}",
+                    "message": "Synthetic open feedback.",
+                }
+            )
+            self.connection.execute(
+                "update sqag_feedback set retention_expires_at = ? where feedback_id = ?",
+                (past, feedback["feedback_id"]),
+            )
+        eligible = store.submit_feedback(
+            {
+                "category": "bug",
+                "title": "Synthetic eligible after scan cap",
+                "message": "Synthetic eligible after scan cap.",
+            }
+        )
+        store.update_feedback_status(
+            eligible["feedback_id"],
+            "resolved",
+            resolution_note="Synthetic closure.",
+            now=dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc),
+        )
+        self.connection.execute(
+            "update sqag_feedback set deletion_claimed_at = ? where feedback_id = ?",
+            ("2019-01-01T00:00:00Z", eligible["feedback_id"]),
+        )
+        self.connection.commit()
+
+        first = store.enforce_retention(
+            now=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+            batch_size=1,
+        )
+        second = store.enforce_retention(
+            now=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+            batch_size=1,
+        )
+
+        self.assertEqual(first.examined, first.scan_limit)
+        self.assertTrue(first.scan_exhausted)
+        self.assertEqual(first.parents_processed, 0)
+        self.assertEqual(second.parents_processed, 1)
+        self.assertEqual(
+            self.connection.execute(
+                "select count(*) from sqag_feedback where feedback_id = ?",
+                (eligible["feedback_id"],),
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_retention_dry_run_classifies_without_mutating_cursor_or_rows(self):
+        store = self.store()
+        past = "2020-01-01T00:00:00Z"
+        open_feedback = store.submit_feedback(
+            {
+                "category": "bug",
+                "title": "Synthetic dry-run review",
+                "message": "Synthetic dry-run review.",
+            }
+        )
+        closed_feedback = store.submit_feedback(
+            {
+                "category": "bug",
+                "title": "Synthetic dry-run eligible",
+                "message": "Synthetic dry-run eligible.",
+            }
+        )
+        store.update_feedback_status(
+            closed_feedback["feedback_id"],
+            "resolved",
+            resolution_note="Synthetic closure.",
+            now=dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc),
+        )
+        self.connection.execute(
+            "update sqag_feedback set retention_expires_at = ? where feedback_id = ?",
+            (past, open_feedback["feedback_id"]),
+        )
+        self.connection.commit()
+
+        result = store.enforce_retention(
+            now=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+            batch_size=1,
+            apply=False,
+        )
+
+        self.assertEqual(result.review_required, 1)
+        self.assertEqual(result.parents_processed, 1)
+        self.assertEqual(result.deleted, 0)
+        rows = self.connection.execute(
+            "select deletion_state, deletion_claimed_at from sqag_feedback "
+            "where feedback_id in (?, ?) order by feedback_id",
+            (open_feedback["feedback_id"], closed_feedback["feedback_id"]),
+        ).fetchall()
+        self.assertEqual(
+            [(row["deletion_state"], row["deletion_claimed_at"]) for row in rows],
+            [("active", None), ("active", None)],
+        )
+
+    def test_artifact_bearing_support_evidence_requires_storage_and_audits_outage(self):
+        store = self.store()
+        run_id = store.record_run_started("generate", {"synthetic": True})
+        store.finish_run(
+            run_id,
+            "failed",
+            quote_session_id="quote-artifact-bearing",
+            canonical_manifest={
+                "artifacts": [
+                    {
+                        "name": "quotation.xlsx",
+                        "sha256": "a" * 64,
+                        "size_bytes": 1,
+                    }
+                ]
+            },
+        )
+        feedback = store.submit_feedback(
+            {
+                "category": "failed_process",
+                "title": "Synthetic artifact-bearing run",
+                "message": "Synthetic artifact-bearing run.",
+                "run_id": run_id,
+            }
+        )
+        outage = webapp.SqagStorageAccessError(
+            "SQAG artifact storage is unavailable.",
+            status=503,
+            reason="storage_artifact_database_not_migrated",
+        )
+        with (
+            mock.patch.object(webapp, "require_support_forensics"),
+            mock.patch.object(
+                webapp,
+                "forensic_store_for_auth_session",
+                return_value=contextlib.nullcontext(store),
+            ),
+            mock.patch.object(
+                webapp,
+                "quote_session_storage_for_auth_session",
+                side_effect=outage,
+            ) as open_artifact_storage,
+        ):
+            with self.assertRaises(webapp.SqagStorageAccessError):
+                webapp.support_feedback_evidence_for_auth_session(
+                    feedback["support_reference"],
+                    "support_investigation",
+                    {"synthetic": True},
+                )
+
+        open_artifact_storage.assert_called_once()
+        self.assertEqual(
+            self.connection.execute(
+                "select count(*) from sqag_audit_events where run_id = ? "
+                "and event_type = 'forensic_evidence_verification_failed'",
+                (run_id,),
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "select count(*) from sqag_audit_events where run_id = ? "
+                "and event_type = 'forensic_evidence_accessed'",
+                (run_id,),
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_failed_artifact_free_evidence_skips_verifier_factory(self):
+        store = self.store()
+        run_id = store.record_run_started("generate", {"synthetic": True})
+        store.finish_run(run_id, "failed", canonical_manifest={"artifacts": []})
+        factory = mock.Mock(
+            side_effect=AssertionError(
+                "artifact-free direct verification created an artifact verifier"
+            )
+        )
+
+        result = store.verify_run_evidence(
+            run_id,
+            reason_code="support_investigation",
+            privileged=True,
+            artifact_verifier_factory=factory,
+        )
+
+        self.assertTrue(result["integrity_ok"])
+        factory.assert_not_called()
+
+    def test_artifact_bearing_evidence_without_session_linkage_fails_closed(self):
+        store = self.store()
+        run_id = store.record_run_started("generate", {"synthetic": True})
+        store.finish_run(
+            run_id,
+            "failed",
+            canonical_manifest={
+                "artifacts": [
+                    {
+                        "name": "quotation.xlsx",
+                        "sha256": "a" * 64,
+                        "size_bytes": 1,
+                    }
+                ]
+            },
+        )
+        feedback = store.submit_feedback(
+            {
+                "category": "failed_process",
+                "title": "Synthetic missing session",
+                "message": "Synthetic missing session.",
+                "run_id": run_id,
+            }
+        )
+        with (
+            mock.patch.object(webapp, "require_support_forensics"),
+            mock.patch.object(
+                webapp,
+                "forensic_store_for_auth_session",
+                return_value=contextlib.nullcontext(store),
+            ),
+            mock.patch.object(
+                webapp,
+                "quote_session_storage_for_auth_session",
+            ) as open_artifact_storage,
+        ):
+            with self.assertRaises(LookupError):
+                webapp.support_feedback_evidence_for_auth_session(
+                    feedback["support_reference"],
+                    "support_investigation",
+                    {"synthetic": True},
+                )
+
+        open_artifact_storage.assert_not_called()
+        self.assertEqual(
+            self.connection.execute(
+                "select count(*) from sqag_audit_events where run_id = ? "
+                "and event_type = 'forensic_evidence_verification_failed'",
+                (run_id,),
+            ).fetchone()[0],
+            1,
+        )
+    def test_repeated_reopens_are_audited_without_extending_linked_run(self):
+        store = self.store()
+        run_id = store.record_run_started("generate", {"synthetic": True})
+        store.finish_run(run_id, "failed", canonical_manifest={"artifacts": []})
+        run_expiry = self.connection.execute(
+            "select retention_expires_at from sqag_generation_runs where run_id = ?",
+            (run_id,),
+        ).fetchone()[0]
+        feedback = store.submit_feedback(
+            {
+                "category": "bug",
+                "title": "Synthetic repeated reopen",
+                "message": "Synthetic repeated reopen.",
+                "run_id": run_id,
+            }
+        )
+        for cycle in range(3):
+            store.update_feedback_status(
+                feedback["feedback_id"],
+                "resolved",
+                resolution_note=f"Synthetic closure {cycle}.",
+                now=dt.datetime(2020 + cycle * 2, 1, 1, tzinfo=dt.timezone.utc),
+            )
+            store.update_feedback_status(
+                feedback["feedback_id"],
+                "in_progress",
+                resolution_note=f"Synthetic reopen {cycle}.",
+                now=dt.datetime(2021 + cycle * 2, 1, 1, tzinfo=dt.timezone.utc),
+            )
+
+        row = self.connection.execute(
+            "select retention_policy_version, closed_at from sqag_feedback "
+            "where feedback_id = ?",
+            (feedback["feedback_id"],),
+        ).fetchone()
+        latest = self.connection.execute(
+            "select event_json from sqag_audit_events where run_id = ? "
+            "and event_type = 'feedback_status_changed' order by created_at desc, event_id desc limit 1",
+            (run_id,),
+        ).fetchone()
+        details = json.loads(latest["event_json"])
+        self.assertEqual(row["retention_policy_version"], "sqag.feedback-retention.v3")
+        self.assertIsNone(row["closed_at"])
+        self.assertEqual(details["reopen_count"], 3)
+        self.assertTrue(details["unusual_reopen_activity"])
+        self.assertEqual(
+            self.connection.execute(
+                "select retention_expires_at from sqag_generation_runs where run_id = ?",
+                (run_id,),
+            ).fetchone()[0],
+            run_expiry,
+        )
     def test_evidence_and_audit_rows_reject_ordinary_mutation(self):
         store = self.store()
         run_id = store.record_run_started("generate", {"synthetic": True})
@@ -411,7 +1174,7 @@ class Pr140RegressionTest(unittest.TestCase):
             now=final_pass,
             artifact_delete=delete_artifacts,
         )
-        self.assertGreaterEqual(second.held, 1)
+        self.assertEqual(second.parents_processed, 2)
         self.assertEqual(
             self.connection.execute(
                 "select count(*) from sqag_feedback where feedback_id = ?",
@@ -419,13 +1182,6 @@ class Pr140RegressionTest(unittest.TestCase):
             ).fetchone()[0],
             0,
         )
-        self.assertTrue(artifact_visible)
-
-        third = store.enforce_retention(
-            now=final_pass,
-            artifact_delete=delete_artifacts,
-        )
-        self.assertEqual(third.parents_processed, 1)
         self.assertFalse(artifact_visible)
         self.assertEqual(calls, [run_id])
         self.assertEqual(
@@ -618,7 +1374,8 @@ class Pr140RegressionTest(unittest.TestCase):
                 }
 
             def verify_run_evidence(self, run_id, **kwargs):
-                self.verified = (run_id, kwargs)
+                verifier = kwargs["artifact_verifier_factory"]()
+                self.verified = (run_id, {**kwargs, "artifact_verifier": verifier})
                 return {"integrity_ok": True, "run_id": run_id}
 
         store = Store()

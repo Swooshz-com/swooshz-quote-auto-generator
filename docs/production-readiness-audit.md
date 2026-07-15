@@ -64,6 +64,24 @@ authorised or used.
 
 ### PR #140 Blocker Repair Closure
 
+- Expired feedback and its status history now remain protected whenever the
+  linked generation-run graph is legally held. Final deletion acquires the same
+  graph locks and rechecks the current parent state before any destructive write.
+- Bounded retention scans separate examined rows from actionable parent limits,
+  rotate blocked/failed work behind unexamined candidates, and expose scan-limit
+  and exhaustion metrics so `batch_size=1` still makes deterministic progress.
+- Artifact-free forensic verification no longer constructs artifact storage.
+  Artifact-bearing verification remains fail-closed and separately audited when
+  durable bytes or the storage boundary are unavailable.
+- Reopening clears the current closure without shortening retained expiry;
+  reclosure records a fresh closure and three-calendar-year expiry while prior
+  closure history remains immutable.
+- The follow-up security finding is closed at the record transaction boundary:
+  every feedback transition canonicalises its support reference to the feedback
+  ID, acquires the workspace-scoped feedback lock before the authoritative status
+  read, and commits status, history, and audit together. Retention deletion uses
+  the same lock identity and rejects reopened, held, missing, malformed-expiry,
+  or no-longer-expired parents after the lock is held.
 - Privileged feedback evidence retrieval now unwraps the workspace-scoped
   feedback `report`, verifies its linked run in the same workspace, and re-reads
   durable artifact bytes. The route preserves non-disclosing denials and a
@@ -90,8 +108,9 @@ authorised or used.
 - `git diff --check`: passed.
 - JavaScript syntax checks: `webapp/static/app.js`, `scripts/playwright-smoke.mjs`, `scripts/playwright-ai-basis-chat-stress.mjs`, `scripts/playwright-download-excel-confirm-regression.mjs`, and `scripts/playwright-forensics-feedback.mjs` passed.
 - Python syntax checks: server, generator, forensics, retention, observability, production DB, and live retention verifier modules passed.
-- `python -m unittest tests.test_forensics_pr140_regressions`: 29 tests passed.
-- `python -m unittest discover -s tests`: 842 tests passed.
+- `python -m unittest tests.test_forensics_pr140_regressions`: 45 tests passed.
+- Focused forensic/feedback/retention and HTTP matrix: 70 tests passed.
+- `python -m unittest discover -s tests -v`: 858 tests passed.
 - `python -m pip check`: passed.
 - `python -m pip_audit -r requirements.txt --strict`: passed, no known vulnerabilities found.
 - `npm ci`: passed, installed/audited 3 packages.
@@ -104,6 +123,8 @@ authorised or used.
 - `npm run playwright:ai-stress`: passed with no console problems.
 - `npm run playwright:smoke`: passed with no console or network problems.
 - `node scripts/playwright-forensics-feedback.mjs`: passed on a fresh local server with health verified and `production_ready=false`.
+- Fresh localhost health verification at `http://127.0.0.1:8765/api/health` passed with the generator available; the task-owned server was stopped and the port released.
+- Codex Security standard scan `165802e6-4a17-4a93-914d-1444fbf550fc` completed with one Low/P3 feedback-transition race. The race was repaired after deterministic RED evidence; final diff-focused source-to-sink review plus the 70-test focused matrix found no surviving transition or reopen/delete race. No live PostgreSQL/provider trace was run.
 - `npm run playwright:download-confirm`: not part of the documented baseline and remains a stale dashboard-first regression harness; it times out waiting for Quote Basis to be visible immediately after load.
 
 
@@ -511,6 +532,57 @@ and do not silently satisfy live-provider evidence or readiness checks. Existing
 database table names and non-object storage compatibility env names remain
 unchanged by this cleanup PR.
 
+### PR #140 four-blocker retention follow-up (2026-07-15)
+
+The exact starting head a1d824dc7380cd61c2205600dd11c1d3d1605116
+was tested before this repair. Four deterministic regression tests failed:
+feedback linked to a legally held run was deleted; two consecutive
+batch_size=1 passes repeatedly selected a dependency-held run and did not
+reach eligible feedback; artifact-free support verification opened artifact
+storage; and reopening retained the first closure timestamp and expiry.
+
+The repaired retention graph derives feedback preservation from an active hold
+on its same-workspace linked run without creating a permanent feedback hold.
+Candidate evaluation and the final deletion transaction both recheck the graph.
+The final transaction acquires deterministic feedback, linked-run, and
+quote-session graph locks, so a linked run hold that commits before deletion
+prevents the feedback deletion. Releasing the run hold restores normal
+eligibility unless an independent feedback/history hold or another retention
+dependency remains.
+
+Retention selection now separates the actionable-parent limit from a bounded
+scan limit. It examines at most sixteen times the requested parent batch, capped
+at 5,000 rows, prioritises expired feedback before runs, and rotates held,
+review-required, and failed rows through the existing deletion-claim timestamp.
+This prevents a permanently blocked first row from monopolising later passes
+while keeping memory and database reads bounded. Metrics distinguish rows
+examined, actionable parents processed, deleted records, held records,
+review-required records, failures, scan limit, and scan exhaustion. Dry-run
+classification does not mutate rows or cursor metadata.
+
+Forensic verification now validates database evidence digests, JSON, manifest
+schema, run/workspace linkage, and the manifest artifact list before requesting
+artifact access. Empty artifact lists require no quote session, artifact schema,
+database BLOB read, or object storage. Artifact-bearing manifests lazily create
+the workspace-scoped verifier, still re-read durable bytes, and fail closed on
+missing session, unavailable storage, missing bytes, checksum mismatch, or size
+mismatch. One successful verification writes one forensic-access event; failed
+verification writes a bounded failure event without artifact names, object
+keys, bytes, quote content, or raw feedback content.
+
+Feedback lifecycle policy sqag.feedback-retention.v3 keeps separate original
+submission expiry, original retention expiry, current lifecycle expiry, current
+closed_at, and append-only transition history. Reopening requires a bounded
+reason, clears the current closure, and does not shorten the current or
+submission expiry. Reclosing records a new current closure and a new
+three-calendar-year expiry, including leap-day handling. Each transition is
+audited with a derived reopen count; three or more reopen events are flagged for
+support review without imposing an arbitrary limit. These transitions do not
+extend linked run or artifact retention, and legal holds suspend deletion
+without rewriting lifecycle dates.
+
+The approved visible Feedback, Privacy, and Terms UI remains unchanged.
+internal_alpha_ready=false and production_ready=false remain unchanged.
 ## Security Audit
 
 Codex Security standard scan status: complete.

@@ -120,6 +120,7 @@ def _main() -> int:
         "status": "partial_failure" if result.failed else ("completed" if args.apply else "dry_run"),
         "workspace_scoped": True,
         "examined": result.examined,
+        "rows_examined": result.examined,
         "deleted": result.deleted,
         "held": result.held,
         "deletion_receipts_created": result.deleted,
@@ -127,6 +128,8 @@ def _main() -> int:
         "failed": result.failed,
         "review_required": result.review_required,
         "batch_size": batch_size,
+        "scan_limit": result.scan_limit,
+        "scan_exhausted": result.scan_exhausted,
         "production_ready": False,
     }
     print(json.dumps(report, indent=2, sort_keys=True))

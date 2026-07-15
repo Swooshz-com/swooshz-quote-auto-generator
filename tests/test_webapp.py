@@ -765,7 +765,16 @@ class WebappServerTest(unittest.TestCase):
             cross_headers = {
                 webapp.configured_csrf_header_name(): webapp.csrf_token_for_cookie_header(cross_cookie)
             }
-            with LocalRunnerServer() as runner:
+            with (
+                mock.patch.object(
+                    webapp,
+                    "quote_session_storage_for_auth_session",
+                    side_effect=AssertionError(
+                        "artifact-free HTTP verification opened artifact storage"
+                    ),
+                ) as open_artifact_storage,
+                LocalRunnerServer() as runner,
+            ):
                 missing_csrf = self.http_json(
                     runner,
                     "GET",
@@ -826,6 +835,7 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(blank_reason["status"], 400)
         self.assertEqual(missing_run["status"], 404)
         self.assertEqual(successful_access_events, 1)
+        open_artifact_storage.assert_not_called()
 
 
     def test_support_feedback_detail_route_returns_bounded_storage_error(self):
