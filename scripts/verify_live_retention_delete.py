@@ -435,34 +435,49 @@ def _runtime_download_verified(
     )
 
 
+
 def _runtime_download_denied(storage: object, session_id: str, backend: ObjectStorageBackend, env: Mapping[str, str]) -> bool:
     if not hasattr(storage, "quote_session_export_artifact"):
         return _object_artifact_row(storage, session_id, "xlsx") is None
     try:
         return _runtime_download(storage, session_id, backend, env) is None
-    except Exception:
-        return True
+    except Exception as exc:
+        return _is_confirmed_missing_error(exc)
+
+
+
+def _is_confirmed_missing_error(exc: Exception) -> bool:
+    return isinstance(exc, ObjectStorageContractError) and str(exc) in {
+        "Artifact is not available.",
+        "Artifact is not available for this workspace.",
+    }
 
 
 def _delete_object_or_confirm_missing(backend: ObjectStorageBackend, metadata: ObjectArtifactMetadata) -> tuple[bool, bool]:
     try:
         deleted = bool(backend.delete_artifact(metadata, workspace_id=metadata.workspace_id))
     except Exception:
-        deleted = False
-    missing_fail_closed = False
+        return False, False
     try:
         backend.retrieve_artifact(metadata, workspace_id=metadata.workspace_id)
-    except Exception:
-        missing_fail_closed = True
-    return bool(deleted or missing_fail_closed), missing_fail_closed
+    except Exception as exc:
+        confirmed_missing = _is_confirmed_missing_error(exc)
+        return bool(deleted or confirmed_missing), confirmed_missing
+    return False, False
 
 
 def _repeated_delete_safe(backend: ObjectStorageBackend, metadata: ObjectArtifactMetadata) -> bool:
     try:
-        result = backend.delete_artifact(metadata, workspace_id=metadata.workspace_id)
-        return bool(result)
+        deleted = bool(backend.delete_artifact(metadata, workspace_id=metadata.workspace_id))
     except Exception:
+        return False
+    if deleted:
         return True
+    try:
+        backend.retrieve_artifact(metadata, workspace_id=metadata.workspace_id)
+    except Exception as exc:
+        return _is_confirmed_missing_error(exc)
+    return False
 
 
 def _cleanup_storage(storage: object, session_id: str) -> bool:

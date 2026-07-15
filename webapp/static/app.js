@@ -181,6 +181,7 @@ const state = {
   restorableOverlay: "",
   dashboardOperation: null,
   quoteSessionId: "",
+  lastGenerationRunId: "",
   quoteSessions: [],
   quoteSessionLoadError: "",
   quoteSessionDashboardLoadId: 0,
@@ -234,6 +235,7 @@ const state = {
   browserRecoveryScope: "",
   isRecoveryScopeTransitioning: false,
   pendingFeedback: "",
+  feedbackContext: null,
   activeSidePanel: "images",
   downloadFile: null,
   pdfFile: null,
@@ -330,6 +332,22 @@ const elements = {
   topbarAuthState: qs("#topbarAuthState"),
   topbarAuthText: qs("#topbarAuthText"),
   topbarLogoutLink: qs("#topbarLogoutLink"),
+  feedbackButton: qs("#feedbackButton"),
+  feedbackModal: qs("#feedbackModal"),
+  feedbackForm: qs("#feedbackForm"),
+  feedbackCategory: qs("#feedbackCategory"),
+  feedbackShortTitle: qs("#feedbackShortTitle"),
+  feedbackMessage: qs("#feedbackMessage"),
+  feedbackExpectedResult: qs("#feedbackExpectedResult"),
+  feedbackActualResult: qs("#feedbackActualResult"),
+  feedbackReproductionSteps: qs("#feedbackReproductionSteps"),
+  feedbackImpact: qs("#feedbackImpact"),
+  feedbackLinkContext: qs("#feedbackLinkContext"),
+  feedbackIncludeLink: qs("#feedbackIncludeLink"),
+  feedbackManualReference: qs("#feedbackManualReference"),
+  feedbackStatus: qs("#feedbackStatus"),
+  cancelFeedbackButton: qs("#cancelFeedbackButton"),
+  submitFeedbackButton: qs("#submitFeedbackButton"),
   dashboardEmptyNewQuoteButton: qs("#dashboardEmptyNewQuoteButton"),
   backToDashboardButton: qs("#backToDashboardButton"),
   dashboardStatusFilter: qs("#dashboardStatusFilter"),
@@ -9801,6 +9819,128 @@ async function fetchPostJsonResponse(url, payload) {
   });
 }
 
+
+function feedbackBrowserFamilyMajor() {
+  const brands = Array.isArray(navigator.userAgentData?.brands) ? navigator.userAgentData.brands : [];
+  const preferred = brands.find((item) => item?.brand && !String(item.brand).includes("Not"));
+  if (preferred) return `${String(preferred.brand).slice(0, 40)} ${String(preferred.version || "").split(".")[0]}`.trim();
+  const agent = String(navigator.userAgent || "");
+  for (const [name, pattern] of [["Edge", /Edg\/(\d+)/], ["Chrome", /Chrome\/(\d+)/], ["Firefox", /Firefox\/(\d+)/], ["Safari", /Version\/(\d+).*Safari/]]) {
+    const match = agent.match(pattern);
+    if (match) return `${name} ${match[1]}`;
+  }
+  return "Unknown";
+}
+
+function feedbackViewportBucket() {
+  const width = Math.max(0, Number(window.innerWidth || 0));
+  if (width < 600) return "small";
+  if (width < 1024) return "medium";
+  if (width < 1600) return "large";
+  return "extra_large";
+}
+
+async function loadFeedbackContext() {
+  if (!elements.feedbackLinkContext) return;
+  elements.feedbackLinkContext.textContent = "Checking the most relevant authorised quote context...";
+  const query = new URLSearchParams({
+    run_id: state.lastGenerationRunId || "",
+    session_id: safeQuoteSessionId(state.quoteSessionId || ""),
+  });
+  try {
+    const response = await fetch(`/api/feedback/context?${query.toString()}`, { cache: "no-store" });
+    const data = await jsonFromResponse(response);
+    if (!response.ok || !data.context) throw new Error("feedback context unavailable");
+    state.feedbackContext = data.context;
+    const context = data.context;
+    const detail = [context.label, context.status, context.created_at].filter(Boolean).join(" - ");
+    elements.feedbackLinkContext.textContent = detail || "No quote context will be linked.";
+    const canLink = context.link_type && context.link_type !== "none";
+    elements.feedbackIncludeLink.checked = Boolean(canLink);
+    elements.feedbackIncludeLink.disabled = !canLink;
+  } catch {
+    state.feedbackContext = null;
+    elements.feedbackLinkContext.textContent = "Quote context could not be verified. This report will be submitted without an automatic link.";
+    elements.feedbackIncludeLink.checked = false;
+    elements.feedbackIncludeLink.disabled = true;
+  }
+}
+
+async function submitFeedback(event) {
+  event.preventDefault();
+  const title = String(elements.feedbackShortTitle?.value || "").trim();
+  const message = String(elements.feedbackMessage?.value || "").trim();
+  if (!title || !message) {
+    elements.feedbackStatus.hidden = false;
+    elements.feedbackStatus.textContent = "Add a short title and description before submitting.";
+    return;
+  }
+  if (!elements.feedbackForm.reportValidity()) return;
+  const includeLink = Boolean(elements.feedbackIncludeLink?.checked && !elements.feedbackIncludeLink?.disabled);
+  const context = includeLink && state.feedbackContext ? state.feedbackContext : {};
+  const manualReference = String(elements.feedbackManualReference?.value || "").trim();
+  elements.submitFeedbackButton.disabled = true;
+  elements.feedbackStatus.hidden = true;
+  try {
+    const response = await fetchPostJsonResponse("/api/feedback", {
+      category: elements.feedbackCategory?.value || "general",
+      title,
+      message,
+      expected_result: String(elements.feedbackExpectedResult?.value || "").trim(),
+      actual_result: String(elements.feedbackActualResult?.value || "").trim(),
+      reproduction_steps: String(elements.feedbackReproductionSteps?.value || "").trim(),
+      impact: elements.feedbackImpact?.value || "medium",
+      include_link: includeLink,
+      link_choice: includeLink ? "automatic" : (manualReference ? "manual" : "none"),
+      run_id: context.run_id || "",
+      session_id: safeQuoteSessionId(context.session_id || ""),
+      manual_reference: manualReference,
+      diagnostic_metadata: {
+        browser_family_major: feedbackBrowserFamilyMajor(),
+        current_route: window.location.pathname,
+        job_state: state.isGenerating ? "processing" : "idle",
+        product_area: state.activeSidePanel || "workspace",
+        viewport_bucket: feedbackViewportBucket(),
+      },
+    });
+    const data = await jsonFromResponse(response);
+    if (!response.ok) {
+      elements.feedbackStatus.hidden = false;
+      elements.feedbackStatus.textContent = genericFailureMessages(data)[0];
+      return;
+    }
+    elements.feedbackStatus.hidden = false;
+    elements.feedbackStatus.textContent = `Feedback submitted. Support reference: ${data.support_reference || data.feedback_id || "recorded"}.`;
+    elements.feedbackShortTitle.value = "";
+    elements.feedbackMessage.value = "";
+    elements.feedbackExpectedResult.value = "";
+    elements.feedbackActualResult.value = "";
+    elements.feedbackReproductionSteps.value = "";
+    elements.feedbackManualReference.value = "";
+  } catch {
+    elements.feedbackStatus.hidden = false;
+    elements.feedbackStatus.textContent = "Feedback could not be submitted. Please try again.";
+  } finally {
+    elements.submitFeedbackButton.disabled = false;
+  }
+}
+
+async function showFeedbackModal() {
+  if (!elements.feedbackModal) return;
+  elements.feedbackStatus.hidden = true;
+  elements.feedbackStatus.textContent = "";
+  elements.feedbackModal.hidden = false;
+  elements.feedbackShortTitle?.focus();
+  await loadFeedbackContext();
+}
+
+function hideFeedbackModal() {
+  if (!elements.feedbackModal) return;
+  elements.feedbackModal.hidden = true;
+  elements.feedbackButton?.focus();
+}
+
+
 async function jsonFromResponse(response) {
   try {
     return await response.json();
@@ -12233,6 +12373,7 @@ async function handleGenerate(options = {}) {
   syncControlStates();
   await ensureQuoteSession({ quoteGenerated: true });
   const started = await startJob(jobType, buildPayload({ viewPdf }), { jobId: operation.id });
+  state.lastGenerationRunId = String(started.data?.generation_run_id || state.lastGenerationRunId || "");
   if (!started.ok) {
     if (started.data?.page_unloading) return;
     state.isGenerating = false;
@@ -12243,6 +12384,7 @@ async function handleGenerate(options = {}) {
     syncControlStates();
     return;
   }
+  state.lastGenerationRunId = String(started.data.generation_run_id || state.lastGenerationRunId || "");
   state.activeJob = { ...operation, id: started.data.job_id || operation.id, phase: "running" };
   saveSessionState();
 
@@ -12256,6 +12398,7 @@ async function handleGenerate(options = {}) {
   clearActiveJob();
 
   const data = polled.data.result || polled.data || {};
+  state.lastGenerationRunId = String(data.generation_run_id || polled.data.generation_run_id || state.lastGenerationRunId || "");
   if (data.quote_session?.session_id) {
     state.quoteSessionId = safeQuoteSessionId(data.quote_session.session_id) || state.quoteSessionId;
   }
@@ -13266,6 +13409,12 @@ function wireEvents() {
     if (event.target.closest("[data-output-delete-close]")) {
       hideOutputDeleteModal();
     }
+  });
+  elements.feedbackButton?.addEventListener("click", showFeedbackModal);
+  elements.cancelFeedbackButton?.addEventListener("click", hideFeedbackModal);
+  elements.feedbackForm?.addEventListener("submit", submitFeedback);
+  elements.feedbackModal?.addEventListener("click", (event) => {
+    if (event.target.closest("[data-feedback-close]")) hideFeedbackModal();
   });
   elements.cancelQuoteSessionDeleteButton?.addEventListener("click", hideQuoteSessionDeleteModal);
   elements.confirmQuoteSessionDeleteButton?.addEventListener("click", confirmQuoteSessionDelete);

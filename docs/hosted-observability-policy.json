@@ -48,6 +48,7 @@
     "do_not_expose_runtime_roots_or_database_urls": true
   },
   "retention": {
+    "production_log_retention_days": 90,
     "local_uat_log_retention_days": 30,
     "host_specific_export_required": true,
     "external_vendor_dependency_required_by_this_repo": false

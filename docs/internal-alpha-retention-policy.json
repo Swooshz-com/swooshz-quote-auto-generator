@@ -11,32 +11,45 @@
     {
       "data_class": "quote_sessions",
       "storage": "sqag_quote_sessions",
-      "retention_days": 90,
+      "retention_calendar_years": 3,
       "rollback_note": "Restore the SQLite database from the prior known-good backup and verify workspace/session checksums before using local-UAT access."
     },
     {
       "data_class": "generated_artifacts",
       "storage": "sqag_quote_artifacts",
-      "retention_days": 90,
+      "retention_calendar_years": 3,
       "rollback_note": "Restore generated artifact rows together with quote-session metadata from the same backup set; verify artifact checksums before download routes are re-enabled."
     },
     {
       "data_class": "uploaded_references",
       "storage": "sqag_file_artifacts",
-      "retention_days": 90,
+      "retention_calendar_years": 3,
       "rollback_note": "Restore uploaded reference artifact rows from the same backup set as pricing/profile metadata and validate row counts plus checksums."
     },
     {
       "data_class": "profile_layout_assets",
       "storage": "sqag_file_artifacts owner_type=profile",
-      "retention_days": 180,
+      "retention_calendar_years": 3,
       "rollback_note": "Restore profile layout assets with their owning profile rows and verify workspace/profile ownership metadata before generation is enabled."
     },
     {
       "data_class": "pricing_visual_assets",
       "storage": "sqag_file_artifacts owner_type=pricing_reference",
-      "retention_days": 180,
+      "retention_calendar_years": 3,
       "rollback_note": "Restore pricing visual assets with their owning pricing-reference rows and verify workspace/reference ownership metadata before reference exports are enabled."
+    },
+
+    {
+      "data_class": "generation_evidence_and_audit",
+      "storage": "sqag_generation_runs, sqag_generation_evidence, sqag_audit_events",
+      "retention_calendar_years": 3,
+      "rollback_note": "Restore the immutable run, evidence, and audit rows from the same workspace-scoped backup set and verify evidence digests before access is restored."
+    },
+    {
+      "data_class": "feedback_and_status_history",
+      "storage": "sqag_feedback, sqag_feedback_status_history",
+      "retention_calendar_years": 3,
+      "rollback_note": "Restore feedback records together with their status history and linked run/session identifiers; do not duplicate canonical generation evidence."
     },
     {
       "data_class": "logs",

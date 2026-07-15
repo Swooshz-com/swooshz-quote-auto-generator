@@ -27,7 +27,7 @@ const options = {
 };
 
 const baseUrl = `http://${options.host}:${options.port}`;
-const outputDir = path.join(root, "_output", "playwright");
+const outputDir = path.join(root, "_logs", "browser", "playwright-ai-basis-chat-stress");
 const quoteDataRoot = path.join(root, "_tmp", "playwright-ai-basis-chat-quote-data");
 
 function pythonCommand() {

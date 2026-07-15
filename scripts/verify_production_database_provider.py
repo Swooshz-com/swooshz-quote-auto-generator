@@ -399,7 +399,7 @@ def run_verification(
     live_operations_validator=None,
     test_injected_backend: bool = False,
 ) -> dict[str, object]:
-    effective_env = env or os.environ
+    effective_env = os.environ if env is None else env
     database_url = effective_env.get(webapp.SQAG_DATABASE_URL_ENV_NAME, "")
     family = database_family(database_url)
     migration_status = metadata_migration_status(migration_paths)

@@ -26,7 +26,7 @@ const options = {
 };
 
 const baseUrl = `http://${options.host}:${options.port}`;
-const outputDir = path.join(root, "_output", "playwright");
+const outputDir = path.join(root, "_logs", "browser", "playwright-download-confirm");
 const sessionStorageKey = "swooshz_quote_session_v1";
 const tinyPngDataUrl =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";

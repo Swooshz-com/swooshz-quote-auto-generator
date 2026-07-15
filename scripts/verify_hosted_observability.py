@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+from unittest import mock
 import time
 from pathlib import Path
 from typing import Any
@@ -148,7 +150,16 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
     error_reference_present = any(
         record.get("details", {}).get("error_reference") == error_reference for record in records
     )
-    health_status = webapp.health_status(force_dependency_probe=True)
+    synthetic_env = {
+        webapp.APP_MODE_ENV_NAME: "local",
+        webapp.SQAG_STORAGE_MODE_ENV_NAME: "local",
+        webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+    }
+    with (
+        mock.patch.dict(os.environ, synthetic_env, clear=True),
+        mock.patch.object(webapp, "read_dotenv_value", side_effect=lambda name, env_path=None: synthetic_env.get(name, "")),
+    ):
+        health_status = webapp.health_status(force_dependency_probe=True)
     health_text = json.dumps(health_status, sort_keys=True)
     health_checks = health_status.get("checks") if isinstance(health_status.get("checks"), list) else []
     health_safe = (
@@ -193,7 +204,8 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
             "schema": policy.get("schema"),
             "allowed_event_categories_count": len(policy.get("allowed_event_categories", [])),
             "forbidden_content_count": len(policy.get("forbidden_content", [])),
-            "retention_days": policy.get("retention", {}).get("internal_alpha_log_retention_days"),
+            "production_log_retention_days": policy.get("retention", {}).get("production_log_retention_days"),
+            "local_uat_log_retention_days": policy.get("retention", {}).get("local_uat_log_retention_days"),
         },
         "structured_logs": {
             "records_checked": len(records),

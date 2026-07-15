@@ -23,6 +23,8 @@
             <span id="topbarAuthText">Internal UAT</span>
             <a href="/logout" id="topbarLogoutLink">Logout</a>
           </span>
+          <button class="topbar-privacy-link topbar-feedback-button" type="button" id="feedbackButton">Feedback</button>
+          <a class="topbar-privacy-link" href="/terms" target="_blank" rel="noopener">Terms</a>
           <a class="topbar-privacy-link" href="/privacy" target="_blank" rel="noopener">Privacy Notice</a>
           <button class="topbar-action" type="button" id="backToDashboardButton" aria-label="Open dashboard" hidden>
             <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
@@ -1228,6 +1230,80 @@
             <button class="secondary-button" type="button" id="analysisConfirmCancelButton">Cancel</button>
             <button class="primary-button" type="button" id="analysisConfirmStartButton">Run Analysis (1 credit)</button>
           </div>
+        </section>
+      </div>
+
+      <div class="modal-overlay" id="feedbackModal" role="dialog" aria-modal="true" aria-labelledby="feedbackTitle" hidden>
+        <div class="modal-backdrop" data-feedback-close></div>
+        <section class="modal-panel feedback-panel">
+          <header class="modal-header">
+            <div>
+              <span class="basis-chat-eyebrow">Workspace Feedback</span>
+              <h3 id="feedbackTitle">Report a quote issue</h3>
+            </div>
+          </header>
+          <form id="feedbackForm">
+            <label class="field-control">
+              Report type
+              <select id="feedbackCategory" required>
+                <option value="bug">Bug</option>
+                <option value="incorrect_output">Incorrect output</option>
+                <option value="failed_process">Failed process</option>
+                <option value="usability">Usability feedback</option>
+                <option value="general">General feedback</option>
+              </select>
+            </label>
+            <label class="field-control">
+              Short title
+              <input id="feedbackShortTitle" type="text" maxlength="120" required>
+            </label>
+            <label class="field-control">
+              Description
+              <textarea id="feedbackMessage" rows="5" maxlength="4000" required></textarea>
+            </label>
+            <div class="feedback-field-grid">
+              <label class="field-control">
+                Expected result (optional)
+                <textarea id="feedbackExpectedResult" rows="3" maxlength="2000"></textarea>
+              </label>
+              <label class="field-control">
+                Actual result (optional)
+                <textarea id="feedbackActualResult" rows="3" maxlength="2000"></textarea>
+              </label>
+            </div>
+            <label class="field-control">
+              Reproduction steps (optional)
+              <textarea id="feedbackReproductionSteps" rows="3" maxlength="3000"></textarea>
+            </label>
+            <label class="field-control">
+              Impact
+              <select id="feedbackImpact" required>
+                <option value="low">Low - minor inconvenience</option>
+                <option value="medium" selected>Medium - work is affected</option>
+                <option value="high">High - quote workflow is blocked</option>
+                <option value="blocking">Blocking - urgent internal work cannot continue</option>
+              </select>
+            </label>
+            <section class="feedback-link-card" aria-labelledby="feedbackLinkHeading">
+              <strong id="feedbackLinkHeading">Diagnostic link</strong>
+              <p id="feedbackLinkContext">Checking the most relevant authorised quote context...</p>
+              <label class="feedback-link-choice">
+                <input id="feedbackIncludeLink" type="checkbox" checked>
+                Link this context to the report
+              </label>
+              <p class="settings-note">Only privacy-minimised technical metadata and secure relationships are included. Full quotation evidence stays in the protected forensic store; authorised support access must be necessary and audited.</p>
+            </section>
+            <label class="field-control">
+              Manual reference (optional)
+              <input id="feedbackManualReference" type="text" maxlength="128" pattern="[A-Za-z0-9 ._:/#-]{1,128}" placeholder="Generation, session, job, error, support, or quotation reference">
+            </label>
+            <p class="settings-note">You can remove the proposed link and submit without quote context. Do not include secrets, payment data, customer details, or unnecessary personal data. Attachments and automatic screenshots are not collected.</p>
+            <p class="feedback-status" id="feedbackStatus" aria-live="polite" hidden></p>
+            <div class="modal-actions">
+              <button class="secondary-button" type="button" id="cancelFeedbackButton">Cancel</button>
+              <button class="primary-button" type="submit" id="submitFeedbackButton">Submit feedback</button>
+            </div>
+          </form>
         </section>
       </div>
     </div>

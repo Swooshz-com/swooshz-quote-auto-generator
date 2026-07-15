@@ -1,4 +1,87 @@
 # SQAG Production-Readiness Audit
+## 2026-07-15 Generation Forensics, Feedback, And Retention Audit
+
+Audit branch: `codex/sqag-forensics-feedback-retention`
+
+Base SHA: `92956c56181b4e7377303b205787b6dbffec7a5f`
+
+App type: full-stack Python HTTP service with a static JavaScript frontend,
+SQLite local/test storage, Postgres-compatible metadata storage, and
+S3-compatible object-artifact storage.
+
+Audit scope: full repository, focused on generation lifecycle integrity,
+protected forensic evidence, privacy-minimised audit/operational telemetry,
+workspace-scoped feedback, retention/deletion, legal surfaces, readiness gates,
+and their existing storage/auth/object boundaries. No live system, deployment,
+external service, credential, payment, customer-data, or private-data action is
+authorised or used.
+
+### RED-Before-GREEN Findings
+
+| Severity | Finding | Current evidence | Required remediation |
+| --- | --- | --- | --- |
+| P0 | Generation attempts are not durably tracked before validation and do not have an immutable canonical evidence record or append-only audit lifecycle. | `create_job()` validates before assigning a `job_id`, keeps lifecycle state only in the process-global `JOBS` dictionary, and `run_quote_job()` can return completion after quote-session/artifact persistence without a mandatory generation-run or completion-audit commit. | Assign a durable `generation_run_id` before validation, persist workspace/actor-scoped run state and canonical evidence, append terminal audit events, and fail closed in deploy mode when mandatory persistence disagrees or is unavailable. |
+| P1 | Deploy metadata schemas do not contain generation runs, audit events, canonical evidence metadata, feedback reports, feedback status history, legal holds, or deletion replay records. | Migrations `001`-`003` cover profiles, pricing references, quote sessions, DB-BLOB artifacts, and object-artifact metadata only. | Add additive SQLite/Postgres-compatible metadata migration and make deploy schema preflight require it. |
+| P1 | Users have no in-product bug-report or feedback workflow and no safe automatic/manual diagnostic linking. | No feedback/report endpoint, storage model, support reference, app-shell action, or support-triage boundary exists. | Add authenticated workspace-scoped submission, safe context suggestions, manual-reference resolution, support/admin access, and audited status/forensic access. |
+| P1 | Current retention policy conflicts with the fixed product policy and has no calendar-aware automatic deletion/legal-hold implementation. | The synthetic internal-alpha policy uses 90/180-day app-data periods and 30-day logs; existing object tombstones are lifecycle groundwork, not a three-calendar-year generation/feedback policy or exact 90-day production-log worker. | Add calendar-aware expiry, bounded idempotent retention processing, legal holds that preserve original expiry, partial-delete retry state, and backup deletion-replay evidence. |
+| P1 | Operational identity fields are privacy-minimised incompletely. | AI log tracking currently records raw `user_id` and `account_id`; sanitisation omits many raw-content keys but there is no versioned keyed pseudonymisation boundary. | Add versioned HMAC pseudonyms for actor/workspace references, fail closed for deploy audit persistence without a key, and add adversarial redaction tests. |
+| P1 | Product-facing legal disclosure does not describe forensic evidence, feedback linking, three-year retention, exact 90-day production logs, legal holds, or residual backups; Terms are absent. | `/privacy` is generic, `/terms` does not exist, and the app shell links only Privacy Notice. | Amend the engineering baseline and Privacy Notice, add counsel/owner-reviewable SQAG Terms or a documented Platform dependency, link legal/support surfaces, and retain legal approval blockers. |
+
+### Existing Controls Preserved
+
+- Platform-authenticated workspace identity and role mapping fail closed in
+  deploy/database/object modes.
+- CSRF/same-origin checks, mutable-route rate limiting, safe input bounds,
+  generic user errors, and support-safe error references exist.
+- Generated object artifacts use workspace-owned metadata, checksums, guarded
+  replacement/deletion, tombstones, compensation, and retry-safe lifecycle
+  boundaries.
+- Quote sessions preserve a privacy-minimised generation snapshot, but it is
+  not the exact immutable evidence required for run reconstruction.
+- Ordinary log writes use an allowlisted event boundary and omit recognised
+  raw-content/secret fields; this is useful groundwork, not full adversarial
+  sanitisation or keyed pseudonymisation.
+
+### Approved Verification Scope
+
+- Codex Security: fresh standard repository scan `18f229ec-ee43-4085-a96e-8d40cf554784` completed with one Medium/P2 finding, `SQAG-SEC-001`, remediated in this working tree.
+- Browser verification: Playwright app smoke, AI-stress smoke, and feedback/Terms/Privacy flow passed. Feedback/legal screenshots were written under `_logs/browser/forensics-feedback-retention/`.
+- Live/deploy/external/provider evidence: not required for this task and remains an explicit readiness blocker. Production readiness stays false until hosted/live owner-approved evidence is rerun and reviewed.
+
+### Remediation Batches
+
+1. Add schema, storage primitives, calendar-aware retention, HMAC identity,
+   immutable generation evidence, and append-only audit events.
+2. Integrate the generation lifecycle and reconcile non-terminal runs without
+   creating false completion states.
+3. Add feedback persistence, context linking, support access, status history,
+   and audited forensic retrieval.
+4. Add Privacy/Terms/support surfaces and update readiness/observability policy.
+5. Run focused RED/GREEN tests, full repository validation, standard security
+   scan, and isolated Playwright verification; record exact results below.
+
+`production_ready=false`
+
+### 2026-07-15 Validation Record
+
+- `git diff --check`: passed.
+- JavaScript syntax checks: `webapp/static/app.js`, `scripts/playwright-smoke.mjs`, `scripts/playwright-ai-basis-chat-stress.mjs`, `scripts/playwright-download-excel-confirm-regression.mjs`, and `scripts/playwright-forensics-feedback.mjs` passed.
+- Python syntax checks: server, generator, forensics, retention, observability, production DB, and live retention verifier modules passed.
+- `python -m unittest discover -s tests`: 791 tests passed.
+- `python -m pip check`: passed.
+- `python -m pip_audit -r requirements.txt --strict`: passed, no known vulnerabilities found.
+- `npm ci`: passed, installed/audited 3 packages.
+- `npm audit --audit-level=high`: passed, 0 vulnerabilities.
+- `python scripts/validate_local_pdf_dependency_usage.py`: passed.
+- `python scripts/validate_dynamic_pricing_reference_rules.py`: passed.
+- `python scripts/scan_sensitive_fixtures.py --fail-on-review`: passed, 0 blocking and 0 review findings.
+- Synthetic verifiers passed: forensics/feedback/retention, hosted observability, database backup/restore, hosted smoke, object-storage contract, and object-artifact lifecycle.
+- Expected fail-closed verifiers: live retention/delete, production database provider, live DB+object backup/restore, and production readiness remained blocked/failed without required owner-supplied live evidence or deployment operations evidence.
+- `npm run playwright:ai-stress`: passed with no console problems.
+- `npm run playwright:smoke`: passed with no console or network problems.
+- `node scripts/playwright-forensics-feedback.mjs`: passed on a fresh local server with health verified and `production_ready=false`.
+- `npm run playwright:download-confirm`: not part of the documented baseline and remains a stale dashboard-first regression harness; it times out waiting for Quote Basis to be visible immediately after load.
+
 
 Audit date: 2026-07-02
 

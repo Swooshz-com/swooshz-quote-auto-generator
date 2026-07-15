@@ -128,7 +128,10 @@ class DatabaseBackupRestoreVerifierTest(unittest.TestCase):
             },
         )
         for item in policy["data_classes"]:
-            self.assertIn("retention_days", item)
+            self.assertTrue(
+                (isinstance(item.get("retention_days"), int) and item["retention_days"] > 0)
+                or (isinstance(item.get("retention_calendar_years"), int) and item["retention_calendar_years"] > 0)
+            )
             self.assertIn("rollback_note", item)
             self.assertNotIn("delete_real_data", json.dumps(item, sort_keys=True).lower())
 

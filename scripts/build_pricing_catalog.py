@@ -268,6 +268,8 @@ def normalize_drawing_target(base_dir: str, target: str) -> str:
 def xlsx_visual_references(source: Path) -> list[dict[str, Any]]:
     visual_refs: list[dict[str, Any]] = []
     with zipfile.ZipFile(source) as zf:
+        if len(zf.infolist()) > quote.MAX_XLSX_ENTRIES:
+            raise ValueError("Spreadsheet archive contains too many entries.")
         media_sizes = {
             info.filename: info.file_size
             for info in zf.infolist()
@@ -283,8 +285,8 @@ def xlsx_visual_references(source: Path) -> list[dict[str, Any]]:
                 break
             rels_name = f"{posixpath.dirname(drawing_name)}/_rels/{posixpath.basename(drawing_name)}.rels"
             try:
-                rels_root = ET.fromstring(zf.read(rels_name))
-                drawing_root = ET.fromstring(zf.read(drawing_name))
+                rels_root = ET.fromstring(quote.read_bounded_xlsx_part(zf, rels_name, max_bytes=1024 * 1024))
+                drawing_root = ET.fromstring(quote.read_bounded_xlsx_part(zf, drawing_name, max_bytes=2 * 1024 * 1024))
             except (KeyError, ET.ParseError):
                 continue
             base_dir = posixpath.dirname(drawing_name)
@@ -323,7 +325,7 @@ def xlsx_visual_references(source: Path) -> list[dict[str, Any]]:
                         "source": image_source,
                         "anchor_row": anchor_row,
                         "anchor_col": anchor_col,
-                        "_bytes": zf.read(image_source),
+                        "_bytes": quote.read_bounded_xlsx_part(zf, image_source, max_bytes=MAX_CATALOG_VISUAL_BYTES),
                     }
                 )
     return visual_refs

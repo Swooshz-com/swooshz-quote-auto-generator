@@ -57,6 +57,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 import pricing_reference_cleanup
 import pricing_reference_enrichment
+from webapp.forensics import ForensicStore
 from webapp.object_storage import (
     ALLOWED_OWNER_TYPES,
     InMemoryObjectStorageBackend,
@@ -267,6 +268,7 @@ CSRF_HEADER_NAME_ENV_NAME = "LOCAL_RUNNER_CSRF_HEADER_NAME"
 CSRF_TOKEN_ENV_NAME = "LOCAL_RUNNER_CSRF_TOKEN"
 LOG_CONTEXT_ENV_NAME = "LOCAL_RUNNER_LOG_CONTEXT"
 APP_MODE_ENV_NAME = "APP_MODE"
+TRACKING_HMAC_KEY_ENV_NAME = "SQAG_TRACKING_HMAC_KEY"
 AUTH_REQUIRED_ENV_NAME = "AUTH_REQUIRED"
 SESSION_SECRET_ENV_NAME = "SESSION_SECRET"
 OIDC_ISSUER_URL_ENV_NAME = "OIDC_ISSUER_URL"
@@ -339,6 +341,7 @@ POST_RATE_LIMITS = {
     "/api/settings/profiles/:id": 30,
     "/api/quote-sessions": 30,
     "/api/quote-sessions/:id": 30,
+    "/api/feedback": 10,
     "/api/log": 180,
 }
 MAX_RATE_LIMIT_OVERFLOW_BUCKETS = len(POST_RATE_LIMITS)
@@ -832,6 +835,8 @@ def ai_failure_metadata(
     return metadata
 
 
+
+
 def privacy_safe_tracking_id(value: Any, fallback: str = "") -> str:
     raw = clean_text(value)
     if not raw:
@@ -840,6 +845,21 @@ def privacy_safe_tracking_id(value: Any, fallback: str = "") -> str:
         return raw
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
     return f"sha256:{digest}"
+
+
+def privacy_safe_audit_tracking_id(value: Any, fallback: str = "") -> str:
+    raw = clean_text(value)
+    if not raw:
+        return fallback
+    if re.fullmatch(r"pid-v1-[0-9a-f]{24}", raw):
+        return raw
+    if raw in {"local-dev", "authenticated-user", "local-user", "local-workspace"}:
+        return raw
+    configured_key = clean_text(read_dotenv_value(TRACKING_HMAC_KEY_ENV_NAME))
+    session_key = clean_text(read_dotenv_value(SESSION_SECRET_ENV_NAME)) if configured_app_mode() == "deploy" else ""
+    key = (configured_key or session_key or "sqag-local-uat-tracking-key-v1").encode("utf-8")
+    digest = hmac.new(key, raw.encode("utf-8"), hashlib.sha256).hexdigest()[:24]
+    return f"pid-v1-{digest}"
 
 
 def normalized_ai_log_tracking_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
@@ -851,8 +871,8 @@ def normalized_ai_log_tracking_metadata(metadata: dict[str, Any] | None) -> dict
         "auth_mode": clean_text(source.get("auth_mode")) or configured_app_mode(),
         "auth_required": bool(auth_required_value),
         "authenticated": bool(authenticated_value),
-        "user_id": privacy_safe_tracking_id(source.get("user_id"), "local-dev"),
-        "account_id": privacy_safe_tracking_id(source.get("account_id"), DEFAULT_COMPANY_ID),
+        "user_id": privacy_safe_audit_tracking_id(source.get("user_id"), "local-dev"),
+        "account_id": privacy_safe_audit_tracking_id(source.get("account_id"), DEFAULT_COMPANY_ID),
         "company_id": safe_company_id(source.get("company_id"), DEFAULT_COMPANY_ID),
         "role": role_permissions(role).get("role", "viewer"),
     }
@@ -868,8 +888,8 @@ def ai_log_tracking_metadata(session: dict[str, Any] | None = None, *, company_i
         "auth_mode": configured_app_mode(),
         "auth_required": auth_required(),
         "authenticated": authenticated,
-        "user_id": privacy_safe_tracking_id(subject, "authenticated-user" if authenticated else "local-dev"),
-        "account_id": privacy_safe_tracking_id(account, company),
+        "user_id": subject or ("authenticated-user" if authenticated else "local-dev"),
+        "account_id": account or company,
         "company_id": company,
         "role": current_permissions().get("role"),
     })
@@ -8363,16 +8383,28 @@ SQAG_STORAGE_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "001_platform_scoped_storage.sql",
     PROJECT_ROOT / "migrations" / "002_platform_scoped_artifacts.sql",
     PROJECT_ROOT / "migrations" / "003_object_artifact_metadata.sql",
+    PROJECT_ROOT / "migrations" / "004_generation_forensics_feedback_retention.sql",
 ]
 SQAG_POSTGRES_METADATA_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "001_platform_scoped_storage.sql",
     PROJECT_ROOT / "migrations" / "003_object_artifact_metadata.sql",
+    PROJECT_ROOT / "migrations" / "004_generation_forensics_feedback_retention.sql",
 ]
 SQAG_APP_METADATA_REQUIRED_COLUMNS = {
     "sqag_profiles": {"workspace_id", "profile_id", "payload_json", "created_at", "updated_at"},
     "sqag_pricing_references": {"workspace_id", "reference_id", "payload_json", "created_at", "updated_at"},
     "sqag_quote_sessions": {"workspace_id", "session_id", "metadata_json", "draft_files_json", "created_at", "updated_at"},
 }
+
+SQAG_FORENSIC_REQUIRED_COLUMNS = {
+    "sqag_generation_runs": {"run_id", "workspace_id", "actor_tracking_id", "job_type", "status", "started_at", "retention_expires_at", "original_retention_expires_at", "legal_hold"},
+    "sqag_generation_evidence": {"evidence_id", "run_id", "workspace_id", "evidence_type", "evidence_json", "evidence_sha256", "created_at", "retention_expires_at", "original_retention_expires_at", "legal_hold"},
+    "sqag_audit_events": {"event_id", "run_id", "workspace_id", "event_type", "event_json", "created_at", "retention_expires_at", "original_retention_expires_at", "legal_hold"},
+    "sqag_feedback": {"feedback_id", "support_reference", "workspace_id", "reporter_tracking_id", "run_id", "session_id", "category", "title", "message", "impact", "link_choice", "manual_reference_text", "manual_reference_status", "diagnostic_metadata_json", "status", "created_at", "updated_at", "retention_expires_at", "original_retention_expires_at", "legal_hold"},
+    "sqag_feedback_status_history": {"history_id", "feedback_id", "workspace_id", "from_status", "to_status", "actor_tracking_id", "created_at", "retention_expires_at", "original_retention_expires_at", "legal_hold"},
+    "sqag_deletion_receipts": {"receipt_id", "workspace_id", "record_type", "record_id", "reason", "deleted_at", "original_retention_expires_at", "created_at"},
+}
+
 SQAG_DATABASE_ARTIFACT_REQUIRED_COLUMNS = {
     "sqag_quote_artifacts": {
         "workspace_id",
@@ -11110,14 +11142,14 @@ class DatabaseSqagStorage:
     def _quote_session_visible_to_current_user(self, metadata: dict[str, Any]) -> bool:
         owner_id = self._quote_session_owner_id(metadata)
         if not owner_id:
-            return True
+            return self.can_view_other_user_quote_sessions() and self._quote_session_visible_to_admin(metadata)
         if self.user_id and owner_id == self.user_id:
             return True
         return self.can_view_other_user_quote_sessions() and self._quote_session_visible_to_admin(metadata)
 
     def _quote_session_editable_by_current_user(self, metadata: dict[str, Any]) -> bool:
         owner_id = self._quote_session_owner_id(metadata)
-        return bool(not owner_id or (self.user_id and owner_id == self.user_id))
+        return bool(owner_id and self.user_id and owner_id == self.user_id)
 
     def _read_quote_session_metadata_for_workspace_on_connection(
         self,
@@ -16679,6 +16711,7 @@ def output_files(job_id: str, output_dir: Path) -> list[dict[str, str]]:
                 "name": filename,
                 "url": f"/api/jobs/{job_id}/files/{filename}",
                 "bytes": str(path.stat().st_size),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             })
     return files
 
@@ -17659,6 +17692,8 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
         "created_at": job.get("created_at"),
         "updated_at": job.get("updated_at"),
     }
+    if clean_text(job.get("generation_run_id")):
+        payload["generation_run_id"] = clean_text(job.get("generation_run_id"))
     if isinstance(job.get("result"), dict):
         payload["result"] = job["result"]
     if isinstance(job.get("errors"), list) and job["errors"]:
@@ -17890,6 +17925,164 @@ def run_job_worker(
             worker(job_id, payload)
 
 
+
+@contextlib.contextmanager
+def forensic_store_for_auth_session(auth_session: dict[str, Any] | None = None):
+    workspace_id = platform_workspace_id_from_auth_session(auth_session) or "local-workspace"
+    actor_source = platform_user_id_from_auth_session(auth_session)
+    actor_tracking_id = privacy_safe_audit_tracking_id(actor_source, "local-user") if actor_source else "local-user"
+    if configured_storage_mode() == "database":
+        storage = DatabaseSqagStorage(
+            configured_database_url(),
+            workspace_id,
+            role=current_permissions().get("role", "viewer"),
+            user_id=actor_source,
+        )
+        storage.ensure_ready()
+        storage._ensure_schema(SQAG_FORENSIC_REQUIRED_COLUMNS, reason="storage_forensics_database_not_migrated")
+        with storage.connection() as connection:
+            yield ForensicStore(connection, workspace_id, actor_tracking_id)
+        return
+
+    database_path = configured_data_root() / "forensics.sqlite3"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    with sqlite_storage_connection(database_url) as connection:
+        migration_path = PROJECT_ROOT / "migrations" / "004_generation_forensics_feedback_retention.sql"
+        connection.executescript(migration_path.read_text(encoding="utf-8"))
+        connection.commit()
+        yield ForensicStore(connection, workspace_id, actor_tracking_id)
+
+
+def forensic_request_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": "swooshz.sqag.generation-request-evidence.v1",
+        "image_count": len(image_entries(payload)),
+        "has_quote_session": isinstance(payload.get("quote_session"), dict),
+        "profile_id": safe_resource_id(profile_id_from_payload(payload), ""),
+        "pricing_reference_id": safe_resource_id(pricing_reference_id_from_payload(payload), ""),
+        "payload_shape_sha256": hashlib.sha256(
+            json.dumps(sorted(str(key) for key in payload.keys()), separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def forensic_result_summary(result: dict[str, Any]) -> dict[str, Any]:
+    files: list[dict[str, Any]] = []
+    for item in result.get("files") if isinstance(result.get("files"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        files.append({
+            "name": clean_text(item.get("name"))[:128],
+            "size_bytes": int(item.get("bytes") or 0),
+            "sha256": clean_text(item.get("sha256")),
+        })
+    return {
+        "schema": "swooshz.sqag.generation-result-evidence.v1",
+        "status": clean_text(result.get("status")),
+        "return_code": int(result.get("return_code") or 0),
+        "artifact_count": len(files),
+        "artifacts": files,
+        "pricing_match_count": len(result.get("pricing_matches")) if isinstance(result.get("pricing_matches"), list) else 0,
+        "export_status_sha256": hashlib.sha256(clean_text(result.get("export_status")).encode("utf-8")).hexdigest(),
+    }
+
+
+def begin_generation_forensics(job_type: str, payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> str:
+    try:
+        with forensic_store_for_auth_session(auth_session) as store:
+            return store.record_run_started(job_type, forensic_request_summary(payload))
+    except Exception as exc:
+        error_reference = new_error_reference()
+        write_local_log("forensic_persistence_failed", unexpected_error_log_details(error_reference, exc))
+        if configured_app_mode() == "deploy":
+            raise SqagStorageAccessError(
+                "Generation evidence storage is unavailable.",
+                status=503,
+                reason="forensic_persistence_unavailable",
+            ) from exc
+        return ""
+
+
+def finish_generation_forensics(
+    run_id: str,
+    result: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+    *,
+    error_category: str = "",
+) -> dict[str, Any]:
+    if not run_id:
+        return result
+    enriched = dict(result)
+    enriched["generation_run_id"] = run_id
+    try:
+        quote_session = result.get("quote_session") if isinstance(result.get("quote_session"), dict) else {}
+        with forensic_store_for_auth_session(auth_session) as store:
+            store.finish_run(
+                run_id,
+                clean_text(result.get("status")) or "failed",
+                error_category=error_category,
+                quote_session_id=safe_quote_session_id(quote_session.get("session_id"), ""),
+                result_summary=forensic_result_summary(result),
+            )
+    except Exception as exc:
+        error_reference = new_error_reference()
+        write_local_log("forensic_persistence_failed", unexpected_error_log_details(error_reference, exc, job_id=clean_text(result.get("job_id"))))
+        if configured_app_mode() == "deploy":
+            return storage_access_error_payload(
+                SqagStorageAccessError(
+                    "Generation evidence storage is unavailable.",
+                    status=503,
+                    reason="forensic_persistence_unavailable",
+                )
+            ) | {"generation_run_id": run_id}
+    return enriched
+
+
+def validated_feedback_session_context(session_id: Any, auth_session: dict[str, Any] | None = None) -> dict[str, str]:
+    safe_id = safe_quote_session_id(session_id, "")
+    if not safe_id:
+        return {}
+    storage = quote_session_storage_for_auth_session(auth_session)
+    session = storage.get_quote_session(safe_id)
+    if not isinstance(session, dict):
+        return {}
+    status = session.get("status") if isinstance(session.get("status"), dict) else {}
+    if status.get("quote_generated") is True:
+        status_label = "completed"
+    elif status.get("draft_modified") is True:
+        status_label = "draft_modified"
+    else:
+        status_label = "draft"
+    return {
+        "session_id": safe_id,
+        "status": status_label,
+        "created_at": clean_text(session.get("created_at"))[:40],
+    }
+
+
+def feedback_context_for_auth_session(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, str]:
+    session_context = validated_feedback_session_context(payload.get("session_id"), auth_session)
+    with forensic_store_for_auth_session(auth_session) as store:
+        return store.feedback_context(
+            run_id=payload.get("run_id"),
+            validated_session_id=session_context.get("session_id"),
+            session_status=session_context.get("status"),
+            session_created_at=session_context.get("created_at"),
+        )
+
+
+def submit_feedback_for_auth_session(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, str]:
+    prepared = dict(payload)
+    if payload.get("include_link") is not False:
+        session_context = validated_feedback_session_context(payload.get("session_id"), auth_session)
+        prepared["validated_session_id"] = session_context.get("session_id", "")
+    manual_reference = clean_text(payload.get("manual_reference"))
+    manual_session_context = validated_feedback_session_context(manual_reference, auth_session) if manual_reference else {}
+    prepared["validated_manual_session_id"] = manual_session_context.get("session_id", "")
+    with forensic_store_for_auth_session(auth_session) as store:
+        return store.submit_feedback(prepared)
+
+
 def create_job(
     job_type: str,
     payload: dict[str, Any],
@@ -17901,21 +18094,24 @@ def create_job(
     normalized_type = clean_text(job_type).lower()
     if normalized_type not in {"draft", "generate", "generate_pdf", "basis_chat"}:
         return {"status": "blocked", "errors": ["Job type must be draft, basis_chat, generate, or generate_pdf."]}
+    generation_run_id = begin_generation_forensics(normalized_type, payload, auth_session) if normalized_type in {"generate", "generate_pdf"} else ""
+    def blocked(errors: list[str], category: str) -> dict[str, Any]:
+        return finish_generation_forensics(generation_run_id, {"status": "blocked", "errors": errors}, auth_session, error_category=category)
     requested_job_id = clean_text(requested_job_id)
     if requested_job_id and not re.fullmatch(r"job-[A-Za-z0-9_-]{8,80}", requested_job_id):
-        return {"status": "blocked", "errors": ["Job request could not be resumed."]}
+        return blocked(["Job request could not be resumed."], "job_resume_invalid")
     if requested_job_id:
         with JOBS_LOCK:
             existing = JOBS.get(requested_job_id)
             if existing:
                 if existing.get("type") != normalized_type or not job_visible_to_auth_session(existing, auth_session):
-                    return {"status": "blocked", "errors": ["Job request could not be resumed."]}
+                    return blocked(["Job request could not be resumed."], "job_resume_invalid")
                 return public_job(existing)
     if not image_entries(payload):
-        return {"status": "blocked", "errors": [MISSING_IMAGES_MESSAGE]}
+        return blocked([MISSING_IMAGES_MESSAGE], "images_missing")
     image_error = image_limit_error(payload)
     if image_error:
-        return {"status": "blocked", "errors": [image_error]}
+        return blocked([image_error], "image_limit")
     if normalized_type in {"generate", "generate_pdf"}:
         payload = generation_payload_with_profile_defaults(payload, auth_session=auth_session)
     missing_details = quote_detail_missing_fields(payload)
@@ -17924,25 +18120,29 @@ def create_job(
             "draft": "AI analysis",
             "basis_chat": "AI basis chat",
         }.get(normalized_type, "continuing")
-        return {
-            "status": "blocked",
-            "errors": [f"Fill quote details before {action_label}: {', '.join(missing_details)}."],
-        }
+
+        return blocked(
+            [f"Fill quote details before {action_label}: {', '.join(missing_details)}."],
+            "quote_details_missing",
+        )
     pricing_reference_error = pricing_reference_selection_error(payload, auth_session=auth_session)
     if pricing_reference_error:
         log_database_pricing_reference_resolution_block(payload)
-        return {"status": "blocked", "errors": [pricing_reference_error]}
+        return blocked([pricing_reference_error], "pricing_reference_invalid")
     profile_error = profile_selection_error(payload, auth_session=auth_session) if normalized_type in {"generate", "generate_pdf"} else ""
     if profile_error:
         log_database_profile_resolution_block(payload)
-        return {"status": "blocked", "errors": [profile_error]}
+        return blocked([profile_error], "profile_invalid")
     resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=auth_session)
     if resolved_payload is None:
         log_database_pricing_reference_resolution_block(payload)
-        return {"status": "blocked", "errors": [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE]}
+        return blocked([PRICING_REFERENCE_SELECTION_ERROR_MESSAGE], "pricing_reference_unavailable")
     payload = resolved_payload
 
     job_id = requested_job_id or f"job-{secrets.token_hex(6)}"
+    if generation_run_id:
+        payload = dict(payload)
+        payload["_generation_run_id"] = generation_run_id
     now = utc_timestamp()
     job = {
         "job_id": job_id,
@@ -17953,12 +18153,13 @@ def create_job(
         "result": None,
         "errors": [],
         "owner": job_owner_context_from_auth_session(auth_session),
+        "generation_run_id": generation_run_id,
     }
     with JOBS_LOCK:
         existing = JOBS.get(job_id)
         if existing:
             if existing.get("type") != normalized_type or not job_visible_to_auth_session(existing, auth_session):
-                return {"status": "blocked", "errors": ["Job request could not be resumed."]}
+                return blocked(["Job request could not be resumed."], "job_resume_invalid")
             return public_job(existing)
         JOBS[job_id] = job
 
@@ -17995,6 +18196,19 @@ def run_quote_job(
     pdf_mode: str = "none",
     auth_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+
+    generation_run_id = clean_text(payload.get("_generation_run_id"))
+    if not generation_run_id:
+        generation_run_id = begin_generation_forensics("generate_pdf" if clean_text(pdf_mode).lower() != "none" else "generate", payload, auth_session)
+
+    def blocked(errors: list[str], category: str) -> dict[str, Any]:
+        return finish_generation_forensics(
+            generation_run_id,
+            {"status": "blocked", "errors": errors},
+            auth_session,
+            error_category=category,
+        )
+
     payload = generation_payload_with_profile_defaults(payload, auth_session=auth_session)
     errors = validate_generation_payload(payload, auth_session=auth_session)
     if errors:
@@ -18002,11 +18216,11 @@ def run_quote_job(
             log_database_pricing_reference_resolution_block(payload)
         if PROFILE_SELECTION_ERROR_MESSAGE in errors:
             log_database_profile_resolution_block(payload)
-        return {"status": "blocked", "errors": errors}
+        return blocked(errors, "generation_validation_failed")
     resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=auth_session)
     if resolved_payload is None:
         log_database_pricing_reference_resolution_block(payload)
-        return {"status": "blocked", "errors": [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE]}
+        return blocked([PRICING_REFERENCE_SELECTION_ERROR_MESSAGE], "pricing_reference_unavailable")
     payload = resolved_payload
 
     quote_session_storage: LocalSqagStorage | DatabaseSqagStorage | None = None
@@ -18014,20 +18228,20 @@ def run_quote_job(
         try:
             quote_session_storage = quote_session_storage_for_auth_session(auth_session)
         except SqagStorageAccessError as exc:
-            return storage_access_error_payload(exc)
+            return finish_generation_forensics(generation_run_id, storage_access_error_payload(exc), auth_session, error_category=exc.reason)
     elif configured_artifact_storage_mode() == "object":
-        return storage_access_error_payload(
+        return finish_generation_forensics(generation_run_id, storage_access_error_payload(
             SqagStorageAccessError(
                 QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
                 status=503,
                 reason="object_artifact_storage_unavailable",
             )
-        )
+        ), auth_session, error_category="object_artifact_storage_unavailable")
 
     try:
         ensure_quote_artifact_storage_available_for_auth_session(auth_session)
     except SqagStorageAccessError as exc:
-        return storage_access_error_payload(exc)
+        return finish_generation_forensics(generation_run_id, storage_access_error_payload(exc), auth_session, error_category=exc.reason)
 
     output_root = output_root or configured_output_root()
     tmp_root = tmp_root or configured_tmp_root()
@@ -18045,7 +18259,7 @@ def run_quote_job(
         layout_template_path = write_database_profile_layout_for_generation(payload, job_tmp, auth_session=auth_session)
         if profile is None or layout_template_path is None:
             log_database_profile_resolution_block(payload, "workspace_profile_layout_missing_or_unavailable")
-            return {"status": "blocked", "errors": [PROFILE_SELECTION_ERROR_MESSAGE]}
+            return blocked([PROFILE_SELECTION_ERROR_MESSAGE], "profile_layout_unavailable")
     else:
         profile = load_profile_pack(profile_id_from_payload(payload))
         layout_template_path = profile.quotation_layout_path
@@ -18076,13 +18290,23 @@ def run_quote_job(
     if normalized_pdf_mode != "none":
         command.extend(["--pdf-mode", normalized_pdf_mode])
 
-    completed = subprocess.run(
+    try:
+        completed = subprocess.run(
         command,
         cwd=str(PROJECT_ROOT),
         text=True,
         capture_output=True,
-        timeout=90,
-    )
+            timeout=90,
+        )
+    except Exception as exc:
+        error_reference = new_error_reference()
+        write_local_log("generate_failed", unexpected_error_log_details(error_reference, exc, job_id=job_id))
+        return finish_generation_forensics(
+            generation_run_id,
+            failed_result_payload(error_reference),
+            auth_session,
+            error_category="generator_execution_failed",
+        )
 
     status = "completed"
     if completed.returncode == 2:
@@ -18136,10 +18360,15 @@ def run_quote_job(
             if configured_artifact_storage_mode() in {"database", "object"}:
                 result.pop("files", None)
         except Exception as exc:  # pragma: no cover - defensive dashboard metadata boundary
+            persistence_error_reference = new_error_reference()
             write_local_log(
                 "quote_session_update_failed",
-                unexpected_error_log_details(new_error_reference(), exc, job_id=job_id),
+                unexpected_error_log_details(persistence_error_reference, exc, job_id=job_id),
             )
+            if configured_app_mode() == "deploy":
+                result.update(failed_result_payload(persistence_error_reference))
+                result["job_id"] = job_id
+                result.pop("files", None)
     if configured_app_mode() != "deploy" and status != "failed":
         result.update({
             "stdout": completed.stdout,
@@ -18147,7 +18376,12 @@ def run_quote_job(
             "brief_path": str(brief_path),
             "output_dir": str(output_dir),
         })
-    return result
+    return finish_generation_forensics(
+        generation_run_id,
+        result,
+        auth_session,
+        error_category="" if result.get("status") == "completed" else "generation_not_completed",
+    )
 
 
 class QuoteRunnerHandler(BaseHTTPRequestHandler):
@@ -18183,6 +18417,9 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         if path == "/privacy":
             self.send_static_file(STATIC_DIR / "privacy.html")
             return
+        if path == "/terms":
+            self.send_static_file(STATIC_DIR / "terms.html")
+            return
         if path.startswith("/static/"):
             relative = unquote(path.removeprefix("/static/"))
             self.send_static_file(STATIC_DIR / relative)
@@ -18202,6 +18439,26 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 "user": session.get("user") if session else None,
                 "browser_recovery_scope": browser_recovery_scope(session),
             })
+            return
+        if path == "/api/feedback/context":
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            try:
+                context = feedback_context_for_auth_session(
+                    {
+                        "run_id": (query.get("run_id") or [""])[0],
+                        "session_id": (query.get("session_id") or [""])[0],
+                    },
+                    self.current_auth_session(),
+                )
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
+            except Exception as exc:
+                error_reference = new_error_reference()
+                write_local_log("feedback_context_failed", unexpected_error_log_details(error_reference, exc))
+                self.send_json(failed_result_payload(error_reference), status=500)
+                return
+            self.send_json({"status": "ok", "context": context})
             return
         if path == "/api/quote-sessions":
             storage = self.current_quote_session_storage()
@@ -18493,6 +18750,24 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             })
             return
 
+
+        if parsed.path == "/api/feedback":
+            try:
+                result = submit_feedback_for_auth_session(payload, self.current_auth_session())
+            except ValueError as exc:
+                self.send_json({"status": "blocked", "errors": safe_error_messages([str(exc)])}, status=400)
+                return
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
+            except Exception as exc:
+                error_reference = new_error_reference()
+                write_local_log("feedback_submission_failed", unexpected_error_log_details(error_reference, exc))
+                self.send_json(failed_result_payload(error_reference), status=500)
+                return
+            self.send_json({"status": "submitted", **result}, status=201)
+            return
+
         if parsed.path == "/api/jobs":
             job_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
             job_type = clean_text(payload.get("type") or payload.get("job_type"))
@@ -18500,7 +18775,11 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             if not allowed:
                 self.send_json(error, status=403)
                 return
-            result = create_job(job_type, job_payload, ai_tracking_context=request_ai_tracking, auth_session=self.current_auth_session(), requested_job_id=payload.get("job_id"))
+            try:
+                result = create_job(job_type, job_payload, ai_tracking_context=request_ai_tracking, auth_session=self.current_auth_session(), requested_job_id=payload.get("job_id"))
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
             if result.get("status") == "blocked":
                 self.send_json(result, status=400)
                 return
@@ -18595,6 +18874,9 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 return
             try:
                 result = run_quote_job(payload, auth_session=self.current_auth_session())
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
             except Exception as exc:  # pragma: no cover - defensive HTTP boundary
                 error_reference = new_error_reference()
                 result = failed_result_payload(error_reference)
@@ -18810,14 +19092,14 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         if (
             deploy_requires_trusted_proxy_guard()
             and not path.startswith('/static/')
-            and path not in {'/api/health', '/privacy'}
+            and path not in {'/api/health', '/privacy', '/terms'}
         ):
             self.send_json({
                 'status': 'blocked',
                 'errors': ['Deploy mode requires a trusted reverse-proxy boundary before serving the app.'],
             }, status=503)
             return True
-        if path.startswith("/static/") or path in {"/api/health", "/privacy"}:
+        if path.startswith("/static/") or path in {"/api/health", "/privacy", "/terms"}:
             return False
         if deploy_requires_auth_guard():
             self.send_json({

@@ -937,7 +937,7 @@ class WebappServerTest(unittest.TestCase):
         self.assertNotIn("Back to Quote Generator", body)
         self.assertIn('class="privacy-notice-card"', body)
         self.assertIn("<details class=\"privacy-section\"", body)
-        self.assertEqual(body.count("<details class=\"privacy-section\" open>"), 8)
+        self.assertEqual(body.count("<details class=\"privacy-section\" open>"), 9)
         self.assertIn("Personal Data We May Collect", body)
         self.assertIn("Cross-Border Transfers", body)
         self.assertIn("PDPA", body)
@@ -5292,7 +5292,7 @@ class WebappServerTest(unittest.TestCase):
         raw = (
             "Item,Cost,Markup\n"
             "\"nos. rigging point for Overhead Structure or Aluminium Box Truss\n"
-            "ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¢ Prices are not inclusive of truss\",300,1.5\n"
+            "ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ Prices are not inclusive of truss\",300,1.5\n"
         ).encode("utf-8")
         parsed = {
             "items": [{
@@ -5350,7 +5350,7 @@ class WebappServerTest(unittest.TestCase):
                         "row_index": 12,
                         "non_empty_cells": {
                             "A": "Hanging Structure",
-                            "B": "nos. RIGGING POINT for Overhead Structure or Aluminium Box Truss\nÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¢ Prices are not inclusive of truss",
+                            "B": "nos. RIGGING POINT for Overhead Structure or Aluminium Box Truss\nÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ Prices are not inclusive of truss",
                             "C": "nos",
                             "D": "300",
                             "E": "1.5",
@@ -9566,8 +9566,8 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(details["auth_mode"], "deploy")
         self.assertTrue(details["auth_required"])
         self.assertTrue(details["authenticated"])
-        self.assertEqual(details["user_id"], "user-123")
-        self.assertEqual(details["account_id"], "account-456")
+        self.assertEqual(details["user_id"], webapp.privacy_safe_audit_tracking_id("user-123"))
+        self.assertEqual(details["account_id"], webapp.privacy_safe_audit_tracking_id("account-456"))
         self.assertEqual(details["company_id"], webapp.DEFAULT_COMPANY_ID)
         self.assertEqual(details["role"], "viewer")
         self.assertNotIn("email", details)
@@ -9612,8 +9612,8 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(job["status"], "completed")
         ai_attempts = [call.args[1] for call in write_log.call_args_list if call.args[0] == "ai_call_attempt"]
         self.assertEqual(len(ai_attempts), 1)
-        self.assertEqual(ai_attempts[0]["user_id"], "user-123")
-        self.assertEqual(ai_attempts[0]["account_id"], "account-456")
+        self.assertEqual(ai_attempts[0]["user_id"], webapp.privacy_safe_audit_tracking_id("user-123"))
+        self.assertEqual(ai_attempts[0]["account_id"], webapp.privacy_safe_audit_tracking_id("account-456"))
         self.assertEqual(ai_attempts[0]["company_id"], webapp.DEFAULT_COMPANY_ID)
         self.assertEqual(ai_attempts[0]["role"], "operator")
 

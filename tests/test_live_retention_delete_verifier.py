@@ -214,8 +214,13 @@ class FakeBackend:
     def retrieve_artifact(self, metadata, *, workspace_id):
         self._maybe_fail("read")
         if metadata.workspace_id != workspace_id:
-            raise RuntimeError("private workspace detail")
-        content = self.objects[metadata.storage_key]
+            raise webapp.ObjectStorageContractError("Artifact is not available for this workspace.")
+        try:
+            content = self.objects[metadata.storage_key]
+        except KeyError as exc:
+            if self.repeated_delete_unsafe:
+                raise RuntimeError("private repeated-delete uncertainty") from exc
+            raise webapp.ObjectStorageContractError("Artifact is not available.") from exc
         if self.tamper_retrieve:
             return content + b"x"
         return content
