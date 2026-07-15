@@ -174,6 +174,7 @@ class FakeBackend:
         tamper_retrieve: bool = False,
         delete_fails: bool = False,
         repeated_delete_unsafe: bool = False,
+        confirmed_missing_after_delete: bool = False,
         cleanup_fails: bool = False,
     ):
         self.metadata_cls = metadata_cls
@@ -181,6 +182,7 @@ class FakeBackend:
         self.tamper_retrieve = tamper_retrieve
         self.delete_fails = delete_fails
         self.repeated_delete_unsafe = repeated_delete_unsafe
+        self.confirmed_missing_after_delete = confirmed_missing_after_delete
         self.cleanup_fails = cleanup_fails
         self.objects = {}
         self.metadata = {}
@@ -234,12 +236,14 @@ class FakeBackend:
         existed = metadata.storage_key in self.objects
         if not existed and self.repeated_delete_unsafe:
             return False
+        if not existed and self.confirmed_missing_after_delete:
+            raise webapp.ObjectStorageContractError("Artifact metadata verification failed.")
         self.objects.pop(metadata.storage_key, None)
         self.metadata.pop(metadata.storage_key, None)
         return True
 
 
-def run_injected_drill(verifier, *, fail_storage="", fail_backend="", backend_factory_fails=False, pairing_mismatch=False, tombstone_returns_zero=False, tamper_retrieve=False, delete_fails=False, repeated_delete_unsafe=False, cleanup_fails=False, runtime_export_available=True, require_runtime_env=False):
+def run_injected_drill(verifier, *, fail_storage="", fail_backend="", backend_factory_fails=False, pairing_mismatch=False, tombstone_returns_zero=False, tamper_retrieve=False, delete_fails=False, repeated_delete_unsafe=False, confirmed_missing_after_delete=False, cleanup_fails=False, runtime_export_available=True, require_runtime_env=False):
     storages = {}
     backend_holder = {}
 
@@ -265,6 +269,7 @@ def run_injected_drill(verifier, *, fail_storage="", fail_backend="", backend_fa
             tamper_retrieve=tamper_retrieve,
             delete_fails=delete_fails,
             repeated_delete_unsafe=repeated_delete_unsafe,
+            confirmed_missing_after_delete=confirmed_missing_after_delete,
             cleanup_fails=cleanup_fails,
         )
         backend_holder["backend"] = backend
@@ -564,6 +569,16 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
 
         self.assertEqual(report["status"], "failed")
         self.assertIn("repeated_delete_not_safe", report["blockers"])
+
+    def test_repeated_delete_accepts_authoritatively_confirmed_missing_object(self):
+        verifier = load_verifier()
+        report, _storages, _backend = run_injected_drill(
+            verifier,
+            confirmed_missing_after_delete=True,
+        )
+
+        self.assertEqual(report["status"], "passed")
+        self.assertTrue(report["checks"]["repeated_delete_safe"])
 
     def test_cleanup_failure_fails_closed(self):
         verifier = load_verifier()

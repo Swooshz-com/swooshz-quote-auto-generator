@@ -457,7 +457,7 @@ def _delete_object_or_confirm_missing(backend: ObjectStorageBackend, metadata: O
     try:
         deleted = bool(backend.delete_artifact(metadata, workspace_id=metadata.workspace_id))
     except Exception:
-        return False, False
+        deleted = False
     try:
         backend.retrieve_artifact(metadata, workspace_id=metadata.workspace_id)
     except Exception as exc:
@@ -470,7 +470,7 @@ def _repeated_delete_safe(backend: ObjectStorageBackend, metadata: ObjectArtifac
     try:
         deleted = bool(backend.delete_artifact(metadata, workspace_id=metadata.workspace_id))
     except Exception:
-        return False
+        deleted = False
     if deleted:
         return True
     try:

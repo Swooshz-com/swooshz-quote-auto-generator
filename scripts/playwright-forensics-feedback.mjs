@@ -58,6 +58,12 @@ function startServer() {
       env: {
         ...process.env,
         APP_MODE: "local",
+        SQAG_STORAGE_MODE: "local",
+        SQAG_ARTIFACT_STORAGE_MODE: "local",
+        SQAG_LIVE_OBJECT_STORAGE_EVIDENCE: "0",
+        SQAG_LIVE_DATABASE_EVIDENCE: "0",
+        SQAG_LIVE_DB_OBJECT_BACKUP_RESTORE_EVIDENCE: "0",
+        SQAG_LIVE_RETENTION_DELETE_EVIDENCE: "0",
         QUOTE_DATA_ROOT: quoteDataRoot,
       },
       stdio: ["ignore", "pipe", "pipe"],
@@ -110,8 +116,15 @@ try {
   const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
   const page = await context.newPage();
   page.on("pageerror", (error) => browserProblems.push(`pageerror:${error.message}`));
+  page.on("response", (response) => {
+    if (response.status() >= 400) {
+      browserProblems.push(`http:${response.status()}:${new URL(response.url()).pathname}`);
+    }
+  });
   page.on("console", (message) => {
-    if (message.type() === "error") browserProblems.push(`console:${message.text()}`);
+    if (message.type() === "error" && !message.text().startsWith("Failed to load resource")) {
+      browserProblems.push(`console:${message.text()}`);
+    }
   });
 
   await page.goto(baseUrl, { waitUntil: "networkidle" });

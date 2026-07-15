@@ -57,7 +57,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 import pricing_reference_cleanup
 import pricing_reference_enrichment
-from webapp.forensics import ForensicStore
+from webapp.forensics import ForensicStore, trusted_workspace_id
 from webapp.object_storage import (
     ALLOWED_OWNER_TYPES,
     InMemoryObjectStorageBackend,
@@ -269,6 +269,7 @@ CSRF_TOKEN_ENV_NAME = "LOCAL_RUNNER_CSRF_TOKEN"
 LOG_CONTEXT_ENV_NAME = "LOCAL_RUNNER_LOG_CONTEXT"
 APP_MODE_ENV_NAME = "APP_MODE"
 TRACKING_HMAC_KEY_ENV_NAME = "SQAG_TRACKING_HMAC_KEY"
+TRACKING_HMAC_KEY_VERSION_ENV_NAME = "SQAG_TRACKING_HMAC_KEY_VERSION"
 AUTH_REQUIRED_ENV_NAME = "AUTH_REQUIRED"
 SESSION_SECRET_ENV_NAME = "SESSION_SECRET"
 OIDC_ISSUER_URL_ENV_NAME = "OIDC_ISSUER_URL"
@@ -342,6 +343,7 @@ POST_RATE_LIMITS = {
     "/api/quote-sessions": 30,
     "/api/quote-sessions/:id": 30,
     "/api/feedback": 10,
+    "/api/support/feedback/:id/status": 30,
     "/api/log": 180,
 }
 MAX_RATE_LIMIT_OVERFLOW_BUCKETS = len(POST_RATE_LIMITS)
@@ -850,16 +852,31 @@ def privacy_safe_tracking_id(value: Any, fallback: str = "") -> str:
 def privacy_safe_audit_tracking_id(value: Any, fallback: str = "") -> str:
     raw = clean_text(value)
     if not raw:
+        if configured_app_mode() == "deploy":
+            raise ValueError("Authenticated actor identity is required for audit tracking.")
         return fallback
-    if re.fullmatch(r"pid-v1-[0-9a-f]{24}", raw):
+    if re.fullmatch(r"pid-[A-Za-z0-9._-]{1,24}-[0-9a-f]{24}", raw):
         return raw
     if raw in {"local-dev", "authenticated-user", "local-user", "local-workspace"}:
+        if configured_app_mode() == "deploy":
+            raise ValueError("Local audit identities are unavailable in deploy mode.")
         return raw
     configured_key = clean_text(read_dotenv_value(TRACKING_HMAC_KEY_ENV_NAME))
-    session_key = clean_text(read_dotenv_value(SESSION_SECRET_ENV_NAME)) if configured_app_mode() == "deploy" else ""
-    key = (configured_key or session_key or "sqag-local-uat-tracking-key-v1").encode("utf-8")
+    key_version = clean_text(read_dotenv_value(TRACKING_HMAC_KEY_VERSION_ENV_NAME))
+    if configured_app_mode() == "deploy" and (not configured_key or not re.fullmatch(r"[A-Za-z0-9._-]{1,24}", key_version)):
+        raise ValueError("Dedicated audit tracking key and version are required in deploy mode.")
+    key_version = key_version or "local-v1"
+    key = (configured_key or "sqag-local-uat-tracking-key-v1").encode("utf-8")
     digest = hmac.new(key, raw.encode("utf-8"), hashlib.sha256).hexdigest()[:24]
-    return f"pid-v1-{digest}"
+    return f"pid-{key_version}-{digest}"
+
+
+def privacy_safe_audit_tracking_id_or_unavailable(value: Any, fallback: str = "") -> str:
+    try:
+        return privacy_safe_audit_tracking_id(value, fallback)
+    except ValueError:
+        return "tracking-unavailable"
+
 
 
 def normalized_ai_log_tracking_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
@@ -871,8 +888,8 @@ def normalized_ai_log_tracking_metadata(metadata: dict[str, Any] | None) -> dict
         "auth_mode": clean_text(source.get("auth_mode")) or configured_app_mode(),
         "auth_required": bool(auth_required_value),
         "authenticated": bool(authenticated_value),
-        "user_id": privacy_safe_audit_tracking_id(source.get("user_id"), "local-dev"),
-        "account_id": privacy_safe_audit_tracking_id(source.get("account_id"), DEFAULT_COMPANY_ID),
+        "user_id": privacy_safe_audit_tracking_id_or_unavailable(source.get("user_id"), "local-dev"),
+        "account_id": privacy_safe_audit_tracking_id_or_unavailable(source.get("account_id"), DEFAULT_COMPANY_ID),
         "company_id": safe_company_id(source.get("company_id"), DEFAULT_COMPANY_ID),
         "role": role_permissions(role).get("role", "viewer"),
     }
@@ -2136,6 +2153,12 @@ def deploy_uat_preflight_status() -> dict[str, Any]:
 
     add(APP_MODE_ENV_NAME, configured_app_mode() == "deploy", "must be set to deploy")
     add(AUTH_REQUIRED_ENV_NAME, configured_bool(AUTH_REQUIRED_ENV_NAME, False), "must be explicitly true")
+    add(
+        TRACKING_HMAC_KEY_ENV_NAME,
+        bool(clean_text(read_dotenv_value(TRACKING_HMAC_KEY_ENV_NAME))),
+        "must be a dedicated forensic pseudonymization key",
+    )
+    add(TRACKING_HMAC_KEY_VERSION_ENV_NAME, bool(re.fullmatch(r"[A-Za-z0-9._-]{1,24}", clean_text(read_dotenv_value(TRACKING_HMAC_KEY_VERSION_ENV_NAME)))), "must identify the active tracking key version")
     add(
         SESSION_SECRET_ENV_NAME,
         deploy_session_secret_ready(),
@@ -7826,6 +7849,8 @@ def is_json_content_type(content_type: str) -> bool:
 
 def rate_limit_path_key(path: str) -> str:
     normalized_path = urlparse(path).path
+    if re.fullmatch(r"/api/support/feedback/[A-Za-z0-9_-]+/status", normalized_path):
+        return "/api/support/feedback/:id/status"
     if re.fullmatch(r"/api/settings/pricing-references/[A-Za-z0-9_-]+", normalized_path):
         return "/api/settings/pricing-references/:id"
     if re.fullmatch(r"/api/quote-sessions/[A-Za-z0-9_-]+", normalized_path):
@@ -8224,6 +8249,7 @@ def role_permissions(role: str) -> dict[str, bool]:
         "canImportPricingReferences": can_manage,
         "canSelectPricingReference": normalized in {"admin", "management", "operator", "viewer"},
         "canGenerateQuote": can_generate,
+        "canSupportForensics": can_manage,
     }
 
 
@@ -8388,7 +8414,8 @@ SQAG_STORAGE_MIGRATION_PATHS = [
 SQAG_POSTGRES_METADATA_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "001_platform_scoped_storage.sql",
     PROJECT_ROOT / "migrations" / "003_object_artifact_metadata.sql",
-    PROJECT_ROOT / "migrations" / "004_generation_forensics_feedback_retention.sql",
+    PROJECT_ROOT / "migrations" / "004_generation_forensics_feedback_retention_postgres.sql",
+    PROJECT_ROOT / "migrations" / "005_forensic_postgres_delete_guards.sql",
 ]
 SQAG_APP_METADATA_REQUIRED_COLUMNS = {
     "sqag_profiles": {"workspace_id", "profile_id", "payload_json", "created_at", "updated_at"},
@@ -8397,12 +8424,14 @@ SQAG_APP_METADATA_REQUIRED_COLUMNS = {
 }
 
 SQAG_FORENSIC_REQUIRED_COLUMNS = {
-    "sqag_generation_runs": {"run_id", "workspace_id", "actor_tracking_id", "job_type", "status", "started_at", "retention_expires_at", "original_retention_expires_at", "legal_hold"},
+    "sqag_generation_runs": {"run_id", "workspace_id", "actor_tracking_id", "actor_key_version", "job_id", "idempotency_key", "job_type", "status", "started_at", "completed_at", "retention_expires_at", "original_retention_expires_at", "deletion_state"},
     "sqag_generation_evidence": {"evidence_id", "run_id", "workspace_id", "evidence_type", "evidence_json", "evidence_sha256", "created_at", "retention_expires_at", "original_retention_expires_at", "legal_hold"},
-    "sqag_audit_events": {"event_id", "run_id", "workspace_id", "event_type", "event_json", "created_at", "retention_expires_at", "original_retention_expires_at", "legal_hold"},
-    "sqag_feedback": {"feedback_id", "support_reference", "workspace_id", "reporter_tracking_id", "run_id", "session_id", "category", "title", "message", "impact", "link_choice", "manual_reference_text", "manual_reference_status", "diagnostic_metadata_json", "status", "created_at", "updated_at", "retention_expires_at", "original_retention_expires_at", "legal_hold"},
-    "sqag_feedback_status_history": {"history_id", "feedback_id", "workspace_id", "from_status", "to_status", "actor_tracking_id", "created_at", "retention_expires_at", "original_retention_expires_at", "legal_hold"},
+    "sqag_audit_events": {"event_id", "run_id", "workspace_id", "actor_tracking_id", "actor_key_version", "event_type", "event_json", "event_sha256", "created_at", "retention_expires_at", "original_retention_expires_at"},
+    "sqag_feedback": {"feedback_id", "support_reference", "workspace_id", "reporter_tracking_id", "reporter_key_version", "run_id", "session_id", "category", "title", "message", "impact", "link_choice", "manual_reference_text", "manual_reference_status", "diagnostic_metadata_json", "status", "created_at", "updated_at", "closed_at", "retention_expires_at", "original_retention_expires_at", "submission_retention_expires_at", "retention_policy_version", "deletion_state"},
+    "sqag_feedback_status_history": {"history_id", "feedback_id", "workspace_id", "from_status", "to_status", "actor_tracking_id", "actor_key_version", "resolution_note", "created_at", "retention_expires_at", "original_retention_expires_at"},
     "sqag_deletion_receipts": {"receipt_id", "workspace_id", "record_type", "record_id", "reason", "deleted_at", "original_retention_expires_at", "created_at"},
+    "sqag_legal_holds": {"hold_id", "workspace_id", "target_type", "target_id", "enabled", "reason_code", "actor_tracking_id", "actor_key_version", "created_at", "released_at"},
+    "sqag_retention_delete_authorizations": {"authorization_id", "workspace_id", "record_type", "record_id", "created_at"},
 }
 
 SQAG_DATABASE_ARTIFACT_REQUIRED_COLUMNS = {
@@ -8612,6 +8641,31 @@ def sqlite_database_path_from_url(database_url: str) -> str:
     return path
 
 
+def upgrade_legacy_local_forensic_schema(connection: sqlite3.Connection) -> None:
+    """Add PR #140 columns before indexes/triggers are installed on an old local DB."""
+    upgrades = {
+        "sqag_generation_runs": {"actor_key_version": "text not null default 'legacy-v1'", "job_id": "text", "idempotency_key": "text", "parent_run_id": "text", "attempt_number": "integer not null default 1", "app_revision": "text", "evidence_schema_version": "text not null default 'swooshz.sqag.generation-evidence.v2'", "deletion_state": "text not null default 'active'", "deletion_error_code": "text", "deletion_claimed_at": "text"},
+        "sqag_generation_evidence": {"evidence_schema_version": "text not null default 'swooshz.sqag.generation-evidence.v2'"},
+        "sqag_audit_events": {"actor_tracking_id": "text not null default 'legacy-actor'", "actor_key_version": "text not null default 'legacy-v1'", "event_sha256": "text not null default '0000000000000000000000000000000000000000000000000000000000000000'"},
+        "sqag_feedback": {"reporter_key_version": "text not null default 'legacy-v1'", "submission_retention_expires_at": "text", "retention_policy_version": "text not null default 'feedback-retention-v1'", "deletion_state": "text not null default 'active'", "deletion_error_code": "text", "deletion_claimed_at": "text"},
+        "sqag_feedback_status_history": {"actor_key_version": "text not null default 'legacy-v1'", "resolution_note": "text"},
+        "sqag_deletion_receipts": {"retention_expires_at": "text"},
+    }
+    for table, columns in upgrades.items():
+        exists = connection.execute("select 1 from sqlite_master where type = 'table' and name = ?", (table,)).fetchone()
+        if not exists:
+            continue
+        present = {str(row[1]) for row in connection.execute(f"pragma table_info({table})").fetchall()}
+        for column, declaration in columns.items():
+            if column not in present:
+                connection.execute(f"alter table {table} add column {column} {declaration}")
+    if connection.execute("select 1 from sqlite_master where type = 'table' and name = 'sqag_feedback'").fetchone():
+        connection.execute("update sqag_feedback set submission_retention_expires_at = retention_expires_at where submission_retention_expires_at is null")
+    if connection.execute("select 1 from sqlite_master where type = 'table' and name = 'sqag_deletion_receipts'").fetchone():
+        connection.execute("update sqag_deletion_receipts set retention_expires_at = original_retention_expires_at where retention_expires_at is null")
+    connection.commit()
+
+
 @contextlib.contextmanager
 def sqlite_storage_connection(database_url: str):
     path = sqlite_database_path_from_url(database_url)
@@ -8620,6 +8674,7 @@ def sqlite_storage_connection(database_url: str):
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
     try:
+        connection.execute("pragma foreign_keys = on")
         yield connection
     finally:
         connection.close()
@@ -8716,6 +8771,15 @@ def sqag_postgres_metadata_migration_sql() -> str:
 
 
 def execute_sql_script(connection: Any, sql: str) -> None:
+    if "-- SQAG_STATEMENT_BOUNDARY" in sql:
+        parts = sql.split("-- SQAG_STATEMENT_BOUNDARY")
+        for statement in (part.strip() for part in parts[0].split(";")):
+            if statement:
+                connection.execute(statement)
+        for statement in (part.strip() for part in parts[1:]):
+            if statement:
+                connection.execute(statement)
+        return
     for statement in (part.strip() for part in sql.split(";")):
         if statement:
             connection.execute(statement)
@@ -8980,7 +9044,7 @@ class DatabaseSqagStorage:
     def __init__(self, database_url: str, workspace_id: str, role: str = "viewer", user_id: str = "") -> None:
         self.database_url = database_url
         self.database_family = database_family_from_url(database_url)
-        self.workspace_id = clean_text(workspace_id)
+        self.workspace_id = trusted_workspace_id(workspace_id, allow_local=configured_app_mode() == "local")
         self.role = role_permissions(role).get("role", "viewer")
         self.user_id = privacy_safe_tracking_id(user_id, "")
         if not self.workspace_id:
@@ -10764,17 +10828,18 @@ class DatabaseSqagStorage:
                 "filename": row["filename"],
                 "content_type": row["content_type"],
                 "size_bytes": int(row["size_bytes"] or 0),
+                "sha256": clean_text(row["checksum_sha256"]),
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
             }
         with self.connection() as connection:
             row = connection.execute(
-                "select filename, content_type, size_bytes, created_at, updated_at from sqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
+                "select filename, content_type, size_bytes, content_blob, created_at, updated_at from sqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
                 (self.workspace_id, safe_id, safe_kind),
             ).fetchone()
         if not row or clean_text(row["filename"]) != expected_filename:
             return None
-        return {"filename": row["filename"], "content_type": row["content_type"], "size_bytes": int(row["size_bytes"] or 0), "created_at": row["created_at"], "updated_at": row["updated_at"]}
+        return {"filename": row["filename"], "content_type": row["content_type"], "size_bytes": int(row["size_bytes"] or 0), "sha256": hashlib.sha256(bytes(row["content_blob"] or b"")).hexdigest(), "created_at": row["created_at"], "updated_at": row["updated_at"]}
 
     def _object_quote_artifact_row(self, session_id: str, kind: str) -> sqlite3.Row | None:
         safe_id = safe_quote_session_id(session_id, "")
@@ -11010,6 +11075,7 @@ class DatabaseSqagStorage:
             metadata["exports"][item.artifact_kind] = {
                 "filename": item.filename,
                 "created_at": now,
+                "sha256": artifact_checksum(item.content),
                 "size_bytes": len(item.content),
                 "stale": False,
             }
@@ -11055,7 +11121,7 @@ class DatabaseSqagStorage:
                 return None
             if not self._object_quote_artifact_row_is_current(safe_id, safe_kind, row):
                 return None
-            return {"filename": row["filename"], "content_type": row["content_type"], "size_bytes": object_metadata.size_bytes, "content": content}
+            return {"filename": row["filename"], "content_type": row["content_type"], "size_bytes": object_metadata.size_bytes, "sha256": object_metadata.checksum_sha256, "content": content}
         with self.connection() as connection:
             row = connection.execute(
                 "select filename, content_type, size_bytes, content_blob, updated_at from sqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
@@ -11068,7 +11134,7 @@ class DatabaseSqagStorage:
             return None
         if not self._database_quote_artifact_row_is_current(safe_id, safe_kind, row):
             return None
-        return {"filename": row["filename"], "content_type": row["content_type"], "size_bytes": int(row["size_bytes"] or 0), "content": content}
+        return {"filename": row["filename"], "content_type": row["content_type"], "size_bytes": int(row["size_bytes"] or 0), "sha256": hashlib.sha256(content).hexdigest(), "content": content}
 
     def tombstone_object_quote_artifacts(self, session_id: str) -> int:
         safe_id = safe_quote_session_id(session_id, "")
@@ -11112,6 +11178,7 @@ class DatabaseSqagStorage:
             export["stale"] = stale
             export["url"] = f"/api/quote-sessions/{public['session_id']}/download/{kind}" if exists else None
             if artifact:
+                export["sha256"] = artifact["sha256"]
                 export["size_bytes"] = artifact["size_bytes"]
             public["exports"][kind] = export
         public["status"]["draft_modified"] = bool(has_stale_export and not has_available_export)
@@ -11544,6 +11611,62 @@ class DatabaseSqagStorage:
 
         try:
             return bool(self._run_storage_transaction(delete_quote_owner))
+        except Exception as exc:
+            if not self._expected_storage_failure(exc):
+                raise
+            raise self._storage_unavailable_error(exc) from exc
+
+    def delete_quote_session_for_retention(self, session_id: str) -> bool:
+        """Delete one workspace-scoped session and its durable artifacts as an admin worker."""
+        safe_id = safe_quote_session_id(session_id, "")
+        if self.role != "admin" or not safe_id:
+            return False
+        artifact_mode = configured_artifact_storage_mode()
+        if artifact_mode == "object":
+            def delete_owner(connection: Any) -> bool:
+                connection.execute(
+                    "delete from sqag_quote_sessions where workspace_id = ? and session_id = ?",
+                    (self.workspace_id, safe_id),
+                )
+                return True
+
+            try:
+                return bool(
+                    self._run_object_owner_delete(
+                        "generated_quote",
+                        safe_id,
+                        delete_owner,
+                        result_from_rows=lambda _rows: True,
+                    )
+                )
+            except Exception as exc:
+                if not self._expected_storage_failure(exc):
+                    raise
+                raise self._storage_unavailable_error(exc) from exc
+        if artifact_mode != "database":
+            raise SqagStorageAccessError(
+                QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                status=503,
+                reason="retention_artifact_storage_unavailable",
+            )
+
+        def delete_database_owner(connection: Any) -> bool:
+            connection.execute(
+                "delete from sqag_quote_artifacts where workspace_id = ? and session_id = ?",
+                (self.workspace_id, safe_id),
+            )
+            connection.execute(
+                "delete from sqag_quote_sessions where workspace_id = ? and session_id = ?",
+                (self.workspace_id, safe_id),
+            )
+            remaining = connection.execute(
+                "select 1 from sqag_quote_artifacts where workspace_id = ? and session_id = ? limit 1",
+                (self.workspace_id, safe_id),
+            ).fetchone()
+            return remaining is None
+
+        try:
+            return bool(self._run_storage_transaction(delete_database_owner))
         except Exception as exc:
             if not self._expected_storage_failure(exc):
                 raise
@@ -16729,6 +16852,9 @@ def quote_session_result_files(session: dict[str, Any] | None) -> list[dict[str,
             size = int(export.get("size_bytes") or 0)
             if size > 0:
                 item["bytes"] = str(size)
+            digest = clean_text(export.get("sha256")).lower()
+            if re.fullmatch(r"[0-9a-f]{64}", digest):
+                item["sha256"] = digest
             files.append(item)
     return files
 
@@ -17333,6 +17459,7 @@ def copy_quote_session_exports(session_id: str, metadata: dict[str, Any], result
         metadata["exports"][kind] = {
             "filename": filename,
             "created_at": utc_timestamp(),
+            "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
             "size_bytes": stat.st_size,
             "stale": False,
         }
@@ -17472,6 +17599,7 @@ def public_quote_session(metadata: dict[str, Any], *, include_draft_state: bool 
         raw_export["stale"] = stale
         raw_export["url"] = f"/api/quote-sessions/{session_id}/download/{kind}" if exists else None
         if file_exists and export_path is not None:
+            raw_export["sha256"] = hashlib.sha256(export_path.read_bytes()).hexdigest()
             raw_export["size_bytes"] = export_path.stat().st_size
         public["exports"][kind] = raw_export
     public["status"]["draft_modified"] = bool(has_stale_export and not has_available_export)
@@ -17609,11 +17737,16 @@ def uncached_health_status() -> dict[str, Any]:
                 "",
             )
             database_storage.ensure_ready()
+            database_storage._ensure_schema(SQAG_FORENSIC_REQUIRED_COLUMNS, reason="storage_forensics_database_not_migrated")
             database_metadata_ready = True
         except Exception:
             database_storage = None
             database_metadata_ready = False
         checks.append({"name": "database_metadata_schema", "ok": database_metadata_ready})
+        checks.append({"name": "forensic_schema", "ok": database_metadata_ready})
+        tracking_ready = configured_app_mode() != "deploy" or (bool(clean_text(read_dotenv_value(TRACKING_HMAC_KEY_ENV_NAME))) and bool(re.fullmatch(r"[A-Za-z0-9._-]{1,24}", clean_text(read_dotenv_value(TRACKING_HMAC_KEY_VERSION_ENV_NAME)))))
+        checks.append({"name": "forensic_tracking_configuration", "ok": tracking_ready})
+        checks.append({"name": "forensic_local_fallback_disabled", "ok": storage_mode == "database"})
 
     if artifact_mode in {"database", "object"}:
         artifact_metadata_ready = False
@@ -17928,9 +18061,16 @@ def run_job_worker(
 
 @contextlib.contextmanager
 def forensic_store_for_auth_session(auth_session: dict[str, Any] | None = None):
-    workspace_id = platform_workspace_id_from_auth_session(auth_session) or "local-workspace"
+    local_mode = configured_app_mode() == "local" and configured_storage_mode() != "database"
+    workspace_source = platform_workspace_id_from_auth_session(auth_session)
+    if not workspace_source and local_mode:
+        workspace_source = "local-workspace"
+    try:
+        workspace_id = trusted_workspace_id(workspace_source, allow_local=local_mode)
+    except ValueError as exc:
+        raise SqagStorageAccessError("Platform workspace context is required.", status=403, reason="storage_platform_session_required") from exc
     actor_source = platform_user_id_from_auth_session(auth_session)
-    actor_tracking_id = privacy_safe_audit_tracking_id(actor_source, "local-user") if actor_source else "local-user"
+    actor_tracking_id = privacy_safe_audit_tracking_id(actor_source, "local-user")
     if configured_storage_mode() == "database":
         storage = DatabaseSqagStorage(
             configured_database_url(),
@@ -17941,23 +18081,28 @@ def forensic_store_for_auth_session(auth_session: dict[str, Any] | None = None):
         storage.ensure_ready()
         storage._ensure_schema(SQAG_FORENSIC_REQUIRED_COLUMNS, reason="storage_forensics_database_not_migrated")
         with storage.connection() as connection:
-            yield ForensicStore(connection, workspace_id, actor_tracking_id)
+            yield ForensicStore(connection, workspace_id, actor_tracking_id, actor_key_version_value=clean_text(read_dotenv_value(TRACKING_HMAC_KEY_VERSION_ENV_NAME)))
         return
 
     database_path = configured_data_root() / "forensics.sqlite3"
     database_url = f"sqlite:///{database_path.as_posix()}"
     with sqlite_storage_connection(database_url) as connection:
         migration_path = PROJECT_ROOT / "migrations" / "004_generation_forensics_feedback_retention.sql"
+        upgrade_legacy_local_forensic_schema(connection)
         connection.executescript(migration_path.read_text(encoding="utf-8"))
         connection.commit()
-        yield ForensicStore(connection, workspace_id, actor_tracking_id)
+        yield ForensicStore(connection, workspace_id, actor_tracking_id, local_mode=True, actor_key_version_value="local-v1")
 
 
 def forensic_request_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    approved_basis = copy.deepcopy(payload.get("quote_basis_sections")) if isinstance(payload.get("quote_basis_sections"), list) else []
+    output_rows = copy.deepcopy(payload.get("line_items")) if isinstance(payload.get("line_items"), list) else []
     return {
         "schema": "swooshz.sqag.generation-request-evidence.v1",
         "image_count": len(image_entries(payload)),
         "has_quote_session": isinstance(payload.get("quote_session"), dict),
+        "approved_basis": approved_basis,
+        "output_rows": output_rows,
         "profile_id": safe_resource_id(profile_id_from_payload(payload), ""),
         "pricing_reference_id": safe_resource_id(pricing_reference_id_from_payload(payload), ""),
         "payload_shape_sha256": hashlib.sha256(
@@ -17987,10 +18132,10 @@ def forensic_result_summary(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def begin_generation_forensics(job_type: str, payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> str:
+def begin_generation_forensics(job_type: str, payload: dict[str, Any], auth_session: dict[str, Any] | None = None, *, job_id: str = "") -> str:
     try:
         with forensic_store_for_auth_session(auth_session) as store:
-            return store.record_run_started(job_type, forensic_request_summary(payload))
+            return store.record_run_started(job_type, forensic_request_summary(payload), job_id=job_id, idempotency_key=job_id, app_revision=clean_text(os.getenv("GIT_REVISION") or os.getenv("COMMIT_SHA")))
     except Exception as exc:
         error_reference = new_error_reference()
         write_local_log("forensic_persistence_failed", unexpected_error_log_details(error_reference, exc))
@@ -18009,6 +18154,7 @@ def finish_generation_forensics(
     auth_session: dict[str, Any] | None = None,
     *,
     error_category: str = "",
+    canonical_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not run_id:
         return result
@@ -18023,6 +18169,7 @@ def finish_generation_forensics(
                 error_category=error_category,
                 quote_session_id=safe_quote_session_id(quote_session.get("session_id"), ""),
                 result_summary=forensic_result_summary(result),
+                canonical_manifest=canonical_manifest,
             )
     except Exception as exc:
         error_reference = new_error_reference()
@@ -18083,6 +18230,75 @@ def submit_feedback_for_auth_session(payload: dict[str, Any], auth_session: dict
         return store.submit_feedback(prepared)
 
 
+
+def require_support_forensics(auth_session: dict[str, Any] | None = None) -> None:
+    if not permissions_for_auth_session(auth_session).get("canSupportForensics"):
+        raise PermissionError("Support report is not available.")
+
+
+def support_feedback_list_for_auth_session(query: str = "", auth_session: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    require_support_forensics(auth_session)
+    with forensic_store_for_auth_session(auth_session) as store:
+        return store.list_feedback(query=query, limit=50)
+
+
+def support_feedback_detail_for_auth_session(reference: str, auth_session: dict[str, Any] | None = None) -> dict[str, Any]:
+    require_support_forensics(auth_session)
+    with forensic_store_for_auth_session(auth_session) as store:
+        return store.get_feedback(reference, audit_access=True)
+
+
+def support_feedback_update_for_auth_session(reference: str, payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any]:
+    require_support_forensics(auth_session)
+    with forensic_store_for_auth_session(auth_session) as store:
+        return store.update_feedback_status(reference, clean_text(payload.get("status")), resolution_note=clean_text(payload.get("resolution_note")))
+
+
+def forensic_artifact_verifier_for_session(storage: Any, session_id: str) -> Any:
+    safe_session_id = safe_quote_session_id(session_id, "")
+
+    def verify(expected: dict[str, Any]) -> bool:
+        filename = clean_text(expected.get("name"))
+        kind = next(
+            (
+                candidate
+                for candidate, expected_filename in QUOTE_SESSION_EXPORT_KINDS.items()
+                if expected_filename.casefold() == filename.casefold()
+            ),
+            "",
+        )
+        if not safe_session_id or not kind:
+            return False
+        artifact = storage.quote_session_export_artifact(safe_session_id, kind)
+        if not isinstance(artifact, dict):
+            return False
+        content = artifact.get("content")
+        if not isinstance(content, bytes):
+            return False
+        expected_digest = clean_text(expected.get("sha256")).lower()
+        return bool(
+            re.fullmatch(r"[0-9a-f]{64}", expected_digest)
+            and hashlib.sha256(content).hexdigest() == expected_digest
+            and clean_text(artifact.get("sha256")).lower() == expected_digest
+            and len(content) == int(expected.get("size_bytes") or -1)
+            and int(artifact.get("size_bytes") or -1) == len(content)
+        )
+
+    return verify
+
+
+def support_feedback_evidence_for_auth_session(reference: str, reason_code: str, auth_session: dict[str, Any] | None = None) -> dict[str, Any]:
+    require_support_forensics(auth_session)
+    with forensic_store_for_auth_session(auth_session) as store:
+        report = store.get_feedback(reference, audit_access=True)
+        artifact_storage = quote_session_storage_for_auth_session(auth_session)
+        verifier = forensic_artifact_verifier_for_session(artifact_storage, clean_text(report.get("session_id")))
+        return store.verify_run_evidence(
+            clean_text(report.get("run_id")),
+            reason_code=reason_code,
+            privileged=True,
+            artifact_verifier=verifier,
+        )
 def create_job(
     job_type: str,
     payload: dict[str, Any],
@@ -18094,7 +18310,7 @@ def create_job(
     normalized_type = clean_text(job_type).lower()
     if normalized_type not in {"draft", "generate", "generate_pdf", "basis_chat"}:
         return {"status": "blocked", "errors": ["Job type must be draft, basis_chat, generate, or generate_pdf."]}
-    generation_run_id = begin_generation_forensics(normalized_type, payload, auth_session) if normalized_type in {"generate", "generate_pdf"} else ""
+    generation_run_id = ""
     def blocked(errors: list[str], category: str) -> dict[str, Any]:
         return finish_generation_forensics(generation_run_id, {"status": "blocked", "errors": errors}, auth_session, error_category=category)
     requested_job_id = clean_text(requested_job_id)
@@ -18105,8 +18321,10 @@ def create_job(
             existing = JOBS.get(requested_job_id)
             if existing:
                 if existing.get("type") != normalized_type or not job_visible_to_auth_session(existing, auth_session):
-                    return blocked(["Job request could not be resumed."], "job_resume_invalid")
+                    return {"status": "blocked", "errors": ["Job request could not be resumed."]}
                 return public_job(existing)
+    job_id = requested_job_id or f"job-{secrets.token_hex(6)}"
+    generation_run_id = begin_generation_forensics(normalized_type, payload, auth_session, job_id=job_id) if normalized_type in {"generate", "generate_pdf"} else ""
     if not image_entries(payload):
         return blocked([MISSING_IMAGES_MESSAGE], "images_missing")
     image_error = image_limit_error(payload)
@@ -18139,7 +18357,6 @@ def create_job(
         return blocked([PRICING_REFERENCE_SELECTION_ERROR_MESSAGE], "pricing_reference_unavailable")
     payload = resolved_payload
 
-    job_id = requested_job_id or f"job-{secrets.token_hex(6)}"
     if generation_run_id:
         payload = dict(payload)
         payload["_generation_run_id"] = generation_run_id
@@ -18198,8 +18415,6 @@ def run_quote_job(
 ) -> dict[str, Any]:
 
     generation_run_id = clean_text(payload.get("_generation_run_id"))
-    if not generation_run_id:
-        generation_run_id = begin_generation_forensics("generate_pdf" if clean_text(pdf_mode).lower() != "none" else "generate", payload, auth_session)
 
     def blocked(errors: list[str], category: str) -> dict[str, Any]:
         return finish_generation_forensics(
@@ -18242,6 +18457,12 @@ def run_quote_job(
         ensure_quote_artifact_storage_available_for_auth_session(auth_session)
     except SqagStorageAccessError as exc:
         return finish_generation_forensics(generation_run_id, storage_access_error_payload(exc), auth_session, error_category=exc.reason)
+
+    if not generation_run_id:
+        try:
+            generation_run_id = begin_generation_forensics("generate_pdf" if clean_text(pdf_mode).lower() != "none" else "generate", payload, auth_session, job_id=clean_text(job_id))
+        except SqagStorageAccessError as exc:
+            return storage_access_error_payload(exc)
 
     output_root = output_root or configured_output_root()
     tmp_root = tmp_root or configured_tmp_root()
@@ -18369,6 +18590,38 @@ def run_quote_job(
                 result.update(failed_result_payload(persistence_error_reference))
                 result["job_id"] = job_id
                 result.pop("files", None)
+    profile_snapshot = copy.deepcopy(profile.config if isinstance(profile, ProfilePack) else profile)
+    profile_snapshot.pop("pack", None)
+    pricing_bytes = pricing_catalog_path.read_bytes()
+    layout_bytes = layout_template_path.read_bytes()
+    layout_rules_snapshot = embedded_layout_rules_from_xlsx_bytes(layout_bytes)
+    if not layout_rules_snapshot and isinstance(profile, ProfilePack) and profile.layout_rules_path.suffix.lower() == ".json":
+        layout_rules_snapshot = load_json_file(profile.layout_rules_path)
+
+    input_references: list[dict[str, Any]] = []
+    for uploaded in uploaded_images:
+        source_path = Path(clean_text(uploaded.get("path")))
+        source_bytes = source_path.read_bytes() if source_path.is_file() else b""
+        input_references.append({"name": clean_text(uploaded.get("name"))[:128], "role": "booth_render", "content_type": clean_text(uploaded.get("type"))[:128], "size_bytes": len(source_bytes), "sha256": hashlib.sha256(source_bytes).hexdigest()})
+    normalized_brief = copy.deepcopy(brief)
+    brief_webapp = normalized_brief.get("_webapp") if isinstance(normalized_brief.get("_webapp"), dict) else {}
+    brief_webapp["uploaded_images"] = copy.deepcopy(input_references)
+    normalized_brief["_webapp"] = brief_webapp
+
+    canonical_manifest = {
+        "generation_schema_version": 1,
+        "job_id": job_id,
+        "normalized_brief": normalized_brief,
+        "approved_basis": copy.deepcopy(payload.get("quote_basis_sections") or []),
+        "output_rows": copy.deepcopy(payload.get("line_items") or []),
+        "profile": {"snapshot": profile_snapshot, "sha256": hashlib.sha256(json.dumps(profile_snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()},
+        "pricing_reference": {"snapshot": json.loads(pricing_bytes.decode("utf-8")), "sha256": hashlib.sha256(pricing_bytes).hexdigest()},
+        "layout_template": {"filename": layout_template_path.name, "sha256": hashlib.sha256(layout_bytes).hexdigest(), "size_bytes": len(layout_bytes)},
+        "generation_configuration": {"pdf_mode": normalized_pdf_mode, "provider": clean_text(read_dotenv_value("AI_PROVIDER")), "model": clean_text(read_dotenv_value("OPENAI_MODEL")), "app_revision": clean_text(os.getenv("GIT_REVISION") or os.getenv("COMMIT_SHA"))},
+        "inputs": input_references,
+        "layout_rules": {"snapshot": layout_rules_snapshot, "sha256": hashlib.sha256(json.dumps(layout_rules_snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()},
+        "artifacts": forensic_result_summary(result).get("artifacts", []),
+    }
     if configured_app_mode() != "deploy" and status != "failed":
         result.update({
             "stdout": completed.stdout,
@@ -18381,6 +18634,7 @@ def run_quote_job(
         result,
         auth_session,
         error_category="" if result.get("status") == "completed" else "generation_not_completed",
+        canonical_manifest=canonical_manifest,
     )
 
 
@@ -18440,8 +18694,34 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 "browser_recovery_scope": browser_recovery_scope(session),
             })
             return
+        if path == "/api/support/feedback":
+            try:
+                query = (parse_qs(parsed.query).get("q") or [""])[0]
+                self.send_json({"reports": support_feedback_list_for_auth_session(query, self.current_auth_session())})
+            except PermissionError:
+                self.send_json({"error": "Not found"}, status=404)
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+            return
+        support_evidence_match = re.fullmatch(r"/api/support/feedback/([A-Za-z0-9_-]+)/evidence", path)
+        if support_evidence_match:
+            try:
+                reason = (parse_qs(parsed.query).get("reason") or [""])[0]
+                self.send_json({"integrity": support_feedback_evidence_for_auth_session(support_evidence_match.group(1), reason, self.current_auth_session())})
+            except (PermissionError, LookupError):
+                self.send_json({"error": "Not found"}, status=404)
+            except ValueError as exc:
+                self.send_json({"status": "blocked", "errors": safe_error_messages([str(exc)])}, status=400)
+            return
+        support_detail_match = re.fullmatch(r"/api/support/feedback/([A-Za-z0-9_-]+)", path)
+        if support_detail_match:
+            try:
+                self.send_json({"report": support_feedback_detail_for_auth_session(support_detail_match.group(1), self.current_auth_session())})
+            except (PermissionError, LookupError):
+                self.send_json({"error": "Not found"}, status=404)
+            return
+        query = parse_qs(parsed.query, keep_blank_values=True)
         if path == "/api/feedback/context":
-            query = parse_qs(parsed.query, keep_blank_values=True)
             try:
                 context = feedback_context_for_auth_session(
                     {
@@ -18751,6 +19031,21 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             return
 
 
+        support_status_match = re.fullmatch(r"/api/support/feedback/([A-Za-z0-9_-]+)/status", parsed.path)
+        if support_status_match:
+            try:
+                result = support_feedback_update_for_auth_session(support_status_match.group(1), payload, self.current_auth_session())
+            except (PermissionError, LookupError):
+                self.send_json({"error": "Not found"}, status=404)
+                return
+            except ValueError as exc:
+                self.send_json({"status": "blocked", "errors": safe_error_messages([str(exc)])}, status=400)
+                return
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
+            self.send_json({"status": "updated", "report": result})
+            return
         if parsed.path == "/api/feedback":
             try:
                 result = submit_feedback_for_auth_session(payload, self.current_auth_session())
@@ -19495,6 +19790,25 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def reconcile_forensic_runs_on_startup(*, batch_size: int = 100) -> int:
+    """Boundedly terminalize stale runs after restart without fabricating success."""
+    total = 0
+    if configured_storage_mode() == "database":
+        storage = DatabaseSqagStorage(configured_database_url(), "sqag-reconciliation-probe", role="admin", user_id="")
+        storage._ensure_schema(SQAG_FORENSIC_REQUIRED_COLUMNS, reason="storage_forensics_database_not_migrated")
+        with storage.connection() as connection:
+            workspaces = connection.execute(
+                "select distinct workspace_id from sqag_generation_runs where status in ('received','queued','running') order by workspace_id limit ?",
+                (100,),
+            ).fetchall()
+            for row in workspaces:
+                workspace_id = clean_text(row["workspace_id"])
+                total += ForensicStore(connection, workspace_id, "retention-worker", actor_key_version_value="system-v1").reconcile_non_terminal_runs(active_job_ids=JOBS.keys(), batch_size=batch_size)
+        return total
+    with forensic_store_for_auth_session(None) as store:
+        return store.reconcile_non_terminal_runs(active_job_ids=JOBS.keys(), batch_size=batch_size)
+
+
 def main() -> int:
     args = parse_args()
     if args.check_deploy_uat_env:
@@ -19546,6 +19860,13 @@ def main() -> int:
         return 2
     configured_output_root().mkdir(parents=True, exist_ok=True)
     configured_tmp_root().mkdir(parents=True, exist_ok=True)
+    try:
+        reconcile_forensic_runs_on_startup()
+    except Exception as exc:
+        error_reference = new_error_reference()
+        write_local_log("forensic_reconciliation_failed", unexpected_error_log_details(error_reference, exc))
+        if configured_app_mode() == "deploy":
+            return 2
     server = ThreadingHTTPServer((args.host, args.port), QuoteRunnerHandler)
     safe_stdout(f"Swooshz Quote Generator listening on http://{args.host}:{args.port}/")
     try:

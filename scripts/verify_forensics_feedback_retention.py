@@ -6,10 +6,12 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import sqlite3
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +51,10 @@ def run_verification(work_dir: Path | None = None) -> dict[str, object]:
         connection.execute("update sqag_generation_runs set retention_expires_at = ?, original_retention_expires_at = ? where run_id = ?", (past, past, run_id))
         connection.execute("update sqag_generation_evidence set retention_expires_at = ?, original_retention_expires_at = ? where run_id = ?", (past, past, run_id))
         connection.execute("update sqag_audit_events set retention_expires_at = ?, original_retention_expires_at = ? where run_id = ?", (past, past, run_id))
+        store.update_feedback_status(feedback["support_reference"], "resolved", resolution_note="Synthetic verifier closure")
+        connection.execute("update sqag_audit_events set retention_expires_at = ?, original_retention_expires_at = ? where run_id = ?", (past, past, run_id))
+        connection.execute("update sqag_feedback set retention_expires_at = ? where feedback_id = ?", (past, feedback["feedback_id"]))
+        connection.execute("update sqag_feedback_status_history set retention_expires_at = ? where feedback_id = ?", (past, feedback["feedback_id"]))
         connection.commit()
         hold_set = store.set_legal_hold("sqag_generation_runs", "run_id", run_id, True)
         held_result = store.enforce_retention(now=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc))
@@ -62,6 +68,8 @@ def run_verification(work_dir: Path | None = None) -> dict[str, object]:
         calendar_expiry = add_calendar_years(leap_start)
         ownerless = {"session_id": "quote-ownerless", "owner": {}}
         editor = webapp.DatabaseSqagStorage("sqlite:///:memory:", "workspace-synthetic", role="editor", user_id="user-editor")
+        with mock.patch.dict(os.environ, {webapp.TRACKING_HMAC_KEY_ENV_NAME: "synthetic-tracking-key-with-enough-entropy", webapp.TRACKING_HMAC_KEY_VERSION_ENV_NAME: "synthetic-v1"}):
+            tracking_identifier = webapp.privacy_safe_audit_tracking_id("user-editor")
         checks = {
             "blocked_attempt_is_durable": run_row["status"] == "blocked" and run_row["error_category"] == "images_missing",
             "canonical_evidence_is_hashed": len(evidence_rows) == 2 and all(len(row["evidence_sha256"]) == 64 for row in evidence_rows),
@@ -71,7 +79,7 @@ def run_verification(work_dir: Path | None = None) -> dict[str, object]:
             "legal_hold_preserves_expired_record": hold_set and held_result.held >= 1 and held_exists,
             "release_makes_expired_record_eligible": hold_released and deletion_result.deleted >= 1 and deleted and receipt_exists,
             "ownerless_sessions_fail_closed": not editor._quote_session_visible_to_current_user(ownerless) and not editor._quote_session_editable_by_current_user(ownerless),
-            "tracking_identifier_is_keyed_and_versioned": webapp.privacy_safe_audit_tracking_id("user-editor").startswith("pid-v1-") and webapp.privacy_safe_audit_tracking_id("user-editor") != "user-editor",
+            "tracking_identifier_is_keyed_and_versioned": tracking_identifier.startswith("pid-synthetic-v1-") and tracking_identifier != "user-editor",
             "xlsx_column_bound_is_enforced": False,
         }
         try:

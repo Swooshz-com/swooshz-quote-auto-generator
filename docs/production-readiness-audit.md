@@ -449,6 +449,38 @@ bytes, backup dumps, restore dumps, or secrets. Passing it may remove only
 removed. Until a non-test-injected operator run passes, live retention/delete
 evidence remains a production blocker and `production_ready=false` remains.
 
+
+### PR #140 blocked-head remediation addendum (2026-07-15)
+
+The review-blocked head `ef9767429211f8d84731d7d660b63c6b73d07de8` was
+retested with synthetic fixtures before repair. Deterministic RED evidence
+confirmed workspace-ID collapse, parent-hold child deletion, duplicate resume
+runs, hosted hash loss, non-reconstructive request evidence, terminal-state
+collapse, submission-only feedback expiry, mutable evidence/audit rows,
+unbounded retention, and repeated-delete false failure.
+
+The repaired design keeps `production_ready=false` and adds exact trusted
+workspace identities with deploy fail-closed behavior, dedicated versioned
+HMAC pseudonyms, one job/idempotency identity per run, bounded abandoned-run
+reconciliation, normalized legal-hold records, graph-aware retention,
+closure-based feedback retention, immutable evidence content, controlled
+retention deletes, privileged audited support access, and authoritative durable
+artifact hashes. Privileged integrity retrieval re-reads the linked durable
+XLSX/PDF bytes and compares their authoritative backend checksum and size with
+the immutable manifest. The canonical generation manifest is written only after
+final artifact persistence and contains normalized brief/Basis/Output values in
+order, immutable profile/pricing snapshots and checksums, template checksum,
+input checksums, material generation configuration, and final artifact hashes.
+The bounded retention worker preserves sessions shared by retained runs,
+deletes database/object session artifacts before forensic rows, resumes safely
+after partial success, and creates deletion receipts only after the remaining
+record graph commits successfully.
+
+Migration 004 is amended in place because it remains unmerged and has never
+entered canonical main history. SQLite and Postgres now use intentionally
+separate migration files; Postgres also has a follow-on controlled-delete guard
+file. This avoids unsupported mixed-dialect DDL while keeping equivalent table,
+index, immutability, and retention authorization semantics.
 The canonical object-storage provider and live-evidence env names use the
 `SQAG_` prefix. Legacy `SQAG_*` object-storage provider names are not aliases
 and do not silently satisfy live-provider evidence or readiness checks. Existing

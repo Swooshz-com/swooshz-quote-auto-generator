@@ -684,6 +684,19 @@ class WebappServerTest(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertTrue(root.is_relative_to(webapp.PROJECT_ROOT))
 
+    def test_feedback_context_http_route_initializes_query_for_normal_users(self):
+        data_root = test_temp_root() / f"feedback-context-{time.time_ns()}"
+        env = {"APP_MODE": "local", "SQAG_STORAGE_MODE": "local", "QUOTE_DATA_ROOT": str(data_root)}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with LocalRunnerServer() as runner:
+                response = self.http_json(runner, "GET", "/api/feedback/context")
+
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(response["body"]["status"], "ok")
+        self.assertEqual(response["body"]["context"]["link_type"], "none")
+        self.assertEqual(response["body"]["context"]["run_id"], "")
+
+
     def test_configured_data_root_preserves_explicit_override(self):
         configured_root = test_temp_root() / "explicit-company-data"
         with mock.patch.dict(os.environ, {"QUOTE_DATA_ROOT": str(configured_root)}, clear=True):
@@ -696,6 +709,8 @@ class WebappServerTest(unittest.TestCase):
             "AUTH_REQUIRED": "true",
             "SESSION_SECRET": "test-session-secret-with-enough-entropy",
             "OIDC_ISSUER_URL": "https://issuer.example",
+            "SQAG_TRACKING_HMAC_KEY": "synthetic-dedicated-tracking-key",
+            "SQAG_TRACKING_HMAC_KEY_VERSION": "test-v1",
             "OIDC_CLIENT_ID": "client-id",
             "OIDC_CLIENT_SECRET": "client-secret",
             "OIDC_REDIRECT_URI": "https://quote.example/callback",
@@ -715,6 +730,8 @@ class WebappServerTest(unittest.TestCase):
             "AUTH_REQUIRED": "true",
             "SESSION_SECRET": "test-session-secret-with-enough-entropy",
             "SQAG_PLATFORM_LAUNCH_MODE": "platform",
+            "SQAG_TRACKING_HMAC_KEY": "synthetic-dedicated-tracking-key",
+            "SQAG_TRACKING_HMAC_KEY_VERSION": "test-v1",
             "SQAG_PLATFORM_BASE_URL": "https://platform.example.test",
         }
         env.update(overrides)
@@ -9546,8 +9563,10 @@ class WebappServerTest(unittest.TestCase):
             }
         }
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.dict(webapp.os.environ, {"APP_MODE": "deploy", "AUTH_REQUIRED": "true"}, clear=True):
+            with mock.patch.dict(webapp.os.environ, {"APP_MODE": "deploy", "AUTH_REQUIRED": "true", "SQAG_TRACKING_HMAC_KEY": "synthetic-dedicated-tracking-key", "SQAG_TRACKING_HMAC_KEY_VERSION": "test-v1"}, clear=True):
                 tracking = webapp.ai_log_tracking_metadata(session)
+                expected_user = webapp.privacy_safe_audit_tracking_id("user-123")
+                expected_account = webapp.privacy_safe_audit_tracking_id("account-456")
                 with webapp.ai_log_tracking_scope(tracking):
                     logged = webapp.log_ai_call_attempt(
                         feature="basis_chat",
@@ -9566,8 +9585,8 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(details["auth_mode"], "deploy")
         self.assertTrue(details["auth_required"])
         self.assertTrue(details["authenticated"])
-        self.assertEqual(details["user_id"], webapp.privacy_safe_audit_tracking_id("user-123"))
-        self.assertEqual(details["account_id"], webapp.privacy_safe_audit_tracking_id("account-456"))
+        self.assertEqual(details["user_id"], expected_user)
+        self.assertEqual(details["account_id"], expected_account)
         self.assertEqual(details["company_id"], webapp.DEFAULT_COMPANY_ID)
         self.assertEqual(details["role"], "viewer")
         self.assertNotIn("email", details)
@@ -22869,6 +22888,8 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         env = {
             "APP_MODE": "deploy",
             "SQAG_STORAGE_MODE": "database",
+            "SQAG_TRACKING_HMAC_KEY": "synthetic-dedicated-tracking-key",
+            "SQAG_TRACKING_HMAC_KEY_VERSION": "test-v1",
             "SQAG_ARTIFACT_STORAGE_MODE": "object",
             "SQAG_DATABASE_URL": database_url,
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
@@ -28299,6 +28320,8 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         tmp_path = test_temp_root() / f"deploy-redaction-{time.time_ns()}"
         database_url = f"sqlite:///{(tmp_path / 'sqag-artifacts.sqlite3').as_posix()}"
         env = {
+            "SQAG_TRACKING_HMAC_KEY": "synthetic-dedicated-tracking-key",
+            "SQAG_TRACKING_HMAC_KEY_VERSION": "test-v1",
             "APP_MODE": "deploy",
             "SQAG_ARTIFACT_STORAGE_MODE": "database",
             "SQAG_DATABASE_URL": database_url,
@@ -28306,7 +28329,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         auth_session = self.platform_auth_session("workspace-deploy-redaction")
         with mock.patch.dict(os.environ, env, clear=False):
             webapp.apply_sqag_storage_migrations(database_url)
-            with mock.patch.object(webapp.subprocess, "run", return_value=completed):
+            with mock.patch.object(webapp.subprocess, "run", return_value=completed), mock.patch.object(webapp, "begin_generation_forensics", return_value=""):
                 result = webapp.run_quote_job(
                     payload,
                     output_root=tmp_path / "out",
