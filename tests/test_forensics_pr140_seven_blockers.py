@@ -96,6 +96,7 @@ class Pr140SevenBlockerRegressionTest(unittest.TestCase):
     def test_client_generation_context_is_transitioned_and_persisted_as_a_pair(self):
         source = (ROOT / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
         self.assertIn("function transitionGenerationContext", source)
+        transition = source.split("function transitionGenerationContext", 1)[1].split("function randomQuoteSessionToken", 1)[0]
         snapshot = source.split("function buildSessionSnapshot()", 1)[1].split("function clearSessionState()", 1)[0]
         restore = source.split("async function applyQuoteSessionSnapshot", 1)[1].split("function quoteOutputProgressForNavigation", 1)[0]
         feedback = source.split("async function loadFeedbackContext()", 1)[1].split("async function openFeedbackModal", 1)[0]
@@ -103,6 +104,9 @@ class Pr140SevenBlockerRegressionTest(unittest.TestCase):
         self.assertIn("generationContext:", snapshot)
         self.assertIn("transitionGenerationContext", restore)
         self.assertIn("transitionGenerationContext", reset)
+        self.assertIn("state.feedbackContextRequestId += 1", transition)
+        self.assertIn("state.feedbackContext = null", transition)
+        self.assertIn("loadFeedbackContext()", transition)
         self.assertIn("currentGenerationContext", feedback)
 
     def test_feedback_retention_deletes_mixed_feedback_run_audits(self):

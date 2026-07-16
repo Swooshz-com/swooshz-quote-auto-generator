@@ -505,10 +505,11 @@ class Pr140FiveBlockerRedTest(unittest.TestCase):
                         ("workspace-five", "run-version-a"),
                     )
                     connection.commit()
-                self.assertFalse(
+                self.assertEqual(
                     storage.delete_quote_publication_version_for_retention(
                         "run-version-a", finalize_graph=lambda _connection: None,
-                    )
+                    ),
+                    webapp.PUBLICATION_RETENTION_HELD,
                 )
                 with storage.connection() as connection:
                     connection.execute(
@@ -517,10 +518,11 @@ class Pr140FiveBlockerRedTest(unittest.TestCase):
                         ("workspace-five", "run-version-a"),
                     )
                     connection.commit()
-                self.assertTrue(
+                self.assertEqual(
                     storage.delete_quote_publication_version_for_retention(
                         "run-version-a", finalize_graph=lambda _connection: None,
-                    )
+                    ),
+                    webapp.PUBLICATION_RETENTION_DELETED,
                 )
 
                 self.assertTrue(
@@ -528,11 +530,12 @@ class Pr140FiveBlockerRedTest(unittest.TestCase):
                         "run-version-d", "quote-versioned-promote"
                     )
                 )
-                self.assertFalse(
+                self.assertEqual(
                     storage.delete_quote_publication_version_for_retention(
                         "run-version-d",
                         finalize_graph=lambda _connection: None,
-                    )
+                    ),
+                    webapp.PUBLICATION_RETENTION_CURRENT,
                 )
                 self.assertTrue(
                     storage.delete_quote_session_for_retention(

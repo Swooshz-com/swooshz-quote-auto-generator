@@ -1,5 +1,7 @@
 import contextlib
 import datetime as dt
+import io
+import json
 import os
 import sys
 import sqlite3
@@ -10,7 +12,7 @@ from unittest import mock
 
 from webapp.forensics import ForensicStore
 from webapp import server as webapp
-from scripts import enforce_log_retention
+from scripts import enforce_forensic_retention, enforce_log_retention
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -135,17 +137,17 @@ class Pr140SixBlockerRedTest(unittest.TestCase):
         self.assertIn(key, webapp.POST_RATE_LIMITS)
         self.assertLess(webapp.POST_RATE_LIMITS[key], 30)
 
-    def test_session_resolution_prefers_exact_published_run_among_history(self):
+    def test_session_resolution_does_not_rebind_at_report_time(self):
         store = self.store()
         older = store.record_run_started("generate", {"synthetic": True})
         store.finish_run(older, "completed", quote_session_id="quote-history", canonical_manifest={"artifacts": []})
         current = store.record_run_started("generate", {"synthetic": True})
         store.finish_run(current, "completed", quote_session_id="quote-history", canonical_manifest={"artifacts": []})
-        resolved = store.resolve_feedback_evidence_run(
-            {"session_id": "quote-history"},
-            publication_context_factory=lambda: {"state": "published", "run_id": current},
-        )
-        self.assertEqual(resolved, current)
+        with self.assertRaisesRegex(LookupError, "Forensic evidence is not available"):
+            store.resolve_feedback_evidence_run(
+                {"session_id": "quote-history"},
+                publication_context_factory=lambda: {"state": "published", "run_id": current},
+            )
 
     def test_session_resolution_rejects_ambiguity_and_staged_publication(self):
         store = self.store()
@@ -328,6 +330,81 @@ class Pr140SixBlockerRedTest(unittest.TestCase):
             with mock.patch.object(sys, "argv", confirmed_args), mock.patch("builtins.print"):
                 self.assertEqual(enforce_log_retention.main(), 0)
             self.assertFalse(unrelated.exists())
+
+    def test_log_legal_hold_paths_are_case_and_separator_normalized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            held = root / "App" / "Held.JSONL"
+            held.parent.mkdir()
+            held.write_text("synthetic held log", encoding="utf-8")
+            old_timestamp = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc).timestamp()
+            os.utime(held, (old_timestamp, old_timestamp))
+            manifest = root / "holds.json"
+            manifest.write_text(
+                json.dumps({"held_relative_paths": ["app\\held.jsonl"]}),
+                encoding="utf-8",
+            )
+            args = [
+                "enforce_log_retention.py",
+                "--mode",
+                "production",
+                "--apply",
+                "--now",
+                "2026-01-01T00:00:00Z",
+                "--log-root",
+                str(root),
+                "--expected-log-root",
+                str(root),
+                "--legal-hold-manifest",
+                str(manifest),
+            ]
+            output = io.StringIO()
+            with mock.patch.object(sys, "argv", args), contextlib.redirect_stdout(output):
+                self.assertEqual(enforce_log_retention.main(), 0)
+            self.assertTrue(held.exists())
+            self.assertEqual(json.loads(output.getvalue())["held"], 1)
+
+    def test_retention_worker_rejects_credential_bearing_argv_url(self):
+        args = mock.Mock(
+            apply=True,
+            dry_run=False,
+            database_url="postgresql://user:secret@example.test/sqag",
+            use_configured_database=False,
+            workspace_id="workspace-six",
+            now=None,
+            batch_size=1,
+        )
+        output = io.StringIO()
+        with (
+            mock.patch.object(enforce_forensic_retention, "parse_args", return_value=args),
+            mock.patch.object(
+                enforce_forensic_retention.webapp,
+                "DatabaseSqagStorage",
+            ) as storage,
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(enforce_forensic_retention._main(), 2)
+        storage.assert_not_called()
+        self.assertEqual(
+            json.loads(output.getvalue())["reason"],
+            "database_url_argv_requires_sqlite",
+        )
+        self.assertTrue(
+            enforce_forensic_retention.argv_database_url_allowed(
+                "sqlite:///C:/tmp/synthetic.db"
+            )
+        )
+        self.assertFalse(
+            enforce_forensic_retention.argv_database_url_allowed(
+                "postgresql://example.test/sqag?access_token=synthetic"
+            )
+        )
+        self.assertFalse(
+            enforce_forensic_retention.argv_database_url_allowed(
+                "postgresql://example.test/sqag?sslpassword=synthetic"
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

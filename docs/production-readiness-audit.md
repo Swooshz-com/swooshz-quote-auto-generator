@@ -826,3 +826,37 @@ in-memory object, real-worker, and Playwright regressions cover these repairs.
 The review found no surviving reportable path in the repaired snapshot and makes
 no hosted or production evidence claim; `internal_alpha_ready=false` and
 `production_ready=false` remain unchanged.
+
+### PR #140 publication-retention and immutable-link closure (2026-07-16)
+
+The retention worker now receives explicit publication outcomes. A run backing
+the current published quote is classified through a separate
+`publication_retained` metric and keeps its immutable manifest, audits,
+publication metadata, bytes, original expiry, and receipt-free state while the
+publication remains current. After atomic supersession, an unheld version may be
+deleted with its exact run graph; a version referenced by feedback remains
+verifiable. Whole-session deletion continues to remove the current publication
+and generation graph together only when no retained links or legal holds remain.
+
+Database publication metadata reads select only filename, content type, stored
+size/checksum, and timestamps. They do not select or hash `content_blob`; byte
+downloads and privileged verification continue to read, size-check, and hash the
+content. Object metadata reads likewise avoid provider retrieval.
+
+Ordinary and retention session deletion now share one workspace-scoped hold
+graph boundary. It locks and rechecks the session, publication versions,
+generation runs and their evidence/audits, linked feedback and history, and
+standalone session audits. Active normalized hold rows or legacy hold flags keep
+database/object artifacts intact without exposing case details.
+
+Accepted generation runs persist a server-validated existing session identity
+at run creation and preserve it through blocked, storage-failed, direct, and
+asynchronous terminal paths. Result/session mismatch fails closed and cannot
+declare staged bytes as durable canonical artifacts. Feedback resolves the exact
+report-time published or uniquely blocked run inside the submission transaction,
+stores the run/version/source/time through additive migration 007, and cannot be
+rebound by later regeneration or a future publication. Historical unbound rows
+remain unbound. No visible UI or readiness flag changed: hosted migration,
+provider, retention/delete, backup/restore, observability, and owner/counsel
+evidence remain outstanding; `internal_alpha_ready=false` and
+`production_ready=false`.

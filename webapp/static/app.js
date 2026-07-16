@@ -676,9 +676,31 @@ function currentGenerationContext() {
 function transitionGenerationContext(sessionId = "", runId = "") {
   const safeSessionId = safeQuoteSessionId(sessionId || "");
   const safeRunId = safeGenerationRunId(runId || "");
+  const previousContext = currentGenerationContext();
   state.quoteSessionId = safeSessionId;
   state.lastGenerationRunId = safeRunId;
   state.lastGenerationRunSessionId = safeRunId ? safeSessionId : "";
+  if (
+    previousContext.session_id !== safeSessionId
+    || previousContext.run_id !== safeRunId
+  ) {
+    state.feedbackContextRequestId += 1;
+    state.feedbackContext = null;
+    state.feedbackContextLoadPromise = null;
+    if (elements.feedbackIncludeLink) {
+      elements.feedbackIncludeLink.checked = false;
+      elements.feedbackIncludeLink.disabled = true;
+    }
+    if (elements.feedbackModal && !elements.feedbackModal.hidden) {
+      const pendingContext = loadFeedbackContext();
+      state.feedbackContextLoadPromise = pendingContext;
+      pendingContext.finally(() => {
+        if (state.feedbackContextLoadPromise === pendingContext) {
+          state.feedbackContextLoadPromise = null;
+        }
+      });
+    }
+  }
   return {
     session_id: safeSessionId,
     run_id: safeRunId,

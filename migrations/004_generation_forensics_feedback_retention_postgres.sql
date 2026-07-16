@@ -31,6 +31,7 @@ create table if not exists sqag_feedback (
   feedback_id text primary key, support_reference text not null unique, workspace_id text not null, reporter_tracking_id text not null, reporter_key_version text not null,
   run_id text, session_id text, category text not null, title text not null, message text not null, expected_result text, actual_result text, reproduction_steps text,
   impact text, link_choice text not null, manual_reference_text text, manual_reference_status text not null, resolved_reference_type text, resolved_reference_id text,
+  publication_version_id text, link_resolution_source text, link_resolved_at text,
   diagnostic_metadata_json text not null, status text not null, created_at text not null, updated_at text not null, closed_at text,
   retention_expires_at text not null, original_retention_expires_at text not null, submission_retention_expires_at text not null, retention_policy_version text not null,
   legal_hold integer not null default 0, deletion_state text not null default 'active', deletion_error_code text, deletion_claimed_at text,

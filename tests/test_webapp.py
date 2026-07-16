@@ -743,6 +743,7 @@ class WebappServerTest(unittest.TestCase):
                         "category": "bug",
                         "title": "Synthetic linked report",
                         "message": "Synthetic support evidence route fixture.",
+                        "run_id": run_id,
                         "validated_session_id": "quote-support123",
                     }
                 )

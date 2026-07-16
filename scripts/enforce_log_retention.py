@@ -7,7 +7,7 @@ import argparse
 import datetime as dt
 import json
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +32,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def normalized_relative_path(value: str) -> str:
+    normalized = PurePosixPath(value.replace("\\", "/")).as_posix()
+    return normalized.casefold()
+
+
 def load_holds(path: Path | None) -> set[str]:
     if path is None:
         return set()
@@ -39,7 +44,13 @@ def load_holds(path: Path | None) -> set[str]:
     values = payload.get("held_relative_paths") if isinstance(payload, dict) else None
     if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
         raise ValueError("Legal-hold manifest must contain held_relative_paths strings.")
-    return {Path(item).as_posix() for item in values if item and not Path(item).is_absolute() and ".." not in Path(item).parts}
+    holds: set[str] = set()
+    for item in values:
+        candidate = PurePosixPath(item.replace("\\", "/"))
+        if not item or candidate.is_absolute() or ".." in candidate.parts:
+            continue
+        holds.add(normalized_relative_path(candidate.as_posix()))
+    return holds
 
 
 def main() -> int:
@@ -76,7 +87,7 @@ def main() -> int:
             continue
         resolved = path.resolve()
         try:
-            relative = resolved.relative_to(root).as_posix()
+            relative = normalized_relative_path(resolved.relative_to(root).as_posix())
         except ValueError:
             skipped += 1
             continue

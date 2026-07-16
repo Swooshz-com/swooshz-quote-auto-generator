@@ -8,20 +8,25 @@ import datetime as dt
 import json
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from webapp.forensics import ForensicStore
+from webapp.forensics import (
+    ForensicStore,
+    RetentionGraphHeld,
+    RetentionPublicationDependency,
+)
 from webapp import server as webapp
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Process a bounded batch of expired SQAG forensic records for one workspace.")
     parser.add_argument("--workspace-id", required=True)
-    parser.add_argument("--database-url", help="Explicit SQLite or Postgres database URL. Values are never printed.")
+    parser.add_argument("--database-url", help="Explicit local SQLite URL only. Use --use-configured-database for Postgres.")
     parser.add_argument("--use-configured-database", action="store_true", help="Use SQAG_DATABASE_URL from the configured environment.")
     parser.add_argument("--apply", action="store_true", help="Perform deletion and create receipts.")
     parser.add_argument("--dry-run", action="store_true", help="Report candidates without deletion.")
@@ -37,6 +42,21 @@ def parsed_now(value: str | None) -> dt.datetime | None:
     if parsed.tzinfo is None:
         raise ValueError("--now must include a timezone.")
     return parsed.astimezone(dt.timezone.utc)
+
+
+def argv_database_url_allowed(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    return bool(
+        parsed.scheme.casefold() == "sqlite"
+        and not parsed.username
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+    )
+
 
 def session_has_retained_forensic_links(
     connection,
@@ -74,6 +94,9 @@ def _main() -> int:
     if args.database_url and args.use_configured_database:
         print(json.dumps(blocked("choose_one_database_source"), indent=2, sort_keys=True))
         return 2
+    if args.database_url and not argv_database_url_allowed(args.database_url):
+        print(json.dumps(blocked("database_url_argv_requires_sqlite"), indent=2, sort_keys=True))
+        return 2
     database_url = args.database_url or (webapp.configured_database_url() if args.use_configured_database else "")
     now = parsed_now(args.now)
     batch_size = max(1, min(args.batch_size, 500))
@@ -90,15 +113,27 @@ def _main() -> int:
                     run_id,
                     finalize_graph=finalize_graph,
                 )
-                if version_result is True:
+                if version_result == webapp.PUBLICATION_RETENTION_DELETED:
                     return True
-                if (
-                    version_result is False
-                    and not storage.quote_publication_version_is_current(
-                        run_id, session_id
-                    )
-                ):
+                if version_result == webapp.PUBLICATION_RETENTION_HELD:
+                    raise RetentionGraphHeld("publication_version_held")
+                if version_result == webapp.PUBLICATION_RETENTION_FAILED:
                     return False
+                if version_result == webapp.PUBLICATION_RETENTION_REFERENCED:
+                    raise RetentionPublicationDependency(
+                        "feedback_requires_publication_version"
+                    )
+                if version_result == webapp.PUBLICATION_RETENTION_CURRENT:
+                    if not session_id or session_has_retained_forensic_links(
+                        connection, args.workspace_id, session_id, run_id
+                    ):
+                        raise RetentionPublicationDependency(
+                            "current_publication_requires_generation_graph"
+                        )
+                    return storage.delete_quote_session_for_retention(
+                        session_id,
+                        finalize_graph=finalize_graph,
+                    )
 
                 if not session_id:
                     finalize_graph(connection)
@@ -137,6 +172,7 @@ def _main() -> int:
         "rows_examined": result.examined,
         "deleted": result.deleted,
         "held": result.held,
+        "publication_retained": result.publication_retained,
         "deletion_receipts_created": max(0, result.deleted - result.receipt_deleted),
         "parents_processed": result.parents_processed,
         "standalone_audits_examined": result.standalone_examined,

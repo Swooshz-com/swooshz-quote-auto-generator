@@ -1898,6 +1898,12 @@ class Pr140RegressionTest(unittest.TestCase):
                 self.published = False
                 self.content = b"synthetic-staged-xlsx"
 
+            def _read_quote_session_metadata_for_workspace(self, session_id):
+                return ({"session_id": session_id, "owner_user_id": "user-test"}, [])
+
+            def _quote_session_editable_by_current_user(self, _metadata):
+                return True
+
             def create_or_update_quote_session(self, _payload, **kwargs):
                 self.published = bool(kwargs.get("publish", True))
                 return {

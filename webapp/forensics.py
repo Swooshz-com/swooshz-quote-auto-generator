@@ -176,10 +176,15 @@ class RetentionResult:
     receipt_examined: int = 0
     receipt_deleted: int = 0
     receipt_failed: int = 0
+    publication_retained: int = 0
 
 
 class RetentionGraphHeld(RuntimeError):
     """Signal that a retention graph became protected before commit."""
+
+
+class RetentionPublicationDependency(RetentionGraphHeld):
+    """Signal that a current publication still requires its generation graph."""
 
 
 class ForensicStore:
@@ -249,6 +254,7 @@ class ForensicStore:
         run_id: str = "",
         job_id: str = "",
         idempotency_key: str = "",
+        quote_session_id: str = "",
         parent_run_id: str = "",
         attempt_number: int = 1,
         app_revision: str = "",
@@ -257,6 +263,9 @@ class ForensicStore:
         safe_job_id = safe_reference(job_id, "job-") if job_id else ""
         if job_id and not safe_job_id:
             raise ValueError("Generation job identity is invalid.")
+        safe_session_id = safe_reference(quote_session_id)
+        if quote_session_id and not safe_session_id:
+            raise ValueError("Quote session identity is invalid.")
         if safe_job_id:
             existing = self.run_for_job(safe_job_id)
             if existing:
@@ -265,11 +274,15 @@ class ForensicStore:
                 return str(existing["run_id"])
         now = now or utc_now()
         run_id = safe_reference(run_id, "run-") or self.new_id("run")
+        lock_identities = [("generation_run", run_id)]
+        if safe_session_id:
+            lock_identities.append(("quote_session", safe_session_id))
+        self._acquire_transaction_locks(*lock_identities)
         expiry, original = self._retention(now)
         try:
             self.connection.execute(
-                "insert into sqag_generation_runs (run_id, workspace_id, actor_tracking_id, actor_key_version, job_id, idempotency_key, parent_run_id, attempt_number, job_type, status, started_at, app_revision, evidence_schema_version, retention_expires_at, original_retention_expires_at, legal_hold, deletion_state) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (run_id, self.workspace_id, self.actor_tracking_id, self.actor_key_version, safe_job_id or None, safe_reference(idempotency_key) or safe_job_id or None, safe_reference(parent_run_id, "run-") or None, max(1, int(attempt_number or 1)), safe_feedback_text(job_type, 40) or "unknown", "received", iso_timestamp(now), safe_feedback_text(app_revision, 80) or None, EVIDENCE_SCHEMA_VERSION, expiry, original, 0, "active"),
+                "insert into sqag_generation_runs (run_id, workspace_id, actor_tracking_id, actor_key_version, job_id, idempotency_key, parent_run_id, attempt_number, job_type, status, quote_session_id, started_at, app_revision, evidence_schema_version, retention_expires_at, original_retention_expires_at, legal_hold, deletion_state) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (run_id, self.workspace_id, self.actor_tracking_id, self.actor_key_version, safe_job_id or None, safe_reference(idempotency_key) or safe_job_id or None, safe_reference(parent_run_id, "run-") or None, max(1, int(attempt_number or 1)), safe_feedback_text(job_type, 40) or "unknown", "received", safe_session_id or None, iso_timestamp(now), safe_feedback_text(app_revision, 80) or None, EVIDENCE_SCHEMA_VERSION, expiry, original, 0, "active"),
             )
         except Exception:
             self.connection.rollback()
@@ -309,14 +322,33 @@ class ForensicStore:
         if status not in TERMINAL_RUN_STATES:
             status = "failed"
         now = now or utc_now()
-        safe_session_id = safe_reference(quote_session_id)
-        if safe_session_id:
-            self._acquire_transaction_locks(
-                ("quote_session", safe_session_id),
-            )
+        safe_run_id = safe_reference(run_id, "run-")
+        if not safe_run_id:
+            raise ValueError("Generation run identity is invalid.")
+        requested_session_id = safe_reference(quote_session_id)
+        if quote_session_id and not requested_session_id:
+            raise ValueError("Quote session identity is invalid.")
+        lock_identities = [("generation_run", safe_run_id)]
+        if requested_session_id:
+            lock_identities.append(("quote_session", requested_session_id))
+        self._acquire_transaction_locks(*lock_identities)
+        existing = row_dict(
+            self.connection.execute(
+                "select status, quote_session_id, completed_at from sqag_generation_runs where workspace_id = ? and actor_tracking_id = ? and run_id = ?",
+                (self.workspace_id, self.actor_tracking_id, safe_run_id),
+            ).fetchone()
+        )
+        if not existing:
+            self.connection.rollback()
+            raise ValueError("Generation run could not be finalized.")
+        stored_session_id = safe_reference(existing.get("quote_session_id"))
+        if stored_session_id and requested_session_id and stored_session_id != requested_session_id:
+            self.connection.rollback()
+            raise ValueError("Generation run session identity changed.")
+        effective_session_id = stored_session_id or requested_session_id
         cursor = self.connection.execute(
             "update sqag_generation_runs set status = ?, error_category = ?, quote_session_id = ?, completed_at = ? where workspace_id = ? and actor_tracking_id = ? and run_id = ? and completed_at is null",
-            (status, safe_feedback_text(error_category, 80), safe_session_id, iso_timestamp(now), self.workspace_id, self.actor_tracking_id, safe_reference(run_id, "run-")),
+            (status, safe_feedback_text(error_category, 80), effective_session_id or None, iso_timestamp(now), self.workspace_id, self.actor_tracking_id, safe_run_id),
         )
         if getattr(cursor, "rowcount", 0) != 1:
             existing = row_dict(self.connection.execute("select status from sqag_generation_runs where workspace_id = ? and actor_tracking_id = ? and run_id = ?", (self.workspace_id, self.actor_tracking_id, safe_reference(run_id, "run-"))).fetchone())
@@ -530,7 +562,62 @@ class ForensicStore:
             "manifest": manifest,
         }
 
-    def submit_feedback(self, payload: dict[str, Any]) -> dict[str, str]:
+    def _feedback_submission_session_link(
+        self,
+        session_id: str,
+        publication_context_factory: Callable[[str], dict[str, str]] | None,
+    ) -> tuple[str, str, str]:
+        safe_session_id = safe_reference(session_id)
+        if not safe_session_id:
+            return "", "", "none"
+        self._acquire_transaction_locks(("quote_session", safe_session_id))
+        if publication_context_factory is not None:
+            publication = publication_context_factory(safe_session_id)
+            if isinstance(publication, dict) and safe_feedback_text(
+                publication.get("state"), 20
+            ).lower() == "published":
+                published_run_id = safe_reference(
+                    publication.get("run_id"), "run-"
+                )
+                version_id = safe_reference(
+                    publication.get("version_id"), "run-"
+                ) or published_run_id
+                if not published_run_id or version_id != published_run_id:
+                    return "", "", "session_without_run"
+                linked = row_dict(
+                    self.connection.execute(
+                        "select run_id, quote_session_id from sqag_generation_runs "
+                        "where workspace_id = ? and run_id = ? limit 1",
+                        (self.workspace_id, published_run_id),
+                    ).fetchone()
+                )
+                if (
+                    linked
+                    and safe_reference(linked.get("quote_session_id"))
+                    == safe_session_id
+                ):
+                    return published_run_id, version_id, "current_published_run"
+        blocked_rows = self.connection.execute(
+            "select run_id from sqag_generation_runs where workspace_id = ? "
+            "and quote_session_id = ? and status in "
+            "('blocked','failed','needs_confirmation','needs_review',"
+            "'completed_with_review_required','degraded','cancelled','timed_out') "
+            "order by completed_at desc, run_id desc limit 2",
+            (self.workspace_id, safe_session_id),
+        ).fetchall()
+        if len(blocked_rows) == 1:
+            blocked_run_id = safe_reference(
+                row_dict(blocked_rows[0]).get("run_id"), "run-"
+            )
+            if blocked_run_id:
+                return blocked_run_id, "", "current_blocked_run"
+        return "", "", "session_without_run"
+    def submit_feedback(
+        self,
+        payload: dict[str, Any],
+        *,
+        publication_context_factory: Callable[[str], dict[str, str]] | None = None,
+    ) -> dict[str, str]:
         category = safe_feedback_text(payload.get("category"), 40)
         if category not in FEEDBACK_CATEGORIES:
             raise ValueError("Select a valid feedback category.")
@@ -561,33 +648,58 @@ class ForensicStore:
             if manual_run:
                 resolved_type, resolved_id, manual_status = "generation_run", str(manual_run["run_id"]), "resolved"
                 run_id = run_id or resolved_id
+                run = manual_run
                 session_id = session_id or safe_reference(manual_run.get("quote_session_id"))
             else:
                 validated = safe_reference(payload.get("validated_manual_session_id"))
                 if validated:
                     resolved_type, resolved_id, manual_status = "quote_session", validated, "resolved"
                     session_id = session_id or validated
+        now = utc_now()
+        publication_version_id = ""
+        link_resolution_source = "none"
+        if run_id:
+            if manual_status == "resolved" and resolved_type == "generation_run":
+                link_resolution_source = "manual_run"
+            elif safe_feedback_text(run.get("status"), 40) in {
+                "blocked", "failed", "needs_confirmation", "needs_review",
+                "completed_with_review_required", "degraded", "cancelled", "timed_out",
+            }:
+                link_resolution_source = "current_blocked_run"
+            else:
+                link_resolution_source = "current_run"
+        elif session_id:
+            (
+                run_id,
+                publication_version_id,
+                link_resolution_source,
+            ) = self._feedback_submission_session_link(
+                session_id,
+                publication_context_factory,
+            )
+        if run_id and not resolved_type:
+            resolved_type, resolved_id = "generation_run", run_id
+        link_resolved_at = iso_timestamp(now) if run_id else None
         source = payload.get("diagnostic_metadata") if isinstance(payload.get("diagnostic_metadata"), dict) else {}
         diagnostics = {key: safe_feedback_text(source.get(key), limit) for key, limit in {"app_revision": 80, "browser_family_major": 80, "current_route": 120, "job_state": 40, "product_area": 80, "viewport_bucket": 40}.items()}
-        now = utc_now()
         feedback_id = self.new_id("feedback")
         support_reference = self.new_support_reference()
         expiry, original = self._retention(now)
         values = (
             feedback_id, support_reference, self.workspace_id, self.actor_tracking_id, self.actor_key_version, run_id or None, session_id or None, category, title, message,
             safe_feedback_text(payload.get("expected_result"), 2000) or None, safe_feedback_text(payload.get("actual_result"), 2000) or None, safe_feedback_text(payload.get("reproduction_steps"), 3000) or None,
-            impact, link_choice if include_link else "none", manual_reference or None, manual_status, resolved_type or None, resolved_id or None,
+            impact, link_choice if include_link else "none", manual_reference or None, manual_status, resolved_type or None, resolved_id or None, publication_version_id or None, link_resolution_source, link_resolved_at,
             canonical_json({key: value for key, value in diagnostics.items() if value}), "open", iso_timestamp(now), iso_timestamp(now), expiry, original, expiry, FEEDBACK_RETENTION_POLICY_VERSION, 0, "active",
         )
         self.connection.execute(
-            "insert into sqag_feedback (feedback_id, support_reference, workspace_id, reporter_tracking_id, reporter_key_version, run_id, session_id, category, title, message, expected_result, actual_result, reproduction_steps, impact, link_choice, manual_reference_text, manual_reference_status, resolved_reference_type, resolved_reference_id, diagnostic_metadata_json, status, created_at, updated_at, retention_expires_at, original_retention_expires_at, submission_retention_expires_at, retention_policy_version, legal_hold, deletion_state) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "insert into sqag_feedback (feedback_id, support_reference, workspace_id, reporter_tracking_id, reporter_key_version, run_id, session_id, category, title, message, expected_result, actual_result, reproduction_steps, impact, link_choice, manual_reference_text, manual_reference_status, resolved_reference_type, resolved_reference_id, publication_version_id, link_resolution_source, link_resolved_at, diagnostic_metadata_json, status, created_at, updated_at, retention_expires_at, original_retention_expires_at, submission_retention_expires_at, retention_policy_version, legal_hold, deletion_state) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             values,
         )
         self.connection.execute(
             "insert into sqag_feedback_status_history (history_id, feedback_id, workspace_id, from_status, to_status, actor_tracking_id, actor_key_version, resolution_note, created_at, retention_expires_at, original_retention_expires_at, legal_hold) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (self.new_id("feedback-history"), feedback_id, self.workspace_id, "", "open", self.actor_tracking_id, self.actor_key_version, None, iso_timestamp(now), expiry, original, 0),
         )
-        self.append_audit("feedback_submitted", {"feedback_id": feedback_id, "support_reference": support_reference, "category": category, "linked_run": bool(run_id), "linked_session": bool(session_id), "manual_reference_status": manual_status}, run_id=run_id, feedback_id=feedback_id, session_id=session_id, now=now, commit=False)
+        self.append_audit("feedback_submitted", {"feedback_id": feedback_id, "support_reference": support_reference, "category": category, "linked_run": bool(run_id), "linked_session": bool(session_id), "manual_reference_status": manual_status, "link_resolution_source": link_resolution_source}, run_id=run_id, feedback_id=feedback_id, session_id=session_id, now=now, commit=False)
         self.connection.commit()
         return {"feedback_id": feedback_id, "feedback_report_id": feedback_id, "support_reference": support_reference, "manual_reference_status": manual_status, "status": "open"}
 
@@ -630,6 +742,11 @@ class ForensicStore:
         if not isinstance(report, dict):
             raise LookupError("Forensic evidence is not available.")
         direct_run_id = safe_reference(report.get("run_id"), "run-")
+        publication_version_id = safe_reference(
+            report.get("publication_version_id"), "run-"
+        )
+        if publication_version_id and publication_version_id != direct_run_id:
+            raise LookupError("Forensic evidence is not available.")
         session_id = safe_reference(report.get("session_id"))
         if direct_run_id:
             direct = row_dict(
@@ -645,58 +762,8 @@ class ForensicStore:
             if session_id and linked_session and session_id != linked_session:
                 raise LookupError("Forensic evidence is not available.")
             return direct_run_id
-        if not session_id:
-            raise LookupError("Forensic evidence is not available.")
-        rows = self.connection.execute(
-            "select run.run_id, run.status, evidence.evidence_json, "
-            "evidence.evidence_sha256 from sqag_generation_runs run "
-            "join sqag_generation_evidence evidence "
-            "on evidence.workspace_id = run.workspace_id "
-            "and evidence.run_id = run.run_id "
-            "and evidence.evidence_type = 'generation_manifest' "
-            "where run.workspace_id = ? and run.quote_session_id = ? "
-            "and run.status not in ('received','queued','running','abandoned','superseded') "
-            "order by run.completed_at, run.run_id",
-            (self.workspace_id, session_id),
-        ).fetchall()
-        candidates: list[dict[str, Any]] = []
-        for row in rows:
-            item = row_dict(row)
-            raw = str(item.get("evidence_json") or "")
-            if hashlib.sha256(raw.encode("utf-8")).hexdigest() != str(
-                item.get("evidence_sha256") or ""
-            ):
-                continue
-            try:
-                manifest = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(manifest, dict):
-                continue
-            if safe_reference(manifest.get("generation_run_id"), "run-") != item.get("run_id"):
-                continue
-            if manifest.get("workspace_id") != self.workspace_id:
-                continue
-            artifacts = manifest.get("artifacts")
-            if not isinstance(artifacts, list):
-                continue
-            candidates.append({"run_id": item["run_id"], "artifacts": artifacts})
-        if len(candidates) == 1 and not candidates[0]["artifacts"]:
-            return str(candidates[0]["run_id"])
-        if not candidates or publication_context_factory is None:
-            raise LookupError("Forensic evidence is not available.")
-        publication = publication_context_factory()
-        if not isinstance(publication, dict):
-            raise LookupError("Forensic evidence is not available.")
-        if safe_feedback_text(publication.get("state"), 20).lower() != "published":
-            raise LookupError("Forensic evidence is not available.")
-        published_run_id = safe_reference(publication.get("run_id"), "run-")
-        selected = [
-            item for item in candidates if item.get("run_id") == published_run_id
-        ]
-        if len(selected) != 1:
-            raise LookupError("Forensic evidence is not available.")
-        return published_run_id
+        _ = publication_context_factory, session_id
+        raise LookupError("Forensic evidence is not available.")
 
     def update_feedback_status(
         self,
@@ -1252,6 +1319,7 @@ class ForensicStore:
         examined = deleted = held = failed = review_required = parents = actions = 0
         standalone_examined = standalone_deleted = standalone_held = standalone_failed = 0
         receipt_examined = receipt_deleted = receipt_failed = 0
+        publication_retained = 0
 
         def mark_examined(kind: str, record_id: str, *, state: str = "") -> None:
             if not apply or kind in {"standalone_audit", "deletion_receipt"}:
@@ -1472,6 +1540,13 @@ class ForensicStore:
                     )
                 self.connection.commit()
                 deleted += len(removed)
+            except RetentionPublicationDependency:
+                self.connection.rollback()
+                parents -= 1
+                actions -= 1
+                held += 1
+                publication_retained += 1
+                mark_examined(kind, record_id)
             except RetentionGraphHeld:
                 self.connection.rollback()
                 parents -= 1
@@ -1509,6 +1584,7 @@ class ForensicStore:
             receipt_examined,
             receipt_deleted,
             receipt_failed,
+            publication_retained,
         )
 
     def reconcile_non_terminal_runs(
