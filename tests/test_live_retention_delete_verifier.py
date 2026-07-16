@@ -222,7 +222,7 @@ class FakeBackend:
         except KeyError as exc:
             if self.repeated_delete_unsafe:
                 raise RuntimeError("private repeated-delete uncertainty") from exc
-            raise webapp.ObjectStorageContractError("Artifact is not available.") from exc
+            raise webapp.ObjectStorageNotFoundError("Artifact is not available.") from exc
         if self.tamper_retrieve:
             return content + b"x"
         return content
@@ -579,6 +579,34 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
 
         self.assertEqual(report["status"], "passed")
         self.assertTrue(report["checks"]["repeated_delete_safe"])
+
+    def test_generic_provider_outage_is_not_confirmed_missing(self):
+        verifier = load_verifier()
+        exc = webapp.ObjectStorageContractError("Artifact is not available.")
+        self.assertFalse(verifier._is_confirmed_missing_error(exc))
+
+    def test_cleanup_preserves_metadata_when_object_absence_is_unconfirmed(self):
+        verifier = load_verifier()
+        backend = FakeBackend(verifier.ObjectArtifactMetadata, cleanup_fails=True)
+        metadata = backend.store_artifact(
+            workspace_id="workspace-cleanup",
+            owner_type="generated_quote",
+            owner_id="quote-cleanup",
+            artifact_kind="xlsx",
+            filename="quotation.xlsx",
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            content=b"synthetic-cleanup",
+        )
+
+        cleaned = verifier._cleanup(
+            storage=None,
+            backend=backend,
+            metadata=metadata,
+            ids={"session_a": "quote-cleanup"},
+        )
+
+        self.assertFalse(cleaned)
+        self.assertIn(metadata.storage_key, backend.objects)
 
     def test_cleanup_failure_fails_closed(self):
         verifier = load_verifier()

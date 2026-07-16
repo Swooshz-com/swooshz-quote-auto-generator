@@ -63,6 +63,13 @@ create table if not exists sqag_deletion_receipts (
   unique (workspace_id, record_type, record_id)
 )
 -- SQAG_STATEMENT_BOUNDARY
+create table if not exists sqag_retention_scan_cursors (
+  workspace_id text not null, candidate_type text not null,
+  last_retention_expires_at text not null, last_record_id text not null,
+  updated_at text not null, primary key (workspace_id, candidate_type)
+)
+-- SQAG_STATEMENT_BOUNDARY
+
 create index if not exists sqag_generation_runs_workspace_started_idx on sqag_generation_runs (workspace_id, started_at)
 -- SQAG_STATEMENT_BOUNDARY
 create index if not exists sqag_generation_runs_retention_idx on sqag_generation_runs (workspace_id, deletion_state, retention_expires_at, run_id)

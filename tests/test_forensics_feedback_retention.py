@@ -45,6 +45,12 @@ class ForensicsFeedbackRetentionTest(unittest.TestCase):
 
     def test_feedback_returns_support_reference_and_does_not_copy_evidence(self):
         run_id = self.store.record_run_started("generate", {"image_count": 1})
+        self.store.finish_run(
+            run_id,
+            "completed",
+            quote_session_id="quote-synthetic",
+            canonical_manifest={"artifacts": []},
+        )
         original_expiry = self.connection.execute(
             "select retention_expires_at from sqag_generation_runs where run_id = ?", (run_id,)
         ).fetchone()[0]
@@ -94,13 +100,13 @@ class ForensicsFeedbackRetentionTest(unittest.TestCase):
         self.assertIsNone(row["run_id"])
         self.assertIsNone(row["resolved_reference_id"])
 
-    def test_context_falls_back_only_to_the_same_actor_latest_run(self):
+    def test_context_without_explicit_pair_does_not_reuse_latest_run(self):
         other = ForensicStore(self.connection, "workspace-a", "pid-v1-user-b")
         other.record_run_started("generate", {"image_count": 1})
-        own_run = self.store.record_run_started("generate", {"image_count": 2})
+        self.store.record_run_started("generate", {"image_count": 2})
         context = self.store.feedback_context()
-        self.assertEqual(context["run_id"], own_run)
-        self.assertEqual(context["source"], "recent_generation")
+        self.assertEqual(context["run_id"], "")
+        self.assertEqual(context["source"], "none")
 
     def test_legal_hold_is_audited_without_resetting_original_expiry(self):
         run_id = self.store.record_run_started("generate", {"image_count": 1})

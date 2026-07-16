@@ -583,6 +583,64 @@ without rewriting lifecycle dates.
 
 The approved visible Feedback, Privacy, and Terms UI remains unchanged.
 internal_alpha_ready=false and production_ready=false remain unchanged.
+### PR #140 seven-blocker forensic closure (2026-07-16)
+
+The exact starting head df9cb87648da169824d3161ef30bb1c5b528fd99
+was tested before repair. Seven deterministic regressions reproduced the
+atomic-publication store-open exception masking, stale run/session feedback
+pairing, orphaned mixed feedback/run audit rows, immortal deletion receipts,
+standalone-audit starvation behind a held prefix, missing manifests for
+accepted validation-blocked runs, and the unrelated AGENTS.md base drift.
+
+Atomic-publication intent is now computed before forensic storage is opened.
+Any store-open or finalisation failure therefore returns the existing generic
+failed result in internal UAT and deploy postures, leaving the caller's staged
+publication compensation path reachable without exposing the original
+exception.
+
+Client feedback context is one explicit (quote_session_id, generation_run_id)
+transition. New, restored, deleted, duplicated, and switched quotes clear or
+restore the run only when the saved pair belongs to the active session. The
+backend independently verifies the owned run's session against the validated
+session and prefers the validated session on mismatch.
+
+Feedback linkage owns the lifecycle of every audit row carrying its
+feedback_id, including rows that also carry a run_id. Those mixed rows are
+feedback workflow evidence, not the run's canonical generation manifest.
+Feedback deletion removes them transactionally, while an active hold on the
+feedback row, audit row, linked run graph, or bounded linked-session graph
+still blocks the whole feedback graph. This prevents dangling identifiers
+without weakening held run evidence. Legal-hold application now maps a
+feedback-linked audit to the feedback graph advisory-lock identity before the
+target recheck, matching the lock used by Postgres retention deletion.
+
+Expired deletion receipts are workspace-scoped retention candidates and are
+deleted directly without authorisation rows or replacement receipts, so receipt
+cleanup cannot recurse. Legal holds apply to canonical run, evidence, audit,
+feedback, and feedback-history records; minimized deletion receipts are not
+hold targets. Standalone audits use a durable workspace/type cursor stored
+outside immutable event content. Apply passes advance across held and failed
+rows and wrap after the bounded keyset is exhausted; dry runs neither read nor
+mutate cursor progress. Metrics separately report standalone examined, held,
+failed, and deleted rows plus receipt examined, failed, and deleted rows.
+
+Every accepted pre-generator terminal path writes a privacy-minimized canonical
+manifest with lifecycle stage, terminal status, bounded category, input
+metadata/checksums when decodable, request-shape hash, and an empty artifact
+list. Raw uploads, prompts, validation messages, stdout, and stderr are omitted.
+Pre-acceptance failures still create no run or manifest. Exact Basis/Output
+request evidence is capped at 1 MiB before run acceptance, preventing invalid
+requests from creating unbounded immutable database rows while successful
+canonical manifests retain exact reconstruction data. AGENTS.md is restored
+byte-for-byte to the PR base; governance changes remain outside PR #140.
+
+The final diff-focused security review also hardened the opt-in live retention
+verifier. Only an authoritative provider not-found condition now proves object
+absence; generic outages remain failures, and cleanup preserves database metadata
+whenever provider-object absence cannot be confirmed. This does not constitute
+live provider evidence or change either readiness result.
+
+
 ## Security Audit
 
 Codex Security standard scan status: complete.

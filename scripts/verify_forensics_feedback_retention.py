@@ -40,7 +40,14 @@ def run_verification(work_dir: Path | None = None) -> dict[str, object]:
         store = ForensicStore(connection, "workspace-synthetic", "pid-v1-synthetic")
 
         run_id = store.record_run_started("generate", {"image_count": 2, "payload_shape_sha256": "0" * 64})
-        store.finish_run(run_id, "blocked", error_category="images_missing", result_summary={"artifact_count": 0})
+        store.finish_run(
+            run_id,
+            "blocked",
+            error_category="images_missing",
+            quote_session_id="quote-synthetic",
+            result_summary={"artifact_count": 0},
+            canonical_manifest={"generator_executed": False, "artifacts": []},
+        )
         run_row = dict(connection.execute("select * from sqag_generation_runs where run_id = ?", (run_id,)).fetchone())
         evidence_rows = [dict(row) for row in connection.execute("select * from sqag_generation_evidence where run_id = ?", (run_id,)).fetchall()]
         audit_types = [row[0] for row in connection.execute("select event_type from sqag_audit_events where run_id = ? order by created_at, event_id", (run_id,)).fetchall()]
@@ -135,7 +142,10 @@ def run_verification(work_dir: Path | None = None) -> dict[str, object]:
         ).fetchone()[0] == 0
         checks = {
             "blocked_attempt_is_durable": run_row["status"] == "blocked" and run_row["error_category"] == "images_missing",
-            "canonical_evidence_is_hashed": len(evidence_rows) == 2 and all(len(row["evidence_sha256"]) == 64 for row in evidence_rows),
+            "canonical_evidence_is_hashed": {
+                row["evidence_type"] for row in evidence_rows
+            } == {"request_manifest", "result_summary", "generation_manifest"}
+            and all(len(row["evidence_sha256"]) == 64 for row in evidence_rows),
             "append_only_audit_covers_lifecycle": {"generation_received", "generation_blocked"}.issubset(set(audit_types)),
             "feedback_links_without_evidence_copy": feedback_row["run_id"] == run_id and feedback_row["session_id"] == "quote-synthetic" and feedback_row["support_reference"].startswith("SQAG-FB-") and "pricing mismatch" not in feedback_row["diagnostic_metadata_json"] and history_count == 1,
             "three_calendar_year_rule_handles_leap_day": calendar_expiry == dt.datetime(2027, 2, 28, tzinfo=dt.timezone.utc),

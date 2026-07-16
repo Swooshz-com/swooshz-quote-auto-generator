@@ -182,6 +182,7 @@ const state = {
   dashboardOperation: null,
   quoteSessionId: "",
   lastGenerationRunId: "",
+  lastGenerationRunSessionId: "",
   quoteSessions: [],
   quoteSessionLoadError: "",
   quoteSessionDashboardLoadId: 0,
@@ -655,6 +656,34 @@ function safeQuoteSessionId(value = "") {
   return /^quote-[A-Za-z0-9_-]{3,64}$/.test(text) ? text : "";
 }
 
+function safeGenerationRunId(value = "") {
+  const text = String(value || "").trim();
+  return /^run-[A-Za-z0-9_-]{8,80}$/.test(text) ? text : "";
+}
+
+function currentGenerationContext() {
+  const sessionId = safeQuoteSessionId(state.quoteSessionId || "");
+  const runId = safeGenerationRunId(state.lastGenerationRunId || "");
+  const runSessionId = safeQuoteSessionId(state.lastGenerationRunSessionId || "");
+  return {
+    session_id: sessionId,
+    run_id: runId && runSessionId === sessionId ? runId : "",
+  };
+}
+
+function transitionGenerationContext(sessionId = "", runId = "") {
+  const safeSessionId = safeQuoteSessionId(sessionId || "");
+  const safeRunId = safeGenerationRunId(runId || "");
+  state.quoteSessionId = safeSessionId;
+  state.lastGenerationRunId = safeRunId;
+  state.lastGenerationRunSessionId = safeRunId ? safeSessionId : "";
+  return {
+    session_id: safeSessionId,
+    run_id: safeRunId,
+  };
+}
+
+
 function randomQuoteSessionToken() {
   const bytes = new Uint8Array(12);
   if (window.crypto?.getRandomValues) {
@@ -746,7 +775,7 @@ function normalizeActiveJob(job = {}, options = {}) {
 function ensureClientQuoteSessionId() {
   const existingSessionId = safeQuoteSessionId(state.quoteSessionId || "");
   if (existingSessionId) return existingSessionId;
-  state.quoteSessionId = newClientQuoteSessionId();
+  transitionGenerationContext(newClientQuoteSessionId(), "");
   saveSessionState();
   return state.quoteSessionId;
 }
@@ -3026,6 +3055,7 @@ function buildSessionSnapshot() {
     pricingReferenceSource: state.pricingReferenceSource,
     selectedPresetValue: state.selectedPresetValue,
     quoteSessionId: state.quoteSessionId,
+    generationContext: currentGenerationContext(),
     quoteSessionDraftSaveStarted: state.quoteSessionDraftSaveStarted,
     quoteSessionRestoredSessionId: state.quoteSessionRestoredSessionId,
     quoteSessionRestoredDraftKey: state.quoteSessionRestoredDraftKey,
@@ -3269,7 +3299,11 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.profileId = saved.profileId || "";
   state.pricingReferenceId = saved.pricingReferenceId || saved.profileId || "";
   state.pricingReferenceSource = saved.pricingReferenceSource || "";
-  state.quoteSessionId = safeQuoteSessionId(options.sessionId || saved.quoteSessionId || "");
+  const targetSessionId = safeQuoteSessionId(options.sessionId || saved.quoteSessionId || "");
+  const savedGenerationContext = saved.generationContext && typeof saved.generationContext === "object"
+    ? saved.generationContext : {};
+  const savedRunMatchesSession = safeQuoteSessionId(savedGenerationContext.session_id || "") === targetSessionId;
+  transitionGenerationContext(targetSessionId, savedRunMatchesSession ? savedGenerationContext.run_id : "");
   state.quoteSessionDraftSaveStarted = Boolean(saved.quoteSessionDraftSaveStarted || options.sessionId);
   const restoredSessionId = safeQuoteSessionId(saved.quoteSessionRestoredSessionId || "");
   state.quoteSessionRestoredSessionId = restoredSessionId && restoredSessionId === state.quoteSessionId ? restoredSessionId : "";
@@ -4268,7 +4302,7 @@ async function startNewQuote() {
 
 function resetCurrentQuoteDraftState() {
   clearQuoteSessionDraftSaveTimer();
-  state.quoteSessionId = "";
+  transitionGenerationContext("", "");
   state.quoteSessionDraftSaveStarted = false;
   clearRestoredQuoteSessionBaseline();
   resetQuoteCommercialTouched();
@@ -9843,10 +9877,8 @@ function feedbackViewportBucket() {
 async function loadFeedbackContext() {
   if (!elements.feedbackLinkContext) return;
   elements.feedbackLinkContext.textContent = "Checking the most relevant authorised quote context...";
-  const query = new URLSearchParams({
-    run_id: state.lastGenerationRunId || "",
-    session_id: safeQuoteSessionId(state.quoteSessionId || ""),
-  });
+  const generationContext = currentGenerationContext();
+  const query = new URLSearchParams(generationContext);
   try {
     const response = await fetch(`/api/feedback/context?${query.toString()}`, { cache: "no-store" });
     const data = await jsonFromResponse(response);
@@ -10331,7 +10363,11 @@ async function saveCurrentQuoteSession(options = {}) {
       return null;
     }
     const session = data.quote_session || {};
-    state.quoteSessionId = safeQuoteSessionId(session.session_id || payload.session_id);
+    const savedSessionId = safeQuoteSessionId(session.session_id || payload.session_id);
+    const currentContext = currentGenerationContext();
+    transitionGenerationContext(
+      savedSessionId, currentContext.session_id === savedSessionId ? currentContext.run_id : ""
+    );
     mergeDashboardQuoteSession(session);
     if (currentQuoteSessionIsRestoredFromDashboard()) {
       state.quoteSessionRestoredDraftKey = quoteSessionDraftComparisonKey();
@@ -11707,7 +11743,7 @@ async function confirmQuoteSessionDelete() {
     return;
   }
   if (sessionIds.includes(safeQuoteSessionId(state.quoteSessionId))) {
-    state.quoteSessionId = "";
+    transitionGenerationContext("", "");
     saveSessionState();
   }
   state.dashboardSelectedSessionIds = dashboardSelectedSessionIds().filter((sessionId) => !sessionIds.includes(sessionId));
@@ -12373,7 +12409,8 @@ async function handleGenerate(options = {}) {
   syncControlStates();
   await ensureQuoteSession({ quoteGenerated: true });
   const started = await startJob(jobType, buildPayload({ viewPdf }), { jobId: operation.id });
-  state.lastGenerationRunId = String(started.data?.generation_run_id || state.lastGenerationRunId || "");
+  const startedContext = currentGenerationContext();
+  transitionGenerationContext(startedContext.session_id, started.data?.generation_run_id || startedContext.run_id);
   if (!started.ok) {
     if (started.data?.page_unloading) return;
     state.isGenerating = false;
@@ -12384,7 +12421,8 @@ async function handleGenerate(options = {}) {
     syncControlStates();
     return;
   }
-  state.lastGenerationRunId = String(started.data.generation_run_id || state.lastGenerationRunId || "");
+  const acceptedContext = currentGenerationContext();
+  transitionGenerationContext(acceptedContext.session_id, started.data.generation_run_id || acceptedContext.run_id);
   state.activeJob = { ...operation, id: started.data.job_id || operation.id, phase: "running" };
   saveSessionState();
 
@@ -12398,10 +12436,11 @@ async function handleGenerate(options = {}) {
   clearActiveJob();
 
   const data = polled.data.result || polled.data || {};
-  state.lastGenerationRunId = String(data.generation_run_id || polled.data.generation_run_id || state.lastGenerationRunId || "");
-  if (data.quote_session?.session_id) {
-    state.quoteSessionId = safeQuoteSessionId(data.quote_session.session_id) || state.quoteSessionId;
-  }
+  const previousContext = currentGenerationContext();
+  const resultSessionId = safeQuoteSessionId(data.quote_session?.session_id || previousContext.session_id);
+  const resultRunId = data.generation_run_id || polled.data.generation_run_id
+    || (previousContext.session_id === resultSessionId ? previousContext.run_id : "");
+  transitionGenerationContext(resultSessionId, resultRunId);
   if (!polled.ok || ["blocked", "failed"].includes(polled.data.status) || data.status === "blocked" || data.status === "failed") {
     setWorkflowStage(state.activeSidePanel === "output" ? "completed" : "details_review");
     setResultStatus(data.status || "Failed", "is-bad");
@@ -12610,9 +12649,11 @@ async function resumeSavedJob() {
     }
 
     const data = polled.data.result || polled.data || {};
-    if (data.quote_session?.session_id) {
-      state.quoteSessionId = safeQuoteSessionId(data.quote_session.session_id) || state.quoteSessionId;
-    }
+    const previousContext = currentGenerationContext();
+    const resultSessionId = safeQuoteSessionId(data.quote_session?.session_id || previousContext.session_id);
+    const resultRunId = data.generation_run_id || polled.data.generation_run_id
+      || (previousContext.session_id === resultSessionId ? previousContext.run_id : "");
+    transitionGenerationContext(resultSessionId, resultRunId);
     if (!polled.ok || ["blocked", "failed"].includes(polled.data.status) || data.status === "blocked" || data.status === "failed") {
       state.isGenerating = false;
       clearActiveJob();

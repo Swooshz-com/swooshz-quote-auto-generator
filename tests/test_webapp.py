@@ -16984,6 +16984,9 @@ function normalizeActiveJob(job) { return job?.id ? job : null; }
 function saveWorkspaceViewState() {}
 
 eval([
+  "safeQuoteSessionId",
+  "safeGenerationRunId",
+  "currentGenerationContext",
   "normalizedContentFingerprint",
   "sessionFileKeyForImage",
   "sessionFileKeyForLogo",

@@ -100,6 +100,8 @@ let browser = null;
 const screenshots = [];
 const browserProblems = [];
 
+const feedbackContextRequests = [];
+let feedbackContextEvidence = {};
 try {
   if (await healthOk()) {
     throw new Error(`Port ${port} already serves an SQAG health response; refusing to reuse a stale server.`);
@@ -126,10 +128,80 @@ try {
       browserProblems.push(`console:${message.text()}`);
     }
   });
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === "/api/feedback/context") {
+      feedbackContextRequests.push(url.toString());
+    }
+  });
 
   await page.goto(baseUrl, { waitUntil: "networkidle" });
   await page.locator("#feedbackButton").waitFor({ state: "visible" });
   screenshots.push(await capture(page, "01-app-shell-feedback-terms-privacy.png"));
+  const generationScenario = await page.evaluate(() => {
+    transitionGenerationContext("quote-synthetic-a", "run-synthetic-a123");
+    const savedA = buildSessionSnapshot();
+    resetCurrentQuoteDraftState();
+    const sessionB = ensureClientQuoteSessionId();
+    return {
+      savedA,
+      sessionB,
+      afterStartB: currentGenerationContext(),
+    };
+  });
+  if (generationScenario.afterStartB.run_id) {
+    throw new Error("Starting quote B retained quote A generation run.");
+  }
+  const firstContextRequest = page.waitForRequest((request) => (
+    new URL(request.url()).pathname === "/api/feedback/context"
+  ));
+  await page.locator("#feedbackButton").click();
+  await page.locator("#feedbackModal").waitFor({ state: "visible" });
+  const quoteBContextUrl = new URL((await firstContextRequest).url());
+  if (quoteBContextUrl.searchParams.get("run_id")) {
+    throw new Error("Quote B feedback lookup sent quote A generation run.");
+  }
+  if (quoteBContextUrl.searchParams.get("session_id") !== generationScenario.sessionB) {
+    throw new Error("Quote B feedback lookup did not send the active quote session.");
+  }
+  await page.locator("#cancelFeedbackButton").click();
+  await page.locator("#feedbackModal").waitFor({ state: "hidden" });
+
+  const restoreScenario = await page.evaluate(async ({ savedA, sessionB }) => {
+    await applyQuoteSessionSnapshot(savedA, {
+      sessionId: "quote-synthetic-a",
+      forceQuoteView: true,
+    });
+    const authoritativeA = currentGenerationContext();
+    const mismatchedRecovery = {
+      ...savedA,
+      quoteSessionId: sessionB,
+      generationContext: {
+        session_id: "quote-synthetic-a",
+        run_id: "run-synthetic-a123",
+      },
+    };
+    await applyQuoteSessionSnapshot(mismatchedRecovery, {
+      sessionId: sessionB,
+      forceQuoteView: true,
+    });
+    return {
+      authoritativeA,
+      mismatchedB: currentGenerationContext(),
+    };
+  }, { savedA: generationScenario.savedA, sessionB: generationScenario.sessionB });
+  if (restoreScenario.authoritativeA.run_id !== "run-synthetic-a123") {
+    throw new Error("Authoritative quote A run/session pair was not restored.");
+  }
+  if (restoreScenario.mismatchedB.run_id) {
+    throw new Error("Browser recovery accepted a mismatched quote A run for quote B.");
+  }
+  feedbackContextEvidence = {
+    quote_b_lookup_omitted_stale_run: true,
+    authoritative_pair_restored: true,
+    mismatched_recovery_rejected: true,
+  };
+
 
   await page.locator("#feedbackButton").click();
   await page.locator("#feedbackModal").waitFor({ state: "visible" });
@@ -166,6 +238,8 @@ try {
     base_url: baseUrl,
     feedback_status: feedbackStatus,
     screenshots,
+    feedback_context_evidence: feedbackContextEvidence,
+    feedback_context_requests: feedbackContextRequests.length,
     fresh_server_health_verified: true,
     production_ready: false,
   }, null, 2));

@@ -39,6 +39,7 @@ from webapp.object_storage import (
     ObjectStorageBackend,
     ObjectStorageConfigurationError,
     ObjectStorageContractError,
+    ObjectStorageNotFoundError,
     S3CompatibleObjectStorageBackend,
     artifact_checksum,
     object_storage_provider_status,
@@ -447,10 +448,7 @@ def _runtime_download_denied(storage: object, session_id: str, backend: ObjectSt
 
 
 def _is_confirmed_missing_error(exc: Exception) -> bool:
-    return isinstance(exc, ObjectStorageContractError) and str(exc) in {
-        "Artifact is not available.",
-        "Artifact is not available for this workspace.",
-    }
+    return isinstance(exc, ObjectStorageNotFoundError)
 
 
 def _delete_object_or_confirm_missing(backend: ObjectStorageBackend, metadata: ObjectArtifactMetadata) -> tuple[bool, bool]:
@@ -500,16 +498,22 @@ def _cleanup_storage(storage: object, session_id: str) -> bool:
 
 def _cleanup(*, storage: object | None, backend: ObjectStorageBackend | None, metadata: ObjectArtifactMetadata | None, ids: Mapping[str, str]) -> bool:
     ok = True
+    object_absence_confirmed = True
     if backend is not None and metadata is not None:
         try:
-            _delete_object_or_confirm_missing(backend, metadata)
+            removed, confirmed_missing = _delete_object_or_confirm_missing(backend, metadata)
+            object_absence_confirmed = bool(removed and confirmed_missing)
+            ok = object_absence_confirmed
         except Exception:
+            object_absence_confirmed = False
             ok = False
-    if storage is not None:
+    if storage is not None and object_absence_confirmed:
         try:
             ok = bool(_cleanup_storage(storage, ids["session_a"])) and ok
         except Exception:
             ok = False
+    elif storage is not None:
+        ok = False
     return ok
 
 

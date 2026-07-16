@@ -71,6 +71,7 @@ from webapp.object_storage import (
     ObjectStorageBackend,
     ObjectStorageConfigurationError,
     ObjectStorageContractError,
+    ObjectStorageNotFoundError,
     S3CompatibleObjectStorageBackend,
     artifact_checksum,
     object_artifact_key,
@@ -169,6 +170,7 @@ MAX_RENDERED_PDF_PAGES = 12
 MAX_RENDERED_PDF_PAGE_BYTES = 1024 * 1024
 PDF_RENDER_TARGET_LONG_EDGE_PX = 1600
 MAX_JOB_REQUEST_BYTES = (((MAX_REFERENCE_IMAGES * max(MAX_IMAGE_BYTES, MAX_PDF_BYTES)) + 2) // 3) * 4 + 2 * 1024 * 1024
+MAX_FORENSIC_REQUEST_EVIDENCE_BYTES = 1024 * 1024
 MAX_PRICING_REFERENCE_BYTES = 10 * 1024 * 1024
 MAX_PROFILE_LAYOUT_BYTES = 10 * 1024 * 1024
 MAX_PROFILE_LAYOUT_RULES_BYTES = 256 * 1024
@@ -8496,6 +8498,10 @@ SQAG_FORENSIC_REQUIRED_COLUMNS = {
     "sqag_retention_delete_authorizations": {
         "authorization_id", "workspace_id", "record_type", "record_id", "created_at",
     },
+    "sqag_retention_scan_cursors": {
+        "workspace_id", "candidate_type", "last_retention_expires_at",
+        "last_record_id", "updated_at",
+    },
 }
 
 SQAG_FORENSIC_REQUIRED_INDEXES = {
@@ -9416,6 +9422,7 @@ class DatabaseSqagStorage:
                 (
                     sqlite3.Error,
                     ObjectStorageContractError,
+    ObjectStorageNotFoundError,
                     SqagStorageAccessError,
                 ),
             )
@@ -18629,6 +18636,24 @@ def forensic_store_for_auth_session(auth_session: dict[str, Any] | None = None):
         yield ForensicStore(connection, workspace_id, actor_tracking_id, local_mode=True, actor_key_version_value="local-v1")
 
 
+def forensic_request_evidence_error(payload: dict[str, Any]) -> str:
+    evidence_values = {
+        "approved_basis": payload.get("quote_basis_sections")
+        if isinstance(payload.get("quote_basis_sections"), list)
+        else [],
+        "output_rows": payload.get("line_items")
+        if isinstance(payload.get("line_items"), list)
+        else [],
+    }
+    try:
+        encoded = json.dumps(evidence_values, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError):
+        return "Quote request details are invalid."
+    if len(encoded) > MAX_FORENSIC_REQUEST_EVIDENCE_BYTES:
+        return "Quote request details are too large."
+    return ""
+
+
 def forensic_request_summary(payload: dict[str, Any]) -> dict[str, Any]:
     approved_basis = copy.deepcopy(payload.get("quote_basis_sections")) if isinstance(payload.get("quote_basis_sections"), list) else []
     output_rows = copy.deepcopy(payload.get("line_items")) if isinstance(payload.get("line_items"), list) else []
@@ -18664,6 +18689,56 @@ def forensic_result_summary(result: dict[str, Any]) -> dict[str, Any]:
         "artifacts": files,
         "pricing_match_count": len(result.get("pricing_matches")) if isinstance(result.get("pricing_matches"), list) else 0,
         "export_status_sha256": hashlib.sha256(clean_text(result.get("export_status")).encode("utf-8")).hexdigest(),
+    }
+
+
+def pre_generator_terminal_manifest(
+    job_id: str,
+    payload: dict[str, Any],
+    *,
+    terminal_status: str,
+    job_type: str = "generate",
+    lifecycle_stage: str = "request_validation",
+    error_category: str,
+) -> dict[str, Any]:
+    inputs: list[dict[str, Any]] = []
+    for entry in image_entries(payload)[:MAX_REFERENCE_IMAGES]:
+        mime_type = reference_file_mime_type(entry)
+        try:
+            declared_size = max(0, int(entry.get("size") or 0))
+        except (TypeError, ValueError):
+            declared_size = 0
+        item = {
+            "role": "booth_render",
+            "content_type": mime_type[:128],
+            "declared_size_bytes": declared_size,
+        }
+        try:
+            max_bytes = MAX_PDF_BYTES if mime_type == "application/pdf" else MAX_IMAGE_BYTES
+            content = decode_reference_data_url_bytes(entry, max_bytes)
+            item["size_bytes"] = len(content)
+            item["sha256"] = hashlib.sha256(content).hexdigest()
+        except (TypeError, ValueError):
+            item["content_valid"] = False
+        inputs.append(item)
+    return {
+        "generation_schema_version": 1,
+        "job_id": safe_resource_id(job_id, ""),
+        "job_type": clean_text(job_type)[:40] or "generate",
+        "lifecycle_stage": clean_text(lifecycle_stage)[:80] or "request_validation",
+        "terminal_status": clean_text(terminal_status) or "failed",
+        "error_category": clean_text(error_category)[:80],
+        "generator_executed": False,
+        "request": {
+            "schema": "swooshz.sqag.blocked-generation-request.v1",
+            "image_count": len(image_entries(payload)),
+            "has_quote_session": isinstance(payload.get("quote_session"), dict),
+            "payload_shape_sha256": hashlib.sha256(
+                json.dumps(sorted(str(key) for key in payload.keys()), separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+        },
+        "inputs": inputs,
+        "artifacts": [],
     }
 
 
@@ -18717,10 +18792,13 @@ def finish_generation_forensics(
         return result
     enriched = dict(result)
     enriched["generation_run_id"] = run_id
+    atomic_publication = bool(
+        publication_storage is not None
+        and safe_quote_session_id(publication_session_id, "")
+    )
     try:
         quote_session = result.get("quote_session") if isinstance(result.get("quote_session"), dict) else {}
         with forensic_store_for_auth_session(auth_session) as store:
-            atomic_publication = bool(publication_storage and safe_quote_session_id(publication_session_id, ""))
             try:
                 store.finish_run(
                     run_id,
@@ -18993,7 +19071,18 @@ def create_job(
         return {"status": "blocked", "errors": ["Job type must be draft, basis_chat, generate, or generate_pdf."]}
     generation_run_id = ""
     def blocked(errors: list[str], category: str) -> dict[str, Any]:
-        return finish_generation_forensics(generation_run_id, {"status": "blocked", "errors": errors}, auth_session, error_category=category)
+        return finish_generation_forensics(
+            generation_run_id,
+            {"status": "blocked", "errors": errors},
+            auth_session,
+            error_category=category,
+            canonical_manifest=(
+                pre_generator_terminal_manifest(
+                    job_id, payload, terminal_status="blocked", error_category=category, job_type=normalized_type
+                )
+                if generation_run_id else None
+            ),
+        )
     requested_job_id = clean_text(requested_job_id)
     if requested_job_id and not re.fullmatch(r"job-[A-Za-z0-9_-]{8,80}", requested_job_id):
         return blocked(["Job request could not be resumed."], "job_resume_invalid")
@@ -19005,6 +19094,10 @@ def create_job(
                     return {"status": "blocked", "errors": ["Job request could not be resumed."]}
                 return public_job(existing)
     job_id = requested_job_id or f"job-{secrets.token_hex(6)}"
+    evidence_error = forensic_request_evidence_error(payload)
+    if normalized_type in {"generate", "generate_pdf"} and evidence_error:
+        return blocked([evidence_error], "request_evidence_too_large")
+
     if normalized_type in {"generate", "generate_pdf"}:
         try:
             generation_run_id = begin_generation_forensics(
@@ -19113,6 +19206,15 @@ def run_quote_job(
     generation_run_id = clean_text(payload.get("_generation_run_id"))
     job_id = safe_resource_id(job_id, f"job-{secrets.token_hex(6)}")
 
+    evidence_error = forensic_request_evidence_error(payload)
+    if evidence_error:
+        result = {"job_id": job_id, "status": "blocked", "errors": [evidence_error]}
+        if not generation_run_id:
+            return result
+        return finish_generation_forensics(
+            generation_run_id, result, auth_session, error_category="request_evidence_too_large"
+        )
+
     if not generation_run_id:
         try:
             generation_run_id = begin_generation_forensics(
@@ -19146,12 +19248,35 @@ def run_quote_job(
                     )
                 )
             return storage_access_error_payload(exc)
+    def terminal_manifest(
+        status: str, category: str, lifecycle_stage: str = "request_validation"
+    ) -> dict[str, Any]:
+        return pre_generator_terminal_manifest(
+            job_id,
+            payload,
+            terminal_status=status,
+            error_category=category,
+            job_type="generate_pdf" if clean_text(pdf_mode).lower() != "none" else "generate",
+            lifecycle_stage=lifecycle_stage,
+        )
 
+    def storage_block(exc: SqagStorageAccessError) -> dict[str, Any]:
+        result = storage_access_error_payload(exc)
+        return finish_generation_forensics(
+            generation_run_id,
+            result,
+            auth_session,
+            error_category=exc.reason,
+            canonical_manifest=terminal_manifest(
+                clean_text(result.get("status")) or "failed", exc.reason, "storage_posture"
+            ),
+        )
     def blocked(errors: list[str], category: str) -> dict[str, Any]:
         return finish_generation_forensics(
             generation_run_id,
             {"job_id": job_id, "status": "blocked", "errors": errors},
             auth_session,
+            canonical_manifest=terminal_manifest("blocked", category),
             error_category=category,
         )
 
@@ -19174,20 +19299,18 @@ def run_quote_job(
         try:
             quote_session_storage = quote_session_storage_for_auth_session(auth_session)
         except SqagStorageAccessError as exc:
-            return finish_generation_forensics(generation_run_id, storage_access_error_payload(exc), auth_session, error_category=exc.reason)
+            return storage_block(exc)
     elif configured_artifact_storage_mode() == "object":
-        return finish_generation_forensics(generation_run_id, storage_access_error_payload(
-            SqagStorageAccessError(
+        return storage_block(SqagStorageAccessError(
                 QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
                 status=503,
                 reason="object_artifact_storage_unavailable",
-            )
-        ), auth_session, error_category="object_artifact_storage_unavailable")
+            ))
 
     try:
         ensure_quote_artifact_storage_available_for_auth_session(auth_session)
     except SqagStorageAccessError as exc:
-        return finish_generation_forensics(generation_run_id, storage_access_error_payload(exc), auth_session, error_category=exc.reason)
+        return storage_block(exc)
 
     output_root = output_root or configured_output_root()
     tmp_root = tmp_root or configured_tmp_root()

@@ -264,6 +264,33 @@ class ObjectStorageProviderConfigTest(unittest.TestCase):
         client.head_bucket = mock.Mock(side_effect=RuntimeError("private-provider-response"))
         self.assertFalse(backend.readiness_probe())
 
+    def test_s3_adapter_distinguishes_authoritative_missing_from_provider_outage(self):
+        client = FakeS3Client()
+        backend = object_storage.S3CompatibleObjectStorageBackend(bucket="synthetic", client=client)
+        metadata = backend.store_artifact(
+            workspace_id="workspace-missing",
+            owner_type="generated_quote",
+            owner_id="quote-missing",
+            artifact_kind="xlsx",
+            filename="quotation.xlsx",
+            content_type="application/octet-stream",
+            content=b"synthetic-object",
+        )
+
+        missing = RuntimeError("private provider detail")
+        missing.response = {
+            "Error": {"Code": "NoSuchKey"},
+            "ResponseMetadata": {"HTTPStatusCode": 404},
+        }
+        client.get_object = mock.Mock(side_effect=missing)
+        with self.assertRaises(object_storage.ObjectStorageNotFoundError):
+            backend.retrieve_artifact(metadata, workspace_id="workspace-missing")
+
+        client.get_object = mock.Mock(side_effect=TimeoutError("private provider timeout"))
+        with self.assertRaises(object_storage.ObjectStorageContractError) as captured:
+            backend.retrieve_artifact(metadata, workspace_id="workspace-missing")
+        self.assertNotIsInstance(captured.exception, object_storage.ObjectStorageNotFoundError)
+
     def test_object_artifact_key_preserves_existing_short_safe_shape(self):
         key = object_storage.object_artifact_key(
             workspace_id="workspace-a",
