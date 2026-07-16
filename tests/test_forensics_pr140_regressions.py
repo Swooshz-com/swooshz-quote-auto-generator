@@ -1620,11 +1620,6 @@ class Pr140RegressionTest(unittest.TestCase):
                     generation_job_id="job-publication123",
                 )
                 self.assertFalse(retried["status"]["quote_generated"])
-                artifact_table = (
-                    "sqag_object_artifacts"
-                    if artifact_mode == "object"
-                    else "sqag_quote_artifacts"
-                )
                 with storage.connection() as connection:
                     self.assertEqual(
                         connection.execute(
@@ -1635,13 +1630,23 @@ class Pr140RegressionTest(unittest.TestCase):
                     )
                     self.assertEqual(
                         connection.execute(
-                            f"select count(*) from {artifact_table} where workspace_id = ? and session_id = ?",
-                            ("workspace-publication", "quote-publication123"),
+                            (
+                                "select count(*) from sqag_object_artifacts "
+                                "where workspace_id = ? and owner_type = ? and owner_id = ?"
+                                if artifact_mode == "object"
+                                else "select count(*) from sqag_quote_publication_artifacts "
+                                "where workspace_id = ? and run_id = ?"
+                            ),
+                            (
+                                ("workspace-publication", "generated_quote_version", run_id)
+                                if artifact_mode == "object"
+                                else ("workspace-publication", run_id)
+                            ),
                         ).fetchone()[0],
                         1,
                     )
                 evidence_files = storage.quote_session_evidence_files(
-                    "quote-publication123"
+                    "quote-publication123", run_id
                 )
                 self.assertEqual(evidence_files[0]["sha256"], digest)
                 self.assertEqual(evidence_files[0]["bytes"], len(content))
@@ -1912,7 +1917,7 @@ class Pr140RegressionTest(unittest.TestCase):
                     },
                 }
 
-            def quote_session_evidence_files(self, _session_id):
+            def quote_session_evidence_files(self, _session_id, _run_id=""):
                 return [
                     {
                         "name": "quotation.xlsx",

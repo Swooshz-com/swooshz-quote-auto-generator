@@ -22,6 +22,7 @@ SAFE_SEGMENT_MAX_LENGTH = 120
 TRANSFORMED_IDENTITY_MARKER = "~"
 ALLOWED_OWNER_TYPES = {
     "generated_quote",
+    "generated_quote_version",
     "uploaded_reference",
     "profile",
     "pricing_reference",

@@ -315,7 +315,10 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
     def test_required_metadata_tables_match_runtime_metadata_schema_only(self):
         self.assertEqual(verifier.REQUIRED_METADATA_TABLES, runtime_required_metadata_tables())
         for db_blob_table in verifier.webapp.SQAG_DATABASE_ARTIFACT_REQUIRED_COLUMNS:
-            self.assertNotIn(db_blob_table, verifier.REQUIRED_METADATA_TABLES)
+            if db_blob_table == "sqag_quote_publication_versions":
+                self.assertIn(db_blob_table, verifier.REQUIRED_METADATA_TABLES)
+            else:
+                self.assertNotIn(db_blob_table, verifier.REQUIRED_METADATA_TABLES)
 
     def test_metadata_migration_status_uses_runtime_required_columns(self):
         status = verifier.metadata_migration_status()
@@ -425,6 +428,28 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
           updated_at text not null,
           deleted_at text
         );
+        create table if not exists sqag_quote_publication_versions (
+          workspace_id text not null,
+          session_id text not null,
+          run_id text not null,
+          job_id text,
+          state text not null,
+          artifact_storage_mode text not null,
+          artifact_source text not null,
+          metadata_json text not null,
+          error_code text,
+          created_at text not null,
+          updated_at text not null,
+          promoted_at text,
+          failed_at text,
+          retention_expires_at text not null,
+          original_retention_expires_at text not null,
+          legal_hold integer not null,
+          deletion_state text not null,
+          deletion_error_code text,
+          deletion_claimed_at text
+        );
+
         """
         status = migration_status_for_sql(sql)
 

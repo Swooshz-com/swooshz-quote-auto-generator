@@ -574,12 +574,21 @@ class Pr140SevenBlockerRegressionTest(unittest.TestCase):
         )
         self.assertEqual(identity, ("feedback", submitted["feedback_id"]))
 
-    def test_oversized_forensic_request_evidence_is_rejected_before_run_acceptance(self):
+    def test_oversized_forensic_request_evidence_is_terminally_tracked_after_acceptance(self):
         payload = {
             "images": [{"type": "image/png", "data_url": "data:image/png;base64,AA=="}],
             "line_items": [{"description": "x" * (webapp.MAX_FORENSIC_REQUEST_EVIDENCE_BYTES + 1)}],
         }
-        with mock.patch.object(webapp, "begin_generation_forensics") as begin:
+        with (
+            mock.patch.object(
+                webapp, "begin_generation_forensics",
+                side_effect=["run-evidence-async", "run-evidence-direct"],
+            ) as begin,
+            mock.patch.object(
+                webapp, "finish_generation_forensics",
+                side_effect=lambda run_id, result, *_args, **_kwargs: {**result, "generation_run_id": run_id},
+            ) as finish,
+        ):
             async_result = webapp.create_job(
                 "generate", payload, requested_job_id="job-evidence-oversize-red"
             )
@@ -587,9 +596,10 @@ class Pr140SevenBlockerRegressionTest(unittest.TestCase):
 
         self.assertEqual(async_result["status"], "blocked")
         self.assertEqual(direct_result["status"], "blocked")
-        self.assertNotIn("generation_run_id", async_result)
-        self.assertNotIn("generation_run_id", direct_result)
-        begin.assert_not_called()
+        self.assertEqual(async_result["generation_run_id"], "run-evidence-async")
+        self.assertEqual(direct_result["generation_run_id"], "run-evidence-direct")
+        self.assertEqual(begin.call_count, 2)
+        self.assertEqual(finish.call_count, 2)
 
 
 if __name__ == "__main__":

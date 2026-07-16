@@ -203,6 +203,108 @@ try {
   };
 
 
+  const racePage = await context.newPage();
+  let raceContextRequests = 0;
+  let releaseQuoteB;
+  let raceFeedbackPayload = null;
+  await racePage.route("**/api/feedback/context?*", async (route) => {
+    raceContextRequests += 1;
+    if (raceContextRequests === 1) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          status: "ok",
+          context: {
+            link_type: "generation_run",
+            run_id: "run-race-a123456",
+            session_id: "quote-race-a",
+            label: "Generation run A",
+            status: "completed",
+          },
+        }),
+      });
+      return;
+    }
+    await new Promise((resolve) => {
+      releaseQuoteB = resolve;
+    });
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "ok",
+        context: {
+          link_type: "quote_session",
+          run_id: "",
+          session_id: "quote-race-b",
+          label: "Quote session B",
+          status: "draft",
+        },
+      }),
+    });
+  });
+  await racePage.route("**/api/feedback", async (route) => {
+    raceFeedbackPayload = route.request().postDataJSON();
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "submitted",
+        support_reference: "support-race-safe",
+      }),
+    });
+  });
+  await racePage.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await racePage.evaluate(() => {
+    transitionGenerationContext("quote-race-a", "run-race-a123456");
+  });
+  await racePage.locator("#feedbackButton").click();
+  await racePage.locator("#feedbackLinkContext", {
+    hasText: "Generation run A",
+  }).waitFor();
+  await racePage.locator("#cancelFeedbackButton").click();
+  await racePage.evaluate(() => {
+    resetCurrentQuoteDraftState();
+    transitionGenerationContext("quote-race-b", "");
+  });
+  await racePage.locator("#feedbackButton").click();
+  const raceRequestStarted = Date.now();
+  while (raceContextRequests < 2 && Date.now() - raceRequestStarted < 3000) {
+    await racePage.waitForTimeout(20);
+  }
+  if (raceContextRequests !== 2) {
+    throw new Error("Delayed quote B feedback context request was not observed.");
+  }
+  await racePage.locator("#feedbackShortTitle").fill("Stale context race");
+  await racePage.locator("#feedbackMessage").fill(
+    "Submit while the current quote context is still loading.",
+  );
+  await racePage.locator("#submitFeedbackButton").click();
+  await racePage.waitForTimeout(200);
+  if (raceFeedbackPayload) {
+    throw new Error("Feedback submitted before the current quote context loaded.");
+  }
+  if (typeof releaseQuoteB !== "function") {
+    throw new Error("Delayed quote B feedback context could not be released.");
+  }
+  releaseQuoteB();
+  const raceSubmitStarted = Date.now();
+  while (!raceFeedbackPayload && Date.now() - raceSubmitStarted < 3000) {
+    await racePage.waitForTimeout(20);
+  }
+  if (
+    !raceFeedbackPayload
+    || raceFeedbackPayload.run_id
+    || raceFeedbackPayload.session_id !== "quote-race-b"
+  ) {
+    throw new Error("Feedback did not use the refreshed quote B context.");
+  }
+  await racePage.close();
+  feedbackContextEvidence.stale_context_submit_waited_for_refresh = true;
+  feedbackContextEvidence.out_of_date_run_not_submitted = true;
+
+
   await page.locator("#feedbackButton").click();
   await page.locator("#feedbackModal").waitFor({ state: "visible" });
   await page.locator("#feedbackCategory").selectOption("incorrect_output");

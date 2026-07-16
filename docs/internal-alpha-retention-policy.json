@@ -15,6 +15,13 @@
       "rollback_note": "Restore the SQLite database from the prior known-good backup and verify workspace/session checksums before using local-UAT access."
     },
     {
+      "data_class": "quote_publication_versions",
+      "storage": "sqag_quote_publication_versions, sqag_quote_publication_artifacts, and run-scoped generated_quote_version object artifacts",
+      "retention_calendar_years": 3,
+      "lifecycle_note": "Replacement artifacts are staged under an immutable generation-run identity. The current published version remains visible until an atomic promotion. Failed and superseded versions stay linked to the generation-run retention graph; legal hold blocks version deletion. Retention deletes version bytes before metadata and the linked forensic graph, and never deletes the current published version independently.",
+      "rollback_note": "Restore publication-version metadata and its exact run-scoped artifacts together; verify checksums and the quote session's authoritative published run before downloads are re-enabled."
+    },
+    {
       "data_class": "generated_artifacts",
       "storage": "sqag_quote_artifacts",
       "retention_calendar_years": 3,

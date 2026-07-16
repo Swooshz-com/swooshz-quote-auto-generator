@@ -12,6 +12,7 @@ from typing import Any, Callable, Iterable
 
 
 EVIDENCE_RETENTION_YEARS = 3
+MAX_GENERATION_MANIFEST_BYTES = 1024 * 1024
 PRODUCTION_LOG_RETENTION_DAYS = 90
 LOCAL_UAT_LOG_RETENTION_DAYS = 30
 EVIDENCE_SCHEMA_VERSION = "swooshz.sqag.generation-evidence.v2"
@@ -88,6 +89,22 @@ def canonical_json(value: Any) -> str:
 
 def digest_json(value: Any) -> tuple[str, str]:
     body = canonical_json(value)
+    return body, hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def bounded_digest_json(
+    value: Any, *, max_bytes: int = MAX_GENERATION_MANIFEST_BYTES
+) -> tuple[str, str]:
+    """Serialize a bounded canonical record without first building an oversized body."""
+    chunks: list[str] = []
+    size_bytes = 0
+    encoder = json.JSONEncoder(ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    for chunk in encoder.iterencode(value):
+        size_bytes += len(chunk.encode("utf-8"))
+        if size_bytes > max_bytes:
+            raise ValueError("Generation evidence exceeds the canonical size limit.")
+        chunks.append(chunk)
+    body = "".join(chunks)
     return body, hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
@@ -332,7 +349,11 @@ class ForensicStore:
     def append_evidence(self, run_id: str, evidence_type: str, evidence: dict[str, Any], *, now: dt.datetime | None = None, commit: bool = True) -> str:
         now = now or utc_now()
         evidence_id = self.new_id("evidence")
-        body, digest = digest_json(evidence)
+        body, digest = (
+            bounded_digest_json(evidence)
+            if evidence_type == "generation_manifest"
+            else digest_json(evidence)
+        )
         expiry, original = self._retention(now)
         self.connection.execute(
             "insert into sqag_generation_evidence (evidence_id, run_id, workspace_id, evidence_type, evidence_schema_version, evidence_json, evidence_sha256, created_at, retention_expires_at, original_retention_expires_at, legal_hold) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1490,19 +1511,139 @@ class ForensicStore:
             receipt_failed,
         )
 
-    def reconcile_non_terminal_runs(self, *, active_job_ids: Iterable[str] = (), now: dt.datetime | None = None, stale_after_seconds: int = 900, batch_size: int = 100) -> int:
+    def reconcile_non_terminal_runs(
+        self,
+        *,
+        active_job_ids: Iterable[str] = (),
+        now: dt.datetime | None = None,
+        stale_after_seconds: int = 900,
+        batch_size: int = 100,
+    ) -> int:
         now = now or utc_now()
-        cutoff = iso_timestamp(now - dt.timedelta(seconds=max(60, int(stale_after_seconds))))
-        active = {safe_reference(item, "job-") for item in active_job_ids}
-        rows = self.connection.execute("select run_id, job_id from sqag_generation_runs where workspace_id = ? and status in ('received','queued','running') and started_at <= ? order by started_at, run_id limit ?", (self.workspace_id, cutoff, max(1, min(int(batch_size), 500)))).fetchall()
+        now_text = iso_timestamp(now)
+        cutoff = iso_timestamp(
+            now - dt.timedelta(seconds=max(60, int(stale_after_seconds)))
+        )
+        active = {
+            safe_reference(item, "job-")
+            for item in active_job_ids
+            if safe_reference(item, "job-")
+        }
+        rows = self.connection.execute(
+            "select run_id, job_id from sqag_generation_runs "
+            "where workspace_id = ? and status in ('received','queued','running') "
+            "and started_at <= ? order by started_at, run_id limit ?",
+            (self.workspace_id, cutoff, max(1, min(int(batch_size), 500))),
+        ).fetchall()
         reconciled = 0
-        for row in rows:
-            item = row_dict(row)
-            if safe_reference(item.get("job_id"), "job-") in active:
+        for candidate in rows:
+            candidate_item = row_dict(candidate)
+            run_id = safe_reference(candidate_item.get("run_id"), "run-")
+            if not run_id or safe_reference(candidate_item.get("job_id"), "job-") in active:
                 continue
-            now_text = iso_timestamp(now)
-            self.connection.execute("update sqag_generation_runs set status = 'abandoned', error_category = 'interrupted_run_reconciliation', completed_at = ? where workspace_id = ? and run_id = ? and status in ('received','queued','running')", (now_text, self.workspace_id, item["run_id"]))
-            self.append_audit("generation_abandoned", {"reason": "interrupted_run_reconciliation"}, run_id=item["run_id"], now=now, commit=False)
-            reconciled += 1
-        self.connection.commit()
+            try:
+                self._acquire_transaction_locks(("generation_run", run_id))
+                run = row_dict(
+                    self.connection.execute(
+                        "select run_id, job_id, job_type, status, started_at, "
+                        "actor_tracking_id, actor_key_version "
+                        "from sqag_generation_runs where workspace_id = ? and run_id = ?",
+                        (self.workspace_id, run_id),
+                    ).fetchone()
+                )
+                if (
+                    run.get("status") not in NON_TERMINAL_RUN_STATES
+                    or safe_feedback_text(run.get("started_at"), 40) > cutoff
+                    or safe_reference(run.get("job_id"), "job-") in active
+                ):
+                    self.connection.commit()
+                    continue
+                request_row = row_dict(
+                    self.connection.execute(
+                        "select evidence_schema_version, evidence_json, evidence_sha256 "
+                        "from sqag_generation_evidence where workspace_id = ? and run_id = ? "
+                        "and evidence_type = 'request_manifest' "
+                        "order by created_at, evidence_id limit 1",
+                        (self.workspace_id, run_id),
+                    ).fetchone()
+                )
+                request_reference: dict[str, Any] = {
+                    "evidence_type": "request_manifest",
+                    "sha256": safe_feedback_text(
+                        request_row.get("evidence_sha256"), 64
+                    ),
+                    "schema": safe_feedback_text(
+                        request_row.get("evidence_schema_version"), 120
+                    ),
+                }
+                raw_request = str(request_row.get("evidence_json") or "")
+                if (
+                    raw_request
+                    and hashlib.sha256(raw_request.encode("utf-8")).hexdigest()
+                    == request_reference["sha256"]
+                ):
+                    try:
+                        parsed_request = json.loads(raw_request)
+                    except json.JSONDecodeError:
+                        parsed_request = {}
+                    if isinstance(parsed_request, dict):
+                        for key in (
+                            "job_id",
+                            "image_count",
+                            "has_quote_session",
+                            "profile_id",
+                            "pricing_reference_id",
+                            "payload_shape_sha256",
+                            "attempt_number",
+                        ):
+                            value = parsed_request.get(key)
+                            if isinstance(value, (str, int, bool)):
+                                request_reference[key] = value
+                manifest = {
+                    "schema": EVIDENCE_SCHEMA_VERSION,
+                    "generation_schema_version": 1,
+                    "generation_run_id": run_id,
+                    "workspace_id": self.workspace_id,
+                    "actor_tracking_id": safe_feedback_text(
+                        run.get("actor_tracking_id"), 160
+                    ),
+                    "actor_key_version": safe_feedback_text(
+                        run.get("actor_key_version"), 80
+                    ),
+                    "job_id": safe_reference(run.get("job_id"), "job-"),
+                    "job_type": safe_feedback_text(run.get("job_type"), 40),
+                    "lifecycle_stage": "startup_reconciliation",
+                    "terminal_status": "abandoned",
+                    "terminal_state": "abandoned",
+                    "terminal_at": now_text,
+                    "error_category": "interrupted_run_reconciliation",
+                    "reconciliation": {"reconciled_at": now_text},
+                    "request_evidence": request_reference,
+                    "artifacts": [],
+                }
+                cursor = self.connection.execute(
+                    "update sqag_generation_runs set status = 'abandoned', "
+                    "error_category = 'interrupted_run_reconciliation', completed_at = ? "
+                    "where workspace_id = ? and run_id = ? and completed_at is null "
+                    "and status in ('received','queued','running')",
+                    (now_text, self.workspace_id, run_id),
+                )
+                if getattr(cursor, "rowcount", 0) != 1:
+                    self.connection.rollback()
+                    continue
+                self.append_evidence(
+                    run_id, "generation_manifest", manifest, now=now, commit=False
+                )
+                self.append_audit(
+                    "generation_abandoned",
+                    {"reason": "interrupted_run_reconciliation"},
+                    run_id=run_id,
+                    now=now,
+                    commit=False,
+                )
+                self.connection.commit()
+                reconciled += 1
+            except Exception:
+                self.connection.rollback()
+                raise
         return reconciled

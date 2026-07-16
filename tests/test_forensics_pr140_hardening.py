@@ -198,6 +198,15 @@ class Pr140HardeningTest(unittest.TestCase):
             create table sqag_quote_artifacts (
               workspace_id text not null, session_id text not null, artifact_kind text not null
             );
+            create table sqag_quote_publication_versions (
+              workspace_id text not null, session_id text not null,
+              run_id text not null, legal_hold integer not null default 0,
+              primary key (workspace_id, run_id)
+            );
+            create table sqag_quote_publication_artifacts (
+              workspace_id text not null, session_id text not null,
+              run_id text not null
+            );
             """
         )
         self.connection.execute(

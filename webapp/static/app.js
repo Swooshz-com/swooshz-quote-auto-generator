@@ -237,6 +237,8 @@ const state = {
   isRecoveryScopeTransitioning: false,
   pendingFeedback: "",
   feedbackContext: null,
+  feedbackContextRequestId: 0,
+  feedbackContextLoadPromise: null,
   activeSidePanel: "images",
   downloadFile: null,
   pdfFile: null,
@@ -4312,6 +4314,9 @@ function resetCurrentQuoteDraftState() {
   state.images = [];
   setImageUploadStatus("");
   state.headerLogo = null;
+  state.feedbackContextRequestId += 1;
+  state.feedbackContextLoadPromise = null;
+  state.feedbackContext = null;
   state.boothDimensions = { ...DEFAULT_BOOTH_DIMENSIONS };
   state.pendingFeedback = "";
   state.downloadFile = null;
@@ -9877,11 +9882,15 @@ function feedbackViewportBucket() {
 async function loadFeedbackContext() {
   if (!elements.feedbackLinkContext) return;
   elements.feedbackLinkContext.textContent = "Checking the most relevant authorised quote context...";
+  const requestId = state.feedbackContextRequestId + 1;
+  state.feedbackContextRequestId = requestId;
+  state.feedbackContext = null;
   const generationContext = currentGenerationContext();
   const query = new URLSearchParams(generationContext);
   try {
     const response = await fetch(`/api/feedback/context?${query.toString()}`, { cache: "no-store" });
     const data = await jsonFromResponse(response);
+    if (requestId !== state.feedbackContextRequestId) return;
     if (!response.ok || !data.context) throw new Error("feedback context unavailable");
     state.feedbackContext = data.context;
     const context = data.context;
@@ -9891,6 +9900,7 @@ async function loadFeedbackContext() {
     elements.feedbackIncludeLink.checked = Boolean(canLink);
     elements.feedbackIncludeLink.disabled = !canLink;
   } catch {
+    if (requestId !== state.feedbackContextRequestId) return;
     state.feedbackContext = null;
     elements.feedbackLinkContext.textContent = "Quote context could not be verified. This report will be submitted without an automatic link.";
     elements.feedbackIncludeLink.checked = false;
@@ -9908,6 +9918,8 @@ async function submitFeedback(event) {
     return;
   }
   if (!elements.feedbackForm.reportValidity()) return;
+  const pendingContext = state.feedbackContextLoadPromise;
+  if (pendingContext) await pendingContext;
   const includeLink = Boolean(elements.feedbackIncludeLink?.checked && !elements.feedbackIncludeLink?.disabled);
   const context = includeLink && state.feedbackContext ? state.feedbackContext : {};
   const manualReference = String(elements.feedbackManualReference?.value || "").trim();
@@ -9963,7 +9975,15 @@ async function showFeedbackModal() {
   elements.feedbackStatus.textContent = "";
   elements.feedbackModal.hidden = false;
   elements.feedbackShortTitle?.focus();
-  await loadFeedbackContext();
+  const pendingContext = loadFeedbackContext();
+  state.feedbackContextLoadPromise = pendingContext;
+  try {
+    await pendingContext;
+  } finally {
+    if (state.feedbackContextLoadPromise === pendingContext) {
+      state.feedbackContextLoadPromise = null;
+    }
+  }
 }
 
 function hideFeedbackModal() {

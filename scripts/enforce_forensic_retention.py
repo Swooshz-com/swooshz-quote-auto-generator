@@ -84,8 +84,22 @@ def _main() -> int:
         storage._ensure_schema(webapp.SQAG_FORENSIC_REQUIRED_COLUMNS, reason="storage_forensics_database_not_migrated")
         with storage.connection() as connection:
             def delete_artifacts(item: dict[str, object], finalize_graph) -> bool:
-                session_id = webapp.safe_quote_session_id(item.get("quote_session_id"), "")
                 run_id = str(item.get("run_id") or "")
+                session_id = webapp.safe_quote_session_id(item.get("quote_session_id"), "")
+                version_result = storage.delete_quote_publication_version_for_retention(
+                    run_id,
+                    finalize_graph=finalize_graph,
+                )
+                if version_result is True:
+                    return True
+                if (
+                    version_result is False
+                    and not storage.quote_publication_version_is_current(
+                        run_id, session_id
+                    )
+                ):
+                    return False
+
                 if not session_id:
                     finalize_graph(connection)
                     return True

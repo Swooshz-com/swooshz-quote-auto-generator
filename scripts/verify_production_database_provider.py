@@ -27,6 +27,7 @@ from webapp import server as webapp
 
 
 PRODUCTION_METADATA_MIGRATION_PATHS = (
+    ROOT / "migrations" / "006_quote_publication_versions_postgres.sql",
     ROOT / "migrations" / "001_platform_scoped_storage.sql",
     ROOT / "migrations" / "003_object_artifact_metadata.sql",
 )
@@ -71,7 +72,7 @@ def postgres_driver_available() -> bool:
 
 def _metadata_table_definition(sql: str, table: str) -> str | None:
     match = re.search(
-        rf"\bcreate\s+table\s+if\s+not\s+exists\s+{re.escape(table.lower())}\s*\((?P<body>.*?)\)\s*;",
+        rf"\bcreate\s+table\s+if\s+not\s+exists\s+{re.escape(table.lower())}\s*\((?P<body>.*?)\)\s*(?:;|--\s*sqag_statement_boundary)",
         sql,
         flags=re.S,
     )

@@ -763,3 +763,66 @@ Synthetic current-head verification covers the complete SQLite and declared
 Postgres forensic contracts plus standalone audit expiry. `internal_alpha_ready`
 and `production_ready` remain false; hosted migration, provider, retention,
 backup/restore, observability, and owner/counsel evidence remain outstanding.
+### PR #140 final five-blocker closure (2026-07-16)
+
+The remaining accepted-generation gap is closed without retaining oversized
+request bodies. Once an authenticated request passes envelope, route, and
+client-owned resume validation, an oversized forensic-evidence section receives
+one server-owned run, a bounded `request_evidence_too_large` category, an
+artifact-free blocked manifest, and a terminal audit. Replays use the existing
+job/run identity. Pre-authentication, authorization, CSRF, rate-limit, malformed
+body, unsupported-route, and invalid-resume rejections remain outside generation
+acceptance.
+
+Privileged feedback detail reads normalize to
+`/api/support/feedback/:id` and allow 12 requests per existing 60-second
+authenticated-client window. The limit runs after support permission and
+read-intent/CSRF checks but before report lookup or the
+`feedback_report_accessed` audit. Evidence reads remain more restrictive at six
+and status updates remain at 30. Overflow continues through the existing bounded
+shared-bucket and privacy-minimized abuse signal.
+
+Startup reconciliation now writes the abandoned terminal update, one
+privacy-minimized canonical manifest, and one terminal audit in the same locked
+transaction. Insert or audit failure rolls the transaction back, leaving the run
+eligible for retry; active, fresh, completed, and already-reconciled runs remain
+untouched.
+
+Database and synthetic object publication now stage generated artifacts under a
+generation-run version identity. The visible quote session and its authoritative
+published run remain unchanged until exact bytes and canonical evidence are
+verified and an atomic compare-and-swap promotion succeeds. Failed or superseded
+attempts cannot overwrite current database rows or object keys. Concurrent
+attempts can promote only the session's current pending run. Historical support
+verification resolves the immutable version identity. Failed and superseded
+versions follow the linked three-calendar-year generation-run retention graph;
+legal hold prevents version deletion, version bytes are removed before metadata,
+and the current published version is never independently deleted.
+
+Successful generation without durable quote-session publication records an
+explicit transient-output count/type summary with `artifacts=[]` and
+`artifacts_durable=false`. Durable database/object publication continues to
+record exact retained artifact hashes and sizes. Artifact-free support
+verification does not open artifact storage. No transient job file is described
+as retained canonical evidence. Visible UI and readiness remain unchanged:
+`internal_alpha_ready=false` and `production_ready=false`.
+### PR #140 final-snapshot security closure (2026-07-16)
+
+The final diff-focused security review reproduced and repaired four adjacent
+issues before publication. Feedback submission now invalidates stale context
+responses and waits for the current quote-context lookup, so an earlier run
+cannot be linked while a later quote is loading. Canonical generation manifests
+compact oversized profile, pricing, layout, brief, basis, and output snapshots
+to hash/size/type/count receipts before finalization, and the persistence sink
+independently enforces a streaming 1 MiB limit.
+
+The database retention worker now assigns the run identity before publication
+routing. A current published version still cannot be deleted independently, but
+when its complete session graph is eligible and unheld, the worker performs a
+hold-aware whole-session deletion that covers every publication version,
+database artifact or run-scoped object, session row, and linked forensic graph.
+Provider failures remain compensating and fail closed. Synthetic database,
+in-memory object, real-worker, and Playwright regressions cover these repairs.
+The review found no surviving reportable path in the repaired snapshot and makes
+no hosted or production evidence claim; `internal_alpha_ready=false` and
+`production_ready=false` remain unchanged.

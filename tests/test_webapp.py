@@ -884,7 +884,51 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(responses[-1]["status"], 429)
         self.assertEqual(evidence_lookup.call_count, 6)
 
+    def test_support_feedback_detail_http_route_rate_limits_before_lookup(self):
+        self.reset_rate_limit_state()
+        self.addCleanup(self.reset_rate_limit_state)
+        env = {
+            "APP_MODE": "local",
+            "SQAG_STORAGE_MODE": "local",
+            "USER_TYPE": "admin",
+        }
+        csrf_header = webapp.configured_csrf_header_name()
+        headers = {csrf_header: webapp.csrf_token_for_cookie_header("")}
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(
+                webapp,
+                "support_feedback_detail_for_auth_session",
+                return_value={"support_reference": "SUP-BOUNDED"},
+            ) as detail_lookup,
+            LocalRunnerServer() as runner,
+        ):
+            responses = [
+                self.http_json(
+                    runner,
+                    "GET",
+                    "/api/support/feedback/SUP-BOUNDED",
+                    headers=headers,
+                )
+                for _ in range(webapp.POST_RATE_LIMITS["/api/support/feedback/:id"] + 1)
+            ]
+        self.assertEqual(
+            [item["status"] for item in responses[:-1]],
+            [200] * webapp.POST_RATE_LIMITS["/api/support/feedback/:id"],
+        )
+        self.assertEqual(responses[-1]["status"], 429)
+        self.assertEqual(
+            detail_lookup.call_count,
+            webapp.POST_RATE_LIMITS["/api/support/feedback/:id"],
+        )
+        self.assertNotIn("SUP-BOUNDED", json.dumps(responses[-1]["body"]))
+        self.assertEqual(
+            webapp.rate_limit_path_key("/api/support/feedback/SUP-MISSING"),
+            webapp.rate_limit_path_key("/api/support/feedback/SUP-EXISTING"),
+        )
+
     def test_support_feedback_detail_route_returns_bounded_storage_error(self):
+
         storage_error = webapp.SqagStorageAccessError(
             "SQAG storage is not available for this workspace.",
             status=503,
@@ -4764,7 +4808,7 @@ class WebappServerTest(unittest.TestCase):
                     "select workspace_id, session_id, metadata_json from sqag_quote_sessions"
                 ).fetchall()
                 stored_artifacts = connection.execute(
-                    "select workspace_id, session_id, artifact_kind, filename, size_bytes, content_blob from sqag_quote_artifacts"
+                    "select workspace_id, session_id, artifact_kind, filename, size_bytes, content_blob from sqag_quote_publication_artifacts"
                 ).fetchall()
             finally:
                 connection.close()
@@ -26617,6 +26661,8 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 result = types.SimpleNamespace(rowcount=1)
                 if "pg_try_advisory_xact_lock" in sql.lower():
                     result.fetchone = lambda: {"lock_acquired": True}
+                elif "legal_hold = ?" in sql.lower():
+                    result.fetchone = lambda: None
                 else:
                     result.fetchone = lambda: {"active_count": 0}
                 result.fetchall = lambda: []

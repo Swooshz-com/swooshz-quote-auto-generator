@@ -57,7 +57,12 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 import pricing_reference_cleanup
 import pricing_reference_enrichment
-from webapp.forensics import ForensicStore, safe_reference, trusted_workspace_id
+from webapp.forensics import (
+    MAX_GENERATION_MANIFEST_BYTES,
+    ForensicStore,
+    safe_reference,
+    trusted_workspace_id,
+)
 from webapp.object_storage import (
     ALLOWED_OWNER_TYPES,
     InMemoryObjectStorageBackend,
@@ -345,6 +350,9 @@ POST_RATE_LIMITS = {
     "/api/quote-sessions": 30,
     "/api/quote-sessions/:id": 30,
     "/api/feedback": 10,
+    # Privileged detail reads append audits, so cap them below status writes.
+    "/api/support/feedback/:id": 12,
+
     "/api/support/feedback/:id/status": 30,
     "/api/support/feedback/:id/evidence": 6,
     "/api/log": 180,
@@ -8433,13 +8441,22 @@ SQAG_STORAGE_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "002_platform_scoped_artifacts.sql",
     PROJECT_ROOT / "migrations" / "003_object_artifact_metadata.sql",
     PROJECT_ROOT / "migrations" / "004_generation_forensics_feedback_retention.sql",
+    PROJECT_ROOT / "migrations" / "006_quote_publication_versions.sql",
 ]
 SQAG_POSTGRES_METADATA_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "001_platform_scoped_storage.sql",
     PROJECT_ROOT / "migrations" / "003_object_artifact_metadata.sql",
     PROJECT_ROOT / "migrations" / "004_generation_forensics_feedback_retention_postgres.sql",
     PROJECT_ROOT / "migrations" / "005_forensic_postgres_delete_guards.sql",
+    PROJECT_ROOT / "migrations" / "006_quote_publication_versions_postgres.sql",
 ]
+SQAG_PUBLICATION_VERSION_REQUIRED_COLUMNS = {
+    "workspace_id", "session_id", "run_id", "job_id", "state",
+    "artifact_storage_mode", "artifact_source", "metadata_json",
+    "error_code", "created_at", "updated_at", "promoted_at", "failed_at",
+    "retention_expires_at", "original_retention_expires_at", "legal_hold",
+    "deletion_state", "deletion_error_code", "deletion_claimed_at",
+}
 SQAG_APP_METADATA_REQUIRED_COLUMNS = {
     "sqag_profiles": {"workspace_id", "profile_id", "payload_json", "created_at", "updated_at"},
     "sqag_pricing_references": {"workspace_id", "reference_id", "payload_json", "created_at", "updated_at"},
@@ -8568,6 +8585,20 @@ SQAG_DATABASE_ARTIFACT_REQUIRED_COLUMNS = {
         "created_at",
         "updated_at",
     },
+    "sqag_quote_publication_artifacts": {
+        "workspace_id",
+        "session_id",
+        "run_id",
+        "artifact_kind",
+        "filename",
+        "content_type",
+        "size_bytes",
+        "checksum_sha256",
+        "content_blob",
+        "created_at",
+        "updated_at",
+    },
+    "sqag_quote_publication_versions": SQAG_PUBLICATION_VERSION_REQUIRED_COLUMNS,
 }
 SQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS = {
     "sqag_object_artifacts": {
@@ -8591,6 +8622,7 @@ SQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS = {
         "updated_at",
         "deleted_at",
     },
+    "sqag_quote_publication_versions": SQAG_PUBLICATION_VERSION_REQUIRED_COLUMNS,
 }
 SQAG_STORAGE_SQL = """
 create table if not exists sqag_profiles (
@@ -9159,6 +9191,7 @@ OBJECT_LIFECYCLE_OWNER_TYPES = frozenset({
     'profile',
     'pricing_reference',
     'generated_quote',
+    'generated_quote_version',
 })
 OBJECT_LIFECYCLE_WRITE_SAVEPOINT = 'sqag_object_lifecycle_write'
 OBJECT_LIFECYCLE_DELETE_ROOT_SAVEPOINT = 'sqag_object_delete_root'
@@ -9452,6 +9485,8 @@ class DatabaseSqagStorage:
         safe_owner_id = (
             safe_quote_session_id(owner_id, '')
             if safe_owner_type == 'generated_quote'
+            else safe_reference(owner_id, 'run-')
+            if safe_owner_type == 'generated_quote_version'
             else safe_resource_id(owner_id, '')
         )
         if not safe_owner_id:
@@ -9504,6 +9539,31 @@ class DatabaseSqagStorage:
             return
         connection.execute('begin immediate')
 
+    def _begin_object_lifecycle_transactions(
+        self,
+        connection: Any,
+        identities: tuple[tuple[str, str], ...],
+    ) -> None:
+        normalized = sorted({
+            self._object_lifecycle_identity(owner_type, owner_id)
+            for owner_type, owner_id in identities
+        })
+        if not normalized:
+            raise ObjectStorageContractError(
+                "Artifact lifecycle identity is invalid."
+            )
+        if self.database_family == "postgres_compatible":
+            for owner_type, owner_id in normalized:
+                self._begin_object_lifecycle_transaction(
+                    connection, owner_type, owner_id
+                )
+            return
+        owner_type, owner_id = normalized[0]
+        self._begin_object_lifecycle_transaction(
+            connection, owner_type, owner_id
+        )
+
+
     def _rollback_to_lifecycle_savepoint(
         self,
         connection: Any,
@@ -9522,16 +9582,18 @@ class DatabaseSqagStorage:
         owner_id: str,
         prepare: Any,
         persist: Any,
+        *,
+        additional_lock_identities: tuple[tuple[str, str], ...] = (),
     ) -> tuple[Any, ObjectArtifactBatchPlan | None]:
         with self.connection() as connection:
             state: Any = None
             plan: ObjectArtifactBatchPlan | None = None
             savepoint_started = False
             try:
-                self._begin_object_lifecycle_transaction(
+                self._begin_object_lifecycle_transactions(
                     connection,
-                    owner_type,
-                    owner_id,
+                    ((owner_type, owner_id),)
+                    + additional_lock_identities,
                 )
                 state, plan = prepare(connection)
                 connection.execute(
@@ -10633,6 +10695,9 @@ class DatabaseSqagStorage:
         delete_owner: Any,
         authorize: Any | None = None,
         result_from_rows: Any | None = None,
+        *,
+        additional_lock_identities: tuple[tuple[str, str], ...] = (),
+        rows_for_delete: Any | None = None,
     ) -> bool | int:
         with self.connection() as connection:
             plan: ObjectArtifactDeletionPlan | None = None
@@ -10643,10 +10708,10 @@ class DatabaseSqagStorage:
                 safe_owner_type, safe_owner_id = (
                     self._object_lifecycle_identity(owner_type, owner_id)
                 )
-                self._begin_object_lifecycle_transaction(
+                self._begin_object_lifecycle_transactions(
                     connection,
-                    safe_owner_type,
-                    safe_owner_id,
+                    ((safe_owner_type, safe_owner_id),)
+                    + additional_lock_identities,
                 )
                 connection.execute(
                     f'savepoint {OBJECT_LIFECYCLE_DELETE_ROOT_SAVEPOINT}'
@@ -10661,10 +10726,14 @@ class DatabaseSqagStorage:
                     owner_type=safe_owner_type,
                     owner_id=safe_owner_id,
                 )
-                rows = self._active_object_artifact_rows(
-                    safe_owner_type,
-                    safe_owner_id,
-                    connection=connection,
+                rows = list(
+                    rows_for_delete(connection)
+                    if rows_for_delete is not None
+                    else self._active_object_artifact_rows(
+                        safe_owner_type,
+                        safe_owner_id,
+                        connection=connection,
+                    )
                 )
                 for row in rows:
                     expected_row = dict(row)
@@ -11047,6 +11116,14 @@ class DatabaseSqagStorage:
         expected_filename = QUOTE_SESSION_EXPORT_KINDS.get(safe_kind)
         if not safe_id or not expected_filename:
             return None
+        metadata, _draft_files = self._read_quote_session_metadata_for_workspace(safe_id)
+        publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
+        current_run_id = safe_reference(publication.get("run_id"), "run-")
+        if current_run_id and self._publication_version_row(current_run_id) is not None:
+            return self._publication_version_artifact(
+                safe_id, current_run_id, safe_kind, include_content=False,
+            )
+
         if configured_artifact_storage_mode() == "object":
             row = self._object_quote_artifact_row(safe_id, safe_kind)
             if not row:
@@ -11270,6 +11347,8 @@ class DatabaseSqagStorage:
         output_dir: Path | None,
         *,
         connection: Any | None = None,
+        object_owner_type: str = "generated_quote",
+        object_owner_id: str = "",
     ) -> tuple[bool, list[ArtifactBatchItem], ObjectArtifactBatchPlan | None]:
         if not result_has_generated_quote(result) or output_dir is None:
             return False, [], None
@@ -11323,14 +11402,118 @@ class DatabaseSqagStorage:
         object_plan = None
         if configured_artifact_storage_mode() == "object":
             object_plan = self._prepare_object_artifact_batch(
-                "generated_quote",
-                session_id,
+                object_owner_type,
+                object_owner_id or session_id,
                 pending_artifacts,
                 set(QUOTE_SESSION_EXPORT_KINDS),
                 retained_kinds,
                 connection=connection,
             )
         return True, pending_artifacts, object_plan
+
+    def _publication_version_row(
+        self,
+        run_id: str,
+        connection: Any | None = None,
+    ) -> Any | None:
+        safe_run_id = safe_reference(run_id, "run-")
+        if not safe_run_id:
+            return None
+        query = (
+            "select * from sqag_quote_publication_versions "
+            "where workspace_id = ? and run_id = ? and deletion_state = ?"
+        )
+        params = (self.workspace_id, safe_run_id, "active")
+        if connection is not None:
+            return connection.execute(query, params).fetchone()
+        with self.connection() as read_connection:
+            return read_connection.execute(query, params).fetchone()
+
+    def _publication_version_artifact(
+        self,
+        session_id: str,
+        run_id: str,
+        kind: str,
+        *,
+        connection: Any | None = None,
+        include_content: bool = True,
+    ) -> dict[str, Any] | None:
+        safe_id = safe_quote_session_id(session_id, "")
+        safe_run_id = safe_reference(run_id, "run-")
+        safe_kind = clean_text(kind).lower()
+        expected_filename = QUOTE_SESSION_EXPORT_KINDS.get(safe_kind)
+        version = self._publication_version_row(safe_run_id, connection)
+        if (
+            not safe_id
+            or not safe_run_id
+            or not expected_filename
+            or not version
+            or clean_text(version["session_id"]) != safe_id
+        ):
+            return None
+        artifact_source = clean_text(version["artifact_source"])
+        mode = clean_text(version["artifact_storage_mode"])
+        if mode == "object":
+            owner_type = "generated_quote" if artifact_source == "legacy_current" else "generated_quote_version"
+            owner_id = safe_id if artifact_source == "legacy_current" else safe_run_id
+            query = (
+                "select * from sqag_object_artifacts where workspace_id = ? "
+                "and owner_type = ? and owner_id = ? and artifact_kind = ? "
+                "and status = ? and retention_status = ? and deleted_at is null"
+            )
+            params = (
+                self.workspace_id, owner_type, owner_id,
+                safe_kind, "active", "active",
+            )
+            if connection is not None:
+                row = connection.execute(query, params).fetchone()
+            else:
+                with self.connection() as read_connection:
+                    row = read_connection.execute(query, params).fetchone()
+            if not row or clean_text(row["filename"]) != expected_filename:
+                return None
+            object_metadata = self._object_metadata_from_row(row)
+            result = {
+                "filename": row["filename"],
+                "content_type": row["content_type"],
+                "size_bytes": object_metadata.size_bytes,
+                "sha256": object_metadata.checksum_sha256,
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            if include_content:
+                try:
+                    content = configured_object_storage_backend().retrieve_artifact(
+                        object_metadata, workspace_id=self.workspace_id,
+                    )
+                except ObjectStorageContractError:
+                    return None
+                if len(content) != object_metadata.size_bytes or artifact_checksum(content) != object_metadata.checksum_sha256:
+                    return None
+                result["content"] = content
+            return result
+        query = (
+            "select * from sqag_quote_publication_artifacts where workspace_id = ? "
+            "and session_id = ? and run_id = ? and artifact_kind = ?"
+        )
+        params = (self.workspace_id, safe_id, safe_run_id, safe_kind)
+        if connection is not None:
+            row = connection.execute(query, params).fetchone()
+        else:
+            with self.connection() as read_connection:
+                row = read_connection.execute(query, params).fetchone()
+        if not row or clean_text(row["filename"]) != expected_filename:
+            return None
+        content = bytes(row["content_blob"] or b"")
+        digest = artifact_checksum(content) if content else ""
+        if len(content) != int(row["size_bytes"] or 0) or digest != clean_text(row["checksum_sha256"]):
+            return None
+        result = {key: row[key] for key in ("filename", "content_type", "size_bytes", "checksum_sha256", "created_at", "updated_at")}
+        result["sha256"] = result.pop("checksum_sha256")
+        if include_content:
+            result["content"] = content
+        return result
+
 
     def _support_forensic_export_artifact(
         self,
@@ -11349,6 +11532,26 @@ class DatabaseSqagStorage:
         if not safe_id or not safe_run_id or not expected_filename:
             return None
         metadata, _draft_files = self._read_quote_session_metadata_for_workspace(safe_id)
+        version = self._publication_version_row(safe_run_id)
+        if version is not None:
+            if clean_text(version["session_id"]) != safe_id or clean_text(version["state"]) not in {"published", "superseded"}:
+                return None
+            try:
+                version_metadata = json.loads(str(version["metadata_json"] or ""))
+            except (TypeError, json.JSONDecodeError):
+                return None
+            export = version_metadata.get("exports", {}).get(safe_kind) if isinstance(version_metadata, dict) else None
+            if (
+                not isinstance(export, dict)
+                or clean_text(export.get("filename")) != expected_filename
+                or export.get("stale") is True
+            ):
+                return None
+            artifact = self._publication_version_artifact(safe_id, safe_run_id, safe_kind)
+            if artifact is None:
+                return None
+            return artifact
+
         publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
         if (
             not quote_session_is_published(metadata)
@@ -11422,6 +11625,17 @@ class DatabaseSqagStorage:
             return None
         if quote_session_export_is_stale(metadata, export):
             return None
+        publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
+        current_run_id = safe_reference(publication.get("run_id"), "run-")
+        if current_run_id and self._publication_version_row(current_run_id) is not None:
+            artifact = self._publication_version_artifact(safe_id, current_run_id, safe_kind)
+            if (
+                artifact is None
+                or clean_text(artifact.get("sha256")).lower() != clean_text(export.get("sha256")).lower()
+                or int(artifact.get("size_bytes") or -1) != int(export.get("size_bytes") or -1)
+            ):
+                return None
+            return artifact
         if artifact_mode == "object":
             row = self._object_quote_artifact_row(safe_id, safe_kind)
             if not row:
@@ -11587,6 +11801,250 @@ class DatabaseSqagStorage:
         if not metadata or not self._quote_session_visible_to_current_user(metadata):
             return {}, []
         return metadata, draft_files
+
+    def _publication_retention_expiry(self, now: str) -> str:
+        value = dt.datetime.fromisoformat(now.replace("Z", "+00:00"))
+        try:
+            value = value.replace(year=value.year + 3)
+        except ValueError:
+            value = value.replace(month=2, day=28, year=value.year + 3)
+        return value.isoformat().replace("+00:00", "Z")
+
+    def _publication_metadata(
+        self,
+        payload: dict[str, Any],
+        patch: dict[str, Any],
+        existing: dict[str, Any],
+        session_id: str,
+        now: str,
+        run_id: str,
+        job_id: str,
+    ) -> dict[str, Any]:
+        metadata = (
+            normalized_quote_session_metadata(existing)
+            if existing
+            else blank_quote_session_metadata(session_id, now)
+        )
+        metadata["updated_at"] = now
+        if self.user_id and not self._quote_session_owner_id(metadata):
+            metadata["owner"] = {"user_id": self.user_id}
+        metadata["customer_summary"] = quote_session_customer_summary(payload, patch)
+        metadata["quote_company_profile"] = quote_session_profile_summary(payload, patch)
+        metadata["pricing_reference"] = quote_session_pricing_reference_summary(payload, patch)
+        metadata["commercials"] = quote_session_commercials(payload, patch)
+        if isinstance(patch.get("draft_state"), dict):
+            metadata["draft_state"] = quote_session_draft_state(patch)
+        metadata["publication"] = {
+            "state": "staged",
+            "run_id": run_id,
+            "job_id": job_id,
+            "error_code": "",
+        }
+        metadata["status"]["quote_generated"] = False
+        for kind in QUOTE_SESSION_EXPORT_KINDS:
+            metadata["status"][f"{kind}_exported"] = False
+        profile_id = safe_resource_id(payload.get("profile_id"), "")
+        pricing_reference_id = (
+            pricing_reference_id_from_payload(payload)
+            or safe_resource_id(payload.get("pricing_reference_id"), "")
+        )
+        metadata["generation_snapshot"] = quote_session_generation_snapshot(
+            payload,
+            patch,
+            created_at=now,
+            workspace_id=self.workspace_id,
+            profile_detail=self.profile_detail(profile_id, source="company") if profile_id else None,
+            pricing_reference_detail=(
+                self.pricing_reference_detail(pricing_reference_id, source="company")
+                if pricing_reference_id
+                else None
+            ),
+        )
+        normalized = normalized_quote_session_metadata(metadata)
+        if not normalized:
+            raise ValueError("Quote session metadata is not valid.")
+        return normalized
+
+    def _execute_stage_publication_version(
+        self,
+        connection: Any,
+        *,
+        session_id: str,
+        run_id: str,
+        job_id: str,
+        metadata: dict[str, Any],
+        draft_files: list[dict[str, Any]],
+        pending_artifacts: list[ArtifactBatchItem],
+        object_plan: ObjectArtifactBatchPlan | None,
+        now: str,
+    ) -> None:
+        expiry = self._publication_retention_expiry(now)
+        connection.execute(
+            "update sqag_quote_publication_versions set state = ?, error_code = ?, "
+            "failed_at = ?, updated_at = ? where workspace_id = ? and session_id = ? "
+            "and state = ? and run_id <> ?",
+            ("failed", "superseded_staging_attempt", now, now, self.workspace_id, session_id, "staged", run_id),
+        )
+        connection.execute(
+            "insert into sqag_quote_publication_versions "
+            "(workspace_id, session_id, run_id, job_id, state, artifact_storage_mode, "
+            "artifact_source, metadata_json, error_code, created_at, updated_at, "
+            "retention_expires_at, original_retention_expires_at, legal_hold, deletion_state) "
+            "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "on conflict(workspace_id, run_id) do update set session_id = excluded.session_id, "
+            "job_id = excluded.job_id, state = excluded.state, artifact_storage_mode = excluded.artifact_storage_mode, "
+            "artifact_source = excluded.artifact_source, metadata_json = excluded.metadata_json, error_code = null, "
+            "updated_at = excluded.updated_at, failed_at = null, deletion_state = excluded.deletion_state, "
+            "deletion_error_code = null, deletion_claimed_at = null",
+            (
+                self.workspace_id, session_id, run_id, job_id, "staged",
+                configured_artifact_storage_mode(), "version",
+                json.dumps(metadata, ensure_ascii=True, sort_keys=True), None,
+                now, now, expiry, expiry, 0, "active",
+            ),
+        )
+        if object_plan is not None:
+            self._execute_object_artifact_batch_metadata(
+                connection,
+                object_plan,
+                quote_session=False,
+            )
+        else:
+            connection.execute(
+                "delete from sqag_quote_publication_artifacts "
+                "where workspace_id = ? and run_id = ?",
+                (self.workspace_id, run_id),
+            )
+            for item in pending_artifacts:
+                connection.execute(
+                    "insert into sqag_quote_publication_artifacts "
+                    "(workspace_id, session_id, run_id, artifact_kind, filename, content_type, "
+                    "size_bytes, checksum_sha256, content_blob, created_at, updated_at) "
+                    "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        self.workspace_id, session_id, run_id, item.artifact_kind,
+                        item.filename, item.content_type, len(item.content),
+                        artifact_checksum(item.content), sqlite3.Binary(item.content), now, now,
+                    ),
+                )
+        current, current_drafts = self._read_quote_session_metadata_for_workspace_on_connection(
+            connection,
+            session_id,
+        )
+        visible = normalized_quote_session_metadata(current) if current else blank_quote_session_metadata(session_id, now)
+        visible["updated_at"] = now
+        if self.user_id and not self._quote_session_owner_id(visible):
+            visible["owner"] = {"user_id": self.user_id}
+        visible_publication = visible.get("publication") if isinstance(visible.get("publication"), dict) else {}
+        visible_publication["pending_run_id"] = run_id
+        visible_publication["pending_job_id"] = job_id
+        visible["publication"] = visible_publication
+        normalized_visible = normalized_quote_session_metadata(visible)
+        retained_drafts = current_drafts if current else draft_files
+        connection.execute(
+            "insert into sqag_quote_sessions "
+            "(workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at) "
+            "values (?, ?, ?, ?, ?, ?) on conflict(workspace_id, session_id) do update set "
+            "metadata_json = excluded.metadata_json, draft_files_json = excluded.draft_files_json, "
+            "updated_at = excluded.updated_at",
+            (
+                self.workspace_id, session_id,
+                json.dumps(normalized_visible, ensure_ascii=True, sort_keys=True),
+                json.dumps(retained_drafts, ensure_ascii=True, sort_keys=True),
+                normalized_visible.get("created_at") or now, now,
+            ),
+        )
+
+    def _stage_versioned_quote_publication(
+        self,
+        payload: dict[str, Any],
+        result: dict[str, Any],
+        output_dir: Path,
+        session_id: str,
+        patch: dict[str, Any],
+        *,
+        publish: bool,
+        run_id: str,
+        job_id: str,
+    ) -> dict[str, Any]:
+        def prepare(connection: Any | None = None) -> dict[str, Any]:
+            existing, _draft_files = (
+                self._read_quote_session_metadata_for_workspace_on_connection(connection, session_id)
+                if connection is not None
+                else self._read_quote_session_metadata_for_workspace(session_id)
+            )
+            now = utc_timestamp()
+            metadata = self._publication_metadata(
+                payload, patch, existing, session_id, now, run_id, job_id,
+            )
+            stored, pending_artifacts, object_plan = self._prepare_quote_export_artifacts(
+                session_id,
+                metadata,
+                result,
+                output_dir,
+                connection=connection,
+                object_owner_type="generated_quote_version",
+                object_owner_id=run_id,
+            )
+            if not stored:
+                raise SqagStorageAccessError(
+                    QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                    status=503,
+                    reason="object_artifact_storage_unavailable",
+                )
+            return {
+                "metadata": metadata,
+                "pending_artifacts": pending_artifacts,
+                "object_plan": object_plan,
+                "draft_files": quote_session_draft_files(patch) if isinstance(patch.get("draft_files"), list) else [],
+                "now": now,
+            }
+
+        def persist(connection: Any, state: dict[str, Any]) -> dict[str, Any]:
+            self._execute_stage_publication_version(
+                connection,
+                session_id=session_id,
+                run_id=run_id,
+                job_id=job_id,
+                metadata=state["metadata"],
+                draft_files=state["draft_files"],
+                pending_artifacts=state["pending_artifacts"],
+                object_plan=state["object_plan"],
+                now=state["now"],
+            )
+            return state
+
+        object_plan = None
+        if configured_artifact_storage_mode() == "object":
+            state, object_plan = self._run_object_lifecycle_save(
+                "generated_quote_version",
+                run_id,
+                lambda connection: (
+                    (prepared := prepare(connection)),
+                    prepared["object_plan"],
+                ),
+                persist,
+                additional_lock_identities=(
+                    ("generated_quote", session_id),
+                ),
+            )
+        else:
+            state = prepare()
+            self._run_storage_transaction(lambda connection: persist(connection, state))
+        if object_plan is not None:
+            self._finalize_object_artifact_batch(object_plan)
+            for item in state["pending_artifacts"]:
+                if item.source is not None:
+                    self._cleanup_object_staging_file(item.source, output_dir)
+        if publish:
+            files = self.quote_session_evidence_files(session_id, run_id)
+            self._run_storage_transaction(
+                lambda connection: self.publish_quote_session_forensic_transaction(
+                    connection, session_id, run_id, files,
+                )
+            )
+        current = self.get_quote_session(session_id)
+        return current or {"session_id": session_id}
 
     def _create_or_update_object_quote_session(
         self,
@@ -11777,6 +12235,21 @@ class DatabaseSqagStorage:
         if existing and not self._quote_session_editable_by_current_user(existing):
             resolved_session_id = new_quote_session_id()
             existing = {}
+        safe_run_id = safe_reference(generation_run_id, "run-")
+        if (
+            safe_run_id
+            and output_dir is not None
+            and isinstance(result, dict)
+            and result_has_generated_quote(result)
+            and configured_artifact_storage_mode() in {"database", "object"}
+        ):
+            return self._stage_versioned_quote_publication(
+                payload, result, output_dir, resolved_session_id, patch,
+                publish=publish, run_id=safe_run_id,
+                job_id=safe_reference(generation_job_id, "job-"),
+            )
+
+
         if configured_artifact_storage_mode() == 'object':
             return self._create_or_update_object_quote_session(
                 payload,
@@ -11877,20 +12350,37 @@ class DatabaseSqagStorage:
             raise
         return self._public_quote_session(normalized)
 
-    def quote_session_evidence_files(self, session_id: str) -> list[dict[str, Any]]:
+    def quote_session_evidence_files(self, session_id: str, run_id: str = "") -> list[dict[str, Any]]:
         safe_id = safe_quote_session_id(session_id, "")
-        metadata, _draft_files = self._read_quote_session_metadata_for_workspace(safe_id)
+        safe_run_id = safe_reference(run_id, "run-")
+        if safe_run_id:
+            version = self._publication_version_row(safe_run_id)
+            if not version or clean_text(version["session_id"]) != safe_id:
+                return []
+            try:
+                metadata = json.loads(str(version["metadata_json"] or ""))
+            except (TypeError, json.JSONDecodeError):
+                return []
+        else:
+            metadata, _draft_files = self._read_quote_session_metadata_for_workspace(safe_id)
         if not metadata:
             return []
         publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
         if clean_text(publication.get("state")).lower() not in {"staged", "published"}:
             return []
+        effective_run_id = safe_run_id or safe_reference(publication.get("run_id"), "run-")
         files: list[dict[str, Any]] = []
         for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
             export = metadata.get("exports", {}).get(kind) if isinstance(metadata.get("exports"), dict) else None
             if not isinstance(export, dict) or clean_text(export.get("filename")) != filename:
                 continue
-            artifact = self._quote_artifact_metadata(safe_id, kind)
+            artifact = (
+                self._publication_version_artifact(
+                    safe_id, effective_run_id, kind, include_content=False,
+                )
+                if effective_run_id and self._publication_version_row(effective_run_id) is not None
+                else self._quote_artifact_metadata(safe_id, kind)
+            )
             if not artifact:
                 continue
             digest = clean_text(export.get("sha256")).lower()
@@ -11911,26 +12401,46 @@ class DatabaseSqagStorage:
         safe_run_id = safe_reference(run_id, "run-")
         if not safe_id or not safe_run_id:
             raise ValueError("Quote publication identity is invalid.")
-        row = connection.execute(
+        session_row = connection.execute(
             "select metadata_json from sqag_quote_sessions where workspace_id = ? and session_id = ?",
             (self.workspace_id, safe_id),
         ).fetchone()
-        if not row:
+        if not session_row:
             raise ValueError("Staged quote session is not available.")
-        raw_metadata = str(row["metadata_json"] or "")
+        raw_metadata = str(session_row["metadata_json"] or "")
         try:
-            metadata = json.loads(raw_metadata)
+            current_metadata = json.loads(raw_metadata)
         except json.JSONDecodeError as exc:
             raise ValueError("Staged quote session is not valid.") from exc
-        metadata = normalized_quote_session_metadata(metadata if isinstance(metadata, dict) else {})
-        publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
-        state = clean_text(publication.get("state")).lower()
-        if safe_reference(publication.get("run_id"), "run-") != safe_run_id:
-            raise ValueError("Staged quote session belongs to another generation run.")
-        if state == "published":
+        current_metadata = normalized_quote_session_metadata(
+            current_metadata if isinstance(current_metadata, dict) else {}
+        )
+        current_publication = (
+            current_metadata.get("publication")
+            if isinstance(current_metadata.get("publication"), dict)
+            else {}
+        )
+        current_run_id = safe_reference(current_publication.get("run_id"), "run-")
+        if (
+            clean_text(current_publication.get("state")).lower() == "published"
+            and current_run_id == safe_run_id
+        ):
             return
-        if state != "staged":
+        if safe_reference(current_publication.get("pending_run_id"), "run-") != safe_run_id:
+            raise ValueError("Staged quote session belongs to another generation run.")
+
+        version = self._publication_version_row(safe_run_id, connection)
+        if (
+            not version
+            or clean_text(version["session_id"]) != safe_id
+            or clean_text(version["state"]) != "staged"
+        ):
             raise ValueError("Quote session is not staged for publication.")
+        try:
+            metadata = json.loads(str(version["metadata_json"] or ""))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("Staged quote session is not valid.") from exc
+        metadata = normalized_quote_session_metadata(metadata if isinstance(metadata, dict) else {})
 
         expected_by_name = {
             clean_text(item.get("name")): item
@@ -11939,7 +12449,6 @@ class DatabaseSqagStorage:
         }
         if "quotation.xlsx" not in expected_by_name:
             raise ValueError("Staged quotation artifact is missing.")
-        artifact_mode = configured_artifact_storage_mode()
         published_kinds: set[str] = set()
         for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
             export = metadata.get("exports", {}).get(kind) if isinstance(metadata.get("exports"), dict) else None
@@ -11954,58 +12463,84 @@ class DatabaseSqagStorage:
                 or size_bytes != int(expected.get("bytes") or -1)
             ):
                 raise ValueError("Staged artifact evidence does not match publication metadata.")
-            if artifact_mode == "object":
-                artifact = connection.execute(
-                    "select * from sqag_object_artifacts "
-                    "where workspace_id = ? and owner_type = ? and owner_id = ? "
-                    "and session_id = ? and artifact_kind = ? and status = ? "
-                    "and retention_status = ? and deleted_at is null",
-                    (self.workspace_id, "generated_quote", safe_id, safe_id, kind, "active", "active"),
-                ).fetchone()
-                durable_key = clean_text(artifact["object_key_ref"]) if artifact else ""
-                durable_content = b""
-                if artifact:
-                    try:
-                        object_metadata = self._object_metadata_from_row(artifact)
-                        durable_content = configured_object_storage_backend().retrieve_artifact(
-                            object_metadata,
-                            workspace_id=self.workspace_id,
-                        )
-                    except ObjectStorageContractError as exc:
-                        raise ValueError(
-                            "Staged durable artifact could not be verified."
-                        ) from exc
-                durable_digest = hashlib.sha256(durable_content).hexdigest() if durable_content else ""
-                durable_size = len(durable_content)
-            else:
-                artifact = connection.execute(
-                    "select filename, size_bytes, content_blob from sqag_quote_artifacts "
-                    "where workspace_id = ? and session_id = ? and artifact_kind = ?",
-                    (self.workspace_id, safe_id, kind),
-                ).fetchone()
-                durable_content = bytes(artifact["content_blob"] or b"") if artifact else b""
-                durable_digest = hashlib.sha256(durable_content).hexdigest() if durable_content else ""
-                durable_size = len(durable_content)
-                durable_key = "database" if artifact else ""
+            artifact = self._publication_version_artifact(
+                safe_id, safe_run_id, kind, connection=connection,
+            )
             if (
-                not artifact
-                or clean_text(artifact["filename"]) != filename
-                or int(artifact["size_bytes"] or -1) != size_bytes
-                or durable_size != size_bytes
-                or durable_digest != digest
-                or not durable_key
+                artifact is None
+                or clean_text(artifact.get("filename")) != filename
+                or int(artifact.get("size_bytes") or -1) != size_bytes
+                or clean_text(artifact.get("sha256")).lower() != digest
             ):
                 raise ValueError("Staged durable artifact does not match publication evidence.")
             published_kinds.add(kind)
 
         if "xlsx" not in published_kinds:
             raise ValueError("Staged quotation artifact is missing.")
+        now = utc_timestamp()
+        if current_run_id and self._publication_version_row(current_run_id, connection) is None:
+            expiry = self._publication_retention_expiry(now)
+            connection.execute(
+                "insert into sqag_quote_publication_versions "
+                "(workspace_id, session_id, run_id, job_id, state, artifact_storage_mode, "
+                "artifact_source, metadata_json, created_at, updated_at, promoted_at, "
+                "retention_expires_at, original_retention_expires_at, legal_hold, deletion_state) "
+                "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    self.workspace_id, safe_id, current_run_id,
+                    safe_reference(current_publication.get("job_id"), "job-"),
+                    "superseded", configured_artifact_storage_mode(), "legacy_current",
+                    raw_metadata, now, now, now, expiry, expiry, 0, "active",
+                ),
+            )
+            if configured_artifact_storage_mode() == "database":
+                connection.execute(
+                    "insert into sqag_quote_publication_artifacts "
+                    "(workspace_id, session_id, run_id, artifact_kind, filename, content_type, "
+                    "size_bytes, checksum_sha256, content_blob, created_at, updated_at) "
+                    "select workspace_id, session_id, ?, artifact_kind, filename, content_type, "
+                    "size_bytes, lower(hex(randomblob(32))), content_blob, created_at, updated_at "
+                    "from sqag_quote_artifacts where workspace_id = ? and session_id = ?",
+                    (current_run_id, self.workspace_id, safe_id),
+                )
+                legacy_rows = connection.execute(
+                    "select artifact_kind, content_blob from sqag_quote_publication_artifacts "
+                    "where workspace_id = ? and run_id = ?",
+                    (self.workspace_id, current_run_id),
+                ).fetchall()
+                for legacy in legacy_rows:
+                    connection.execute(
+                        "update sqag_quote_publication_artifacts set checksum_sha256 = ? "
+                        "where workspace_id = ? and run_id = ? and artifact_kind = ?",
+                        (
+                            artifact_checksum(bytes(legacy["content_blob"] or b"")),
+                            self.workspace_id, current_run_id, legacy["artifact_kind"],
+                        ),
+                    )
+        connection.execute(
+            "update sqag_quote_publication_versions set state = ?, updated_at = ? "
+            "where workspace_id = ? and session_id = ? and state = ? and run_id <> ?",
+            ("superseded", now, self.workspace_id, safe_id, "published", safe_run_id),
+        )
         metadata["publication"]["state"] = "published"
         metadata["publication"]["error_code"] = ""
+        metadata["publication"].pop("pending_run_id", None)
+        metadata["publication"].pop("pending_job_id", None)
         metadata["status"]["quote_generated"] = True
         for kind in QUOTE_SESSION_EXPORT_KINDS:
             metadata["status"][f"{kind}_exported"] = kind in published_kinds
         normalized = normalized_quote_session_metadata(metadata)
+        version_cursor = connection.execute(
+            "update sqag_quote_publication_versions set state = ?, metadata_json = ?, "
+            "error_code = null, updated_at = ?, promoted_at = ? where workspace_id = ? "
+            "and run_id = ? and state = ?",
+            (
+                "published", json.dumps(normalized, ensure_ascii=True, sort_keys=True),
+                now, now, self.workspace_id, safe_run_id, "staged",
+            ),
+        )
+        if getattr(version_cursor, "rowcount", 0) != 1:
+            raise ValueError("Quote publication state changed concurrently.")
         cursor = connection.execute(
             "update sqag_quote_sessions set metadata_json = ? where workspace_id = ? and session_id = ? and metadata_json = ?",
             (json.dumps(normalized, ensure_ascii=True, sort_keys=True), self.workspace_id, safe_id, raw_metadata),
@@ -12024,19 +12559,31 @@ class DatabaseSqagStorage:
             nonlocal changed
             metadata, draft_files = self._read_quote_session_metadata_for_workspace_on_connection(connection, safe_id)
             publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
-            if clean_text(publication.get("state")).lower() != "staged" or safe_reference(publication.get("run_id"), "run-") != safe_run_id:
-                return
-            metadata["publication"]["state"] = "failed"
-            metadata["publication"]["error_code"] = safe_resource_id(error_code, "publication_failed")
-            metadata["status"]["quote_generated"] = False
-            for kind in QUOTE_SESSION_EXPORT_KINDS:
-                metadata["status"][f"{kind}_exported"] = False
-            normalized = normalized_quote_session_metadata(metadata)
-            connection.execute(
-                "update sqag_quote_sessions set metadata_json = ?, draft_files_json = ? where workspace_id = ? and session_id = ?",
-                (json.dumps(normalized, ensure_ascii=True, sort_keys=True), json.dumps(draft_files, ensure_ascii=True, sort_keys=True), self.workspace_id, safe_id),
+            now = utc_timestamp()
+            cursor = connection.execute(
+                "update sqag_quote_publication_versions set state = ?, error_code = ?, "
+                "failed_at = ?, updated_at = ? where workspace_id = ? and session_id = ? "
+                "and run_id = ? and state = ?",
+                (
+                    "failed", safe_resource_id(error_code, "publication_failed"),
+                    now, now, self.workspace_id, safe_id, safe_run_id, "staged",
+                ),
             )
-            changed = True
+            changed = getattr(cursor, "rowcount", 0) == 1
+            if safe_reference(publication.get("pending_run_id"), "run-") == safe_run_id:
+                publication.pop("pending_run_id", None)
+                publication.pop("pending_job_id", None)
+                metadata["publication"] = publication
+                normalized = normalized_quote_session_metadata(metadata)
+                connection.execute(
+                    "update sqag_quote_sessions set metadata_json = ?, draft_files_json = ? "
+                    "where workspace_id = ? and session_id = ?",
+                    (
+                        json.dumps(normalized, ensure_ascii=True, sort_keys=True),
+                        json.dumps(draft_files, ensure_ascii=True, sort_keys=True),
+                        self.workspace_id, safe_id,
+                    ),
+                )
 
         self._run_storage_transaction(mark_failed)
         return changed
@@ -12066,59 +12613,281 @@ class DatabaseSqagStorage:
         session = self._public_quote_session(metadata, include_draft_state=include_draft_state, draft_files=draft_files)
         return session or None
 
-    def delete_quote_session(self, session_id: str) -> bool:
-        safe_id = safe_quote_session_id(session_id, "")
-        if not safe_id:
-            return False
-        metadata, _draft_files = self._read_quote_session_metadata_for_workspace(safe_id)
-        if not metadata or not self._quote_session_editable_by_current_user(metadata):
-            return False
+    def _publication_version_lock_identities_for_session(
+        self, session_id: str
+    ) -> tuple[tuple[str, str], ...]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "select run_id from sqag_quote_publication_versions "
+                "where workspace_id = ? and session_id = ? order by run_id",
+                (self.workspace_id, session_id),
+            ).fetchall()
+        return tuple(
+            ("generated_quote_version", safe_run_id)
+            for row in rows
+            if (safe_run_id := safe_reference(row["run_id"], "run-"))
+        )
+
+    def _session_deletion_blocked_by_hold(
+        self, connection: Any, session_id: str
+    ) -> bool:
+        version_hold = connection.execute(
+            "select 1 from sqag_quote_publication_versions "
+            "where workspace_id = ? and session_id = ? and legal_hold = ? limit 1",
+            (self.workspace_id, session_id, 1),
+        ).fetchone()
+        run_hold = connection.execute(
+            "select 1 from sqag_generation_runs "
+            "where workspace_id = ? and quote_session_id = ? and legal_hold = ? limit 1",
+            (self.workspace_id, session_id, 1),
+        ).fetchone()
+        return version_hold is not None or run_hold is not None
+
+    def _active_object_quote_rows_for_session(
+        self, connection: Any, session_id: str
+    ) -> list[Any]:
+        rows = connection.execute(
+            "select artifact_id, workspace_id, owner_type, owner_id, "
+            "platform_user_id, session_id, job_id, artifact_kind, filename, "
+            "content_type, size_bytes, checksum_sha256, object_provider_type, "
+            "object_key_ref, status, retention_status, created_at, updated_at, "
+            "deleted_at from sqag_object_artifacts "
+            "where workspace_id = ? and ("
+            "(owner_type = ? and owner_id = ?) or "
+            "(owner_type = ? and owner_id in ("
+            "select run_id from sqag_quote_publication_versions "
+            "where workspace_id = ? and session_id = ?))) "
+            "and status = ? and retention_status = ? and deleted_at is null "
+            "order by owner_type, owner_id, artifact_kind",
+            (
+                self.workspace_id,
+                "generated_quote",
+                session_id,
+                "generated_quote_version",
+                self.workspace_id,
+                session_id,
+                "active",
+                "active",
+            ),
+        ).fetchall()
+        for row in rows:
+            owner_type = clean_text(row["owner_type"])
+            owner_id = clean_text(row["owner_id"])
+            if owner_type == "generated_quote" and owner_id == session_id:
+                continue
+            if owner_type == "generated_quote_version":
+                version = connection.execute(
+                    "select 1 from sqag_quote_publication_versions "
+                    "where workspace_id = ? and session_id = ? and run_id = ?",
+                    (self.workspace_id, session_id, owner_id),
+                ).fetchone()
+                if version is not None:
+                    continue
+            raise ObjectStorageContractError(
+                "Quote publication artifact ownership is invalid."
+            )
+        return list(rows)
+
+    def _delete_quote_session_with_publications(
+        self,
+        session_id: str,
+        *,
+        authorize: Any,
+        finalize_graph: Callable[[Any], Any] | None = None,
+        already_absent_is_success: bool = False,
+    ) -> bool:
         artifact_mode = configured_artifact_storage_mode()
+        if artifact_mode not in {"local", "database", "object"}:
+            raise SqagStorageAccessError(
+                QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                status=503,
+                reason="retention_artifact_storage_unavailable",
+            )
+
+        def delete_owner(connection: Any) -> bool:
+            if finalize_graph is not None:
+                finalize_graph(
+                    connection,
+                    require_session_exclusive=True,
+                )
+            connection.execute(
+                "delete from sqag_quote_publication_artifacts "
+                "where workspace_id = ? and session_id = ?",
+                (self.workspace_id, session_id),
+            )
+            connection.execute(
+                "delete from sqag_quote_publication_versions "
+                "where workspace_id = ? and session_id = ?",
+                (self.workspace_id, session_id),
+            )
+            if artifact_mode == "database":
+                connection.execute(
+                    "delete from sqag_quote_artifacts "
+                    "where workspace_id = ? and session_id = ?",
+                    (self.workspace_id, session_id),
+                )
+            cursor = connection.execute(
+                "delete from sqag_quote_sessions "
+                "where workspace_id = ? and session_id = ?",
+                (self.workspace_id, session_id),
+            )
+            return bool(
+                getattr(cursor, "rowcount", 0) > 0
+                or already_absent_is_success
+            )
+
         if artifact_mode == "object":
-            def authorize_object_quote_delete(connection: Any) -> bool:
-                current_metadata, _current_draft_files = (
-                    self._read_quote_session_metadata_for_workspace_on_connection(
-                        connection,
-                        safe_id,
-                    )
-                )
-                return bool(
-                    current_metadata
-                    and self._quote_session_editable_by_current_user(
-                        current_metadata
-                    )
-                )
-
-            def delete_object_quote_owner(connection: Any) -> bool:
-                cursor = connection.execute(
-                    "delete from sqag_quote_sessions where workspace_id = ? and session_id = ?",
-                    (self.workspace_id, safe_id),
-                )
-                return cursor.rowcount > 0
-
             try:
-                return self._run_object_owner_delete(
-                    "generated_quote",
-                    safe_id,
-                    delete_object_quote_owner,
-                    authorize_object_quote_delete,
+                return bool(
+                    self._run_object_owner_delete(
+                        "generated_quote",
+                        session_id,
+                        delete_owner,
+                        authorize,
+                        additional_lock_identities=(
+                            self._publication_version_lock_identities_for_session(
+                                session_id
+                            )
+                        ),
+                        rows_for_delete=lambda connection: (
+                            self._active_object_quote_rows_for_session(
+                                connection, session_id
+                            )
+                        ),
+                    )
                 )
             except Exception as exc:
                 if not self._expected_storage_failure(exc):
                     raise
                 raise self._storage_unavailable_error(exc) from exc
 
-        def delete_quote_owner(connection: Any) -> bool:
-            if artifact_mode == "database":
-                connection.execute(
-                    "delete from sqag_quote_artifacts where workspace_id = ? and session_id = ?",
-                    (self.workspace_id, safe_id),
-                )
-            cursor = connection.execute("delete from sqag_quote_sessions where workspace_id = ? and session_id = ?", (self.workspace_id, safe_id))
-            return cursor.rowcount > 0
+        def delete_database_owner(connection: Any) -> bool:
+            if not authorize(connection):
+                return False
+            return delete_owner(connection)
 
         try:
-            return bool(self._run_storage_transaction(delete_quote_owner))
+            return bool(self._run_storage_transaction(delete_database_owner))
+        except Exception as exc:
+            if not self._expected_storage_failure(exc):
+                raise
+            raise self._storage_unavailable_error(exc) from exc
+
+    def delete_quote_session(self, session_id: str) -> bool:
+        safe_id = safe_quote_session_id(session_id, "")
+        if not safe_id:
+            return False
+
+        def authorize(connection: Any) -> bool:
+            metadata, _draft_files = (
+                self._read_quote_session_metadata_for_workspace_on_connection(
+                    connection, safe_id
+                )
+            )
+            return bool(
+                metadata
+                and self._quote_session_editable_by_current_user(metadata)
+                and not self._session_deletion_blocked_by_hold(
+                    connection, safe_id
+                )
+            )
+
+        return self._delete_quote_session_with_publications(
+            safe_id,
+            authorize=authorize,
+        )
+
+    def quote_publication_version_is_current(
+        self, run_id: str, session_id: str = ""
+    ) -> bool:
+        safe_run_id = safe_reference(run_id, "run-")
+        if not safe_run_id:
+            return False
+        version = self._publication_version_row(safe_run_id)
+        if version is None:
+            return False
+        safe_id = safe_quote_session_id(version["session_id"], "")
+        requested_id = safe_quote_session_id(session_id, "")
+        if not safe_id or requested_id and requested_id != safe_id:
+            return False
+        current, _draft_files = self._read_quote_session_metadata_for_workspace(
+            safe_id
+        )
+        publication = (
+            current.get("publication")
+            if isinstance(current.get("publication"), dict)
+            else {}
+        )
+        return bool(
+            clean_text(publication.get("state")).lower() == "published"
+            and safe_reference(publication.get("run_id"), "run-")
+            == safe_run_id
+        )
+
+    def delete_quote_publication_version_for_retention(
+        self,
+        run_id: str,
+        *,
+        finalize_graph: Callable[[Any], Any],
+    ) -> bool | None:
+        """Delete one non-current publication version with its generation graph."""
+        safe_run_id = safe_reference(run_id, "run-")
+        if self.role != "admin" or not safe_run_id:
+            return None
+        version = self._publication_version_row(safe_run_id)
+        if version is None:
+            return None
+        safe_id = safe_quote_session_id(version["session_id"], "")
+        if not safe_id or bool(version["legal_hold"]):
+            return False
+        current, _draft_files = self._read_quote_session_metadata_for_workspace(safe_id)
+        publication = current.get("publication") if isinstance(current.get("publication"), dict) else {}
+        if (
+            clean_text(publication.get("state")).lower() == "published"
+            and safe_reference(publication.get("run_id"), "run-") == safe_run_id
+        ):
+            return False
+
+        def finalize_version(connection: Any) -> bool:
+            cursor = connection.execute(
+                "delete from sqag_quote_publication_versions where workspace_id = ? "
+                "and run_id = ? and state <> ? and legal_hold = ?",
+                (self.workspace_id, safe_run_id, "published", 0),
+            )
+            if getattr(cursor, "rowcount", 0) != 1:
+                return False
+            finalize_graph(connection)
+            return True
+
+        mode = clean_text(version["artifact_storage_mode"])
+        source = clean_text(version["artifact_source"])
+        if mode == "object":
+            owner_type = (
+                "generated_quote"
+                if source == "legacy_current"
+                else "generated_quote_version"
+            )
+            owner_id = safe_id if source == "legacy_current" else safe_run_id
+            try:
+                return bool(
+                    self._run_object_owner_delete(
+                        owner_type,
+                        owner_id,
+                        finalize_version,
+                        result_from_rows=lambda _rows: True,
+                        additional_lock_identities=(
+                            ("generated_quote", safe_id),
+                        ),
+                    )
+                )
+            except Exception as exc:
+                if not self._expected_storage_failure(exc):
+                    raise
+                raise self._storage_unavailable_error(exc) from exc
+        if mode != "database":
+            return False
+        try:
+            return bool(self._run_storage_transaction(finalize_version))
         except Exception as exc:
             if not self._expected_storage_failure(exc):
                 raise
@@ -12130,70 +12899,31 @@ class DatabaseSqagStorage:
         *,
         finalize_graph: Callable[[Any], Any] | None = None,
     ) -> bool:
-        """Delete one workspace-scoped session and its durable artifacts as an admin worker."""
+        """Delete one workspace-scoped session and all versioned artifacts."""
         safe_id = safe_quote_session_id(session_id, "")
         if self.role != "admin" or not safe_id:
             return False
-        artifact_mode = configured_artifact_storage_mode()
-        if artifact_mode == "object":
-            def delete_owner(connection: Any) -> bool:
-                if finalize_graph is not None:
-                    finalize_graph(
-                        connection,
-                        require_session_exclusive=True,
-                    )
-                connection.execute(
-                    "delete from sqag_quote_sessions where workspace_id = ? and session_id = ?",
-                    (self.workspace_id, safe_id),
-                )
-                return True
 
-            try:
-                return bool(
-                    self._run_object_owner_delete(
-                        "generated_quote",
-                        safe_id,
-                        delete_owner,
-                        result_from_rows=lambda _rows: True,
-                    )
-                )
-            except Exception as exc:
-                if not self._expected_storage_failure(exc):
-                    raise
-                raise self._storage_unavailable_error(exc) from exc
-        if artifact_mode != "database":
-            raise SqagStorageAccessError(
-                QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
-                status=503,
-                reason="retention_artifact_storage_unavailable",
-            )
-
-        def delete_database_owner(connection: Any) -> bool:
-            if finalize_graph is not None:
-                finalize_graph(
-                    connection,
-                    require_session_exclusive=True,
-                )
-            connection.execute(
-                "delete from sqag_quote_artifacts where workspace_id = ? and session_id = ?",
-                (self.workspace_id, safe_id),
-            )
-            connection.execute(
-                "delete from sqag_quote_sessions where workspace_id = ? and session_id = ?",
-                (self.workspace_id, safe_id),
-            )
-            remaining = connection.execute(
-                "select 1 from sqag_quote_artifacts where workspace_id = ? and session_id = ? limit 1",
+        def authorize(connection: Any) -> bool:
+            session_exists = connection.execute(
+                "select 1 from sqag_quote_sessions "
+                "where workspace_id = ? and session_id = ?",
                 (self.workspace_id, safe_id),
             ).fetchone()
-            return remaining is None
+            if session_exists is None:
+                return True
+            return bool(
+                not self._session_deletion_blocked_by_hold(
+                    connection, safe_id
+                )
+            )
 
-        try:
-            return bool(self._run_storage_transaction(delete_database_owner))
-        except Exception as exc:
-            if not self._expected_storage_failure(exc):
-                raise
-            raise self._storage_unavailable_error(exc) from exc
+        return self._delete_quote_session_with_publications(
+            safe_id,
+            authorize=authorize,
+            finalize_graph=finalize_graph,
+            already_absent_is_success=True,
+        )
 
     def quote_session_export_file_path(self, session_id: str, kind: str) -> Path | None:
         _ = session_id, kind
@@ -18636,22 +19366,194 @@ def forensic_store_for_auth_session(auth_session: dict[str, Any] | None = None):
         yield ForensicStore(connection, workspace_id, actor_tracking_id, local_mode=True, actor_key_version_value="local-v1")
 
 
-def forensic_request_evidence_error(payload: dict[str, Any]) -> str:
-    evidence_values = {
-        "approved_basis": payload.get("quote_basis_sections")
-        if isinstance(payload.get("quote_basis_sections"), list)
-        else [],
-        "output_rows": payload.get("line_items")
-        if isinstance(payload.get("line_items"), list)
-        else [],
+FORENSIC_MANIFEST_ENVELOPE_RESERVE_BYTES = 4096
+
+
+def forensic_json_fingerprint(value: Any) -> tuple[int, str]:
+    encoder = json.JSONEncoder(
+        ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    )
+    digest = hashlib.sha256()
+    size_bytes = 0
+    for chunk in encoder.iterencode(value):
+        encoded = chunk.encode("utf-8")
+        size_bytes += len(encoded)
+        digest.update(encoded)
+    return size_bytes, digest.hexdigest()
+
+
+def forensic_compacted_value(value: Any) -> dict[str, Any]:
+    size_bytes, digest = forensic_json_fingerprint(value)
+    summary: dict[str, Any] = {
+        "snapshot_compacted": True,
+        "canonical_size_bytes": size_bytes,
+        "canonical_sha256": digest,
+        "value_type": type(value).__name__,
     }
-    try:
-        encoded = json.dumps(evidence_values, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    except (TypeError, ValueError):
-        return "Quote request details are invalid."
-    if len(encoded) > MAX_FORENSIC_REQUEST_EVIDENCE_BYTES:
-        return "Quote request details are too large."
-    return ""
+    if isinstance(value, (dict, list, tuple)):
+        summary["item_count"] = len(value)
+    return summary
+
+
+def compact_generation_canonical_manifest(
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep terminal evidence bounded while preserving hashes and shape receipts."""
+    body_limit = (
+        MAX_GENERATION_MANIFEST_BYTES
+        - FORENSIC_MANIFEST_ENVELOPE_RESERVE_BYTES
+    )
+    original_size, _original_digest = forensic_json_fingerprint(manifest)
+    if original_size <= body_limit:
+        return manifest
+
+    compacted = copy.deepcopy(manifest)
+    compacted_fields: list[str] = []
+    paths = (
+        ("pricing_reference", "snapshot"),
+        ("profile", "snapshot"),
+        ("layout_rules", "snapshot"),
+        ("normalized_brief",),
+        ("approved_basis",),
+        ("output_rows",),
+    )
+    for path in paths:
+        owner: Any = compacted
+        for part in path[:-1]:
+            owner = owner.get(part) if isinstance(owner, dict) else None
+        leaf = path[-1]
+        if not isinstance(owner, dict) or leaf not in owner:
+            continue
+        owner[leaf] = forensic_compacted_value(owner[leaf])
+        compacted_fields.append(".".join(path))
+        compacted["evidence_compaction"] = {
+            "schema": "swooshz.sqag.generation-evidence-compaction.v1",
+            "compacted": True,
+            "original_size_bytes": original_size,
+            "limit_bytes": body_limit,
+            "compacted_fields": list(compacted_fields),
+        }
+        compacted_size, _compacted_digest = forensic_json_fingerprint(compacted)
+        if compacted_size <= body_limit:
+            return compacted
+
+    fallback = {
+        "generation_schema_version": manifest.get("generation_schema_version"),
+        "job_id": clean_text(manifest.get("job_id")),
+        "evidence_compaction": {
+            "schema": "swooshz.sqag.generation-evidence-compaction.v1",
+            "compacted": True,
+            "fallback_summary": True,
+            "original_size_bytes": original_size,
+            "limit_bytes": body_limit,
+            "compacted_fields": sorted(str(key) for key in manifest),
+        },
+        "field_summaries": {
+            str(key): forensic_compacted_value(value)
+            for key, value in manifest.items()
+        },
+        "artifacts": [],
+        "artifacts_durable": False,
+    }
+    fallback_size, _fallback_digest = forensic_json_fingerprint(fallback)
+    if fallback_size > body_limit:
+        raise ValueError("Generation evidence cannot be represented safely.")
+    return fallback
+
+
+
+def forensic_request_evidence_assessment(payload: dict[str, Any]) -> dict[str, Any]:
+    """Measure allowed immutable evidence without retaining an oversized body."""
+    sections = (
+        (
+            "approved_basis",
+            payload.get("quote_basis_sections")
+            if isinstance(payload.get("quote_basis_sections"), list)
+            else [],
+        ),
+        (
+            "output_rows",
+            payload.get("line_items")
+            if isinstance(payload.get("line_items"), list)
+            else [],
+        ),
+    )
+    encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
+    measured = 1
+    exceeded_section = ""
+    invalid_section = ""
+    for index, (name, value) in enumerate(sections):
+        measured += len(("," if index else "") + json.dumps(name) + ":")
+        try:
+            for chunk in encoder.iterencode(value):
+                measured += len(chunk.encode("utf-8"))
+                if measured > MAX_FORENSIC_REQUEST_EVIDENCE_BYTES:
+                    exceeded_section = name
+                    break
+        except (TypeError, ValueError):
+            invalid_section = name
+        if exceeded_section or invalid_section:
+            break
+    if not exceeded_section and not invalid_section:
+        measured += 1
+    return {
+        "error": (
+            "Quote request details are invalid."
+            if invalid_section
+            else "Quote request details are too large."
+            if exceeded_section
+            else ""
+        ),
+        "error_category": (
+            "request_evidence_invalid"
+            if invalid_section
+            else "request_evidence_too_large"
+            if exceeded_section
+            else ""
+        ),
+        "bounded_size_bytes": min(
+            measured, MAX_FORENSIC_REQUEST_EVIDENCE_BYTES + 1
+        ),
+        "measurement_capped": bool(exceeded_section),
+        "exceeded_section": exceeded_section or invalid_section,
+        "approved_basis_count": len(sections[0][1]),
+        "output_row_count": len(sections[1][1]),
+        "limit_bytes": MAX_FORENSIC_REQUEST_EVIDENCE_BYTES,
+    }
+
+
+def forensic_request_evidence_error(payload: dict[str, Any]) -> str:
+    return clean_text(forensic_request_evidence_assessment(payload).get("error"))
+
+
+def minimal_forensic_request_summary(
+    payload: dict[str, Any], assessment: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "schema": "swooshz.sqag.generation-request-evidence.v2",
+        "image_count": len(image_entries(payload)),
+        "has_quote_session": isinstance(payload.get("quote_session"), dict),
+        "profile_id": safe_resource_id(profile_id_from_payload(payload), ""),
+        "pricing_reference_id": safe_resource_id(
+            pricing_reference_id_from_payload(payload), ""
+        ),
+        "payload_shape_sha256": hashlib.sha256(
+            json.dumps(
+                sorted(str(key) for key in payload.keys()), separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest(),
+        "request_evidence": {
+            key: assessment.get(key)
+            for key in (
+                "bounded_size_bytes",
+                "measurement_capped",
+                "exceeded_section",
+                "approved_basis_count",
+                "output_row_count",
+                "limit_bytes",
+            )
+        },
+    }
 
 
 def forensic_request_summary(payload: dict[str, Any]) -> dict[str, Any]:
@@ -18700,6 +19602,7 @@ def pre_generator_terminal_manifest(
     job_type: str = "generate",
     lifecycle_stage: str = "request_validation",
     error_category: str,
+    request_evidence_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     inputs: list[dict[str, Any]] = []
     for entry in image_entries(payload)[:MAX_REFERENCE_IMAGES]:
@@ -18721,7 +19624,7 @@ def pre_generator_terminal_manifest(
         except (TypeError, ValueError):
             item["content_valid"] = False
         inputs.append(item)
-    return {
+    manifest = {
         "generation_schema_version": 1,
         "job_id": safe_resource_id(job_id, ""),
         "job_type": clean_text(job_type)[:40] or "generate",
@@ -18740,6 +19643,19 @@ def pre_generator_terminal_manifest(
         "inputs": inputs,
         "artifacts": [],
     }
+    if request_evidence_metadata:
+        manifest["request"]["forensic_evidence"] = {
+            key: request_evidence_metadata.get(key)
+            for key in (
+                "bounded_size_bytes",
+                "measurement_capped",
+                "exceeded_section",
+                "approved_basis_count",
+                "output_row_count",
+                "limit_bytes",
+            )
+        }
+    return manifest
 
 
 def begin_generation_forensics(
@@ -18749,10 +19665,21 @@ def begin_generation_forensics(
     *,
     job_id: str = "",
     claim_status: str = "",
+    request_summary_override: dict[str, Any] | None = None,
 ) -> str:
     try:
         with forensic_store_for_auth_session(auth_session) as store:
-            run_id = store.record_run_started(job_type, forensic_request_summary(payload), job_id=job_id, idempotency_key=job_id, app_revision=clean_text(os.getenv("GIT_REVISION") or os.getenv("COMMIT_SHA")))
+            run_id = store.record_run_started(
+                job_type,
+                dict(request_summary_override)
+                if request_summary_override is not None
+                else forensic_request_summary(payload),
+                job_id=job_id,
+                idempotency_key=job_id,
+                app_revision=clean_text(
+                    os.getenv("GIT_REVISION") or os.getenv("COMMIT_SHA")
+                ),
+            )
             if claim_status:
                 run = store.run_for_job(job_id)
                 current_status = clean_text(run.get("status")).lower()
@@ -19094,9 +20021,43 @@ def create_job(
                     return {"status": "blocked", "errors": ["Job request could not be resumed."]}
                 return public_job(existing)
     job_id = requested_job_id or f"job-{secrets.token_hex(6)}"
-    evidence_error = forensic_request_evidence_error(payload)
+    evidence_assessment = forensic_request_evidence_assessment(payload)
+    evidence_error = clean_text(evidence_assessment.get("error"))
     if normalized_type in {"generate", "generate_pdf"} and evidence_error:
-        return blocked([evidence_error], "request_evidence_too_large")
+        category = clean_text(evidence_assessment.get("error_category"))
+        try:
+            generation_run_id = begin_generation_forensics(
+                normalized_type,
+                payload,
+                auth_session,
+                job_id=job_id,
+                claim_status="queued",
+                request_summary_override=minimal_forensic_request_summary(
+                    payload, evidence_assessment
+                ),
+            )
+        except GenerationRunReplay as replay:
+            return {
+                "job_id": job_id,
+                "status": "blocked",
+                "errors": [GENERATION_REQUEST_ALREADY_ACCEPTED_MESSAGE],
+                "generation_run_id": replay.run_id,
+                "idempotent_replay": True,
+            }
+        return finish_generation_forensics(
+            generation_run_id,
+            {"job_id": job_id, "status": "blocked", "errors": [evidence_error]},
+            auth_session,
+            error_category=category,
+            canonical_manifest=pre_generator_terminal_manifest(
+                job_id,
+                payload,
+                terminal_status="blocked",
+                error_category=category,
+                job_type=normalized_type,
+                request_evidence_metadata=evidence_assessment,
+            ),
+        )
 
     if normalized_type in {"generate", "generate_pdf"}:
         try:
@@ -19206,13 +20167,52 @@ def run_quote_job(
     generation_run_id = clean_text(payload.get("_generation_run_id"))
     job_id = safe_resource_id(job_id, f"job-{secrets.token_hex(6)}")
 
-    evidence_error = forensic_request_evidence_error(payload)
+    evidence_assessment = forensic_request_evidence_assessment(payload)
+    evidence_error = clean_text(evidence_assessment.get("error"))
     if evidence_error:
+        category = clean_text(evidence_assessment.get("error_category"))
         result = {"job_id": job_id, "status": "blocked", "errors": [evidence_error]}
         if not generation_run_id:
-            return result
+            try:
+                generation_run_id = begin_generation_forensics(
+                    "generate_pdf"
+                    if clean_text(pdf_mode).lower() != "none"
+                    else "generate",
+                    payload,
+                    auth_session,
+                    job_id=job_id,
+                    claim_status="running",
+                    request_summary_override=minimal_forensic_request_summary(
+                        payload, evidence_assessment
+                    ),
+                )
+            except GenerationRunReplay as replay:
+                return {
+                    "job_id": job_id,
+                    "status": "blocked",
+                    "errors": [GENERATION_REQUEST_ALREADY_ACCEPTED_MESSAGE],
+                    "generation_run_id": replay.run_id,
+                    "idempotent_replay": True,
+                }
+            except SqagStorageAccessError as exc:
+                return storage_access_error_payload(exc)
         return finish_generation_forensics(
-            generation_run_id, result, auth_session, error_category="request_evidence_too_large"
+            generation_run_id,
+            result,
+            auth_session,
+            error_category=category,
+            canonical_manifest=pre_generator_terminal_manifest(
+                job_id,
+                payload,
+                terminal_status="blocked",
+                error_category=category,
+                job_type=(
+                    "generate_pdf"
+                    if clean_text(pdf_mode).lower() != "none"
+                    else "generate"
+                ),
+                request_evidence_metadata=evidence_assessment,
+            ),
         )
 
     if not generation_run_id:
@@ -19444,7 +20444,7 @@ def run_quote_job(
             if atomic_publication:
                 publication_storage = storage
                 publication_session_id = safe_quote_session_id(result["quote_session"].get("session_id"), "")
-                publication_files = storage.quote_session_evidence_files(publication_session_id)
+                publication_files = storage.quote_session_evidence_files(publication_session_id, generation_run_id)
                 result["files"] = publication_files
             elif artifact_mode in {"database", "object"}:
                 result["files"] = quote_session_result_files(result.get("quote_session"))
@@ -19481,6 +20481,18 @@ def run_quote_job(
     brief_webapp["uploaded_images"] = copy.deepcopy(input_references)
     normalized_brief["_webapp"] = brief_webapp
 
+    result_evidence_summary = forensic_result_summary(result)
+    durable_artifacts = (
+        copy.deepcopy(publication_files)
+        if publication_storage is not None and publication_session_id
+        else []
+    )
+    transient_outputs = result_evidence_summary.get("artifacts", [])
+    transient_output_types = sorted({
+        clean_text(item.get("name")).rsplit(".", 1)[-1].lower()
+        for item in transient_outputs
+        if isinstance(item, dict) and "." in clean_text(item.get("name"))
+    })
     canonical_manifest = {
         "generation_schema_version": 1,
         "job_id": job_id,
@@ -19493,8 +20505,27 @@ def run_quote_job(
         "generation_configuration": {"pdf_mode": normalized_pdf_mode, "provider": clean_text(read_dotenv_value("AI_PROVIDER")), "model": clean_text(read_dotenv_value("OPENAI_MODEL")), "app_revision": clean_text(os.getenv("GIT_REVISION") or os.getenv("COMMIT_SHA"))},
         "inputs": input_references,
         "layout_rules": {"snapshot": layout_rules_snapshot, "sha256": hashlib.sha256(json.dumps(layout_rules_snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()},
-        "artifacts": forensic_result_summary(result).get("artifacts", []),
+        "artifacts": durable_artifacts,
+        "artifacts_durable": bool(durable_artifacts),
+        "transient_outputs": {
+            "output_count": 0 if durable_artifacts else len(transient_outputs),
+            "output_types": [] if durable_artifacts else transient_output_types,
+            "retained_as_canonical_artifacts": False,
+        },
     }
+    canonical_manifest = compact_generation_canonical_manifest(canonical_manifest)
+    compaction = canonical_manifest.get("evidence_compaction")
+    if isinstance(compaction, dict) and compaction.get("compacted") is True:
+        write_local_log(
+            "forensic_manifest_compacted",
+            {
+                "job_id": job_id,
+                "compacted_field_count": len(
+                    compaction.get("compacted_fields") or []
+                ),
+            },
+        )
+
     if configured_app_mode() != "deploy" and status != "failed":
         result.update({
             "stdout": completed.stdout,
