@@ -21,6 +21,7 @@ SQAG_TABLES = {
     "sqag_pricing_references",
     "sqag_quote_sessions",
     "sqag_quote_artifacts",
+    "sqag_quote_publication_versions",
     "sqag_file_artifacts",
     "sqag_object_artifacts",
 }
@@ -57,6 +58,7 @@ class FakePostgresConnection:
     required_tables = {
         "sqag_profiles",
         "sqag_pricing_references",
+        "sqag_quote_publication_versions",
         "sqag_quote_sessions",
         "sqag_object_artifacts",
     }
@@ -104,6 +106,7 @@ class FakePostgresConnection:
                     "updated_at",
                     "deleted_at",
                 },
+                "sqag_quote_publication_versions": webapp.SQAG_PUBLICATION_VERSION_REQUIRED_COLUMNS,
             }
             for table in sorted(self.required_tables - self.missing_tables):
                 if table not in params:

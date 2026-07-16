@@ -8836,3 +8836,67 @@ body.privacy-page {
 .settings-section-actions {
   margin: 10px 0;
 }
+
+
+/* Feedback and legal-entry controls added for the internal UAT evidence workflow. */
+.topbar-feedback-button {
+  appearance: none;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+}
+
+.feedback-panel {
+  max-height: min(90vh, 58rem);
+  max-width: 50rem;
+  overflow-y: auto;
+}
+
+.feedback-panel form {
+  display: grid;
+  gap: 1rem;
+}
+
+.feedback-panel textarea {
+  min-height: 5rem;
+  resize: vertical;
+}
+
+.feedback-field-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.feedback-link-card {
+  background: var(--surface-soft, #f6f8fb);
+  border: 1px solid var(--border-color, #d9dee7);
+  border-radius: 0.75rem;
+  display: grid;
+  gap: 0.6rem;
+  padding: 0.9rem;
+}
+
+.feedback-link-card p {
+  margin: 0;
+}
+
+.feedback-link-choice {
+  align-items: center;
+  display: flex;
+  gap: 0.55rem;
+}
+
+.feedback-status {
+  color: var(--text-color, #18212f);
+  font-weight: 650;
+  margin: 0;
+}
+
+@media (max-width: 700px) {
+  .feedback-field-grid {
+    grid-template-columns: 1fr;
+  }
+}

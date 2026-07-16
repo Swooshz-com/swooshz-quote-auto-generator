@@ -27,7 +27,7 @@ const options = {
 };
 
 const baseUrl = `http://${options.host}:${options.port}`;
-const outputDir = path.join(root, "_output", "playwright");
+const outputDir = path.join(root, "_logs", "browser", "playwright-smoke");
 const quoteDataRoot = path.join(root, "_tmp", "playwright-quote-data");
 
 function pythonCommand() {

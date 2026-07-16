@@ -351,6 +351,8 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
         "APP_MODE": "deploy",
         "AUTH_REQUIRED": "true",
         "SESSION_SECRET": "synthetic-session-secret-with-enough-entropy",
+        "SQAG_TRACKING_HMAC_KEY": "synthetic-tracking-hmac-key-with-enough-entropy",
+        "SQAG_TRACKING_HMAC_KEY_VERSION": "synthetic-v1",
         "SQAG_PLATFORM_LAUNCH_MODE": "platform",
         "SQAG_PLATFORM_BASE_URL": "https://platform.example.test",
         "SQAG_STORAGE_MODE": "database",

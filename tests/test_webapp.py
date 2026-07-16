@@ -684,6 +684,365 @@ class WebappServerTest(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertTrue(root.is_relative_to(webapp.PROJECT_ROOT))
 
+    def test_feedback_context_http_route_initializes_query_for_normal_users(self):
+        data_root = test_temp_root() / f"feedback-context-{time.time_ns()}"
+        env = {"APP_MODE": "local", "SQAG_STORAGE_MODE": "local", "QUOTE_DATA_ROOT": str(data_root)}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with LocalRunnerServer() as runner:
+                response = self.http_json(runner, "GET", "/api/feedback/context")
+
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(response["body"]["status"], "ok")
+        self.assertEqual(response["body"]["context"]["link_type"], "none")
+        self.assertEqual(response["body"]["context"]["run_id"], "")
+
+    def test_support_feedback_evidence_http_route_is_privileged_scoped_and_audited(self):
+        root = test_temp_root() / f"support-feedback-evidence-{time.time_ns()}"
+        database_url = f"sqlite:///{(root / 'sqag.sqlite3').as_posix()}"
+        env = self.deploy_auth_env(
+            SQAG_STORAGE_MODE="database",
+            SQAG_ARTIFACT_STORAGE_MODE="database",
+            SQAG_DATABASE_URL=database_url,
+            QUOTE_DATA_ROOT=str(root / "data"),
+            QUOTE_LOG_ROOT=str(root / "logs"),
+        )
+        admin_session = self.platform_auth_session(
+            "workspace-support-evidence", membership_role="owner", user_id="support-admin"
+        )
+        viewer_session = self.platform_auth_session(
+            "workspace-support-evidence", membership_role="viewer", user_id="support-viewer"
+        )
+        cross_workspace_session = self.platform_auth_session(
+            "workspace-support-other", membership_role="owner", user_id="support-other"
+        )
+        with mock.patch.dict(os.environ, env, clear=True):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.DatabaseSqagStorage(
+                database_url,
+                "workspace-support-evidence",
+                role="admin",
+                user_id="support-admin",
+            )
+            with storage.connection() as connection:
+                store = webapp.ForensicStore(
+                    connection,
+                    "workspace-support-evidence",
+                    "pid-test-v1-" + "s" * 24,
+                )
+                run_id = store.record_run_started(
+                    "generate", {"synthetic": True}, job_id="job-support123"
+                )
+                store.finish_run(
+                    run_id,
+                    "completed",
+                    quote_session_id="quote-support123",
+                    canonical_manifest={"artifacts": []},
+                )
+                linked = store.submit_feedback(
+                    {
+                        "category": "bug",
+                        "title": "Synthetic linked report",
+                        "message": "Synthetic support evidence route fixture.",
+                        "run_id": run_id,
+                        "validated_session_id": "quote-support123",
+                    }
+                )
+                unlinked = store.submit_feedback(
+                    {
+                        "category": "bug",
+                        "title": "Synthetic unlinked report",
+                        "message": "Synthetic support missing-run fixture.",
+                    }
+                )
+
+            def cookie(session):
+                return f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(session)}"
+
+            admin_cookie = cookie(admin_session)
+            admin_headers = {
+                webapp.configured_csrf_header_name(): webapp.csrf_token_for_cookie_header(admin_cookie)
+            }
+            cross_cookie = cookie(cross_workspace_session)
+            cross_headers = {
+                webapp.configured_csrf_header_name(): webapp.csrf_token_for_cookie_header(cross_cookie)
+            }
+            with (
+                mock.patch.object(
+                    webapp,
+                    "quote_session_storage_for_auth_session",
+                    side_effect=AssertionError(
+                        "artifact-free HTTP verification opened artifact storage"
+                    ),
+                ) as open_artifact_storage,
+                LocalRunnerServer() as runner,
+            ):
+                missing_csrf = self.http_json(
+                    runner,
+                    "GET",
+                    f"/api/support/feedback/{linked['support_reference']}/evidence?reason=support_investigation",
+                    cookie=admin_cookie,
+                )
+                success = self.http_json(
+                    runner,
+                    "GET",
+                    f"/api/support/feedback/{linked['support_reference']}/evidence?reason=support_investigation",
+                    cookie=admin_cookie,
+                    headers=admin_headers,
+                )
+                viewer = self.http_json(
+                    runner,
+                    "GET",
+                    f"/api/support/feedback/{linked['support_reference']}/evidence?reason=support_investigation",
+                    cookie=cookie(viewer_session),
+                )
+                cross_workspace = self.http_json(
+                    runner,
+                    "GET",
+                    f"/api/support/feedback/{linked['support_reference']}/evidence?reason=support_investigation",
+                    cookie=cross_cookie,
+                    headers=cross_headers,
+                )
+                blank_reason = self.http_json(
+                    runner,
+                    "GET",
+                    f"/api/support/feedback/{linked['support_reference']}/evidence?reason=",
+                    cookie=admin_cookie,
+                    headers=admin_headers,
+                )
+                missing_run = self.http_json(
+                    runner,
+                    "GET",
+                    f"/api/support/feedback/{unlinked['support_reference']}/evidence?reason=support_investigation",
+                    cookie=admin_cookie,
+                    headers=admin_headers,
+                )
+
+            with storage.connection() as connection:
+                successful_access_events = connection.execute(
+                    "select count(*) from sqag_audit_events where workspace_id = ? and run_id = ? and event_type = ?",
+                    (
+                        "workspace-support-evidence",
+                        run_id,
+                        "forensic_evidence_accessed",
+                    ),
+                ).fetchone()[0]
+
+        self.assertEqual(success["status"], 200, success)
+        self.assertTrue(success["body"]["integrity"]["integrity_ok"])
+        self.assertEqual(success["body"]["integrity"]["run_id"], run_id)
+        self.assertEqual(missing_csrf["status"], 403)
+        self.assertEqual(viewer["status"], 404)
+        self.assertEqual(cross_workspace["status"], 404)
+        self.assertEqual(blank_reason["status"], 400)
+        self.assertEqual(missing_run["status"], 404)
+        self.assertEqual(successful_access_events, 1)
+        open_artifact_storage.assert_not_called()
+
+    def test_support_feedback_evidence_http_route_rate_limits_before_lookup(self):
+        self.reset_rate_limit_state()
+        self.addCleanup(self.reset_rate_limit_state)
+        root = test_temp_root() / f"support-evidence-rate-{time.time_ns()}"
+        database_url = f"sqlite:///{(root / 'sqag.sqlite3').as_posix()}"
+        env = self.deploy_auth_env(
+            SQAG_STORAGE_MODE="database",
+            SQAG_ARTIFACT_STORAGE_MODE="database",
+            SQAG_DATABASE_URL=database_url,
+            QUOTE_DATA_ROOT=str(root / "data"),
+            QUOTE_LOG_ROOT=str(root / "logs"),
+        )
+        admin_session = self.platform_auth_session(
+            "workspace-evidence-rate", membership_role="owner", user_id="support-rate"
+        )
+        integrity = {"integrity_ok": True, "run_id": "run-rate123"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            webapp.apply_sqag_storage_migrations(database_url)
+            cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(admin_session)}"
+            headers = {
+                webapp.configured_csrf_header_name(): webapp.csrf_token_for_cookie_header(cookie)
+            }
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(
+                webapp,
+                "support_feedback_evidence_for_auth_session",
+                return_value=integrity,
+            ) as evidence_lookup,
+            LocalRunnerServer() as runner,
+        ):
+            responses = [
+                self.http_json(
+                    runner,
+                    "GET",
+                    "/api/support/feedback/SUP-REDACTED/evidence?reason=support_investigation",
+                    cookie=cookie,
+                    headers=headers,
+                )
+                for _ in range(
+                    webapp.POST_RATE_LIMITS["/api/support/feedback/:id/evidence"] + 1
+                )
+            ]
+        self.assertEqual([item["status"] for item in responses[:-1]], [200] * 6)
+        self.assertEqual(responses[-1]["status"], 429)
+        self.assertEqual(evidence_lookup.call_count, 6)
+
+    def test_support_feedback_detail_http_route_rate_limits_before_lookup(self):
+        self.reset_rate_limit_state()
+        self.addCleanup(self.reset_rate_limit_state)
+        env = {
+            "APP_MODE": "local",
+            "SQAG_STORAGE_MODE": "local",
+            "USER_TYPE": "admin",
+        }
+        csrf_header = webapp.configured_csrf_header_name()
+        headers = {csrf_header: webapp.csrf_token_for_cookie_header("")}
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(
+                webapp,
+                "support_feedback_detail_for_auth_session",
+                return_value={"support_reference": "SUP-BOUNDED"},
+            ) as detail_lookup,
+            LocalRunnerServer() as runner,
+        ):
+            responses = [
+                self.http_json(
+                    runner,
+                    "GET",
+                    "/api/support/feedback/SUP-BOUNDED",
+                    headers=headers,
+                )
+                for _ in range(webapp.POST_RATE_LIMITS["/api/support/feedback/:id"] + 1)
+            ]
+        self.assertEqual(
+            [item["status"] for item in responses[:-1]],
+            [200] * webapp.POST_RATE_LIMITS["/api/support/feedback/:id"],
+        )
+        self.assertEqual(responses[-1]["status"], 429)
+        self.assertEqual(
+            detail_lookup.call_count,
+            webapp.POST_RATE_LIMITS["/api/support/feedback/:id"],
+        )
+        self.assertNotIn("SUP-BOUNDED", json.dumps(responses[-1]["body"]))
+        self.assertEqual(
+            webapp.rate_limit_path_key("/api/support/feedback/SUP-MISSING"),
+            webapp.rate_limit_path_key("/api/support/feedback/SUP-EXISTING"),
+        )
+
+    def test_support_feedback_detail_route_returns_bounded_storage_error(self):
+
+        storage_error = webapp.SqagStorageAccessError(
+            "SQAG storage is not available for this workspace.",
+            status=503,
+            reason="storage_database_not_migrated",
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"APP_MODE": "local", "SQAG_STORAGE_MODE": "local", "USER_TYPE": "admin"},
+                clear=True,
+            ),
+            mock.patch.object(
+                webapp,
+                "support_feedback_detail_for_auth_session",
+                side_effect=storage_error,
+            ),
+            LocalRunnerServer() as runner,
+        ):
+            response = self.http_json(
+                runner,
+                "GET",
+                "/api/support/feedback/SQAG-FB-SYNTHETIC",
+                headers={
+                    webapp.configured_csrf_header_name(): webapp.csrf_token_for_cookie_header("")
+                },
+            )
+        self.assertEqual(response["status"], 503)
+        self.assertEqual(response["body"]["status"], "failed")
+        self.assertEqual(response["body"]["errors"], ["SQAG storage is not available for this workspace."])
+        self.assertRegex(response["body"]["error_reference"], r"^ERR-[A-F0-9]{8}$")
+        self.assertNotIn("reason", response["body"])
+
+    def test_direct_generate_http_validation_has_one_terminal_idempotent_run(self):
+        root = test_temp_root() / f"direct-generate-forensics-{time.time_ns()}"
+        database_url = f"sqlite:///{(root / 'sqag.sqlite3').as_posix()}"
+        env = self.deploy_auth_env(
+            SQAG_STORAGE_MODE="database",
+            SQAG_ARTIFACT_STORAGE_MODE="database",
+            SQAG_DATABASE_URL=database_url,
+            QUOTE_DATA_ROOT=str(root / "data"),
+            QUOTE_LOG_ROOT=str(root / "logs"),
+        )
+        session = self.platform_auth_session(
+            "workspace-direct-generate", membership_role="owner", user_id="generator-user"
+        )
+        with mock.patch.dict(os.environ, env, clear=True):
+            cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(session)}"
+            webapp.apply_sqag_storage_migrations(database_url)
+            with LocalRunnerServer() as runner:
+                session_response = self.http_json(
+                    runner, "GET", "/api/session", cookie=cookie
+                )
+                csrf_header = session_response["body"]["csrf_header"]
+                csrf_token = session_response["body"]["csrf_token"]
+                headers = {
+                    csrf_header: csrf_token,
+                    "Idempotency-Key": "job-directhttp123",
+                }
+                first = self.http_json(
+                    runner,
+                    "POST",
+                    "/api/generate",
+                    cookie=cookie,
+                    body={"_generation_run_id": "run-client-controlled123"},
+                    headers=headers,
+                )
+                retry = self.http_json(
+                    runner,
+                    "POST",
+                    "/api/generate",
+                    cookie=cookie,
+                    body={},
+                    headers=headers,
+                )
+                unauthenticated = self.http_json(
+                    runner,
+                    "POST",
+                    "/api/generate",
+                    body={},
+                    headers={"Idempotency-Key": "job-preauth123"},
+                )
+
+            storage = webapp.DatabaseSqagStorage(
+                database_url,
+                "workspace-direct-generate",
+                role="admin",
+                user_id="generator-user",
+            )
+            with storage.connection() as connection:
+                runs = connection.execute(
+                    "select run_id, status, completed_at from sqag_generation_runs where workspace_id = ? and job_id = ?",
+                    ("workspace-direct-generate", "job-directhttp123"),
+                ).fetchall()
+                blocked_events = connection.execute(
+                    "select count(*) from sqag_audit_events where workspace_id = ? and run_id = ? and event_type = ?",
+                    ("workspace-direct-generate", runs[0]["run_id"], "generation_blocked"),
+                ).fetchone()[0]
+                preauth_runs = connection.execute(
+                    "select count(*) from sqag_generation_runs where workspace_id = ? and job_id = ?",
+                    ("workspace-direct-generate", "job-preauth123"),
+                ).fetchone()[0]
+
+        self.assertEqual(first["status"], 400, first)
+        self.assertEqual(retry["status"], 400, retry)
+        self.assertEqual(first["body"]["generation_run_id"], retry["body"]["generation_run_id"])
+        self.assertNotEqual(first["body"]["generation_run_id"], "run-client-controlled123")
+        self.assertEqual(unauthenticated["status"], 401)
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["status"], "blocked")
+        self.assertIsNotNone(runs[0]["completed_at"])
+        self.assertEqual(blocked_events, 1)
+        self.assertEqual(preauth_runs, 0)
+
     def test_configured_data_root_preserves_explicit_override(self):
         configured_root = test_temp_root() / "explicit-company-data"
         with mock.patch.dict(os.environ, {"QUOTE_DATA_ROOT": str(configured_root)}, clear=True):
@@ -696,6 +1055,8 @@ class WebappServerTest(unittest.TestCase):
             "AUTH_REQUIRED": "true",
             "SESSION_SECRET": "test-session-secret-with-enough-entropy",
             "OIDC_ISSUER_URL": "https://issuer.example",
+            "SQAG_TRACKING_HMAC_KEY": "synthetic-dedicated-tracking-key",
+            "SQAG_TRACKING_HMAC_KEY_VERSION": "test-v1",
             "OIDC_CLIENT_ID": "client-id",
             "OIDC_CLIENT_SECRET": "client-secret",
             "OIDC_REDIRECT_URI": "https://quote.example/callback",
@@ -715,6 +1076,8 @@ class WebappServerTest(unittest.TestCase):
             "AUTH_REQUIRED": "true",
             "SESSION_SECRET": "test-session-secret-with-enough-entropy",
             "SQAG_PLATFORM_LAUNCH_MODE": "platform",
+            "SQAG_TRACKING_HMAC_KEY": "synthetic-dedicated-tracking-key",
+            "SQAG_TRACKING_HMAC_KEY_VERSION": "test-v1",
             "SQAG_PLATFORM_BASE_URL": "https://platform.example.test",
         }
         env.update(overrides)
@@ -937,7 +1300,7 @@ class WebappServerTest(unittest.TestCase):
         self.assertNotIn("Back to Quote Generator", body)
         self.assertIn('class="privacy-notice-card"', body)
         self.assertIn("<details class=\"privacy-section\"", body)
-        self.assertEqual(body.count("<details class=\"privacy-section\" open>"), 8)
+        self.assertEqual(body.count("<details class=\"privacy-section\" open>"), 9)
         self.assertIn("Personal Data We May Collect", body)
         self.assertIn("Cross-Border Transfers", body)
         self.assertIn("PDPA", body)
@@ -4446,7 +4809,7 @@ class WebappServerTest(unittest.TestCase):
                     "select workspace_id, session_id, metadata_json from sqag_quote_sessions"
                 ).fetchall()
                 stored_artifacts = connection.execute(
-                    "select workspace_id, session_id, artifact_kind, filename, size_bytes, content_blob from sqag_quote_artifacts"
+                    "select workspace_id, session_id, artifact_kind, filename, size_bytes, content_blob from sqag_quote_publication_artifacts"
                 ).fetchall()
             finally:
                 connection.close()
@@ -5292,7 +5655,7 @@ class WebappServerTest(unittest.TestCase):
         raw = (
             "Item,Cost,Markup\n"
             "\"nos. rigging point for Overhead Structure or Aluminium Box Truss\n"
-            "ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¢ Prices are not inclusive of truss\",300,1.5\n"
+            "ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ Prices are not inclusive of truss\",300,1.5\n"
         ).encode("utf-8")
         parsed = {
             "items": [{
@@ -5350,7 +5713,7 @@ class WebappServerTest(unittest.TestCase):
                         "row_index": 12,
                         "non_empty_cells": {
                             "A": "Hanging Structure",
-                            "B": "nos. RIGGING POINT for Overhead Structure or Aluminium Box Truss\nÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¢ Prices are not inclusive of truss",
+                            "B": "nos. RIGGING POINT for Overhead Structure or Aluminium Box Truss\nÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ Prices are not inclusive of truss",
                             "C": "nos",
                             "D": "300",
                             "E": "1.5",
@@ -9546,8 +9909,10 @@ class WebappServerTest(unittest.TestCase):
             }
         }
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.dict(webapp.os.environ, {"APP_MODE": "deploy", "AUTH_REQUIRED": "true"}, clear=True):
+            with mock.patch.dict(webapp.os.environ, {"APP_MODE": "deploy", "AUTH_REQUIRED": "true", "SQAG_TRACKING_HMAC_KEY": "synthetic-dedicated-tracking-key", "SQAG_TRACKING_HMAC_KEY_VERSION": "test-v1"}, clear=True):
                 tracking = webapp.ai_log_tracking_metadata(session)
+                expected_user = webapp.privacy_safe_audit_tracking_id("user-123")
+                expected_account = webapp.privacy_safe_audit_tracking_id("account-456")
                 with webapp.ai_log_tracking_scope(tracking):
                     logged = webapp.log_ai_call_attempt(
                         feature="basis_chat",
@@ -9566,8 +9931,8 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(details["auth_mode"], "deploy")
         self.assertTrue(details["auth_required"])
         self.assertTrue(details["authenticated"])
-        self.assertEqual(details["user_id"], "user-123")
-        self.assertEqual(details["account_id"], "account-456")
+        self.assertEqual(details["user_id"], expected_user)
+        self.assertEqual(details["account_id"], expected_account)
         self.assertEqual(details["company_id"], webapp.DEFAULT_COMPANY_ID)
         self.assertEqual(details["role"], "viewer")
         self.assertNotIn("email", details)
@@ -9612,8 +9977,8 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(job["status"], "completed")
         ai_attempts = [call.args[1] for call in write_log.call_args_list if call.args[0] == "ai_call_attempt"]
         self.assertEqual(len(ai_attempts), 1)
-        self.assertEqual(ai_attempts[0]["user_id"], "user-123")
-        self.assertEqual(ai_attempts[0]["account_id"], "account-456")
+        self.assertEqual(ai_attempts[0]["user_id"], webapp.privacy_safe_audit_tracking_id("user-123"))
+        self.assertEqual(ai_attempts[0]["account_id"], webapp.privacy_safe_audit_tracking_id("account-456"))
         self.assertEqual(ai_attempts[0]["company_id"], webapp.DEFAULT_COMPANY_ID)
         self.assertEqual(ai_attempts[0]["role"], "operator")
 
@@ -16664,6 +17029,9 @@ function normalizeActiveJob(job) { return job?.id ? job : null; }
 function saveWorkspaceViewState() {}
 
 eval([
+  "safeQuoteSessionId",
+  "safeGenerationRunId",
+  "currentGenerationContext",
   "normalizedContentFingerprint",
   "sessionFileKeyForImage",
   "sessionFileKeyForLogo",
@@ -22869,6 +23237,8 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         env = {
             "APP_MODE": "deploy",
             "SQAG_STORAGE_MODE": "database",
+            "SQAG_TRACKING_HMAC_KEY": "synthetic-dedicated-tracking-key",
+            "SQAG_TRACKING_HMAC_KEY_VERSION": "test-v1",
             "SQAG_ARTIFACT_STORAGE_MODE": "object",
             "SQAG_DATABASE_URL": database_url,
             "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
@@ -24314,6 +24684,79 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertTrue(tombstone[2])
         with self.assertRaises(webapp.ObjectStorageContractError):
             backend.retrieve_artifact(metadata_before, workspace_id="workspace-object-delete-session")
+
+    def test_object_retention_graph_failure_restores_provider_bytes_and_metadata(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        tmp_path = test_temp_root() / f"object-retention-rollback-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        output_dir = tmp_path / "out" / "job-object-retention-rollback"
+        output_dir.mkdir(parents=True)
+        content = b"synthetic-xlsx-retention-rollback"
+        (output_dir / "quotation.xlsx").write_bytes(content)
+        payload = valid_payload()
+        payload["quote_session"] = {"session_id": "quote-object-retention-rollback"}
+        result = {
+            "status": "completed",
+            "files": [
+                {
+                    "name": "quotation.xlsx",
+                    "url": "/api/jobs/job-object-retention-rollback/files/quotation.xlsx",
+                }
+            ],
+        }
+        env = {
+            **self.deploy_auth_env(),
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "object",
+            "SQAG_DATABASE_URL": database_url,
+            "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "https://object-store.example.test",
+            "SQAG_OBJECT_STORAGE_BUCKET": "example-artifact-bucket",
+            "SQAG_OBJECT_STORAGE_REGION": "ap-southeast-1",
+            "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "EXAMPLE_ACCESS_KEY_ID",
+            "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "example-secret-key",
+        }
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.DatabaseSqagStorage(
+                database_url,
+                "workspace-object-retention-rollback",
+                role="admin",
+                user_id="retention-worker",
+            )
+            storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+            row_before = storage._object_quote_artifact_row(
+                "quote-object-retention-rollback",
+                "xlsx",
+            )
+            metadata_before = storage._object_metadata_from_row(row_before)
+
+            with self.assertRaises(RuntimeError):
+                storage.delete_quote_session_for_retention(
+                    "quote-object-retention-rollback",
+                    finalize_graph=lambda _connection, **_kwargs: (_ for _ in ()).throw(
+                        RuntimeError("synthetic graph failure")
+                    ),
+                )
+
+            row_after = storage._object_quote_artifact_row(
+                "quote-object-retention-rollback",
+                "xlsx",
+            )
+            session_after = storage.get_quote_session("quote-object-retention-rollback")
+            restored = backend.retrieve_artifact(
+                metadata_before,
+                workspace_id="workspace-object-retention-rollback",
+            )
+
+        self.assertIsNotNone(session_after)
+        self.assertEqual(row_after["status"], "active")
+        self.assertEqual(row_after["retention_status"], "active")
+        self.assertEqual(restored, content)
 
     def test_object_artifact_delete_failure_preserves_session_and_active_metadata(self):
         class DeleteFailingBackend(webapp.InMemoryObjectStorageBackend):
@@ -26219,6 +26662,8 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 result = types.SimpleNamespace(rowcount=1)
                 if "pg_try_advisory_xact_lock" in sql.lower():
                     result.fetchone = lambda: {"lock_acquired": True}
+                elif "legal_hold = ?" in sql.lower():
+                    result.fetchone = lambda: None
                 else:
                     result.fetchone = lambda: {"active_count": 0}
                 result.fetchall = lambda: []
@@ -28299,6 +28744,8 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         tmp_path = test_temp_root() / f"deploy-redaction-{time.time_ns()}"
         database_url = f"sqlite:///{(tmp_path / 'sqag-artifacts.sqlite3').as_posix()}"
         env = {
+            "SQAG_TRACKING_HMAC_KEY": "synthetic-dedicated-tracking-key",
+            "SQAG_TRACKING_HMAC_KEY_VERSION": "test-v1",
             "APP_MODE": "deploy",
             "SQAG_ARTIFACT_STORAGE_MODE": "database",
             "SQAG_DATABASE_URL": database_url,
@@ -28306,7 +28753,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         auth_session = self.platform_auth_session("workspace-deploy-redaction")
         with mock.patch.dict(os.environ, env, clear=False):
             webapp.apply_sqag_storage_migrations(database_url)
-            with mock.patch.object(webapp.subprocess, "run", return_value=completed):
+            with mock.patch.object(webapp.subprocess, "run", return_value=completed), mock.patch.object(webapp, "begin_generation_forensics", return_value=""):
                 result = webapp.run_quote_job(
                     payload,
                     output_root=tmp_path / "out",

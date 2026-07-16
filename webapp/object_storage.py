@@ -22,6 +22,7 @@ SAFE_SEGMENT_MAX_LENGTH = 120
 TRANSFORMED_IDENTITY_MARKER = "~"
 ALLOWED_OWNER_TYPES = {
     "generated_quote",
+    "generated_quote_version",
     "uploaded_reference",
     "profile",
     "pricing_reference",
@@ -47,6 +48,23 @@ class ObjectStorageContractError(Exception):
 
 class ObjectStorageConfigurationError(ObjectStorageContractError):
     """Raised when object storage configuration exists but no safe backend can run."""
+
+
+class ObjectStorageNotFoundError(ObjectStorageContractError):
+    """Raised only when the provider authoritatively reports a missing object."""
+
+
+def _provider_object_missing_error(exc: Exception) -> bool:
+    if isinstance(exc, KeyError):
+        return True
+    response = getattr(exc, "response", None)
+    if not isinstance(response, Mapping):
+        return False
+    error = response.get("Error")
+    code = str(error.get("Code") or "").strip().lower() if isinstance(error, Mapping) else ""
+    metadata = response.get("ResponseMetadata")
+    status = metadata.get("HTTPStatusCode") if isinstance(metadata, Mapping) else None
+    return code in {"404", "nosuchkey", "notfound"} or status == 404
 
 
 @dataclass(frozen=True)
@@ -391,6 +409,8 @@ class S3CompatibleObjectStorageBackend:
         except ObjectStorageContractError:
             raise
         except Exception as exc:
+            if _provider_object_missing_error(exc):
+                raise ObjectStorageNotFoundError("Artifact is not available.") from exc
             raise ObjectStorageContractError("Artifact is not available.") from exc
         if len(content_bytes) != metadata.size_bytes or artifact_checksum(content_bytes) != metadata.checksum_sha256:
             raise ObjectStorageContractError("Artifact integrity check failed.")
@@ -506,7 +526,7 @@ class InMemoryObjectStorageBackend:
         self._require_workspace(metadata, workspace_id)
         content = self._objects.get(metadata.storage_key)
         if content is None:
-            raise ObjectStorageContractError("Artifact is not available.")
+            raise ObjectStorageNotFoundError("Artifact is not available.")
         if len(content) != metadata.size_bytes or artifact_checksum(content) != metadata.checksum_sha256:
             raise ObjectStorageContractError("Artifact integrity check failed.")
         return bytes(content)

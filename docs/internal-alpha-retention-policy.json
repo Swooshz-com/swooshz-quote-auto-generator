@@ -11,32 +11,55 @@
     {
       "data_class": "quote_sessions",
       "storage": "sqag_quote_sessions",
-      "retention_days": 90,
+      "retention_calendar_years": 3,
       "rollback_note": "Restore the SQLite database from the prior known-good backup and verify workspace/session checksums before using local-UAT access."
+    },
+    {
+      "data_class": "quote_publication_versions",
+      "storage": "sqag_quote_publication_versions, sqag_quote_publication_artifacts, and run-scoped generated_quote_version object artifacts",
+      "retention_calendar_years": 3,
+      "lifecycle_note": "Replacement artifacts are staged under an immutable generation-run identity. The current published version remains visible until an atomic promotion. The current publication keeps its complete run evidence and audit graph even when sibling runs share the session. Failed and superseded versions stay linked to the generation-run retention graph; feedback linked to an exact publication version keeps that version verifiable; legal hold blocks version or whole-session deletion. Retention deletes version bytes before metadata and the linked forensic graph, never writes a receipt for a publication-retained graph, and never deletes the current published version independently.",
+      "rollback_note": "Restore publication-version metadata and its exact run-scoped artifacts together; verify checksums and the quote session's authoritative published run before downloads are re-enabled."
     },
     {
       "data_class": "generated_artifacts",
       "storage": "sqag_quote_artifacts",
-      "retention_days": 90,
+      "retention_calendar_years": 3,
       "rollback_note": "Restore generated artifact rows together with quote-session metadata from the same backup set; verify artifact checksums before download routes are re-enabled."
     },
     {
       "data_class": "uploaded_references",
       "storage": "sqag_file_artifacts",
-      "retention_days": 90,
+      "retention_calendar_years": 3,
       "rollback_note": "Restore uploaded reference artifact rows from the same backup set as pricing/profile metadata and validate row counts plus checksums."
     },
     {
       "data_class": "profile_layout_assets",
       "storage": "sqag_file_artifacts owner_type=profile",
-      "retention_days": 180,
+      "retention_calendar_years": 3,
       "rollback_note": "Restore profile layout assets with their owning profile rows and verify workspace/profile ownership metadata before generation is enabled."
     },
     {
       "data_class": "pricing_visual_assets",
       "storage": "sqag_file_artifacts owner_type=pricing_reference",
-      "retention_days": 180,
+      "retention_calendar_years": 3,
       "rollback_note": "Restore pricing visual assets with their owning pricing-reference rows and verify workspace/reference ownership metadata before reference exports are enabled."
+    },
+
+    {
+      "data_class": "generation_evidence_and_audit",
+      "storage": "sqag_generation_runs, sqag_generation_evidence, sqag_audit_events",
+      "retention_calendar_years": 3,
+      "lifecycle_note": "Run-linked audit rows are deleted with their run graph; explicitly feedback-linked audit rows are deleted with their feedback graph; standalone audit rows use their own indexed three-calendar-year expiry, controlled-delete authorization, legal-hold check, receipt, bounded batch metrics, fair cross-kind progress, and retry-safe transaction. A held generation run also preserves feedback linked only through that run's exact quote session.",
+      "rollback_note": "Restore the immutable run, evidence, and audit rows from the same workspace-scoped backup set and verify evidence digests before access is restored."
+    },
+    {
+      "data_class": "feedback_and_status_history",
+      "storage": "sqag_feedback, sqag_feedback_status_history",
+      "retention_calendar_years": 3,
+      "lifecycle_policy_version": "sqag.feedback-retention.v3",
+      "lifecycle_note": "First closure expires three calendar years from closure. Reopening clears the current closed_at without shortening submission or current lifecycle expiry. Reclosure records a new current closed_at and expiry while prior closures remain in status history. Reopen transitions require a bounded reason; every transition is audited with a derived reopen count and unusual repeated reopening is flagged for support review. Automatic session feedback resolves and stores the exact report-time published or uniquely blocked run, publication version, bounded resolution source, and resolution timestamp. That linkage is schema-immutable and is never rebound during support access; reports without an authoritative run remain unbound after future publication. Legal holds suspend deletion without rewriting lifecycle dates or extending unrelated runs or artifacts. Status transitions and retention deletion share the workspace-scoped feedback transaction lock, and deletion rechecks current status, expiry, and hold state after locking.",
+      "rollback_note": "Restore feedback records together with their status history and linked run/session identifiers; do not duplicate canonical generation evidence."
     },
     {
       "data_class": "logs",

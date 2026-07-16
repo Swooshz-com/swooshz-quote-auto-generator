@@ -39,6 +39,7 @@ from webapp.object_storage import (
     ObjectStorageBackend,
     ObjectStorageConfigurationError,
     ObjectStorageContractError,
+    ObjectStorageNotFoundError,
     S3CompatibleObjectStorageBackend,
     artifact_checksum,
     object_storage_provider_status,
@@ -435,13 +436,19 @@ def _runtime_download_verified(
     )
 
 
+
 def _runtime_download_denied(storage: object, session_id: str, backend: ObjectStorageBackend, env: Mapping[str, str]) -> bool:
     if not hasattr(storage, "quote_session_export_artifact"):
         return _object_artifact_row(storage, session_id, "xlsx") is None
     try:
         return _runtime_download(storage, session_id, backend, env) is None
-    except Exception:
-        return True
+    except Exception as exc:
+        return _is_confirmed_missing_error(exc)
+
+
+
+def _is_confirmed_missing_error(exc: Exception) -> bool:
+    return isinstance(exc, ObjectStorageNotFoundError)
 
 
 def _delete_object_or_confirm_missing(backend: ObjectStorageBackend, metadata: ObjectArtifactMetadata) -> tuple[bool, bool]:
@@ -449,20 +456,26 @@ def _delete_object_or_confirm_missing(backend: ObjectStorageBackend, metadata: O
         deleted = bool(backend.delete_artifact(metadata, workspace_id=metadata.workspace_id))
     except Exception:
         deleted = False
-    missing_fail_closed = False
     try:
         backend.retrieve_artifact(metadata, workspace_id=metadata.workspace_id)
-    except Exception:
-        missing_fail_closed = True
-    return bool(deleted or missing_fail_closed), missing_fail_closed
+    except Exception as exc:
+        confirmed_missing = _is_confirmed_missing_error(exc)
+        return bool(deleted or confirmed_missing), confirmed_missing
+    return False, False
 
 
 def _repeated_delete_safe(backend: ObjectStorageBackend, metadata: ObjectArtifactMetadata) -> bool:
     try:
-        result = backend.delete_artifact(metadata, workspace_id=metadata.workspace_id)
-        return bool(result)
+        deleted = bool(backend.delete_artifact(metadata, workspace_id=metadata.workspace_id))
     except Exception:
+        deleted = False
+    if deleted:
         return True
+    try:
+        backend.retrieve_artifact(metadata, workspace_id=metadata.workspace_id)
+    except Exception as exc:
+        return _is_confirmed_missing_error(exc)
+    return False
 
 
 def _cleanup_storage(storage: object, session_id: str) -> bool:
@@ -485,16 +498,22 @@ def _cleanup_storage(storage: object, session_id: str) -> bool:
 
 def _cleanup(*, storage: object | None, backend: ObjectStorageBackend | None, metadata: ObjectArtifactMetadata | None, ids: Mapping[str, str]) -> bool:
     ok = True
+    object_absence_confirmed = True
     if backend is not None and metadata is not None:
         try:
-            _delete_object_or_confirm_missing(backend, metadata)
+            removed, confirmed_missing = _delete_object_or_confirm_missing(backend, metadata)
+            object_absence_confirmed = bool(removed and confirmed_missing)
+            ok = object_absence_confirmed
         except Exception:
+            object_absence_confirmed = False
             ok = False
-    if storage is not None:
+    if storage is not None and object_absence_confirmed:
         try:
             ok = bool(_cleanup_storage(storage, ids["session_a"])) and ok
         except Exception:
             ok = False
+    elif storage is not None:
+        ok = False
     return ok
 
 

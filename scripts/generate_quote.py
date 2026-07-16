@@ -56,6 +56,11 @@ NS_CONTENT_TYPES = "{http://schemas.openxmlformats.org/package/2006/content-type
 NS_PACKAGE_REL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
 NS_DRAWING = "{http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing}"
 NS_A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+MAX_XLSX_XML_BYTES = 8 * 1024 * 1024
+MAX_XLSX_COMPRESSION_RATIO = 200
+MAX_XLSX_COLUMNS = 16_384
+MAX_XLSX_ROWS = 1_048_576
+MAX_XLSX_ENTRIES = 4096
 XMLNS_MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 XMLNS_CP = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
 XMLNS_DC = "http://purl.org/dc/elements/1.1/"
@@ -212,17 +217,39 @@ class RichTextRun:
     underline: bool = False
 
 
+
 def col_to_index(cell_ref: str) -> int:
-    letters = "".join(ch for ch in cell_ref if ch.isalpha())
+    match = re.fullmatch(r"([A-Za-z]{1,3})([1-9][0-9]{0,6})?", str(cell_ref or ""))
+    if not match:
+        raise ValueError("Spreadsheet cell reference is not valid.")
+    letters = match.group(1)
     total = 0
     for ch in letters:
         total = total * 26 + (ord(ch.upper()) - 64)
-    return total - 1
+    index = total - 1
+    row_number = int(match.group(2)) if match.group(2) else 1
+    if index < 0 or index >= MAX_XLSX_COLUMNS or row_number > MAX_XLSX_ROWS:
+        raise ValueError("Spreadsheet cell reference exceeds XLSX limits.")
+    return index
+
+
+def read_bounded_xlsx_part(zf: zipfile.ZipFile, name: str, *, max_bytes: int = MAX_XLSX_XML_BYTES) -> bytes:
+    info = zf.getinfo(name)
+    if info.file_size < 0 or info.file_size > max_bytes:
+        raise ValueError(f"Spreadsheet XML part exceeds the {max_bytes}-byte limit.")
+    if info.compress_size == 0 and info.file_size > 0:
+        raise ValueError("Spreadsheet XML part has an invalid compression size.")
+    if info.compress_size and info.file_size / info.compress_size > MAX_XLSX_COMPRESSION_RATIO:
+        raise ValueError("Spreadsheet XML part exceeds the compression-ratio limit.")
+    data = zf.read(info)
+    if len(data) != info.file_size or len(data) > max_bytes:
+        raise ValueError("Spreadsheet XML part could not be read safely.")
+    return data
 
 
 def read_shared_strings(zf: zipfile.ZipFile) -> list[str]:
     try:
-        xml = zf.read("xl/sharedStrings.xml")
+        xml = read_bounded_xlsx_part(zf, "xl/sharedStrings.xml")
     except KeyError:
         return []
     root = ET.fromstring(xml)
@@ -257,8 +284,10 @@ def cell_value(cell: ET.Element, shared_strings: list[str]) -> Any:
 
 def read_first_sheet_rows_with_numbers(xlsx_path: Path) -> list[tuple[int, list[Any]]]:
     with zipfile.ZipFile(xlsx_path) as zf:
+        if len(zf.infolist()) > MAX_XLSX_ENTRIES:
+            raise ValueError("Spreadsheet archive contains too many entries.")
         shared_strings = read_shared_strings(zf)
-        sheet_xml = zf.read("xl/worksheets/sheet1.xml")
+        sheet_xml = read_bounded_xlsx_part(zf, "xl/worksheets/sheet1.xml")
     root = ET.fromstring(sheet_xml)
     rows: list[tuple[int, list[Any]]] = []
     for row in root.iter(f"{NS_MAIN}row"):

@@ -181,6 +181,8 @@ const state = {
   restorableOverlay: "",
   dashboardOperation: null,
   quoteSessionId: "",
+  lastGenerationRunId: "",
+  lastGenerationRunSessionId: "",
   quoteSessions: [],
   quoteSessionLoadError: "",
   quoteSessionDashboardLoadId: 0,
@@ -234,6 +236,9 @@ const state = {
   browserRecoveryScope: "",
   isRecoveryScopeTransitioning: false,
   pendingFeedback: "",
+  feedbackContext: null,
+  feedbackContextRequestId: 0,
+  feedbackContextLoadPromise: null,
   activeSidePanel: "images",
   downloadFile: null,
   pdfFile: null,
@@ -330,6 +335,22 @@ const elements = {
   topbarAuthState: qs("#topbarAuthState"),
   topbarAuthText: qs("#topbarAuthText"),
   topbarLogoutLink: qs("#topbarLogoutLink"),
+  feedbackButton: qs("#feedbackButton"),
+  feedbackModal: qs("#feedbackModal"),
+  feedbackForm: qs("#feedbackForm"),
+  feedbackCategory: qs("#feedbackCategory"),
+  feedbackShortTitle: qs("#feedbackShortTitle"),
+  feedbackMessage: qs("#feedbackMessage"),
+  feedbackExpectedResult: qs("#feedbackExpectedResult"),
+  feedbackActualResult: qs("#feedbackActualResult"),
+  feedbackReproductionSteps: qs("#feedbackReproductionSteps"),
+  feedbackImpact: qs("#feedbackImpact"),
+  feedbackLinkContext: qs("#feedbackLinkContext"),
+  feedbackIncludeLink: qs("#feedbackIncludeLink"),
+  feedbackManualReference: qs("#feedbackManualReference"),
+  feedbackStatus: qs("#feedbackStatus"),
+  cancelFeedbackButton: qs("#cancelFeedbackButton"),
+  submitFeedbackButton: qs("#submitFeedbackButton"),
   dashboardEmptyNewQuoteButton: qs("#dashboardEmptyNewQuoteButton"),
   backToDashboardButton: qs("#backToDashboardButton"),
   dashboardStatusFilter: qs("#dashboardStatusFilter"),
@@ -637,6 +658,56 @@ function safeQuoteSessionId(value = "") {
   return /^quote-[A-Za-z0-9_-]{3,64}$/.test(text) ? text : "";
 }
 
+function safeGenerationRunId(value = "") {
+  const text = String(value || "").trim();
+  return /^run-[A-Za-z0-9_-]{8,80}$/.test(text) ? text : "";
+}
+
+function currentGenerationContext() {
+  const sessionId = safeQuoteSessionId(state.quoteSessionId || "");
+  const runId = safeGenerationRunId(state.lastGenerationRunId || "");
+  const runSessionId = safeQuoteSessionId(state.lastGenerationRunSessionId || "");
+  return {
+    session_id: sessionId,
+    run_id: runId && runSessionId === sessionId ? runId : "",
+  };
+}
+
+function transitionGenerationContext(sessionId = "", runId = "") {
+  const safeSessionId = safeQuoteSessionId(sessionId || "");
+  const safeRunId = safeGenerationRunId(runId || "");
+  const previousContext = currentGenerationContext();
+  state.quoteSessionId = safeSessionId;
+  state.lastGenerationRunId = safeRunId;
+  state.lastGenerationRunSessionId = safeRunId ? safeSessionId : "";
+  if (
+    previousContext.session_id !== safeSessionId
+    || previousContext.run_id !== safeRunId
+  ) {
+    state.feedbackContextRequestId += 1;
+    state.feedbackContext = null;
+    state.feedbackContextLoadPromise = null;
+    if (elements.feedbackIncludeLink) {
+      elements.feedbackIncludeLink.checked = false;
+      elements.feedbackIncludeLink.disabled = true;
+    }
+    if (elements.feedbackModal && !elements.feedbackModal.hidden) {
+      const pendingContext = loadFeedbackContext();
+      state.feedbackContextLoadPromise = pendingContext;
+      pendingContext.finally(() => {
+        if (state.feedbackContextLoadPromise === pendingContext) {
+          state.feedbackContextLoadPromise = null;
+        }
+      });
+    }
+  }
+  return {
+    session_id: safeSessionId,
+    run_id: safeRunId,
+  };
+}
+
+
 function randomQuoteSessionToken() {
   const bytes = new Uint8Array(12);
   if (window.crypto?.getRandomValues) {
@@ -728,7 +799,7 @@ function normalizeActiveJob(job = {}, options = {}) {
 function ensureClientQuoteSessionId() {
   const existingSessionId = safeQuoteSessionId(state.quoteSessionId || "");
   if (existingSessionId) return existingSessionId;
-  state.quoteSessionId = newClientQuoteSessionId();
+  transitionGenerationContext(newClientQuoteSessionId(), "");
   saveSessionState();
   return state.quoteSessionId;
 }
@@ -3008,6 +3079,7 @@ function buildSessionSnapshot() {
     pricingReferenceSource: state.pricingReferenceSource,
     selectedPresetValue: state.selectedPresetValue,
     quoteSessionId: state.quoteSessionId,
+    generationContext: currentGenerationContext(),
     quoteSessionDraftSaveStarted: state.quoteSessionDraftSaveStarted,
     quoteSessionRestoredSessionId: state.quoteSessionRestoredSessionId,
     quoteSessionRestoredDraftKey: state.quoteSessionRestoredDraftKey,
@@ -3251,7 +3323,11 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.profileId = saved.profileId || "";
   state.pricingReferenceId = saved.pricingReferenceId || saved.profileId || "";
   state.pricingReferenceSource = saved.pricingReferenceSource || "";
-  state.quoteSessionId = safeQuoteSessionId(options.sessionId || saved.quoteSessionId || "");
+  const targetSessionId = safeQuoteSessionId(options.sessionId || saved.quoteSessionId || "");
+  const savedGenerationContext = saved.generationContext && typeof saved.generationContext === "object"
+    ? saved.generationContext : {};
+  const savedRunMatchesSession = safeQuoteSessionId(savedGenerationContext.session_id || "") === targetSessionId;
+  transitionGenerationContext(targetSessionId, savedRunMatchesSession ? savedGenerationContext.run_id : "");
   state.quoteSessionDraftSaveStarted = Boolean(saved.quoteSessionDraftSaveStarted || options.sessionId);
   const restoredSessionId = safeQuoteSessionId(saved.quoteSessionRestoredSessionId || "");
   state.quoteSessionRestoredSessionId = restoredSessionId && restoredSessionId === state.quoteSessionId ? restoredSessionId : "";
@@ -4250,7 +4326,7 @@ async function startNewQuote() {
 
 function resetCurrentQuoteDraftState() {
   clearQuoteSessionDraftSaveTimer();
-  state.quoteSessionId = "";
+  transitionGenerationContext("", "");
   state.quoteSessionDraftSaveStarted = false;
   clearRestoredQuoteSessionBaseline();
   resetQuoteCommercialTouched();
@@ -4260,6 +4336,9 @@ function resetCurrentQuoteDraftState() {
   state.images = [];
   setImageUploadStatus("");
   state.headerLogo = null;
+  state.feedbackContextRequestId += 1;
+  state.feedbackContextLoadPromise = null;
+  state.feedbackContext = null;
   state.boothDimensions = { ...DEFAULT_BOOTH_DIMENSIONS };
   state.pendingFeedback = "";
   state.downloadFile = null;
@@ -9801,6 +9880,141 @@ async function fetchPostJsonResponse(url, payload) {
   });
 }
 
+
+function feedbackBrowserFamilyMajor() {
+  const brands = Array.isArray(navigator.userAgentData?.brands) ? navigator.userAgentData.brands : [];
+  const preferred = brands.find((item) => item?.brand && !String(item.brand).includes("Not"));
+  if (preferred) return `${String(preferred.brand).slice(0, 40)} ${String(preferred.version || "").split(".")[0]}`.trim();
+  const agent = String(navigator.userAgent || "");
+  for (const [name, pattern] of [["Edge", /Edg\/(\d+)/], ["Chrome", /Chrome\/(\d+)/], ["Firefox", /Firefox\/(\d+)/], ["Safari", /Version\/(\d+).*Safari/]]) {
+    const match = agent.match(pattern);
+    if (match) return `${name} ${match[1]}`;
+  }
+  return "Unknown";
+}
+
+function feedbackViewportBucket() {
+  const width = Math.max(0, Number(window.innerWidth || 0));
+  if (width < 600) return "small";
+  if (width < 1024) return "medium";
+  if (width < 1600) return "large";
+  return "extra_large";
+}
+
+async function loadFeedbackContext() {
+  if (!elements.feedbackLinkContext) return;
+  elements.feedbackLinkContext.textContent = "Checking the most relevant authorised quote context...";
+  const requestId = state.feedbackContextRequestId + 1;
+  state.feedbackContextRequestId = requestId;
+  state.feedbackContext = null;
+  const generationContext = currentGenerationContext();
+  const query = new URLSearchParams(generationContext);
+  try {
+    const response = await fetch(`/api/feedback/context?${query.toString()}`, { cache: "no-store" });
+    const data = await jsonFromResponse(response);
+    if (requestId !== state.feedbackContextRequestId) return;
+    if (!response.ok || !data.context) throw new Error("feedback context unavailable");
+    state.feedbackContext = data.context;
+    const context = data.context;
+    const detail = [context.label, context.status, context.created_at].filter(Boolean).join(" - ");
+    elements.feedbackLinkContext.textContent = detail || "No quote context will be linked.";
+    const canLink = context.link_type && context.link_type !== "none";
+    elements.feedbackIncludeLink.checked = Boolean(canLink);
+    elements.feedbackIncludeLink.disabled = !canLink;
+  } catch {
+    if (requestId !== state.feedbackContextRequestId) return;
+    state.feedbackContext = null;
+    elements.feedbackLinkContext.textContent = "Quote context could not be verified. This report will be submitted without an automatic link.";
+    elements.feedbackIncludeLink.checked = false;
+    elements.feedbackIncludeLink.disabled = true;
+  }
+}
+
+async function submitFeedback(event) {
+  event.preventDefault();
+  const title = String(elements.feedbackShortTitle?.value || "").trim();
+  const message = String(elements.feedbackMessage?.value || "").trim();
+  if (!title || !message) {
+    elements.feedbackStatus.hidden = false;
+    elements.feedbackStatus.textContent = "Add a short title and description before submitting.";
+    return;
+  }
+  if (!elements.feedbackForm.reportValidity()) return;
+  const pendingContext = state.feedbackContextLoadPromise;
+  if (pendingContext) await pendingContext;
+  const includeLink = Boolean(elements.feedbackIncludeLink?.checked && !elements.feedbackIncludeLink?.disabled);
+  const context = includeLink && state.feedbackContext ? state.feedbackContext : {};
+  const manualReference = String(elements.feedbackManualReference?.value || "").trim();
+  elements.submitFeedbackButton.disabled = true;
+  elements.feedbackStatus.hidden = true;
+  try {
+    const response = await fetchPostJsonResponse("/api/feedback", {
+      category: elements.feedbackCategory?.value || "general",
+      title,
+      message,
+      expected_result: String(elements.feedbackExpectedResult?.value || "").trim(),
+      actual_result: String(elements.feedbackActualResult?.value || "").trim(),
+      reproduction_steps: String(elements.feedbackReproductionSteps?.value || "").trim(),
+      impact: elements.feedbackImpact?.value || "medium",
+      include_link: includeLink,
+      link_choice: includeLink ? "automatic" : (manualReference ? "manual" : "none"),
+      run_id: context.run_id || "",
+      session_id: safeQuoteSessionId(context.session_id || ""),
+      manual_reference: manualReference,
+      diagnostic_metadata: {
+        browser_family_major: feedbackBrowserFamilyMajor(),
+        current_route: window.location.pathname,
+        job_state: state.isGenerating ? "processing" : "idle",
+        product_area: state.activeSidePanel || "workspace",
+        viewport_bucket: feedbackViewportBucket(),
+      },
+    });
+    const data = await jsonFromResponse(response);
+    if (!response.ok) {
+      elements.feedbackStatus.hidden = false;
+      elements.feedbackStatus.textContent = genericFailureMessages(data)[0];
+      return;
+    }
+    elements.feedbackStatus.hidden = false;
+    elements.feedbackStatus.textContent = `Feedback submitted. Support reference: ${data.support_reference || data.feedback_id || "recorded"}.`;
+    elements.feedbackShortTitle.value = "";
+    elements.feedbackMessage.value = "";
+    elements.feedbackExpectedResult.value = "";
+    elements.feedbackActualResult.value = "";
+    elements.feedbackReproductionSteps.value = "";
+    elements.feedbackManualReference.value = "";
+  } catch {
+    elements.feedbackStatus.hidden = false;
+    elements.feedbackStatus.textContent = "Feedback could not be submitted. Please try again.";
+  } finally {
+    elements.submitFeedbackButton.disabled = false;
+  }
+}
+
+async function showFeedbackModal() {
+  if (!elements.feedbackModal) return;
+  elements.feedbackStatus.hidden = true;
+  elements.feedbackStatus.textContent = "";
+  elements.feedbackModal.hidden = false;
+  elements.feedbackShortTitle?.focus();
+  const pendingContext = loadFeedbackContext();
+  state.feedbackContextLoadPromise = pendingContext;
+  try {
+    await pendingContext;
+  } finally {
+    if (state.feedbackContextLoadPromise === pendingContext) {
+      state.feedbackContextLoadPromise = null;
+    }
+  }
+}
+
+function hideFeedbackModal() {
+  if (!elements.feedbackModal) return;
+  elements.feedbackModal.hidden = true;
+  elements.feedbackButton?.focus();
+}
+
+
 async function jsonFromResponse(response) {
   try {
     return await response.json();
@@ -10191,7 +10405,11 @@ async function saveCurrentQuoteSession(options = {}) {
       return null;
     }
     const session = data.quote_session || {};
-    state.quoteSessionId = safeQuoteSessionId(session.session_id || payload.session_id);
+    const savedSessionId = safeQuoteSessionId(session.session_id || payload.session_id);
+    const currentContext = currentGenerationContext();
+    transitionGenerationContext(
+      savedSessionId, currentContext.session_id === savedSessionId ? currentContext.run_id : ""
+    );
     mergeDashboardQuoteSession(session);
     if (currentQuoteSessionIsRestoredFromDashboard()) {
       state.quoteSessionRestoredDraftKey = quoteSessionDraftComparisonKey();
@@ -11567,7 +11785,7 @@ async function confirmQuoteSessionDelete() {
     return;
   }
   if (sessionIds.includes(safeQuoteSessionId(state.quoteSessionId))) {
-    state.quoteSessionId = "";
+    transitionGenerationContext("", "");
     saveSessionState();
   }
   state.dashboardSelectedSessionIds = dashboardSelectedSessionIds().filter((sessionId) => !sessionIds.includes(sessionId));
@@ -12233,6 +12451,8 @@ async function handleGenerate(options = {}) {
   syncControlStates();
   await ensureQuoteSession({ quoteGenerated: true });
   const started = await startJob(jobType, buildPayload({ viewPdf }), { jobId: operation.id });
+  const startedContext = currentGenerationContext();
+  transitionGenerationContext(startedContext.session_id, started.data?.generation_run_id || startedContext.run_id);
   if (!started.ok) {
     if (started.data?.page_unloading) return;
     state.isGenerating = false;
@@ -12243,6 +12463,8 @@ async function handleGenerate(options = {}) {
     syncControlStates();
     return;
   }
+  const acceptedContext = currentGenerationContext();
+  transitionGenerationContext(acceptedContext.session_id, started.data.generation_run_id || acceptedContext.run_id);
   state.activeJob = { ...operation, id: started.data.job_id || operation.id, phase: "running" };
   saveSessionState();
 
@@ -12256,9 +12478,11 @@ async function handleGenerate(options = {}) {
   clearActiveJob();
 
   const data = polled.data.result || polled.data || {};
-  if (data.quote_session?.session_id) {
-    state.quoteSessionId = safeQuoteSessionId(data.quote_session.session_id) || state.quoteSessionId;
-  }
+  const previousContext = currentGenerationContext();
+  const resultSessionId = safeQuoteSessionId(data.quote_session?.session_id || previousContext.session_id);
+  const resultRunId = data.generation_run_id || polled.data.generation_run_id
+    || (previousContext.session_id === resultSessionId ? previousContext.run_id : "");
+  transitionGenerationContext(resultSessionId, resultRunId);
   if (!polled.ok || ["blocked", "failed"].includes(polled.data.status) || data.status === "blocked" || data.status === "failed") {
     setWorkflowStage(state.activeSidePanel === "output" ? "completed" : "details_review");
     setResultStatus(data.status || "Failed", "is-bad");
@@ -12467,9 +12691,11 @@ async function resumeSavedJob() {
     }
 
     const data = polled.data.result || polled.data || {};
-    if (data.quote_session?.session_id) {
-      state.quoteSessionId = safeQuoteSessionId(data.quote_session.session_id) || state.quoteSessionId;
-    }
+    const previousContext = currentGenerationContext();
+    const resultSessionId = safeQuoteSessionId(data.quote_session?.session_id || previousContext.session_id);
+    const resultRunId = data.generation_run_id || polled.data.generation_run_id
+      || (previousContext.session_id === resultSessionId ? previousContext.run_id : "");
+    transitionGenerationContext(resultSessionId, resultRunId);
     if (!polled.ok || ["blocked", "failed"].includes(polled.data.status) || data.status === "blocked" || data.status === "failed") {
       state.isGenerating = false;
       clearActiveJob();
@@ -13266,6 +13492,12 @@ function wireEvents() {
     if (event.target.closest("[data-output-delete-close]")) {
       hideOutputDeleteModal();
     }
+  });
+  elements.feedbackButton?.addEventListener("click", showFeedbackModal);
+  elements.cancelFeedbackButton?.addEventListener("click", hideFeedbackModal);
+  elements.feedbackForm?.addEventListener("submit", submitFeedback);
+  elements.feedbackModal?.addEventListener("click", (event) => {
+    if (event.target.closest("[data-feedback-close]")) hideFeedbackModal();
   });
   elements.cancelQuoteSessionDeleteButton?.addEventListener("click", hideQuoteSessionDeleteModal);
   elements.confirmQuoteSessionDeleteButton?.addEventListener("click", confirmQuoteSessionDelete);
