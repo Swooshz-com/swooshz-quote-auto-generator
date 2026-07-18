@@ -8764,6 +8764,8 @@ def migrate_legacy_sqag_tables_postgres(connection: Any) -> None:
     for suffix in SQAG_TABLE_SUFFIXES:
         legacy_table = legacy_storage_table_name(suffix)
         sqag_table = sqag_storage_table_name(suffix)
+        # The adapter always invokes psycopg with a params tuple, so PostgreSQL
+        # format() placeholders must escape the client-side percent parser.
         connection.execute(
             f"""
 do $$
@@ -8771,8 +8773,8 @@ begin
   if to_regclass('public.{legacy_table}') is not null and to_regclass('public.{sqag_table}') is null then
     alter table public.{legacy_table} rename to {sqag_table};
   elsif to_regclass('public.{legacy_table}') is not null and to_regclass('public.{sqag_table}') is not null then
-    execute format('insert into public.%I select * from public.%I on conflict do nothing', '{sqag_table}', '{legacy_table}');
-    execute format('drop table public.%I', '{legacy_table}');
+    execute format('insert into public.%%I select * from public.%%I on conflict do nothing', '{sqag_table}', '{legacy_table}');
+    execute format('drop table public.%%I', '{legacy_table}');
   end if;
 end $$;
 """
