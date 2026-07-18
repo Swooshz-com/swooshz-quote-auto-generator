@@ -1,11 +1,15 @@
 import json
 import os
+import re
 import sqlite3
 import sys
 import unittest
 import uuid
 from pathlib import Path
 from unittest import mock
+
+from psycopg._queries import PostgresQuery
+from psycopg.adapt import Transformer
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -231,13 +235,26 @@ class FakePostgresConnection:
         self.closed = True
 
 
-class RecordingConnection:
+class PsycopgParsingConnection:
+    """Exercise psycopg's real client placeholder parser without a database."""
+
     def __init__(self):
+        self.closed = False
+        self.commits = 0
         self.queries = []
 
     def execute(self, sql, params=None):
-        self.queries.append((sql, tuple(params or ())))
+        query = PostgresQuery(Transformer())
+        query.convert(sql, tuple(params or ()))
+        rendered = query.query.decode("utf-8")
+        self.queries.append((rendered, tuple(params or ())))
         return FakePostgresCursor()
+
+    def commit(self):
+        self.commits += 1
+
+    def close(self):
+        self.closed = True
 
 
 class SqliteSqagMigrationTest(unittest.TestCase):
@@ -333,15 +350,52 @@ class SqliteSqagMigrationTest(unittest.TestCase):
         self.assertFalse(any(table.startswith(f"{LEGACY_PREFIX}_") for table in tables))
 
     def test_postgres_legacy_table_migration_sql_uses_guarded_sqag_rename_merge(self):
-        connection = RecordingConnection()
+        raw_connection = PsycopgParsingConnection()
+        connection = webapp.PostgresConnectionAdapter(raw_connection)
 
         webapp.migrate_legacy_sqag_tables_postgres(connection)
 
-        executed_sql = "\n".join(query for query, _params in connection.queries)
+        executed_sql = "\n".join(query for query, _params in raw_connection.queries)
+        self.assertEqual(len(raw_connection.queries), len(webapp.SQAG_TABLE_SUFFIXES))
+        self.assertTrue(all(re.fullmatch(r"[a-z_]+", suffix) for suffix in webapp.SQAG_TABLE_SUFFIXES))
+        for suffix, (query, params) in zip(webapp.SQAG_TABLE_SUFFIXES, raw_connection.queries):
+            legacy_table = webapp.legacy_storage_table_name(suffix)
+            sqag_table = webapp.sqag_storage_table_name(suffix)
+            self.assertEqual(params, ())
+            self.assertIn(f"to_regclass('public.{legacy_table}') is not null", query)
+            self.assertIn(f"to_regclass('public.{sqag_table}') is null", query)
         self.assertIn("public.sqag_profiles", executed_sql)
         self.assertIn(f"public.{LEGACY_PREFIX}_profiles", executed_sql)
+        self.assertIn("to_regclass", executed_sql.lower())
+        self.assertIn("%I", executed_sql)
+        self.assertNotIn("%%I", executed_sql)
         self.assertIn("on conflict do nothing", executed_sql.lower())
         self.assertIn("drop table", executed_sql.lower())
+
+    def test_empty_postgres_database_path_reaches_ordered_metadata_migrations(self):
+        connection = PsycopgParsingConnection()
+        expected_migrations = [
+            "001_platform_scoped_storage.sql",
+            "003_object_artifact_metadata.sql",
+            "004_generation_forensics_feedback_retention_postgres.sql",
+            "005_forensic_postgres_delete_guards.sql",
+            "006_quote_publication_versions_postgres.sql",
+            "007_feedback_publication_binding_postgres.sql",
+        ]
+
+        with mock.patch(
+            "webapp.server.postgres_driver_connection_factory",
+            return_value=lambda _database_url: connection,
+        ):
+            webapp.apply_sqag_storage_migrations(POSTGRES_URL)
+
+        migration_names = [path.name for path in webapp.SQAG_POSTGRES_METADATA_MIGRATION_PATHS]
+        executed_sql = "\n".join(query for query, _params in connection.queries)
+        self.assertEqual(migration_names, expected_migrations)
+        self.assertNotIn("002_platform_scoped_artifacts.sql", migration_names)
+        self.assertIn("create table if not exists sqag_profiles", executed_sql.lower())
+        self.assertEqual(connection.commits, 1)
+        self.assertTrue(connection.closed)
 
 
 class PostgresMetadataStorageTest(unittest.TestCase):
