@@ -9205,6 +9205,7 @@ class ObjectArtifactBatchPlan:
 OBJECT_LIFECYCLE_OWNER_TYPES = frozenset({
     'profile',
     'pricing_reference',
+    'uploaded_reference',
     'generated_quote',
     'generated_quote_version',
 })
@@ -9499,7 +9500,7 @@ class DatabaseSqagStorage:
             )
         safe_owner_id = (
             safe_quote_session_id(owner_id, '')
-            if safe_owner_type == 'generated_quote'
+            if safe_owner_type in {'generated_quote', 'uploaded_reference'}
             else safe_reference(owner_id, 'run-')
             if safe_owner_type == 'generated_quote_version'
             else safe_resource_id(owner_id, '')
@@ -11829,6 +11830,49 @@ class DatabaseSqagStorage:
             return {}, []
         return metadata, [item for item in draft_files if isinstance(item, dict)]
 
+    def _hydrate_object_draft_files(
+        self,
+        session_id: str,
+        records: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        hydrated: list[dict[str, Any]] = []
+        for record in records:
+            artifact_kind = safe_resource_id(record.get("artifact_kind"), "")
+            if not artifact_kind.startswith("uploaded_reference_"):
+                raise SqagStorageAccessError(
+                    QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                    status=503,
+                    reason="object_artifact_storage_unavailable",
+                )
+            try:
+                artifact = self._read_object_file_artifact(
+                    "uploaded_reference", session_id, artifact_kind,
+                )
+            except Exception as exc:
+                raise self._storage_unavailable_error(exc) from exc
+            if (
+                artifact is None
+                or int(record.get("size") or 0) != int(artifact["size_bytes"])
+                or clean_text(record.get("sha256")).lower()
+                != artifact_checksum(artifact["content"])
+            ):
+                raise SqagStorageAccessError(
+                    QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                    status=503,
+                    reason="object_artifact_storage_unavailable",
+                )
+            restored = {
+                key: copy.deepcopy(value)
+                for key, value in record.items()
+                if key not in {"artifact_kind", "sha256"}
+            }
+            restored["data_url"] = (
+                f"data:{artifact['content_type']};base64,"
+                + base64.b64encode(artifact["content"]).decode("ascii")
+            )
+            hydrated.append(restored)
+        return hydrated
+
     def _read_quote_session_metadata(self, session_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         metadata, draft_files = self._read_quote_session_metadata_for_workspace(session_id)
         if not metadata or not self._quote_session_visible_to_current_user(metadata):
@@ -11974,6 +12018,12 @@ class DatabaseSqagStorage:
         visible["publication"] = visible_publication
         normalized_visible = normalized_quote_session_metadata(visible)
         retained_drafts = current_drafts if current else draft_files
+        if any(clean_text(item.get("data_url")) for item in retained_drafts):
+            raise SqagStorageAccessError(
+                QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                status=503,
+                reason="object_artifact_storage_unavailable",
+            )
         connection.execute(
             "insert into sqag_quote_sessions "
             "(workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at) "
@@ -12147,6 +12197,36 @@ class DatabaseSqagStorage:
                 output_dir,
                 connection=connection,
             )
+            draft_files = (
+                quote_session_draft_files(patch)
+                if isinstance(patch.get("draft_files"), list)
+                else _draft_files
+            )
+            draft_metadata = draft_files
+            draft_plan = None
+            if isinstance(patch.get("draft_files"), list):
+                draft_metadata, draft_items, draft_kinds = quote_session_draft_object_artifacts(draft_files)
+                prior_draft_kinds = {
+                    clean_text(row["artifact_kind"])
+                    for row in self._active_object_artifact_rows(
+                        "uploaded_reference",
+                        resolved_session_id,
+                        connection=connection,
+                    )
+                }
+                draft_plan = self._prepare_object_artifact_batch(
+                    "uploaded_reference",
+                    resolved_session_id,
+                    draft_items,
+                    draft_kinds | prior_draft_kinds,
+                    draft_kinds,
+                    connection=connection,
+                )
+            if object_plan is not None and draft_plan is not None:
+                raise ObjectStorageContractError(
+                    "Quote export and uploaded-reference replacement must be separate operations."
+                )
+            effective_plan = draft_plan or object_plan
             if stored_generated_quote:
                 metadata["publication"] = {
                     "state": "published" if publish else "staged",
@@ -12164,9 +12244,11 @@ class DatabaseSqagStorage:
                 "now": now,
                 "stored_generated_quote": stored_generated_quote,
                 "pending_artifacts": pending_artifacts,
-                "object_plan": object_plan,
+                "object_plan": effective_plan,
+                "object_plan_is_quote_export": object_plan is not None,
+                "draft_files": draft_metadata,
             }
-            return state, object_plan
+            return state, effective_plan
 
         def persist_object_quote(connection: Any, state: dict[str, Any]):
             metadata = state["metadata"]
@@ -12208,16 +12290,12 @@ class DatabaseSqagStorage:
             normalized = normalized_quote_session_metadata(metadata)
             if not normalized:
                 raise ValueError("Quote session metadata is not valid.")
-            draft_files = (
-                quote_session_draft_files(patch)
-                if isinstance(patch.get("draft_files"), list)
-                else []
-            )
-            if stored_generated_quote and object_plan is not None:
+            draft_files = state["draft_files"]
+            if object_plan is not None:
                 self._execute_object_artifact_batch_metadata(
                     connection,
                     object_plan,
-                    quote_session=True,
+                    quote_session=state["object_plan_is_quote_export"],
                 )
             connection.execute(
                 "insert into sqag_quote_sessions (workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at) values (?, ?, ?, ?, ?, ?) on conflict(workspace_id, session_id) do update set metadata_json = excluded.metadata_json, draft_files_json = excluded.draft_files_json, updated_at = excluded.updated_at",
@@ -12243,11 +12321,19 @@ class DatabaseSqagStorage:
             return state
 
         try:
+            lifecycle_owner_type = (
+                "uploaded_reference"
+                if isinstance(patch.get("draft_files"), list)
+                and not result_has_generated_quote(result)
+                else "generated_quote"
+            )
             state, object_plan = self._run_object_lifecycle_save(
-                "generated_quote",
+                lifecycle_owner_type,
                 resolved_session_id,
                 prepare_object_quote,
                 persist_object_quote,
+                additional_lock_identities=(("generated_quote", resolved_session_id),)
+                if lifecycle_owner_type == "uploaded_reference" else (),
             )
         except Exception as exc:
             if not self._expected_storage_failure(exc):
@@ -12651,6 +12737,11 @@ class DatabaseSqagStorage:
         metadata, draft_files = self._read_quote_session_metadata(session_id)
         if not metadata:
             return None
+        if include_draft_state and configured_artifact_storage_mode() == "object":
+            draft_files = self._hydrate_object_draft_files(
+                safe_quote_session_id(session_id, ""),
+                draft_files,
+            )
         session = self._public_quote_session(metadata, include_draft_state=include_draft_state, draft_files=draft_files)
         return session or None
 
@@ -12776,6 +12867,7 @@ class DatabaseSqagStorage:
             "deleted_at from sqag_object_artifacts "
             "where workspace_id = ? and ("
             "(owner_type = ? and owner_id = ?) or "
+            "(owner_type = ? and owner_id = ?) or "
             "(owner_type = ? and owner_id in ("
             "select run_id from sqag_quote_publication_versions "
             "where workspace_id = ? and session_id = ?))) "
@@ -12784,6 +12876,8 @@ class DatabaseSqagStorage:
             (
                 self.workspace_id,
                 "generated_quote",
+                session_id,
+                "uploaded_reference",
                 session_id,
                 "generated_quote_version",
                 self.workspace_id,
@@ -12795,6 +12889,8 @@ class DatabaseSqagStorage:
         for row in rows:
             owner_type = clean_text(row["owner_type"])
             owner_id = clean_text(row["owner_id"])
+            if owner_type == "uploaded_reference" and owner_id == session_id:
+                continue
             if owner_type == "generated_quote" and owner_id == session_id:
                 continue
             if owner_type == "generated_quote_version":
@@ -12866,11 +12962,8 @@ class DatabaseSqagStorage:
                         session_id,
                         delete_owner,
                         authorize,
-                        additional_lock_identities=(
-                            self._publication_version_lock_identities_for_session(
-                                session_id
-                            )
-                        ),
+                        additional_lock_identities=(("uploaded_reference", session_id),)
+                        + self._publication_version_lock_identities_for_session(session_id),
                         rows_for_delete=lambda connection: (
                             self._active_object_quote_rows_for_session(
                                 connection, session_id
@@ -14244,16 +14337,19 @@ def persist_pdf_page_debug_images(
 ) -> list[dict[str, Any]]:
     if not images:
         return []
+    if configured_app_mode() == "deploy":
+        return images
     safe_source = safe_segment(Path(source_name).stem or "reference", "reference")
     safe_digest = re.sub(r"[^a-fA-F0-9]", "", source_digest)[:12] or "unknown"
-    output_dir = DEFAULT_TMP_ROOT / "pdf-pages" / f"{safe_source}-{safe_digest}"
+    tmp_root = configured_tmp_root()
+    output_dir = tmp_root / "pdf-pages" / f"{safe_source}-{safe_digest}"
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
         return images
     try:
         resolved_output = output_dir.resolve()
-        resolved_tmp_root = DEFAULT_TMP_ROOT.resolve()
+        resolved_tmp_root = tmp_root.resolve()
         if resolved_tmp_root in resolved_output.parents:
             for stale_path in output_dir.glob("page-*"):
                 if stale_path.is_file():
@@ -18626,6 +18722,45 @@ def quote_session_draft_files(patch: dict[str, Any]) -> list[dict[str, Any]]:
     return records
 
 
+def quote_session_draft_object_artifacts(
+    records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[ArtifactBatchItem], set[str]]:
+    metadata_records: list[dict[str, Any]] = []
+    items: list[ArtifactBatchItem] = []
+    managed_kinds: set[str] = set()
+    for record in records:
+        session_file_key = clean_text(record.get("session_file_key"))
+        mime_type = reference_file_mime_type(record)
+        max_bytes = MAX_PDF_BYTES if mime_type == "application/pdf" else MAX_IMAGE_BYTES
+        content = decode_reference_data_url_bytes(record, max_bytes)
+        artifact_kind = (
+            "uploaded_reference_"
+            + hashlib.sha256(session_file_key.encode("utf-8")).hexdigest()[:24]
+        )
+        filename = safe_segment(clean_text(record.get("name")), "reference-file")
+        managed_kinds.add(artifact_kind)
+        items.append(ArtifactBatchItem(
+            artifact_kind=artifact_kind,
+            filename=filename,
+            content_type=mime_type,
+            content=content,
+        ))
+        stored = {
+            key: copy.deepcopy(value)
+            for key, value in record.items()
+            if key != "data_url"
+        }
+        stored.update({
+            "artifact_kind": artifact_kind,
+            "name": filename,
+            "type": mime_type,
+            "size": len(content),
+            "sha256": artifact_checksum(content),
+        })
+        metadata_records.append(stored)
+    return metadata_records, items, managed_kinds
+
+
 def write_quote_session_draft_files(session_id: str, records: list[dict[str, Any]]) -> None:
     path = quote_session_draft_files_path(session_id)
     if not records:
@@ -20481,7 +20616,7 @@ def get_job(job_id: str, auth_session: dict[str, Any] | None = None) -> dict[str
         return public_job(job) if job else None
 
 
-def run_quote_job(
+def _run_quote_job(
     payload: dict[str, Any],
     output_root: Path | None = None,
     tmp_root: Path | None = None,
@@ -20922,6 +21057,61 @@ def run_quote_job(
                     unexpected_error_log_details(compensation_reference, exc, job_id=job_id),
                 )
     return finalized
+
+
+def cleanup_object_mode_job_scratch(
+    job_tmp: Path,
+    output_dir: Path,
+    tmp_root: Path,
+    output_root: Path,
+) -> None:
+    if configured_artifact_storage_mode() != "object":
+        return
+    for path, root in ((job_tmp, tmp_root), (output_dir, output_root)):
+        try:
+            resolved_path = path.resolve()
+            resolved_root = root.resolve()
+            resolved_path.relative_to(resolved_root)
+            if resolved_path == resolved_root:
+                raise ValueError("Scratch path must be below its configured root.")
+            if resolved_path.exists():
+                shutil.rmtree(resolved_path)
+        except Exception as exc:
+            raise SqagStorageAccessError(
+                QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                status=503,
+                reason="object_artifact_staging_cleanup_failed",
+            ) from exc
+
+
+def run_quote_job(
+    payload: dict[str, Any],
+    output_root: Path | None = None,
+    tmp_root: Path | None = None,
+    job_id: str | None = None,
+    pdf_mode: str = "none",
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    resolved_job_id = safe_resource_id(job_id, f"job-{secrets.token_hex(6)}")
+    resolved_output_root = output_root or configured_output_root()
+    resolved_tmp_root = tmp_root or configured_tmp_root()
+    try:
+        return _run_quote_job(
+            payload,
+            output_root=resolved_output_root,
+            tmp_root=resolved_tmp_root,
+            job_id=resolved_job_id,
+            pdf_mode=pdf_mode,
+            auth_session=auth_session,
+        )
+    finally:
+        cleanup_object_mode_job_scratch(
+            resolved_tmp_root / resolved_job_id,
+            resolved_output_root / resolved_job_id,
+            resolved_tmp_root,
+            resolved_output_root,
+        )
+
 
 
 class QuoteRunnerHandler(BaseHTTPRequestHandler):
