@@ -4,6 +4,7 @@ import io
 import json
 import os
 import sys
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -26,6 +27,15 @@ def load_verifier():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@contextlib.contextmanager
+def local_test_directory():
+    root = ROOT / "_tmp" / "tests" / "live-retention-delete"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"case-{time.time_ns()}"
+    path.mkdir()
+    yield path
 
 
 def complete_env() -> dict[str, str]:
@@ -506,6 +516,114 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
         self.assertFalse(report["checks"]["tombstone_attempted"])
         self.assertFalse(report["checks"]["deleted_metadata_download_denied"])
         self.assertIn("active_runtime_download_not_verified", report["blockers"])
+        self.assertEqual(report["runtime_download_failure_stage"], "runtime_returned_none")
+
+    def test_real_database_storage_fixture_completes_runtime_download_and_delete_lifecycle(self):
+        verifier = load_verifier()
+        with local_test_directory() as temp_dir:
+            database_url = f"sqlite:///{(Path(temp_dir) / 'sqag.sqlite3').as_posix()}"
+            env = complete_env()
+            env[webapp.SQAG_DATABASE_URL_ENV_NAME] = database_url
+            backend = webapp.InMemoryObjectStorageBackend()
+            with mock.patch.dict(os.environ, env, clear=True):
+                report = verifier.run_verification(
+                    env=env,
+                    storage_factory=verifier._build_default_storage,
+                    backend_factory=lambda _env: backend,
+                    migration_applier=webapp.apply_sqag_storage_migrations,
+                    test_injected_backend=True,
+                )
+
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["runtime_download_failure_stage"], "")
+        for check in (
+            "db_metadata_active_verified",
+            "object_write_read_verified",
+            "active_runtime_download_verified",
+            "checksum_match",
+            "metadata_object_pairing_verified",
+            "tombstone_metadata_verified",
+            "object_delete_verified",
+            "deleted_metadata_download_denied",
+            "missing_object_fail_closed",
+            "wrong_workspace_denied",
+            "repeated_delete_safe",
+            "cleanup_completed",
+        ):
+            self.assertTrue(report["checks"][check], check)
+
+    def test_real_database_storage_unpublished_session_is_not_runtime_download_verified(self):
+        verifier = load_verifier()
+        with local_test_directory() as temp_dir:
+            database_url = f"sqlite:///{(Path(temp_dir) / 'sqag.sqlite3').as_posix()}"
+            env = complete_env()
+            env[webapp.SQAG_DATABASE_URL_ENV_NAME] = database_url
+            backend = webapp.InMemoryObjectStorageBackend()
+            with mock.patch.dict(os.environ, env, clear=True):
+                webapp.apply_sqag_storage_migrations(database_url)
+                storage = verifier._build_default_storage(database_url, "workspace-unpublished")
+                session_id = "quote-unpublished123"
+                payload = b"synthetic-unpublished-runtime-download"
+                metadata = backend.store_artifact(
+                    workspace_id=storage.workspace_id,
+                    owner_type="generated_quote",
+                    owner_id=session_id,
+                    artifact_kind="xlsx",
+                    filename=verifier.SYNTHETIC_FILENAME,
+                    content_type=verifier.SYNTHETIC_CONTENT_TYPE,
+                    content=payload,
+                )
+                storage.create_or_update_quote_session(
+                    {
+                        "session_id": session_id,
+                        "status": {"quote_generated": True, "xlsx_exported": True},
+                        "exports": {
+                            "xlsx": {
+                                "filename": verifier.SYNTHETIC_FILENAME,
+                                "created_at": metadata.created_at,
+                                "size_bytes": metadata.size_bytes,
+                                "sha256": metadata.checksum_sha256,
+                                "stale": False,
+                            }
+                        },
+                    },
+                    session_id=session_id,
+                )
+                storage._upsert_object_quote_artifact(
+                    session_id,
+                    "xlsx",
+                    verifier.SYNTHETIC_FILENAME,
+                    verifier.SYNTHETIC_CONTENT_TYPE,
+                    metadata,
+                )
+                diagnostics = {}
+                verified = verifier._runtime_download_verified(
+                    storage=storage,
+                    session_id=session_id,
+                    backend=backend,
+                    env=env,
+                    metadata=metadata,
+                    payload=payload,
+                    diagnostics=diagnostics,
+                )
+
+        self.assertFalse(verified)
+        self.assertEqual(diagnostics["failure_stage"], "session_not_published")
+
+    def test_runtime_download_report_drops_unallowlisted_failure_detail(self):
+        verifier = load_verifier()
+        private_detail = "private runtime target detail"
+        report = verifier._report(
+            status="failed",
+            checks={},
+            missing_env_names=[],
+            blockers=["active_runtime_download_not_verified"],
+            test_injected_backend=True,
+            runtime_download_failure_stage=private_detail,
+        )
+
+        self.assertEqual(report["runtime_download_failure_stage"], "")
+        self.assertNotIn(private_detail, json.dumps(report, sort_keys=True))
 
     def test_db_schema_failure_fails_closed(self):
         verifier = load_verifier()

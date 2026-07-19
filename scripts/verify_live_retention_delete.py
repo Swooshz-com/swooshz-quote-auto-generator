@@ -68,6 +68,18 @@ REQUIRED_ENV_NAMES = [
 TRUE_VALUES = {"1", "true", "yes", "on", "run", "enabled"}
 SYNTHETIC_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 SYNTHETIC_FILENAME = webapp.QUOTE_SESSION_EXPORT_KINDS["xlsx"]
+RUNTIME_DOWNLOAD_FAILURE_STAGES = {
+    "session_missing_or_not_visible",
+    "session_not_published",
+    "export_metadata_missing_or_noncanonical",
+    "export_stale",
+    "active_object_metadata_missing",
+    "object_not_found",
+    "object_contract_error",
+    "runtime_returned_none",
+    "runtime_response_mismatch",
+    "unexpected_runtime_exception",
+}
 OBJECT_ARTIFACT_ROW_FIELDS = (
     "artifact_id",
     "workspace_id",
@@ -190,8 +202,14 @@ def _report(
     active_db_rows: int = 0,
     active_object_count: int = 0,
     active_object_deleted_count: int = 0,
+    runtime_download_failure_stage: str = "",
 ) -> dict[str, object]:
     supported = status == "passed" and not test_injected_backend
+    safe_runtime_download_failure_stage = (
+        runtime_download_failure_stage
+        if runtime_download_failure_stage in RUNTIME_DOWNLOAD_FAILURE_STAGES
+        else ""
+    )
     return {
         "schema": "swooshz.sqag.live-retention-delete-evidence.v1",
         "status": status,
@@ -204,6 +222,7 @@ def _report(
         "active_object_synthetic_objects_written": int(active_object_count),
         "active_object_synthetic_objects_deleted": int(active_object_deleted_count),
         "db_blob_artifact_rows_written": 0,
+        "runtime_download_failure_stage": safe_runtime_download_failure_stage,
         "privacy": _privacy_report(),
         "production_ready": False,
         "blockers": list(blockers),
@@ -357,12 +376,21 @@ def _write_synthetic_metadata(storage: object, ids: Mapping[str, str], metadata:
                     "filename": SYNTHETIC_FILENAME,
                     "created_at": metadata.created_at,
                     "size_bytes": metadata.size_bytes,
+                    "sha256": metadata.checksum_sha256,
                     "stale": False,
                 }
+            },
+            "publication": {
+                "state": "published",
+                "run_id": "",
+                "job_id": "",
+                "error_code": "",
             },
         },
         session_id=ids["session_a"],
     )
+    if hasattr(storage, "connection"):
+        _persist_synthetic_published_session(storage, ids["session_a"], metadata)
     rows = 1
     storage._upsert_object_quote_artifact(
         ids["session_a"],
@@ -373,6 +401,56 @@ def _write_synthetic_metadata(storage: object, ids: Mapping[str, str], metadata:
     )
     rows += 1
     return rows
+
+
+def _persist_synthetic_published_session(
+    storage: object,
+    session_id: str,
+    metadata: ObjectArtifactMetadata,
+) -> None:
+    """Persist verifier-owned publication metadata rejected by normal caller APIs."""
+    with storage.connection() as connection:
+        row = connection.execute(
+            "select metadata_json from sqag_quote_sessions where workspace_id = ? and session_id = ?",
+            (storage.workspace_id, session_id),
+        ).fetchone()
+        if not row:
+            raise ObjectStorageContractError("Synthetic quote session metadata is unavailable.")
+        try:
+            current = json.loads(row["metadata_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ObjectStorageContractError("Synthetic quote session metadata is unavailable.") from exc
+        published = webapp.normalized_quote_session_metadata(current if isinstance(current, dict) else {})
+        if not published:
+            raise ObjectStorageContractError("Synthetic quote session metadata is unavailable.")
+        now = webapp.utc_timestamp()
+        published["updated_at"] = now
+        published["publication"] = {
+            "state": "published",
+            "run_id": "",
+            "job_id": "",
+            "error_code": "",
+        }
+        published["status"]["quote_generated"] = True
+        published["status"]["xlsx_exported"] = True
+        published["status"]["pdf_exported"] = False
+        published["exports"]["xlsx"] = {
+            "filename": SYNTHETIC_FILENAME,
+            "created_at": metadata.created_at,
+            "size_bytes": metadata.size_bytes,
+            "sha256": metadata.checksum_sha256,
+            "stale": False,
+        }
+        connection.execute(
+            "update sqag_quote_sessions set metadata_json = ?, updated_at = ? where workspace_id = ? and session_id = ?",
+            (
+                json.dumps(published, ensure_ascii=True, sort_keys=True),
+                now,
+                storage.workspace_id,
+                session_id,
+            ),
+        )
+        connection.commit()
 
 
 def _runtime_env_names() -> list[str]:
@@ -419,13 +497,28 @@ def _runtime_download_verified(
     env: Mapping[str, str],
     metadata: ObjectArtifactMetadata,
     payload: bytes,
+    diagnostics: dict[str, str] | None = None,
 ) -> bool:
+    if diagnostics is not None:
+        diagnostics["failure_stage"] = ""
     try:
         artifact = _runtime_download(storage, session_id, backend, env)
-    except Exception:
+    except Exception as exc:
+        if isinstance(exc, ObjectStorageNotFoundError):
+            stage = "object_not_found"
+        elif isinstance(exc, ObjectStorageContractError):
+            stage = "object_contract_error"
+        else:
+            stage = "unexpected_runtime_exception"
+        if diagnostics is not None:
+            diagnostics["failure_stage"] = stage
+        return False
+    if artifact is None:
+        if diagnostics is not None:
+            diagnostics["failure_stage"] = _runtime_download_precondition_failure_stage(storage, session_id)
         return False
     content = artifact.get("content") if isinstance(artifact, Mapping) else None
-    return bool(
+    verified = bool(
         isinstance(artifact, Mapping)
         and bytes(content or b"") == payload
         and _clean(artifact.get("filename")) == SYNTHETIC_FILENAME
@@ -434,6 +527,29 @@ def _runtime_download_verified(
         and artifact_checksum(bytes(content or b"")) == metadata.checksum_sha256
         and _metadata_object_pairing_ok(storage, session_id, metadata)
     )
+    if not verified and diagnostics is not None:
+        diagnostics["failure_stage"] = "runtime_response_mismatch"
+    return verified
+
+
+def _runtime_download_precondition_failure_stage(storage: object, session_id: str) -> str:
+    try:
+        if hasattr(storage, "_read_quote_session_metadata"):
+            metadata, _draft_files = storage._read_quote_session_metadata(session_id)
+            if not metadata:
+                return "session_missing_or_not_visible"
+            if not webapp.quote_session_is_published(metadata):
+                return "session_not_published"
+            export = metadata.get("exports", {}).get("xlsx") if isinstance(metadata.get("exports"), dict) else None
+            if not isinstance(export, dict) or _clean(export.get("filename")) != SYNTHETIC_FILENAME:
+                return "export_metadata_missing_or_noncanonical"
+            if webapp.quote_session_export_is_stale(metadata, export):
+                return "export_stale"
+        if _object_artifact_row(storage, session_id, "xlsx") is None:
+            return "active_object_metadata_missing"
+    except Exception:
+        return "runtime_returned_none"
+    return "runtime_returned_none"
 
 
 
@@ -535,6 +651,7 @@ def _run_drill(
     storage_factory: StorageFactory,
     backend_factory: BackendFactory,
     migration_applier: MigrationApplier,
+    runtime_download_diagnostics: dict[str, str],
 ) -> tuple[dict[str, bool], list[str], int, int, int]:
     ids = _synthetic_ids()
     database_url = _clean(env.get(webapp.SQAG_DATABASE_URL_ENV_NAME))
@@ -603,6 +720,7 @@ def _run_drill(
             env=env,
             metadata=metadata,
             payload=payload,
+            diagnostics=runtime_download_diagnostics,
         )
         try:
             backend.retrieve_artifact(metadata, workspace_id=ids["workspace_b"])
@@ -696,6 +814,7 @@ def run_verification(
         runtime_database_mode_enabled=runtime_database_mode_enabled,
         runtime_object_artifact_mode_enabled=runtime_object_artifact_mode_enabled,
     )
+    runtime_download_diagnostics = {"failure_stage": ""}
 
     blockers: list[str] = []
     if missing or not live_opt_in_enabled:
@@ -722,6 +841,7 @@ def run_verification(
         storage_factory=storage_factory or _build_default_storage,
         backend_factory=backend_factory or _build_s3_backend,
         migration_applier=migration_applier or webapp.apply_sqag_storage_migrations,
+        runtime_download_diagnostics=runtime_download_diagnostics,
     )
     status = "passed" if not blockers else "failed"
     return _report(
@@ -733,6 +853,7 @@ def run_verification(
         active_db_rows=active_db_rows,
         active_object_count=active_object_count,
         active_object_deleted_count=active_object_deleted_count,
+        runtime_download_failure_stage=runtime_download_diagnostics["failure_stage"],
     )
 
 
