@@ -11174,8 +11174,8 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertIn("discardCurrentQuoteDraftSession", js)
         self.assertIn("includeDraftState: true", js)
         self.assertIn("includeDraftFiles: false", js)
-        self.assertIn("payload.draft_state = currentQuoteSessionDraftState()", js)
-        self.assertIn("payload.draft_files = sessionFileRecordsFromDraft()", js)
+        self.assertIn("payload.draft_state = options.draftState || currentQuoteSessionDraftState()", js)
+        self.assertIn(": sessionFileRecordsFromDraft()", js)
         self.assertIn("quoteSessionDraftSaveStarted", js)
         self.assertIn("quoteSessionDraftStateCanSave", js)
         self.assertIn("&& !state.isRecoveryScopeTransitioning", js)
@@ -19448,6 +19448,158 @@ assert.strictEqual(collectQuoteCurrency(), "JPY");
         self.assertIn("quoteCommercialTouched: normalizeQuoteCommercialTouched(state.quoteCommercialTouched || {})", snapshot_body)
         self.assertIn("quoteCommercialTouched: snapshot.quoteCommercialTouched", draft_state_body)
         self.assertIn("quoteDetailsCommercialTouched(saved.quoteDetails || {})", restore_body)
+
+    def test_browser_generation_serializes_and_confirms_latest_draft_save(self):
+        node = require_node(self)
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const marker = `function ${name}`;
+  let start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  if (source.slice(start - 6, start) === "async ") start -= 6;
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+let quoteSessionDraftSaveTimer = null;
+let quoteSessionInitialSavePromise = null;
+let quoteSessionDraftSavePromise = null;
+let quoteSessionConfirmedDraftSessionId = "";
+let quoteSessionConfirmedDraftKey = "";
+let quoteSessionConfirmedDraftFileKey = "";
+let draftVersion = 1;
+let fileVersion = 1;
+const state = {
+  quoteSessionId: "quote-browser-sync",
+  basisConfirmed: true,
+  outputRows: [],
+};
+const window = { clearTimeout() {} };
+const calls = [];
+const gates = [];
+const safeQuoteSessionId = (value) => String(value || "");
+const normalizedContentFingerprint = (value) => String(value || "");
+const quoteSessionDraftStateCanSave = () => true;
+const saveSessionState = () => {};
+const currentQuoteSessionDraftState = () => ({
+  version: draftVersion,
+  savedAt: `time-${draftVersion}`,
+  images: [`image-${fileVersion}`],
+});
+const sessionFileRecordsFromDraft = () => [{
+  session_file_key: `file-${fileVersion}`,
+  file_role: "reference",
+  name: `render-${fileVersion}.png`,
+  type: "image/png",
+  size: fileVersion,
+  content_fingerprint: `sha256:${fileVersion}`,
+  data_url: `data:image/png;base64,${fileVersion}`,
+}];
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+async function saveCurrentQuoteSession(options) {
+  const gate = deferred();
+  gates.push(gate);
+  calls.push(options);
+  const outcome = await gate.promise;
+  if (outcome === "fail") return null;
+  const draftKey = quoteSessionDraftComparisonKey(options.draftState);
+  const fileKey = options.includeDraftFiles
+    ? quoteSessionDraftFileComparisonKey(options.draftFiles)
+    : null;
+  rememberConfirmedQuoteSessionDraft(state.quoteSessionId, draftKey, fileKey);
+  return { session_id: state.quoteSessionId };
+}
+
+eval([
+  "quoteSessionDraftComparisonKey",
+  "quoteSessionDraftFileComparisonKey",
+  "rememberConfirmedQuoteSessionDraft",
+  "quoteSessionDraftFilesAreConfirmed",
+  "quoteSessionDraftIsConfirmed",
+  "clearQuoteSessionDraftSaveTimer",
+  "saveQuoteSessionDraftState",
+  "ensureQuoteSession",
+].map(extractFunction).join("\n"));
+
+(async () => {
+  const firstAutosave = saveQuoteSessionDraftState({ quoteGenerated: false });
+  await Promise.resolve();
+  assert.strictEqual(calls.length, 1);
+  assert.strictEqual(calls[0].includeDraftFiles, true);
+
+  draftVersion = 2;
+  fileVersion = 2;
+  let generationFinished = false;
+  const generationSync = ensureQuoteSession({ quoteGenerated: true, synchronizeDraft: true })
+    .then((value) => { generationFinished = true; return value; });
+  await Promise.resolve();
+  assert.strictEqual(calls.length, 1);
+  assert.strictEqual(generationFinished, false);
+
+  gates[0].resolve("ok");
+  await firstAutosave;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(calls.length, 2);
+  assert.strictEqual(calls[1].includeDraftFiles, true);
+  assert.strictEqual(generationFinished, false);
+  gates[1].resolve("ok");
+  assert.strictEqual(await generationSync, "quote-browser-sync");
+
+  assert.strictEqual(
+    await ensureQuoteSession({ quoteGenerated: true, synchronizeDraft: true }),
+    "quote-browser-sync",
+  );
+  assert.strictEqual(calls.length, 2);
+
+  draftVersion = 3;
+  const metadataOnlySync = ensureQuoteSession({ quoteGenerated: true, synchronizeDraft: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(calls.length, 3);
+  assert.strictEqual(calls[2].includeDraftFiles, false);
+  gates[2].resolve("ok");
+  assert.strictEqual(await metadataOnlySync, "quote-browser-sync");
+
+  draftVersion = 4;
+  fileVersion = 3;
+  const failedSync = ensureQuoteSession({ quoteGenerated: true, synchronizeDraft: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(calls.length, 4);
+  gates[3].resolve("fail");
+  assert.strictEqual(await failedSync, "");
+})();
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+        js = (ROOT / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
+        for function_name in ("handleDraftBasis", "handleGenerate"):
+            body = js.split(f"async function {function_name}", 1)[1].split("\nasync function ", 1)[0]
+            self.assertLess(body.index("synchronizeDraft: true"), body.index("await startJob("))
+            self.assertIn("if (!synchronizedSessionId)", body)
+        resume_body = js.split("async function ensureSavedServerJobStarted", 1)[1].split("\nasync function ", 1)[0]
+        self.assertLess(resume_body.index("synchronizeDraft: true"), resume_body.index("await startJob("))
 
     def test_static_pricing_reference_save_button_explains_blocked_state(self):
         js = (ROOT / "webapp" / "static" / "app.js").read_text(encoding="utf-8")

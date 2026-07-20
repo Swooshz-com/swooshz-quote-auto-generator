@@ -159,12 +159,16 @@ class CloudCutoverTest(unittest.TestCase):
                 output_dir.mkdir(parents=True)
                 (job_tmp / "upload.pdf").write_bytes(b"scratch")
                 (output_dir / "pricing_matches.csv").write_text("scratch", encoding="utf-8")
-                side_effect = None if outcome == "success" else RuntimeError("synthetic failure")
+                def run_with_owned_scratch(*_args, scratch_ownership=None, **_kwargs):
+                    scratch_ownership.update({"job_tmp": True, "output_dir": True})
+                    if outcome == "failure":
+                        raise RuntimeError("synthetic failure")
+                    return {"status": "completed"}
                 with (
                     mock.patch.dict(os.environ, env),
-                    mock.patch.object(webapp, "_run_quote_job", return_value={"status": "completed"}, side_effect=side_effect),
+                    mock.patch.object(webapp, "_run_quote_job", side_effect=run_with_owned_scratch),
                 ):
-                    if side_effect:
+                    if outcome == "failure":
                         with self.assertRaises(RuntimeError):
                             webapp.run_quote_job({}, output_root, tmp_root, job_id)
                     else:
@@ -179,15 +183,19 @@ class CloudCutoverTest(unittest.TestCase):
             reason="object_artifact_staging_cleanup_failed",
         )
         with writable_test_root() as root:
+            def committed_with_owned_scratch(*_args, scratch_ownership=None, **_kwargs):
+                scratch_ownership.update({"job_tmp": True, "output_dir": True})
+                return {
+                    "status": "completed",
+                    "_durable_publication_committed": True,
+                }
+
             with (
                 mock.patch.dict(os.environ, {"SQAG_ARTIFACT_STORAGE_MODE": "object"}),
                 mock.patch.object(
                     webapp,
                     "_run_quote_job",
-                    return_value={
-                        "status": "completed",
-                        "_durable_publication_committed": True,
-                    },
+                    side_effect=committed_with_owned_scratch,
                 ) as runner,
                 mock.patch.object(
                     webapp,
@@ -210,9 +218,13 @@ class CloudCutoverTest(unittest.TestCase):
             )
             self.assertNotIn(str(root), json.dumps(logger.call_args.args[1]))
 
+            def uncommitted_with_owned_scratch(*_args, scratch_ownership=None, **_kwargs):
+                scratch_ownership.update({"job_tmp": True, "output_dir": True})
+                return {"status": "completed"}
+
             with (
                 mock.patch.dict(os.environ, {"SQAG_ARTIFACT_STORAGE_MODE": "object"}),
-                mock.patch.object(webapp, "_run_quote_job", return_value={"status": "completed"}),
+                mock.patch.object(webapp, "_run_quote_job", side_effect=uncommitted_with_owned_scratch),
                 mock.patch.object(
                     webapp,
                     "cleanup_object_mode_job_scratch",
@@ -224,6 +236,86 @@ class CloudCutoverTest(unittest.TestCase):
                         {}, root / "output", root / "tmp", "job-uncommitted-cleanup"
                     )
             self.assertEqual(precommit.exception.reason, "object_artifact_staging_cleanup_failed")
+
+    def test_idempotent_replay_never_cleans_another_invocation_scratch(self):
+        with writable_test_root() as root:
+            tmp_root = root / "tmp"
+            output_root = root / "output"
+            job_id = "job-concurrent-replay"
+            original_started = webapp.threading.Event()
+            allow_original_finish = webapp.threading.Event()
+            original_saw_intact_scratch = webapp.threading.Event()
+            results = {}
+            calls = 0
+            calls_lock = webapp.threading.Lock()
+
+            def concurrent_runner(*_args, scratch_ownership=None, **_kwargs):
+                nonlocal calls
+                with calls_lock:
+                    calls += 1
+                    invocation = calls
+                if invocation != 1:
+                    return {
+                        "job_id": job_id,
+                        "status": "blocked",
+                        "idempotent_replay": True,
+                    }
+                job_tmp = tmp_root / job_id
+                output_dir = output_root / job_id
+                job_tmp.mkdir(parents=True)
+                output_dir.mkdir(parents=True)
+                (job_tmp / "brief.json").write_text("synthetic", encoding="utf-8")
+                (output_dir / "quotation.xlsx").write_bytes(b"synthetic")
+                scratch_ownership.update({"job_tmp": True, "output_dir": True})
+                original_started.set()
+                self.assertTrue(allow_original_finish.wait(5))
+                if (job_tmp / "brief.json").is_file() and (output_dir / "quotation.xlsx").is_file():
+                    original_saw_intact_scratch.set()
+                return {
+                    "job_id": job_id,
+                    "status": "completed",
+                    "_durable_publication_committed": True,
+                }
+
+            def run_original():
+                results["original"] = webapp.run_quote_job(
+                    {}, output_root, tmp_root, job_id,
+                )
+
+            with (
+                mock.patch.dict(os.environ, {"SQAG_ARTIFACT_STORAGE_MODE": "object"}),
+                mock.patch.object(webapp, "_run_quote_job", side_effect=concurrent_runner),
+            ):
+                thread = webapp.threading.Thread(target=run_original)
+                thread.start()
+                self.assertTrue(original_started.wait(5))
+                replay = webapp.run_quote_job({}, output_root, tmp_root, job_id)
+                self.assertTrue((tmp_root / job_id / "brief.json").is_file())
+                self.assertTrue((output_root / job_id / "quotation.xlsx").is_file())
+                allow_original_finish.set()
+                thread.join(timeout=5)
+
+                self.assertFalse(thread.is_alive())
+                self.assertTrue(replay["idempotent_replay"])
+                self.assertTrue(original_saw_intact_scratch.is_set())
+                self.assertEqual(results["original"]["status"], "completed")
+                self.assertFalse((tmp_root / job_id).exists())
+                self.assertFalse((output_root / job_id).exists())
+
+                unrelated_tmp = tmp_root / job_id
+                unrelated_output = output_root / job_id
+                unrelated_tmp.mkdir(parents=True)
+                unrelated_output.mkdir(parents=True)
+                (unrelated_tmp / "unrelated").write_text("keep", encoding="utf-8")
+                (unrelated_output / "unrelated").write_text("keep", encoding="utf-8")
+                replay_after_completion = webapp.run_quote_job(
+                    {}, output_root, tmp_root, job_id,
+                )
+                self.assertTrue(replay_after_completion["idempotent_replay"])
+                self.assertTrue((unrelated_tmp / "unrelated").is_file())
+                self.assertTrue((unrelated_output / "unrelated").is_file())
+
+            self.assertEqual(calls, 3)
 
     def test_cleanup_attempts_both_scratch_directories_before_failing(self):
         with writable_test_root() as root:
@@ -246,6 +338,28 @@ class CloudCutoverTest(unittest.TestCase):
                         job_tmp, output_dir, tmp_root, output_root,
                     )
             self.assertEqual(remove.call_count, 2)
+
+    def test_cleanup_removes_only_explicitly_owned_scratch(self):
+        with writable_test_root() as root:
+            tmp_root = root / "tmp"
+            output_root = root / "output"
+            job_tmp = tmp_root / "job-owned-paths"
+            output_dir = output_root / "job-owned-paths"
+            job_tmp.mkdir(parents=True)
+            output_dir.mkdir(parents=True)
+            (job_tmp / "other-invocation").write_text("keep", encoding="utf-8")
+            (output_dir / "owned").write_text("remove", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"SQAG_ARTIFACT_STORAGE_MODE": "object"}):
+                webapp.cleanup_object_mode_job_scratch(
+                    job_tmp,
+                    output_dir,
+                    tmp_root,
+                    output_root,
+                    owns_job_tmp=False,
+                    owns_output_dir=True,
+                )
+            self.assertTrue((job_tmp / "other-invocation").is_file())
+            self.assertFalse(output_dir.exists())
 
     def test_deploy_pdf_page_debug_images_do_not_write_local_files(self):
         with writable_test_root() as tmp_root:

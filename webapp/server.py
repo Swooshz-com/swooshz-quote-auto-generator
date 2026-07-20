@@ -21009,6 +21009,7 @@ def _run_quote_job(
     job_id: str | None = None,
     pdf_mode: str = "none",
     auth_session: dict[str, Any] | None = None,
+    scratch_ownership: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     generation_run_id = clean_text(payload.get("_generation_run_id"))
     job_id = safe_resource_id(job_id, f"job-{secrets.token_hex(6)}")
@@ -21168,8 +21169,28 @@ def _run_quote_job(
     tmp_root = tmp_root or configured_tmp_root()
     job_tmp = tmp_root / job_id
     output_dir = output_root / job_id
-    job_tmp.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    ownership = scratch_ownership if scratch_ownership is not None else {}
+    ownership["job_tmp"] = False
+    ownership["output_dir"] = False
+    if configured_artifact_storage_mode() == "object":
+        try:
+            tmp_root.mkdir(parents=True, exist_ok=True)
+            output_root.mkdir(parents=True, exist_ok=True)
+            job_tmp.mkdir(exist_ok=False)
+            ownership["job_tmp"] = True
+            output_dir.mkdir(exist_ok=False)
+            ownership["output_dir"] = True
+        except OSError:
+            return storage_block(
+                SqagStorageAccessError(
+                    QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                    status=503,
+                    reason="object_artifact_staging_unavailable",
+                )
+            )
+    else:
+        job_tmp.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
     normalized_pdf_mode = clean_text(pdf_mode).lower()
     if normalized_pdf_mode not in {"none", "workbook"}:
         normalized_pdf_mode = "none"
@@ -21456,11 +21477,20 @@ def cleanup_object_mode_job_scratch(
     output_dir: Path,
     tmp_root: Path,
     output_root: Path,
+    *,
+    owns_job_tmp: bool = True,
+    owns_output_dir: bool = True,
 ) -> None:
     if configured_artifact_storage_mode() != "object":
         return
     cleanup_failed = False
-    for path, root in ((job_tmp, tmp_root), (output_dir, output_root)):
+    owned_paths = (
+        (job_tmp, tmp_root, owns_job_tmp),
+        (output_dir, output_root, owns_output_dir),
+    )
+    for path, root, is_owned in owned_paths:
+        if not is_owned:
+            continue
         try:
             resolved_path = path.resolve()
             resolved_root = root.resolve()
@@ -21490,6 +21520,20 @@ def run_quote_job(
     resolved_job_id = safe_resource_id(job_id, f"job-{secrets.token_hex(6)}")
     resolved_output_root = output_root or configured_output_root()
     resolved_tmp_root = tmp_root or configured_tmp_root()
+    scratch_ownership = {"job_tmp": False, "output_dir": False}
+
+    def cleanup_owned_scratch() -> None:
+        if not any(scratch_ownership.values()):
+            return
+        cleanup_object_mode_job_scratch(
+            resolved_tmp_root / resolved_job_id,
+            resolved_output_root / resolved_job_id,
+            resolved_tmp_root,
+            resolved_output_root,
+            owns_job_tmp=scratch_ownership["job_tmp"],
+            owns_output_dir=scratch_ownership["output_dir"],
+        )
+
     try:
         result = _run_quote_job(
             payload,
@@ -21498,15 +21542,11 @@ def run_quote_job(
             job_id=resolved_job_id,
             pdf_mode=pdf_mode,
             auth_session=auth_session,
+            scratch_ownership=scratch_ownership,
         )
     except BaseException:
         try:
-            cleanup_object_mode_job_scratch(
-                resolved_tmp_root / resolved_job_id,
-                resolved_output_root / resolved_job_id,
-                resolved_tmp_root,
-                resolved_output_root,
-            )
+            cleanup_owned_scratch()
         except SqagStorageAccessError as cleanup_exc:
             cleanup_reference = new_error_reference()
             write_local_log(
@@ -21521,12 +21561,7 @@ def run_quote_job(
         raise
     publication_committed = result.pop("_durable_publication_committed", False) is True
     try:
-        cleanup_object_mode_job_scratch(
-            resolved_tmp_root / resolved_job_id,
-            resolved_output_root / resolved_job_id,
-            resolved_tmp_root,
-            resolved_output_root,
-        )
+        cleanup_owned_scratch()
     except SqagStorageAccessError as exc:
         if not publication_committed:
             raise
@@ -22039,6 +22074,9 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 if storage is None:
                     return
                 session = storage.create_or_update_quote_session(payload)
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
             except ValueError as exc:
                 self.send_json({"status": "blocked", "errors": safe_error_messages([str(exc)])}, status=400)
                 return

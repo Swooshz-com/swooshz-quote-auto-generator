@@ -662,6 +662,110 @@ class InlineDraftObjectMigrationTest(unittest.TestCase):
                     self.assertEqual(status, 200)
                     self.assertTrue(body["authenticated"])
 
+    def test_quote_session_post_storage_failures_are_structured_and_compensated(self):
+        class StoreFailingBackend(webapp.InMemoryObjectStorageBackend):
+            def store_artifact(self, **_kwargs):
+                raise webapp.ObjectStorageContractError("private provider write detail")
+
+        for failure_kind in ("provider", "metadata"):
+            with self.subTest(failure_kind=failure_kind), writable_test_root() as root:
+                database_url = f"sqlite:///{(root / 'sqag.sqlite3').as_posix()}"
+                db_path = root / "sqag.sqlite3"
+                backend = StoreFailingBackend() if failure_kind == "provider" else webapp.InMemoryObjectStorageBackend()
+                auth_session = self.auth_session(
+                    f"workspace-post-{failure_kind}",
+                    user_id=f"post-{failure_kind}-user",
+                )
+                env = {
+                    **self.object_env(database_url),
+                    "APP_MODE": "local",
+                    "AUTH_REQUIRED": "true",
+                    "SESSION_SECRET": "test-session-secret-with-enough-entropy",
+                }
+                def request_json(runner, method, path, *, body=None, headers=None):
+                    parsed = urllib.parse.urlparse(runner.base_url)
+                    request_headers = {"Accept": "application/json", "Cookie": cookie}
+                    if body is not None:
+                        request_headers["Content-Type"] = "application/json"
+                    request_headers.update(headers or {})
+                    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
+                    try:
+                        connection.request(
+                            method,
+                            path,
+                            body=json.dumps(body).encode("utf-8") if body is not None else None,
+                            headers=request_headers,
+                        )
+                        response = connection.getresponse()
+                        response_body = json.loads(response.read().decode("utf-8"))
+                        return response.status, response_body
+                    finally:
+                        connection.close()
+
+                with (
+                    mock.patch.dict(os.environ, env, clear=True),
+                    mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+                ):
+                    cookie = (
+                        f"{webapp.SESSION_COOKIE_NAME}="
+                        f"{webapp.signed_cookie_value({'user': auth_session['user']})}"
+                    )
+                    webapp.apply_sqag_storage_migrations(database_url)
+                    metadata_failure = (
+                        mock.patch.object(
+                            webapp.DatabaseSqagStorage,
+                            "_execute_object_artifact_batch_metadata",
+                            side_effect=sqlite3.OperationalError("private database detail"),
+                        )
+                        if failure_kind == "metadata"
+                        else contextlib.nullcontext()
+                    )
+                    with LocalRunnerServer() as runner:
+                        session_status, session_body = request_json(runner, "GET", "/api/session")
+                        self.assertEqual(session_status, 200)
+                        csrf_headers = {
+                            "Origin": runner.base_url,
+                            session_body["csrf_header"]: session_body["csrf_token"],
+                        }
+                        with metadata_failure:
+                            status, body = request_json(
+                                runner,
+                                "POST",
+                                "/api/quote-sessions",
+                                body={
+                                    "quote_session": {
+                                        "session_id": f"quote-post-{failure_kind}",
+                                        "draft_state": {"activeSidePanel": "customer"},
+                                        "draft_files": [self.inline_record(f"post-{failure_kind}")],
+                                    }
+                                },
+                                headers=csrf_headers,
+                            )
+                        self.assertEqual(status, 503)
+                        self.assertEqual(body["status"], "failed")
+                        self.assertTrue(body.get("error_reference"))
+                        response_text = json.dumps(body, sort_keys=True)
+                        self.assertNotIn("synthetic-bucket", response_text)
+                        self.assertNotIn("private provider write detail", response_text)
+                        self.assertNotIn("private database detail", response_text)
+                        self.assertNotIn("object_key", response_text)
+                        subsequent_status, subsequent_body = request_json(
+                            runner, "GET", "/api/session",
+                        )
+                        self.assertEqual(subsequent_status, 200)
+                        self.assertTrue(subsequent_body["authenticated"])
+
+                    with contextlib.closing(sqlite3.connect(db_path)) as connection:
+                        self.assertEqual(
+                            connection.execute("select count(*) from sqag_quote_sessions").fetchone()[0],
+                            0,
+                        )
+                        self.assertEqual(
+                            connection.execute("select count(*) from sqag_object_artifacts").fetchone()[0],
+                            0,
+                        )
+                    self.assertEqual(backend._objects, {})
+
     def test_cli_defaults_to_count_only_then_applies_a_bounded_batch(self):
         backend = webapp.InMemoryObjectStorageBackend()
         migrator = load_migrator()

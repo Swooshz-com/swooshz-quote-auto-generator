@@ -1064,6 +1064,49 @@ nonzero with `production_ready=false` and all live evidence `not_run_by_checker`
 as expected. A bounded localhost launch reached `/api/health` with HTTP 200; the
 detached validation process did not persist after the launch shell returned.
 
+The follow-up PR #144 amendment closes the generation/save race by serializing
+quote-session draft writes and recording separate confirmed draft-state and
+draft-file comparison keys for the active session. Generation cancels a
+pending timer, awaits any exact in-flight save, and repeats the serialized save
+when a later state or reference change is not covered by that completion. The
+job request is built and sent only after the latest draft and reference keys
+are confirmed. A failed save leaves the browser draft intact, returns an
+actionable privacy-safe error, and prevents job creation. Unchanged confirmed
+references are omitted from later metadata-only saves, so generation and
+autosave do not create another uploaded-reference object batch. Server-side
+lock-time reference ownership and metadata verification remains unchanged.
+
+Quote-session POST now converts `SqagStorageAccessError` into the same
+privacy-safe structured storage response used by other storage-backed routes,
+while the existing `ValueError` HTTP 400 boundary and authorization checks
+remain intact. Injected provider-write and database-metadata failures return
+HTTP 503, expose no provider/database/object details, leave the server usable,
+remove staged objects, and commit neither object rows nor quote-session rows.
+
+Object-mode scratch cleanup now receives explicit per-invocation ownership for
+the job temp and output directories. The accepted invocation marks each path
+only after creating it; an idempotent replay owns neither and therefore cannot
+delete the original invocation's live inputs or outputs. Existing same-job
+paths fail closed rather than being adopted. The owning invocation still
+cleans success and failure paths, cleanup attempts both owned bounded paths,
+and post-durable-publication cleanup failure remains a warning without
+rewriting durable success.
+
+Follow-up validation used only local and synthetic storage with every live
+evidence opt-in disabled. Focused cutover, inline migration, object lifecycle,
+object contract/provider, Postgres metadata, browser synchronization, POST
+failure, and scratch ownership coverage passed 66 tests. The final clean
+repository suite passed 939 tests. Python compile checks, JavaScript syntax,
+sensitive-fixture scan (zero blocking and zero review findings), architecture
+fallback audit, local PDF dependency guard, dynamic pricing/reference guard,
+`pip check`, and `git diff --check` passed. The readiness checker remained
+nonzero with `production_ready=false` and every live evidence check
+`not_run_by_checker`, as expected. A bounded forced-local launch reached
+`/api/health` with HTTP 200; as in the prior amendment, the detached process
+did not persist after its launcher command returned. The scoped manual hard
+review found no additional unresolved P0/P1/P2 issue in the amended browser,
+POST, idempotency, scratch, publication, locking, or compensation paths.
+
 ## What Was Not Verified
 
 - Live deployed Swooshz Platform behavior, platform token service, hosted SQAG handoff, or platform workspace membership enforcement; this audit checked source-contract surfaces only, and `scripts/verify_hosted_smoke.py` uses only synthetic platform/workspace context.
