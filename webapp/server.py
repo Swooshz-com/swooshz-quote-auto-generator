@@ -11830,11 +11830,247 @@ class DatabaseSqagStorage:
             return {}, []
         return metadata, [item for item in draft_files if isinstance(item, dict)]
 
+    def _migrate_inline_draft_files_to_object_storage(
+        self,
+        session_id: str,
+        records: list[dict[str, Any]],
+        *,
+        require_visibility: bool = True,
+    ) -> list[dict[str, Any]]:
+        safe_id = safe_quote_session_id(session_id, "")
+        if (
+            configured_artifact_storage_mode() != "object"
+            or not safe_id
+            or not any(clean_text(item.get("data_url")) for item in records)
+        ):
+            return records
+
+        def prepare(connection: Any):
+            metadata, current_records = (
+                self._read_quote_session_metadata_for_workspace_on_connection(
+                    connection,
+                    safe_id,
+                )
+            )
+            if (
+                not metadata
+                or (
+                    require_visibility and not self._quote_session_visible_to_current_user(metadata)
+                )
+            ):
+                raise SqagStorageAccessError(
+                    QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                    status=404,
+                    reason="quote_session_not_found",
+                )
+            if not any(
+                clean_text(item.get("data_url")) for item in current_records
+            ):
+                return {
+                    "changed": False,
+                    "records": current_records,
+                }, None
+
+            inline_records: list[dict[str, Any]] = []
+            retained_kinds: set[str] = set()
+            for record in current_records:
+                if clean_text(record.get("data_url")):
+                    normalized = quote_session_draft_file_record(record)
+                    if not normalized:
+                        raise ValueError(
+                            "Saved reference file metadata is invalid."
+                        )
+                    inline_records.append(normalized)
+                    continue
+                artifact_kind = safe_resource_id(
+                    record.get("artifact_kind"), ""
+                )
+                if not artifact_kind.startswith("uploaded_reference_"):
+                    raise ValueError(
+                        "Saved reference file metadata is invalid."
+                    )
+                retained_kinds.add(artifact_kind)
+
+            migrated_records, items, new_kinds = (
+                quote_session_draft_object_artifacts(inline_records)
+            )
+            migrated_iter = iter(migrated_records)
+            rewritten_records = [
+                next(migrated_iter)
+                if clean_text(record.get("data_url"))
+                else copy.deepcopy(record)
+                for record in current_records
+            ]
+            retained_kinds.update(new_kinds)
+            prior_kinds = {
+                clean_text(row["artifact_kind"])
+                for row in self._active_object_artifact_rows(
+                    "uploaded_reference",
+                    safe_id,
+                    connection=connection,
+                )
+            }
+            plan = self._prepare_object_artifact_batch(
+                "uploaded_reference",
+                safe_id,
+                items,
+                retained_kinds | prior_kinds,
+                retained_kinds,
+                connection=connection,
+            )
+            return {
+                "changed": True,
+                "records": rewritten_records,
+                "plan": plan,
+            }, plan
+
+        def persist(connection: Any, state: dict[str, Any]):
+            if not state["changed"]:
+                return state
+            plan = state["plan"]
+            self._execute_object_artifact_batch_metadata(
+                connection,
+                plan,
+                quote_session=False,
+            )
+            cursor = connection.execute(
+                "update sqag_quote_sessions set draft_files_json = ? "
+                "where workspace_id = ? and session_id = ?",
+                (
+                    json.dumps(
+                        state["records"],
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ),
+                    self.workspace_id,
+                    safe_id,
+                ),
+            )
+            if getattr(cursor, "rowcount", 0) != 1:
+                raise ObjectStorageContractError(
+                    "Saved reference migration state changed."
+                )
+            return state
+
+        try:
+            state, plan = self._run_object_lifecycle_save(
+                "uploaded_reference",
+                safe_id,
+                prepare,
+                persist,
+                additional_lock_identities=(("generated_quote", safe_id),),
+            )
+        except ValueError as exc:
+            raise SqagStorageAccessError(
+                QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                status=503,
+                reason="object_draft_migration_invalid",
+            ) from exc
+        except Exception as exc:
+            if not self._expected_storage_failure(exc):
+                raise
+            raise self._storage_unavailable_error(exc) from exc
+        if plan is not None:
+            self._finalize_object_artifact_batch(plan)
+        return state["records"]
+
+    def _ensure_inline_draft_object_migration_access(self) -> None:
+        if self.role != "admin":
+            raise SqagStorageAccessError(
+                "Workspace administrator access is required.",
+                status=403,
+                reason="storage_admin_required",
+            )
+        if configured_artifact_storage_mode() != "object":
+            raise SqagStorageAccessError(
+                QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                status=503,
+                reason="object_artifact_storage_unavailable",
+            )
+        self.ensure_ready()
+        self.ensure_object_artifact_ready()
+
+    def count_workspace_inline_draft_files_for_object_migration(self) -> int:
+        self._ensure_inline_draft_object_migration_access()
+        inline_pattern = '%"data_url"%'
+        with self.connection() as connection:
+            return int(connection.execute(
+                "select count(*) from sqag_quote_sessions "
+                "where workspace_id = ? and draft_files_json like ?",
+                (self.workspace_id, inline_pattern),
+            ).fetchone()[0])
+
+    def migrate_workspace_inline_draft_files_to_object_storage(
+        self,
+        *,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        self._ensure_inline_draft_object_migration_access()
+        safe_limit = max(1, min(int(limit), 1000))
+        inline_pattern = '%"data_url"%'
+        candidate_count = self.count_workspace_inline_draft_files_for_object_migration()
+        with self.connection() as connection:
+            rows = connection.execute(
+                "select session_id, draft_files_json from sqag_quote_sessions "
+                "where workspace_id = ? and draft_files_json like ? "
+                "order by session_id limit ?",
+                (self.workspace_id, inline_pattern, safe_limit),
+            ).fetchall()
+
+        migrated = 0
+        failed = 0
+        failure_reasons: dict[str, int] = {}
+        for row in rows:
+            try:
+                records = json.loads(row["draft_files_json"] or "[]")
+                if (
+                    not isinstance(records, list)
+                    or any(not isinstance(item, dict) for item in records)
+                ):
+                    raise ValueError("Saved reference file metadata is invalid.")
+                if not any(
+                    clean_text(item.get("data_url")) for item in records
+                ):
+                    raise ValueError("Saved reference file metadata is invalid.")
+
+                migrated_records = self._migrate_inline_draft_files_to_object_storage(
+                    clean_text(row["session_id"]),
+                    records,
+                    require_visibility=False,
+                )
+                if not any(
+                    clean_text(item.get("data_url")) for item in migrated_records
+                ):
+                    migrated += 1
+            except (SqagStorageAccessError, ValueError) as exc:
+                failed += 1
+                reason = safe_resource_id(
+                    getattr(exc, "reason", "invalid_inline_draft"),
+                    "inline_draft_migration_failed",
+                )
+                failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
+
+        remaining = self.count_workspace_inline_draft_files_for_object_migration()
+        return {
+            "workspace_id": self.workspace_id,
+            "limit": safe_limit,
+            "candidates": candidate_count,
+            "processed": len(rows),
+            "migrated": migrated,
+            "failed": failed,
+            "failure_reasons": failure_reasons,
+            "remaining": remaining,
+        }
+
     def _hydrate_object_draft_files(
         self,
         session_id: str,
         records: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
+        if any(clean_text(item.get("data_url")) for item in records):
+            records = self._migrate_inline_draft_files_to_object_storage(
+                session_id, records,
+            )
         hydrated: list[dict[str, Any]] = []
         for record in records:
             artifact_kind = safe_resource_id(record.get("artifact_kind"), "")
@@ -12018,7 +12254,9 @@ class DatabaseSqagStorage:
         visible["publication"] = visible_publication
         normalized_visible = normalized_quote_session_metadata(visible)
         retained_drafts = current_drafts if current else draft_files
-        if any(clean_text(item.get("data_url")) for item in retained_drafts):
+        if configured_artifact_storage_mode() == "object" and any(
+            clean_text(item.get("data_url")) for item in retained_drafts
+        ):
             raise SqagStorageAccessError(
                 QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
                 status=503,
@@ -12354,6 +12592,18 @@ class DatabaseSqagStorage:
         if existing and not self._quote_session_editable_by_current_user(existing):
             resolved_session_id = new_quote_session_id()
             existing = {}
+        if isinstance(patch.get("draft_files"), list):
+            quote_session_draft_files(patch)
+        if (
+            configured_artifact_storage_mode() == "object"
+            and isinstance(patch.get("draft_files"), list)
+            and result_has_generated_quote(result)
+        ):
+            raise SqagStorageAccessError(
+                "Save draft reference files before generating the quote.",
+                status=409,
+                reason="object_combined_mutation_unsupported",
+            )
         safe_run_id = safe_reference(generation_run_id, "run-")
         if (
             safe_run_id
@@ -18677,6 +18927,10 @@ def quote_session_draft_state(patch: dict[str, Any]) -> dict[str, Any]:
     return sanitized if isinstance(sanitized, dict) else {}
 
 
+class EmptyReferenceFileError(ValueError):
+    pass
+
+
 def quote_session_draft_file_record(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
@@ -18688,7 +18942,12 @@ def quote_session_draft_file_record(value: Any) -> dict[str, Any]:
     if not (mime_type.startswith("image/") or mime_type == "application/pdf"):
         return {}
     max_bytes = MAX_PDF_BYTES if mime_type == "application/pdf" else MAX_IMAGE_BYTES
-    decode_reference_data_url_bytes({**value, "data_url": data_url}, max_bytes)
+    content = decode_reference_data_url_bytes(
+        {**value, "data_url": data_url},
+        max_bytes,
+    )
+    if not content:
+        raise EmptyReferenceFileError("Reference file payload must not be empty.")
     size = dashboard_safe_number(value.get("size"))
     file_role = dashboard_safe_text(value.get("file_role") or value.get("role"), 80).lower()
     record = {
@@ -18712,6 +18971,8 @@ def quote_session_draft_files(patch: dict[str, Any]) -> list[dict[str, Any]]:
     for value in supplied[:MAX_REFERENCE_IMAGES + 2]:
         try:
             record = quote_session_draft_file_record(value)
+        except EmptyReferenceFileError:
+            raise
         except ValueError:
             continue
         key = clean_text(record.get("session_file_key"))
@@ -18733,6 +18994,8 @@ def quote_session_draft_object_artifacts(
         mime_type = reference_file_mime_type(record)
         max_bytes = MAX_PDF_BYTES if mime_type == "application/pdf" else MAX_IMAGE_BYTES
         content = decode_reference_data_url_bytes(record, max_bytes)
+        if not content:
+            raise EmptyReferenceFileError("Reference file payload must not be empty.")
         artifact_kind = (
             "uploaded_reference_"
             + hashlib.sha256(session_file_key.encode("utf-8")).hexdigest()[:24]

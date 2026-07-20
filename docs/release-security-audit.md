@@ -1004,6 +1004,30 @@ verifier adapters were updated to model advisory-lock rows and rollback. These
 are local SQLite and synthetic Postgres adapter results only; no live provider
 or live Postgres concurrency evidence is claimed.
 
+### PR #144 inline-draft object recovery addendum
+
+Object-mode quote drafts no longer persist inline `data_url` payloads. A
+currently visible session that still contains legacy inline draft metadata is
+lazily migrated only when its draft state is hydrated; this is a safety net,
+not a startup, deploy, or background migration. Explicit legacy recovery uses
+`scripts/migrate_inline_draft_files_to_object_storage.py --workspace-id
+<workspace>` and requires configured database plus object storage. It is
+workspace-scoped and administrator-only, defaults to a metadata-only candidate
+count, and changes data only with `--apply`. Apply mode clamps each batch to 1
+through 1000 records, emits only sanitized counts/failure reasons, and is
+retry-safe: already converted records are skipped while a blank `data_url`
+remains a counted failure and is never converted. No live database, provider,
+deployment, or credential action was run for this change.
+
+In object mode, a request that combines explicit draft files with generated
+quote output now fails with HTTP 409 before any object, metadata, session, or
+publication-version mutation; callers must save the draft first. The
+equivalent database-artifact versioned publication continues to retain its
+already saved upload. Empty data URLs are rejected as HTTP 400 input errors
+before the object backend is reached. Provider/metadata failure compensation
+retains the legacy inline record and removes newly staged provider objects so
+a later retry starts from the prior state.
+
 ## What Was Not Verified
 
 - Live deployed Swooshz Platform behavior, platform token service, hosted SQAG handoff, or platform workspace membership enforcement; this audit checked source-contract surfaces only, and `scripts/verify_hosted_smoke.py` uses only synthetic platform/workspace context.
