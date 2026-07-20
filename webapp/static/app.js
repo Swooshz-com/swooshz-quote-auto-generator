@@ -317,6 +317,10 @@ const elapsedTimerIds = new Map();
 let sessionFileDbPromise = null;
 let quoteSessionDraftSaveTimer = null;
 let quoteSessionInitialSavePromise = null;
+let quoteSessionDraftSavePromise = null;
+let quoteSessionConfirmedDraftSessionId = "";
+let quoteSessionConfirmedDraftKey = "";
+let quoteSessionConfirmedDraftFileKey = "";
 
 const elements = {
   healthText: qs("#healthText"),
@@ -7073,6 +7077,7 @@ function buildPayload(options = {}) {
     quote_session: currentQuoteSessionPayload({
       quoteGenerated: Boolean(state.basisConfirmed || state.outputRows.length),
       includeDraftState: true,
+      includeDraftFiles: false,
     }),
     analysis_mode: normalizeAnalysisMode(options.analysisMode || state.pendingAnalysisMode),
     generator_label: generator.label,
@@ -10316,6 +10321,46 @@ function quoteSessionDraftComparisonKey(draftState = currentQuoteSessionDraftSta
   return JSON.stringify(comparable);
 }
 
+function quoteSessionDraftFileComparisonKey(draftFiles = sessionFileRecordsFromDraft()) {
+  return JSON.stringify((Array.isArray(draftFiles) ? draftFiles : []).map((file) => ({
+    session_file_key: String(file?.session_file_key || ""),
+    file_role: String(file?.file_role || ""),
+    name: String(file?.name || ""),
+    type: String(file?.type || ""),
+    size: Number.isFinite(Number(file?.size)) ? Number(file.size) : 0,
+    content_fingerprint: normalizedContentFingerprint(file?.content_fingerprint),
+  })));
+}
+
+function rememberConfirmedQuoteSessionDraft(sessionId, draftKey, draftFileKey = null) {
+  const safeSessionId = safeQuoteSessionId(sessionId || "");
+  if (!safeSessionId || !draftKey) return;
+  const sameSession = quoteSessionConfirmedDraftSessionId === safeSessionId;
+  quoteSessionConfirmedDraftSessionId = safeSessionId;
+  quoteSessionConfirmedDraftKey = String(draftKey);
+  if (draftFileKey !== null) {
+    quoteSessionConfirmedDraftFileKey = String(draftFileKey);
+  } else if (!sameSession) {
+    quoteSessionConfirmedDraftFileKey = "";
+  }
+}
+
+function quoteSessionDraftFilesAreConfirmed(sessionId, draftFileKey) {
+  const safeSessionId = safeQuoteSessionId(sessionId || "");
+  return Boolean(
+    safeSessionId
+    && quoteSessionConfirmedDraftSessionId === safeSessionId
+    && quoteSessionConfirmedDraftFileKey === String(draftFileKey),
+  );
+}
+
+function quoteSessionDraftIsConfirmed(sessionId, draftKey, draftFileKey) {
+  return Boolean(
+    quoteSessionDraftFilesAreConfirmed(sessionId, draftFileKey)
+    && quoteSessionConfirmedDraftKey === String(draftKey),
+  );
+}
+
 function rememberRestoredQuoteSessionBaseline(sessionId = state.quoteSessionId) {
   const safeSessionId = safeQuoteSessionId(sessionId || "");
   state.quoteSessionRestoredSessionId = safeSessionId;
@@ -10381,8 +10426,12 @@ function currentQuoteSessionPayload(options = {}) {
     },
   };
   if (options.includeDraftState === true && quoteSessionDraftStateCanSave()) {
-    payload.draft_state = currentQuoteSessionDraftState();
-    payload.draft_files = sessionFileRecordsFromDraft();
+    payload.draft_state = options.draftState || currentQuoteSessionDraftState();
+    if (options.includeDraftFiles !== false) {
+      payload.draft_files = Array.isArray(options.draftFiles)
+        ? options.draftFiles
+        : sessionFileRecordsFromDraft();
+    }
   }
   return payload;
 }
@@ -10398,6 +10447,12 @@ async function saveCurrentQuoteSession(options = {}) {
     requestedSessionId = ensureClientQuoteSessionId();
   }
   const payload = currentQuoteSessionPayload({ ...options, sessionId: requestedSessionId });
+  const payloadDraftKey = payload.draft_state
+    ? quoteSessionDraftComparisonKey(payload.draft_state)
+    : "";
+  const payloadDraftFileKey = Array.isArray(payload.draft_files)
+    ? quoteSessionDraftFileComparisonKey(payload.draft_files)
+    : null;
   const savePromise = (async () => {
     const { ok, data } = await postJson("/api/quote-sessions", payload);
     if (!ok) {
@@ -10411,8 +10466,11 @@ async function saveCurrentQuoteSession(options = {}) {
       savedSessionId, currentContext.session_id === savedSessionId ? currentContext.run_id : ""
     );
     mergeDashboardQuoteSession(session);
+    if (payloadDraftKey) {
+      rememberConfirmedQuoteSessionDraft(savedSessionId, payloadDraftKey, payloadDraftFileKey);
+    }
     if (currentQuoteSessionIsRestoredFromDashboard()) {
-      state.quoteSessionRestoredDraftKey = quoteSessionDraftComparisonKey();
+      state.quoteSessionRestoredDraftKey = payloadDraftKey || state.quoteSessionRestoredDraftKey;
     }
     return session;
   })();
@@ -10426,6 +10484,25 @@ async function saveCurrentQuoteSession(options = {}) {
 }
 
 async function ensureQuoteSession(options = {}) {
+  if (options.synchronizeDraft === true && quoteSessionDraftStateCanSave()) {
+    clearQuoteSessionDraftSaveTimer();
+    while (true) {
+      const draftState = currentQuoteSessionDraftState();
+      const draftFiles = sessionFileRecordsFromDraft();
+      const draftKey = quoteSessionDraftComparisonKey(draftState);
+      const draftFileKey = quoteSessionDraftFileComparisonKey(draftFiles);
+      const currentSessionId = safeQuoteSessionId(state.quoteSessionId || "");
+      if (quoteSessionDraftIsConfirmed(currentSessionId, draftKey, draftFileKey)) {
+        return currentSessionId;
+      }
+      const session = await saveQuoteSessionDraftState({
+        quoteGenerated: options.quoteGenerated,
+        draftState,
+        draftFiles,
+      });
+      if (!session || !safeQuoteSessionId(session.session_id || state.quoteSessionId)) return "";
+    }
+  }
   if (safeQuoteSessionId(state.quoteSessionId)) return state.quoteSessionId;
   const session = await saveCurrentQuoteSession(options);
   return safeQuoteSessionId(session?.session_id || state.quoteSessionId);
@@ -10434,12 +10511,39 @@ async function ensureQuoteSession(options = {}) {
 async function saveQuoteSessionDraftState(options = {}) {
   if (!quoteSessionDraftStateCanSave()) return null;
   saveSessionState();
-  const session = await saveCurrentQuoteSession({
-    quoteGenerated: Boolean(options.quoteGenerated ?? (state.basisConfirmed || state.outputRows.length)),
-    includeDraftState: true,
-  });
-  if (session) saveSessionState();
-  return session;
+  const draftState = options.draftState || currentQuoteSessionDraftState();
+  const draftFiles = Array.isArray(options.draftFiles)
+    ? options.draftFiles
+    : sessionFileRecordsFromDraft();
+  const draftKey = quoteSessionDraftComparisonKey(draftState);
+  const draftFileKey = quoteSessionDraftFileComparisonKey(draftFiles);
+  const priorSave = quoteSessionDraftSavePromise;
+  const savePromise = (async () => {
+    if (priorSave) await priorSave.catch(() => null);
+    const currentSessionId = safeQuoteSessionId(state.quoteSessionId || "");
+    if (quoteSessionDraftIsConfirmed(currentSessionId, draftKey, draftFileKey)) {
+      return { session_id: currentSessionId };
+    }
+    const session = await saveCurrentQuoteSession({
+      quoteGenerated: Boolean(options.quoteGenerated ?? (state.basisConfirmed || state.outputRows.length)),
+      includeDraftState: true,
+      includeDraftFiles: !quoteSessionDraftFilesAreConfirmed(currentSessionId, draftFileKey),
+      draftState,
+      draftFiles,
+    });
+    if (session) saveSessionState();
+    return session;
+  })();
+  quoteSessionDraftSavePromise = savePromise;
+  try {
+    return await savePromise;
+  } finally {
+    if (quoteSessionDraftSavePromise === savePromise) quoteSessionDraftSavePromise = null;
+  }
+}
+
+function quoteSessionDraftSynchronizationFailureMessage() {
+  return "Reference files could not be saved. Please try again before generating the quote.";
 }
 
 function clearQuoteSessionDraftSaveTimer() {
@@ -12212,7 +12316,19 @@ async function handleDraftBasis(options = {}) {
   clearBasisReviewSurface();
   setSidePanel("basis", { force: true });
   syncControlStates();
-  await ensureQuoteSession({ quoteGenerated: false });
+  const synchronizedSessionId = await ensureQuoteSession({
+    quoteGenerated: false,
+    synchronizeDraft: true,
+  });
+  if (!synchronizedSessionId) {
+    state.isAnalysisRunning = false;
+    clearActiveJob();
+    setWorkflowStage("ready_to_analyze");
+    showAiFailureBanner(quoteSessionDraftSynchronizationFailureMessage());
+    restoreQuoteCommercialOverrideSnapshot(quoteCommercialSnapshot, { reason: "draft_reference_save_failed" });
+    syncControlStates();
+    return;
+  }
 
   const started = await startJob("draft", buildPayload({
     analysisMode,
@@ -12449,7 +12565,19 @@ async function handleGenerate(options = {}) {
   renderMatchSummary({});
   clearPricingReviewMessages();
   syncControlStates();
-  await ensureQuoteSession({ quoteGenerated: true });
+  const synchronizedSessionId = await ensureQuoteSession({
+    quoteGenerated: true,
+    synchronizeDraft: true,
+  });
+  if (!synchronizedSessionId) {
+    state.isGenerating = false;
+    clearActiveJob();
+    setWorkflowStage(state.activeSidePanel === "output" ? "completed" : "details_review");
+    setResultStatus("Reference save failed", "is-bad");
+    renderMessages([quoteSessionDraftSynchronizationFailureMessage()], "error");
+    syncControlStates();
+    return;
+  }
   const started = await startJob(jobType, buildPayload({ viewPdf }), { jobId: operation.id });
   const startedContext = currentGenerationContext();
   transitionGenerationContext(startedContext.session_id, started.data?.generation_run_id || startedContext.run_id);
@@ -12533,6 +12661,19 @@ async function ensureSavedServerJobStarted(activeJob) {
   if (activeJob.phase !== "starting") return { ok: true, data: { job_id: activeJob.id } };
   const isDraft = activeJob.type === "draft";
   const viewPdf = activeJob.type === "generate_pdf" || activeJob.viewPdf === true;
+  const synchronizedSessionId = await ensureQuoteSession({
+    quoteGenerated: !isDraft,
+    synchronizeDraft: true,
+  });
+  if (!synchronizedSessionId) {
+    return {
+      ok: false,
+      data: {
+        status: "failed",
+        errors: [quoteSessionDraftSynchronizationFailureMessage()],
+      },
+    };
+  }
   let payload;
   if (isDraft) {
     payload = buildPayload({
@@ -12543,7 +12684,6 @@ async function ensureSavedServerJobStarted(activeJob) {
   } else {
     payload = buildPayload({ viewPdf });
   }
-  await ensureQuoteSession({ quoteGenerated: !isDraft });
   const started = await startJob(activeJob.type, payload, { jobId: activeJob.id });
   if (!started.ok) return started;
   state.activeJob = {

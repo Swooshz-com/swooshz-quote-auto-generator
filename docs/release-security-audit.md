@@ -1004,6 +1004,109 @@ verifier adapters were updated to model advisory-lock rows and rollback. These
 are local SQLite and synthetic Postgres adapter results only; no live provider
 or live Postgres concurrency evidence is claimed.
 
+### PR #144 inline-draft object recovery addendum
+
+Object-mode quote drafts no longer persist inline `data_url` payloads. A
+normal quote-session GET is strictly read-only. If an authorized session still
+contains legacy inline draft metadata, GET returns the standard privacy-safe
+artifact-storage 503 contract with `recovery_required=true`; it does not write
+database metadata or contact object storage. Explicit legacy recovery uses
+`scripts/migrate_inline_draft_files_to_object_storage.py --workspace-id
+<workspace>` and requires configured database plus object storage. It is
+workspace-scoped and administrator-only, defaults to a metadata-only candidate
+count, and changes data only with `--apply`. Apply mode clamps each batch to 1
+through 1000 records and uses an explicit keyset continuation value through
+`--after-session-id`. The result's `next_cursor` lets operators advance beyond
+permanently malformed early rows without deleting or rewriting those rows.
+Output contains only bounded workspace/session identifiers, sanitized counts,
+and sanitized failure reasons. Already converted records are skipped; malformed
+records remain available for diagnosis and deterministic retry. No HTTP
+recovery mutation, startup migration, background migration, live database,
+provider, deployment, or credential action is introduced or run.
+
+Browser generation omits draft-file bytes after the separate draft-save path.
+For compatibility, object-mode generation that still carries draft files is
+accepted only when bounded display metadata, session file identity, MIME type,
+byte size, checksum, derived artifact kind, and workspace/session-owned active
+object metadata exactly match the persisted references. That match is
+revalidated under the uploaded-reference and generated-quote lifecycle locks
+before output staging. Matching references are retained without replacement or
+duplicate upload; a real replacement or tampered/cross-session reference still
+fails with HTTP 409 before either object batch mutates. Database-artifact mode
+continues to support inline saved drafts and versioned publication. Empty data
+URLs remain HTTP 400 input errors before the object backend is reached.
+
+Object draft hydration now verifies storage filename, content type, byte size,
+and checksum. Missing, corrupt, mismatched, or temporarily unavailable provider
+content returns the standard privacy-safe structured 503 response; authorized
+session GET never silently omits a broken reference, and cross-workspace reads
+remain 404. Draft metadata preserves a bounded Unicode-capable display filename
+while object rows and keys use a separate path-safe storage filename. Legacy
+migration uses the same separation.
+
+After forensic finalization and the atomic durable publication transaction have
+committed, scratch cleanup failure is recorded as a privacy-safe operational
+warning and does not rewrite the completed job/publication as failed. Cleanup
+still attempts both bounded job scratch directories, and the same bounded
+cleanup helper can be retried by maintenance. Before a durable publication is
+committed, cleanup failure remains fail-closed. Provider/metadata failure
+compensation retains legacy inline records, removes newly staged objects,
+restores prior objects where applicable, and rolls database/session metadata
+back together so retry starts from the prior state.
+
+Final amendment validation used only local/synthetic storage with live database
+and object-provider opt-ins cleared. The complete repository suite passed 935
+tests. Python and JavaScript compile checks, the sensitive-fixture scan (zero
+blocking and zero review findings), local PDF dependency guard, dynamic pricing
+reference guard, pinned dependency check, architecture fallback audit, and
+`git diff --check` passed. The metadata-only readiness checker remained
+nonzero with `production_ready=false` and all live evidence `not_run_by_checker`,
+as expected. A bounded localhost launch reached `/api/health` with HTTP 200; the
+detached validation process did not persist after the launch shell returned.
+
+The follow-up PR #144 amendment closes the generation/save race by serializing
+quote-session draft writes and recording separate confirmed draft-state and
+draft-file comparison keys for the active session. Generation cancels a
+pending timer, awaits any exact in-flight save, and repeats the serialized save
+when a later state or reference change is not covered by that completion. The
+job request is built and sent only after the latest draft and reference keys
+are confirmed. A failed save leaves the browser draft intact, returns an
+actionable privacy-safe error, and prevents job creation. Unchanged confirmed
+references are omitted from later metadata-only saves, so generation and
+autosave do not create another uploaded-reference object batch. Server-side
+lock-time reference ownership and metadata verification remains unchanged.
+
+Quote-session POST now converts `SqagStorageAccessError` into the same
+privacy-safe structured storage response used by other storage-backed routes,
+while the existing `ValueError` HTTP 400 boundary and authorization checks
+remain intact. Injected provider-write and database-metadata failures return
+HTTP 503, expose no provider/database/object details, leave the server usable,
+remove staged objects, and commit neither object rows nor quote-session rows.
+
+Object-mode scratch cleanup now receives explicit per-invocation ownership for
+the job temp and output directories. The accepted invocation marks each path
+only after creating it; an idempotent replay owns neither and therefore cannot
+delete the original invocation's live inputs or outputs. Existing same-job
+paths fail closed rather than being adopted. The owning invocation still
+cleans success and failure paths, cleanup attempts both owned bounded paths,
+and post-durable-publication cleanup failure remains a warning without
+rewriting durable success.
+
+Follow-up validation used only local and synthetic storage with every live
+evidence opt-in disabled. Focused cutover, inline migration, object lifecycle,
+object contract/provider, Postgres metadata, browser synchronization, POST
+failure, and scratch ownership coverage passed 66 tests. The final clean
+repository suite passed 939 tests. Python compile checks, JavaScript syntax,
+sensitive-fixture scan (zero blocking and zero review findings), architecture
+fallback audit, local PDF dependency guard, dynamic pricing/reference guard,
+`pip check`, and `git diff --check` passed. The readiness checker remained
+nonzero with `production_ready=false` and every live evidence check
+`not_run_by_checker`, as expected. A bounded forced-local launch reached
+`/api/health` with HTTP 200; as in the prior amendment, the detached process
+did not persist after its launcher command returned. The scoped manual hard
+review found no additional unresolved P0/P1/P2 issue in the amended browser,
+POST, idempotency, scratch, publication, locking, or compensation paths.
+
 ## What Was Not Verified
 
 - Live deployed Swooshz Platform behavior, platform token service, hosted SQAG handoff, or platform workspace membership enforcement; this audit checked source-contract surfaces only, and `scripts/verify_hosted_smoke.py` uses only synthetic platform/workspace context.
