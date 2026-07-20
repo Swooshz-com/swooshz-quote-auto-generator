@@ -1,5 +1,6 @@
 import base64
 import contextlib
+import http.client
 import importlib.util
 import io
 import json
@@ -8,10 +9,12 @@ import shutil
 import sqlite3
 import sys
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
 from webapp import server as webapp
+from tests.test_webapp import LocalRunnerServer
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT / "scripts" / "migrate_inline_draft_files_to_object_storage.py"
@@ -151,11 +154,49 @@ class InlineDraftObjectMigrationTest(unittest.TestCase):
                     generation_run_id="run-existing-123",
                     generation_job_id="job-existing-123",
                 )
-                prior_session = owner.get_quote_session(
-                    session_id,
-                    include_draft_state=True,
-                )
                 prior_objects = dict(backend._objects)
+                with contextlib.closing(sqlite3.connect(root / "sqag.sqlite3")) as connection:
+                    prior_upload_rows = connection.execute(
+                        "select artifact_kind, object_key_ref, checksum_sha256 from sqag_object_artifacts "
+                        "where workspace_id = ? and owner_type = ? and status = ? order by artifact_kind",
+                        ("workspace-combined", "uploaded_reference", "active"),
+                    ).fetchall()
+                (output_dir / "quotation.xlsx").write_bytes(b"synthetic-xlsx")
+                unchanged = owner.create_or_update_quote_session(
+                    {
+                        "quote_session": {
+                            "session_id": session_id,
+                            "draft_files": [self.inline_record("old-reference")],
+                        }
+                    },
+                    {"status": "completed"},
+                    output_dir,
+                    generation_run_id="run-unchanged-123",
+                    generation_job_id="job-unchanged-123",
+                )
+                self.assertEqual(unchanged["session_id"], session_id)
+                with contextlib.closing(sqlite3.connect(root / "sqag.sqlite3")) as connection:
+                    self.assertEqual(
+                        connection.execute(
+                            "select artifact_kind, object_key_ref, checksum_sha256 from sqag_object_artifacts "
+                            "where workspace_id = ? and owner_type = ? and status = ? order by artifact_kind",
+                            ("workspace-combined", "uploaded_reference", "active"),
+                        ).fetchall(),
+                        prior_upload_rows,
+                    )
+                    self.assertGreater(
+                        connection.execute(
+                            "select count(*) from sqag_object_artifacts where workspace_id = ? and owner_type = ? and status = ?",
+                            ("workspace-combined", "generated_quote_version", "active"),
+                        ).fetchone()[0],
+                        0,
+                    )
+                for object_key, content in prior_objects.items():
+                    self.assertEqual(backend._objects[object_key], content)
+                object_snapshot_after_generation = dict(backend._objects)
+                session_snapshot_after_generation = owner.get_quote_session(
+                    session_id, include_draft_state=True,
+                )
                 (output_dir / "quotation.xlsx").write_bytes(b"replacement-xlsx")
                 payload = {
                     "quote_session": {
@@ -172,10 +213,10 @@ class InlineDraftObjectMigrationTest(unittest.TestCase):
                         generation_job_id="job-combined-123",
                     )
                 self.assertEqual(raised.exception.status, 409)
-                self.assertEqual(backend._objects, prior_objects)
+                self.assertEqual(backend._objects, object_snapshot_after_generation)
                 self.assertEqual(
                     owner.get_quote_session(session_id, include_draft_state=True),
-                    prior_session,
+                    session_snapshot_after_generation,
                 )
                 with contextlib.closing(sqlite3.connect(root / "sqag.sqlite3")) as connection:
                     self.assertEqual(
@@ -186,8 +227,42 @@ class InlineDraftObjectMigrationTest(unittest.TestCase):
                         connection.execute(
                             "select count(*) from sqag_quote_publication_versions"
                         ).fetchone()[0],
-                        1,
+                        2,
                     )
+
+                tampered = self.inline_record("other-session-reference")
+                with self.assertRaises(webapp.SqagStorageAccessError) as tampered_error:
+                    owner.create_or_update_quote_session(
+                        {"quote_session": {"session_id": session_id, "draft_files": [tampered]}},
+                        {"status": "completed"},
+                        output_dir,
+                        generation_run_id="run-tampered-123",
+                        generation_job_id="job-tampered-123",
+                    )
+                self.assertEqual(tampered_error.exception.status, 409)
+                self.assertEqual(backend._objects, object_snapshot_after_generation)
+
+                (output_dir / "quotation.xlsx").write_bytes(b"race-xlsx")
+                with mock.patch.object(
+                    owner,
+                    "_object_draft_files_match_persisted",
+                    side_effect=[True, False],
+                ):
+                    with self.assertRaises(webapp.SqagStorageAccessError) as race_error:
+                        owner.create_or_update_quote_session(
+                            {
+                                "quote_session": {
+                                    "session_id": session_id,
+                                    "draft_files": [self.inline_record("old-reference")],
+                                }
+                            },
+                            {"status": "completed"},
+                            output_dir,
+                            generation_run_id="run-race-123",
+                            generation_job_id="job-race-123",
+                        )
+                self.assertEqual(race_error.exception.status, 409)
+                self.assertEqual(backend._objects, object_snapshot_after_generation)
 
     def test_database_versioned_generation_keeps_existing_saved_upload(self):
         with writable_test_root() as root:
@@ -224,6 +299,50 @@ class InlineDraftObjectMigrationTest(unittest.TestCase):
                     include_draft_state=True,
                 )
                 self.assertEqual(restored["draft_files"], [upload])
+
+    def test_object_nonversioned_generation_accepts_unchanged_saved_upload(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        with writable_test_root() as root:
+            database_url = f"sqlite:///{(root / 'sqag.sqlite3').as_posix()}"
+            output_dir = root / "output"
+            output_dir.mkdir()
+            (output_dir / "quotation.xlsx").write_bytes(b"synthetic-nonversioned-xlsx")
+            upload = self.inline_record("nonversioned-reference")
+            with (
+                mock.patch.dict(os.environ, self.object_env(database_url)),
+                mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+            ):
+                webapp.apply_sqag_storage_migrations(database_url)
+                owner = webapp.app_storage_for_auth_session(self.auth_session("workspace-nonversioned"))
+                owner.create_or_update_quote_session(
+                    {"quote_session": {"session_id": "quote-nonversioned", "draft_files": [upload]}}
+                )
+                with contextlib.closing(sqlite3.connect(root / "sqag.sqlite3")) as connection:
+                    upload_row_before = connection.execute(
+                        "select artifact_kind, object_key_ref, checksum_sha256 from sqag_object_artifacts "
+                        "where workspace_id = ? and owner_type = ? and owner_id = ? and status = ?",
+                        ("workspace-nonversioned", "uploaded_reference", "quote-nonversioned", "active"),
+                    ).fetchone()
+                upload_object_before = backend._objects[upload_row_before[1]]
+                generated = owner.create_or_update_quote_session(
+                    {"quote_session": {"session_id": "quote-nonversioned", "draft_files": [upload]}},
+                    {"status": "completed"},
+                    output_dir,
+                )
+                self.assertEqual(generated["session_id"], "quote-nonversioned")
+                with contextlib.closing(sqlite3.connect(root / "sqag.sqlite3")) as connection:
+                    upload_rows = connection.execute(
+                        "select artifact_kind, object_key_ref, checksum_sha256 from sqag_object_artifacts "
+                        "where workspace_id = ? and owner_type = ? and owner_id = ? and status = ?",
+                        ("workspace-nonversioned", "uploaded_reference", "quote-nonversioned", "active"),
+                    ).fetchall()
+                    generated_rows = connection.execute(
+                        "select count(*) from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and status = ?",
+                        ("workspace-nonversioned", "generated_quote", "quote-nonversioned", "active"),
+                    ).fetchone()[0]
+                self.assertEqual(upload_rows, [upload_row_before])
+                self.assertEqual(backend._objects[upload_row_before[1]], upload_object_before)
+                self.assertGreater(generated_rows, 0)
 
     def test_workspace_scoped_recovery_counts_blank_as_failure_and_is_idempotent(self):
         backend = webapp.InMemoryObjectStorageBackend()
@@ -272,7 +391,7 @@ class InlineDraftObjectMigrationTest(unittest.TestCase):
                 )
                 self.assertEqual(restored["draft_files"][0]["data_url"], good["data_url"])
 
-    def test_visible_session_lazy_recovery_is_admin_gated_for_batch_and_compensates(self):
+    def test_legacy_get_is_read_only_and_admin_recovery_compensates(self):
         backend = webapp.InMemoryObjectStorageBackend()
         with writable_test_root() as root:
             database_url = f"sqlite:///{(root / 'sqag.sqlite3').as_posix()}"
@@ -290,10 +409,28 @@ class InlineDraftObjectMigrationTest(unittest.TestCase):
                 with self.assertRaises(webapp.SqagStorageAccessError) as raised:
                     owner.count_workspace_inline_draft_files_for_object_migration()
                 self.assertEqual(raised.exception.status, 403)
-                restored = owner.get_quote_session(
-                    "quote-lazy-visible",
-                    include_draft_state=True,
-                )
+                before = dict(backend._objects)
+                with contextlib.closing(sqlite3.connect(db_path)) as connection:
+                    before_json = connection.execute(
+                        "select draft_files_json from sqag_quote_sessions where workspace_id = ? and session_id = ?",
+                        ("workspace-lazy", "quote-lazy-visible"),
+                    ).fetchone()[0]
+                with self.assertRaises(webapp.SqagStorageAccessError) as recovery_required:
+                    owner.get_quote_session("quote-lazy-visible", include_draft_state=True)
+                self.assertEqual(recovery_required.exception.reason, "object_draft_recovery_required")
+                self.assertEqual(backend._objects, before)
+                with contextlib.closing(sqlite3.connect(db_path)) as connection:
+                    self.assertEqual(
+                        connection.execute(
+                            "select draft_files_json from sqag_quote_sessions where workspace_id = ? and session_id = ?",
+                            ("workspace-lazy", "quote-lazy-visible"),
+                        ).fetchone()[0],
+                        before_json,
+                    )
+                admin = self.admin_storage(database_url, "workspace-lazy")
+                migrated = admin.migrate_workspace_inline_draft_files_to_object_storage(limit=1)
+                self.assertEqual((migrated["migrated"], migrated["failed"]), (1, 0))
+                restored = owner.get_quote_session("quote-lazy-visible", include_draft_state=True)
                 self.assertEqual(restored["draft_files"][0]["data_url"], good["data_url"])
                 self.insert_legacy(
                     db_path,
@@ -322,6 +459,208 @@ class InlineDraftObjectMigrationTest(unittest.TestCase):
                         ).fetchone()[0]
                     )
                 self.assertEqual(stored, [self.inline_record("compensate-reference")])
+
+    def test_migration_keyset_cursor_advances_past_permanent_failures(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        with writable_test_root() as root:
+            database_url = f"sqlite:///{(root / 'sqag.sqlite3').as_posix()}"
+            db_path = root / "sqag.sqlite3"
+            with (
+                mock.patch.dict(os.environ, self.object_env(database_url)),
+                mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+            ):
+                webapp.apply_sqag_storage_migrations(database_url)
+                invalid = {**self.inline_record("invalid"), "data_url": ""}
+                for index in range(3):
+                    self.insert_legacy(db_path, "workspace-cursor", f"quote-00{index}", [invalid])
+                for index in range(3):
+                    self.insert_legacy(
+                        db_path,
+                        "workspace-cursor",
+                        f"quote-10{index}",
+                        [self.inline_record(f"valid-{index}")],
+                    )
+                self.insert_legacy(
+                    db_path, "workspace-other", "quote-999", [self.inline_record("other")]
+                )
+                admin = self.admin_storage(database_url, "workspace-cursor")
+                first = admin.migrate_workspace_inline_draft_files_to_object_storage(limit=3)
+                self.assertEqual((first["processed"], first["failed"], first["migrated"]), (3, 3, 0))
+                self.assertEqual(first["next_cursor"], "quote-002")
+                second = admin.migrate_workspace_inline_draft_files_to_object_storage(
+                    limit=3, after_session_id=first["next_cursor"],
+                )
+                self.assertEqual((second["processed"], second["failed"], second["migrated"]), (3, 0, 3))
+                object_snapshot = dict(backend._objects)
+                retry = admin.migrate_workspace_inline_draft_files_to_object_storage(
+                    limit=3, after_session_id=first["next_cursor"],
+                )
+                self.assertEqual((retry["processed"], retry["migrated"]), (0, 0))
+                self.assertEqual(backend._objects, object_snapshot)
+                self.assertEqual(admin.count_workspace_inline_draft_files_for_object_migration(), 3)
+                self.assertEqual(
+                    self.admin_storage(database_url, "workspace-other").count_workspace_inline_draft_files_for_object_migration(),
+                    1,
+                )
+                with contextlib.closing(sqlite3.connect(db_path)) as connection:
+                    failed_rows = connection.execute(
+                        "select session_id from sqag_quote_sessions where workspace_id = ? and draft_files_json like ? order by session_id",
+                        ("workspace-cursor", '%"data_url"%'),
+                    ).fetchall()
+                self.assertEqual([row[0] for row in failed_rows], ["quote-000", "quote-001", "quote-002"])
+
+    def test_display_filename_is_separate_from_storage_filename(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        with writable_test_root() as root:
+            database_url = f"sqlite:///{(root / 'sqag.sqlite3').as_posix()}"
+            db_path = root / "sqag.sqlite3"
+            names = [
+                "Booth Render Final.png",
+                "展台设计.png",
+                "x" * 220 + ".png",
+                "../../unsafe/path/render.png",
+                "é.png",
+                "è.png",
+            ]
+            records = [
+                {**self.inline_record(f"display-{index}"), "name": name}
+                for index, name in enumerate(names)
+            ]
+            with (
+                mock.patch.dict(os.environ, self.object_env(database_url)),
+                mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+            ):
+                webapp.apply_sqag_storage_migrations(database_url)
+                owner = webapp.app_storage_for_auth_session(self.auth_session("workspace-filenames"))
+                owner.create_or_update_quote_session(
+                    {"quote_session": {"session_id": "quote-filenames", "draft_files": records}}
+                )
+                restored = owner.get_quote_session("quote-filenames", include_draft_state=True)
+                expected_names = [names[0], names[1], names[2][:180], "render.png", names[4], names[5]]
+                self.assertEqual([item["name"] for item in restored["draft_files"]], expected_names)
+                with contextlib.closing(sqlite3.connect(db_path)) as connection:
+                    storage_names = [
+                        row[0] for row in connection.execute(
+                            "select filename from sqag_object_artifacts where workspace_id = ? and owner_type = ? order by artifact_kind",
+                            ("workspace-filenames", "uploaded_reference"),
+                        ).fetchall()
+                    ]
+                self.assertTrue(all(name == webapp.safe_segment(name, "reference-file") for name in storage_names))
+                self.assertEqual(len(backend._objects), len(records))
+                owner.create_or_update_quote_session(
+                    {"quote_session": {"session_id": "quote-filenames", "draft_files": [records[0]]}}
+                )
+                replaced = owner.get_quote_session("quote-filenames", include_draft_state=True)
+                self.assertEqual([item["name"] for item in replaced["draft_files"]], [names[0]])
+                self.assertEqual(len(backend._objects), 1)
+
+                legacy = {**self.inline_record("legacy-display"), "name": "../旧版 图片.png"}
+                self.insert_legacy(db_path, "workspace-filenames", "quote-legacy-filename", [legacy])
+                admin = self.admin_storage(database_url, "workspace-filenames")
+                migrated = admin.migrate_workspace_inline_draft_files_to_object_storage(limit=10)
+                self.assertEqual(migrated["migrated"], 1)
+                reloaded = owner.get_quote_session("quote-legacy-filename", include_draft_state=True)
+                self.assertEqual(reloaded["draft_files"][0]["name"], "旧版 图片.png")
+
+    def test_quote_session_get_storage_failures_are_safe_503_and_server_recovers(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        with writable_test_root() as root:
+            database_url = f"sqlite:///{(root / 'sqag.sqlite3').as_posix()}"
+            db_path = root / "sqag.sqlite3"
+            auth_session = self.auth_session("workspace-http")
+            env = {
+                **self.object_env(database_url),
+                "APP_MODE": "local",
+                "AUTH_REQUIRED": "true",
+                "SESSION_SECRET": "test-session-secret-with-enough-entropy",
+            }
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+            ):
+                webapp.apply_sqag_storage_migrations(database_url)
+                owner = webapp.app_storage_for_auth_session(auth_session)
+                cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value({'user': auth_session['user']})}"
+
+                def request(runner, path, request_cookie=cookie):
+                    parsed = urllib.parse.urlparse(runner.base_url)
+                    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
+                    connection.request("GET", path, headers={"Cookie": request_cookie})
+                    response = connection.getresponse()
+                    body = json.loads(response.read().decode("utf-8"))
+                    connection.close()
+                    return response.status, body
+
+                cases = ("missing", "checksum", "size", "provider")
+                with LocalRunnerServer() as runner:
+                    legacy_session_id = "quote-http-legacy"
+                    self.insert_legacy(
+                        db_path, "workspace-http", legacy_session_id, [self.inline_record("legacy-http")]
+                    )
+                    with contextlib.closing(sqlite3.connect(db_path)) as connection:
+                        legacy_before = connection.execute(
+                            "select draft_files_json from sqag_quote_sessions where workspace_id = ? and session_id = ?",
+                            ("workspace-http", legacy_session_id),
+                        ).fetchone()[0]
+                    objects_before_legacy_get = dict(backend._objects)
+                    status, body = request(runner, f"/api/quote-sessions/{legacy_session_id}")
+                    self.assertEqual(status, 503)
+                    self.assertTrue(body["recovery_required"])
+                    self.assertEqual(backend._objects, objects_before_legacy_get)
+                    with contextlib.closing(sqlite3.connect(db_path)) as connection:
+                        self.assertEqual(
+                            connection.execute(
+                                "select draft_files_json from sqag_quote_sessions where workspace_id = ? and session_id = ?",
+                                ("workspace-http", legacy_session_id),
+                            ).fetchone()[0],
+                            legacy_before,
+                        )
+                    other_auth = self.auth_session("workspace-other-http", user_id="other-http-user")
+                    other_cookie = (
+                        f"{webapp.SESSION_COOKIE_NAME}="
+                        f"{webapp.signed_cookie_value({'user': other_auth['user']})}"
+                    )
+                    cross_status, _cross_body = request(
+                        runner, f"/api/quote-sessions/{legacy_session_id}", other_cookie,
+                    )
+                    self.assertEqual(cross_status, 404)
+                    self.assertEqual(backend._objects, objects_before_legacy_get)
+                    for case in cases:
+                        session_id = f"quote-http-{case}"
+                        owner.create_or_update_quote_session(
+                            {"quote_session": {"session_id": session_id, "draft_files": [self.inline_record(case)]}}
+                        )
+                        object_snapshot = dict(backend._objects)
+                        patcher = contextlib.nullcontext()
+                        if case == "missing":
+                            backend._objects.clear()
+                        elif case in {"checksum", "size"}:
+                            column = "checksum_sha256" if case == "checksum" else "size_bytes"
+                            value = "0" * 64 if case == "checksum" else 999999
+                            with contextlib.closing(sqlite3.connect(db_path)) as connection:
+                                connection.execute(
+                                    f"update sqag_object_artifacts set {column} = ? where workspace_id = ? and owner_type = ? and owner_id = ?",
+                                    (value, "workspace-http", "uploaded_reference", session_id),
+                                )
+                                connection.commit()
+                        else:
+                            patcher = mock.patch.object(
+                                backend, "retrieve_artifact", side_effect=RuntimeError("private provider detail")
+                            )
+                        with patcher:
+                            status, body = request(runner, f"/api/quote-sessions/{session_id}")
+                        self.assertEqual(status, 503, (case, body))
+                        self.assertEqual(body["status"], "failed")
+                        self.assertTrue(body.get("error_reference"))
+                        serialized = json.dumps(body)
+                        self.assertNotIn("synthetic-bucket", serialized)
+                        self.assertNotIn("private provider detail", serialized)
+                        self.assertNotIn("object_key", serialized)
+                        backend._objects.clear()
+                        backend._objects.update(object_snapshot)
+                    status, body = request(runner, "/api/session")
+                    self.assertEqual(status, 200)
+                    self.assertTrue(body["authenticated"])
 
     def test_cli_defaults_to_count_only_then_applies_a_bounded_batch(self):
         backend = webapp.InMemoryObjectStorageBackend()

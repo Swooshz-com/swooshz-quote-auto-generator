@@ -11173,6 +11173,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertIn("quoteDraftShouldPersistToDashboard", js)
         self.assertIn("discardCurrentQuoteDraftSession", js)
         self.assertIn("includeDraftState: true", js)
+        self.assertIn("includeDraftFiles: false", js)
         self.assertIn("payload.draft_state = currentQuoteSessionDraftState()", js)
         self.assertIn("payload.draft_files = sessionFileRecordsFromDraft()", js)
         self.assertIn("quoteSessionDraftSaveStarted", js)

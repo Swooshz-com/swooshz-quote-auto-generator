@@ -3,7 +3,9 @@
 
 The default mode is count-only. Apply mode is bounded and never runs during
 application startup or deploy. After recovery-capable code is deployed, repeat
-apply mode per workspace until the reported remaining count reaches zero.
+apply mode per workspace with each reported ``next_cursor`` so malformed early
+rows cannot starve later valid rows. A final pass from the beginning retries
+remaining failures; no failed inline record is discarded automatically.
 """
 
 from __future__ import annotations
@@ -30,6 +32,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workspace-id", required=True)
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument(
+        "--after-session-id",
+        default="",
+        help="Continue after the prior batch's next_cursor value.",
+    )
+    parser.add_argument(
         "--apply",
         action="store_true",
         help="Write a bounded batch to configured object storage and metadata storage.",
@@ -53,6 +60,7 @@ def main() -> int:
         if args.apply:
             result = storage.migrate_workspace_inline_draft_files_to_object_storage(
                 limit=args.limit,
+                after_session_id=args.after_session_id,
             )
             status = "ok" if not result["failed"] and not result["remaining"] else "incomplete"
         else:

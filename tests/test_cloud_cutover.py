@@ -172,6 +172,81 @@ class CloudCutoverTest(unittest.TestCase):
                 self.assertFalse(job_tmp.exists())
                 self.assertFalse(output_dir.exists())
 
+    def test_cleanup_failure_does_not_rewrite_committed_publication(self):
+        cleanup_error = webapp.SqagStorageAccessError(
+            webapp.QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+            status=503,
+            reason="object_artifact_staging_cleanup_failed",
+        )
+        with writable_test_root() as root:
+            with (
+                mock.patch.dict(os.environ, {"SQAG_ARTIFACT_STORAGE_MODE": "object"}),
+                mock.patch.object(
+                    webapp,
+                    "_run_quote_job",
+                    return_value={
+                        "status": "completed",
+                        "_durable_publication_committed": True,
+                    },
+                ) as runner,
+                mock.patch.object(
+                    webapp,
+                    "cleanup_object_mode_job_scratch",
+                    side_effect=cleanup_error,
+                ),
+                mock.patch.object(webapp, "write_local_log") as logger,
+            ):
+                result = webapp.run_quote_job(
+                    {}, root / "output", root / "tmp", "job-committed-cleanup"
+                )
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["cleanup_warning"]["status"], "pending_maintenance")
+            self.assertNotIn("_durable_publication_committed", result)
+            runner.assert_called_once()
+            logger.assert_called_once()
+            self.assertEqual(
+                logger.call_args.args[1]["terminal_outcome"],
+                "durable_publication_committed",
+            )
+            self.assertNotIn(str(root), json.dumps(logger.call_args.args[1]))
+
+            with (
+                mock.patch.dict(os.environ, {"SQAG_ARTIFACT_STORAGE_MODE": "object"}),
+                mock.patch.object(webapp, "_run_quote_job", return_value={"status": "completed"}),
+                mock.patch.object(
+                    webapp,
+                    "cleanup_object_mode_job_scratch",
+                    side_effect=cleanup_error,
+                ),
+            ):
+                with self.assertRaises(webapp.SqagStorageAccessError) as precommit:
+                    webapp.run_quote_job(
+                        {}, root / "output", root / "tmp", "job-uncommitted-cleanup"
+                    )
+            self.assertEqual(precommit.exception.reason, "object_artifact_staging_cleanup_failed")
+
+    def test_cleanup_attempts_both_scratch_directories_before_failing(self):
+        with writable_test_root() as root:
+            tmp_root = root / "tmp"
+            output_root = root / "output"
+            job_tmp = tmp_root / "job-partial-cleanup"
+            output_dir = output_root / "job-partial-cleanup"
+            job_tmp.mkdir(parents=True)
+            output_dir.mkdir(parents=True)
+            with (
+                mock.patch.dict(os.environ, {"SQAG_ARTIFACT_STORAGE_MODE": "object"}),
+                mock.patch.object(
+                    webapp.shutil,
+                    "rmtree",
+                    side_effect=[OSError("locked"), None],
+                ) as remove,
+            ):
+                with self.assertRaises(webapp.SqagStorageAccessError):
+                    webapp.cleanup_object_mode_job_scratch(
+                        job_tmp, output_dir, tmp_root, output_root,
+                    )
+            self.assertEqual(remove.call_count, 2)
+
     def test_deploy_pdf_page_debug_images_do_not_write_local_files(self):
         with writable_test_root() as tmp_root:
             images = [{"page": 1, "renderer": "synthetic", "data_url": "data:image/png;base64," + base64.b64encode(b"image").decode("ascii")}]

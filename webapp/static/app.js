@@ -7073,6 +7073,7 @@ function buildPayload(options = {}) {
     quote_session: currentQuoteSessionPayload({
       quoteGenerated: Boolean(state.basisConfirmed || state.outputRows.length),
       includeDraftState: true,
+      includeDraftFiles: false,
     }),
     analysis_mode: normalizeAnalysisMode(options.analysisMode || state.pendingAnalysisMode),
     generator_label: generator.label,
@@ -10382,7 +10383,7 @@ function currentQuoteSessionPayload(options = {}) {
   };
   if (options.includeDraftState === true && quoteSessionDraftStateCanSave()) {
     payload.draft_state = currentQuoteSessionDraftState();
-    payload.draft_files = sessionFileRecordsFromDraft();
+    if (options.includeDraftFiles !== false) payload.draft_files = sessionFileRecordsFromDraft();
   }
   return payload;
 }

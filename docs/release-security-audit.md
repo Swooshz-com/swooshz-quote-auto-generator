@@ -1007,26 +1007,62 @@ or live Postgres concurrency evidence is claimed.
 ### PR #144 inline-draft object recovery addendum
 
 Object-mode quote drafts no longer persist inline `data_url` payloads. A
-currently visible session that still contains legacy inline draft metadata is
-lazily migrated only when its draft state is hydrated; this is a safety net,
-not a startup, deploy, or background migration. Explicit legacy recovery uses
+normal quote-session GET is strictly read-only. If an authorized session still
+contains legacy inline draft metadata, GET returns the standard privacy-safe
+artifact-storage 503 contract with `recovery_required=true`; it does not write
+database metadata or contact object storage. Explicit legacy recovery uses
 `scripts/migrate_inline_draft_files_to_object_storage.py --workspace-id
 <workspace>` and requires configured database plus object storage. It is
 workspace-scoped and administrator-only, defaults to a metadata-only candidate
 count, and changes data only with `--apply`. Apply mode clamps each batch to 1
-through 1000 records, emits only sanitized counts/failure reasons, and is
-retry-safe: already converted records are skipped while a blank `data_url`
-remains a counted failure and is never converted. No live database, provider,
-deployment, or credential action was run for this change.
+through 1000 records and uses an explicit keyset continuation value through
+`--after-session-id`. The result's `next_cursor` lets operators advance beyond
+permanently malformed early rows without deleting or rewriting those rows.
+Output contains only bounded workspace/session identifiers, sanitized counts,
+and sanitized failure reasons. Already converted records are skipped; malformed
+records remain available for diagnosis and deterministic retry. No HTTP
+recovery mutation, startup migration, background migration, live database,
+provider, deployment, or credential action is introduced or run.
 
-In object mode, a request that combines explicit draft files with generated
-quote output now fails with HTTP 409 before any object, metadata, session, or
-publication-version mutation; callers must save the draft first. The
-equivalent database-artifact versioned publication continues to retain its
-already saved upload. Empty data URLs are rejected as HTTP 400 input errors
-before the object backend is reached. Provider/metadata failure compensation
-retains the legacy inline record and removes newly staged provider objects so
-a later retry starts from the prior state.
+Browser generation omits draft-file bytes after the separate draft-save path.
+For compatibility, object-mode generation that still carries draft files is
+accepted only when bounded display metadata, session file identity, MIME type,
+byte size, checksum, derived artifact kind, and workspace/session-owned active
+object metadata exactly match the persisted references. That match is
+revalidated under the uploaded-reference and generated-quote lifecycle locks
+before output staging. Matching references are retained without replacement or
+duplicate upload; a real replacement or tampered/cross-session reference still
+fails with HTTP 409 before either object batch mutates. Database-artifact mode
+continues to support inline saved drafts and versioned publication. Empty data
+URLs remain HTTP 400 input errors before the object backend is reached.
+
+Object draft hydration now verifies storage filename, content type, byte size,
+and checksum. Missing, corrupt, mismatched, or temporarily unavailable provider
+content returns the standard privacy-safe structured 503 response; authorized
+session GET never silently omits a broken reference, and cross-workspace reads
+remain 404. Draft metadata preserves a bounded Unicode-capable display filename
+while object rows and keys use a separate path-safe storage filename. Legacy
+migration uses the same separation.
+
+After forensic finalization and the atomic durable publication transaction have
+committed, scratch cleanup failure is recorded as a privacy-safe operational
+warning and does not rewrite the completed job/publication as failed. Cleanup
+still attempts both bounded job scratch directories, and the same bounded
+cleanup helper can be retried by maintenance. Before a durable publication is
+committed, cleanup failure remains fail-closed. Provider/metadata failure
+compensation retains legacy inline records, removes newly staged objects,
+restores prior objects where applicable, and rolls database/session metadata
+back together so retry starts from the prior state.
+
+Final amendment validation used only local/synthetic storage with live database
+and object-provider opt-ins cleared. The complete repository suite passed 935
+tests. Python and JavaScript compile checks, the sensitive-fixture scan (zero
+blocking and zero review findings), local PDF dependency guard, dynamic pricing
+reference guard, pinned dependency check, architecture fallback audit, and
+`git diff --check` passed. The metadata-only readiness checker remained
+nonzero with `production_ready=false` and all live evidence `not_run_by_checker`,
+as expected. A bounded localhost launch reached `/api/health` with HTTP 200; the
+detached validation process did not persist after the launch shell returned.
 
 ## What Was Not Verified
 
