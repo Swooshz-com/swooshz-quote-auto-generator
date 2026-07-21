@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+import datetime as dt
 import urllib.parse
 import urllib.request
 import zipfile
@@ -67,6 +68,10 @@ class SyntheticHttpServer:
             def log_message(self, format: str, *args: Any) -> None:
                 return
 
+        self.host_patcher = mock.patch.object(webapp, "is_allowed_host_header", return_value=True)
+        self.origin_patcher = mock.patch.object(webapp, "request_sqag_origin", side_effect=lambda _host: webapp.configured_sqag_public_base_url() or self.base_url)
+        self.host_patcher.start()
+        self.origin_patcher.start()
         self.server = webapp.ThreadingHTTPServer(("127.0.0.1", 0), QuietQuoteRunnerHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -78,6 +83,8 @@ class SyntheticHttpServer:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
+        self.origin_patcher.stop()
+        self.host_patcher.stop()
 
 
 class JsonResponse:
@@ -87,6 +94,8 @@ class JsonResponse:
         self.headers: dict[str, str] = {}
 
     def read(self, size: int | None = None) -> bytes:
+        if self.status == 204:
+            return b""
         return json.dumps(self.payload, ensure_ascii=True).encode("utf-8")
 
     def __enter__(self):
@@ -166,6 +175,7 @@ def xlsx_bytes() -> bytes:
 
 
 def synthetic_platform_payload() -> dict[str, Any]:
+    expires_at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     return {
         "outcome": "consumed",
         "user": {
@@ -184,7 +194,8 @@ def synthetic_platform_payload() -> dict[str, Any]:
             "appName": "SQAG",
         },
         "membershipRole": "owner",
-        "launchTokenExpiresAt": "2999-01-01T00:00:00.000Z",
+        "launchTokenExpiresAt": expires_at,
+        "validationGrantId": "synthetic-hosted-validation-grant",
     }
 
 
@@ -354,7 +365,10 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
         "SQAG_TRACKING_HMAC_KEY": "synthetic-tracking-hmac-key-with-enough-entropy",
         "SQAG_TRACKING_HMAC_KEY_VERSION": "synthetic-v1",
         "SQAG_PLATFORM_LAUNCH_MODE": "platform",
-        "SQAG_PLATFORM_BASE_URL": "https://platform.example.test",
+        "SQAG_PLATFORM_BASE_URL": "https://swooshz.com",
+        "SQAG_PUBLIC_BASE_URL": "https://quote.swooshz.com",
+        "SQAG_PLATFORM_SERVICE_SECRET": "synthetic-platform-service-secret",
+        "SQAG_PLATFORM_REQUEST_TIMEOUT_SECONDS": "10",
         "SQAG_STORAGE_MODE": "database",
         "SQAG_ARTIFACT_STORAGE_MODE": "database",
         "SQAG_DATABASE_URL": database_url,
@@ -380,9 +394,37 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
 
     def fake_urlopen(request, timeout=0):
         captured_platform_requests.append(request)
+        if request.full_url.endswith(webapp.PLATFORM_FINALIZATION_REGISTER_PATH):
+            return JsonResponse({}, status=204)
+        if request.full_url.endswith(webapp.PLATFORM_FINALIZATION_CONSUME_PATH):
+            payload = synthetic_platform_payload()
+            return JsonResponse({
+                "validationGrantId": payload["validationGrantId"],
+                "userId": payload["user"]["userId"],
+                "workspaceId": payload["workspace"]["workspaceId"],
+                "appKey": payload["app"]["appKey"],
+                "launchTokenExpiresAt": payload["launchTokenExpiresAt"],
+                "currentRole": payload["membershipRole"],
+            })
+        if request.full_url.endswith(webapp.PLATFORM_ACCESS_VALIDATE_PATH):
+            payload = synthetic_platform_payload()
+            return JsonResponse({
+                "valid": True,
+                "validationGrantId": payload["validationGrantId"],
+                "userId": payload["user"]["userId"],
+                "workspaceId": payload["workspace"]["workspaceId"],
+                "appKey": payload["app"]["appKey"],
+                "currentRole": payload["membershipRole"],
+            })
+        if request.full_url.endswith(webapp.PLATFORM_ACCESS_REVOKE_PATH):
+            return JsonResponse({}, status=204)
         return JsonResponse(synthetic_platform_payload())
 
-    with mock.patch.dict(os.environ, env, clear=True):
+    with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+        webapp.urllib.request,
+        "urlopen",
+        side_effect=fake_urlopen,
+    ):
         webapp.apply_sqag_storage_migrations(database_url)
         storage = webapp.app_storage_for_auth_session(synthetic_auth_session())
         storage.save_pricing_reference(synthetic_pricing_reference())
@@ -391,18 +433,30 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
         with SyntheticHttpServer() as runner:
             checks["health_metadata"] = health_check(runner.base_url)
             checks["unauthenticated_routes_blocked"] = unauthenticated_check(runner.base_url)
-            with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=fake_urlopen):
-                launch_status, launch_body, launch_headers = json_request(
-                    runner.base_url,
-                    "POST",
-                    "/api/platform/launch",
-                    headers={"X-App-Launch-Token": SYNTHETIC_TOKEN},
-                )
-                session_cookie = launch_headers["Set-Cookie"].split(";", 1)[0]
+            launch_status, launch_body, launch_headers = json_request(
+                runner.base_url,
+                "POST",
+                "/api/platform/launch",
+                headers={
+                    "X-App-Launch-Token": SYNTHETIC_TOKEN,
+                    webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER: env["SQAG_PLATFORM_SERVICE_SECRET"],
+                },
+            )
+            finalize_status, finalize_body, finalize_headers = json_request(
+                runner.base_url,
+                "POST",
+                webapp.PLATFORM_FINALIZATION_ENDPOINT,
+                headers={
+                    "Origin": env["SQAG_PLATFORM_BASE_URL"],
+                    webapp.PLATFORM_FINALIZATION_HANDLE_HEADER: launch_headers.get(webapp.PLATFORM_FINALIZATION_HANDLE_HEADER, ""),
+                },
+            )
+            session_cookie = finalize_headers["Set-Cookie"].split(";", 1)[0]
             checks["synthetic_platform_launch"] = (
                 launch_status == 200
-                and launch_body.get("status") == "platform_session_created"
-                and len(captured_platform_requests) == 1
+                and launch_body.get("status") == "platform_finalization_registered"
+                and finalize_status == 200
+                and finalize_body.get("status") == "platform_session_created"
                 and SYNTHETIC_TOKEN not in captured_platform_requests[0].full_url
             )
 

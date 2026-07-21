@@ -29,6 +29,9 @@ REQUIRED_KEYS = (
     "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY",
     "SQAG_PLATFORM_LAUNCH_MODE",
     "SQAG_PLATFORM_BASE_URL",
+    "SQAG_PUBLIC_BASE_URL",
+    "SQAG_PLATFORM_SERVICE_SECRET",
+    "SQAG_PLATFORM_REQUEST_TIMEOUT_SECONDS",
     "QUOTE_DATA_ROOT",
     "QUOTE_OUTPUT_ROOT",
     "QUOTE_TMP_ROOT",
@@ -46,7 +49,7 @@ PLACEHOLDER_KEYS = {
     "SQAG_OBJECT_STORAGE_REGION",
     "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID",
     "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY",
-    "SQAG_PLATFORM_BASE_URL",
+    "SQAG_PLATFORM_SERVICE_SECRET",
     "QUOTE_DATA_ROOT",
     "QUOTE_OUTPUT_ROOT",
     "QUOTE_TMP_ROOT",
@@ -60,6 +63,13 @@ EXPECTED_VALUES = {
     "SQAG_STORAGE_MODE": "database",
     "SQAG_ARTIFACT_STORAGE_MODE": "object",
     "SQAG_PLATFORM_LAUNCH_MODE": "platform",
+    "SQAG_PLATFORM_BASE_URL": "https://swooshz.com",
+    "SQAG_PUBLIC_BASE_URL": "https://quote.swooshz.com",
+    "SQAG_PLATFORM_REQUEST_TIMEOUT_SECONDS": "10",
+}
+
+EXACT_PLACEHOLDERS = {
+    "SQAG_PLATFORM_SERVICE_SECRET": "<host-secret-manager-platform-service-secret>",
 }
 
 FORBIDDEN_MARKERS = {
@@ -138,13 +148,20 @@ def verify_template(path: Path = DEFAULT_TEMPLATE) -> dict[str, object]:
         if value and not is_placeholder(value):
             findings.append(Finding(key, "non-placeholder-value", "provider-specific or secret value must remain a placeholder"))
 
+    for key, expected in EXACT_PLACEHOLDERS.items():
+        if values.get(key, "") != expected:
+            findings.append(Finding(key, "unexpected-placeholder", "security-sensitive placeholder does not match the approved template marker"))
+
     for key, expected in EXPECTED_VALUES.items():
         if values.get(key, "") != expected:
             findings.append(Finding(key, "unexpected-value", "value does not match the internal UAT template expectation"))
 
     template_text = path.read_text(encoding="utf-8", errors="replace")
+    marker_scan_text = template_text
+    for canonical_origin in ("https://swooshz.com", "https://quote.swooshz.com"):
+        marker_scan_text = marker_scan_text.replace(canonical_origin, "<canonical-origin>")
     for category, pattern in FORBIDDEN_MARKERS.items():
-        if pattern.search(template_text):
+        if pattern.search(marker_scan_text):
             findings.append(Finding(path.name, category, "template contains a forbidden marker"))
 
     return {"status": "ready" if not findings else "blocked", "findings": findings}

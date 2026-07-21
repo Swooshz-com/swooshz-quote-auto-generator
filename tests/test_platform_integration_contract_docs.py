@@ -81,7 +81,7 @@ class PlatformIntegrationContractDocsTest(unittest.TestCase):
     def test_contract_doc_points_to_existing_sqag_coverage(self):
         text = self.text
         for expected in (
-            "test_platform_launch_mode_consumes_header_token_and_sets_safe_session",
+            "test_platform_launch_registers_header_only_finalization_then_sets_safe_host_cookie",
             "test_database_storage_scopes_profiles_pricing_and_sessions_by_platform_workspace",
             "test_database_storage_new_workspace_has_no_koncept_or_synthetic_defaults",
             "test_platform_session_context_blocks_local_quote_session_runtime_storage_in_local_app_mode",

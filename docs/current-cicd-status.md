@@ -63,6 +63,10 @@ Source of truth: `.github/workflows/ci.yml`
   socket peer. Platform-launch and normal mutable routes use the same client
   resolver, so direct spoofing cannot split buckets and distinct proxied
   clients do not share Traefik socket identity.
+- Deploy preflight requires `SQAG_PLATFORM_SERVICE_SECRET` to contain at least
+  32 characters. `POST /api/platform/launch` requires exactly one
+  `X-SQAG-Service-Authorization` value and validates it before launch-token
+  consume or any finalization/session side effect.
 - Each process retains at most 4,096 ordinary client/normalized-route
   rate-limit buckets. When that map is full, previously unseen identities share
   one fail-closed overflow bucket per normalized configured route; overflow
