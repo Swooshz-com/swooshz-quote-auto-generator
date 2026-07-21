@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-07-11
+Last updated: 2026-07-21
 
 Source of truth: `.github/workflows/ci.yml`
 
@@ -26,6 +26,9 @@ Source of truth: `.github/workflows/ci.yml`
 - Installs pinned Python dependencies with `python -m pip install --only-binary=:all: -r requirements.txt`.
 - Installs `pip-audit` and runs `python -m pip_audit -r requirements.txt --strict` against pinned Python dependencies.
 - Installs Playwright Chromium.
+- Starts an isolated disposable PostgreSQL 16 service for migration-ledger
+  integration tests. The service has no production connectivity or provider
+  credentials.
 - Checks JavaScript syntax for `webapp/static/app.js`, `scripts/playwright-smoke.mjs`, and `scripts/playwright-ai-basis-chat-stress.mjs`.
 - Checks Python syntax for `webapp/server.py`, quote/pricing scripts, and validation guard scripts.
 - Runs `python scripts/validate_local_pdf_dependency_usage.py` to keep `pypdfium2` and `Pillow` usage on the local PDF rendering path only.
@@ -40,6 +43,9 @@ Source of truth: `.github/workflows/ci.yml`
 - `.env.example` must contain placeholders only.
 - Local `.env` files stay ignored and must not be committed.
 - CI must stay free of production/customer secrets unless a future deployment design explicitly documents the new boundary and approval path.
+- CI never applies migrations against a configured production database. The
+  real PostgreSQL migration tests create and remove only disposable databases
+  inside the job-scoped service.
 
 ## Deploy Runtime Gate
 

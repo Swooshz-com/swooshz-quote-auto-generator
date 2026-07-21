@@ -58,6 +58,21 @@ jobs:
       APP_MODE: local
       LOCAL_USER_ROLE: admin
       CI: "true"
+      SQAG_TEST_POSTGRES_HOST: 127.0.0.1
+      SQAG_TEST_POSTGRES_PORT: "5432"
+      SQAG_TEST_POSTGRES_USER: postgres
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -94,7 +109,7 @@ jobs:
           node --check scripts/playwright-ai-basis-chat-stress.mjs
 
       - name: Check Python syntax
-        run: python -m py_compile webapp/server.py scripts/generate_quote.py scripts/live_ai_basis_chat_smoke.py scripts/build_pricing_catalog.py scripts/pricing_reference_cleanup.py scripts/pricing_reference_enrichment.py scripts/validate_dynamic_pricing_reference_rules.py scripts/validate_local_pdf_dependency_usage.py
+        run: python -m py_compile webapp/server.py webapp/postgres_migrations.py scripts/migrate_sqag_storage.py scripts/preflight_sqag_migrations.py scripts/generate_quote.py scripts/live_ai_basis_chat_smoke.py scripts/build_pricing_catalog.py scripts/pricing_reference_cleanup.py scripts/pricing_reference_enrichment.py scripts/validate_dynamic_pricing_reference_rules.py scripts/validate_local_pdf_dependency_usage.py
 
       - name: Guard local PDF dependency usage
         run: python scripts/validate_local_pdf_dependency_usage.py

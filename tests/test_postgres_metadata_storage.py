@@ -386,6 +386,24 @@ class SqliteSqagMigrationTest(unittest.TestCase):
         with mock.patch(
             "webapp.server.postgres_driver_connection_factory",
             return_value=lambda _database_url: connection,
+        ), mock.patch(
+            "webapp.postgres_migrations.inspect_postgres_migrations",
+            side_effect=[
+                {
+                    "safeToApply": True,
+                    "ledgerState": "missing",
+                    "appliedMigrationIds": [],
+                    "pendingMigrationIds": expected_migrations,
+                    "blockers": [],
+                },
+                {
+                    "safeToApply": True,
+                    "ledgerState": "present",
+                    "appliedMigrationIds": expected_migrations,
+                    "pendingMigrationIds": [],
+                    "blockers": [],
+                },
+            ],
         ):
             webapp.apply_sqag_storage_migrations(POSTGRES_URL)
 

@@ -56,7 +56,8 @@ missing, incomplete, unauthorized, or failing.
 
 ## Migration
 
-Review the migrations, then apply them explicitly:
+SQLite remains the local-UAT migration path. Review the migrations, then apply
+them explicitly:
 
 - `migrations/001_platform_scoped_storage.sql` for workspace-scoped app data
 - `migrations/002_platform_scoped_artifacts.sql` for workspace-scoped file and quote artifacts
@@ -67,13 +68,11 @@ $env:SQAG_DATABASE_URL="sqlite:///C:/path/to/local/sqag-storage.sqlite3"
 python scripts/migrate_sqag_storage.py
 ```
 
-For Postgres/Neon-compatible metadata storage, apply only the metadata
-migrations that do not create DB-BLOB artifact tables:
-
-- `migrations/001_platform_scoped_storage.sql`
-- `migrations/003_object_artifact_metadata.sql`
-
-The app does not auto-run migrations on startup.
+Postgres/Neon-compatible metadata migrations are governed by the immutable
+manifest, checksum ledger, advisory lock, read-only preflight, and operator
+sequence in `docs/postgres-migration-runbook.md`. Do not apply individual SQL
+files or silently baseline an existing schema. The app does not auto-run
+migrations on startup.
 
 ## Backup, Restore, Retention, And Rollback Evidence
 
