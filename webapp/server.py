@@ -319,6 +319,7 @@ SESSION_COOKIE_NAME = "swooshz_quote_session"
 OIDC_STATE_COOKIE_NAME = "swooshz_quote_oidc_state"
 SESSION_COOKIE_MAX_AGE_SECONDS = 8 * 60 * 60
 MIN_DEPLOY_SESSION_SECRET_CHARS = 32
+MIN_PLATFORM_SERVICE_SECRET_CHARS = 32
 TRUSTED_PROXY_CIDRS_ENV_NAME = 'SQAG_TRUSTED_PROXY_CIDRS'
 MAX_FORWARDED_FOR_HEADER_BYTES = 4096
 MAX_FORWARDED_FOR_HOPS = 32
@@ -1663,6 +1664,14 @@ def configured_platform_service_secret() -> str:
     return clean_text(read_dotenv_value(PLATFORM_SERVICE_SECRET_ENV_NAME))
 
 
+def platform_service_secret_ready() -> bool:
+    secret = configured_platform_service_secret()
+    return bool(secret) and (
+        configured_app_mode() != "deploy"
+        or len(secret) >= MIN_PLATFORM_SERVICE_SECRET_CHARS
+    )
+
+
 def configured_platform_request_timeout_seconds() -> int:
     raw = clean_text(read_dotenv_value(PLATFORM_REQUEST_TIMEOUT_ENV_NAME))
     if not raw:
@@ -1690,7 +1699,7 @@ def platform_launch_config_complete() -> bool:
         and deploy_session_secret_ready()
         and configured_platform_base_url()
         and configured_sqag_public_base_url()
-        and configured_platform_service_secret()
+        and platform_service_secret_ready()
     )
 
 
@@ -2077,7 +2086,7 @@ def platform_service_request(
 ) -> dict[str, Any]:
     secret = configured_platform_service_secret()
     url = platform_internal_url(path)
-    if not secret or not url:
+    if not platform_service_secret_ready() or not url:
         raise PlatformLaunchError(
             "Platform request could not be verified.",
             status=503,
@@ -2452,7 +2461,11 @@ def deploy_uat_preflight_status() -> dict[str, Any]:
     add(PLATFORM_LAUNCH_MODE_ENV_NAME, configured_platform_launch_mode() == "platform", "must be set to platform")
     add(PLATFORM_BASE_URL_ENV_NAME, bool(configured_platform_base_url()), "must be an https or loopback http platform base URL")
     add(SQAG_PUBLIC_BASE_URL_ENV_NAME, bool(configured_sqag_public_base_url()), "must be the exact canonical SQAG origin")
-    add(PLATFORM_SERVICE_SECRET_ENV_NAME, bool(configured_platform_service_secret()), "must be supplied by the host secret manager")
+    add(
+        PLATFORM_SERVICE_SECRET_ENV_NAME,
+        platform_service_secret_ready(),
+        f"must be supplied by the host secret manager and contain at least {MIN_PLATFORM_SERVICE_SECRET_CHARS} characters",
+    )
     add(
         TRUSTED_PROXY_CIDRS_ENV_NAME,
         trusted_proxy_config_complete(),
@@ -22675,6 +22688,38 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             return
         if self.block_platform_launch_rate_limit():
             return
+        supplied_service_secret, service_header_valid = singleton_http_header(
+            self.headers,
+            PLATFORM_SERVICE_AUTHORIZATION_HEADER,
+            reject_comma=True,
+        )
+        configured_service_secret = configured_platform_service_secret()
+        service_secret_matches = secrets.compare_digest(
+            supplied_service_secret,
+            configured_service_secret,
+        )
+        if (
+            not service_header_valid
+            or not platform_service_secret_ready()
+            or not service_secret_matches
+        ):
+            supplied_service_secret = ""
+            configured_service_secret = ""
+            write_local_log(
+                "security_event",
+                {
+                    "reason": "platform_launch_authentication_failed",
+                    "path": PLATFORM_LAUNCH_ENDPOINT,
+                    "status": 403,
+                },
+            )
+            self.send_json(
+                {"status": "blocked", "errors": ["Platform launch could not be completed."]},
+                status=403,
+            )
+            return
+        supplied_service_secret = ""
+        configured_service_secret = ""
         raw_launch_token, launch_header_valid = singleton_http_header(
             self.headers,
             PLATFORM_LAUNCH_TOKEN_HEADER,

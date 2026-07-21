@@ -437,7 +437,10 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
                 runner.base_url,
                 "POST",
                 "/api/platform/launch",
-                headers={"X-App-Launch-Token": SYNTHETIC_TOKEN},
+                headers={
+                    "X-App-Launch-Token": SYNTHETIC_TOKEN,
+                    webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER: env["SQAG_PLATFORM_SERVICE_SECRET"],
+                },
             )
             finalize_status, finalize_body, finalize_headers = json_request(
                 runner.base_url,

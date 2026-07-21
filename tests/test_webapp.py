@@ -4234,7 +4234,10 @@ class WebappServerTest(unittest.TestCase):
                     request = urllib.request.Request(
                         f"{runner.base_url}/api/platform/launch",
                         data=b"",
-                        headers={"X-App-Launch-Token": raw_launch_token},
+                        headers={
+                            "X-App-Launch-Token": raw_launch_token,
+                            webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER: env["SQAG_PLATFORM_SERVICE_SECRET"],
+                        },
                         method="POST",
                     )
                     response = opener.open(request, timeout=3)
@@ -4314,7 +4317,10 @@ class WebappServerTest(unittest.TestCase):
                             runner,
                             'POST',
                             webapp.PLATFORM_LAUNCH_ENDPOINT,
-                            headers={'X-Forwarded-For': f'198.51.100.{index + 1}'},
+                            headers={
+                                webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER: env['SQAG_PLATFORM_SERVICE_SECRET'],
+                                'X-Forwarded-For': f'198.51.100.{index + 1}',
+                            },
                         )
                         self.assertEqual(missing_token['status'], 400)
 
@@ -4324,6 +4330,7 @@ class WebappServerTest(unittest.TestCase):
                         webapp.PLATFORM_LAUNCH_ENDPOINT,
                         headers={
                             webapp.PLATFORM_LAUNCH_TOKEN_HEADER: self.synthetic_platform_launch_token(),
+                            webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER: env['SQAG_PLATFORM_SERVICE_SECRET'],
                             'X-Forwarded-For': '203.0.113.250',
                         },
                     )
@@ -4389,7 +4396,10 @@ class WebappServerTest(unittest.TestCase):
                         runner,
                         "POST",
                         webapp.PLATFORM_LAUNCH_ENDPOINT,
-                        headers={"X-Forwarded-For": f"198.51.100.{index + 1}"},
+                        headers={
+                            webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER: env["SQAG_PLATFORM_SERVICE_SECRET"],
+                            "X-Forwarded-For": f"198.51.100.{index + 1}",
+                        },
                     )
                     self.assertEqual(missing_token["status"], 400)
 
@@ -4399,6 +4409,7 @@ class WebappServerTest(unittest.TestCase):
                     webapp.PLATFORM_LAUNCH_ENDPOINT,
                     headers={
                         webapp.PLATFORM_LAUNCH_TOKEN_HEADER: self.synthetic_platform_launch_token(),
+                        webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER: env["SQAG_PLATFORM_SERVICE_SECRET"],
                         "X-Forwarded-For": "203.0.113.40",
                     },
                 )
@@ -4410,7 +4421,10 @@ class WebappServerTest(unittest.TestCase):
                         runner,
                         "POST",
                         webapp.PLATFORM_LAUNCH_ENDPOINT,
-                        headers={"X-Forwarded-For": f"2001:db8::{index + 1}"},
+                        headers={
+                            webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER: env["SQAG_PLATFORM_SERVICE_SECRET"],
+                            "X-Forwarded-For": f"2001:db8::{index + 1}",
+                        },
                     )
                     overflow_statuses.append(response["status"])
 
@@ -4420,6 +4434,7 @@ class WebappServerTest(unittest.TestCase):
                     webapp.PLATFORM_LAUNCH_ENDPOINT,
                     headers={
                         webapp.PLATFORM_LAUNCH_TOKEN_HEADER: self.synthetic_platform_launch_token(),
+                        webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER: env["SQAG_PLATFORM_SERVICE_SECRET"],
                         "X-Forwarded-For": "2001:db8::ffff",
                     },
                 )
@@ -4450,7 +4465,10 @@ class WebappServerTest(unittest.TestCase):
                         runner,
                         'POST',
                         webapp.PLATFORM_LAUNCH_ENDPOINT,
-                        headers={'X-Forwarded-For': f'198.51.100.{index + 1}'},
+                        headers={
+                            webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER: env['SQAG_PLATFORM_SERVICE_SECRET'],
+                            'X-Forwarded-For': f'198.51.100.{index + 1}',
+                        },
                     )
                     statuses.append(response['status'])
 
@@ -4476,6 +4494,7 @@ class WebappServerTest(unittest.TestCase):
                     'POST',
                     webapp.PLATFORM_LAUNCH_ENDPOINT,
                     headers={
+                        webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER: env['SQAG_PLATFORM_SERVICE_SECRET'],
                         'X-Forwarded-For': '198.51.100.99, 203.0.113.25, 192.0.2.10',
                     },
                 )
@@ -4564,7 +4583,10 @@ class WebappServerTest(unittest.TestCase):
                         runner,
                         'POST',
                         webapp.PLATFORM_LAUNCH_ENDPOINT,
-                        headers={'X-Forwarded-For': '203.0.113.44'},
+                        headers={
+                            webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER: env['SQAG_PLATFORM_SERVICE_SECRET'],
+                            'X-Forwarded-For': '203.0.113.44',
+                        },
                     )
                     statuses.append(response['status'])
 
@@ -4872,7 +4894,10 @@ class WebappServerTest(unittest.TestCase):
                         launch_request = urllib.request.Request(
                             f"{runner.base_url}/api/platform/launch",
                             data=b"",
-                            headers={"X-App-Launch-Token": raw_launch_token},
+                            headers={
+                                "X-App-Launch-Token": raw_launch_token,
+                                webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER: env["SQAG_PLATFORM_SERVICE_SECRET"],
+                            },
                             method="POST",
                         )
                         launch_response = opener.open(launch_request, timeout=3)
@@ -5210,7 +5235,14 @@ class WebappServerTest(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             with mock.patch.object(webapp.urllib.request, "urlopen") as urlopen:
                 with LocalRunnerServer() as runner:
-                    request = urllib.request.Request(f"{runner.base_url}/api/platform/launch", data=b"", method="POST")
+                    request = urllib.request.Request(
+                        f"{runner.base_url}/api/platform/launch",
+                        data=b"",
+                        headers={
+                            webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER: env["SQAG_PLATFORM_SERVICE_SECRET"],
+                        },
+                        method="POST",
+                    )
                     with self.assertRaises(urllib.error.HTTPError) as error:
                         opener.open(request, timeout=3)
                     body = json.loads(error.exception.read().decode("utf-8"))
@@ -5219,6 +5251,69 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(body["status"], "blocked")
         self.assertIn("Platform launch could not be completed.", body["errors"])
         urlopen.assert_not_called()
+
+    def test_platform_launch_requires_single_matching_service_credential_before_token_use(self):
+        env = self.platform_launch_env()
+        raw_launch_token = "synthetic-launch-token-that-must-stay-private"
+        service_secret = env["SQAG_PLATFORM_SERVICE_SECRET"]
+        incorrect_secret = "incorrect-platform-service-secret-value"
+        cases = (
+            ("missing", ()),
+            ("blank", ((webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER, ""),)),
+            ("incorrect", ((webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER, incorrect_secret),)),
+            (
+                "duplicate",
+                (
+                    (webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER, service_secret),
+                    (webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER, service_secret),
+                ),
+            ),
+            (
+                "comma-combined",
+                ((webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER, f"{service_secret},other"),),
+            ),
+        )
+        written_stderr: list[str] = []
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "consume_platform_launch_token") as consume,
+            mock.patch.object(webapp, "register_platform_finalization") as register,
+            mock.patch.object(webapp.urllib.request, "urlopen") as urlopen,
+            mock.patch.object(webapp.secrets, "token_urlsafe") as generate_handle,
+            mock.patch.object(webapp, "write_local_log") as write_log,
+            mock.patch.object(webapp, "safe_stderr", side_effect=written_stderr.append),
+        ):
+            with LocalRunnerServer() as runner:
+                parsed = urllib.parse.urlparse(runner.base_url)
+                for label, service_headers in cases:
+                    with self.subTest(label=label):
+                        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
+                        try:
+                            connection.putrequest("POST", webapp.PLATFORM_LAUNCH_ENDPOINT)
+                            connection.putheader(webapp.PLATFORM_LAUNCH_TOKEN_HEADER, raw_launch_token)
+                            for name, value in service_headers:
+                                connection.putheader(name, value)
+                            connection.putheader("Content-Length", "0")
+                            connection.endheaders()
+                            response = connection.getresponse()
+                            body = json.loads(response.read().decode("utf-8"))
+                            self.assertEqual(response.status, 403)
+                            self.assertEqual(
+                                body,
+                                {"status": "blocked", "errors": ["Platform launch could not be completed."]},
+                            )
+                            self.assertIsNone(response.getheader(webapp.PLATFORM_FINALIZATION_HANDLE_HEADER))
+                            self.assertIsNone(response.getheader("Set-Cookie"))
+                        finally:
+                            connection.close()
+
+        consume.assert_not_called()
+        register.assert_not_called()
+        urlopen.assert_not_called()
+        generate_handle.assert_not_called()
+        logged = repr(write_log.call_args_list) + "".join(written_stderr)
+        for private_value in (service_secret, incorrect_secret, raw_launch_token):
+            self.assertNotIn(private_value, logged)
 
     def test_platform_launch_rejects_wrong_app_key(self):
         env = self.platform_launch_env()
@@ -5234,7 +5329,10 @@ class WebappServerTest(unittest.TestCase):
                     request = urllib.request.Request(
                         f"{runner.base_url}/api/platform/launch",
                         data=b"",
-                        headers={"X-App-Launch-Token": self.synthetic_platform_launch_token()},
+                        headers={
+                            "X-App-Launch-Token": self.synthetic_platform_launch_token(),
+                            webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER: env["SQAG_PLATFORM_SERVICE_SECRET"],
+                        },
                         method="POST",
                     )
                     with self.assertRaises(urllib.error.HTTPError) as error:
@@ -5265,7 +5363,10 @@ class WebappServerTest(unittest.TestCase):
                     request = urllib.request.Request(
                         f"{runner.base_url}/api/platform/launch",
                         data=b"",
-                        headers={"X-App-Launch-Token": self.synthetic_platform_launch_token()},
+                        headers={
+                            "X-App-Launch-Token": self.synthetic_platform_launch_token(),
+                            webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER: env["SQAG_PLATFORM_SERVICE_SECRET"],
+                        },
                         method="POST",
                     )
                     with self.assertRaises(urllib.error.HTTPError) as error:
@@ -5422,6 +5523,7 @@ class WebappServerTest(unittest.TestCase):
                         (
                             webapp.PLATFORM_LAUNCH_ENDPOINT,
                             (
+                                (webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER, env["SQAG_PLATFORM_SERVICE_SECRET"]),
                                 (webapp.PLATFORM_LAUNCH_TOKEN_HEADER, "first-token"),
                                 (webapp.PLATFORM_LAUNCH_TOKEN_HEADER, "second-token"),
                             ),
@@ -5810,14 +5912,24 @@ class WebappServerTest(unittest.TestCase):
                 ready = webapp.deploy_uat_preflight_status()
             with mock.patch.dict(os.environ, {**env, "SQAG_PLATFORM_BASE_URL": ""}, clear=True):
                 blocked = webapp.deploy_uat_preflight_status()
+            with mock.patch.dict(os.environ, {**env, "SQAG_PLATFORM_SERVICE_SECRET": ""}, clear=True):
+                missing_service_secret = webapp.deploy_uat_preflight_status()
+            weak_value = "weak-service-secret"
+            with mock.patch.dict(os.environ, {**env, "SQAG_PLATFORM_SERVICE_SECRET": weak_value}, clear=True):
+                weak_service_secret = webapp.deploy_uat_preflight_status()
 
         ready_text = json.dumps(ready)
         blocked_text = json.dumps(blocked)
         self.assertEqual(ready["status"], "ready")
         self.assertEqual(blocked["status"], "blocked")
+        self.assertEqual(missing_service_secret["status"], "blocked")
+        self.assertEqual(weak_service_secret["status"], "blocked")
         self.assertIn("SQAG_PLATFORM_BASE_URL", blocked_text)
-        for text in (ready_text, blocked_text):
+        self.assertIn("SQAG_PLATFORM_SERVICE_SECRET", json.dumps(missing_service_secret))
+        self.assertIn("SQAG_PLATFORM_SERVICE_SECRET", json.dumps(weak_service_secret))
+        for text in (ready_text, blocked_text, json.dumps(missing_service_secret), json.dumps(weak_service_secret)):
             self.assertNotIn("session-secret-sensitive", text)
+            self.assertNotIn(weak_value, text)
 
     def test_internal_uat_coolify_env_template_is_offline_verifiable(self):
         proxy_values, _ = deploy_template.parse_env_template(

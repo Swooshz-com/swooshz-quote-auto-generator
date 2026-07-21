@@ -90,7 +90,15 @@ Platform-to-SQAG handoff:
 ```http
 POST <sqag-base-url>/api/platform/launch
 X-App-Launch-Token: <one-time-platform-launch-token>
+X-SQAG-Service-Authorization: <shared-platform-service-secret>
 ```
+
+SQAG requires exactly one nonblank, non-comma-combined
+`X-SQAG-Service-Authorization` header and compares it in constant time with its
+locally configured `SQAG_PLATFORM_SERVICE_SECRET` before inspecting or
+consuming the launch token. Missing, duplicate, combined, or incorrect service
+credentials fail generically before SQAG makes any Platform request, generates
+or registers a finalization handle, or creates a session.
 
 SQAG-to-Platform consume:
 
@@ -102,6 +110,11 @@ X-App-Launch-Token: <one-time-platform-launch-token>
 The raw launch token must stay header-only. It must not appear in URLs, query
 parameters, fragments, browser storage, cookies, logs, docs, screenshots,
 committed files, telemetry, or public API responses.
+
+Platform and SQAG must each receive the same shared service-secret value as a
+separate secure runtime configuration entry. In deploy mode the value must be
+at least 32 characters. Secret values must never appear in repositories, logs,
+screenshots, reports, or chat.
 
 SQAG accepts only the safe Platform consume response shape:
 

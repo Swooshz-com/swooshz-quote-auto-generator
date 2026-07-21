@@ -61,7 +61,14 @@ SQAG accepts a platform launch token only through:
 ```http
 POST /api/platform/launch HTTP/1.1
 X-App-Launch-Token: <one-time-platform-launch-token>
+X-SQAG-Service-Authorization: <shared-platform-service-secret>
 ```
+
+SQAG independently requires exactly one nonblank, non-comma-combined service
+authorization header and compares it in constant time with
+`SQAG_PLATFORM_SERVICE_SECRET` before consuming the launch token or making any
+other Platform request. Authentication failure is generic and cannot generate
+a finalization handle or SQAG cookie.
 
 The adapter then calls:
 
@@ -85,6 +92,11 @@ authenticated SQAG API request validates the non-secret grant ID with Platform
 under `X-SQAG-Service-Authorization`; validation failures and authority changes
 take effect on that request. Logout always clears the SQAG cookie and attempts
 to revoke the Platform grant.
+
+The same shared service-secret value must be entered separately and securely
+in Platform and SQAG runtime configuration. SQAG requires at least 32
+characters in deploy mode. Never place the value in a repository, log,
+screenshot, report, or chat.
 
 Production routing is exact: Platform is `https://swooshz.com`,
 `https://www.swooshz.com` permanently redirects to the apex, and SQAG is

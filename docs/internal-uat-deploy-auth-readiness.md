@@ -55,7 +55,9 @@ The deploy/auth surface is already represented in `.env.example` and
 - `SQAG_PLATFORM_LAUNCH_MODE`, `SQAG_PLATFORM_BASE_URL`,
   `SQAG_PUBLIC_BASE_URL`, and `SQAG_PLATFORM_SERVICE_SECRET`: mandatory platform/workspace launch,
   finalization, validation, and revoke boundary for protected hosted/deploy
-  use. `SQAG_PLATFORM_REQUEST_TIMEOUT_SECONDS` is an optional bounded,
+  use. The shared service secret must be configured separately in both runtimes
+  and contain at least 32 characters; it must not appear in repositories, logs,
+  screenshots, reports, or chat. `SQAG_PLATFORM_REQUEST_TIMEOUT_SECONDS` is an optional bounded,
   non-secret timeout. The
   deploy mode fixes these origins to `https://swooshz.com` and
   `https://quote.swooshz.com`; loopback flexibility is local-mode only.
