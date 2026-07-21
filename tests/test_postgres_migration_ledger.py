@@ -48,7 +48,7 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
 
         cls.psycopg = psycopg
         cls.sql = sql
-        cls.dict_row = dict_row
+        cls.dict_row = staticmethod(dict_row)
         cls.manifest = migration_manifest(ROOT / "migrations")
 
     def setUp(self):
