@@ -609,7 +609,23 @@ def workspace_profile_with_layout(profile_id: str = "workspace-profile") -> dict
 
 
 class LocalRunnerServer:
+    def __init__(self, *, allow_any_host=True, canonical_origin=True):
+        self.allow_any_host = allow_any_host
+        self.canonical_origin = canonical_origin
+
     def __enter__(self):
+        self.host_patcher = None
+        self.origin_patcher = None
+        if self.allow_any_host:
+            self.host_patcher = mock.patch.object(webapp, "is_allowed_host_header", return_value=True)
+            self.host_patcher.start()
+        if self.canonical_origin:
+            self.origin_patcher = mock.patch.object(
+                webapp,
+                "request_sqag_origin",
+                side_effect=lambda _host: webapp.configured_sqag_public_base_url() or self.base_url,
+            )
+            self.origin_patcher.start()
         self.server = webapp.ThreadingHTTPServer(("127.0.0.1", 0), webapp.QuoteRunnerHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -621,6 +637,10 @@ class LocalRunnerServer:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
+        if self.origin_patcher is not None:
+            self.origin_patcher.stop()
+        if self.host_patcher is not None:
+            self.host_patcher.stop()
 
 
 class JsonResponseMock:
@@ -630,6 +650,8 @@ class JsonResponseMock:
         self.headers = {}
 
     def read(self, size: int | None = None):
+        if self.status == 204:
+            return b""
         return json.dumps(self.payload).encode("utf-8")
 
     def __enter__(self):
@@ -1076,9 +1098,11 @@ class WebappServerTest(unittest.TestCase):
             "AUTH_REQUIRED": "true",
             "SESSION_SECRET": "test-session-secret-with-enough-entropy",
             "SQAG_PLATFORM_LAUNCH_MODE": "platform",
+            "SQAG_PLATFORM_SERVICE_SECRET": "synthetic-platform-service-secret",
             "SQAG_TRACKING_HMAC_KEY": "synthetic-dedicated-tracking-key",
             "SQAG_TRACKING_HMAC_KEY_VERSION": "test-v1",
-            "SQAG_PLATFORM_BASE_URL": "https://platform.example.test",
+            "SQAG_PLATFORM_BASE_URL": "https://swooshz.com",
+            "SQAG_PUBLIC_BASE_URL": "https://quote.swooshz.com",
         }
         env.update(overrides)
         return env
@@ -1102,6 +1126,9 @@ class WebappServerTest(unittest.TestCase):
         return "-".join(("synthetic", "launch", "token", "reference"))
 
     def platform_consume_payload(self, **overrides):
+        launch_expiry = (
+            webapp.dt.datetime.now(webapp.dt.timezone.utc) + webapp.dt.timedelta(minutes=5)
+        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         payload = {
             "outcome": "consumed",
             "user": {
@@ -1120,7 +1147,8 @@ class WebappServerTest(unittest.TestCase):
                 "appName": "SQAG / SAQG",
             },
             "membershipRole": "owner",
-            "launchTokenExpiresAt": "2999-01-01T00:00:00.000Z",
+            "launchTokenExpiresAt": launch_expiry,
+            "validationGrantId": "synthetic-validation-grant-123",
         }
         for key, value in overrides.items():
             payload[key] = value
@@ -1144,6 +1172,20 @@ class WebappServerTest(unittest.TestCase):
             )
         )
         return {"user": webapp.user_from_platform_launch_context(context)}
+
+    def platform_validation_payload(self, **overrides):
+        context = self.platform_consume_payload()
+        payload = {
+            "valid": True,
+            "validationGrantId": context["validationGrantId"],
+            "userId": context["user"]["userId"],
+            "workspaceId": context["workspace"]["workspaceId"],
+            "appKey": context["app"]["appKey"],
+            "launchTokenExpiresAt": context["launchTokenExpiresAt"],
+            "currentRole": context["membershipRole"],
+        }
+        payload.update(overrides)
+        return payload
 
     def no_redirect_opener(self):
         class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -3907,9 +3949,9 @@ class WebappServerTest(unittest.TestCase):
 
         loopback_platform_url = "http://127.0.0.1:4317"
         with mock.patch.dict(os.environ, self.platform_launch_env(SQAG_PLATFORM_BASE_URL=loopback_platform_url), clear=True):
-            self.assertEqual(webapp.configured_platform_base_url(), loopback_platform_url)
-            self.assertTrue(webapp.platform_launch_config_complete())
-            self.assertFalse(webapp.deploy_requires_auth_guard())
+            self.assertEqual(webapp.configured_platform_base_url(), "")
+            self.assertFalse(webapp.platform_launch_config_complete())
+            self.assertTrue(webapp.deploy_requires_auth_guard())
 
     def test_deploy_auth_routes_block_unauthenticated_access_and_redirect_login(self):
         env = self.deploy_auth_env(OIDC_LOGOUT_URL="https://issuer.example/logout")
@@ -3951,12 +3993,8 @@ class WebappServerTest(unittest.TestCase):
                 self.assertIn(webapp.OIDC_STATE_COOKIE_NAME, login_redirect.exception.headers["Set-Cookie"])
 
     def test_deploy_platform_auth_pages_link_back_to_platform_home(self):
-        platform_url = "http://127.0.0.1:4317"
-        env = self.deploy_auth_env(
-            SQAG_PLATFORM_LAUNCH_MODE="platform",
-            SQAG_PLATFORM_BASE_URL=platform_url,
-            OIDC_AUTHORIZE_URL="",
-        )
+        platform_url = "https://swooshz.com"
+        env = self.platform_launch_env(OIDC_AUTHORIZE_URL="")
         with mock.patch.dict(os.environ, env, clear=True):
             with LocalRunnerServer() as runner:
                 parsed = urllib.parse.urlparse(runner.base_url)
@@ -4169,13 +4207,24 @@ class WebappServerTest(unittest.TestCase):
         for sensitive in ("state-secret", "fake-code", "private-provider-detail"):
             self.assertNotIn(sensitive, output)
 
-    def test_platform_launch_mode_consumes_header_token_and_sets_safe_session(self):
+    def test_platform_launch_registers_header_only_finalization_then_sets_safe_host_cookie(self):
         env = self.platform_launch_env()
         raw_launch_token = self.synthetic_platform_launch_token()
         captured_requests: list[urllib.request.Request] = []
 
         def fake_urlopen(request, timeout=0):
             captured_requests.append(request)
+            if request.full_url.endswith("/api/internal/sqag/finalizations/register"):
+                return JsonResponseMock({}, status=204)
+            if request.full_url.endswith("/api/internal/sqag/finalizations/consume"):
+                return JsonResponseMock({
+                    "validationGrantId": "synthetic-validation-grant-123",
+                    "userId": "platform-user-123",
+                    "workspaceId": "workspace-123",
+                    "appKey": "sqag",
+                    "launchTokenExpiresAt": self.platform_consume_payload()["launchTokenExpiresAt"],
+                    "currentRole": "owner",
+                })
             return JsonResponseMock(self.platform_consume_payload())
 
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -4192,35 +4241,58 @@ class WebappServerTest(unittest.TestCase):
                     body = json.loads(response.read().decode("utf-8"))
 
                     self.assertEqual(response.status, 200)
-                    self.assertEqual(body["status"], "platform_session_created")
-                    self.assertEqual(body["redirect_url"], "/")
-                    session_cookie = response.headers["Set-Cookie"]
+                    self.assertEqual(body["status"], "platform_finalization_registered")
+                    self.assertEqual(
+                        body["finalizationUrl"],
+                        f"{env['SQAG_PUBLIC_BASE_URL']}{webapp.PLATFORM_FINALIZATION_ENDPOINT}",
+                    )
+                    self.assertNotIn("finalizeUrl", body)
+                    self.assertNotIn("Set-Cookie", response.headers)
+                    finalization_handle = response.headers[webapp.PLATFORM_FINALIZATION_HANDLE_HEADER]
+                    self.assertTrue(finalization_handle)
+                    finalize_request = urllib.request.Request(
+                        f"{runner.base_url}{webapp.PLATFORM_FINALIZATION_ENDPOINT}",
+                        data=b"",
+                        headers={
+                            "Origin": env["SQAG_PLATFORM_BASE_URL"],
+                            webapp.PLATFORM_FINALIZATION_HANDLE_HEADER: finalization_handle,
+                        },
+                        method="POST",
+                    )
+                    finalize_response = opener.open(finalize_request, timeout=3)
+                    finalize_body = json.loads(finalize_response.read().decode("utf-8"))
+                    self.assertEqual(finalize_body["status"], "platform_session_created")
+                    session_cookie = finalize_response.headers["Set-Cookie"]
                     self.assertIn("Secure", session_cookie)
                     self.assertIn("HttpOnly", session_cookie)
                     self.assertIn("SameSite=Lax", session_cookie)
+                    self.assertNotIn("Domain=", session_cookie)
 
-                    session_request = urllib.request.Request(
-                        f"{runner.base_url}/api/session",
-                        headers={"Cookie": session_cookie},
-                    )
-                    session_body = json.loads(opener.open(session_request, timeout=3).read().decode("utf-8"))
-
-        self.assertEqual(len(captured_requests), 1)
+        self.assertEqual(len(captured_requests), 3)
         consume_request = captured_requests[0]
         self.assertEqual(
             consume_request.full_url,
-            "https://platform.example.test/api/platform/apps/launch/consume?appKey=sqag",
+            "https://swooshz.com/api/platform/apps/launch/consume?appKey=sqag",
         )
         self.assertEqual(consume_request.get_method(), "POST")
         self.assertEqual(consume_request.get_header("X-app-launch-token"), raw_launch_token)
         self.assertNotIn(raw_launch_token, consume_request.full_url)
         self.assertNotIn(raw_launch_token, json.dumps(body, sort_keys=True))
-        self.assertNotIn(raw_launch_token, json.dumps(session_body, sort_keys=True))
-        self.assertTrue(session_body["authenticated"])
-        self.assertEqual(session_body["user"]["subject"], "platform-user-123")
-        self.assertEqual(session_body["user"]["account"], "workspace-123")
-        self.assertEqual(session_body["user"]["platform"]["app"]["appKey"], "sqag")
-        self.assertEqual(session_body["permissions"]["role"], "admin")
+        register_request = captured_requests[1]
+        register_body = json.loads(register_request.data.decode("utf-8"))
+        self.assertNotEqual(register_body["handleHashSha256"], finalization_handle)
+        self.assertEqual(register_body["handleHashSha256"], hashlib.sha256(finalization_handle.encode()).hexdigest())
+        self.assertNotIn(finalization_handle, json.dumps(register_body))
+        self.assertEqual(register_body["validationGrantId"], "synthetic-validation-grant-123")
+        self.assertEqual(register_request.get_header("X-sqag-service-authorization"), env["SQAG_PLATFORM_SERVICE_SECRET"])
+        finalization_request = captured_requests[2]
+        self.assertEqual(finalization_request.get_header("X-sqag-finalization-handle"), finalization_handle)
+        self.assertNotIn(finalization_handle, finalization_request.full_url)
+        self.assertNotIn(finalization_handle, finalization_request.data.decode("utf-8"))
+        cookie_value = session_cookie.split(";", 1)[0].split("=", 1)[1]
+        serialized_cookie = json.dumps(webapp.verified_cookie_payload(cookie_value), sort_keys=True)
+        for private_field in ("email", "displayName", "status", "workspaceSlug", "workspaceName", "appName"):
+            self.assertNotIn(private_field, serialized_cookie)
 
     def test_platform_launch_rate_limit_isolates_clients_behind_trusted_proxy(self):
         env = self.platform_launch_env()
@@ -4228,6 +4300,8 @@ class WebappServerTest(unittest.TestCase):
 
         def fake_urlopen(request, timeout=0):
             captured_requests.append(request)
+            if request.full_url.endswith(webapp.PLATFORM_FINALIZATION_REGISTER_PATH):
+                return JsonResponseMock({}, status=204)
             return JsonResponseMock(self.platform_consume_payload())
 
         webapp.RATE_LIMIT_BUCKETS.clear()
@@ -4255,8 +4329,42 @@ class WebappServerTest(unittest.TestCase):
                     )
 
         self.assertEqual(valid['status'], 200)
-        self.assertEqual(valid['body']['status'], 'platform_session_created')
-        self.assertEqual(len(captured_requests), 1)
+        self.assertEqual(valid['body']['status'], 'platform_finalization_registered')
+        self.assertEqual(len(captured_requests), 2)
+
+    def test_platform_finalization_rate_limit_blocks_platform_request_amplification(self):
+        self.reset_rate_limit_state()
+        self.addCleanup(self.reset_rate_limit_state)
+        env = self.platform_launch_env()
+        platform_calls: list[urllib.request.Request] = []
+
+        def unavailable_platform(request, timeout=0):
+            platform_calls.append(request)
+            raise urllib.error.URLError("synthetic platform outage")
+
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        statuses: list[int] = []
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=unavailable_platform):
+                with LocalRunnerServer() as runner:
+                    for index in range(webapp.POST_RATE_LIMITS[webapp.PLATFORM_FINALIZATION_ENDPOINT] + 1):
+                        request = urllib.request.Request(
+                            f"{runner.base_url}{webapp.PLATFORM_FINALIZATION_ENDPOINT}",
+                            data=b"",
+                            headers={
+                                "Origin": env["SQAG_PLATFORM_BASE_URL"],
+                                webapp.PLATFORM_FINALIZATION_HANDLE_HEADER: f"synthetic-handle-{index}",
+                            },
+                            method="POST",
+                        )
+                        with self.assertRaises(urllib.error.HTTPError) as response_error:
+                            opener.open(request, timeout=3)
+                        statuses.append(response_error.exception.code)
+
+        limit = webapp.POST_RATE_LIMITS[webapp.PLATFORM_FINALIZATION_ENDPOINT]
+        self.assertEqual(statuses[:-1], [502] * limit)
+        self.assertEqual(statuses[-1], 429)
+        self.assertEqual(len(platform_calls), limit)
 
     def test_platform_launch_rate_limit_state_is_bounded_and_fail_closed(self):
         env = self.platform_launch_env()
@@ -4264,6 +4372,8 @@ class WebappServerTest(unittest.TestCase):
 
         def fake_urlopen(request, timeout=0):
             captured_requests.append(request)
+            if request.full_url.endswith(webapp.PLATFORM_FINALIZATION_REGISTER_PATH):
+                return JsonResponseMock({}, status=204)
             return JsonResponseMock(self.platform_consume_payload())
 
         self.reset_rate_limit_state()
@@ -4316,7 +4426,7 @@ class WebappServerTest(unittest.TestCase):
 
         self.assertEqual(overflow_statuses, [400] * webapp.POST_RATE_LIMITS[webapp.PLATFORM_LAUNCH_ENDPOINT])
         self.assertEqual(saturated_valid["status"], 429)
-        self.assertEqual(len(captured_requests), 1)
+        self.assertEqual(len(captured_requests), 2)
         self.assertEqual(len(webapp.RATE_LIMIT_BUCKETS), 4)
         self.assertEqual(
             set(webapp.RATE_LIMIT_OVERFLOW_BUCKETS),
@@ -4639,7 +4749,7 @@ class WebappServerTest(unittest.TestCase):
     def test_platform_mode_rejects_oidc_callback_before_provider_calls(self):
         env = self.deploy_auth_env(
             SQAG_PLATFORM_LAUNCH_MODE="platform",
-            SQAG_PLATFORM_BASE_URL="https://platform.example.test",
+            SQAG_PLATFORM_BASE_URL="https://swooshz.com",
         )
         opener = self.no_redirect_opener()
         with mock.patch.dict(os.environ, env, clear=True):
@@ -4690,7 +4800,7 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(logout_redirect.exception.code, 302)
         self.assertEqual(
             logout_redirect.exception.headers["Location"],
-            "https://platform.example.test/",
+            "https://swooshz.com/",
         )
         self.assertTrue(any(
             cookie.startswith(f"{webapp.SESSION_COOKIE_NAME}=") and "Max-Age=0" in cookie
@@ -4708,6 +4818,19 @@ class WebappServerTest(unittest.TestCase):
 
         def fake_urlopen(request, timeout=0):
             captured_requests.append(request)
+            if request.full_url.endswith(webapp.PLATFORM_FINALIZATION_REGISTER_PATH):
+                return JsonResponseMock({}, status=204)
+            if request.full_url.endswith(webapp.PLATFORM_FINALIZATION_CONSUME_PATH):
+                return JsonResponseMock({
+                    "validationGrantId": "synthetic-validation-grant-123",
+                    "userId": "platform-user-123",
+                    "workspaceId": "workspace-123",
+                    "appKey": "sqag",
+                    "launchTokenExpiresAt": self.platform_consume_payload()["launchTokenExpiresAt"],
+                    "currentRole": "owner",
+                })
+            if request.full_url.endswith(webapp.PLATFORM_ACCESS_VALIDATE_PATH):
+                return JsonResponseMock(self.platform_validation_payload())
             return JsonResponseMock(self.platform_consume_payload())
 
         def fake_generator_run(command, **kwargs):
@@ -4744,7 +4867,7 @@ class WebappServerTest(unittest.TestCase):
                 storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-123"))
                 storage.save_pricing_reference(workspace_pricing_reference("workspace-platform-uat-pricing"))
                 storage.save_profile(workspace_profile_with_layout("workspace-platform-uat-profile"))
-                with LocalRunnerServer() as runner:
+                with mock.patch.object(webapp, "validated_platform_auth_session", side_effect=lambda session: session), LocalRunnerServer() as runner:
                     with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=fake_urlopen):
                         launch_request = urllib.request.Request(
                             f"{runner.base_url}/api/platform/launch",
@@ -4754,7 +4877,18 @@ class WebappServerTest(unittest.TestCase):
                         )
                         launch_response = opener.open(launch_request, timeout=3)
                         launch_body = json.loads(launch_response.read().decode("utf-8"))
-                        session_cookie = launch_response.headers["Set-Cookie"].split(";", 1)[0]
+                        finalization_handle = launch_response.headers[webapp.PLATFORM_FINALIZATION_HANDLE_HEADER]
+                        finalization_request = urllib.request.Request(
+                            f"{runner.base_url}{webapp.PLATFORM_FINALIZATION_ENDPOINT}",
+                            data=b"",
+                            headers={
+                                "Origin": env["SQAG_PLATFORM_BASE_URL"],
+                                webapp.PLATFORM_FINALIZATION_HANDLE_HEADER: finalization_handle,
+                            },
+                            method="POST",
+                        )
+                        finalization_response = opener.open(finalization_request, timeout=3)
+                        session_cookie = finalization_response.headers["Set-Cookie"].split(";", 1)[0]
 
                     with mock.patch.object(webapp.subprocess, "run", side_effect=fake_generator_run):
                         session_request = urllib.request.Request(
@@ -4814,11 +4948,12 @@ class WebappServerTest(unittest.TestCase):
             finally:
                 connection.close()
 
-        self.assertEqual(len(captured_requests), 1)
-        consume_request = captured_requests[0]
+        consume_requests = [request for request in captured_requests if "/api/platform/apps/launch/consume" in request.full_url]
+        self.assertEqual(len(consume_requests), 1)
+        consume_request = consume_requests[0]
         self.assertEqual(consume_request.get_header("X-app-launch-token"), raw_launch_token)
         self.assertNotIn(raw_launch_token, consume_request.full_url)
-        self.assertEqual(launch_body["status"], "platform_session_created")
+        self.assertEqual(launch_body["status"], "platform_finalization_registered")
         self.assertEqual(generate_response.status, 202)
         self.assertEqual(generate_body["status"], "completed")
         self.assertEqual(generate_body["quote_session"]["session_id"], "quote-platform-uat-smoke")
@@ -5082,7 +5217,7 @@ class WebappServerTest(unittest.TestCase):
 
         self.assertEqual(error.exception.code, 400)
         self.assertEqual(body["status"], "blocked")
-        self.assertIn("Platform launch token is required.", body["errors"])
+        self.assertIn("Platform launch could not be completed.", body["errors"])
         urlopen.assert_not_called()
 
     def test_platform_launch_rejects_wrong_app_key(self):
@@ -5139,7 +5274,7 @@ class WebappServerTest(unittest.TestCase):
 
         self.assertEqual(error.exception.code, 502)
         self.assertEqual(body["status"], "blocked")
-        self.assertIn("Platform launch could not be verified.", body["errors"])
+        self.assertIn("Platform request could not be verified.", body["errors"])
         self.assertNotIn("private", json.dumps(body))
         self.assertNotIn(self.synthetic_platform_launch_token(), json.dumps(body))
 
@@ -5158,6 +5293,354 @@ class WebappServerTest(unittest.TestCase):
                     webapp.safe_platform_launch_context(payload)
                 self.assertEqual(error.exception.status, 403)
                 self.assertIn("not valid for SQAG", str(error.exception))
+
+    def test_platform_launch_expiry_is_mandatory_timezone_aware_future_and_bounded(self):
+        now = webapp.dt.datetime.now(webapp.dt.timezone.utc)
+        cases = [
+            ("missing", None),
+            ("blank", "   "),
+            ("malformed", "not-a-date"),
+            ("naive", (now + webapp.dt.timedelta(minutes=1)).replace(tzinfo=None).isoformat()),
+            ("expired", (now - webapp.dt.timedelta(seconds=1)).isoformat()),
+            (
+                "inconsistent-future",
+                (now + webapp.dt.timedelta(seconds=webapp.PLATFORM_LAUNCH_MAX_FUTURE_SECONDS + 1)).isoformat(),
+            ),
+        ]
+        for label, expiry in cases:
+            with self.subTest(label=label):
+                payload = self.platform_consume_payload()
+                if expiry is None:
+                    payload.pop("launchTokenExpiresAt")
+                else:
+                    payload["launchTokenExpiresAt"] = expiry
+                with self.assertRaises(webapp.PlatformLaunchError):
+                    webapp.safe_platform_launch_context(payload)
+
+    def test_platform_finalization_cors_preflight_allows_only_exact_platform_origin(self):
+        env = self.platform_launch_env()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with mock.patch.dict(os.environ, env, clear=True):
+            with LocalRunnerServer() as runner:
+                allowed = urllib.request.Request(
+                    f"{runner.base_url}{webapp.PLATFORM_FINALIZATION_ENDPOINT}",
+                    headers={
+                        "Origin": env["SQAG_PLATFORM_BASE_URL"],
+                        "Access-Control-Request-Method": "POST",
+                        "Access-Control-Request-Headers": "X-SQAG-Finalization-Handle",
+                    },
+                    method="OPTIONS",
+                )
+                response = opener.open(allowed, timeout=3)
+                self.assertEqual(response.status, 204)
+                self.assertEqual(response.headers["Access-Control-Allow-Origin"], env["SQAG_PLATFORM_BASE_URL"])
+                self.assertEqual(response.headers["Access-Control-Allow-Credentials"], "true")
+                self.assertEqual(response.headers["Access-Control-Allow-Methods"], "POST, OPTIONS")
+                self.assertEqual(response.headers["Access-Control-Allow-Headers"], "X-SQAG-Finalization-Handle")
+                self.assertEqual(response.headers["Vary"], "Origin")
+                self.assertIsNone(response.headers.get("Access-Control-Expose-Headers"))
+
+                for label, origin in (
+                    ("absent", ""),
+                    ("wrong", "https://other.example.test"),
+                    ("www", "https://www.swooshz.com"),
+                    ("retired-app", "https://app.swooshz.com"),
+                    ("sqag", "https://quote.swooshz.com"),
+                    ("wildcard", "*"),
+                    ("malformed", "not an origin"),
+                    ("path", env["SQAG_PLATFORM_BASE_URL"] + "/path"),
+                ):
+                    with self.subTest(label=label):
+                        headers = {
+                            "Access-Control-Request-Method": "POST",
+                            "Access-Control-Request-Headers": "X-SQAG-Finalization-Handle",
+                        }
+                        if origin:
+                            headers["Origin"] = origin
+                        denied = urllib.request.Request(
+                            f"{runner.base_url}{webapp.PLATFORM_FINALIZATION_ENDPOINT}",
+                            headers=headers,
+                            method="OPTIONS",
+                        )
+                        with self.assertRaises(urllib.error.HTTPError) as error:
+                            opener.open(denied, timeout=3)
+                        self.assertEqual(error.exception.code, 403)
+                        self.assertIsNone(error.exception.headers.get("Access-Control-Allow-Origin"))
+
+    def test_deploy_origins_and_host_are_fixed_to_canonical_production_routes(self):
+        env = self.platform_launch_env()
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(webapp.configured_platform_base_url(), "https://swooshz.com")
+            self.assertEqual(webapp.configured_sqag_public_base_url(), "https://quote.swooshz.com")
+            self.assertTrue(webapp.is_allowed_host_header("quote.swooshz.com"))
+            self.assertEqual(webapp.request_sqag_origin("quote.swooshz.com"), "https://quote.swooshz.com")
+            for host in ("swooshz.com", "www.swooshz.com", "app.swooshz.com", "quote.swooshz.com:444", "other.example"):
+                with self.subTest(host=host):
+                    self.assertFalse(webapp.is_allowed_host_header(host))
+                    self.assertEqual(webapp.request_sqag_origin(host), "")
+
+        invalid_configs = (
+            {"SQAG_PLATFORM_BASE_URL": "https://www.swooshz.com"},
+            {"SQAG_PLATFORM_BASE_URL": "https://app.swooshz.com"},
+            {"SQAG_PLATFORM_BASE_URL": "http://swooshz.com"},
+            {"SQAG_PUBLIC_BASE_URL": "https://swooshz.com"},
+            {"SQAG_PUBLIC_BASE_URL": "https://quote.swooshz.com:444"},
+            {"SQAG_PUBLIC_BASE_URL": "http://quote.swooshz.com"},
+        )
+        for override in invalid_configs:
+            with self.subTest(override=override):
+                with mock.patch.dict(os.environ, self.platform_launch_env(**override), clear=True):
+                    self.assertFalse(webapp.platform_launch_config_complete())
+
+    def test_platform_finalization_rejects_wrong_origin_without_platform_call(self):
+        env = self.platform_launch_env()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.object(webapp.urllib.request, "urlopen") as urlopen:
+                with LocalRunnerServer() as runner:
+                    request = urllib.request.Request(
+                        f"{runner.base_url}{webapp.PLATFORM_FINALIZATION_ENDPOINT}",
+                        data=b"",
+                        headers={
+                            "Origin": "https://other.example.test",
+                            webapp.PLATFORM_FINALIZATION_HANDLE_HEADER: "synthetic-handle",
+                        },
+                        method="POST",
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as error:
+                        opener.open(request, timeout=3)
+        self.assertEqual(error.exception.code, 403)
+        urlopen.assert_not_called()
+
+    def test_platform_security_singleton_headers_reject_duplicates(self):
+        env = self.platform_launch_env()
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.object(webapp.urllib.request, "urlopen") as urlopen:
+                with LocalRunnerServer() as runner:
+                    parsed = urllib.parse.urlparse(runner.base_url)
+                    cases = (
+                        (
+                            webapp.PLATFORM_LAUNCH_ENDPOINT,
+                            (
+                                (webapp.PLATFORM_LAUNCH_TOKEN_HEADER, "first-token"),
+                                (webapp.PLATFORM_LAUNCH_TOKEN_HEADER, "second-token"),
+                            ),
+                            400,
+                        ),
+                        (
+                            webapp.PLATFORM_FINALIZATION_ENDPOINT,
+                            (
+                                ("Origin", env["SQAG_PLATFORM_BASE_URL"]),
+                                ("Origin", "https://www.swooshz.com"),
+                                (webapp.PLATFORM_FINALIZATION_HANDLE_HEADER, "one-handle"),
+                            ),
+                            403,
+                        ),
+                        (
+                            webapp.PLATFORM_FINALIZATION_ENDPOINT,
+                            (
+                                ("Origin", env["SQAG_PLATFORM_BASE_URL"]),
+                                (webapp.PLATFORM_FINALIZATION_HANDLE_HEADER, "first-handle"),
+                                (webapp.PLATFORM_FINALIZATION_HANDLE_HEADER, "second-handle"),
+                            ),
+                            400,
+                        ),
+                    )
+                    for path, headers, expected_status in cases:
+                        with self.subTest(path=path, expected_status=expected_status):
+                            connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
+                            try:
+                                connection.putrequest("POST", path)
+                                for name, value in headers:
+                                    connection.putheader(name, value)
+                                connection.putheader("Content-Length", "0")
+                                connection.endheaders()
+                                response = connection.getresponse()
+                                response.read()
+                                self.assertEqual(response.status, expected_status)
+                            finally:
+                                connection.close()
+        urlopen.assert_not_called()
+
+    def test_platform_finalization_replay_and_mismatched_context_fail_closed(self):
+        env = self.platform_launch_env()
+        valid = {
+            "validationGrantId": "synthetic-validation-grant-123",
+            "userId": "platform-user-123",
+            "workspaceId": "workspace-123",
+            "appKey": "sqag",
+            "launchTokenExpiresAt": self.platform_consume_payload()["launchTokenExpiresAt"],
+            "currentRole": "owner",
+        }
+        calls = 0
+
+        def fake_urlopen(request, timeout=0):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return JsonResponseMock(valid)
+            raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, io.BytesIO(b"{}"))
+
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=fake_urlopen):
+                with LocalRunnerServer() as runner:
+                    for expected_status in (200, 502):
+                        request = urllib.request.Request(
+                            f"{runner.base_url}{webapp.PLATFORM_FINALIZATION_ENDPOINT}",
+                            data=b"",
+                            headers={
+                                "Origin": env["SQAG_PLATFORM_BASE_URL"],
+                                webapp.PLATFORM_FINALIZATION_HANDLE_HEADER: "synthetic-one-time-handle",
+                            },
+                            method="POST",
+                        )
+                        if expected_status == 200:
+                            response = opener.open(request, timeout=3)
+                            self.assertEqual(response.status, 200)
+                        else:
+                            with self.assertRaises(urllib.error.HTTPError) as error:
+                                opener.open(request, timeout=3)
+                            self.assertEqual(error.exception.code, expected_status)
+
+        for field, value in (("appKey", "other"), ("workspaceId", ""), ("userId", "")):
+            with self.subTest(field=field):
+                with mock.patch.dict(os.environ, env, clear=True):
+                    with mock.patch.object(
+                        webapp.urllib.request,
+                        "urlopen",
+                        return_value=JsonResponseMock({**valid, field: value}),
+                    ):
+                        with self.assertRaises(webapp.PlatformLaunchError):
+                            webapp.platform_finalization_context(
+                                "synthetic-one-time-handle",
+                                intended_sqag_origin="https://sqag.example.test",
+                            )
+
+    def test_platform_api_validation_runs_each_request_and_applies_role_downgrade(self):
+        env = self.platform_launch_env()
+        with mock.patch.dict(os.environ, env, clear=True):
+            session_cookie = (
+                f"{webapp.SESSION_COOKIE_NAME}="
+                f"{webapp.signed_cookie_value(self.platform_auth_session(membership_role='owner'))}"
+            )
+        roles = iter(("member", "viewer"))
+        captured: list[urllib.request.Request] = []
+
+        def fake_urlopen(request, timeout=0):
+            captured.append(request)
+            role = next(roles)
+            return JsonResponseMock(self.platform_validation_payload(
+                currentRole=role,
+                launchTokenExpiresAt="2000-01-01T00:00:00Z" if role == "viewer" else self.platform_consume_payload()["launchTokenExpiresAt"],
+            ))
+
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=fake_urlopen):
+                with LocalRunnerServer() as runner:
+                    first = json.loads(opener.open(urllib.request.Request(f"{runner.base_url}/api/session", headers={"Cookie": session_cookie}), timeout=3).read())
+                    second = json.loads(opener.open(urllib.request.Request(f"{runner.base_url}/api/session", headers={"Cookie": session_cookie}), timeout=3).read())
+
+        self.assertEqual(first["permissions"]["role"], "operator")
+        self.assertEqual(second["permissions"]["role"], "viewer")
+        self.assertEqual(len(captured), 2)
+        for request in captured:
+            self.assertEqual(request.full_url, env["SQAG_PLATFORM_BASE_URL"] + webapp.PLATFORM_ACCESS_VALIDATE_PATH)
+            self.assertEqual(request.get_header("X-sqag-validation-grant"), "synthetic-validation-grant-123")
+            self.assertEqual(request.get_header("X-sqag-service-authorization"), env["SQAG_PLATFORM_SERVICE_SECRET"])
+
+    def test_platform_api_validation_timeout_transport_non_2xx_malformed_and_binding_fail_closed(self):
+        env = self.platform_launch_env()
+        with mock.patch.dict(os.environ, env, clear=True):
+            cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(self.platform_auth_session())}"
+        failures = [
+            TimeoutError("synthetic timeout"),
+            urllib.error.URLError("synthetic transport"),
+            urllib.error.HTTPError("https://swooshz.com", 403, "Forbidden", {}, io.BytesIO(b"{}")),
+            JsonResponseMock(["not-an-object"]),
+            JsonResponseMock(self.platform_validation_payload(valid=False)),
+            JsonResponseMock(self.platform_validation_payload(appKey="other")),
+            JsonResponseMock(self.platform_validation_payload(workspaceId="other")),
+            JsonResponseMock(self.platform_validation_payload(userId="other")),
+        ]
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        for index, failure in enumerate(failures):
+            with self.subTest(index=index):
+                side_effect = failure if isinstance(failure, BaseException) else None
+                return_value = None if side_effect else failure
+                with mock.patch.dict(os.environ, env, clear=True):
+                    with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=side_effect, return_value=return_value):
+                        with LocalRunnerServer() as runner:
+                            request = urllib.request.Request(f"{runner.base_url}/api/session", headers={"Cookie": cookie})
+                            with self.assertRaises(urllib.error.HTTPError) as error:
+                                opener.open(request, timeout=3)
+                            self.assertEqual(error.exception.code, 401)
+
+    def test_platform_logout_revokes_grant_best_effort_and_always_clears_local_cookie(self):
+        env = self.platform_launch_env()
+        with mock.patch.dict(os.environ, env, clear=True):
+            cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(self.platform_auth_session())}"
+        opener = self.no_redirect_opener()
+        captured: list[urllib.request.Request] = []
+
+        def failed_revoke(request, timeout=0):
+            captured.append(request)
+            raise urllib.error.URLError("synthetic unavailable")
+
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=failed_revoke):
+                with LocalRunnerServer() as runner:
+                    request = urllib.request.Request(f"{runner.base_url}/logout", headers={"Cookie": cookie})
+                    with self.assertRaises(urllib.error.HTTPError) as redirect:
+                        opener.open(request, timeout=3)
+        self.assertEqual(redirect.exception.code, 302)
+        self.assertTrue(any(value.startswith(f"{webapp.SESSION_COOKIE_NAME}=") and "Max-Age=0" in value for value in redirect.exception.headers.get_all("Set-Cookie")))
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].full_url, env["SQAG_PLATFORM_BASE_URL"] + webapp.PLATFORM_ACCESS_REVOKE_PATH)
+        self.assertEqual(captured[0].get_header("X-sqag-validation-grant"), "synthetic-validation-grant-123")
+
+    def test_platform_finalized_cookie_revalidates_after_sqag_server_replacement(self):
+        env = self.platform_launch_env()
+        finalization_payload = {
+            "validationGrantId": "synthetic-validation-grant-123",
+            "userId": "platform-user-123",
+            "workspaceId": "workspace-123",
+            "appKey": "sqag",
+            "launchTokenExpiresAt": self.platform_consume_payload()["launchTokenExpiresAt"],
+            "currentRole": "owner",
+        }
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.object(webapp.urllib.request, "urlopen", return_value=JsonResponseMock(finalization_payload)):
+                with LocalRunnerServer() as first_runner:
+                    request = urllib.request.Request(
+                        f"{first_runner.base_url}{webapp.PLATFORM_FINALIZATION_ENDPOINT}",
+                        data=b"",
+                        headers={
+                            "Origin": env["SQAG_PLATFORM_BASE_URL"],
+                            webapp.PLATFORM_FINALIZATION_HANDLE_HEADER: "synthetic-one-time-handle",
+                        },
+                        method="POST",
+                    )
+                    finalized = opener.open(request, timeout=3)
+                    cookie = finalized.headers["Set-Cookie"].split(";", 1)[0]
+
+            with mock.patch.object(
+                webapp.urllib.request,
+                "urlopen",
+                return_value=JsonResponseMock(self.platform_validation_payload()),
+            ) as validate:
+                with LocalRunnerServer() as replacement_runner:
+                    request = urllib.request.Request(
+                        f"{replacement_runner.base_url}/api/session",
+                        headers={"Cookie": cookie},
+                    )
+                    body = json.loads(opener.open(request, timeout=3).read())
+
+        self.assertTrue(body["authenticated"])
+        self.assertEqual(body["user"]["account"], "workspace-123")
+        self.assertEqual(validate.call_count, 1)
 
     def test_platform_launch_rejects_unsupported_membership_role(self):
         payload = self.platform_consume_payload(membershipRole="billing-admin")
@@ -5284,7 +5767,7 @@ class WebappServerTest(unittest.TestCase):
                 f"{webapp.SESSION_COOKIE_NAME}="
                 f"{webapp.signed_cookie_value(self.platform_auth_session('workspace-b', user_id='user-b'))}"
             )
-            with mock.patch.object(webapp.QuoteRunnerHandler, "current_quote_session_storage", return_value=stored):
+            with mock.patch.object(webapp, "validated_platform_auth_session", side_effect=lambda session: session), mock.patch.object(webapp.QuoteRunnerHandler, "current_quote_session_storage", return_value=stored):
                 with LocalRunnerServer() as runner:
                     session_a = self.http_json(runner, "GET", "/api/session", cookie=cookie_a)
                     session_b = self.http_json(runner, "GET", "/api/session", cookie=cookie_b)
@@ -5357,6 +5840,30 @@ class WebappServerTest(unittest.TestCase):
         ):
             self.assertIn(key, values)
             self.assertTrue(deploy_template.is_placeholder(values[key]), key)
+
+    def test_internal_uat_coolify_env_template_rejects_disguised_platform_service_secret(self):
+        source = ROOT / "deploy" / "internal-uat" / "coolify" / "sqag.uat.env.example"
+        source_text = source.read_text(encoding="utf-8")
+        disguised_secret = source_text.replace(
+            "SQAG_PLATFORM_SERVICE_SECRET=<host-secret-manager-platform-service-secret>",
+            "SQAG_PLATFORM_SERVICE_SECRET=<literal-reusable-service-credential>",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "sqag.uat.env.example"
+            template.write_text(disguised_secret, encoding="utf-8")
+            result = deploy_template.verify_template(template)
+
+        findings = [deploy_template.finding_to_dict(finding) for finding in result["findings"]]
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn(
+            {
+                "key": "SQAG_PLATFORM_SERVICE_SECRET",
+                "category": "unexpected-placeholder",
+                "message": "security-sensitive placeholder does not match the approved template marker",
+            },
+            findings,
+        )
 
     def test_internal_uat_coolify_env_template_requires_placeholder_proxy_cidrs(self):
         source = ROOT / 'deploy' / 'internal-uat' / 'coolify' / 'sqag.uat.env.example'
@@ -10136,7 +10643,7 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(webapp.RATE_LIMIT_OVERFLOW_BUCKETS, {})
 
     def test_http_post_requires_allowed_host_csrf_and_json_content_type(self):
-        with LocalRunnerServer() as runner:
+        with LocalRunnerServer(allow_any_host=False, canonical_origin=False) as runner:
             session_response = urllib.request.urlopen(f"{runner.base_url}/api/session", timeout=3)
             cache_control = session_response.headers["Cache-Control"]
             for directive in ("no-store", "no-cache", "must-revalidate", "max-age=0", "private"):
@@ -10456,7 +10963,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 owner_cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(self.platform_auth_session('workspace-a', user_id='owner-user'))}"
                 other_cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(self.platform_auth_session('workspace-b', user_id='other-user'))}"
                 webapp.apply_sqag_storage_migrations(database_url)
-                with LocalRunnerServer() as runner:
+                with mock.patch.object(webapp, "validated_platform_auth_session", side_effect=lambda session: session), LocalRunnerServer() as runner:
                     parsed = urllib.parse.urlparse(runner.base_url)
                     for cookie in (owner_cookie, other_cookie):
                         with self.subTest(cookie=cookie[:20]):
@@ -10511,7 +11018,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
             same_workspace_cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(same_workspace_other)}"
             other_workspace_cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(other_workspace_admin)}"
 
-            with LocalRunnerServer() as runner:
+            with mock.patch.object(webapp, "validated_platform_auth_session", side_effect=lambda session: session), LocalRunnerServer() as runner:
                 owner_request = urllib.request.Request(
                     f"{runner.base_url}/api/jobs/{job_id}",
                     headers={"Cookie": owner_cookie},
@@ -10976,7 +11483,11 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
             QUOTE_DATA_ROOT=str(data_root),
             QUOTE_LOG_ROOT=str(log_root),
         )
-        with mock.patch.dict(os.environ, env, clear=True):
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+            webapp,
+            "validated_platform_auth_session",
+            side_effect=lambda session: session,
+        ):
             session_cookie = (
                 f"{webapp.SESSION_COOKIE_NAME}="
                 f"{webapp.signed_cookie_value(platform_session)}"
@@ -23277,6 +23788,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         private_customer = "Synthetic Object Artifact Customer"
         root = test_temp_root() / f"object-artifact-fail-closed-{time.time_ns()}"
         output_root = root / "output"
+        job_id = f"job-object-artifact-protected-{time.time_ns()}"
         payload = valid_payload()
         payload["client"]["name"] = private_customer
 
@@ -23305,7 +23817,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 payload,
                 output_root=output_root,
                 tmp_root=root / "tmp",
-                job_id="job-object-artifact-protected",
+                job_id=job_id,
                 auth_session=self.platform_auth_session("workspace-object-runtime"),
             )
 
@@ -23318,13 +23830,14 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertNotIn(private_customer, result_text)
         self.assertNotIn("synthetic-private-object-quote", result_text)
         self.assertNotIn(str(output_root), result_text)
-        self.assertFalse((output_root / "job-object-artifact-protected" / "quotation.xlsx").exists())
+        self.assertFalse((output_root / job_id / "quotation.xlsx").exists())
 
     def test_object_artifact_storage_mode_with_incomplete_provider_config_fails_closed(self):
         example_endpoint = "https://object-store.example.test/path"
         example_bucket = "example-artifact-bucket"
         example_access_key = "EXAMPLE_ACCESS_KEY_ID"
         root = test_temp_root() / f"object-artifact-incomplete-provider-{time.time_ns()}"
+        job_id = f"job-object-provider-incomplete-{time.time_ns()}"
         payload = valid_payload()
 
         env = self.deploy_auth_env(
@@ -23345,7 +23858,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 payload,
                 output_root=root / "output",
                 tmp_root=root / "tmp",
-                job_id="job-object-provider-incomplete",
+                job_id=job_id,
                 auth_session=self.platform_auth_session("workspace-object-provider"),
             )
 
@@ -28928,6 +29441,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         root = test_temp_root() / f"local-artifact-protected-deploy-{time.time_ns()}"
         output_root = root / "output"
         log_root = root / "logs"
+        job_id = f"job-local-artifact-protected-{time.time_ns()}"
         payload = valid_payload()
         payload["client"]["name"] = private_customer
 
@@ -28954,7 +29468,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 payload,
                 output_root=output_root,
                 tmp_root=root / "tmp",
-                job_id="job-local-artifact-protected",
+                job_id=job_id,
                 auth_session={"user": {"subject": "deploy-user", "email": "alex@example.com"}},
             )
 
@@ -28966,7 +29480,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertNotIn(private_customer, result_text)
         self.assertNotIn("synthetic-private-quote-content", result_text)
         self.assertNotIn(str(output_root), result_text)
-        self.assertFalse((output_root / "job-local-artifact-protected" / "quotation.xlsx").exists())
+        self.assertFalse((output_root / job_id / "quotation.xlsx").exists())
 
         log_records = []
         for log_path in log_root.rglob("*.jsonl"):
@@ -28986,6 +29500,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         private_customer = "Synthetic Platform Artifact Customer"
         root = test_temp_root() / f"local-artifact-platform-context-{time.time_ns()}"
         output_root = root / "output"
+        job_id = f"job-local-artifact-platform-{time.time_ns()}"
         payload = valid_payload()
         payload["client"]["name"] = private_customer
 
@@ -29013,7 +29528,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 payload,
                 output_root=output_root,
                 tmp_root=root / "tmp",
-                job_id="job-local-artifact-platform",
+                job_id=job_id,
                 auth_session=self.platform_auth_session("workspace-local-artifact"),
             )
 
@@ -29025,7 +29540,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertNotIn(private_customer, result_text)
         self.assertNotIn("synthetic-platform-quote-content", result_text)
         self.assertNotIn(str(output_root), result_text)
-        self.assertFalse((output_root / "job-local-artifact-platform" / "quotation.xlsx").exists())
+        self.assertFalse((output_root / job_id / "quotation.xlsx").exists())
 
     def test_protected_settings_profile_layout_upload_blocks_local_artifact_storage(self):
         root = test_temp_root() / f"profile-layout-artifact-block-{time.time_ns()}"
@@ -29043,7 +29558,11 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             QUOTE_DATA_ROOT=str(root / "data"),
             QUOTE_LOG_ROOT=str(root / "logs"),
         )
-        with mock.patch.dict(os.environ, env, clear=True):
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+            webapp,
+            "validated_platform_auth_session",
+            side_effect=lambda session: session,
+        ):
             session_cookie = (
                 f"{webapp.SESSION_COOKIE_NAME}="
                 f"{webapp.signed_cookie_value(platform_session)}"
@@ -29082,7 +29601,11 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             SQAG_LOCAL_PRICING_REFERENCES_ROOT=str(root / "pricing-references"),
             QUOTE_LOG_ROOT=str(root / "logs"),
         )
-        with mock.patch.dict(os.environ, env, clear=True):
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+            webapp,
+            "validated_platform_auth_session",
+            side_effect=lambda session: session,
+        ):
             session_cookie = (
                 f"{webapp.SESSION_COOKIE_NAME}="
                 f"{webapp.signed_cookie_value(platform_session)}"

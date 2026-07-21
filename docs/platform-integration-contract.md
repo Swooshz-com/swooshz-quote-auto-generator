@@ -60,6 +60,9 @@ host secret manager or local UAT process environment and must not be committed.
 
 - `SQAG_PLATFORM_LAUNCH_MODE`
 - `SQAG_PLATFORM_BASE_URL`
+- `SQAG_PUBLIC_BASE_URL`
+- `SQAG_PLATFORM_SERVICE_SECRET`
+- `SQAG_PLATFORM_REQUEST_TIMEOUT_SECONDS` (optional, non-secret, bounded)
 - `SESSION_SECRET`
 - `SQAG_STORAGE_MODE`
 - `SQAG_ARTIFACT_STORAGE_MODE`
@@ -114,11 +117,35 @@ SQAG accepts only the safe Platform consume response shape:
 - `app.appName`
 - `membershipRole`
 - `launchTokenExpiresAt`
+- `validationGrantId`
 
 SQAG rejects missing tokens, consume transport failures, oversized or invalid
 JSON responses, non-`consumed` outcomes, app keys other than `sqag`, missing
-platform user IDs, missing workspace IDs, unsupported membership roles, and
-expired launch-token timestamps.
+platform user IDs, missing workspace IDs, unsupported membership roles,
+missing/malformed/naive/expired/inconsistently distant launch-token timestamps,
+and missing validation grant IDs.
+
+After launch consume, SQAG creates a cryptographically random handle and
+registers only `handleHashSha256`, its short mandatory expiry, the grant ID, and
+the intended SQAG origin at Platform's service-authenticated finalization
+register route. SQAG returns the raw handle only in
+`X-SQAG-Finalization-Handle`. The exact configured Platform origin may send it
+to `POST /api/auth/platform/finalize`; SQAG consumes it with Platform and only
+then sets its host-only cookie. The handle never enters URLs, bodies, DOM,
+storage, cookies, logs, or telemetry.
+
+Each authenticated SQAG API request sends the non-secret grant ID and
+`{workspaceId, appKey: "sqag"}` to Platform's validation route under
+`X-SQAG-Service-Authorization`. Timeout, transport, non-2xx, malformed, invalid,
+expired, revoked, disabled-user, membership, entitlement, app, user, or
+workspace mismatch all fail closed. Current Platform role replaces the cookie
+role for that request, so downgrades are immediate. Logout clears the local
+cookie even if best-effort Platform revoke is unavailable.
+
+Production uses only `https://swooshz.com` as the Platform/CORS origin and
+`https://quote.swooshz.com` as SQAG's canonical public origin. Deploy Host
+validation and finalization binding use `SQAG_PUBLIC_BASE_URL`; the `www`
+hostname redirects permanently to the apex and is not accepted as CORS.
 
 ## Role And Capability Expectations
 
@@ -165,7 +192,7 @@ Platform credentials:
 
 | Coverage area | Existing tests |
 | --- | --- |
-| Header-only launch consume and safe session creation | `test_platform_launch_mode_consumes_header_token_and_sets_safe_session` |
+| Header-only launch, hashed finalization registration, and host-only session creation | `test_platform_launch_registers_header_only_finalization_then_sets_safe_host_cookie` |
 | Missing, wrong-app, failed, expired, and unsupported launch contexts | `test_platform_launch_rejects_*` platform launch tests |
 | Role mapping and unsupported-role fail closed behavior | `test_platform_launch_supported_roles_map_to_permissions`, `test_platform_session_with_unsupported_role_does_not_fallback_to_local_permissions` |
 | Deploy guard satisfied by complete Platform config | `test_platform_launch_mode_satisfies_deploy_guard_without_oidc` |
@@ -209,6 +236,10 @@ The expected post-migration Platform contract remains:
   only safe user/workspace/app/membership context for `appKey=sqag`.
 - Platform viewer access for SQAG is blocked because SQAG has no approved
   read-only launch mode.
+- Platform stores finalization handles only as hashes, consumes them atomically,
+  and keeps their single-use state durable across SQAG restarts/replacements.
+- Platform owns grant validation/revocation and rechecks user, membership,
+  entitlement, app, workspace, and current role on every SQAG API validation.
 
 ## Hosted Readiness Checklist
 

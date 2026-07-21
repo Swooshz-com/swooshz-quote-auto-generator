@@ -7,8 +7,9 @@ SQAG mode.
 ## Boundary
 
 Swooshz Platform owns login, platform sessions, users, workspaces, membership
-roles, app entitlements, and app access decisions. SQAG consumes only the
-platform launch context needed to create its own runtime session.
+roles, app entitlements, app access decisions, finalization state, and
+validation-grant lifecycle. SQAG keeps only its signed host-only runtime cookie
+with safe Platform context and the non-secret validation grant ID.
 
 SQAG must not store provider tokens, raw provider claims, auth codes, OIDC
 state, nonce, platform session cookies, raw launch tokens, or platform database
@@ -44,7 +45,10 @@ $env:APP_MODE="deploy"
 $env:AUTH_REQUIRED="true"
 $env:SESSION_SECRET="<sqag-session-secret>"
 $env:SQAG_PLATFORM_LAUNCH_MODE="platform"
-$env:SQAG_PLATFORM_BASE_URL="https://platform.example.test"
+$env:SQAG_PLATFORM_BASE_URL="https://swooshz.com"
+$env:SQAG_PUBLIC_BASE_URL="https://quote.swooshz.com"
+$env:SQAG_PLATFORM_SERVICE_SECRET="<host-managed-shared-secret>"
+$env:SQAG_PLATFORM_REQUEST_TIMEOUT_SECONDS="10"
 ```
 
 `SQAG_PLATFORM_LAUNCH_MODE=disabled` is the default and keeps the existing
@@ -67,8 +71,26 @@ X-App-Launch-Token: <one-time-platform-launch-token>
 ```
 
 The raw token must not be placed in query parameters, browser storage, logs,
-files, screenshots, docs, or telemetry. After consume, SQAG stores only the safe
-platform context returned by the consume response in its signed SQAG session.
+files, screenshots, docs, or telemetry. Consume must return a mandatory,
+timezone-aware, future, bounded `launchTokenExpiresAt` plus a non-secret
+`validationGrantId`. SQAG then generates a random short-lived finalization
+handle, registers only its SHA-256 hash with Platform, and returns the raw
+handle only in `X-SQAG-Finalization-Handle`.
+
+The browser sends that header from the exact configured Platform origin to
+`POST /api/auth/platform/finalize`. SQAG consumes the handle server-to-server,
+then sets only its host-only `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`
+cookie. It never sets a Platform cookie or a parent-domain cookie. Every later
+authenticated SQAG API request validates the non-secret grant ID with Platform
+under `X-SQAG-Service-Authorization`; validation failures and authority changes
+take effect on that request. Logout always clears the SQAG cookie and attempts
+to revoke the Platform grant.
+
+Production routing is exact: Platform is `https://swooshz.com`,
+`https://www.swooshz.com` permanently redirects to the apex, and SQAG is
+`https://quote.swooshz.com`. `SQAG_PUBLIC_BASE_URL` binds deploy Host checks and
+finalization state to the exact SQAG origin; wrong hosts or ports are rejected.
+`app.swooshz.com` is not a production Platform origin.
 
 ## Accepted Consume Context
 
@@ -86,6 +108,7 @@ SQAG stores only these fields:
 - `app.appName`
 - `membershipRole`
 - `launchTokenExpiresAt`
+- `validationGrantId`
 
 SQAG rejects missing tokens, consume failures, non-`consumed` outcomes, wrong
 app keys, missing platform user IDs, missing workspace IDs, and stale expiry

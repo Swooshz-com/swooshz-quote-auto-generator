@@ -8,7 +8,7 @@ with synthetic values only.
 
 This is not an account system, public SaaS launch, customer portal, billing
 flow, database-backed user model, or production deployment plan. Hosted SQAG
-uses only the Swooshz Platform launch boundary so the authenticated session
+uses only the Swooshz Platform launch/finalization/validation boundary so the authenticated session
 includes the trusted workspace, membership role, and entitlement.
 
 ## Approved Tester Launch Flow
@@ -22,7 +22,8 @@ launch token server-side and creates only its own signed session.
 Approved testers should expect:
 
 - A normal sign-in and workspace-selection flow owned by Swooshz Platform.
-- Return to SQAG after a successful Platform launch consume.
+- Return to SQAG after a successful exact-origin, header-only Platform
+  finalization that sets only the SQAG host-only cookie.
 - A privacy-safe dashboard state such as `Signed in as approved tester`.
 - A logout action that clears the SQAG session and returns to Platform.
 
@@ -47,7 +48,7 @@ python scripts\verify_internal_alpha_hosted_validation.py --work-dir _tmp\valida
 ```
 
 ```powershell
-python -m unittest tests.test_webapp.WebappServerTest.test_platform_launch_mode_consumes_header_token_and_sets_safe_session
+python -m unittest tests.test_webapp.WebappServerTest.test_platform_launch_registers_header_only_finalization_then_sets_safe_host_cookie
 python -m unittest tests.test_webapp.WebappServerTest.test_deploy_logout_clears_session_and_state_cookies
 python -m unittest tests.test_webapp.WebappServerTest.test_deploy_rejects_oidc_identity_without_platform_workspace_context
 python -m unittest tests.test_webapp.WebappServerTest.test_internal_uat_coolify_env_template_is_offline_verifiable
@@ -72,7 +73,7 @@ These checks verify:
 - Unauthenticated browser requests redirect to login.
 - Unauthenticated API requests return `auth_required`.
 - `/login` redirects to the configured synthetic Platform URL.
-- Mocked Platform consume success sets a signed session containing only trusted
+- Mocked Platform consume/finalization success sets a signed session containing only trusted
   workspace, membership, entitlement, and privacy-minimized user metadata.
 - Missing, replayed, malformed, or denied launch tokens are blocked without
   leaking private values.
@@ -106,7 +107,10 @@ $env:SQAG_STORAGE_MODE="<database>"
 $env:SQAG_ARTIFACT_STORAGE_MODE="<object-for-readiness-or-database-for-negative-test>"
 $env:SQAG_DATABASE_URL="<synthetic-database-url>"
 $env:SQAG_PLATFORM_LAUNCH_MODE="<platform>"
-$env:SQAG_PLATFORM_BASE_URL="<synthetic-platform-base-url>"
+$env:SQAG_PLATFORM_BASE_URL="https://swooshz.com"
+$env:SQAG_PUBLIC_BASE_URL="https://quote.swooshz.com"
+$env:SQAG_PLATFORM_SERVICE_SECRET="<synthetic-shared-service-secret>"
+$env:SQAG_PLATFORM_REQUEST_TIMEOUT_SECONDS="<10>"
 ```
 
 Do not commit populated env files, real provider values, private local paths,

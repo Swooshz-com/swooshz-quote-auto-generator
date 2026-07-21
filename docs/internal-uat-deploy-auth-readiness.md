@@ -52,10 +52,13 @@ The deploy/auth surface is already represented in `.env.example` and
   storage.
 - `SQAG_DATABASE_URL`: database connection configured through the host secret
   manager only.
-- `SQAG_PLATFORM_LAUNCH_MODE` and `SQAG_PLATFORM_BASE_URL`: mandatory
-  platform/workspace launch context for protected hosted/deploy use. The
-  platform base URL must use HTTPS, except loopback HTTP is allowed for local
-  smoke-only endpoints.
+- `SQAG_PLATFORM_LAUNCH_MODE`, `SQAG_PLATFORM_BASE_URL`,
+  `SQAG_PUBLIC_BASE_URL`, and `SQAG_PLATFORM_SERVICE_SECRET`: mandatory platform/workspace launch,
+  finalization, validation, and revoke boundary for protected hosted/deploy
+  use. `SQAG_PLATFORM_REQUEST_TIMEOUT_SECONDS` is an optional bounded,
+  non-secret timeout. The
+  deploy mode fixes these origins to `https://swooshz.com` and
+  `https://quote.swooshz.com`; loopback flexibility is local-mode only.
 - `SQAG_TRUSTED_PROXY_CIDRS`: mandatory deploy-mode comma-separated CIDRs for
   only the reverse-proxy peers that connect directly to SQAG. SQAG accepts a
   bounded, valid `X-Forwarded-For` chain only from those peers, walks the chain
@@ -88,8 +91,9 @@ state cookies are emitted with `Secure`, `HttpOnly`, and `SameSite=Lax`.
   Forwarded headers are not logged and cannot be used by a direct untrusted
   client to select a rate-limit bucket.
 - Deploy request authentication accepts only a signed session containing the
-  consumed Platform user, workspace, SQAG app key, and supported membership
-  role. A still-valid pre-upgrade OIDC-only cookie is rejected as
+  consumed Platform user, workspace, SQAG app key, supported membership role,
+  and non-secret validation grant ID. Every authenticated API request rechecks
+  that grant and replaces the role with Platform's current result. A still-valid pre-upgrade OIDC-only cookie is rejected as
   unauthenticated and receives no deploy permissions.
 - Platform mode does not process the legacy OIDC callback. Logout remains
   available to clear both session and OIDC-state cookies and returns to the
@@ -210,6 +214,7 @@ while checking env values.
       `APP_MODE`, `AUTH_REQUIRED`, `SESSION_SECRET`, `SQAG_STORAGE_MODE`,
       `SQAG_ARTIFACT_STORAGE_MODE`, `SQAG_DATABASE_URL`,
       `SQAG_PLATFORM_LAUNCH_MODE`, `SQAG_PLATFORM_BASE_URL`,
+      `SQAG_PUBLIC_BASE_URL`, `SQAG_PLATFORM_SERVICE_SECRET`,
       `SQAG_TRUSTED_PROXY_CIDRS`, and runtime housekeeping root envs.
 - [ ] Run `python webapp\server.py --check-deploy-uat-env`.
 - [ ] Run `python scripts\verify_internal_alpha_hosted_validation.py --work-dir _tmp\validation\hosted-blocked`.
@@ -224,8 +229,12 @@ while checking env values.
       database schema, object-artifact metadata schema, and object-storage
       bucket probe pass; dependency failure must return metadata-only HTTP 503.
 - [ ] Confirm unauthenticated users are blocked or redirected.
-- [ ] Confirm Swooshz Platform launch consume creates a session containing the
-      intended workspace and membership role without returning the launch token.
+- [ ] Confirm launch consume registers a hashed short-lived finalization handle,
+      exact-origin browser finalization sets only the host-only SQAG cookie, and
+      handle replay fails without returning the launch token or raw handle in a body/URL.
+- [ ] Confirm validation runs on every authenticated SQAG API request and that
+      revoke, expiry, role downgrade, user/membership/entitlement disable, and
+      Platform unavailability deny or reduce authority on the next request.
 - [ ] Confirm distinct forwarded clients behind the configured trusted proxy do
       not share one Platform-launch or mutable-route rate-limit bucket, while
       repeated requests from the same effective client still receive HTTP 429.

@@ -63,6 +63,9 @@ class InlineDraftObjectMigrationTest(unittest.TestCase):
         }
 
     def auth_session(self, workspace_id, user_id="migration-user", membership_role="owner"):
+        launch_expiry = (
+            webapp.dt.datetime.now(webapp.dt.timezone.utc) + webapp.dt.timedelta(minutes=5)
+        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         context = webapp.safe_platform_launch_context(
             {
                 "outcome": "consumed",
@@ -79,7 +82,8 @@ class InlineDraftObjectMigrationTest(unittest.TestCase):
                 },
                 "app": {"appKey": "sqag", "appName": "SQAG"},
                 "membershipRole": membership_role,
-                "launchTokenExpiresAt": "2999-01-01T00:00:00.000Z",
+                "launchTokenExpiresAt": launch_expiry,
+                "validationGrantId": f"synthetic-grant-{workspace_id}-{user_id}",
             }
         )
         return {

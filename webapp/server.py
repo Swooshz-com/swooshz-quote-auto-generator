@@ -295,6 +295,9 @@ OIDC_USERINFO_URL_ENV_NAME = "OIDC_USERINFO_URL"
 OIDC_LOGOUT_URL_ENV_NAME = "OIDC_LOGOUT_URL"
 PLATFORM_LAUNCH_MODE_ENV_NAME = "SQAG_PLATFORM_LAUNCH_MODE"
 PLATFORM_BASE_URL_ENV_NAME = "SQAG_PLATFORM_BASE_URL"
+SQAG_PUBLIC_BASE_URL_ENV_NAME = "SQAG_PUBLIC_BASE_URL"
+PLATFORM_SERVICE_SECRET_ENV_NAME = "SQAG_PLATFORM_SERVICE_SECRET"
+PLATFORM_REQUEST_TIMEOUT_ENV_NAME = "SQAG_PLATFORM_REQUEST_TIMEOUT_SECONDS"
 AUTH_ALLOWED_EMAILS_ENV_NAME = "AUTH_ALLOWED_EMAILS"
 AUTH_ALLOWED_DOMAINS_ENV_NAME = "AUTH_ALLOWED_DOMAINS"
 AUTH_ALLOW_ANY_AUTHENTICATED_USER_ENV_NAME = "AUTH_ALLOW_ANY_AUTHENTICATED_USER"
@@ -322,9 +325,23 @@ MAX_FORWARDED_FOR_HOPS = 32
 OIDC_PROVIDER_TIMEOUT_SECONDS = 15
 OIDC_PROVIDER_MAX_RESPONSE_BYTES = 128 * 1024
 PLATFORM_LAUNCH_ENDPOINT = "/api/platform/launch"
+PLATFORM_FINALIZATION_ENDPOINT = "/api/auth/platform/finalize"
 PLATFORM_APP_KEY = "sqag"
 PLATFORM_LAUNCH_TOKEN_HEADER = "X-App-Launch-Token"
-PLATFORM_LAUNCH_PROVIDER_TIMEOUT_SECONDS = 15
+PLATFORM_FINALIZATION_HANDLE_HEADER = "X-SQAG-Finalization-Handle"
+PLATFORM_SERVICE_AUTHORIZATION_HEADER = "X-SQAG-Service-Authorization"
+PLATFORM_VALIDATION_GRANT_HEADER = "X-SQAG-Validation-Grant"
+PLATFORM_FINALIZATION_REGISTER_PATH = "/api/internal/sqag/finalizations/register"
+PLATFORM_FINALIZATION_CONSUME_PATH = "/api/internal/sqag/finalizations/consume"
+PLATFORM_ACCESS_VALIDATE_PATH = "/api/internal/sqag/access/validate"
+PLATFORM_ACCESS_REVOKE_PATH = "/api/internal/sqag/access/revoke"
+PLATFORM_REQUEST_TIMEOUT_SECONDS_DEFAULT = 10
+PLATFORM_REQUEST_TIMEOUT_SECONDS_MIN = 1
+PLATFORM_REQUEST_TIMEOUT_SECONDS_MAX = 30
+PLATFORM_LAUNCH_MAX_FUTURE_SECONDS = 10 * 60
+PLATFORM_FINALIZATION_TTL_SECONDS = 2 * 60
+PRODUCTION_PLATFORM_ORIGIN = "https://swooshz.com"
+PRODUCTION_SQAG_ORIGIN = "https://quote.swooshz.com"
 PLATFORM_LAUNCH_PROVIDER_MAX_RESPONSE_BYTES = 64 * 1024
 PLATFORM_MEMBERSHIP_ROLE_TO_LOCAL_ROLE = {
     "owner": "admin",
@@ -343,6 +360,7 @@ RATE_LIMIT_PRUNE_INTERVAL_SECONDS = 15
 MAX_RATE_LIMIT_BUCKETS = 4096
 POST_RATE_LIMITS = {
     PLATFORM_LAUNCH_ENDPOINT: 20,
+    PLATFORM_FINALIZATION_ENDPOINT: 30,
     "/api/jobs": 30,
     "/api/draft": 15,
     "/api/generate": 15,
@@ -1596,9 +1614,42 @@ def configured_platform_base_url() -> str:
     if not base_url:
         return ""
     parsed = urlparse(base_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment:
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.path not in {"", "/"}
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or parsed.username
+        or parsed.password
+    ):
         return ""
     if not url_uses_https_or_loopback_http(base_url):
+        return ""
+    if configured_app_mode() == "deploy" and base_url != PRODUCTION_PLATFORM_ORIGIN:
+        return ""
+    return base_url
+
+
+def configured_sqag_public_base_url() -> str:
+    base_url = clean_text(read_dotenv_value(SQAG_PUBLIC_BASE_URL_ENV_NAME)).rstrip("/")
+    if not base_url:
+        return ""
+    parsed = urlparse(base_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.path not in {"", "/"}
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or parsed.username
+        or parsed.password
+        or not url_uses_https_or_loopback_http(base_url)
+    ):
+        return ""
+    if configured_app_mode() == "deploy" and base_url != PRODUCTION_SQAG_ORIGIN:
         return ""
     return base_url
 
@@ -1608,13 +1659,39 @@ def configured_platform_home_url() -> str:
     return f"{base_url}/" if base_url else ""
 
 
+def configured_platform_service_secret() -> str:
+    return clean_text(read_dotenv_value(PLATFORM_SERVICE_SECRET_ENV_NAME))
+
+
+def configured_platform_request_timeout_seconds() -> int:
+    raw = clean_text(read_dotenv_value(PLATFORM_REQUEST_TIMEOUT_ENV_NAME))
+    if not raw:
+        return PLATFORM_REQUEST_TIMEOUT_SECONDS_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        return PLATFORM_REQUEST_TIMEOUT_SECONDS_DEFAULT
+    return max(PLATFORM_REQUEST_TIMEOUT_SECONDS_MIN, min(value, PLATFORM_REQUEST_TIMEOUT_SECONDS_MAX))
+
+
 def platform_launch_consume_url() -> str:
     base_url = configured_platform_base_url()
     return f"{base_url}/api/platform/apps/launch/consume?{urlencode({'appKey': PLATFORM_APP_KEY})}" if base_url else ""
 
 
+def platform_internal_url(path: str) -> str:
+    base_url = configured_platform_base_url()
+    return f"{base_url}{path}" if base_url and path.startswith("/") else ""
+
+
 def platform_launch_config_complete() -> bool:
-    return bool(platform_launch_mode_enabled() and deploy_session_secret_ready() and configured_platform_base_url())
+    return bool(
+        platform_launch_mode_enabled()
+        and deploy_session_secret_ready()
+        and configured_platform_base_url()
+        and configured_sqag_public_base_url()
+        and configured_platform_service_secret()
+    )
 
 
 def allowed_auth_emails() -> set[str]:
@@ -1939,37 +2016,82 @@ def oidc_fetch_userinfo(access_token: str) -> dict[str, Any]:
     return claims
 
 
-def platform_launch_json_request(request: urllib.request.Request) -> dict[str, Any]:
+def platform_json_request(
+    request: urllib.request.Request,
+    *,
+    expected_statuses: tuple[int, ...] = (200,),
+) -> dict[str, Any]:
     try:
-        with urllib.request.urlopen(request, timeout=PLATFORM_LAUNCH_PROVIDER_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(request, timeout=configured_platform_request_timeout_seconds()) as response:
+            status = int(getattr(response, "status", 200))
             raw = response.read(PLATFORM_LAUNCH_PROVIDER_MAX_RESPONSE_BYTES + 1)
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, http.client.HTTPException, OSError) as exc:
         raise PlatformLaunchError(
-            "Platform launch could not be verified.",
+            "Platform request could not be verified.",
             status=502,
-            reason="platform_launch_consume_failed",
+            reason="platform_request_failed",
         ) from exc
+    if status not in expected_statuses:
+        raise PlatformLaunchError(
+            "Platform request could not be verified.",
+            status=502,
+            reason="platform_response_status_invalid",
+        )
     if len(raw) > PLATFORM_LAUNCH_PROVIDER_MAX_RESPONSE_BYTES:
         raise PlatformLaunchError(
-            "Platform launch could not be verified.",
+            "Platform request could not be verified.",
             status=502,
-            reason="platform_launch_response_too_large",
+            reason="platform_response_too_large",
         )
+    if status == 204:
+        if raw:
+            raise PlatformLaunchError(
+                "Platform request could not be verified.",
+                status=502,
+                reason="platform_response_body_unexpected",
+            )
+        return {}
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PlatformLaunchError(
-            "Platform launch could not be verified.",
+            "Platform request could not be verified.",
             status=502,
-            reason="platform_launch_invalid_json",
+            reason="platform_response_invalid_json",
         ) from exc
     if not isinstance(payload, dict):
         raise PlatformLaunchError(
-            "Platform launch could not be verified.",
+            "Platform request could not be verified.",
             status=502,
-            reason="platform_launch_invalid_json",
+            reason="platform_response_invalid_json",
         )
     return payload
+
+
+def platform_service_request(
+    path: str,
+    *,
+    payload: dict[str, Any],
+    extra_headers: Mapping[str, str] | None = None,
+    expected_statuses: tuple[int, ...] = (200,),
+) -> dict[str, Any]:
+    secret = configured_platform_service_secret()
+    url = platform_internal_url(path)
+    if not secret or not url:
+        raise PlatformLaunchError(
+            "Platform request could not be verified.",
+            status=503,
+            reason="platform_service_not_configured",
+        )
+    body = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        PLATFORM_SERVICE_AUTHORIZATION_HEADER: secret,
+    }
+    headers.update(extra_headers or {})
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    return platform_json_request(request, expected_statuses=expected_statuses)
 
 
 def consume_platform_launch_token(raw_launch_token: str) -> dict[str, Any]:
@@ -1996,13 +2118,17 @@ def consume_platform_launch_token(raw_launch_token: str) -> dict[str, Any]:
         },
         method="POST",
     )
-    return safe_platform_launch_context(platform_launch_json_request(request))
+    return safe_platform_launch_context(platform_json_request(request))
 
 
-def parse_platform_expiry(value: Any) -> dt.datetime | None:
+def parse_platform_expiry(value: Any) -> dt.datetime:
     raw = clean_text(value)
     if not raw:
-        return None
+        raise PlatformLaunchError(
+            "Platform launch context is not valid for SQAG.",
+            status=403,
+            reason="platform_launch_expiry_missing",
+        )
     try:
         parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError as exc:
@@ -2011,8 +2137,12 @@ def parse_platform_expiry(value: Any) -> dt.datetime | None:
             status=403,
             reason="platform_launch_invalid_expiry",
         ) from exc
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise PlatformLaunchError(
+            "Platform launch context is not valid for SQAG.",
+            status=403,
+            reason="platform_launch_expiry_timezone_missing",
+        )
     return parsed.astimezone(dt.timezone.utc)
 
 
@@ -2032,11 +2162,18 @@ def safe_platform_launch_context(payload: dict[str, Any]) -> dict[str, Any]:
     expires_at = clean_text(payload.get("launchTokenExpiresAt"))
     membership_role = clean_text(payload.get("membershipRole")).lower()
     expiry = parse_platform_expiry(expires_at)
-    if expiry and expiry <= dt.datetime.now(dt.timezone.utc):
+    now = dt.datetime.now(dt.timezone.utc)
+    if expiry <= now:
         raise PlatformLaunchError(
             "Platform launch context is not valid for SQAG.",
             status=403,
             reason="platform_launch_expired",
+        )
+    if expiry > now + dt.timedelta(seconds=PLATFORM_LAUNCH_MAX_FUTURE_SECONDS):
+        raise PlatformLaunchError(
+            "Platform launch context is not valid for SQAG.",
+            status=403,
+            reason="platform_launch_expiry_inconsistent",
         )
     if not user_id or not workspace_id or app_key != PLATFORM_APP_KEY:
         raise PlatformLaunchError(
@@ -2049,6 +2186,13 @@ def safe_platform_launch_context(payload: dict[str, Any]) -> dict[str, Any]:
             "Platform launch context is not valid for SQAG.",
             status=403,
             reason="platform_launch_unsupported_role",
+        )
+    validation_grant_id = clean_text(payload.get("validationGrantId"))
+    if not validation_grant_id:
+        raise PlatformLaunchError(
+            "Platform launch context is not valid for SQAG.",
+            status=403,
+            reason="platform_launch_validation_grant_missing",
         )
     return {
         "outcome": "consumed",
@@ -2069,7 +2213,108 @@ def safe_platform_launch_context(payload: dict[str, Any]) -> dict[str, Any]:
         },
         "membershipRole": membership_role,
         "launchTokenExpiresAt": expires_at,
+        "validationGrantId": validation_grant_id,
     }
+
+
+def isoformat_utc(value: dt.datetime) -> str:
+    return value.astimezone(dt.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def register_platform_finalization(
+    context: dict[str, Any],
+    *,
+    handle_hash_sha256: str,
+    intended_sqag_origin: str,
+) -> str:
+    launch_expiry = parse_platform_expiry(context.get("launchTokenExpiresAt"))
+    expires_at = min(
+        launch_expiry,
+        dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=PLATFORM_FINALIZATION_TTL_SECONDS),
+    )
+    platform_service_request(
+        PLATFORM_FINALIZATION_REGISTER_PATH,
+        payload={
+            "validationGrantId": clean_text(context.get("validationGrantId")),
+            "handleHashSha256": handle_hash_sha256,
+            "expiresAt": isoformat_utc(expires_at),
+            "intendedSqagOrigin": intended_sqag_origin,
+        },
+        expected_statuses=(204,),
+    )
+    return isoformat_utc(expires_at)
+
+
+def platform_finalization_context(raw_handle: str, *, intended_sqag_origin: str) -> dict[str, Any]:
+    handle = clean_text(raw_handle)
+    if not handle:
+        raise PlatformLaunchError(
+            "Platform session could not be created.",
+            status=400,
+            reason="platform_finalization_handle_missing",
+        )
+    payload = platform_service_request(
+        PLATFORM_FINALIZATION_CONSUME_PATH,
+        payload={"intendedSqagOrigin": intended_sqag_origin},
+        extra_headers={PLATFORM_FINALIZATION_HANDLE_HEADER: handle},
+    )
+    return safe_platform_launch_context({
+        "outcome": "consumed",
+        "user": {"userId": payload.get("userId")},
+        "workspace": {"workspaceId": payload.get("workspaceId")},
+        "app": {"appKey": payload.get("appKey")},
+        "membershipRole": payload.get("currentRole"),
+        "launchTokenExpiresAt": payload.get("launchTokenExpiresAt"),
+        "validationGrantId": payload.get("validationGrantId"),
+    })
+
+
+def validated_platform_auth_session(session: dict[str, Any]) -> dict[str, Any]:
+    platform = platform_context_from_auth_session(session) or {}
+    user = platform.get("user") if isinstance(platform.get("user"), dict) else {}
+    workspace = platform.get("workspace") if isinstance(platform.get("workspace"), dict) else {}
+    app = platform.get("app") if isinstance(platform.get("app"), dict) else {}
+    grant_id = clean_text(platform.get("validationGrantId"))
+    payload = platform_service_request(
+        PLATFORM_ACCESS_VALIDATE_PATH,
+        payload={
+            "workspaceId": clean_text(workspace.get("workspaceId")),
+            "appKey": PLATFORM_APP_KEY,
+        },
+        extra_headers={PLATFORM_VALIDATION_GRANT_HEADER: grant_id},
+    )
+    bindings_match = (
+        payload.get("valid") is True
+        and clean_text(payload.get("validationGrantId")) == grant_id
+        and clean_text(payload.get("userId")) == clean_text(user.get("userId"))
+        and clean_text(payload.get("workspaceId")) == clean_text(workspace.get("workspaceId"))
+        and clean_text(payload.get("appKey")) == PLATFORM_APP_KEY
+    )
+    current_role = clean_text(payload.get("currentRole")).lower()
+    if not bindings_match or current_role not in PLATFORM_MEMBERSHIP_ROLE_TO_LOCAL_ROLE:
+        raise PlatformLaunchError(
+            "Platform session could not be verified.",
+            status=401,
+            reason="platform_validation_context_mismatch",
+        )
+    updated = copy.deepcopy(session)
+    updated_platform = updated["user"]["platform"]
+    updated_platform["membershipRole"] = current_role
+    updated["user"]["subject"] = clean_text(payload.get("userId"))
+    updated["user"]["account"] = clean_text(payload.get("workspaceId"))
+    return updated
+
+
+def revoke_platform_validation_grant(grant_id: str) -> None:
+    normalized_grant = clean_text(grant_id)
+    if not normalized_grant:
+        return
+    platform_service_request(
+        PLATFORM_ACCESS_REVOKE_PATH,
+        payload={},
+        extra_headers={PLATFORM_VALIDATION_GRANT_HEADER: normalized_grant},
+        expected_statuses=(200, 204),
+    )
 
 
 def platform_membership_role_to_local_role(value: Any) -> str:
@@ -2091,12 +2336,18 @@ def blocked_platform_permissions() -> dict[str, bool]:
 def user_from_platform_launch_context(context: dict[str, Any]) -> dict[str, Any]:
     user = context["user"]
     workspace = context["workspace"]
+    platform = {
+        "outcome": "consumed",
+        "user": {"userId": user["userId"]},
+        "workspace": {"workspaceId": workspace["workspaceId"]},
+        "app": {"appKey": context["app"]["appKey"]},
+        "membershipRole": context["membershipRole"],
+        "validationGrantId": context["validationGrantId"],
+    }
     return {
         "subject": user["userId"],
-        "email": user["email"],
-        "name": user["displayName"],
         "account": workspace["workspaceId"],
-        "platform": context,
+        "platform": platform,
     }
 
 
@@ -2111,6 +2362,7 @@ def platform_auth_session_complete(session: dict[str, Any] | None) -> bool:
         and clean_text(workspace.get("workspaceId"))
         and clean_text(app.get("appKey")) == PLATFORM_APP_KEY
         and platform_membership_role_to_local_role(platform.get("membershipRole"))
+        and clean_text(platform.get("validationGrantId"))
     )
 
 
@@ -2199,6 +2451,8 @@ def deploy_uat_preflight_status() -> dict[str, Any]:
     )
     add(PLATFORM_LAUNCH_MODE_ENV_NAME, configured_platform_launch_mode() == "platform", "must be set to platform")
     add(PLATFORM_BASE_URL_ENV_NAME, bool(configured_platform_base_url()), "must be an https or loopback http platform base URL")
+    add(SQAG_PUBLIC_BASE_URL_ENV_NAME, bool(configured_sqag_public_base_url()), "must be the exact canonical SQAG origin")
+    add(PLATFORM_SERVICE_SECRET_ENV_NAME, bool(configured_platform_service_secret()), "must be supplied by the host secret manager")
     add(
         TRUSTED_PROXY_CIDRS_ENV_NAME,
         trusted_proxy_config_complete(),
@@ -7855,7 +8109,9 @@ def normalized_netloc(value: str) -> str:
 
 def is_allowed_host_header(host_header: str) -> bool:
     if configured_app_mode() == "deploy":
-        return bool(normalized_host_name(host_header)) and not deploy_requires_auth_guard()
+        public_base_url = configured_sqag_public_base_url()
+        expected_netloc = normalized_netloc(urlparse(public_base_url).netloc) if public_base_url else ""
+        return bool(expected_netloc) and normalized_netloc(host_header) == expected_netloc and not deploy_requires_auth_guard()
     return normalized_host_name(host_header) in ALLOWED_LOCAL_HOSTS
 
 
@@ -7873,6 +8129,57 @@ def is_same_origin_request(origin: str, host_header: str) -> bool:
     if parsed.scheme not in allowed_schemes:
         return False
     return normalized_netloc(parsed.netloc) == normalized_netloc(host_header)
+
+
+def request_sqag_origin(host_header: str) -> str:
+    if configured_app_mode() == "deploy":
+        public_origin = configured_sqag_public_base_url()
+        expected_netloc = normalized_netloc(urlparse(public_origin).netloc) if public_origin else ""
+        return public_origin if expected_netloc and normalized_netloc(host_header) == expected_netloc else ""
+    raw_host = clean_text(host_header).lower()
+    parsed = urlparse(f"//{raw_host}")
+    if (
+        not raw_host
+        or not parsed.hostname
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or parsed.username
+        or parsed.password
+    ):
+        return ""
+    scheme = "http" if parsed.hostname.rstrip(".") in ALLOWED_LOCAL_HOSTS else "https"
+    return f"{scheme}://{raw_host}"
+
+
+def exact_platform_cors_origin(origin: str) -> str:
+    configured = configured_platform_base_url()
+    supplied = clean_text(origin)
+    if not configured or not supplied or supplied != configured:
+        return ""
+    parsed = urlparse(supplied)
+    if parsed.path or parsed.params or parsed.query or parsed.fragment or parsed.username or parsed.password:
+        return ""
+    return configured
+
+
+def requested_cors_header_names(value: str) -> set[str] | None:
+    if not clean_text(value):
+        return set()
+    names = {part.strip().lower() for part in value.split(",") if part.strip()}
+    if any(not re.fullmatch(r"[!#$%&'*+.^_`|~0-9a-z-]+", name) for name in names):
+        return None
+    return names
+
+
+def singleton_http_header(headers: Any, name: str, *, reject_comma: bool = False) -> tuple[str, bool]:
+    values = headers.get_all(name, []) if hasattr(headers, "get_all") else []
+    if len(values) != 1:
+        return "", False
+    value = clean_text(values[0])
+    if not value or (reject_comma and "," in value):
+        return "", False
+    return value, True
 
 
 def is_json_content_type(content_type: str) -> bool:
@@ -9085,7 +9392,14 @@ def safe_platform_session_context(platform: dict[str, Any]) -> dict[str, Any]:
     workspace_id = clean_text(workspace.get("workspaceId"))
     app_key = clean_text(app.get("appKey"))
     membership_role = clean_text(platform.get("membershipRole")).lower()
-    if clean_text(platform.get("outcome")) != "consumed" or not user_id or not workspace_id or app_key != PLATFORM_APP_KEY:
+    validation_grant_id = clean_text(platform.get("validationGrantId"))
+    if (
+        clean_text(platform.get("outcome")) != "consumed"
+        or not user_id
+        or not workspace_id
+        or app_key != PLATFORM_APP_KEY
+        or not validation_grant_id
+    ):
         raise PlatformLaunchError(
             "Platform session context is not valid for SQAG.",
             status=403,
@@ -9099,23 +9413,11 @@ def safe_platform_session_context(platform: dict[str, Any]) -> dict[str, Any]:
         )
     return {
         "outcome": "consumed",
-        "user": {
-            "userId": user_id,
-            "email": clean_text(user.get("email")),
-            "displayName": clean_text(user.get("displayName")),
-            "status": clean_text(user.get("status")),
-        },
-        "workspace": {
-            "workspaceId": workspace_id,
-            "workspaceSlug": clean_text(workspace.get("workspaceSlug")),
-            "workspaceName": clean_text(workspace.get("workspaceName")),
-        },
-        "app": {
-            "appKey": app_key,
-            "appName": clean_text(app.get("appName")),
-        },
+        "user": {"userId": user_id},
+        "workspace": {"workspaceId": workspace_id},
+        "app": {"appKey": app_key},
         "membershipRole": membership_role,
-        "launchTokenExpiresAt": clean_text(platform.get("launchTokenExpiresAt")),
+        "validationGrantId": validation_grant_id,
     }
 
 
@@ -21902,6 +22204,9 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         if parsed.path == PLATFORM_LAUNCH_ENDPOINT:
             self.handle_platform_launch()
             return
+        if parsed.path == PLATFORM_FINALIZATION_ENDPOINT:
+            self.handle_platform_finalization()
+            return
         if self.block_unauthenticated_request(parsed.path):
             return
         if self.block_unsafe_post(parsed.path):
@@ -22269,10 +22574,32 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         if self.block_untrusted_host():
             return
+        if urlparse(self.path).path == PLATFORM_FINALIZATION_ENDPOINT:
+            self.handle_platform_finalization_preflight()
+            return
         self.send_json({"status": "blocked", "errors": ["CORS preflight is not allowed for this local runner."]}, status=403)
 
     def current_auth_session(self) -> dict[str, Any] | None:
-        return session_from_cookie_header(self.headers.get("Cookie", ""))
+        if hasattr(self, "_validated_auth_session"):
+            return self._validated_auth_session
+        session = session_from_cookie_header(self.headers.get("Cookie", ""))
+        path = urlparse(self.path).path
+        if (
+            session
+            and platform_launch_mode_enabled()
+            and path.startswith("/api/")
+            and path not in {"/api/health", PLATFORM_LAUNCH_ENDPOINT, PLATFORM_FINALIZATION_ENDPOINT}
+        ):
+            try:
+                session = validated_platform_auth_session(session)
+            except PlatformLaunchError as exc:
+                write_local_log(
+                    "security_event",
+                    {"reason": exc.reason, "path": path, "status": exc.status},
+                )
+                session = None
+        self._validated_auth_session = session
+        return session
 
     def current_permissions(self) -> dict[str, bool]:
         return permissions_for_auth_session(self.current_auth_session())
@@ -22305,16 +22632,28 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         return ai_log_tracking_metadata(self.current_auth_session())
 
     def block_platform_launch_rate_limit(self) -> bool:
+        return self.block_platform_boundary_rate_limit(
+            PLATFORM_LAUNCH_ENDPOINT,
+            "Too many platform launch requests. Wait a moment and retry.",
+        )
+
+    def block_platform_finalization_rate_limit(self) -> bool:
+        return self.block_platform_boundary_rate_limit(
+            PLATFORM_FINALIZATION_ENDPOINT,
+            "Too many platform session requests. Wait a moment and retry.",
+        )
+
+    def block_platform_boundary_rate_limit(self, path: str, public_error: str) -> bool:
         client_id = self.client_address[0] if self.client_address else "unknown"
         if is_rate_limited(
             effective_rate_limit_client_id(
                 client_id,
                 single_forwarded_for_header_value(self.headers),
             ),
-            PLATFORM_LAUNCH_ENDPOINT,
+            path,
         ):
-            write_local_log("abuse_signal", {"reason": "rate_limit", "path": PLATFORM_LAUNCH_ENDPOINT, "status": 429})
-            self.send_json({"status": "blocked", "errors": ["Too many platform launch requests. Wait a moment and retry."]}, status=429)
+            write_local_log("abuse_signal", {"reason": "rate_limit", "path": path, "status": 429})
+            self.send_json({"status": "blocked", "errors": [public_error]}, status=429)
             return True
         return False
 
@@ -22336,7 +22675,14 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             return
         if self.block_platform_launch_rate_limit():
             return
-        raw_launch_token = clean_text(self.headers.get(PLATFORM_LAUNCH_TOKEN_HEADER, ""))
+        raw_launch_token, launch_header_valid = singleton_http_header(
+            self.headers,
+            PLATFORM_LAUNCH_TOKEN_HEADER,
+            reject_comma=True,
+        )
+        if not launch_header_valid:
+            self.send_json({"status": "blocked", "errors": ["Platform launch could not be completed."]}, status=400)
+            return
         try:
             context = consume_platform_launch_token(raw_launch_token)
         except PlatformLaunchError as exc:
@@ -22346,13 +22692,123 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             )
             self.send_json({"status": "blocked", "errors": [str(exc)]}, status=exc.status)
             return
-        session_cookie_value = signed_cookie_value({"user": user_from_platform_launch_context(context)})
-        if not session_cookie_value:
+        finally:
+            raw_launch_token = ""
+        intended_sqag_origin = request_sqag_origin(self.headers.get("Host", ""))
+        if not intended_sqag_origin:
+            self.send_json({"status": "blocked", "errors": ["Platform launch could not be completed."]}, status=403)
+            return
+        finalization_handle = secrets.token_urlsafe(32)
+        handle_hash = hashlib.sha256(finalization_handle.encode("utf-8")).hexdigest()
+        try:
+            expires_at = register_platform_finalization(
+                context,
+                handle_hash_sha256=handle_hash,
+                intended_sqag_origin=intended_sqag_origin,
+            )
+        except PlatformLaunchError as exc:
             write_local_log(
                 "security_event",
-                {"reason": "platform_launch_session_secret_missing", "path": PLATFORM_LAUNCH_ENDPOINT, "status": 503},
+                {"reason": exc.reason, "path": PLATFORM_LAUNCH_ENDPOINT, "status": exc.status},
             )
-            self.send_json({"status": "blocked", "errors": ["Platform launch is not configured."]}, status=503)
+            self.send_json({"status": "blocked", "errors": ["Platform launch could not be completed."]}, status=exc.status)
+            return
+        finalization_url = f"{intended_sqag_origin}{PLATFORM_FINALIZATION_ENDPOINT}"
+        launch_url = f"{intended_sqag_origin}/"
+        self.send_json(
+            {
+                "status": "platform_finalization_registered",
+                "finalizationUrl": finalization_url,
+                "launchUrl": launch_url,
+                "expiresAt": expires_at,
+            },
+            extra_headers=[(PLATFORM_FINALIZATION_HANDLE_HEADER, finalization_handle)],
+        )
+
+    def platform_finalization_cors_headers(self, origin: str) -> list[tuple[str, str]]:
+        return [
+            ("Access-Control-Allow-Origin", origin),
+            ("Access-Control-Allow-Credentials", "true"),
+            ("Vary", "Origin"),
+        ]
+
+    def handle_platform_finalization_preflight(self) -> None:
+        raw_origin, origin_valid = singleton_http_header(self.headers, "Origin", reject_comma=True)
+        raw_method, method_valid = singleton_http_header(self.headers, "Access-Control-Request-Method", reject_comma=True)
+        raw_headers, headers_valid = singleton_http_header(self.headers, "Access-Control-Request-Headers")
+        origin = exact_platform_cors_origin(raw_origin) if origin_valid else ""
+        requested_method = raw_method.upper() if method_valid else ""
+        requested_headers = requested_cors_header_names(raw_headers) if headers_valid else None
+        allowed_headers = {PLATFORM_FINALIZATION_HANDLE_HEADER.lower()}
+        if (
+            not platform_launch_mode_enabled()
+            or not origin
+            or requested_method != "POST"
+            or requested_headers is None
+            or PLATFORM_FINALIZATION_HANDLE_HEADER.lower() not in requested_headers
+            or not requested_headers.issubset(allowed_headers)
+        ):
+            self.send_json({"status": "blocked", "errors": ["Cross-origin request was not allowed."]}, status=403)
+            return
+        self.send_empty(
+            status=204,
+            extra_headers=[
+                *self.platform_finalization_cors_headers(origin),
+                ("Access-Control-Allow-Methods", "POST, OPTIONS"),
+                ("Access-Control-Allow-Headers", PLATFORM_FINALIZATION_HANDLE_HEADER),
+            ],
+        )
+
+    def handle_platform_finalization(self) -> None:
+        raw_origin, origin_valid = singleton_http_header(self.headers, "Origin", reject_comma=True)
+        origin = exact_platform_cors_origin(raw_origin) if origin_valid else ""
+        if not platform_launch_mode_enabled() or not origin:
+            self.send_json({"status": "blocked", "errors": ["Cross-origin request was not allowed."]}, status=403)
+            return
+        if self.block_platform_finalization_rate_limit():
+            return
+        intended_sqag_origin = request_sqag_origin(self.headers.get("Host", ""))
+        if not intended_sqag_origin:
+            self.send_json(
+                {"status": "blocked", "errors": ["Platform session could not be created."]},
+                status=403,
+                extra_headers=self.platform_finalization_cors_headers(origin),
+            )
+            return
+        raw_handle, handle_header_valid = singleton_http_header(
+            self.headers,
+            PLATFORM_FINALIZATION_HANDLE_HEADER,
+            reject_comma=True,
+        )
+        if not handle_header_valid:
+            self.send_json(
+                {"status": "blocked", "errors": ["Platform session could not be created."]},
+                status=400,
+                extra_headers=self.platform_finalization_cors_headers(origin),
+            )
+            return
+        try:
+            context = platform_finalization_context(raw_handle, intended_sqag_origin=intended_sqag_origin)
+        except PlatformLaunchError as exc:
+            write_local_log(
+                "security_event",
+                {"reason": exc.reason, "path": PLATFORM_FINALIZATION_ENDPOINT, "status": exc.status},
+            )
+            self.send_json(
+                {"status": "blocked", "errors": ["Platform session could not be created."]},
+                status=exc.status,
+                extra_headers=self.platform_finalization_cors_headers(origin),
+            )
+            return
+        finally:
+            raw_handle = ""
+        session_cookie_value = signed_cookie_value({"user": user_from_platform_launch_context(context)})
+        if not session_cookie_value:
+            self.send_json(
+                {"status": "blocked", "errors": ["Platform session could not be created."]},
+                status=503,
+                extra_headers=self.platform_finalization_cors_headers(origin),
+            )
             return
         session_cookie = cookie_header_value(
             SESSION_COOKIE_NAME,
@@ -22360,16 +22816,11 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             max_age=SESSION_COOKIE_MAX_AGE_SECONDS,
         )
         self.send_json(
-            {
-                "status": "platform_session_created",
-                "redirect_url": "/",
-                "user": context["user"],
-                "workspace": context["workspace"],
-                "app": context["app"],
-                "membershipRole": context["membershipRole"],
-                "launchTokenExpiresAt": context["launchTokenExpiresAt"],
-            },
-            extra_headers=[("Set-Cookie", session_cookie)],
+            {"status": "platform_session_created", "launchUrl": f"{intended_sqag_origin}/"},
+            extra_headers=[
+                *self.platform_finalization_cors_headers(origin),
+                ("Set-Cookie", session_cookie),
+            ],
         )
 
     def block_unauthenticated_request(self, path: str) -> bool:
@@ -22511,6 +22962,17 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         )
 
     def handle_logout(self) -> None:
+        session = session_from_cookie_header(self.headers.get("Cookie", ""))
+        platform = platform_context_from_auth_session(session)
+        grant_id = clean_text(platform.get("validationGrantId")) if platform else ""
+        if platform_launch_mode_enabled() and grant_id:
+            try:
+                revoke_platform_validation_grant(grant_id)
+            except PlatformLaunchError as exc:
+                write_local_log(
+                    "security_event",
+                    {"reason": exc.reason, "path": "/logout", "status": exc.status},
+                )
         logout_url = (
             configured_platform_home_url() or "/signed-out"
             if platform_launch_mode_enabled()
@@ -22600,6 +23062,19 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def send_empty(
+        self,
+        *,
+        status: int,
+        extra_headers: list[tuple[str, str]] | None = None,
+    ) -> None:
+        self.send_response(status)
+        self.send_header("Content-Length", "0")
+        self.send_security_headers()
+        for name, value in extra_headers or []:
+            self.send_header(name, value)
+        self.end_headers()
 
     def send_json_download(self, filename: str, payload: dict[str, Any]) -> None:
         safe_filename = safe_segment(filename, "company-profile.json")

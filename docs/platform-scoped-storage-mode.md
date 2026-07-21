@@ -32,7 +32,8 @@ SQAG database URL:
 
 ```powershell
 $env:SQAG_PLATFORM_LAUNCH_MODE="platform"
-$env:SQAG_PLATFORM_BASE_URL="https://platform.example.test"
+$env:SQAG_PLATFORM_BASE_URL="https://swooshz.com"
+$env:SQAG_PUBLIC_BASE_URL="https://quote.swooshz.com"
 $env:SQAG_STORAGE_MODE="database"
 $env:SQAG_ARTIFACT_STORAGE_MODE="object"
 $env:SQAG_DATABASE_URL="sqlite:///C:/path/to/local/sqag-storage.sqlite3"

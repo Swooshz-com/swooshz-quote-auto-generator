@@ -22,7 +22,10 @@ In scope:
 - SQAG launch consume through `POST /api/platform/launch`.
 - Raw launch token forwarded from SQAG to Platform only in the
   `X-App-Launch-Token` header.
-- SQAG signed runtime session with safe Platform context only.
+- Cross-subdomain finalization with a header-only one-time handle and an SQAG
+  host-only signed runtime cookie containing safe context plus a non-secret
+  validation grant ID.
+- Fail-closed Platform validation on every authenticated SQAG API request.
 - Platform-scoped SQAG database rows for quote sessions.
 - Platform-scoped generated XLSX artifact storage and download through the
   quote-session route used by the past-session dashboard.
@@ -93,15 +96,22 @@ If you need to run the commands manually, set the same local process
 environment:
 
 ```powershell
-$env:APP_MODE="deploy"
+$env:APP_MODE="local"
 $env:AUTH_REQUIRED="true"
 $env:SESSION_SECRET="<sqag-session-secret>"
 $env:SQAG_PLATFORM_LAUNCH_MODE="platform"
 $env:SQAG_PLATFORM_BASE_URL="<platform-base-url>"
+$env:SQAG_PUBLIC_BASE_URL="<sqag-base-url>"
+$env:SQAG_PLATFORM_SERVICE_SECRET="<synthetic-shared-service-secret>"
+$env:SQAG_PLATFORM_REQUEST_TIMEOUT_SECONDS="10"
 $env:SQAG_STORAGE_MODE="database"
 $env:SQAG_ARTIFACT_STORAGE_MODE="database"
 $env:SQAG_DATABASE_URL="<sqag-local-database-url>"
 ```
+
+Local mode is required for this same-machine fallback because deploy mode
+accepts only the fixed production origins. Production evidence must use the
+canonical origins listed below.
 
 Apply the reviewed SQAG storage migrations only against a disposable local
 database:
@@ -156,18 +166,23 @@ $env:PLATFORM_SQAG_APP_BASE_URL="<sqag-local-base-url>"
 
 ## Browser Launch Shape
 
-The Platform internal shell now uses the browser-safe handoff route:
+The Platform internal shell uses the browser-safe handoff route:
 `POST /api/platform/apps/launch/open?workspaceId=<platform-workspace-id>&appKey=sqag`.
 The browser calls Platform only. Platform creates the one-time launch token
 server-side, sends it to SQAG only in the `X-App-Launch-Token` header on
-`POST <sqag-local-base-url>/api/platform/launch`, relays SQAG's session cookie
-for the same browser cookie host, and returns only the safe SQAG launch URL to
-the browser.
+`POST <sqag-local-base-url>/api/platform/launch`. SQAG consumes the token,
+registers only a random handle hash with Platform, and returns the raw handle
+only in `X-SQAG-Finalization-Handle`. Platform returns that header to the
+browser with clean finalization/launch URLs. The browser credentialed-POSTs the
+header to SQAG's `/api/auth/platform/finalize` from the exact Platform origin.
+Only SQAG sets the final host-only cookie; Platform never relays or sets it.
 
-For local UAT, Platform and SQAG must be visited through the same browser cookie
-host, for example `127.0.0.1` on different ports. Mixing `localhost` and
-`127.0.0.1` is intentionally rejected by Platform. Cross-host or production
-routing remains out of scope for this runbook.
+Platform and SQAG may use separate allowed origins/subdomains. Confirm the
+finalization preflight permits only the exact configured Platform origin and
+the finalization-handle header, and that no parent-domain cookie is emitted.
+For production evidence, use only `https://swooshz.com` for Platform and
+`https://quote.swooshz.com` for SQAG; `www` must permanently redirect to the
+apex and must not pass CORS.
 
 ## Pass Criteria
 
@@ -176,7 +191,11 @@ routing remains out of scope for this runbook.
 - SQAG app access appears.
 - Platform SQAG launch button reaches SQAG through the server-side handoff.
 - SQAG launch consume succeeds.
+- Header-only finalization succeeds once and replay fails.
 - SQAG browser-scoped session context loads with Platform workspace context.
+- Role downgrade, revoke, expiry, disabled user/membership/entitlement, and
+  Platform validation unavailability deny the next authenticated SQAG API
+  request.
 - Automated local smoke proves a generated quote session is stored under the
   Platform workspace ID.
 - Automated local smoke proves a generated XLSX artifact downloads from the

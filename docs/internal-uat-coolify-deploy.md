@@ -67,7 +67,7 @@ Required names for any future hosted validation environment:
 | --- | --- |
 | App/auth | `APP_MODE`, `AUTH_REQUIRED`, `SESSION_SECRET` |
 | Storage | `SQAG_STORAGE_MODE`, `SQAG_ARTIFACT_STORAGE_MODE`, `SQAG_DATABASE_URL`, `SQAG_OBJECT_STORAGE_PROVIDER`, `SQAG_OBJECT_STORAGE_ENDPOINT_URL`, `SQAG_OBJECT_STORAGE_BUCKET`, `SQAG_OBJECT_STORAGE_REGION`, `SQAG_OBJECT_STORAGE_ACCESS_KEY_ID`, `SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY` |
-| Platform launch | `SQAG_PLATFORM_LAUNCH_MODE`, `SQAG_PLATFORM_BASE_URL` |
+| Platform launch/session validation | `SQAG_PLATFORM_LAUNCH_MODE`, `SQAG_PLATFORM_BASE_URL`, `SQAG_PUBLIC_BASE_URL`, `SQAG_PLATFORM_SERVICE_SECRET`, optional non-secret `SQAG_PLATFORM_REQUEST_TIMEOUT_SECONDS` |
 | Reverse proxy | `SQAG_TRUSTED_PROXY_CIDRS` |
 | Runtime housekeeping | `QUOTE_DATA_ROOT`, `QUOTE_OUTPUT_ROOT`, `QUOTE_TMP_ROOT`, `QUOTE_LOG_ROOT`, `PORT` |
 
@@ -139,6 +139,10 @@ bytes, host IPs, or private paths into issue/PR output.
   schema, object-artifact metadata schema, and object bucket are usable.
 - Unauthenticated protected routes block or redirect.
 - Platform/workspace launch reaches the app.
+- Cross-subdomain finalization permits only the exact Platform origin, sets
+  only the host-only SQAG cookie, and rejects replay.
+- Every authenticated SQAG API request is revalidated with Platform; current
+  role/authority changes and Platform unavailability fail closed immediately.
 - Distinct clients behind the trusted proxy receive independent Platform
   launch and mutable-route rate-limit buckets, while repeated requests from
   the same effective client still receive HTTP 429.
@@ -160,6 +164,28 @@ bytes, host IPs, or private paths into issue/PR output.
   paths.
 - Logs remain metadata-only and omit secrets, provider responses, private data,
   generated quote contents, and artifact bytes.
+
+## Production Routing And Reputation Evidence
+
+The only approved production routing shape is:
+
+- `https://swooshz.com`: Platform and the only allowed browser finalization
+  Origin.
+- `https://www.swooshz.com`: permanent redirect to the apex, preserving only
+  safe intended paths/query behavior.
+- `https://quote.swooshz.com`: SQAG and the exact `SQAG_PUBLIC_BASE_URL`.
+- `app.swooshz.com`: not a production origin or redirect target.
+
+Before recording hosted evidence, verify trusted certificates and SAN coverage
+for each served hostname. No route may expose a Traefik default 404/503,
+self-signed certificate, wrong-host response, or wrong-port origin. Test the
+apex/www/quote behavior from desktop and mobile user agents and Googlebot.
+Capture sanitized evidence for redirects, certificate trust/SAN, screenshots,
+forms, iframes, external resources, API requests, and every redirect/CORS
+origin. Verify Google Safe Browsing status separately for each hostname. If the
+operator already has Search Console access, record sanitized URL Inspection
+results; this runbook does not authorize requesting indexing, review, or
+reconsideration.
 
 ## Not Proven
 
