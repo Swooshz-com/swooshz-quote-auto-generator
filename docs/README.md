@@ -40,6 +40,9 @@ platform concerns belong in `Swooshz-com/swooshz-platform`.
   integration gaps.
 - `docs/platform-scoped-storage-mode.md`: platform-workspace-scoped SQAG app
   data storage boundary, migration command, and local-vs-database mode notes.
+- `docs/postgres-migration-runbook.md`: immutable PostgreSQL migration manifest,
+  checksum ledger, read-only preflight, future operator sequence, and rollback
+  constraints.
 - `docs/pricing-catalog-import.md`: current pricing-reference import behavior,
   AI normalization/enrichment contracts, save behavior, ordering, and deferred
   import items.

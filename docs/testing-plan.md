@@ -21,7 +21,7 @@ Use the smallest relevant subset for the change, then broaden as risk increases:
 ```powershell
 git diff --check
 node --check webapp\static\app.js
-python -m py_compile webapp\server.py scripts\generate_quote.py scripts\live_ai_basis_chat_smoke.py
+python -m py_compile webapp\server.py webapp\postgres_migrations.py scripts\migrate_sqag_storage.py scripts\preflight_sqag_migrations.py scripts\generate_quote.py scripts\live_ai_basis_chat_smoke.py
 python scripts\validate_local_pdf_dependency_usage.py
 python -m unittest discover -s tests
 npm run playwright:ai-stress
@@ -37,6 +37,12 @@ npm run playwright:smoke
 - Frontend layout, controls, settings, privacy page, or responsive behavior: run syntax checks and a browser/Playwright visual interaction loop on the changed screen.
 - Auth, permissions, OIDC, cookies, CSRF, file download boundaries, or secret handling: run focused security/authorization tests and broaden to full unit tests.
 - CI/CD, package scripts, dependency setup, or workflow files: validate the YAML/script syntax when possible, run the nearest local command, and update `docs/current-cicd-status.md`.
+- PostgreSQL migration manifest, ledger, preflight, or operator command: run
+  `tests.test_postgres_migration_ledger` against the isolated CI PostgreSQL
+  service and require fresh apply, complete schema, exact checksums, no-op
+  replay, drift refusal, concurrency serialization, read-only preflight, and
+  failed-transaction rollback evidence. Never point this CI test at a provider
+  or production database.
 
 ## Regression Standard
 

@@ -8973,7 +8973,7 @@ def execute_sql_script(connection: Any, sql: str) -> None:
             connection.execute(statement)
 
 
-def apply_sqag_storage_migrations(database_url: str | None = None) -> None:
+def apply_sqag_storage_migrations(database_url: str | None = None) -> dict[str, Any] | None:
     url = clean_text(database_url) or configured_database_url()
     if not url:
         raise SqagStorageAccessError("SQAG database storage is not configured.", status=503, reason="storage_database_not_configured")
@@ -8987,11 +8987,19 @@ def apply_sqag_storage_migrations(database_url: str | None = None) -> None:
             connection.commit()
         return
     if family == "postgres_compatible":
+        from .postgres_migrations import apply_postgres_migrations, migration_manifest
+
         with postgres_storage_connection(url) as connection:
-            migrate_legacy_sqag_tables_postgres(connection)
-            execute_sql_script(connection, sqag_postgres_metadata_migration_sql())
-            connection.commit()
-        return
+            try:
+                result = apply_postgres_migrations(
+                    connection,
+                    migration_manifest(PROJECT_ROOT / "migrations"),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return result
     raise SqagStorageAccessError("SQAG database storage is not configured.", status=503, reason="storage_database_url_unsupported")
 
 

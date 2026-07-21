@@ -18,8 +18,17 @@ def main() -> int:
     if not database_url:
         print("SQAG_DATABASE_URL is required for the storage migration.", file=sys.stderr)
         return 2
-    webapp.apply_sqag_storage_migrations(database_url)
-    print("SQAG storage migrations applied.")
+    try:
+        result = webapp.apply_sqag_storage_migrations(database_url)
+    except Exception:
+        print("SQAG storage migrations failed closed; inspect privacy-safe operator logs.", file=sys.stderr)
+        return 2
+    if isinstance(result, dict):
+        applied = result.get("appliedNow", [])
+        print(f"SQAG PostgreSQL migration head: {result.get('expectedHead') or 'none'}")
+        print("Applied migration IDs: " + (", ".join(applied) if applied else "none"))
+    else:
+        print("SQAG local storage migrations applied.")
     return 0
 
 
