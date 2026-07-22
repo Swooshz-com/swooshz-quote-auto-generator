@@ -125,14 +125,27 @@ class Migration:
     checksum_sha256: str
 
 
+def canonical_migration_payload(path: Path) -> bytes:
+    """Read migration source as strict UTF-8 with canonical LF line endings."""
+
+    migration_id = path.name
+    try:
+        raw_payload = path.read_bytes()
+    except OSError as exc:
+        raise MigrationSafetyError(f"migration_source_missing:{migration_id}") from exc
+    try:
+        source = raw_payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise MigrationSafetyError(f"migration_source_invalid_utf8:{migration_id}") from exc
+    return source.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+
+
 def migration_manifest(migrations_dir: Path) -> tuple[Migration, ...]:
     migrations: list[Migration] = []
     for sequence_no, file_name in enumerate(MIGRATION_FILE_NAMES, start=1):
         path = migrations_dir / file_name
-        try:
-            payload = path.read_bytes()
-        except OSError as exc:
-            raise MigrationSafetyError(f"migration_source_missing:{file_name}") from exc
+        payload = canonical_migration_payload(path)
+
         migrations.append(
             Migration(
                 sequence_no=sequence_no,
@@ -326,10 +339,8 @@ def apply_postgres_migrations(
     applied_now: list[str] = []
     applied_count = len(before["appliedMigrationIds"])
     for migration in migrations[applied_count:]:
-        try:
-            payload = migration.path.read_bytes()
-        except OSError as exc:
-            raise MigrationSafetyError(f"migration_source_missing:{migration.migration_id}") from exc
+        payload = canonical_migration_payload(migration.path)
+
         actual_checksum = sha256(payload).hexdigest()
         if actual_checksum != migration.checksum_sha256:
             raise MigrationSafetyError(f"migration_source_changed_during_run:{migration.migration_id}")

@@ -8,6 +8,7 @@ import uuid
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,9 +21,11 @@ from webapp.postgres_migrations import (
     EXPECTED_TRIGGERS,
     LEDGER_TABLE,
     MIGRATION_LOCK_KEY,
+    MIGRATION_FILE_NAMES,
     Migration,
     MigrationSafetyError,
     apply_postgres_migrations,
+    canonical_migration_payload,
     inspect_postgres_migrations,
     migration_manifest,
 )
@@ -36,6 +39,125 @@ def postgres_test_conninfo(database_name: str = "postgres") -> str | None:
     if not host or not port or not user:
         return None
     return f"host={host} port={port} user={user} dbname={database_name}"
+
+
+def write_migration_copy(destination: Path, line_ending: bytes) -> tuple[Migration, ...]:
+    destination.mkdir(parents=True, exist_ok=True)
+    for file_name in MIGRATION_FILE_NAMES:
+        canonical = canonical_migration_payload(ROOT / "migrations" / file_name)
+        (destination / file_name).write_bytes(canonical.replace(b"\n", line_ending))
+    return migration_manifest(destination)
+
+
+class RecordingConnection:
+    def __init__(self):
+        self.calls = []
+
+    def execute(self, sql, params=None):
+        self.calls.append((sql, params))
+        return self
+
+
+class MigrationPayloadCanonicalizationTest(unittest.TestCase):
+    def test_lf_crlf_and_bare_cr_have_identical_payloads_and_checksums(self):
+        variants = (
+            b"select 1;\nselect 2;\n",
+            b"select 1;\r\nselect 2;\r\n",
+            b"select 1;\rselect 2;\r",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            payloads = []
+            checksums = []
+            for index, variant in enumerate(variants):
+                path = Path(temp_dir) / f"variant-{index}.sql"
+                path.write_bytes(variant)
+                payload = canonical_migration_payload(path)
+                payloads.append(payload)
+                checksums.append(sha256(payload).hexdigest())
+
+        self.assertEqual(payloads, [b"select 1;\nselect 2;\n"] * 3)
+        self.assertEqual(len(set(checksums)), 1)
+
+    def test_non_eol_change_has_different_canonical_checksum(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            first = Path(temp_dir) / "first.sql"
+            second = Path(temp_dir) / "second.sql"
+            first.write_bytes(b"select 1;\r\n")
+            second.write_bytes(b"select 2;\n")
+
+            first_checksum = sha256(canonical_migration_payload(first)).hexdigest()
+            second_checksum = sha256(canonical_migration_payload(second)).hexdigest()
+
+        self.assertNotEqual(first_checksum, second_checksum)
+
+    def test_invalid_utf8_fails_closed_with_file_only_blocker(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "004_invalid.sql"
+            path.write_bytes(b"select '\xff';")
+
+            with self.assertRaises(MigrationSafetyError) as raised:
+                canonical_migration_payload(path)
+
+        self.assertEqual(raised.exception.blocker, "migration_source_invalid_utf8:004_invalid.sql")
+
+    def test_manifest_and_execution_use_same_canonical_payload_and_ledger_checksum(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            migrations_dir = Path(temp_dir)
+            manifest = write_migration_copy(migrations_dir, b"\r\n")
+            for migration in manifest:
+                migration.path.write_bytes(migration.path.read_bytes().replace(b"\r\n", b"\n"))
+
+            before = {
+                "safeToApply": True,
+                "ledgerState": "missing",
+                "appliedMigrationIds": [],
+                "blockers": [],
+            }
+            after = {
+                "safeToApply": True,
+                "pendingMigrationIds": [],
+                "blockers": [],
+            }
+            connection = RecordingConnection()
+            with patch(
+                "webapp.postgres_migrations.inspect_postgres_migrations",
+                side_effect=(before, after),
+            ), patch("webapp.postgres_migrations.execute_migration_sql") as execute_sql:
+                result = apply_postgres_migrations(connection, manifest)
+
+        self.assertEqual(result["appliedNow"], list(MIGRATION_FILE_NAMES))
+        self.assertEqual(
+            [call.args[1] for call in execute_sql.call_args_list],
+            [
+                canonical_migration_payload(ROOT / "migrations" / name).decode("utf-8")
+                for name in MIGRATION_FILE_NAMES
+            ],
+        )
+        ledger_checksums = [
+            params[2]
+            for sql, params in connection.calls
+            if sql.startswith("insert into public.sqag_schema_migrations")
+        ]
+        self.assertEqual(ledger_checksums, [migration.checksum_sha256 for migration in manifest])
+
+    def test_substantive_change_between_manifest_and_execution_is_blocked(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest = write_migration_copy(Path(temp_dir), b"\n")
+            manifest[0].path.write_bytes(manifest[0].path.read_bytes() + b"select 2;\n")
+            before = {
+                "safeToApply": True,
+                "ledgerState": "missing",
+                "appliedMigrationIds": [],
+                "blockers": [],
+            }
+            with patch("webapp.postgres_migrations.inspect_postgres_migrations", return_value=before):
+                with self.assertRaises(MigrationSafetyError) as raised:
+                    apply_postgres_migrations(RecordingConnection(), manifest)
+
+        self.assertEqual(
+            raised.exception.blocker,
+            f"migration_source_changed_during_run:{MIGRATION_FILE_NAMES[0]}",
+        )
 
 
 @unittest.skipUnless(postgres_test_conninfo(), "isolated PostgreSQL test service is not configured")
@@ -52,30 +174,37 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
         cls.manifest = migration_manifest(ROOT / "migrations")
 
     def setUp(self):
-        self.database_name = "sqag_migration_test_" + uuid.uuid4().hex
+        self.database_names = []
+        self.database_name = self.create_database()
+
+    def create_database(self) -> str:
+        database_name = "sqag_migration_test_" + uuid.uuid4().hex
         with self.psycopg.connect(postgres_test_conninfo(), autocommit=True) as connection:
-            connection.execute(self.sql.SQL("create database {}").format(self.sql.Identifier(self.database_name)))
+            connection.execute(self.sql.SQL("create database {}").format(self.sql.Identifier(database_name)))
+        self.database_names.append(database_name)
+        return database_name
 
     def tearDown(self):
         with self.psycopg.connect(postgres_test_conninfo(), autocommit=True) as connection:
-            connection.execute(
-                "select pg_terminate_backend(pid) from pg_stat_activity "
-                "where datname = %s and pid <> pg_backend_pid()",
-                (self.database_name,),
-            )
-            connection.execute(
-                self.sql.SQL("drop database if exists {}").format(self.sql.Identifier(self.database_name))
-            )
+            for database_name in reversed(self.database_names):
+                connection.execute(
+                    "select pg_terminate_backend(pid) from pg_stat_activity "
+                    "where datname = %s and pid <> pg_backend_pid()",
+                    (database_name,),
+                )
+                connection.execute(
+                    self.sql.SQL("drop database if exists {}").format(self.sql.Identifier(database_name))
+                )
 
-    def connect(self) -> PostgresConnectionAdapter:
+    def connect(self, database_name=None) -> PostgresConnectionAdapter:
         raw = self.psycopg.connect(
-            postgres_test_conninfo(self.database_name),
+            postgres_test_conninfo(database_name or self.database_name),
             row_factory=self.dict_row,
         )
         return PostgresConnectionAdapter(raw)
 
-    def apply(self, migrations=None):
-        connection = self.connect()
+    def apply(self, migrations=None, database_name=None):
+        connection = self.connect(database_name)
         try:
             result = apply_postgres_migrations(connection, migrations or self.manifest)
             connection.commit()
@@ -86,8 +215,8 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def inspect(self, migrations=None):
-        connection = self.connect()
+    def inspect(self, migrations=None, database_name=None):
+        connection = self.connect(database_name)
         try:
             connection.execute("set transaction read only")
             return inspect_postgres_migrations(connection, migrations or self.manifest)
@@ -155,6 +284,63 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
         self.assertTrue(EXPECTED_INDEXES.issubset(indexes))
         self.assertTrue(EXPECTED_TRIGGERS.issubset(triggers))
         self.assertTrue(EXPECTED_ROUTINES.issubset(routines))
+
+    def test_lf_and_crlf_create_equivalent_stored_routine_definitions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            lf_manifest = write_migration_copy(root / "lf", b"\n")
+            crlf_manifest = write_migration_copy(root / "crlf", b"\r\n")
+            crlf_database = self.create_database()
+
+            self.apply(lf_manifest)
+            self.apply(crlf_manifest, crlf_database)
+
+            routine_sources = []
+            for database_name in (self.database_name, crlf_database):
+                connection = self.connect(database_name)
+                try:
+                    row = connection.execute(
+                        "select prosrc from pg_catalog.pg_proc p "
+                        "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+                        "where n.nspname = 'public' "
+                        "and p.proname = 'sqag_require_retention_delete_authorization'"
+                    ).fetchone()
+                    routine_sources.append(row["prosrc"])
+                finally:
+                    connection.rollback()
+                    connection.close()
+
+        self.assertEqual(routine_sources[0], routine_sources[1])
+        self.assertNotIn("\r", routine_sources[0])
+
+    def test_cross_eol_manifest_accepts_existing_ledger_and_preflight(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            lf_manifest = write_migration_copy(root / "lf", b"\n")
+            crlf_manifest = write_migration_copy(root / "crlf", b"\r\n")
+
+            self.apply(lf_manifest)
+            report = self.inspect(crlf_manifest)
+
+            connection = self.connect()
+            try:
+                rows = connection.execute(
+                    "select checksum_sha256 from public.sqag_schema_migrations order by sequence_no"
+                ).fetchall()
+            finally:
+                connection.rollback()
+                connection.close()
+
+        self.assertEqual(
+            [migration.checksum_sha256 for migration in lf_manifest],
+            [migration.checksum_sha256 for migration in crlf_manifest],
+        )
+        self.assertEqual(
+            [row["checksum_sha256"] for row in rows],
+            [migration.checksum_sha256 for migration in crlf_manifest],
+        )
+        self.assertTrue(report["safeToApply"])
+        self.assertEqual(report["pendingMigrationIds"], [])
 
     def test_checksum_modification_fails_closed(self):
         self.apply()
