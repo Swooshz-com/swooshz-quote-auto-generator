@@ -19,9 +19,13 @@ history.
 
 Successful applications are recorded in `public.sqag_schema_migrations` with
 the sequence number, migration ID, SHA-256 source checksum, and database-applied
-timestamp. A transaction-scoped PostgreSQL advisory lock serializes migration
-processes. The ledger row and its migration SQL commit in the same transaction;
-a failed statement cannot record false success.
+timestamp. The checksum is calculated over strict UTF-8 migration bytes after
+CRLF and bare CR line endings are normalized to LF. Working-tree EOL conversion
+therefore does not change ledger identity. The same canonical UTF-8/LF bytes are
+decoded and executed; hashing and execution do not use separate representations.
+A transaction-scoped PostgreSQL advisory lock serializes migration processes.
+The ledger row and its migration SQL commit in the same transaction; a failed
+statement cannot record false success.
 
 The runner accepts only an exact ordered prefix of the repository manifest. It
 fails closed for checksum drift, an unknown or out-of-order ledger row, a
@@ -73,7 +77,9 @@ and approval for all of the following: an isolated clone or branch, exact schema
 comparison against repository expectations, checksum and object inventory,
 review of existing data, an explicit baseline operation, and a rollback point.
 This repository intentionally contains no automatic `mark current`, repair, or
-baseline shortcut.
+baseline shortcut. Canonical migration bytes remove cross-platform EOL drift;
+they do not prove equivalence for an existing unledgered schema and do not
+authorize production baselining.
 
 ## CI Evidence
 
