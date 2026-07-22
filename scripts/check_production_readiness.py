@@ -51,13 +51,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--with-hosted-smoke-evidence",
         action="store_true",
-        help="Run the synthetic hosted smoke verifier and include only its pass/fail status.",
+        help="Run the synthetic/local hosted-contract smoke verifier (not a public URL, Neon/R2, or Platform handoff test) and include only its pass/fail status.",
     )
     parser.add_argument(
         "--hosted-smoke-work-dir",
         type=Path,
         default=None,
-        help="Synthetic hosted smoke verifier workspace. The path is never printed.",
+        help="Synthetic/local hosted-contract smoke verifier workspace. The path is never printed.",
     )
     parser.add_argument(
         "--with-object-storage-evidence",
@@ -99,7 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--with-live-retention-delete-evidence",
         action="store_true",
-        help="Run the opt-in live retention/delete drill; it fails closed unless explicit live DB/object env vars are present.",
+        help="Run the opt-in live retention/delete drill; it requires a read-only trusted zero-pending migration preflight and never applies migrations.",
     )
     return parser
 

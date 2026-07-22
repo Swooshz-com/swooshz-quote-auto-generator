@@ -511,6 +511,10 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
         "schema": "swooshz.sqag.hosted-smoke-verification.v1",
         "status": "passed" if passed else "failed",
         "synthetic_only": True,
+        "evidence_scope": "synthetic_local_hosted_contract",
+        "public_hosted_url_tested": False,
+        "live_neon_r2_evidence": False,
+        "platform_handoff_evidence": False,
         "network": {"host": "127.0.0.1"},
         "storage": {
             "app_mode": "deploy",
@@ -540,7 +544,8 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
         "internal_alpha_ready": False,
         "production_ready": False,
         "notes": [
-            "This verifies a synthetic hosted-like smoke path only.",
+            "This verifies a synthetic/local hosted-contract smoke path on 127.0.0.1 only.",
+            "It does not test a public hosted URL and is not live Neon/R2 evidence or Platform handoff evidence.",
             "It does not call Swooshz Platform, configure object storage, prove external deployment operations, or claim production readiness.",
         ],
     }
@@ -606,7 +611,7 @@ def contains_sensitive_value(text: str) -> bool:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Verify synthetic hosted smoke evidence.")
+    parser = argparse.ArgumentParser(description="Verify synthetic/local hosted-contract smoke evidence.")
     parser.add_argument("--work-dir", type=Path, default=None, help="Synthetic verifier workspace. The path is never printed.")
     return parser
 
@@ -620,6 +625,10 @@ def main(argv: list[str] | None = None) -> int:
             "schema": "swooshz.sqag.hosted-smoke-verification.v1",
             "status": "failed",
             "synthetic_only": True,
+            "evidence_scope": "synthetic_local_hosted_contract",
+            "public_hosted_url_tested": False,
+            "live_neon_r2_evidence": False,
+            "platform_handoff_evidence": False,
             "privacy": {
                 "output": "metadata-only",
                 "paths": "omitted",
@@ -632,7 +641,8 @@ def main(argv: list[str] | None = None) -> int:
                 "provider_responses": "omitted",
             },
             "notes": [
-                "Synthetic hosted smoke verification failed before producing evidence.",
+                "Synthetic/local hosted-contract smoke verification failed before producing evidence.",
+                "No public hosted URL, live Neon/R2 target, or Platform handoff was tested.",
                 "Failure details are omitted to avoid printing private paths, tokens, payloads, or artifact bytes.",
             ],
         }

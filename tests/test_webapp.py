@@ -5942,6 +5942,8 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(result["status"], "ready", [deploy_template.finding_to_dict(finding) for finding in result["findings"]])
         values, _ = deploy_template.parse_env_template(ROOT / "deploy" / "internal-uat" / "coolify" / "sqag.uat.env.example")
         self.assertEqual(values["SQAG_ARTIFACT_STORAGE_MODE"], "object")
+        self.assertTrue(deploy_template.is_placeholder(values["SQAG_TRACKING_HMAC_KEY"]))
+        self.assertEqual(values["SQAG_TRACKING_HMAC_KEY_VERSION"], "tracking-v1")
         for key in (
             "SQAG_OBJECT_STORAGE_PROVIDER",
             "SQAG_OBJECT_STORAGE_ENDPOINT_URL",
@@ -5952,6 +5954,83 @@ class WebappServerTest(unittest.TestCase):
         ):
             self.assertIn(key, values)
             self.assertTrue(deploy_template.is_placeholder(values[key]), key)
+
+    def test_internal_uat_coolify_env_template_requires_tracking_variables(self):
+        source = ROOT / "deploy" / "internal-uat" / "coolify" / "sqag.uat.env.example"
+        source_text = source.read_text(encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "sqag.uat.env.example"
+            for missing_key in ("SQAG_TRACKING_HMAC_KEY", "SQAG_TRACKING_HMAC_KEY_VERSION"):
+                without_key = "\n".join(
+                    line for line in source_text.splitlines() if not line.startswith(f"{missing_key}=")
+                )
+                template.write_text(without_key + "\n", encoding="utf-8")
+                result = deploy_template.verify_template(template)
+                findings = [deploy_template.finding_to_dict(finding) for finding in result["findings"]]
+                self.assertEqual(result["status"], "blocked")
+                self.assertIn(
+                    {"key": missing_key, "category": "missing-key", "message": "required key is missing"},
+                    findings,
+                )
+
+    def test_internal_uat_coolify_env_template_rejects_placeholder_or_malformed_tracking_version_without_values(self):
+        source = ROOT / "deploy" / "internal-uat" / "coolify" / "sqag.uat.env.example"
+        source_text = source.read_text(encoding="utf-8")
+        invalid_values = ("<host-configured-tracking-key-version>", "invalid version with spaces", "x" * 25)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "sqag.uat.env.example"
+            for invalid_value in invalid_values:
+                template.write_text(
+                    source_text.replace("SQAG_TRACKING_HMAC_KEY_VERSION=tracking-v1", f"SQAG_TRACKING_HMAC_KEY_VERSION={invalid_value}"),
+                    encoding="utf-8",
+                )
+                result = deploy_template.verify_template(template)
+                rendered = json.dumps([deploy_template.finding_to_dict(finding) for finding in result["findings"]])
+                self.assertEqual(result["status"], "blocked")
+                self.assertIn("SQAG_TRACKING_HMAC_KEY_VERSION", rendered)
+                self.assertIn("invalid-format", rendered)
+                self.assertNotIn(invalid_value, rendered)
+
+    def test_internal_uat_coolify_env_template_accepts_runtime_valid_tracking_version(self):
+        source = ROOT / "deploy" / "internal-uat" / "coolify" / "sqag.uat.env.example"
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "sqag.uat.env.example"
+            template.write_text(
+                source.read_text(encoding="utf-8").replace(
+                    "SQAG_TRACKING_HMAC_KEY_VERSION=tracking-v1",
+                    "SQAG_TRACKING_HMAC_KEY_VERSION=rotation_2026.07",
+                ),
+                encoding="utf-8",
+            )
+            result = deploy_template.verify_template(template)
+
+        self.assertEqual(result["status"], "ready")
+
+    def test_internal_uat_coolify_env_template_cli_never_prints_tracking_values(self):
+        source = ROOT / "deploy" / "internal-uat" / "coolify" / "sqag.uat.env.example"
+        secret_value = "private-tracking-secret-value"
+        malformed_version = "private malformed tracking version"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "sqag.uat.env.example"
+            template.write_text(
+                source.read_text(encoding="utf-8")
+                .replace("<host-secret-manager-dedicated-tracking-hmac-key>", secret_value)
+                .replace("SQAG_TRACKING_HMAC_KEY_VERSION=tracking-v1", f"SQAG_TRACKING_HMAC_KEY_VERSION={malformed_version}"),
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = deploy_template.main([str(template)])
+
+        output = stdout.getvalue()
+        self.assertEqual(exit_code, 1)
+        self.assertIn("SQAG_TRACKING_HMAC_KEY", output)
+        self.assertIn("SQAG_TRACKING_HMAC_KEY_VERSION", output)
+        self.assertNotIn(secret_value, output)
+        self.assertNotIn(malformed_version, output)
 
     def test_internal_uat_coolify_env_template_rejects_disguised_platform_service_secret(self):
         source = ROOT / "deploy" / "internal-uat" / "coolify" / "sqag.uat.env.example"

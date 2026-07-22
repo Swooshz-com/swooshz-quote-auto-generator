@@ -44,6 +44,11 @@ from webapp.object_storage import (
     artifact_checksum,
     object_storage_provider_status,
 )
+from webapp.postgres_migrations import (
+    MIGRATION_FILE_NAMES,
+    inspect_postgres_migrations,
+    migration_manifest,
+)
 
 
 LIVE_RETENTION_DELETE_ENV_NAME = "SQAG_LIVE_RETENTION_DELETE_EVIDENCE"
@@ -105,7 +110,7 @@ OBJECT_ARTIFACT_ROW_FIELD_INDEX = {field: index for index, field in enumerate(OB
 
 StorageFactory = Callable[[str, str], Any]
 BackendFactory = Callable[[Mapping[str, str]], ObjectStorageBackend]
-MigrationApplier = Callable[[str], None]
+MigrationInspector = Callable[[str], Mapping[str, Any]]
 
 
 def _clean(value: object) -> str:
@@ -146,6 +151,10 @@ def _default_checks(
         "active_object_target_present": object_present,
         "runtime_database_mode_enabled": runtime_database_mode_enabled,
         "runtime_object_artifact_mode_enabled": runtime_object_artifact_mode_enabled,
+        "migration_preflight_attempted": False,
+        "trusted_migration_ledger": False,
+        "zero_pending_migrations": False,
+        "migration_schema_ready": False,
         "connection_attempted": False,
         "write_attempted": False,
         "read_attempted": False,
@@ -222,6 +231,7 @@ def _report(
         "active_object_synthetic_objects_written": int(active_object_count),
         "active_object_synthetic_objects_deleted": int(active_object_deleted_count),
         "db_blob_artifact_rows_written": 0,
+        "migration_payload_statements_executed": 0,
         "runtime_download_failure_stage": safe_runtime_download_failure_stage,
         "privacy": _privacy_report(),
         "production_ready": False,
@@ -231,8 +241,52 @@ def _report(
             "It fails closed unless explicit live retention/delete evidence env names are present.",
             "It never reports private target values, object keys, artifact bytes, tenant data, generated quote contents, or secrets.",
             "A test-injected backend exercises verifier logic only and is not live production evidence.",
+            "This verifier has no migration authority and requires a read-only preflight with a trusted zero-pending ledger.",
         ],
     }
+
+
+def _inspect_migration_readiness(database_url: str) -> Mapping[str, Any]:
+    migrations = migration_manifest(ROOT / "migrations")
+    with webapp.postgres_storage_connection(database_url) as connection:
+        try:
+            connection.execute("set transaction read only")
+            return inspect_postgres_migrations(connection, migrations)
+        finally:
+            connection.rollback()
+
+
+def _migration_preflight_blockers(report: Mapping[str, Any]) -> list[str]:
+    expected_ids = list(MIGRATION_FILE_NAMES)
+    ledger_state = _clean(report.get("ledgerState"))
+    pending_ids = report.get("pendingMigrationIds")
+    applied_ids = report.get("appliedMigrationIds")
+    inspection_blockers = report.get("blockers")
+
+    if ledger_state == "missing":
+        return ["migration_ledger_missing"]
+    if ledger_state != "present":
+        return ["migration_ledger_untrusted"]
+    if not isinstance(pending_ids, list) or not isinstance(applied_ids, list) or not isinstance(inspection_blockers, list):
+        return ["migration_preflight_invalid"]
+    if pending_ids:
+        return ["pending_migrations"]
+    if applied_ids != expected_ids:
+        return ["migration_ledger_untrusted"]
+    if inspection_blockers:
+        if any(str(item).startswith("checksum_drift:") for item in inspection_blockers):
+            return ["migration_checksum_drift"]
+        if any(item in {"unexpected_applied_migration", "unknown_or_out_of_order_migration"} for item in inspection_blockers):
+            return ["migration_ledger_untrusted"]
+        return ["migration_schema_not_ready"]
+    if (
+        report.get("status") != "ready"
+        or report.get("safeToApply") is not True
+        or report.get("expectedHead") != expected_ids[-1]
+        or report.get("appliedHead") != expected_ids[-1]
+    ):
+        return ["migration_schema_not_ready"]
+    return []
 
 
 def _build_default_storage(database_url: str, workspace_id: str) -> Any:
@@ -650,7 +704,6 @@ def _run_drill(
     blockers: list[str],
     storage_factory: StorageFactory,
     backend_factory: BackendFactory,
-    migration_applier: MigrationApplier,
     runtime_download_diagnostics: dict[str, str],
 ) -> tuple[dict[str, bool], list[str], int, int, int]:
     ids = _synthetic_ids()
@@ -666,7 +719,6 @@ def _run_drill(
     try:
         checks["connection_attempted"] = True
         try:
-            migration_applier(database_url)
             storage = storage_factory(database_url, ids["workspace_a"])
             storage.ensure_ready()
             storage.ensure_object_artifact_ready()
@@ -798,7 +850,7 @@ def run_verification(
     env: Mapping[str, str] | None = None,
     storage_factory: StorageFactory | None = None,
     backend_factory: BackendFactory | None = None,
-    migration_applier: MigrationApplier | None = None,
+    migration_inspector: MigrationInspector | None = None,
     execute_live_drill: bool = True,
     test_injected_backend: bool = False,
 ) -> dict[str, object]:
@@ -834,13 +886,32 @@ def run_verification(
             test_injected_backend=test_injected_backend,
         )
 
+    checks["migration_preflight_attempted"] = True
+    try:
+        migration_report = (migration_inspector or _inspect_migration_readiness)(
+            _clean(effective_env.get(webapp.SQAG_DATABASE_URL_ENV_NAME))
+        )
+        migration_blockers = _migration_preflight_blockers(migration_report)
+    except Exception:
+        migration_blockers = ["migration_preflight_failed"]
+    if migration_blockers:
+        return _report(
+            status="blocked",
+            checks=checks,
+            missing_env_names=missing,
+            blockers=migration_blockers,
+            test_injected_backend=test_injected_backend,
+        )
+    checks["trusted_migration_ledger"] = True
+    checks["zero_pending_migrations"] = True
+    checks["migration_schema_ready"] = True
+
     checks, blockers, active_db_rows, active_object_count, active_object_deleted_count = _run_drill(
         env=effective_env,
         checks=checks,
         blockers=blockers,
         storage_factory=storage_factory or _build_default_storage,
         backend_factory=backend_factory or _build_s3_backend,
-        migration_applier=migration_applier or webapp.apply_sqag_storage_migrations,
         runtime_download_diagnostics=runtime_download_diagnostics,
     )
     status = "passed" if not blockers else "failed"

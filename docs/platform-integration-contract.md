@@ -214,7 +214,7 @@ Platform credentials:
 | Profile/pricing/layout workspace-only reads | `test_database_storage_profiles_are_workspace_db_only`, `test_database_storage_pricing_references_are_workspace_db_only`, `test_database_artifact_profile_layout_is_workspace_db_only` |
 | Database artifact workspace scoping and raw token omission | `test_database_artifact_storage_saves_workspace_scoped_generated_exports`, `test_database_artifact_storage_does_not_persist_raw_platform_launch_token` |
 | Local quote-session and artifact fallback blocked by Platform context | `test_platform_session_context_blocks_local_quote_session_runtime_storage_in_local_app_mode`, `test_platform_session_context_blocks_local_artifact_storage_in_local_app_mode` |
-| Synthetic hosted negative launch/generate/session/download/delete smoke | `test_platform_uat_smoke_launch_generate_list_and_download_database_artifact` and `scripts/verify_hosted_smoke.py`; readiness remains blocked until object storage evidence is live |
+| Synthetic/local hosted-contract negative launch/generate/session/download/delete smoke | `test_platform_uat_smoke_launch_generate_list_and_download_database_artifact` and compatibility command `scripts/verify_hosted_smoke.py`; this does not test a public URL and is not live Neon/R2 or Platform handoff evidence; readiness remains blocked until object storage evidence is live |
 
 This PR adds no duplicate runtime behavior tests because the existing tests
 already cover the SQAG-side fail-closed and isolation behavior. The new docs

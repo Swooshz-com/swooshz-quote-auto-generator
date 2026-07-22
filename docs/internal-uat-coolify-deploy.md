@@ -66,8 +66,9 @@ Required names for any future hosted validation environment:
 | Area | Names |
 | --- | --- |
 | App/auth | `APP_MODE`, `AUTH_REQUIRED`, `SESSION_SECRET` |
+| Security/tracking | secret `SQAG_TRACKING_HMAC_KEY`; non-secret configuration `SQAG_TRACKING_HMAC_KEY_VERSION` |
 | Storage | `SQAG_STORAGE_MODE`, `SQAG_ARTIFACT_STORAGE_MODE`, `SQAG_DATABASE_URL`, `SQAG_OBJECT_STORAGE_PROVIDER`, `SQAG_OBJECT_STORAGE_ENDPOINT_URL`, `SQAG_OBJECT_STORAGE_BUCKET`, `SQAG_OBJECT_STORAGE_REGION`, `SQAG_OBJECT_STORAGE_ACCESS_KEY_ID`, `SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY` |
-| Platform launch/session validation | `SQAG_PLATFORM_LAUNCH_MODE`, `SQAG_PLATFORM_BASE_URL`, `SQAG_PUBLIC_BASE_URL`, `SQAG_PLATFORM_SERVICE_SECRET`, optional non-secret `SQAG_PLATFORM_REQUEST_TIMEOUT_SECONDS` |
+| Platform launch/session validation | `SQAG_PLATFORM_LAUNCH_MODE`, `SQAG_PLATFORM_BASE_URL`, `SQAG_PUBLIC_BASE_URL`, `SQAG_PLATFORM_SERVICE_SECRET`, non-secret `SQAG_PLATFORM_REQUEST_TIMEOUT_SECONDS` |
 | Reverse proxy | `SQAG_TRUSTED_PROXY_CIDRS` |
 | Runtime housekeeping | `QUOTE_DATA_ROOT`, `QUOTE_OUTPUT_ROOT`, `QUOTE_TMP_ROOT`, `QUOTE_LOG_ROOT`, `PORT` |
 
@@ -80,6 +81,11 @@ uses the first untrusted address for both Platform-launch and normal mutable
 route rate limits. Missing, malformed, oversized, or overlong forwarding data
 falls back to the socket peer. Missing or malformed trusted-proxy
 configuration blocks deploy preflight and startup.
+
+`SQAG_TRACKING_HMAC_KEY` is a dedicated secret and must be supplied only by
+the host secret manager. `SQAG_TRACKING_HMAC_KEY_VERSION` is non-secret
+configuration and must contain 1-24 ASCII letters, digits, dots, underscores,
+or hyphens, matching deploy runtime preflight. Neither value may be printed.
 
 Rate-limit state is also bounded per SQAG process. The ordinary map holds at
 most 4,096 client/normalized-route buckets. At capacity, unseen identities
@@ -116,6 +122,10 @@ python scripts\verify_hosted_observability.py --work-dir _tmp\validation\hosted-
 python scripts\verify_hosted_smoke.py --work-dir _tmp\validation\hosted-smoke
 ```
 
+`verify_hosted_smoke.py` is a synthetic/local hosted-contract smoke verifier.
+It binds only to `127.0.0.1`; it does not test a public hosted URL and is not
+live Neon/R2 evidence or Platform handoff evidence.
+
 Run the readiness checker with database metadata plus object artifact mode:
 
 ```powershell
@@ -126,6 +136,20 @@ The readiness checker is expected to keep both `internal_alpha_ready=false` and
 `production_ready=false` until live object provider, live retention/delete,
 DB+object backup/restore, hosted operations, and hosted smoke evidence are
 actually available.
+
+Before any separately authorized live retention/delete evidence run:
+
+1. Run `python scripts\preflight_sqag_migrations.py`; it is read-only.
+2. Require a present, exact ordered trusted ledger, zero pending migrations,
+   and ready tables, indexes, triggers, and routines.
+3. If migration application is needed, obtain separate authorization and use
+   the migration runbook; verification does not grant that authority.
+4. Re-run the read-only preflight and require zero pending migrations.
+5. Only then may the live retention/delete evidence drill be separately
+   authorized.
+
+A verification command never grants itself migration authority, creates or
+repairs the ledger, executes migration payloads, or runs DDL.
 
 ## Hosted Smoke Checklist
 
