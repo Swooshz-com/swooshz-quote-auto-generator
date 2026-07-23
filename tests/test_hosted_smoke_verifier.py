@@ -49,6 +49,10 @@ class HostedSmokeVerifierTest(unittest.TestCase):
 
         self.assertEqual(report["status"], "passed")
         self.assertTrue(report["synthetic_only"])
+        self.assertEqual(report["evidence_scope"], "synthetic_local_hosted_contract")
+        self.assertFalse(report["public_hosted_url_tested"])
+        self.assertFalse(report["live_neon_r2_evidence"])
+        self.assertFalse(report["platform_handoff_evidence"])
         self.assertEqual(report["network"]["host"], "127.0.0.1")
         self.assertNotIn("localhost", text.lower())
         self.assertEqual(report["privacy"]["output"], "metadata-only")
@@ -103,6 +107,8 @@ class HostedSmokeVerifierTest(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["evidence_scope"], "synthetic_local_hosted_contract")
+        self.assertFalse(report["public_hosted_url_tested"])
         self.assertNotIn(private_path, output)
 
 

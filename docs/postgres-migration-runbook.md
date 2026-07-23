@@ -69,6 +69,19 @@ new empty PostgreSQL database:
 The migration command reports migration IDs only. It does not print the target
 connection value.
 
+## Evidence Verifier Boundary
+
+Live retention/delete verification is not a migration action. Before that
+evidence can be separately authorized, run the read-only migration preflight
+and require a present exact ordered ledger, zero pending migrations, and ready
+tables, indexes, triggers, and routines. If migrations are pending, stop and
+obtain separate authorization for migration application, then repeat the
+read-only preflight.
+
+Verification commands never grant themselves migration authority. They do not
+create or populate the ledger, run DDL, execute migration files, or silently
+repair schema state.
+
 ## Existing Unledgered Schema
 
 The production schema described before this change has no trusted ledger. Do

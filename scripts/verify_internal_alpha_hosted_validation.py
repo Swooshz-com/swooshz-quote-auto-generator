@@ -32,6 +32,8 @@ REQUIRED_ENV_NAMES = [
     "APP_MODE",
     "AUTH_REQUIRED",
     "SESSION_SECRET",
+    "SQAG_TRACKING_HMAC_KEY",
+    "SQAG_TRACKING_HMAC_KEY_VERSION",
     "SQAG_STORAGE_MODE",
     "SQAG_ARTIFACT_STORAGE_MODE",
     "SQAG_DATABASE_URL",
@@ -51,6 +53,7 @@ REQUIRED_ENV_NAMES = [
 
 HOST_SECRET_MANAGER_ONLY_ENV_NAMES = [
     "SESSION_SECRET",
+    "SQAG_TRACKING_HMAC_KEY",
     "SQAG_DATABASE_URL",
     "SQAG_PLATFORM_BASE_URL",
     "OIDC_ISSUER_URL",
@@ -110,6 +113,12 @@ def safe_failure_report(stage: str) -> dict[str, Any]:
         "failed_stage": stage,
         "synthetic_only": True,
         "live_deployment_evidence": False,
+        "hosted_smoke_scope": {
+            "evidence_scope": "synthetic_local_hosted_contract",
+            "public_hosted_url_tested": False,
+            "live_neon_r2_evidence": False,
+            "platform_handoff_evidence": False,
+        },
         "production_ready": False,
         "privacy": privacy_summary(),
         "notes": [
@@ -175,6 +184,12 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
         "status": status,
         "synthetic_only": True,
         "live_deployment_evidence": False,
+        "hosted_smoke_scope": {
+            "evidence_scope": "synthetic_local_hosted_contract",
+            "public_hosted_url_tested": False,
+            "live_neon_r2_evidence": False,
+            "platform_handoff_evidence": False,
+        },
         "target_posture": {
             "environment": "blocked-deploy-database-blob-artifact-validation",
             "app_mode": "deploy",
@@ -208,13 +223,14 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
         "proves": [
             "synthetic SQLite database/database-artifact backup, restore, rollback, and retention-policy evidence ran",
             "synthetic privacy-minimized hosted observability schema and health metadata evidence",
-            "synthetic deploy/database/database-artifact hosted smoke evidence on 127.0.0.1",
+            "synthetic/local deploy/database/database-artifact hosted-contract smoke evidence on 127.0.0.1",
             "readiness checker blocks DB/BLOB artifact mode from launch, hosted, protected, deploy, and production readiness",
         ],
         "does_not_prove": [
             "live VPS, Coolify, DNS, TLS, firewall, reverse proxy, or host health evidence",
             "real OIDC provider login/logout or live Swooshz Platform integration",
             "real object-storage provider, DB+object backup/restore, or live retention/delete evidence",
+            "a public hosted URL test, live Neon/R2 evidence, or Platform handoff evidence",
             "hosted launch readiness, production deployment operations, alert delivery, supply-chain hardening, or production readiness",
         ],
         "privacy": privacy_summary(),
@@ -230,7 +246,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Verify metadata-only SQAG blocked hosted validation evidence.")
+    parser = argparse.ArgumentParser(description="Verify metadata-only SQAG blocked synthetic/local hosted-contract evidence.")
     parser.add_argument("--work-dir", type=Path, default=None, help="Synthetic verifier workspace. The path is never printed.")
     return parser
 

@@ -53,6 +53,22 @@ def complete_env() -> dict[str, str]:
     }
 
 
+def trusted_migration_report(verifier, **updates):
+    migration_ids = list(verifier.MIGRATION_FILE_NAMES)
+    report = {
+        "status": "ready",
+        "safeToApply": True,
+        "ledgerState": "present",
+        "expectedHead": migration_ids[-1],
+        "appliedHead": migration_ids[-1],
+        "appliedMigrationIds": migration_ids,
+        "pendingMigrationIds": [],
+        "blockers": [],
+    }
+    report.update(updates)
+    return report
+
+
 class FakeStorage:
     def __init__(
         self,
@@ -289,13 +305,77 @@ def run_injected_drill(verifier, *, fail_storage="", fail_backend="", backend_fa
         env=complete_env(),
         storage_factory=storage_factory,
         backend_factory=backend_factory,
-        migration_applier=lambda _database_url: None,
+        migration_inspector=lambda _database_url: trusted_migration_report(verifier),
         test_injected_backend=True,
     )
     return report, storages, backend_holder
 
 
 class LiveRetentionDeleteVerifierTest(unittest.TestCase):
+    def run_preflight_case(self, verifier, migration_report=None, migration_error=None):
+        called = {"storage": False, "backend": False}
+
+        def storage_factory(*_args, **_kwargs):
+            called["storage"] = True
+            raise AssertionError("storage factory must not run before a trusted zero-pending preflight")
+
+        def backend_factory(*_args, **_kwargs):
+            called["backend"] = True
+            raise AssertionError("backend factory must not run before a trusted zero-pending preflight")
+
+        def migration_inspector(_database_url):
+            if migration_error is not None:
+                raise migration_error
+            return migration_report
+
+        report = verifier.run_verification(
+            env=complete_env(),
+            storage_factory=storage_factory,
+            backend_factory=backend_factory,
+            migration_inspector=migration_inspector,
+            test_injected_backend=True,
+        )
+        return report, called
+
+    def run_dependency_classification_case(
+        self,
+        verifier,
+        *,
+        inject_storage=False,
+        inject_backend=False,
+        inject_migration=False,
+        explicit_test_flag=None,
+        backend_failure=False,
+        private_marker="PRIVATE-INJECTED-DEPENDENCY-DETAIL",
+    ):
+        def storage_factory(_database_url, workspace_id, **_kwargs):
+            return FakeStorage(workspace_id=workspace_id)
+
+        def backend_factory(_env):
+            if backend_failure:
+                raise RuntimeError(private_marker)
+            return FakeBackend(verifier.ObjectArtifactMetadata)
+
+        def migration_inspector(_database_url):
+            return trusted_migration_report(verifier)
+
+        kwargs = {}
+        if inject_storage:
+            kwargs["storage_factory"] = storage_factory
+        if inject_backend:
+            kwargs["backend_factory"] = backend_factory
+        if inject_migration:
+            kwargs["migration_inspector"] = migration_inspector
+        if explicit_test_flag is not None:
+            kwargs["test_injected_backend"] = explicit_test_flag
+
+        with (
+            mock.patch.object(verifier, "_build_default_storage", new=storage_factory),
+            mock.patch.object(verifier, "_build_s3_backend", new=backend_factory),
+            mock.patch.object(verifier, "_inspect_migration_readiness", new=migration_inspector),
+        ):
+            return verifier.run_verification(env=complete_env(), **kwargs)
+
     def test_missing_env_reports_blocked_without_values(self):
         verifier = load_verifier()
         report = verifier.run_verification(env={})
@@ -337,7 +417,7 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
             env=env,
             storage_factory=storage_factory,
             backend_factory=backend_factory,
-            migration_applier=lambda _database_url: None,
+            migration_inspector=lambda _database_url: trusted_migration_report(verifier),
             test_injected_backend=True,
         )
 
@@ -359,7 +439,7 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
             env=env,
             storage_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("storage factory should not be called")),
             backend_factory=lambda _env: (_ for _ in ()).throw(AssertionError("backend factory should not be called")),
-            migration_applier=lambda _database_url: None,
+            migration_inspector=lambda _database_url: trusted_migration_report(verifier),
             test_injected_backend=True,
         )
 
@@ -379,7 +459,7 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
             env=env,
             storage_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("storage factory should not be called")),
             backend_factory=lambda _env: (_ for _ in ()).throw(AssertionError("backend factory should not be called")),
-            migration_applier=lambda _database_url: None,
+            migration_inspector=lambda _database_url: trusted_migration_report(verifier),
             test_injected_backend=True,
         )
 
@@ -400,7 +480,7 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
                 env=env,
                 storage_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("storage factory should not be called")),
                 backend_factory=lambda _env: (_ for _ in ()).throw(AssertionError("backend factory should not be called")),
-                migration_applier=lambda _database_url: None,
+                migration_inspector=lambda _database_url: trusted_migration_report(verifier),
                 test_injected_backend=True,
             )
 
@@ -441,7 +521,7 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
             env=env,
             storage_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("storage factory should not be called")),
             backend_factory=lambda _env: (_ for _ in ()).throw(AssertionError("backend factory should not be called")),
-            migration_applier=lambda _database_url: None,
+            migration_inspector=lambda _database_url: trusted_migration_report(verifier),
             test_injected_backend=True,
         )
 
@@ -507,6 +587,228 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
         self.assertNotIn("OPAQUE-STORAGE-REF", text)
         self.assertNotIn("private-payload", text)
 
+    def test_dependency_injection_is_automatically_non_live_without_manual_flag(self):
+        verifier = load_verifier()
+        report = self.run_dependency_classification_case(
+            verifier,
+            inject_storage=True,
+            inject_backend=True,
+            inject_migration=True,
+        )
+
+        self.assertEqual(report["status"], "passed")
+        self.assertTrue(report["test_injected_backend"])
+        self.assertFalse(report["live_retention_delete_evidence_supported"])
+
+    def test_each_injected_dependency_automatically_forces_non_live_classification(self):
+        verifier = load_verifier()
+
+        for dependency_name in ("storage", "backend", "migration"):
+            with self.subTest(dependency=dependency_name):
+                report = self.run_dependency_classification_case(
+                    verifier,
+                    inject_storage=dependency_name == "storage",
+                    inject_backend=dependency_name == "backend",
+                    inject_migration=dependency_name == "migration",
+                )
+
+                self.assertEqual(report["status"], "passed")
+                self.assertTrue(report["test_injected_backend"])
+                self.assertFalse(report["live_retention_delete_evidence_supported"])
+
+    def test_explicit_false_cannot_override_automatic_injected_classification(self):
+        verifier = load_verifier()
+        report = self.run_dependency_classification_case(
+            verifier,
+            inject_storage=True,
+            inject_backend=True,
+            inject_migration=True,
+            explicit_test_flag=False,
+        )
+
+        self.assertEqual(report["status"], "passed")
+        self.assertTrue(report["test_injected_backend"])
+        self.assertFalse(report["live_retention_delete_evidence_supported"])
+
+    def test_explicit_true_remains_non_live_without_dependency_injection(self):
+        verifier = load_verifier()
+        report = self.run_dependency_classification_case(
+            verifier,
+            explicit_test_flag=True,
+        )
+
+        self.assertEqual(report["status"], "passed")
+        self.assertTrue(report["test_injected_backend"])
+        self.assertFalse(report["live_retention_delete_evidence_supported"])
+
+    def test_failed_injected_verification_uses_the_same_non_live_classification(self):
+        verifier = load_verifier()
+        report = self.run_dependency_classification_case(
+            verifier,
+            inject_backend=True,
+            backend_failure=True,
+        )
+
+        self.assertEqual(report["status"], "failed")
+        self.assertTrue(report["test_injected_backend"])
+        self.assertFalse(report["live_retention_delete_evidence_supported"])
+
+    def test_no_argument_dependency_path_is_not_automatically_classified_as_injected(self):
+        verifier = load_verifier()
+        report = self.run_dependency_classification_case(verifier)
+
+        self.assertEqual(report["status"], "passed")
+        self.assertFalse(report["test_injected_backend"])
+        self.assertTrue(report["live_retention_delete_evidence_supported"])
+
+    def test_injected_dependency_details_are_not_serialized(self):
+        verifier = load_verifier()
+        private_marker = "PRIVATE-INJECTED-DEPENDENCY-DETAIL"
+        report = self.run_dependency_classification_case(
+            verifier,
+            inject_backend=True,
+            backend_failure=True,
+            private_marker=private_marker,
+        )
+
+        self.assertTrue(report["test_injected_backend"])
+        self.assertNotIn(private_marker, json.dumps(report, sort_keys=True))
+
+    def test_verifier_never_calls_migration_appliers(self):
+        verifier = load_verifier()
+        import webapp.postgres_migrations as postgres_migrations
+
+        with (
+            mock.patch.object(webapp, "apply_sqag_storage_migrations", side_effect=AssertionError("must not apply")) as legacy_apply,
+            mock.patch.object(postgres_migrations, "apply_postgres_migrations", side_effect=AssertionError("must not apply")) as postgres_apply,
+        ):
+            report, _storages, _backend = run_injected_drill(verifier)
+
+        self.assertEqual(report["status"], "passed")
+        self.assertTrue(report["checks"]["migration_preflight_attempted"])
+        self.assertTrue(report["checks"]["trusted_migration_ledger"])
+        self.assertTrue(report["checks"]["zero_pending_migrations"])
+        self.assertTrue(report["checks"]["migration_schema_ready"])
+        self.assertEqual(report["migration_payload_statements_executed"], 0)
+        legacy_apply.assert_not_called()
+        postgres_apply.assert_not_called()
+
+    def test_default_migration_inspector_executes_read_only_preflight_only(self):
+        verifier = load_verifier()
+        statements = []
+
+        class Connection:
+            def execute(self, statement):
+                statements.append(statement)
+
+            def rollback(self):
+                statements.append("rollback")
+
+        class ConnectionContext:
+            def __enter__(self):
+                return Connection()
+
+            def __exit__(self, *_args):
+                return False
+
+        expected = trusted_migration_report(verifier)
+        with (
+            mock.patch.object(verifier.webapp, "postgres_storage_connection", return_value=ConnectionContext()),
+            mock.patch.object(verifier, "migration_manifest", return_value=(object(),)),
+            mock.patch.object(verifier, "inspect_postgres_migrations", return_value=expected) as inspect,
+        ):
+            report = verifier._inspect_migration_readiness("PRIVATE-CONNECTION-DETAIL")
+
+        self.assertEqual(report, expected)
+        self.assertEqual(statements, ["set transaction read only", "rollback"])
+        inspect.assert_called_once()
+
+    def test_pending_migration_blocks_before_evidence_writes(self):
+        verifier = load_verifier()
+        migration_ids = list(verifier.MIGRATION_FILE_NAMES)
+        report, called = self.run_preflight_case(
+            verifier,
+            trusted_migration_report(
+                verifier,
+                appliedHead=migration_ids[-2],
+                appliedMigrationIds=migration_ids[:-1],
+                pendingMigrationIds=migration_ids[-1:],
+            ),
+        )
+
+        self.assertEqual(report["status"], "blocked")
+        self.assertEqual(report["blockers"], ["pending_migrations"])
+        self.assertEqual(called, {"storage": False, "backend": False})
+        self.assertFalse(report["checks"]["write_attempted"])
+
+    def test_checksum_drift_blocks_before_evidence_writes(self):
+        verifier = load_verifier()
+        report, called = self.run_preflight_case(
+            verifier,
+            trusted_migration_report(verifier, status="unsafe", safeToApply=False, blockers=["checksum_drift:001_platform_scoped_storage.sql"]),
+        )
+
+        self.assertEqual(report["blockers"], ["migration_checksum_drift"])
+        self.assertEqual(called, {"storage": False, "backend": False})
+
+    def test_unknown_or_out_of_order_ledger_blocks_before_evidence_writes(self):
+        verifier = load_verifier()
+        report, called = self.run_preflight_case(
+            verifier,
+            trusted_migration_report(
+                verifier,
+                status="unsafe",
+                safeToApply=False,
+                appliedMigrationIds=["999_unknown.sql"],
+                appliedHead="999_unknown.sql",
+                blockers=["unknown_or_out_of_order_migration"],
+            ),
+        )
+
+        self.assertEqual(report["blockers"], ["migration_ledger_untrusted"])
+        self.assertEqual(called, {"storage": False, "backend": False})
+
+    def test_missing_schema_trigger_or_routine_readiness_blocks_before_evidence_writes(self):
+        verifier = load_verifier()
+        report, called = self.run_preflight_case(
+            verifier,
+            trusted_migration_report(
+                verifier,
+                status="unsafe",
+                safeToApply=False,
+                blockers=["schema_ledger_inconsistent_missing_triggers:sqag_quote_sessions_delete_guard"],
+            ),
+        )
+
+        self.assertEqual(report["blockers"], ["migration_schema_not_ready"])
+        self.assertEqual(called, {"storage": False, "backend": False})
+
+    def test_missing_ledger_blocks_before_evidence_writes(self):
+        verifier = load_verifier()
+        report, called = self.run_preflight_case(
+            verifier,
+            trusted_migration_report(
+                verifier,
+                ledgerState="missing",
+                appliedHead=None,
+                appliedMigrationIds=[],
+                pendingMigrationIds=list(verifier.MIGRATION_FILE_NAMES),
+            ),
+        )
+
+        self.assertEqual(report["blockers"], ["migration_ledger_missing"])
+        self.assertEqual(called, {"storage": False, "backend": False})
+
+    def test_migration_preflight_failure_is_sanitized_and_blocks_writes(self):
+        verifier = load_verifier()
+        private_detail = "postgresql://private-user:private-password@private-host/private-db"
+        report, called = self.run_preflight_case(verifier, migration_error=RuntimeError(private_detail))
+        text = json.dumps(report, sort_keys=True)
+
+        self.assertEqual(report["blockers"], ["migration_preflight_failed"])
+        self.assertEqual(called, {"storage": False, "backend": False})
+        self.assertNotIn(private_detail, text)
+
     def test_missing_active_runtime_download_fails_closed_before_tombstone(self):
         verifier = load_verifier()
         report, _storages, _backend = run_injected_drill(verifier, runtime_export_available=False)
@@ -526,11 +828,12 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
             env[webapp.SQAG_DATABASE_URL_ENV_NAME] = database_url
             backend = webapp.InMemoryObjectStorageBackend()
             with mock.patch.dict(os.environ, env, clear=True):
+                webapp.apply_sqag_storage_migrations(database_url)
                 report = verifier.run_verification(
                     env=env,
                     storage_factory=verifier._build_default_storage,
                     backend_factory=lambda _env: backend,
-                    migration_applier=webapp.apply_sqag_storage_migrations,
+                    migration_inspector=lambda _database_url: trusted_migration_report(verifier),
                     test_injected_backend=True,
                 )
 

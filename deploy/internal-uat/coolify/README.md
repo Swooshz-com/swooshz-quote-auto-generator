@@ -22,10 +22,12 @@ Recommended app settings:
   `SQAG_ARTIFACT_STORAGE_MODE=object` with the canonical
   `SQAG_OBJECT_STORAGE_*` names supplied through the host secret manager
 - Auth posture: `AUTH_REQUIRED=true`, a host-secret-managed `SESSION_SECRET`
-  of at least 32 characters, `SQAG_PLATFORM_LAUNCH_MODE=platform`, and an HTTPS
-  `SQAG_PLATFORM_BASE_URL` except for explicit loopback-only local smoke
-  endpoints. Standalone OIDC does not establish a workspace and cannot start
-  deploy mode.
+  of at least 32 characters, a dedicated host-secret-managed
+  `SQAG_TRACKING_HMAC_KEY`, non-secret `SQAG_TRACKING_HMAC_KEY_VERSION`
+  configuration matching the runtime format,
+  `SQAG_PLATFORM_LAUNCH_MODE=platform`, and an HTTPS `SQAG_PLATFORM_BASE_URL`
+  except for explicit loopback-only local smoke endpoints. Standalone OIDC
+  does not establish a workspace and cannot start deploy mode.
 - Proxy posture: `SQAG_TRUSTED_PROXY_CIDRS` contains only the exact CIDR or
   comma-separated CIDRs of the Coolify/Traefik proxy peers that connect
   directly to SQAG. Do not use a trust-all network. Missing or malformed proxy
@@ -48,6 +50,10 @@ python scripts\verify_internal_uat_deploy_template.py
 ```powershell
 python scripts\verify_internal_alpha_hosted_validation.py --work-dir _tmp\validation\internal-alpha-hosted
 ```
+
+This validation uses synthetic/local hosted-contract smoke on `127.0.0.1`.
+It does not test a public hosted URL and is not live Neon/R2 or Platform
+handoff evidence.
 
 Keep populated env files, real Platform values, database URLs, private
 profile/pricing files, runtime data, generated quote exports, object-provider

@@ -10,6 +10,9 @@ from unittest import mock
 from webapp import server as webapp
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import check_production_readiness as readiness_checker
 
 
 def test_temp_root() -> Path:
@@ -19,6 +22,25 @@ def test_temp_root() -> Path:
 
 
 class ProductionReadinessStatusTest(unittest.TestCase):
+    def test_live_retention_readiness_wrapper_never_calls_migration_appliers(self):
+        import webapp.postgres_migrations as postgres_migrations
+
+        with (
+            mock.patch.object(webapp, "apply_sqag_storage_migrations", side_effect=AssertionError("must not apply")) as legacy_apply,
+            mock.patch.object(postgres_migrations, "apply_postgres_migrations", side_effect=AssertionError("must not apply")) as postgres_apply,
+            mock.patch.object(
+                readiness_checker.verify_live_retention_delete,
+                "run_verification",
+                return_value={"status": "passed", "live_retention_delete_evidence_supported": True},
+            ) as verifier,
+        ):
+            status = readiness_checker.live_retention_delete_evidence_status(enabled=True)
+
+        self.assertEqual(status, "passed")
+        verifier.assert_called_once_with()
+        legacy_apply.assert_not_called()
+        postgres_apply.assert_not_called()
+
     def readiness_json(self, env):
         with mock.patch.dict(webapp.os.environ, env, clear=True):
             status = webapp.production_readiness_status(security_scan_status="standard_scan_started")

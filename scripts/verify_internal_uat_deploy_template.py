@@ -18,6 +18,8 @@ REQUIRED_KEYS = (
     "APP_MODE",
     "AUTH_REQUIRED",
     "SESSION_SECRET",
+    "SQAG_TRACKING_HMAC_KEY",
+    "SQAG_TRACKING_HMAC_KEY_VERSION",
     "SQAG_STORAGE_MODE",
     "SQAG_ARTIFACT_STORAGE_MODE",
     "SQAG_DATABASE_URL",
@@ -42,6 +44,7 @@ REQUIRED_KEYS = (
 PLACEHOLDER_KEYS = {
     'SQAG_TRUSTED_PROXY_CIDRS',
     "SESSION_SECRET",
+    "SQAG_TRACKING_HMAC_KEY",
     "SQAG_DATABASE_URL",
     "SQAG_OBJECT_STORAGE_PROVIDER",
     "SQAG_OBJECT_STORAGE_ENDPOINT_URL",
@@ -70,7 +73,10 @@ EXPECTED_VALUES = {
 
 EXACT_PLACEHOLDERS = {
     "SQAG_PLATFORM_SERVICE_SECRET": "<host-secret-manager-platform-service-secret>",
+    "SQAG_TRACKING_HMAC_KEY": "<host-secret-manager-dedicated-tracking-hmac-key>",
 }
+
+TRACKING_KEY_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,24}$")
 
 FORBIDDEN_MARKERS = {
     "embedded-logo-reference": re.compile(r"logo_data_url|data:image/[^;\s]+;base64,", re.IGNORECASE),
@@ -155,6 +161,16 @@ def verify_template(path: Path = DEFAULT_TEMPLATE) -> dict[str, object]:
     for key, expected in EXPECTED_VALUES.items():
         if values.get(key, "") != expected:
             findings.append(Finding(key, "unexpected-value", "value does not match the internal UAT template expectation"))
+
+    tracking_key_version = values.get("SQAG_TRACKING_HMAC_KEY_VERSION", "")
+    if tracking_key_version and not TRACKING_KEY_VERSION_PATTERN.fullmatch(tracking_key_version):
+        findings.append(
+            Finding(
+                "SQAG_TRACKING_HMAC_KEY_VERSION",
+                "invalid-format",
+                "tracking key version must use 1-24 ASCII letters, digits, dots, underscores, or hyphens",
+            )
+        )
 
     template_text = path.read_text(encoding="utf-8", errors="replace")
     marker_scan_text = template_text
