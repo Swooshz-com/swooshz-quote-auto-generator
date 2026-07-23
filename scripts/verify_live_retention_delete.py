@@ -854,6 +854,15 @@ def run_verification(
     execute_live_drill: bool = True,
     test_injected_backend: bool = False,
 ) -> dict[str, object]:
+    dependency_injected = any(
+        dependency is not None
+        for dependency in (
+            storage_factory,
+            backend_factory,
+            migration_inspector,
+        )
+    )
+    effective_test_injected = bool(test_injected_backend or dependency_injected)
     effective_env = dict(os.environ if env is None else env)
     missing = _missing_env_names(effective_env)
     live_opt_in_enabled = _enabled(effective_env)
@@ -883,7 +892,7 @@ def run_verification(
             checks=checks,
             missing_env_names=missing,
             blockers=blockers,
-            test_injected_backend=test_injected_backend,
+            test_injected_backend=effective_test_injected,
         )
 
     checks["migration_preflight_attempted"] = True
@@ -900,7 +909,7 @@ def run_verification(
             checks=checks,
             missing_env_names=missing,
             blockers=migration_blockers,
-            test_injected_backend=test_injected_backend,
+            test_injected_backend=effective_test_injected,
         )
     checks["trusted_migration_ledger"] = True
     checks["zero_pending_migrations"] = True
@@ -920,7 +929,7 @@ def run_verification(
         checks=checks,
         missing_env_names=missing,
         blockers=blockers,
-        test_injected_backend=test_injected_backend,
+        test_injected_backend=effective_test_injected,
         active_db_rows=active_db_rows,
         active_object_count=active_object_count,
         active_object_deleted_count=active_object_deleted_count,

@@ -337,6 +337,45 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
         )
         return report, called
 
+    def run_dependency_classification_case(
+        self,
+        verifier,
+        *,
+        inject_storage=False,
+        inject_backend=False,
+        inject_migration=False,
+        explicit_test_flag=None,
+        backend_failure=False,
+        private_marker="PRIVATE-INJECTED-DEPENDENCY-DETAIL",
+    ):
+        def storage_factory(_database_url, workspace_id, **_kwargs):
+            return FakeStorage(workspace_id=workspace_id)
+
+        def backend_factory(_env):
+            if backend_failure:
+                raise RuntimeError(private_marker)
+            return FakeBackend(verifier.ObjectArtifactMetadata)
+
+        def migration_inspector(_database_url):
+            return trusted_migration_report(verifier)
+
+        kwargs = {}
+        if inject_storage:
+            kwargs["storage_factory"] = storage_factory
+        if inject_backend:
+            kwargs["backend_factory"] = backend_factory
+        if inject_migration:
+            kwargs["migration_inspector"] = migration_inspector
+        if explicit_test_flag is not None:
+            kwargs["test_injected_backend"] = explicit_test_flag
+
+        with (
+            mock.patch.object(verifier, "_build_default_storage", new=storage_factory),
+            mock.patch.object(verifier, "_build_s3_backend", new=backend_factory),
+            mock.patch.object(verifier, "_inspect_migration_readiness", new=migration_inspector),
+        ):
+            return verifier.run_verification(env=complete_env(), **kwargs)
+
     def test_missing_env_reports_blocked_without_values(self):
         verifier = load_verifier()
         report = verifier.run_verification(env={})
@@ -547,6 +586,93 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
             self.assertNotIn(value, text)
         self.assertNotIn("OPAQUE-STORAGE-REF", text)
         self.assertNotIn("private-payload", text)
+
+    def test_dependency_injection_is_automatically_non_live_without_manual_flag(self):
+        verifier = load_verifier()
+        report = self.run_dependency_classification_case(
+            verifier,
+            inject_storage=True,
+            inject_backend=True,
+            inject_migration=True,
+        )
+
+        self.assertEqual(report["status"], "passed")
+        self.assertTrue(report["test_injected_backend"])
+        self.assertFalse(report["live_retention_delete_evidence_supported"])
+
+    def test_each_injected_dependency_automatically_forces_non_live_classification(self):
+        verifier = load_verifier()
+
+        for dependency_name in ("storage", "backend", "migration"):
+            with self.subTest(dependency=dependency_name):
+                report = self.run_dependency_classification_case(
+                    verifier,
+                    inject_storage=dependency_name == "storage",
+                    inject_backend=dependency_name == "backend",
+                    inject_migration=dependency_name == "migration",
+                )
+
+                self.assertEqual(report["status"], "passed")
+                self.assertTrue(report["test_injected_backend"])
+                self.assertFalse(report["live_retention_delete_evidence_supported"])
+
+    def test_explicit_false_cannot_override_automatic_injected_classification(self):
+        verifier = load_verifier()
+        report = self.run_dependency_classification_case(
+            verifier,
+            inject_storage=True,
+            inject_backend=True,
+            inject_migration=True,
+            explicit_test_flag=False,
+        )
+
+        self.assertEqual(report["status"], "passed")
+        self.assertTrue(report["test_injected_backend"])
+        self.assertFalse(report["live_retention_delete_evidence_supported"])
+
+    def test_explicit_true_remains_non_live_without_dependency_injection(self):
+        verifier = load_verifier()
+        report = self.run_dependency_classification_case(
+            verifier,
+            explicit_test_flag=True,
+        )
+
+        self.assertEqual(report["status"], "passed")
+        self.assertTrue(report["test_injected_backend"])
+        self.assertFalse(report["live_retention_delete_evidence_supported"])
+
+    def test_failed_injected_verification_uses_the_same_non_live_classification(self):
+        verifier = load_verifier()
+        report = self.run_dependency_classification_case(
+            verifier,
+            inject_backend=True,
+            backend_failure=True,
+        )
+
+        self.assertEqual(report["status"], "failed")
+        self.assertTrue(report["test_injected_backend"])
+        self.assertFalse(report["live_retention_delete_evidence_supported"])
+
+    def test_no_argument_dependency_path_is_not_automatically_classified_as_injected(self):
+        verifier = load_verifier()
+        report = self.run_dependency_classification_case(verifier)
+
+        self.assertEqual(report["status"], "passed")
+        self.assertFalse(report["test_injected_backend"])
+        self.assertTrue(report["live_retention_delete_evidence_supported"])
+
+    def test_injected_dependency_details_are_not_serialized(self):
+        verifier = load_verifier()
+        private_marker = "PRIVATE-INJECTED-DEPENDENCY-DETAIL"
+        report = self.run_dependency_classification_case(
+            verifier,
+            inject_backend=True,
+            backend_failure=True,
+            private_marker=private_marker,
+        )
+
+        self.assertTrue(report["test_injected_backend"])
+        self.assertNotIn(private_marker, json.dumps(report, sort_keys=True))
 
     def test_verifier_never_calls_migration_appliers(self):
         verifier = load_verifier()
