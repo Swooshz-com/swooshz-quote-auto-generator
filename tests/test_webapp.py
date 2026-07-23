@@ -7837,6 +7837,87 @@ class WebappServerTest(unittest.TestCase):
                         urllib.request.urlopen(f"{runner.base_url}{path}", timeout=3)
                     self.assertEqual(raised.exception.code, 404)
 
+    def test_reference_image_decoder_rejects_oversized_payload(self):
+        oversized = b"\x89PNG\r\n\x1a\n" + (b"\0" * (webapp.MAX_IMAGE_BYTES - 7))
+        entry = {
+            "name": "oversized.png",
+            "type": "image/png",
+            "data_url": "data:image/png;base64," + base64.b64encode(oversized).decode("ascii"),
+        }
+
+        with self.assertRaisesRegex(ValueError, "larger than 12 MB"):
+            webapp.decode_reference_data_url_bytes(entry, webapp.MAX_IMAGE_BYTES)
+
+    def test_prompt_image_decoder_rejects_malformed_supported_format(self):
+        self.assertEqual(webapp.compressed_prompt_image_data_url(b"\xff\xd8\xffnot-a-jpeg"), "")
+
+    def test_prompt_image_decoder_rejects_unsupported_format_without_pillow(self):
+        with mock.patch("PIL.Image.open") as image_open:
+            result = webapp.compressed_prompt_image_data_url(b"%!PS-Adobe-3.0 EPSF-3.0")
+
+        self.assertEqual(result, "")
+        image_open.assert_not_called()
+
+    def test_prompt_image_decoder_rejects_decompression_bomb_warning(self):
+        import warnings
+        from PIL import Image
+
+        class WarnedImage:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def load(self):
+                return None
+
+        def warned_open(_source):
+            warnings.warn("oversized image", Image.DecompressionBombWarning)
+            return WarnedImage()
+
+        with mock.patch("PIL.Image.open", side_effect=warned_open):
+            result = webapp.compressed_prompt_image_data_url(SANITIZED_LOGO_PNG_BYTES)
+
+        self.assertEqual(result, "")
+
+    def test_prompt_image_decoder_accepts_supported_png(self):
+        from PIL import Image
+
+        source = io.BytesIO()
+        Image.new("RGBA", (4, 3), (10, 20, 30, 128)).save(source, format="PNG")
+
+        data_url = webapp.compressed_prompt_image_data_url(source.getvalue())
+        encoded = data_url.partition(",")[2]
+        with Image.open(io.BytesIO(base64.b64decode(encoded, validate=True))) as decoded:
+            decoded.load()
+            decoded_size = decoded.size
+            decoded_format = decoded.format
+
+        self.assertTrue(data_url.startswith("data:image/png;base64,"))
+        self.assertEqual(decoded_size, (4, 3))
+        self.assertEqual(decoded_format, "PNG")
+
+    def test_prompt_image_encoder_converts_rgba_to_bounded_jpeg(self):
+        from PIL import Image
+
+        data_url = webapp.prompt_image_data_url_from_pil(
+            Image.new("RGBA", (8, 6), (10, 20, 30, 128))
+        )
+        encoded = data_url.partition(",")[2]
+        raw = base64.b64decode(encoded, validate=True)
+        with Image.open(io.BytesIO(raw)) as decoded:
+            decoded.load()
+            decoded_size = decoded.size
+            decoded_format = decoded.format
+            decoded_mode = decoded.mode
+
+        self.assertTrue(data_url.startswith("data:image/jpeg;base64,"))
+        self.assertLessEqual(len(raw), webapp.MAX_RENDERED_PDF_PAGE_BYTES)
+        self.assertEqual(decoded_size, (8, 6))
+        self.assertEqual(decoded_format, "JPEG")
+        self.assertEqual(decoded_mode, "RGB")
+
     def test_persist_pdf_page_debug_images_writes_review_copies_under_tmp(self):
         pages = [{
             "name": "deck-page-1.jpg",

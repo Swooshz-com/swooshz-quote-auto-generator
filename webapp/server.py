@@ -38,6 +38,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import warnings
 import zipfile
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14988,8 +14989,6 @@ def prompt_image_data_url_from_pil(image: Any) -> str:
 
 def compressed_prompt_image_data_url(raw: bytes) -> str:
     mime_type = image_mime_type_from_bytes(raw)
-    if mime_type and len(raw) <= MAX_RENDERED_PDF_PAGE_BYTES:
-        return image_data_url_from_bytes(raw, mime_type)
     if mime_type not in {"image/jpeg", "image/png", "image/webp"}:
         return ""
 
@@ -14999,12 +14998,15 @@ def compressed_prompt_image_data_url(raw: bytes) -> str:
         return ""
 
     try:
-        image = Image.open(io.BytesIO(raw))
-        image.load()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(raw)) as image:
+                image.load()
+                if len(raw) <= MAX_RENDERED_PDF_PAGE_BYTES:
+                    return image_data_url_from_bytes(raw, mime_type)
+                return prompt_image_data_url_from_pil(image)
     except Exception:
-        return image_data_url_from_bytes(raw, image_mime_type_from_bytes(raw))
-
-    return prompt_image_data_url_from_pil(image)
+        return ""
 
 
 def pdf_page_image_entry(source_name: str, page_number: int, data_url: str, renderer: str) -> dict[str, Any]:
