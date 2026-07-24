@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { chromium } from "playwright";
+import { chromium, request } from "playwright";
 
 const python = process.env.PYTHON || process.env.PYTHON_EXECUTABLE || "python";
 const harness = spawn(python, ["tests/internal_google_browser_harness.py"], {
@@ -27,14 +27,31 @@ const baseUrl = await new Promise((resolve, reject) => {
 
 const browser = await chromium.launch({ headless: true });
 const page = await browser.newPage();
+const anonymousApi = await request.newContext();
+let authenticatedApi;
 const consoleProblems = [];
 page.on("console", (message) => {
-  if (["error", "warning"].includes(message.type())) consoleProblems.push(message.text());
+  if (["error", "warning"].includes(message.type())) {
+    const location = message.location().url;
+    consoleProblems.push(location ? `${message.text()} (${location})` : message.text());
+  }
 });
 page.on("pageerror", (error) => consoleProblems.push(error.message));
+await page.route("**/api/quote-sessions", async (route) => {
+  if (route.request().method() === "GET") {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ quote_sessions: [] }),
+    });
+    return;
+  }
+  await route.fallback();
+});
+await page.route("**/api/log", (route) => route.fulfill({ status: 204, body: "" }));
 
 try {
-  const denied = await page.request.get(`${baseUrl}/api/session`);
+  const denied = await anonymousApi.get(`${baseUrl}/api/session`);
   if (denied.status() !== 401) throw new Error(`Expected unauthenticated 401, got ${denied.status()}.`);
 
   await page.goto(`${baseUrl}/login`, { waitUntil: "domcontentloaded", timeout: 15000 });
@@ -53,7 +70,10 @@ try {
     throw new Error("Stable synthetic subject was not the primary session identity.");
   }
 
-  const unsafeLogout = await page.request.get(`${baseUrl}/logout`);
+  authenticatedApi = await request.newContext({
+    storageState: await page.context().storageState(),
+  });
+  const unsafeLogout = await authenticatedApi.get(`${baseUrl}/logout`);
   if (unsafeLogout.status() !== 405) throw new Error("GET logout was not rejected.");
 
   const logout = await page.evaluate(async ({ header, token }) => {
@@ -70,11 +90,13 @@ try {
     throw new Error("CSRF-safe logout did not revoke the local session.");
   }
 
-  const revoked = await page.request.get(`${baseUrl}/api/session`);
+  const revoked = await authenticatedApi.get(`${baseUrl}/api/session`);
   if (revoked.status() !== 401) throw new Error("Logged-out session remained usable.");
   if (consoleProblems.length) throw new Error(`Browser console problems: ${consoleProblems.join(" | ")}`);
   console.log("Internal Google synthetic Playwright flow passed.");
 } finally {
+  if (authenticatedApi) await authenticatedApi.dispose();
+  await anonymousApi.dispose();
   await browser.close();
   harness.kill("SIGTERM");
 }
