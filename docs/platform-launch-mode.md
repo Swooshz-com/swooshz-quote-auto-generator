@@ -1,8 +1,9 @@
 # SQAG Platform Launch Mode
 
-This runbook covers the first SQAG-side adapter boundary for Swooshz Platform
-launch handoff. It is disabled by default and does not change local/internal
-SQAG mode.
+This runbook covers the final SQAG-side adapter boundary for Swooshz Platform
+launch handoff. Select it explicitly with `SQAG_AUTH_MODE=platform`. The
+temporary `internal_google` lane is mutually exclusive and documented in
+`docs/internal-google-auth-mode.md`.
 
 ## Boundary
 
@@ -17,7 +18,7 @@ details.
 
 ## Deploy Invariant
 
-`APP_MODE=deploy` requires a complete Platform launch configuration. A
+`APP_MODE=deploy` with `SQAG_AUTH_MODE=platform` requires a complete Platform launch configuration. A
 standalone OIDC session has no Platform workspace, membership role, or app
 entitlement and therefore cannot start the hosted SQAG process. OIDC helpers
 remain available only for localhost/local component testing; SQAG must not
@@ -43,6 +44,7 @@ Use placeholders for local smoke setup:
 ```powershell
 $env:APP_MODE="deploy"
 $env:AUTH_REQUIRED="true"
+$env:SQAG_AUTH_MODE="platform"
 $env:SESSION_SECRET="<sqag-session-secret>"
 $env:SQAG_PLATFORM_LAUNCH_MODE="platform"
 $env:SQAG_PLATFORM_BASE_URL="https://swooshz.com"

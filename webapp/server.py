@@ -83,6 +83,20 @@ from webapp.object_storage import (
     object_artifact_key,
     object_storage_provider_status,
 )
+from webapp.internal_google_auth import (
+    GOOGLE_ISSUER,
+    INTERNAL_AUTH_MODE,
+    INTERNAL_SESSION_TTL_SECONDS,
+    OIDC_TRANSACTION_TTL_SECONDS,
+    InternalAuthConfigError,
+    InternalAuthPolicy,
+    InternalAuthState,
+    InternalAuthStateError,
+    GoogleOidcVerifier,
+    OidcProtocolError,
+    OidcRuntimeConfig,
+    canonical_email,
+)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 GENERATOR_PATH = PROJECT_ROOT / "scripts" / "generate_quote.py"
@@ -297,6 +311,7 @@ APP_MODE_ENV_NAME = "APP_MODE"
 TRACKING_HMAC_KEY_ENV_NAME = "SQAG_TRACKING_HMAC_KEY"
 TRACKING_HMAC_KEY_VERSION_ENV_NAME = "SQAG_TRACKING_HMAC_KEY_VERSION"
 AUTH_REQUIRED_ENV_NAME = "AUTH_REQUIRED"
+AUTH_MODE_ENV_NAME = "SQAG_AUTH_MODE"
 SESSION_SECRET_ENV_NAME = "SESSION_SECRET"
 OIDC_ISSUER_URL_ENV_NAME = "OIDC_ISSUER_URL"
 OIDC_CLIENT_ID_ENV_NAME = "OIDC_CLIENT_ID"
@@ -315,6 +330,10 @@ AUTH_ALLOWED_EMAILS_ENV_NAME = "AUTH_ALLOWED_EMAILS"
 AUTH_ALLOWED_DOMAINS_ENV_NAME = "AUTH_ALLOWED_DOMAINS"
 AUTH_ALLOW_ANY_AUTHENTICATED_USER_ENV_NAME = "AUTH_ALLOW_ANY_AUTHENTICATED_USER"
 AUTH_APPROVED_TESTER_ROLE_ENV_NAME = "AUTH_APPROVED_TESTER_ROLE"
+INTERNAL_WORKSPACE_ID_ENV_NAME = "SQAG_INTERNAL_WORKSPACE_ID"
+INTERNAL_ALLOWED_EMAILS_ENV_NAME = "SQAG_INTERNAL_ALLOWED_EMAILS"
+INTERNAL_ADMIN_EMAILS_ENV_NAME = "SQAG_INTERNAL_ADMIN_EMAILS"
+INTERNAL_OPERATOR_EMAILS_ENV_NAME = "SQAG_INTERNAL_OPERATOR_EMAILS"
 QUOTE_OUTPUT_ROOT_ENV_NAME = "QUOTE_OUTPUT_ROOT"
 QUOTE_TMP_ROOT_ENV_NAME = "QUOTE_TMP_ROOT"
 QUOTE_LOG_ROOT_ENV_NAME = "QUOTE_LOG_ROOT"
@@ -338,6 +357,8 @@ MAX_FORWARDED_FOR_HEADER_BYTES = 4096
 MAX_FORWARDED_FOR_HOPS = 32
 OIDC_PROVIDER_TIMEOUT_SECONDS = 15
 OIDC_PROVIDER_MAX_RESPONSE_BYTES = 128 * 1024
+OIDC_CALLBACK_MAX_QUERY_BYTES = 8192
+OIDC_CALLBACK_MAX_FIELDS = 12
 PLATFORM_LAUNCH_ENDPOINT = "/api/platform/launch"
 PLATFORM_FINALIZATION_ENDPOINT = "/api/auth/platform/finalize"
 PLATFORM_APP_KEY = "sqag"
@@ -402,6 +423,7 @@ RATE_LIMIT_BUCKETS: dict[tuple[str, str], list[float]] = {}
 RATE_LIMIT_OVERFLOW_BUCKETS: dict[str, list[float]] = {}
 RATE_LIMIT_LAST_PRUNE_AT = 0.0
 RATE_LIMIT_LOCK = threading.Lock()
+INTERNAL_AUTH_STATE = InternalAuthState()
 AI_LOG_TRACKING_CONTEXT = threading.local()
 ALLOWED_LOG_EVENTS = {
     "abuse_signal",
@@ -1467,6 +1489,17 @@ def configured_app_mode() -> str:
     return "deploy" if mode == "deploy" else "local"
 
 
+def configured_auth_mode() -> str:
+    raw = clean_text(read_dotenv_value(AUTH_MODE_ENV_NAME)).lower()
+    if not raw and configured_app_mode() != "deploy":
+        return "local"
+    return raw if raw in {"platform", INTERNAL_AUTH_MODE, "local"} else ""
+
+
+def auth_mode_explicit() -> bool:
+    return bool(clean_text(read_dotenv_value(AUTH_MODE_ENV_NAME)))
+
+
 def configured_bool(name: str, default: bool = False) -> bool:
     raw = clean_text(os.environ.get(name) or read_dotenv_value(name)).lower()
     if not raw:
@@ -1620,7 +1653,87 @@ def configured_platform_launch_mode() -> str:
 
 
 def platform_launch_mode_enabled() -> bool:
-    return configured_platform_launch_mode() == "platform"
+    return (
+        configured_auth_mode() == "platform"
+        and configured_platform_launch_mode() == "platform"
+    )
+
+
+def internal_google_mode_enabled() -> bool:
+    return configured_auth_mode() == INTERNAL_AUTH_MODE
+
+
+def internal_auth_policy() -> InternalAuthPolicy:
+    return InternalAuthPolicy.from_values(
+        workspace_id=read_dotenv_value(INTERNAL_WORKSPACE_ID_ENV_NAME),
+        allowed_emails=read_dotenv_value(INTERNAL_ALLOWED_EMAILS_ENV_NAME),
+        admin_emails=read_dotenv_value(INTERNAL_ADMIN_EMAILS_ENV_NAME),
+        operator_emails=read_dotenv_value(INTERNAL_OPERATOR_EMAILS_ENV_NAME),
+    )
+
+
+def internal_auth_policy_config_complete() -> bool:
+    supported_names = {
+        INTERNAL_ALLOWED_EMAILS_ENV_NAME,
+        INTERNAL_ADMIN_EMAILS_ENV_NAME,
+        INTERNAL_OPERATOR_EMAILS_ENV_NAME,
+    }
+    for name, value in os.environ.items():
+        if (
+            name.startswith("SQAG_INTERNAL_")
+            and name.endswith("_EMAILS")
+            and name not in supported_names
+            and clean_text(value)
+        ):
+            return False
+    try:
+        internal_auth_policy()
+    except InternalAuthConfigError:
+        return False
+    return True
+
+
+def internal_google_runtime_config() -> OidcRuntimeConfig:
+    config = oidc_config()
+    return OidcRuntimeConfig(
+        issuer_url=config["issuer_url"],
+        client_id=config["client_id"],
+        client_secret=config["client_secret"],
+        redirect_uri=config["redirect_uri"],
+        authorize_url=config["authorize_url"],
+        token_url=config["token_url"],
+    )
+
+
+def internal_google_config_complete() -> bool:
+    config = oidc_config()
+    public_origin = configured_sqag_public_base_url()
+    expected_redirect = f"{public_origin}/callback" if public_origin else ""
+    legacy_escape_hatch_present = bool(
+        clean_text(read_dotenv_value(AUTH_ALLOWED_DOMAINS_ENV_NAME))
+        or clean_text(read_dotenv_value(AUTH_ALLOW_ANY_AUTHENTICATED_USER_ENV_NAME))
+        or clean_text(read_dotenv_value(AUTH_ALLOWED_EMAILS_ENV_NAME))
+        or clean_text(read_dotenv_value(AUTH_APPROVED_TESTER_ROLE_ENV_NAME))
+    )
+    platform_config_present = bool(
+        configured_platform_launch_mode() == "platform"
+        or clean_text(read_dotenv_value(PLATFORM_BASE_URL_ENV_NAME))
+        or clean_text(read_dotenv_value(PLATFORM_SERVICE_SECRET_ENV_NAME))
+    )
+    return bool(
+        internal_google_mode_enabled()
+        and deploy_session_secret_ready()
+        and internal_auth_policy_config_complete()
+        and not legacy_escape_hatch_present
+        and not platform_config_present
+        and config["issuer_url"] == GOOGLE_ISSUER
+        and config["client_id"]
+        and config["client_secret"]
+        and config["redirect_uri"] == expected_redirect
+        and config["authorize_url"]
+        and config["token_url"]
+        and oidc_config_urls_secure(config, require_userinfo=False)
+    )
 
 
 def configured_platform_base_url() -> str:
@@ -1707,8 +1820,24 @@ def platform_internal_url(path: str) -> str:
 
 
 def platform_launch_config_complete() -> bool:
+    internal_config_present = any(
+        clean_text(read_dotenv_value(name))
+        for name in (
+            INTERNAL_WORKSPACE_ID_ENV_NAME,
+            INTERNAL_ALLOWED_EMAILS_ENV_NAME,
+            INTERNAL_ADMIN_EMAILS_ENV_NAME,
+            INTERNAL_OPERATOR_EMAILS_ENV_NAME,
+            OIDC_ISSUER_URL_ENV_NAME,
+            OIDC_CLIENT_ID_ENV_NAME,
+            OIDC_CLIENT_SECRET_ENV_NAME,
+            OIDC_REDIRECT_URI_ENV_NAME,
+            OIDC_AUTHORIZE_URL_ENV_NAME,
+            OIDC_TOKEN_URL_ENV_NAME,
+        )
+    )
     return bool(
         platform_launch_mode_enabled()
+        and not internal_config_present
         and deploy_session_secret_ready()
         and configured_platform_base_url()
         and configured_sqag_public_base_url()
@@ -1762,13 +1891,22 @@ def auth_required() -> bool:
 def deploy_requires_auth_guard() -> bool:
     if configured_app_mode() != "deploy":
         return False
+    mode = configured_auth_mode()
+    if not auth_mode_explicit() or mode not in {"platform", INTERNAL_AUTH_MODE}:
+        return True
     if not auth_required():
         return True
-    return not (oidc_config_complete() or platform_launch_config_complete())
+    if mode == "platform":
+        return not platform_launch_config_complete()
+    return not internal_google_config_complete()
 
 
 def deploy_requires_platform_workspace_guard() -> bool:
-    return configured_app_mode() == "deploy" and not platform_launch_config_complete()
+    return (
+        configured_app_mode() == "deploy"
+        and configured_auth_mode() == "platform"
+        and not platform_launch_config_complete()
+    )
 
 
 def deploy_requires_trusted_proxy_guard() -> bool:
@@ -1851,14 +1989,19 @@ def url_uses_https_or_loopback_http(value: str) -> bool:
     return parsed.scheme == "http" and is_loopback_url(value)
 
 
-def oidc_config_urls_secure(config: dict[str, str]) -> bool:
-    required_urls = (
+def oidc_config_urls_secure(
+    config: dict[str, str],
+    *,
+    require_userinfo: bool = True,
+) -> bool:
+    required_urls = [
         "issuer_url",
         "redirect_uri",
         "authorize_url",
         "token_url",
-        "userinfo_url",
-    )
+    ]
+    if require_userinfo:
+        required_urls.append("userinfo_url")
     return all(url_uses_https_or_loopback_http(config.get(name, "")) for name in required_urls)
 
 
@@ -1875,7 +2018,11 @@ def signed_cookie_value(payload: dict[str, Any], *, max_age_seconds: int = SESSI
     return f"{encoded}.{b64url_encode(signature)}"
 
 
-def verified_cookie_payload(value: str) -> dict[str, Any] | None:
+def verified_cookie_payload(
+    value: str,
+    *,
+    allow_expired: bool = False,
+) -> dict[str, Any] | None:
     secret = session_secret()
     if not secret or "." not in value:
         return None
@@ -1891,7 +2038,7 @@ def verified_cookie_payload(value: str) -> dict[str, Any] | None:
         return None
     if not isinstance(payload, dict):
         return None
-    if int(payload.get("exp") or 0) < int(time.time()):
+    if not allow_expired and int(payload.get("exp") or 0) < int(time.time()):
         return None
     return payload
 
@@ -1907,11 +2054,41 @@ def cookies_from_header(cookie_header: str) -> dict[str, str]:
 
 def session_from_cookie_header(cookie_header: str) -> dict[str, Any] | None:
     cookies = cookies_from_header(cookie_header)
-    payload = verified_cookie_payload(cookies.get(SESSION_COOKIE_NAME, ""))
+    mode = configured_auth_mode()
+    payload = verified_cookie_payload(
+        cookies.get(SESSION_COOKIE_NAME, ""),
+        allow_expired=mode == INTERNAL_AUTH_MODE,
+    )
     if not payload or not isinstance(payload.get("user"), dict):
         return None
-    if configured_app_mode() == "deploy" and not platform_auth_session_complete(payload):
-        return None
+    if configured_app_mode() == "deploy":
+        if mode == "platform":
+            if payload.get("auth_mode") != "platform" or not platform_auth_session_complete(payload):
+                return None
+        elif mode == INTERNAL_AUTH_MODE:
+            try:
+                payload = INTERNAL_AUTH_STATE.validate_session(
+                    payload,
+                    policy=internal_auth_policy(),
+                    current_mode=mode,
+                )
+            except (InternalAuthConfigError, InternalAuthStateError) as exc:
+                reason = getattr(exc, "reason", "internal_session_policy_invalid")
+                write_local_log(
+                    "security_event",
+                    {
+                        "reason": reason,
+                        "path": "protected_request",
+                        "status": 401,
+                        "user_id": privacy_safe_tracking_id(
+                            payload.get("google_sub"),
+                            "unknown",
+                        ),
+                    },
+                )
+                return None
+        else:
+            return None
     return payload
 
 
@@ -1963,6 +2140,80 @@ def oidc_state_from_cookie(cookie_header: str) -> str:
     cookies = cookies_from_header(cookie_header)
     payload = verified_cookie_payload(cookies.get(OIDC_STATE_COOKIE_NAME, ""))
     return clean_text(payload.get("state")) if payload else ""
+
+
+def oidc_transaction_binding_from_cookie(cookie_header: str) -> str:
+    cookies = cookies_from_header(cookie_header)
+    payload = verified_cookie_payload(cookies.get(OIDC_STATE_COOKIE_NAME, ""))
+    if not payload or payload.get("auth_mode") != INTERNAL_AUTH_MODE:
+        return ""
+    return clean_text(payload.get("transaction_id"))
+
+
+def internal_google_authorize_url(transaction: Any) -> str:
+    return internal_google_runtime_config().authorize_redirect(transaction)
+
+
+def google_oidc_verifier() -> GoogleOidcVerifier:
+    return GoogleOidcVerifier(internal_google_runtime_config())
+
+
+def parse_internal_google_callback_query(query: str) -> dict[str, str]:
+    if len((query or "").encode("utf-8")) > OIDC_CALLBACK_MAX_QUERY_BYTES:
+        raise OidcAuthError(
+            "Authentication could not be completed.",
+            reason="oidc_callback_query_too_large",
+        )
+    try:
+        pairs = parse_qsl(
+            query,
+            keep_blank_values=True,
+            strict_parsing=True,
+            max_num_fields=OIDC_CALLBACK_MAX_FIELDS,
+        )
+    except ValueError as exc:
+        raise OidcAuthError(
+            "Authentication could not be completed.",
+            reason="oidc_callback_malformed",
+        ) from exc
+    allowed_names = {
+        "state",
+        "code",
+        "error",
+        "error_description",
+        "error_uri",
+        "scope",
+        "authuser",
+        "prompt",
+        "hd",
+        "iss",
+    }
+    params: dict[str, str] = {}
+    for name, value in pairs:
+        if (
+            name not in allowed_names
+            or name in params
+            or len(name) > 64
+            or len(value) > 4096
+        ):
+            raise OidcAuthError(
+                "Authentication could not be completed.",
+                reason="oidc_callback_parameter_invalid",
+            )
+        params[name] = value
+    if not clean_text(params.get("state")):
+        raise OidcAuthError(
+            "Authentication could not be completed.",
+            reason="oidc_callback_state_missing",
+        )
+    has_code = bool(clean_text(params.get("code")))
+    has_error = bool(clean_text(params.get("error")))
+    if has_code == has_error:
+        raise OidcAuthError(
+            "Authentication could not be completed.",
+            reason="oidc_callback_result_invalid",
+        )
+    return params
 
 
 def user_from_oidc_claims(claims: dict[str, Any]) -> dict[str, str]:
@@ -2379,7 +2630,12 @@ def platform_auth_session_complete(session: dict[str, Any] | None) -> bool:
     workspace = platform.get("workspace") if isinstance(platform, dict) and isinstance(platform.get("workspace"), dict) else {}
     app = platform.get("app") if isinstance(platform, dict) and isinstance(platform.get("app"), dict) else {}
     return bool(
-        clean_text(platform.get("outcome")) == "consumed"
+        isinstance(session, dict)
+        and (
+            configured_app_mode() != "deploy"
+            or session.get("auth_mode") == "platform"
+        )
+        and clean_text(platform.get("outcome")) == "consumed"
         and clean_text(user.get("userId"))
         and clean_text(workspace.get("workspaceId"))
         and clean_text(app.get("appKey")) == PLATFORM_APP_KEY
@@ -2389,8 +2645,14 @@ def platform_auth_session_complete(session: dict[str, Any] | None) -> bool:
 
 
 def permissions_for_auth_session(session: dict[str, Any] | None) -> dict[str, bool]:
-    if configured_app_mode() == "deploy" and not platform_auth_session_complete(session):
-        return blocked_platform_permissions()
+    if configured_app_mode() == "deploy":
+        mode = configured_auth_mode()
+        if mode == INTERNAL_AUTH_MODE:
+            user = session.get("user") if isinstance(session, dict) else {}
+            role = clean_text(user.get("internal_role")).lower() if isinstance(user, dict) else ""
+            return role_permissions(role) if role in {"admin", "operator"} else blocked_platform_permissions()
+        if not platform_auth_session_complete(session):
+            return blocked_platform_permissions()
     user = session.get("user") if isinstance(session, dict) else None
     platform = user.get("platform") if isinstance(user, dict) and isinstance(user.get("platform"), dict) else None
     if platform:
@@ -2407,7 +2669,7 @@ def safe_logout_redirect_url(value: str) -> str:
         return "/signed-out"
     parsed = urlparse(candidate)
     if parsed.scheme in {"http", "https"} and parsed.netloc:
-        return candidate
+        return candidate if candidate == configured_platform_home_url() else "/signed-out"
     if candidate.startswith("/") and not candidate.startswith("//"):
         return candidate
     return "/signed-out"
@@ -2471,20 +2733,30 @@ def deploy_uat_preflight_status() -> dict[str, Any]:
         deploy_session_secret_ready(),
         f"must be at least {MIN_DEPLOY_SESSION_SECRET_CHARS} characters",
     )
-    add(PLATFORM_LAUNCH_MODE_ENV_NAME, configured_platform_launch_mode() == "platform", "must be set to platform")
-    add(PLATFORM_BASE_URL_ENV_NAME, bool(configured_platform_base_url()), "must be an https or loopback http platform base URL")
-    add(SQAG_PUBLIC_BASE_URL_ENV_NAME, bool(configured_sqag_public_base_url()), "must be the exact canonical SQAG origin")
+    auth_mode = configured_auth_mode()
     add(
-        PLATFORM_SERVICE_SECRET_ENV_NAME,
-        platform_service_secret_ready(),
-        f"must be supplied by the host secret manager and contain at least {MIN_PLATFORM_SERVICE_SECRET_CHARS} characters",
+        AUTH_MODE_ENV_NAME,
+        auth_mode_explicit() and auth_mode in {"platform", INTERNAL_AUTH_MODE},
+        "must explicitly select platform or internal_google in deploy mode",
     )
+    add(SQAG_PUBLIC_BASE_URL_ENV_NAME, bool(configured_sqag_public_base_url()), "must be the exact canonical SQAG origin")
     add(
         TRUSTED_PROXY_CIDRS_ENV_NAME,
         trusted_proxy_config_complete(),
         'must contain valid CIDRs for reverse proxies allowed to supply X-Forwarded-For',
     )
-    if not platform_launch_mode_enabled():
+    if auth_mode == "platform":
+        add(PLATFORM_LAUNCH_MODE_ENV_NAME, configured_platform_launch_mode() == "platform", "must be set to platform")
+        add(PLATFORM_BASE_URL_ENV_NAME, bool(configured_platform_base_url()), "must be an https or loopback http platform base URL")
+        add(
+            PLATFORM_SERVICE_SECRET_ENV_NAME,
+            platform_service_secret_ready(),
+            f"must be supplied by the host secret manager and contain at least {MIN_PLATFORM_SERVICE_SECRET_CHARS} characters",
+        )
+        add("platform auth contract", platform_launch_config_complete(), "must be complete and must not include internal-Google configuration")
+    elif auth_mode == INTERNAL_AUTH_MODE:
+        add(PLATFORM_LAUNCH_MODE_ENV_NAME, configured_platform_launch_mode() == "disabled", "must be disabled")
+        add("platform auth configuration absent", not bool(clean_text(read_dotenv_value(PLATFORM_BASE_URL_ENV_NAME)) or clean_text(read_dotenv_value(PLATFORM_SERVICE_SECRET_ENV_NAME))), "must not be mixed with internal_google")
         for name in (
             OIDC_ISSUER_URL_ENV_NAME,
             OIDC_CLIENT_ID_ENV_NAME,
@@ -2492,7 +2764,6 @@ def deploy_uat_preflight_status() -> dict[str, Any]:
             OIDC_REDIRECT_URI_ENV_NAME,
             OIDC_AUTHORIZE_URL_ENV_NAME,
             OIDC_TOKEN_URL_ENV_NAME,
-            OIDC_USERINFO_URL_ENV_NAME,
         ):
             add(name, bool(clean_text(read_dotenv_value(name))), "must be present")
         for name in (
@@ -2500,19 +2771,12 @@ def deploy_uat_preflight_status() -> dict[str, Any]:
             OIDC_REDIRECT_URI_ENV_NAME,
             OIDC_AUTHORIZE_URL_ENV_NAME,
             OIDC_TOKEN_URL_ENV_NAME,
-            OIDC_USERINFO_URL_ENV_NAME,
         ):
-            add(name, url_uses_https_or_loopback_http(read_dotenv_value(name)), "must be https or loopback http")
-        add(
-            f"{AUTH_ALLOWED_EMAILS_ENV_NAME} or {AUTH_ALLOWED_DOMAINS_ENV_NAME}",
-            auth_allowlist_configured(),
-            "must allow approved testers or set the internal-only escape hatch",
-        )
-        add(
-            AUTH_APPROVED_TESTER_ROLE_ENV_NAME,
-            bool(user_type_role(read_dotenv_value(AUTH_APPROVED_TESTER_ROLE_ENV_NAME))),
-            "must be admin, management, operator, or viewer",
-        )
+            add(name, url_uses_https_or_loopback_http(read_dotenv_value(name)), "must use HTTPS")
+        add(OIDC_ISSUER_URL_ENV_NAME + " exact Google issuer", clean_text(read_dotenv_value(OIDC_ISSUER_URL_ENV_NAME)) == GOOGLE_ISSUER, "must be the exact Google issuer")
+        add("internal allowlist and role policy", internal_auth_policy_config_complete(), "must be exact, complete, and conflict-free")
+        add("legacy auth escape hatches absent", not bool(clean_text(read_dotenv_value(AUTH_ALLOWED_EMAILS_ENV_NAME)) or clean_text(read_dotenv_value(AUTH_ALLOWED_DOMAINS_ENV_NAME)) or clean_text(read_dotenv_value(AUTH_ALLOW_ANY_AUTHENTICATED_USER_ENV_NAME)) or clean_text(read_dotenv_value(AUTH_APPROVED_TESTER_ROLE_ENV_NAME))), "must not be configured")
+        add("internal Google auth contract", internal_google_config_complete(), "must be complete and fail closed")
     add(SQAG_STORAGE_MODE_ENV_NAME, configured_storage_mode() == "database", "must be database for hosted/deploy validation")
     add(SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME, configured_artifact_storage_mode() == "object", "must be object for hosted/deploy validation")
     add(SQAG_DATABASE_URL_ENV_NAME, bool(clean_text(read_dotenv_value(SQAG_DATABASE_URL_ENV_NAME))), "must be present")
@@ -3191,6 +3455,45 @@ def production_readiness_status(
     )
 
     blockers: list[dict[str, Any]] = []
+    auth_mode = configured_auth_mode()
+    if configured_app_mode() != "deploy":
+        blockers.append(readiness_blocker(
+            "deploy_mode_required",
+            "P1",
+            "Hosted readiness requires APP_MODE=deploy.",
+        ))
+    if not auth_required():
+        blockers.append(readiness_blocker(
+            "auth_required_disabled",
+            "P1",
+            "Hosted readiness requires AUTH_REQUIRED=true.",
+        ))
+    if not auth_mode_explicit() or auth_mode not in {"platform", INTERNAL_AUTH_MODE}:
+        blockers.append(readiness_blocker(
+            "auth_mode_missing_or_invalid",
+            "P1",
+            "Hosted readiness requires an explicit supported SQAG_AUTH_MODE.",
+        ))
+    elif auth_mode == "platform":
+        if not platform_launch_config_complete():
+            blockers.append(readiness_blocker(
+                "platform_auth_contract_incomplete",
+                "P1",
+                "Platform authentication is selected but its launch, finalization, session, or revocation contract is incomplete.",
+            ))
+    elif auth_mode == INTERNAL_AUTH_MODE:
+        if not internal_google_config_complete():
+            blockers.append(readiness_blocker(
+                "internal_google_auth_contract_incomplete",
+                "P1",
+                "Temporary internal Google authentication is selected but its exact allowlist, role, OIDC, or session contract is incomplete.",
+            ))
+        blockers.append(readiness_blocker(
+            "temporary_internal_auth_not_public_release_ready",
+            "P1",
+            "Temporary internal Google authentication can never satisfy public production readiness.",
+            gates=("production",),
+        ))
     if not database_mode:
         blockers.append(readiness_blocker("local_runtime_storage", "P1", "Profiles, pricing references, and quote sessions are still using local runtime storage."))
     if not (database_artifacts or object_artifacts):
@@ -3251,6 +3554,7 @@ def production_readiness_status(
     ]
     return {
         "schema": "swooshz.sqag.production-readiness.v1",
+        "sqag_auth_mode": auth_mode or "invalid",
         "sqag_storage_mode": storage_mode,
         "sqag_artifact_storage_mode": artifact_mode,
         "database_family": database_family,
@@ -3283,7 +3587,7 @@ def production_readiness_status(
         "local_uat_supported": True,
         "internal_alpha_blockers": internal_alpha_blockers,
         "production_blockers": production_blockers,
-        "internal_alpha_ready": False,
+        "internal_alpha_ready": not internal_alpha_blockers,
         "internal_alpha_future_exception": {
             "possible": False,
             "summary": (
@@ -3292,7 +3596,7 @@ def production_readiness_status(
                 "generated XLSX/PDF bytes, live provider evidence, DB+object backup/restore, operations, and final audit."
             ),
         },
-        "production_ready": False if production_blockers else True,
+        "production_ready": not production_blockers,
         "blockers_count": len(blockers),
         "blockers": blockers,
         "notes": [
@@ -9345,7 +9649,12 @@ def platform_context_from_auth_session(session: dict[str, Any] | None) -> dict[s
 def platform_workspace_id_from_auth_session(session: dict[str, Any] | None) -> str:
     platform = platform_context_from_auth_session(session)
     workspace = platform.get("workspace") if isinstance(platform, dict) and isinstance(platform.get("workspace"), dict) else {}
-    return clean_text(workspace.get("workspaceId"))
+    if clean_text(workspace.get("workspaceId")):
+        return clean_text(workspace.get("workspaceId"))
+    user = session.get("user") if isinstance(session, dict) and isinstance(session.get("user"), dict) else {}
+    if session and session.get("auth_mode") == INTERNAL_AUTH_MODE:
+        return clean_text(user.get("account"))
+    return ""
 
 
 def platform_user_id_from_auth_session(session: dict[str, Any] | None) -> str:
@@ -9383,13 +9692,27 @@ def browser_recovery_scope(session: dict[str, Any] | None) -> str:
 
 def safe_auth_session_for_async(session: dict[str, Any] | None) -> dict[str, Any] | None:
     platform = platform_context_from_auth_session(session)
+    if isinstance(session, dict) and session.get("auth_mode") == INTERNAL_AUTH_MODE:
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        return {
+            "auth_mode": INTERNAL_AUTH_MODE,
+            "user": {
+                "subject": clean_text(user.get("subject")),
+                "account": clean_text(user.get("account")),
+                "internal_role": clean_text(user.get("internal_role")),
+                "auth_mode": INTERNAL_AUTH_MODE,
+            },
+        }
     if not platform:
         return None
     try:
         context = safe_platform_session_context(platform)
     except PlatformLaunchError:
         return None
-    return {"user": user_from_platform_launch_context(context)}
+    return {
+        "auth_mode": "platform",
+        "user": user_from_platform_launch_context(context),
+    }
 
 
 def storage_access_error_payload(exc: SqagStorageAccessError) -> dict[str, Any]:
@@ -21959,7 +22282,14 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             self.handle_oidc_callback(parsed.query)
             return
         if path == "/logout":
-            self.handle_logout()
+            self.send_json(
+                {
+                    "status": "blocked",
+                    "errors": ["Logout requires a same-origin POST request."],
+                },
+                status=405,
+                extra_headers=[("Allow", "POST")],
+            )
             return
         if path == "/signed-out":
             self.send_auth_page(
@@ -22257,6 +22587,13 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == PLATFORM_FINALIZATION_ENDPOINT:
             self.handle_platform_finalization()
+            return
+        if parsed.path == "/logout":
+            if self.block_unauthenticated_request(parsed.path):
+                return
+            if self.block_unsafe_post(parsed.path):
+                return
+            self.handle_logout()
             return
         if self.block_unauthenticated_request(parsed.path):
             return
@@ -22885,7 +23222,12 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             return
         finally:
             raw_handle = ""
-        session_cookie_value = signed_cookie_value({"user": user_from_platform_launch_context(context)})
+        session_cookie_value = signed_cookie_value(
+            {
+                "auth_mode": "platform",
+                "user": user_from_platform_launch_context(context),
+            }
+        )
         if not session_cookie_value:
             self.send_json(
                 {"status": "blocked", "errors": ["Platform session could not be created."]},
@@ -22958,19 +23300,72 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 status=401,
             )
             return
-        if not oidc_config_complete():
+        if (
+            configured_app_mode() == "local"
+            and configured_auth_mode() == "local"
+            and oidc_config_complete()
+        ):
+            state = secrets.token_urlsafe(24)
+            state_cookie = cookie_header_value(
+                OIDC_STATE_COOKIE_NAME,
+                signed_cookie_value(
+                    {"state": state},
+                    max_age_seconds=OIDC_TRANSACTION_TTL_SECONDS,
+                ),
+                max_age=OIDC_TRANSACTION_TTL_SECONDS,
+            )
+            self.send_redirect(
+                oidc_authorize_url(state),
+                extra_headers=[("Set-Cookie", state_cookie)],
+            )
+            return
+        if not internal_google_mode_enabled():
+            self.send_json({"error": "Not found"}, status=404)
+            return
+        if not internal_google_config_complete():
             self.send_json({
                 "status": "blocked",
-                "errors": ["OIDC login is not configured for deploy mode."],
+                "errors": ["Internal authentication is not configured for deploy mode."],
             }, status=503)
             return
-        state = secrets.token_urlsafe(24)
+        try:
+            transaction = INTERNAL_AUTH_STATE.begin_transaction()
+        except InternalAuthStateError as exc:
+            write_local_log(
+                "security_event",
+                {"reason": exc.reason, "path": "/login", "status": 503},
+            )
+            self.send_json(
+                {
+                    "status": "blocked",
+                    "errors": ["Authentication could not be started."],
+                },
+                status=503,
+            )
+            return
         state_cookie = cookie_header_value(
             OIDC_STATE_COOKIE_NAME,
-            signed_cookie_value({"state": state}, max_age_seconds=10 * 60),
-            max_age=10 * 60,
+            signed_cookie_value(
+                {
+                    "auth_mode": INTERNAL_AUTH_MODE,
+                    "transaction_id": transaction.browser_binding,
+                },
+                max_age_seconds=OIDC_TRANSACTION_TTL_SECONDS,
+            ),
+            max_age=OIDC_TRANSACTION_TTL_SECONDS,
         )
-        self.send_redirect(oidc_authorize_url(state), extra_headers=[("Set-Cookie", state_cookie)])
+        write_local_log(
+            "security_event",
+            {
+                "reason": "internal_google_login_initiated",
+                "path": "/login",
+                "status": 302,
+            },
+        )
+        self.send_redirect(
+            internal_google_authorize_url(transaction),
+            extra_headers=[("Set-Cookie", state_cookie)],
+        )
 
     def handle_oidc_callback(self, query: str) -> None:
         if deploy_requires_auth_guard():
@@ -22979,18 +23374,161 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 "errors": ["Deploy mode requires a complete auth boundary before serving the app."],
             }, status=503)
             return
-        if platform_launch_mode_enabled():
+        if (
+            configured_app_mode() == "local"
+            and configured_auth_mode() == "local"
+            and oidc_config_complete()
+        ):
+            self.handle_local_component_oidc_callback(query)
+            return
+        if not internal_google_mode_enabled():
             self.send_json({"error": "Not found"}, status=404)
             return
-        if not auth_required():
-            self.send_redirect("/")
-            return
-        if not oidc_config_complete():
+        if not internal_google_config_complete():
             self.send_json({
                 "status": "blocked",
-                "errors": ["OIDC callback is not configured for deploy mode."],
+                "errors": ["Internal authentication is not configured for deploy mode."],
             }, status=503)
             return
+        clear_transaction_cookie = (
+            "Set-Cookie",
+            clear_cookie_header_value(OIDC_STATE_COOKIE_NAME),
+        )
+        try:
+            params = parse_internal_google_callback_query(query)
+            transaction = INTERNAL_AUTH_STATE.consume_transaction(
+                params["state"],
+                oidc_transaction_binding_from_cookie(
+                    self.headers.get("Cookie", "")
+                ),
+            )
+        except (OidcAuthError, InternalAuthStateError) as exc:
+            reason = getattr(exc, "reason", "oidc_callback_failed")
+            write_local_log(
+                "security_event",
+                {"reason": reason, "path": "/callback", "status": 400},
+            )
+            self.send_auth_page(
+                "Sign in was not completed",
+                "Authentication could not be completed. Start a new sign-in attempt.",
+                status=400,
+                extra_headers=[clear_transaction_cookie],
+            )
+            return
+        if params.get("error"):
+            write_local_log(
+                "security_event",
+                {
+                    "reason": "oidc_authorization_denied",
+                    "path": "/callback",
+                    "status": 400,
+                },
+            )
+            self.send_auth_page(
+                "Sign in was not completed",
+                "Authentication was not completed. Start a new sign-in attempt.",
+                status=400,
+                extra_headers=[clear_transaction_cookie],
+            )
+            return
+        try:
+            claims = google_oidc_verifier().exchange_and_verify(
+                code=params["code"],
+                code_verifier=transaction.code_verifier,
+                nonce=transaction.nonce,
+            )
+        except OidcProtocolError as exc:
+            write_local_log(
+                "security_event",
+                {"reason": exc.reason, "path": "/callback", "status": exc.status},
+            )
+            self.send_auth_page(
+                "Sign in was not completed",
+                "Authentication could not be completed. Start a new sign-in attempt.",
+                status=exc.status,
+                extra_headers=[clear_transaction_cookie],
+            )
+            return
+        try:
+            policy = internal_auth_policy()
+            email = canonical_email(claims.get("email"))
+            role = policy.role_for(email)
+        except InternalAuthConfigError:
+            role = ""
+            email = ""
+        if not role:
+            write_local_log(
+                "security_event",
+                {
+                    "reason": "internal_google_admission_denied",
+                    "path": "/callback",
+                    "status": 403,
+                    "user_id": privacy_safe_tracking_id(claims.get("sub"), "unknown"),
+                },
+            )
+            self.send_auth_page(
+                "Approved tester access required",
+                "Authenticated user is not approved for this internal UAT app.",
+                status=403,
+                extra_headers=[clear_transaction_cookie],
+            )
+            return
+        previous_payload = verified_cookie_payload(
+            cookies_from_header(self.headers.get("Cookie", "")).get(
+                SESSION_COOKIE_NAME,
+                "",
+            ),
+            allow_expired=True,
+        ) or {}
+        try:
+            session_record = INTERNAL_AUTH_STATE.create_session(
+                google_sub=claims.get("sub"),
+                email=email,
+                policy=policy,
+                previous_session_id=previous_payload.get("session_id"),
+            )
+        except (InternalAuthConfigError, InternalAuthStateError) as exc:
+            reason = getattr(exc, "reason", "internal_session_creation_failed")
+            write_local_log(
+                "security_event",
+                {"reason": reason, "path": "/callback", "status": 503},
+            )
+            self.send_auth_page(
+                "Sign in was not completed",
+                "Authentication could not be completed. Start a new sign-in attempt.",
+                status=503,
+                extra_headers=[clear_transaction_cookie],
+            )
+            return
+        session_cookie = cookie_header_value(
+            SESSION_COOKIE_NAME,
+            signed_cookie_value(
+                session_record,
+                max_age_seconds=INTERNAL_SESSION_TTL_SECONDS,
+            ),
+            max_age=INTERNAL_SESSION_TTL_SECONDS,
+        )
+        write_local_log(
+            "security_event",
+            {
+                "reason": "internal_google_authentication_succeeded",
+                "path": "/callback",
+                "status": 302,
+                "user_id": privacy_safe_tracking_id(
+                    session_record.get("google_sub"),
+                    "unknown",
+                ),
+            },
+        )
+        self.send_redirect(
+            "/",
+            extra_headers=[
+                ("Set-Cookie", session_cookie),
+                ("Set-Cookie", clear_cookie_header_value(OIDC_STATE_COOKIE_NAME)),
+            ],
+        )
+
+    def handle_local_component_oidc_callback(self, query: str) -> None:
         params = parse_qs(query, keep_blank_values=True)
         supplied_state = clean_text((params.get("state") or [""])[0])
         expected_state = oidc_state_from_cookie(self.headers.get("Cookie", ""))
@@ -23016,15 +23554,6 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             self.send_auth_page("Sign in was not completed", str(exc), status=exc.status)
             return
         if not oidc_claims_allowed(claims):
-            write_local_log(
-                "security_event",
-                {
-                    "reason": "auth_allowlist_denied",
-                    "path": "/callback",
-                    "status": 403,
-                    "user_id": privacy_safe_tracking_id(claims.get("sub"), "unknown"),
-                },
-            )
             self.send_auth_page(
                 "Approved tester access required",
                 "Authenticated user is not approved for this internal UAT app.",
@@ -23056,17 +23585,27 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                     "security_event",
                     {"reason": exc.reason, "path": "/logout", "status": exc.status},
                 )
-        logout_url = (
+        if (
+            configured_auth_mode() == INTERNAL_AUTH_MODE
+            and isinstance(session, dict)
+        ):
+            INTERNAL_AUTH_STATE.revoke_session(session.get("session_id"))
+        logout_location = (
             configured_platform_home_url() or "/signed-out"
             if platform_launch_mode_enabled()
-            else safe_logout_redirect_url(oidc_config().get("logout_url") or "")
+            else "/signed-out"
         )
         headers = [
             ("Set-Cookie", clear_cookie_header_value(SESSION_COOKIE_NAME)),
             ("Set-Cookie", clear_cookie_header_value(OIDC_STATE_COOKIE_NAME)),
             ("Clear-Site-Data", '"storage"'),
+            ("X-SQAG-Logout-Location", logout_location),
         ]
-        self.send_redirect(logout_url, extra_headers=headers)
+        write_local_log(
+            "security_event",
+            {"reason": "logout_completed", "path": "/logout", "status": 204},
+        )
+        self.send_empty(status=204, extra_headers=headers)
 
     def block_untrusted_host(self) -> bool:
         if is_allowed_host_header(self.headers.get("Host", "")):
@@ -23188,12 +23727,15 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         status: int = 200,
         action_href: str = "/login",
         action_label: str = "Sign in",
+        extra_headers: list[tuple[str, str]] | None = None,
     ) -> None:
         body = auth_html_page(title, message, action_href=action_href, action_label=action_label)
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_security_headers()
+        for name, value in extra_headers or []:
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 

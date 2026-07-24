@@ -13,6 +13,7 @@ Thumbs.db
 .superpowers/
 .agent-toolkit-backups/
 node_modules/
+.venv/
 playwright-report/
 test-results/
 screenshots/

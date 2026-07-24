@@ -23,6 +23,7 @@ git diff --check
 node --check webapp\static\app.js
 python -m py_compile webapp\server.py webapp\postgres_migrations.py scripts\migrate_sqag_storage.py scripts\preflight_sqag_migrations.py scripts\generate_quote.py scripts\live_ai_basis_chat_smoke.py
 python scripts\validate_local_pdf_dependency_usage.py
+python -m unittest tests.test_internal_google_auth tests.test_internal_google_auth_webapp
 python -m unittest discover -s tests
 npm run playwright:ai-stress
 npm run playwright:smoke
@@ -35,7 +36,11 @@ npm run playwright:smoke
 - Output pricing review, manual price detection, subtotal, Excel download, or quote generation: run generator unit tests plus an app smoke test that reaches output.
 - Upload intake, PDF/image handling, sample loading, browser refresh persistence, or local file state: run server tests for request validation and a rendered Playwright flow for the affected upload/persistence path.
 - Frontend layout, controls, settings, privacy page, or responsive behavior: run syntax checks and a browser/Playwright visual interaction loop on the changed screen.
-- Auth, permissions, OIDC, cookies, CSRF, file download boundaries, or secret handling: run focused security/authorization tests and broaden to full unit tests.
+- Auth, permissions, OIDC, cookies, CSRF, file download boundaries, or secret
+  handling: run `tests.test_internal_google_auth`,
+  `tests.test_internal_google_auth_webapp`, focused Platform/session tests, and
+  then the full unit and Playwright suites. Provider behavior must use local
+  synthetic adapters only.
 - CI/CD, package scripts, dependency setup, or workflow files: validate the YAML/script syntax when possible, run the nearest local command, and update `docs/current-cicd-status.md`.
 - PostgreSQL migration manifest, ledger, preflight, or operator command: run
   `tests.test_postgres_migration_ledger` against the isolated CI PostgreSQL

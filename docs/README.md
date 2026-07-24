@@ -19,6 +19,8 @@ platform concerns belong in `Swooshz-com/swooshz-platform`.
 - `docs/internal-uat-deploy-auth-readiness.md`: existing gated single-instance
   internal UAT deploy/auth readiness notes, boundaries, smoke checks, and
   non-production limitations.
+- `docs/internal-google-auth-mode.md`: canonical temporary exact-allowlist
+  Google OIDC mode, admission, session revocation, and readiness contract.
 - `docs/internal-uat-coolify-deploy.md`: SQAG-specific historical hosted
   validation notes; the DB/BLOB artifact path is now documented as blocked for
   hosted/protected/deploy/production readiness.

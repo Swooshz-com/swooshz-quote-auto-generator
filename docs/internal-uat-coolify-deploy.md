@@ -1,5 +1,14 @@
 # SQAG Hosted Validation Notes
 
+## Temporary internal-alpha authentication
+
+The committed env template now describes `SQAG_AUTH_MODE=internal_google`, not
+an enabled Platform launch. Its exact-placeholder email lists, fixed workspace,
+Google OIDC endpoints, client identifier, and client secret must be populated
+only in a separately authorised host secret/configuration manager. The mode is
+single-instance and private-alpha only; it cannot satisfy public production
+readiness. See `docs/internal-google-auth-mode.md`.
+
 ## Purpose
 
 This note preserves the SQAG app-specific hosted validation checklist shape for
@@ -65,10 +74,10 @@ Required names for any future hosted validation environment:
 
 | Area | Names |
 | --- | --- |
-| App/auth | `APP_MODE`, `AUTH_REQUIRED`, `SESSION_SECRET` |
+| App/auth | `APP_MODE`, `AUTH_REQUIRED`, `SQAG_AUTH_MODE`, `SESSION_SECRET` |
 | Security/tracking | secret `SQAG_TRACKING_HMAC_KEY`; non-secret configuration `SQAG_TRACKING_HMAC_KEY_VERSION` |
 | Storage | `SQAG_STORAGE_MODE`, `SQAG_ARTIFACT_STORAGE_MODE`, `SQAG_DATABASE_URL`, `SQAG_OBJECT_STORAGE_PROVIDER`, `SQAG_OBJECT_STORAGE_ENDPOINT_URL`, `SQAG_OBJECT_STORAGE_BUCKET`, `SQAG_OBJECT_STORAGE_REGION`, `SQAG_OBJECT_STORAGE_ACCESS_KEY_ID`, `SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY` |
-| Platform launch/session validation | `SQAG_PLATFORM_LAUNCH_MODE`, `SQAG_PLATFORM_BASE_URL`, `SQAG_PUBLIC_BASE_URL`, `SQAG_PLATFORM_SERVICE_SECRET`, non-secret `SQAG_PLATFORM_REQUEST_TIMEOUT_SECONDS` |
+| Temporary internal Google | `SQAG_PLATFORM_LAUNCH_MODE=disabled`, `SQAG_PUBLIC_BASE_URL`, `SQAG_INTERNAL_WORKSPACE_ID`, `SQAG_INTERNAL_ALLOWED_EMAILS`, `SQAG_INTERNAL_ADMIN_EMAILS`, `SQAG_INTERNAL_OPERATOR_EMAILS`, `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI`, `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL` |
 | Reverse proxy | `SQAG_TRUSTED_PROXY_CIDRS` |
 | Runtime housekeeping | `QUOTE_DATA_ROOT`, `QUOTE_OUTPUT_ROOT`, `QUOTE_TMP_ROOT`, `QUOTE_LOG_ROOT`, `PORT` |
 

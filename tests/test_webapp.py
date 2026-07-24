@@ -754,7 +754,7 @@ class WebappServerTest(unittest.TestCase):
     def test_support_feedback_evidence_http_route_is_privileged_scoped_and_audited(self):
         root = test_temp_root() / f"support-feedback-evidence-{time.time_ns()}"
         database_url = f"sqlite:///{(root / 'sqag.sqlite3').as_posix()}"
-        env = self.deploy_auth_env(
+        env = self.platform_launch_env(
             SQAG_STORAGE_MODE="database",
             SQAG_ARTIFACT_STORAGE_MODE="database",
             SQAG_DATABASE_URL=database_url,
@@ -829,6 +829,11 @@ class WebappServerTest(unittest.TestCase):
                         "artifact-free HTTP verification opened artifact storage"
                     ),
                 ) as open_artifact_storage,
+                mock.patch.object(
+                    webapp,
+                    "validated_platform_auth_session",
+                    side_effect=lambda session: session,
+                ),
                 LocalRunnerServer() as runner,
             ):
                 missing_csrf = self.http_json(
@@ -898,7 +903,7 @@ class WebappServerTest(unittest.TestCase):
         self.addCleanup(self.reset_rate_limit_state)
         root = test_temp_root() / f"support-evidence-rate-{time.time_ns()}"
         database_url = f"sqlite:///{(root / 'sqag.sqlite3').as_posix()}"
-        env = self.deploy_auth_env(
+        env = self.platform_launch_env(
             SQAG_STORAGE_MODE="database",
             SQAG_ARTIFACT_STORAGE_MODE="database",
             SQAG_DATABASE_URL=database_url,
@@ -922,6 +927,11 @@ class WebappServerTest(unittest.TestCase):
                 "support_feedback_evidence_for_auth_session",
                 return_value=integrity,
             ) as evidence_lookup,
+            mock.patch.object(
+                webapp,
+                "validated_platform_auth_session",
+                side_effect=lambda session: session,
+            ),
             LocalRunnerServer() as runner,
         ):
             responses = [
@@ -1020,7 +1030,7 @@ class WebappServerTest(unittest.TestCase):
     def test_direct_generate_http_validation_has_one_terminal_idempotent_run(self):
         root = test_temp_root() / f"direct-generate-forensics-{time.time_ns()}"
         database_url = f"sqlite:///{(root / 'sqag.sqlite3').as_posix()}"
-        env = self.deploy_auth_env(
+        env = self.platform_launch_env(
             SQAG_STORAGE_MODE="database",
             SQAG_ARTIFACT_STORAGE_MODE="database",
             SQAG_DATABASE_URL=database_url,
@@ -1030,7 +1040,11 @@ class WebappServerTest(unittest.TestCase):
         session = self.platform_auth_session(
             "workspace-direct-generate", membership_role="owner", user_id="generator-user"
         )
-        with mock.patch.dict(os.environ, env, clear=True):
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+            webapp,
+            "validated_platform_auth_session",
+            side_effect=lambda session: session,
+        ):
             cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(session)}"
             webapp.apply_sqag_storage_migrations(database_url)
             with LocalRunnerServer() as runner:
@@ -1129,6 +1143,7 @@ class WebappServerTest(unittest.TestCase):
             'SQAG_TRUSTED_PROXY_CIDRS': '127.0.0.1/32',
             "APP_MODE": "deploy",
             "AUTH_REQUIRED": "true",
+            "SQAG_AUTH_MODE": "platform",
             "SESSION_SECRET": "test-session-secret-with-enough-entropy",
             "SQAG_PLATFORM_LAUNCH_MODE": "platform",
             "SQAG_PLATFORM_SERVICE_SECRET": "synthetic-platform-service-secret",
@@ -1204,7 +1219,10 @@ class WebappServerTest(unittest.TestCase):
                 membershipRole=membership_role,
             )
         )
-        return {"user": webapp.user_from_platform_launch_context(context)}
+        return {
+            "auth_mode": "platform",
+            "user": webapp.user_from_platform_launch_context(context),
+        }
 
     def platform_validation_payload(self, **overrides):
         context = self.platform_consume_payload()
@@ -3822,16 +3840,15 @@ class WebappServerTest(unittest.TestCase):
 
         with mock.patch.dict(os.environ, env, clear=True):
             status = webapp.deploy_uat_preflight_status()
-            self.assertFalse(webapp.deploy_requires_auth_guard())
-            self.assertTrue(webapp.deploy_requires_platform_workspace_guard())
+            self.assertTrue(webapp.deploy_requires_auth_guard())
+            self.assertFalse(webapp.deploy_requires_platform_workspace_guard())
             self.assertEqual(webapp.platform_workspace_id_from_auth_session(oidc_session), "")
             with self.assertRaises(webapp.SqagStorageAccessError) as storage_error:
                 webapp.app_storage_for_auth_session(oidc_session)
 
         checks = {check["name"]: check for check in status["checks"]}
         self.assertEqual(status["status"], "blocked")
-        self.assertFalse(checks["SQAG_PLATFORM_LAUNCH_MODE"]["ok"])
-        self.assertFalse(checks["SQAG_PLATFORM_BASE_URL"]["ok"])
+        self.assertFalse(checks["SQAG_AUTH_MODE"]["ok"])
         self.assertEqual(storage_error.exception.reason, "storage_platform_session_required")
 
     def test_deploy_main_stops_oidc_only_configuration_before_server_construction(self):
@@ -3934,7 +3951,7 @@ class WebappServerTest(unittest.TestCase):
         with mock.patch.dict(os.environ, self.deploy_auth_env(APP_MODE="local"), clear=True):
             self.assertFalse(webapp.deploy_requires_platform_workspace_guard())
 
-    def test_deploy_auth_requires_allowlist_or_explicit_internal_escape_hatch(self):
+    def test_deploy_legacy_oidc_allowlist_escape_hatches_never_satisfy_auth(self):
         with mock.patch.dict(os.environ, self.deploy_auth_env(OIDC_AUTHORIZE_URL=""), clear=True):
             self.assertFalse(webapp.oidc_config_complete())
             self.assertTrue(webapp.deploy_requires_auth_guard())
@@ -3944,10 +3961,10 @@ class WebappServerTest(unittest.TestCase):
             self.assertTrue(webapp.deploy_requires_auth_guard())
 
         with mock.patch.dict(os.environ, self.deploy_auth_env(AUTH_ALLOWED_EMAILS="alex@example.com"), clear=True):
-            self.assertFalse(webapp.deploy_requires_auth_guard())
+            self.assertTrue(webapp.deploy_requires_auth_guard())
 
         with mock.patch.dict(os.environ, self.deploy_auth_env(AUTH_ALLOWED_EMAILS="", AUTH_ALLOWED_DOMAINS="example.com"), clear=True):
-            self.assertFalse(webapp.deploy_requires_auth_guard())
+            self.assertTrue(webapp.deploy_requires_auth_guard())
 
         with mock.patch.dict(
             os.environ,
@@ -3958,7 +3975,7 @@ class WebappServerTest(unittest.TestCase):
             ),
             clear=True,
         ):
-            self.assertFalse(webapp.deploy_requires_auth_guard())
+            self.assertTrue(webapp.deploy_requires_auth_guard())
 
     def test_deploy_auth_requires_strong_secret_and_secure_upstream_urls(self):
         with mock.patch.dict(os.environ, self.deploy_auth_env(SESSION_SECRET="short"), clear=True):
@@ -3973,7 +3990,12 @@ class WebappServerTest(unittest.TestCase):
 
             self.assertFalse(webapp.oidc_config_complete())
             self.assertTrue(webapp.deploy_requires_auth_guard())
-        self.assertTrue(any(check["name"] == "OIDC_TOKEN_URL" and not check["ok"] for check in status["checks"]))
+        self.assertTrue(
+            any(
+                check["name"] == "SQAG_AUTH_MODE" and not check["ok"]
+                for check in status["checks"]
+            )
+        )
 
         with mock.patch.dict(os.environ, self.platform_launch_env(SQAG_PLATFORM_BASE_URL="http://platform.example.test"), clear=True):
             self.assertEqual(webapp.configured_platform_base_url(), "")
@@ -3986,7 +4008,7 @@ class WebappServerTest(unittest.TestCase):
             self.assertFalse(webapp.platform_launch_config_complete())
             self.assertTrue(webapp.deploy_requires_auth_guard())
 
-    def test_deploy_auth_routes_block_unauthenticated_access_and_redirect_login(self):
+    def test_deploy_legacy_oidc_configuration_fails_before_serving_routes(self):
         env = self.deploy_auth_env(OIDC_LOGOUT_URL="https://issuer.example/logout")
         opener = self.no_redirect_opener()
         with mock.patch.dict(os.environ, env, clear=True):
@@ -3998,32 +4020,17 @@ class WebappServerTest(unittest.TestCase):
 
                 with self.assertRaises(urllib.error.HTTPError) as root_error:
                     opener.open(f"{runner.base_url}/", timeout=3)
-                self.assertEqual(root_error.exception.code, 302)
-                self.assertEqual(root_error.exception.headers["Location"], "/login")
+                self.assertEqual(root_error.exception.code, 503)
 
                 with self.assertRaises(urllib.error.HTTPError) as api_error:
                     opener.open(f"{runner.base_url}/api/session", timeout=3)
-                self.assertEqual(api_error.exception.code, 401)
+                self.assertEqual(api_error.exception.code, 503)
                 api_body = json.loads(api_error.exception.read().decode("utf-8"))
-                self.assertEqual(api_body["status"], "auth_required")
+                self.assertEqual(api_body["status"], "blocked")
 
-                with self.assertRaises(urllib.error.HTTPError) as login_redirect:
+                with self.assertRaises(urllib.error.HTTPError) as login_error:
                     opener.open(f"{runner.base_url}/login", timeout=3)
-                self.assertEqual(login_redirect.exception.code, 302)
-                login_location = login_redirect.exception.headers["Location"]
-                login_url = urllib.parse.urlparse(login_location)
-                configured_authorize_url = urllib.parse.urlparse(env["OIDC_AUTHORIZE_URL"])
-                self.assertEqual(login_location.split("?", 1)[0], env["OIDC_AUTHORIZE_URL"])
-                self.assertEqual(login_url.scheme, configured_authorize_url.scheme)
-                self.assertEqual(login_url.netloc, configured_authorize_url.netloc)
-                self.assertEqual(login_url.path, configured_authorize_url.path)
-                login_params = urllib.parse.parse_qs(login_url.query)
-                self.assertEqual(login_params["client_id"], [env["OIDC_CLIENT_ID"]])
-                self.assertEqual(login_params["redirect_uri"], [env["OIDC_REDIRECT_URI"]])
-                self.assertEqual(login_params["response_type"], ["code"])
-                self.assertEqual(login_params["scope"], ["openid email profile"])
-                self.assertTrue(login_params["state"][0])
-                self.assertIn(webapp.OIDC_STATE_COOKIE_NAME, login_redirect.exception.headers["Set-Cookie"])
+                self.assertEqual(login_error.exception.code, 503)
 
     def test_deploy_platform_auth_pages_link_back_to_platform_home(self):
         platform_url = "https://swooshz.com"
@@ -4095,8 +4102,13 @@ class WebappServerTest(unittest.TestCase):
         self.assertTrue(session_body["permissions"]["canGenerateQuote"])
         self.assertTrue(session_body["permissions"]["canManageProfiles"])
 
-    def test_deploy_oidc_callback_accepts_approved_tester_domain(self):
-        env = self.deploy_auth_env(AUTH_ALLOWED_EMAILS="", AUTH_ALLOWED_DOMAINS="example.com")
+    def test_local_oidc_callback_accepts_approved_tester_domain(self):
+        env = self.deploy_auth_env(
+            APP_MODE="local",
+            USER_TYPE="ADMIN",
+            AUTH_ALLOWED_EMAILS="",
+            AUTH_ALLOWED_DOMAINS="example.com",
+        )
         opener = self.no_redirect_opener()
         with mock.patch.dict(os.environ, env, clear=True):
             with LocalRunnerServer() as runner:
@@ -4121,8 +4133,8 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(callback_redirect.exception.headers["Location"], "/")
         self.assertTrue(any(cookie.startswith(f"{webapp.SESSION_COOKIE_NAME}=") for cookie in set_cookies))
 
-    def test_deploy_oidc_callback_rejects_missing_userinfo_subject_generically(self):
-        env = self.deploy_auth_env()
+    def test_local_oidc_callback_rejects_missing_userinfo_subject_generically(self):
+        env = self.deploy_auth_env(APP_MODE="local", USER_TYPE="ADMIN")
         opener = self.no_redirect_opener()
         with mock.patch.dict(os.environ, env, clear=True):
             with LocalRunnerServer() as runner:
@@ -4166,8 +4178,13 @@ class WebappServerTest(unittest.TestCase):
         self.assertIn("Quote List", body)
         self.assertIn("topbarAuthState", body)
 
-    def test_deploy_oidc_callback_denies_unapproved_tester_without_leaking_claims_or_secrets(self):
-        env = self.deploy_auth_env(AUTH_ALLOWED_EMAILS="alex@example.com", AUTH_ALLOWED_DOMAINS="")
+    def test_local_oidc_callback_denies_unapproved_tester_without_leaking_claims_or_secrets(self):
+        env = self.deploy_auth_env(
+            APP_MODE="local",
+            USER_TYPE="ADMIN",
+            AUTH_ALLOWED_EMAILS="alex@example.com",
+            AUTH_ALLOWED_DOMAINS="",
+        )
         opener = self.no_redirect_opener()
         with mock.patch.dict(os.environ, env, clear=True):
             with LocalRunnerServer() as runner:
@@ -4200,8 +4217,8 @@ class WebappServerTest(unittest.TestCase):
         ):
             self.assertNotIn(sensitive, body)
 
-    def test_deploy_oidc_callback_rejects_state_provider_error_and_missing_code_safely(self):
-        env = self.deploy_auth_env()
+    def test_local_oidc_callback_rejects_state_provider_error_and_missing_code_safely(self):
+        env = self.deploy_auth_env(APP_MODE="local", USER_TYPE="ADMIN")
         opener = self.no_redirect_opener()
         with mock.patch.dict(os.environ, env, clear=True):
             with LocalRunnerServer() as runner:
@@ -4801,7 +4818,7 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(permissions["role"], "admin")
         self.assertTrue(permissions["canGenerateQuote"])
 
-    def test_platform_mode_rejects_oidc_callback_before_provider_calls(self):
+    def test_platform_mode_rejects_mixed_oidc_configuration_before_provider_calls(self):
         env = self.deploy_auth_env(
             SQAG_PLATFORM_LAUNCH_MODE="platform",
             SQAG_PLATFORM_BASE_URL="https://swooshz.com",
@@ -4828,12 +4845,12 @@ class WebappServerTest(unittest.TestCase):
                     with self.assertRaises(urllib.error.HTTPError) as callback_error:
                         opener.open(request, timeout=3)
 
-        self.assertEqual(callback_error.exception.code, 404)
+        self.assertEqual(callback_error.exception.code, 503)
         self.assertFalse(callback_error.exception.headers.get_all("Set-Cookie"))
         exchange.assert_not_called()
         userinfo.assert_not_called()
 
-    def test_platform_logout_clears_legacy_cookie_and_returns_to_platform(self):
+    def test_platform_logout_rejects_legacy_cookie_and_unsafe_get(self):
         env = self.platform_launch_env(
             OIDC_LOGOUT_URL="https://stale-issuer.example.test/logout",
         )
@@ -4844,27 +4861,27 @@ class WebappServerTest(unittest.TestCase):
                 f"{webapp.signed_cookie_value({'user': {'subject': 'legacy-oidc-user'}})}"
             )
             with LocalRunnerServer() as runner:
-                request = urllib.request.Request(
-                    f"{runner.base_url}/logout",
-                    headers={"Cookie": legacy_cookie},
-                )
-                with self.assertRaises(urllib.error.HTTPError) as logout_redirect:
-                    opener.open(request, timeout=3)
-                set_cookies = logout_redirect.exception.headers.get_all("Set-Cookie")
+                with self.assertRaises(urllib.error.HTTPError) as unsafe_get:
+                    opener.open(
+                        urllib.request.Request(
+                            f"{runner.base_url}/logout",
+                            headers={"Cookie": legacy_cookie},
+                        ),
+                        timeout=3,
+                    )
+                with self.assertRaises(urllib.error.HTTPError) as rejected_post:
+                    opener.open(
+                        urllib.request.Request(
+                            f"{runner.base_url}/logout",
+                            data=b"",
+                            headers={"Cookie": legacy_cookie},
+                            method="POST",
+                        ),
+                        timeout=3,
+                    )
 
-        self.assertEqual(logout_redirect.exception.code, 302)
-        self.assertEqual(
-            logout_redirect.exception.headers["Location"],
-            "https://swooshz.com/",
-        )
-        self.assertTrue(any(
-            cookie.startswith(f"{webapp.SESSION_COOKIE_NAME}=") and "Max-Age=0" in cookie
-            for cookie in set_cookies
-        ))
-        self.assertTrue(any(
-            cookie.startswith(f"{webapp.OIDC_STATE_COOKIE_NAME}=") and "Max-Age=0" in cookie
-            for cookie in set_cookies
-        ))
+        self.assertEqual(unsafe_get.exception.code, 405)
+        self.assertEqual(rejected_post.exception.code, 401)
 
     def test_platform_uat_smoke_launch_generate_list_and_download_database_artifact(self):
         raw_launch_token = self.synthetic_platform_launch_token()
@@ -5720,17 +5737,27 @@ class WebappServerTest(unittest.TestCase):
         captured: list[urllib.request.Request] = []
 
         def failed_revoke(request, timeout=0):
+            if request.full_url.endswith(webapp.PLATFORM_ACCESS_VALIDATE_PATH):
+                return JsonResponseMock(self.platform_validation_payload())
             captured.append(request)
             raise urllib.error.URLError("synthetic unavailable")
 
         with mock.patch.dict(os.environ, env, clear=True):
             with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=failed_revoke):
                 with LocalRunnerServer() as runner:
-                    request = urllib.request.Request(f"{runner.base_url}/logout", headers={"Cookie": cookie})
-                    with self.assertRaises(urllib.error.HTTPError) as redirect:
-                        opener.open(request, timeout=3)
-        self.assertEqual(redirect.exception.code, 302)
-        self.assertTrue(any(value.startswith(f"{webapp.SESSION_COOKIE_NAME}=") and "Max-Age=0" in value for value in redirect.exception.headers.get_all("Set-Cookie")))
+                    request = urllib.request.Request(
+                        f"{runner.base_url}/logout",
+                        data=b"",
+                        headers={
+                            "Cookie": cookie,
+                            webapp.configured_csrf_header_name(): webapp.csrf_token_for_cookie_header(cookie),
+                        },
+                        method="POST",
+                    )
+                    response = opener.open(request, timeout=3)
+        self.assertEqual(response.status, 204)
+        self.assertEqual(response.headers["X-SQAG-Logout-Location"], "https://swooshz.com/")
+        self.assertTrue(any(value.startswith(f"{webapp.SESSION_COOKIE_NAME}=") and "Max-Age=0" in value for value in response.headers.get_all("Set-Cookie")))
         self.assertEqual(len(captured), 1)
         self.assertEqual(captured[0].full_url, env["SQAG_PLATFORM_BASE_URL"] + webapp.PLATFORM_ACCESS_REVOKE_PATH)
         self.assertEqual(captured[0].get_header("X-sqag-validation-grant"), "synthetic-validation-grant-123")
@@ -5862,32 +5889,25 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(error.exception.code, 404)
         self.assertEqual(body["error"], "Not found")
 
-    def test_deploy_logout_clears_session_and_state_cookies(self):
+    def test_deploy_logout_is_never_state_changing_get_and_external_redirect_is_rejected(self):
         env = self.deploy_auth_env(OIDC_LOGOUT_URL="https://issuer.example/logout")
         opener = self.no_redirect_opener()
         with mock.patch.dict(os.environ, env, clear=True):
-            session_cookie = webapp.cookie_header_value(
-                webapp.SESSION_COOKIE_NAME,
-                webapp.signed_cookie_value({"user": {"subject": "user-123", "email": "alex@example.com"}}),
-                max_age=webapp.SESSION_COOKIE_MAX_AGE_SECONDS,
-            ).split(";", 1)[0]
-            with LocalRunnerServer() as runner:
-                request = urllib.request.Request(f"{runner.base_url}/logout", headers={"Cookie": session_cookie})
-                with self.assertRaises(urllib.error.HTTPError) as logout_redirect:
+            with mock.patch.object(
+                webapp,
+                "validated_platform_auth_session",
+                side_effect=lambda session: session,
+            ), LocalRunnerServer() as runner:
+                request = urllib.request.Request(f"{runner.base_url}/logout")
+                with self.assertRaises(urllib.error.HTTPError) as logout_error:
                     opener.open(request, timeout=3)
-                set_cookies = logout_redirect.exception.headers.get_all("Set-Cookie")
-
-        self.assertEqual(logout_redirect.exception.code, 302)
-        self.assertEqual(logout_redirect.exception.headers["Location"], env["OIDC_LOGOUT_URL"])
-        self.assertEqual(logout_redirect.exception.headers["Clear-Site-Data"], '"storage"')
-        self.assertTrue(any(cookie.startswith(f"{webapp.SESSION_COOKIE_NAME}=") and "Max-Age=0" in cookie for cookie in set_cookies))
-        self.assertTrue(any(cookie.startswith(f"{webapp.OIDC_STATE_COOKIE_NAME}=") and "Max-Age=0" in cookie for cookie in set_cookies))
+        self.assertEqual(logout_error.exception.code, 405)
 
         with mock.patch.dict(os.environ, self.deploy_auth_env(OIDC_LOGOUT_URL="javascript:alert(1)"), clear=True):
-            with LocalRunnerServer() as runner:
-                with self.assertRaises(urllib.error.HTTPError) as safe_logout_redirect:
-                    opener.open(f"{runner.base_url}/logout", timeout=3)
-        self.assertEqual(safe_logout_redirect.exception.headers["Location"], "/signed-out")
+            self.assertEqual(
+                webapp.safe_logout_redirect_url("https://evil.example.test/"),
+                "/signed-out",
+            )
     def test_stale_platform_tab_cannot_mutate_after_workspace_cookie_switch(self):
         env = self.platform_launch_env()
         stored = mock.Mock()
@@ -6065,12 +6085,12 @@ class WebappServerTest(unittest.TestCase):
         self.assertNotIn(secret_value, output)
         self.assertNotIn(malformed_version, output)
 
-    def test_internal_uat_coolify_env_template_rejects_disguised_platform_service_secret(self):
+    def test_internal_uat_coolify_env_template_rejects_disguised_oidc_client_secret(self):
         source = ROOT / "deploy" / "internal-uat" / "coolify" / "sqag.uat.env.example"
         source_text = source.read_text(encoding="utf-8")
         disguised_secret = source_text.replace(
-            "SQAG_PLATFORM_SERVICE_SECRET=<host-secret-manager-platform-service-secret>",
-            "SQAG_PLATFORM_SERVICE_SECRET=<literal-reusable-service-credential>",
+            "OIDC_CLIENT_SECRET=<host-secret-manager-google-oidc-client-secret>",
+            "OIDC_CLIENT_SECRET=<literal-reusable-service-credential>",
         )
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -6082,7 +6102,7 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(result["status"], "blocked")
         self.assertIn(
             {
-                "key": "SQAG_PLATFORM_SERVICE_SECRET",
+                "key": "OIDC_CLIENT_SECRET",
                 "category": "unexpected-placeholder",
                 "message": "security-sensitive placeholder does not match the approved template marker",
             },
@@ -6134,7 +6154,7 @@ class WebappServerTest(unittest.TestCase):
             bad_template = Path(tmp) / "sqag.uat.env.example"
             bad_template.write_text(
                 source.read_text(encoding="utf-8")
-                .replace("SQAG_PLATFORM_LAUNCH_MODE=platform", "SQAG_PLATFORM_LAUNCH_MODE=disabled")
+                .replace("SQAG_AUTH_MODE=internal_google", "SQAG_AUTH_MODE=local")
                 .replace("QUOTE_DATA_ROOT=<host-managed-runtime-root>", "QUOTE_DATA_ROOT=C:\\Users\\Private\\runtime")
                 .replace("SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY=<host-secret-manager-object-storage-secret-access-key>", "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY=sk-real-looking-token-123456"),
                 encoding="utf-8",
@@ -6144,7 +6164,7 @@ class WebappServerTest(unittest.TestCase):
 
         finding_text = json.dumps([deploy_template.finding_to_dict(finding) for finding in result["findings"]])
         self.assertEqual(result["status"], "blocked")
-        self.assertIn("SQAG_PLATFORM_LAUNCH_MODE", finding_text)
+        self.assertIn("SQAG_AUTH_MODE", finding_text)
         self.assertIn("QUOTE_DATA_ROOT", finding_text)
         self.assertIn("non-placeholder-value", finding_text)
         self.assertIn("private-local-path", finding_text)
@@ -24496,8 +24516,10 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             payload = valid_payload()
             payload["quote_session"] = {"session_id": "quote-http-artifact"}
             result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-http-artifact/files/quotation.xlsx"}]}
-            env = {**self.deploy_auth_env(), "SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
-            with mock.patch.dict(os.environ, env, clear=True):
+            env = {**self.platform_launch_env(), "SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+                webapp, "validated_platform_auth_session", side_effect=lambda session: session
+            ):
                 webapp.apply_sqag_storage_migrations(database_url)
                 storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-http-artifact"))
                 storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
@@ -24532,8 +24554,10 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         payload = valid_payload()
         payload["quote_session"] = {"session_id": "quote-db-delete"}
         result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-db-delete/files/quotation.xlsx"}]}
-        env = {**self.deploy_auth_env(), "SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
-        with mock.patch.dict(os.environ, env, clear=True):
+        env = {**self.platform_launch_env(), "SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+            webapp, "validated_platform_auth_session", side_effect=lambda session: session
+        ):
             webapp.apply_sqag_storage_migrations(database_url)
             storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-db-delete"))
             storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
@@ -24605,8 +24629,10 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         output_dir = tmp_path / "out" / "job-db-stale"
         output_dir.mkdir(parents=True)
         (output_dir / "quotation.xlsx").write_bytes(b"xlsx-db-stale")
-        env = {**self.deploy_auth_env(), "SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
-        with mock.patch.dict(os.environ, env, clear=True):
+        env = {**self.platform_launch_env(), "SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+            webapp, "validated_platform_auth_session", side_effect=lambda session: session
+        ):
             webapp.apply_sqag_storage_migrations(database_url)
             storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-db-stale"))
             storage.save_profile(webapp.normalize_profile_payload({"id": "stale-profile", "label": "Generated Stale Profile"}))
@@ -24670,7 +24696,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         payload["quote_session"] = {"session_id": "quote-object-artifact"}
         result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-object-artifact/files/quotation.xlsx"}]}
         env = {
-            **self.deploy_auth_env(),
+            **self.platform_launch_env(),
             "SQAG_STORAGE_MODE": "database",
             "SQAG_ARTIFACT_STORAGE_MODE": "object",
             "SQAG_DATABASE_URL": database_url,
@@ -24684,6 +24710,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         with (
             mock.patch.dict(os.environ, env, clear=True),
             mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+            mock.patch.object(webapp, "validated_platform_auth_session", side_effect=lambda session: session),
         ):
             webapp.apply_sqag_storage_migrations(database_url)
             workspace_a = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-a"))

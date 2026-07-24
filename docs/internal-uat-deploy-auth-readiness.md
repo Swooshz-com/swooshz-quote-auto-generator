@@ -1,5 +1,18 @@
 # Internal UAT Deploy/Auth Readiness
 
+## 2026-07-24 authentication-mode update
+
+Deploy authentication is now selected explicitly with `SQAG_AUTH_MODE`.
+`platform` retains the final Platform architecture; `internal_google` enables
+the temporary private exact-allowlist alpha lane; `local` is rejected in
+deploy mode. Missing, unknown, mixed, or incomplete modes fail closed.
+
+The complete temporary OIDC, admission, session, logout, and readiness contract
+is canonical in `docs/internal-google-auth-mode.md`. Where older sections below
+describe Platform as the only deploy-capable mode, read them as the Platform
+branch of the explicit selector. Legacy `AUTH_ALLOWED_*` settings remain local
+component-test inputs and are forbidden in `internal_google`.
+
 ## Purpose
 
 This document explains the existing single-instance gated internal UAT path for
@@ -21,6 +34,8 @@ The deploy/auth surface is already represented in `.env.example` and
   explicitly overridden.
 - `APP_MODE=deploy`: gated deploy mode. The server defaults to a deploy bind
   host and `AUTH_REQUIRED=true`.
+- `SQAG_AUTH_MODE`: explicit deploy selector: `platform`,
+  `internal_google`, or local-only `local`.
 - `AUTH_REQUIRED`: explicit auth gate toggle. In deploy mode, leaving this
   unset still defaults to auth required. Setting it to `false` is treated as an
   incomplete auth boundary and must not be used for hosted UAT.

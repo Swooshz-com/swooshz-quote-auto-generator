@@ -13224,8 +13224,23 @@ function wireEvents() {
     elements.topbarLogoutLink.addEventListener("click", async (event) => {
       event.preventDefault();
       const href = elements.topbarLogoutLink.getAttribute("href") || "/logout";
-      await purgeBrowserRecoveryState();
-      window.location.assign(href);
+      const headers = state.csrfToken
+        ? { [state.csrfHeaderName]: state.csrfToken }
+        : {};
+      try {
+        const response = await fetch(href, {
+          method: "POST",
+          headers,
+          credentials: "same-origin",
+          redirect: "manual",
+        });
+        if (!response.ok) return;
+        const logoutLocation = response.headers.get("X-SQAG-Logout-Location") || "/signed-out";
+        await purgeBrowserRecoveryState();
+        window.location.assign(logoutLocation);
+      } catch (_error) {
+        return;
+      }
     });
   }
   wireRichTextEditors();

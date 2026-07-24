@@ -1,4 +1,51 @@
 # SQAG Production-Readiness Audit
+
+## 2026-07-24 Temporary Internal Google Authentication Audit
+
+Base SHA: `a8055aeb9bd31084ecf509e5c5ffb73303b5553a`
+
+Scope: repository-only implementation and synthetic validation of an explicit
+`SQAG_AUTH_MODE` contract and temporary exact-allowlist Google OIDC lane. No
+OAuth client, credential, provider, deployment, infrastructure, or production
+data operation was performed.
+
+Verdict:
+
+- `platform`: existing launch/finalization/workspace/entitlement/revocation
+  boundaries remain enabled only under the explicit Platform selector.
+- `internal_google`: may qualify only for a private single-instance internal
+  alpha when the complete hosted and authentication contracts pass.
+- `local`: never qualifies for deploy readiness.
+- `production_ready=false` whenever `internal_google` is selected.
+
+Security review focused on deterministic source and test evidence: state and
+nonce one-time use, S256 PKCE, exact public redirect authority, maintained
+PyJWT/cryptography verification, exact issuer/audience/signature/time claims,
+exact allowlist and role parsing, server-side session revocation, per-request
+policy revalidation, CSRF-safe POST logout, privacy-safe errors/audits, and
+mode mutual exclusion. The retired Codex Security plugin was intentionally not
+invoked and is not an acceptance gate for this task.
+
+Canonical design: `docs/internal-google-auth-mode.md`.
+
+Validation record:
+
+- RED: `python -m unittest tests.test_internal_google_auth` initially failed
+  because `webapp.internal_google_auth` did not exist.
+- GREEN: 29 focused internal-auth tests passed.
+- Full local Python suite: 1,030 passed; 10 PostgreSQL-only tests skipped
+  because this Windows host has no disposable PostgreSQL service. CI provisions
+  PostgreSQL 16 and remains the zero-applicable-skip gate.
+- Synthetic internal-auth, AI-stress, and full application Playwright flows
+  passed.
+- Strict Python audit found no known vulnerabilities; Node audit found zero
+  vulnerabilities; `pip check` passed.
+- Python/JavaScript syntax, dynamic-pricing guard, local-PDF dependency guard,
+  sensitive-fixture scan, deploy-template verifier, synthetic hosted-validation
+  bundle, and `git diff --check` passed.
+- Fresh task-owned localhost server health at `127.0.0.1:8765/api/health`
+  returned HTTP 200.
+
 ## 2026-07-15 Generation Forensics, Feedback, And Retention Audit
 
 Audit branch: `codex/sqag-forensics-feedback-retention`

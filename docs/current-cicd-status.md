@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-07-21
+Last updated: 2026-07-24
 
 Source of truth: `.github/workflows/ci.yml`
 
@@ -12,7 +12,7 @@ Source of truth: `.github/workflows/ci.yml`
 - No deployment job is configured
 - This phase-planning PR adds no deployment job
 - No production environment mutation is performed by CI
-- CI does not require OpenAI, DeepSeek, Gemini, OIDC, deployment, or production secrets
+- CI does not require OpenAI, DeepSeek, Gemini, Google OIDC, deployment, or production secrets
 
 ## Active Jobs
 
@@ -24,6 +24,8 @@ Source of truth: `.github/workflows/ci.yml`
 
 - Installs Python 3.12 and Node 22.
 - Installs pinned Python dependencies with `python -m pip install --only-binary=:all: -r requirements.txt`.
+- Uses pinned PyJWT and cryptography packages for synthetic RS256/JWK and OIDC
+  claim-validation compatibility tests; CI never contacts Google.
 - Installs `pip-audit` and runs `python -m pip_audit -r requirements.txt --strict` against pinned Python dependencies.
 - Installs Playwright Chromium.
 - Starts an isolated disposable PostgreSQL 16 service for migration-ledger
@@ -50,8 +52,14 @@ Source of truth: `.github/workflows/ci.yml`
 ## Deploy Runtime Gate
 
 - CI still performs no deployment.
-- `APP_MODE=deploy` now requires Swooshz Platform launch configuration; a
-  standalone OIDC session cannot satisfy the workspace identity boundary.
+- `APP_MODE=deploy` requires an explicit `SQAG_AUTH_MODE` of `platform` or
+  `internal_google`, plus `AUTH_REQUIRED=true`; missing, unknown, local, mixed,
+  or incomplete configurations fail closed.
+- `platform` preserves the Swooshz Platform launch, workspace, entitlement, and
+  per-request validation/revocation boundary.
+- `internal_google` is a temporary single-instance private-alpha lane with
+  exact email/role admission, verified Google OIDC code flow, and server-side
+  session revocation. It can never satisfy public production readiness.
 - Deploy requests accept only signed sessions containing the consumed Platform
   user, workspace, app, and supported membership-role context. Pre-existing
   OIDC-only cookies are treated as unauthenticated and cannot inherit a tester
