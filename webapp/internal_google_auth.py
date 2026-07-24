@@ -30,6 +30,8 @@ MAX_INTERNAL_SESSIONS = 4096
 MAX_PROVIDER_RESPONSE_BYTES = 128 * 1024
 MAX_ID_TOKEN_BYTES = 32 * 1024
 MAX_CALLBACK_VALUE_CHARS = 4096
+MAX_INTERNAL_IDENTITIES_JSON_BYTES = 16 * 1024
+MAX_INTERNAL_IDENTITIES = 100
 SUPPORTED_INTERNAL_ROLES = frozenset({"admin", "operator"})
 WORKSPACE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,63}$")
 EMAIL_PATTERN = re.compile(
@@ -38,6 +40,7 @@ EMAIL_PATTERN = re.compile(
     r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
 )
 OPAQUE_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,256}$")
+GOOGLE_SUBJECT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{5,254}$")
 
 
 class InternalAuthConfigError(ValueError):
@@ -73,25 +76,49 @@ def canonical_email(value: Any) -> str:
     return candidate
 
 
-def _parse_email_list(value: Any, *, field: str, required: bool) -> tuple[str, ...]:
-    raw = str(value or "")
-    if not raw.strip():
-        if required:
-            raise InternalAuthConfigError(f"{field}_required")
-        return ()
-    entries = raw.split(",")
-    if any(not entry.strip() for entry in entries):
-        raise InternalAuthConfigError(f"{field}_empty_entry")
-    canonical = tuple(canonical_email(entry) for entry in entries)
-    if len(set(canonical)) != len(canonical):
-        raise InternalAuthConfigError(f"{field}_duplicate")
-    return canonical
+def _configured_google_subject(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or not GOOGLE_SUBJECT_PATTERN.fullmatch(value)
+    ):
+        raise InternalAuthConfigError("internal_identity_subject_invalid")
+    return value
+
+
+def _session_google_subject(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or not GOOGLE_SUBJECT_PATTERN.fullmatch(value)
+    ):
+        raise InternalAuthStateError("oidc_subject_invalid")
+    return value
+
+
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise InternalAuthConfigError("internal_identity_json_duplicate_key")
+        result[key] = value
+    return result
+
+
+@dataclasses.dataclass(frozen=True)
+class InternalGoogleIdentity:
+    sub: str
+    email: str
+    role: str
+
+    def fingerprint_record(self) -> dict[str, str]:
+        return {"sub": self.sub, "email": self.email, "role": self.role}
 
 
 @dataclasses.dataclass(frozen=True)
 class InternalAuthPolicy:
     workspace_id: str
-    email_roles: Mapping[str, str]
+    identities: tuple[InternalGoogleIdentity, ...]
     fingerprint: str
 
     @classmethod
@@ -99,57 +126,106 @@ class InternalAuthPolicy:
         cls,
         *,
         workspace_id: Any,
-        allowed_emails: Any,
-        admin_emails: Any,
-        operator_emails: Any,
+        identities_json: Any,
+        legacy_allowed_emails: Any = "",
+        legacy_admin_emails: Any = "",
+        legacy_operator_emails: Any = "",
     ) -> "InternalAuthPolicy":
         workspace = str(workspace_id or "").strip()
         if not WORKSPACE_ID_PATTERN.fullmatch(workspace):
             raise InternalAuthConfigError("internal_workspace_invalid")
-        allowed = _parse_email_list(
-            allowed_emails,
-            field="internal_allowed_emails",
-            required=True,
+        if any(
+            str(value or "").strip()
+            for value in (
+                legacy_allowed_emails,
+                legacy_admin_emails,
+                legacy_operator_emails,
+            )
+        ):
+            raise InternalAuthConfigError("internal_legacy_identity_config_rejected")
+        if not isinstance(identities_json, str):
+            raise InternalAuthConfigError("internal_identities_json_required")
+        try:
+            encoded = identities_json.encode("utf-8", errors="strict")
+        except UnicodeEncodeError as exc:
+            raise InternalAuthConfigError("internal_identities_json_utf8_invalid") from exc
+        if not encoded:
+            raise InternalAuthConfigError("internal_identities_json_required")
+        if len(encoded) > MAX_INTERNAL_IDENTITIES_JSON_BYTES:
+            raise InternalAuthConfigError("internal_identities_json_too_large")
+        try:
+            decoded = json.loads(
+                identities_json,
+                object_pairs_hook=_strict_json_object,
+            )
+        except InternalAuthConfigError:
+            raise
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise InternalAuthConfigError("internal_identities_json_invalid") from exc
+        if not isinstance(decoded, list):
+            raise InternalAuthConfigError("internal_identities_array_required")
+        if not decoded:
+            raise InternalAuthConfigError("internal_identities_required")
+        if len(decoded) > MAX_INTERNAL_IDENTITIES:
+            raise InternalAuthConfigError("internal_identities_too_many")
+        identities: list[InternalGoogleIdentity] = []
+        subjects: set[str] = set()
+        emails: set[str] = set()
+        required_keys = {"sub", "email", "role"}
+        for raw_record in decoded:
+            if not isinstance(raw_record, dict):
+                raise InternalAuthConfigError("internal_identity_object_required")
+            if set(raw_record) != required_keys:
+                raise InternalAuthConfigError("internal_identity_keys_invalid")
+            if any(not isinstance(raw_record[key], str) for key in required_keys):
+                raise InternalAuthConfigError("internal_identity_value_type_invalid")
+            if any(raw_record[key] != raw_record[key].strip() for key in required_keys):
+                raise InternalAuthConfigError("internal_identity_value_padded")
+            subject = _configured_google_subject(raw_record["sub"])
+            if not raw_record["email"]:
+                raise InternalAuthConfigError("internal_identity_email_invalid")
+            email = canonical_email(raw_record["email"])
+            role = raw_record["role"]
+            if role not in SUPPORTED_INTERNAL_ROLES:
+                raise InternalAuthConfigError("internal_identity_role_invalid")
+            if subject in subjects:
+                raise InternalAuthConfigError("internal_identity_subject_duplicate")
+            if email in emails:
+                raise InternalAuthConfigError("internal_identity_email_duplicate")
+            subjects.add(subject)
+            emails.add(email)
+            identities.append(
+                InternalGoogleIdentity(sub=subject, email=email, role=role)
+            )
+        canonical_identities = tuple(
+            sorted(identities, key=lambda item: (item.sub, item.email, item.role))
         )
-        admins = _parse_email_list(
-            admin_emails,
-            field="internal_admin_emails",
-            required=False,
-        )
-        operators = _parse_email_list(
-            operator_emails,
-            field="internal_operator_emails",
-            required=False,
-        )
-        allowed_set = set(allowed)
-        admin_set = set(admins)
-        operator_set = set(operators)
-        if not admin_set.issubset(allowed_set) or not operator_set.issubset(allowed_set):
-            raise InternalAuthConfigError("internal_role_not_allowlisted")
-        if admin_set & operator_set:
-            raise InternalAuthConfigError("internal_role_conflict")
-        assigned = admin_set | operator_set
-        if assigned != allowed_set:
-            raise InternalAuthConfigError("internal_role_missing")
-        roles = {
-            email: ("admin" if email in admin_set else "operator")
-            for email in sorted(allowed_set)
-        }
         fingerprint_material = json.dumps(
-            {"workspace_id": workspace, "email_roles": roles},
+            {
+                "workspace_id": workspace,
+                "identities": [
+                    identity.fingerprint_record()
+                    for identity in canonical_identities
+                ],
+            },
             ensure_ascii=True,
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
         fingerprint = hashlib.sha256(fingerprint_material).hexdigest()
-        return cls(workspace_id=workspace, email_roles=roles, fingerprint=fingerprint)
+        return cls(
+            workspace_id=workspace,
+            identities=canonical_identities,
+            fingerprint=fingerprint,
+        )
 
-    def role_for(self, email: Any) -> str:
-        try:
-            normalized = canonical_email(email)
-        except InternalAuthConfigError:
-            return ""
-        return self.email_roles.get(normalized, "")
+    def identity_for_subject(self, subject: Any) -> InternalGoogleIdentity | None:
+        if not isinstance(subject, str):
+            return None
+        return next(
+            (identity for identity in self.identities if identity.sub == subject),
+            None,
+        )
 
 
 def _token_urlsafe(byte_count: int = 32) -> str:
@@ -286,13 +362,12 @@ class InternalAuthState:
         now: int | None = None,
     ) -> dict[str, Any]:
         issued_at = int(time.time() if now is None else now)
-        subject = str(google_sub or "").strip()
+        subject = _session_google_subject(google_sub)
         canonical = canonical_email(email)
-        role = policy.role_for(canonical)
-        if not subject or len(subject) > 255 or any(char.isspace() for char in subject):
-            raise InternalAuthStateError("oidc_subject_invalid")
-        if role not in SUPPORTED_INTERNAL_ROLES:
+        identity = policy.identity_for_subject(subject)
+        if identity is None or identity.email != canonical:
             raise InternalAuthStateError("internal_admission_denied")
+        role = identity.role
         session_id = _token_urlsafe()
         expires_at = issued_at + INTERNAL_SESSION_TTL_SECONDS
         record = {
@@ -345,15 +420,18 @@ class InternalAuthState:
         if current_mode != INTERNAL_AUTH_MODE or stored.get("auth_mode") != current_mode:
             self.revoke_session(session_id)
             raise InternalAuthStateError("internal_session_mode_mismatch")
-        email = str(stored.get("email") or "")
-        role = policy.role_for(email)
-        if not role:
+        subject = stored.get("google_sub")
+        identity = policy.identity_for_subject(subject)
+        if identity is None:
             self.revoke_session(session_id)
-            raise InternalAuthStateError("internal_session_allowlist_revoked")
+            raise InternalAuthStateError("internal_session_identity_revoked")
+        email = stored.get("email")
+        role = stored.get("role")
         if (
             stored.get("policy_fingerprint") != policy.fingerprint
             or stored.get("workspace_id") != policy.workspace_id
-            or stored.get("role") != role
+            or email != identity.email
+            or role != identity.role
         ):
             self.revoke_session(session_id)
             raise InternalAuthStateError("internal_session_policy_revoked")

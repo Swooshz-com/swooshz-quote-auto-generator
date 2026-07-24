@@ -18,6 +18,8 @@ from webapp.internal_google_auth import (
     GOOGLE_ISSUER,
     INTERNAL_AUTH_MODE,
     INTERNAL_SESSION_TTL_SECONDS,
+    MAX_INTERNAL_IDENTITIES,
+    MAX_INTERNAL_IDENTITIES_JSON_BYTES,
     OIDC_TRANSACTION_TTL_SECONDS,
     BoundedOidcHttpClient,
     GoogleOidcVerifier,
@@ -139,12 +141,28 @@ class BoundedOidcHttpClientTest(unittest.TestCase):
 
 
 class InternalGoogleAuthContractTest(unittest.TestCase):
+    def identities_json(self, records=None):
+        return json.dumps(
+            records
+            or [
+                {
+                    "sub": "stable-google-subject",
+                    "email": "admin@example.test",
+                    "role": "admin",
+                },
+                {
+                    "sub": "stable-google-operator-subject",
+                    "email": "operator@example.test",
+                    "role": "operator",
+                },
+            ],
+            separators=(",", ":"),
+        )
+
     def policy(self, **overrides):
         values = {
             "workspace_id": "workspace-internal-alpha",
-            "allowed_emails": "admin@example.test,operator@example.test",
-            "admin_emails": "admin@example.test",
-            "operator_emails": "operator@example.test",
+            "identities_json": self.identities_json(),
         }
         values.update(overrides)
         return InternalAuthPolicy.from_values(**values)
@@ -154,53 +172,170 @@ class InternalGoogleAuthContractTest(unittest.TestCase):
 
     def test_policy_canonicalizes_case_without_alias_transformations(self):
         policy = self.policy(
-            allowed_emails="Test.User+alpha@example.test",
-            admin_emails="test.user+ALPHA@example.test",
-            operator_emails="",
+            identities_json=self.identities_json(
+                [
+                    {
+                        "sub": "synthetic-case-subject",
+                        "email": "Test.User+ALPHA@example.test",
+                        "role": "admin",
+                    }
+                ]
+            ),
         )
-        self.assertEqual(policy.role_for("TEST.USER+ALPHA@example.test"), "admin")
-        self.assertEqual(policy.role_for("testuser+alpha@example.test"), "")
-        self.assertEqual(policy.role_for("test.user@example.test"), "")
+        identity = policy.identity_for_subject("synthetic-case-subject")
+        self.assertIsNotNone(identity)
+        self.assertEqual(identity.email, "test.user+alpha@example.test")
+        store = InternalAuthState()
+        store.create_session(
+            google_sub="synthetic-case-subject",
+            email="TEST.USER+ALPHA@example.test",
+            policy=policy,
+        )
+        for alias in (
+            "testuser+alpha@example.test",
+            "test.user@example.test",
+            "test.user+other@example.test",
+        ):
+            with self.subTest(alias=alias), self.assertRaises(InternalAuthStateError):
+                store.create_session(
+                    google_sub="synthetic-case-subject",
+                    email=alias,
+                    policy=policy,
+                )
 
-    def test_policy_rejects_invalid_allowlist_and_role_shapes(self):
+    def test_policy_rejects_invalid_identity_json_shapes(self):
+        valid = json.loads(self.identities_json())
         invalid_cases = {
-            "empty_entry": {"allowed_emails": "admin@example.test,"},
+            "missing": {"identities_json": ""},
+            "object_not_array": {"identities_json": "{}"},
+            "empty_array": {"identities_json": "[]"},
+            "element_not_object": {"identities_json": '["value"]'},
+            "missing_key": {
+                "identities_json": json.dumps(
+                    [{"sub": "synthetic-subject-one", "email": "a@example.test"}]
+                )
+            },
+            "additional_key": {
+                "identities_json": json.dumps(
+                    [{**valid[0], "workspace": "other"}]
+                )
+            },
+            "numeric_value": {
+                "identities_json": json.dumps([{**valid[0], "sub": 123}])
+            },
+            "null_value": {
+                "identities_json": json.dumps([{**valid[0], "email": None}])
+            },
+            "boolean_value": {
+                "identities_json": json.dumps([{**valid[0], "role": True}])
+            },
+            "nested_value": {
+                "identities_json": json.dumps([{**valid[0], "sub": {"id": "x"}}])
+            },
+            "padded_subject": {
+                "identities_json": json.dumps(
+                    [{**valid[0], "sub": " synthetic-subject-one"}]
+                )
+            },
+            "padded_email": {
+                "identities_json": json.dumps(
+                    [{**valid[0], "email": "admin@example.test "}]
+                )
+            },
+            "padded_role": {
+                "identities_json": json.dumps([{**valid[0], "role": "admin "}])
+            },
             "wildcard": {
-                "allowed_emails": "*@example.test",
-                "admin_emails": "*@example.test",
-                "operator_emails": "",
+                "identities_json": json.dumps(
+                    [{**valid[0], "email": "*@example.test"}]
+                )
             },
             "domain_only": {
-                "allowed_emails": "example.test",
-                "admin_emails": "example.test",
-                "operator_emails": "",
+                "identities_json": json.dumps(
+                    [{**valid[0], "email": "example.test"}]
+                )
             },
-            "malformed": {
-                "allowed_emails": "not-an-email",
-                "admin_emails": "not-an-email",
-                "operator_emails": "",
+            "malformed_email": {
+                "identities_json": json.dumps(
+                    [{**valid[0], "email": "not-an-email"}]
+                )
             },
-            "duplicate_casefolded": {
-                "allowed_emails": "ADMIN@example.test,admin@example.test",
+            "unsupported_role": {
+                "identities_json": json.dumps([{**valid[0], "role": "owner"}])
             },
-            "role_not_subset": {"admin_emails": "outsider@example.test"},
-            "multiple_roles": {"operator_emails": "admin@example.test"},
-            "missing_role": {"operator_emails": ""},
+            "duplicate_subject": {
+                "identities_json": json.dumps(
+                    [valid[0], {**valid[1], "sub": valid[0]["sub"]}]
+                )
+            },
+            "duplicate_email": {
+                "identities_json": json.dumps(
+                    [valid[0], {**valid[1], "email": "ADMIN@example.test"}]
+                )
+            },
+            "duplicate_json_key": {
+                "identities_json": (
+                    '[{"sub":"synthetic-subject-one",'
+                    '"sub":"synthetic-subject-two",'
+                    '"email":"admin@example.test","role":"admin"}]'
+                )
+            },
             "workspace_missing": {"workspace_id": ""},
             "workspace_malformed": {"workspace_id": "workspace value"},
+            "legacy_mixed": {"legacy_allowed_emails": "admin@example.test"},
         }
         for name, overrides in invalid_cases.items():
             with self.subTest(name=name), self.assertRaises(InternalAuthConfigError):
                 self.policy(**overrides)
 
-    def test_policy_fingerprint_changes_for_allowlist_role_or_workspace(self):
+    def test_policy_enforces_json_size_count_utf8_and_subject_bounds(self):
+        valid = json.loads(self.identities_json())[0]
+        cases = {
+            "too_large": " " * (MAX_INTERNAL_IDENTITIES_JSON_BYTES + 1),
+            "too_many": json.dumps(
+                [
+                    {
+                        "sub": f"synthetic-subject-{index:03d}",
+                        "email": f"identity-{index:03d}@example.test",
+                        "role": "operator",
+                    }
+                    for index in range(MAX_INTERNAL_IDENTITIES + 1)
+                ]
+            ),
+            "missing_subject": json.dumps([{**valid, "sub": ""}]),
+            "short_subject": json.dumps([{**valid, "sub": "short"}]),
+            "overlong_subject": json.dumps([{**valid, "sub": "s" * 256}]),
+            "invalid_subject_syntax": json.dumps([{**valid, "sub": "subject/value"}]),
+            "invalid_utf8_scalar": '[{"sub":"synthetic-subject","email":"a@e.test","role":"admin"}]\ud800',
+        }
+        for name, value in cases.items():
+            with self.subTest(name=name), self.assertRaises(InternalAuthConfigError):
+                self.policy(identities_json=value)
+
+    def test_policy_fingerprint_is_order_stable_and_changes_for_identity_or_workspace(self):
         baseline = self.policy()
+        records = json.loads(self.identities_json())
+        reordered = self.policy(identities_json=self.identities_json(list(reversed(records))))
         changed_role = self.policy(
-            admin_emails="operator@example.test",
-            operator_emails="admin@example.test",
+            identities_json=self.identities_json(
+                [{**records[0], "role": "operator"}, records[1]]
+            )
+        )
+        changed_subject = self.policy(
+            identities_json=self.identities_json(
+                [{**records[0], "sub": "replacement-google-subject"}, records[1]]
+            )
+        )
+        changed_email = self.policy(
+            identities_json=self.identities_json(
+                [{**records[0], "email": "replacement@example.test"}, records[1]]
+            )
         )
         changed_workspace = self.policy(workspace_id="workspace-other-alpha")
+        self.assertEqual(baseline.fingerprint, reordered.fingerprint)
         self.assertNotEqual(baseline.fingerprint, changed_role.fingerprint)
+        self.assertNotEqual(baseline.fingerprint, changed_subject.fingerprint)
+        self.assertNotEqual(baseline.fingerprint, changed_email.fingerprint)
         self.assertNotEqual(baseline.fingerprint, changed_workspace.fingerprint)
 
     def test_state_nonce_and_pkce_transaction_is_one_time_and_bounded(self):
@@ -327,14 +462,22 @@ class InternalGoogleAuthContractTest(unittest.TestCase):
                 current_mode = "platform"
             elif reason == "allowlist":
                 effective_policy = self.policy(
-                    allowed_emails="operator@example.test",
-                    admin_emails="",
-                    operator_emails="operator@example.test",
+                    identities_json=self.identities_json(
+                        [
+                            {
+                                "sub": "stable-google-operator-subject",
+                                "email": "operator@example.test",
+                                "role": "operator",
+                            }
+                        ]
+                    ),
                 )
             elif reason == "role":
+                records = json.loads(self.identities_json())
                 effective_policy = self.policy(
-                    admin_emails="",
-                    operator_emails="admin@example.test,operator@example.test",
+                    identities_json=self.identities_json(
+                        [{**records[0], "role": "operator"}, records[1]]
+                    ),
                 )
             elif reason == "fingerprint":
                 candidate["policy_fingerprint"] = "0" * 64
@@ -377,24 +520,112 @@ class InternalGoogleAuthContractTest(unittest.TestCase):
                 now=102,
             )
 
-    def test_same_email_with_different_subject_has_distinct_primary_identity(self):
+    def test_subject_first_admission_rejects_substitution_and_role_inheritance(self):
         store = InternalAuthState()
         policy = self.policy()
-        first = store.create_session(
-            google_sub="google-subject-one",
+        approved = store.create_session(
+            google_sub="stable-google-subject",
             email="admin@example.test",
             policy=policy,
             now=100,
         )
-        second = store.create_session(
-            google_sub="google-subject-two",
+        self.assertEqual(approved["role"], "admin")
+        rejected = (
+            ("same_email_different_subject", "different-google-subject", "admin@example.test"),
+            ("same_subject_different_email", "stable-google-subject", "operator@example.test"),
+            ("operator_subject_admin_email", "stable-google-operator-subject", "admin@example.test"),
+            ("admin_subject_operator_email", "stable-google-subject", "operator@example.test"),
+            ("subject_prefix", "prefix-stable-google-subject", "admin@example.test"),
+            ("subject_suffix", "stable-google-subject-suffix", "admin@example.test"),
+        )
+        for name, subject, email in rejected:
+            with self.subTest(name=name), self.assertRaises(InternalAuthStateError) as caught:
+                store.create_session(
+                    google_sub=subject,
+                    email=email,
+                    policy=policy,
+                    now=101,
+                )
+            self.assertEqual(caught.exception.reason, "internal_admission_denied")
+
+    def test_session_creation_rejects_invalid_subject_claims(self):
+        store = InternalAuthState()
+        policy = self.policy()
+        for name, subject in (
+            ("missing", ""),
+            ("padded", " stable-google-subject"),
+            ("whitespace", "stable google subject"),
+            ("overlong", "s" * 256),
+            ("non_string", 123),
+        ):
+            with self.subTest(name=name), self.assertRaises(InternalAuthStateError) as caught:
+                store.create_session(
+                    google_sub=subject,
+                    email="admin@example.test",
+                    policy=policy,
+                )
+            self.assertEqual(caught.exception.reason, "oidc_subject_invalid")
+
+    def test_restart_uses_configured_binding_not_first_use_state(self):
+        policy = self.policy()
+        original_store = InternalAuthState()
+        old_session = original_store.create_session(
+            google_sub="stable-google-subject",
             email="admin@example.test",
             policy=policy,
-            now=101,
+            now=100,
         )
-        self.assertNotEqual(first["google_sub"], second["google_sub"])
-        self.assertNotEqual(first["user"]["subject"], second["user"]["subject"])
-        self.assertNotEqual(first["session_id"], second["session_id"])
+        restarted_store = InternalAuthState()
+        with self.assertRaises(InternalAuthStateError) as caught:
+            restarted_store.validate_session(
+                old_session,
+                policy=policy,
+                current_mode=INTERNAL_AUTH_MODE,
+                now=101,
+            )
+        self.assertEqual(caught.exception.reason, "internal_session_revoked_or_restarted")
+        new_session = restarted_store.create_session(
+            google_sub="stable-google-subject",
+            email="ADMIN@example.test",
+            policy=policy,
+            now=102,
+        )
+        self.assertEqual(new_session["role"], "admin")
+        with self.assertRaises(InternalAuthStateError):
+            restarted_store.create_session(
+                google_sub="replacement-google-subject",
+                email="admin@example.test",
+                policy=policy,
+                now=103,
+            )
+
+    def test_identity_mapping_changes_revoke_existing_session(self):
+        baseline = self.policy()
+        records = json.loads(self.identities_json())
+        mutations = {
+            "removed": [records[1]],
+            "subject": [{**records[0], "sub": "replacement-google-subject"}, records[1]],
+            "email": [{**records[0], "email": "replacement@example.test"}, records[1]],
+            "role": [{**records[0], "role": "operator"}, records[1]],
+        }
+        for name, changed_records in mutations.items():
+            store = InternalAuthState()
+            session = store.create_session(
+                google_sub="stable-google-subject",
+                email="admin@example.test",
+                policy=baseline,
+                now=100,
+            )
+            changed_policy = self.policy(
+                identities_json=self.identities_json(changed_records)
+            )
+            with self.subTest(name=name), self.assertRaises(InternalAuthStateError):
+                store.validate_session(
+                    session,
+                    policy=changed_policy,
+                    current_mode=INTERNAL_AUTH_MODE,
+                    now=101,
+                )
 
 
 class _FakeOidcHttpClient:

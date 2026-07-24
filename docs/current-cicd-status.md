@@ -58,8 +58,10 @@ Source of truth: `.github/workflows/ci.yml`
 - `platform` preserves the Swooshz Platform launch, workspace, entitlement, and
   per-request validation/revocation boundary.
 - `internal_google` is a temporary single-instance private-alpha lane with
-  exact email/role admission, verified Google OIDC code flow, and server-side
-  session revocation. It can never satisfy public production readiness.
+  one bounded server-only subject/email/role identity map, verified Google OIDC
+  code flow, per-request mapping revalidation, and server-side session
+  revocation. Legacy email-list configuration is rejected. It can never
+  satisfy public production readiness.
 - Deploy requests accept only signed sessions containing the consumed Platform
   user, workspace, app, and supported membership-role context. Pre-existing
   OIDC-only cookies are treated as unauthenticated and cannot inherit a tester

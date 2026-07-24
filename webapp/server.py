@@ -331,6 +331,7 @@ AUTH_ALLOWED_DOMAINS_ENV_NAME = "AUTH_ALLOWED_DOMAINS"
 AUTH_ALLOW_ANY_AUTHENTICATED_USER_ENV_NAME = "AUTH_ALLOW_ANY_AUTHENTICATED_USER"
 AUTH_APPROVED_TESTER_ROLE_ENV_NAME = "AUTH_APPROVED_TESTER_ROLE"
 INTERNAL_WORKSPACE_ID_ENV_NAME = "SQAG_INTERNAL_WORKSPACE_ID"
+INTERNAL_GOOGLE_IDENTITIES_JSON_ENV_NAME = "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON"
 INTERNAL_ALLOWED_EMAILS_ENV_NAME = "SQAG_INTERNAL_ALLOWED_EMAILS"
 INTERNAL_ADMIN_EMAILS_ENV_NAME = "SQAG_INTERNAL_ADMIN_EMAILS"
 INTERNAL_OPERATOR_EMAILS_ENV_NAME = "SQAG_INTERNAL_OPERATOR_EMAILS"
@@ -1666,23 +1667,29 @@ def internal_google_mode_enabled() -> bool:
 def internal_auth_policy() -> InternalAuthPolicy:
     return InternalAuthPolicy.from_values(
         workspace_id=read_dotenv_value(INTERNAL_WORKSPACE_ID_ENV_NAME),
-        allowed_emails=read_dotenv_value(INTERNAL_ALLOWED_EMAILS_ENV_NAME),
-        admin_emails=read_dotenv_value(INTERNAL_ADMIN_EMAILS_ENV_NAME),
-        operator_emails=read_dotenv_value(INTERNAL_OPERATOR_EMAILS_ENV_NAME),
+        identities_json=read_dotenv_value(INTERNAL_GOOGLE_IDENTITIES_JSON_ENV_NAME),
+        legacy_allowed_emails=read_dotenv_value(INTERNAL_ALLOWED_EMAILS_ENV_NAME),
+        legacy_admin_emails=read_dotenv_value(INTERNAL_ADMIN_EMAILS_ENV_NAME),
+        legacy_operator_emails=read_dotenv_value(INTERNAL_OPERATOR_EMAILS_ENV_NAME),
     )
 
 
 def internal_auth_policy_config_complete() -> bool:
-    supported_names = {
+    legacy_names = {
         INTERNAL_ALLOWED_EMAILS_ENV_NAME,
         INTERNAL_ADMIN_EMAILS_ENV_NAME,
         INTERNAL_OPERATOR_EMAILS_ENV_NAME,
     }
+    if any(clean_text(read_dotenv_value(name)) for name in legacy_names):
+        return False
     for name, value in os.environ.items():
         if (
             name.startswith("SQAG_INTERNAL_")
-            and name.endswith("_EMAILS")
-            and name not in supported_names
+            and (
+                name.endswith("_EMAILS")
+                or name.endswith("_IDENTITIES_JSON")
+            )
+            and name != INTERNAL_GOOGLE_IDENTITIES_JSON_ENV_NAME
             and clean_text(value)
         ):
             return False
@@ -1824,6 +1831,7 @@ def platform_launch_config_complete() -> bool:
         clean_text(read_dotenv_value(name))
         for name in (
             INTERNAL_WORKSPACE_ID_ENV_NAME,
+            INTERNAL_GOOGLE_IDENTITIES_JSON_ENV_NAME,
             INTERNAL_ALLOWED_EMAILS_ENV_NAME,
             INTERNAL_ADMIN_EMAILS_ENV_NAME,
             INTERNAL_OPERATOR_EMAILS_ENV_NAME,
@@ -2080,7 +2088,7 @@ def session_from_cookie_header(cookie_header: str) -> dict[str, Any] | None:
                         "reason": reason,
                         "path": "protected_request",
                         "status": 401,
-                        "user_id": privacy_safe_tracking_id(
+                        "user_id": privacy_safe_audit_tracking_id_or_unavailable(
                             payload.get("google_sub"),
                             "unknown",
                         ),
@@ -23451,52 +23459,53 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             return
         try:
             policy = internal_auth_policy()
-            email = canonical_email(claims.get("email"))
-            role = policy.role_for(email)
+            previous_payload = verified_cookie_payload(
+                cookies_from_header(self.headers.get("Cookie", "")).get(
+                    SESSION_COOKIE_NAME,
+                    "",
+                ),
+                allow_expired=True,
+            ) or {}
+            session_record = INTERNAL_AUTH_STATE.create_session(
+                google_sub=claims.get("sub"),
+                email=claims.get("email"),
+                policy=policy,
+                previous_session_id=previous_payload.get("session_id"),
+            )
         except InternalAuthConfigError:
-            role = ""
-            email = ""
-        if not role:
             write_local_log(
                 "security_event",
                 {
-                    "reason": "internal_google_admission_denied",
+                    "reason": "internal_identity_policy_invalid",
+                    "path": "/callback",
+                    "status": 503,
+                },
+            )
+            self.send_auth_page(
+                "Sign in was not completed",
+                "Authentication could not be completed. Start a new sign-in attempt.",
+                status=503,
+                extra_headers=[clear_transaction_cookie],
+            )
+            return
+        except InternalAuthStateError as exc:
+            reason = getattr(exc, "reason", "internal_session_creation_failed")
+            write_local_log(
+                "security_event",
+                {
+                    "reason": reason,
                     "path": "/callback",
                     "status": 403,
-                    "user_id": privacy_safe_tracking_id(claims.get("sub"), "unknown"),
+                    "user_id": privacy_safe_audit_tracking_id_or_unavailable(
+                        claims.get("sub"),
+                        "unknown",
+                    ),
                 },
             )
             self.send_auth_page(
                 "Approved tester access required",
                 "Authenticated user is not approved for this internal UAT app.",
                 status=403,
-                extra_headers=[clear_transaction_cookie],
-            )
-            return
-        previous_payload = verified_cookie_payload(
-            cookies_from_header(self.headers.get("Cookie", "")).get(
-                SESSION_COOKIE_NAME,
-                "",
-            ),
-            allow_expired=True,
-        ) or {}
-        try:
-            session_record = INTERNAL_AUTH_STATE.create_session(
-                google_sub=claims.get("sub"),
-                email=email,
-                policy=policy,
-                previous_session_id=previous_payload.get("session_id"),
-            )
-        except (InternalAuthConfigError, InternalAuthStateError) as exc:
-            reason = getattr(exc, "reason", "internal_session_creation_failed")
-            write_local_log(
-                "security_event",
-                {"reason": reason, "path": "/callback", "status": 503},
-            )
-            self.send_auth_page(
-                "Sign in was not completed",
-                "Authentication could not be completed. Start a new sign-in attempt.",
-                status=503,
                 extra_headers=[clear_transaction_cookie],
             )
             return
@@ -23514,7 +23523,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 "reason": "internal_google_authentication_succeeded",
                 "path": "/callback",
                 "status": 302,
-                "user_id": privacy_safe_tracking_id(
+                "user_id": privacy_safe_audit_tracking_id_or_unavailable(
                     session_record.get("google_sub"),
                     "unknown",
                 ),

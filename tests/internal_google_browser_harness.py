@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import urllib.parse
@@ -14,6 +15,8 @@ from webapp import server as webapp
 
 
 class SyntheticVerifier:
+    claim_case = "approved"
+
     def exchange_and_verify(self, *, code: str, code_verifier: str, nonce: str):
         if (
             code != "synthetic-browser-code"
@@ -21,16 +24,45 @@ class SyntheticVerifier:
             or not nonce
         ):
             raise webapp.OidcProtocolError("synthetic_oidc_denied")
-        return {
-            "sub": "synthetic-browser-subject",
-            "email": "alpha-admin@example.test",
-            "email_verified": True,
+        claims = {
+            "approved": (
+                "synthetic-browser-subject",
+                "alpha-admin@example.test",
+            ),
+            "unknown-sub": (
+                "synthetic-browser-unknown-subject",
+                "alpha-admin@example.test",
+            ),
+            "same-email-different-sub": (
+                "synthetic-browser-reassigned-subject",
+                "alpha-admin@example.test",
+            ),
+            "same-sub-different-email": (
+                "synthetic-browser-subject",
+                "alpha-operator@example.test",
+            ),
         }
+        subject, email = claims.get(self.claim_case, claims["unknown-sub"])
+        return {"sub": subject, "email": email, "email_verified": True}
 
 
 class HarnessHandler(webapp.QuoteRunnerHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/__synthetic_oidc/case":
+            params = urllib.parse.parse_qs(parsed.query)
+            value = (params.get("value") or [""])[0]
+            if value not in {
+                "approved",
+                "unknown-sub",
+                "same-email-different-sub",
+                "same-sub-different-email",
+            }:
+                self.send_json({"error": "invalid synthetic case"}, status=400)
+                return
+            SyntheticVerifier.claim_case = value
+            self.send_json({"status": "ok"})
+            return
         if parsed.path == "/__synthetic_oidc/authorize":
             params = urllib.parse.parse_qs(parsed.query)
             state = (params.get("state") or [""])[0]
@@ -61,9 +93,21 @@ def main() -> int:
             "SQAG_PLATFORM_LAUNCH_MODE": "disabled",
             "SQAG_PUBLIC_BASE_URL": "https://quote.swooshz.com",
             "SQAG_INTERNAL_WORKSPACE_ID": "workspace-internal-alpha",
-            "SQAG_INTERNAL_ALLOWED_EMAILS": "alpha-admin@example.test",
-            "SQAG_INTERNAL_ADMIN_EMAILS": "alpha-admin@example.test",
-            "SQAG_INTERNAL_OPERATOR_EMAILS": "",
+            "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON": json.dumps(
+                [
+                    {
+                        "sub": "synthetic-browser-subject",
+                        "email": "alpha-admin@example.test",
+                        "role": "admin",
+                    },
+                    {
+                        "sub": "synthetic-browser-operator-subject",
+                        "email": "alpha-operator@example.test",
+                        "role": "operator",
+                    },
+                ],
+                separators=(",", ":"),
+            ),
             "OIDC_ISSUER_URL": "https://accounts.google.com",
             "OIDC_CLIENT_ID": "synthetic-browser-client",
             "OIDC_CLIENT_SECRET": "synthetic-browser-client-secret",

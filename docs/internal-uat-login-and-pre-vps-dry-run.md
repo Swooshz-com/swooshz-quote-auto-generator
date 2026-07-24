@@ -16,9 +16,13 @@ architecture remains Platform launch/finalization/validation. See
 
 In the temporary lane, `/login` creates one-time state, nonce, and S256 PKCE
 transaction data and redirects to the exact configured Google endpoint.
-`/callback` verifies the signed ID token, exact allowlist and role mapping, then
-creates a bounded server-revocable session for one fixed internal workspace.
+`/callback` verifies the signed ID token, then requires one exact configured
+subject/email/role identity record before creating a bounded server-revocable
+session for one fixed internal workspace.
 Logout is a CSRF-checked POST. No self-registration or domain admission exists.
+The identity JSON is server-only. Obtaining real Google subjects is separate,
+explicitly authorised provider enrolment; local evidence uses synthetic
+subjects only.
 
 The following Platform flow remains the final mode and is tested separately.
 

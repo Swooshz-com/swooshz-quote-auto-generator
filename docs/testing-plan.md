@@ -39,8 +39,11 @@ npm run playwright:smoke
 - Auth, permissions, OIDC, cookies, CSRF, file download boundaries, or secret
   handling: run `tests.test_internal_google_auth`,
   `tests.test_internal_google_auth_webapp`, focused Platform/session tests, and
-  then the full unit and Playwright suites. Provider behavior must use local
-  synthetic adapters only.
+  then the full unit and Playwright suites. Internal identity changes must cover
+  strict bounded JSON parsing, bidirectional subject/email substitution,
+  role/workspace changes, policy fingerprinting, restart, route denial without
+  a cookie, and browser positive/negative flows. Provider behavior must use
+  local synthetic adapters only.
 - CI/CD, package scripts, dependency setup, or workflow files: validate the YAML/script syntax when possible, run the nearest local command, and update `docs/current-cicd-status.md`.
 - PostgreSQL migration manifest, ledger, preflight, or operator command: run
   `tests.test_postgres_migration_ledger` against the isolated CI PostgreSQL

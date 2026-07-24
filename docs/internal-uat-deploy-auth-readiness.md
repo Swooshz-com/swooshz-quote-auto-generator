@@ -13,6 +13,13 @@ describe Platform as the only deploy-capable mode, read them as the Platform
 branch of the explicit selector. Legacy `AUTH_ALLOWED_*` settings remain local
 component-test inputs and are forbidden in `internal_google`.
 
+Temporary internal admission uses only `SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON`
+plus one fixed `SQAG_INTERNAL_WORKSPACE_ID`. Each bounded record binds an exact
+Google subject to one canonical email and one `admin` or `operator` role. The
+former `SQAG_INTERNAL_ALLOWED_EMAILS`, `SQAG_INTERNAL_ADMIN_EMAILS`, and
+`SQAG_INTERNAL_OPERATOR_EMAILS` variables are rejected, including mixed
+configuration. Real subject enrolment is separately authorised provider work.
+
 ## Purpose
 
 This document explains the existing single-instance gated internal UAT path for
@@ -120,13 +127,10 @@ state cookies are emitted with `Secure`, `HttpOnly`, and `SameSite=Lax`.
 - In local OIDC component mode, `/login` redirects to `OIDC_AUTHORIZE_URL` with the configured client,
   redirect URI, response type, scope, and signed state when the auth boundary
   is complete.
-- `/callback` validates state, handles provider errors generically, requires an
-  authorization code, exchanges it at `OIDC_TOKEN_URL`, fetches user claims from
-  `OIDC_USERINFO_URL`, requires a stable `sub`, enforces the internal allowlist,
-  sets the signed session cookie, clears the temporary OIDC state cookie, and
-  redirects to `/`.
-- The callback uses token endpoint plus userinfo endpoint. It does not perform
-  custom JWT signature verification.
+- In `internal_google`, `/callback` validates one-time state, nonce, S256 PKCE,
+  the maintained-library verified ID token, exact issuer/audience, verified
+  email, and the configured subject/email identity record before creating a
+  session. Unknown or reassigned subjects fail before session creation.
 - Provider tokens, raw provider responses, authorization codes,
   `OIDC_CLIENT_SECRET`, and `SESSION_SECRET` must not be printed or returned.
 - In-memory jobs are acceptable for local mode and a first single-instance UAT

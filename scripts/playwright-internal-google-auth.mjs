@@ -54,6 +54,39 @@ try {
   const denied = await anonymousApi.get(`${baseUrl}/api/session`);
   if (denied.status() !== 401) throw new Error(`Expected unauthenticated 401, got ${denied.status()}.`);
 
+  for (const claimCase of [
+    "unknown-sub",
+    "same-email-different-sub",
+    "same-sub-different-email",
+  ]) {
+    const selected = await anonymousApi.get(
+      `${baseUrl}/__synthetic_oidc/case?value=${encodeURIComponent(claimCase)}`,
+    );
+    if (selected.status() !== 200) throw new Error(`Could not select ${claimCase}.`);
+    const deniedContext = await browser.newContext();
+    const deniedPage = await deniedContext.newPage();
+    const deniedResponse = await deniedPage.goto(`${baseUrl}/login`, {
+      waitUntil: "domcontentloaded",
+      timeout: 15000,
+    });
+    if (!deniedResponse || deniedResponse.status() !== 403) {
+      throw new Error(`${claimCase} was not rejected before session creation.`);
+    }
+    const cookies = await deniedContext.cookies(baseUrl);
+    if (cookies.some((cookie) => cookie.name === "swooshz_quote_session")) {
+      throw new Error(`${claimCase} received a session cookie.`);
+    }
+    const protectedResponse = await deniedContext.request.get(`${baseUrl}/api/session`);
+    if (protectedResponse.status() !== 401) {
+      throw new Error(`${claimCase} reached a protected API.`);
+    }
+    await deniedContext.close();
+  }
+  const approvedCase = await anonymousApi.get(
+    `${baseUrl}/__synthetic_oidc/case?value=approved`,
+  );
+  if (approvedCase.status() !== 200) throw new Error("Could not restore approved identity.");
+
   await page.goto(`${baseUrl}/login`, { waitUntil: "domcontentloaded", timeout: 15000 });
   if (new URL(page.url()).origin !== new URL(baseUrl).origin) {
     throw new Error("Synthetic OIDC flow escaped the local harness.");

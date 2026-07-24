@@ -47,9 +47,21 @@ class InternalGoogleAuthWebappTest(unittest.TestCase):
             "SQAG_PLATFORM_LAUNCH_MODE": "disabled",
             "SQAG_PUBLIC_BASE_URL": "https://quote.swooshz.com",
             "SQAG_INTERNAL_WORKSPACE_ID": "workspace-internal-alpha",
-            "SQAG_INTERNAL_ALLOWED_EMAILS": "admin@example.test,operator@example.test",
-            "SQAG_INTERNAL_ADMIN_EMAILS": "admin@example.test",
-            "SQAG_INTERNAL_OPERATOR_EMAILS": "operator@example.test",
+            "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON": json.dumps(
+                [
+                    {
+                        "sub": "stable-google-subject",
+                        "email": "admin@example.test",
+                        "role": "admin",
+                    },
+                    {
+                        "sub": "stable-google-operator-subject",
+                        "email": "operator@example.test",
+                        "role": "operator",
+                    },
+                ],
+                separators=(",", ":"),
+            ),
             "OIDC_ISSUER_URL": "https://accounts.google.com",
             "OIDC_CLIENT_ID": "synthetic-client-id",
             "OIDC_CLIENT_SECRET": "synthetic-client-secret",
@@ -114,7 +126,7 @@ class InternalGoogleAuthWebappTest(unittest.TestCase):
         self.assertTrue(transaction_cookie)
         return location, transaction_cookie
 
-    def finish_login(self, runner, location, transaction_cookie, verifier=None):
+    def callback_response(self, runner, location, transaction_cookie, verifier=None):
         params = urllib.parse.parse_qs(urllib.parse.urlparse(location).query)
         verifier = verifier or _VerifiedClaimsAdapter()
         callback = (
@@ -140,6 +152,15 @@ class InternalGoogleAuthWebappTest(unittest.TestCase):
                     "Cookie": f"{webapp.OIDC_STATE_COOKIE_NAME}={transaction_cookie}",
                 },
             )
+        return status, headers, _body, verifier
+
+    def finish_login(self, runner, location, transaction_cookie, verifier=None):
+        status, headers, _body, verifier = self.callback_response(
+            runner,
+            location,
+            transaction_cookie,
+            verifier,
+        )
         self.assertEqual(status, 302)
         session_cookie = self.cookie_value(
             headers,
@@ -162,9 +183,19 @@ class InternalGoogleAuthWebappTest(unittest.TestCase):
             "platform_plus_internal": {
                 **self.platform_env(),
                 "SQAG_INTERNAL_WORKSPACE_ID": "workspace-internal-alpha",
-                "SQAG_INTERNAL_ALLOWED_EMAILS": "admin@example.test",
-                "SQAG_INTERNAL_ADMIN_EMAILS": "admin@example.test",
+                "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON": json.dumps(
+                    [
+                        {
+                            "sub": "stable-google-subject",
+                            "email": "admin@example.test",
+                            "role": "admin",
+                        }
+                    ]
+                ),
             },
+            "mixed_legacy_identity_config": self.internal_env(
+                SQAG_INTERNAL_ALLOWED_EMAILS="admin@example.test",
+            ),
             "unauthenticated_fallback": self.internal_env(AUTH_REQUIRED="false"),
         }
         for name, env in cases.items():
@@ -314,6 +345,67 @@ class InternalGoogleAuthWebappTest(unittest.TestCase):
             {details["reason"] for _event, details in audit},
         )
 
+    def test_callback_rejects_subject_email_substitution_without_session_or_disclosure(self):
+        cases = {
+            "unknown_subject": {
+                "sub": "synthetic-unknown-google-subject",
+                "email": "admin@example.test",
+                "email_verified": True,
+            },
+            "same_email_different_subject": {
+                "sub": "synthetic-reassigned-google-subject",
+                "email": "admin@example.test",
+                "email_verified": True,
+            },
+            "same_subject_different_email": {
+                "sub": "stable-google-subject",
+                "email": "operator@example.test",
+                "email_verified": True,
+            },
+        }
+        for name, claims in cases.items():
+            audit = []
+            with self.subTest(name=name), mock.patch.dict(
+                os.environ,
+                self.internal_env(),
+                clear=True,
+            ), mock.patch.object(
+                webapp,
+                "write_local_log",
+                side_effect=lambda event, details, **_kwargs: audit.append(
+                    (event, details)
+                ),
+            ):
+                with LocalRunnerServer() as runner:
+                    location, transaction_cookie = self.start_login(runner)
+                    status, headers, body, _verifier = self.callback_response(
+                        runner,
+                        location,
+                        transaction_cookie,
+                        _VerifiedClaimsAdapter(claims),
+                    )
+                    protected_status, _protected_headers, _protected_body = self.http(
+                        runner,
+                        "GET",
+                        "/api/session",
+                    )
+            self.assertEqual(status, 403)
+            self.assertFalse(
+                self.cookie_value(headers, webapp.SESSION_COOKIE_NAME)
+            )
+            self.assertEqual(protected_status, 401)
+            public_text = body.decode("utf-8")
+            evidence_text = json.dumps(audit)
+            for private_value in (
+                claims["sub"],
+                claims["email"],
+                self.internal_env()["SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON"],
+                "synthetic-authorization-code",
+                "synthetic-client-secret",
+            ):
+                self.assertNotIn(private_value, public_text)
+                self.assertNotIn(private_value, evidence_text)
+
     def test_callback_state_replay_and_nonce_failure_are_one_time(self):
         with mock.patch.dict(os.environ, self.internal_env(), clear=True), mock.patch.object(
             webapp,
@@ -350,7 +442,7 @@ class InternalGoogleAuthWebappTest(unittest.TestCase):
             replay_body.decode("utf-8"),
         )
 
-    def test_allowlist_removal_and_role_change_revoke_on_next_request(self):
+    def test_identity_removal_and_role_change_revoke_on_next_request(self):
         with mock.patch.object(webapp, "write_local_log", return_value=True):
             with mock.patch.dict(os.environ, self.internal_env(), clear=True):
                 with LocalRunnerServer() as runner:
@@ -363,8 +455,15 @@ class InternalGoogleAuthWebappTest(unittest.TestCase):
                     with mock.patch.dict(
                         os.environ,
                         self.internal_env(
-                            SQAG_INTERNAL_ALLOWED_EMAILS="operator@example.test",
-                            SQAG_INTERNAL_ADMIN_EMAILS="",
+                            SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON=json.dumps(
+                                [
+                                    {
+                                        "sub": "stable-google-operator-subject",
+                                        "email": "operator@example.test",
+                                        "role": "operator",
+                                    }
+                                ]
+                            ),
                         ),
                         clear=True,
                     ):
@@ -476,7 +575,8 @@ class InternalGoogleAuthWebappTest(unittest.TestCase):
                 self.assertEqual(local_status, 404)
 
     def test_readiness_never_credits_internal_google_for_public_production(self):
-        with mock.patch.dict(os.environ, self.internal_env(), clear=True):
+        environment = self.internal_env()
+        with mock.patch.dict(os.environ, environment, clear=True):
             status = webapp.production_readiness_status()
         self.assertEqual(status["sqag_auth_mode"], "internal_google")
         self.assertFalse(status["production_ready"])
@@ -484,6 +584,15 @@ class InternalGoogleAuthWebappTest(unittest.TestCase):
             "temporary_internal_auth_not_public_release_ready",
             {item["id"] for item in status["production_blockers"]},
         )
+        report_text = json.dumps(status)
+        for private_value in (
+            environment["SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON"],
+            "stable-google-subject",
+            "admin@example.test",
+            environment["OIDC_CLIENT_SECRET"],
+            environment["SESSION_SECRET"],
+        ):
+            self.assertNotIn(private_value, report_text)
 
 
 if __name__ == "__main__":

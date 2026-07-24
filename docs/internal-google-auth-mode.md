@@ -51,28 +51,57 @@ tokens, client secrets, raw provider responses, or tester email addresses.
 Audit records contain bounded failure categories and an opaque subject digest
 where correlation is necessary.
 
-## Exact admission and roles
+## Exact subject-bound admission and roles
 
 The host secret/configuration manager supplies:
 
 ```text
 SQAG_INTERNAL_WORKSPACE_ID
-SQAG_INTERNAL_ALLOWED_EMAILS
-SQAG_INTERNAL_ADMIN_EMAILS
-SQAG_INTERNAL_OPERATOR_EMAILS
+SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON
 ```
 
 The workspace identifier is one fixed 3-64 character ASCII identifier using
-letters, digits, underscore, or hyphen. Email lists are comma-separated exact
-addresses. Parsing trims surrounding whitespace and case-folds addresses; it
-does not apply Gmail dot, alias, or plus-address transformations.
+letters, digits, underscore, or hyphen. The identity value is one server-only,
+valid UTF-8 JSON array of 1-100 records and at most 16 KiB. Every record has
+exactly three string fields:
 
-Configuration is rejected for empty entries, wildcards, domain-only entries,
-malformed addresses, case-folded duplicates, role entries outside the main
-allowlist, multiple roles, allowed users without exactly one supported role, or
-unknown `SQAG_INTERNAL_*_EMAILS` role variables. The only roles are `admin` and
-`operator`. No domain inference, self-registration, or any-authenticated-user
-fallback exists. Google `sub`, not email, is the primary external identity.
+```json
+[
+  {
+    "sub": "synthetic-google-subject-001",
+    "email": "synthetic-admin@example.test",
+    "role": "admin"
+  }
+]
+```
+
+The subject is an exact 6-255 character ASCII identifier using letters,
+digits, dot, underscore, colon, or hyphen. Email parsing rejects surrounding
+whitespace and case-folds only; it does not apply Gmail dot, alias, plus,
+domain, or Unicode transformations. The only roles are exactly `admin` and
+`operator`.
+
+Configuration rejects malformed JSON, non-arrays, empty or oversized arrays,
+non-object entries, missing or additional keys, non-string or nested values,
+padded or blank values, invalid subjects, wildcards, domain-only or malformed
+emails, duplicate subjects, duplicate canonical emails, conflicting roles,
+and unsupported roles. The former `SQAG_INTERNAL_ALLOWED_EMAILS`,
+`SQAG_INTERNAL_ADMIN_EMAILS`, and `SQAG_INTERNAL_OPERATOR_EMAILS` variables are
+deprecated rejected configuration. Supplying any of them, including alongside
+the JSON authority, fails deploy readiness. There is no second admission
+authority.
+
+After token verification, SQAG looks up the approved record by exact `sub`,
+then requires the token's canonical verified email to equal that record and
+derives the role only from that record. Unknown subjects, subject/email
+substitution, account reassignment, and role inheritance are rejected before
+session creation. No domain inference, trust-on-first-login, automatic
+enrolment, email-only bootstrap, self-registration, or any-authenticated-user
+fallback exists.
+
+Obtaining each real tester's Google subject is a separate explicitly authorised
+provider-enrolment operation. Repository tests use synthetic subjects only.
+SQAG provides no endpoint that returns subjects.
 
 ## Session, revocation, and logout
 
@@ -82,13 +111,17 @@ eight-hour bounded session binds the authentication mode, Google `sub`,
 canonical verified email, fixed workspace, exact role, issue/expiry times,
 random session identifier, and a SHA-256 policy fingerprint.
 
-The process-local server registry is authoritative. Every protected request
-revalidates the signed cookie against that registry and the current allowlist,
-role mapping, workspace, mode, expiry, and policy fingerprint. Allowlist
-removal, role/workspace change, mode change, expiry, logout, cookie tampering,
-or process restart therefore denies the next request. This intentionally limits
-the temporary lane to one app instance; multi-instance sessions require a
-durable shared revocation store and are not credited by readiness.
+The policy fingerprint includes the fixed workspace and the complete canonical
+subject/email/role map sorted independently of input JSON order. Every
+protected request revalidates the signed cookie against the process-local
+registry, current exact identity record, workspace, role, mode, expiry, and
+fingerprint. Subject/email/role/workspace removal or change, mode change,
+expiry, logout, cookie tampering, or process restart denies the next request.
+JSON reordering alone preserves the fingerprint. The configured identity map
+is available again after restart, while process-local sessions remain
+invalidated. This intentionally limits the temporary lane to one app instance;
+multi-instance sessions require a durable shared revocation store and are not
+credited by readiness.
 
 Logout is an authenticated, CSRF-checked `POST /logout`. `GET /logout` returns
 405 and cannot mutate state. Logout revokes the server-side session, clears
@@ -107,3 +140,12 @@ cookies and browser storage, and returns only a fixed safe navigation target in
 The committed Coolify template is a placeholder-only inventory for the
 temporary internal lane. Populating it, creating an OAuth client, deploying,
 or testing real credentials requires separate authorization and evidence.
+
+## Public-release removal gate
+
+Public release remains blocked until `internal_google`, its identity JSON and
+fixed workspace configuration, its direct Google login/callback routes, and
+all temporary sessions are removed or permanently disabled from public-release
+paths. Provider-side OAuth client retirement and redirect removal are separate
+authorised operations. Platform must own login, membership, role, entitlement,
+launch, and revocation before public release.
