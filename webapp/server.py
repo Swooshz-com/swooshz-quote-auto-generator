@@ -175,6 +175,18 @@ MAX_REFERENCE_IMAGES = 8
 MAX_RENDERED_PDF_PAGES = 12
 MAX_RENDERED_PDF_PAGE_BYTES = 1024 * 1024
 PDF_RENDER_TARGET_LONG_EDGE_PX = 1600
+# 4K-axis inputs and fewer than 9 million pixels cover DCI 4K quote/reference
+# images while bounding decoded RGB/RGBA buffers to about 26/35 MiB, well below
+# Pillow's library-wide decompression-bomb threshold.
+MAX_PROMPT_IMAGE_WIDTH = 4096
+MAX_PROMPT_IMAGE_HEIGHT = 4096
+MAX_PROMPT_IMAGE_PIXELS = 9_000_000 - 1
+PROMPT_IMAGE_PIL_FORMATS = ("JPEG", "PNG", "WEBP")
+PROMPT_IMAGE_PIL_FORMAT_BY_MIME = {
+    "image/jpeg": "JPEG",
+    "image/png": "PNG",
+    "image/webp": "WEBP",
+}
 MAX_JOB_REQUEST_BYTES = (((MAX_REFERENCE_IMAGES * max(MAX_IMAGE_BYTES, MAX_PDF_BYTES)) + 2) // 3) * 4 + 2 * 1024 * 1024
 MAX_FORENSIC_REQUEST_EVIDENCE_BYTES = 1024 * 1024
 MAX_PRICING_REFERENCE_BYTES = 10 * 1024 * 1024
@@ -14945,6 +14957,25 @@ def image_mime_type_from_bytes(raw: bytes) -> str:
     return ""
 
 
+def prompt_image_dimensions_are_allowed(size: Any) -> bool:
+    try:
+        width, height = size
+    except (TypeError, ValueError):
+        return False
+    if (
+        not isinstance(width, int)
+        or isinstance(width, bool)
+        or not isinstance(height, int)
+        or isinstance(height, bool)
+        or width <= 0
+        or height <= 0
+        or width > MAX_PROMPT_IMAGE_WIDTH
+        or height > MAX_PROMPT_IMAGE_HEIGHT
+    ):
+        return False
+    return width <= MAX_PROMPT_IMAGE_PIXELS // height
+
+
 def image_data_url_from_bytes(raw: bytes, mime_type: str) -> str:
     if not raw or mime_type not in {"image/jpeg", "image/png", "image/webp"}:
         return ""
@@ -14989,7 +15020,8 @@ def prompt_image_data_url_from_pil(image: Any) -> str:
 
 def compressed_prompt_image_data_url(raw: bytes) -> str:
     mime_type = image_mime_type_from_bytes(raw)
-    if mime_type not in {"image/jpeg", "image/png", "image/webp"}:
+    expected_format = PROMPT_IMAGE_PIL_FORMAT_BY_MIME.get(mime_type)
+    if not expected_format:
         return ""
 
     try:
@@ -15000,7 +15032,11 @@ def compressed_prompt_image_data_url(raw: bytes) -> str:
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(io.BytesIO(raw)) as image:
+            with Image.open(io.BytesIO(raw), formats=PROMPT_IMAGE_PIL_FORMATS) as image:
+                if clean_text(getattr(image, "format", "")).upper() != expected_format:
+                    return ""
+                if not prompt_image_dimensions_are_allowed(getattr(image, "size", None)):
+                    return ""
                 image.load()
                 if len(raw) <= MAX_RENDERED_PDF_PAGE_BYTES:
                     return image_data_url_from_bytes(raw, mime_type)

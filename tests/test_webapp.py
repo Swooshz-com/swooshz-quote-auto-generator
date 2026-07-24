@@ -15,12 +15,14 @@ import queue
 import re
 import shutil
 import sqlite3
+import struct
 import subprocess
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+import zlib
 from pathlib import Path
 import sys
 import types
@@ -43,6 +45,9 @@ SANITIZED_LOGO_PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
 )
 SANITIZED_LOGO_DATA_URL = "data:image/png;base64," + base64.b64encode(SANITIZED_LOGO_PNG_BYTES).decode("ascii")
+EXPECTED_PROMPT_IMAGE_MAX_WIDTH = 4096
+EXPECTED_PROMPT_IMAGE_MAX_HEIGHT = 4096
+EXPECTED_PROMPT_IMAGE_MAX_PIXELS = 9_000_000 - 1
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
@@ -51,6 +56,34 @@ import verify_internal_uat_deploy_template as deploy_template
 from webapp import server as webapp
 
 AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE = "AI draft generation is not available in this environment."
+
+
+def highly_compressible_rgb_png(width, height):
+    if not isinstance(width, int) or not isinstance(height, int) or width <= 0 or height <= 0:
+        raise ValueError("PNG dimensions must be positive integers.")
+
+    def png_chunk(chunk_type, payload):
+        checksum = zlib.crc32(chunk_type + payload) & 0xFFFFFFFF
+        return (
+            struct.pack(">I", len(payload))
+            + chunk_type
+            + payload
+            + struct.pack(">I", checksum)
+        )
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    compressor = zlib.compressobj(level=9)
+    compressed = bytearray()
+    scanline = b"\0" + (b"\0" * (width * 3))
+    for _ in range(height):
+        compressed.extend(compressor.compress(scanline))
+    compressed.extend(compressor.flush())
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", header)
+        + png_chunk(b"IDAT", bytes(compressed))
+        + png_chunk(b"IEND", b"")
+    )
 
 
 class CoordinatedStorageConnection:
@@ -7872,7 +7905,7 @@ class WebappServerTest(unittest.TestCase):
             def load(self):
                 return None
 
-        def warned_open(_source):
+        def warned_open(_source, **_kwargs):
             warnings.warn("oversized image", Image.DecompressionBombWarning)
             return WarnedImage()
 
@@ -7880,6 +7913,148 @@ class WebappServerTest(unittest.TestCase):
             result = webapp.compressed_prompt_image_data_url(SANITIZED_LOGO_PNG_BYTES)
 
         self.assertEqual(result, "")
+
+    def test_prompt_image_decoder_rejects_real_below_pillow_limit_before_decode(self):
+        from PIL import Image
+
+        raw = highly_compressible_rgb_png(4000, 4000)
+        self.assertLessEqual(len(raw), webapp.MAX_IMAGE_BYTES)
+        self.assertGreater(4000 * 4000, EXPECTED_PROMPT_IMAGE_MAX_PIXELS)
+        self.assertLess(4000 * 4000, Image.MAX_IMAGE_PIXELS)
+
+        with (
+            mock.patch.object(
+                Image.Image,
+                "load",
+                side_effect=AssertionError("over-limit input reached pixel loading"),
+            ) as image_load,
+            mock.patch.object(
+                Image.Image,
+                "convert",
+                side_effect=AssertionError("over-limit input reached conversion"),
+            ) as image_convert,
+            mock.patch.object(
+                Image.Image,
+                "copy",
+                side_effect=AssertionError("over-limit input reached copying"),
+            ) as image_copy,
+            mock.patch.object(
+                Image.Image,
+                "thumbnail",
+                side_effect=AssertionError("over-limit input reached resampling"),
+            ) as image_thumbnail,
+            mock.patch.object(
+                Image.Image,
+                "save",
+                side_effect=AssertionError("over-limit input reached encoding"),
+            ) as image_save,
+        ):
+            result = webapp.compressed_prompt_image_data_url(raw)
+
+        self.assertEqual(result, "")
+        image_load.assert_not_called()
+        image_convert.assert_not_called()
+        image_copy.assert_not_called()
+        image_thumbnail.assert_not_called()
+        image_save.assert_not_called()
+
+    def test_prompt_image_decoder_accepts_exact_application_boundaries(self):
+        self.assertEqual(webapp.MAX_PROMPT_IMAGE_WIDTH, EXPECTED_PROMPT_IMAGE_MAX_WIDTH)
+        self.assertEqual(webapp.MAX_PROMPT_IMAGE_HEIGHT, EXPECTED_PROMPT_IMAGE_MAX_HEIGHT)
+        self.assertEqual(webapp.MAX_PROMPT_IMAGE_PIXELS, EXPECTED_PROMPT_IMAGE_MAX_PIXELS)
+
+        exact_boundaries = (
+            (EXPECTED_PROMPT_IMAGE_MAX_WIDTH, 1, "width"),
+            (1, EXPECTED_PROMPT_IMAGE_MAX_HEIGHT, "height"),
+            (2999, 3001, "pixels"),
+        )
+        for width, height, boundary in exact_boundaries:
+            with self.subTest(boundary=boundary):
+                raw = highly_compressible_rgb_png(width, height)
+                data_url = webapp.compressed_prompt_image_data_url(raw)
+                self.assertTrue(data_url.startswith("data:image/png;base64,"))
+
+    def test_prompt_image_decoder_rejects_each_application_boundary_overage(self):
+        from PIL import Image
+
+        overages = (
+            (EXPECTED_PROMPT_IMAGE_MAX_WIDTH + 1, 1, "width"),
+            (1, EXPECTED_PROMPT_IMAGE_MAX_HEIGHT + 1, "height"),
+            (3000, 3000, "pixels"),
+        )
+        for width, height, boundary in overages:
+            with self.subTest(boundary=boundary):
+                raw = highly_compressible_rgb_png(width, height)
+                with mock.patch.object(
+                    Image.Image,
+                    "load",
+                    side_effect=AssertionError("rejected image reached pixel loading"),
+                ) as image_load:
+                    result = webapp.compressed_prompt_image_data_url(raw)
+                self.assertEqual(result, "")
+                image_load.assert_not_called()
+
+    def test_prompt_image_decoder_rejects_non_positive_header_dimensions_before_decode(self):
+        class HeaderOnlyImage:
+            format = "PNG"
+
+            def __init__(self, size):
+                self.size = size
+                self.load = mock.Mock()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        for size in ((0, 1), (1, 0), (-1, 1), (1, -1)):
+            with self.subTest(size=size):
+                image = HeaderOnlyImage(size)
+                with mock.patch("PIL.Image.open", return_value=image):
+                    result = webapp.compressed_prompt_image_data_url(SANITIZED_LOGO_PNG_BYTES)
+                self.assertEqual(result, "")
+                image.load.assert_not_called()
+
+    def test_prompt_image_decoder_requires_signature_and_decoder_format_agreement(self):
+        class HeaderOnlyImage:
+            size = (1, 1)
+
+            def __init__(self, actual_format):
+                self.format = actual_format
+                self.load = mock.Mock()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        for actual_format in ("JPEG", "BMP"):
+            with self.subTest(actual_format=actual_format):
+                image = HeaderOnlyImage(actual_format)
+                with mock.patch("PIL.Image.open", return_value=image) as image_open:
+                    result = webapp.compressed_prompt_image_data_url(SANITIZED_LOGO_PNG_BYTES)
+                self.assertEqual(result, "")
+                image_open.assert_called_once()
+                self.assertEqual(
+                    image_open.call_args.kwargs.get("formats"),
+                    ("JPEG", "PNG", "WEBP"),
+                )
+                image.load.assert_not_called()
+
+    def test_prompt_image_decoder_passes_explicit_format_allowlist(self):
+        from PIL import Image
+
+        original_open = Image.open
+        with mock.patch("PIL.Image.open", wraps=original_open) as image_open:
+            result = webapp.compressed_prompt_image_data_url(SANITIZED_LOGO_PNG_BYTES)
+
+        self.assertTrue(result.startswith("data:image/png;base64,"))
+        self.assertEqual(
+            image_open.call_args.kwargs.get("formats"),
+            ("JPEG", "PNG", "WEBP"),
+        )
 
     def test_prompt_image_decoder_accepts_supported_png(self):
         from PIL import Image
@@ -7897,6 +8072,28 @@ class WebappServerTest(unittest.TestCase):
         self.assertTrue(data_url.startswith("data:image/png;base64,"))
         self.assertEqual(decoded_size, (4, 3))
         self.assertEqual(decoded_format, "PNG")
+
+    def test_prompt_image_decoder_accepts_supported_jpeg(self):
+        from PIL import Image
+
+        source = io.BytesIO()
+        Image.new("RGB", (4, 3), (10, 20, 30)).save(source, format="JPEG")
+
+        data_url = webapp.compressed_prompt_image_data_url(source.getvalue())
+
+        self.assertTrue(data_url.startswith("data:image/jpeg;base64,"))
+
+    def test_prompt_image_decoder_accepts_supported_webp_when_available(self):
+        from PIL import Image, features
+
+        if not features.check("webp"):
+            self.skipTest("Installed Pillow build does not support WebP.")
+        source = io.BytesIO()
+        Image.new("RGBA", (4, 3), (10, 20, 30, 128)).save(source, format="WEBP")
+
+        data_url = webapp.compressed_prompt_image_data_url(source.getvalue())
+
+        self.assertTrue(data_url.startswith("data:image/webp;base64,"))
 
     def test_prompt_image_encoder_converts_rgba_to_bounded_jpeg(self):
         from PIL import Image
