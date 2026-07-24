@@ -7,11 +7,24 @@ bounded internal UAT login and deploy-auth path that can be verified locally
 with synthetic values only.
 
 This is not an account system, public SaaS launch, customer portal, billing
-flow, database-backed user model, or production deployment plan. Hosted SQAG
-uses only the Swooshz Platform launch/finalization/validation boundary so the authenticated session
-includes the trusted workspace, membership role, and entitlement.
+flow, database-backed user model, or production deployment plan. The temporary
+private-alpha lane uses `SQAG_AUTH_MODE=internal_google`; the final hosted
+architecture remains Platform launch/finalization/validation. See
+`docs/internal-google-auth-mode.md`.
 
-## Approved Tester Launch Flow
+## Approved Temporary Google Flow
+
+In the temporary lane, `/login` creates one-time state, nonce, and S256 PKCE
+transaction data and redirects to the exact configured Google endpoint.
+`/callback` verifies the signed ID token, then requires one exact configured
+subject/email/role identity record before creating a bounded server-revocable
+session for one fixed internal workspace.
+Logout is a CSRF-checked POST. No self-registration or domain admission exists.
+The identity JSON is server-only. Obtaining real Google subjects is separate,
+explicitly authorised provider enrolment; local evidence uses synthetic
+subjects only.
+
+The following Platform flow remains the final mode and is tested separately.
 
 In deploy mode, unauthenticated browser requests redirect to `/login`, which
 shows a Platform-launch-required page linking to the configured Swooshz

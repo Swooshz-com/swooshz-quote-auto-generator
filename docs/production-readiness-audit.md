@@ -1,4 +1,67 @@
 # SQAG Production-Readiness Audit
+
+## 2026-07-24 Temporary Internal Google Authentication Audit
+
+Base SHA: `a8055aeb9bd31084ecf509e5c5ffb73303b5553a`
+
+Current target `main`: `728a8636bd30557201c3cc3b028f1fd0b7e001c0`.
+The target adds only the unrelated zero-byte `nonexistent` file; PR #152 keeps
+its historical lineage and does not modify that file.
+
+Scope: repository-only implementation and synthetic validation of an explicit
+`SQAG_AUTH_MODE` contract and temporary exact-allowlist Google OIDC lane. No
+OAuth client, credential, provider, deployment, infrastructure, or production
+data operation was performed.
+
+Verdict:
+
+- `platform`: existing launch/finalization/workspace/entitlement/revocation
+  boundaries remain enabled only under the explicit Platform selector.
+- `internal_google`: may qualify only for a private single-instance internal
+  alpha when the complete hosted and authentication contracts pass.
+- `local`: never qualifies for deploy readiness.
+- `production_ready=false` whenever `internal_google` is selected.
+
+Security review focused on deterministic source and test evidence: state and
+nonce one-time use, S256 PKCE, exact public redirect authority, maintained
+PyJWT/cryptography verification, exact issuer/audience/signature/time claims,
+exact allowlist and role parsing, server-side session revocation, per-request
+policy revalidation, CSRF-safe POST logout, privacy-safe errors/audits, and
+mode mutual exclusion. The retired Codex Security plugin was intentionally not
+invoked and is not an acceptance gate for this task.
+
+The independently identified identity-binding P1 is repaired through one
+server-only `SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON` authority. Admission now
+looks up the exact subject first, requires the canonical verified email to
+match, and derives role only from that record. The fixed workspace and sorted
+complete identity map are fingerprinted and revalidated on every protected
+request. Legacy three-list configuration fails closed. Real subject enrolment
+remains a separate provider operation.
+
+P1 RED at exact starting head `85cab033c3ec8c15f8b6351eb94d5c97a0f74fd5`:
+the existing test accepted two subjects for one admin email, and a direct
+characterisation accepted one subject first as admin and then as operator.
+
+Canonical design: `docs/internal-google-auth-mode.md`.
+
+Validation record:
+
+- RED: `python -m unittest tests.test_internal_google_auth` initially failed
+  because `webapp.internal_google_auth` did not exist.
+- GREEN: 34 focused internal-auth tests passed.
+- Full local Python suite: 1,035 passed with zero skips against a disposable
+  PostgreSQL 16 service bound only to `127.0.0.1`; the task-owned service was
+  stopped immediately after the gate.
+- Synthetic internal-auth, AI-stress, and full application Playwright flows
+  passed.
+- Strict Python audit found no known vulnerabilities; Node audit found zero
+  vulnerabilities; `pip check` passed.
+- Python/JavaScript syntax, dynamic-pricing guard, local-PDF dependency guard,
+  sensitive-fixture scan, deploy-template verifier, synthetic hosted-validation
+  bundle, and `git diff --check` passed.
+- Fresh task-owned localhost server health at `127.0.0.1:8765/api/health`
+  returned HTTP 200.
+
 ## 2026-07-15 Generation Forensics, Feedback, And Retention Audit
 
 Audit branch: `codex/sqag-forensics-feedback-retention`

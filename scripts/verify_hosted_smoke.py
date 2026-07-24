@@ -201,7 +201,10 @@ def synthetic_platform_payload() -> dict[str, Any]:
 
 def synthetic_auth_session() -> dict[str, Any]:
     context = webapp.safe_platform_launch_context(synthetic_platform_payload())
-    return {"user": webapp.user_from_platform_launch_context(context)}
+    return {
+        "auth_mode": "platform",
+        "user": webapp.user_from_platform_launch_context(context),
+    }
 
 
 def pricing_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -361,6 +364,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
         'SQAG_TRUSTED_PROXY_CIDRS': '127.0.0.1/32',
         "APP_MODE": "deploy",
         "AUTH_REQUIRED": "true",
+        "SQAG_AUTH_MODE": "platform",
         "SESSION_SECRET": "synthetic-session-secret-with-enough-entropy",
         "SQAG_TRACKING_HMAC_KEY": "synthetic-tracking-hmac-key-with-enough-entropy",
         "SQAG_TRACKING_HMAC_KEY_VERSION": "synthetic-v1",
@@ -500,7 +504,12 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
                 headers={csrf_header: csrf_token},
             )
             checks["quote_session_delete"] = delete_status == 200 and delete_body.get("status") == "deleted" and count_rows(db_path, "sqag_quote_sessions") == 0
-            checks["logout"] = logout_check(runner.base_url, session_cookie)
+            checks["logout"] = logout_check(
+                runner.base_url,
+                session_cookie,
+                csrf_header,
+                csrf_token,
+            )
 
     serialized_checks = json.dumps(checks, sort_keys=True)
     no_sensitive_output = not contains_sensitive_value(serialized_checks)
@@ -600,10 +609,21 @@ def legacy_file_blocked(base_url: str, session_cookie: str, job_id: str) -> bool
     return status in {403, 404}
 
 
-def logout_check(base_url: str, session_cookie: str) -> bool:
-    status, _body, headers = binary_request(base_url, "GET", "/logout", cookie=session_cookie)
-    location = str(headers.get("Location") or "")
-    return status in {302, 303} and bool(location) and "?" not in location
+def logout_check(
+    base_url: str,
+    session_cookie: str,
+    csrf_header: str,
+    csrf_token: str,
+) -> bool:
+    status, _body, headers = binary_request(
+        base_url,
+        "POST",
+        "/logout",
+        cookie=session_cookie,
+        headers={csrf_header: csrf_token},
+    )
+    location = str(headers.get("X-SQAG-Logout-Location") or "")
+    return status == 204 and bool(location) and "?" not in location
 
 
 def contains_sensitive_value(text: str) -> bool:

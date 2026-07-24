@@ -17,6 +17,7 @@ REQUIRED_KEYS = (
     'SQAG_TRUSTED_PROXY_CIDRS',
     "APP_MODE",
     "AUTH_REQUIRED",
+    "SQAG_AUTH_MODE",
     "SESSION_SECRET",
     "SQAG_TRACKING_HMAC_KEY",
     "SQAG_TRACKING_HMAC_KEY_VERSION",
@@ -30,10 +31,15 @@ REQUIRED_KEYS = (
     "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID",
     "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY",
     "SQAG_PLATFORM_LAUNCH_MODE",
-    "SQAG_PLATFORM_BASE_URL",
     "SQAG_PUBLIC_BASE_URL",
-    "SQAG_PLATFORM_SERVICE_SECRET",
-    "SQAG_PLATFORM_REQUEST_TIMEOUT_SECONDS",
+    "SQAG_INTERNAL_WORKSPACE_ID",
+    "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON",
+    "OIDC_ISSUER_URL",
+    "OIDC_CLIENT_ID",
+    "OIDC_CLIENT_SECRET",
+    "OIDC_REDIRECT_URI",
+    "OIDC_AUTHORIZE_URL",
+    "OIDC_TOKEN_URL",
     "QUOTE_DATA_ROOT",
     "QUOTE_OUTPUT_ROOT",
     "QUOTE_TMP_ROOT",
@@ -52,7 +58,10 @@ PLACEHOLDER_KEYS = {
     "SQAG_OBJECT_STORAGE_REGION",
     "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID",
     "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY",
-    "SQAG_PLATFORM_SERVICE_SECRET",
+    "SQAG_INTERNAL_WORKSPACE_ID",
+    "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON",
+    "OIDC_CLIENT_ID",
+    "OIDC_CLIENT_SECRET",
     "QUOTE_DATA_ROOT",
     "QUOTE_OUTPUT_ROOT",
     "QUOTE_TMP_ROOT",
@@ -63,17 +72,38 @@ PLACEHOLDER_KEYS = {
 EXPECTED_VALUES = {
     "APP_MODE": "deploy",
     "AUTH_REQUIRED": "true",
+    "SQAG_AUTH_MODE": "internal_google",
     "SQAG_STORAGE_MODE": "database",
     "SQAG_ARTIFACT_STORAGE_MODE": "object",
-    "SQAG_PLATFORM_LAUNCH_MODE": "platform",
-    "SQAG_PLATFORM_BASE_URL": "https://swooshz.com",
+    "SQAG_PLATFORM_LAUNCH_MODE": "disabled",
     "SQAG_PUBLIC_BASE_URL": "https://quote.swooshz.com",
-    "SQAG_PLATFORM_REQUEST_TIMEOUT_SECONDS": "10",
+    "OIDC_ISSUER_URL": "https://accounts.google.com",
+    "OIDC_REDIRECT_URI": "https://quote.swooshz.com/callback",
+    "OIDC_AUTHORIZE_URL": "https://accounts.google.com/o/oauth2/v2/auth",
+    "OIDC_TOKEN_URL": "https://oauth2.googleapis.com/token",
 }
 
 EXACT_PLACEHOLDERS = {
-    "SQAG_PLATFORM_SERVICE_SECRET": "<host-secret-manager-platform-service-secret>",
     "SQAG_TRACKING_HMAC_KEY": "<host-secret-manager-dedicated-tracking-hmac-key>",
+    "SQAG_INTERNAL_WORKSPACE_ID": "<host-configured-fixed-internal-workspace-id>",
+    "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON": "<host-secret-manager-bounded-google-identities-json>",
+    "OIDC_CLIENT_ID": "<host-secret-manager-google-oidc-client-id>",
+    "OIDC_CLIENT_SECRET": "<host-secret-manager-google-oidc-client-secret>",
+}
+
+FORBIDDEN_KEYS = {
+    "SQAG_PLATFORM_BASE_URL",
+    "SQAG_PLATFORM_SERVICE_SECRET",
+    "SQAG_PLATFORM_REQUEST_TIMEOUT_SECONDS",
+    "AUTH_ALLOWED_EMAILS",
+    "AUTH_ALLOWED_DOMAINS",
+    "AUTH_ALLOW_ANY_AUTHENTICATED_USER",
+    "AUTH_APPROVED_TESTER_ROLE",
+    "SQAG_INTERNAL_ALLOWED_EMAILS",
+    "SQAG_INTERNAL_ADMIN_EMAILS",
+    "SQAG_INTERNAL_OPERATOR_EMAILS",
+    "OIDC_USERINFO_URL",
+    "OIDC_LOGOUT_URL",
 }
 
 TRACKING_KEY_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,24}$")
@@ -162,6 +192,10 @@ def verify_template(path: Path = DEFAULT_TEMPLATE) -> dict[str, object]:
         if values.get(key, "") != expected:
             findings.append(Finding(key, "unexpected-value", "value does not match the internal UAT template expectation"))
 
+    for key in sorted(FORBIDDEN_KEYS):
+        if key in values:
+            findings.append(Finding(key, "forbidden-key", "key is not allowed in the internal_google deployment template"))
+
     tracking_key_version = values.get("SQAG_TRACKING_HMAC_KEY_VERSION", "")
     if tracking_key_version and not TRACKING_KEY_VERSION_PATTERN.fullmatch(tracking_key_version):
         findings.append(
@@ -174,7 +208,11 @@ def verify_template(path: Path = DEFAULT_TEMPLATE) -> dict[str, object]:
 
     template_text = path.read_text(encoding="utf-8", errors="replace")
     marker_scan_text = template_text
-    for canonical_origin in ("https://swooshz.com", "https://quote.swooshz.com"):
+    for canonical_origin in (
+        "https://quote.swooshz.com",
+        "https://accounts.google.com",
+        "https://oauth2.googleapis.com",
+    ):
         marker_scan_text = marker_scan_text.replace(canonical_origin, "<canonical-origin>")
     for category, pattern in FORBIDDEN_MARKERS.items():
         if pattern.search(marker_scan_text):
