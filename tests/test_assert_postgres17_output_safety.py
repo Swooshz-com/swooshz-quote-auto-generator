@@ -22,6 +22,7 @@ SENTINEL_PORT = "SENTINEL_PORT_VALUE_67890"
 SENTINEL_USER = "SENTINEL_USER_VALUE_ABCDE"
 SENTINEL_DB = "SENTINEL_DB_VALUE_FGHIJ"
 SENTINEL_DRIVER_MSG = "SENTINEL_DRIVER_EXCEPTION_MESSAGE_XYZ"
+SENTINEL_CLASS_NAME = "Sensitive_Internal_Endpoint_Sentinel_7a8b9c"
 
 
 def _run_assertion(env_overrides: dict[str, str] | None = None):
@@ -105,8 +106,25 @@ class TestConnectionFailure(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"psycopg": mock_psycopg}):
             exit_code, stdout, stderr = _run_assertion()
             self.assertEqual(exit_code, 12)
-            self.assertIn("PostgreSQL connection failed", stderr)
+            self.assertIn("PostgreSQL connection or version query failed", stderr)
             _assert_no_sentinels(stdout, stderr)
+
+    def test_connection_failure_with_dynamically_named_exception(self):
+        """Verify that dynamically named exception classes do not leak after fix."""
+        dynamic_exception_class = type(
+            SENTINEL_CLASS_NAME,
+            (Exception,),
+            {}
+        )
+        mock_psycopg = mock.MagicMock()
+        mock_psycopg.connect.side_effect = dynamic_exception_class("test message")
+        with mock.patch.dict(sys.modules, {"psycopg": mock_psycopg}):
+            exit_code, stdout, stderr = _run_assertion()
+            self.assertEqual(exit_code, 12)
+            combined = stdout + stderr
+            self.assertNotIn(SENTINEL_CLASS_NAME, combined,
+                           f"Sentinel class name must not appear: {combined}")
+            self.assertIn("PostgreSQL connection or version query failed", stderr)
 
 
 class TestQueryFailure(unittest.TestCase):
@@ -120,8 +138,29 @@ class TestQueryFailure(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"psycopg": mock_psycopg}):
             exit_code, stdout, stderr = _run_assertion()
             self.assertEqual(exit_code, 12)
-            self.assertIn("PostgreSQL connection failed", stderr)
+            self.assertIn("PostgreSQL connection or version query failed", stderr)
             _assert_no_sentinels(stdout, stderr)
+
+    def test_query_failure_with_dynamically_named_exception(self):
+        """Verify query failures also use fixed category, not exception class name."""
+        dynamic_exception_class = type(
+            SENTINEL_CLASS_NAME,
+            (Exception,),
+            {}
+        )
+        mock_cursor = mock.MagicMock()
+        mock_cursor.execute.side_effect = dynamic_exception_class("query error")
+        mock_connection = mock.MagicMock()
+        mock_connection.cursor.return_value.__enter__.return_value = mock_cursor
+        mock_psycopg = mock.MagicMock()
+        mock_psycopg.connect.return_value.__enter__.return_value = mock_connection
+        with mock.patch.dict(sys.modules, {"psycopg": mock_psycopg}):
+            exit_code, stdout, stderr = _run_assertion()
+            self.assertEqual(exit_code, 12)
+            combined = stdout + stderr
+            self.assertNotIn(SENTINEL_CLASS_NAME, combined,
+                           f"Sentinel class name must not appear: {combined}")
+            self.assertIn("PostgreSQL connection or version query failed", stderr)
 
 
 class TestVersionValidation(unittest.TestCase):

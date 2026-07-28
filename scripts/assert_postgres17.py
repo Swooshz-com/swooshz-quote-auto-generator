@@ -61,9 +61,8 @@ def main() -> int:
             with connection.cursor() as cursor:
                 cursor.execute("SHOW server_version_num")
                 row = cursor.fetchone()
-    except Exception as exc:
-        exc_type = type(exc).__name__
-        print(f"FAIL: PostgreSQL connection failed [{exc_type}]", file=sys.stderr)
+    except Exception:
+        print("FAIL: PostgreSQL connection or version query failed", file=sys.stderr)
         return 12
 
     if not row or row[0] is None:
