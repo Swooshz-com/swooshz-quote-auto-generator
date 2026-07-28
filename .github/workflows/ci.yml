@@ -63,7 +63,7 @@ jobs:
       SQAG_TEST_POSTGRES_USER: postgres
     services:
       postgres:
-        image: postgres:16
+        image: postgres:17
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
         ports:
@@ -102,6 +102,9 @@ jobs:
       - name: Install Playwright Chromium
         run: npx playwright install --with-deps chromium
 
+      - name: Assert disposable PostgreSQL service is major version 17
+        run: python scripts/assert_postgres17.py
+
       - name: Check JavaScript syntax
         run: |
           node --check webapp/static/app.js
@@ -110,7 +113,8 @@ jobs:
           node --check scripts/playwright-internal-google-auth.mjs
 
       - name: Check Python syntax
-        run: python -m py_compile webapp/server.py webapp/internal_google_auth.py webapp/postgres_migrations.py tests/internal_google_browser_harness.py scripts/migrate_sqag_storage.py scripts/preflight_sqag_migrations.py scripts/generate_quote.py scripts/live_ai_basis_chat_smoke.py scripts/build_pricing_catalog.py scripts/pricing_reference_cleanup.py scripts/pricing_reference_enrichment.py scripts/validate_dynamic_pricing_reference_rules.py scripts/validate_local_pdf_dependency_usage.py
+        run: |
+          python -m py_compile webapp/server.py webapp/internal_google_auth.py webapp/postgres_migrations.py tests/internal_google_browser_harness.py scripts/migrate_sqag_storage.py scripts/preflight_sqag_migrations.py scripts/generate_quote.py scripts/live_ai_basis_chat_smoke.py scripts/build_pricing_catalog.py scripts/pricing_reference_cleanup.py scripts/pricing_reference_enrichment.py scripts/validate_dynamic_pricing_reference_rules.py scripts/validate_local_pdf_dependency_usage.py scripts/assert_postgres17.py
 
       - name: Guard local PDF dependency usage
         run: python scripts/validate_local_pdf_dependency_usage.py
