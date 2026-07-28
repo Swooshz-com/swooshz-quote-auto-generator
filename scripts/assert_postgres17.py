@@ -34,14 +34,20 @@ def _read_required(name: str) -> str:
 
 def main() -> int:
     host = _read_required("SQAG_TEST_POSTGRES_HOST")
-    port = int(_read_required("SQAG_TEST_POSTGRES_PORT"))
+    port_raw = _read_required("SQAG_TEST_POSTGRES_PORT")
     user = _read_required("SQAG_TEST_POSTGRES_USER")
     dbname = os.environ.get("SQAG_TEST_POSTGRES_DB", "postgres").strip() or "postgres"
 
     try:
+        port = int(port_raw)
+    except (ValueError, TypeError):
+        print("FAIL: malformed port value", file=sys.stderr)
+        return 18
+
+    try:
         import psycopg
-    except ImportError as exc:
-        print(f"FAIL: psycopg is not importable: {exc}", file=sys.stderr)
+    except ImportError:
+        print("FAIL: psycopg import failed", file=sys.stderr)
         return 11
 
     try:
@@ -56,10 +62,8 @@ def main() -> int:
                 cursor.execute("SHOW server_version_num")
                 row = cursor.fetchone()
     except Exception as exc:
-        print(
-            f"FAIL: could not connect to PostgreSQL at {host}:{port} as {user}: {exc}",
-            file=sys.stderr,
-        )
+        exc_type = type(exc).__name__
+        print(f"FAIL: PostgreSQL connection failed [{exc_type}]", file=sys.stderr)
         return 12
 
     if not row or row[0] is None:
@@ -72,11 +76,11 @@ def main() -> int:
         return 14
 
     if not value.isdigit():
-        print(f"FAIL: malformed server_version_num: {value!r}", file=sys.stderr)
+        print("FAIL: malformed server_version_num", file=sys.stderr)
         return 15
 
     if len(value) < 5:
-        print(f"FAIL: server_version_num too short: {value!r}", file=sys.stderr)
+        print("FAIL: server_version_num too short", file=sys.stderr)
         return 16
 
     major = int(value[:2])
