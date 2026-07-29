@@ -28,9 +28,12 @@ Source of truth: `.github/workflows/ci.yml`
   claim-validation compatibility tests; CI never contacts Google.
 - Installs `pip-audit` and runs `python -m pip_audit -r requirements.txt --strict` against pinned Python dependencies.
 - Installs Playwright Chromium.
-- Starts an isolated disposable PostgreSQL 16 service for migration-ledger
+- Starts an isolated disposable PostgreSQL 17 service for migration-ledger
   integration tests. The service has no production connectivity or provider
-  credentials.
+  credentials. Before the main test suite CI asserts the running PostgreSQL
+  major version via `scripts/assert_postgres17.py`; an unexpected major version
+  fails the job. This assertion does not prove production Neon, Coolify or
+  hosted deployment state.
 - Checks JavaScript syntax for `webapp/static/app.js`, `scripts/playwright-smoke.mjs`, and `scripts/playwright-ai-basis-chat-stress.mjs`.
 - Checks Python syntax for `webapp/server.py`, quote/pricing scripts, and validation guard scripts.
 - Runs `python scripts/validate_local_pdf_dependency_usage.py` to keep `pypdfium2` and `Pillow` usage on the local PDF rendering path only.
