@@ -981,6 +981,8 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             connection.commit()
         finally:
             connection.close()
+        if function_name in self._public_function_baselines:
+            self._public_function_restoration_receipts[function_name] = True
 
     def _restore_and_drop_public_function(self, function_name: str, expected: bool) -> None:
         self._restore_public_execute(function_name, expected)
@@ -1012,6 +1014,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             yield connection
         finally:
             try:
+                connection.rollback()
                 connection.execute("reset role")
             finally:
                 connection.rollback()
@@ -1213,7 +1216,8 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             rows = connection.execute(
                 "select n.nspname as schema_name, c.relname as table_name, p.privilege_type, "
                 "coalesce((select bool_or(a.is_grantable) from pg_catalog.aclexplode(coalesce(c.relacl, pg_catalog.acldefault('r', c.relowner))) a "
-                "where a.grantee = 0 or a.grantee = (select oid from pg_catalog.pg_roles where rolname = %s)), false) as is_grantable "
+                "where (a.grantee = 0 or a.grantee = (select oid from pg_catalog.pg_roles where rolname = %s)) "
+                "and a.privilege_type = p.privilege_type), false) as is_grantable "
                 "from pg_catalog.pg_class c "
                 "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
                 "cross join (values ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE')) p(privilege_type) "
@@ -1403,6 +1407,11 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             connection.close()
         before_public_execute = self._public_function_execute("show_db_tree")
         self._public_function_baselines["show_db_tree"] = before_public_execute
+        self.addCleanup(
+            self._restore_and_drop_public_function,
+            "show_db_tree",
+            before_public_execute,
+        )
         self.assertTrue(before_public_execute)
         self.assertTrue(self._has_function_privilege(runtime_name, "show_db_tree"))
         self.assertEqual(self._call_function_as_role(runtime_name, "show_db_tree"), {})
@@ -1414,11 +1423,6 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self._restore_public_execute("show_db_tree", before_public_execute)
         self.assertTrue(self._has_function_privilege(runtime_name, "show_db_tree"))
         self.assertEqual(self._call_function_as_role(runtime_name, "show_db_tree"), {})
-        self.addCleanup(
-            self._restore_and_drop_public_function,
-            "show_db_tree",
-            before_public_execute,
-        )
         self.apply_migrations()
         rows = self._assert_routine_inventory(provider_name=provider_name, runtime_name=runtime_name)
         provider_row = next(row for row in rows if row["proname"] == "show_db_tree")
