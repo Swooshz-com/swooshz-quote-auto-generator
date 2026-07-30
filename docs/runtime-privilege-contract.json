@@ -1,0 +1,343 @@
+{
+  "$schema": "runtime-privilege-contract-schema-v1",
+  "schema_version": 1,
+  "contract_type": "runtime_privilege_contract",
+  "repository": "Swooshz-com/swooshz-quote-auto-generator",
+  "canonical_source_revision": "cc53c685ff617aaa5bf1eb24e8a62c1273570779",
+  "canonical_source_tree": "68d67a9a08c4c3d9e86460e24060f31fdc0eaa27",
+
+  "roles": {
+    "runtime": {
+      "name": "sqag_runtime",
+      "description": "Restricted application runtime role. Dormant NOLOGIN during Boundary A/B. Activated with LOGIN in #160 only after independent verification.",
+      "attributes": {
+        "login": false,
+        "password": null,
+        "superuser": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "bypassrls": false,
+        "inherit": true,
+        "connection_limit": -1
+      },
+      "memberships": [],
+      "ownership": [],
+      "grant_options": []
+    },
+    "migrator": {
+      "name": "sqag_migrator",
+      "description": "Owner/operator authority. Owns all application database objects. Applies ACL changes. Cannot create roles.",
+      "can_create_roles": false
+    },
+    "legacy": {
+      "name": "sqag_app",
+      "description": "Legacy active rollback role. Retained until separately gated retirement after #160 switch and observation window.",
+      "status": "retained_until_retirement"
+    },
+    "provider": {
+      "name": "neondb_owner",
+      "description": "Provider/control-plane role. Creates/alters roles through separately authorised provider authority. Unchanged by SQAG.",
+      "status": "provider_unchanged"
+    },
+    "forbidden": ["sqag_maintenance"]
+  },
+
+  "production_migrations": [
+    {
+      "path": "migrations/001_platform_scoped_storage.sql",
+      "sequence_no": 1,
+      "sha256": "7ee6e622ba1f99d5d1ae192e0ca979a660ba9a398b67b4ce6e0113bc9c09a8a4",
+      "tables": ["sqag_profiles", "sqag_pricing_references", "sqag_quote_sessions"]
+    },
+    {
+      "path": "migrations/003_object_artifact_metadata.sql",
+      "sequence_no": 2,
+      "sha256": "df3e7bb40865d9b11dbe7dfb9e6a721937680c4401341f0ddf255dab5627ac19",
+      "tables": ["sqag_object_artifacts"]
+    },
+    {
+      "path": "migrations/004_generation_forensics_feedback_retention_postgres.sql",
+      "sequence_no": 3,
+      "sha256": "17e3e779891e76197db477305d0d5d436fb3f25f9ea508993063ce9bd7b39933",
+      "tables": [
+        "sqag_generation_runs",
+        "sqag_generation_evidence",
+        "sqag_audit_events",
+        "sqag_feedback",
+        "sqag_feedback_status_history",
+        "sqag_legal_holds",
+        "sqag_retention_delete_authorizations",
+        "sqag_deletion_receipts",
+        "sqag_retention_scan_cursors"
+      ]
+    },
+    {
+      "path": "migrations/005_forensic_postgres_delete_guards.sql",
+      "sequence_no": 4,
+      "sha256": "e4a8d9ce7aceeb59b896dcf621dd04e760a8820891eea258d9edc12f7c0de057",
+      "tables": []
+    },
+    {
+      "path": "migrations/006_quote_publication_versions_postgres.sql",
+      "sequence_no": 5,
+      "sha256": "a66f620733c171571dfe44d078ef4bd37d2f8425bdc39d5278703af948d8e2f2",
+      "tables": ["sqag_quote_publication_versions", "sqag_quote_publication_artifacts"]
+    },
+    {
+      "path": "migrations/007_feedback_publication_binding_postgres.sql",
+      "sequence_no": 6,
+      "sha256": "886faa1a4cc76c942decbe02834662961fa336ca670d88f159ab3c5523cccc78",
+      "tables": []
+    }
+  ],
+
+  "database_acl": {
+    "public": {
+      "connect": true,
+      "temporary": "forbidden_after_boundary_b",
+      "create": false
+    },
+    "sqag_migrator": {
+      "connect": true,
+      "create": true,
+      "temporary": true
+    },
+    "sqag_app": {
+      "connect": "retained_until_retirement"
+    },
+    "sqag_runtime": {
+      "connect": true,
+      "create": false,
+      "temporary": false
+    }
+  },
+
+  "schema_acl": {
+    "schema_name": "public",
+    "public": {
+      "usage": true
+    },
+    "pg_database_owner": {
+      "create": true,
+      "usage": true
+    },
+    "sqag_app": {
+      "usage": "retained_until_retirement"
+    },
+    "sqag_runtime": {
+      "usage": true,
+      "create": false
+    }
+  },
+
+  "tables": {
+    "rw_count": 11,
+    "forbidden_count": 5,
+    "total_count": 16,
+    "runtime_accessible": {
+      "sqag_profiles": {
+        "class": "mutable",
+        "schema": "public",
+        "privileges": {
+          "select": true,
+          "insert": true,
+          "update": true,
+          "delete": true
+        }
+      },
+      "sqag_pricing_references": {
+        "class": "mutable",
+        "schema": "public",
+        "privileges": {
+          "select": true,
+          "insert": true,
+          "update": true,
+          "delete": true
+        }
+      },
+      "sqag_quote_sessions": {
+        "class": "mutable",
+        "schema": "public",
+        "privileges": {
+          "select": true,
+          "insert": true,
+          "update": true,
+          "delete": true
+        }
+      },
+      "sqag_generation_runs": {
+        "class": "append_and_status",
+        "schema": "public",
+        "privileges": {
+          "select": true,
+          "insert": true,
+          "update": true,
+          "delete": false
+        }
+      },
+      "sqag_generation_evidence": {
+        "class": "immutable_evidence",
+        "schema": "public",
+        "privileges": {
+          "select": true,
+          "insert": true,
+          "update": false,
+          "delete": false
+        }
+      },
+      "sqag_audit_events": {
+        "class": "immutable_audit",
+        "schema": "public",
+        "privileges": {
+          "select": true,
+          "insert": true,
+          "update": false,
+          "delete": false
+        }
+      },
+      "sqag_feedback": {
+        "class": "mutable_feedback",
+        "schema": "public",
+        "privileges": {
+          "select": true,
+          "insert": true,
+          "update": true,
+          "delete": false
+        }
+      },
+      "sqag_feedback_status_history": {
+        "class": "append_only_history",
+        "schema": "public",
+        "privileges": {
+          "select": true,
+          "insert": true,
+          "update": false,
+          "delete": false
+        }
+      },
+      "sqag_object_artifacts": {
+        "class": "mutable_metadata",
+        "schema": "public",
+        "privileges": {
+          "select": true,
+          "insert": true,
+          "update": true,
+          "delete": false
+        }
+      },
+      "sqag_quote_publication_versions": {
+        "class": "mutable",
+        "schema": "public",
+        "privileges": {
+          "select": true,
+          "insert": true,
+          "update": true,
+          "delete": true
+        }
+      },
+      "sqag_quote_publication_artifacts": {
+        "class": "mutable",
+        "schema": "public",
+        "privileges": {
+          "select": true,
+          "insert": true,
+          "update": false,
+          "delete": true
+        }
+      }
+    },
+    "runtime_forbidden": {
+      "sqag_legal_holds": {
+        "class": "operator_only",
+        "schema": "public",
+        "reason": "No runtime privilege. Operator/retention-only."
+      },
+      "sqag_retention_delete_authorizations": {
+        "class": "retention_only",
+        "schema": "public",
+        "reason": "No runtime privilege. Retention-only internal mechanism."
+      },
+      "sqag_deletion_receipts": {
+        "class": "retention_only",
+        "schema": "public",
+        "reason": "No runtime privilege. Retention-only internal mechanism."
+      },
+      "sqag_retention_scan_cursors": {
+        "class": "retention_only",
+        "schema": "public",
+        "reason": "No runtime privilege. Retention-only internal mechanism."
+      },
+      "sqag_schema_migrations": {
+        "class": "migration_only",
+        "schema": "public",
+        "reason": "No runtime privilege. Migration ledger owned by sqag_migrator."
+      }
+    }
+  },
+
+  "sequences": {
+    "user_defined_public_count": 0,
+    "runtime_privileges": "none",
+    "rule": "Any future production sequence must be explicitly classified before CI passes."
+  },
+
+  "routines": {
+    "sqag_owned_triggers": {
+      "sqag_reject_immutable_change": {
+        "schema": "public",
+        "owner": "sqag_migrator",
+        "security_mode": "invoker",
+        "class": "trigger_only",
+        "direct_runtime_execute": false,
+        "public_execute_after_boundary_b": false
+      },
+      "sqag_require_retention_delete_authorization": {
+        "schema": "public",
+        "owner": "sqag_migrator",
+        "security_mode": "invoker",
+        "class": "trigger_only",
+        "direct_runtime_execute": false,
+        "public_execute_after_boundary_b": false
+      }
+    },
+    "sqag_owned_count": 2,
+    "provider_owned_exceptions": {
+      "show_db_tree": {
+        "schema": "public",
+        "owner": "neondb_owner",
+        "class": "provider_diagnostic_exception",
+        "direct_runtime_grant": false,
+        "public_execute": "unchanged",
+        "effective_runtime_execution": "bounded_public_exception"
+      }
+    },
+    "total_count": 3,
+    "rule": "No direct runtime routine grants. Every future routine must be explicitly classified before CI passes."
+  },
+
+  "default_privileges": {
+    "sqag_runtime": {
+      "tables": "none",
+      "sequences": "none",
+      "routines": "none"
+    },
+    "sqag_migrator_to_sqag_app": "preserved_during_boundary_a_and_initial_boundary_b",
+    "provider_controlled": "unchanged",
+    "verification_rule": "Must expand defaclacl through aclexplode() or equivalent grantee-aware operation. Checking defaclrole alone is insufficient."
+  },
+
+  "verification_queries": {
+    "database_acl": "select datacl from pg_catalog.pg_database where datname = current_database()",
+    "schema_acl": "select nspacl from pg_catalog.pg_namespace where nspname = 'public'",
+    "table_acl": "select relname, relacl from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relkind = 'r' and n.nspname = 'public' and c.relname like 'sqag_%' order by relname",
+    "routine_acl": "select p.proname, p.proacl, r.rolname as owner from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace join pg_catalog.pg_roles r on r.oid = p.proowner where n.nspname = 'public' and p.proname like 'sqag_%' union all select p.proname, p.proacl, r.rolname as owner from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace join pg_catalog.pg_roles r on r.oid = p.proowner where n.nspname = 'public' and p.proname = 'show_db_tree' order by proname",
+    "default_acl": "select defaclrole, defaclnamespace, defaclobjtype, defaclacl from pg_catalog.pg_default_acl order by defaclrole",
+    "role_attributes": "select rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolreplication, rolbypassrls, rolconnlimit, rolpassword from pg_catalog.pg_roles where rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_app', 'neondb_owner') order by rolname",
+    "role_memberships": "select r.rolname as role, m.rolname as member, a.admin_option from pg_catalog.pg_auth_members am join pg_catalog.pg_roles r on r.oid = am.roleid join pg_catalog.pg_roles m on m.oid = am.member order by role, member",
+    "sequence_acl": "select relname, relacl from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relkind = 'S' and n.nspname = 'public' order by relname",
+    "effective_runtime_table_privileges": "select table_name, privilege_type from information_schema.role_table_grants where grantee in ('PUBLIC', 'sqag_runtime') and table_schema = 'public' order by table_name, privilege_type",
+    "effective_runtime_schema_privileges": "select privilege_type, is_grantable from information_schema.role_usage_grants where grantee in ('PUBLIC', 'sqag_runtime') and object_schema = 'public'",
+    "effective_runtime_routine_privileges": "select routine_name, privilege_type from information_schema.role_routine_grants where grantee in ('PUBLIC', 'sqag_runtime') and routine_schema = 'public' order by routine_name, privilege_type"
+  }
+}
