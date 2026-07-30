@@ -466,8 +466,8 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         connection = self.connect()
         try:
             connection.execute(
-                f"create role {_quote_identifier(role_name)} no login nosuperuser nocreatedb "
-                f"nocreaterole noreplication nobypassrls inherit connection limit -1"
+                f"create role {_quote_identifier(role_name)} NOLOGIN NOSUPERUSER NOCREATEDB "
+                f"NOCREATEROLE NOREPLICATION NOBYPASSRLS INHERIT CONNECTION LIMIT -1"
             )
             connection.commit()
         finally:
