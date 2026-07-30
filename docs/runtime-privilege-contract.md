@@ -19,7 +19,7 @@ The JSON manifest is the single authoritative source of truth for runtime privil
 - **Machine-readable**: consumed by the validator, tests, and CI without interpretation.
 - **Versioned**: schema version `1` with strict key validation; unknown or duplicate keys cause the validator to fail closed.
 - **Fail-closed**: any missing, extra, or over-broad entry is rejected.
-- **Migration-bound**: every production PostgreSQL migration path and SHA-256 digest is locked; adding, removing, renaming, or reordering a migration requires a reviewed contract refresh.
+- **Migration-bound**: every production PostgreSQL migration path, SHA-256 digest, and exact table binding from `MIGRATION_TABLES` is locked; adding, removing, renaming, or reordering a migration requires a reviewed contract refresh.
 
 Code-level expectations elsewhere in the repository, such as `webapp/postgres_migrations.py`, are secondary sources. The manifest takes precedence, and the validator reconciles them.
 
@@ -36,7 +36,7 @@ When you add, remove, rename, reorder, or modify a production PostgreSQL migrati
    - `path` must match `migrations/<filename>`.
    - `sequence_no` must be its 1-indexed position.
    - `sha256` must be the canonical hex digest.
-   - `tables` must list the tables created by that migration.
+   - `tables` must exactly match the tables introduced or governed by that migration in `webapp.postgres_migrations.MIGRATION_TABLES`.
 4. If the table inventory changes, update the `tables` section as described below.
 5. Run the validator:
    ```
@@ -68,6 +68,8 @@ The validator rejects:
 - A count mismatch.
 - A privilege not listed as a boolean for a runtime-accessible table.
 - A forbidden table with an empty class or reason.
+- Duplicate JSON object keys, nested unknown keys, missing nested keys, wrong JSON types, and contradictory locked values.
+- A migration binding that omits or adds a table relative to the migration table map.
 
 ## Unknown objects fail closed
 
@@ -123,6 +125,14 @@ The validator fails when:
 - The exception is broadened to another routine.
 - The exception is represented as having no effective runtime execution.
 
+Routine inventory is defined by the user-created/public-schema boundary: every
+`pg_proc` row whose namespace is `public` and whose `prokind` is a routine kind
+(`f`, `p`, `a`, or `w`) is included. The proof checks owner, invoker security
+mode, trigger dependency, ACL posture, and deterministic identity-argument
+ordering. Stock PostgreSQL must contain no `show_db_tree()` routine. A
+provider-compatible fixture may add exactly that one routine and no other
+public routine.
+
 ## PUBLIC TEMPORARY
 
 Database-level TEMPORARY is currently granted to PUBLIC. This allows any connecting role, including `sqag_runtime` when activated, to create temporary tables.
@@ -146,17 +156,27 @@ The disposable PostgreSQL tests prove that after the revoke, a runtime role has 
 
 PostgreSQL's `ALTER DEFAULT PRIVILEGES` stores grants in `pg_catalog.pg_default_acl`. The `defaclrole` column records which role granted the defaults, not which role receives them. The actual grantee is embedded in the `defaclacl` ACL array.
 
-To verify no default privilege targets `sqag_runtime`, you must expand each `defaclacl` entry through `aclexplode()` or an equivalent grantee-aware operation:
+The canonical verification query uses one grantee-expanded `CROSS JOIN
+LATERAL aclexplode(...)` and resolves named grantees through a nullable role
+join. It does not cast an absent role name to `regrole`:
 
 ```sql
-select
-  defaclrole::regrole::text as granting_role,
-  (aclexplode(defaclacl)).grantee::regrole::text as grantee,
-  defaclobjtype,
-  (aclexplode(defaclacl)).privilege_type,
-  (aclexplode(defaclacl)).is_grantable
-from pg_catalog.pg_default_acl
-order by granting_role, grantee, defaclobjtype;
+select owner_role.rolname as owner,
+       coalesce(ns.nspname, '<global>') as namespace,
+       d.defaclobjtype as object_type,
+       case when expanded.grantee = 0 then 'PUBLIC'
+            else coalesce(grantee_role.rolname, 'OID:' || expanded.grantee::text)
+       end as grantee,
+       expanded.privilege_type,
+       expanded.is_grantable
+from pg_catalog.pg_default_acl d
+join pg_catalog.pg_roles owner_role on owner_role.oid = d.defaclrole
+left join pg_catalog.pg_namespace ns on ns.oid = d.defaclnamespace
+cross join lateral pg_catalog.aclexplode(d.defaclacl) expanded
+left join pg_catalog.pg_roles grantee_role
+  on grantee_role.oid = expanded.grantee and expanded.grantee <> 0
+where d.defaclobjtype in ('r', 'S', 'f')
+order by owner, namespace, object_type, grantee, expanded.privilege_type, expanded.is_grantable;
 ```
 
 Checking only `defaclrole = 'sqag_runtime'` is insufficient and must not be used as the sole acceptance proof. The validator and tests must distinguish:
@@ -166,6 +186,61 @@ Checking only `defaclrole = 'sqag_runtime'` is insufficient and must not be used
 - Schema (`defaclnamespace`).
 - Privilege.
 - Grant option.
+
+The disposable PostgreSQL suite creates five negative fixtures: a table,
+sequence, and routine default grant to a runtime-like role; a default grant to
+`PUBLIC`; and a `WITH GRANT OPTION` default grant. It snapshots the complete
+provider-owned default state before migrations, applies the canonical
+migrations, snapshots again, and compares owner, namespace, object type,
+grantee, privilege, and grant-option tuples exactly.
+
+## Runtime trigger and effective-privilege proof
+
+The trigger tests revoke PUBLIC EXECUTE on both SQAG trigger functions, then
+use a non-superuser runtime-like role with only database CONNECT, schema USAGE,
+and the exact table privileges needed by the fixture. A permitted
+`sqag_feedback` UPDATE executes the installed migrated trigger and must return
+SQLSTATE `P0001` with the exact immutable-record message while leaving the row
+unchanged. Direct calls to both trigger functions run under `SET ROLE` and
+must fail specifically with SQLSTATE `42501`.
+
+The runtime table proof constructs the expected set directly from the manifest
+as `(schema_name, table_name, privilege_type, is_grantable)` and compares it
+with the complete effective set. It separately checks database CONNECT,
+database CREATE, database TEMPORARY after PUBLIC revocation, schema USAGE,
+schema CREATE, all five forbidden tables, unexpected tables, missing grants,
+swapped grants, and grant options. It does not use aggregate row counts as
+acceptance evidence.
+
+## Deterministic cleanup and discovery receipt
+
+Every temporary role, object/schema/database grant, PUBLIC ACL change, routine
+ACL change, and default-ACL fixture registers cleanup immediately after the
+change succeeds. Cleanup explicitly revokes default privileges, memberships,
+database/schema/object privileges, runs `DROP OWNED`, and drops the role; any
+failure is raised as a test failure. Role resets occur in `finally` blocks.
+Each disposable database is audited after its test cleanups, and the class
+teardown performs the final cluster audit for leftover roles, memberships,
+default ACL rows, and test databases.
+
+The deterministic discovery receipt for this amendment is:
+
+| Receipt item | Count |
+|---|---:|
+| Discovered test methods | 55 |
+| Static and validator methods | 37 |
+| PostgreSQL methods | 18 |
+| Hosted executions | 55 |
+| Hosted skips | 0 |
+| Unique locked requirement IDs | 38 (`R01`-`R38`) |
+
+The ten adversarial manifest fixtures are regression cases, not additional
+requirement IDs. Recalculate the receipt with the repository's unittest
+discovery before updating this section or the PR body:
+
+```powershell
+python -c "import unittest; s=unittest.defaultTestLoader.loadTestsFromName('tests.test_runtime_privilege_contract'); print(s.countTestCases())"
+```
 
 ## Boundary A versus Boundary B versus #160
 
