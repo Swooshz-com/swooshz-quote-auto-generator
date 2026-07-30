@@ -1,11 +1,11 @@
 """Runtime privilege contract tests.
 
 Deterministic discovery receipt for this amendment:
-  discovered methods: 76
-  static and validator methods: 42
+  discovered methods: 93
+  static and validator methods: 59
   PostgreSQL methods: 31
   requirement-map and documentation parity methods: 3
-  hosted executions: 76
+  hosted executions: 93
   hosted skips: 0
   unique locked requirement IDs: 38 (R01-R38)
 
@@ -314,6 +314,22 @@ class ValidatorStaticTest(unittest.TestCase):
         finally:
             Path(path).unlink(missing_ok=True)
 
+    def _assert_fixture_accepted(self, manifest: dict[str, Any]) -> None:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as fh:
+            json.dump(manifest, fh)
+            path = fh.name
+        try:
+            self.assertEqual(validate_manifest_strictly(path), 0)
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def _assert_exact_query_rejected(self, query_key: str, query: str) -> None:
+        self._assert_query_fixture_rejected(
+            query_key,
+            query,
+            f"verification_query_{query_key}_executable_structure_mismatch",
+        )
+
     def _mutated_fixture(self, mutate: Any) -> dict[str, Any]:
         manifest = copy.deepcopy(load_manifest())
         mutate(manifest)
@@ -415,8 +431,185 @@ class ValidatorStaticTest(unittest.TestCase):
     def test_canonical_verification_queries_pass_lexical_shape(self) -> None:
         manifest = load_manifest()
         self.assertEqual(validate_manifest_strictly(str(MANIFEST_PATH)), 0)
-        for key in ("default_acl", "routine_acl"):
+        for key in manifest["verification_queries"]:
             self.assertTrue(lex_sql(manifest["verification_queries"][key]))
+
+    def test_exact_query_contract_accepts_formatting_and_comments(self) -> None:
+        manifest = load_manifest()
+        for key, canonical in manifest["verification_queries"].items():
+            variants = (
+                re.sub(r"\s+", "\n\t", canonical).strip(),
+                canonical.replace(" ", " /* presentation */\n ", 1),
+                canonical.replace("select", "SELECT", 1),
+            )
+            for variant in variants:
+                candidate = copy.deepcopy(manifest)
+                candidate["verification_queries"][key] = variant
+                self._assert_fixture_accepted(candidate)
+
+    def test_exact_query_contract_accepts_authorised_final_semicolon(self) -> None:
+        manifest = load_manifest()
+        for key, canonical in manifest["verification_queries"].items():
+            candidate = copy.deepcopy(manifest)
+            candidate["verification_queries"][key] = canonical + ";\n/* trailing presentation comment */"
+            self._assert_fixture_accepted(candidate)
+
+    def test_exact_query_contract_opaque_regions_cannot_supply_structure(self) -> None:
+        fixtures = {
+            "default_acl": (
+                "select 'from pg_catalog.pg_default_acl defaclrole defaclnamespace defaclobjtype '"
+                "'defaclacl privilege_type is_grantable grantee owner namespace order by'",
+                'select "from pg_catalog.pg_default_acl defaclrole defaclnamespace defaclobjtype '
+                'defaclacl privilege_type is_grantable grantee owner namespace order by"',
+                "select $$from pg_catalog.pg_default_acl defaclrole defaclnamespace defaclobjtype "
+                "defaclacl privilege_type is_grantable grantee owner namespace order by$$",
+            ),
+            "routine_acl": (
+                "select 'from pg_catalog.pg_proc pg_catalog.pg_namespace pg_catalog.pg_roles '"
+                "'pg_catalog.pg_trigger order by'",
+                'select "from pg_catalog.pg_proc pg_catalog.pg_namespace pg_catalog.pg_roles '
+                'pg_catalog.pg_trigger order by"',
+                "select $$from pg_catalog.pg_proc pg_catalog.pg_namespace pg_catalog.pg_roles "
+                "pg_catalog.pg_trigger order by$$",
+            ),
+        }
+        for query_key, query_variants in fixtures.items():
+            for query in query_variants:
+                self._assert_exact_query_rejected(query_key, query)
+
+    def test_exact_query_contract_rejects_unqualified_sequence_mutation(self) -> None:
+        query = load_manifest()["verification_queries"]["default_acl"]
+        self._assert_exact_query_rejected(
+            "default_acl",
+            query.replace(" order by ", " and nextval('sqag_probe') is null order by ", 1),
+        )
+
+    def test_exact_query_contract_rejects_schema_qualified_sequence_mutation(self) -> None:
+        query = load_manifest()["verification_queries"]["default_acl"]
+        self._assert_exact_query_rejected(
+            "default_acl",
+            query.replace(" order by ", " and pg_catalog.nextval('sqag_probe') is null order by ", 1),
+        )
+
+    def test_exact_query_contract_rejects_unqualified_advisory_lock_mutation(self) -> None:
+        query = load_manifest()["verification_queries"]["routine_acl"]
+        self._assert_exact_query_rejected(
+            "routine_acl",
+            query.replace(" order by ", " and pg_advisory_lock(1) is null order by ", 1),
+        )
+
+    def test_exact_query_contract_rejects_schema_qualified_advisory_lock_mutation(self) -> None:
+        query = load_manifest()["verification_queries"]["routine_acl"]
+        self._assert_exact_query_rejected(
+            "routine_acl",
+            query.replace(" order by ", " and pg_catalog.pg_advisory_lock(1) is null order by ", 1),
+        )
+
+    def test_exact_query_contract_rejects_transaction_advisory_lock_mutation(self) -> None:
+        query = load_manifest()["verification_queries"]["default_acl"]
+        self._assert_exact_query_rejected(
+            "default_acl",
+            query.replace(" order by ", " and pg_advisory_xact_lock(1) is null order by ", 1),
+        )
+
+    def test_exact_query_contract_rejects_schema_qualified_transaction_advisory_lock_mutation(self) -> None:
+        query = load_manifest()["verification_queries"]["default_acl"]
+        self._assert_exact_query_rejected(
+            "default_acl",
+            query.replace(" order by ", " and pg_catalog.pg_advisory_xact_lock(1) is null order by ", 1),
+        )
+
+    def test_exact_query_contract_rejects_unqualified_procedural_delay_mutation(self) -> None:
+        query = load_manifest()["verification_queries"]["routine_acl"]
+        self._assert_exact_query_rejected(
+            "routine_acl",
+            query.replace(" order by ", " and pg_sleep(0) is null order by ", 1),
+        )
+
+    def test_exact_query_contract_rejects_schema_qualified_procedural_delay_mutation(self) -> None:
+        query = load_manifest()["verification_queries"]["routine_acl"]
+        self._assert_exact_query_rejected(
+            "routine_acl",
+            query.replace(" order by ", " and pg_catalog.pg_sleep(0) is null order by ", 1),
+        )
+
+    def test_exact_query_contract_rejects_user_defined_callable_substitution(self) -> None:
+        query = load_manifest()["verification_queries"]["routine_acl"]
+        self._assert_exact_query_rejected(
+            "routine_acl",
+            query.replace(
+                "p.proname, pg_get_function_identity_arguments",
+                "sqag_user_defined(p.proname) as proname, pg_get_function_identity_arguments",
+                1,
+            ),
+        )
+
+    def test_exact_query_contract_rejects_side_effecting_extra_projection(self) -> None:
+        query = load_manifest()["verification_queries"]["default_acl"]
+        self._assert_exact_query_rejected(
+            "default_acl",
+            query.replace(
+                "('r', 'S', 'f') order by",
+                "('r', 'S', 'f') and exists (select 1, nextval('sqag_probe') "
+                "from pg_catalog.pg_roles probe) order by",
+                1,
+            ),
+        )
+
+    def test_exact_query_contract_rejects_side_effecting_predicate(self) -> None:
+        query = load_manifest()["verification_queries"]["default_acl"]
+        self._assert_exact_query_rejected(
+            "default_acl",
+            query.replace(" order by ", " and pg_sleep(0) is null order by ", 1),
+        )
+
+    def test_exact_query_contract_rejects_side_effecting_ordering_expression(self) -> None:
+        query = load_manifest()["verification_queries"]["default_acl"]
+        self._assert_exact_query_rejected(
+            "default_acl",
+            query.replace(
+                "order by owner, namespace, object_type, grantee, expanded.privilege_type, expanded.is_grantable",
+                "order by owner, namespace, object_type, grantee, expanded.privilege_type, "
+                "expanded.is_grantable, pg_sleep(0)",
+                1,
+            ),
+        )
+
+    def test_exact_query_contract_rejects_projection_structure_mutations(self) -> None:
+        query = load_manifest()["verification_queries"]["default_acl"]
+        mutations = (
+            query.replace(", expanded.is_grantable", "", 1),
+            query.replace("select owner.rolname as owner,", "select owner.rolname as owner, 1 as extra,", 1),
+            query.replace(
+                "owner.rolname as owner, coalesce(ns.nspname, '<global>') as namespace",
+                "coalesce(ns.nspname, '<global>') as namespace, owner.rolname as owner",
+                1,
+            ),
+        )
+        for mutation in mutations:
+            self._assert_exact_query_rejected("default_acl", mutation)
+
+    def test_exact_query_contract_rejects_relation_predicate_literal_operator_order_and_function_mutations(self) -> None:
+        manifest = load_manifest()
+        routine_query = manifest["verification_queries"]["routine_acl"]
+        default_query = manifest["verification_queries"]["default_acl"]
+        mutations = (
+            ("routine_acl", routine_query.replace("pg_catalog.pg_proc", "pg_catalog.pg_class", 1)),
+            ("default_acl", default_query.replace("defaclobjtype in", "defaclobjtype not in", 1)),
+            ("routine_acl", routine_query.replace("n.nspname = 'public'", "n.nspname = 'private'", 1)),
+            ("default_acl", default_query.replace("expanded.grantee = 0", "expanded.grantee <> 0", 1)),
+            (
+                "routine_acl",
+                routine_query.replace(
+                    "order by p.proname, identity_arguments",
+                    "order by identity_arguments, p.proname",
+                    1,
+                ),
+            ),
+            ("default_acl", default_query.replace("pg_catalog.aclexplode", "pg_catalog.jsonb_array_elements", 1)),
+        )
+        for query_key, mutation in mutations:
+            self._assert_exact_query_rejected(query_key, mutation)
 
     def test_query_lexer_rejects_comment_literal_and_dollar_noops(self) -> None:
         fixtures = {
@@ -467,9 +660,7 @@ class ValidatorStaticTest(unittest.TestCase):
             )
 
     def test_query_lexer_rejects_multiple_and_write_statements(self) -> None:
-        canonical_default = load_manifest()["verification_queries"]["default_acl"]
-        canonical_routine = load_manifest()["verification_queries"]["routine_acl"]
-        for query_key, canonical in (("default_acl", canonical_default), ("routine_acl", canonical_routine)):
+        for query_key, canonical in load_manifest()["verification_queries"].items():
             self._assert_query_fixture_rejected(
                 query_key,
                 canonical + "; select 1",

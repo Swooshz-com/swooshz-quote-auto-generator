@@ -332,11 +332,11 @@ The deterministic discovery receipt for this amendment is:
 
 | Receipt item | Count |
 |---|---:|
-| Discovered test methods | 76 |
-| Static and validator methods | 42 |
+| Discovered test methods | 93 |
+| Static and validator methods | 59 |
 | PostgreSQL methods | 31 |
 | Requirement-map and documentation parity methods | 3 |
-| Hosted executions | 76 |
+| Hosted executions | 93 |
 | Hosted skips | 0 |
 | Unique locked requirement IDs | 38 (`R01`-`R38`) |
 

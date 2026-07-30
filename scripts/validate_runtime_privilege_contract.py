@@ -129,6 +129,130 @@ VERIFICATION_QUERY_KEYS = frozenset(
     }
 )
 
+# These SQL strings are the reviewed executable-query contracts.  They are
+# intentionally kept separate from the manifest: deriving the expected
+# sequence from a candidate manifest would allow a query mutation to redefine
+# its own admission contract.
+CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
+    "database_acl": """
+        select datacl
+        from pg_catalog.pg_database
+        where datname = current_database()
+    """,
+    "schema_acl": """
+        select nspacl
+        from pg_catalog.pg_namespace
+        where nspname = 'public'
+    """,
+    "table_acl": """
+        select relname, relacl
+        from pg_catalog.pg_class c
+        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+        where c.relkind = 'r'
+          and n.nspname = 'public'
+          and c.relname like 'sqag_' || chr(37)
+        order by relname
+    """,
+    "routine_acl": """
+        select p.proname,
+               pg_get_function_identity_arguments(p.oid) as identity_arguments,
+               p.prokind,
+               p.prosecdef,
+               p.proacl,
+               p.proowner,
+               r.rolname as owner,
+               exists (
+                   select 1
+                   from pg_catalog.pg_trigger t
+                   where t.tgfoid = p.oid
+                     and not t.tgisinternal
+               ) as has_trigger_dependency
+        from pg_catalog.pg_proc p
+        join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+        join pg_catalog.pg_roles r on r.oid = p.proowner
+        where n.nspname = 'public'
+          and p.prokind in ('f', 'p', 'a', 'w')
+        order by p.proname, identity_arguments
+    """,
+    "default_acl": """
+        select owner.rolname as owner,
+               coalesce(ns.nspname, '<global>') as namespace,
+               d.defaclobjtype as object_type,
+               case
+                   when expanded.grantee = 0 then 'PUBLIC'
+                   else coalesce(grantee_role.rolname, 'OID:' || expanded.grantee::text)
+               end as grantee,
+               expanded.privilege_type,
+               expanded.is_grantable
+        from pg_catalog.pg_default_acl d
+        join pg_catalog.pg_roles owner on owner.oid = d.defaclrole
+        left join pg_catalog.pg_namespace ns on ns.oid = d.defaclnamespace
+        cross join lateral pg_catalog.aclexplode(d.defaclacl) expanded
+        left join pg_catalog.pg_roles grantee_role
+          on grantee_role.oid = expanded.grantee and expanded.grantee <> 0
+        where d.defaclobjtype in ('r', 'S', 'f')
+        order by owner, namespace, object_type, grantee, expanded.privilege_type, expanded.is_grantable
+    """,
+    "role_attributes": """
+        select rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb,
+               rolcanlogin, rolreplication, rolbypassrls, rolconnlimit, rolpassword
+        from pg_catalog.pg_roles
+        where rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_app', 'neondb_owner')
+        order by rolname
+    """,
+    "role_memberships": """
+        select r.rolname as role, m.rolname as member, a.admin_option
+        from pg_catalog.pg_auth_members am
+        join pg_catalog.pg_roles r on r.oid = am.roleid
+        join pg_catalog.pg_roles m on m.oid = am.member
+        order by role, member
+    """,
+    "sequence_acl": """
+        select relname, relacl
+        from pg_catalog.pg_class c
+        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+        where c.relkind = 'S' and n.nspname = 'public'
+        order by relname
+    """,
+    "effective_runtime_table_privileges": """
+        select n.nspname as schema_name,
+               c.relname as table_name,
+               p.privilege_type,
+               has_table_privilege('sqag_runtime', c.oid, p.privilege_type) as effective,
+               coalesce(
+                   (
+                       select bool_or(a.is_grantable)
+                       from pg_catalog.aclexplode(coalesce(c.relacl, pg_catalog.acldefault('r', c.relowner))) a
+                       where a.grantee = 0
+                          or a.grantee = (select oid from pg_catalog.pg_roles where rolname = 'sqag_runtime')
+                   ),
+                   false
+               ) as is_grantable
+        from pg_catalog.pg_class c
+        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+        cross join (values ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE')) p(privilege_type)
+        where n.nspname = 'public'
+          and c.relkind = 'r'
+          and has_table_privilege('sqag_runtime', c.oid, p.privilege_type)
+        order by n.nspname, c.relname, p.privilege_type
+    """,
+    "effective_runtime_schema_privileges": """
+        select p.privilege_type,
+               has_schema_privilege('sqag_runtime', 'public', p.privilege_type) as effective,
+               false as is_grantable
+        from (values ('USAGE'), ('CREATE')) p(privilege_type)
+        order by p.privilege_type
+    """,
+    "effective_runtime_routine_privileges": """
+        select p.proname as routine_name,
+               has_function_privilege('sqag_runtime', p.oid, 'EXECUTE') as effective
+        from pg_catalog.pg_proc p
+        join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = 'public'
+        order by p.proname
+    """,
+}
+
 RUNTIME_TABLES = frozenset(
     {
         "sqag_profiles",
@@ -814,6 +938,18 @@ def _token_matches(token: SQLToken, expected: str | tuple[str, str]) -> bool:
     return token.value == expected
 
 
+def _normalise_executable_tokens(tokens: tuple[SQLToken, ...] | list[SQLToken]) -> tuple[tuple[str, str], ...]:
+    """Return the executable structure with presentation-only differences removed."""
+    return tuple(
+        (
+            token.kind,
+            token.value.lower() if token.kind == "WORD" else token.value,
+        )
+        for token in tokens
+        if token.kind != "COMMENT"
+    )
+
+
 def _find_token_pattern(
     tokens: tuple[SQLToken, ...] | list[SQLToken], pattern: list[str | tuple[str, str]]
 ) -> bool:
@@ -860,7 +996,7 @@ def _require_sql_features(
 
 def _read_only_query_tokens(query: str, key: str, errors: list[str]) -> tuple[SQLToken, ...] | None:
     try:
-        tokens = list(lex_sql(query))
+        tokens = [token for token in lex_sql(query) if token.kind != "COMMENT"]
     except SQLLexError as exc:
         _add_error(errors, f"verification_query_{key}_lexical_error_{exc}")
         return None
@@ -885,6 +1021,22 @@ def _read_only_query_tokens(query: str, key: str, errors: list[str]) -> tuple[SQ
     if forbidden:
         _add_error(errors, f"verification_query_{key}_contains_forbidden_executable_words_{','.join(forbidden)}")
     return tuple(tokens)
+
+
+EXPECTED_VERIFICATION_QUERY_TOKENS: dict[str, tuple[tuple[str, str], ...]] = {
+    key: _normalise_executable_tokens(lex_sql(query))
+    for key, query in CANONICAL_VERIFICATION_QUERY_SQL.items()
+}
+
+
+def _validate_exact_query_contract(query: str, key: str, errors: list[str]) -> None:
+    """Require the complete reviewed executable token sequence for one key."""
+    tokens = _read_only_query_tokens(query, key, errors)
+    if tokens is None:
+        return
+    expected = EXPECTED_VERIFICATION_QUERY_TOKENS.get(key)
+    if expected is None or _normalise_executable_tokens(tokens) != expected:
+        _add_error(errors, f"verification_query_{key}_executable_structure_mismatch")
 
 
 def _top_level_index(tokens: tuple[SQLToken, ...], word: str) -> int | None:
@@ -1080,6 +1232,7 @@ def validate_verification_queries(manifest: dict[str, Any], errors: list[str]) -
             tokens = _read_only_query_tokens(value, key, errors)
             if tokens is not None:
                 _require_sql_features(tokens, key, REQUIRED_QUERY_FEATURES[key], errors)
+        _validate_exact_query_contract(value, key, errors)
     table_query = queries.get("effective_runtime_table_privileges")
     if type(table_query) is str and table_query.strip():
         tokens = _read_only_query_tokens(table_query, "effective_runtime_table_privileges", errors)
