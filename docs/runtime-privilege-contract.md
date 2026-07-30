@@ -161,7 +161,7 @@ LATERAL aclexplode(...)` and resolves named grantees through a nullable role
 join. It does not cast an absent role name to `regrole`:
 
 ```sql
-select owner_role.rolname as owner,
+select owner.rolname as owner,
        coalesce(ns.nspname, '<global>') as namespace,
        d.defaclobjtype as object_type,
        case when expanded.grantee = 0 then 'PUBLIC'
@@ -170,7 +170,7 @@ select owner_role.rolname as owner,
        expanded.privilege_type,
        expanded.is_grantable
 from pg_catalog.pg_default_acl d
-join pg_catalog.pg_roles owner_role on owner_role.oid = d.defaclrole
+join pg_catalog.pg_roles owner on owner.oid = d.defaclrole
 left join pg_catalog.pg_namespace ns on ns.oid = d.defaclnamespace
 cross join lateral pg_catalog.aclexplode(d.defaclacl) expanded
 left join pg_catalog.pg_roles grantee_role
@@ -187,12 +187,44 @@ Checking only `defaclrole = 'sqag_runtime'` is insufficient and must not be used
 - Privilege.
 - Grant option.
 
-The disposable PostgreSQL suite creates five negative fixtures: a table,
-sequence, and routine default grant to a runtime-like role; a default grant to
-`PUBLIC`; and a `WITH GRANT OPTION` default grant. It snapshots the complete
+The disposable PostgreSQL suite creates adversarial table, sequence, and
+routine default grants to a runtime-like role, a default grant to `PUBLIC`,
+and a real `WITH GRANT OPTION` default grant. It snapshots the complete
 provider-owned default state before migrations, applies the canonical
 migrations, snapshots again, and compares owner, namespace, object type,
-grantee, privilege, and grant-option tuples exactly.
+grantee, privilege, and grant-option tuples exactly. A separate provider
+fixture creates non-vacuous baseline tuples for table (`r`), sequence (`S`),
+and function (`f`) defaults owned by `neondb_owner`, requires all three tuples
+to be present, and rejects an empty baseline as evidence.
+
+## Bounded verification-query validation
+
+The validator does not accept feature words found by raw substring search. It
+uses a bounded SQL lexer that skips line comments, supports nested block
+comments, and treats single-quoted strings, double-quoted identifiers, and
+dollar-quoted bodies as opaque tokens. Unterminated quoted or comment regions
+fail closed. After lexing, each verification query must be exactly one
+executable read-only `SELECT` statement, with at most one terminal semicolon;
+additional statements and write, DDL, transaction, session, or procedural
+keywords are rejected.
+
+The default-ACL query must have the exact six-column projection
+`owner, namespace, object_type, grantee, privilege_type, is_grantable`, one
+`CROSS JOIN LATERAL aclexplode(...)`, the `r`/`S`/`f` object-type boundary, the
+PUBLIC case mapping, and deterministic ordering. The routine query must have
+the exact eight-column projection
+`proname, identity_arguments, prokind, prosecdef, proacl, proowner, owner,
+has_trigger_dependency`, the complete public-schema routine boundary, and
+deterministic identity-argument ordering. PostgreSQL evidence executes both
+canonical queries, asserts the exact returned column names, and requires
+non-empty fixture rows.
+
+Adversarial static fixtures cover comment-token, string-literal, and
+dollar-quote no-op attempts; multiple statements; write statements;
+unterminated lexical regions; wrong projections; wrong catalog relations;
+missing lateral expansion; missing grant-option output; and missing PUBLIC
+mapping. These fixtures prove that validation tokens must be executable query
+structure.
 
 ## Runtime trigger and effective-privilege proof
 
@@ -206,11 +238,84 @@ must fail specifically with SQLSTATE `42501`.
 
 The runtime table proof constructs the expected set directly from the manifest
 as `(schema_name, table_name, privilege_type, is_grantable)` and compares it
-with the complete effective set. It separately checks database CONNECT,
-database CREATE, database TEMPORARY after PUBLIC revocation, schema USAGE,
-schema CREATE, all five forbidden tables, unexpected tables, missing grants,
-swapped grants, and grant options. It does not use aggregate row counts as
-acceptance evidence.
+with the complete effective set. Ten independent disposable-database tests
+each start from a valid matrix and reject one named mismatch class:
+
+1. a missing privilege tuple;
+2. an extra privilege tuple;
+3. a privilege moved from one table to another;
+4. a missing tuple offset by an unrelated extra tuple;
+5. a privilege on a forbidden table;
+6. a real `WITH GRANT OPTION` ACL;
+7. a privilege on an unexpected table;
+8. a completely missing accessible table;
+9. the wrong privilege type on an otherwise correct table; and
+10. equal aggregate row counts with the wrong tuple distribution.
+
+The proof also checks database CONNECT, database CREATE, database TEMPORARY
+after PUBLIC revocation, schema USAGE, schema CREATE, and all five forbidden
+tables. It asserts the exact symmetric difference for each negative case, so
+aggregate counts are never acceptance evidence.
+
+## PUBLIC ACL baseline and cleanup proof
+
+Before any disposable test mutates a PUBLIC database privilege or routine
+EXECUTE ACL, the suite captures the exact baseline values. Cleanup restores
+the captured value, asserts the restored state, and records a restoration
+receipt before dropping a fixture routine. The final database cleanup audit
+compares every remaining PUBLIC database and routine ACL to its captured
+baseline and fails if a routine disappeared without an explicit restoration
+receipt. The early-failure regression raises after a deliberate ACL mutation
+and proves its `finally` restoration runs; the omitted-restoration regression
+proves the final audit itself detects a drift. This catches both a missing
+cleanup registration and an omitted restoration step.
+
+## Requirement-to-evidence map
+
+Each locked requirement has exactly one named evidence method. The map is
+explicit and independently checked for exact `R01`-`R38` ordering, discoverable
+method references, and parity with this documentation table.
+
+| ID | Requirement | Evidence |
+|---|---|---|
+| R01 | Schema version is locked to v1. | `ManifestStructureTest.test_schema_version_is_1` |
+| R02 | Manifest binds to the canonical repository revision and tree. | `ManifestStructureTest.test_repository_binding` |
+| R03 | Runtime role attributes are dormant and restricted. | `ManifestStructureTest.test_runtime_role_attributes` |
+| R04 | Runtime role has no memberships, ownership, or grant options. | `ManifestStructureTest.test_runtime_role_no_memberships_no_ownership` |
+| R05 | Migrator cannot create roles. | `ManifestStructureTest.test_migrator_cannot_create_roles` |
+| R06 | Forbidden maintenance role is classified. | `ManifestStructureTest.test_sqag_maintenance_is_forbidden` |
+| R07 | Production migrations, digests, and table bindings match repository authority. | `ManifestStructureTest.test_production_migrations_match_repository` |
+| R08 | The complete table inventory is 16 objects. | `ManifestStructureTest.test_all_tables_union_is_16` |
+| R09 | The runtime-accessible table set is exact. | `ManifestStructureTest.test_runtime_accessible_table_set_is_exact` |
+| R10 | The forbidden table set is exact. | `ManifestStructureTest.test_forbidden_table_set_is_exact` |
+| R11 | Every runtime table privilege tuple matches the locked matrix. | `ManifestStructureTest.test_runtime_accessible_table_privileges_are_exact` |
+| R12 | No user-defined public sequence has runtime privilege. | `ManifestStructureTest.test_sequence_count_is_0` |
+| R13 | Routine inventory contains the two SQAG routines and one bounded provider exception. | `ManifestStructureTest.test_routine_inventory_is_two_sqag_plus_one_provider` |
+| R14 | SQAG routines are trigger-only invoker routines with no direct runtime grant. | `ManifestStructureTest.test_sqag_trigger_routines_are_trigger_only` |
+| R15 | Database and schema ACL targets are exact. | `ManifestStructureTest.test_database_and_schema_acl_targets` |
+| R16 | Default-privilege targets are grantee-aware and provider defaults are unchanged. | `ManifestStructureTest.test_default_privileges_are_grantee_aware` |
+| R17 | All canonical verification-query keys are present. | `ManifestStructureTest.test_verification_queries_are_complete` |
+| R18 | The unmodified manifest passes strict validation. | `ValidatorStaticTest.test_valid_manifest_passes` |
+| R19 | Duplicate JSON keys fail closed. | `ValidatorStaticTest.test_duplicate_json_key_fixture_fails` |
+| R20 | Recursive unknown-key violations fail closed. | `ValidatorStaticTest.test_nested_unknown_key_fixture_fails` |
+| R21 | Provider routine exception set cannot be broadened. | `ValidatorStaticTest.test_extra_provider_exception_fixture_fails` |
+| R22 | Missing migration table bindings fail closed. | `ValidatorStaticTest.test_missing_migration_table_binding_fixture_fails` |
+| R23 | Contradictory PUBLIC database ACL values fail closed. | `ValidatorStaticTest.test_incorrect_public_temporary_fixture_fails` |
+| R24 | Contradictory runtime role attributes fail closed. | `ValidatorStaticTest.test_incorrect_runtime_connection_limit_fixture_fails` |
+| R25 | Canonical verification queries have bounded lexical shape. | `ValidatorStaticTest.test_canonical_verification_queries_pass_lexical_shape` |
+| R26 | Comment, literal, and dollar-quote no-op tokens cannot satisfy query validation. | `ValidatorStaticTest.test_query_lexer_rejects_comment_literal_and_dollar_noops` |
+| R27 | Verification queries are one executable read-only SELECT statement. | `ValidatorStaticTest.test_query_lexer_rejects_multiple_and_write_statements` |
+| R28 | Canonical query result projections are exact. | `PostgreSQLContractIntegrationTest.test_canonical_query_result_shapes_and_non_empty_fixture_rows` |
+| R29 | PostgreSQL routine inventory covers the complete public routine boundary. | `PostgreSQLContractIntegrationTest.test_actual_routine_inventory_has_no_stock_provider_exception` |
+| R30 | Provider routine exception is bounded and PUBLIC-only. | `PostgreSQLContractIntegrationTest.test_provider_show_db_tree_is_only_bounded_exception` |
+| R31 | Migrated trigger dependencies match routine classification. | `PostgreSQLContractIntegrationTest.test_trigger_dependencies_match_migrated_routine_classification` |
+| R32 | Runtime table operations still enforce trigger invariants after PUBLIC EXECUTE revoke. | `PostgreSQLContractIntegrationTest.test_trigger_enforcement_runs_under_runtime_authority_after_public_revoke` |
+| R33 | Direct runtime calls to both trigger functions fail with 42501. | `PostgreSQLContractIntegrationTest.test_direct_runtime_calls_to_both_trigger_functions_are_denied_42501` |
+| R34 | The positive effective privilege matrix matches the manifest exactly. | `PostgreSQLContractIntegrationTest.test_effective_runtime_table_privileges_match_manifest_exactly` |
+| R35 | Every required matrix mismatch class is isolated and rejected. | `PostgreSQLContractIntegrationTest.test_effective_runtime_matrix_missing_privilege_is_rejected` |
+| R36 | Effective database and schema privilege boundaries are exact. | `PostgreSQLContractIntegrationTest.test_public_connect_and_database_schema_acl_posture_is_exact` |
+| R37 | Default ACL adversarial grants and real grant options are detected. | `PostgreSQLContractIntegrationTest.test_default_acl_adversarial_fixtures_detect_runtime_public_and_grant_option` |
+| R38 | Cleanup restores PUBLIC ACL baselines and surfaces early failures. | `PostgreSQLContractIntegrationTest.test_early_failure_cleanup_restores_public_acl_baseline` |
 
 ## Deterministic cleanup and discovery receipt
 
@@ -227,10 +332,11 @@ The deterministic discovery receipt for this amendment is:
 
 | Receipt item | Count |
 |---|---:|
-| Discovered test methods | 55 |
-| Static and validator methods | 37 |
-| PostgreSQL methods | 18 |
-| Hosted executions | 55 |
+| Discovered test methods | 76 |
+| Static and validator methods | 42 |
+| PostgreSQL methods | 31 |
+| Requirement-map and documentation parity methods | 3 |
+| Hosted executions | 76 |
 | Hosted skips | 0 |
 | Unique locked requirement IDs | 38 (`R01`-`R38`) |
 

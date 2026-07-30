@@ -1,10 +1,11 @@
 """Runtime privilege contract tests.
 
 Deterministic discovery receipt for this amendment:
-  discovered methods: 55
-  static and validator methods: 37
-  PostgreSQL methods: 18
-  hosted executions: 55
+  discovered methods: 76
+  static and validator methods: 42
+  PostgreSQL methods: 31
+  requirement-map and documentation parity methods: 3
+  hosted executions: 76
   hosted skips: 0
   unique locked requirement IDs: 38 (R01-R38)
 
@@ -34,6 +35,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.validate_runtime_privilege_contract import (  # noqa: E402
+    LOCKED_PRIVILEGE_MATRIX,
+    SQLLexError,
+    lex_sql,
     validate_manifest_strictly,
 )
 from webapp.postgres_migrations import (  # noqa: E402
@@ -104,6 +108,64 @@ def _fixture_json(manifest: dict[str, Any]) -> str:
     return json.dumps(manifest, ensure_ascii=True, sort_keys=True)
 
 
+REQUIREMENT_IDS = tuple(f"R{index:02d}" for index in range(1, 39))
+REQUIREMENT_EVIDENCE: dict[str, dict[str, str]] = {
+    "R01": {"requirement": "Schema version is locked to v1.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_schema_version_is_1"},
+    "R02": {"requirement": "Manifest binds to the canonical repository revision and tree.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_repository_binding"},
+    "R03": {"requirement": "Runtime role attributes are dormant and restricted.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_runtime_role_attributes"},
+    "R04": {"requirement": "Runtime role has no memberships, ownership, or grant options.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_runtime_role_no_memberships_no_ownership"},
+    "R05": {"requirement": "Migrator cannot create roles.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_migrator_cannot_create_roles"},
+    "R06": {"requirement": "Forbidden maintenance role is classified.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_sqag_maintenance_is_forbidden"},
+    "R07": {"requirement": "Production migrations, digests, and table bindings match repository authority.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_production_migrations_match_repository"},
+    "R08": {"requirement": "The complete table inventory is 16 objects.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_all_tables_union_is_16"},
+    "R09": {"requirement": "The runtime-accessible table set is exact.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_runtime_accessible_table_set_is_exact"},
+    "R10": {"requirement": "The forbidden table set is exact.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_forbidden_table_set_is_exact"},
+    "R11": {"requirement": "Every runtime table privilege tuple matches the locked matrix.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_runtime_accessible_table_privileges_are_exact"},
+    "R12": {"requirement": "No user-defined public sequence has runtime privilege.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_sequence_count_is_0"},
+    "R13": {"requirement": "Routine inventory contains the two SQAG routines and one bounded provider exception.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_routine_inventory_is_two_sqag_plus_one_provider"},
+    "R14": {"requirement": "SQAG routines are trigger-only invoker routines with no direct runtime grant.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_sqag_trigger_routines_are_trigger_only"},
+    "R15": {"requirement": "Database and schema ACL targets are exact.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_database_and_schema_acl_targets"},
+    "R16": {"requirement": "Default-privilege targets are grantee-aware and provider defaults are unchanged.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_default_privileges_are_grantee_aware"},
+    "R17": {"requirement": "All canonical verification-query keys are present.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_verification_queries_are_complete"},
+    "R18": {"requirement": "The unmodified manifest passes strict validation.", "evidence_type": "static", "evidence": "ValidatorStaticTest.test_valid_manifest_passes"},
+    "R19": {"requirement": "Duplicate JSON keys fail closed.", "evidence_type": "static", "evidence": "ValidatorStaticTest.test_duplicate_json_key_fixture_fails"},
+    "R20": {"requirement": "Recursive unknown-key violations fail closed.", "evidence_type": "static", "evidence": "ValidatorStaticTest.test_nested_unknown_key_fixture_fails"},
+    "R21": {"requirement": "Provider routine exception set cannot be broadened.", "evidence_type": "static", "evidence": "ValidatorStaticTest.test_extra_provider_exception_fixture_fails"},
+    "R22": {"requirement": "Missing migration table bindings fail closed.", "evidence_type": "static", "evidence": "ValidatorStaticTest.test_missing_migration_table_binding_fixture_fails"},
+    "R23": {"requirement": "Contradictory PUBLIC database ACL values fail closed.", "evidence_type": "static", "evidence": "ValidatorStaticTest.test_incorrect_public_temporary_fixture_fails"},
+    "R24": {"requirement": "Contradictory runtime role attributes fail closed.", "evidence_type": "static", "evidence": "ValidatorStaticTest.test_incorrect_runtime_connection_limit_fixture_fails"},
+    "R25": {"requirement": "Canonical verification queries have bounded lexical shape.", "evidence_type": "static", "evidence": "ValidatorStaticTest.test_canonical_verification_queries_pass_lexical_shape"},
+    "R26": {"requirement": "Comment, literal, and dollar-quote no-op tokens cannot satisfy query validation.", "evidence_type": "static", "evidence": "ValidatorStaticTest.test_query_lexer_rejects_comment_literal_and_dollar_noops"},
+    "R27": {"requirement": "Verification queries are one executable read-only SELECT statement.", "evidence_type": "static", "evidence": "ValidatorStaticTest.test_query_lexer_rejects_multiple_and_write_statements"},
+    "R28": {"requirement": "Canonical query result projections are exact.", "evidence_type": "postgresql", "evidence": "PostgreSQLContractIntegrationTest.test_canonical_query_result_shapes_and_non_empty_fixture_rows"},
+    "R29": {"requirement": "PostgreSQL routine inventory covers the complete public routine boundary.", "evidence_type": "postgresql", "evidence": "PostgreSQLContractIntegrationTest.test_actual_routine_inventory_has_no_stock_provider_exception"},
+    "R30": {"requirement": "Provider routine exception is bounded and PUBLIC-only.", "evidence_type": "postgresql", "evidence": "PostgreSQLContractIntegrationTest.test_provider_show_db_tree_is_only_bounded_exception"},
+    "R31": {"requirement": "Migrated trigger dependencies match routine classification.", "evidence_type": "postgresql", "evidence": "PostgreSQLContractIntegrationTest.test_trigger_dependencies_match_migrated_routine_classification"},
+    "R32": {"requirement": "Runtime table operations still enforce trigger invariants after PUBLIC EXECUTE revoke.", "evidence_type": "postgresql", "evidence": "PostgreSQLContractIntegrationTest.test_trigger_enforcement_runs_under_runtime_authority_after_public_revoke"},
+    "R33": {"requirement": "Direct runtime calls to both trigger functions fail with 42501.", "evidence_type": "postgresql", "evidence": "PostgreSQLContractIntegrationTest.test_direct_runtime_calls_to_both_trigger_functions_are_denied_42501"},
+    "R34": {"requirement": "The positive effective privilege matrix matches the manifest exactly.", "evidence_type": "postgresql", "evidence": "PostgreSQLContractIntegrationTest.test_effective_runtime_table_privileges_match_manifest_exactly"},
+    "R35": {"requirement": "Every required matrix mismatch class is isolated and rejected.", "evidence_type": "postgresql", "evidence": "PostgreSQLContractIntegrationTest.test_effective_runtime_matrix_missing_privilege_is_rejected"},
+    "R36": {"requirement": "Effective database and schema privilege boundaries are exact.", "evidence_type": "postgresql", "evidence": "PostgreSQLContractIntegrationTest.test_public_connect_and_database_schema_acl_posture_is_exact"},
+    "R37": {"requirement": "Default ACL adversarial grants and real grant options are detected.", "evidence_type": "postgresql", "evidence": "PostgreSQLContractIntegrationTest.test_default_acl_adversarial_fixtures_detect_runtime_public_and_grant_option"},
+    "R38": {"requirement": "Cleanup restores PUBLIC ACL baselines and surfaces early failures.", "evidence_type": "postgresql", "evidence": "PostgreSQLContractIntegrationTest.test_early_failure_cleanup_restores_public_acl_baseline"},
+}
+
+
+def _discover_test_method_names() -> set[str]:
+    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+    names: set[str] = set()
+
+    def visit(item: unittest.TestSuite | unittest.TestCase) -> None:
+        if isinstance(item, unittest.TestSuite):
+            for child in item:
+                visit(child)
+        else:
+            names.add(f"{item.__class__.__name__}.{item._testMethodName}")
+
+    visit(suite)
+    return names
+
+
 class ManifestStructureTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -171,6 +233,13 @@ class ManifestStructureTest(unittest.TestCase):
         self.assertEqual(actual, ALL_TABLES)
         self.assertEqual(len(actual), 16)
         self.assertFalse(set(self.manifest["tables"]["runtime_accessible"]) & set(self.manifest["tables"]["runtime_forbidden"]))
+
+    def test_runtime_accessible_table_privileges_are_exact(self) -> None:
+        actual = {
+            table_name: dict(entry["privileges"])
+            for table_name, entry in self.manifest["tables"]["runtime_accessible"].items()
+        }
+        self.assertEqual(actual, LOCKED_PRIVILEGE_MATRIX)
 
     def test_no_runtime_table_has_grant_option(self) -> None:
         for entry in self.manifest["tables"]["runtime_accessible"].values():
@@ -339,6 +408,149 @@ class ValidatorStaticTest(unittest.TestCase):
             "verification_query_routine_acl_must_not_prefix_filter_routines",
         )
 
+    def _assert_query_fixture_rejected(self, query_key: str, query: str, expected_error: str) -> None:
+        manifest = self._mutated_fixture(lambda m: m["verification_queries"].update({query_key: query}))
+        self._assert_fixture_rejected(json.dumps(manifest), expected_error)
+
+    def test_canonical_verification_queries_pass_lexical_shape(self) -> None:
+        manifest = load_manifest()
+        self.assertEqual(validate_manifest_strictly(str(MANIFEST_PATH)), 0)
+        for key in ("default_acl", "routine_acl"):
+            self.assertTrue(lex_sql(manifest["verification_queries"][key]))
+
+    def test_query_lexer_rejects_comment_literal_and_dollar_noops(self) -> None:
+        fixtures = {
+            "default_acl": [
+                "select 1 /* pg_catalog.pg_default_acl defaclrole defaclnamespace defaclobjtype defaclacl privilege_type is_grantable grantee owner namespace order by cross join lateral aclexplode( case when expanded.grantee = 0 then 'PUBLIC' left join pg_catalog.pg_roles defaclobjtype in ('r', 'S', 'f') */",
+                "select 1 -- pg_catalog.pg_default_acl defaclrole defaclnamespace defaclobjtype defaclacl privilege_type is_grantable grantee owner namespace order by cross join lateral aclexplode( case when expanded.grantee = 0 then 'PUBLIC' left join pg_catalog.pg_roles defaclobjtype in ('r', 'S', 'f')\n",
+                "select 'pg_catalog.pg_default_acl defaclrole defaclnamespace defaclobjtype defaclacl privilege_type is_grantable grantee owner namespace order by cross join lateral aclexplode( case when expanded.grantee = 0 then PUBLIC left join pg_catalog.pg_roles defaclobjtype in (r, S, f)'",
+                'select "pg_catalog.pg_default_acl defaclrole defaclnamespace defaclobjtype defaclacl privilege_type is_grantable grantee owner namespace order by cross join lateral aclexplode case when expanded.grantee left join pg_catalog.pg_roles"',
+                "select $$pg_catalog.pg_default_acl defaclrole defaclnamespace defaclobjtype defaclacl privilege_type is_grantable grantee owner namespace order by cross join lateral aclexplode( case when expanded.grantee = 0 then PUBLIC left join pg_catalog.pg_roles defaclobjtype in (r, S, f)$$",
+            ],
+            "routine_acl": [
+                "select 1 /* pg_catalog.pg_proc pg_catalog.pg_namespace pg_catalog.pg_roles pg_catalog.pg_trigger pg_get_function_identity_arguments proname proacl proowner prosecdef prokind tgfoid tgisinternal order by nspname = 'public' p.prokind in ('f', 'p', 'a', 'w') */",
+                "select 1 -- pg_catalog.pg_proc pg_catalog.pg_namespace pg_catalog.pg_roles pg_catalog.pg_trigger pg_get_function_identity_arguments proname proacl proowner prosecdef prokind tgfoid tgisinternal order by nspname = 'public' p.prokind in ('f', 'p', 'a', 'w')\n",
+                "select 'pg_catalog.pg_proc pg_catalog.pg_namespace pg_catalog.pg_roles pg_catalog.pg_trigger pg_get_function_identity_arguments proname proacl proowner prosecdef prokind tgfoid tgisinternal order by nspname = public p.prokind in (f, p, a, w)'",
+                'select "pg_catalog.pg_proc pg_catalog.pg_namespace pg_catalog.pg_roles pg_catalog.pg_trigger pg_get_function_identity_arguments proname proacl proowner prosecdef prokind tgfoid tgisinternal order by nspname p.prokind"',
+                "select $$pg_catalog.pg_proc pg_catalog.pg_namespace pg_catalog.pg_roles pg_catalog.pg_trigger pg_get_function_identity_arguments proname proacl proowner prosecdef prokind tgfoid tgisinternal order by nspname = public p.prokind in (f, p, a, w)$$",
+            ],
+        }
+        for query_key, query_variants in fixtures.items():
+            for query in query_variants:
+                manifest = self._mutated_fixture(lambda m, key=query_key, value=query: m["verification_queries"].update({key: value}))
+                stderr = io.StringIO()
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as fh:
+                    json.dump(manifest, fh)
+                    path = fh.name
+                try:
+                    with redirect_stderr(stderr):
+                        result = validate_manifest_strictly(path)
+                    self.assertEqual(result, 2, f"{query_key} no-op unexpectedly passed")
+                finally:
+                    Path(path).unlink(missing_ok=True)
+
+        for query_key, required_feature in (
+            ("database_acl", "pg_catalog.pg_database"),
+            ("schema_acl", "pg_catalog.pg_namespace"),
+            ("table_acl", "pg_catalog.pg_class"),
+            ("role_attributes", "pg_catalog.pg_roles"),
+            ("role_memberships", "pg_catalog.pg_auth_members"),
+            ("sequence_acl", "pg_catalog.pg_class"),
+            ("effective_runtime_schema_privileges", "has_schema_privilege"),
+            ("effective_runtime_routine_privileges", "has_function_privilege"),
+            ("effective_runtime_table_privileges", "has_table_privilege"),
+        ):
+            self._assert_query_fixture_rejected(
+                query_key,
+                f"select '{required_feature} datacl relacl public execute has_table_privilege'",
+                f"verification_query_{query_key}_missing_semantic_feature_{required_feature}",
+            )
+
+    def test_query_lexer_rejects_multiple_and_write_statements(self) -> None:
+        canonical_default = load_manifest()["verification_queries"]["default_acl"]
+        canonical_routine = load_manifest()["verification_queries"]["routine_acl"]
+        for query_key, canonical in (("default_acl", canonical_default), ("routine_acl", canonical_routine)):
+            self._assert_query_fixture_rejected(
+                query_key,
+                canonical + "; select 1",
+                f"verification_query_{query_key}_must_be_single_executable_statement",
+            )
+            self._assert_query_fixture_rejected(
+                query_key,
+                canonical.replace("select ", "update ", 1),
+                f"verification_query_{query_key}_must_be_single_read_only_select",
+            )
+
+    def test_query_lexer_rejects_unterminated_and_wrong_projection_fixtures(self) -> None:
+        manifest = load_manifest()
+        default_query = manifest["verification_queries"]["default_acl"]
+        routine_query = manifest["verification_queries"]["routine_acl"]
+        self._assert_query_fixture_rejected(
+            "default_acl",
+            default_query + " /* unterminated",
+            "verification_query_default_acl_lexical_error_unterminated_block_comment",
+        )
+        self._assert_query_fixture_rejected(
+            "routine_acl",
+            routine_query + " $$unterminated",
+            "verification_query_routine_acl_lexical_error_unterminated_dollar_quote",
+        )
+        with self.assertRaises(SQLLexError):
+            lex_sql("select $$unterminated")
+        self._assert_query_fixture_rejected(
+            "default_acl",
+            default_query.replace("select owner.rolname as owner", "select 1 as owner", 1),
+            "verification_query_default_acl_projection_0_missing_expected_expression",
+        )
+        self._assert_query_fixture_rejected(
+            "default_acl",
+            default_query.replace("pg_default_acl", "pg_class", 1),
+            "verification_query_default_acl_must_read_pg_default_acl",
+        )
+        self._assert_query_fixture_rejected(
+            "default_acl",
+            default_query.replace("cross join lateral pg_catalog.aclexplode", "join pg_catalog.aclexplode", 1),
+            "verification_query_default_acl_requires_exactly_one_cross_join_lateral_aclexplode",
+        )
+        self._assert_query_fixture_rejected(
+            "default_acl",
+            default_query.replace("expanded.is_grantable", "expanded.grantable_missing"),
+            "verification_query_default_acl_missing_semantic_feature_is_grantable",
+        )
+        self._assert_query_fixture_rejected(
+            "default_acl",
+            default_query.replace("case when expanded.grantee = 0 then 'PUBLIC'", "case when expanded.grantee = 0 then 'PRIVATE'", 1),
+            "verification_query_default_acl_projection_grantee_missing_public_mapping",
+        )
+
+
+class RequirementEvidenceMapTest(unittest.TestCase):
+    def test_requirement_evidence_map_is_exact_and_discoverable(self) -> None:
+        self.assertEqual(tuple(REQUIREMENT_EVIDENCE), REQUIREMENT_IDS)
+        self.assertEqual(len(REQUIREMENT_EVIDENCE), 38)
+        discovered = _discover_test_method_names()
+        for requirement_id, entry in REQUIREMENT_EVIDENCE.items():
+            self.assertEqual(set(entry), {"requirement", "evidence_type", "evidence"}, requirement_id)
+            self.assertTrue(entry["requirement"].strip(), requirement_id)
+            self.assertIn(entry["evidence_type"], {"static", "postgresql", "documentation"}, requirement_id)
+            self.assertIn(entry["evidence"], discovered, requirement_id)
+
+    def test_documentation_requirement_ids_match_canonical_map(self) -> None:
+        documentation = (ROOT / "docs" / "runtime-privilege-contract.md").read_text(encoding="utf-8")
+        documented_ids = re.findall(r"^\|\s*(R\d{2})\s*\|", documentation, flags=re.MULTILINE)
+        self.assertEqual(documented_ids, list(REQUIREMENT_IDS))
+
+    def test_ci_status_document_matches_runtime_contract_workflow_gate(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        documentation = (ROOT / "docs" / "current-cicd-status.md").read_text(encoding="utf-8")
+        self.assertIn("- name: Validate runtime privilege contract", workflow)
+        self.assertIn("run: python scripts/validate_runtime_privilege_contract.py", workflow)
+        self.assertIn("Runtime privilege-contract static validation", documentation)
+        self.assertIn("Disposable PostgreSQL 17 runtime privilege-contract tests run with zero hosted skips", documentation)
+        self.assertIn("Boundary A remains repository-only", documentation)
+        self.assertIn("Green CI does not authorise Boundary B or #160", documentation)
+        self.assertNotIn("green CI authorises Boundary B", documentation.lower())
+
 
 @unittest.skipUnless(postgres_test_conninfo(), "isolated PostgreSQL test service is not configured")
 class PostgreSQLContractIntegrationTest(unittest.TestCase):
@@ -420,6 +632,12 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.database_name = self._create_database()
+        self._public_database_baseline = {
+            privilege: self._has_database_privilege("public", privilege)
+            for privilege in ("CONNECT", "CREATE", "TEMPORARY")
+        }
+        self._public_function_baselines: dict[str, bool] = {}
+        self._public_function_restoration_receipts: dict[str, bool] = {}
         self.addCleanup(self._audit_and_drop_database)
         self._create_role("sqag_migrator")
         self._grant_database_privilege("sqag_migrator", "CONNECT")
@@ -497,6 +715,11 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
     def _audit_and_drop_database(self) -> None:
         errors: list[str] = []
         connection: PostgresConnectionAdapter | None = None
+        try:
+            self._audit_public_acl_baseline()
+        except Exception as exc:
+            errors.append(f"public_acl_baseline_audit_failed:{exc}")
+
         try:
             connection = self.connect()
             leftover_roles = connection.execute(
@@ -631,8 +854,62 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             connection.rollback()
             connection.close()
 
+    def _public_database_acl_snapshot(self) -> dict[str, bool]:
+        return {
+            privilege: self._has_database_privilege("public", privilege)
+            for privilege in ("CONNECT", "CREATE", "TEMPORARY")
+        }
+
+    def _function_exists(self, function_name: str) -> bool:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "select exists (select 1 from pg_catalog.pg_proc p "
+                "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+                "where n.nspname = 'public' and p.proname = %s "
+                "and pg_get_function_identity_arguments(p.oid) = '') as present",
+                (function_name,),
+            ).fetchone()
+            return bool(_row_dict(row, "present"))
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def _public_function_acl_snapshot(self, function_names: set[str] | None = None) -> dict[str, bool]:
+        names = function_names or set(self._public_function_baselines)
+        return {
+            name: self._public_function_execute(name)
+            for name in sorted(names)
+            if self._function_exists(name)
+        }
+
+    def _assert_public_acl_baseline_values(
+        self,
+        expected_database: dict[str, bool],
+        actual_database: dict[str, bool],
+        expected_functions: dict[str, bool],
+        actual_functions: dict[str, bool],
+    ) -> None:
+        self.assertEqual(actual_database, expected_database, "PUBLIC database ACL baseline drifted")
+        self.assertEqual(actual_functions, expected_functions, "PUBLIC routine EXECUTE baseline drifted")
+
+    def _audit_public_acl_baseline(self) -> None:
+        expected_functions: dict[str, bool] = {}
+        for name, expected in self._public_function_baselines.items():
+            if self._function_exists(name):
+                expected_functions[name] = expected
+            elif not self._public_function_restoration_receipts.get(name, False):
+                raise AssertionError(f"PUBLIC routine baseline disappeared without restoration receipt: {name}")
+        actual_functions = self._public_function_acl_snapshot(set(expected_functions))
+        self._assert_public_acl_baseline_values(
+            self._public_database_baseline,
+            self._public_database_acl_snapshot(),
+            expected_functions,
+            actual_functions,
+        )
+
     def _alter_public_database_privilege(self, privilege: str, grant: bool) -> None:
-        before = self._has_database_privilege("public", privilege)
+        before = self._public_database_baseline[privilege]
         connection = self.connect()
         try:
             verb = "grant" if grant else "revoke"
@@ -664,15 +941,36 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             connection.rollback()
             connection.close()
 
-    def _revoke_public_execute(self, function_name: str) -> None:
+    def _has_function_privilege(self, grantee: str, function_name: str) -> bool:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "select has_function_privilege(%s, %s, 'EXECUTE') as allowed",
+                (grantee, f"public.{function_name}()"),
+            ).fetchone()
+            return bool(_row_dict(row, "allowed"))
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def _call_function_as_role(self, role_name: str, function_name: str) -> object:
+        with self.as_role(role_name) as connection:
+            row = connection.execute(
+                f"select public.{_quote_identifier(function_name)}() as result"
+            ).fetchone()
+            return _row_dict(row, "result")
+
+    def _revoke_public_execute(self, function_name: str, *, register_cleanup: bool = True) -> None:
         before = self._public_function_execute(function_name)
+        self._public_function_baselines.setdefault(function_name, before)
         connection = self.connect()
         try:
             connection.execute(f"revoke execute on function public.{_quote_identifier(function_name)}() from public")
             connection.commit()
         finally:
             connection.close()
-        self.addCleanup(self._restore_public_execute, function_name, before)
+        if register_cleanup:
+            self.addCleanup(self._restore_public_execute, function_name, before)
 
     def _restore_public_execute(self, function_name: str, expected: bool) -> None:
         connection = self.connect()
@@ -683,6 +981,14 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             connection.commit()
         finally:
             connection.close()
+
+    def _restore_and_drop_public_function(self, function_name: str, expected: bool) -> None:
+        self._restore_public_execute(function_name, expected)
+        self.assertEqual(self._public_function_execute(function_name), expected)
+        self._public_function_restoration_receipts[function_name] = True
+        self._cleanup_steps(
+            [(f"drop_{function_name}", f"drop function public.{_quote_identifier(function_name)}()")]
+        )
 
     def apply_migrations(self) -> None:
         migrations = migration_manifest(ROOT / "migrations")
@@ -738,6 +1044,12 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             connection.rollback()
             connection.close()
 
+    def _assert_expected_provider_default_tuples(
+        self, snapshot: set[tuple[Any, ...]], expected: set[tuple[Any, ...]]
+    ) -> None:
+        missing = expected - snapshot
+        self.assertEqual(missing, set(), f"provider default baseline missing intended tuples: {missing}")
+
     def _alter_default_privilege(
         self,
         owner_name: str,
@@ -791,6 +1103,16 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         rows = self._default_acl_snapshot()
         leftovers = [row for row in rows if row[0] in role_names or row[3] in role_names]
         self.assertEqual(leftovers, [], f"default ACL cleanup left rows: {leftovers}")
+
+    def _execute_contract_query(self, query_key: str) -> tuple[list[str], list[dict[str, Any]]]:
+        connection = self.connect()
+        try:
+            cursor = connection.execute(self.contract["verification_queries"][query_key])
+            columns = [column.name if hasattr(column, "name") else column[0] for column in cursor.description]
+            return columns, [dict(row) for row in cursor.fetchall()]
+        finally:
+            connection.rollback()
+            connection.close()
 
     def _routine_inventory(self) -> list[dict[str, Any]]:
         connection = self.connect()
@@ -928,6 +1250,37 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.assertFalse({row[1] for row in actual} & set(self.contract["tables"]["runtime_forbidden"]))
         self.assertFalse(any(row[3] for row in actual), f"grant options found: {actual}")
 
+    def _execute_admin_sql(self, sql: str) -> None:
+        connection = self.connect()
+        try:
+            connection.execute(sql)
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _new_exact_matrix_role(self, purpose: str) -> str:
+        self.apply_migrations()
+        role_name = self._new_role(purpose)
+        self._grant_database_privilege(role_name, "CONNECT")
+        self._grant_schema_privilege(role_name, "USAGE")
+        for table_name, entry in self.contract["tables"]["runtime_accessible"].items():
+            for privilege, allowed in entry["privileges"].items():
+                if allowed:
+                    self._grant_table_privilege(role_name, table_name, privilege.upper())
+        self._assert_exact_runtime_matrix(role_name)
+        return role_name
+
+    def _assert_isolated_matrix_mismatch(
+        self,
+        role_name: str,
+        expected_symmetric_diff: set[tuple[str, str, str, bool]],
+    ) -> None:
+        expected = self._expected_runtime_grants()
+        actual = self._effective_table_grants(role_name)
+        self.assertEqual(actual ^ expected, expected_symmetric_diff)
+        with self.assertRaises(AssertionError):
+            self._assert_exact_runtime_matrix(role_name)
+
     def test_actual_table_inventory_equals_manifest(self) -> None:
         self.apply_migrations()
         connection = self.connect()
@@ -955,6 +1308,56 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             connection.rollback()
             connection.close()
         self.assertEqual(actual, set())
+
+    def test_canonical_query_result_shapes_and_non_empty_fixture_rows(self) -> None:
+        owner_name = self._new_role("query_owner")
+        grantee_name = self._new_role("query_grantee")
+        self._alter_default_privilege(owner_name, grantee_name, "SELECT", "TABLES")
+        self.apply_migrations()
+
+        default_columns, default_rows = self._execute_contract_query("default_acl")
+        self.assertEqual(
+            default_columns,
+            ["owner", "namespace", "object_type", "grantee", "privilege_type", "is_grantable"],
+        )
+        self.assertTrue(default_rows)
+        self.assertIn(
+            {
+                "owner": owner_name,
+                "namespace": "public",
+                "object_type": "r",
+                "grantee": grantee_name,
+                "privilege_type": "SELECT",
+                "is_grantable": False,
+            },
+            default_rows,
+        )
+
+        routine_columns, routine_rows = self._execute_contract_query("routine_acl")
+        self.assertEqual(
+            routine_columns,
+            [
+                "proname",
+                "identity_arguments",
+                "prokind",
+                "prosecdef",
+                "proacl",
+                "proowner",
+                "owner",
+                "has_trigger_dependency",
+            ],
+        )
+        self.assertTrue(routine_rows)
+        routine_by_name = {str(row["proname"]): row for row in routine_rows}
+        self.assertTrue(set(EXPECTED_ROUTINES) <= set(routine_by_name))
+        for routine_name in EXPECTED_ROUTINES:
+            row = routine_by_name[routine_name]
+            self.assertIsInstance(row["identity_arguments"], str)
+            self.assertEqual(row["prokind"], "f")
+            self.assertIs(row["prosecdef"], False)
+            self.assertIsInstance(row["proowner"], int)
+            self.assertEqual(row["owner"], "sqag_migrator")
+            self.assertIs(row["has_trigger_dependency"], True)
 
     def test_actual_routine_inventory_has_no_stock_provider_exception(self) -> None:
         runtime_name = self._new_role("routine_inventory")
@@ -987,6 +1390,8 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
     def test_provider_show_db_tree_is_only_bounded_exception(self) -> None:
         runtime_name = self._new_role("provider_runtime")
         provider_name = self._create_role("neondb_owner")
+        self._grant_database_privilege(runtime_name, "CONNECT")
+        self._grant_schema_privilege(runtime_name, "USAGE")
         self._grant_schema_privilege(provider_name, "CREATE")
         connection = self.connect()
         try:
@@ -997,14 +1402,28 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         finally:
             connection.close()
         before_public_execute = self._public_function_execute("show_db_tree")
+        self._public_function_baselines["show_db_tree"] = before_public_execute
+        self.assertTrue(before_public_execute)
+        self.assertTrue(self._has_function_privilege(runtime_name, "show_db_tree"))
+        self.assertEqual(self._call_function_as_role(runtime_name, "show_db_tree"), {})
+        self._revoke_public_execute("show_db_tree", register_cleanup=False)
+        self.assertFalse(self._has_function_privilege(runtime_name, "show_db_tree"))
+        with self.assertRaises(Exception) as denied:
+            self._call_function_as_role(runtime_name, "show_db_tree")
+        self.assertEqual(getattr(denied.exception, "sqlstate", None), "42501")
+        self._restore_public_execute("show_db_tree", before_public_execute)
+        self.assertTrue(self._has_function_privilege(runtime_name, "show_db_tree"))
+        self.assertEqual(self._call_function_as_role(runtime_name, "show_db_tree"), {})
         self.addCleanup(
-            self._cleanup_steps,
-            [("drop_show_db_tree", "drop function public.show_db_tree()")],
+            self._restore_and_drop_public_function,
+            "show_db_tree",
+            before_public_execute,
         )
         self.apply_migrations()
         rows = self._assert_routine_inventory(provider_name=provider_name, runtime_name=runtime_name)
         provider_row = next(row for row in rows if row["proname"] == "show_db_tree")
         self.assertEqual(provider_row["owner"], "neondb_owner")
+        self.assertTrue(provider_row["public_execute"])
         self.assertEqual(self._public_function_execute("show_db_tree"), before_public_execute)
 
     def test_trigger_dependencies_match_migrated_routine_classification(self) -> None:
@@ -1143,26 +1562,186 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         for table_name in FORBIDDEN_TABLES:
             self.assertFalse(("public", table_name, "SELECT", False) in self._effective_table_grants(role_name))
 
-    def test_effective_runtime_matrix_rejects_swapped_missing_and_forbidden_grants(self) -> None:
-        self.apply_migrations()
-        role_name = self._new_role("matrix_negative")
-        self._grant_database_privilege(role_name, "CONNECT")
-        self._grant_schema_privilege(role_name, "USAGE")
-        for table_name, entry in self.contract["tables"]["runtime_accessible"].items():
-            for privilege, allowed in entry["privileges"].items():
-                if allowed:
-                    self._grant_table_privilege(role_name, table_name, privilege.upper())
+    def test_effective_runtime_matrix_missing_privilege_is_rejected(self) -> None:
+        role_name = self._new_exact_matrix_role("matrix_missing")
+        table_name = "sqag_profiles"
+        privilege = "DELETE"
+        self._execute_admin_sql(
+            f"revoke {privilege} on table {_quote_identifier(table_name)} from {_quote_identifier(role_name)}"
+        )
+        self.addCleanup(
+            self._cleanup_steps,
+            [("restore_missing_privilege", f"grant {privilege} on table {_quote_identifier(table_name)} to {_quote_identifier(role_name)}")],
+        )
+        self._assert_isolated_matrix_mismatch(role_name, {("public", table_name, privilege, False)})
+
+    def test_effective_runtime_matrix_extra_privilege_is_rejected(self) -> None:
+        role_name = self._new_exact_matrix_role("matrix_extra")
+        table_name = "sqag_generation_runs"
+        privilege = "DELETE"
+        self._grant_table_privilege(role_name, table_name, privilege)
+        self._assert_isolated_matrix_mismatch(role_name, {("public", table_name, privilege, False)})
+
+    def test_effective_runtime_matrix_moved_privilege_table_to_table_is_rejected(self) -> None:
+        role_name = self._new_exact_matrix_role("matrix_moved")
+        source_table = "sqag_object_artifacts"
+        target_table = "sqag_quote_publication_artifacts"
+        privilege = "UPDATE"
+        self._execute_admin_sql(
+            f"revoke {privilege} on table {_quote_identifier(source_table)} from {_quote_identifier(role_name)}"
+        )
+        self.addCleanup(
+            self._cleanup_steps,
+            [("restore_moved_source", f"grant {privilege} on table {_quote_identifier(source_table)} to {_quote_identifier(role_name)}")],
+        )
+        self._grant_table_privilege(role_name, target_table, privilege)
+        self._assert_isolated_matrix_mismatch(
+            role_name,
+            {
+                ("public", source_table, privilege, False),
+                ("public", target_table, privilege, False),
+            },
+        )
+
+    def test_effective_runtime_matrix_missing_privilege_offset_by_unrelated_extra_is_rejected(self) -> None:
+        role_name = self._new_exact_matrix_role("matrix_offset")
+        missing_table = "sqag_audit_events"
+        missing_privilege = "INSERT"
+        extra_table = "sqag_feedback_status_history"
+        extra_privilege = "UPDATE"
+        self._execute_admin_sql(
+            f"revoke {missing_privilege} on table {_quote_identifier(missing_table)} from {_quote_identifier(role_name)}"
+        )
+        self.addCleanup(
+            self._cleanup_steps,
+            [("restore_offset_missing", f"grant {missing_privilege} on table {_quote_identifier(missing_table)} to {_quote_identifier(role_name)}")],
+        )
+        self._grant_table_privilege(role_name, extra_table, extra_privilege)
+        self._assert_isolated_matrix_mismatch(
+            role_name,
+            {
+                ("public", missing_table, missing_privilege, False),
+                ("public", extra_table, extra_privilege, False),
+            },
+        )
+
+    def test_effective_runtime_matrix_forbidden_table_privilege_is_rejected(self) -> None:
+        role_name = self._new_exact_matrix_role("matrix_forbidden")
+        table_name = "sqag_legal_holds"
+        privilege = "SELECT"
+        self._grant_table_privilege(role_name, table_name, privilege)
+        self._assert_isolated_matrix_mismatch(role_name, {("public", table_name, privilege, False)})
+
+    def test_effective_runtime_matrix_real_grant_option_is_rejected(self) -> None:
+        role_name = self._new_exact_matrix_role("matrix_grant_option")
+        table_name = "sqag_profiles"
+        privilege = "SELECT"
+        table_ident = _quote_identifier(table_name)
+        role_ident = _quote_identifier(role_name)
+        self._execute_admin_sql(f"grant {privilege} on table {table_ident} to {role_ident} with grant option")
+        self.addCleanup(
+            self._cleanup_steps,
+            [
+                ("revoke_grant_option", f"revoke {privilege} on table {table_ident} from {role_ident}"),
+                ("restore_without_grant_option", f"grant {privilege} on table {table_ident} to {role_ident}"),
+            ],
+        )
+        self._assert_isolated_matrix_mismatch(
+            role_name,
+            {
+                ("public", table_name, privilege, False),
+                ("public", table_name, privilege, True),
+            },
+        )
+
+    def test_effective_runtime_matrix_unexpected_table_privilege_is_rejected(self) -> None:
+        role_name = self._new_exact_matrix_role("matrix_unexpected_table")
+        table_name = "sqag_rpc_unexpected_table"
+        role_ident = _quote_identifier(role_name)
+        table_ident = _quote_identifier(table_name)
         connection = self.connect()
         try:
-            connection.execute(f"revoke UPDATE on table {_quote_identifier('sqag_generation_runs')} from {_quote_identifier(role_name)}")
+            connection.execute("set role \"sqag_migrator\"")
+            connection.execute(f"create table {table_ident} (id integer not null)")
+            connection.execute("reset role")
             connection.commit()
         finally:
             connection.close()
-        self.addCleanup(self._grant_table_privilege, role_name, "sqag_generation_runs", "UPDATE")
-        self._grant_table_privilege(role_name, "sqag_generation_evidence", "UPDATE")
-        self._grant_table_privilege(role_name, "sqag_legal_holds", "SELECT")
-        with self.assertRaises(AssertionError):
-            self._assert_exact_runtime_matrix(role_name)
+        self._execute_admin_sql(f"grant SELECT on table {table_ident} to {role_ident}")
+        self.addCleanup(
+            self._cleanup_steps,
+            [
+                ("revoke_unexpected_table", f"revoke SELECT on table {table_ident} from {role_ident}"),
+                ("drop_unexpected_table", f"drop table {table_ident}"),
+            ],
+        )
+        self._assert_isolated_matrix_mismatch(role_name, {("public", table_name, "SELECT", False)})
+
+    def test_effective_runtime_matrix_missing_accessible_table_is_rejected(self) -> None:
+        role_name = self._new_exact_matrix_role("matrix_missing_table")
+        table_name = "sqag_feedback"
+        expected_missing = {
+            ("public", table_name, privilege, False)
+            for privilege in ("SELECT", "INSERT", "UPDATE")
+        }
+        self._execute_admin_sql(
+            f"revoke all privileges on table {_quote_identifier(table_name)} from {_quote_identifier(role_name)}"
+        )
+        self.addCleanup(
+            self._cleanup_steps,
+            [
+                (
+                    f"restore_{table_name}_{privilege}",
+                    f"grant {privilege} on table {_quote_identifier(table_name)} to {_quote_identifier(role_name)}",
+                )
+                for privilege in ("SELECT", "INSERT", "UPDATE")
+            ],
+        )
+        self._assert_isolated_matrix_mismatch(role_name, expected_missing)
+
+    def test_effective_runtime_matrix_wrong_privilege_type_on_correct_table_is_rejected(self) -> None:
+        role_name = self._new_exact_matrix_role("matrix_wrong_type")
+        table_name = "sqag_generation_evidence"
+        missing_privilege = "INSERT"
+        extra_privilege = "UPDATE"
+        self._execute_admin_sql(
+            f"revoke {missing_privilege} on table {_quote_identifier(table_name)} from {_quote_identifier(role_name)}"
+        )
+        self.addCleanup(
+            self._cleanup_steps,
+            [("restore_wrong_type_missing", f"grant {missing_privilege} on table {_quote_identifier(table_name)} to {_quote_identifier(role_name)}")],
+        )
+        self._grant_table_privilege(role_name, table_name, extra_privilege)
+        self._assert_isolated_matrix_mismatch(
+            role_name,
+            {
+                ("public", table_name, missing_privilege, False),
+                ("public", table_name, extra_privilege, False),
+            },
+        )
+
+    def test_effective_runtime_matrix_aggregate_counts_do_not_accept_wrong_distribution(self) -> None:
+        role_name = self._new_exact_matrix_role("matrix_counts")
+        missing_table = "sqag_profiles"
+        moved_table = "sqag_generation_runs"
+        privilege = "DELETE"
+        self._execute_admin_sql(
+            f"revoke {privilege} on table {_quote_identifier(missing_table)} from {_quote_identifier(role_name)}"
+        )
+        self.addCleanup(
+            self._cleanup_steps,
+            [("restore_count_distribution", f"grant {privilege} on table {_quote_identifier(missing_table)} to {_quote_identifier(role_name)}")],
+        )
+        self._grant_table_privilege(role_name, moved_table, privilege)
+        actual = self._effective_table_grants(role_name)
+        self.assertEqual(len(actual), len(self._expected_runtime_grants()))
+        self._assert_isolated_matrix_mismatch(
+            role_name,
+            {
+                ("public", missing_table, privilege, False),
+                ("public", moved_table, privilege, False),
+            },
+        )
 
     def test_forbidden_tables_have_no_effective_runtime_privilege(self) -> None:
         self.apply_migrations()
@@ -1191,6 +1770,36 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self._alter_public_database_privilege("TEMPORARY", False)
         self.assertFalse(self._has_database_privilege(role_name, "TEMPORARY"))
         self.assertFalse(self._has_database_privilege("public", "TEMPORARY"))
+
+    def test_public_acl_baseline_audit_detects_omitted_restoration(self) -> None:
+        privilege = "TEMPORARY"
+        expected = self._public_database_baseline[privilege]
+        self._execute_admin_sql(
+            f"grant {privilege} on database {_quote_identifier(self.database_name)} to public"
+            if not expected
+            else f"revoke {privilege} on database {_quote_identifier(self.database_name)} from public"
+        )
+        try:
+            with self.assertRaisesRegex(AssertionError, "PUBLIC database ACL baseline drifted"):
+                self._audit_public_acl_baseline()
+        finally:
+            self._restore_public_database_privilege(privilege, expected)
+
+    def test_early_failure_cleanup_restores_public_acl_baseline(self) -> None:
+        privilege = "TEMPORARY"
+        expected = self._public_database_baseline[privilege]
+        self._alter_public_database_privilege(privilege, not expected)
+        with self.assertRaisesRegex(RuntimeError, "synthetic early failure"):
+            try:
+                raise RuntimeError("synthetic early failure")
+            finally:
+                self._restore_public_database_privilege(privilege, expected)
+        self._assert_public_acl_baseline_values(
+            self._public_database_baseline,
+            self._public_database_acl_snapshot(),
+            {},
+            {},
+        )
 
     def test_runtime_grants_have_no_grant_options(self) -> None:
         self.apply_migrations()
@@ -1232,9 +1841,20 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self._alter_default_privilege(provider_name, grantee_name, "USAGE", "SEQUENCES")
         self._alter_default_privilege(provider_name, grantee_name, "EXECUTE", "FUNCTIONS")
         before = self._default_acl_snapshot(provider_name)
+        expected = {
+            (provider_name, "public", "r", grantee_name, "SELECT", False),
+            (provider_name, "public", "S", grantee_name, "USAGE", False),
+            (provider_name, "public", "f", grantee_name, "EXECUTE", False),
+        }
+        self._assert_expected_provider_default_tuples(before, expected)
         self.apply_migrations()
         after = self._default_acl_snapshot(provider_name)
         self.assertEqual(after, before)
+
+    def test_provider_default_baseline_absence_is_rejected(self) -> None:
+        expected = {("neondb_owner", "public", "r", "provider_grantee", "SELECT", False)}
+        with self.assertRaises(AssertionError):
+            self._assert_expected_provider_default_tuples(set(), expected)
 
 
 if __name__ == "__main__":

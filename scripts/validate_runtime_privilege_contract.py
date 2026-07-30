@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -210,8 +211,8 @@ ROLE_DESCRIPTIONS = {
 
 REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
     "database_acl": ("pg_catalog.pg_database", "datname", "datacl", "current_database"),
-    "schema_acl": ("pg_catalog.pg_namespace", "nspname", "nspacl", "public"),
-    "table_acl": ("pg_catalog.pg_class", "pg_catalog.pg_namespace", "relacl", "relkind", "public", "order by"),
+    "schema_acl": ("pg_catalog.pg_namespace", "nspname", "nspacl", "'public'"),
+    "table_acl": ("pg_catalog.pg_class", "pg_catalog.pg_namespace", "relacl", "relkind", "'public'", "order by"),
     "role_attributes": (
         "pg_catalog.pg_roles",
         "rolname",
@@ -222,8 +223,8 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
     ),
     "role_memberships": ("pg_catalog.pg_auth_members", "admin_option", "pg_catalog.pg_roles"),
     "sequence_acl": ("pg_catalog.pg_class", "relkind", "'s'", "pg_catalog.pg_namespace", "relacl"),
-    "effective_runtime_schema_privileges": ("has_schema_privilege", "public", "usage", "create"),
-    "effective_runtime_routine_privileges": ("has_function_privilege", "pg_catalog.pg_proc", "public", "execute"),
+    "effective_runtime_schema_privileges": ("has_schema_privilege", "'public'", "'usage'", "'create'"),
+    "effective_runtime_routine_privileges": ("has_function_privilege", "pg_catalog.pg_proc", "'public'", "'execute'"),
 }
 
 
@@ -623,21 +624,336 @@ def validate_default_privileges(manifest: dict[str, Any], errors: list[str]) -> 
     )
 
 
-def _normalized_sql(value: str) -> str:
-    return re.sub(r"\s+", " ", value.strip().lower())
+class SQLLexError(ValueError):
+    """Raised when a verification query cannot be lexed deterministically."""
+
+
+@dataclass(frozen=True)
+class SQLToken:
+    kind: str
+    value: str
+    position: int
+
+
+_DOLLAR_QUOTE_TAG = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$")
+_SQL_MULTI_SYMBOLS = ("::", "||", "<=", ">=", "<>", "!=", "=>", "->", "#>")
+_READ_ONLY_FORBIDDEN_WORDS = frozenset(
+    {
+        "insert",
+        "update",
+        "delete",
+        "merge",
+        "truncate",
+        "create",
+        "alter",
+        "drop",
+        "grant",
+        "revoke",
+        "comment",
+        "call",
+        "copy",
+        "begin",
+        "start",
+        "commit",
+        "rollback",
+        "abort",
+        "savepoint",
+        "release",
+        "set",
+        "set_config",
+        "reset",
+        "show",
+        "prepare",
+        "execute",
+        "do",
+        "vacuum",
+        "analyze",
+        "refresh",
+        "lock",
+        "listen",
+        "notify",
+        "discard",
+    }
+)
+
+
+def lex_sql(query: str) -> tuple[SQLToken, ...]:
+    """Tokenize only the bounded SQL needed by the read-only contract.
+
+    Comments and quoted bodies are represented as non-code tokens, so words
+    inside them cannot satisfy a catalog/query-shape assertion. This is a
+    lexer, not a general SQL parser.
+    """
+
+    if type(query) is not str:
+        raise SQLLexError("query_not_string")
+    tokens: list[SQLToken] = []
+    index = 0
+    length = len(query)
+    while index < length:
+        char = query[index]
+        if char.isspace():
+            index += 1
+            continue
+        if query.startswith("--", index):
+            newline = query.find("\n", index + 2)
+            index = length if newline < 0 else newline + 1
+            continue
+        if query.startswith("/*", index):
+            start = index
+            index += 2
+            depth = 1
+            while index < length and depth:
+                if query.startswith("/*", index):
+                    depth += 1
+                    index += 2
+                elif query.startswith("*/", index):
+                    depth -= 1
+                    index += 2
+                else:
+                    index += 1
+            if depth:
+                raise SQLLexError(f"unterminated_block_comment_at_{start}")
+            tokens.append(SQLToken("COMMENT", "", start))
+            continue
+        if char == "'":
+            start = index
+            index += 1
+            value: list[str] = []
+            closed = False
+            while index < length:
+                if query[index] == "\\" and index + 1 < length:
+                    value.extend((query[index], query[index + 1]))
+                    index += 2
+                elif query[index] == "'":
+                    if index + 1 < length and query[index + 1] == "'":
+                        value.append("'")
+                        index += 2
+                    else:
+                        index += 1
+                        closed = True
+                        break
+                else:
+                    value.append(query[index])
+                    index += 1
+            if not closed:
+                raise SQLLexError(f"unterminated_single_quote_at_{start}")
+            tokens.append(SQLToken("STRING", "".join(value), start))
+            continue
+        if char == '"':
+            start = index
+            index += 1
+            value = []
+            closed = False
+            while index < length:
+                if query[index] == '"':
+                    if index + 1 < length and query[index + 1] == '"':
+                        value.append('"')
+                        index += 2
+                    else:
+                        index += 1
+                        closed = True
+                        break
+                else:
+                    value.append(query[index])
+                    index += 1
+            if not closed:
+                raise SQLLexError(f"unterminated_double_quote_at_{start}")
+            tokens.append(SQLToken("QUOTED_IDENTIFIER", "".join(value), start))
+            continue
+        if char == "$":
+            match = _DOLLAR_QUOTE_TAG.match(query, index)
+            if match:
+                delimiter = match.group(0)
+                start = index
+                body_start = index + len(delimiter)
+                body_end = query.find(delimiter, body_start)
+                if body_end < 0:
+                    raise SQLLexError(f"unterminated_dollar_quote_at_{start}")
+                tokens.append(SQLToken("DOLLAR_QUOTE", query[body_start:body_end], start))
+                index = body_end + len(delimiter)
+                continue
+        if char.isalpha() or char == "_":
+            start = index
+            index += 1
+            while index < length and (query[index].isalnum() or query[index] in {"_", "$"}):
+                index += 1
+            tokens.append(SQLToken("WORD", query[start:index], start))
+            continue
+        if char.isdigit():
+            start = index
+            index += 1
+            while index < length and (query[index].isdigit() or query[index] == "."):
+                index += 1
+            tokens.append(SQLToken("NUMBER", query[start:index], start))
+            continue
+        matched_symbol = next((symbol for symbol in _SQL_MULTI_SYMBOLS if query.startswith(symbol, index)), None)
+        if matched_symbol is not None:
+            tokens.append(SQLToken("SYMBOL", matched_symbol, index))
+            index += len(matched_symbol)
+            continue
+        tokens.append(SQLToken("SYMBOL", char, index))
+        index += 1
+    return tuple(tokens)
+
+
+def _token_is_word(token: SQLToken, value: str) -> bool:
+    return token.kind == "WORD" and token.value.lower() == value.lower()
+
+
+def _token_matches(token: SQLToken, expected: str | tuple[str, str]) -> bool:
+    if isinstance(expected, tuple):
+        kind, value = expected
+        if kind == "STRING_EXACT":
+            return token.kind == "STRING" and token.value == value
+        if kind == "STRING":
+            return token.kind == "STRING" and token.value.lower() == value.lower()
+        return token.kind == kind and token.value.lower() == value.lower()
+    if token.kind == "WORD":
+        return token.value.lower() == expected.lower()
+    return token.value == expected
+
+
+def _find_token_pattern(
+    tokens: tuple[SQLToken, ...] | list[SQLToken], pattern: list[str | tuple[str, str]]
+) -> bool:
+    if not pattern or len(tokens) < len(pattern):
+        return False
+    return any(
+        all(_token_matches(tokens[index + offset], expected) for offset, expected in enumerate(pattern))
+        for index in range(len(tokens) - len(pattern) + 1)
+    )
+
+
+def _count_token_pattern(
+    tokens: tuple[SQLToken, ...] | list[SQLToken], pattern: list[str | tuple[str, str]]
+) -> int:
+    if not pattern or len(tokens) < len(pattern):
+        return 0
+    return sum(
+        all(_token_matches(tokens[index + offset], expected) for offset, expected in enumerate(pattern))
+        for index in range(len(tokens) - len(pattern) + 1)
+    )
+
+
+def _qualified_pattern(value: str) -> list[str]:
+    return [part for index, part in enumerate(value.split(".")) for part in (([".", part] if index else [part]))]
+
+
+def _feature_pattern(feature: str) -> list[str | tuple[str, str]]:
+    if len(feature) >= 2 and feature[0] == "'" and feature[-1] == "'":
+        return [("STRING", feature[1:-1])]
+    if " " in feature:
+        return feature.lower().split()
+    if "." in feature:
+        return _qualified_pattern(feature.lower())
+    return [feature.lower()]
 
 
 def _require_sql_features(
-    query: str, key: str, features: tuple[str, ...], errors: list[str]
+    tokens: tuple[SQLToken, ...], key: str, features: tuple[str, ...], errors: list[str]
 ) -> None:
-    normalized = _normalized_sql(query)
     for feature in features:
-        if feature.lower() not in normalized:
+        if not _find_token_pattern(tokens, _feature_pattern(feature)):
             _add_error(errors, f"verification_query_{key}_missing_semantic_feature_{feature}")
 
 
+def _read_only_query_tokens(query: str, key: str, errors: list[str]) -> tuple[SQLToken, ...] | None:
+    try:
+        tokens = list(lex_sql(query))
+    except SQLLexError as exc:
+        _add_error(errors, f"verification_query_{key}_lexical_error_{exc}")
+        return None
+    semicolons = [index for index, token in enumerate(tokens) if token.value == ";"]
+    if semicolons:
+        if len(semicolons) != 1 or semicolons[0] != len(tokens) - 1:
+            _add_error(errors, f"verification_query_{key}_must_be_single_executable_statement")
+            return None
+        tokens.pop()
+    if not tokens:
+        _add_error(errors, f"verification_query_{key}_must_contain_one_read_only_query")
+        return None
+    if not _token_is_word(tokens[0], "select"):
+        _add_error(errors, f"verification_query_{key}_must_be_single_read_only_select")
+    forbidden = sorted(
+        {
+            token.value.lower()
+            for token in tokens
+            if token.kind in {"WORD", "QUOTED_IDENTIFIER"} and token.value.lower() in _READ_ONLY_FORBIDDEN_WORDS
+        }
+    )
+    if forbidden:
+        _add_error(errors, f"verification_query_{key}_contains_forbidden_executable_words_{','.join(forbidden)}")
+    return tuple(tokens)
+
+
+def _top_level_index(tokens: tuple[SQLToken, ...], word: str) -> int | None:
+    depth = 0
+    for index, token in enumerate(tokens):
+        if token.value == "(":
+            depth += 1
+        elif token.value == ")":
+            depth -= 1
+        elif depth == 0 and _token_is_word(token, word):
+            return index
+    return None
+
+
+def _split_top_level(tokens: tuple[SQLToken, ...]) -> list[tuple[SQLToken, ...]]:
+    parts: list[tuple[SQLToken, ...]] = []
+    current: list[SQLToken] = []
+    depth = 0
+    for token in tokens:
+        if token.value == "(":
+            depth += 1
+        elif token.value == ")":
+            depth -= 1
+        if token.value == "," and depth == 0:
+            parts.append(tuple(current))
+            current = []
+        else:
+            current.append(token)
+    parts.append(tuple(current))
+    return parts
+
+
+def _projection_alias(part: tuple[SQLToken, ...]) -> str | None:
+    for index in range(len(part) - 2, -1, -1):
+        if _token_is_word(part[index], "as") and part[index + 1].kind in {"WORD", "QUOTED_IDENTIFIER"}:
+            return part[index + 1].value.lower()
+    for token in reversed(part):
+        if token.kind in {"WORD", "QUOTED_IDENTIFIER"}:
+            return token.value.lower()
+    return None
+
+
+def _projection_parts(tokens: tuple[SQLToken, ...], key: str, errors: list[str]) -> list[tuple[SQLToken, ...]] | None:
+    from_index = _top_level_index(tokens, "from")
+    if from_index is None or from_index <= 1:
+        _add_error(errors, f"verification_query_{key}_must_have_top_level_from")
+        return None
+    parts = _split_top_level(tokens[1:from_index])
+    if any(not part for part in parts):
+        _add_error(errors, f"verification_query_{key}_projection_contains_empty_column")
+        return None
+    return parts
+
+
+def _require_projection_shape(
+    parts: list[tuple[SQLToken, ...]],
+    expected_aliases: list[str],
+    key: str,
+    errors: list[str],
+) -> None:
+    aliases = [_projection_alias(part) for part in parts]
+    if aliases != expected_aliases:
+        _add_error(errors, f"verification_query_{key}_projected_columns_invalid_expected_{expected_aliases}_got_{aliases}")
+
+
 def _validate_default_acl_query(query: str, errors: list[str]) -> None:
-    normalized = _normalized_sql(query)
+    tokens = _read_only_query_tokens(query, "default_acl", errors)
+    if tokens is None:
+        return
     required = (
         "pg_catalog.pg_default_acl",
         "defaclrole",
@@ -651,50 +967,99 @@ def _validate_default_acl_query(query: str, errors: list[str]) -> None:
         "namespace",
         "order by",
     )
-    _require_sql_features(query, "default_acl", required, errors)
-    lateral_explode_count = len(
-        re.findall(r"cross\s+join\s+lateral\s+(?:pg_catalog\.)?aclexplode\s*\(", normalized)
-    )
-    if lateral_explode_count != 1:
+    _require_sql_features(tokens, "default_acl", required, errors)
+    parts = _projection_parts(tokens, "default_acl", errors)
+    if parts is not None:
+        _require_projection_shape(parts, ["owner", "namespace", "object_type", "grantee", "privilege_type", "is_grantable"], "default_acl", errors)
+        for index, pattern in {
+            0: _qualified_pattern("owner.rolname"),
+            1: _qualified_pattern("ns.nspname"),
+            2: _qualified_pattern("d.defaclobjtype"),
+            4: _qualified_pattern("expanded.privilege_type"),
+            5: _qualified_pattern("expanded.is_grantable"),
+        }.items():
+            if index < len(parts) and not _find_token_pattern(parts[index], pattern):
+                _add_error(errors, f"verification_query_default_acl_projection_{index}_missing_expected_expression")
+        if len(parts) > 3 and (
+            not _find_token_pattern(
+                parts[3],
+                ["case", "when", *_qualified_pattern("expanded.grantee"), "=", "0", "then", ("STRING", "public")],
+            )
+            or not _find_token_pattern(parts[3], ["end", "as", "grantee"])
+        ):
+            _add_error(errors, "verification_query_default_acl_projection_grantee_missing_public_mapping")
+    if not _find_token_pattern(tokens, ["from", *_qualified_pattern("pg_catalog.pg_default_acl"), "d"]):
+        _add_error(errors, "verification_query_default_acl_must_read_pg_default_acl")
+    if not _find_token_pattern(tokens, ["join", *_qualified_pattern("pg_catalog.pg_roles"), "owner"]):
+        _add_error(errors, "verification_query_default_acl_must_join_owner_role")
+    if not _find_token_pattern(tokens, ["left", "join", *_qualified_pattern("pg_catalog.pg_namespace"), "ns"]):
+        _add_error(errors, "verification_query_default_acl_must_left_join_namespace")
+    lateral_pattern = ["cross", "join", "lateral", *_qualified_pattern("pg_catalog.aclexplode"), "("]
+    if _count_token_pattern(tokens, lateral_pattern) != 1:
         _add_error(errors, "verification_query_default_acl_requires_exactly_one_cross_join_lateral_aclexplode")
-    if not re.search(r"defaclobjtype\s+in\s*\(\s*'r'\s*,\s*'s'\s*,\s*'f'\s*\)", normalized):
-        _add_error(errors, "verification_query_default_acl_must_cover_r_s_f_object_types")
-    if not re.search(r"case\s+when\s+[^;]*grantee\s*=\s*0[^;]*public", normalized):
-        _add_error(errors, "verification_query_default_acl_must_map_grantee_zero_to_public")
-    if "::regrole" in normalized or "::name" in normalized:
-        _add_error(errors, "verification_query_default_acl_must_not_cast_absent_role_names")
-    if not re.search(r"left\s+join\s+(?:pg_catalog\.)?pg_roles", normalized):
+    if not _find_token_pattern(tokens, ["left", "join", *_qualified_pattern("pg_catalog.pg_roles"), "grantee_role"]):
         _add_error(errors, "verification_query_default_acl_must_left_join_named_grantees")
+    if not _find_token_pattern(tokens, ["where", "d", ".", "defaclobjtype", "in", "(", ("STRING_EXACT", "r"), ",", ("STRING_EXACT", "S"), ",", ("STRING_EXACT", "f"), ")"]):
+        _add_error(errors, "verification_query_default_acl_must_cover_r_s_f_object_types")
+    if _find_token_pattern(tokens, ["::", "regrole"]) or _find_token_pattern(tokens, ["::", "name"]):
+        _add_error(errors, "verification_query_default_acl_must_not_cast_absent_role_names")
+    if not _find_token_pattern(tokens, ["order", "by", "owner", ",", "namespace", ",", "object_type", ",", "grantee", ",", "expanded", ".", "privilege_type", ",", "expanded", ".", "is_grantable"]):
+        _add_error(errors, "verification_query_default_acl_must_order_deterministically")
 
 
 def _validate_routine_query(query: str, errors: list[str]) -> None:
-    normalized = _normalized_sql(query)
-    _require_sql_features(
-        query,
-        "routine_acl",
-        (
-            "pg_catalog.pg_proc",
-            "pg_catalog.pg_namespace",
-            "pg_catalog.pg_roles",
-            "pg_catalog.pg_trigger",
-            "pg_get_function_identity_arguments",
-            "proname",
-            "proacl",
-            "proowner",
-            "prosecdef",
-            "prokind",
-            "tgfoid",
-            "tgisinternal",
-            "order by",
-        ),
-        errors,
+    tokens = _read_only_query_tokens(query, "routine_acl", errors)
+    if tokens is None:
+        return
+    required = (
+        "pg_catalog.pg_proc",
+        "pg_catalog.pg_namespace",
+        "pg_catalog.pg_roles",
+        "pg_catalog.pg_trigger",
+        "pg_get_function_identity_arguments",
+        "proname",
+        "proacl",
+        "proowner",
+        "prosecdef",
+        "prokind",
+        "tgfoid",
+        "tgisinternal",
+        "order by",
     )
-    if "nspname = 'public'" not in normalized:
+    _require_sql_features(tokens, "routine_acl", required, errors)
+    parts = _projection_parts(tokens, "routine_acl", errors)
+    if parts is not None:
+        expected_aliases = ["proname", "identity_arguments", "prokind", "prosecdef", "proacl", "proowner", "owner", "has_trigger_dependency"]
+        _require_projection_shape(parts, expected_aliases, "routine_acl", errors)
+        projection_patterns = {
+            0: _qualified_pattern("p.proname"),
+            1: ["pg_get_function_identity_arguments", "(", "p", ".", "oid", ")", "as", "identity_arguments"],
+            2: _qualified_pattern("p.prokind"),
+            3: _qualified_pattern("p.prosecdef"),
+            4: _qualified_pattern("p.proacl"),
+            5: _qualified_pattern("p.proowner"),
+            6: ["r", ".", "rolname", "as", "owner"],
+            7: ["exists", "(", "select", "1", "from", *_qualified_pattern("pg_catalog.pg_trigger"), "t"],
+        }
+        for index, pattern in projection_patterns.items():
+            if index < len(parts) and not _find_token_pattern(parts[index], pattern):
+                _add_error(errors, f"verification_query_routine_acl_projection_{index}_missing_expected_expression")
+    if not _find_token_pattern(tokens, ["from", *_qualified_pattern("pg_catalog.pg_proc"), "p"]):
+        _add_error(errors, "verification_query_routine_acl_must_read_pg_proc")
+    if not _find_token_pattern(tokens, ["join", *_qualified_pattern("pg_catalog.pg_namespace"), "n"]):
+        _add_error(errors, "verification_query_routine_acl_must_join_namespace")
+    if not _find_token_pattern(tokens, ["join", *_qualified_pattern("pg_catalog.pg_roles"), "r"]):
+        _add_error(errors, "verification_query_routine_acl_must_join_owner_roles")
+    if not _find_token_pattern(tokens, ["from", *_qualified_pattern("pg_catalog.pg_trigger"), "t"]):
+        _add_error(errors, "verification_query_routine_acl_must_read_trigger_catalog")
+    if not _find_token_pattern(tokens, ["where", "n", ".", "nspname", "=", ("STRING", "public")]):
         _add_error(errors, "verification_query_routine_acl_must_define_public_schema_boundary")
-    if not re.search(r"p\.prokind\s+in\s*\(\s*'f'\s*,\s*'p'\s*,\s*'a'\s*,\s*'w'\s*\)", normalized):
+    if not _find_token_pattern(tokens, ["p", ".", "prokind", "in", "(", ("STRING_EXACT", "f"), ",", ("STRING_EXACT", "p"), ",", ("STRING_EXACT", "a"), ",", ("STRING_EXACT", "w"), ")"]):
         _add_error(errors, "verification_query_routine_acl_must_cover_all_user_defined_routine_kinds")
-    if re.search(r"proname\s+like", normalized):
+    if _find_token_pattern(tokens, ["proname", "like"]):
         _add_error(errors, "verification_query_routine_acl_must_not_prefix_filter_routines")
+    if not _find_token_pattern(tokens, ["order", "by", "p", ".", "proname", ",", "identity_arguments"]):
+        _add_error(errors, "verification_query_routine_acl_must_order_deterministically")
 
 
 def validate_verification_queries(manifest: dict[str, Any], errors: list[str]) -> None:
@@ -712,15 +1077,19 @@ def validate_verification_queries(manifest: dict[str, Any], errors: list[str]) -
         elif key == "routine_acl":
             _validate_routine_query(value, errors)
         elif key in REQUIRED_QUERY_FEATURES:
-            _require_sql_features(value, key, REQUIRED_QUERY_FEATURES[key], errors)
+            tokens = _read_only_query_tokens(value, key, errors)
+            if tokens is not None:
+                _require_sql_features(tokens, key, REQUIRED_QUERY_FEATURES[key], errors)
     table_query = queries.get("effective_runtime_table_privileges")
     if type(table_query) is str and table_query.strip():
-        _require_sql_features(
-            table_query,
-            "effective_runtime_table_privileges",
-            ("has_table_privilege", "pg_catalog.pg_class", "is_grantable", "sqag_runtime", "public"),
-            errors,
-        )
+        tokens = _read_only_query_tokens(table_query, "effective_runtime_table_privileges", errors)
+        if tokens is not None:
+            _require_sql_features(
+                tokens,
+                "effective_runtime_table_privileges",
+                ("has_table_privilege", "pg_catalog.pg_class", "is_grantable", "'sqag_runtime'", "'public'"),
+                errors,
+            )
 
 
 def validate_manifest_strictly(manifest_path: str) -> int:
