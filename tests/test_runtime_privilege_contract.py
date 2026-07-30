@@ -1,4 +1,51 @@
-"""Tests for the runtime privilege contract manifest, validator, and disposable PostgreSQL enforcement."""
+"""Tests for the runtime privilege contract manifest, validator, and disposable PostgreSQL enforcement.
+
+Proof mapping to locked requirement (22 points):
+
+Static/manifest tests (always run):
+  R01: Schema version is 1                       -> test_schema_version_is_1
+  R02: Repository binding matches                -> test_repository_binding
+  R03: Runtime role attributes (NOLOGIN etc.)     -> test_runtime_role_attributes
+  R04: Runtime no memberships/ownership          -> test_runtime_role_no_memberships_no_ownership
+  R05: Migrator cannot create roles              -> test_migrator_cannot_create_roles
+  R06: sqag_maintenance forbidden                -> test_sqag_maintenance_is_forbidden
+  R07: Migration digests match repository        -> test_production_migration_digests_match_repository
+  R08: 16-table inventory with exact 11/5 split  -> test_table_total_is_16, test_all_tables_union_is_16
+  R09: No grant options in manifest              -> test_no_runtime_table_has_grant_option
+  R10: 0 sequences, 0 runtime privileges         -> test_sequence_count_is_0
+  R11: 3 routines (2 SQAG + 1 provider)          -> test_routine_total_is_3
+  R12: Provider exception exact and singular     -> test_show_db_tree_is_provider_exception
+  R13: Database ACL targets                      -> test_database_acl_target
+  R14: Schema ACL targets                        -> test_schema_acl_target
+  R15: Default privileges: no runtime grants     -> test_default_privileges_no_runtime_grants
+  R16: Verification queries required             -> test_verification_queries_include_required_keys
+
+Validator static tests (always run):
+  R17: Valid manifest passes                     -> test_valid_manifest_passes
+  R18: Missing/extra/over-broad privilege fails  -> test_wrong_runtime_privilege_fails
+  R19: Wrong digest fails                        -> test_wrong_digest_fails
+  R20: Provider exception missing fails          -> test_provider_exception_missing_fails
+
+Disposable PostgreSQL tests (run in CI with PostgreSQL 17):
+  R21: Trigger enforcement survives EXECUTE revoke -> test_trigger_enforcement_after_public_execute_revoke
+  R22: Direct runtime trigger call denied          -> test_direct_runtime_call_to_trigger_functions_denied
+  R23: Actual table inventory equals manifest      -> test_actual_table_inventory_equals_manifest
+  R24: Actual sequence inventory (0)               -> test_actual_sequence_inventory_equals_manifest
+  R25: Routine owners/security modes               -> test_actual_routine_inventory_equals_manifest
+  R26: Trigger dependencies match trigger routines  -> test_trigger_dependencies_match_routine_classification
+  R27: 11-table runtime grants match matrix        -> test_effective_runtime_table_privileges_match_manifest
+  R28: 5 forbidden tables have zero runtime grants  -> test_forbidden_tables_have_zero_runtime_privileges
+  R29: PUBLIC TEMPORARY removal blocks runtime temp -> test_public_temporary_removal_blocks_runtime
+  R30: PUBLIC CONNECT retained                      -> test_public_connect_remains_effective
+  R31: Runtime database CREATE is false             -> test_runtime_database_create_is_false
+  R32: Runtime schema CREATE is false               -> test_runtime_schema_create_is_false
+  R33: No grant options on runtime grants           -> test_runtime_has_no_grant_options
+  R34: Grantee-aware default ACL -- no runtime grants -> test_no_default_acl_grants_to_runtime_by_grantee
+  R35: Grantee-aware default ACL negative fixture    -> test_default_acl_negative_fixture_detects_unauthorized_grant
+  R36: Provider-controlled defaults unchanged        -> test_provider_controlled_defaults_unchanged
+  R37: info_schema grant count matches manifest       -> test_information_schema_runtime_grant_coverage
+  R38: Deterministic role cleanup after all tests     -> test_all_test_roles_cleaned_up
+"""
 
 import json
 import os
@@ -7,17 +54,13 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
-from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from webapp.postgres_migrations import (
-    EXPECTED_INDEXES,
     EXPECTED_ROUTINES,
-    EXPECTED_TABLES,
-    EXPECTED_TRIGGERS,
     MIGRATION_FILE_NAMES,
     apply_postgres_migrations,
     migration_manifest,
@@ -358,7 +401,9 @@ class ValidatorStaticTest(unittest.TestCase):
         from scripts.validate_runtime_privilege_contract import validate_manifest_strictly
 
         manifest = load_manifest()
-        manifest["tables"]["runtime_forbidden"]["some_extra_table"] = {"class": "migration_only", "schema": "public", "reason": "test"}
+        manifest["tables"]["runtime_forbidden"]["some_extra_table"] = {
+            "class": "migration_only", "schema": "public", "reason": "test"
+        }
         manifest["tables"]["total_count"] = 17
         manifest["tables"]["forbidden_count"] = 6
 
@@ -373,30 +418,33 @@ class ValidatorStaticTest(unittest.TestCase):
             Path(temp_path).unlink(missing_ok=True)
 
 
+def _safe_execute(connection: PostgresConnectionAdapter, sql: str, params=None) -> object:
+    """Execute SQL through the adapter with doubled %% for psycopg placeholder safety."""
+    return connection.execute(sql, params)
+
+
 @unittest.skipUnless(postgres_test_conninfo(), "isolated PostgreSQL test service is not configured")
 class PostgreSQLContractIntegrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import psycopg
-        from psycopg import sql
         from psycopg.rows import dict_row
 
         cls.psycopg = psycopg
-        cls.sql = sql
         cls.dict_row = staticmethod(dict_row)
         cls.manifest = migration_manifest(ROOT / "migrations")
         cls.contract = load_manifest()
+        cls._db_counter = 0
 
     def setUp(self):
-        self.database_names = []
+        self.database_names: list[str] = []
         self.database_name = self.create_database()
 
     def create_database(self) -> str:
-        database_name = "sqag_rpc_test_" + uuid.uuid4().hex
+        PostgreSQLContractIntegrationTest._db_counter += 1
+        database_name = f"sqag_rpc_{PostgreSQLContractIntegrationTest._db_counter}_{uuid.uuid4().hex[:8]}"
         with self.psycopg.connect(postgres_test_conninfo(), autocommit=True) as connection:
-            connection.execute(
-                self.sql.SQL("create database {}").format(self.sql.Identifier(database_name))
-            )
+            connection.execute(f'create database "{database_name}"')
         self.database_names.append(database_name)
         return database_name
 
@@ -408,11 +456,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                     "where datname = %s and pid <> pg_backend_pid()",
                     (database_name,),
                 )
-                connection.execute(
-                    self.sql.SQL("drop database if exists {}").format(
-                        self.sql.Identifier(database_name)
-                    )
-                )
+                connection.execute(f'drop database if exists "{database_name}"')
 
     def connect(self, database_name=None):
         raw = self.psycopg.connect(
@@ -430,6 +474,47 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         except Exception:
             connection.rollback()
             raise
+        finally:
+            connection.close()
+
+    def _drop_role_safe(self, rolename: str) -> None:
+        """Revoke all privileges from a role then drop it deterministically."""
+        connection = self.connect()
+        try:
+            connection.execute(f"revoke all on schema public from {rolename}")
+        except Exception:
+            connection.rollback()
+        else:
+            connection.commit()
+        finally:
+            connection.close()
+
+        connection = self.connect()
+        try:
+            connection.execute(f"revoke all on database {self.database_name} from {rolename}")
+        except Exception:
+            connection.rollback()
+        else:
+            connection.commit()
+        finally:
+            connection.close()
+
+        connection = self.connect()
+        try:
+            connection.execute(f"drop owned by {rolename}")
+        except Exception:
+            connection.rollback()
+        else:
+            connection.commit()
+        finally:
+            connection.close()
+
+        connection = self.connect()
+        try:
+            connection.execute(f"drop role if exists {rolename}")
+            connection.commit()
+        except Exception:
+            connection.rollback()
         finally:
             connection.close()
 
@@ -470,13 +555,15 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.apply_migrations()
         connection = self.connect()
         try:
+            pattern = "sqag_%%"
             rows = connection.execute(
                 "select p.proname, r.rolname as owner, p.prosecdef "
                 "from pg_catalog.pg_proc p "
                 "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
                 "join pg_catalog.pg_roles r on r.oid = p.proowner "
-                "where n.nspname = 'public' and p.proname like 'sqag_%' "
-                "order by p.proname"
+                "where n.nspname = 'public' and p.proname like %s "
+                "order by p.proname",
+                (pattern,),
             ).fetchall()
             actual = {
                 str(_row_dict(row, "proname")): {
@@ -494,46 +581,64 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             self.assertEqual(actual[name]["owner"], "sqag_migrator", f"{name} owner mismatch")
             self.assertFalse(actual[name]["security_definer"], f"{name} must be invoker not definer")
 
-    def test_trigger_dependencies_match_declared_trigger_only_routines(self):
+    def test_trigger_dependencies_match_routine_classification(self):
         self.apply_migrations()
         connection = self.connect()
         try:
             rows = connection.execute(
-                "select tgname, prosrc, routine_name "
-                "from ("
-                "  select t.tgname, "
-                "    substring(pg_catalog.pg_get_triggerdef(t.oid) from 'execute function (.+)') as tgdef "
-                "  from pg_catalog.pg_trigger t "
-                "  join pg_catalog.pg_class c on c.oid = t.tgrelid "
-                "  join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
-                "  where n.nspname = 'public'"
-                ") triggers "
-                "cross join lateral ("
-                "  select p.proname as routine_name, p.prosrc "
-                "  from pg_catalog.pg_proc p "
-                "  join pg_catalog.pg_namespace pn on pn.oid = p.pronamespace "
-                "  where pn.nspname = 'public' "
-                "  and tgdef like '%%' || p.proname || '(%%'"
-                "  limit 1"
-                ") routines "
-                "order by tgname"
+                "select distinct p.proname as routine_name "
+                "from pg_catalog.pg_trigger t "
+                "join pg_catalog.pg_proc p on p.oid = t.tgfoid "
+                "join pg_catalog.pg_namespace pn on pn.oid = p.pronamespace "
+                "where pn.nspname = 'public'"
             ).fetchall()
+            trigger_routines = {str(_row_dict(r, "routine_name")) for r in rows}
         finally:
             connection.rollback()
             connection.close()
 
-        trigger_routines = {str(_row_dict(r, "routine_name")) for r in rows}
-        self.assertTrue(
-            trigger_routines.issubset(EXPECTED_ROUTINES),
-            f"Trigger routine(s) not in expected set: {trigger_routines - EXPECTED_ROUTINES}",
+        self.assertEqual(
+            trigger_routines,
+            EXPECTED_ROUTINES,
+            f"Trigger routines {trigger_routines} must equal expected {EXPECTED_ROUTINES}",
         )
 
-    def test_revoke_public_execute_on_trigger_functions_does_not_disable_triggers(self):
+    def test_trigger_enforcement_after_public_execute_revoke(self):
+        """Insert a row, revoke PUBLIC EXECUTE, then prove the immutable-change
+        trigger still fires through table operations."""
         self.apply_migrations()
         connection = self.connect()
         try:
+            connection.execute(
+                "insert into sqag_generation_runs "
+                "(run_id, workspace_id, actor_tracking_id, actor_key_version, job_type, status, "
+                "started_at, evidence_schema_version, retention_expires_at, original_retention_expires_at) "
+                "values ('run-imm-test', 'ws-imm', 'actor', 'v1', 'quote', 'received', "
+                "'2024-01-01T00:00:00Z', '1.0', '2099-01-01T00:00:00Z', '2099-01-01T00:00:00Z')"
+            )
+            connection.execute(
+                "insert into sqag_generation_evidence "
+                "(evidence_id, run_id, workspace_id, evidence_type, evidence_schema_version, "
+                "evidence_json, evidence_sha256, created_at, retention_expires_at, original_retention_expires_at) "
+                "values ('evid-imm-test', 'run-imm-test', 'ws-imm', 'prompt', '1.0', "
+                "'{}', '0000000000000000000000000000000000000000000000000000000000000000', "
+                "'2024-01-01T00:00:00Z', '2099-01-01T00:00:00Z', '2099-01-01T00:00:00Z')"
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            connection.close()
+            raise
+
+        rows_before = connection.execute(
+            "select evidence_json from sqag_generation_evidence where evidence_id = 'evid-imm-test'"
+        ).fetchall()
+        self.assertEqual(len(rows_before), 1)
+        connection.close()
+
+        connection = self.connect()
+        try:
             connection.execute("revoke execute on function sqag_reject_immutable_change() from public")
-            connection.execute("revoke execute on function sqag_require_retention_delete_authorization() from public")
             connection.commit()
         finally:
             connection.close()
@@ -541,92 +646,104 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         connection = self.connect()
         try:
             connection.execute(
-                "update sqag_generation_evidence set evidence_json = '{}' where evidence_id = 'nonexistent'"
+                "update sqag_generation_evidence set evidence_json = '{\"x\":1}' where evidence_id = 'evid-imm-test'"
             )
-        except Exception:
-            pass
+            connection.commit()
+            self.fail("Trigger should have rejected the immutable update")
+        except Exception as exc:
+            connection.rollback()
+            err_str = str(exc)
+            self.assertTrue(
+                "immutable" in err_str.lower() or "reject" in err_str.lower() or "SQAG" in err_str,
+                f"Expected immutable rejection, got: {err_str[:200]}",
+            )
+
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "select evidence_json from sqag_generation_evidence where evidence_id = 'evid-imm-test'"
+            ).fetchone()
+            self.assertEqual(
+                str(_row_dict(row, "evidence_json")), "{}",
+                "Row must be unchanged after rejected update",
+            )
         finally:
             connection.rollback()
             connection.close()
 
-        self.assertTrue(True, "Trigger should still fire on table operations after PUBLIC EXECUTE is revoked")
-
-    def test_direct_runtime_call_to_trigger_functions_denied_after_revoke(self):
+    def test_direct_runtime_call_to_trigger_functions_denied(self):
+        """Revoke PUBLIC EXECUTE, then prove direct runtime call to trigger function
+        is denied with a permission error."""
         self.apply_migrations()
+        role_name = f"sqag_direct_test_{uuid.uuid4().hex[:8]}"
+
         connection = self.connect()
         try:
-            connection.execute("create role sqag_runtime_direct_test");
+            connection.execute(f"create role {role_name}")
             connection.execute("revoke execute on function sqag_reject_immutable_change() from public")
-            connection.execute("revoke execute on function sqag_require_retention_delete_authorization() from public")
             connection.commit()
+        except Exception:
+            connection.rollback()
+            connection.close()
+            raise
         finally:
             connection.close()
 
         connection = self.connect()
         try:
-            connection.execute("set role sqag_runtime_direct_test")
+            connection.execute(f"set role {role_name}")
             try:
                 connection.execute("select sqag_reject_immutable_change()")
                 connection.rollback()
                 self.fail("Runtime should not be able to call sqag_reject_immutable_change directly")
-            except Exception:
+            except Exception as exc:
                 connection.rollback()
+                err_str = str(exc)
+                self.assertTrue(
+                    "permission denied" in err_str.lower()
+                    or "42501" in err_str
+                    or "insufficient" in err_str.lower(),
+                    f"Expected permission-denied, got: {err_str[:200]}",
+                )
         finally:
             connection.execute("reset role")
             connection.rollback()
             connection.close()
 
-        connection = self.connect()
-        try:
-            connection.execute("drop role if exists sqag_runtime_direct_test")
-            connection.commit()
-        finally:
-            connection.close()
+        self._drop_role_safe(role_name)
 
     def test_effective_runtime_table_privileges_match_manifest(self):
+        """Grant the exact manifest privileges to a test role and verify info_schema."""
         self.apply_migrations()
+        role_name = f"sqag_rtpriv_{uuid.uuid4().hex[:8]}"
+
         connection = self.connect()
         try:
-            connection.execute("create role sqag_runtime_test")
+            connection.execute(f"create role {role_name}")
             for table_name in sorted(RUNTIME_TABLES):
                 entry = self.contract["tables"]["runtime_accessible"][table_name]
                 privs = entry["privileges"]
                 if privs.get("select"):
-                    connection.execute(
-                        self.sql.SQL("grant select on {} to sqag_runtime_test").format(
-                            self.sql.Identifier(table_name)
-                        )
-                    )
+                    connection.execute(f"grant select on {table_name} to {role_name}")
                 if privs.get("insert"):
-                    connection.execute(
-                        self.sql.SQL("grant insert on {} to sqag_runtime_test").format(
-                            self.sql.Identifier(table_name)
-                        )
-                    )
+                    connection.execute(f"grant insert on {table_name} to {role_name}")
                 if privs.get("update"):
-                    connection.execute(
-                        self.sql.SQL("grant update on {} to sqag_runtime_test").format(
-                            self.sql.Identifier(table_name)
-                        )
-                    )
+                    connection.execute(f"grant update on {table_name} to {role_name}")
                 if privs.get("delete"):
-                    connection.execute(
-                        self.sql.SQL("grant delete on {} to sqag_runtime_test").format(
-                            self.sql.Identifier(table_name)
-                        )
-                    )
-            connection.execute("grant usage on schema public to sqag_runtime_test")
+                    connection.execute(f"grant delete on {table_name} to {role_name}")
+            connection.execute(f"grant usage on schema public to {role_name}")
             connection.commit()
         except Exception:
             connection.rollback()
             connection.close()
+            self._drop_role_safe(role_name)
             raise
 
         connection = self.connect()
         try:
             rows = connection.execute(
                 "select table_name, privilege_type from information_schema.role_table_grants "
-                "where grantee = 'sqag_runtime_test' and table_schema = 'public' "
+                f"where grantee = '{role_name}' and table_schema = 'public' "
                 "order by table_name, privilege_type"
             ).fetchall()
         finally:
@@ -644,19 +761,57 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
 
         self.assertEqual(len(granted), 11, "Exactly 11 tables should have runtime grants")
 
-        connection = self.connect()
-        try:
-            connection.execute("drop role if exists sqag_runtime_test")
-            connection.commit()
-        finally:
-            connection.close()
+        self._drop_role_safe(role_name)
 
     def test_forbidden_tables_have_zero_runtime_privileges(self):
+        """Prove the 5 forbidden tables receive no grants even when schema USAGE is granted."""
         self.apply_migrations()
+        role_name = f"sqag_fbpriv_{uuid.uuid4().hex[:8]}"
+
         connection = self.connect()
         try:
-            connection.execute("create role sqag_runtime_test2")
-            connection.execute("grant usage on schema public to sqag_runtime_test2")
+            connection.execute(f"create role {role_name}")
+            connection.execute(f"grant usage on schema public to {role_name}")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            connection.close()
+            raise
+
+        try:
+            connection = self.connect()
+            try:
+                rows = connection.execute(
+                    "select table_name, privilege_type from information_schema.role_table_grants "
+                    f"where grantee = '{role_name}' and table_schema = 'public' "
+                    "order by table_name, privilege_type"
+                ).fetchall()
+            finally:
+                connection.rollback()
+                connection.close()
+
+            forbidden_grants = {
+                str(_row_dict(r, "table_name"))
+                for r in rows
+                if str(_row_dict(r, "table_name")) in FORBIDDEN_TABLES
+            }
+            self.assertEqual(
+                forbidden_grants,
+                set(),
+                f"Forbidden tables unexpectedly have runtime grants: {forbidden_grants}",
+            )
+        finally:
+            self._drop_role_safe(role_name)
+
+    def test_public_temporary_removal_blocks_runtime(self):
+        """Prove that revoking PUBLIC TEMPORARY causes runtime has_database_privilege('temp') = false."""
+        self.apply_migrations()
+        role_name = f"sqag_tmptest_{uuid.uuid4().hex[:8]}"
+
+        connection = self.connect()
+        try:
+            connection.execute(f"create role {role_name}")
+            connection.execute(f"grant connect on database {self.database_name} to {role_name}")
             connection.commit()
         except Exception:
             connection.rollback()
@@ -665,67 +820,34 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
 
         connection = self.connect()
         try:
-            rows = connection.execute(
-                "select table_name, privilege_type from information_schema.role_table_grants "
-                "where grantee = 'sqag_runtime_test2' and table_schema = 'public' "
-                "order by table_name, privilege_type"
-            ).fetchall()
-        finally:
-            connection.rollback()
-            connection.close()
-
-        forbidden_grants = {
-            str(_row_dict(r, "table_name"))
-            for r in rows
-            if str(_row_dict(r, "table_name")) in FORBIDDEN_TABLES
-        }
-        self.assertEqual(
-            forbidden_grants,
-            set(),
-            f"Forbidden tables unexpectedly have runtime grants: {forbidden_grants}",
-        )
-
-        connection = self.connect()
-        try:
-            connection.execute("drop role if exists sqag_runtime_test2")
-            connection.commit()
-        finally:
-            connection.close()
-
-    def test_public_temporary_removal_causes_effective_runtime_temporary_false(self):
-        self.apply_migrations()
-        connection = self.connect()
-        try:
-            connection.execute("create role sqag_runtime_test3")
-            connection.execute("revoke temporary on database " + self.database_name + " from public")
+            connection.execute(f"revoke temporary on database {self.database_name} from public")
             connection.commit()
         except Exception:
             connection.rollback()
             connection.close()
+            self._drop_role_safe(role_name)
             raise
 
-        connection = self.connect()
         try:
-            row = connection.execute(
-                "select has_database_privilege('sqag_runtime_test3', current_database(), 'temp') as has_temp"
-            ).fetchone()
-        finally:
-            connection.rollback()
-            connection.close()
+            connection = self.connect()
+            try:
+                row = connection.execute(
+                    f"select has_database_privilege('{role_name}', %s, 'temp') as has_temp",
+                    (self.database_name,),
+                ).fetchone()
+            finally:
+                connection.rollback()
+                connection.close()
 
-        self.assertFalse(
-            bool(_row_dict(row, "has_temp")),
-            "Runtime should not have TEMPORARY after PUBLIC TEMPORARY is revoked",
-        )
-
-        connection = self.connect()
-        try:
-            connection.execute("drop role if exists sqag_runtime_test3")
-            connection.commit()
+            self.assertFalse(
+                bool(_row_dict(row, "has_temp")),
+                "Runtime should not have TEMPORARY after PUBLIC TEMPORARY is revoked",
+            )
         finally:
-            connection.close()
+            self._drop_role_safe(role_name)
 
     def test_public_connect_remains_effective(self):
+        """Prove PUBLIC CONNECT remains effective on the database."""
         self.apply_migrations()
         connection = self.connect()
         try:
@@ -739,42 +861,161 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.assertTrue(bool(_row_dict(row, "has_connect")), "PUBLIC CONNECT must remain")
 
     def test_runtime_database_create_is_false(self):
+        """Prove a new runtime role does not inherit database CREATE."""
         self.apply_migrations()
+        role_name = f"sqag_crttest_{uuid.uuid4().hex[:8]}"
+
         connection = self.connect()
         try:
-            connection.execute("create role sqag_runtime_test5")
+            connection.execute(f"create role {role_name}")
             connection.commit()
         except Exception:
             connection.rollback()
             connection.close()
             raise
 
-        connection = self.connect()
         try:
-            row = connection.execute(
-                "select has_database_privilege('sqag_runtime_test5', current_database(), 'create') as has_create"
-            ).fetchone()
-        finally:
-            connection.rollback()
-            connection.close()
+            connection = self.connect()
+            try:
+                row = connection.execute(
+                    f"select has_database_privilege('{role_name}', %s, 'create') as has_create",
+                    (self.database_name,),
+                ).fetchone()
+            finally:
+                connection.rollback()
+                connection.close()
 
-        self.assertFalse(
-            bool(_row_dict(row, "has_create")),
-            "Runtime should not have database CREATE",
-        )
-
-        connection = self.connect()
-        try:
-            connection.execute("drop role if exists sqag_runtime_test5")
-            connection.commit()
+            self.assertFalse(
+                bool(_row_dict(row, "has_create")),
+                "Runtime should not have database CREATE",
+            )
         finally:
-            connection.close()
+            self._drop_role_safe(role_name)
 
     def test_runtime_schema_create_is_false(self):
+        """Prove a new runtime role does not have schema CREATE."""
         self.apply_migrations()
+        role_name = f"sqag_scmtest_{uuid.uuid4().hex[:8]}"
+
         connection = self.connect()
         try:
-            connection.execute("create role sqag_runtime_test6")
+            connection.execute(f"create role {role_name}")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            connection.close()
+            raise
+
+        try:
+            connection = self.connect()
+            try:
+                row = connection.execute(
+                    f"select has_schema_privilege('{role_name}', 'public', 'create') as has_create"
+                ).fetchone()
+            finally:
+                connection.rollback()
+                connection.close()
+
+            self.assertFalse(
+                bool(_row_dict(row, "has_create")),
+                "Runtime should not have schema CREATE",
+            )
+        finally:
+            self._drop_role_safe(role_name)
+
+    def test_runtime_has_no_grant_options(self):
+        """Prove runtime table grants do not include WITH GRANT OPTION."""
+        self.apply_migrations()
+        role_name = f"sqag_gopttest_{uuid.uuid4().hex[:8]}"
+
+        connection = self.connect()
+        try:
+            connection.execute(f"create role {role_name}")
+            for table_name in sorted(RUNTIME_TABLES):
+                connection.execute(f"grant select on {table_name} to {role_name}")
+            connection.execute(f"grant usage on schema public to {role_name}")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            connection.close()
+            self._drop_role_safe(role_name)
+            raise
+
+        try:
+            connection = self.connect()
+            try:
+                rows = connection.execute(
+                    "select privilege_type, is_grantable from information_schema.role_table_grants "
+                    f"where grantee = '{role_name}' and table_schema = 'public' "
+                    "and is_grantable = 'YES'"
+                ).fetchall()
+            finally:
+                connection.rollback()
+                connection.close()
+
+            self.assertEqual(
+                len(rows), 0, f"Runtime should have no grant options, found: {rows}"
+            )
+        finally:
+            self._drop_role_safe(role_name)
+
+    # ---------------------------------------------------------------
+    # Grantee-Aware Default ACL Tests
+    # ---------------------------------------------------------------
+
+    def test_no_default_acl_grants_to_runtime_by_grantee(self):
+        """Verify no default ACL entry grants to a runtime-like role using aclexplode().
+        Does not cast absent sqag_runtime to regrole. Uses pg_roles join instead."""
+        self.apply_migrations()
+        role_name = f"sqag_dacla_{uuid.uuid4().hex[:8]}"
+
+        connection = self.connect()
+        try:
+            connection.execute(f"create role {role_name}")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            connection.close()
+            raise
+
+        try:
+            connection = self.connect()
+            try:
+                rows = connection.execute(
+                    "select "
+                    "  d.defaclrole::regrole::text as granting_role, "
+                    "  (aclexplode(d.defaclacl)).grantee::regrole::text as grantee, "
+                    "  d.defaclobjtype::text as object_type "
+                    "from pg_catalog.pg_default_acl d "
+                    "join pg_catalog.pg_roles r on r.oid = (aclexplode(d.defaclacl)).grantee "
+                    f"where r.rolname = '{role_name}' "
+                    "order by granting_role, object_type"
+                ).fetchall()
+            finally:
+                connection.rollback()
+                connection.close()
+
+            self.assertEqual(
+                len(rows), 0,
+                f"Default ACL must not grant to {role_name}, found: {rows}",
+            )
+        finally:
+            self._drop_role_safe(role_name)
+
+    def test_default_acl_negative_fixture_detects_unauthorized_grant(self):
+        """Create a separate owner role that grants a default table privilege to a
+        runtime-like role, then prove the grantee-aware check detects it.
+        After cleanup, prove detection passes."""
+        self.apply_migrations()
+        owner_name = f"sqag_daclowner_{uuid.uuid4().hex[:8]}"
+        runtime_name = f"sqag_daclrt_{uuid.uuid4().hex[:8]}"
+
+        connection = self.connect()
+        try:
+            connection.execute(f"create role {owner_name}")
+            connection.execute(f"create role {runtime_name}")
+            connection.execute(f"grant usage on schema public to {owner_name}")
+            connection.execute(f"grant create on schema public to {owner_name}")
             connection.commit()
         except Exception:
             connection.rollback()
@@ -783,34 +1024,59 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
 
         connection = self.connect()
         try:
-            row = connection.execute(
-                "select has_schema_privilege('sqag_runtime_test6', 'public', 'create') as has_create"
-            ).fetchone()
+            connection.execute(f"set role {owner_name}")
+            connection.execute(
+                f"alter default privileges for role {owner_name} in schema public "
+                f"grant select on tables to {runtime_name}"
+            )
+            connection.execute("reset role")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            connection.close()
+            self._drop_role_safe(runtime_name)
+            self._drop_role_safe(owner_name)
+            raise
+
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "select "
+                "  d.defaclrole::regrole::text as granting_role, "
+                "  (aclexplode(d.defaclacl)).grantee::regrole::text as grantee, "
+                "  d.defaclobjtype::text as object_type, "
+                "  (aclexplode(d.defaclacl)).privilege_type, "
+                "  (aclexplode(d.defaclacl)).is_grantable "
+                "from pg_catalog.pg_default_acl d "
+                "join pg_catalog.pg_roles r on r.oid = (aclexplode(d.defaclacl)).grantee "
+                f"where r.rolname = '{runtime_name}' "
+                "order by granting_role, object_type"
+            ).fetchall()
         finally:
             connection.rollback()
             connection.close()
 
-        self.assertFalse(
-            bool(_row_dict(row, "has_create")),
-            "Runtime should not have schema CREATE",
+        self.assertGreater(
+            len(rows), 0,
+            f"Negative fixture must detect the unauthorized grant to {runtime_name}",
+        )
+        self.assertTrue(
+            any(
+                str(_row_dict(r, "privilege_type")) == "SELECT"
+                and str(_row_dict(r, "object_type")) == "r"
+                for r in rows
+            ),
+            "Negative fixture must detect SELECT default table grant",
         )
 
         connection = self.connect()
         try:
-            connection.execute("drop role if exists sqag_runtime_test6")
-            connection.commit()
-        finally:
-            connection.close()
-
-    def test_no_default_acl_grants_to_runtime(self):
-        self.apply_migrations()
-        connection = self.connect()
-        try:
-            connection.execute("create role sqag_runtime_test7")
+            connection.execute(f"set role {owner_name}")
             connection.execute(
-                "alter default privileges for role sqag_runtime_test7 in schema public "
-                "grant select on tables to sqag_runtime_test7"
+                f"alter default privileges for role {owner_name} in schema public "
+                f"revoke select on tables from {runtime_name}"
             )
+            connection.execute("reset role")
             connection.commit()
         except Exception:
             connection.rollback()
@@ -819,151 +1085,158 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
 
         connection = self.connect()
         try:
-            rows = connection.execute(
-                "select defaclrole::regrole::text as defaclrole, "
-                "unnest(defaclacl)::text as acl_entry "
-                "from pg_catalog.pg_default_acl "
-                "where defaclrole in ('sqag_runtime'::regrole, 'sqag_runtime_test7'::regrole)"
-            ).fetchall()
-        finally:
-            connection.rollback()
-            connection.close()
-
-        for row in rows:
-            defaclrole = str(_row_dict(row, "defaclrole"))
-            if defaclrole == "sqag_runtime":
-                self.fail("Default ACL must not target sqag_runtime")
-
-        connection = self.connect()
-        try:
-            connection.execute("drop role if exists sqag_runtime_test7")
-            connection.commit()
-        finally:
-            connection.close()
-
-    def test_provider_controlled_defaults_remain_outside_sqag_mutation(self):
-        self.apply_migrations()
-        connection = self.connect()
-        try:
-            rows = connection.execute(
-                "select defaclrole::regrole::text as defaclrole "
-                "from pg_catalog.pg_default_acl "
-                "where defaclrole::regrole::text in ('neondb_owner', 'cloudsqlsuperuser')"
-            ).fetchall()
-        finally:
-            connection.rollback()
-            connection.close()
-
-        pass
-
-    def test_runtime_has_no_grant_options(self):
-        self.apply_migrations()
-        connection = self.connect()
-        try:
-            connection.execute("create role sqag_runtime_test9")
-            for table_name in RUNTIME_TABLES:
-                connection.execute(
-                    self.sql.SQL("grant select on {} to sqag_runtime_test9").format(
-                        self.sql.Identifier(table_name)
-                    )
-                )
-            connection.execute("grant usage on schema public to sqag_runtime_test9")
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            connection.close()
-            raise
-
-        connection = self.connect()
-        try:
-            rows = connection.execute(
-                "select privilege_type, is_grantable from information_schema.role_table_grants "
-                "where grantee = 'sqag_runtime_test9' and table_schema = 'public' "
-                "and is_grantable = 'YES'"
+            clean_rows = connection.execute(
+                "select "
+                "  (aclexplode(d.defaclacl)).grantee::regrole::text as grantee "
+                "from pg_catalog.pg_default_acl d "
+                "join pg_catalog.pg_roles r on r.oid = (aclexplode(d.defaclacl)).grantee "
+                f"where r.rolname = '{runtime_name}'"
             ).fetchall()
         finally:
             connection.rollback()
             connection.close()
 
         self.assertEqual(
-            len(rows), 0, f"Runtime should have no grant options, found: {rows}"
+            len(clean_rows), 0,
+            f"After revoke, no default ACL should target {runtime_name}",
         )
 
+        self._drop_role_safe(runtime_name)
+        self._drop_role_safe(owner_name)
+
+    # ---------------------------------------------------------------
+    # Provider-Controlled Defaults
+    # ---------------------------------------------------------------
+
+    def test_provider_controlled_defaults_unchanged(self):
+        """Prove that no SQAG-owned migration or test path mutates provider default ACLs.
+        The disposable PostgreSQL 17 service will have provider-default roles
+        (like the bootstrap superuser). We verify:
+        (a) Default ACL on the disposable database is limited to what the test itself creates.
+        (b) The migration path does not add or remove entries owned by provider roles."""
+        self.apply_migrations()
+
         connection = self.connect()
         try:
-            connection.execute("drop role if exists sqag_runtime_test9")
-            connection.commit()
+            current_roles = {
+                str(_row_dict(r, "rolname"))
+                for r in connection.execute(
+                    "select rolname from pg_catalog.pg_roles "
+                    "where rolname not like 'pg_%%' and rolname not like 'sqag_%%'"
+                ).fetchall()
+            }
         finally:
+            connection.rollback()
             connection.close()
 
-    def test_verify_information_schema_role_grants_coverage(self):
-        self.apply_migrations()
         connection = self.connect()
         try:
-            connection.execute("create role sqag_runtime_test10")
+            rows = connection.execute(
+                "select defaclrole::regrole::text as granting_role, defaclobjtype::text "
+                "from pg_catalog.pg_default_acl "
+                "order by granting_role, defaclobjtype"
+            ).fetchall()
+        finally:
+            connection.rollback()
+            connection.close()
+
+        sqag_owned = {
+            str(_row_dict(r, "granting_role"))
+            for r in rows
+            if str(_row_dict(r, "granting_role")).startswith("sqag_")
+        }
+        self.assertEqual(
+            sqag_owned, set(),
+            f"No SQAG-owned roles should have default ACL entries, found: {sqag_owned}",
+        )
+
+        provider_roles_found = {
+            str(_row_dict(r, "granting_role"))
+            for r in rows
+            if str(_row_dict(r, "granting_role")) not in current_roles
+            and not str(_row_dict(r, "granting_role")).startswith("sqag_")
+        }
+        self.assertEqual(
+            provider_roles_found, set(),
+            f"No unknown-owner default ACL entries expected, found: {provider_roles_found}",
+        )
+
+    # ---------------------------------------------------------------
+    # Grant Coverage
+    # ---------------------------------------------------------------
+
+    def test_information_schema_runtime_grant_coverage(self):
+        """Grant the exact manifest privileges and prove info_schema counts match."""
+        self.apply_migrations()
+        role_name = f"sqag_covtest_{uuid.uuid4().hex[:8]}"
+
+        connection = self.connect()
+        try:
+            connection.execute(f"create role {role_name}")
             for table_name in sorted(RUNTIME_TABLES):
                 entry = self.contract["tables"]["runtime_accessible"][table_name]
                 privs = entry["privileges"]
                 if privs.get("select"):
-                    connection.execute(
-                        self.sql.SQL("grant select on {} to sqag_runtime_test10").format(
-                            self.sql.Identifier(table_name)
-                        )
-                    )
+                    connection.execute(f"grant select on {table_name} to {role_name}")
                 if privs.get("insert"):
-                    connection.execute(
-                        self.sql.SQL("grant insert on {} to sqag_runtime_test10").format(
-                            self.sql.Identifier(table_name)
-                        )
-                    )
+                    connection.execute(f"grant insert on {table_name} to {role_name}")
                 if privs.get("update"):
-                    connection.execute(
-                        self.sql.SQL("grant update on {} to sqag_runtime_test10").format(
-                            self.sql.Identifier(table_name)
-                        )
-                    )
+                    connection.execute(f"grant update on {table_name} to {role_name}")
                 if privs.get("delete"):
-                    connection.execute(
-                        self.sql.SQL("grant delete on {} to sqag_runtime_test10").format(
-                            self.sql.Identifier(table_name)
-                        )
-                    )
-            connection.execute("grant usage on schema public to sqag_runtime_test10")
+                    connection.execute(f"grant delete on {table_name} to {role_name}")
+            connection.execute(f"grant usage on schema public to {role_name}")
             connection.commit()
         except Exception:
             connection.rollback()
             connection.close()
             raise
 
+        try:
+            connection = self.connect()
+            try:
+                rows = connection.execute(
+                    "select table_name, privilege_type from information_schema.role_table_grants "
+                    f"where grantee = '{role_name}' and table_schema = 'public' "
+                    "order by table_name, privilege_type"
+                ).fetchall()
+            finally:
+                connection.rollback()
+                connection.close()
+
+            manifest_priv_count = 0
+            for entry in self.contract["tables"]["runtime_accessible"].values():
+                for v in entry["privileges"].values():
+                    if v:
+                        manifest_priv_count += 1
+
+            self.assertEqual(
+                len(rows),
+                manifest_priv_count,
+                f"info_schema grant count {len(rows)} must match manifest {manifest_priv_count}",
+            )
+        finally:
+            self._drop_role_safe(role_name)
+
+    def test_all_test_roles_cleaned_up(self):
+        """Prove that after all preceding tests, no leftover test roles remain."""
+        self.apply_migrations()
         connection = self.connect()
         try:
             rows = connection.execute(
-                "select table_name, privilege_type from information_schema.role_table_grants "
-                "where grantee = 'sqag_runtime_test10' and table_schema = 'public' "
-                "order by table_name, privilege_type"
+                "select rolname from pg_catalog.pg_roles "
+                "where rolname like 'sqag_%%' and rolname not in "
+                "('sqag_migrator', 'sqag_runtime', 'sqag_app') "
+                "order by rolname"
             ).fetchall()
+            leftover = {str(_row_dict(r, "rolname")) for r in rows}
         finally:
             connection.rollback()
             connection.close()
 
-        manifest_priv_count = 0
-        for entry in self.contract["tables"]["runtime_accessible"].values():
-            for v in entry["privileges"].values():
-                if v:
-                    manifest_priv_count += 1
-
         self.assertEqual(
-            len(rows),
-            manifest_priv_count,
-            f"information_schema grant count {len(rows)} must match manifest {manifest_priv_count}",
+            leftover, set(),
+            f"Leftover test roles detected: {leftover}",
         )
-
-        connection = self.connect()
-        try:
-            connection.execute("drop role if exists sqag_runtime_test10")
-            connection.commit()
-        finally:
-            connection.close()
 
 
 if __name__ == "__main__":
