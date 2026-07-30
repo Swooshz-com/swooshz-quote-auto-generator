@@ -38,7 +38,6 @@ from scripts.validate_runtime_privilege_contract import (  # noqa: E402
 )
 from webapp.postgres_migrations import (  # noqa: E402
     EXPECTED_ROUTINES,
-    EXPECTED_TABLES,
     MIGRATION_FILE_NAMES,
     MIGRATION_TABLES,
     apply_postgres_migrations,
@@ -940,7 +939,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         finally:
             connection.rollback()
             connection.close()
-        self.assertEqual(actual, set(EXPECTED_TABLES))
+        self.assertEqual(actual, ALL_TABLES)
 
     def test_actual_sequence_inventory_is_zero(self) -> None:
         self.apply_migrations()
@@ -1027,9 +1026,9 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         connection = self.connect()
         try:
             row = connection.execute(
-                "select rolcanlogin, rolpassword, rolsuper, rolcreatedb, rolcreaterole, "
-                "rolreplication, rolbypassrls, rolinherit, rolconnlimit "
-                "from pg_catalog.pg_roles where rolname = %s",
+                "select rolcanlogin, rolpassword is null as password_is_null, rolsuper, rolcreatedb, "
+                "rolcreaterole, rolreplication, rolbypassrls, rolinherit, rolconnlimit "
+                "from pg_catalog.pg_authid where rolname = %s",
                 (role_name,),
             ).fetchone()
             memberships = connection.execute(
@@ -1046,7 +1045,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             connection.rollback()
             connection.close()
         self.assertIs(_row_dict(row, "rolcanlogin"), False)
-        self.assertIsNone(_row_dict(row, "rolpassword"))
+        self.assertIs(_row_dict(row, "password_is_null"), True)
         self.assertIs(_row_dict(row, "rolsuper"), False)
         self.assertIs(_row_dict(row, "rolcreatedb"), False)
         self.assertIs(_row_dict(row, "rolcreaterole"), False)
@@ -1115,8 +1114,8 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self._grant_schema_privilege(role_name, "USAGE")
         self._revoke_public_execute("sqag_reject_immutable_change")
         self._revoke_public_execute("sqag_require_retention_delete_authorization")
-        with self.as_role(role_name) as runtime_connection:
-            for function_name in ("sqag_reject_immutable_change", "sqag_require_retention_delete_authorization"):
+        for function_name in ("sqag_reject_immutable_change", "sqag_require_retention_delete_authorization"):
+            with self.as_role(role_name) as runtime_connection:
                 try:
                     runtime_connection.execute(f"select public.{_quote_identifier(function_name)}()")
                     runtime_connection.rollback()
