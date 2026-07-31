@@ -39,8 +39,8 @@ Source of truth: `.github/workflows/ci.yml`
 - Runs `python scripts/validate_local_pdf_dependency_usage.py` to keep `pypdfium2` and `Pillow` usage on the local PDF rendering path only.
 - Runs `python scripts/validate_dynamic_pricing_reference_rules.py` to keep pricing-reference matching data-driven and block source-code semantic family/synonym packs.
 - Runs `python scripts/scan_sensitive_fixtures.py --fail-on-review` so review-level sensitive fixture findings fail CI.
-- Runtime privilege-contract static validation runs `python scripts/validate_runtime_privilege_contract.py`; the canonical manifest, thirteen-key bounded verification-query set, independent executable-token contracts, and repository requirement binding fail closed.
-- Disposable PostgreSQL 17 runtime privilege-contract tests exercise the thirteen canonical query keys, exact result shapes, complete table/column privilege matrices, and database/schema grant-option semantics with disposable service databases and roles only. The hosted exact-head evidence must report zero skips.
+- Runtime privilege-contract static validation runs `python scripts/validate_runtime_privilege_contract.py`; the canonical manifest, thirteen-key bounded verification-query set, independent executable-token contracts, exact publication-artifact column authority, complete `r`/`S`/`f`/`n`/`T` default-ACL object-class binding, and repository requirement binding fail closed.
+- Disposable PostgreSQL 17 runtime privilege-contract tests exercise the thirteen canonical query keys, exact result shapes, the real publication checksum-backfill path, complete table/column privilege matrices, complete default-ACL object classes, and database/schema grant-option semantics with disposable service databases and roles only. The hosted exact-head evidence must report zero skips.
 - Boundary A remains repository-only. It performs no live database, provider, credential, Coolify, deployment, or activation mutation.
 - Green CI does not authorise Boundary B or #160; those scopes require their own exact-head authority and verification.
 - Runs `python -m unittest discover -s tests`.

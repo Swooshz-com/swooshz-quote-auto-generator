@@ -1,11 +1,11 @@
 """Runtime privilege contract tests.
 
 Deterministic discovery receipt for this amendment:
-  discovered methods: 111
-  static and validator methods: 62
-  PostgreSQL methods: 46
+  discovered methods: 122
+  static and validator methods: 69
+  PostgreSQL methods: 50
   requirement-map and documentation parity methods: 3
-  hosted executions: 111
+  hosted executions: 122
   hosted skips: 0
   unique locked requirement IDs: 38 (R01-R38)
 
@@ -18,7 +18,9 @@ migrated objects, and non-superuser SET ROLE sessions.
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
+import inspect
 import json
 import os
 import re
@@ -29,6 +31,7 @@ import uuid
 from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 from typing import Any, Iterator
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,7 +50,7 @@ from webapp.postgres_migrations import (  # noqa: E402
     apply_postgres_migrations,
     migration_manifest,
 )
-from webapp.server import PostgresConnectionAdapter  # noqa: E402
+from webapp.server import DatabaseSqagStorage, PostgresConnectionAdapter  # noqa: E402
 
 
 MANIFEST_PATH = ROOT / "docs" / "runtime-privilege-contract.json"
@@ -68,6 +71,12 @@ TABLE_PRIVILEGES = (
 COLUMN_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "REFERENCES")
 DATABASE_PRIVILEGES = ("CONNECT", "CREATE", "TEMPORARY")
 SCHEMA_PRIVILEGES = ("USAGE", "CREATE")
+DEFAULT_ACL_OBJECT_TYPES = ("r", "S", "f", "n", "T")
+EXPLICIT_COLUMN_PRIVILEGES = {
+    "sqag_quote_publication_artifacts": {
+        "UPDATE": ("checksum_sha256",),
+    },
+}
 
 # Independent query-shape authority.  These expectations are deliberately
 # repository-owned test data, not generated from candidate manifest values.
@@ -111,7 +120,7 @@ CANONICAL_QUERY_COLUMNS = {
         "rolreplication",
         "rolbypassrls",
         "rolconnlimit",
-        "rolpassword",
+        "password_is_null",
     ],
     "role_memberships": ["role", "member", "admin_option"],
     "sequence_acl": ["relname", "relacl"],
@@ -149,7 +158,7 @@ left join pg_catalog.pg_namespace ns on ns.oid = d.defaclnamespace
 cross join lateral pg_catalog.aclexplode(d.defaclacl) expanded
 left join pg_catalog.pg_roles grantee_role
   on grantee_role.oid = expanded.grantee and expanded.grantee <> 0
-where d.defaclobjtype in ('r', 'S', 'f')
+where d.defaclobjtype in ('r', 'S', 'f', 'n', 'T')
 order by owner_name, namespace, object_type, grantee, expanded.privilege_type, expanded.is_grantable
 """
 
@@ -320,6 +329,26 @@ class ManifestStructureTest(unittest.TestCase):
         }
         self.assertEqual(actual, LOCKED_PRIVILEGE_MATRIX)
 
+    def test_publication_artifact_column_update_is_exact(self) -> None:
+        self.assertEqual(
+            self.manifest["column_privileges"],
+            {"sqag_quote_publication_artifacts": {"update": ["checksum_sha256"]}},
+        )
+        self.assertIs(
+            self.manifest["tables"]["runtime_accessible"]["sqag_quote_publication_artifacts"]["privileges"]["update"],
+            False,
+        )
+
+    def test_publication_backfill_application_path_updates_only_checksum(self) -> None:
+        source = inspect.getsource(DatabaseSqagStorage.publish_quote_session_forensic_transaction)
+        self.assertEqual(source.count("update sqag_quote_publication_artifacts"), 1)
+        self.assertEqual(source.count("set checksum_sha256 = ?"), 1)
+        self.assertNotIn("set checksum_sha256 = ?,", source)
+        self.assertIn(
+            "where workspace_id = ? and run_id = ? and artifact_kind = ?",
+            source,
+        )
+
     def test_no_runtime_table_has_grant_option(self) -> None:
         for entry in self.manifest["tables"]["runtime_accessible"].values():
             self.assertNotIn("grant_option", entry)
@@ -360,6 +389,7 @@ class ManifestStructureTest(unittest.TestCase):
 
     def test_default_privileges_are_grantee_aware(self) -> None:
         defaults = self.manifest["default_privileges"]
+        self.assertEqual(defaults["object_classes"], list(DEFAULT_ACL_OBJECT_TYPES))
         self.assertEqual(defaults["sqag_runtime"], {"tables": "none", "sequences": "none", "routines": "none"})
         self.assertIn("aclexplode", defaults["verification_rule"])
         self.assertIn("grantee", defaults["verification_rule"])
@@ -464,6 +494,26 @@ class ValidatorStaticTest(unittest.TestCase):
         )
         self._assert_fixture_rejected(json.dumps(manifest), "accessible_table_sqag_generation_evidence_delete_invalid")
 
+    def test_publication_column_grant_fixture_fails_closed(self) -> None:
+        manifest = self._mutated_fixture(
+            lambda m: m["column_privileges"]["sqag_quote_publication_artifacts"].update(
+                {"update": ["content_blob"]}
+            )
+        )
+        self._assert_fixture_rejected(
+            json.dumps(manifest),
+            "column_privileges_sqag_quote_publication_artifacts_update_invalid",
+        )
+
+    def test_default_acl_object_class_fixture_fails_closed(self) -> None:
+        manifest = self._mutated_fixture(
+            lambda m: m["default_privileges"].update({"object_classes": ["r", "S", "f"]})
+        )
+        self._assert_fixture_rejected(
+            json.dumps(manifest),
+            "default_privilege_object_classes_invalid",
+        )
+
     def test_wrong_digest_fixture_fails(self) -> None:
         manifest = self._mutated_fixture(lambda m: m["production_migrations"][0].update({"sha256": "0" * 64}))
         self._assert_fixture_rejected(json.dumps(manifest), "migration_0_sha256_invalid")
@@ -494,6 +544,41 @@ class ValidatorStaticTest(unittest.TestCase):
         self._assert_fixture_rejected(
             json.dumps(self._mutated_fixture(mutate)),
             "verification_query_routine_acl_must_not_prefix_filter_routines",
+        )
+
+    def test_default_acl_query_missing_schema_and_type_classes_fails(self) -> None:
+        query = load_manifest()["verification_queries"]["default_acl"].replace(
+            ", 'n', 'T'", "", 1
+        )
+        self._assert_query_fixture_rejected(
+            "default_acl",
+            query,
+            "verification_query_default_acl_must_cover_r_s_f_n_T_object_types",
+        )
+
+    def test_role_attributes_masked_catalog_query_fails(self) -> None:
+        query = (
+            "select rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, "
+            "rolcanlogin, rolreplication, rolbypassrls, rolconnlimit, rolpassword "
+            "from pg_catalog.pg_roles where rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_app', 'neondb_owner') "
+            "order by rolname"
+        )
+        self._assert_query_fixture_rejected(
+            "role_attributes",
+            query,
+            "verification_query_role_attributes_must_read_pg_authid",
+        )
+
+    def test_role_attributes_raw_password_projection_fails(self) -> None:
+        query = load_manifest()["verification_queries"]["role_attributes"].replace(
+            "a.rolpassword is null as password_is_null",
+            "a.rolpassword as password_is_null",
+            1,
+        )
+        self._assert_query_fixture_rejected(
+            "role_attributes",
+            query,
+            "verification_query_role_attributes_password_state_must_be_boolean_null_assertion",
         )
 
     def _assert_query_fixture_rejected(self, query_key: str, query: str, expected_error: str) -> None:
@@ -621,8 +706,8 @@ class ValidatorStaticTest(unittest.TestCase):
         self._assert_exact_query_rejected(
             "default_acl",
             query.replace(
-                "('r', 'S', 'f') order by",
-                "('r', 'S', 'f') and exists (select 1, nextval('sqag_probe') "
+                "('r', 'S', 'f', 'n', 'T') order by",
+                "('r', 'S', 'f', 'n', 'T') and exists (select 1, nextval('sqag_probe') "
                 "from pg_catalog.pg_roles probe) order by",
                 1,
             ),
@@ -1313,6 +1398,32 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             connection.rollback()
             connection.close()
 
+    def _has_table_privilege(self, grantee: str, table_name: str, privilege: str) -> bool:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "select has_table_privilege(%s, %s, %s) as allowed",
+                (grantee, f"public.{table_name}", privilege),
+            ).fetchone()
+            return bool(_row_dict(row, "allowed"))
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def _has_column_privilege(
+        self, grantee: str, table_name: str, column_name: str, privilege: str
+    ) -> bool:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "select has_column_privilege(%s, %s, %s, %s) as allowed",
+                (grantee, f"public.{table_name}", column_name, privilege),
+            ).fetchone()
+            return bool(_row_dict(row, "allowed"))
+        finally:
+            connection.rollback()
+            connection.close()
+
     def _public_database_acl_snapshot(self) -> dict[str, bool]:
         return {
             privilege: self._has_database_privilege("public", privilege)
@@ -1486,8 +1597,8 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             params: tuple[Any, ...] = ()
             if owner_name is not None:
                 query = query.replace(
-                    "where d.defaclobjtype in ('r', 'S', 'f')",
-                    "where d.defaclobjtype in ('r', 'S', 'f') and owner_role.rolname = %s",
+                    "where d.defaclobjtype in ('r', 'S', 'f', 'n', 'T')",
+                    "where d.defaclobjtype in ('r', 'S', 'f', 'n', 'T') and owner_role.rolname = %s",
                 )
                 params = (owner_name,)
             rows = connection.execute(query, params).fetchall()
@@ -1524,20 +1635,14 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             "TABLES": {"SELECT", "INSERT", "UPDATE", "DELETE"},
             "SEQUENCES": {"SELECT", "USAGE", "UPDATE"},
             "FUNCTIONS": {"EXECUTE"},
+            "SCHEMAS": {"USAGE", "CREATE"},
+            "TYPES": {"USAGE"},
         }
         if object_keyword not in allowed_privileges or privilege not in allowed_privileges[object_keyword]:
             raise ValueError(f"invalid default privilege: {privilege}:{object_keyword}")
         target = "public" if grantee == "PUBLIC" else _quote_identifier(grantee)
         option = " with grant option" if with_grant_option else ""
-        connection = self.connect()
-        try:
-            connection.execute(
-                f"alter default privileges for role {_quote_identifier(owner_name)} in schema public "
-                f"grant {privilege} on {object_keyword} to {target}{option}"
-            )
-            connection.commit()
-        finally:
-            connection.close()
+        scope = "" if object_keyword == "SCHEMAS" else " in schema public"
         self.addCleanup(
             self._revoke_default_privilege,
             owner_name,
@@ -1545,14 +1650,24 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             privilege,
             object_keyword,
         )
+        connection = self.connect()
+        try:
+            connection.execute(
+                f"alter default privileges for role {_quote_identifier(owner_name)}{scope} "
+                f"grant {privilege} on {object_keyword} to {target}{option}"
+            )
+            connection.commit()
+        finally:
+            connection.close()
 
     def _revoke_default_privilege(self, owner_name: str, grantee: str, privilege: str, object_keyword: str) -> None:
         target = "public" if grantee == "PUBLIC" else _quote_identifier(grantee)
+        scope = "" if object_keyword == "SCHEMAS" else " in schema public"
         self._cleanup_steps(
             [
                 (
                     f"revoke_default_{owner_name}_{grantee}_{privilege}_{object_keyword}",
-                    f"alter default privileges for role {_quote_identifier(owner_name)} in schema public "
+                    f"alter default privileges for role {_quote_identifier(owner_name)}{scope} "
                     f"revoke {privilege} on {object_keyword} from {target}",
                 )
             ]
@@ -1759,6 +1874,12 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 for privilege in COLUMN_PRIVILEGES:
                     if entry["privileges"].get(privilege.lower(), False):
                         expected.add((str(entry["schema"]), table_name, column_name, privilege, False))
+        for table_name, grants in EXPLICIT_COLUMN_PRIVILEGES.items():
+            schema = str(self.contract["tables"]["runtime_accessible"][table_name]["schema"])
+            for privilege, column_names in grants.items():
+                for column_name in column_names:
+                    self.assertIn(column_name, columns.get(table_name, ()))
+                    expected.add((schema, table_name, column_name, privilege, False))
         return expected
 
     def _assert_exact_runtime_column_matrix(self, role_name: str) -> None:
@@ -1855,6 +1976,10 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             for privilege, allowed in entry["privileges"].items():
                 if allowed:
                     self._grant_table_privilege(role_name, table_name, privilege.upper())
+        for table_name, grants in EXPLICIT_COLUMN_PRIVILEGES.items():
+            for privilege, column_names in grants.items():
+                for column_name in column_names:
+                    self._grant_column_privilege(role_name, table_name, column_name, privilege)
         self._assert_exact_runtime_matrix(role_name)
         return role_name
 
@@ -1866,6 +1991,10 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             for privilege, allowed in entry["privileges"].items():
                 if allowed:
                     self._grant_table_privilege("sqag_runtime", table_name, privilege.upper())
+        for table_name, grants in EXPLICIT_COLUMN_PRIVILEGES.items():
+            for privilege, column_names in grants.items():
+                for column_name in column_names:
+                    self._grant_column_privilege("sqag_runtime", table_name, column_name, privilege)
         self._alter_public_database_privilege("TEMPORARY", False)
         owner_name = self._new_role("query_owner")
         grantee_name = self._new_role("query_grantee")
@@ -1968,6 +2097,9 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         )
         role_rows = results["role_attributes"][1]
         self.assertEqual({str(row["rolname"]) for row in role_rows}, {"sqag_migrator", "sqag_runtime"})
+        self.assertTrue(all(isinstance(row["password_is_null"], bool) for row in role_rows))
+        self.assertTrue(all(row["password_is_null"] for row in role_rows))
+        self.assertTrue(all("rolpassword" not in row for row in role_rows))
         membership_rows = results["role_memberships"][1]
         membership_tuples = self._membership_tuples(membership_rows)
         self.assertEqual(membership_tuples, self._membership_baseline)
@@ -2177,6 +2309,43 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.assertEqual(_row_dict(memberships, "count"), 0)
         self.assertEqual(_row_dict(ownership, "count"), 0)
 
+    def _assert_canonical_runtime_password_is_null(self) -> None:
+        columns, rows = self._execute_contract_query("role_attributes")
+        self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["role_attributes"])
+        runtime_rows = [row for row in rows if row["rolname"] == "sqag_runtime"]
+        self.assertEqual(len(runtime_rows), 1)
+        self.assertIs(runtime_rows[0]["password_is_null"], True)
+        self.assertNotIn("rolpassword", runtime_rows[0])
+
+    def test_canonical_role_attribute_password_state_round_trip(self) -> None:
+        self.apply_migrations()
+        self._assert_canonical_runtime_password_is_null()
+        synthetic_password = "sqag-run22-" + uuid.uuid4().hex
+        try:
+            self._execute_admin_sql(
+                f"alter role {_quote_identifier('sqag_runtime')} password '{synthetic_password}'"
+            )
+            columns, rows = self._execute_contract_query("role_attributes")
+            self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["role_attributes"])
+            runtime_row = next(row for row in rows if row["rolname"] == "sqag_runtime")
+            self.assertIs(runtime_row["password_is_null"], False)
+            with self.assertRaises(AssertionError):
+                self._assert_canonical_runtime_password_is_null()
+        finally:
+            self._execute_admin_sql(f"alter role {_quote_identifier('sqag_runtime')} password null")
+        self._assert_canonical_runtime_password_is_null()
+
+    def test_runtime_like_role_cannot_read_pg_authid_password_catalog(self) -> None:
+        self.apply_migrations()
+        with self.as_role("sqag_runtime") as runtime_connection:
+            with self.assertRaises(Exception) as failure:
+                runtime_connection.execute(
+                    "select a.rolpassword from pg_catalog.pg_authid a "
+                    "where a.rolname = 'sqag_runtime'"
+                ).fetchall()
+            runtime_connection.rollback()
+            self.assertEqual(getattr(failure.exception, "sqlstate", None), "42501")
+
     def test_trigger_enforcement_runs_under_runtime_authority_after_public_revoke(self) -> None:
         self.apply_migrations()
         role_name = self._new_role("trigger")
@@ -2254,6 +2423,10 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             for privilege, allowed in entry["privileges"].items():
                 if allowed:
                     self._grant_table_privilege(role_name, table_name, privilege.upper())
+        for table_name, grants in EXPLICIT_COLUMN_PRIVILEGES.items():
+            for privilege, column_names in grants.items():
+                for column_name in column_names:
+                    self._grant_column_privilege(role_name, table_name, column_name, privilege)
         self._alter_public_database_privilege("TEMPORARY", False)
         self._assert_exact_runtime_matrix(role_name)
         self._assert_exact_runtime_column_matrix(role_name)
@@ -2261,6 +2434,268 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self._assert_exact_runtime_schema_privileges(role_name)
         for table_name in FORBIDDEN_TABLES:
             self.assertFalse(("public", table_name, "SELECT", False) in self._effective_table_grants(role_name))
+
+    def test_publication_backfill_actual_application_path_uses_only_checksum_update(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        workspace_id = "workspace-run22-publication"
+        session_id = "quote-run22-session"
+        old_run_id = "run-run22-old"
+        new_run_id = "run-run22-new"
+        old_job_id = "job-run22-old"
+        new_job_id = "job-run22-new"
+        timestamp = "2026-07-31T00:00:00Z"
+        legacy_content = b"run22 legacy quotation content"
+        staged_content = b"run22 staged quotation content"
+        legacy_digest = hashlib.sha256(legacy_content).hexdigest()
+        staged_digest = hashlib.sha256(staged_content).hexdigest()
+        content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        legacy_table = "run22_legacy_quote_artifacts"
+        compatibility_schema = "run22_app_compat"
+        target_table = "sqag_quote_publication_artifacts"
+
+        current_metadata = {
+            "schema_version": 1,
+            "session_id": session_id,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "exports": {
+                "xlsx": {
+                    "filename": "quotation.xlsx",
+                    "created_at": timestamp,
+                    "sha256": staged_digest,
+                    "size_bytes": len(staged_content),
+                    "stale": False,
+                },
+                "pdf": {},
+            },
+            "status": {"quote_generated": False, "xlsx_exported": True, "pdf_exported": False},
+            "publication": {
+                "state": "staged",
+                "run_id": old_run_id,
+                "job_id": old_job_id,
+                "pending_run_id": new_run_id,
+                "pending_job_id": new_job_id,
+            },
+        }
+        staged_metadata = copy.deepcopy(current_metadata)
+        staged_metadata["publication"] = {
+            "state": "staged",
+            "run_id": new_run_id,
+            "job_id": new_job_id,
+        }
+        current_metadata_json = json.dumps(current_metadata, ensure_ascii=True, sort_keys=True)
+        staged_metadata_json = json.dumps(staged_metadata, ensure_ascii=True, sort_keys=True)
+
+        self.addCleanup(
+            self._cleanup_steps,
+            [
+                (
+                    "drop_run22_compatibility_schema",
+                    f"drop schema if exists {_quote_identifier(compatibility_schema)} cascade",
+                ),
+                (
+                    "drop_run22_legacy_quote_view",
+                    "drop view if exists public.sqag_quote_artifacts",
+                ),
+                (
+                    "drop_run22_legacy_quote_table",
+                    f"drop table if exists public.{_quote_identifier(legacy_table)}",
+                ),
+            ],
+        )
+        connection = self.connect()
+        try:
+            connection.execute("set role \"sqag_migrator\"")
+            connection.execute(
+                f"create table public.{_quote_identifier(legacy_table)} ("
+                "workspace_id text not null, session_id text not null, artifact_kind text not null, "
+                "filename text not null, content_type text not null, size_bytes bigint not null, "
+                "content_blob bytea not null, created_at text not null, updated_at text not null)"
+            )
+            connection.execute(
+                "create view public.sqag_quote_artifacts as "
+                f"select workspace_id, session_id, artifact_kind, filename, content_type, size_bytes, "
+                f"content_blob, created_at, updated_at from public.{_quote_identifier(legacy_table)}"
+            )
+            connection.execute(
+                f"create schema {_quote_identifier(compatibility_schema)}"
+            )
+            connection.execute(
+                f"create function {_quote_identifier(compatibility_schema)}.randomblob(integer) "
+                "returns bytea language sql immutable as $$ select decode(repeat('00', $1), 'hex') $$"
+            )
+            connection.execute(
+                f"create function {_quote_identifier(compatibility_schema)}.hex(bytea) "
+                "returns text language sql immutable as $$ select encode($1, 'hex') $$"
+            )
+            connection.execute(
+                f"grant usage on schema {_quote_identifier(compatibility_schema)} to \"sqag_runtime\""
+            )
+            connection.execute(
+                "grant select on table public.sqag_quote_artifacts to \"sqag_runtime\""
+            )
+            connection.execute(
+                f"insert into public.{_quote_identifier(legacy_table)} "
+                "(workspace_id, session_id, artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at) "
+                "values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    workspace_id, session_id, "xlsx", "quotation.xlsx", content_type,
+                    len(legacy_content), legacy_content, timestamp, timestamp,
+                ),
+            )
+            connection.execute("reset role")
+            connection.commit()
+        finally:
+            connection.close()
+
+        connection = self.connect()
+        try:
+            connection.execute(
+                "insert into sqag_quote_sessions "
+                "(workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at) "
+                "values (?, ?, ?, ?, ?, ?)",
+                (workspace_id, session_id, current_metadata_json, "[]", timestamp, timestamp),
+            )
+            connection.execute(
+                "insert into sqag_quote_publication_versions "
+                "(workspace_id, session_id, run_id, job_id, state, artifact_storage_mode, artifact_source, "
+                "metadata_json, created_at, updated_at, promoted_at, retention_expires_at, "
+                "original_retention_expires_at, legal_hold, deletion_state) "
+                "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    workspace_id, session_id, new_run_id, new_job_id, "staged", "database", "version",
+                    staged_metadata_json, timestamp, timestamp, None, "2099-01-01T00:00:00Z",
+                    "2099-01-01T00:00:00Z", 0, "active",
+                ),
+            )
+            connection.execute(
+                "insert into sqag_quote_publication_artifacts "
+                "(workspace_id, session_id, run_id, artifact_kind, filename, content_type, size_bytes, "
+                "checksum_sha256, content_blob, created_at, updated_at) "
+                "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    workspace_id, session_id, new_run_id, "xlsx", "quotation.xlsx", content_type,
+                    len(staged_content), staged_digest, staged_content, timestamp, timestamp,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        storage = DatabaseSqagStorage.__new__(DatabaseSqagStorage)
+        storage.workspace_id = workspace_id
+        expected_files = [{"name": "quotation.xlsx", "bytes": len(staged_content), "sha256": staged_digest}]
+        with self.as_role("sqag_runtime") as runtime_connection:
+            runtime_connection.execute(
+                f"set local search_path = {_quote_identifier(compatibility_schema)}, public"
+            )
+            with mock.patch("webapp.server.configured_artifact_storage_mode", return_value="database"):
+                storage.publish_quote_session_forensic_transaction(
+                    runtime_connection, session_id, new_run_id, expected_files
+                )
+            runtime_connection.commit()
+
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "select workspace_id, session_id, run_id, artifact_kind, filename, content_type, size_bytes, "
+                "checksum_sha256, content_blob, created_at, updated_at "
+                "from sqag_quote_publication_artifacts where workspace_id = ? and run_id = ?",
+                (workspace_id, old_run_id),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["checksum_sha256"], legacy_digest)
+            self.assertEqual(bytes(row["content_blob"]), legacy_content)
+            self.assertEqual(row["workspace_id"], workspace_id)
+            self.assertEqual(row["session_id"], session_id)
+            self.assertEqual(row["run_id"], old_run_id)
+            self.assertEqual(row["artifact_kind"], "xlsx")
+            self.assertEqual(row["filename"], "quotation.xlsx")
+            self.assertEqual(row["content_type"], content_type)
+            self.assertEqual(int(row["size_bytes"]), len(legacy_content))
+            self.assertEqual(row["created_at"], timestamp)
+            self.assertEqual(row["updated_at"], timestamp)
+            authority = connection.execute(
+                "select has_table_privilege('sqag_runtime', 'public.sqag_quote_publication_artifacts', 'UPDATE') as table_update, "
+                "has_table_privilege('sqag_runtime', 'public.sqag_quote_publication_artifacts', 'UPDATE WITH GRANT OPTION') as table_grantable, "
+                "exists (select 1 from pg_catalog.aclexplode(coalesce(c.relacl, pg_catalog.acldefault('r', c.relowner))) expanded "
+                "where expanded.grantee = (select oid from pg_catalog.pg_roles where rolname = 'sqag_runtime') "
+                "and expanded.privilege_type = 'UPDATE') as direct_table_update "
+                "from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+                "where n.nspname = 'public' and c.relname = 'sqag_quote_publication_artifacts'"
+            ).fetchone()
+            self.assertIs(_row_dict(authority, "table_update"), False)
+            self.assertIs(_row_dict(authority, "table_grantable"), False)
+            self.assertIs(_row_dict(authority, "direct_table_update"), False)
+        finally:
+            connection.rollback()
+            connection.close()
+
+        publication_columns = self._user_columns()[target_table]
+        self.assertIn("checksum_sha256", publication_columns)
+        self.assertTrue(
+            self._has_column_privilege(
+                "sqag_runtime", target_table, "checksum_sha256", "UPDATE"
+            )
+        )
+        self.assertFalse(
+            self._has_column_privilege(
+                "sqag_runtime", target_table, "checksum_sha256", "UPDATE WITH GRANT OPTION"
+            )
+        )
+        self.assertFalse(
+            self._has_column_privilege("public", target_table, "checksum_sha256", "UPDATE")
+        )
+        for column_name in publication_columns:
+            if column_name == "checksum_sha256":
+                continue
+            self.assertFalse(
+                self._has_column_privilege("sqag_runtime", target_table, column_name, "UPDATE"),
+                column_name,
+            )
+            with self.as_role("sqag_runtime") as runtime_connection:
+                try:
+                    runtime_connection.execute(
+                        f"update {_quote_identifier(target_table)} set {_quote_identifier(column_name)} = "
+                        f"{_quote_identifier(column_name)} where false"
+                    )
+                    runtime_connection.commit()
+                except Exception as exc:
+                    runtime_connection.rollback()
+                    self.assertEqual(getattr(exc, "sqlstate", None), "42501", column_name)
+                else:
+                    self.fail(f"non-checksum UPDATE unexpectedly succeeded: {column_name}")
+
+        columns, rows = self._execute_contract_query("effective_runtime_column_privileges")
+        self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["effective_runtime_column_privileges"])
+        checksum_rows = [
+            row for row in rows
+            if row["table_name"] == target_table
+            and row["column_name"] == "checksum_sha256"
+            and row["privilege_type"] == "UPDATE"
+        ]
+        self.assertEqual(len(checksum_rows), 1)
+        self.assertIs(checksum_rows[0]["effective"], True)
+        self.assertIs(checksum_rows[0]["is_grantable"], False)
+
+        self._execute_admin_sql(
+            f"grant UPDATE on table {_quote_identifier(target_table)} to public"
+        )
+        try:
+            self.assertTrue(self._has_table_privilege("sqag_runtime", target_table, "UPDATE"))
+            with self.assertRaises(AssertionError):
+                self._assert_exact_runtime_matrix("sqag_runtime")
+        finally:
+            self._execute_admin_sql(
+                f"revoke UPDATE on table {_quote_identifier(target_table)} from public"
+            )
+
+        parent_name = self._new_role("publication_update_parent")
+        self._grant_role_membership(parent_name, "sqag_runtime")
+        self._grant_table_privilege(parent_name, target_table, "UPDATE")
+        self.assertTrue(self._has_table_privilege("sqag_runtime", target_table, "UPDATE"))
+        with self.assertRaises(AssertionError):
+            self._assert_exact_runtime_matrix("sqag_runtime")
 
     def test_effective_runtime_matrix_missing_privilege_is_rejected(self) -> None:
         role_name = self._new_exact_matrix_role("matrix_missing")
@@ -2908,14 +3343,192 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self._alter_default_privilege(owner_name, runtime_name, "SELECT", "TABLES")
         self._alter_default_privilege(owner_name, runtime_name, "USAGE", "SEQUENCES")
         self._alter_default_privilege(owner_name, runtime_name, "EXECUTE", "FUNCTIONS")
+        self._alter_default_privilege(owner_name, runtime_name, "USAGE", "SCHEMAS")
+        self._alter_default_privilege(owner_name, runtime_name, "USAGE", "TYPES")
         self._alter_default_privilege(owner_name, "PUBLIC", "SELECT", "TABLES")
         self._alter_default_privilege(owner_name, runtime_name, "UPDATE", "TABLES", with_grant_option=True)
         rows = self._default_acl_snapshot(owner_name)
         self.assertIn((owner_name, "public", "r", runtime_name, "SELECT", False), rows)
         self.assertIn((owner_name, "public", "S", runtime_name, "USAGE", False), rows)
         self.assertIn((owner_name, "public", "f", runtime_name, "EXECUTE", False), rows)
+        self.assertIn((owner_name, "<global>", "n", runtime_name, "USAGE", False), rows)
+        self.assertIn((owner_name, "public", "T", runtime_name, "USAGE", False), rows)
         self.assertIn((owner_name, "public", "r", "PUBLIC", "SELECT", False), rows)
         self.assertIn((owner_name, "public", "r", runtime_name, "UPDATE", True), rows)
+
+    def test_default_acl_schema_type_and_tuple_mutations_fail_exact_contract(self) -> None:
+        self.apply_migrations()
+
+        def assert_mismatch(
+            owner_name: str,
+            expected: set[tuple[Any, ...]],
+            mutate: Any,
+            restore: Any,
+        ) -> None:
+            before = self._default_acl_snapshot(owner_name)
+            mutate()
+            actual = self._default_acl_snapshot(owner_name)
+            self.assertNotEqual(actual, expected)
+            with self.assertRaises(AssertionError):
+                self.assertEqual(actual, expected)
+            restore()
+            self.assertEqual(self._default_acl_snapshot(owner_name), before)
+
+        schema_owner = self._new_role("default_schema_owner")
+        schema_runtime = self._new_role("default_schema_runtime")
+        self._register_default_acl_audit({schema_owner, schema_runtime})
+        assert_mismatch(
+            schema_owner,
+            set(),
+            lambda: self._alter_default_privilege(schema_owner, schema_runtime, "USAGE", "SCHEMAS"),
+            lambda: self._revoke_default_privilege(schema_owner, schema_runtime, "USAGE", "SCHEMAS"),
+        )
+
+        type_owner = self._new_role("default_type_owner")
+        type_runtime = self._new_role("default_type_runtime")
+        self._register_default_acl_audit({type_owner, type_runtime})
+        expected_type_tuple = {
+            (type_owner, "public", "T", type_runtime, "USAGE", False),
+        }
+        before_type = self._default_acl_snapshot(type_owner)
+        self._alter_default_privilege(type_owner, type_runtime, "USAGE", "TYPES")
+        actual_type = self._default_acl_snapshot(type_owner)
+        self.assertEqual(actual_type, expected_type_tuple)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(actual_type, set())
+        self._revoke_default_privilege(type_owner, type_runtime, "USAGE", "TYPES")
+        self.assertEqual(self._default_acl_snapshot(type_owner), before_type)
+
+        public_owner = self._new_role("default_public_owner")
+        public_runtime = self._new_role("default_public_runtime")
+        self._register_default_acl_audit({public_owner, public_runtime})
+        assert_mismatch(
+            public_owner,
+            {(public_owner, "public", "T", public_runtime, "USAGE", False)},
+            lambda: self._alter_default_privilege(public_owner, "PUBLIC", "USAGE", "TYPES"),
+            lambda: self._revoke_default_privilege(public_owner, "PUBLIC", "USAGE", "TYPES"),
+        )
+
+        option_owner = self._new_role("default_option_owner")
+        option_runtime = self._new_role("default_option_runtime")
+        self._register_default_acl_audit({option_owner, option_runtime})
+        assert_mismatch(
+            option_owner,
+            {(option_owner, "public", "T", option_runtime, "USAGE", False)},
+            lambda: self._alter_default_privilege(
+                option_owner, option_runtime, "USAGE", "TYPES", with_grant_option=True
+            ),
+            lambda: self._revoke_default_privilege(option_owner, option_runtime, "USAGE", "TYPES"),
+        )
+
+        extra_owner = self._new_role("default_extra_owner")
+        extra_runtime = self._new_role("default_extra_runtime")
+        self._register_default_acl_audit({extra_owner, extra_runtime})
+        expected_extra = {(extra_owner, "public", "r", extra_runtime, "SELECT", False)}
+        self._alter_default_privilege(extra_owner, extra_runtime, "SELECT", "TABLES")
+        self._alter_default_privilege(extra_owner, extra_runtime, "INSERT", "TABLES")
+        actual_extra = self._default_acl_snapshot(extra_owner)
+        self.assertNotEqual(actual_extra, expected_extra)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(actual_extra, expected_extra)
+        self._revoke_default_privilege(extra_owner, extra_runtime, "INSERT", "TABLES")
+        self._revoke_default_privilege(extra_owner, extra_runtime, "SELECT", "TABLES")
+
+        missing_owner = self._new_role("default_missing_owner")
+        missing_runtime = self._new_role("default_missing_runtime")
+        self._register_default_acl_audit({missing_owner, missing_runtime})
+        expected_missing = {(missing_owner, "public", "r", missing_runtime, "SELECT", False)}
+        self._alter_default_privilege(missing_owner, missing_runtime, "SELECT", "TABLES")
+        self.assertEqual(self._default_acl_snapshot(missing_owner), expected_missing)
+        self._revoke_default_privilege(missing_owner, missing_runtime, "SELECT", "TABLES")
+        actual_missing = self._default_acl_snapshot(missing_owner)
+        self.assertNotEqual(actual_missing, expected_missing)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(actual_missing, expected_missing)
+
+        wrong_grantee_owner = self._new_role("default_wrong_grantee_owner")
+        expected_runtime = self._new_role("default_expected_runtime")
+        wrong_grantee = self._new_role("default_wrong_grantee")
+        self._register_default_acl_audit({wrong_grantee_owner, expected_runtime, wrong_grantee})
+        expected_grantee = {
+            (wrong_grantee_owner, "public", "r", expected_runtime, "SELECT", False),
+        }
+        assert_mismatch(
+            wrong_grantee_owner,
+            expected_grantee,
+            lambda: self._alter_default_privilege(wrong_grantee_owner, wrong_grantee, "SELECT", "TABLES"),
+            lambda: self._revoke_default_privilege(wrong_grantee_owner, wrong_grantee, "SELECT", "TABLES"),
+        )
+
+        expected_owner = self._new_role("default_expected_owner")
+        wrong_owner = self._new_role("default_wrong_owner")
+        owner_runtime = self._new_role("default_owner_runtime")
+        self._register_default_acl_audit({expected_owner, wrong_owner, owner_runtime})
+        expected_owner_tuple = {
+            (expected_owner, "public", "r", owner_runtime, "SELECT", False),
+        }
+        before_all = self._default_acl_snapshot()
+        self._alter_default_privilege(wrong_owner, owner_runtime, "SELECT", "TABLES")
+        actual_wrong_owner = self._default_acl_snapshot()
+        self.assertNotEqual(actual_wrong_owner & expected_owner_tuple, expected_owner_tuple)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(actual_wrong_owner, expected_owner_tuple)
+        self._revoke_default_privilege(wrong_owner, owner_runtime, "SELECT", "TABLES")
+        self.assertEqual(self._default_acl_snapshot(), before_all)
+
+        wrong_type_owner = self._new_role("default_wrong_type_owner")
+        wrong_type_runtime = self._new_role("default_wrong_type_runtime")
+        self._register_default_acl_audit({wrong_type_owner, wrong_type_runtime})
+        expected_table_tuple = {
+            (wrong_type_owner, "public", "r", wrong_type_runtime, "SELECT", False),
+        }
+        assert_mismatch(
+            wrong_type_owner,
+            expected_table_tuple,
+            lambda: self._alter_default_privilege(wrong_type_owner, wrong_type_runtime, "USAGE", "SEQUENCES"),
+            lambda: self._revoke_default_privilege(wrong_type_owner, wrong_type_runtime, "USAGE", "SEQUENCES"),
+        )
+
+        distribution_owner = self._new_role("default_distribution_owner")
+        distribution_runtime = self._new_role("default_distribution_runtime")
+        self._register_default_acl_audit({distribution_owner, distribution_runtime})
+        expected_distribution = {
+            (distribution_owner, "public", "r", distribution_runtime, "SELECT", False),
+        }
+        assert_mismatch(
+            distribution_owner,
+            expected_distribution,
+            lambda: self._alter_default_privilege(distribution_owner, "PUBLIC", "SELECT", "TABLES"),
+            lambda: self._revoke_default_privilege(distribution_owner, "PUBLIC", "SELECT", "TABLES"),
+        )
+
+        membership_owner = self._new_role("default_membership_owner")
+        membership_parent = self._new_role("default_membership_parent")
+        membership_runtime = self._new_role("default_membership_runtime")
+        self._register_default_acl_audit({membership_owner, membership_parent, membership_runtime})
+        membership_table = "run22_default_membership"
+        self.addCleanup(
+            self._cleanup_steps,
+            [("drop_default_membership_table", f"drop table if exists public.{_quote_identifier(membership_table)}")],
+        )
+        self._grant_schema_privilege(membership_owner, "CREATE")
+        self._grant_role_membership(membership_parent, membership_runtime)
+        self._alter_default_privilege(membership_owner, membership_parent, "SELECT", "TABLES")
+        connection = self.connect()
+        try:
+            connection.execute(f"set role {_quote_identifier(membership_owner)}")
+            connection.execute(f"create table public.{_quote_identifier(membership_table)} (id integer)")
+            connection.execute("reset role")
+            connection.commit()
+        finally:
+            connection.close()
+        self.assertTrue(
+            self._has_table_privilege(membership_runtime, membership_table, "SELECT")
+        )
+        actual_membership = self._default_acl_snapshot(membership_owner)
+        self.assertNotEqual(actual_membership, set())
+        with self.assertRaises(AssertionError):
+            self.assertEqual(actual_membership, set())
 
     def test_provider_default_acl_state_is_identical_before_and_after_migrations(self) -> None:
         provider_name = self._create_role("neondb_owner")
@@ -2924,11 +3537,15 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self._alter_default_privilege(provider_name, grantee_name, "SELECT", "TABLES")
         self._alter_default_privilege(provider_name, grantee_name, "USAGE", "SEQUENCES")
         self._alter_default_privilege(provider_name, grantee_name, "EXECUTE", "FUNCTIONS")
+        self._alter_default_privilege(provider_name, grantee_name, "USAGE", "SCHEMAS")
+        self._alter_default_privilege(provider_name, grantee_name, "USAGE", "TYPES")
         before = self._default_acl_snapshot(provider_name)
         expected = {
             (provider_name, "public", "r", grantee_name, "SELECT", False),
             (provider_name, "public", "S", grantee_name, "USAGE", False),
             (provider_name, "public", "f", grantee_name, "EXECUTE", False),
+            (provider_name, "<global>", "n", grantee_name, "USAGE", False),
+            (provider_name, "public", "T", grantee_name, "USAGE", False),
         }
         self._assert_expected_provider_default_tuples(before, expected)
         self.apply_migrations()

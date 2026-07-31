@@ -97,7 +97,12 @@ There is no silent adoption path. Every new production object requires a contrac
 | `sqag_feedback_status_history` | append_only_history | SELECT, INSERT |
 | `sqag_object_artifacts` | mutable_metadata | SELECT, INSERT, UPDATE |
 | `sqag_quote_publication_versions` | mutable | SELECT, INSERT, UPDATE, DELETE |
-| `sqag_quote_publication_artifacts` | mutable | SELECT, INSERT, DELETE |
+| `sqag_quote_publication_artifacts` | mutable | SELECT, INSERT, DELETE; column-only UPDATE on `checksum_sha256` |
+
+The publication-artifact table has no table-level `UPDATE`. The only update
+authority is the manifest's exact column grant on `checksum_sha256`; all other
+columns remain denied, no grant option is allowed, and PUBLIC or membership
+authority must not supply table-level UPDATE.
 
 ### Runtime-forbidden (5 tables)
 
@@ -169,7 +174,7 @@ contract explicitly permits that state.
 | `table_acl` | `relname`, `relacl` | 16 |
 | `routine_acl` | `proname`, `identity_arguments`, `prokind`, `prosecdef`, `proacl`, `proowner`, `owner`, `has_trigger_dependency` | 2 |
 | `default_acl` | `owner`, `namespace`, `object_type`, `grantee`, `privilege_type`, `is_grantable` | 1 |
-| `role_attributes` | `rolname`, `rolsuper`, `rolinherit`, `rolcreaterole`, `rolcreatedb`, `rolcanlogin`, `rolreplication`, `rolbypassrls`, `rolconnlimit`, `rolpassword` | 2 |
+| `role_attributes` | `rolname`, `rolsuper`, `rolinherit`, `rolcreaterole`, `rolcreatedb`, `rolcanlogin`, `rolreplication`, `rolbypassrls`, `rolconnlimit`, `password_is_null` | 2 |
 | `role_memberships` | `role`, `member`, `admin_option` | 0 |
 | `sequence_acl` | `relname`, `relacl` | 0 |
 | `effective_runtime_database_privileges` | `privilege_type`, `effective`, `is_grantable` | 3 |
@@ -191,8 +196,10 @@ PostgreSQL 17 set `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`,
 `REFERENCES`, `TRIGGER`, `MAINTAIN`. The column proof evaluates every
 non-dropped user column against `SELECT`, `INSERT`, `UPDATE`, and `REFERENCES`.
 Expected effective column rows are exactly those implied by the locked
-table-level matrix; column grants cannot add authority to a forbidden table,
-an unauthorized table-level privilege, another column, or a grant option.
+table-level matrix plus the one explicit `UPDATE(checksum_sha256)` tuple on
+`sqag_quote_publication_artifacts`. Column grants cannot add authority to a
+forbidden table, an unauthorized table-level privilege, another
+publication-artifact column, or a grant option.
 
 ## Grantee-aware default-privilege verification
 
@@ -217,7 +224,7 @@ left join pg_catalog.pg_namespace ns on ns.oid = d.defaclnamespace
 cross join lateral pg_catalog.aclexplode(d.defaclacl) expanded
 left join pg_catalog.pg_roles grantee_role
   on grantee_role.oid = expanded.grantee and expanded.grantee <> 0
-where d.defaclobjtype in ('r', 'S', 'f')
+where d.defaclobjtype in ('r', 'S', 'f', 'n', 'T')
 order by owner, namespace, object_type, grantee, expanded.privilege_type, expanded.is_grantable;
 ```
 
@@ -229,15 +236,17 @@ Checking only `defaclrole = 'sqag_runtime'` is insufficient and must not be used
 - Privilege.
 - Grant option.
 
-The disposable PostgreSQL suite creates adversarial table, sequence, and
-routine default grants to a runtime-like role, a default grant to `PUBLIC`,
-and a real `WITH GRANT OPTION` default grant. It snapshots the complete
-provider-owned default state before migrations, applies the canonical
-migrations, snapshots again, and compares owner, namespace, object type,
-grantee, privilege, and grant-option tuples exactly. A separate provider
-fixture creates non-vacuous baseline tuples for table (`r`), sequence (`S`),
-and function (`f`) defaults owned by `neondb_owner`, requires all three tuples
-to be present, and rejects an empty baseline as evidence.
+The canonical object-class boundary is complete: `r` tables, `S` sequences,
+`f` functions, `n` schemas, and `T` types. The disposable PostgreSQL suite
+creates adversarial direct, PUBLIC, membership-derived, grant-option,
+additional, missing, wrong-grantee, wrong-owner, wrong-object-type, and
+equal-count/wrong-tuple fixtures across that boundary. It snapshots complete
+provider/default-ACL state before migrations, registers cleanup before each
+mutation, applies the canonical migrations, restores the state, and compares
+owner, namespace, object type, grantee, privilege, and grant-option tuples
+exactly. A separate provider fixture creates non-vacuous baseline tuples for
+all five object classes owned by `neondb_owner`, requires them to be present,
+and rejects an empty baseline as evidence.
 
 ## Bounded verification-query validation
 
@@ -252,8 +261,11 @@ keywords are rejected.
 
 The default-ACL query must have the exact six-column projection
 `owner, namespace, object_type, grantee, privilege_type, is_grantable`, one
-`CROSS JOIN LATERAL aclexplode(...)`, the `r`/`S`/`f` object-type boundary, the
-PUBLIC case mapping, and deterministic ordering. The routine query must have
+`CROSS JOIN LATERAL aclexplode(...)`, the `r`/`S`/`f`/`n`/`T` object-type
+boundary, the PUBLIC case mapping, and deterministic ordering. The
+role-attribute query must join `pg_roles` to the authoritative `pg_authid`
+catalog and project only the boolean `password_is_null` assertion; it never
+returns the password field. The routine query must have
 the exact eight-column projection
 `proname, identity_arguments, prokind, prosecdef, proacl, proowner, owner,
 has_trigger_dependency`, the complete public-schema routine boundary, and
@@ -388,11 +400,11 @@ The deterministic discovery receipt for this amendment is:
 
 | Receipt item | Count |
 |---|---:|
-| Discovered test methods | 111 |
-| Static and validator methods | 62 |
-| PostgreSQL methods | 46 |
+| Discovered test methods | 122 |
+| Static and validator methods | 69 |
+| PostgreSQL methods | 50 |
 | Requirement-map and documentation parity methods | 3 |
-| Hosted executions | 111 |
+| Hosted executions | 122 |
 | Hosted skips | 0 |
 | Unique locked requirement IDs | 38 (`R01`-`R38`) |
 

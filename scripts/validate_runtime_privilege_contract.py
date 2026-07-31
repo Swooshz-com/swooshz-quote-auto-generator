@@ -36,6 +36,7 @@ TOP_LEVEL_KEYS = frozenset(
         "database_acl",
         "schema_acl",
         "tables",
+        "column_privileges",
         "sequences",
         "routines",
         "default_privileges",
@@ -110,9 +111,12 @@ PROVIDER_EXCEPTION_KEYS = frozenset(
     }
 )
 DEFAULT_PRIVILEGES_KEYS = frozenset(
-    {"sqag_runtime", "sqag_migrator_to_sqag_app", "provider_controlled", "verification_rule"}
+    {"object_classes", "sqag_runtime", "sqag_migrator_to_sqag_app", "provider_controlled", "verification_rule"}
 )
 RUNTIME_DEFAULT_KEYS = frozenset({"tables", "sequences", "routines"})
+COLUMN_PRIVILEGES_TABLE_KEYS = frozenset({"sqag_quote_publication_artifacts"})
+COLUMN_PRIVILEGE_ENTRY_KEYS = frozenset({"update"})
+DEFAULT_ACL_OBJECT_CLASSES = ["r", "S", "f", "n", "T"]
 VERIFICATION_QUERY_KEYS = frozenset(
     {
         "database_acl",
@@ -192,15 +196,17 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
         cross join lateral pg_catalog.aclexplode(d.defaclacl) expanded
         left join pg_catalog.pg_roles grantee_role
           on grantee_role.oid = expanded.grantee and expanded.grantee <> 0
-        where d.defaclobjtype in ('r', 'S', 'f')
+        where d.defaclobjtype in ('r', 'S', 'f', 'n', 'T')
         order by owner, namespace, object_type, grantee, expanded.privilege_type, expanded.is_grantable
     """,
     "role_attributes": """
-        select rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb,
-               rolcanlogin, rolreplication, rolbypassrls, rolconnlimit, rolpassword
-        from pg_catalog.pg_roles
-        where rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_app', 'neondb_owner')
-        order by rolname
+        select r.rolname, r.rolsuper, r.rolinherit, r.rolcreaterole, r.rolcreatedb,
+               r.rolcanlogin, r.rolreplication, r.rolbypassrls, r.rolconnlimit,
+               a.rolpassword is null as password_is_null
+        from pg_catalog.pg_roles r
+        join pg_catalog.pg_authid a on a.oid = r.oid
+        where r.rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_app', 'neondb_owner')
+        order by r.rolname
     """,
     "role_memberships": """
         select r.rolname as role, m.rolname as member, am.admin_option
@@ -391,11 +397,15 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
     "table_acl": ("pg_catalog.pg_class", "pg_catalog.pg_namespace", "relacl", "relkind", "'public'", "order by"),
     "role_attributes": (
         "pg_catalog.pg_roles",
+        "pg_catalog.pg_authid",
         "rolname",
         "rolsuper",
         "rolcanlogin",
         "rolconnlimit",
         "rolpassword",
+        "password_is_null",
+        "is",
+        "null",
     ),
     "role_memberships": ("pg_catalog.pg_auth_members", "admin_option", "pg_catalog.pg_roles"),
     "sequence_acl": ("pg_catalog.pg_class", "relkind", "'s'", "pg_catalog.pg_namespace", "relacl"),
@@ -697,6 +707,38 @@ def validate_table_matrix(manifest: dict[str, Any], errors: list[str]) -> None:
             _exact_value(entry.get("reason"), expected_reason, f"{label}_reason", errors)
 
 
+def validate_column_privileges(manifest: dict[str, Any], errors: list[str]) -> None:
+    column_privileges = manifest.get("column_privileges")
+    if not _exact_keys(column_privileges, COLUMN_PRIVILEGES_TABLE_KEYS, "column_privileges", errors):
+        if not isinstance(column_privileges, dict):
+            return
+    entry = column_privileges.get("sqag_quote_publication_artifacts")
+    label = "column_privileges_sqag_quote_publication_artifacts"
+    if not _exact_keys(entry, COLUMN_PRIVILEGE_ENTRY_KEYS, label, errors):
+        if not isinstance(entry, dict):
+            return
+    _check_exact_string_list(
+        entry.get("update"),
+        ["checksum_sha256"],
+        f"{label}_update",
+        errors,
+    )
+    tables = manifest.get("tables")
+    runtime_accessible = tables.get("runtime_accessible") if isinstance(tables, dict) else None
+    table_entry = (
+        runtime_accessible.get("sqag_quote_publication_artifacts", {})
+        if isinstance(runtime_accessible, dict)
+        else {}
+    )
+    table_privileges = table_entry.get("privileges", {}) if isinstance(table_entry, dict) else {}
+    _exact_value(
+        table_privileges.get("update"),
+        False,
+        "column_privileges_publication_artifacts_table_update",
+        errors,
+    )
+
+
 def validate_sequences(manifest: dict[str, Any], errors: list[str]) -> None:
     sequence = manifest.get("sequences")
     if not _exact_keys(sequence, SEQUENCE_KEYS, "sequences", errors):
@@ -815,6 +857,12 @@ def validate_default_privileges(manifest: dict[str, Any], errors: list[str]) -> 
     if not _exact_keys(default_privileges, DEFAULT_PRIVILEGES_KEYS, "default_privileges", errors):
         if not isinstance(default_privileges, dict):
             return
+    _check_exact_string_list(
+        default_privileges.get("object_classes"),
+        DEFAULT_ACL_OBJECT_CLASSES,
+        "default_privilege_object_classes",
+        errors,
+    )
     runtime = default_privileges.get("sqag_runtime")
     if _exact_keys(runtime, RUNTIME_DEFAULT_KEYS, "runtime_default_privileges", errors):
         for key in sorted(RUNTIME_DEFAULT_KEYS):
@@ -1242,12 +1290,71 @@ def _validate_default_acl_query(query: str, errors: list[str]) -> None:
         _add_error(errors, "verification_query_default_acl_requires_exactly_one_cross_join_lateral_aclexplode")
     if not _find_token_pattern(tokens, ["left", "join", *_qualified_pattern("pg_catalog.pg_roles"), "grantee_role"]):
         _add_error(errors, "verification_query_default_acl_must_left_join_named_grantees")
-    if not _find_token_pattern(tokens, ["where", "d", ".", "defaclobjtype", "in", "(", ("STRING_EXACT", "r"), ",", ("STRING_EXACT", "S"), ",", ("STRING_EXACT", "f"), ")"]):
-        _add_error(errors, "verification_query_default_acl_must_cover_r_s_f_object_types")
+    if not _find_token_pattern(
+        tokens,
+        [
+            "where", "d", ".", "defaclobjtype", "in", "(",
+            ("STRING_EXACT", "r"), ",", ("STRING_EXACT", "S"), ",",
+            ("STRING_EXACT", "f"), ",", ("STRING_EXACT", "n"), ",",
+            ("STRING_EXACT", "T"), ")",
+        ],
+    ):
+        _add_error(errors, "verification_query_default_acl_must_cover_r_s_f_n_T_object_types")
     if _find_token_pattern(tokens, ["::", "regrole"]) or _find_token_pattern(tokens, ["::", "name"]):
         _add_error(errors, "verification_query_default_acl_must_not_cast_absent_role_names")
     if not _find_token_pattern(tokens, ["order", "by", "owner", ",", "namespace", ",", "object_type", ",", "grantee", ",", "expanded", ".", "privilege_type", ",", "expanded", ".", "is_grantable"]):
         _add_error(errors, "verification_query_default_acl_must_order_deterministically")
+
+
+def _validate_role_attributes_query(query: str, errors: list[str]) -> None:
+    tokens = _read_only_query_tokens(query, "role_attributes", errors)
+    if tokens is None:
+        return
+    required = (
+        "pg_catalog.pg_roles",
+        "pg_catalog.pg_authid",
+        "rolname",
+        "rolsuper",
+        "rolinherit",
+        "rolcreaterole",
+        "rolcreatedb",
+        "rolcanlogin",
+        "rolreplication",
+        "rolbypassrls",
+        "rolconnlimit",
+        "rolpassword",
+        "password_is_null",
+        "order by",
+    )
+    _require_sql_features(tokens, "role_attributes", required, errors)
+    parts = _projection_parts(tokens, "role_attributes", errors)
+    if parts is not None:
+        _require_projection_shape(
+            parts,
+            [
+                "rolname", "rolsuper", "rolinherit", "rolcreaterole", "rolcreatedb",
+                "rolcanlogin", "rolreplication", "rolbypassrls", "rolconnlimit",
+                "password_is_null",
+            ],
+            "role_attributes",
+            errors,
+        )
+        if parts and not _find_token_pattern(parts[0], ["r", ".", "rolname"]):
+            _add_error(errors, "verification_query_role_attributes_projection_role_name_invalid")
+        if len(parts) > 9 and not _find_token_pattern(
+            parts[9], ["a", ".", "rolpassword", "is", "null", "as", "password_is_null"]
+        ):
+            _add_error(errors, "verification_query_role_attributes_password_state_must_be_boolean_null_assertion")
+    if not _find_token_pattern(tokens, ["from", *_qualified_pattern("pg_catalog.pg_roles"), "r"]):
+        _add_error(errors, "verification_query_role_attributes_must_read_pg_roles")
+    if not _find_token_pattern(tokens, ["join", *_qualified_pattern("pg_catalog.pg_authid"), "a"]):
+        _add_error(errors, "verification_query_role_attributes_must_read_pg_authid")
+    if not _find_token_pattern(tokens, ["on", "a", ".", "oid", "=", "r", ".", "oid"]):
+        _add_error(errors, "verification_query_role_attributes_must_join_authid_by_oid")
+    if not _find_token_pattern(tokens, ["where", "r", ".", "rolname", "in"]):
+        _add_error(errors, "verification_query_role_attributes_must_filter_declared_roles")
+    if not _find_token_pattern(tokens, ["order", "by", "r", ".", "rolname"]):
+        _add_error(errors, "verification_query_role_attributes_must_order_by_role_name")
 
 
 def _validate_routine_query(query: str, errors: list[str]) -> None:
@@ -1319,6 +1426,8 @@ def validate_verification_queries(manifest: dict[str, Any], errors: list[str]) -
             continue
         if key == "default_acl":
             _validate_default_acl_query(value, errors)
+        elif key == "role_attributes":
+            _validate_role_attributes_query(value, errors)
         elif key == "routine_acl":
             _validate_routine_query(value, errors)
         elif key in REQUIRED_QUERY_FEATURES:
@@ -1363,6 +1472,7 @@ def validate_manifest_strictly(manifest_path: str) -> int:
     validate_roles(manifest, errors)
     validate_production_migrations(manifest, errors)
     validate_table_matrix(manifest, errors)
+    validate_column_privileges(manifest, errors)
     validate_sequences(manifest, errors)
     validate_routines(manifest, errors)
     validate_database_acl(manifest, errors)
