@@ -1,11 +1,11 @@
 """Runtime privilege contract tests.
 
 Deterministic discovery receipt for this amendment:
-  discovered methods: 93
-  static and validator methods: 59
-  PostgreSQL methods: 31
+  discovered methods: 111
+  static and validator methods: 62
+  PostgreSQL methods: 46
   requirement-map and documentation parity methods: 3
-  hosted executions: 93
+  hosted executions: 111
   hosted skips: 0
   unique locked requirement IDs: 38 (R01-R38)
 
@@ -55,6 +55,85 @@ IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 RUNTIME_TABLES = frozenset(load_name for load_name in json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))["tables"]["runtime_accessible"])
 FORBIDDEN_TABLES = frozenset(json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))["tables"]["runtime_forbidden"])
 ALL_TABLES = RUNTIME_TABLES | FORBIDDEN_TABLES
+TABLE_PRIVILEGES = (
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "TRUNCATE",
+    "REFERENCES",
+    "TRIGGER",
+    "MAINTAIN",
+)
+COLUMN_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "REFERENCES")
+DATABASE_PRIVILEGES = ("CONNECT", "CREATE", "TEMPORARY")
+SCHEMA_PRIVILEGES = ("USAGE", "CREATE")
+
+# Independent query-shape authority.  These expectations are deliberately
+# repository-owned test data, not generated from candidate manifest values.
+CANONICAL_QUERY_KEYS = (
+    "database_acl",
+    "schema_acl",
+    "table_acl",
+    "routine_acl",
+    "default_acl",
+    "role_attributes",
+    "role_memberships",
+    "sequence_acl",
+    "effective_runtime_database_privileges",
+    "effective_runtime_table_privileges",
+    "effective_runtime_column_privileges",
+    "effective_runtime_schema_privileges",
+    "effective_runtime_routine_privileges",
+)
+CANONICAL_QUERY_COLUMNS = {
+    "database_acl": ["datacl"],
+    "schema_acl": ["nspacl"],
+    "table_acl": ["relname", "relacl"],
+    "routine_acl": [
+        "proname",
+        "identity_arguments",
+        "prokind",
+        "prosecdef",
+        "proacl",
+        "proowner",
+        "owner",
+        "has_trigger_dependency",
+    ],
+    "default_acl": ["owner", "namespace", "object_type", "grantee", "privilege_type", "is_grantable"],
+    "role_attributes": [
+        "rolname",
+        "rolsuper",
+        "rolinherit",
+        "rolcreaterole",
+        "rolcreatedb",
+        "rolcanlogin",
+        "rolreplication",
+        "rolbypassrls",
+        "rolconnlimit",
+        "rolpassword",
+    ],
+    "role_memberships": ["role", "member", "admin_option"],
+    "sequence_acl": ["relname", "relacl"],
+    "effective_runtime_database_privileges": ["privilege_type", "effective", "is_grantable"],
+    "effective_runtime_table_privileges": [
+        "schema_name",
+        "table_name",
+        "privilege_type",
+        "effective",
+        "is_grantable",
+    ],
+    "effective_runtime_column_privileges": [
+        "schema_name",
+        "table_name",
+        "column_name",
+        "privilege_type",
+        "effective",
+        "is_grantable",
+    ],
+    "effective_runtime_schema_privileges": ["privilege_type", "effective", "is_grantable"],
+    "effective_runtime_routine_privileges": ["routine_name", "effective"],
+}
 DEFAULT_ACL_SNAPSHOT_SQL = """
 select owner_role.rolname as owner_name,
        coalesce(ns.nspname, '<global>') as namespace,
@@ -286,15 +365,8 @@ class ManifestStructureTest(unittest.TestCase):
         self.assertIn("grantee", defaults["verification_rule"])
 
     def test_verification_queries_are_complete(self) -> None:
-        self.assertEqual(
-            set(self.manifest["verification_queries"]),
-            {
-                "database_acl", "schema_acl", "table_acl", "routine_acl", "default_acl",
-                "role_attributes", "role_memberships", "sequence_acl",
-                "effective_runtime_table_privileges", "effective_runtime_schema_privileges",
-                "effective_runtime_routine_privileges",
-            },
-        )
+        self.assertEqual(tuple(self.manifest["verification_queries"]), CANONICAL_QUERY_KEYS)
+        self.assertEqual(set(self.manifest["verification_queries"]), set(CANONICAL_QUERY_COLUMNS))
         for query in self.manifest["verification_queries"].values():
             self.assertIsInstance(query, str)
             self.assertTrue(query.strip())
@@ -438,7 +510,7 @@ class ValidatorStaticTest(unittest.TestCase):
         manifest = load_manifest()
         for key, canonical in manifest["verification_queries"].items():
             variants = (
-                re.sub(r"\s+", "\n\t", canonical).strip(),
+                canonical.replace("\n", " ").replace("\t", " ").strip(),
                 canonical.replace(" ", " /* presentation */\n ", 1),
                 canonical.replace("select", "SELECT", 1),
             )
@@ -649,9 +721,11 @@ class ValidatorStaticTest(unittest.TestCase):
             ("role_attributes", "pg_catalog.pg_roles"),
             ("role_memberships", "pg_catalog.pg_auth_members"),
             ("sequence_acl", "pg_catalog.pg_class"),
+            ("effective_runtime_database_privileges", "has_database_privilege"),
             ("effective_runtime_schema_privileges", "has_schema_privilege"),
             ("effective_runtime_routine_privileges", "has_function_privilege"),
             ("effective_runtime_table_privileges", "has_table_privilege"),
+            ("effective_runtime_column_privileges", "has_column_privilege"),
         ):
             self._assert_query_fixture_rejected(
                 query_key,
@@ -714,6 +788,71 @@ class ValidatorStaticTest(unittest.TestCase):
             "verification_query_default_acl_projection_grantee_missing_public_mapping",
         )
 
+    def test_query_key_contract_rejects_missing_unknown_and_swapped_bindings(self) -> None:
+        manifest = load_manifest()
+        missing = copy.deepcopy(manifest)
+        missing["verification_queries"].pop("effective_runtime_column_privileges")
+        self._assert_fixture_rejected(json.dumps(missing), "verification_queries_missing_keys")
+
+        unknown = copy.deepcopy(manifest)
+        unknown["verification_queries"]["unexpected_query"] = manifest["verification_queries"]["database_acl"]
+        self._assert_fixture_rejected(json.dumps(unknown), "verification_queries_unknown_keys")
+
+        swapped = copy.deepcopy(manifest)
+        swapped["verification_queries"]["effective_runtime_database_privileges"], swapped["verification_queries"]["effective_runtime_schema_privileges"] = (
+            swapped["verification_queries"]["effective_runtime_schema_privileges"],
+            swapped["verification_queries"]["effective_runtime_database_privileges"],
+        )
+        self._assert_fixture_rejected(
+            json.dumps(swapped),
+            "verification_query_effective_runtime_database_privileges_executable_structure_mismatch",
+        )
+
+    def test_role_membership_query_alias_and_projection_mutations_fail(self) -> None:
+        query = load_manifest()["verification_queries"]["role_memberships"]
+        mutations = (
+            query.replace("am.admin_option", "a.admin_option", 1),
+            query.replace("am.admin_option", "am.grant_option", 1),
+            query.replace(", am.admin_option", "", 1),
+        )
+        for mutation in mutations:
+            self._assert_exact_query_rejected("role_memberships", mutation)
+
+    def test_effective_privilege_query_contracts_bind_every_privilege_and_grant_option(self) -> None:
+        manifest = load_manifest()
+        table_query = manifest["verification_queries"]["effective_runtime_table_privileges"]
+        for privilege in TABLE_PRIVILEGES:
+            self._assert_exact_query_rejected(
+                "effective_runtime_table_privileges",
+                table_query.replace(f"('{privilege}')", "('REPLACED')", 1),
+            )
+        column_query = manifest["verification_queries"]["effective_runtime_column_privileges"]
+        for privilege in COLUMN_PRIVILEGES:
+            self._assert_exact_query_rejected(
+                "effective_runtime_column_privileges",
+                column_query.replace(f"('{privilege}')", "('REPLACED')", 1),
+            )
+        mutations = (
+            ("effective_runtime_table_privileges", table_query.replace("has_table_privilege", "has_schema_privilege", 1)),
+            ("effective_runtime_table_privileges", table_query.replace("c.relname like", "n.nspname like", 1)),
+            ("effective_runtime_column_privileges", column_query.replace("a.attname", "c.relname", 1)),
+            ("effective_runtime_column_privileges", column_query.replace("has_column_privilege", "has_table_privilege", 1)),
+            (
+                "effective_runtime_database_privileges",
+                manifest["verification_queries"]["effective_runtime_database_privileges"].replace(
+                    " WITH GRANT OPTION", "", 1
+                ),
+            ),
+            (
+                "effective_runtime_schema_privileges",
+                manifest["verification_queries"]["effective_runtime_schema_privileges"].replace(
+                    "has_schema_privilege", "has_database_privilege", 1
+                ),
+            ),
+        )
+        for query_key, mutation in mutations:
+            self._assert_exact_query_rejected(query_key, mutation)
+
 
 class RequirementEvidenceMapTest(unittest.TestCase):
     def test_requirement_evidence_map_is_exact_and_discoverable(self) -> None:
@@ -737,7 +876,7 @@ class RequirementEvidenceMapTest(unittest.TestCase):
         self.assertIn("- name: Validate runtime privilege contract", workflow)
         self.assertIn("run: python scripts/validate_runtime_privilege_contract.py", workflow)
         self.assertIn("Runtime privilege-contract static validation", documentation)
-        self.assertIn("Disposable PostgreSQL 17 runtime privilege-contract tests run with zero hosted skips", documentation)
+        self.assertIn("Disposable PostgreSQL 17 runtime privilege-contract tests exercise the thirteen canonical query keys", documentation)
         self.assertIn("Boundary A remains repository-only", documentation)
         self.assertIn("Green CI does not authorise Boundary B or #160", documentation)
         self.assertNotIn("green CI authorises Boundary B", documentation.lower())
@@ -773,7 +912,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                     str(_row_dict(row, "rolname"))
                     for row in connection.execute(
                         "select rolname from pg_catalog.pg_roles "
-                        "where rolname in ('sqag_migrator', 'neondb_owner') or rolname like %s "
+                        "where rolname in ('sqag_runtime', 'sqag_migrator', 'neondb_owner') or rolname like %s "
                         "order by rolname",
                         ("sqag_rpc_role_%",),
                     ).fetchall()
@@ -783,8 +922,8 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                     "from pg_catalog.pg_auth_members am "
                     "join pg_catalog.pg_roles parent on parent.oid = am.roleid "
                     "join pg_catalog.pg_roles member on member.oid = am.member "
-                    "where parent.rolname in ('sqag_migrator', 'neondb_owner') "
-                    "or member.rolname in ('sqag_migrator', 'neondb_owner') "
+                    "where parent.rolname in ('sqag_runtime', 'sqag_migrator', 'neondb_owner') "
+                    "or member.rolname in ('sqag_runtime', 'sqag_migrator', 'neondb_owner') "
                     "or parent.rolname like %s or member.rolname like %s",
                     ("sqag_rpc_role_%", "sqag_rpc_role_%"),
                 ).fetchall()
@@ -806,7 +945,9 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                                 "cross join lateral pg_catalog.aclexplode(d.defaclacl) expanded "
                                 "left join pg_catalog.pg_roles grantee_role on grantee_role.oid = expanded.grantee "
                                 "where owner_role.rolname in ('sqag_migrator', 'neondb_owner') "
+                                "or owner_role.rolname = 'sqag_runtime' "
                                 "or owner_role.rolname like %s "
+                                "or grantee_role.rolname in ('sqag_runtime', 'sqag_migrator', 'neondb_owner') "
                                 "or grantee_role.rolname like %s",
                                 ("sqag_rpc_role_%", "sqag_rpc_role_%"),
                             ).fetchall()
@@ -831,6 +972,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self._public_function_restoration_receipts: dict[str, bool] = {}
         self.addCleanup(self._audit_and_drop_database)
         self._create_role("sqag_migrator")
+        self._create_role("sqag_runtime")
         self._grant_database_privilege("sqag_migrator", "CONNECT")
         self._grant_database_privilege("sqag_migrator", "CREATE")
         self._grant_database_privilege("sqag_migrator", "TEMPORARY")
@@ -891,6 +1033,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
     def _drop_role(self, role_name: str) -> None:
         ident = _quote_identifier(role_name)
         database_ident = _quote_identifier(self.database_name)
+        self._revoke_role_memberships(role_name)
         self._cleanup_steps(
             [
                 ("revoke_schema", f"revoke all privileges on schema public from {ident}"),
@@ -902,6 +1045,33 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 ("drop_role", f"drop role {ident}"),
             ]
         )
+
+    def _revoke_role_memberships(self, role_name: str) -> None:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "select parent.rolname as parent_name, member.rolname as member_name "
+                "from pg_catalog.pg_auth_members am "
+                "join pg_catalog.pg_roles parent on parent.oid = am.roleid "
+                "join pg_catalog.pg_roles member on member.oid = am.member "
+                "where parent.rolname = %s or member.rolname = %s "
+                "order by parent_name, member_name",
+                (role_name, role_name),
+            ).fetchall()
+        finally:
+            connection.rollback()
+            connection.close()
+        steps = [
+            (
+                f"revoke_membership_{parent}_{member}",
+                f"revoke {_quote_identifier(str(parent))} from {_quote_identifier(str(member))}",
+            )
+            for parent, member in (
+                (_row_dict(row, "parent_name"), _row_dict(row, "member_name")) for row in rows
+            )
+        ]
+        if steps:
+            self._cleanup_steps(steps)
 
     def _audit_and_drop_database(self) -> None:
         errors: list[str] = []
@@ -915,7 +1085,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             connection = self.connect()
             leftover_roles = connection.execute(
                 "select rolname from pg_catalog.pg_roles "
-                "where rolname in ('sqag_migrator', 'neondb_owner') or rolname like %s "
+                "where rolname in ('sqag_runtime', 'sqag_migrator', 'neondb_owner') or rolname like %s "
                 "order by rolname",
                 ("sqag_rpc_role_%",),
             ).fetchall()
@@ -927,8 +1097,9 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 "join pg_catalog.pg_roles owner_role on owner_role.oid = d.defaclrole "
                 "cross join lateral pg_catalog.aclexplode(d.defaclacl) expanded "
                 "left join pg_catalog.pg_roles grantee_role on grantee_role.oid = expanded.grantee "
-                "where owner_role.rolname in ('sqag_migrator', 'neondb_owner') "
+                "where owner_role.rolname in ('sqag_runtime', 'sqag_migrator', 'neondb_owner') "
                 "or owner_role.rolname like %s "
+                "or grantee_role.rolname in ('sqag_runtime', 'sqag_migrator', 'neondb_owner') "
                 "or grantee_role.rolname like %s",
                 ("sqag_rpc_role_%", "sqag_rpc_role_%"),
             ).fetchall()
@@ -999,7 +1170,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         )
 
     def _grant_table_privilege(self, role_name: str, table_name: str, privilege: str) -> None:
-        if table_name not in ALL_TABLES or privilege not in {"SELECT", "INSERT", "UPDATE", "DELETE"}:
+        if table_name not in ALL_TABLES or privilege not in set(TABLE_PRIVILEGES):
             raise ValueError(f"invalid table grant: {table_name}:{privilege}")
         connection = self.connect()
         try:
@@ -1010,6 +1181,69 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         finally:
             connection.close()
         self.addCleanup(self._revoke_table_privilege, role_name, table_name, privilege)
+
+    def _grant_column_privilege(
+        self,
+        role_name: str,
+        table_name: str,
+        column_name: str,
+        privilege: str,
+        *,
+        grantee: str | None = None,
+        with_grant_option: bool = False,
+    ) -> None:
+        if table_name not in ALL_TABLES or privilege not in set(COLUMN_PRIVILEGES):
+            raise ValueError(f"invalid column grant: {table_name}:{column_name}:{privilege}")
+        target = grantee or role_name
+        target_sql = "public" if target == "PUBLIC" else _quote_identifier(target)
+        option = " with grant option" if with_grant_option else ""
+        connection = self.connect()
+        try:
+            connection.execute(
+                f"grant {privilege} ({_quote_identifier(column_name)}) on table "
+                f"{_quote_identifier(table_name)} to {target_sql}{option}"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        self.addCleanup(
+            self._revoke_column_privilege,
+            table_name,
+            column_name,
+            privilege,
+            target,
+        )
+
+    def _revoke_column_privilege(
+        self, table_name: str, column_name: str, privilege: str, grantee: str
+    ) -> None:
+        target_sql = "public" if grantee == "PUBLIC" else _quote_identifier(grantee)
+        self._cleanup_steps(
+            [
+                (
+                    f"revoke_column_{table_name}_{column_name}_{privilege}_{grantee}",
+                    f"revoke {privilege} ({_quote_identifier(column_name)}) on table "
+                    f"{_quote_identifier(table_name)} from {target_sql}",
+                )
+            ]
+        )
+
+    def _grant_role_membership(
+        self, parent_role: str, member_role: str, *, admin_option: bool = False
+    ) -> None:
+        option = " with admin option" if admin_option else ""
+        self._execute_admin_sql(
+            f"grant {_quote_identifier(parent_role)} to {_quote_identifier(member_role)}{option}"
+        )
+        self.addCleanup(
+            self._cleanup_steps,
+            [
+                (
+                    f"revoke_membership_{parent_role}_{member_role}",
+                    f"revoke {_quote_identifier(parent_role)} from {_quote_identifier(member_role)}",
+                )
+            ],
+        )
 
     def _revoke_table_privilege(self, role_name: str, table_name: str, privilege: str) -> None:
         self._cleanup_steps(
@@ -1406,14 +1640,13 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         try:
             rows = connection.execute(
                 "select n.nspname as schema_name, c.relname as table_name, p.privilege_type, "
-                "coalesce((select bool_or(a.is_grantable) from pg_catalog.aclexplode(coalesce(c.relacl, pg_catalog.acldefault('r', c.relowner))) a "
-                "where (a.grantee = 0 or a.grantee = (select oid from pg_catalog.pg_roles where rolname = %s)) "
-                "and a.privilege_type = p.privilege_type), false) as is_grantable "
+                "has_table_privilege(%s, c.oid, p.privilege_type) as effective, "
+                "has_table_privilege(%s, c.oid, p.privilege_type || ' WITH GRANT OPTION') as is_grantable "
                 "from pg_catalog.pg_class c "
                 "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
-                "cross join (values ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE')) p(privilege_type) "
-                "where n.nspname = 'public' and c.relkind = 'r' "
-                "and has_table_privilege(%s, c.oid, p.privilege_type) "
+                "cross join (values ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE'), "
+                "('REFERENCES'), ('TRIGGER'), ('MAINTAIN')) p(privilege_type) "
+                "where n.nspname = 'public' and c.relkind = 'r' and c.relname like 'sqag_' || chr(37) "
                 "order by n.nspname, c.relname, p.privilege_type",
                 (role_name, role_name),
             ).fetchall()
@@ -1425,10 +1658,136 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                     bool(row["is_grantable"]),
                 )
                 for row in rows
+                if bool(row["effective"])
             }
         finally:
             connection.rollback()
             connection.close()
+
+    def _user_columns(self) -> dict[str, tuple[str, ...]]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "select c.relname as table_name, a.attname as column_name "
+                "from pg_catalog.pg_class c "
+                "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+                "join pg_catalog.pg_attribute a on a.attrelid = c.oid "
+                "where n.nspname = 'public' and c.relkind = 'r' "
+                "and c.relname like 'sqag_' || chr(37) and a.attnum > 0 and not a.attisdropped "
+                "order by c.relname, a.attnum"
+            ).fetchall()
+            columns: dict[str, list[str]] = {}
+            for row in rows:
+                columns.setdefault(str(row["table_name"]), []).append(str(row["column_name"]))
+            return {table_name: tuple(names) for table_name, names in columns.items()}
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def _effective_column_grants(
+        self, role_name: str
+    ) -> set[tuple[str, str, str, str, bool]]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "select n.nspname as schema_name, c.relname as table_name, a.attname as column_name, "
+                "p.privilege_type, has_column_privilege(%s, c.oid, a.attname, p.privilege_type) as effective, "
+                "has_column_privilege(%s, c.oid, a.attname, p.privilege_type || ' WITH GRANT OPTION') as is_grantable "
+                "from pg_catalog.pg_class c "
+                "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+                "join pg_catalog.pg_attribute a on a.attrelid = c.oid "
+                "cross join (values ('SELECT'), ('INSERT'), ('UPDATE'), ('REFERENCES')) p(privilege_type) "
+                "where n.nspname = 'public' and c.relkind = 'r' "
+                "and c.relname like 'sqag_' || chr(37) and a.attnum > 0 and not a.attisdropped "
+                "order by n.nspname, c.relname, a.attname, p.privilege_type",
+                (role_name, role_name),
+            ).fetchall()
+            return {
+                (
+                    str(row["schema_name"]),
+                    str(row["table_name"]),
+                    str(row["column_name"]),
+                    str(row["privilege_type"]),
+                    bool(row["is_grantable"]),
+                )
+                for row in rows
+                if bool(row["effective"])
+            }
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def _expected_runtime_column_grants(self) -> set[tuple[str, str, str, str, bool]]:
+        columns = self._user_columns()
+        expected: set[tuple[str, str, str, str, bool]] = set()
+        for table_name, entry in self.contract["tables"]["runtime_accessible"].items():
+            for column_name in columns.get(table_name, ()):
+                for privilege in COLUMN_PRIVILEGES:
+                    if entry["privileges"].get(privilege.lower(), False):
+                        expected.add((str(entry["schema"]), table_name, column_name, privilege, False))
+        return expected
+
+    def _assert_exact_runtime_column_matrix(self, role_name: str) -> None:
+        actual = self._effective_column_grants(role_name)
+        self.assertEqual(actual, self._expected_runtime_column_grants())
+        self.assertFalse(any(row[4] for row in actual), f"column grant options found: {actual}")
+        self.assertFalse({row[1] for row in actual} & FORBIDDEN_TABLES)
+
+    def _effective_database_privileges(self, role_name: str) -> set[tuple[str, bool, bool]]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "select p.privilege_type, "
+                "has_database_privilege(%s, current_database(), p.privilege_type) as effective, "
+                "has_database_privilege(%s, current_database(), p.privilege_type || ' WITH GRANT OPTION') as is_grantable "
+                "from (values ('CONNECT'), ('CREATE'), ('TEMPORARY')) p(privilege_type) "
+                "order by p.privilege_type",
+                (role_name, role_name),
+            ).fetchall()
+            return {
+                (str(row["privilege_type"]), bool(row["effective"]), bool(row["is_grantable"]))
+                for row in rows
+            }
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def _expected_runtime_database_privileges(self) -> set[tuple[str, bool, bool]]:
+        return {("CONNECT", True, False), ("CREATE", False, False), ("TEMPORARY", False, False)}
+
+    def _assert_exact_runtime_database_privileges(self, role_name: str) -> None:
+        self.assertEqual(
+            self._effective_database_privileges(role_name),
+            self._expected_runtime_database_privileges(),
+        )
+
+    def _effective_schema_privileges(self, role_name: str) -> set[tuple[str, bool, bool]]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "select p.privilege_type, "
+                "has_schema_privilege(%s, 'public', p.privilege_type) as effective, "
+                "has_schema_privilege(%s, 'public', p.privilege_type || ' WITH GRANT OPTION') as is_grantable "
+                "from (values ('USAGE'), ('CREATE')) p(privilege_type) "
+                "order by p.privilege_type",
+                (role_name, role_name),
+            ).fetchall()
+            return {
+                (str(row["privilege_type"]), bool(row["effective"]), bool(row["is_grantable"]))
+                for row in rows
+            }
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def _expected_runtime_schema_privileges(self) -> set[tuple[str, bool, bool]]:
+        return {("USAGE", True, False), ("CREATE", False, False)}
+
+    def _assert_exact_runtime_schema_privileges(self, role_name: str) -> None:
+        self.assertEqual(
+            self._effective_schema_privileges(role_name),
+            self._expected_runtime_schema_privileges(),
+        )
 
     def _expected_runtime_grants(self) -> set[tuple[str, str, str, bool]]:
         expected: set[tuple[str, str, str, bool]] = set()
@@ -1465,6 +1824,20 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self._assert_exact_runtime_matrix(role_name)
         return role_name
 
+    def _prepare_fixed_runtime_contract_fixture(self) -> tuple[str, str]:
+        self.apply_migrations()
+        self._grant_database_privilege("sqag_runtime", "CONNECT")
+        self._grant_schema_privilege("sqag_runtime", "USAGE")
+        for table_name, entry in self.contract["tables"]["runtime_accessible"].items():
+            for privilege, allowed in entry["privileges"].items():
+                if allowed:
+                    self._grant_table_privilege("sqag_runtime", table_name, privilege.upper())
+        self._alter_public_database_privilege("TEMPORARY", False)
+        owner_name = self._new_role("query_owner")
+        grantee_name = self._new_role("query_grantee")
+        self._alter_default_privilege(owner_name, grantee_name, "SELECT", "TABLES")
+        return owner_name, grantee_name
+
     def _assert_isolated_matrix_mismatch(
         self,
         role_name: str,
@@ -1475,6 +1848,17 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.assertEqual(actual ^ expected, expected_symmetric_diff)
         with self.assertRaises(AssertionError):
             self._assert_exact_runtime_matrix(role_name)
+
+    def _assert_isolated_column_mismatch(
+        self,
+        role_name: str,
+        expected_symmetric_diff: set[tuple[str, str, str, str, bool]],
+    ) -> None:
+        expected = self._expected_runtime_column_grants()
+        actual = self._effective_column_grants(role_name)
+        self.assertEqual(actual ^ expected, expected_symmetric_diff)
+        with self.assertRaises(AssertionError):
+            self._assert_exact_runtime_column_matrix(role_name)
 
     def test_actual_table_inventory_equals_manifest(self) -> None:
         self.apply_migrations()
@@ -1505,17 +1889,38 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.assertEqual(actual, set())
 
     def test_canonical_query_result_shapes_and_non_empty_fixture_rows(self) -> None:
-        owner_name = self._new_role("query_owner")
-        grantee_name = self._new_role("query_grantee")
-        self._alter_default_privilege(owner_name, grantee_name, "SELECT", "TABLES")
-        self.apply_migrations()
+        owner_name, grantee_name = self._prepare_fixed_runtime_contract_fixture()
+        expected_cardinality = {
+            "database_acl": 1,
+            "schema_acl": 1,
+            "table_acl": 16,
+            "routine_acl": 2,
+            "default_acl": 1,
+            "role_attributes": 2,
+            "role_memberships": 0,
+            "sequence_acl": 0,
+            "effective_runtime_database_privileges": 3,
+            "effective_runtime_table_privileges": len(ALL_TABLES) * len(TABLE_PRIVILEGES),
+            "effective_runtime_column_privileges": sum(len(columns) for columns in self._user_columns().values()) * len(COLUMN_PRIVILEGES),
+            "effective_runtime_schema_privileges": 2,
+            "effective_runtime_routine_privileges": 2,
+        }
+        executed: list[str] = []
+        results: dict[str, tuple[list[str], list[dict[str, Any]]]] = {}
+        for query_key in CANONICAL_QUERY_KEYS:
+            self.assertNotIn(query_key, executed)
+            executed.append(query_key)
+            results[query_key] = self._execute_contract_query(query_key)
 
-        default_columns, default_rows = self._execute_contract_query("default_acl")
-        self.assertEqual(
-            default_columns,
-            ["owner", "namespace", "object_type", "grantee", "privilege_type", "is_grantable"],
-        )
-        self.assertTrue(default_rows)
+        self.assertEqual(executed, list(CANONICAL_QUERY_KEYS))
+        self.assertEqual(len(executed), 13)
+        self.assertEqual(set(executed), set(self.contract["verification_queries"]))
+        for query_key in CANONICAL_QUERY_KEYS:
+            columns, rows = results[query_key]
+            self.assertEqual(columns, CANONICAL_QUERY_COLUMNS[query_key], query_key)
+            self.assertEqual(len(rows), expected_cardinality[query_key], query_key)
+
+        default_rows = results["default_acl"][1]
         self.assertIn(
             {
                 "owner": owner_name,
@@ -1527,32 +1932,89 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             },
             default_rows,
         )
-
-        routine_columns, routine_rows = self._execute_contract_query("routine_acl")
+        role_rows = results["role_attributes"][1]
+        self.assertEqual({str(row["rolname"]) for row in role_rows}, {"sqag_migrator", "sqag_runtime"})
+        membership_rows = results["role_memberships"][1]
+        self.assertEqual(membership_rows, [])
+        database_rows = results["effective_runtime_database_privileges"][1]
         self.assertEqual(
-            routine_columns,
-            [
-                "proname",
-                "identity_arguments",
-                "prokind",
-                "prosecdef",
-                "proacl",
-                "proowner",
-                "owner",
-                "has_trigger_dependency",
-            ],
+            {
+                (str(row["privilege_type"]), bool(row["effective"]), bool(row["is_grantable"]))
+                for row in database_rows
+            },
+            self._expected_runtime_database_privileges(),
         )
-        self.assertTrue(routine_rows)
-        routine_by_name = {str(row["proname"]): row for row in routine_rows}
-        self.assertTrue(set(EXPECTED_ROUTINES) <= set(routine_by_name))
-        for routine_name in EXPECTED_ROUTINES:
-            row = routine_by_name[routine_name]
-            self.assertIsInstance(row["identity_arguments"], str)
-            self.assertEqual(row["prokind"], "f")
-            self.assertIs(row["prosecdef"], False)
-            self.assertIsInstance(row["proowner"], int)
-            self.assertEqual(row["owner"], "sqag_migrator")
-            self.assertIs(row["has_trigger_dependency"], True)
+        schema_rows = results["effective_runtime_schema_privileges"][1]
+        self.assertEqual(
+            {
+                (str(row["privilege_type"]), bool(row["effective"]), bool(row["is_grantable"]))
+                for row in schema_rows
+            },
+            self._expected_runtime_schema_privileges(),
+        )
+        table_rows = results["effective_runtime_table_privileges"][1]
+        self.assertEqual(
+            {
+                (str(row["schema_name"]), str(row["table_name"]), str(row["privilege_type"]), bool(row["is_grantable"]))
+                for row in table_rows
+                if bool(row["effective"])
+            },
+            self._expected_runtime_grants(),
+        )
+        column_rows = results["effective_runtime_column_privileges"][1]
+        self.assertEqual(
+            {
+                (
+                    str(row["schema_name"]),
+                    str(row["table_name"]),
+                    str(row["column_name"]),
+                    str(row["privilege_type"]),
+                    bool(row["is_grantable"]),
+                )
+                for row in column_rows
+                if bool(row["effective"])
+            },
+            self._expected_runtime_column_grants(),
+        )
+        routine_rows = results["effective_runtime_routine_privileges"][1]
+        self.assertEqual({str(row["routine_name"]) for row in routine_rows}, set(EXPECTED_ROUTINES))
+        self.assertTrue(all(bool(row["effective"]) for row in routine_rows))
+
+    def test_role_membership_query_executes_and_invalid_alias_fails(self) -> None:
+        invalid_query = self.contract["verification_queries"]["role_memberships"].replace(
+            "am.admin_option", "a.admin_option", 1
+        )
+        connection = self.connect()
+        try:
+            with self.assertRaises(Exception) as failure:
+                connection.execute(invalid_query).fetchall()
+            connection.rollback()
+            self.assertEqual(getattr(failure.exception, "sqlstate", None), "42P01")
+        finally:
+            connection.close()
+
+        columns, rows = self._execute_contract_query("role_memberships")
+        self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["role_memberships"])
+        self.assertEqual(rows, [])
+
+        parent_name = self._new_role("membership_parent")
+        self._grant_role_membership(parent_name, "sqag_runtime", admin_option=True)
+        columns, rows = self._execute_contract_query("role_memberships")
+        self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["role_memberships"])
+        self.assertEqual(
+            [
+                (str(row["role"]), str(row["member"]), bool(row["admin_option"]))
+                for row in rows
+            ],
+            [(parent_name, "sqag_runtime", True)],
+        )
+        with self.assertRaises(AssertionError):
+            self.assertEqual(rows, [])
+
+    def test_canonical_query_shape_contract_is_independent_and_complete(self) -> None:
+        self.assertEqual(tuple(CANONICAL_QUERY_COLUMNS), CANONICAL_QUERY_KEYS)
+        self.assertEqual(set(CANONICAL_QUERY_KEYS), set(self.contract["verification_queries"]))
+        self.assertEqual(len(CANONICAL_QUERY_KEYS), 13)
 
     def test_actual_routine_inventory_has_no_stock_provider_exception(self) -> None:
         runtime_name = self._new_role("routine_inventory")
@@ -1749,11 +2211,9 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                     self._grant_table_privilege(role_name, table_name, privilege.upper())
         self._alter_public_database_privilege("TEMPORARY", False)
         self._assert_exact_runtime_matrix(role_name)
-        self.assertTrue(self._has_database_privilege(role_name, "CONNECT"))
-        self.assertFalse(self._has_database_privilege(role_name, "CREATE"))
-        self.assertFalse(self._has_database_privilege(role_name, "TEMPORARY"))
-        self.assertTrue(self._has_schema_privilege(role_name, "USAGE"))
-        self.assertFalse(self._has_schema_privilege(role_name, "CREATE"))
+        self._assert_exact_runtime_column_matrix(role_name)
+        self._assert_exact_runtime_database_privileges(role_name)
+        self._assert_exact_runtime_schema_privileges(role_name)
         for table_name in FORBIDDEN_TABLES:
             self.assertFalse(("public", table_name, "SELECT", False) in self._effective_table_grants(role_name))
 
@@ -1848,6 +2308,194 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 ("public", table_name, privilege, True),
             },
         )
+
+    def test_table_privilege_matrix_direct_mismatches_cover_all_postgresql17_privileges(self) -> None:
+        role_name = self._new_exact_matrix_role("table_direct_all")
+        table_name = "sqag_legal_holds"
+        for privilege in TABLE_PRIVILEGES:
+            with self.subTest(privilege=privilege):
+                self._execute_admin_sql(
+                    f"grant {privilege} on table {_quote_identifier(table_name)} to {_quote_identifier(role_name)}"
+                )
+                try:
+                    self._assert_isolated_matrix_mismatch(
+                        role_name,
+                        {("public", table_name, privilege, False)},
+                    )
+                finally:
+                    self._execute_admin_sql(
+                        f"revoke {privilege} on table {_quote_identifier(table_name)} from {_quote_identifier(role_name)}"
+                    )
+
+    def test_table_privilege_matrix_direct_grant_options_cover_all_postgresql17_privileges(self) -> None:
+        role_name = self._new_exact_matrix_role("table_grant_option_all")
+        table_name = "sqag_legal_holds"
+        for privilege in TABLE_PRIVILEGES:
+            with self.subTest(privilege=privilege):
+                self._execute_admin_sql(
+                    f"grant {privilege} on table {_quote_identifier(table_name)} "
+                    f"to {_quote_identifier(role_name)} with grant option"
+                )
+                try:
+                    self._assert_isolated_matrix_mismatch(
+                        role_name,
+                        {("public", table_name, privilege, True)},
+                    )
+                finally:
+                    self._execute_admin_sql(
+                        f"revoke {privilege} on table {_quote_identifier(table_name)} from {_quote_identifier(role_name)}"
+                    )
+
+    def test_table_privilege_matrix_public_grants_cover_all_postgresql17_privileges(self) -> None:
+        role_name = self._new_exact_matrix_role("table_public_all")
+        table_name = "sqag_legal_holds"
+        for privilege in TABLE_PRIVILEGES:
+            with self.subTest(privilege=privilege):
+                self._execute_admin_sql(
+                    f"grant {privilege} on table {_quote_identifier(table_name)} to public"
+                )
+                try:
+                    self._assert_isolated_matrix_mismatch(
+                        role_name,
+                        {("public", table_name, privilege, False)},
+                    )
+                finally:
+                    self._execute_admin_sql(
+                        f"revoke {privilege} on table {_quote_identifier(table_name)} from public"
+                    )
+
+    def test_table_privilege_matrix_membership_grants_cover_all_postgresql17_privileges(self) -> None:
+        role_name = self._new_exact_matrix_role("table_membership_all")
+        parent_name = self._new_role("table_membership_parent")
+        self._grant_role_membership(parent_name, role_name)
+        table_name = "sqag_legal_holds"
+        for privilege in TABLE_PRIVILEGES:
+            with self.subTest(privilege=privilege):
+                self._execute_admin_sql(
+                    f"grant {privilege} on table {_quote_identifier(table_name)} to {_quote_identifier(parent_name)}"
+                )
+                try:
+                    self._assert_isolated_matrix_mismatch(
+                        role_name,
+                        {("public", table_name, privilege, False)},
+                    )
+                finally:
+                    self._execute_admin_sql(
+                        f"revoke {privilege} on table {_quote_identifier(table_name)} from {_quote_identifier(parent_name)}"
+                    )
+
+    def test_column_privilege_matrix_direct_grants_cover_all_postgresql17_column_privileges(self) -> None:
+        role_name = self._new_exact_matrix_role("column_direct_all")
+        table_name = "sqag_legal_holds"
+        column_name = self._user_columns()[table_name][0]
+        for privilege in COLUMN_PRIVILEGES:
+            with self.subTest(privilege=privilege):
+                self._execute_admin_sql(
+                    f"grant {privilege} ({_quote_identifier(column_name)}) on table "
+                    f"{_quote_identifier(table_name)} to {_quote_identifier(role_name)}"
+                )
+                try:
+                    self._assert_isolated_column_mismatch(
+                        role_name,
+                        {("public", table_name, column_name, privilege, False)},
+                    )
+                finally:
+                    self._execute_admin_sql(
+                        f"revoke {privilege} ({_quote_identifier(column_name)}) on table "
+                        f"{_quote_identifier(table_name)} from {_quote_identifier(role_name)}"
+                    )
+
+    def test_column_privilege_matrix_grant_options_cover_all_postgresql17_column_privileges(self) -> None:
+        role_name = self._new_exact_matrix_role("column_grant_option_all")
+        table_name = "sqag_legal_holds"
+        column_name = self._user_columns()[table_name][0]
+        for privilege in COLUMN_PRIVILEGES:
+            with self.subTest(privilege=privilege):
+                self._execute_admin_sql(
+                    f"grant {privilege} ({_quote_identifier(column_name)}) on table "
+                    f"{_quote_identifier(table_name)} to {_quote_identifier(role_name)} with grant option"
+                )
+                try:
+                    self._assert_isolated_column_mismatch(
+                        role_name,
+                        {("public", table_name, column_name, privilege, True)},
+                    )
+                finally:
+                    self._execute_admin_sql(
+                        f"revoke {privilege} ({_quote_identifier(column_name)}) on table "
+                        f"{_quote_identifier(table_name)} from {_quote_identifier(role_name)}"
+                    )
+
+    def test_column_privilege_matrix_public_grants_cover_all_postgresql17_column_privileges(self) -> None:
+        role_name = self._new_exact_matrix_role("column_public_all")
+        table_name = "sqag_legal_holds"
+        column_name = self._user_columns()[table_name][0]
+        for privilege in COLUMN_PRIVILEGES:
+            with self.subTest(privilege=privilege):
+                self._execute_admin_sql(
+                    f"grant {privilege} ({_quote_identifier(column_name)}) on table "
+                    f"{_quote_identifier(table_name)} to public"
+                )
+                try:
+                    self._assert_isolated_column_mismatch(
+                        role_name,
+                        {("public", table_name, column_name, privilege, False)},
+                    )
+                finally:
+                    self._execute_admin_sql(
+                        f"revoke {privilege} ({_quote_identifier(column_name)}) on table "
+                        f"{_quote_identifier(table_name)} from public"
+                    )
+
+    def test_column_privilege_matrix_membership_grants_cover_all_postgresql17_column_privileges(self) -> None:
+        role_name = self._new_exact_matrix_role("column_membership_all")
+        parent_name = self._new_role("column_membership_parent")
+        self._grant_role_membership(parent_name, role_name)
+        table_name = "sqag_legal_holds"
+        column_name = self._user_columns()[table_name][0]
+        for privilege in COLUMN_PRIVILEGES:
+            with self.subTest(privilege=privilege):
+                self._execute_admin_sql(
+                    f"grant {privilege} ({_quote_identifier(column_name)}) on table "
+                    f"{_quote_identifier(table_name)} to {_quote_identifier(parent_name)}"
+                )
+                try:
+                    self._assert_isolated_column_mismatch(
+                        role_name,
+                        {("public", table_name, column_name, privilege, False)},
+                    )
+                finally:
+                    self._execute_admin_sql(
+                        f"revoke {privilege} ({_quote_identifier(column_name)}) on table "
+                        f"{_quote_identifier(table_name)} from {_quote_identifier(parent_name)}"
+                    )
+
+    def test_column_grants_are_exact_per_column_and_not_hidden_by_table_authority(self) -> None:
+        role_name = self._new_exact_matrix_role("column_exact_distribution")
+        table_name = "sqag_generation_evidence"
+        columns = self._user_columns()[table_name]
+        self.assertGreaterEqual(len(columns), 2)
+        first_column, second_column = columns[:2]
+        privilege = "UPDATE"
+        self._execute_admin_sql(
+            f"grant {privilege} ({_quote_identifier(first_column)}) on table "
+            f"{_quote_identifier(table_name)} to {_quote_identifier(role_name)}"
+        )
+        try:
+            self._assert_isolated_column_mismatch(
+                role_name,
+                {("public", table_name, first_column, privilege, False)},
+            )
+            actual = self._effective_column_grants(role_name)
+            self.assertNotIn(("public", table_name, second_column, privilege, False), actual)
+            self.assertFalse(
+                any(row[1] != table_name and row[3] == privilege for row in actual)
+            )
+        finally:
+            self._execute_admin_sql(
+                f"revoke {privilege} ({_quote_identifier(first_column)}) on table "
+                f"{_quote_identifier(table_name)} from {_quote_identifier(role_name)}"
+            )
 
     def test_effective_runtime_matrix_unexpected_table_privilege_is_rejected(self) -> None:
         role_name = self._new_exact_matrix_role("matrix_unexpected_table")
@@ -1951,12 +2599,113 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         role_name = self._new_role("acl")
         self._grant_database_privilege(role_name, "CONNECT")
         self._grant_schema_privilege(role_name, "USAGE")
+        self._alter_public_database_privilege("TEMPORARY", False)
         self.assertTrue(self._has_database_privilege("public", "CONNECT"))
         self.assertFalse(self._has_database_privilege("public", "CREATE"))
-        self.assertTrue(self._has_database_privilege(role_name, "CONNECT"))
-        self.assertFalse(self._has_database_privilege(role_name, "CREATE"))
-        self.assertTrue(self._has_schema_privilege(role_name, "USAGE"))
-        self.assertFalse(self._has_schema_privilege(role_name, "CREATE"))
+        self._assert_exact_runtime_database_privileges(role_name)
+        self._assert_exact_runtime_schema_privileges(role_name)
+
+    def test_database_privilege_matrix_direct_public_membership_and_cross_substitution(self) -> None:
+        self._alter_public_database_privilege("CONNECT", False)
+        self._alter_public_database_privilege("TEMPORARY", False)
+        direct_role = self._new_role("database_direct_all")
+        for privilege in DATABASE_PRIVILEGES:
+            with self.subTest(source="direct", privilege=privilege):
+                self._execute_admin_sql(
+                    f"grant {privilege} on database {_quote_identifier(self.database_name)} "
+                    f"to {_quote_identifier(direct_role)}"
+                )
+                try:
+                    if privilege == "CONNECT":
+                        self._assert_exact_runtime_database_privileges(direct_role)
+                    else:
+                        self.assertNotEqual(
+                            self._effective_database_privileges(direct_role),
+                            self._expected_runtime_database_privileges(),
+                        )
+                        self.assertTrue(
+                            any(row[0] == privilege and row[1] for row in self._effective_database_privileges(direct_role))
+                        )
+                finally:
+                    self._execute_admin_sql(
+                        f"revoke {privilege} on database {_quote_identifier(self.database_name)} "
+                        f"from {_quote_identifier(direct_role)}"
+                    )
+
+        public_role = self._new_role("database_public_all")
+        for privilege in DATABASE_PRIVILEGES:
+            with self.subTest(source="public", privilege=privilege):
+                self._execute_admin_sql(
+                    f"grant {privilege} on database {_quote_identifier(self.database_name)} to public"
+                )
+                try:
+                    if privilege == "CONNECT":
+                        self._assert_exact_runtime_database_privileges(public_role)
+                    else:
+                        self.assertNotEqual(
+                            self._effective_database_privileges(public_role),
+                            self._expected_runtime_database_privileges(),
+                        )
+                finally:
+                    self._execute_admin_sql(
+                        f"revoke {privilege} on database {_quote_identifier(self.database_name)} from public"
+                    )
+
+        membership_role = self._new_role("database_membership_all")
+        parent_role = self._new_role("database_membership_parent")
+        self._grant_role_membership(parent_role, membership_role)
+        for privilege in DATABASE_PRIVILEGES:
+            with self.subTest(source="membership", privilege=privilege):
+                self._execute_admin_sql(
+                    f"grant {privilege} on database {_quote_identifier(self.database_name)} "
+                    f"to {_quote_identifier(parent_role)}"
+                )
+                try:
+                    if privilege == "CONNECT":
+                        self._assert_exact_runtime_database_privileges(membership_role)
+                    else:
+                        self.assertNotEqual(
+                            self._effective_database_privileges(membership_role),
+                            self._expected_runtime_database_privileges(),
+                        )
+                finally:
+                    self._execute_admin_sql(
+                        f"revoke {privilege} on database {_quote_identifier(self.database_name)} "
+                        f"from {_quote_identifier(parent_role)}"
+                    )
+
+        cross_role = self._new_role("database_cross")
+        self._execute_admin_sql(
+            f"grant CREATE on database {_quote_identifier(self.database_name)} to {_quote_identifier(cross_role)}"
+        )
+        self.assertFalse(
+            next(row for row in self._effective_database_privileges(cross_role) if row[0] == "CONNECT")[1]
+        )
+        self.assertTrue(
+            next(row for row in self._effective_database_privileges(cross_role) if row[0] == "CREATE")[1]
+        )
+
+    def test_database_privilege_matrix_grant_options_cover_all_privileges(self) -> None:
+        self._alter_public_database_privilege("CONNECT", False)
+        self._alter_public_database_privilege("TEMPORARY", False)
+        role_name = self._new_role("database_grant_options")
+        for privilege in DATABASE_PRIVILEGES:
+            with self.subTest(privilege=privilege):
+                self._execute_admin_sql(
+                    f"grant {privilege} on database {_quote_identifier(self.database_name)} "
+                    f"to {_quote_identifier(role_name)} with grant option"
+                )
+                try:
+                    actual = self._effective_database_privileges(role_name)
+                    row = next(item for item in actual if item[0] == privilege)
+                    self.assertTrue(row[1])
+                    self.assertTrue(row[2])
+                    self.assertNotEqual(actual, self._expected_runtime_database_privileges())
+                finally:
+                    self._execute_admin_sql(
+                        f"revoke {privilege} on database {_quote_identifier(self.database_name)} "
+                        f"from {_quote_identifier(role_name)}"
+                    )
 
     def test_public_temporary_revocation_blocks_runtime_and_restores(self) -> None:
         self.apply_migrations()
@@ -1965,6 +2714,96 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self._alter_public_database_privilege("TEMPORARY", False)
         self.assertFalse(self._has_database_privilege(role_name, "TEMPORARY"))
         self.assertFalse(self._has_database_privilege("public", "TEMPORARY"))
+
+    def test_schema_privilege_matrix_direct_public_membership_and_cross_substitution(self) -> None:
+        self._alter_public_database_privilege("TEMPORARY", False)
+        self._execute_admin_sql("revoke USAGE on schema public from public")
+        self.addCleanup(self._execute_admin_sql, "grant USAGE on schema public to public")
+
+        direct_role = self._new_role("schema_direct_all")
+        for privilege in SCHEMA_PRIVILEGES:
+            with self.subTest(source="direct", privilege=privilege):
+                self._execute_admin_sql(
+                    f"grant {privilege} on schema public to {_quote_identifier(direct_role)}"
+                )
+                try:
+                    if privilege == "USAGE":
+                        self._assert_exact_runtime_schema_privileges(direct_role)
+                    else:
+                        self.assertNotEqual(
+                            self._effective_schema_privileges(direct_role),
+                            self._expected_runtime_schema_privileges(),
+                        )
+                finally:
+                    self._execute_admin_sql(
+                        f"revoke {privilege} on schema public from {_quote_identifier(direct_role)}"
+                    )
+
+        public_role = self._new_role("schema_public_all")
+        for privilege in SCHEMA_PRIVILEGES:
+            with self.subTest(source="public", privilege=privilege):
+                self._execute_admin_sql(f"grant {privilege} on schema public to public")
+                try:
+                    if privilege == "USAGE":
+                        self._assert_exact_runtime_schema_privileges(public_role)
+                    else:
+                        self.assertNotEqual(
+                            self._effective_schema_privileges(public_role),
+                            self._expected_runtime_schema_privileges(),
+                        )
+                finally:
+                    self._execute_admin_sql(f"revoke {privilege} on schema public from public")
+
+        membership_role = self._new_role("schema_membership_all")
+        parent_role = self._new_role("schema_membership_parent")
+        self._grant_role_membership(parent_role, membership_role)
+        for privilege in SCHEMA_PRIVILEGES:
+            with self.subTest(source="membership", privilege=privilege):
+                self._execute_admin_sql(
+                    f"grant {privilege} on schema public to {_quote_identifier(parent_role)}"
+                )
+                try:
+                    if privilege == "USAGE":
+                        self._assert_exact_runtime_schema_privileges(membership_role)
+                    else:
+                        self.assertNotEqual(
+                            self._effective_schema_privileges(membership_role),
+                            self._expected_runtime_schema_privileges(),
+                        )
+                finally:
+                    self._execute_admin_sql(
+                        f"revoke {privilege} on schema public from {_quote_identifier(parent_role)}"
+                    )
+
+        cross_role = self._new_role("schema_cross")
+        self._execute_admin_sql(f"grant CREATE on schema public to {_quote_identifier(cross_role)}")
+        self.assertFalse(
+            next(row for row in self._effective_schema_privileges(cross_role) if row[0] == "USAGE")[1]
+        )
+        self.assertTrue(
+            next(row for row in self._effective_schema_privileges(cross_role) if row[0] == "CREATE")[1]
+        )
+
+    def test_schema_privilege_matrix_grant_options_cover_all_privileges(self) -> None:
+        self._alter_public_database_privilege("TEMPORARY", False)
+        self._execute_admin_sql("revoke USAGE on schema public from public")
+        self.addCleanup(self._execute_admin_sql, "grant USAGE on schema public to public")
+        role_name = self._new_role("schema_grant_options")
+        for privilege in SCHEMA_PRIVILEGES:
+            with self.subTest(privilege=privilege):
+                self._execute_admin_sql(
+                    f"grant {privilege} on schema public to {_quote_identifier(role_name)} with grant option"
+                )
+                try:
+                    actual = self._effective_schema_privileges(role_name)
+                    row = next(item for item in actual if item[0] == privilege)
+                    self.assertTrue(row[1])
+                    self.assertTrue(row[2])
+                    self.assertNotEqual(actual, self._expected_runtime_schema_privileges())
+                finally:
+                    self._execute_admin_sql(
+                        f"revoke {privilege} on schema public from {_quote_identifier(role_name)}"
+                    )
 
     def test_public_acl_baseline_audit_detects_omitted_restoration(self) -> None:
         privilege = "TEMPORARY"

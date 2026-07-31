@@ -50,7 +50,7 @@ CI enforces digest freshness automatically. A digest drift against the committed
 
 Every `sqag_` table must be classified in the manifest under exactly one of two sections:
 
-- `tables.runtime_accessible`: exactly 11 tables. Each entry records the exact `SELECT`, `INSERT`, `UPDATE`, `DELETE` boolean privileges.
+- `tables.runtime_accessible`: exactly 11 tables. Each entry records the exact currently authorized table-level `SELECT`, `INSERT`, `UPDATE`, `DELETE` boolean privileges. The PostgreSQL 17 effective proof also enumerates `TRUNCATE`, `REFERENCES`, `TRIGGER`, and `MAINTAIN` and requires them to remain false unless a future Design Lock authorizes them.
 - `tables.runtime_forbidden`: exactly 5 tables. Each entry records only its class and reason.
 
 ### How to classify a new table
@@ -152,6 +152,48 @@ The contract manifest records this as:
 
 The disposable PostgreSQL tests prove that after the revoke, a runtime role has `has_database_privilege('temp') = false`.
 
+## PostgreSQL 17 effective privilege proofs
+
+The manifest and validator bind exactly thirteen canonical verification-query
+keys. Each key has an independent repository-owned executable-token contract;
+candidate manifest text cannot redefine its expected query. The PostgreSQL
+integration contract executes every key once, checks the exact returned column
+names and order, and applies the row-cardinality rule for its disposable
+fixture. The role-membership result may be empty because the no-membership
+contract explicitly permits that state.
+
+| Key | Exact result columns | Fixture cardinality |
+|---|---|---:|
+| `database_acl` | `datacl` | 1 |
+| `schema_acl` | `nspacl` | 1 |
+| `table_acl` | `relname`, `relacl` | 16 |
+| `routine_acl` | `proname`, `identity_arguments`, `prokind`, `prosecdef`, `proacl`, `proowner`, `owner`, `has_trigger_dependency` | 2 |
+| `default_acl` | `owner`, `namespace`, `object_type`, `grantee`, `privilege_type`, `is_grantable` | 1 |
+| `role_attributes` | `rolname`, `rolsuper`, `rolinherit`, `rolcreaterole`, `rolcreatedb`, `rolcanlogin`, `rolreplication`, `rolbypassrls`, `rolconnlimit`, `rolpassword` | 2 |
+| `role_memberships` | `role`, `member`, `admin_option` | 0 |
+| `sequence_acl` | `relname`, `relacl` | 0 |
+| `effective_runtime_database_privileges` | `privilege_type`, `effective`, `is_grantable` | 3 |
+| `effective_runtime_table_privileges` | `schema_name`, `table_name`, `privilege_type`, `effective`, `is_grantable` | 128 |
+| `effective_runtime_column_privileges` | `schema_name`, `table_name`, `column_name`, `privilege_type`, `effective`, `is_grantable` | fixture columns x 4 |
+| `effective_runtime_schema_privileges` | `privilege_type`, `effective`, `is_grantable` | 2 |
+| `effective_runtime_routine_privileges` | `routine_name`, `effective` | 2 |
+
+The effective database proof covers `CONNECT`, `CREATE`, and `TEMPORARY`; the
+locked runtime result is `true/false/false`, with all three grantable flags
+false. The effective schema proof covers `USAGE` and `CREATE` with the locked
+result `true/false`, again with both grantable flags false. Both queries use
+PostgreSQL's `has_*_privilege(... 'WITH GRANT OPTION')` evaluation, so direct,
+PUBLIC, membership-derived, owner-derived, and grant-option authority is
+evaluated for the exact privilege rather than inferred from ACL text.
+
+The table proof evaluates every `public.sqag_*` table against the ordered
+PostgreSQL 17 set `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`,
+`REFERENCES`, `TRIGGER`, `MAINTAIN`. The column proof evaluates every
+non-dropped user column against `SELECT`, `INSERT`, `UPDATE`, and `REFERENCES`.
+Expected effective column rows are exactly those implied by the locked
+table-level matrix; column grants cannot add authority to a forbidden table,
+an unauthorized table-level privilege, another column, or a grant option.
+
 ## Grantee-aware default-privilege verification
 
 PostgreSQL's `ALTER DEFAULT PRIVILEGES` stores grants in `pg_catalog.pg_default_acl`. The `defaclrole` column records which role granted the defaults, not which role receives them. The actual grantee is embedded in the `defaclacl` ACL array.
@@ -215,9 +257,17 @@ PUBLIC case mapping, and deterministic ordering. The routine query must have
 the exact eight-column projection
 `proname, identity_arguments, prokind, prosecdef, proacl, proowner, owner,
 has_trigger_dependency`, the complete public-schema routine boundary, and
-deterministic identity-argument ordering. PostgreSQL evidence executes both
-canonical queries, asserts the exact returned column names, and requires
-non-empty fixture rows.
+deterministic identity-argument ordering. The PostgreSQL query-shape evidence
+executes all thirteen canonical queries, asserts the exact returned column
+names, and applies the documented cardinality rules.
+
+The remaining effective queries have the same exact-token binding. In
+particular, the membership query must project `role`, `member`, and
+`admin_option` from the declared `am` alias; the table query must retain all
+eight privilege literals; the column query must retain the table, column, and
+privilege predicates; and database/schema grantability must remain a real
+privilege-specific `WITH GRANT OPTION` check. Invalid SQL is still rejected by
+PostgreSQL execution even when a candidate happens to contain expected words.
 
 Adversarial static fixtures cover comment-token, string-literal, and
 dollar-quote no-op attempts; multiple statements; write statements;
@@ -236,10 +286,15 @@ SQLSTATE `P0001` with the exact immutable-record message while leaving the row
 unchanged. Direct calls to both trigger functions run under `SET ROLE` and
 must fail specifically with SQLSTATE `42501`.
 
-The runtime table proof constructs the expected set directly from the manifest
-as `(schema_name, table_name, privilege_type, is_grantable)` and compares it
-with the complete effective set. Ten independent disposable-database tests
-each start from a valid matrix and reject one named mismatch class:
+The runtime table proof constructs the expected effective set directly from
+the manifest as `(schema_name, table_name, privilege_type, is_grantable)` and
+compares it with the complete effective set. The table and column adversarial
+matrices independently exercise direct, grant-option, PUBLIC, and
+membership-derived authority for every PostgreSQL 17 table privilege and each
+column privilege. They also reject one-column/one-table substitutions, equal
+aggregate counts with wrong distribution, and column grants hidden by table
+authority. The disposable-database tests start from valid matrices and reject
+these named mismatch classes:
 
 1. a missing privilege tuple;
 2. an extra privilege tuple;
@@ -252,10 +307,11 @@ each start from a valid matrix and reject one named mismatch class:
 9. the wrong privilege type on an otherwise correct table; and
 10. equal aggregate row counts with the wrong tuple distribution.
 
-The proof also checks database CONNECT, database CREATE, database TEMPORARY
-after PUBLIC revocation, schema USAGE, schema CREATE, and all five forbidden
-tables. It asserts the exact symmetric difference for each negative case, so
-aggregate counts are never acceptance evidence.
+The proof also checks database `CONNECT`, `CREATE`, and `TEMPORARY`, schema
+`USAGE` and `CREATE`, their grant options, direct/PUBLIC/membership-derived
+authority, cross-privilege substitutions, and all five forbidden tables. It
+asserts exact tuples for each negative case, so aggregate counts are never
+acceptance evidence.
 
 ## PUBLIC ACL baseline and cleanup proof
 
@@ -332,11 +388,11 @@ The deterministic discovery receipt for this amendment is:
 
 | Receipt item | Count |
 |---|---:|
-| Discovered test methods | 93 |
-| Static and validator methods | 59 |
-| PostgreSQL methods | 31 |
+| Discovered test methods | 111 |
+| Static and validator methods | 62 |
+| PostgreSQL methods | 46 |
 | Requirement-map and documentation parity methods | 3 |
-| Hosted executions | 93 |
+| Hosted executions | 111 |
 | Hosted skips | 0 |
 | Unique locked requirement IDs | 38 (`R01`-`R38`) |
 

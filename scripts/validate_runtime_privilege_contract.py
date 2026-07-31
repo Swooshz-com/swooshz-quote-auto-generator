@@ -123,7 +123,9 @@ VERIFICATION_QUERY_KEYS = frozenset(
         "role_attributes",
         "role_memberships",
         "sequence_acl",
+        "effective_runtime_database_privileges",
         "effective_runtime_table_privileges",
+        "effective_runtime_column_privileges",
         "effective_runtime_schema_privileges",
         "effective_runtime_routine_privileges",
     }
@@ -201,7 +203,7 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
         order by rolname
     """,
     "role_memberships": """
-        select r.rolname as role, m.rolname as member, a.admin_option
+        select r.rolname as role, m.rolname as member, am.admin_option
         from pg_catalog.pg_auth_members am
         join pg_catalog.pg_roles r on r.oid = am.roleid
         join pg_catalog.pg_roles m on m.oid = am.member
@@ -214,32 +216,82 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
         where c.relkind = 'S' and n.nspname = 'public'
         order by relname
     """,
+    "effective_runtime_database_privileges": """
+        select p.privilege_type,
+               has_database_privilege('sqag_runtime', current_database(), p.privilege_type) as effective,
+               has_database_privilege(
+                   'sqag_runtime',
+                   current_database(),
+                   p.privilege_type || ' WITH GRANT OPTION'
+               ) as is_grantable
+        from (values ('CONNECT'), ('CREATE'), ('TEMPORARY')) p(privilege_type)
+        order by p.privilege_type
+    """,
     "effective_runtime_table_privileges": """
         select n.nspname as schema_name,
                c.relname as table_name,
                p.privilege_type,
                has_table_privilege('sqag_runtime', c.oid, p.privilege_type) as effective,
-               coalesce(
-                   (
-                       select bool_or(a.is_grantable)
-                       from pg_catalog.aclexplode(coalesce(c.relacl, pg_catalog.acldefault('r', c.relowner))) a
-                       where a.grantee = 0
-                          or a.grantee = (select oid from pg_catalog.pg_roles where rolname = 'sqag_runtime')
-                   ),
-                   false
+               has_table_privilege(
+                   'sqag_runtime',
+                   c.oid,
+                   p.privilege_type || ' WITH GRANT OPTION'
                ) as is_grantable
         from pg_catalog.pg_class c
         join pg_catalog.pg_namespace n on n.oid = c.relnamespace
-        cross join (values ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE')) p(privilege_type)
+        cross join (
+            values
+                ('SELECT'),
+                ('INSERT'),
+                ('UPDATE'),
+                ('DELETE'),
+                ('TRUNCATE'),
+                ('REFERENCES'),
+                ('TRIGGER'),
+                ('MAINTAIN')
+        ) p(privilege_type)
         where n.nspname = 'public'
           and c.relkind = 'r'
-          and has_table_privilege('sqag_runtime', c.oid, p.privilege_type)
+          and c.relname like 'sqag_' || chr(37)
         order by n.nspname, c.relname, p.privilege_type
+    """,
+    "effective_runtime_column_privileges": """
+        select n.nspname as schema_name,
+               c.relname as table_name,
+               a.attname as column_name,
+               p.privilege_type,
+               has_column_privilege('sqag_runtime', c.oid, a.attname, p.privilege_type) as effective,
+               has_column_privilege(
+                   'sqag_runtime',
+                   c.oid,
+                   a.attname,
+                   p.privilege_type || ' WITH GRANT OPTION'
+               ) as is_grantable
+        from pg_catalog.pg_class c
+        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+        join pg_catalog.pg_attribute a on a.attrelid = c.oid
+        cross join (
+            values
+                ('SELECT'),
+                ('INSERT'),
+                ('UPDATE'),
+                ('REFERENCES')
+        ) p(privilege_type)
+        where n.nspname = 'public'
+          and c.relkind = 'r'
+          and c.relname like 'sqag_' || chr(37)
+          and a.attnum > 0
+          and not a.attisdropped
+        order by n.nspname, c.relname, a.attname, p.privilege_type
     """,
     "effective_runtime_schema_privileges": """
         select p.privilege_type,
                has_schema_privilege('sqag_runtime', 'public', p.privilege_type) as effective,
-               false as is_grantable
+               has_schema_privilege(
+                   'sqag_runtime',
+                   'public',
+                   p.privilege_type || ' WITH GRANT OPTION'
+               ) as is_grantable
         from (values ('USAGE'), ('CREATE')) p(privilege_type)
         order by p.privilege_type
     """,
@@ -347,6 +399,45 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
     ),
     "role_memberships": ("pg_catalog.pg_auth_members", "admin_option", "pg_catalog.pg_roles"),
     "sequence_acl": ("pg_catalog.pg_class", "relkind", "'s'", "pg_catalog.pg_namespace", "relacl"),
+    "effective_runtime_database_privileges": (
+        "has_database_privilege",
+        "current_database",
+        "privilege_type",
+        "is_grantable",
+        "' WITH GRANT OPTION'",
+        "'connect'",
+        "'create'",
+        "'temporary'",
+    ),
+    "effective_runtime_table_privileges": (
+        "has_table_privilege",
+        "pg_catalog.pg_class",
+        "pg_catalog.pg_namespace",
+        "c.relname",
+        "is_grantable",
+        "' WITH GRANT OPTION'",
+        "'select'",
+        "'insert'",
+        "'update'",
+        "'delete'",
+        "'truncate'",
+        "'references'",
+        "'trigger'",
+        "'maintain'",
+    ),
+    "effective_runtime_column_privileges": (
+        "has_column_privilege",
+        "pg_catalog.pg_attribute",
+        "attname",
+        "attnum",
+        "attisdropped",
+        "is_grantable",
+        "' WITH GRANT OPTION'",
+        "'select'",
+        "'insert'",
+        "'update'",
+        "'references'",
+    ),
     "effective_runtime_schema_privileges": ("has_schema_privilege", "'public'", "'usage'", "'create'"),
     "effective_runtime_routine_privileges": ("has_function_privilege", "pg_catalog.pg_proc", "'public'", "'execute'"),
 }
@@ -1216,6 +1307,8 @@ def _validate_routine_query(query: str, errors: list[str]) -> None:
 
 def validate_verification_queries(manifest: dict[str, Any], errors: list[str]) -> None:
     queries = manifest.get("verification_queries")
+    if set(CANONICAL_VERIFICATION_QUERY_SQL) != set(VERIFICATION_QUERY_KEYS):
+        _add_error(errors, "repository_expected_verification_query_contract_keys_mismatch")
     if not _exact_keys(queries, VERIFICATION_QUERY_KEYS, "verification_queries", errors):
         if not isinstance(queries, dict):
             return
