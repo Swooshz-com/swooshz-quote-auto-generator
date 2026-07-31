@@ -964,6 +964,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.database_name = self._create_database()
+        self._membership_baseline = self._membership_snapshot()
         self._public_database_baseline = {
             privilege: self._has_database_privilege("public", privilege)
             for privilege in ("CONNECT", "CREATE", "TEMPORARY")
@@ -971,6 +972,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self._public_function_baselines: dict[str, bool] = {}
         self._public_function_restoration_receipts: dict[str, bool] = {}
         self.addCleanup(self._audit_and_drop_database)
+        self.addCleanup(self._assert_membership_baseline_restored)
         self._create_role("sqag_migrator")
         self._create_role("sqag_runtime")
         self._grant_database_privilege("sqag_migrator", "CONNECT")
@@ -992,6 +994,38 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             row_factory=self.dict_row,
         )
         return PostgresConnectionAdapter(raw)
+
+    @staticmethod
+    def _membership_tuples(rows: list[dict[str, Any]]) -> tuple[tuple[str, str, bool], ...]:
+        return tuple(
+            sorted(
+                (
+                    str(row["role"]),
+                    str(row["member"]),
+                    bool(row["admin_option"]),
+                )
+                for row in rows
+            )
+        )
+
+    def _membership_snapshot(self) -> tuple[tuple[str, str, bool], ...]:
+        columns, rows = self._execute_contract_query("role_memberships")
+        self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["role_memberships"])
+        return self._membership_tuples(rows)
+
+    @staticmethod
+    def _runtime_like_memberships(
+        memberships: tuple[tuple[str, str, bool], ...],
+    ) -> tuple[tuple[str, str, bool], ...]:
+        runtime_like_roles = {"sqag_runtime", "sqag_migrator"}
+        return tuple(
+            row
+            for row in memberships
+            if row[0] in runtime_like_roles or row[1] in runtime_like_roles
+        )
+
+    def _assert_membership_baseline_restored(self) -> None:
+        self.assertEqual(self._membership_snapshot(), self._membership_baseline)
 
     def _cleanup_steps(self, steps: list[tuple[str, str]], database_name: str | None = None) -> None:
         errors: list[str] = []
@@ -1232,9 +1266,6 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self, parent_role: str, member_role: str, *, admin_option: bool = False
     ) -> None:
         option = " with admin option" if admin_option else ""
-        self._execute_admin_sql(
-            f"grant {_quote_identifier(parent_role)} to {_quote_identifier(member_role)}{option}"
-        )
         self.addCleanup(
             self._cleanup_steps,
             [
@@ -1243,6 +1274,9 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                     f"revoke {_quote_identifier(parent_role)} from {_quote_identifier(member_role)}",
                 )
             ],
+        )
+        self._execute_admin_sql(
+            f"grant {_quote_identifier(parent_role)} to {_quote_identifier(member_role)}{option}"
         )
 
     def _revoke_table_privilege(self, role_name: str, table_name: str, privilege: str) -> None:
@@ -1897,7 +1931,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             "routine_acl": 2,
             "default_acl": 1,
             "role_attributes": 2,
-            "role_memberships": 0,
+            "role_memberships": len(self._membership_baseline),
             "sequence_acl": 0,
             "effective_runtime_database_privileges": 3,
             "effective_runtime_table_privileges": len(ALL_TABLES) * len(TABLE_PRIVILEGES),
@@ -1935,7 +1969,9 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         role_rows = results["role_attributes"][1]
         self.assertEqual({str(row["rolname"]) for row in role_rows}, {"sqag_migrator", "sqag_runtime"})
         membership_rows = results["role_memberships"][1]
-        self.assertEqual(membership_rows, [])
+        membership_tuples = self._membership_tuples(membership_rows)
+        self.assertEqual(membership_tuples, self._membership_baseline)
+        self.assertEqual(self._runtime_like_memberships(membership_tuples), ())
         database_rows = results["effective_runtime_database_privileges"][1]
         self.assertEqual(
             {
@@ -1995,21 +2031,30 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
 
         columns, rows = self._execute_contract_query("role_memberships")
         self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["role_memberships"])
-        self.assertEqual(rows, [])
+        self.assertEqual(self._membership_tuples(rows), self._membership_baseline)
+        self.assertEqual(self._runtime_like_memberships(self._membership_tuples(rows)), ())
 
         parent_name = self._new_role("membership_parent")
-        self._grant_role_membership(parent_name, "sqag_runtime", admin_option=True)
+        synthetic_false = (parent_name, "sqag_runtime", False)
+        self._grant_role_membership(parent_name, "sqag_runtime", admin_option=False)
+        admin_parent_name = self._new_role("membership_admin_parent")
+        synthetic_true = (admin_parent_name, "sqag_runtime", True)
+        self._grant_role_membership(admin_parent_name, "sqag_runtime", admin_option=True)
         columns, rows = self._execute_contract_query("role_memberships")
         self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["role_memberships"])
+        actual = self._membership_tuples(rows)
+        expected = tuple(sorted((*self._membership_baseline, synthetic_false, synthetic_true)))
+        self.assertEqual(actual, expected)
         self.assertEqual(
-            [
-                (str(row["role"]), str(row["member"]), bool(row["admin_option"]))
-                for row in rows
-            ],
-            [(parent_name, "sqag_runtime", True)],
+            set(actual) ^ set(self._membership_baseline),
+            {synthetic_false, synthetic_true},
+        )
+        self.assertEqual(
+            self._runtime_like_memberships(actual),
+            tuple(sorted((synthetic_false, synthetic_true))),
         )
         with self.assertRaises(AssertionError):
-            self.assertEqual(rows, [])
+            self.assertEqual(self._runtime_like_memberships(actual), ())
 
     def test_canonical_query_shape_contract_is_independent_and_complete(self) -> None:
         self.assertEqual(tuple(CANONICAL_QUERY_COLUMNS), CANONICAL_QUERY_KEYS)
@@ -2486,10 +2531,15 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 role_name,
                 {("public", table_name, first_column, privilege, False)},
             )
+            expected = self._expected_runtime_column_grants()
             actual = self._effective_column_grants(role_name)
+            intended_delta = {("public", table_name, first_column, privilege, False)}
+            self.assertEqual(actual ^ expected, intended_delta)
+            self.assertEqual(actual - expected, intended_delta)
+            self.assertEqual(expected - actual, set())
             self.assertNotIn(("public", table_name, second_column, privilege, False), actual)
             self.assertFalse(
-                any(row[1] != table_name and row[3] == privilege for row in actual)
+                any(row[1] != table_name and row[3] == privilege for row in actual - expected)
             )
         finally:
             self._execute_admin_sql(
