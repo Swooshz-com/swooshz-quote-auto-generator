@@ -30,7 +30,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install pinned Python dependencies
-        run: python -m pip install --only-binary=:all: -r requirements.txt
+        run: "python -m pip install --only-binary=:all: -r requirements.txt"
 
       - name: Reproduce immutable test-only RED state
         run: python scripts/reproduce_run34_red.py
