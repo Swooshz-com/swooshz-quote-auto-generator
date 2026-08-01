@@ -1,11 +1,11 @@
 """Runtime privilege contract tests.
 
 Deterministic discovery receipt for this amendment:
-  discovered methods: 122
-  static and validator methods: 69
-  PostgreSQL methods: 50
+  discovered methods: 142
+  static and validator methods: 87
+  PostgreSQL methods: 52
   requirement-map and documentation parity methods: 3
-  hosted executions: 122
+  hosted executions: 142
   hosted skips: 0
   unique locked requirement IDs: 38 (R01-R38)
 
@@ -32,6 +32,8 @@ from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 from typing import Any, Iterator
 from unittest import mock
+
+import scripts.validate_runtime_privilege_contract as contract_validator
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -122,7 +124,14 @@ CANONICAL_QUERY_COLUMNS = {
         "rolconnlimit",
         "password_is_null",
     ],
-    "role_memberships": ["role", "member", "admin_option"],
+    "role_memberships": [
+        "role",
+        "member",
+        "grantor",
+        "admin_option",
+        "inherit_option",
+        "set_option",
+    ],
     "sequence_acl": ["relname", "relacl"],
     "effective_runtime_database_privileges": ["privilege_type", "effective", "is_grantable"],
     "effective_runtime_table_privileges": [
@@ -161,6 +170,28 @@ left join pg_catalog.pg_roles grantee_role
 where d.defaclobjtype in ('r', 'S', 'f', 'n', 'T')
 order by owner_name, namespace, object_type, grantee, expanded.privilege_type, expanded.is_grantable
 """
+
+PRODUCTION_PROVIDER_CONTROL_EDGE = {
+    "parent_role": "sqag_runtime",
+    "member_role": "neondb_owner",
+    "grantor": "cloud_admin",
+    "admin_option": True,
+    "inherit_option": False,
+    "set_option": False,
+    "classification": "postgresql17_creator_admin_control",
+    "security_rationale": (
+        "PostgreSQL 17 system-generated creator-admin control for the provider administrator; "
+        "it grants no privilege, inheritance, or SET-role path to sqag_runtime."
+    ),
+}
+PRODUCTION_PROVIDER_CONTROL_ROW = {
+    "role": "sqag_runtime",
+    "member": "neondb_owner",
+    "grantor": "cloud_admin",
+    "admin_option": True,
+    "inherit_option": False,
+    "set_option": False,
+}
 
 
 def postgres_test_conninfo(database_name: str = "postgres") -> str | None:
@@ -201,7 +232,7 @@ REQUIREMENT_EVIDENCE: dict[str, dict[str, str]] = {
     "R01": {"requirement": "Schema version is locked to v1.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_schema_version_is_1"},
     "R02": {"requirement": "Manifest binds to the canonical repository revision and tree.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_repository_binding"},
     "R03": {"requirement": "Runtime role attributes are dormant and restricted.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_runtime_role_attributes"},
-    "R04": {"requirement": "Runtime role has no memberships, ownership, or grant options.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_runtime_role_no_memberships_no_ownership"},
+    "R04": {"requirement": "The runtime has no privilege-bearing membership, inherited role, SET-role path or runtime-as-member edge; exactly one PostgreSQL-17 provider creator-admin control edge is permitted with ADMIN true, INHERIT false and SET false.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_runtime_role_membership_contract_is_exact"},
     "R05": {"requirement": "Migrator cannot create roles.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_migrator_cannot_create_roles"},
     "R06": {"requirement": "Forbidden maintenance role is classified.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_sqag_maintenance_is_forbidden"},
     "R07": {"requirement": "Production migrations, digests, and table bindings match repository authority.", "evidence_type": "static", "evidence": "ManifestStructureTest.test_production_migrations_match_repository"},
@@ -279,9 +310,13 @@ class ManifestStructureTest(unittest.TestCase):
         self.assertIs(attrs["inherit"], True)
         self.assertEqual(attrs["connection_limit"], -1)
 
-    def test_runtime_role_no_memberships_no_ownership(self) -> None:
+    def test_runtime_role_membership_contract_is_exact(self) -> None:
         runtime = self.manifest["roles"]["runtime"]
-        self.assertEqual(runtime["memberships"], [])
+        self.assertEqual(runtime["memberships_as_member"], [])
+        self.assertEqual(runtime["inherited_roles"], [])
+        self.assertEqual(runtime["set_assumable_roles"], [])
+        self.assertEqual(runtime["membership_derived_privileges"], [])
+        self.assertEqual(runtime["provider_control_edges"], [PRODUCTION_PROVIDER_CONTROL_EDGE])
         self.assertEqual(runtime["ownership"], [])
         self.assertEqual(runtime["grant_options"], [])
 
@@ -899,6 +934,9 @@ class ValidatorStaticTest(unittest.TestCase):
             query.replace("am.admin_option", "a.admin_option", 1),
             query.replace("am.admin_option", "am.grant_option", 1),
             query.replace(", am.admin_option", "", 1),
+            query.replace("grantor.rolname as grantor,", "", 1),
+            query.replace("am.inherit_option,", "", 1),
+            query.replace("am.set_option", "false as set_option", 1),
         )
         for mutation in mutations:
             self._assert_exact_query_rejected("role_memberships", mutation)
@@ -939,6 +977,129 @@ class ValidatorStaticTest(unittest.TestCase):
             self._assert_exact_query_rejected(query_key, mutation)
 
 
+class RuntimeMembershipEdgeEvaluatorTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manifest = load_manifest()
+
+    def _errors(
+        self,
+        rows: list[dict[str, Any]],
+        manifest: dict[str, Any] | None = None,
+    ) -> tuple[str, ...]:
+        return contract_validator.validate_runtime_membership_edges(
+            manifest or self.manifest,
+            rows,
+        )
+
+    def _assert_rejected(
+        self,
+        rows: list[dict[str, Any]],
+        expected_fragment: str,
+        manifest: dict[str, Any] | None = None,
+    ) -> None:
+        errors = self._errors(rows, manifest)
+        self.assertTrue(
+            any(expected_fragment in error for error in errors),
+            f"missing {expected_fragment!r} in {errors!r}",
+        )
+
+    def test_exact_postgresql17_creator_admin_edge_is_accepted(self) -> None:
+        self.assertEqual(self._errors([copy.deepcopy(PRODUCTION_PROVIDER_CONTROL_ROW)]), ())
+
+    def test_runtime_as_member_is_rejected(self) -> None:
+        row = {**PRODUCTION_PROVIDER_CONTROL_ROW, "role": "sqag_parent", "member": "sqag_runtime"}
+        self._assert_rejected([PRODUCTION_PROVIDER_CONTROL_ROW, row], "runtime_as_member")
+
+    def test_runtime_inherited_role_is_rejected(self) -> None:
+        row = {
+            **PRODUCTION_PROVIDER_CONTROL_ROW,
+            "role": "sqag_parent",
+            "member": "sqag_runtime",
+            "inherit_option": True,
+        }
+        self._assert_rejected([PRODUCTION_PROVIDER_CONTROL_ROW, row], "runtime_inherit_path")
+
+    def test_runtime_set_authority_is_rejected(self) -> None:
+        row = {
+            **PRODUCTION_PROVIDER_CONTROL_ROW,
+            "role": "sqag_parent",
+            "member": "sqag_runtime",
+            "set_option": True,
+        }
+        self._assert_rejected([PRODUCTION_PROVIDER_CONTROL_ROW, row], "runtime_set_path")
+
+    def test_second_runtime_as_parent_edge_is_rejected(self) -> None:
+        second = {**PRODUCTION_PROVIDER_CONTROL_ROW, "member": "sqag_other_provider"}
+        self._assert_rejected([PRODUCTION_PROVIDER_CONTROL_ROW, second], "runtime_edge_count")
+
+    def test_wrong_provider_member_is_rejected(self) -> None:
+        row = {**PRODUCTION_PROVIDER_CONTROL_ROW, "member": "unknown_provider"}
+        self._assert_rejected([row], "provider_control_edge_tuple")
+
+    def test_wrong_grantor_is_rejected(self) -> None:
+        row = {**PRODUCTION_PROVIDER_CONTROL_ROW, "grantor": "postgres"}
+        self._assert_rejected([row], "provider_control_edge_tuple")
+
+    def test_admin_option_false_is_rejected(self) -> None:
+        row = {**PRODUCTION_PROVIDER_CONTROL_ROW, "admin_option": False}
+        self._assert_rejected([row], "provider_control_edge_tuple")
+
+    def test_inherit_option_true_is_rejected(self) -> None:
+        row = {**PRODUCTION_PROVIDER_CONTROL_ROW, "inherit_option": True}
+        self._assert_rejected([row], "provider_control_edge_tuple")
+
+    def test_set_option_true_is_rejected(self) -> None:
+        row = {**PRODUCTION_PROVIDER_CONTROL_ROW, "set_option": True}
+        self._assert_rejected([row], "provider_control_edge_tuple")
+
+    def test_provider_edge_involving_sqag_app_is_rejected(self) -> None:
+        row = {**PRODUCTION_PROVIDER_CONTROL_ROW, "member": "sqag_app"}
+        self._assert_rejected([row], "forbidden_provider_control_role_sqag_app")
+
+    def test_provider_edge_involving_sqag_migrator_is_rejected(self) -> None:
+        row = {**PRODUCTION_PROVIDER_CONTROL_ROW, "member": "sqag_migrator"}
+        self._assert_rejected([row], "forbidden_provider_control_role_sqag_migrator")
+
+    def test_provider_edge_involving_neon_superuser_is_rejected(self) -> None:
+        row = {**PRODUCTION_PROVIDER_CONTROL_ROW, "member": "neon_superuser"}
+        self._assert_rejected([row], "forbidden_provider_control_role_neon_superuser")
+
+    def test_recursive_runtime_membership_path_is_rejected(self) -> None:
+        reverse = {
+            **PRODUCTION_PROVIDER_CONTROL_ROW,
+            "role": "neondb_owner",
+            "member": "sqag_runtime",
+            "inherit_option": True,
+            "set_option": True,
+        }
+        self._assert_rejected([PRODUCTION_PROVIDER_CONTROL_ROW, reverse], "recursive_runtime_membership")
+
+    def test_effective_runtime_privilege_introduced_through_membership_is_rejected(self) -> None:
+        row = {
+            **PRODUCTION_PROVIDER_CONTROL_ROW,
+            "role": "privileged_parent",
+            "member": "sqag_runtime",
+            "inherit_option": True,
+        }
+        self._assert_rejected([PRODUCTION_PROVIDER_CONTROL_ROW, row], "runtime_privilege_membership_path")
+
+    def test_unknown_provider_control_classification_is_rejected(self) -> None:
+        manifest = copy.deepcopy(self.manifest)
+        manifest["roles"]["runtime"]["provider_control_edges"][0]["classification"] = "unknown"
+        self._assert_rejected([PRODUCTION_PROVIDER_CONTROL_ROW], "classification", manifest)
+
+    def test_missing_required_provider_control_field_is_rejected(self) -> None:
+        manifest = copy.deepcopy(self.manifest)
+        manifest["roles"]["runtime"]["provider_control_edges"][0].pop("grantor")
+        self._assert_rejected([PRODUCTION_PROVIDER_CONTROL_ROW], "missing_keys", manifest)
+
+    def test_duplicate_provider_control_edges_are_rejected(self) -> None:
+        manifest = copy.deepcopy(self.manifest)
+        manifest["roles"]["runtime"]["provider_control_edges"].append(
+            copy.deepcopy(manifest["roles"]["runtime"]["provider_control_edges"][0])
+        )
+        self._assert_rejected([PRODUCTION_PROVIDER_CONTROL_ROW], "provider_control_edges_count", manifest)
+
 class RequirementEvidenceMapTest(unittest.TestCase):
     def test_requirement_evidence_map_is_exact_and_discoverable(self) -> None:
         self.assertEqual(tuple(REQUIREMENT_EVIDENCE), REQUIREMENT_IDS)
@@ -952,8 +1113,15 @@ class RequirementEvidenceMapTest(unittest.TestCase):
 
     def test_documentation_requirement_ids_match_canonical_map(self) -> None:
         documentation = (ROOT / "docs" / "runtime-privilege-contract.md").read_text(encoding="utf-8")
-        documented_ids = re.findall(r"^\|\s*(R\d{2})\s*\|", documentation, flags=re.MULTILINE)
-        self.assertEqual(documented_ids, list(REQUIREMENT_IDS))
+        documented_rows = re.findall(
+            r"^\|\s*(R\d{2})\s*\|\s*(.*?)\s*\|\s*`([^`]+)`\s*\|$",
+            documentation,
+            flags=re.MULTILINE,
+        )
+        self.assertEqual([row[0] for row in documented_rows], list(REQUIREMENT_IDS))
+        for requirement_id, requirement, evidence in documented_rows:
+            self.assertEqual(requirement, REQUIREMENT_EVIDENCE[requirement_id]["requirement"])
+            self.assertEqual(evidence, REQUIREMENT_EVIDENCE[requirement_id]["evidence"])
 
     def test_ci_status_document_matches_runtime_contract_workflow_gate(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
@@ -962,6 +1130,7 @@ class RequirementEvidenceMapTest(unittest.TestCase):
         self.assertIn("run: python scripts/validate_runtime_privilege_contract.py", workflow)
         self.assertIn("Runtime privilege-contract static validation", documentation)
         self.assertIn("Disposable PostgreSQL 17 runtime privilege-contract tests exercise the thirteen canonical query keys", documentation)
+        self.assertIn("creator-admin control edge with ADMIN true, INHERIT false, and SET false", documentation)
         self.assertIn("Boundary A remains repository-only", documentation)
         self.assertIn("Green CI does not authorise Boundary B or #160", documentation)
         self.assertNotIn("green CI authorises Boundary B", documentation.lower())
@@ -1081,27 +1250,32 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         return PostgresConnectionAdapter(raw)
 
     @staticmethod
-    def _membership_tuples(rows: list[dict[str, Any]]) -> tuple[tuple[str, str, bool], ...]:
+    def _membership_tuples(
+        rows: list[dict[str, Any]],
+    ) -> tuple[tuple[str, str, str, bool, bool, bool], ...]:
         return tuple(
             sorted(
                 (
                     str(row["role"]),
                     str(row["member"]),
+                    str(row["grantor"]),
                     bool(row["admin_option"]),
+                    bool(row["inherit_option"]),
+                    bool(row["set_option"]),
                 )
                 for row in rows
             )
         )
 
-    def _membership_snapshot(self) -> tuple[tuple[str, str, bool], ...]:
+    def _membership_snapshot(self) -> tuple[tuple[str, str, str, bool, bool, bool], ...]:
         columns, rows = self._execute_contract_query("role_memberships")
         self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["role_memberships"])
         return self._membership_tuples(rows)
 
     @staticmethod
     def _runtime_like_memberships(
-        memberships: tuple[tuple[str, str, bool], ...],
-    ) -> tuple[tuple[str, str, bool], ...]:
+        memberships: tuple[tuple[str, str, str, bool, bool, bool], ...],
+    ) -> tuple[tuple[str, str, str, bool, bool, bool], ...]:
         runtime_like_roles = {"sqag_runtime", "sqag_migrator"}
         return tuple(
             row
@@ -2167,26 +2341,167 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.assertEqual(self._runtime_like_memberships(self._membership_tuples(rows)), ())
 
         parent_name = self._new_role("membership_parent")
-        synthetic_false = (parent_name, "sqag_runtime", False)
         self._grant_role_membership(parent_name, "sqag_runtime", admin_option=False)
         admin_parent_name = self._new_role("membership_admin_parent")
-        synthetic_true = (admin_parent_name, "sqag_runtime", True)
         self._grant_role_membership(admin_parent_name, "sqag_runtime", admin_option=True)
         columns, rows = self._execute_contract_query("role_memberships")
         self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["role_memberships"])
         actual = self._membership_tuples(rows)
-        expected = tuple(sorted((*self._membership_baseline, synthetic_false, synthetic_true)))
-        self.assertEqual(actual, expected)
-        self.assertEqual(
-            set(actual) ^ set(self._membership_baseline),
-            {synthetic_false, synthetic_true},
+        added = tuple(row for row in actual if row not in self._membership_baseline)
+        self.assertEqual({row[0] for row in added}, {parent_name, admin_parent_name})
+        self.assertEqual({row[1] for row in added}, {"sqag_runtime"})
+        self.assertEqual({row[3] for row in added}, {False, True})
+        self.assertTrue(all(type(option) is bool for row in added for option in row[3:]))
+        self.assertEqual(self._runtime_like_memberships(actual), tuple(sorted(added)))
+        membership_errors = contract_validator.validate_runtime_membership_edges(
+            self.contract,
+            rows,
+        )
+        self.assertTrue(any("runtime_as_member" in error for error in membership_errors))
+
+    def test_postgresql17_creator_admin_edge_is_system_generated_dormant_and_non_removable(self) -> None:
+        with self.psycopg.connect(
+            postgres_test_conninfo(self.database_name),
+            row_factory=self.dict_row,
+        ) as bootstrap_connection:
+            identity = bootstrap_connection.execute(
+                "select session_user as bootstrap_user, current_setting('server_version_num')::int as version_num"
+            ).fetchone()
+            bootstrap_user = str(_row_dict(identity, "bootstrap_user"))
+            self.assertGreaterEqual(int(_row_dict(identity, "version_num")), 170000)
+            self.assertLess(int(_row_dict(identity, "version_num")), 180000)
+
+        creator_name = self._new_role("pg17_creator")
+        self._execute_admin_sql(f"alter role {_quote_identifier(creator_name)} createrole")
+        runtime_name = f"sqag_rpc_role_pg17_runtime_{uuid.uuid4().hex[:8]}"
+        _quote_identifier(runtime_name)
+        connection = self.connect()
+        try:
+            connection.execute(f"set session authorization {_quote_identifier(creator_name)}")
+            connection.execute(
+                f"create role {_quote_identifier(runtime_name)} NOLOGIN NOSUPERUSER NOCREATEDB "
+                "NOCREATEROLE NOREPLICATION NOBYPASSRLS INHERIT CONNECTION LIMIT -1"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        type(self)._seen_roles.add(runtime_name)
+        self.addCleanup(self._drop_role, runtime_name)
+
+        columns, rows = self._execute_contract_query("role_memberships")
+        self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["role_memberships"])
+        actual_edge = next(
+            row
+            for row in rows
+            if row["role"] == runtime_name and row["member"] == creator_name
         )
         self.assertEqual(
-            self._runtime_like_memberships(actual),
-            tuple(sorted((synthetic_false, synthetic_true))),
+            actual_edge,
+            {
+                "role": runtime_name,
+                "member": creator_name,
+                "grantor": bootstrap_user,
+                "admin_option": True,
+                "inherit_option": False,
+                "set_option": False,
+            },
+        )
+
+        fixture_manifest = copy.deepcopy(self.contract)
+        fixture_edge = fixture_manifest["roles"]["runtime"]["provider_control_edges"][0]
+        fixture_edge["parent_role"] = runtime_name
+        fixture_edge["member_role"] = creator_name
+        fixture_edge["grantor"] = bootstrap_user
+        self.assertEqual(
+            contract_validator.validate_runtime_membership_edges(
+                fixture_manifest,
+                rows,
+                enforce_production_identity=False,
+            ),
+            (),
+        )
+
+        connection = self.connect()
+        try:
+            connection.execute(f"set session authorization {_quote_identifier(creator_name)}")
+            with self.assertRaises(Exception) as set_failure:
+                connection.execute(f"set role {_quote_identifier(runtime_name)}")
+            self.assertEqual(getattr(set_failure.exception, "sqlstate", None), "42501")
+            connection.rollback()
+        finally:
+            connection.close()
+
+        revoke_result = "completed"
+        connection = self.connect()
+        try:
+            connection.execute(f"set session authorization {_quote_identifier(creator_name)}")
+            try:
+                connection.execute(
+                    f"revoke {_quote_identifier(runtime_name)} from {_quote_identifier(creator_name)}"
+                )
+                connection.commit()
+            except Exception as exc:
+                revoke_result = f"rejected:{getattr(exc, 'sqlstate', 'unknown')}"
+                connection.rollback()
+        finally:
+            connection.close()
+        self.assertTrue(revoke_result == "completed" or revoke_result.startswith("rejected:"))
+
+        _, rows_after_revoke = self._execute_contract_query("role_memberships")
+        edge_after_revoke = next(
+            row
+            for row in rows_after_revoke
+            if row["role"] == runtime_name and row["member"] == creator_name
+        )
+        self.assertEqual(edge_after_revoke, actual_edge)
+
+        self._grant_database_privilege(creator_name, "CREATE")
+        self.assertTrue(self._has_database_privilege(creator_name, "CREATE"))
+        self.assertFalse(self._has_database_privilege(runtime_name, "CREATE"))
+
+        mutations = {
+            "parent": {**actual_edge, "role": "unknown_parent"},
+            "member": {**actual_edge, "member": "unknown_member"},
+            "grantor": {**actual_edge, "grantor": "unknown_grantor"},
+            "admin": {**actual_edge, "admin_option": False},
+            "inherit": {**actual_edge, "inherit_option": True},
+            "set": {**actual_edge, "set_option": True},
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label):
+                self.assertTrue(
+                    contract_validator.validate_runtime_membership_edges(
+                        fixture_manifest,
+                        [mutation],
+                        enforce_production_identity=False,
+                    )
+                )
+        additional = {**actual_edge, "member": "unknown_second_member"}
+        additional_errors = contract_validator.validate_runtime_membership_edges(
+            fixture_manifest,
+            [actual_edge, additional],
+            enforce_production_identity=False,
+        )
+        self.assertTrue(any("runtime_edge_count" in error for error in additional_errors))
+
+    def test_effective_runtime_privilege_introduced_through_membership_fails_edge_contract(self) -> None:
+        self.apply_migrations()
+        privileged_parent = self._new_role("membership_privileged_parent")
+        forbidden_table = sorted(FORBIDDEN_TABLES)[0]
+        self._grant_table_privilege(privileged_parent, forbidden_table, "SELECT")
+        self._grant_role_membership(privileged_parent, "sqag_runtime")
+        self.assertTrue(self._has_table_privilege("sqag_runtime", forbidden_table, "SELECT"))
+        _, rows = self._execute_contract_query("role_memberships")
+        membership_errors = contract_validator.validate_runtime_membership_edges(
+            self.contract,
+            rows,
+        )
+        self.assertTrue(
+            any("runtime_privilege_membership_path" in error for error in membership_errors),
+            membership_errors,
         )
         with self.assertRaises(AssertionError):
-            self.assertEqual(self._runtime_like_memberships(actual), ())
+            self._assert_exact_runtime_matrix("sqag_runtime")
 
     def test_canonical_query_shape_contract_is_independent_and_complete(self) -> None:
         self.assertEqual(tuple(CANONICAL_QUERY_COLUMNS), CANONICAL_QUERY_KEYS)
