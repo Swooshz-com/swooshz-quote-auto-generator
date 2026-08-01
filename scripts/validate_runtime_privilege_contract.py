@@ -90,6 +90,16 @@ PROVIDER_CONTROL_EDGE_KEYS = frozenset(
 MEMBERSHIP_ROW_KEYS = frozenset(
     {"role", "member", "grantor", "admin_option", "inherit_option", "set_option"}
 )
+PROTECTED_PRODUCTION_ROLES = frozenset(
+    {
+        "sqag_runtime",
+        "sqag_migrator",
+        "sqag_app",
+        "neondb_owner",
+        "neon_superuser",
+        "cloud_admin",
+    }
+)
 PROVIDER_CONTROL_CLASSIFICATION = "postgresql17_creator_admin_control"
 PROVIDER_CONTROL_SECURITY_RATIONALE = (
     "PostgreSQL 17 system-generated creator-admin control for the provider administrator; "
@@ -634,9 +644,11 @@ def validate_runtime_membership_edges(
 ) -> tuple[str, ...]:
     """Evaluate the complete membership result without pre-filtering rows.
 
-    Unrelated cluster membership rows are retained during the scan. Any row
-    involving the runtime or a forbidden provider-control participant is
-    evaluated before the exact one-edge runtime contract is decided.
+    Unrelated cluster membership rows are retained during the scan. Every
+    well-formed row is classified as the exact provider-control edge, a
+    protected-role row, or a truly unrelated row before the complete graph is
+    evaluated. A row with a protected participant is never ignored because the
+    runtime is absent from its parent/member positions.
     """
 
     errors: list[str] = []
@@ -662,8 +674,14 @@ def validate_runtime_membership_edges(
         return (*errors, "role_membership_rows_must_be_list")
 
     runtime_name = str(edge["parent_role"])
-    forbidden_provider_roles = {"sqag_app", "sqag_migrator", "neon_superuser"}
+    protected_roles = PROTECTED_PRODUCTION_ROLES | {
+        str(edge["parent_role"]),
+        str(edge["member_role"]),
+        str(edge["grantor"]),
+    }
     runtime_rows: list[dict[str, Any]] = []
+    protected_rows: list[dict[str, Any]] = []
+    seen_rows: set[tuple[str, str, str, bool, bool, bool]] = set()
     graph: dict[str, set[str]] = {}
     for index, row in enumerate(rows):
         label = f"role_membership_row_{index}"
@@ -680,9 +698,30 @@ def validate_runtime_membership_edges(
 
         parent = str(row["role"])
         member = str(row["member"])
+        grantor = str(row["grantor"])
+        row_tuple = (
+            parent,
+            member,
+            grantor,
+            row["admin_option"],
+            row["inherit_option"],
+            row["set_option"],
+        )
+        if row_tuple in seen_rows:
+            _add_error(errors, f"{label}_duplicate_role_membership_row")
+        seen_rows.add(row_tuple)
+
         graph.setdefault(member, set()).add(parent)
-        if parent == runtime_name or member == runtime_name:
+        participants = {parent, member, grantor}
+        is_expected_edge = row == expected_row
+        protected_participants = participants & protected_roles
+        if is_expected_edge or protected_participants:
+            protected_rows.append(row)
+        if runtime_name in participants:
             runtime_rows.append(row)
+        if is_expected_edge:
+            continue
+
         if member == runtime_name:
             _add_error(errors, f"{label}_runtime_as_member_forbidden")
             _add_error(errors, f"{label}_runtime_privilege_membership_path_forbidden")
@@ -690,13 +729,25 @@ def validate_runtime_membership_edges(
                 _add_error(errors, f"{label}_runtime_inherit_path_forbidden")
             if row["set_option"]:
                 _add_error(errors, f"{label}_runtime_set_path_forbidden")
-        for forbidden_role in sorted(forbidden_provider_roles):
-            if forbidden_role in {parent, member} and (
-                runtime_name in {parent, member}
-                or edge["member_role"] in {parent, member}
-                or row["grantor"] == edge["grantor"]
-            ):
-                _add_error(errors, f"{label}_forbidden_provider_control_role_{forbidden_role}")
+
+        if protected_participants:
+            _add_error(errors, f"{label}_protected_role_edge_forbidden")
+            if grantor in protected_roles:
+                _add_error(errors, f"{label}_protected_grantor_forbidden")
+            if row["admin_option"]:
+                _add_error(errors, f"{label}_protected_admin_option_forbidden")
+            if row["inherit_option"]:
+                _add_error(errors, f"{label}_protected_inherit_option_forbidden")
+            if row["set_option"]:
+                _add_error(errors, f"{label}_protected_set_option_forbidden")
+            for participant in sorted(participants - protected_roles):
+                _add_error(
+                    errors,
+                    f"{label}_unknown_protected_edge_participant_{participant}",
+                )
+            for forbidden_role in ("neon_superuser", "sqag_app", "sqag_migrator"):
+                if forbidden_role in {parent, member}:
+                    _add_error(errors, f"{label}_forbidden_provider_control_role_{forbidden_role}")
 
     if len(runtime_rows) != 1:
         _add_error(errors, f"runtime_edge_count_invalid_expected_1_got_{len(runtime_rows)}")
@@ -707,19 +758,38 @@ def validate_runtime_membership_edges(
             if row != expected_row:
                 _add_error(errors, f"provider_control_edge_tuple_mismatch_at_runtime_edge_{index}")
 
-    reachable = [runtime_name]
-    visited: set[str] = set()
-    while reachable:
-        current = reachable.pop()
-        if current in visited:
-            continue
-        visited.add(current)
-        for parent in graph.get(current, set()):
-            if parent == runtime_name:
+    if len(protected_rows) != 1:
+        _add_error(
+            errors,
+            f"protected_role_row_count_invalid_expected_1_got_{len(protected_rows)}",
+        )
+
+    def reachable_cycle(start: str) -> bool:
+        visited: set[str] = set()
+        active: set[str] = set()
+
+        def visit(current: str) -> bool:
+            if current in active:
+                return True
+            if current in visited:
+                return False
+            visited.add(current)
+            active.add(current)
+            try:
+                return any(visit(parent) for parent in graph.get(current, set()))
+            finally:
+                active.remove(current)
+
+        return visit(start)
+
+    for protected_role in sorted(protected_roles):
+        if reachable_cycle(protected_role):
+            _add_error(
+                errors,
+                f"recursive_protected_role_membership_path_forbidden_{protected_role}",
+            )
+            if protected_role == runtime_name:
                 _add_error(errors, "recursive_runtime_membership_path_forbidden")
-                reachable.clear()
-                break
-            reachable.append(parent)
 
     return tuple(errors)
 

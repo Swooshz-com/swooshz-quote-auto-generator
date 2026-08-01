@@ -104,6 +104,9 @@ authority is the manifest's exact column grant on `checksum_sha256`; all other
 columns remain denied, no grant option is allowed, and PUBLIC or membership
 authority must not supply table-level UPDATE.
 
+The direct runtime grant total remains exactly 37: 34 table grants, one column
+grant, one database grant, and one schema grant.
+
 ### Runtime-forbidden (5 tables)
 
 | Table | Class |
@@ -201,6 +204,26 @@ names and order, and applies the row-cardinality rule for its disposable
 fixture. The generic shape fixture has no runtime edge; the dedicated
 non-superuser `CREATEROLE` fixture produces exactly one automatic edge and is
 the acceptance proof for the complete tuple.
+
+### Membership-query narrative contract
+
+The membership query projects the exact aliases `role`, `member`, `grantor`,
+`admin_option`, `inherit_option`, and `set_option`. Its evaluator consumes the
+complete unfiltered membership result, validates the `grantor`, and
+distinguishes ADMIN authority from INHERIT and SET authority. No column may be
+omitted, no value may be supplied by a substituted default, and no unexpected
+row may be filtered away.
+
+Every well-formed row is classified before validation. The only authorised
+protected-role row is the exact PostgreSQL 17 creator-admin control tuple shown
+above. Any other row containing `sqag_runtime`, `sqag_migrator`, `sqag_app`,
+`neondb_owner`, `neon_superuser`, or `cloud_admin` in the parent, member, or
+grantor position fails closed, including unknown participants, duplicate rows,
+unexpected ADMIN, INHERIT, or SET authority, and recursive protected-role
+paths. A membership row whose parent, member, and grantor contain no protected
+participant and which creates no recursive protected-role authority is outside
+this contract, but it remains in the complete result and is classified rather
+than silently discarded by the protected-role branch.
 
 | Key | Exact result columns | Fixture cardinality |
 |---|---|---:|
@@ -309,10 +332,10 @@ executes all thirteen canonical queries, asserts the exact returned column
 names, and applies the documented cardinality rules.
 
 The remaining effective queries have the same exact-token binding. In
-particular, the membership query must project `role`, `member`, and
-`admin_option` from the declared `am` alias; the table query must retain all
-eight privilege literals; the column query must retain the table, column, and
-privilege predicates; and database/schema grantability must remain a real
+particular, the membership query must preserve the complete six-field contract
+and aliases defined above; the table query must retain all eight privilege
+literals; the column query must retain the table, column, and privilege
+predicates; and database/schema grantability must remain a real
 privilege-specific `WITH GRANT OPTION` check. Invalid SQL is still rejected by
 PostgreSQL execution even when a candidate happens to contain expected words.
 
@@ -435,11 +458,11 @@ The deterministic discovery receipt for this amendment is:
 
 | Receipt item | Count |
 |---|---:|
-| Discovered test methods | 142 |
-| Static and validator methods | 87 |
+| Discovered test methods | 159 |
+| Static and validator methods | 103 |
 | PostgreSQL methods | 52 |
-| Requirement-map and documentation parity methods | 3 |
-| Hosted executions | 142 |
+| Requirement-map and documentation parity methods | 4 |
+| Hosted executions | 159 |
 | Hosted skips | 0 |
 | Unique locked requirement IDs | 38 (`R01`-`R38`) |
 

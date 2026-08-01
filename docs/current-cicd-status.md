@@ -9,6 +9,9 @@ Source of truth: `.github/workflows/ci.yml`
 - Workflow name: `CI`
 - Triggers: pull requests, pushes to `main`, and manual `workflow_dispatch`
 - Permissions: read-only repository contents
+- Every checkout binds to the pull request's exact `pull_request.head.sha`, or
+  to `github.sha` for push/manual runs; hosted results therefore identify the
+  tested source head instead of relying on a synthetic pull-request merge ref.
 - No deployment job is configured
 - This phase-planning PR adds no deployment job
 - No production environment mutation is performed by CI
@@ -16,9 +19,16 @@ Source of truth: `.github/workflows/ci.yml`
 
 ## Active Jobs
 
+- `Retrospective exact-starting-head RED reproduction`: checks out the exact
+  workflow head, verifies the repository-owned test-only patch digest, creates
+  a temporary detached worktree at immutable commit
+  `fa03eca2b0406b864618453f30292c0303f34744`, applies only that test patch,
+  requires the 13 expected assertion failures, removes the worktree, and emits
+  only a bounded public-safe summary. This is retrospective evidence, not the
+  original RED chronology or original development sequence.
 - `Secret scan`: checks the repository with Gitleaks before validation work proceeds.
 - `Dependency audit`: installs Node dependencies with `npm ci` and runs `npm audit --audit-level=high`.
-- `Validate app`: runs after the security gates pass.
+- `Validate app`: runs after the retrospective RED reproduction and security gates pass.
 
 ## Validate App Checks
 
@@ -39,7 +49,7 @@ Source of truth: `.github/workflows/ci.yml`
 - Runs `python scripts/validate_local_pdf_dependency_usage.py` to keep `pypdfium2` and `Pillow` usage on the local PDF rendering path only.
 - Runs `python scripts/validate_dynamic_pricing_reference_rules.py` to keep pricing-reference matching data-driven and block source-code semantic family/synonym packs.
 - Runs `python scripts/scan_sensitive_fixtures.py --fail-on-review` so review-level sensitive fixture findings fail CI.
-- Runtime privilege-contract static validation runs `python scripts/validate_runtime_privilege_contract.py`; the canonical manifest, closed runtime-as-member/provider-control schema, exact six-column membership tuple, thirteen-key bounded verification-query set, independent executable-token contracts, exact publication-artifact column authority, complete `r`/`S`/`f`/`n`/`T` default-ACL object-class binding, and repository requirement binding fail closed.
+- Runtime privilege-contract static validation runs `python scripts/validate_runtime_privilege_contract.py`; the canonical manifest, complete unfiltered protected-role membership evaluation across parent/member/grantor positions, closed runtime-as-member/provider-control schema, exact six-column membership tuple, thirteen-key bounded verification-query set, independent executable-token contracts, exact publication-artifact column authority, complete `r`/`S`/`f`/`n`/`T` default-ACL object-class binding, and repository requirement binding fail closed.
 - Disposable PostgreSQL 17 runtime privilege-contract tests exercise the thirteen canonical query keys, exact result shapes, the automatic creator-admin control edge with ADMIN true, INHERIT false, and SET false, creator REVOKE non-removability, absence of inherited/SET/effective runtime authority, the real publication checksum-backfill path, complete table/column privilege matrices, complete default-ACL object classes, and database/schema grant-option semantics with disposable service databases and roles only. The hosted exact-head evidence must report zero skips.
 - Boundary A remains repository-only. It performs no live database, provider, credential, Coolify, deployment, or activation mutation.
 - Green CI does not authorise Boundary B or #160; those scopes require their own exact-head authority and verification.
