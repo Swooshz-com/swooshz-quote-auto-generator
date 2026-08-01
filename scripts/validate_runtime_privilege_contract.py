@@ -674,7 +674,10 @@ def validate_runtime_membership_edges(
         return (*errors, "role_membership_rows_must_be_list")
 
     runtime_name = str(edge["parent_role"])
-    protected_roles = PROTECTED_PRODUCTION_ROLES | {
+    identity_protected_roles = (
+        PROTECTED_PRODUCTION_ROLES if enforce_production_identity else frozenset()
+    )
+    protected_roles = identity_protected_roles | {
         str(edge["parent_role"]),
         str(edge["member_role"]),
         str(edge["grantor"]),
