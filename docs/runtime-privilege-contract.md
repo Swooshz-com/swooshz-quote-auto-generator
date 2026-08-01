@@ -225,6 +225,12 @@ participant and which creates no recursive protected-role authority is outside
 this contract, but it remains in the complete result and is classified rather
 than silently discarded by the protected-role branch.
 
+The disposable creator-admin fixture preserves every queried membership row
+and its graph position. For validator evaluation only, it copies the observed
+automatic edge to a dedicated existing fixture-grantor identity; all unrelated
+rows remain unchanged and non-protected. The regression separately proves that
+using that fixture grantor on an otherwise unrelated row is rejected.
+
 | Key | Exact result columns | Fixture cardinality |
 |---|---|---:|
 | `database_acl` | `datacl` | 1 |
@@ -458,11 +464,11 @@ The deterministic discovery receipt for this amendment is:
 
 | Receipt item | Count |
 |---|---:|
-| Discovered test methods | 159 |
+| Discovered test methods | 160 |
 | Static and validator methods | 103 |
-| PostgreSQL methods | 52 |
+| PostgreSQL methods | 53 |
 | Requirement-map and documentation parity methods | 4 |
-| Hosted executions | 159 |
+| Hosted executions | 160 |
 | Hosted skips | 0 |
 | Unique locked requirement IDs | 38 (`R01`-`R38`) |
 

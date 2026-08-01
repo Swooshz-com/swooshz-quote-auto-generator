@@ -1,11 +1,11 @@
 """Runtime privilege contract tests.
 
 Deterministic discovery receipt for this amendment:
-  discovered methods: 159
+  discovered methods: 160
   static and validator methods: 103
-  PostgreSQL methods: 52
+  PostgreSQL methods: 53
   requirement-map and documentation parity methods: 4
-  hosted executions: 159
+  hosted executions: 160
   hosted skips: 0
   unique locked requirement IDs: 38 (R01-R38)
 
@@ -2519,7 +2519,9 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         )
         self.assertTrue(any("runtime_as_member" in error for error in membership_errors))
 
-    def test_postgresql17_creator_admin_edge_is_system_generated_dormant_and_non_removable(self) -> None:
+    def _create_postgresql17_creator_admin_fixture(
+        self,
+    ) -> tuple[str, str, str, list[dict[str, Any]], dict[str, Any]]:
         with self.psycopg.connect(
             postgres_test_conninfo(self.database_name),
             row_factory=self.dict_row,
@@ -2555,6 +2557,130 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             for row in rows
             if row["role"] == runtime_name and row["member"] == creator_name
         )
+        return runtime_name, creator_name, bootstrap_user, rows, actual_edge
+
+    def _scope_postgresql17_creator_admin_fixture_participants(
+        self,
+        rows: list[dict[str, Any]],
+        actual_edge: dict[str, Any],
+    ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+        fixture_grantor = self._new_role("pg17_fixture_grantor")
+        fixture_edge = {**actual_edge, "grantor": fixture_grantor}
+        fixture_rows = [
+            fixture_edge if row == actual_edge else copy.deepcopy(row) for row in rows
+        ]
+        self.assertEqual(len(fixture_rows), len(rows))
+        self.assertEqual(sum(row == fixture_edge for row in fixture_rows), 1)
+        return fixture_grantor, fixture_rows, fixture_edge
+
+    def test_run35_creator_admin_fixture_classifies_only_exact_edge_as_protected(self) -> None:
+        runtime_name, creator_name, _, rows, actual_edge = (
+            self._create_postgresql17_creator_admin_fixture()
+        )
+        grantor_name, fixture_rows, fixture_actual_edge = (
+            self._scope_postgresql17_creator_admin_fixture_participants(rows, actual_edge)
+        )
+        fixture_manifest = copy.deepcopy(self.contract)
+        fixture_edge = fixture_manifest["roles"]["runtime"]["provider_control_edges"][0]
+        fixture_edge["parent_role"] = runtime_name
+        fixture_edge["member_role"] = creator_name
+        fixture_edge["grantor"] = grantor_name
+        self.assertEqual(fixture_edge["classification"], "postgresql17_creator_admin_control")
+
+        unrelated_rows = [row for row in fixture_rows if row != fixture_actual_edge]
+        protected_participants = {runtime_name, creator_name, grantor_name}
+        self.assertTrue(unrelated_rows, "the PostgreSQL fixture must retain unrelated graph rows")
+        for row in unrelated_rows:
+            self.assertTrue(
+                {str(row["role"]), str(row["member"]), str(row["grantor"])}.isdisjoint(
+                    protected_participants
+                ),
+                row,
+            )
+        self.assertEqual(
+            contract_validator.validate_runtime_membership_edges(
+                fixture_manifest,
+                fixture_rows,
+                enforce_production_identity=False,
+            ),
+            (),
+        )
+
+        material_row = copy.deepcopy(unrelated_rows[0])
+        protected_variants = {
+            "parent": ({**material_row, "role": creator_name}, "protected_role_edge_forbidden"),
+            "member": ({**material_row, "member": creator_name}, "protected_role_edge_forbidden"),
+            "grantor": ({**material_row, "grantor": grantor_name}, "protected_grantor_forbidden"),
+        }
+        for label, (variant, expected_fragment) in protected_variants.items():
+            with self.subTest(protected_participant=label):
+                errors = contract_validator.validate_runtime_membership_edges(
+                    fixture_manifest,
+                    [*fixture_rows, variant],
+                    enforce_production_identity=False,
+                )
+                self.assertTrue(any(expected_fragment in error for error in errors), errors)
+
+        duplicate_errors = contract_validator.validate_runtime_membership_edges(
+            fixture_manifest,
+            [*fixture_rows, copy.deepcopy(fixture_actual_edge)],
+            enforce_production_identity=False,
+        )
+        self.assertTrue(
+            any("duplicate_role_membership_row" in error for error in duplicate_errors),
+            duplicate_errors,
+        )
+
+        unsafe_variants = {
+            "admin": (
+                {**fixture_actual_edge, "admin_option": False},
+                "provider_control_edge_tuple_mismatch",
+            ),
+            "inherit": (
+                {**fixture_actual_edge, "inherit_option": True},
+                "protected_inherit_option_forbidden",
+            ),
+            "set": (
+                {**fixture_actual_edge, "set_option": True},
+                "protected_set_option_forbidden",
+            ),
+        }
+        unrelated_only = [row for row in fixture_rows if row != fixture_actual_edge]
+        for label, (variant, expected_fragment) in unsafe_variants.items():
+            with self.subTest(unsafe_option=label):
+                errors = contract_validator.validate_runtime_membership_edges(
+                    fixture_manifest,
+                    [*unrelated_only, variant],
+                    enforce_production_identity=False,
+                )
+                self.assertTrue(any(expected_fragment in error for error in errors), errors)
+
+        recursive_rows = [
+            {
+                **material_row,
+                "role": creator_name,
+                "member": "run35_recursive_bridge",
+            },
+            {
+                **material_row,
+                "role": "run35_recursive_bridge",
+                "member": creator_name,
+            },
+        ]
+        recursive_errors = contract_validator.validate_runtime_membership_edges(
+            fixture_manifest,
+            [*fixture_rows, *recursive_rows],
+            enforce_production_identity=False,
+        )
+        self.assertTrue(
+            any("recursive_protected_role_membership_path" in error for error in recursive_errors),
+            recursive_errors,
+        )
+
+    def test_postgresql17_creator_admin_edge_is_system_generated_dormant_and_non_removable(self) -> None:
+        runtime_name, creator_name, bootstrap_user, rows, actual_edge = (
+            self._create_postgresql17_creator_admin_fixture()
+        )
         self.assertEqual(
             actual_edge,
             {
@@ -2567,15 +2693,18 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             },
         )
 
+        fixture_grantor, fixture_rows, fixture_actual_edge = (
+            self._scope_postgresql17_creator_admin_fixture_participants(rows, actual_edge)
+        )
         fixture_manifest = copy.deepcopy(self.contract)
         fixture_edge = fixture_manifest["roles"]["runtime"]["provider_control_edges"][0]
         fixture_edge["parent_role"] = runtime_name
         fixture_edge["member_role"] = creator_name
-        fixture_edge["grantor"] = bootstrap_user
+        fixture_edge["grantor"] = fixture_grantor
         self.assertEqual(
             contract_validator.validate_runtime_membership_edges(
                 fixture_manifest,
-                rows,
+                fixture_rows,
                 enforce_production_identity=False,
             ),
             (),
@@ -2620,12 +2749,12 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.assertFalse(self._has_database_privilege(runtime_name, "CREATE"))
 
         mutations = {
-            "parent": {**actual_edge, "role": "unknown_parent"},
-            "member": {**actual_edge, "member": "unknown_member"},
-            "grantor": {**actual_edge, "grantor": "unknown_grantor"},
-            "admin": {**actual_edge, "admin_option": False},
-            "inherit": {**actual_edge, "inherit_option": True},
-            "set": {**actual_edge, "set_option": True},
+            "parent": {**fixture_actual_edge, "role": "unknown_parent"},
+            "member": {**fixture_actual_edge, "member": "unknown_member"},
+            "grantor": {**fixture_actual_edge, "grantor": "unknown_grantor"},
+            "admin": {**fixture_actual_edge, "admin_option": False},
+            "inherit": {**fixture_actual_edge, "inherit_option": True},
+            "set": {**fixture_actual_edge, "set_option": True},
         }
         for label, mutation in mutations.items():
             with self.subTest(label=label):
@@ -2636,10 +2765,10 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                         enforce_production_identity=False,
                     )
                 )
-        additional = {**actual_edge, "member": "unknown_second_member"}
+        additional = {**fixture_actual_edge, "member": "unknown_second_member"}
         additional_errors = contract_validator.validate_runtime_membership_edges(
             fixture_manifest,
-            [actual_edge, additional],
+            [fixture_actual_edge, additional],
             enforce_production_identity=False,
         )
         self.assertTrue(any("runtime_edge_count" in error for error in additional_errors))
