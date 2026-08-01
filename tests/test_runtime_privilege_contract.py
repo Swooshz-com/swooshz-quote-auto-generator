@@ -1,11 +1,11 @@
 """Runtime privilege contract tests.
 
 Deterministic discovery receipt for this amendment:
-  discovered methods: 160
-  static and validator methods: 103
+  discovered methods: 161
+  static and validator methods: 104
   PostgreSQL methods: 53
   requirement-map and documentation parity methods: 4
-  hosted executions: 160
+  hosted executions: 161
   hosted skips: 0
   unique locked requirement IDs: 38 (R01-R38)
 
@@ -30,7 +30,7 @@ import unittest
 import uuid
 from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, cast
 from unittest import mock
 
 import scripts.validate_runtime_privilege_contract as contract_validator
@@ -1214,6 +1214,113 @@ class RuntimeMembershipEdgeEvaluatorTest(unittest.TestCase):
     def test_truly_unrelated_membership_row_is_outside_contract(self) -> None:
         unrelated = self._membership_row("unrelated_parent", "unrelated_member")
         self.assertEqual(self._errors([PRODUCTION_PROVIDER_CONTROL_ROW, unrelated]), ())
+
+    def test_malformed_membership_rows_fail_closed(self) -> None:
+        def evaluate(rows: Any) -> tuple[str, ...]:
+            return contract_validator.validate_runtime_membership_edges(
+                self.manifest,
+                cast(list[dict[str, Any]], rows),
+            )
+
+        def expect_category(label: str, rows: Any, category: str) -> None:
+            with self.subTest(case=label):
+                errors = evaluate(rows)
+                self.assertIn(category, errors)
+
+        for label, rows in (
+            ("rows_none", None),
+            ("rows_tuple", (PRODUCTION_PROVIDER_CONTROL_ROW,)),
+            ("rows_dictionary", {"row": PRODUCTION_PROVIDER_CONTROL_ROW}),
+            ("rows_string", "synthetic_rows"),
+        ):
+            expect_category(label, rows, "role_membership_rows_must_be_list")
+
+        for value_label, value in (
+            ("none", None),
+            ("string", "synthetic"),
+            ("integer", 7),
+            ("list", []),
+            ("boolean", False),
+        ):
+            expect_category(
+                f"non_object_{value_label}",
+                [value],
+                "role_membership_row_0_must_be_object",
+            )
+
+        for key in ("role", "member", "grantor", "admin_option", "inherit_option", "set_option"):
+            row = copy.deepcopy(PRODUCTION_PROVIDER_CONTROL_ROW)
+            row.pop(key)
+            expect_category(
+                f"missing_{key}",
+                [row],
+                f"role_membership_row_0_missing_keys: {key}",
+            )
+
+        for key in ("unexpected_scalar", "unexpected_second"):
+            row = copy.deepcopy(PRODUCTION_PROVIDER_CONTROL_ROW)
+            row[key] = "synthetic" if key == "unexpected_scalar" else False
+            expect_category(
+                f"unexpected_{key}",
+                [row],
+                f"role_membership_row_0_unknown_keys: {key}",
+            )
+
+        for field in ("role", "member", "grantor"):
+            for value_label, value in (
+                ("none", None),
+                ("integer", 7),
+                ("boolean", False),
+                ("list", []),
+                ("dictionary", {}),
+                ("empty", ""),
+                ("whitespace", "   "),
+            ):
+                row = copy.deepcopy(PRODUCTION_PROVIDER_CONTROL_ROW)
+                row[field] = value
+                expect_category(
+                    f"invalid_{field}_{value_label}",
+                    [row],
+                    f"role_membership_row_0_{field}_must_be_non_empty_string",
+                )
+
+        for field in ("admin_option", "inherit_option", "set_option"):
+            for value_label, value in (
+                ("zero", 0),
+                ("one", 1),
+                ("false_string", "false"),
+                ("true_string", "true"),
+                ("none", None),
+                ("empty_list", []),
+            ):
+                row = copy.deepcopy(PRODUCTION_PROVIDER_CONTROL_ROW)
+                row[field] = value
+                expect_category(
+                    f"invalid_{field}_{value_label}",
+                    [row],
+                    f"role_membership_row_0_{field}_must_be_bool",
+                )
+
+        malformed_unrelated = self._membership_row("unrelated_parent", "unrelated_member")
+        malformed_unrelated.pop("grantor")
+        expect_category(
+            "malformed_unrelated_row_is_not_ignored",
+            [PRODUCTION_PROVIDER_CONTROL_ROW, malformed_unrelated],
+            "role_membership_row_1_missing_keys: grantor",
+        )
+
+        expect_category(
+            "malformed_row_after_exact_edge_fails_closed",
+            [PRODUCTION_PROVIDER_CONTROL_ROW, "synthetic_row"],
+            "role_membership_row_1_must_be_object",
+        )
+
+        mixed = copy.deepcopy(PRODUCTION_PROVIDER_CONTROL_ROW)
+        mixed["role"] = None
+        mixed["admin_option"] = 0
+        mixed_errors = evaluate([mixed])
+        self.assertIn("role_membership_row_0_role_must_be_non_empty_string", mixed_errors)
+        self.assertIn("role_membership_row_0_admin_option_must_be_bool", mixed_errors)
 
 class RequirementEvidenceMapTest(unittest.TestCase):
     def test_requirement_evidence_map_is_exact_and_discoverable(self) -> None:

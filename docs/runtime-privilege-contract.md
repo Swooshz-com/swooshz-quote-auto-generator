@@ -231,6 +231,14 @@ automatic edge to a dedicated existing fixture-grantor identity; all unrelated
 rows remain unchanged and non-protected. The regression separately proves that
 using that fixture grantor on an otherwise unrelated row is rejected.
 
+The evaluator boundary also has direct malformed-row coverage. One bounded
+test method exercises non-list row containers, non-object rows, each missing
+required key, unexpected keys, invalid `role`/`member`/`grantor` values, invalid
+`admin_option`/`inherit_option`/`set_option` values, and mixed malformed rows.
+Each case asserts the existing row-indexed fail-closed error category. This is
+test evidence against the unchanged validator, not a production correction or
+live-system evidence.
+
 | Key | Exact result columns | Fixture cardinality |
 |---|---|---:|
 | `database_acl` | `datacl` | 1 |
@@ -464,11 +472,11 @@ The deterministic discovery receipt for this amendment is:
 
 | Receipt item | Count |
 |---|---:|
-| Discovered test methods | 160 |
-| Static and validator methods | 103 |
+| Discovered test methods | 161 |
+| Static and validator methods | 104 |
 | PostgreSQL methods | 53 |
 | Requirement-map and documentation parity methods | 4 |
-| Hosted executions | 160 |
+| Hosted executions | 161 |
 | Hosted skips | 0 |
 | Unique locked requirement IDs | 38 (`R01`-`R38`) |
 
