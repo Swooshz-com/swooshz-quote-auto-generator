@@ -6,11 +6,14 @@ import ast
 import base64
 import hashlib
 import json
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from scripts import reproduce_run34_red as red
@@ -42,6 +45,19 @@ def _directory_factory(path: Path):
         return str(path)
 
     return create
+
+
+def _rewrite_manifest(package: Path, mutate: object) -> str:
+    path = package / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    mutate(manifest)
+    data = (json.dumps(manifest, indent=2) + "\n").encode("utf-8")
+    path.write_bytes(data)
+    return hashlib.sha256(data).hexdigest()
+
+
+def _child_command(source: str) -> list[str]:
+    return [sys.executable, "-c", source]
 
 
 class RetrospectiveFixtureIntegrityTest(unittest.TestCase):
@@ -282,6 +298,437 @@ class RetrospectiveResultContractTest(unittest.TestCase):
                 self.manifest,
             )
         self.assertEqual(failure.exception.code, "signal_terminated")
+
+
+class RetrospectiveFailClosedIntegrityTest(unittest.TestCase):
+    def test_raw_path_examples_and_windows_forms_are_rejected(self) -> None:
+        rejected = (
+            "",
+            "/absolute",
+            "a/",
+            "a//b",
+            "./a",
+            "a/./b",
+            "../a",
+            "a/../b",
+            "a\\b",
+            "\\\\server\\share",
+            "C:/absolute",
+            "C:relative",
+            "name:stream",
+            "a\x00b",
+            "a\nb",
+            "a./b.",
+            "a/part ",
+            "aux",
+            "CON.txt",
+            "prn.log",
+            "Com1.data",
+            "lPt9.out",
+        )
+        for value in rejected:
+            with self.subTest(value=value):
+                with self.assertRaises(red.FixtureError) as failure:
+                    red._validate_relative_path(value)
+                self.assertEqual(failure.exception.code, "invalid_fixture_path")
+
+    def test_case_and_normalisation_collisions_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sqag-run44-collision-") as temporary:
+            package = _copy_fixture(Path(temporary))
+            digest = _rewrite_manifest(package, lambda manifest: manifest["payload"][1].update({"path": "DEPENDENCIES.JSON"}))
+            with mock.patch.object(red, "MANIFEST_SHA256", digest):
+                with self.assertRaises(red.FixtureError) as failure:
+                    red._validate_fixture(package)
+            self.assertEqual(failure.exception.code, "duplicate_payload_path")
+
+    def test_duplicate_payload_digest_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sqag-run44-duplicate-digest-") as temporary:
+            package = _copy_fixture(Path(temporary))
+            digest = _rewrite_manifest(
+                package,
+                lambda manifest: manifest["payload"][1].update({"sha256": manifest["payload"][0]["sha256"]}),
+            )
+            with mock.patch.object(red, "MANIFEST_SHA256", digest):
+                with self.assertRaises(red.FixtureError) as failure:
+                    red._validate_fixture(package)
+            self.assertEqual(failure.exception.code, "duplicate_payload_digest")
+
+    def test_closed_manifest_types_reject_unknown_role_and_boolean_counts(self) -> None:
+        mutations = (
+            (lambda manifest: manifest["payload"][0].update({"role": "unknown"}), "payload_entry_schema_mismatch"),
+            (lambda manifest: manifest["expected_result"].update({"tests": True}), "expected_result_mismatch"),
+            (lambda manifest: manifest["historical_test_change"].update({"implementation_files_applied": False}), "historical_change_scope_mismatch"),
+        )
+        for index, (mutate, expected_code) in enumerate(mutations):
+            with self.subTest(index=index), tempfile.TemporaryDirectory(prefix="sqag-run44-closed-schema-") as temporary:
+                package = _copy_fixture(Path(temporary))
+                digest = _rewrite_manifest(package, mutate)
+                with mock.patch.object(red, "MANIFEST_SHA256", digest):
+                    with self.assertRaises(red.FixtureError) as failure:
+                        red._validate_fixture(package)
+                self.assertEqual(failure.exception.code, expected_code)
+
+    def test_symlink_payload_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sqag-run44-symlink-") as temporary:
+            package = _copy_fixture(Path(temporary))
+            target = package / "fixture-explanation.md"
+            outside = Path(temporary) / "outside.md"
+            outside.write_text("outside\n", encoding="utf-8")
+            target.unlink()
+            try:
+                os.symlink(outside, target)
+            except OSError:
+                self.skipTest("host does not permit symlink creation")
+            with self.assertRaises(red.FixtureError) as failure:
+                red._validate_fixture(package)
+            self.assertEqual(failure.exception.code, "fixture_entry_forbidden")
+
+    def test_symlink_intermediate_directory_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sqag-run44-intermediate-link-") as temporary:
+            root = Path(temporary)
+            package = _copy_fixture(root)
+            outside = root / "outside-tests"
+            shutil.copytree(package / "tests", outside)
+            shutil.rmtree(package / "tests")
+            try:
+                os.symlink(outside, package / "tests", target_is_directory=True)
+            except OSError:
+                self.skipTest("host does not permit directory symlink creation")
+            with self.assertRaises(red.FixtureError) as failure:
+                red._validate_fixture(package)
+            self.assertEqual(failure.exception.code, "fixture_entry_forbidden")
+
+    def test_link_inserted_after_enumeration_is_rejected_before_payload_read(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sqag-run44-link-race-") as temporary:
+            root = Path(temporary)
+            package = _copy_fixture(root)
+            outside = root / "outside-tests"
+            shutil.copytree(package / "tests", outside)
+            original_payload_files = red._payload_files
+
+            def enumerate_then_replace(path: Path) -> set[str]:
+                result = original_payload_files(path)
+                shutil.rmtree(path / "tests")
+                try:
+                    os.symlink(outside, path / "tests", target_is_directory=True)
+                except OSError:
+                    raise unittest.SkipTest("host does not permit directory symlink creation")
+                return result
+
+            with mock.patch.object(red, "_payload_files", side_effect=enumerate_then_replace):
+                with self.assertRaises(red.FixtureError) as failure:
+                    red._validate_fixture(package)
+            self.assertEqual(failure.exception.code, "fixture_entry_forbidden")
+
+    def test_hard_link_payload_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sqag-run44-hardlink-") as temporary:
+            package = _copy_fixture(Path(temporary))
+            target = package / "fixture-explanation.md"
+            outside = Path(temporary) / "hardlink-target.md"
+            try:
+                os.link(target, outside)
+            except OSError:
+                self.skipTest("host does not permit hard-link creation")
+            with self.assertRaises(red.FixtureError) as failure:
+                red._validate_fixture(package)
+            self.assertEqual(failure.exception.code, "fixture_entry_forbidden")
+
+    def test_non_regular_fifo_payload_is_rejected_on_posix(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX FIFO capability is unavailable on Windows")
+        with tempfile.TemporaryDirectory(prefix="sqag-run44-fifo-") as temporary:
+            package = _copy_fixture(Path(temporary))
+            fifo = package / "fifo"
+            os.mkfifo(fifo)
+            with self.assertRaises(red.FixtureError) as failure:
+                red._validate_fixture(package)
+            self.assertEqual(failure.exception.code, "fixture_entry_forbidden")
+
+    def test_windows_junction_is_rejected_when_supported(self) -> None:
+        if os.name != "nt":
+            self.skipTest("Windows reparse-point capability is unavailable on this host")
+        with tempfile.TemporaryDirectory(prefix="sqag-run44-junction-") as temporary:
+            package = _copy_fixture(Path(temporary))
+            target = package / "docs"
+            link = package / "linked-docs"
+            result = subprocess.run(
+                ["cmd.exe", "/c", "mklink", "/J", str(link), str(target)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if result.returncode != 0:
+                self.skipTest("host does not permit junction creation")
+            with self.assertRaises(red.FixtureError) as failure:
+                red._validate_fixture(package)
+            self.assertEqual(failure.exception.code, "fixture_entry_forbidden")
+
+    def test_materialisation_uses_original_verified_bytes_after_source_mutation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sqag-run44-toctou-") as temporary:
+            root = Path(temporary)
+            package = _copy_fixture(root)
+            manifest = red._validate_fixture(package)
+            original = manifest.payload_bytes["fixture-explanation.md"]
+            with self.assertRaises(TypeError):
+                manifest.payload_bytes["fixture-explanation.md"] = b"forged"  # type: ignore[index]
+            source = package / "fixture-explanation.md"
+            source.write_bytes(b"changed after validation with the same path")
+            execution = root / "execution"
+            execution.mkdir()
+            red._materialise_fixture(manifest, package, execution)
+            self.assertEqual((execution / "fixture-explanation.md").read_bytes(), original)
+
+    def test_materialisation_survives_source_replacement_with_link(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sqag-run44-toctou-link-") as temporary:
+            root = Path(temporary)
+            package = _copy_fixture(root)
+            manifest = red._validate_fixture(package)
+            original = manifest.payload_bytes["fixture-explanation.md"]
+            source = package / "fixture-explanation.md"
+            outside = root / "outside.md"
+            outside.write_bytes(b"replacement")
+            source.unlink()
+            try:
+                os.symlink(outside, source)
+            except OSError:
+                self.skipTest("host does not permit symlink creation")
+            execution = root / "execution"
+            execution.mkdir()
+            red._materialise_fixture(manifest, package, execution)
+            self.assertEqual((execution / "fixture-explanation.md").read_bytes(), original)
+
+    def test_materialisation_survives_source_replacement_with_hard_link(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sqag-run44-toctou-hardlink-") as temporary:
+            root = Path(temporary)
+            package = _copy_fixture(root)
+            manifest = red._validate_fixture(package)
+            original = manifest.payload_bytes["fixture-explanation.md"]
+            source = package / "fixture-explanation.md"
+            outside = root / "outside-hardlink.md"
+            outside.write_bytes(b"replacement")
+            source.unlink()
+            try:
+                os.link(outside, source)
+            except OSError:
+                self.skipTest("host does not permit hard-link creation")
+            execution = root / "execution"
+            execution.mkdir()
+            red._materialise_fixture(manifest, package, execution)
+            self.assertEqual((execution / "fixture-explanation.md").read_bytes(), original)
+
+    def test_materialisation_rejects_linked_destination_parent(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sqag-run44-destination-link-") as temporary:
+            root = Path(temporary)
+            package = _copy_fixture(root)
+            manifest = red._validate_fixture(package)
+            execution = root / "execution"
+            execution.mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            linked_parent = execution / "tests"
+            try:
+                os.symlink(outside, linked_parent, target_is_directory=True)
+            except OSError:
+                self.skipTest("host does not permit directory symlink creation")
+            with self.assertRaises(red.FixtureError) as failure:
+                red._materialise_fixture(manifest, package, execution)
+            self.assertEqual(failure.exception.code, "fixture_materialisation_failed")
+            self.assertFalse((outside / "test_runtime_privilege_contract.py").exists())
+            shutil.rmtree(execution, ignore_errors=True)
+
+    def test_interpreter_identity_and_version_mismatches_reject(self) -> None:
+        manifest = red._validate_fixture()
+        with mock.patch.object(red.sys, "version_info", (3, 12, 12)):
+            with self.assertRaises(red.FixtureError) as failure:
+                red._validate_interpreter(manifest)
+        self.assertEqual(failure.exception.code, "interpreter_mismatch")
+        with mock.patch.object(red.sys, "version_info", (3, 13, 0)):
+            with self.assertRaises(red.FixtureError) as failure:
+                red._validate_interpreter(manifest)
+        self.assertEqual(failure.exception.code, "interpreter_mismatch")
+        with mock.patch.object(red.sys, "implementation", SimpleNamespace(name="pypy")):
+            with self.assertRaises(red.FixtureError) as failure:
+                red._validate_interpreter(manifest)
+        self.assertEqual(failure.exception.code, "interpreter_mismatch")
+
+
+class StrictReceiptParserTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.manifest = red._validate_fixture()
+        cls.receipt = red._success_receipt(cls.manifest)
+        cls.line = red._serialise_receipt(cls.receipt)
+
+    def assert_rejected(self, value: bytes | str) -> None:
+        with self.assertRaises(red.FixtureError) as failure:
+            red._parse_receipt(value)
+        self.assertEqual(failure.exception.code, "receipt_invalid")
+
+    def test_valid_receipt_is_independently_parsed(self) -> None:
+        parsed = red._parse_receipt(self.line.encode("utf-8"))
+        self.assertEqual(parsed, self.receipt)
+
+    def test_receipt_negative_matrix(self) -> None:
+        cases: list[bytes | str] = [
+            b"",
+            b"not-json",
+            b"\xff",
+            self.line + "\n" + self.line,
+            " " + self.line,
+            self.line + " ",
+            self.line + "\n",
+            '{"schema":"sqag-retrospective-receipt-v1","schema":"sqag-retrospective-receipt-v1"}',
+            (self.line[:-1] + ",").encode("utf-8"),
+            ("x" * (red.MAX_RECEIPT_BYTES + 1)),
+        ]
+        conflicting = dict(self.receipt)
+        conflicting["test_count"] = 12
+        cases.append(self.line + "\n" + red._serialise_receipt(conflicting))
+        missing = dict(self.receipt)
+        missing.pop("schema")
+        cases.append(red._serialise_receipt(missing))
+        unknown = dict(self.receipt)
+        unknown["unknown"] = False
+        cases.append(red._serialise_receipt(unknown))
+        cases.append(red._serialise_receipt(dict(reversed(tuple(self.receipt.items())))))
+        wrong_schema = dict(self.receipt)
+        wrong_schema["schema"] = "other"
+        cases.append(red._serialise_receipt(wrong_schema))
+        wrong_status = dict(self.receipt)
+        wrong_status["status"] = "other"
+        cases.append(red._serialise_receipt(wrong_status))
+        for field in ("test_count", "assertion_failures", "errors", "unexpected_passes", "skipped"):
+            candidate = dict(self.receipt)
+            candidate[field] = True
+            cases.append(red._serialise_receipt(candidate))
+        for field in ("timeout", "signal_termination", "output_overflow", "cleanup_verified"):
+            candidate = dict(self.receipt)
+            candidate[field] = 1
+            cases.append(red._serialise_receipt(candidate))
+        for field in (
+            "historical_git_lookup",
+            "current_dependencies_used",
+            "child_output_emitted",
+            "live_system_use",
+            "secret_bearing_output",
+        ):
+            candidate = dict(self.receipt)
+            candidate[field] = 1
+            cases.append(red._serialise_receipt(candidate))
+        for field in ("schema", "status", "fixture_version"):
+            candidate = dict(self.receipt)
+            candidate[field] = 1
+            cases.append(red._serialise_receipt(candidate))
+        wrong_error_type = dict(self.receipt)
+        wrong_error_type["error_code"] = 1
+        cases.append(red._serialise_receipt(wrong_error_type))
+        wrong_child_status = dict(self.receipt)
+        wrong_child_status["child_exit_status"] = "1"
+        cases.append(red._serialise_receipt(wrong_child_status))
+        negative = dict(self.receipt)
+        negative["test_count"] = -1
+        cases.append(red._serialise_receipt(negative))
+        inconsistent = dict(self.receipt)
+        inconsistent["assertion_failures"] = 12
+        cases.append(red._serialise_receipt(inconsistent))
+        success_error = dict(self.receipt)
+        success_error["error_code"] = "interpreter_mismatch"
+        cases.append(red._serialise_receipt(success_error))
+        cleanup_false = dict(self.receipt)
+        cleanup_false["cleanup_verified"] = False
+        cases.append(red._serialise_receipt(cleanup_false))
+        for field in ("historical_git_lookup", "current_dependencies_used", "child_output_emitted", "live_system_use", "secret_bearing_output"):
+            candidate = dict(self.receipt)
+            candidate[field] = True
+            cases.append(red._serialise_receipt(candidate))
+        uri_error = dict(self.receipt)
+        uri_error["status"] = "failed"
+        uri_error["error_code"] = "https://invalid.example/secret"
+        uri_error["fixture_version"] = None
+        uri_error["child_exit_status"] = None
+        uri_error.update({field: 0 for field in ("test_count", "assertion_failures", "errors", "unexpected_passes", "skipped")})
+        uri_error.update({field: False for field in ("cleanup_verified", "timeout", "signal_termination", "output_overflow", "historical_git_lookup", "current_dependencies_used", "child_output_emitted", "live_system_use", "secret_bearing_output")})
+        cases.append(red._serialise_receipt(uri_error))
+        unknown_error = dict(uri_error)
+        unknown_error["error_code"] = "unknown_error_category"
+        cases.append(red._serialise_receipt(unknown_error))
+        missing_error = dict(uri_error)
+        missing_error["error_code"] = None
+        cases.append(red._serialise_receipt(missing_error))
+        free_form_error = dict(uri_error)
+        free_form_error["error_code"] = "Traceback: secret-shaped detail"
+        cases.append(red._serialise_receipt(free_form_error))
+        historical_git = dict(self.receipt)
+        historical_git["historical_git_lookup"] = True
+        cases.append(red._serialise_receipt(historical_git))
+        for index, case in enumerate(cases):
+            with self.subTest(index=index):
+                self.assert_rejected(case)
+
+    def test_failure_posture_is_consistent(self) -> None:
+        timeout = red._failure_receipt("execution_timeout")
+        self.assertTrue(red._parse_receipt(red._serialise_receipt(timeout))["timeout"])
+        bad = dict(timeout)
+        bad["timeout"] = False
+        self.assert_rejected(red._serialise_receipt(bad))
+
+
+class RealSubprocessLifecycleTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.execution_root = Path(tempfile.mkdtemp(prefix="sqag-run44-process-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.execution_root, ignore_errors=True)
+
+    def test_real_timeout_terminates_child_and_returns_fixed_category(self) -> None:
+        with self.assertRaises(red.FixtureError) as failure:
+            red._execute_child(
+                _child_command("import time; time.sleep(5)"),
+                self.execution_root,
+                timeout_seconds=0.1,
+            )
+        self.assertEqual(failure.exception.code, "execution_timeout")
+
+    def test_real_stdout_overflow_is_bounded_and_terminated(self) -> None:
+        with self.assertRaises(red.FixtureError) as failure:
+            red._execute_child(
+                _child_command("import sys; sys.stdout.write('x' * 70000); sys.stdout.flush()"),
+                self.execution_root,
+                timeout_seconds=5,
+            )
+        self.assertEqual(failure.exception.code, "output_overflow")
+
+    def test_real_stderr_overflow_is_bounded_and_terminated(self) -> None:
+        with self.assertRaises(red.FixtureError) as failure:
+            red._execute_child(
+                _child_command("import sys; sys.stderr.write('x' * 70000); sys.stderr.flush()"),
+                self.execution_root,
+                timeout_seconds=5,
+            )
+        self.assertEqual(failure.exception.code, "output_overflow")
+
+    def test_signal_result_is_rejected_on_posix(self) -> None:
+        if os.name == "nt":
+            self.skipTest("signal termination semantics are unavailable on Windows")
+        result = red._execute_child(
+            _child_command("import os, signal; os.kill(os.getpid(), signal.SIGTERM)"),
+            self.execution_root,
+            timeout_seconds=5,
+        )
+        self.assertLess(result.returncode, 0)
+        with self.assertRaises(red.FixtureError) as failure:
+            red._validate_test_result(result, red._validate_fixture())
+        self.assertEqual(failure.exception.code, "signal_terminated")
+
+    def test_both_reader_streams_close_without_deadlock(self) -> None:
+        result = red._execute_child(
+            _child_command("import sys; sys.stdout.write('out'); sys.stderr.write('err')"),
+            self.execution_root,
+            timeout_seconds=5,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b"out")
+        self.assertEqual(result.stderr, b"err")
 
 
 if __name__ == "__main__":

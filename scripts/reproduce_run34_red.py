@@ -14,20 +14,27 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import Any, Callable
 
 
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "retrospective" / "run34"
 MANIFEST_PATH = FIXTURE_ROOT / "manifest.json"
-MANIFEST_SHA256 = "88e01577be6aa83e43a4c6e2ebd9655b453943ae624f3ba67ce7610271662a0c"
+MANIFEST_SHA256 = "2db053c00ca4ba6717c5ebe2a9e4366dbec71a6874bf9eb24a8bf32a3c41da53"
 MAX_OUTPUT_BYTES = 64 * 1024
+MAX_FIXTURE_FILE_BYTES = 2 * 1024 * 1024
+MAX_RECEIPT_BYTES = 8 * 1024
 TEST_TIMEOUT_SECONDS = 30.0
+EXPECTED_INTERPRETER = "cpython"
+EXPECTED_PYTHON_VERSION = (3, 12, 13)
 
 EXPECTED_TEST_SELECTION = (
     "tests.test_runtime_privilege_contract.RuntimeMembershipEdgeEvaluatorTest.test_unrelated_parent_to_sqag_migrator_is_rejected",
@@ -62,6 +69,10 @@ RECEIPT_KEYS = (
     "errors",
     "unexpected_passes",
     "skipped",
+    "child_exit_status",
+    "timeout",
+    "signal_termination",
+    "output_overflow",
     "cleanup_verified",
     "historical_git_lookup",
     "current_dependencies_used",
@@ -69,6 +80,101 @@ RECEIPT_KEYS = (
     "live_system_use",
     "secret_bearing_output",
 )
+
+RECEIPT_ERROR_CODES = frozenset(
+    {
+        "child_start_failed",
+        "child_output_decode_failed",
+        "cleanup_failed",
+        "cleanup_remnant",
+        "dependency_definition_digest_mismatch",
+        "dependency_definition_format_mismatch",
+        "dependency_definition_not_bound",
+        "dependency_definition_schema_mismatch",
+        "dependency_snapshot_schema_mismatch",
+        "dependency_snapshot_value_mismatch",
+        "duplicate_json_key",
+        "duplicate_payload_digest",
+        "duplicate_payload_path",
+        "expected_failure_category_missing",
+        "expected_result_mismatch",
+        "execution_timeout",
+        "failure_summary_mismatch",
+        "fixture_entry_forbidden",
+        "fixture_enumeration_failed",
+        "fixture_execution_failed",
+        "fixture_file_changed",
+        "fixture_file_digest_mismatch",
+        "fixture_file_missing",
+        "fixture_file_set_mismatch",
+        "fixture_file_size_limit",
+        "fixture_json_must_be_object",
+        "fixture_materialisation_failed",
+        "fixture_root_forbidden",
+        "fixture_version_mismatch",
+        "historical_change_decoded_digest_mismatch",
+        "historical_change_digest_mismatch",
+        "historical_change_encoding_invalid",
+        "historical_change_not_bound",
+        "historical_change_scope_mismatch",
+        "historical_change_schema_mismatch",
+        "historical_change_target_mismatch",
+        "import_or_collection_error",
+        "invalid_fixture_digest",
+        "invalid_fixture_json",
+        "invalid_fixture_path",
+        "interpreter_mismatch",
+        "manifest_digest_mismatch",
+        "manifest_missing",
+        "manifest_schema_mismatch",
+        "non_assertion_result_present",
+        "output_overflow",
+        "payload_entry_schema_mismatch",
+        "payload_schema_mismatch",
+        "payload_size_mismatch",
+        "provenance_schema_mismatch",
+        "provenance_value_mismatch",
+        "reader_shutdown_failed",
+        "receipt_internal_validation_failed",
+        "receipt_invalid",
+        "receipt_schema_mismatch",
+        "signal_terminated",
+        "test_count_mismatch",
+        "test_selection_contract_mismatch",
+        "test_selection_execution_mismatch",
+        "test_selection_mismatch",
+        "test_selection_schema_mismatch",
+        "temporary_directory_create_failed",
+        "unexpected_exit_status",
+        "unexpected_test_status",
+        "validated_fixture_required",
+    }
+)
+
+_REPARSE_POINT_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+)
+_PAYLOAD_ROLES = frozenset(
+    {
+        "dependency-definition",
+        "explanation",
+        "historical-source-fragment",
+        "historical-test-selection",
+        "historical-documentation-fragment",
+        "historical-test-change",
+    }
+)
+
+
+class _ValidatedManifest(dict[str, Any]):
+    """Manifest mapping plus the immutable bytes verified for its payload."""
+
+    def __init__(self, values: dict[str, Any], payload_bytes: dict[str, bytes]) -> None:
+        super().__init__(values)
+        self.payload_bytes = MappingProxyType(dict(payload_bytes))
 
 
 class FixtureError(RuntimeError):
@@ -88,23 +194,161 @@ def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _load_json(path: Path) -> dict[str, Any]:
+def _load_json_bytes(data: bytes, error_code: str) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_strict_object)
-    except (OSError, UnicodeError, json.JSONDecodeError, FixtureError):
-        raise FixtureError("invalid_fixture_json") from None
+        value = json.loads(data.decode("utf-8"), object_pairs_hook=_strict_object)
+    except (UnicodeError, json.JSONDecodeError, FixtureError):
+        raise FixtureError(error_code) from None
     if type(value) is not dict:
         raise FixtureError("fixture_json_must_be_object")
     return value
 
 
+def _safe_lstat(path: Path, error_code: str) -> os.stat_result:
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        raise FixtureError(error_code) from None
+    attributes = int(getattr(metadata, "st_file_attributes", 0))
+    if stat.S_ISLNK(metadata.st_mode) or attributes & _REPARSE_POINT_ATTRIBUTE:
+        raise FixtureError(error_code)
+    return metadata
+
+
+def _validate_ancestor_chain(path: Path, error_code: str) -> None:
+    absolute = Path(os.path.abspath(path))
+    current = absolute
+    ancestors: list[Path] = []
+    while True:
+        ancestors.append(current)
+        if current == current.parent:
+            break
+        current = current.parent
+    for ancestor in reversed(ancestors):
+        metadata = _safe_lstat(ancestor, error_code)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise FixtureError(error_code)
+
+
+def _read_verified_bytes(
+    path: Path,
+    *,
+    expected_size: int | None,
+    expected_digest: str | None,
+    missing_code: str,
+) -> bytes:
+    _validate_ancestor_chain(path.parent, "fixture_entry_forbidden")
+    before = _safe_lstat(path, missing_code)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise FixtureError("fixture_entry_forbidden")
+    if before.st_size > MAX_FIXTURE_FILE_BYTES:
+        raise FixtureError("fixture_file_size_limit")
+    flags = (
+        os.O_RDONLY
+        | int(getattr(os, "O_BINARY", 0))
+        | int(getattr(os, "O_NOFOLLOW", 0))
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        raise FixtureError(missing_code) from None
+    try:
+        opened = os.fstat(descriptor)
+        opened_attributes = int(getattr(opened, "st_file_attributes", 0))
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened_attributes & _REPARSE_POINT_ATTRIBUTE
+            or opened.st_size > MAX_FIXTURE_FILE_BYTES
+            or opened.st_size != before.st_size
+            or (before.st_ino and opened.st_ino != before.st_ino)
+            or (before.st_dev and opened.st_dev != before.st_dev)
+        ):
+            raise FixtureError("fixture_file_changed")
+        _validate_ancestor_chain(path.parent, "fixture_file_changed")
+        visible = _safe_lstat(path, "fixture_file_changed")
+        if (
+            not stat.S_ISREG(visible.st_mode)
+            or visible.st_nlink != 1
+            or (opened.st_ino and visible.st_ino != opened.st_ino)
+            or (opened.st_dev and visible.st_dev != opened.st_dev)
+        ):
+            raise FixtureError("fixture_file_changed")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_FIXTURE_FILE_BYTES:
+                raise FixtureError("fixture_file_size_limit")
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+    except FixtureError:
+        raise
+    except OSError:
+        raise FixtureError("fixture_file_changed") from None
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    data = b"".join(chunks)
+    _validate_ancestor_chain(path.parent, "fixture_file_changed")
+    visible = _safe_lstat(path, "fixture_file_changed")
+    after_attributes = int(getattr(after, "st_file_attributes", 0))
+    if (
+        not stat.S_ISREG(after.st_mode)
+        or after.st_nlink != 1
+        or after_attributes & _REPARSE_POINT_ATTRIBUTE
+        or after.st_size != total
+        or after.st_size != before.st_size
+        or (before.st_ino and after.st_ino != before.st_ino)
+        or (before.st_dev and after.st_dev != before.st_dev)
+        or not stat.S_ISREG(visible.st_mode)
+        or visible.st_nlink != 1
+        or (after.st_ino and visible.st_ino != after.st_ino)
+        or (after.st_dev and visible.st_dev != after.st_dev)
+    ):
+        raise FixtureError("fixture_file_changed")
+    if expected_size is not None and len(data) != expected_size:
+        raise FixtureError("fixture_file_digest_mismatch")
+    if expected_digest is not None and hashlib.sha256(data).hexdigest() != expected_digest:
+        raise FixtureError("fixture_file_digest_mismatch")
+    return data
+
+
 def _validate_relative_path(value: Any) -> str:
-    if type(value) is not str or not value or "\\" in value:
+    if type(value) is not str or not value or "\x00" in value:
         raise FixtureError("invalid_fixture_path")
+    if (
+        value.startswith("/")
+        or value.endswith("/")
+        or "//" in value
+        or "\\" in value
+        or ":" in value
+        or unicodedata.normalize("NFC", value) != value
+        or any(unicodedata.category(character) == "Cc" for character in value)
+    ):
+        raise FixtureError("invalid_fixture_path")
+    components = value.split("/")
+    if any(
+        not component
+        or component in {".", ".."}
+        or component.endswith((".", " "))
+        or component.rstrip(" .") != component
+        for component in components
+    ):
+        raise FixtureError("invalid_fixture_path")
+    for component in components:
+        device_name = component.split(".", 1)[0].casefold().upper()
+        if device_name in _WINDOWS_RESERVED_NAMES:
+            raise FixtureError("invalid_fixture_path")
     path = PurePosixPath(value)
-    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+    if path.is_absolute() or path.as_posix() != value:
         raise FixtureError("invalid_fixture_path")
-    return path.as_posix()
+    return value
 
 
 def _validate_sha(value: Any) -> str:
@@ -115,32 +359,43 @@ def _validate_sha(value: Any) -> str:
 
 def _payload_files(package_root: Path) -> set[str]:
     actual: set[str] = set()
-    try:
-        candidates = tuple(package_root.rglob("*"))
-    except OSError:
-        raise FixtureError("fixture_enumeration_failed") from None
-    for candidate in candidates:
-        if candidate.is_symlink():
-            raise FixtureError("fixture_symlink_forbidden")
-        if not candidate.is_file():
-            continue
-        relative = candidate.relative_to(package_root).as_posix()
-        if relative == "manifest.json":
-            continue
-        actual.add(relative)
+    def visit(directory: Path, prefix: str) -> None:
+        metadata = _safe_lstat(directory, "fixture_entry_forbidden")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise FixtureError("fixture_entry_forbidden")
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError:
+            raise FixtureError("fixture_enumeration_failed") from None
+        for entry in entries:
+            candidate = Path(entry.path)
+            relative = f"{prefix}/{entry.name}" if prefix else entry.name
+            metadata = _safe_lstat(candidate, "fixture_entry_forbidden")
+            if stat.S_ISDIR(metadata.st_mode):
+                visit(candidate, relative)
+                continue
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise FixtureError("fixture_entry_forbidden")
+            if relative != "manifest.json":
+                actual.add(relative)
+
+    visit(package_root, "")
     return actual
 
 
 def _validate_fixture(package_root: Path = FIXTURE_ROOT) -> dict[str, Any]:
-    package_root = package_root.resolve()
+    package_root = Path(os.path.abspath(package_root))
+    _validate_ancestor_chain(package_root, "fixture_root_forbidden")
     manifest_path = package_root / "manifest.json"
-    try:
-        manifest_bytes = manifest_path.read_bytes()
-    except OSError:
-        raise FixtureError("manifest_missing") from None
+    manifest_bytes = _read_verified_bytes(
+        manifest_path,
+        expected_size=None,
+        expected_digest=None,
+        missing_code="manifest_missing",
+    )
     if hashlib.sha256(manifest_bytes).hexdigest() != MANIFEST_SHA256:
         raise FixtureError("manifest_digest_mismatch")
-    manifest = _load_json(manifest_path)
+    manifest = _load_json_bytes(manifest_bytes, "invalid_fixture_json")
 
     expected_top_level = {
         "$schema",
@@ -182,8 +437,12 @@ def _validate_fixture(package_root: Path = FIXTURE_ROOT) -> dict[str, Any]:
     if type(payload) is not list or not payload:
         raise FixtureError("payload_schema_mismatch")
     expected_payload: dict[str, dict[str, Any]] = {}
+    canonical_paths: set[str] = set()
+    digest_paths: dict[str, tuple[str, int]] = {}
     for entry in payload:
         if type(entry) is not dict or set(entry) != {"path", "role", "sha256", "size"}:
+            raise FixtureError("payload_entry_schema_mismatch")
+        if type(entry["role"]) is not str or entry["role"] not in _PAYLOAD_ROLES:
             raise FixtureError("payload_entry_schema_mismatch")
         path = _validate_relative_path(entry["path"])
         digest = _validate_sha(entry["sha256"])
@@ -191,17 +450,25 @@ def _validate_fixture(package_root: Path = FIXTURE_ROOT) -> dict[str, Any]:
             raise FixtureError("payload_size_mismatch")
         if path in expected_payload:
             raise FixtureError("duplicate_payload_path")
+        canonical_path = unicodedata.normalize("NFC", path).casefold()
+        if canonical_path in canonical_paths:
+            raise FixtureError("duplicate_payload_path")
+        canonical_paths.add(canonical_path)
+        if digest in digest_paths:
+            raise FixtureError("duplicate_payload_digest")
+        digest_paths[digest] = (path, entry["size"])
         expected_payload[path] = {"role": entry["role"], "sha256": digest, "size": entry["size"]}
     if set(expected_payload) != _payload_files(package_root):
         raise FixtureError("fixture_file_set_mismatch")
 
+    payload_bytes: dict[str, bytes] = {}
     for relative, entry in expected_payload.items():
-        try:
-            data = (package_root / Path(*PurePosixPath(relative).parts)).read_bytes()
-        except OSError:
-            raise FixtureError("fixture_file_missing") from None
-        if len(data) != entry["size"] or hashlib.sha256(data).hexdigest() != entry["sha256"]:
-            raise FixtureError("fixture_file_digest_mismatch")
+        payload_bytes[relative] = _read_verified_bytes(
+            package_root / Path(*relative.split("/")),
+            expected_size=entry["size"],
+            expected_digest=entry["sha256"],
+            missing_code="fixture_file_missing",
+        )
 
     dependency = manifest["dependency_definition"]
     if type(dependency) is not dict or set(dependency) != {"path", "sha256", "format"}:
@@ -215,7 +482,7 @@ def _validate_fixture(package_root: Path = FIXTURE_ROOT) -> dict[str, Any]:
         raise FixtureError("dependency_definition_not_bound")
     if dependency_entry["sha256"] != dependency_digest:
         raise FixtureError("dependency_definition_digest_mismatch")
-    dependency_data = _load_json(package_root / Path(*PurePosixPath(dependency_path).parts))
+    dependency_data = _load_json_bytes(payload_bytes[dependency_path], "invalid_fixture_json")
     if set(dependency_data) != {"schema", "snapshot_version", "runtime", "packages"}:
         raise FixtureError("dependency_snapshot_schema_mismatch")
     runtime = dependency_data["runtime"]
@@ -239,6 +506,10 @@ def _validate_fixture(package_root: Path = FIXTURE_ROOT) -> dict[str, Any]:
         "implementation_files_applied",
     }:
         raise FixtureError("historical_change_schema_mismatch")
+    if type(historical_change["changed_files"]) is not list or any(
+        type(path) is not str for path in historical_change["changed_files"]
+    ):
+        raise FixtureError("historical_change_schema_mismatch")
     patch_path = _validate_relative_path(historical_change["path"])
     patch_entry = expected_payload.get(patch_path)
     if patch_entry is None or patch_entry["role"] != "historical-test-change":
@@ -247,54 +518,116 @@ def _validate_fixture(package_root: Path = FIXTURE_ROOT) -> dict[str, Any]:
         raise FixtureError("historical_change_digest_mismatch")
     try:
         patch_bytes = base64.b64decode(
-            (package_root / Path(*PurePosixPath(patch_path).parts)).read_bytes().strip(),
+            payload_bytes[patch_path].strip(),
             validate=True,
         )
-    except (OSError, ValueError):
+    except (KeyError, ValueError):
         raise FixtureError("historical_change_encoding_invalid") from None
     if hashlib.sha256(patch_bytes).hexdigest() != _validate_sha(historical_change["decoded_sha256"]):
         raise FixtureError("historical_change_decoded_digest_mismatch")
+    try:
+        patch_text = patch_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise FixtureError("historical_change_encoding_invalid") from None
     patch_targets = tuple(
         line.removeprefix("+++ b/")
-        for line in patch_bytes.decode("utf-8").splitlines()
+        for line in patch_text.splitlines()
         if line.startswith("+++ b/")
     )
     if tuple(historical_change["changed_files"]) != patch_targets or patch_targets != (
         "tests/test_runtime_privilege_contract.py",
     ):
         raise FixtureError("historical_change_target_mismatch")
-    if historical_change["implementation_files_applied"] != 0:
+    if type(historical_change["implementation_files_applied"]) is not int or historical_change["implementation_files_applied"] != 0:
         raise FixtureError("historical_change_scope_mismatch")
 
     selection = manifest["test_selection"]
-    if type(selection) is not list or tuple(item.get("name") for item in selection) != EXPECTED_TEST_SELECTION:
+    if type(selection) is not list or any(type(item) is not dict for item in selection):
+        raise FixtureError("test_selection_schema_mismatch")
+    if tuple(item.get("name") for item in selection) != EXPECTED_TEST_SELECTION:
         raise FixtureError("test_selection_mismatch")
-    if any(type(item) is not dict or set(item) != {"name", "expected", "category"} for item in selection):
+    if any(set(item) != {"name", "expected", "category"} for item in selection):
         raise FixtureError("test_selection_schema_mismatch")
     if any(item["expected"] != "failure" or type(item["category"]) is not str for item in selection):
         raise FixtureError("test_selection_contract_mismatch")
-    if manifest["expected_result"] != EXPECTED_RESULT:
+    expected_result = manifest["expected_result"]
+    if (
+        type(expected_result) is not dict
+        or set(expected_result) != set(EXPECTED_RESULT)
+        or any(type(value) is not int or value < 0 for value in expected_result.values())
+        or expected_result != EXPECTED_RESULT
+    ):
         raise FixtureError("expected_result_mismatch")
 
     receipt_schema = manifest["receipt_schema"]
-    if type(receipt_schema) is not dict or set(receipt_schema) != {"name", "keys"}:
+    if (
+        type(receipt_schema) is not dict
+        or set(receipt_schema) != {"name", "keys"}
+        or type(receipt_schema["keys"]) is not list
+        or any(type(key) is not str for key in receipt_schema["keys"])
+    ):
         raise FixtureError("receipt_schema_mismatch")
     if receipt_schema["name"] != "sqag-retrospective-receipt-v1" or tuple(receipt_schema["keys"]) != RECEIPT_KEYS:
         raise FixtureError("receipt_schema_mismatch")
-    return manifest
+    return _ValidatedManifest(manifest, payload_bytes)
 
 
 def _materialise_fixture(manifest: dict[str, Any], package_root: Path, execution_root: Path) -> None:
-    for entry in manifest["payload"]:
-        relative = PurePosixPath(entry["path"])
-        source = package_root / Path(*relative.parts)
-        destination = execution_root / Path(*relative.parts)
+    del package_root
+    if not isinstance(manifest, _ValidatedManifest):
+        raise FixtureError("validated_fixture_required")
+    execution_root = Path(os.path.abspath(execution_root))
+    _validate_ancestor_chain(execution_root, "fixture_materialisation_failed")
+    root_resolved = execution_root.resolve()
+    for relative, data in manifest.payload_bytes.items():
+        destination = execution_root.joinpath(*relative.split("/"))
+        descriptor: int | None = None
+        created = False
+        materialised = False
         try:
-            destination.resolve().relative_to(execution_root.resolve())
             destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(source.read_bytes())
+            _validate_ancestor_chain(destination.parent, "fixture_materialisation_failed")
+            destination.parent.resolve().relative_to(root_resolved)
+            descriptor = os.open(
+                destination,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | int(getattr(os, "O_BINARY", 0)),
+                0o600,
+            )
+            created = True
+            offset = 0
+            while offset < len(data):
+                written = os.write(descriptor, data[offset:])
+                if written <= 0:
+                    raise FixtureError("fixture_materialisation_failed")
+                offset += written
+            metadata = os.fstat(descriptor)
+            attributes = int(getattr(metadata, "st_file_attributes", 0))
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or attributes & _REPARSE_POINT_ATTRIBUTE
+                or metadata.st_size != len(data)
+            ):
+                raise FixtureError("fixture_materialisation_failed")
+            materialised = True
+        except FixtureError:
+            raise
         except (OSError, ValueError):
             raise FixtureError("fixture_materialisation_failed") from None
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if created and not materialised:
+                try:
+                    destination.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 class _OutputCollector:
@@ -326,13 +659,87 @@ def _drain(stream: Any, collector: _OutputCollector) -> None:
 
 def _kill_process(process: subprocess.Popen[bytes]) -> None:
     try:
-        process.kill()
+        process.terminate()
     except OSError:
         pass
     try:
-        process.wait(timeout=5)
+        process.wait(timeout=1)
+        return
     except (OSError, subprocess.TimeoutExpired):
-        pass
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                process.kill()
+            except OSError:
+                pass
+            process.wait()
+
+
+def _child_environment() -> dict[str, str]:
+    environment = {
+        key: os.environ[key]
+        for key in ("PATH", "SystemRoot", "WINDIR", "TEMP", "TMP", "TMPDIR")
+        if key in os.environ
+    }
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["PYTHONHASHSEED"] = "0"
+    return environment
+
+
+def _join_reader_threads(threads: tuple[threading.Thread, threading.Thread]) -> None:
+    for thread in threads:
+        thread.join(timeout=5)
+    if any(thread.is_alive() for thread in threads):
+        raise FixtureError("reader_shutdown_failed")
+
+
+def _execute_child(
+    command: list[str],
+    execution_root: Path,
+    *,
+    timeout_seconds: float = TEST_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[bytes]:
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=execution_root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_child_environment(),
+        )
+    except OSError:
+        raise FixtureError("child_start_failed") from None
+    stdout = _OutputCollector()
+    stderr = _OutputCollector()
+    stdout_thread = threading.Thread(target=_drain, args=(process.stdout, stdout), daemon=True)
+    stderr_thread = threading.Thread(target=_drain, args=(process.stderr, stderr), daemon=True)
+    reader_threads = (stdout_thread, stderr_thread)
+    stdout_thread.start()
+    stderr_thread.start()
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while process.poll() is None:
+            if stdout.overflow or stderr.overflow:
+                _kill_process(process)
+                raise FixtureError("output_overflow")
+            if time.monotonic() >= deadline:
+                _kill_process(process)
+                raise FixtureError("execution_timeout")
+            time.sleep(0.02)
+        _join_reader_threads(reader_threads)
+        if stdout.overflow or stderr.overflow:
+            raise FixtureError("output_overflow")
+        return subprocess.CompletedProcess(command, process.returncode, bytes(stdout.data), bytes(stderr.data))
+    finally:
+        if process.poll() is None:
+            _kill_process(process)
+        _join_reader_threads(reader_threads)
 
 
 def _execute_selected_tests(execution_root: Path, selection: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
@@ -345,55 +752,132 @@ def _execute_selected_tests(execution_root: Path, selection: tuple[str, ...]) ->
         "raise SystemExit(0 if result.wasSuccessful() else 1)"
     )
     command = [sys.executable, "-I", "-S", "-c", launcher]
-    environment = {
-        key: os.environ[key]
-        for key in ("PATH", "SystemRoot", "WINDIR", "TEMP", "TMP", "TMPDIR")
-        if key in os.environ
-    }
-    environment["PYTHONNOUSERSITE"] = "1"
-    environment["PYTHONHASHSEED"] = "0"
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=execution_root,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=environment,
-        )
-    except OSError:
-        raise FixtureError("child_start_failed") from None
-    stdout = _OutputCollector()
-    stderr = _OutputCollector()
-    stdout_thread = threading.Thread(target=_drain, args=(process.stdout, stdout), daemon=True)
-    stderr_thread = threading.Thread(target=_drain, args=(process.stderr, stderr), daemon=True)
-    stdout_thread.start()
-    stderr_thread.start()
-    deadline = time.monotonic() + TEST_TIMEOUT_SECONDS
-    try:
-        while process.poll() is None:
-            if stdout.overflow or stderr.overflow:
-                _kill_process(process)
-                raise FixtureError("output_overflow")
-            if time.monotonic() >= deadline:
-                _kill_process(process)
-                raise FixtureError("execution_timeout")
-            time.sleep(0.02)
-        stdout_thread.join(timeout=5)
-        stderr_thread.join(timeout=5)
-        if stdout.overflow or stderr.overflow:
-            raise FixtureError("output_overflow")
-        return subprocess.CompletedProcess(command, process.returncode, bytes(stdout.data), bytes(stderr.data))
-    finally:
-        if process.poll() is None:
-            _kill_process(process)
-        stdout_thread.join(timeout=5)
-        stderr_thread.join(timeout=5)
+    return _execute_child(command, execution_root)
 
 
 def _validate_output_size(stdout: bytes, stderr: bytes) -> None:
     if len(stdout) + len(stderr) > MAX_OUTPUT_BYTES:
         raise FixtureError("output_overflow")
+
+
+def _validate_interpreter(manifest: dict[str, Any]) -> None:
+    dependency = manifest["dependency_definition"]
+    dependency_data = _load_json_bytes(manifest.payload_bytes[dependency["path"]], "invalid_fixture_json")
+    runtime = dependency_data["runtime"]
+    implementation = getattr(getattr(sys, "implementation", None), "name", None)
+    try:
+        version = tuple(sys.version_info[:3])
+    except (AttributeError, TypeError):
+        version = ()
+    if (
+        implementation != EXPECTED_INTERPRETER
+        or version != EXPECTED_PYTHON_VERSION
+        or runtime.get("implementation") != "CPython"
+        or runtime.get("version") != "3.12.13"
+    ):
+        raise FixtureError("interpreter_mismatch")
+
+
+def _receipt_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    try:
+        return _strict_object(pairs)
+    except FixtureError:
+        raise FixtureError("receipt_invalid") from None
+
+
+def _parse_receipt(value: bytes | str) -> dict[str, Any]:
+    if isinstance(value, str):
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError:
+            raise FixtureError("receipt_invalid") from None
+    elif isinstance(value, bytes):
+        encoded = value
+    else:
+        raise FixtureError("receipt_invalid")
+    if not encoded or len(encoded) > MAX_RECEIPT_BYTES:
+        raise FixtureError("receipt_invalid")
+    try:
+        line = encoded.decode("utf-8")
+    except UnicodeDecodeError:
+        raise FixtureError("receipt_invalid") from None
+    if line != line.strip() or "\n" in line or "\r" in line:
+        raise FixtureError("receipt_invalid")
+    try:
+        parsed = json.loads(line, object_pairs_hook=_receipt_object)
+    except (json.JSONDecodeError, FixtureError):
+        raise FixtureError("receipt_invalid") from None
+    if type(parsed) is not dict or tuple(parsed) != RECEIPT_KEYS:
+        raise FixtureError("receipt_invalid")
+    integer_fields = (
+        "test_count",
+        "assertion_failures",
+        "errors",
+        "unexpected_passes",
+        "skipped",
+    )
+    boolean_fields = (
+        "timeout",
+        "signal_termination",
+        "output_overflow",
+        "cleanup_verified",
+        "historical_git_lookup",
+        "current_dependencies_used",
+        "child_output_emitted",
+        "live_system_use",
+        "secret_bearing_output",
+    )
+    if any(type(parsed[field]) is not int or parsed[field] < 0 for field in integer_fields):
+        raise FixtureError("receipt_invalid")
+    if any(type(parsed[field]) is not bool for field in boolean_fields):
+        raise FixtureError("receipt_invalid")
+    if parsed["schema"] != "sqag-retrospective-receipt-v1" or type(parsed["schema"]) is not str:
+        raise FixtureError("receipt_invalid")
+    if type(parsed["status"]) is not str or parsed["status"] not in {"passed", "failed"}:
+        raise FixtureError("receipt_invalid")
+    if parsed["child_exit_status"] is not None and type(parsed["child_exit_status"]) is not int:
+        raise FixtureError("receipt_invalid")
+    if parsed["status"] == "passed":
+        if (
+            parsed["error_code"] is not None
+            or parsed["fixture_version"] != "1.0.0"
+            or parsed["child_exit_status"] != EXPECTED_RESULT["exit_status"]
+            or parsed["test_count"] != EXPECTED_RESULT["tests"]
+            or parsed["assertion_failures"] != EXPECTED_RESULT["assertion_failures"]
+            or parsed["errors"] != EXPECTED_RESULT["errors"]
+            or parsed["unexpected_passes"] != EXPECTED_RESULT["unexpected_passes"]
+            or parsed["skipped"] != EXPECTED_RESULT["skipped"]
+            or parsed["cleanup_verified"] is not True
+            or any(parsed[field] for field in boolean_fields if field != "cleanup_verified")
+        ):
+            raise FixtureError("receipt_invalid")
+    else:
+        if (
+            type(parsed["error_code"]) is not str
+            or parsed["error_code"] not in RECEIPT_ERROR_CODES
+            or parsed["fixture_version"] is not None
+            or parsed["child_exit_status"] is not None
+            or any(parsed[field] != 0 for field in integer_fields)
+            or parsed["cleanup_verified"] is not False
+            or parsed["historical_git_lookup"]
+            or parsed["current_dependencies_used"]
+            or parsed["child_output_emitted"]
+            or parsed["live_system_use"]
+            or parsed["secret_bearing_output"]
+        ):
+            raise FixtureError("receipt_invalid")
+        expected_posture = {
+            "timeout": parsed["error_code"] == "execution_timeout",
+            "signal_termination": parsed["error_code"] == "signal_terminated",
+            "output_overflow": parsed["error_code"] == "output_overflow",
+        }
+        if any(parsed[field] != expected_posture[field] for field in expected_posture):
+            raise FixtureError("receipt_invalid")
+    return parsed
+
+
+def _serialise_receipt(receipt: dict[str, Any]) -> str:
+    return json.dumps(receipt, ensure_ascii=True, separators=(",", ":"))
 
 
 def _validate_test_result(result: subprocess.CompletedProcess[bytes], manifest: dict[str, Any]) -> None:
@@ -447,6 +931,10 @@ def _success_receipt(manifest: dict[str, Any]) -> dict[str, Any]:
         "errors": expected["errors"],
         "unexpected_passes": expected["unexpected_passes"],
         "skipped": expected["skipped"],
+        "child_exit_status": expected["exit_status"],
+        "timeout": False,
+        "signal_termination": False,
+        "output_overflow": False,
         "cleanup_verified": True,
         "historical_git_lookup": False,
         "current_dependencies_used": False,
@@ -464,12 +952,13 @@ def run_reproduction(
     """Validate, materialise, run, and clean one closed fixture directory."""
 
     manifest = _validate_fixture(package_root)
+    _validate_interpreter(manifest)
     temporary_path: Path | None = None
     try:
         temporary_path = Path(temp_directory_factory(prefix="sqag-run34-fixture-")).resolve()
         if not temporary_path.is_dir():
             raise FixtureError("temporary_directory_create_failed")
-        _materialise_fixture(manifest, Path(package_root).resolve(), temporary_path)
+        _materialise_fixture(manifest, package_root, temporary_path)
         result = _execute_selected_tests(temporary_path, EXPECTED_TEST_SELECTION)
         _validate_test_result(result, manifest)
         return _success_receipt(manifest)
@@ -484,6 +973,11 @@ def run_reproduction(
 
 
 def _failure_receipt(error_code: str) -> dict[str, Any]:
+    posture = {
+        "timeout": error_code == "execution_timeout",
+        "signal_termination": error_code == "signal_terminated",
+        "output_overflow": error_code == "output_overflow",
+    }
     return {
         "schema": "sqag-retrospective-receipt-v1",
         "status": "failed",
@@ -494,6 +988,10 @@ def _failure_receipt(error_code: str) -> dict[str, Any]:
         "errors": 0,
         "unexpected_passes": 0,
         "skipped": 0,
+        "child_exit_status": None,
+        "timeout": posture["timeout"],
+        "signal_termination": posture["signal_termination"],
+        "output_overflow": posture["output_overflow"],
         "cleanup_verified": False,
         "historical_git_lookup": False,
         "current_dependencies_used": False,
@@ -508,13 +1006,15 @@ def main() -> int:
         receipt = run_reproduction()
     except FixtureError as exc:
         receipt = _failure_receipt(exc.code)
-        print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
-        return 2
+        pass
     except Exception:
-        print(json.dumps(_failure_receipt("fixture_execution_failed"), sort_keys=True, separators=(",", ":")))
-        return 2
-    print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
-    return 0
+        receipt = _failure_receipt("fixture_execution_failed")
+    try:
+        parsed = _parse_receipt(_serialise_receipt(receipt))
+    except FixtureError:
+        parsed = _failure_receipt("receipt_internal_validation_failed")
+    print(_serialise_receipt(parsed))
+    return 0 if parsed["status"] == "passed" else 2
 
 
 if __name__ == "__main__":

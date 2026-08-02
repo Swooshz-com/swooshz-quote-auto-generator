@@ -21,14 +21,24 @@ Source of truth: `.github/workflows/ci.yml`
 
 - `Retrospective fixture integrity and RED reproduction`: checks out the exact
   workflow head, validates a repository-contained closed fixture manifest and
-  every preserved-input digest, materialises only that fixture in one bounded
-  temporary directory, and runs the exact thirteen-test selection with the
-  immutable stdlib-only dependency snapshot. It requires exactly thirteen
-  assertion failures, zero errors, zero unexpected passes, and zero skipped
-  required tests, removes the temporary directory, and emits only a bounded
-  public-safe receipt. It performs no historical Git lookup and is
-  retrospective evidence, not the original RED chronology or original
-  development sequence.
+  every preserved-input digest. Raw manifest paths are rejected before path
+  normalisation when they contain traversal, separator, drive-relative,
+  colon/ADS, reserved-device, trailing-dot/space, control-character, or
+  Unicode-normalisation hazards. Fixture enumeration rejects symbolic links,
+  reparse points/junctions, hard links, and non-regular entries. Each payload
+  is read once through a checked descriptor; materialisation writes those exact
+  verified bytes and never rereads a mutable source path. The runner requires
+  the executing interpreter to be CPython 3.12.13 and keeps the explicit empty
+  third-party package snapshot. It materialises only that fixture in one
+  bounded temporary directory and runs the exact thirteen-test selection. It
+  requires exactly thirteen assertion failures, zero errors, zero unexpected
+  passes, and zero skipped required tests. An independent strict receipt
+  parser enforces the closed schema, exact types, fixed values, process
+  posture, and safety flags. Real timeout, stdout/stderr overflow, signal,
+  reader, and cleanup tests cover the bounded child lifecycle. The runner
+  removes the temporary directory and emits only one bounded public-safe
+  receipt. It performs no historical Git lookup and is retrospective evidence,
+  not the original RED chronology or original development sequence.
 - `Secret scan`: checks the repository with Gitleaks before validation work proceeds.
 - `Dependency audit`: installs Node dependencies with `npm ci` and runs `npm audit --audit-level=high`.
 - `Validate app`: runs after retrospective fixture integrity/result and security gates pass.
