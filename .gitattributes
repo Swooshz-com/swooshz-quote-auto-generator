@@ -2,3 +2,4 @@ migrations/*_postgres.sql text eol=lf
 migrations/001_platform_scoped_storage.sql text eol=lf
 migrations/003_object_artifact_metadata.sql text eol=lf
 migrations/005_forensic_postgres_delete_guards.sql text eol=lf
+tests/fixtures/retrospective/run34/** text eol=lf

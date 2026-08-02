@@ -1,0 +1,159 @@
+{
+  "$schema": "sqag-retrospective-fixture-manifest-v1",
+  "fixture_version": "1.0.0",
+  "provenance": {
+    "historical_source_revision": "fa03eca2b0406b864618453f30292c0303f34744",
+    "canonical_parent": "134ce9e0da25c8e5b7f261d726110f17afad99c6",
+    "canonical_replacement_head": "5c6c35397f6ef60ef9f804b963bda9f5f97b2da5",
+    "retrospective": true,
+    "original_red_chronology": false,
+    "original_development_sequence": false
+  },
+  "payload": [
+    {
+      "path": "dependencies.json",
+      "role": "dependency-definition",
+      "sha256": "b721ce657f3997d73f5089cd65e09596da5ebdc042e6b1e46c4c1b2e5ae4463e",
+      "size": 187
+    },
+    {
+      "path": "fixture-explanation.md",
+      "role": "explanation",
+      "sha256": "8aabce4ff22fe4f19c3ca97fe851d366c177d0a86f680d6da79da3f0aed6439b",
+      "size": 1126
+    },
+    {
+      "path": "scripts/validate_runtime_privilege_contract.py",
+      "role": "historical-source-fragment",
+      "sha256": "67979305a5f2b56dff3308a50edd8160f1634179b7eea6e9f6cfa15f0be4a278",
+      "size": 2975
+    },
+    {
+      "path": "tests/test_runtime_privilege_contract.py",
+      "role": "historical-test-selection",
+      "sha256": "0d60abedadf88734f47778ce87a17c844e890d861bfa1fddb9c9d5639684a731",
+      "size": 8301
+    },
+    {
+      "path": "docs/runtime-privilege-contract.md",
+      "role": "historical-documentation-fragment",
+      "sha256": "0c1fea8c17c18e5567830a4b12e8317d578f71e11479b67d1a36c0958614313d",
+      "size": 493
+    },
+    {
+      "path": "tests/evidence/run34-exact-starting-head-tests.patch.b64",
+      "role": "historical-test-change",
+      "sha256": "f52bc5c60e4fafbf39190a8f9563014338321746c9b406247a79d00f50c91d03",
+      "size": 11221
+    }
+  ],
+  "dependency_definition": {
+    "path": "dependencies.json",
+    "sha256": "b721ce657f3997d73f5089cd65e09596da5ebdc042e6b1e46c4c1b2e5ae4463e",
+    "format": "json-closed-v1"
+  },
+  "historical_test_change": {
+    "path": "tests/evidence/run34-exact-starting-head-tests.patch.b64",
+    "sha256": "f52bc5c60e4fafbf39190a8f9563014338321746c9b406247a79d00f50c91d03",
+    "decoded_sha256": "db9e0c9d6df26d8b3de84e9381276b138fbdefcd8be0a37386b200a4c82bb02d",
+    "changed_files": [
+      "tests/test_runtime_privilege_contract.py"
+    ],
+    "implementation_files_applied": 0
+  },
+  "test_selection": [
+    {
+      "name": "tests.test_runtime_privilege_contract.RuntimeMembershipEdgeEvaluatorTest.test_unrelated_parent_to_sqag_migrator_is_rejected",
+      "expected": "failure",
+      "category": "protected_role_edge_forbidden"
+    },
+    {
+      "name": "tests.test_runtime_privilege_contract.RuntimeMembershipEdgeEvaluatorTest.test_unrelated_parent_to_sqag_app_is_rejected",
+      "expected": "failure",
+      "category": "protected_role_edge_forbidden"
+    },
+    {
+      "name": "tests.test_runtime_privilege_contract.RuntimeMembershipEdgeEvaluatorTest.test_unrelated_parent_to_neon_superuser_is_rejected",
+      "expected": "failure",
+      "category": "protected_role_edge_forbidden"
+    },
+    {
+      "name": "tests.test_runtime_privilege_contract.RuntimeMembershipEdgeEvaluatorTest.test_sqag_migrator_to_unrelated_member_is_rejected",
+      "expected": "failure",
+      "category": "protected_role_edge_forbidden"
+    },
+    {
+      "name": "tests.test_runtime_privilege_contract.RuntimeMembershipEdgeEvaluatorTest.test_sqag_app_to_unrelated_member_is_rejected",
+      "expected": "failure",
+      "category": "protected_role_edge_forbidden"
+    },
+    {
+      "name": "tests.test_runtime_privilege_contract.RuntimeMembershipEdgeEvaluatorTest.test_neon_superuser_to_unrelated_member_is_rejected",
+      "expected": "failure",
+      "category": "protected_role_edge_forbidden"
+    },
+    {
+      "name": "tests.test_runtime_privilege_contract.RuntimeMembershipEdgeEvaluatorTest.test_protected_role_used_as_grantor_is_rejected",
+      "expected": "failure",
+      "category": "protected_grantor_forbidden"
+    },
+    {
+      "name": "tests.test_runtime_privilege_contract.RuntimeMembershipEdgeEvaluatorTest.test_inherit_true_on_unrelated_parent_protected_member_is_rejected",
+      "expected": "failure",
+      "category": "protected_inherit_option_forbidden"
+    },
+    {
+      "name": "tests.test_runtime_privilege_contract.RuntimeMembershipEdgeEvaluatorTest.test_set_true_on_unrelated_parent_protected_member_is_rejected",
+      "expected": "failure",
+      "category": "protected_set_option_forbidden"
+    },
+    {
+      "name": "tests.test_runtime_privilege_contract.RuntimeMembershipEdgeEvaluatorTest.test_admin_true_on_unauthorised_protected_role_row_is_rejected",
+      "expected": "failure",
+      "category": "protected_admin_option_forbidden"
+    },
+    {
+      "name": "tests.test_runtime_privilege_contract.RuntimeMembershipEdgeEvaluatorTest.test_multiple_protected_role_rows_alongside_exact_edge_are_rejected",
+      "expected": "failure",
+      "category": "protected_role_row_count_invalid"
+    },
+    {
+      "name": "tests.test_runtime_privilege_contract.RuntimeMembershipEdgeEvaluatorTest.test_recursive_protected_role_path_not_beginning_with_runtime_is_rejected",
+      "expected": "failure",
+      "category": "recursive_protected_role_membership_path"
+    },
+    {
+      "name": "tests.test_runtime_privilege_contract.RequirementEvidenceMapTest.test_membership_query_narrative_has_exact_six_field_unfiltered_contract",
+      "expected": "failure",
+      "category": "membership-query narrative section is missing"
+    }
+  ],
+  "expected_result": {
+    "tests": 13,
+    "assertion_failures": 13,
+    "errors": 0,
+    "unexpected_passes": 0,
+    "skipped": 0,
+    "exit_status": 1
+  },
+  "receipt_schema": {
+    "name": "sqag-retrospective-receipt-v1",
+    "keys": [
+      "schema",
+      "status",
+      "error_code",
+      "fixture_version",
+      "test_count",
+      "assertion_failures",
+      "errors",
+      "unexpected_passes",
+      "skipped",
+      "cleanup_verified",
+      "historical_git_lookup",
+      "current_dependencies_used",
+      "child_output_emitted",
+      "live_system_use",
+      "secret_bearing_output"
+    ]
+  }
+}

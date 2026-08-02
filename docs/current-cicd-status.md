@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-08-01
+Last updated: 2026-08-02
 
 Source of truth: `.github/workflows/ci.yml`
 
@@ -13,27 +13,33 @@ Source of truth: `.github/workflows/ci.yml`
   to `github.sha` for push/manual runs; hosted results therefore identify the
   tested source head instead of relying on a synthetic pull-request merge ref.
 - No deployment job is configured
-- This phase-planning PR adds no deployment job
+- This remediation adds no deployment job
 - No production environment mutation is performed by CI
 - CI does not require OpenAI, DeepSeek, Gemini, Google OIDC, deployment, or production secrets
 
 ## Active Jobs
 
-- `Retrospective exact-starting-head RED reproduction`: checks out the exact
-  workflow head, verifies the repository-owned test-only patch digest, creates
-  a temporary detached worktree at immutable commit
-  `fa03eca2b0406b864618453f30292c0303f34744`, applies only that test patch,
-  requires the 13 expected assertion failures, removes the worktree, and emits
-  only a bounded public-safe summary. This is retrospective evidence, not the
-  original RED chronology or original development sequence.
+- `Retrospective fixture integrity and RED reproduction`: checks out the exact
+  workflow head, validates a repository-contained closed fixture manifest and
+  every preserved-input digest, materialises only that fixture in one bounded
+  temporary directory, and runs the exact thirteen-test selection with the
+  immutable stdlib-only dependency snapshot. It requires exactly thirteen
+  assertion failures, zero errors, zero unexpected passes, and zero skipped
+  required tests, removes the temporary directory, and emits only a bounded
+  public-safe receipt. It performs no historical Git lookup and is
+  retrospective evidence, not the original RED chronology or original
+  development sequence.
 - `Secret scan`: checks the repository with Gitleaks before validation work proceeds.
 - `Dependency audit`: installs Node dependencies with `npm ci` and runs `npm audit --audit-level=high`.
-- `Validate app`: runs after the retrospective RED reproduction and security gates pass.
+- `Validate app`: runs after retrospective fixture integrity/result and security gates pass.
 
 ## Validate App Checks
 
 - Installs Python 3.12 and Node 22.
 - Installs pinned Python dependencies with `python -m pip install --only-binary=:all: -r requirements.txt`.
+  This current application dependency set is used only by `Validate app`; the
+  retrospective job uses its own closed fixture dependency snapshot and does
+  not read or install from `requirements.txt`.
 - Uses pinned PyJWT and cryptography packages for synthetic RS256/JWK and OIDC
   claim-validation compatibility tests; CI never contacts Google.
 - Installs `pip-audit` and runs `python -m pip_audit -r requirements.txt --strict` against pinned Python dependencies.

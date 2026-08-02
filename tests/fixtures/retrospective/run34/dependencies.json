@@ -1,0 +1,9 @@
+{
+  "schema": "sqag-retrospective-dependency-snapshot-v1",
+  "snapshot_version": "1.0.0",
+  "runtime": {
+    "implementation": "CPython",
+    "version": "3.12.13"
+  },
+  "packages": []
+}
