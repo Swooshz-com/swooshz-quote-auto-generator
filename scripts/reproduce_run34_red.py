@@ -152,6 +152,7 @@ RECEIPT_ERROR_CODES = frozenset(
 )
 
 _REPARSE_POINT_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_FORBIDDEN_RAW_PATH_CATEGORIES = frozenset({"Cc", "Cf", "Cs"})
 _WINDOWS_RESERVED_NAMES = frozenset(
     {"CON", "PRN", "AUX", "NUL"}
     | {f"COM{index}" for index in range(1, 10)}
@@ -329,7 +330,7 @@ def _validate_relative_path(value: Any) -> str:
         or "\\" in value
         or ":" in value
         or unicodedata.normalize("NFC", value) != value
-        or any(unicodedata.category(character) == "Cc" for character in value)
+        or any(unicodedata.category(character) in _FORBIDDEN_RAW_PATH_CATEGORIES for character in value)
     ):
         raise FixtureError("invalid_fixture_path")
     components = value.split("/")
@@ -342,7 +343,7 @@ def _validate_relative_path(value: Any) -> str:
     ):
         raise FixtureError("invalid_fixture_path")
     for component in components:
-        device_name = component.split(".", 1)[0].casefold().upper()
+        device_name = component.split(".", 1)[0].rstrip(" .").casefold().upper()
         if device_name in _WINDOWS_RESERVED_NAMES:
             raise FixtureError("invalid_fixture_path")
     path = PurePosixPath(value)

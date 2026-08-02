@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -331,6 +332,29 @@ class RetrospectiveFailClosedIntegrityTest(unittest.TestCase):
                 with self.assertRaises(red.FixtureError) as failure:
                     red._validate_relative_path(value)
                 self.assertEqual(failure.exception.code, "invalid_fixture_path")
+
+    def test_control_format_and_surrogate_categories_are_rejected(self) -> None:
+        values = (
+            "safe" + chr(0x0009) + "name",
+            "safe" + chr(0x202E) + "name",
+            "safe" + chr(0xD800) + "name",
+        )
+        for value in values:
+            with self.subTest(category=unicodedata.category(value[4])):
+                with self.assertRaises(red.FixtureError) as failure:
+                    red._validate_relative_path(value)
+                self.assertEqual(failure.exception.code, "invalid_fixture_path")
+
+    def test_reserved_device_canonicalisation_rejects_adjacent_forms_and_keeps_near_misses(self) -> None:
+        for stem in sorted(red._WINDOWS_RESERVED_NAMES):
+            for value in (stem.lower() + ".data", stem + " .data", stem + "...data", stem + " . .data"):
+                with self.subTest(kind="reserved", stem=stem):
+                    with self.assertRaises(red.FixtureError) as failure:
+                        red._validate_relative_path(value)
+                    self.assertEqual(failure.exception.code, "invalid_fixture_path")
+        for value in ("CONX.data", "COM10.data", "LPT10.data", "AUXILIARY.data"):
+            with self.subTest(kind="near_miss"):
+                self.assertEqual(red._validate_relative_path(value), value)
 
     def test_case_and_normalisation_collisions_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="sqag-run44-collision-") as temporary:
