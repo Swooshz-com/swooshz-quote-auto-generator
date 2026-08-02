@@ -46,7 +46,18 @@ TOP_LEVEL_KEYS = frozenset(
 
 ROLE_KEYS = frozenset({"runtime", "migrator", "legacy", "provider", "forbidden"})
 RUNTIME_ROLE_KEYS = frozenset(
-    {"name", "description", "attributes", "memberships", "ownership", "grant_options"}
+    {
+        "name",
+        "description",
+        "attributes",
+        "memberships_as_member",
+        "inherited_roles",
+        "set_assumable_roles",
+        "membership_derived_privileges",
+        "provider_control_edges",
+        "ownership",
+        "grant_options",
+    }
 )
 MIGRATOR_ROLE_KEYS = frozenset({"name", "description", "can_create_roles"})
 LEGACY_ROLE_KEYS = frozenset({"name", "description", "status"})
@@ -64,6 +75,46 @@ RUNTIME_ROLE_ATTRIBUTE_KEYS = frozenset(
         "connection_limit",
     }
 )
+PROVIDER_CONTROL_EDGE_KEYS = frozenset(
+    {
+        "parent_role",
+        "member_role",
+        "grantor",
+        "admin_option",
+        "inherit_option",
+        "set_option",
+        "classification",
+        "security_rationale",
+    }
+)
+MEMBERSHIP_ROW_KEYS = frozenset(
+    {"role", "member", "grantor", "admin_option", "inherit_option", "set_option"}
+)
+PROTECTED_PRODUCTION_ROLES = frozenset(
+    {
+        "sqag_runtime",
+        "sqag_migrator",
+        "sqag_app",
+        "neondb_owner",
+        "neon_superuser",
+        "cloud_admin",
+    }
+)
+PROVIDER_CONTROL_CLASSIFICATION = "postgresql17_creator_admin_control"
+PROVIDER_CONTROL_SECURITY_RATIONALE = (
+    "PostgreSQL 17 system-generated creator-admin control for the provider administrator; "
+    "it grants no privilege, inheritance, or SET-role path to sqag_runtime."
+)
+PRODUCTION_PROVIDER_CONTROL_EDGE = {
+    "parent_role": "sqag_runtime",
+    "member_role": "neondb_owner",
+    "grantor": "cloud_admin",
+    "admin_option": True,
+    "inherit_option": False,
+    "set_option": False,
+    "classification": PROVIDER_CONTROL_CLASSIFICATION,
+    "security_rationale": PROVIDER_CONTROL_SECURITY_RATIONALE,
+}
 
 MIGRATION_KEYS = frozenset({"path", "sequence_no", "sha256", "tables"})
 DATABASE_ACL_KEYS = frozenset({"public", "sqag_migrator", "sqag_app", "sqag_runtime"})
@@ -209,11 +260,17 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
         order by r.rolname
     """,
     "role_memberships": """
-        select r.rolname as role, m.rolname as member, am.admin_option
+        select r.rolname as role,
+               m.rolname as member,
+               grantor.rolname as grantor,
+               am.admin_option,
+               am.inherit_option,
+               am.set_option
         from pg_catalog.pg_auth_members am
         join pg_catalog.pg_roles r on r.oid = am.roleid
         join pg_catalog.pg_roles m on m.oid = am.member
-        order by role, member
+        join pg_catalog.pg_roles grantor on grantor.oid = am.grantor
+        order by role, member, grantor
     """,
     "sequence_acl": """
         select relname, relacl
@@ -407,7 +464,14 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "is",
         "null",
     ),
-    "role_memberships": ("pg_catalog.pg_auth_members", "admin_option", "pg_catalog.pg_roles"),
+    "role_memberships": (
+        "pg_catalog.pg_auth_members",
+        "pg_catalog.pg_roles",
+        "grantor",
+        "admin_option",
+        "inherit_option",
+        "set_option",
+    ),
     "sequence_acl": ("pg_catalog.pg_class", "relkind", "'s'", "pg_catalog.pg_namespace", "relacl"),
     "effective_runtime_database_privileges": (
         "has_database_privilege",
@@ -531,6 +595,208 @@ def _check_exact_string_list(
         _add_error(errors, f"{label}_invalid_expected_{expected!r}_got_{value!r}")
 
 
+def _validate_provider_control_edge_policy(
+    runtime: Any,
+    errors: list[str],
+    *,
+    enforce_production_identity: bool = True,
+) -> dict[str, Any] | None:
+    if not isinstance(runtime, dict):
+        _add_error(errors, "runtime_role_must_be_object")
+        return None
+    edges = runtime.get("provider_control_edges")
+    if type(edges) is not list:
+        _add_error(errors, "provider_control_edges_must_be_list")
+        return None
+    if len(edges) != 1:
+        _add_error(errors, f"provider_control_edges_count_invalid_expected_1_got_{len(edges)}")
+    if not edges:
+        return None
+    edge = edges[0]
+    if not _exact_keys(edge, PROVIDER_CONTROL_EDGE_KEYS, "provider_control_edge_0", errors):
+        return None
+    for key in ("parent_role", "member_role", "grantor"):
+        _require_non_empty_string(edge.get(key), f"provider_control_edge_0_{key}", errors)
+    for key, expected in {
+        "admin_option": True,
+        "inherit_option": False,
+        "set_option": False,
+        "classification": PROVIDER_CONTROL_CLASSIFICATION,
+        "security_rationale": PROVIDER_CONTROL_SECURITY_RATIONALE,
+    }.items():
+        _exact_value(edge.get(key), expected, f"provider_control_edge_0_{key}", errors)
+    if enforce_production_identity:
+        for key in ("parent_role", "member_role", "grantor"):
+            _exact_value(
+                edge.get(key),
+                PRODUCTION_PROVIDER_CONTROL_EDGE[key],
+                f"provider_control_edge_0_{key}",
+                errors,
+            )
+    return edge
+
+
+def validate_runtime_membership_edges(
+    manifest: dict[str, Any],
+    rows: list[dict[str, Any]],
+    *,
+    enforce_production_identity: bool = True,
+) -> tuple[str, ...]:
+    """Evaluate the complete membership result without pre-filtering rows.
+
+    Unrelated cluster membership rows are retained during the scan. Every
+    well-formed row is classified as the exact provider-control edge, a
+    protected-role row, or a truly unrelated row before the complete graph is
+    evaluated. A row with a protected participant is never ignored because the
+    runtime is absent from its parent/member positions.
+    """
+
+    errors: list[str] = []
+    roles = manifest.get("roles") if isinstance(manifest, dict) else None
+    runtime = roles.get("runtime") if isinstance(roles, dict) else None
+    edge = _validate_provider_control_edge_policy(
+        runtime,
+        errors,
+        enforce_production_identity=enforce_production_identity,
+    )
+    if edge is None:
+        return tuple(errors)
+
+    expected_row = {
+        "role": edge["parent_role"],
+        "member": edge["member_role"],
+        "grantor": edge["grantor"],
+        "admin_option": edge["admin_option"],
+        "inherit_option": edge["inherit_option"],
+        "set_option": edge["set_option"],
+    }
+    if type(rows) is not list:
+        return (*errors, "role_membership_rows_must_be_list")
+
+    runtime_name = str(edge["parent_role"])
+    identity_protected_roles = (
+        PROTECTED_PRODUCTION_ROLES if enforce_production_identity else frozenset()
+    )
+    protected_roles = identity_protected_roles | {
+        str(edge["parent_role"]),
+        str(edge["member_role"]),
+        str(edge["grantor"]),
+    }
+    runtime_rows: list[dict[str, Any]] = []
+    protected_rows: list[dict[str, Any]] = []
+    seen_rows: set[tuple[str, str, str, bool, bool, bool]] = set()
+    graph: dict[str, set[str]] = {}
+    for index, row in enumerate(rows):
+        label = f"role_membership_row_{index}"
+        if not _exact_keys(row, MEMBERSHIP_ROW_KEYS, label, errors):
+            continue
+        for key in ("role", "member", "grantor"):
+            _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
+        for key in ("admin_option", "inherit_option", "set_option"):
+            _require_type(row.get(key), bool, f"{label}_{key}", errors)
+        if any(type(row.get(key)) is not str for key in ("role", "member", "grantor")):
+            continue
+        if any(type(row.get(key)) is not bool for key in ("admin_option", "inherit_option", "set_option")):
+            continue
+
+        parent = str(row["role"])
+        member = str(row["member"])
+        grantor = str(row["grantor"])
+        row_tuple = (
+            parent,
+            member,
+            grantor,
+            row["admin_option"],
+            row["inherit_option"],
+            row["set_option"],
+        )
+        if row_tuple in seen_rows:
+            _add_error(errors, f"{label}_duplicate_role_membership_row")
+        seen_rows.add(row_tuple)
+
+        graph.setdefault(member, set()).add(parent)
+        participants = {parent, member, grantor}
+        is_expected_edge = row == expected_row
+        protected_participants = participants & protected_roles
+        if is_expected_edge or protected_participants:
+            protected_rows.append(row)
+        if runtime_name in participants:
+            runtime_rows.append(row)
+        if is_expected_edge:
+            continue
+
+        if member == runtime_name:
+            _add_error(errors, f"{label}_runtime_as_member_forbidden")
+            _add_error(errors, f"{label}_runtime_privilege_membership_path_forbidden")
+            if row["inherit_option"]:
+                _add_error(errors, f"{label}_runtime_inherit_path_forbidden")
+            if row["set_option"]:
+                _add_error(errors, f"{label}_runtime_set_path_forbidden")
+
+        if protected_participants:
+            _add_error(errors, f"{label}_protected_role_edge_forbidden")
+            if grantor in protected_roles:
+                _add_error(errors, f"{label}_protected_grantor_forbidden")
+            if row["admin_option"]:
+                _add_error(errors, f"{label}_protected_admin_option_forbidden")
+            if row["inherit_option"]:
+                _add_error(errors, f"{label}_protected_inherit_option_forbidden")
+            if row["set_option"]:
+                _add_error(errors, f"{label}_protected_set_option_forbidden")
+            for participant in sorted(participants - protected_roles):
+                _add_error(
+                    errors,
+                    f"{label}_unknown_protected_edge_participant_{participant}",
+                )
+            for forbidden_role in ("neon_superuser", "sqag_app", "sqag_migrator"):
+                if forbidden_role in {parent, member}:
+                    _add_error(errors, f"{label}_forbidden_provider_control_role_{forbidden_role}")
+
+    if len(runtime_rows) != 1:
+        _add_error(errors, f"runtime_edge_count_invalid_expected_1_got_{len(runtime_rows)}")
+    if len(runtime_rows) == 1 and runtime_rows[0] != expected_row:
+        _add_error(errors, "provider_control_edge_tuple_mismatch")
+    elif len(runtime_rows) > 1:
+        for index, row in enumerate(runtime_rows):
+            if row != expected_row:
+                _add_error(errors, f"provider_control_edge_tuple_mismatch_at_runtime_edge_{index}")
+
+    if len(protected_rows) != 1:
+        _add_error(
+            errors,
+            f"protected_role_row_count_invalid_expected_1_got_{len(protected_rows)}",
+        )
+
+    def reachable_cycle(start: str) -> bool:
+        visited: set[str] = set()
+        active: set[str] = set()
+
+        def visit(current: str) -> bool:
+            if current in active:
+                return True
+            if current in visited:
+                return False
+            visited.add(current)
+            active.add(current)
+            try:
+                return any(visit(parent) for parent in graph.get(current, set()))
+            finally:
+                active.remove(current)
+
+        return visit(start)
+
+    for protected_role in sorted(protected_roles):
+        if reachable_cycle(protected_role):
+            _add_error(
+                errors,
+                f"recursive_protected_role_membership_path_forbidden_{protected_role}",
+            )
+            if protected_role == runtime_name:
+                _add_error(errors, "recursive_runtime_membership_path_forbidden")
+
+    return tuple(errors)
+
+
 def validate_top_level_keys(manifest: dict[str, Any], errors: list[str]) -> None:
     _exact_keys(manifest, TOP_LEVEL_KEYS, "top_level", errors)
 
@@ -582,7 +848,20 @@ def validate_roles(manifest: dict[str, Any], errors: list[str]) -> None:
             }
             for key, expected in expected_attributes.items():
                 _exact_value(attributes.get(key), expected, f"runtime_attribute_{key}", errors)
-        _check_exact_string_list(runtime.get("memberships"), [], "runtime_memberships", errors)
+        _check_exact_string_list(
+            runtime.get("memberships_as_member"), [], "runtime_memberships_as_member", errors
+        )
+        _check_exact_string_list(runtime.get("inherited_roles"), [], "runtime_inherited_roles", errors)
+        _check_exact_string_list(
+            runtime.get("set_assumable_roles"), [], "runtime_set_assumable_roles", errors
+        )
+        _check_exact_string_list(
+            runtime.get("membership_derived_privileges"),
+            [],
+            "runtime_membership_derived_privileges",
+            errors,
+        )
+        _validate_provider_control_edge_policy(runtime, errors)
         _check_exact_string_list(runtime.get("ownership"), [], "runtime_ownership", errors)
         _check_exact_string_list(runtime.get("grant_options"), [], "runtime_grant_options", errors)
 

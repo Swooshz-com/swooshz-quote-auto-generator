@@ -104,6 +104,9 @@ authority is the manifest's exact column grant on `checksum_sha256`; all other
 columns remain denied, no grant option is allowed, and PUBLIC or membership
 authority must not supply table-level UPDATE.
 
+The direct runtime grant total remains exactly 37: 34 table grants, one column
+grant, one database grant, and one schema grant.
+
 ### Runtime-forbidden (5 tables)
 
 | Table | Class |
@@ -159,13 +162,82 @@ The disposable PostgreSQL tests prove that after the revoke, a runtime role has 
 
 ## PostgreSQL 17 effective privilege proofs
 
+### Runtime membership and provider creator-admin control
+
+The runtime has zero `memberships_as_member`, zero `inherited_roles`, zero
+`set_assumable_roles`, and zero `membership_derived_privileges`. It therefore
+has no privilege-bearing membership, inherited authority, SET-role path, or
+database, schema, table, column, sequence, or routine authority derived from a
+role membership.
+
+PostgreSQL 17 automatically records one creator-admin edge when a
+non-superuser `CREATEROLE` provider administrator creates `sqag_runtime`. The
+manifest represents that administrative control relationship separately from
+runtime membership as one closed-schema `provider_control_edges` entry:
+
+```json
+{
+  "parent_role": "sqag_runtime",
+  "member_role": "neondb_owner",
+  "grantor": "cloud_admin",
+  "admin_option": true,
+  "inherit_option": false,
+  "set_option": false,
+  "classification": "postgresql17_creator_admin_control",
+  "security_rationale": "PostgreSQL 17 system-generated creator-admin control for the provider administrator; it grants no privilege, inheritance, or SET-role path to sqag_runtime."
+}
+```
+
+This edge gives the already-privileged provider administrator administrative
+control over the dormant runtime role. It gives `sqag_runtime` no privilege,
+inheritance, or SET-role path and must never be described as runtime privilege
+or runtime membership inheritance. Any second runtime edge, runtime-as-member
+edge, different identity or grantor, mutated option, recursive path, protected
+SQAG/provider role, unknown classification, missing field, duplicate edge, or
+membership-derived effective privilege fails closed.
+
 The manifest and validator bind exactly thirteen canonical verification-query
 keys. Each key has an independent repository-owned executable-token contract;
 candidate manifest text cannot redefine its expected query. The PostgreSQL
 integration contract executes every key once, checks the exact returned column
 names and order, and applies the row-cardinality rule for its disposable
-fixture. The role-membership result may be empty because the no-membership
-contract explicitly permits that state.
+fixture. The generic shape fixture has no runtime edge; the dedicated
+non-superuser `CREATEROLE` fixture produces exactly one automatic edge and is
+the acceptance proof for the complete tuple.
+
+### Membership-query narrative contract
+
+The membership query projects the exact aliases `role`, `member`, `grantor`,
+`admin_option`, `inherit_option`, and `set_option`. Its evaluator consumes the
+complete unfiltered membership result, validates the `grantor`, and
+distinguishes ADMIN authority from INHERIT and SET authority. No column may be
+omitted, no value may be supplied by a substituted default, and no unexpected
+row may be filtered away.
+
+Every well-formed row is classified before validation. The only authorised
+protected-role row is the exact PostgreSQL 17 creator-admin control tuple shown
+above. Any other row containing `sqag_runtime`, `sqag_migrator`, `sqag_app`,
+`neondb_owner`, `neon_superuser`, or `cloud_admin` in the parent, member, or
+grantor position fails closed, including unknown participants, duplicate rows,
+unexpected ADMIN, INHERIT, or SET authority, and recursive protected-role
+paths. A membership row whose parent, member, and grantor contain no protected
+participant and which creates no recursive protected-role authority is outside
+this contract, but it remains in the complete result and is classified rather
+than silently discarded by the protected-role branch.
+
+The disposable creator-admin fixture preserves every queried membership row
+and its graph position. For validator evaluation only, it copies the observed
+automatic edge to a dedicated existing fixture-grantor identity; all unrelated
+rows remain unchanged and non-protected. The regression separately proves that
+using that fixture grantor on an otherwise unrelated row is rejected.
+
+The evaluator boundary also has direct malformed-row coverage. One bounded
+test method exercises non-list row containers, non-object rows, each missing
+required key, unexpected keys, invalid `role`/`member`/`grantor` values, invalid
+`admin_option`/`inherit_option`/`set_option` values, and mixed malformed rows.
+Each case asserts the existing row-indexed fail-closed error category. This is
+test evidence against the unchanged validator, not a production correction or
+live-system evidence.
 
 | Key | Exact result columns | Fixture cardinality |
 |---|---|---:|
@@ -175,7 +247,7 @@ contract explicitly permits that state.
 | `routine_acl` | `proname`, `identity_arguments`, `prokind`, `prosecdef`, `proacl`, `proowner`, `owner`, `has_trigger_dependency` | 2 |
 | `default_acl` | `owner`, `namespace`, `object_type`, `grantee`, `privilege_type`, `is_grantable` | 1 |
 | `role_attributes` | `rolname`, `rolsuper`, `rolinherit`, `rolcreaterole`, `rolcreatedb`, `rolcanlogin`, `rolreplication`, `rolbypassrls`, `rolconnlimit`, `password_is_null` | 2 |
-| `role_memberships` | `role`, `member`, `admin_option` | 0 |
+| `role_memberships` | `role`, `member`, `grantor`, `admin_option`, `inherit_option`, `set_option` | 0 in the generic shape fixture; 1 exact runtime edge in the creator fixture |
 | `sequence_acl` | `relname`, `relacl` | 0 |
 | `effective_runtime_database_privileges` | `privilege_type`, `effective`, `is_grantable` | 3 |
 | `effective_runtime_table_privileges` | `schema_name`, `table_name`, `privilege_type`, `effective`, `is_grantable` | 128 |
@@ -274,10 +346,10 @@ executes all thirteen canonical queries, asserts the exact returned column
 names, and applies the documented cardinality rules.
 
 The remaining effective queries have the same exact-token binding. In
-particular, the membership query must project `role`, `member`, and
-`admin_option` from the declared `am` alias; the table query must retain all
-eight privilege literals; the column query must retain the table, column, and
-privilege predicates; and database/schema grantability must remain a real
+particular, the membership query must preserve the complete six-field contract
+and aliases defined above; the table query must retain all eight privilege
+literals; the column query must retain the table, column, and privilege
+predicates; and database/schema grantability must remain a real
 privilege-specific `WITH GRANT OPTION` check. Invalid SQL is still rejected by
 PostgreSQL execution even when a candidate happens to contain expected words.
 
@@ -349,7 +421,7 @@ method references, and parity with this documentation table.
 | R01 | Schema version is locked to v1. | `ManifestStructureTest.test_schema_version_is_1` |
 | R02 | Manifest binds to the canonical repository revision and tree. | `ManifestStructureTest.test_repository_binding` |
 | R03 | Runtime role attributes are dormant and restricted. | `ManifestStructureTest.test_runtime_role_attributes` |
-| R04 | Runtime role has no memberships, ownership, or grant options. | `ManifestStructureTest.test_runtime_role_no_memberships_no_ownership` |
+| R04 | The runtime has no privilege-bearing membership, inherited role, SET-role path or runtime-as-member edge; exactly one PostgreSQL-17 provider creator-admin control edge is permitted with ADMIN true, INHERIT false and SET false. | `ManifestStructureTest.test_runtime_role_membership_contract_is_exact` |
 | R05 | Migrator cannot create roles. | `ManifestStructureTest.test_migrator_cannot_create_roles` |
 | R06 | Forbidden maintenance role is classified. | `ManifestStructureTest.test_sqag_maintenance_is_forbidden` |
 | R07 | Production migrations, digests, and table bindings match repository authority. | `ManifestStructureTest.test_production_migrations_match_repository` |
@@ -400,11 +472,11 @@ The deterministic discovery receipt for this amendment is:
 
 | Receipt item | Count |
 |---|---:|
-| Discovered test methods | 122 |
-| Static and validator methods | 69 |
-| PostgreSQL methods | 50 |
-| Requirement-map and documentation parity methods | 3 |
-| Hosted executions | 122 |
+| Discovered test methods | 161 |
+| Static and validator methods | 104 |
+| PostgreSQL methods | 53 |
+| Requirement-map and documentation parity methods | 4 |
+| Hosted executions | 161 |
 | Hosted skips | 0 |
 | Unique locked requirement IDs | 38 (`R01`-`R38`) |
 

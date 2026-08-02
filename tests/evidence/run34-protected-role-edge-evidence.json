@@ -1,0 +1,109 @@
+{
+  "label": "retrospective exact-starting-head RED reproduction",
+  "run_id": "sqag-runtime-postgresql17-protected-role-edge-amendment-20260801-34",
+  "provider": "OpenAI",
+  "model": "GPT-5.6 Sol",
+  "reasoning": "High",
+  "starting_head": "fa03eca2b0406b864618453f30292c0303f34744",
+  "canonical_base": "134ce9e0da25c8e5b7f261d726110f17afad99c6",
+  "chronology_classification": {
+    "retrospective": true,
+    "original_red_chronology": false,
+    "original_development_sequence": false,
+    "pre_existing_historical_evidence": false
+  },
+  "test_only_patch": {
+    "path": "tests/evidence/run34-exact-starting-head-tests.patch.b64",
+    "sha256": "db9e0c9d6df26d8b3de84e9381276b138fbdefcd8be0a37386b200a4c82bb02d",
+    "changed_files": [
+      "tests/test_runtime_privilege_contract.py"
+    ],
+    "implementation_files_applied": 0
+  },
+  "focused_red": {
+    "tests": [
+      "RuntimeMembershipEdgeEvaluatorTest.test_unrelated_parent_to_sqag_migrator_is_rejected",
+      "RuntimeMembershipEdgeEvaluatorTest.test_unrelated_parent_to_sqag_app_is_rejected",
+      "RuntimeMembershipEdgeEvaluatorTest.test_unrelated_parent_to_neon_superuser_is_rejected",
+      "RuntimeMembershipEdgeEvaluatorTest.test_sqag_migrator_to_unrelated_member_is_rejected",
+      "RuntimeMembershipEdgeEvaluatorTest.test_sqag_app_to_unrelated_member_is_rejected",
+      "RuntimeMembershipEdgeEvaluatorTest.test_neon_superuser_to_unrelated_member_is_rejected",
+      "RuntimeMembershipEdgeEvaluatorTest.test_protected_role_used_as_grantor_is_rejected",
+      "RuntimeMembershipEdgeEvaluatorTest.test_inherit_true_on_unrelated_parent_protected_member_is_rejected",
+      "RuntimeMembershipEdgeEvaluatorTest.test_set_true_on_unrelated_parent_protected_member_is_rejected",
+      "RuntimeMembershipEdgeEvaluatorTest.test_admin_true_on_unauthorised_protected_role_row_is_rejected",
+      "RuntimeMembershipEdgeEvaluatorTest.test_multiple_protected_role_rows_alongside_exact_edge_are_rejected",
+      "RuntimeMembershipEdgeEvaluatorTest.test_recursive_protected_role_path_not_beginning_with_runtime_is_rejected",
+      "RequirementEvidenceMapTest.test_membership_query_narrative_has_exact_six_field_unfiltered_contract"
+    ],
+    "expected_failure_categories": [
+      "protected_role_edge_forbidden",
+      "protected_grantor_forbidden",
+      "protected_inherit_option_forbidden",
+      "protected_set_option_forbidden",
+      "protected_admin_option_forbidden",
+      "protected_role_row_count_invalid",
+      "recursive_protected_role_membership_path",
+      "membership-query narrative section is missing"
+    ],
+    "observed_test_count": 13,
+    "observed_assertion_failures": 13,
+    "observed_errors": 0,
+    "observed_exit_status": 1,
+    "temporary_worktree_removed": true,
+    "temporary_worktree_remnant": false
+  },
+  "final_green": {
+    "focused_evaluator_and_narrative": {
+      "tests": 34,
+      "failures": 0,
+      "errors": 0,
+      "status": "passed"
+    },
+    "complete_non_postgresql_contract": {
+      "tests": 112,
+      "failures": 0,
+      "errors": 0,
+      "status": "passed"
+    },
+    "complete_postgresql17_contract": {
+      "expected_runtime_contract_tests": 159,
+      "required_skips": 0,
+      "status": "hosted_exact_head_required"
+    },
+    "full_application_suite": {
+      "tests": 1222,
+      "failures": 0,
+      "errors": 0,
+      "environment_skips": 62,
+      "status": "passed_locally"
+    },
+    "playwright": {
+      "ai_stress": "passed",
+      "internal_auth": "passed",
+      "smoke": "passed"
+    },
+    "dependency_audits": {
+      "npm_high_or_greater_vulnerabilities": 0,
+      "python_known_vulnerabilities": 0
+    },
+    "secret_scan": {
+      "blocking_findings": 0,
+      "review_findings": 0
+    }
+  },
+  "hosted_ci": {
+    "workflow": ".github/workflows/ci.yml",
+    "job": "Retrospective exact-starting-head RED reproduction",
+    "final_head_binding": "pull_request.head.sha",
+    "reproduction_command": "python scripts/reproduce_run34_red.py",
+    "status": "required_on_final_head"
+  },
+  "safety": {
+    "secret_bearing_output": false,
+    "live_system_use": false,
+    "provider_api_use": false,
+    "deployment_use": false,
+    "credential_mutation": false
+  }
+}
