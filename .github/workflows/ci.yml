@@ -12,14 +12,15 @@ permissions:
 
 jobs:
   retrospective_exact_starting_head_red:
-    name: Retrospective exact-starting-head RED reproduction
+    name: Retrospective fixture integrity and RED reproduction
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Check out exact workflow head
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Verify exact workflow head binding
         run: test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
@@ -27,12 +28,9 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.12.13"
 
-      - name: Install pinned Python dependencies
-        run: "python -m pip install --only-binary=:all: -r requirements.txt"
-
-      - name: Reproduce immutable test-only RED state
+      - name: Run immutable repository-contained retrospective fixture
         run: python scripts/reproduce_run34_red.py
 
   secret-scan:
