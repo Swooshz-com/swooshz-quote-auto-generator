@@ -84,6 +84,7 @@ RECEIPT_KEYS = (
 RECEIPT_ERROR_CODES = frozenset(
     {
         "child_start_failed",
+        "child_stream_mismatch",
         "child_output_decode_failed",
         "cleanup_failed",
         "cleanup_remnant",
@@ -881,43 +882,154 @@ def _serialise_receipt(receipt: dict[str, Any]) -> str:
     return json.dumps(receipt, ensure_ascii=True, separators=(",", ":"))
 
 
+def _normalise_child_channel(value: bytes) -> str:
+    try:
+        text = value.decode("utf-8")
+    except UnicodeDecodeError:
+        raise FixtureError("child_output_decode_failed") from None
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _split_normalised_output(text: str) -> list[str]:
+    if text.endswith("\n"):
+        text = text[:-1]
+    return text.split("\n")
+
+
+def _bounded_ascii_line(line: str, maximum: int) -> bool:
+    return bool(line) and len(line) <= maximum and all(0x20 <= ord(character) <= 0x7E for character in line)
+
+
+def _validate_complete_child_stream(stdout: str, stderr: str, manifest: dict[str, Any]) -> None:
+    if stdout:
+        raise FixtureError("child_stream_mismatch")
+
+    lines = _split_normalised_output(stderr)
+    selection = tuple(item["name"] for item in manifest["test_selection"])
+    categories = tuple(item["category"] for item in manifest["test_selection"])
+    expected = manifest["expected_result"]
+    record_pattern = re.compile(r"^(test_[A-Za-z0-9_]+) \(([^()\r\n]+)\) \.\.\. (.+)$")
+    header_pattern = re.compile(r"^FAIL: (test_[A-Za-z0-9_]+) \(([^()\r\n]+)\)$")
+    frame_pattern = re.compile(
+        r'^  File "([^"\r\n]+)", line ([1-9][0-9]*), in (?:[A-Za-z_][A-Za-z0-9_]*|<[^>\r\n]+>)$'
+    )
+    cursor = 0
+    test_source_paths = tuple(entry["path"] for entry in manifest["payload"] if entry.get("role") == "historical-test-selection")
+    if len(test_source_paths) != 1:
+        raise FixtureError("test_selection_schema_mismatch")
+    try:
+        source_lines = frozenset(
+            line.lstrip(" ")
+            for line in manifest.payload_bytes[test_source_paths[0]].decode("utf-8").splitlines()
+            if line.strip()
+        )
+    except (AttributeError, KeyError, UnicodeDecodeError):
+        raise FixtureError("test_selection_schema_mismatch") from None
+    for name in selection:
+        if cursor >= len(lines):
+            raise FixtureError("child_stream_mismatch")
+        match = record_pattern.fullmatch(lines[cursor])
+        if match is None:
+            raise FixtureError("child_stream_mismatch")
+        if match.group(2) != name or match.group(1) != name.rsplit(".", 1)[1]:
+            raise FixtureError("child_stream_mismatch")
+        if match.group(3) != "FAIL":
+            raise FixtureError("unexpected_test_status")
+        cursor += 1
+
+    if cursor >= len(lines) or lines[cursor] != "":
+        raise FixtureError("child_stream_mismatch")
+    cursor += 1
+
+    for index, name in enumerate(selection):
+        if cursor >= len(lines) or lines[cursor] != "=" * 70:
+            raise FixtureError("child_stream_mismatch")
+        cursor += 1
+        if cursor >= len(lines):
+            raise FixtureError("child_stream_mismatch")
+        header = header_pattern.fullmatch(lines[cursor])
+        if header is None or header.group(2) != name or header.group(1) != name.rsplit(".", 1)[1]:
+            raise FixtureError("child_stream_mismatch")
+        cursor += 1
+        if cursor >= len(lines) or lines[cursor] != "-" * 70:
+            raise FixtureError("child_stream_mismatch")
+        cursor += 1
+        if cursor >= len(lines) or lines[cursor] != "Traceback (most recent call last):":
+            raise FixtureError("child_stream_mismatch")
+        cursor += 1
+
+        frame_count = 1 if index == len(selection) - 1 else 2
+        frame_suffixes = [test_source_paths[0]] * frame_count
+        expected_category = categories[index]
+        for frame_index, suffix in enumerate(frame_suffixes):
+            if cursor >= len(lines):
+                raise FixtureError("child_stream_mismatch")
+            frame = frame_pattern.fullmatch(lines[cursor])
+            if frame is None or not frame.group(1).replace("\\", "/").endswith(suffix):
+                raise FixtureError("child_stream_mismatch")
+            cursor += 1
+            if cursor >= len(lines):
+                raise FixtureError("child_stream_mismatch")
+            source = lines[cursor]
+            if not source.startswith("    ") or not _bounded_ascii_line(source, 256):
+                raise FixtureError("child_stream_mismatch")
+            if frame_index == 0 and (
+                expected_category not in source
+                or any(category != expected_category and category in source for category in categories)
+            ):
+                raise FixtureError("expected_failure_category_missing")
+            if source.lstrip(" ") not in source_lines:
+                raise FixtureError("child_stream_mismatch")
+            cursor += 1
+
+        if cursor >= len(lines):
+            raise FixtureError("child_stream_mismatch")
+        assertion = lines[cursor]
+        if not assertion.startswith("AssertionError: ") or not _bounded_ascii_line(assertion, 512):
+            raise FixtureError("child_stream_mismatch")
+        if expected_category not in assertion or any(
+            category != expected_category and category in assertion for category in categories
+        ):
+            raise FixtureError("expected_failure_category_missing")
+        cursor += 1
+        if cursor >= len(lines) or lines[cursor] != "":
+            raise FixtureError("child_stream_mismatch")
+        cursor += 1
+
+    if cursor >= len(lines) or lines[cursor] != "-" * 70:
+        raise FixtureError("child_stream_mismatch")
+    cursor += 1
+    if cursor >= len(lines):
+        raise FixtureError("test_count_mismatch")
+    count_marker = re.fullmatch(r"Ran ([0-9]+) tests? in ([0-9]+\.[0-9]+)s", lines[cursor])
+    if count_marker is None or int(count_marker.group(1)) != expected["tests"]:
+        raise FixtureError("test_count_mismatch")
+    cursor += 1
+    if cursor >= len(lines) or lines[cursor] != "":
+        raise FixtureError("child_stream_mismatch")
+    cursor += 1
+    summary = f"FAILED (failures={expected['assertion_failures']})"
+    if cursor >= len(lines) or lines[cursor] != summary:
+        raise FixtureError("failure_summary_mismatch")
+    cursor += 1
+    if cursor != len(lines):
+        raise FixtureError("child_stream_mismatch")
+
+
 def _validate_test_result(result: subprocess.CompletedProcess[bytes], manifest: dict[str, Any]) -> None:
     if result.returncode < 0:
         raise FixtureError("signal_terminated")
     _validate_output_size(result.stdout, result.stderr)
-    try:
-        output = (result.stdout + result.stderr).decode("utf-8", errors="replace")
-    except Exception:
-        raise FixtureError("child_output_decode_failed") from None
-    output = output.replace("\r\n", "\n").replace("\r", "\n")
+    stdout = _normalise_child_channel(result.stdout)
+    stderr = _normalise_child_channel(result.stderr)
 
-    if result.returncode != EXPECTED_RESULT["exit_status"]:
+    if result.returncode != manifest["expected_result"]["exit_status"]:
         raise FixtureError("unexpected_exit_status")
-    if "unittest.loader._FailedTest" in output or "ImportError:" in output or "ModuleNotFoundError:" in output:
+    if stdout:
+        raise FixtureError("child_stream_mismatch")
+    if "unittest.loader._FailedTest" in stderr or "ImportError:" in stderr or "ModuleNotFoundError:" in stderr:
         raise FixtureError("import_or_collection_error")
-    ran_match = re.search(r"^Ran (\d+) tests? in [0-9.]+s$", output, flags=re.MULTILINE)
-    failure_match = re.search(r"^FAILED \(([^)]*)\)$", output, flags=re.MULTILINE)
-    if ran_match is None or int(ran_match.group(1)) != EXPECTED_RESULT["tests"]:
-        raise FixtureError("test_count_mismatch")
-    if failure_match is None or failure_match.group(1) != "failures=13":
-        raise FixtureError("failure_summary_mismatch")
-    if "errors=" in output or "skipped=" in output or "unexpected successes" in output:
-        raise FixtureError("non_assertion_result_present")
-
-    records: dict[str, str] = {}
-    record_count = 0
-    status_pattern = re.compile(r"^(test_[A-Za-z0-9_]+) \(([^)]+)\) \.\.\. (.+)$", flags=re.MULTILINE)
-    for match in status_pattern.finditer(output):
-        record_count += 1
-        records[match.group(2)] = match.group(3).strip()
-    selection = tuple(item["name"] for item in manifest["test_selection"])
-    if record_count != len(selection) or set(records) != set(selection) or len(records) != len(selection):
-        raise FixtureError("test_selection_execution_mismatch")
-    if any(records[name] != "FAIL" for name in selection):
-        raise FixtureError("unexpected_test_status")
-    for item in manifest["test_selection"]:
-        if item["category"] not in output:
-            raise FixtureError("expected_failure_category_missing")
+    _validate_complete_child_stream(stdout, stderr, manifest)
 
 
 def _success_receipt(manifest: dict[str, Any]) -> dict[str, Any]:

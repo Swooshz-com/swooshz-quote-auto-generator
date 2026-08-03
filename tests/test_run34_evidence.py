@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -31,12 +32,19 @@ def _copy_fixture(parent: Path) -> Path:
     return target
 
 
-def _completed(output: str, *, returncode: int = 1) -> subprocess.CompletedProcess[bytes]:
+def _completed(
+    output: str | bytes,
+    *,
+    returncode: int = 1,
+    stdout: bytes = b"",
+    stderr: bytes | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    encoded = output.encode("utf-8") if isinstance(output, str) else output
     return subprocess.CompletedProcess(
         ["fixture-test"],
         returncode,
-        output.encode("utf-8"),
-        b"",
+        stdout,
+        encoded if stderr is None else stderr,
     )
 
 
@@ -55,6 +63,21 @@ def _rewrite_manifest(package: Path, mutate: object) -> str:
     data = (json.dumps(manifest, indent=2) + "\n").encode("utf-8")
     path.write_bytes(data)
     return hashlib.sha256(data).hexdigest()
+
+
+def _capture_historical_child_result() -> subprocess.CompletedProcess[bytes]:
+    manifest = red._validate_fixture()
+    red._validate_interpreter(manifest)
+    with tempfile.TemporaryDirectory(prefix="sqag-run34-captured-") as temporary:
+        execution_root = Path(temporary)
+        red._materialise_fixture(manifest, red.FIXTURE_ROOT, execution_root)
+        result = red._execute_selected_tests(execution_root, red.EXPECTED_TEST_SELECTION)
+        return subprocess.CompletedProcess(
+            list(result.args),
+            result.returncode,
+            bytes(result.stdout),
+            bytes(result.stderr),
+        )
 
 
 def _child_command(source: str) -> list[str]:
@@ -231,21 +254,48 @@ class RetrospectiveResultContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.manifest = red._validate_fixture()
+        cls.historical_result = _capture_historical_child_result()
+        cls.historical_stderr = red._normalise_child_channel(cls.historical_result.stderr)
 
     def _valid_output(self, *, statuses: dict[str, str] | None = None, count: int = 13, summary: str = "failures=13") -> str:
         statuses = statuses or {name: "FAIL" for name in red.EXPECTED_TEST_SELECTION}
-        lines = []
-        for name, status in statuses.items():
-            short = name.rsplit(".", 1)[1]
-            lines.append(f"{short} ({name}) ... {status}")
-        lines.append("")
-        lines.append(f"Ran {count} tests in 0.001s")
-        lines.append(f"FAILED ({summary})")
-        lines.extend(item["category"] for item in self.manifest["test_selection"])
-        return "\n".join(lines) + "\n"
+        lines = self.historical_stderr.splitlines()
+        for index, line in enumerate(lines):
+            match = re.fullmatch(r"(test_[A-Za-z0-9_]+) \(([^)]+)\) \.\.\. (.+)", line)
+            if match and match.group(2) in statuses:
+                lines[index] = f"{match.group(1)} ({match.group(2)}) ... {statuses[match.group(2)]}"
+        count_index = next(index for index, line in enumerate(lines) if line.startswith("Ran "))
+        summary_index = next(index for index, line in enumerate(lines) if line.startswith("FAILED "))
+        lines[count_index] = f"Ran {count} tests in 0.001s"
+        lines[summary_index] = f"FAILED ({summary})"
+        return "\n".join(lines) + ("\n" if self.historical_stderr.endswith("\n") else "")
+
+    def _result_from_lines(self, lines: list[str], *, stdout: bytes = b"") -> subprocess.CompletedProcess[bytes]:
+        text = "\n".join(lines) + ("\n" if self.historical_stderr.endswith("\n") else "")
+        return _completed(text, stdout=stdout)
+
+    def _assert_rejected(self, result: subprocess.CompletedProcess[bytes], code: str) -> None:
+        with self.assertRaises(red.FixtureError) as failure:
+            red._validate_test_result(result, self.manifest)
+        self.assertEqual(failure.exception.code, code)
 
     def test_exactly_13_assertion_failures_and_zero_errors_are_accepted(self) -> None:
-        result = _completed(self._valid_output())
+        red._validate_test_result(self.historical_result, self.manifest)
+
+    def test_crlf_normalization_is_accepted(self) -> None:
+        result = _completed(self.historical_stderr.replace("\n", "\r\n"))
+        red._validate_test_result(result, self.manifest)
+
+    def test_lone_cr_normalization_is_accepted(self) -> None:
+        result = _completed(self.historical_stderr.replace("\n", "\r"))
+        red._validate_test_result(result, self.manifest)
+
+    def test_permitted_timing_variation_is_accepted(self) -> None:
+        result = _completed(self.historical_stderr.replace(" in 0.", " in 12.345"))
+        red._validate_test_result(result, self.manifest)
+
+    def test_permitted_terminal_newline_is_optional(self) -> None:
+        result = _completed(self.historical_stderr.rstrip("\n"))
         red._validate_test_result(result, self.manifest)
 
     def test_12_or_14_failures_are_rejected(self) -> None:
@@ -278,12 +328,20 @@ class RetrospectiveResultContractTest(unittest.TestCase):
         )
         with self.assertRaises(red.FixtureError) as failure:
             red._validate_test_result(_completed(output), self.manifest)
-        self.assertEqual(failure.exception.code, "failure_summary_mismatch")
+        self.assertEqual(failure.exception.code, "unexpected_test_status")
 
     def test_output_overflow_is_rejected(self) -> None:
         with self.assertRaises(red.FixtureError) as failure:
             red._validate_output_size(b"x" * (red.MAX_OUTPUT_BYTES + 1), b"")
         self.assertEqual(failure.exception.code, "output_overflow")
+
+    def test_decode_failure_is_rejected(self) -> None:
+        result = subprocess.CompletedProcess(["fixture-test"], 1, b"", b"\xff")
+        self._assert_rejected(result, "child_output_decode_failed")
+
+    def test_unexpected_exit_status_is_rejected(self) -> None:
+        result = _completed(self.historical_stderr, returncode=0)
+        self._assert_rejected(result, "unexpected_exit_status")
 
     def test_timeout_and_signal_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="sqag-run34-timeout-") as temporary:
@@ -299,6 +357,138 @@ class RetrospectiveResultContractTest(unittest.TestCase):
                 self.manifest,
             )
         self.assertEqual(failure.exception.code, "signal_terminated")
+
+
+    def test_duplicate_count_marker_is_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        index = next(index for index, line in enumerate(lines) if line.startswith("Ran "))
+        lines.insert(index + 1, lines[index])
+        self._assert_rejected(self._result_from_lines(lines), "child_stream_mismatch")
+
+    def test_conflicting_count_marker_is_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        index = next(index for index, line in enumerate(lines) if line.startswith("Ran "))
+        lines.insert(index + 1, "Ran 12 tests in 0.001s")
+        self._assert_rejected(self._result_from_lines(lines), "child_stream_mismatch")
+
+    def test_missing_count_marker_is_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        index = next(index for index, line in enumerate(lines) if line.startswith("Ran "))
+        lines.pop(index)
+        self._assert_rejected(self._result_from_lines(lines), "test_count_mismatch")
+
+    def test_duplicate_terminal_summary_is_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        index = next(index for index, line in enumerate(lines) if line.startswith("FAILED "))
+        lines.insert(index + 1, lines[index])
+        self._assert_rejected(self._result_from_lines(lines), "child_stream_mismatch")
+
+    def test_conflicting_terminal_summary_is_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        index = next(index for index, line in enumerate(lines) if line.startswith("FAILED "))
+        lines.insert(index + 1, "FAILED (failures=12)")
+        self._assert_rejected(self._result_from_lines(lines), "child_stream_mismatch")
+
+    def test_missing_terminal_summary_is_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        index = next(index for index, line in enumerate(lines) if line.startswith("FAILED "))
+        lines.pop(index)
+        self._assert_rejected(self._result_from_lines(lines), "failure_summary_mismatch")
+
+    def test_reordered_markers_are_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        count_index = next(index for index, line in enumerate(lines) if line.startswith("Ran "))
+        summary_index = next(index for index, line in enumerate(lines) if line.startswith("FAILED "))
+        lines[count_index], lines[summary_index] = lines[summary_index], lines[count_index]
+        self._assert_rejected(self._result_from_lines(lines), "test_count_mismatch")
+
+    def test_duplicate_selected_test_record_is_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        lines.insert(1, lines[0])
+        self._assert_rejected(self._result_from_lines(lines), "child_stream_mismatch")
+
+    def test_extra_selected_test_record_is_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        lines.insert(0, "test_extra (tests.extra.ExtraTest.test_extra) ... FAIL")
+        self._assert_rejected(self._result_from_lines(lines), "child_stream_mismatch")
+
+    def test_missing_selected_test_record_is_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        lines.pop(0)
+        self._assert_rejected(self._result_from_lines(lines), "child_stream_mismatch")
+
+    def test_reordered_selected_test_records_are_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        lines[0], lines[1] = lines[1], lines[0]
+        self._assert_rejected(self._result_from_lines(lines), "child_stream_mismatch")
+
+    def test_unmatched_prefix_is_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        lines.insert(0, "unmatched-prefix")
+        self._assert_rejected(self._result_from_lines(lines), "child_stream_mismatch")
+
+    def test_unmatched_interstitial_material_is_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        lines.insert(len(red.EXPECTED_TEST_SELECTION), "unmatched-interstitial")
+        self._assert_rejected(self._result_from_lines(lines), "child_stream_mismatch")
+
+    def test_trailing_material_is_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        lines.append("unmatched-suffix")
+        self._assert_rejected(self._result_from_lines(lines), "child_stream_mismatch")
+
+    def test_valid_stream_followed_by_second_result_structure_is_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        lines.extend(["Ran 13 tests in 0.001s", "", "FAILED (failures=13)"])
+        self._assert_rejected(self._result_from_lines(lines), "child_stream_mismatch")
+
+    def test_required_failure_category_in_wrong_test_block_is_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        starts = [index for index, line in enumerate(lines) if line.startswith("FAIL: ")]
+        categories = tuple(item["category"] for item in self.manifest["test_selection"])
+        first_end = starts[1]
+        other_end = starts[7]
+        for index in range(starts[0], first_end):
+            lines[index] = lines[index].replace(categories[0], "__temporary_category__").replace(categories[6], categories[0])
+            lines[index] = lines[index].replace("__temporary_category__", categories[6])
+        for index in range(starts[6], other_end):
+            lines[index] = lines[index].replace(categories[6], "__temporary_category__").replace(categories[0], categories[6])
+            lines[index] = lines[index].replace("__temporary_category__", categories[0])
+        self._assert_rejected(self._result_from_lines(lines), "expected_failure_category_missing")
+
+    def test_error_indicator_is_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        lines.insert(len(red.EXPECTED_TEST_SELECTION), "ERROR")
+        self._assert_rejected(self._result_from_lines(lines), "child_stream_mismatch")
+
+    def test_skip_indicator_is_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        lines.insert(len(red.EXPECTED_TEST_SELECTION), "SKIP")
+        self._assert_rejected(self._result_from_lines(lines), "child_stream_mismatch")
+
+    def test_unexpected_success_indicator_is_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        lines.insert(len(red.EXPECTED_TEST_SELECTION), "unexpected success")
+        self._assert_rejected(self._result_from_lines(lines), "child_stream_mismatch")
+
+    def test_contradictory_success_structure_is_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        lines.insert(len(red.EXPECTED_TEST_SELECTION), "OK")
+        self._assert_rejected(self._result_from_lines(lines), "child_stream_mismatch")
+
+    def test_improper_cross_channel_split_is_rejected(self) -> None:
+        encoded = self.historical_stderr.encode("utf-8")
+        split = encoded.index(b"Ran ")
+        result = _completed(b"", stdout=encoded[:split], stderr=encoded[split:])
+        self._assert_rejected(result, "child_stream_mismatch")
+
+    def test_conflicting_valid_structures_across_channels_are_rejected(self) -> None:
+        result = _completed(
+            b"",
+            stdout=b"Ran 13 tests in 0.001s\n\nFAILED (failures=13)\n",
+            stderr=self.historical_stderr.encode("utf-8"),
+        )
+        self._assert_rejected(result, "child_stream_mismatch")
 
 
 class RetrospectiveFailClosedIntegrityTest(unittest.TestCase):
@@ -695,6 +885,8 @@ class StrictReceiptParserTest(unittest.TestCase):
         bad = dict(timeout)
         bad["timeout"] = False
         self.assert_rejected(red._serialise_receipt(bad))
+        stream_failure = red._failure_receipt("child_stream_mismatch")
+        self.assertEqual(red._parse_receipt(red._serialise_receipt(stream_failure)), stream_failure)
 
 
 class RealSubprocessLifecycleTest(unittest.TestCase):
