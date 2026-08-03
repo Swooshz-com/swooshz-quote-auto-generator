@@ -80,6 +80,16 @@ def _capture_historical_child_result() -> subprocess.CompletedProcess[bytes]:
         )
 
 
+_HISTORICAL_CAPTURE: subprocess.CompletedProcess[bytes] | None = None
+
+
+def _cached_historical_result() -> subprocess.CompletedProcess[bytes]:
+    global _HISTORICAL_CAPTURE
+    if _HISTORICAL_CAPTURE is None:
+        _HISTORICAL_CAPTURE = _capture_historical_child_result()
+    return _HISTORICAL_CAPTURE
+
+
 def _child_command(source: str) -> list[str]:
     return [sys.executable, "-c", source]
 
@@ -489,6 +499,233 @@ class RetrospectiveResultContractTest(unittest.TestCase):
             stderr=self.historical_stderr.encode("utf-8"),
         )
         self._assert_rejected(result, "child_stream_mismatch")
+
+
+class RetrospectiveFieldBoundContractTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.manifest = red._validate_fixture()
+        cls.historical_result = _cached_historical_result()
+        cls.historical_stderr = red._normalise_child_channel(cls.historical_result.stderr)
+        cls.source_path = next(
+            entry["path"] for entry in cls.manifest["payload"] if entry.get("role") == "historical-test-selection"
+        )
+        cls.source_text = cls.manifest.payload_bytes[cls.source_path].decode("utf-8")
+        cls.source_all_lines = cls.source_text.splitlines()
+        cls.source_line_count = len(cls.source_all_lines)
+
+    def _result_from_lines(self, lines: list[str]) -> subprocess.CompletedProcess[bytes]:
+        return _completed("\n".join(lines) + ("\n" if self.historical_stderr.endswith("\n") else ""))
+
+    def _assert_rejected(self, result: subprocess.CompletedProcess[bytes], code: str) -> None:
+        with self.assertRaises(red.FixtureError) as failure:
+            red._validate_test_result(result, self.manifest)
+        self.assertEqual(failure.exception.code, code)
+
+    def _frame_and_source(self, frame_line: str) -> tuple[int, int]:
+        lines = self.historical_stderr.splitlines()
+        frame_index = next(
+            index for index, line in enumerate(lines) if line.startswith('  File "') and frame_line in line
+        )
+        return frame_index, frame_index + 1
+
+    def _mutate_second_frame(self, new_number: str, new_source: str | None = None) -> subprocess.CompletedProcess[bytes]:
+        lines = self.historical_stderr.splitlines()
+        frame_index, source_index = self._frame_and_source(", line 46, in _assert_rejected")
+        lines[frame_index] = lines[frame_index].replace(
+            ", line 46, in ", ", line %s, in " % new_number
+        )
+        if new_source is not None:
+            lines[source_index] = "    " + new_source
+        return self._result_from_lines(lines)
+
+    def test_minimum_valid_source_line_is_accepted(self) -> None:
+        red._validate_test_result(
+            self._mutate_second_frame("1", self.source_all_lines[0].lstrip(" ")),
+            self.manifest,
+        )
+
+    def test_maximum_valid_source_line_is_accepted(self) -> None:
+        red._validate_test_result(
+            self._mutate_second_frame(str(self.source_line_count), self.source_all_lines[-1].lstrip(" ")),
+            self.manifest,
+        )
+
+    def test_maximum_valid_source_line_with_correct_source_text_is_accepted(self) -> None:
+        red._validate_test_result(
+            self._mutate_second_frame(str(self.source_line_count), self.source_all_lines[-1].lstrip(" ")),
+            self.manifest,
+        )
+
+    def test_line_number_invalid_matrix_rejects(self) -> None:
+        invalid_numbers = (
+            "0",
+            "-5",
+            "+5",
+            " 5",
+            "5 ",
+            "046",
+            str(self.source_line_count + 1),
+            "999",
+            "1000",
+            "9" * 400,
+            "9" * 2000,
+            "5.0",
+            "5e3",
+            "\u0665",
+        )
+        for value in invalid_numbers:
+            with self.subTest(line_number=value):
+                self._assert_rejected(self._mutate_second_frame(value), "child_stream_mismatch")
+
+    def test_correct_line_number_with_wrong_source_text_is_rejected(self) -> None:
+        wrong_source = self.source_all_lines[71].lstrip(" ")
+        self.assertNotEqual(wrong_source, self.source_all_lines[45].lstrip(" "))
+        self._assert_rejected(self._mutate_second_frame("46", wrong_source), "child_stream_mismatch")
+
+    def test_correct_source_text_attached_to_wrong_line_number_is_rejected(self) -> None:
+        correct_text = self.source_all_lines[45].lstrip(" ")
+        self._assert_rejected(self._mutate_second_frame("72", correct_text), "child_stream_mismatch")
+
+    def test_timing_valid_matrix_is_accepted(self) -> None:
+        valid_timings = (
+            "0",
+            "0.001",
+            "0.123456",
+            "3600.000",
+            "3600",
+        )
+        for timing in valid_timings:
+            with self.subTest(timing=timing):
+                red._validate_test_result(self._timing_result(timing), self.manifest)
+
+    def test_timing_invalid_matrix_rejects(self) -> None:
+        invalid_timings = (
+            "3600.000001",
+            "10000.000",
+            "0.1234567",
+            "9" * 200 + ".000",
+            "0." + "9" * 200,
+            "01.500",
+            ".500",
+            "5.",
+            "0.",
+            "5.1.2",
+            "+5.000",
+            "-5.000",
+            " 5.000",
+            "5.000 ",
+            "5e3",
+            "NaN",
+            "inf",
+            "-inf",
+            "\u0665.\u0665",
+        )
+        for timing in invalid_timings:
+            with self.subTest(timing=timing):
+                self._assert_rejected(self._timing_result(timing), "child_stream_mismatch")
+
+    def test_extra_timing_marker_is_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        count_index = next(index for index, line in enumerate(lines) if line.startswith("Ran "))
+        lines.insert(count_index + 1, "Ran 13 tests in 0.001s")
+        self._assert_rejected(self._result_from_lines(lines), "child_stream_mismatch")
+
+    def test_conflicting_timing_marker_is_rejected(self) -> None:
+        lines = self.historical_stderr.splitlines()
+        count_index = next(index for index, line in enumerate(lines) if line.startswith("Ran "))
+        lines.insert(count_index + 1, "Ran 13 tests in 0.002s")
+        self._assert_rejected(self._result_from_lines(lines), "child_stream_mismatch")
+
+    def _timing_result(self, timing: str) -> subprocess.CompletedProcess[bytes]:
+        lines = self.historical_stderr.splitlines()
+        count_index = next(index for index, line in enumerate(lines) if line.startswith("Ran "))
+        lines[count_index] = "Ran 13 tests in %ss" % timing
+        return self._result_from_lines(lines)
+
+
+class RetrospectiveCleanupNegativeContractTest(unittest.TestCase):
+    def test_cleanup_failure_returns_non_success_receipt_and_recovers(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sqag-run51-cleanup-fail-") as temporary:
+            target = Path(temporary) / "work"
+            created: list = []
+            real_popen = red.subprocess.Popen
+
+            def recording_popen(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                created.append(process)
+                return process
+
+            def failing_rmtree(path, *args, **kwargs):
+                raise OSError("forced cleanup failure")
+
+            with mock.patch.object(red.subprocess, "Popen", side_effect=recording_popen):
+                with mock.patch.object(red.shutil, "rmtree", side_effect=failing_rmtree):
+                    with self.assertRaises(red.FixtureError) as failure:
+                        red.run_reproduction(temp_directory_factory=_directory_factory(target))
+            self.assertEqual(failure.exception.code, "cleanup_failed")
+            self.assertTrue(all(process.poll() is not None for process in created))
+            receipt = red._failure_receipt("cleanup_failed")
+            serialised = red._serialise_receipt(receipt)
+            self.assertEqual(red._parse_receipt(serialised), receipt)
+            self.assertEqual(receipt["status"], "failed")
+            self.assertFalse(receipt["cleanup_verified"])
+            self.assertFalse(receipt["child_output_emitted"])
+            self.assertNotIn(str(target), serialised)
+            self.assertNotIn("AssertionError", serialised)
+            self.assertTrue(target.exists())
+            shutil.rmtree(target, ignore_errors=True)
+            self.assertFalse(target.exists())
+
+    def test_cleanup_remnant_returns_non_success_receipt_and_recovers(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sqag-run51-remnant-") as temporary:
+            target = Path(temporary) / "work"
+            created: list = []
+            real_popen = red.subprocess.Popen
+            real_rmtree = red.shutil.rmtree
+
+            def recording_popen(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                created.append(process)
+                return process
+
+            def rmtree_leaving_remnant(path, *args, **kwargs):
+                real_rmtree(path, *args, **kwargs)
+                remnant = Path(path) / "synthetic-remnant.txt"
+                remnant.parent.mkdir(parents=True, exist_ok=True)
+                remnant.write_text("synthetic remnant", encoding="utf-8")
+
+            with mock.patch.object(red.subprocess, "Popen", side_effect=recording_popen):
+                with mock.patch.object(red.shutil, "rmtree", side_effect=rmtree_leaving_remnant):
+                    with self.assertRaises(red.FixtureError) as failure:
+                        red.run_reproduction(temp_directory_factory=_directory_factory(target))
+            self.assertEqual(failure.exception.code, "cleanup_remnant")
+            self.assertTrue(all(process.poll() is not None for process in created))
+            receipt = red._failure_receipt("cleanup_remnant")
+            serialised = red._serialise_receipt(receipt)
+            self.assertEqual(red._parse_receipt(serialised), receipt)
+            self.assertEqual(receipt["status"], "failed")
+            self.assertFalse(receipt["cleanup_verified"])
+            self.assertFalse(receipt["child_output_emitted"])
+            self.assertNotIn(str(target), serialised)
+            self.assertNotIn("AssertionError", serialised)
+            self.assertTrue(target.exists())
+            shutil.rmtree(target, ignore_errors=True)
+            self.assertFalse(target.exists())
+
+    def test_cleanup_failure_and_remnant_receipts_are_distinct_and_bounded(self) -> None:
+        failure_receipt = red._failure_receipt("cleanup_failed")
+        remnant_receipt = red._failure_receipt("cleanup_remnant")
+        self.assertEqual(tuple(failure_receipt), red.RECEIPT_KEYS)
+        self.assertEqual(tuple(remnant_receipt), red.RECEIPT_KEYS)
+        self.assertNotEqual(failure_receipt["error_code"], remnant_receipt["error_code"])
+        self.assertIn(failure_receipt["error_code"], red.RECEIPT_ERROR_CODES)
+        self.assertIn(remnant_receipt["error_code"], red.RECEIPT_ERROR_CODES)
+        for receipt in (failure_receipt, remnant_receipt):
+            self.assertEqual(len(red._serialise_receipt(receipt).encode("utf-8")) <= red.MAX_RECEIPT_BYTES, True)
+            self.assertEqual(red._parse_receipt(red._serialise_receipt(receipt)), receipt)
+            self.assertFalse(receipt["child_output_emitted"])
+            self.assertIsNone(receipt["child_exit_status"])
 
 
 class RetrospectiveFailClosedIntegrityTest(unittest.TestCase):

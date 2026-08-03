@@ -35,6 +35,8 @@ MAX_RECEIPT_BYTES = 8 * 1024
 TEST_TIMEOUT_SECONDS = 30.0
 EXPECTED_INTERPRETER = "cpython"
 EXPECTED_PYTHON_VERSION = (3, 12, 13)
+RETROSPECTIVE_TIMING_MAX_SECONDS = 3600
+RETROSPECTIVE_TIMING_MAX_MICROS = RETROSPECTIVE_TIMING_MAX_SECONDS * 1_000_000
 
 EXPECTED_TEST_SELECTION = (
     "tests.test_runtime_privilege_contract.RuntimeMembershipEdgeEvaluatorTest.test_unrelated_parent_to_sqag_migrator_is_rejected",
@@ -900,6 +902,32 @@ def _bounded_ascii_line(line: str, maximum: int) -> bool:
     return bool(line) and len(line) <= maximum and all(0x20 <= ord(character) <= 0x7E for character in line)
 
 
+_TIMING_INTEGER_WIDTH = len(str(RETROSPECTIVE_TIMING_MAX_SECONDS))
+_TIMING_INTEGER_PATTERN = r"[1-9][0-9]{0,%d}" % (_TIMING_INTEGER_WIDTH - 1)
+_TIMING_FULL_PATTERN = re.compile(r"^(?:0|%s)(?:\.[0-9]{1,6})?$" % _TIMING_INTEGER_PATTERN)
+
+
+def _parse_bounded_timing_micros(value: str) -> int | None:
+    """Parse a bounded fixed-point timing value into microseconds.
+
+    Returns the microsecond value when the input is a canonical unsigned
+    bounded fixed-point decimal, or None when the input is malformed or above
+    the retrospective timing maximum.
+    """
+    if _TIMING_FULL_PATTERN.fullmatch(value) is None:
+        return None
+    integer_part, separator, fraction_part = value.partition(".")
+    integer = int(integer_part)
+    if separator:
+        fraction_micros = int(fraction_part.ljust(6, "0"))
+    else:
+        fraction_micros = 0
+    micros = integer * 1_000_000 + fraction_micros
+    if micros > RETROSPECTIVE_TIMING_MAX_MICROS:
+        return None
+    return micros
+
+
 def _validate_complete_child_stream(stdout: str, stderr: str, manifest: dict[str, Any]) -> None:
     if stdout:
         raise FixtureError("child_stream_mismatch")
@@ -910,21 +938,31 @@ def _validate_complete_child_stream(stdout: str, stderr: str, manifest: dict[str
     expected = manifest["expected_result"]
     record_pattern = re.compile(r"^(test_[A-Za-z0-9_]+) \(([^()\r\n]+)\) \.\.\. (.+)$")
     header_pattern = re.compile(r"^FAIL: (test_[A-Za-z0-9_]+) \(([^()\r\n]+)\)$")
-    frame_pattern = re.compile(
-        r'^  File "([^"\r\n]+)", line ([1-9][0-9]*), in (?:[A-Za-z_][A-Za-z0-9_]*|<[^>\r\n]+>)$'
-    )
     cursor = 0
     test_source_paths = tuple(entry["path"] for entry in manifest["payload"] if entry.get("role") == "historical-test-selection")
     if len(test_source_paths) != 1:
         raise FixtureError("test_selection_schema_mismatch")
     try:
-        source_lines = frozenset(
-            line.lstrip(" ")
-            for line in manifest.payload_bytes[test_source_paths[0]].decode("utf-8").splitlines()
-            if line.strip()
-        )
+        source_text = manifest.payload_bytes[test_source_paths[0]].decode("utf-8")
     except (AttributeError, KeyError, UnicodeDecodeError):
         raise FixtureError("test_selection_schema_mismatch") from None
+    source_all_lines = source_text.splitlines()
+    source_line_count = len(source_all_lines)
+    source_lines = frozenset(
+        line.lstrip(" ")
+        for line in source_all_lines
+        if line.strip()
+    )
+    source_lines_by_number = {
+        number: line.lstrip(" ")
+        for number, line in enumerate(source_all_lines, start=1)
+        if line.strip()
+    }
+    frame_line_width = len(str(source_line_count))
+    frame_pattern = re.compile(
+        r'^  File "([^"\r\n]+)", line ([1-9][0-9]{0,%d}), in (?:[A-Za-z_][A-Za-z0-9_]*|<[^>\r\n]+>)$'
+        % (frame_line_width - 1)
+    )
     for name in selection:
         if cursor >= len(lines):
             raise FixtureError("child_stream_mismatch")
@@ -967,6 +1005,9 @@ def _validate_complete_child_stream(stdout: str, stderr: str, manifest: dict[str
             frame = frame_pattern.fullmatch(lines[cursor])
             if frame is None or not frame.group(1).replace("\\", "/").endswith(suffix):
                 raise FixtureError("child_stream_mismatch")
+            line_number = int(frame.group(2))
+            if line_number < 1 or line_number > source_line_count:
+                raise FixtureError("child_stream_mismatch")
             cursor += 1
             if cursor >= len(lines):
                 raise FixtureError("child_stream_mismatch")
@@ -979,6 +1020,8 @@ def _validate_complete_child_stream(stdout: str, stderr: str, manifest: dict[str
             ):
                 raise FixtureError("expected_failure_category_missing")
             if source.lstrip(" ") not in source_lines:
+                raise FixtureError("child_stream_mismatch")
+            if source_lines_by_number.get(line_number) != source.lstrip(" "):
                 raise FixtureError("child_stream_mismatch")
             cursor += 1
 
@@ -1001,9 +1044,11 @@ def _validate_complete_child_stream(stdout: str, stderr: str, manifest: dict[str
     cursor += 1
     if cursor >= len(lines):
         raise FixtureError("test_count_mismatch")
-    count_marker = re.fullmatch(r"Ran ([0-9]+) tests? in ([0-9]+\.[0-9]+)s", lines[cursor])
+    count_marker = re.fullmatch(r"Ran ([0-9]+) tests? in (.+)s", lines[cursor])
     if count_marker is None or int(count_marker.group(1)) != expected["tests"]:
         raise FixtureError("test_count_mismatch")
+    if _parse_bounded_timing_micros(count_marker.group(2)) is None:
+        raise FixtureError("child_stream_mismatch")
     cursor += 1
     if cursor >= len(lines) or lines[cursor] != "":
         raise FixtureError("child_stream_mismatch")
