@@ -297,6 +297,21 @@
     }
   },
 
+  "views": {
+    "count": 1,
+    "runtime_accessible": {
+      "sqag_quote_artifacts": {
+        "schema": "public",
+        "class": "legacy_publication_backfill",
+        "privileges": {
+          "select": true
+        },
+        "production_source": "webapp.server.DatabaseSqagStorage.publish_quote_session_forensic_transaction",
+        "bound": true
+      }
+    }
+  },
+
   "sequences": {
     "user_defined_public_count": 0,
     "runtime_privileges": "none",
@@ -349,6 +364,23 @@
     "verification_rule": "Must expand defaclacl through aclexplode() or equivalent grantee-aware operation. Checking defaclrole alone is insufficient."
   },
 
+  "boundary_b": {
+    "requires_postgresql17": true,
+    "runtime_role": "sqag_runtime",
+    "object_owner": "sqag_migrator",
+    "database_owner_authority": "database_owner",
+    "authority_input_model": "variable_reference_only",
+    "fail_closed": true,
+    "idempotent_rerun": true,
+    "operations": {
+      "database_acl_grant": "database_owner_authority",
+      "schema_acl_grant": "database_owner_authority",
+      "public_temporary_revoke": "database_owner_authority",
+      "object_privilege_grants": "object_owner",
+      "public_trigger_execute_revoke": "object_owner"
+    }
+  },
+
   "verification_queries": {
     "database_acl": "select datacl from pg_catalog.pg_database where datname = current_database()",
     "schema_acl": "select nspacl from pg_catalog.pg_namespace where nspname = 'public'",
@@ -362,6 +394,7 @@
     "effective_runtime_table_privileges": "select n.nspname as schema_name, c.relname as table_name, p.privilege_type, has_table_privilege('sqag_runtime', c.oid, p.privilege_type) as effective, has_table_privilege('sqag_runtime', c.oid, p.privilege_type || ' WITH GRANT OPTION') as is_grantable from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace cross join (values ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE'), ('REFERENCES'), ('TRIGGER'), ('MAINTAIN')) p(privilege_type) where n.nspname = 'public' and c.relkind = 'r' and c.relname like 'sqag_' || chr(37) order by n.nspname, c.relname, p.privilege_type",
     "effective_runtime_column_privileges": "select n.nspname as schema_name, c.relname as table_name, a.attname as column_name, p.privilege_type, has_column_privilege('sqag_runtime', c.oid, a.attname, p.privilege_type) as effective, has_column_privilege('sqag_runtime', c.oid, a.attname, p.privilege_type || ' WITH GRANT OPTION') as is_grantable from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace join pg_catalog.pg_attribute a on a.attrelid = c.oid cross join (values ('SELECT'), ('INSERT'), ('UPDATE'), ('REFERENCES')) p(privilege_type) where n.nspname = 'public' and c.relkind = 'r' and c.relname like 'sqag_' || chr(37) and a.attnum > 0 and not a.attisdropped order by n.nspname, c.relname, a.attname, p.privilege_type",
     "effective_runtime_schema_privileges": "select p.privilege_type, has_schema_privilege('sqag_runtime', 'public', p.privilege_type) as effective, has_schema_privilege('sqag_runtime', 'public', p.privilege_type || ' WITH GRANT OPTION') as is_grantable from (values ('USAGE'), ('CREATE')) p(privilege_type) order by p.privilege_type",
-    "effective_runtime_routine_privileges": "select p.proname as routine_name, has_function_privilege('sqag_runtime', p.oid, 'EXECUTE') as effective from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' order by p.proname"
+    "effective_runtime_routine_privileges": "select p.proname as routine_name, has_function_privilege('sqag_runtime', p.oid, 'EXECUTE') as effective from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' order by p.proname",
+    "view_acl": "select c.relname as view_name, c.relacl as view_acl from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relkind = 'v' and n.nspname = 'public' order by c.relname"
   }
 }

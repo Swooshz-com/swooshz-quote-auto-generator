@@ -5,6 +5,11 @@
     "historical_source_revision": "fa03eca2b0406b864618453f30292c0303f34744",
     "canonical_parent": "134ce9e0da25c8e5b7f261d726110f17afad99c6",
     "canonical_replacement_head": "5c6c35397f6ef60ef9f804b963bda9f5f97b2da5",
+    "attribution": {
+      "provider": "OpenAI",
+      "model": "GPT-5.6 Sol",
+      "reasoning": "High"
+    },
     "retrospective": true,
     "original_red_chronology": false,
     "original_development_sequence": false

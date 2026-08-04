@@ -244,6 +244,20 @@ class RetrospectiveFixtureIntegrityTest(unittest.TestCase):
         self.assertIn("needs:\n      - retrospective_exact_starting_head_red", workflow)
         self.assertIn("needs.retrospective_exact_starting_head_red.result == 'success'", workflow)
 
+    def test_general_validate_job_is_pinned_to_exact_python_patch(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        validate_section = workflow.split("  validate:", 1)[1]
+        self.assertIn('python-version: "3.12.13"', validate_section)
+        self.assertNotIn('python-version: "3.12"\n', validate_section)
+
+    def test_non_matching_general_interpreter_does_not_crash_unrelated_checks(self) -> None:
+        manifest = red._validate_fixture()
+        with mock.patch.object(red.sys, "version_info", (3, 12, 12)):
+            self.assertEqual(red._validate_fixture()["fixture_version"], "1.0.0")
+            with self.assertRaises(red.FixtureError) as failure:
+                red._validate_interpreter(manifest)
+            self.assertEqual(failure.exception.code, "interpreter_mismatch")
+
     def test_cleanup_occurs_on_success_and_failure(self) -> None:
         with tempfile.TemporaryDirectory(prefix="sqag-run34-cleanup-") as temporary:
             success_path = Path(temporary) / "success"
@@ -1182,6 +1196,170 @@ class RealSubprocessLifecycleTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, b"out")
         self.assertEqual(result.stderr, b"err")
+
+
+HISTORICAL_ATTRIBUTION = {
+    "provider": "OpenAI",
+    "model": "GPT-5.6 Sol",
+    "reasoning": "High",
+}
+
+
+class _EmptyReaderStream:
+    def read(self, _size: int) -> bytes:
+        return b""
+
+    def close(self) -> None:
+        pass
+
+
+class _UnreapableProcess:
+    def __init__(self, stream: object | None = None) -> None:
+        self.stdout = stream if stream is not None else _EmptyReaderStream()
+        self.stderr = self.stdout
+        self.returncode: int | None = None
+        self.wait_calls: list[object] = []
+
+    def poll(self) -> None:
+        return None
+
+    def wait(self, timeout: object | None = None) -> None:
+        self.wait_calls.append(timeout)
+        raise subprocess.TimeoutExpired(["synthetic"], timeout)
+
+    def terminate(self) -> None:
+        pass
+
+    def kill(self) -> None:
+        pass
+
+
+class RetrospectiveAttributionContractTest(unittest.TestCase):
+    def _assert_attribution_rejected(self, attribution: object, expected_code: str) -> None:
+        with tempfile.TemporaryDirectory(prefix="sqag-run55-attribution-") as temporary:
+            package = _copy_fixture(Path(temporary))
+
+            def mutate(manifest: dict[str, Any]) -> None:
+                manifest["provenance"]["attribution"] = attribution
+
+            digest = _rewrite_manifest(package, mutate)
+            with mock.patch.object(red, "MANIFEST_SHA256", digest):
+                with self.assertRaises(red.FixtureError) as failure:
+                    red._validate_fixture(package)
+            self.assertEqual(failure.exception.code, expected_code)
+
+    def test_historical_attribution_is_preserved_in_manifest(self) -> None:
+        manifest = red._validate_fixture()
+        self.assertEqual(manifest["provenance"]["attribution"], HISTORICAL_ATTRIBUTION)
+
+    def test_missing_blank_wrong_type_extra_and_oversized_attribution_rejects(self) -> None:
+        cases: list[tuple[object, str]] = [
+            (None, "provenance_schema_mismatch"),
+            ({"provider": "OpenAI", "model": "GPT-5.6 Sol"}, "provenance_schema_mismatch"),
+            ({"provider": "OpenAI", "reasoning": "High"}, "provenance_schema_mismatch"),
+            ({"model": "GPT-5.6 Sol", "reasoning": "High"}, "provenance_schema_mismatch"),
+            ({"provider": "", "model": "GPT-5.6 Sol", "reasoning": "High"}, "provenance_schema_mismatch"),
+            ({"provider": "OpenAI", "model": "   ", "reasoning": "High"}, "provenance_schema_mismatch"),
+            ({"provider": "OpenAI", "model": "GPT-5.6 Sol", "reasoning": ""}, "provenance_schema_mismatch"),
+            ({"provider": 7, "model": "GPT-5.6 Sol", "reasoning": "High"}, "provenance_schema_mismatch"),
+            ({"provider": "OpenAI", "model": None, "reasoning": "High"}, "provenance_schema_mismatch"),
+            ({"provider": "OpenAI", "model": "GPT-5.6 Sol", "reasoning": ["High"]}, "provenance_schema_mismatch"),
+            ({"provider": "OpenAI", "model": "GPT-5.6 Sol", "reasoning": "High", "run_id": "x"}, "provenance_schema_mismatch"),
+            ({"provider": "OpenAI", "model": "GPT-5.6 Sol", "reasoning": "High", "model2": "x"}, "provenance_schema_mismatch"),
+            ({"provider": "O" * 65, "model": "GPT-5.6 Sol", "reasoning": "High"}, "provenance_schema_mismatch"),
+            ({"provider": "OpenAI", "model": "M" * 65, "reasoning": "High"}, "provenance_schema_mismatch"),
+            ({"provider": "OpenAI", "model": "GPT-5.6 Sol", "reasoning": "R" * 65}, "provenance_schema_mismatch"),
+        ]
+        for index, (attribution, expected_code) in enumerate(cases):
+            with self.subTest(index=index):
+                self._assert_attribution_rejected(attribution, expected_code)
+
+    def test_changed_attribution_invalidates_manifest_digest(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sqag-run55-attribution-digest-") as temporary:
+            package = _copy_fixture(Path(temporary))
+
+            def mutate(manifest: dict[str, Any]) -> None:
+                manifest["provenance"]["attribution"] = {
+                    "provider": "DeepSeek",
+                    "model": "DeepSeek V4 Flash",
+                    "reasoning": "High",
+                }
+
+            _rewrite_manifest(package, mutate)
+            with self.assertRaises(red.FixtureError) as failure:
+                red._validate_fixture(package)
+            self.assertEqual(failure.exception.code, "manifest_digest_mismatch")
+
+    def test_current_executor_model_cannot_alter_historical_attribution(self) -> None:
+        source = Path(red.__file__).read_text(encoding="utf-8")
+        for token in ("deepseek", "DeepSeek V4 Flash", "DeepSeek V4"):
+            self.assertNotIn(token, source, token)
+        manifest = red._validate_fixture()
+        self.assertEqual(manifest["provenance"]["attribution"], HISTORICAL_ATTRIBUTION)
+
+    def test_reproduction_receipt_requires_valid_attribution_contract(self) -> None:
+        receipt = red.run_reproduction()
+        self.assertEqual(receipt["status"], "passed")
+        self.assertEqual(tuple(receipt), red.RECEIPT_KEYS)
+
+
+class BoundedChildReapContractTest(unittest.TestCase):
+    def test_child_reap_failed_is_a_fixed_bounded_receipt_category(self) -> None:
+        self.assertIn("child_reap_failed", red.RECEIPT_ERROR_CODES)
+        receipt = red._failure_receipt("child_reap_failed")
+        self.assertEqual(red._parse_receipt(red._serialise_receipt(receipt)), receipt)
+        self.assertLessEqual(len(red._serialise_receipt(receipt).encode("utf-8")), red.MAX_RECEIPT_BYTES)
+        self.assertFalse(receipt["child_output_emitted"])
+        self.assertFalse(receipt["cleanup_verified"])
+
+    def test_unreapable_child_returns_fixed_lifecycle_error_with_bounded_waits(self) -> None:
+        process = _UnreapableProcess()
+        with self.assertRaises(red.FixtureError) as failure:
+            red._kill_process(process)
+        self.assertEqual(failure.exception.code, "child_reap_failed")
+        self.assertGreaterEqual(len(process.wait_calls), 3)
+        self.assertTrue(all(timeout is not None for timeout in process.wait_calls))
+
+    def test_no_final_wait_is_invoked_without_a_timeout(self) -> None:
+        source = Path(red.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        bounded_waits = True
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr != "wait":
+                continue
+            keywords = {keyword.arg for keyword in node.keywords}
+            if "timeout" not in keywords:
+                bounded_waits = False
+                break
+        self.assertTrue(bounded_waits)
+
+    def test_child_ignoring_terminate_is_reaped_after_kill(self) -> None:
+        if os.name == "nt":
+            self.skipTest("SIGTERM ignore semantics are unavailable on Windows")
+        child = red.subprocess.Popen(
+            _child_command("import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            red._kill_process(child)
+            self.assertIsNotNone(child.poll())
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
+
+    def test_child_reap_failure_propagates_from_execute_child_without_masking(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sqag-run55-reap-") as temporary:
+            execution_root = Path(temporary)
+            process = _UnreapableProcess()
+            with mock.patch.object(red.subprocess, "Popen", return_value=process):
+                with self.assertRaises(red.FixtureError) as failure:
+                    red._execute_child(["synthetic"], execution_root, timeout_seconds=0.05)
+            self.assertEqual(failure.exception.code, "child_reap_failed")
+            self.assertTrue(all(timeout is not None for timeout in process.wait_calls))
 
 
 if __name__ == "__main__":
