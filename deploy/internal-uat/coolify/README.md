@@ -15,7 +15,8 @@ Recommended app settings:
 
 - Runtime/buildpack: Nixpacks with exact Python-only contract at `nixpacks.toml`
   (see validator: `python scripts/validate_nixpacks_python_contract.py`)
-- Python version: `3.12.13` bound through `.python-version`
+- Python version: `3.12.13` bound through `.python-version` and pinned
+  exactly through the immutable `nixpkgsArchive` in `[phases.setup]`.
 - Python dependencies: `requirements.txt`
 - Start command: `python webapp/server.py` (bound in `nixpacks.toml`)
 - The root `package.json` is CI/local-Playwright tooling and must not cause

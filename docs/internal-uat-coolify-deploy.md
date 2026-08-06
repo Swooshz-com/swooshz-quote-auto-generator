@@ -52,7 +52,9 @@ The `nixpacks.toml` file enforces an exact Python-only production build contract
 
 - `providers = ["python"]` — Node is never a production provider.
 - Start command: `python webapp/server.py` (locked in `[start].cmd`).
-- Python version: `3.12.13` bound in `.python-version`.
+- Python version: `3.12.13` bound in `.python-version` and pinned through
+  `[phases.setup].nixpkgsArchive` to the immutable Nixpkgs commit
+  `5c994fe2b1e540ff83aa59ba370918ad5aae4776` (python312: 3.12.12 -> 3.12.13).
 - Dependencies: `requirements.txt`.
 - The root `package.json` is preserved for local Playwright scripts, CI
   smokes and `npm audit`; it must not cause Nixpacks to select Node.

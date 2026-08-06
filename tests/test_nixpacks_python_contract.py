@@ -1,6 +1,7 @@
 """Nixpacks Python-only production contract tests.
 
-Focused RED/GREEN contract tests for the Nixpacks Python provider binding.
+Focused RED/GREEN contract tests for the Nixpacks Python provider binding
+with locked Nixpkgs archive pinning.
 """
 
 from __future__ import annotations
@@ -23,49 +24,72 @@ class NixpacksTomlParsingTests(unittest.TestCase):
 
     def test_parses_python_only_provider(self):
         result = validator._parse_nixpacks_toml(
-            _toml_text('providers = ["python"]\n[start]\ncmd = "python webapp/server.py"')
+            _toml_text(
+                'providers = ["python"]\n'
+                '[phases.setup]\nnixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+                '[start]\ncmd = "python webapp/server.py"'
+            )
         )
-        self.assertEqual(result, (["python"], "python webapp/server.py"))
+        self.assertEqual(
+            result,
+            (["python"], "python webapp/server.py", "5c994fe2b1e540ff83aa59ba370918ad5aae4776"),
+        )
 
     def test_parses_no_start_section(self):
         result = validator._parse_nixpacks_toml(
             _toml_text('providers = ["python"]')
         )
-        self.assertEqual(result, (["python"], None))
+        self.assertEqual(result, (["python"], None, None))
 
     def test_parses_no_providers(self):
         result = validator._parse_nixpacks_toml(
             _toml_text('[start]\ncmd = "python webapp/server.py"')
         )
-        self.assertEqual(result, (None, "python webapp/server.py"))
+        self.assertEqual(result, (None, "python webapp/server.py", None))
 
     def test_parses_empty(self):
         result = validator._parse_nixpacks_toml(_toml_text(""))
-        self.assertEqual(result, (None, None))
+        self.assertEqual(result, (None, None, None))
 
     def test_parses_comment_lines(self):
         result = validator._parse_nixpacks_toml(
-            _toml_text('# comment\nproviders = ["python"]\n# another\n[start]\ncmd = "echo hi"')
+            _toml_text(
+                '# comment\n'
+                'providers = ["python"]\n'
+                '# another\n'
+                '[phases.setup]\n'
+                'nixpkgsArchive = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n'
+                '[start]\ncmd = "echo hi"'
+            )
         )
-        self.assertEqual(result, (["python"], "echo hi"))
+        self.assertEqual(
+            result,
+            (["python"], "echo hi", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        )
 
     def test_parses_provider_with_spaces(self):
         result = validator._parse_nixpacks_toml(
-            _toml_text('providers = [ "python" ]\n[start]\ncmd = "python webapp/server.py"')
+            _toml_text(
+                'providers = [ "python" ]\n'
+                '[start]\ncmd = "python webapp/server.py"'
+            )
         )
-        self.assertEqual(result, (["python"], "python webapp/server.py"))
+        self.assertEqual(result, (["python"], "python webapp/server.py", None))
 
     def test_detects_node_provider(self):
         result = validator._parse_nixpacks_toml(
-            _toml_text('providers = ["node", "python"]\n[start]\ncmd = "python webapp/server.py"')
+            _toml_text(
+                'providers = ["node", "python"]\n'
+                '[start]\ncmd = "python webapp/server.py"'
+            )
         )
-        self.assertEqual(result, (["node", "python"], "python webapp/server.py"))
+        self.assertEqual(result, (["node", "python"], "python webapp/server.py", None))
 
     def test_detects_node_only(self):
         result = validator._parse_nixpacks_toml(
             _toml_text('providers = ["node"]')
         )
-        self.assertEqual(result, (["node"], None))
+        self.assertEqual(result, (["node"], None, None))
 
 
 class NixpacksPythonContractREDTests(unittest.TestCase):
@@ -91,7 +115,11 @@ class NixpacksPythonContractREDTests(unittest.TestCase):
     def _write_valid_files(self):
         self._write(
             "nixpacks.toml",
-            'providers = ["python"]\n[start]\ncmd = "python webapp/server.py"\n',
+            'providers = ["python"]\n'
+            '[phases.setup]\n'
+            'nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+            '[start]\n'
+            'cmd = "python webapp/server.py"\n',
         )
         self._write(".python-version", "3.12.13\n")
         self._write("requirements.txt", "pyjwt==2.13.0\n")
@@ -116,7 +144,12 @@ class NixpacksPythonContractREDTests(unittest.TestCase):
 
     def test_fail_provider_absent(self):
         self._write_valid_files()
-        self._write("nixpacks.toml", '[start]\ncmd = "python webapp/server.py"\n')
+        self._write(
+            "nixpacks.toml",
+            '[phases.setup]\n'
+            'nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+            '[start]\ncmd = "python webapp/server.py"\n',
+        )
         self._redirect_root()
         self.assertNotEqual(validator.validate(), 0)
 
@@ -124,7 +157,10 @@ class NixpacksPythonContractREDTests(unittest.TestCase):
         self._write_valid_files()
         self._write(
             "nixpacks.toml",
-            'providers = ["node", "python"]\n[start]\ncmd = "python webapp/server.py"\n',
+            'providers = ["node", "python"]\n'
+            '[phases.setup]\n'
+            'nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+            '[start]\ncmd = "python webapp/server.py"\n',
         )
         self._redirect_root()
         self.assertNotEqual(validator.validate(), 0)
@@ -133,7 +169,10 @@ class NixpacksPythonContractREDTests(unittest.TestCase):
         self._write_valid_files()
         self._write(
             "nixpacks.toml",
-            'providers = ["node"]\n[start]\ncmd = "python webapp/server.py"\n',
+            'providers = ["node"]\n'
+            '[phases.setup]\n'
+            'nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+            '[start]\ncmd = "python webapp/server.py"\n',
         )
         self._redirect_root()
         self.assertNotEqual(validator.validate(), 0)
@@ -160,7 +199,10 @@ class NixpacksPythonContractREDTests(unittest.TestCase):
         self._write_valid_files()
         self._write(
             "nixpacks.toml",
-            'providers = ["python"]\n[start]\ncmd = "node server.js"\n',
+            'providers = ["python"]\n'
+            '[phases.setup]\n'
+            'nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+            '[start]\ncmd = "node server.js"\n',
         )
         self._redirect_root()
         self.assertNotEqual(validator.validate(), 0)
@@ -193,10 +235,111 @@ class NixpacksPythonContractREDTests(unittest.TestCase):
         self._write_valid_files()
         self._write(
             "nixpacks.toml",
-            'providers = ["python", "node", "rust"]\n[start]\ncmd = "python webapp/server.py"\n',
+            'providers = ["python", "node", "rust"]\n'
+            '[phases.setup]\n'
+            'nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+            '[start]\ncmd = "python webapp/server.py"\n',
         )
         self._redirect_root()
         self.assertNotEqual(validator.validate(), 0)
+
+    # -- New archive-pinning fail-closed tests -----------------------------------
+
+    def test_fail_missing_setup_phase(self):
+        self._write_valid_files()
+        self._write(
+            "nixpacks.toml",
+            'providers = ["python"]\n'
+            '[start]\ncmd = "python webapp/server.py"\n',
+        )
+        self._redirect_root()
+        self.assertNotEqual(validator.validate(), 0)
+
+    def test_fail_missing_nixpkgs_archive(self):
+        self._write_valid_files()
+        self._write(
+            "nixpacks.toml",
+            'providers = ["python"]\n'
+            '[phases.setup]\n'
+            '[start]\ncmd = "python webapp/server.py"\n',
+        )
+        self._redirect_root()
+        self.assertNotEqual(validator.validate(), 0)
+
+    def test_fail_archive_not_40_hex(self):
+        self._write_valid_files()
+        self._write(
+            "nixpacks.toml",
+            'providers = ["python"]\n'
+            '[phases.setup]\n'
+            'nixpkgsArchive = "short"\n'
+            '[start]\ncmd = "python webapp/server.py"\n',
+        )
+        self._redirect_root()
+        self.assertNotEqual(validator.validate(), 0)
+
+    def test_fail_archive_not_hex(self):
+        self._write_valid_files()
+        self._write(
+            "nixpacks.toml",
+            'providers = ["python"]\n'
+            '[phases.setup]\n'
+            'nixpkgsArchive = "gggggggggggggggggggggggggggggggggggggggg"\n'
+            '[start]\ncmd = "python webapp/server.py"\n',
+        )
+        self._redirect_root()
+        self.assertNotEqual(validator.validate(), 0)
+
+    def test_fail_archive_branch_reference(self):
+        self._write_valid_files()
+        self._write(
+            "nixpacks.toml",
+            'providers = ["python"]\n'
+            '[phases.setup]\n'
+            'nixpkgsArchive = "nixos-unstable"\n'
+            '[start]\ncmd = "python webapp/server.py"\n',
+        )
+        self._redirect_root()
+        self.assertNotEqual(validator.validate(), 0)
+
+    def test_fail_wrong_archive_commit(self):
+        self._write_valid_files()
+        self._write(
+            "nixpacks.toml",
+            'providers = ["python"]\n'
+            '[phases.setup]\n'
+            'nixpkgsArchive = "1111111111111111111111111111111111111111"\n'
+            '[start]\ncmd = "python webapp/server.py"\n',
+        )
+        self._redirect_root()
+        self.assertNotEqual(validator.validate(), 0)
+
+    def test_fail_archive_has_uppercase(self):
+        self._write_valid_files()
+        self._write(
+            "nixpacks.toml",
+            'providers = ["python"]\n'
+            '[phases.setup]\n'
+            'nixpkgsArchive = "5C994FE2B1E540FF83AA59BA370918AD5AAE4776"\n'
+            '[start]\ncmd = "python webapp/server.py"\n',
+        )
+        self._redirect_root()
+        self.assertNotEqual(validator.validate(), 0)
+
+
+class NixpacksArchiveProofTests(unittest.TestCase):
+    """Tests that the locked archive is a well-formed, immutable Nixpkgs commit."""
+
+    def test_locked_archive_is_40_hex(self):
+        self.assertIsNotNone(
+            validator.HEX_ARCHIVE_RE.fullmatch(validator.LOCKED_NIXPKGS_ARCHIVE)
+        )
+
+    def test_locked_archive_matches_validator_constant(self):
+        self.assertEqual(
+            validator.LOCKED_NIXPKGS_ARCHIVE,
+            "5c994fe2b1e540ff83aa59ba370918ad5aae4776",
+        )
 
 
 def _toml_text(content: str) -> Path:

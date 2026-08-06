@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Validate the Nixpacks Python-only production contract.
+"""Validate the Nixpacks Python-only production contract with locked Nixpkgs archive.
 
 Checks that the repository enforces:
 - nixpacks.toml exists with providers = ["python"] only.
+- [phases.setup] section present with an exact 40-char lowercase hex nixpkgsArchive.
+- The archive matches the locked immutable NixOS/nixpkgs commit for python312==3.12.13.
 - Start command is exactly python webapp/server.py.
 - .python-version contains exactly 3.12.13.
 - No Node provider, Dockerfile, Procfile or alternate runtime is configured.
@@ -42,6 +44,13 @@ LOCKED_PYTHON_VERSION = "3.12.13"
 LOCKED_START_CMD = "python webapp/server.py"
 LOCKED_PROVIDERS = ("python",)
 
+# Immutable NixOS/nixpkgs commit providing python312 == 3.12.13 on x86_64-linux.
+# Commit message: "python312: 3.12.12 -> 3.12.13"
+# Verified via: https://github.com/NixOS/nixpkgs/commit/5c994fe2b1e540ff83aa59ba370918ad5aae4776
+LOCKED_NIXPKGS_ARCHIVE = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"
+
+HEX_ARCHIVE_RE = re.compile(r"^[0-9a-f]{40}$")
+
 EXIT_CODE_OK = 0
 EXIT_CODE_SINGLE_ISSUE = 1
 EXIT_CODE_MULTI_ISSUE = 2
@@ -55,26 +64,34 @@ def _fail(issues: list[str]) -> int:
     return EXIT_CODE_MULTI_ISSUE
 
 
-def _parse_nixpacks_toml(path: Path) -> tuple[list[str] | None, str | None]:
-    """Return (providers, start_cmd) or raise on parse failure."""
+def _parse_nixpacks_toml(path: Path) -> tuple[list[str] | None, str | None, str | None]:
+    """Return (providers, start_cmd, nixpkgs_archive) or raise on parse failure."""
     text = path.read_text(encoding="utf-8").strip()
     if not text:
-        return None, None
+        return None, None, None
 
     providers = None
     start_cmd = None
+    nixpkgs_archive = None
 
-    in_start_section = False
+    current_section: str | None = None
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
 
-        if line.startswith("["):
-            in_start_section = line == "[start]"
+        sec_match = re.match(r"^\[(.+)\]$", line)
+        if sec_match:
+            current_section = sec_match.group(1)
             continue
 
-        if in_start_section:
+        if current_section == "phases.setup":
+            m = re.match(r"^nixpkgsArchive\s*=\s*\"(.+)\"$", line)
+            if m:
+                nixpkgs_archive = m.group(1)
+            continue
+
+        if current_section == "start":
             m = re.match(r'^cmd\s*=\s*"(.+)"$', line)
             if m:
                 start_cmd = m.group(1)
@@ -85,7 +102,7 @@ def _parse_nixpacks_toml(path: Path) -> tuple[list[str] | None, str | None]:
             providers = [p.strip().strip('"').strip("'") for p in m.group(1).split(",")]
             continue
 
-    return providers, start_cmd
+    return providers, start_cmd, nixpkgs_archive
 
 
 def validate() -> int:
@@ -109,14 +126,28 @@ def validate() -> int:
     nixpacks_path = ROOT / "nixpacks.toml"
     if nixpacks_path.is_file() and nixpacks_path.stat().st_size > 0:
         try:
-            providers, start_cmd = _parse_nixpacks_toml(nixpacks_path)
+            providers, start_cmd, nixpkgs_archive = _parse_nixpacks_toml(nixpacks_path)
         except Exception as exc:
-            providers, start_cmd = None, None
+            providers, start_cmd, nixpkgs_archive = None, None, None
             issues.append(f"nixpacks.toml unparseable: {exc}")
     else:
-        providers, start_cmd = None, None
+        providers, start_cmd, nixpkgs_archive = None, None, None
 
-    # -- 4. Providers --------------------------------------------------------------
+    # -- 4. [phases.setup] section ---------------------------------------------------
+    if nixpkgs_archive is None:
+        issues.append("nixpacks.toml: [phases.setup].nixpkgsArchive absent")
+    else:
+        if not HEX_ARCHIVE_RE.fullmatch(nixpkgs_archive):
+            issues.append(
+                "nixpacks.toml: nixpkgsArchive is not exactly 40 lowercase hex chars"
+            )
+        elif nixpkgs_archive != LOCKED_NIXPKGS_ARCHIVE:
+            issues.append(
+                f"nixpacks.toml: nixpkgsArchive does not match locked archive "
+                f"{LOCKED_NIXPKGS_ARCHIVE}"
+            )
+
+    # -- 5. Providers --------------------------------------------------------------
     if providers is None:
         issues.append("nixpacks.toml: providers absent")
     else:
@@ -129,7 +160,7 @@ def validate() -> int:
         if "node" in [p.lower() for p in providers]:
             issues.append("nixpacks.toml: Node provider present (forbidden)")
 
-    # -- 5. Start command ----------------------------------------------------------
+    # -- 6. Start command ----------------------------------------------------------
     if start_cmd is None:
         issues.append("nixpacks.toml: start command absent")
     elif start_cmd != LOCKED_START_CMD:
@@ -138,7 +169,7 @@ def validate() -> int:
             f'locked "{LOCKED_START_CMD}"'
         )
 
-    # -- 6. .python-version --------------------------------------------------------
+    # -- 7. .python-version --------------------------------------------------------
     pyver_path = ROOT / ".python-version"
     if pyver_path.is_file() and pyver_path.stat().st_size > 0:
         content = pyver_path.read_text(encoding="utf-8").strip()
@@ -149,7 +180,7 @@ def validate() -> int:
     else:
         issues.append(".python-version: missing or empty")
 
-    # -- 7. requirements.txt bound --------------------------------------------------
+    # -- 8. requirements.txt bound --------------------------------------------------
     req_path = ROOT / "requirements.txt"
     if req_path.is_file() and req_path.stat().st_size > 0:
         req_text = req_path.read_text(encoding="utf-8").strip()
@@ -158,7 +189,7 @@ def validate() -> int:
     else:
         issues.append("requirements.txt: missing or empty")
 
-    # -- 8. package.json preserved --------------------------------------------------
+    # -- 9. package.json preserved --------------------------------------------------
     pkg_path = ROOT / "package.json"
     if not pkg_path.is_file():
         issues.append("package.json: missing (allowed CI/local tooling file)")
