@@ -46,10 +46,29 @@ storage for generated artifact bytes:
 Database/BLOB artifact mode is local-UAT/synthetic evidence only. It must not
 satisfy hosted, protected, deploy, or production readiness.
 
+## Nixpacks Production Build Contract
+
+The `nixpacks.toml` file enforces an exact Python-only production build contract:
+
+- `providers = ["python"]` — Node is never a production provider.
+- Start command: `python webapp/server.py` (locked in `[start].cmd`).
+- Python version: `3.12.13` bound in `.python-version`.
+- Dependencies: `requirements.txt`.
+- The root `package.json` is preserved for local Playwright scripts, CI
+  smokes and `npm audit`; it must not cause Nixpacks to select Node.
+
+Validate the contract before deployment:
+
+```powershell
+python scripts\validate_nixpacks_python_contract.py
+python -m unittest tests.test_nixpacks_python_contract
+```
+
 ## Host Boundary
 
 This repo owns only the app-specific shape:
 
+- Build provider contract: `nixpacks.toml` and `.python-version`.
 - Start command: `python webapp/server.py`.
 - Health/readiness path: `/api/health`. It returns HTTP 200 only after the
   generator, required database schemas, and read-only object bucket probe pass;
