@@ -1,0 +1,7 @@
+providers = ["python"]
+
+[phases.setup]
+nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"
+
+[start]
+cmd = "python webapp/server.py"

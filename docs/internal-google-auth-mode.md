@@ -32,7 +32,7 @@ The internal lane uses Google authorization code flow with:
   `https://quote.swooshz.com/callback`, never the reverse-proxy request URL;
 - Google discovery metadata pinned to the exact issuer, authorization endpoint,
   token endpoint, HTTPS JWKS URI, `S256`, and `RS256`;
-- PyJWT 2.13.0 and cryptography 49.0.0 for maintained JWK, RSA signature, and
+- PyJWT 2.13.0 and cryptography 50.0.0 for maintained JWK, RSA signature, and
   issuer/audience/time/required-claim validation;
 - a fixed `RS256` allowlist, exact audience, exact issuer, bounded clock skew,
   exact nonce comparison, stable nonempty Google `sub`, `email_verified=true`,

@@ -37,9 +37,11 @@ TOP_LEVEL_KEYS = frozenset(
         "schema_acl",
         "tables",
         "column_privileges",
+        "views",
         "sequences",
         "routines",
         "default_privileges",
+        "boundary_b",
         "verification_queries",
     }
 )
@@ -137,6 +139,32 @@ ACCESSIBLE_TABLE_KEYS = frozenset({"class", "schema", "privileges"})
 FORBIDDEN_TABLE_KEYS = frozenset({"class", "schema", "reason"})
 PRIVILEGE_KEYS = frozenset({"select", "insert", "update", "delete"})
 
+VIEWS_KEYS = frozenset({"count", "runtime_accessible"})
+ACCESSIBLE_VIEW_KEYS = frozenset({"schema", "class", "privileges", "production_source", "bound"})
+VIEW_PRIVILEGE_KEYS = frozenset({"select"})
+
+BOUNDARY_B_KEYS = frozenset(
+    {
+        "requires_postgresql17",
+        "runtime_role",
+        "object_owner",
+        "database_owner_authority",
+        "authority_input_model",
+        "fail_closed",
+        "idempotent_rerun",
+        "operations",
+    }
+)
+BOUNDARY_B_OPERATION_KEYS = frozenset(
+    {
+        "database_acl_grant",
+        "schema_acl_grant",
+        "public_temporary_revoke",
+        "object_privilege_grants",
+        "public_trigger_execute_revoke",
+    }
+)
+
 SEQUENCE_KEYS = frozenset({"user_defined_public_count", "runtime_privileges", "rule"})
 ROUTINES_KEYS = frozenset(
     {"sqag_owned_triggers", "sqag_owned_count", "provider_owned_exceptions", "total_count", "rule"}
@@ -183,6 +211,7 @@ VERIFICATION_QUERY_KEYS = frozenset(
         "effective_runtime_column_privileges",
         "effective_runtime_schema_privileges",
         "effective_runtime_routine_privileges",
+        "view_acl",
     }
 )
 
@@ -366,6 +395,15 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
         where n.nspname = 'public'
         order by p.proname
     """,
+    "view_acl": """
+        select c.relname as view_name,
+               c.relacl as view_acl
+        from pg_catalog.pg_class c
+        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+        where c.relkind = 'v'
+          and n.nspname = 'public'
+        order by c.relname
+    """,
 }
 
 RUNTIME_TABLES = frozenset(
@@ -441,6 +479,22 @@ FORBIDDEN_TABLE_DETAILS = {
     ),
 }
 
+LEGACY_VIEWS = frozenset({"sqag_quote_artifacts"})
+LEGACY_VIEW_DETAILS = {
+    "sqag_quote_artifacts": (
+        "legacy_publication_backfill",
+        "webapp.server.DatabaseSqagStorage.publish_quote_session_forensic_transaction",
+    ),
+}
+
+BOUNDARY_B_OPERATION_AUTHORITY = {
+    "database_acl_grant": "database_owner_authority",
+    "schema_acl_grant": "database_owner_authority",
+    "public_temporary_revoke": "database_owner_authority",
+    "object_privilege_grants": "object_owner",
+    "public_trigger_execute_revoke": "object_owner",
+}
+
 ROLE_DESCRIPTIONS = {
     "runtime": "Restricted application runtime role. Dormant NOLOGIN during Boundary A/B. Activated with LOGIN in #160 only after independent verification.",
     "migrator": "Owner/operator authority. Owns all application database objects. Applies ACL changes. Cannot create roles.",
@@ -514,6 +568,7 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
     ),
     "effective_runtime_schema_privileges": ("has_schema_privilege", "'public'", "'usage'", "'create'"),
     "effective_runtime_routine_privileges": ("has_function_privilege", "pg_catalog.pg_proc", "'public'", "'execute'"),
+    "view_acl": ("pg_catalog.pg_class", "pg_catalog.pg_namespace", "relname", "relacl", "relkind", "'public'", "order by"),
 }
 
 
@@ -1016,6 +1071,74 @@ def validate_column_privileges(manifest: dict[str, Any], errors: list[str]) -> N
         "column_privileges_publication_artifacts_table_update",
         errors,
     )
+
+
+def validate_views(manifest: dict[str, Any], errors: list[str]) -> None:
+    views = manifest.get("views")
+    if not _exact_keys(views, VIEWS_KEYS, "views", errors):
+        if not isinstance(views, dict):
+            return
+    _exact_value(views.get("count"), 1, "view_count", errors)
+    accessible = views.get("runtime_accessible")
+    if not isinstance(accessible, dict):
+        _add_error(errors, "runtime_accessible_views_must_be_object")
+        return
+    actual = set(accessible)
+    if actual != LEGACY_VIEWS:
+        _add_error(
+            errors,
+            f"view_set_mismatch_extra_{sorted(actual - LEGACY_VIEWS)}_missing_{sorted(LEGACY_VIEWS - actual)}",
+        )
+    for view_name, entry in accessible.items():
+        label = f"accessible_view_{view_name}"
+        if not _exact_keys(entry, ACCESSIBLE_VIEW_KEYS, label, errors):
+            if not isinstance(entry, dict):
+                continue
+        expected_class, expected_source = LEGACY_VIEW_DETAILS.get(view_name, (None, None))
+        _exact_value(entry.get("schema"), "public", f"{label}_schema", errors)
+        _exact_value(entry.get("class"), expected_class, f"{label}_class", errors)
+        _exact_value(
+            entry.get("production_source"),
+            expected_source,
+            f"{label}_production_source",
+            errors,
+        )
+        _exact_value(entry.get("bound"), True, f"{label}_bound", errors)
+        privileges = entry.get("privileges")
+        if not _exact_keys(privileges, VIEW_PRIVILEGE_KEYS, f"{label}_privileges", errors):
+            if not isinstance(privileges, dict):
+                continue
+        _exact_value(privileges.get("select"), True, f"{label}_select", errors)
+
+
+def validate_boundary_b(manifest: dict[str, Any], errors: list[str]) -> None:
+    boundary = manifest.get("boundary_b")
+    if not _exact_keys(boundary, BOUNDARY_B_KEYS, "boundary_b", errors):
+        if not isinstance(boundary, dict):
+            return
+    _exact_value(boundary.get("requires_postgresql17"), True, "boundary_b_requires_postgresql17", errors)
+    _exact_value(boundary.get("runtime_role"), "sqag_runtime", "boundary_b_runtime_role", errors)
+    _exact_value(boundary.get("object_owner"), "sqag_migrator", "boundary_b_object_owner", errors)
+    _exact_value(
+        boundary.get("database_owner_authority"),
+        "database_owner",
+        "boundary_b_database_owner_authority",
+        errors,
+    )
+    _exact_value(
+        boundary.get("authority_input_model"),
+        "variable_reference_only",
+        "boundary_b_authority_input_model",
+        errors,
+    )
+    _exact_value(boundary.get("fail_closed"), True, "boundary_b_fail_closed", errors)
+    _exact_value(boundary.get("idempotent_rerun"), True, "boundary_b_idempotent_rerun", errors)
+    operations = boundary.get("operations")
+    if not _exact_keys(operations, BOUNDARY_B_OPERATION_KEYS, "boundary_b_operations", errors):
+        if not isinstance(operations, dict):
+            return
+    for operation, authority in BOUNDARY_B_OPERATION_AUTHORITY.items():
+        _exact_value(operations.get(operation), authority, f"boundary_b_{operation}", errors)
 
 
 def validate_sequences(manifest: dict[str, Any], errors: list[str]) -> None:
@@ -1752,11 +1875,13 @@ def validate_manifest_strictly(manifest_path: str) -> int:
     validate_production_migrations(manifest, errors)
     validate_table_matrix(manifest, errors)
     validate_column_privileges(manifest, errors)
+    validate_views(manifest, errors)
     validate_sequences(manifest, errors)
     validate_routines(manifest, errors)
     validate_database_acl(manifest, errors)
     validate_schema_acl(manifest, errors)
     validate_default_privileges(manifest, errors)
+    validate_boundary_b(manifest, errors)
     validate_verification_queries(manifest, errors)
 
     if errors:

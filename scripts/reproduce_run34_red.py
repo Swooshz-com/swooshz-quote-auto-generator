@@ -28,7 +28,7 @@ from typing import Any, Callable
 
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "retrospective" / "run34"
 MANIFEST_PATH = FIXTURE_ROOT / "manifest.json"
-MANIFEST_SHA256 = "2db053c00ca4ba6717c5ebe2a9e4366dbec71a6874bf9eb24a8bf32a3c41da53"
+MANIFEST_SHA256 = "0b9cb4740334fe15c93b645c22d3230dae03586f49783bd5f180225c9c6d78e1"
 MAX_OUTPUT_BYTES = 64 * 1024
 MAX_FIXTURE_FILE_BYTES = 2 * 1024 * 1024
 MAX_RECEIPT_BYTES = 8 * 1024
@@ -37,6 +37,13 @@ EXPECTED_INTERPRETER = "cpython"
 EXPECTED_PYTHON_VERSION = (3, 12, 13)
 RETROSPECTIVE_TIMING_MAX_SECONDS = 3600
 RETROSPECTIVE_TIMING_MAX_MICROS = RETROSPECTIVE_TIMING_MAX_SECONDS * 1_000_000
+
+EXPECTED_ATTRIBUTION = {
+    "provider": "OpenAI",
+    "model": "GPT-5.6 Sol",
+    "reasoning": "High",
+}
+MAX_ATTRIBUTION_FIELD_LENGTH = 64
 
 EXPECTED_TEST_SELECTION = (
     "tests.test_runtime_privilege_contract.RuntimeMembershipEdgeEvaluatorTest.test_unrelated_parent_to_sqag_migrator_is_rejected",
@@ -88,6 +95,7 @@ RECEIPT_ERROR_CODES = frozenset(
         "child_start_failed",
         "child_stream_mismatch",
         "child_output_decode_failed",
+        "child_reap_failed",
         "cleanup_failed",
         "cleanup_remnant",
         "dependency_definition_digest_mismatch",
@@ -422,11 +430,24 @@ def _validate_fixture(package_root: Path = FIXTURE_ROOT) -> dict[str, Any]:
         "historical_source_revision",
         "canonical_parent",
         "canonical_replacement_head",
+        "attribution",
         "retrospective",
         "original_red_chronology",
         "original_development_sequence",
     }:
         raise FixtureError("provenance_schema_mismatch")
+    attribution = provenance["attribution"]
+    if type(attribution) is not dict or set(attribution) != set(EXPECTED_ATTRIBUTION):
+        raise FixtureError("provenance_schema_mismatch")
+    if any(
+        type(attribution[key]) is not str
+        or not attribution[key].strip()
+        or len(attribution[key]) > MAX_ATTRIBUTION_FIELD_LENGTH
+        for key in EXPECTED_ATTRIBUTION
+    ):
+        raise FixtureError("provenance_schema_mismatch")
+    if attribution != EXPECTED_ATTRIBUTION:
+        raise FixtureError("provenance_value_mismatch")
     if (
         type(provenance["historical_source_revision"]) is not str
         or type(provenance["canonical_parent"]) is not str
@@ -661,27 +682,39 @@ def _drain(stream: Any, collector: _OutputCollector) -> None:
         stream.close()
 
 
+_TERMINATE_WAIT_SECONDS = 1.0
+_KILL_WAIT_SECONDS = 5.0
+_FINAL_WAIT_SECONDS = 1.0
+
+
 def _kill_process(process: subprocess.Popen[bytes]) -> None:
     try:
         process.terminate()
     except OSError:
         pass
     try:
-        process.wait(timeout=1)
+        process.wait(timeout=_TERMINATE_WAIT_SECONDS)
         return
     except (OSError, subprocess.TimeoutExpired):
-        try:
-            process.kill()
-        except OSError:
-            pass
-        try:
-            process.wait(timeout=5)
-        except (OSError, subprocess.TimeoutExpired):
-            try:
-                process.kill()
-            except OSError:
-                pass
-            process.wait()
+        pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=_KILL_WAIT_SECONDS)
+        return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=_FINAL_WAIT_SECONDS)
+        return
+    except (OSError, subprocess.TimeoutExpired):
+        raise FixtureError("child_reap_failed") from None
 
 
 def _child_environment() -> dict[str, str]:
@@ -742,7 +775,10 @@ def _execute_child(
         return subprocess.CompletedProcess(command, process.returncode, bytes(stdout.data), bytes(stderr.data))
     finally:
         if process.poll() is None:
-            _kill_process(process)
+            try:
+                _kill_process(process)
+            except FixtureError:
+                pass
         _join_reader_threads(reader_threads)
 
 

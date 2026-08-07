@@ -104,8 +104,10 @@ authority is the manifest's exact column grant on `checksum_sha256`; all other
 columns remain denied, no grant option is allowed, and PUBLIC or membership
 authority must not supply table-level UPDATE.
 
-The direct runtime grant total remains exactly 37: 34 table grants, one column
-grant, one database grant, and one schema grant.
+The direct runtime grant total remains exactly 38: 34 table grants, one column
+grant, one database grant, one schema grant, and one legacy-view grant. The
+legacy-view grant is the `SELECT` read on `public.sqag_quote_artifacts` that the
+publication-backfill path requires under the runtime identity.
 
 ### Runtime-forbidden (5 tables)
 
@@ -116,6 +118,33 @@ grant, one database grant, and one schema grant.
 | `sqag_deletion_receipts` | retention_only |
 | `sqag_retention_scan_cursors` | retention_only |
 | `sqag_schema_migrations` | migration_only |
+
+## Legacy publication-backfill view read
+
+When a database-backed quote session predates its publication-version row,
+`DatabaseSqagStorage.publish_quote_session_forensic_transaction` executes the
+publication backfill `INSERT ... SELECT ... FROM sqag_quote_artifacts`
+(`webapp/server.py`) under the restricted runtime role. That legacy relation is
+not a production migration table; it is read directly by the application path
+and therefore carries one bounded runtime authority.
+
+The manifest records it under `views.runtime_accessible` as the single closed
+inventory entry:
+
+- **Relation**: `public.sqag_quote_artifacts`
+- **Class**: `legacy_publication_backfill`
+- **Privilege**: `SELECT` only
+- **Production source**: `webapp.server.DatabaseSqagStorage.publish_quote_session_forensic_transaction`
+- **Bound**: true
+
+The direct runtime view authority is exactly one `SELECT` grant. No write
+authority, ownership, grant option, sequence, or routine authority is granted
+through this change. The canonical `view_acl` verification query enumerates
+every `public` schema view (`relkind = 'v'`) with its raw ACL; the disposable
+suite proves that the prescribed `SELECT` is effective, that any unrelated
+legacy or application view is denied, and that a revoked read restores the
+expected `42501` failure under the runtime identity. Denial of every other
+legacy or application relation is preserved by the closed view inventory.
 
 ## Provider-owned routine exception
 
@@ -196,7 +225,7 @@ edge, different identity or grantor, mutated option, recursive path, protected
 SQAG/provider role, unknown classification, missing field, duplicate edge, or
 membership-derived effective privilege fails closed.
 
-The manifest and validator bind exactly thirteen canonical verification-query
+The manifest and validator bind exactly fourteen canonical verification-query
 keys. Each key has an independent repository-owned executable-token contract;
 candidate manifest text cannot redefine its expected query. The PostgreSQL
 integration contract executes every key once, checks the exact returned column
@@ -254,6 +283,7 @@ live-system evidence.
 | `effective_runtime_column_privileges` | `schema_name`, `table_name`, `column_name`, `privilege_type`, `effective`, `is_grantable` | fixture columns x 4 |
 | `effective_runtime_schema_privileges` | `privilege_type`, `effective`, `is_grantable` | 2 |
 | `effective_runtime_routine_privileges` | `routine_name`, `effective` | 2 |
+| `view_acl` | `view_name`, `view_acl` | 0 in the generic shape fixture; 1 when the legacy view fixture is present |
 
 The effective database proof covers `CONNECT`, `CREATE`, and `TEMPORARY`; the
 locked runtime result is `true/false/false`, with all three grantable flags
@@ -342,7 +372,7 @@ the exact eight-column projection
 `proname, identity_arguments, prokind, prosecdef, proacl, proowner, owner,
 has_trigger_dependency`, the complete public-schema routine boundary, and
 deterministic identity-argument ordering. The PostgreSQL query-shape evidence
-executes all thirteen canonical queries, asserts the exact returned column
+executes all fourteen canonical queries, asserts the exact returned column
 names, and applies the documented cardinality rules.
 
 The remaining effective queries have the same exact-token binding. In
@@ -472,11 +502,11 @@ The deterministic discovery receipt for this amendment is:
 
 | Receipt item | Count |
 |---|---:|
-| Discovered test methods | 161 |
-| Static and validator methods | 104 |
-| PostgreSQL methods | 53 |
+| Discovered test methods | 178 |
+| Static and validator methods | 116 |
+| PostgreSQL methods | 58 |
 | Requirement-map and documentation parity methods | 4 |
-| Hosted executions | 161 |
+| Hosted executions | 178 |
 | Hosted skips | 0 |
 | Unique locked requirement IDs | 38 (`R01`-`R38`) |
 
@@ -500,18 +530,34 @@ Boundary A performs no live database, provider, Coolify, credential, or deployme
 
 ## Staged multi-authority Boundary B sequence
 
-Boundary B is not one atomic cross-authority operation because role creation and object grants use different authorities:
+Boundary B is not one atomic cross-authority operation because role creation,
+owner authority, and object grants use different authorities. The manifest
+`boundary_b` block records the exact split and requires PostgreSQL 17 and an
+exact target database/runtime identity before any disposable mutation. The
+owner authority is modelled by the role-reference variable
+`database_owner_authority` only; no credential, password, URI, or account
+value is ever stored or exposed:
 
 1. **Read-only preflight** and baseline snapshot.
 2. **Provider authority** creates `sqag_runtime` as dormant `NOLOGIN`, password null.
-3. **Object owner** (`sqag_migrator`) grants exact database, schema, and 11-table privileges.
-4. **Object owner** revokes `PUBLIC TEMPORARY`.
-5. **Object owner** revokes `PUBLIC EXECUTE` on the two SQAG-owned trigger functions.
-6. **Metadata and effective-privilege verification** runs.
-7. **Independent exact-state review** accepts or rejects the result.
-8. Stop with `sqag_runtime` still `NOLOGIN`, no password, and no credential.
+3. **Database owner authority** (`database_owner_authority`, the database and
+   `public`-schema owner) grants the runtime database `CONNECT` and schema
+   `USAGE`. `sqag_migrator` cannot perform these operations because it owns the
+   application objects but not the database or `public` schema, and its
+   database/schema privileges carry no grant option.
+4. **Object owner** (`sqag_migrator`) grants the exact 11-table privileges, the
+   publication-artifact column grant, and the legacy-view `SELECT` read it owns.
+5. **Database owner authority** revokes `PUBLIC TEMPORARY`; a role-specific
+   revoke is insufficient because the PUBLIC grant overrides it.
+6. **Object owner** revokes `PUBLIC EXECUTE` on the two SQAG-owned trigger functions.
+7. **Metadata and effective-privilege verification** runs.
+8. **Independent exact-state review** accepts or rejects the result.
+9. Stop with `sqag_runtime` still `NOLOGIN`, no password, and no credential.
 
-On failure, compensate in reverse order.
+Every stage fails closed when the owner authority is absent, wrong-role,
+wrong-database, or insufficiently granted; no mutation begins in that case.
+Reruns are idempotent, and on failure the sequence compensates in reverse
+order while preserving the original runtime role OID.
 
 ## Rollback limitations
 

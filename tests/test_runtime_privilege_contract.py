@@ -1,11 +1,11 @@
 """Runtime privilege contract tests.
 
 Deterministic discovery receipt for this amendment:
-  discovered methods: 161
-  static and validator methods: 104
-  PostgreSQL methods: 53
+  discovered methods: 178
+  static and validator methods: 116
+  PostgreSQL methods: 58
   requirement-map and documentation parity methods: 4
-  hosted executions: 161
+  hosted executions: 178
   hosted skips: 0
   unique locked requirement IDs: 38 (R01-R38)
 
@@ -96,6 +96,7 @@ CANONICAL_QUERY_KEYS = (
     "effective_runtime_column_privileges",
     "effective_runtime_schema_privileges",
     "effective_runtime_routine_privileges",
+    "view_acl",
 )
 CANONICAL_QUERY_COLUMNS = {
     "database_acl": ["datacl"],
@@ -151,6 +152,7 @@ CANONICAL_QUERY_COLUMNS = {
     ],
     "effective_runtime_schema_privileges": ["privilege_type", "effective", "is_grantable"],
     "effective_runtime_routine_privileges": ["routine_name", "effective"],
+    "view_acl": ["view_name", "view_acl"],
 }
 DEFAULT_ACL_SNAPSHOT_SQL = """
 select owner_role.rolname as owner_name,
@@ -364,7 +366,7 @@ class ManifestStructureTest(unittest.TestCase):
         }
         self.assertEqual(actual, LOCKED_PRIVILEGE_MATRIX)
 
-    def test_direct_runtime_grant_total_is_exactly_37(self) -> None:
+    def test_runtime_direct_grant_total_is_exactly_38(self) -> None:
         table_grants = sum(
             privilege is True
             for table in self.manifest["tables"]["runtime_accessible"].values()
@@ -383,11 +385,54 @@ class ManifestStructureTest(unittest.TestCase):
             privilege is True
             for privilege in self.manifest["schema_acl"]["sqag_runtime"].values()
         )
-        self.assertEqual(
-            (table_grants, column_grants, database_grants, schema_grants),
-            (34, 1, 1, 1),
+        view_grants = sum(
+            privilege is True
+            for view in self.manifest["views"]["runtime_accessible"].values()
+            for privilege in view["privileges"].values()
         )
-        self.assertEqual(table_grants + column_grants + database_grants + schema_grants, 37)
+        self.assertEqual(
+            (table_grants, column_grants, database_grants, schema_grants, view_grants),
+            (34, 1, 1, 1, 1),
+        )
+        self.assertEqual(table_grants + column_grants + database_grants + schema_grants + view_grants, 38)
+
+    def test_legacy_view_inventory_is_exact(self) -> None:
+        views = self.manifest["views"]
+        self.assertEqual(views["count"], 1)
+        self.assertEqual(set(views["runtime_accessible"]), {"sqag_quote_artifacts"})
+        entry = views["runtime_accessible"]["sqag_quote_artifacts"]
+        self.assertEqual(entry["schema"], "public")
+        self.assertEqual(entry["class"], "legacy_publication_backfill")
+        self.assertEqual(entry["privileges"], {"select": True})
+        self.assertIs(entry["bound"], True)
+        self.assertEqual(
+            entry["production_source"],
+            "webapp.server.DatabaseSqagStorage.publish_quote_session_forensic_transaction",
+        )
+
+    def test_publication_backfill_reads_legacy_view_under_runtime_identity(self) -> None:
+        source = inspect.getsource(DatabaseSqagStorage.publish_quote_session_forensic_transaction)
+        self.assertIn(
+            "from sqag_quote_artifacts where workspace_id = ? and session_id = ?",
+            source,
+        )
+        self.assertIn('configured_artifact_storage_mode() == "database"', source)
+
+    def test_boundary_b_authority_model_is_exact(self) -> None:
+        boundary = self.manifest["boundary_b"]
+        self.assertTrue(boundary["requires_postgresql17"])
+        self.assertEqual(boundary["runtime_role"], "sqag_runtime")
+        self.assertEqual(boundary["object_owner"], "sqag_migrator")
+        self.assertEqual(boundary["database_owner_authority"], "database_owner")
+        self.assertEqual(boundary["authority_input_model"], "variable_reference_only")
+        self.assertIs(boundary["fail_closed"], True)
+        self.assertIs(boundary["idempotent_rerun"], True)
+        operations = boundary["operations"]
+        self.assertEqual(operations["database_acl_grant"], "database_owner_authority")
+        self.assertEqual(operations["schema_acl_grant"], "database_owner_authority")
+        self.assertEqual(operations["public_temporary_revoke"], "database_owner_authority")
+        self.assertEqual(operations["object_privilege_grants"], "object_owner")
+        self.assertEqual(operations["public_trigger_execute_revoke"], "object_owner")
 
     def test_publication_artifact_column_update_is_exact(self) -> None:
         self.assertEqual(
@@ -640,6 +685,62 @@ class ValidatorStaticTest(unittest.TestCase):
             query,
             "verification_query_role_attributes_password_state_must_be_boolean_null_assertion",
         )
+
+    def test_missing_legacy_view_fails_closed(self) -> None:
+        def mutate(manifest: dict[str, Any]) -> None:
+            manifest["views"]["runtime_accessible"].pop("sqag_quote_artifacts")
+
+        self._assert_fixture_rejected(json.dumps(self._mutated_fixture(mutate)), "view_set_mismatch")
+
+    def test_extra_legacy_view_fails_closed(self) -> None:
+        def mutate(manifest: dict[str, Any]) -> None:
+            manifest["views"]["runtime_accessible"]["sqag_file_artifacts"] = {
+                "schema": "public",
+                "class": "legacy_publication_backfill",
+                "privileges": {"select": True},
+                "production_source": "webapp.server.DatabaseSqagStorage.publish_quote_session_forensic_transaction",
+                "bound": True,
+            }
+
+        self._assert_fixture_rejected(json.dumps(self._mutated_fixture(mutate)), "view_set_mismatch")
+
+    def test_view_write_authority_fails_closed(self) -> None:
+        def mutate(manifest: dict[str, Any]) -> None:
+            manifest["views"]["runtime_accessible"]["sqag_quote_artifacts"]["privileges"].update({"insert": True})
+
+        self._assert_fixture_rejected(
+            json.dumps(self._mutated_fixture(mutate)),
+            "accessible_view_sqag_quote_artifacts_privileges_unknown_keys",
+        )
+
+    def test_view_grant_option_fails_closed(self) -> None:
+        def mutate(manifest: dict[str, Any]) -> None:
+            manifest["views"]["runtime_accessible"]["sqag_quote_artifacts"].update({"grant_option": True})
+
+        self._assert_fixture_rejected(
+            json.dumps(self._mutated_fixture(mutate)),
+            "accessible_view_sqag_quote_artifacts_unknown_keys",
+        )
+
+    def test_view_acl_query_must_enumerate_public_views(self) -> None:
+        query = load_manifest()["verification_queries"]["view_acl"].replace("'v'", "'r'", 1)
+        self._assert_query_fixture_rejected(
+            "view_acl",
+            query,
+            "verification_query_view_acl_executable_structure_mismatch",
+        )
+
+    def test_boundary_b_wrong_authority_fails_closed(self) -> None:
+        def mutate(manifest: dict[str, Any]) -> None:
+            manifest["boundary_b"]["operations"].update({"database_acl_grant": "object_owner"})
+
+        self._assert_fixture_rejected(json.dumps(self._mutated_fixture(mutate)), "boundary_b_database_acl_grant_invalid")
+
+    def test_boundary_b_missing_authority_model_fails_closed(self) -> None:
+        def mutate(manifest: dict[str, Any]) -> None:
+            del manifest["boundary_b"]["authority_input_model"]
+
+        self._assert_fixture_rejected(json.dumps(self._mutated_fixture(mutate)), "boundary_b_missing_keys")
 
     def _assert_query_fixture_rejected(self, query_key: str, query: str, expected_error: str) -> None:
         manifest = self._mutated_fixture(lambda m: m["verification_queries"].update({query_key: query}))
@@ -965,6 +1066,24 @@ class ValidatorStaticTest(unittest.TestCase):
         )
         for mutation in mutations:
             self._assert_exact_query_rejected("role_memberships", mutation)
+
+    def test_view_acl_query_key_is_mandatory_and_cannot_be_skipped(self) -> None:
+        def mutate(manifest: dict[str, Any]) -> None:
+            manifest["verification_queries"].pop("view_acl")
+
+        self._assert_fixture_rejected(
+            json.dumps(self._mutated_fixture(mutate)),
+            "verification_queries_missing_keys",
+        )
+
+    def test_verification_query_malformed_value_fails_closed(self) -> None:
+        manifest = self._mutated_fixture(
+            lambda m: m["verification_queries"].update({"view_acl": ["not", "a", "query"]})
+        )
+        self._assert_fixture_rejected(
+            json.dumps(manifest),
+            "verification_query_view_acl_must_be_non_empty_string",
+        )
 
     def test_effective_privilege_query_contracts_bind_every_privilege_and_grant_option(self) -> None:
         manifest = load_manifest()
@@ -1351,7 +1470,7 @@ class RequirementEvidenceMapTest(unittest.TestCase):
         self.assertIn("- name: Validate runtime privilege contract", workflow)
         self.assertIn("run: python scripts/validate_runtime_privilege_contract.py", workflow)
         self.assertIn("Runtime privilege-contract static validation", documentation)
-        self.assertIn("Disposable PostgreSQL 17 runtime privilege-contract tests exercise the thirteen canonical query keys", documentation)
+        self.assertIn("Disposable PostgreSQL 17 runtime privilege-contract tests exercise the fourteen canonical query keys", documentation)
         self.assertIn("creator-admin control edge with ADMIN true, INHERIT false, and SET false", documentation)
         self.assertIn("Boundary A remains repository-only", documentation)
         self.assertIn("Green CI does not authorise Boundary B or #160", documentation)
@@ -2464,6 +2583,299 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self._assert_exact_runtime_column_matrix(role_name)
 
+    def _session_user(self) -> str:
+        connection = self.connect()
+        try:
+            row = connection.execute("select session_user as name").fetchone()
+            return str(_row_dict(row, "name"))
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def _current_user(self, role_name: str) -> str:
+        with self.as_role(role_name) as connection:
+            row = connection.execute("select current_user as name").fetchone()
+            return str(_row_dict(row, "name"))
+
+    def _role_attribute_row(self, role_name: str) -> dict[str, Any]:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "select r.rolname, r.rolsuper, r.rolinherit, r.rolcreaterole, r.rolcreatedb, "
+                "r.rolcanlogin, r.rolreplication, r.rolbypassrls, r.rolconnlimit "
+                "from pg_catalog.pg_roles r where r.rolname = %s",
+                (role_name,),
+            ).fetchone()
+            return dict(row) if row is not None else {}
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def _database_owner(self, database_name: str | None = None) -> str:
+        connection = self.psycopg.connect(
+            postgres_test_conninfo(database_name or self.database_name),
+            row_factory=self.dict_row,
+        )
+        try:
+            row = connection.execute(
+                "select r.rolname as owner from pg_catalog.pg_database d "
+                "join pg_catalog.pg_roles r on r.oid = d.datdba where d.datname = current_database()"
+            ).fetchone()
+            return str(_row_dict(row, "owner"))
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def _schema_owner(self) -> str:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "select r.rolname as owner from pg_catalog.pg_namespace n "
+                "join pg_catalog.pg_roles r on r.oid = n.nspowner where n.nspname = 'public'"
+            ).fetchone()
+            return str(_row_dict(row, "owner"))
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def _table_owner(self, table_name: str) -> str:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "select r.rolname as owner from pg_catalog.pg_class c "
+                "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+                "join pg_catalog.pg_roles r on r.oid = c.relowner "
+                "where n.nspname = 'public' and c.relname = %s",
+                (table_name,),
+            ).fetchone()
+            return str(_row_dict(row, "owner"))
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def _is_role_member(self, member: str, parent: str) -> bool:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "select exists (select 1 from pg_catalog.pg_auth_members am "
+                "join pg_catalog.pg_roles m on m.oid = am.member "
+                "join pg_catalog.pg_roles p on p.oid = am.roleid "
+                "where m.rolname = %s and p.rolname = %s) as present",
+                (member, parent),
+            ).fetchone()
+            return bool(_row_dict(row, "present"))
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def _raw_database_acl_entry(
+        self, grantee: str, privilege: str, database_name: str | None = None
+    ) -> bool | None:
+        connection = self.psycopg.connect(
+            postgres_test_conninfo(database_name or self.database_name),
+            row_factory=self.dict_row,
+        )
+        try:
+            row = connection.execute(
+                "select expanded.is_grantable from pg_catalog.pg_database d "
+                "cross join lateral pg_catalog.aclexplode("
+                "coalesce(d.datacl, pg_catalog.acldefault('d', d.datdba))) expanded "
+                "left join pg_catalog.pg_roles grantee_role on grantee_role.oid = expanded.grantee "
+                "where d.datname = current_database() "
+                "and case when expanded.grantee = 0 then 'PUBLIC' "
+                "else coalesce(grantee_role.rolname, 'OID:' || expanded.grantee::text) end = %s "
+                "and expanded.privilege_type = %s",
+                (grantee, privilege),
+            ).fetchone()
+            return bool(_row_dict(row, "is_grantable")) if row is not None else None
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def _raw_schema_acl_entry(self, grantee: str, privilege: str) -> bool | None:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "select expanded.is_grantable from pg_catalog.pg_namespace n "
+                "cross join lateral pg_catalog.aclexplode("
+                "coalesce(n.nspacl, pg_catalog.acldefault('n', n.nspowner))) expanded "
+                "left join pg_catalog.pg_roles grantee_role on grantee_role.oid = expanded.grantee "
+                "where n.nspname = 'public' "
+                "and case when expanded.grantee = 0 then 'PUBLIC' "
+                "else coalesce(grantee_role.rolname, 'OID:' || expanded.grantee::text) end = %s "
+                "and expanded.privilege_type = %s",
+                (grantee, privilege),
+            ).fetchone()
+            return bool(_row_dict(row, "is_grantable")) if row is not None else None
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def _drop_extra_database(self, database_name: str) -> None:
+        with self.psycopg.connect(postgres_test_conninfo(), autocommit=True) as connection:
+            connection.execute(
+                "select pg_catalog.pg_terminate_backend(pid) from pg_catalog.pg_stat_activity "
+                "where datname = %s and pid <> pg_catalog.pg_backend_pid()",
+                (database_name,),
+            )
+            connection.execute(f"drop database if exists {_quote_identifier(database_name)}")
+        type(self)._seen_databases.discard(database_name)
+
+    def _grant_view_privilege(
+        self,
+        role_name: str,
+        view_name: str,
+        privilege: str,
+        *,
+        with_grant_option: bool = False,
+    ) -> None:
+        option = " with grant option" if with_grant_option else ""
+        connection = self.connect()
+        try:
+            connection.execute(
+                f"grant {privilege} on table {_quote_identifier(view_name)} "
+                f"to {_quote_identifier(role_name)}{option}"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        self.addCleanup(self._revoke_view_privilege, role_name, view_name, privilege)
+
+    def _revoke_view_privilege(self, role_name: str, view_name: str, privilege: str) -> None:
+        self._cleanup_steps(
+            [
+                (
+                    f"revoke_view_{view_name}_{privilege}",
+                    f"revoke {privilege} on table {_quote_identifier(view_name)} from {_quote_identifier(role_name)}",
+                )
+            ]
+        )
+
+    def _grant_manifest_view_authority(self, role_name: str) -> None:
+        for view_name, entry in self.contract["views"]["runtime_accessible"].items():
+            for privilege, allowed in entry["privileges"].items():
+                if allowed:
+                    self._grant_view_privilege(role_name, view_name, privilege.upper())
+
+    def _create_legacy_quote_artifacts_view(self) -> str:
+        table_name = f"legacy_quote_artifacts_{uuid.uuid4().hex[:8]}"
+        self.addCleanup(
+            self._cleanup_steps,
+            [
+                ("drop_run55_legacy_quote_view", "drop view if exists public.sqag_quote_artifacts"),
+                ("drop_run55_legacy_quote_table", f"drop table if exists public.{_quote_identifier(table_name)}"),
+            ],
+        )
+        connection = self.connect()
+        try:
+            connection.execute("set role \"sqag_migrator\"")
+            connection.execute(
+                f"create table public.{_quote_identifier(table_name)} ("
+                "workspace_id text not null, session_id text not null, artifact_kind text not null, "
+                "filename text not null, content_type text not null, size_bytes bigint not null, "
+                "content_blob bytea not null, created_at text not null, updated_at text not null)"
+            )
+            connection.execute(
+                "create view public.sqag_quote_artifacts as "
+                f"select workspace_id, session_id, artifact_kind, filename, content_type, size_bytes, "
+                f"content_blob, created_at, updated_at from public.{_quote_identifier(table_name)}"
+            )
+            connection.execute("reset role")
+            connection.commit()
+        finally:
+            connection.close()
+        return table_name
+
+    def _public_view_names(self) -> set[str]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "select c.relname as view_name from pg_catalog.pg_class c "
+                "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+                "where n.nspname = 'public' and c.relkind = 'v' order by c.relname"
+            ).fetchall()
+            return {str(_row_dict(row, "view_name")) for row in rows}
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def _view_owner(self, view_name: str) -> str:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "select r.rolname as owner from pg_catalog.pg_class c "
+                "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+                "join pg_catalog.pg_roles r on r.oid = c.relowner "
+                "where n.nspname = 'public' and c.relkind = 'v' and c.relname = %s",
+                (view_name,),
+            ).fetchone()
+            return str(_row_dict(row, "owner"))
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def _exact_view_acl_entries(self, view_name: str) -> set[tuple[str, str, bool]]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "select case when expanded.grantee = 0 then 'PUBLIC' "
+                "else coalesce(grantee_role.rolname, 'OID:' || expanded.grantee::text) end as grantee, "
+                "expanded.privilege_type, expanded.is_grantable "
+                "from pg_catalog.pg_class c "
+                "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+                "cross join lateral pg_catalog.aclexplode("
+                "coalesce(c.relacl, pg_catalog.acldefault('r', c.relowner))) expanded "
+                "left join pg_catalog.pg_roles grantee_role on grantee_role.oid = expanded.grantee "
+                "where n.nspname = 'public' and c.relkind = 'v' and c.relname = %s "
+                "order by grantee, expanded.privilege_type",
+                (view_name,),
+            ).fetchall()
+            return {
+                (str(row["grantee"]), str(row["privilege_type"]), bool(row["is_grantable"]))
+                for row in rows
+            }
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def _expected_exact_view_acl(self, view_owner: str, role_name: str) -> set[tuple[str, str, bool]]:
+        expected: set[tuple[str, str, bool]] = set()
+        for privilege in TABLE_PRIVILEGES:
+            expected.add((view_owner, privilege, False))
+        for view_name, entry in self.contract["views"]["runtime_accessible"].items():
+            for privilege, allowed in entry["privileges"].items():
+                if allowed:
+                    expected.add((role_name, privilege.upper(), False))
+        return expected
+
+    def _assert_exact_runtime_view_grants(self, role_name: str) -> None:
+        view_name = "sqag_quote_artifacts"
+        self.assertEqual(
+            self._public_view_names(),
+            set(self.contract["views"]["runtime_accessible"]),
+            "public view inventory must remain closed",
+        )
+        view_owner = self._view_owner(view_name)
+        actual = self._exact_view_acl_entries(view_name)
+        expected = self._expected_exact_view_acl(view_owner, role_name)
+        self.assertEqual(actual, expected, f"exact view ACL provenance mismatch for {view_name}")
+        self.assertFalse(any(entry[2] for entry in actual), f"view grant options found: {actual}")
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "select c.relname as view_name from pg_catalog.pg_class c "
+                "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+                "cross join lateral pg_catalog.aclexplode(c.relacl) expanded "
+                "where n.nspname = 'public' and c.relkind = 'v' "
+                "and expanded.grantee = (select oid from pg_catalog.pg_roles where rolname = %s)",
+                (role_name,),
+            ).fetchall()
+            granted_views = {str(_row_dict(row, "view_name")) for row in rows}
+        finally:
+            connection.rollback()
+            connection.close()
+        self.assertEqual(granted_views, {view_name}, f"unrelated view authority detected: {granted_views}")
+
     def test_actual_table_inventory_equals_manifest(self) -> None:
         self.apply_migrations()
         connection = self.connect()
@@ -2508,6 +2920,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             "effective_runtime_column_privileges": sum(len(columns) for columns in self._user_columns().values()) * len(COLUMN_PRIVILEGES),
             "effective_runtime_schema_privileges": 2,
             "effective_runtime_routine_privileges": 2,
+            "view_acl": 0,
         }
         executed: list[str] = []
         results: dict[str, tuple[list[str], list[dict[str, Any]]]] = {}
@@ -2517,7 +2930,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             results[query_key] = self._execute_contract_query(query_key)
 
         self.assertEqual(executed, list(CANONICAL_QUERY_KEYS))
-        self.assertEqual(len(executed), 13)
+        self.assertEqual(len(executed), 14)
         self.assertEqual(set(executed), set(self.contract["verification_queries"]))
         for query_key in CANONICAL_QUERY_KEYS:
             columns, rows = results[query_key]
@@ -2901,8 +3314,23 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
 
     def test_canonical_query_shape_contract_is_independent_and_complete(self) -> None:
         self.assertEqual(tuple(CANONICAL_QUERY_COLUMNS), CANONICAL_QUERY_KEYS)
+        manifest_keys = tuple(self.contract["verification_queries"])
+        self.assertEqual(manifest_keys, CANONICAL_QUERY_KEYS)
         self.assertEqual(set(CANONICAL_QUERY_KEYS), set(self.contract["verification_queries"]))
-        self.assertEqual(len(CANONICAL_QUERY_KEYS), 13)
+        self.assertEqual(len(CANONICAL_QUERY_KEYS), 14)
+        self.assertEqual(len(set(CANONICAL_QUERY_KEYS)), 14)
+        self.assertEqual(len(self.contract["verification_queries"]), 14)
+        self.assertEqual(len(set(self.contract["verification_queries"])), 14)
+        self.assertIn("view_acl", CANONICAL_QUERY_KEYS)
+        for query_key in CANONICAL_QUERY_KEYS:
+            self.assertIn(query_key, CANONICAL_QUERY_COLUMNS)
+            query = self.contract["verification_queries"][query_key]
+            self.assertIsInstance(query, str)
+            self.assertTrue(query.strip())
+        for index in range(1, len(CANONICAL_QUERY_KEYS)):
+            reordered = CANONICAL_QUERY_KEYS[index:] + CANONICAL_QUERY_KEYS[:index]
+            self.assertEqual(set(reordered), set(CANONICAL_QUERY_KEYS))
+            self.assertNotEqual(tuple(reordered), CANONICAL_QUERY_KEYS)
 
     def test_actual_routine_inventory_has_no_stock_provider_exception(self) -> None:
         runtime_name = self._new_role("routine_inventory")
@@ -3243,9 +3671,6 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 f"grant usage on schema {_quote_identifier(compatibility_schema)} to \"sqag_runtime\""
             )
             connection.execute(
-                "grant select on table public.sqag_quote_artifacts to \"sqag_runtime\""
-            )
-            connection.execute(
                 f"insert into public.{_quote_identifier(legacy_table)} "
                 "(workspace_id, session_id, artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at) "
                 "values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -3258,6 +3683,8 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             connection.commit()
         finally:
             connection.close()
+
+        self._grant_manifest_view_authority("sqag_runtime")
 
         connection = self.connect()
         try:
@@ -3407,6 +3834,289 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.assertTrue(self._has_table_privilege("sqag_runtime", target_table, "UPDATE"))
         with self.assertRaises(AssertionError):
             self._assert_exact_runtime_matrix("sqag_runtime")
+        self._assert_exact_runtime_view_grants("sqag_runtime")
+
+    def test_legacy_view_runtime_read_is_prescribed_and_verified(self) -> None:
+        self.apply_migrations()
+        self._create_legacy_quote_artifacts_view()
+        self._grant_manifest_view_authority("sqag_runtime")
+        self._assert_exact_runtime_view_grants("sqag_runtime")
+        self.assertTrue(self._has_table_privilege("sqag_runtime", "sqag_quote_artifacts", "SELECT"))
+        self.assertFalse(
+            self._has_table_privilege("sqag_runtime", "sqag_quote_artifacts", "SELECT WITH GRANT OPTION")
+        )
+        with self.as_role("sqag_runtime") as runtime_connection:
+            runtime_connection.execute("select * from public.sqag_quote_artifacts limit 0")
+            runtime_connection.commit()
+        columns, rows = self._execute_contract_query("view_acl")
+        self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["view_acl"])
+        self.assertEqual({str(row["view_name"]) for row in rows}, {"sqag_quote_artifacts"})
+        for privilege in ("INSERT", "UPDATE", "DELETE"):
+            self.assertFalse(self._has_table_privilege("sqag_runtime", "sqag_quote_artifacts", privilege))
+        self._execute_admin_sql("grant select on table public.sqag_quote_artifacts to public")
+        try:
+            self.assertTrue(self._has_table_privilege("sqag_runtime", "sqag_quote_artifacts", "SELECT"))
+            with self.assertRaises(AssertionError):
+                self._assert_exact_runtime_view_grants("sqag_runtime")
+        finally:
+            self._execute_admin_sql("revoke select on table public.sqag_quote_artifacts from public")
+        self._assert_exact_runtime_view_grants("sqag_runtime")
+
+        membership_parent = self._new_role("legacy_view_parent")
+        self._grant_role_membership(membership_parent, "sqag_runtime")
+        self._grant_view_privilege(membership_parent, "sqag_quote_artifacts", "SELECT")
+        self.assertTrue(self._has_table_privilege("sqag_runtime", "sqag_quote_artifacts", "SELECT"))
+        with self.assertRaises(AssertionError):
+            self._assert_exact_runtime_view_grants("sqag_runtime")
+
+    def test_legacy_view_revocation_restores_expected_failure(self) -> None:
+        self.apply_migrations()
+        self._create_legacy_quote_artifacts_view()
+        self._grant_manifest_view_authority("sqag_runtime")
+        with self.as_role("sqag_runtime") as runtime_connection:
+            runtime_connection.execute("select * from public.sqag_quote_artifacts limit 0")
+            runtime_connection.commit()
+        self._execute_admin_sql("revoke select on table public.sqag_quote_artifacts from \"sqag_runtime\"")
+        with self.as_role("sqag_runtime") as runtime_connection:
+            try:
+                runtime_connection.execute("select * from public.sqag_quote_artifacts limit 0")
+                runtime_connection.commit()
+            except Exception as exc:
+                runtime_connection.rollback()
+                self.assertEqual(getattr(exc, "sqlstate", None), "42501")
+            else:
+                self.fail("view read unexpectedly succeeded after revoke")
+
+    def test_unrelated_legacy_view_authority_is_denied(self) -> None:
+        self.apply_migrations()
+        self._create_legacy_quote_artifacts_view()
+        unrelated = "sqag_file_artifacts"
+        self.addCleanup(
+            self._cleanup_steps,
+            [("drop_run55_unrelated_view", f"drop view if exists public.{_quote_identifier(unrelated)}")],
+        )
+        connection = self.connect()
+        try:
+            connection.execute("set role \"sqag_migrator\"")
+            connection.execute(f"create view public.{_quote_identifier(unrelated)} as select 1 as marker")
+            connection.execute("reset role")
+            connection.commit()
+        finally:
+            connection.close()
+        self.assertFalse(self._has_table_privilege("sqag_runtime", unrelated, "SELECT"))
+        self._grant_view_privilege("sqag_runtime", unrelated, "SELECT")
+        self.assertTrue(self._has_table_privilege("sqag_runtime", unrelated, "SELECT"))
+        with self.assertRaises(AssertionError):
+            self._assert_exact_runtime_view_grants("sqag_runtime")
+
+    def test_legacy_view_write_authority_is_rejected(self) -> None:
+        self.apply_migrations()
+        self._create_legacy_quote_artifacts_view()
+        self._grant_manifest_view_authority("sqag_runtime")
+        self._assert_exact_runtime_view_grants("sqag_runtime")
+        self._grant_view_privilege("sqag_runtime", "sqag_quote_artifacts", "INSERT")
+        self.assertTrue(self._has_table_privilege("sqag_runtime", "sqag_quote_artifacts", "INSERT"))
+        with self.assertRaises(AssertionError):
+            self._assert_exact_runtime_view_grants("sqag_runtime")
+        self._revoke_view_privilege("sqag_runtime", "sqag_quote_artifacts", "INSERT")
+        self._grant_view_privilege("sqag_runtime", "sqag_quote_artifacts", "SELECT", with_grant_option=True)
+        self.assertTrue(
+            self._has_table_privilege("sqag_runtime", "sqag_quote_artifacts", "SELECT WITH GRANT OPTION")
+        )
+        with self.assertRaises(AssertionError):
+            self._assert_exact_runtime_view_grants("sqag_runtime")
+
+    def test_boundary_b_owner_authority_is_required_and_exact(self) -> None:
+        self.apply_migrations()
+        runtime_name = "sqag_runtime"
+        migrator_name = "sqag_migrator"
+        bootstrap_identity = self._session_user()
+        owner_name = self._new_role("boundary_b_owner")
+        unrelated_name = self._new_role("boundary_b_unrelated")
+        self.addCleanup(
+            self._cleanup_steps,
+            [
+                (
+                    "restore_database_owner",
+                    f"alter database {_quote_identifier(self.database_name)} owner to {_quote_identifier(bootstrap_identity)}",
+                )
+            ],
+        )
+
+        # 1. Session/bootstrap identity and the active current_user under every SET ROLE boundary.
+        self.assertNotIn(bootstrap_identity, {runtime_name, migrator_name, owner_name, unrelated_name})
+        for role_name in (migrator_name, runtime_name, owner_name, unrelated_name):
+            self.assertEqual(self._current_user(role_name), role_name, role_name)
+
+        # 2. Exact role attributes for every boundary identity; none is superuser.
+        for role_name in (migrator_name, runtime_name, owner_name, unrelated_name):
+            attrs = self._role_attribute_row(role_name)
+            self.assertEqual(attrs["rolname"], role_name)
+            self.assertIs(attrs["rolsuper"], False)
+            self.assertIs(attrs["rolcreatedb"], False)
+            self.assertIs(attrs["rolcreaterole"], False)
+            self.assertIs(attrs["rolreplication"], False)
+            self.assertIs(attrs["rolbypassrls"], False)
+            self.assertIs(attrs["rolcanlogin"], False)
+            self.assertIs(attrs["rolinherit"], True)
+            self.assertEqual(attrs["rolconnlimit"], -1)
+
+        # 3. The database-owner authority owns the exact disposable database.
+        self.assertEqual(self._database_owner(), bootstrap_identity)
+        self._execute_admin_sql(
+            f"alter database {_quote_identifier(self.database_name)} owner to {_quote_identifier(owner_name)}"
+        )
+        self.assertEqual(self._database_owner(), owner_name)
+
+        # 4. The public schema is owned by pg_database_owner, which resolves to the exact database owner.
+        self.assertEqual(self._schema_owner(), "pg_database_owner")
+        self.assertEqual(self._database_owner(), owner_name)
+
+        # 5. The migrator has no database/schema ownership, no membership in the
+        #    database-owner authority, and no hidden membership source.
+        self.assertNotEqual(self._database_owner(), migrator_name)
+        self.assertNotEqual(self._schema_owner(), migrator_name)
+        self.assertFalse(self._is_role_member(migrator_name, owner_name))
+        self.assertFalse(self._is_role_member(migrator_name, "pg_database_owner"))
+        self.assertFalse(self._is_role_member(runtime_name, owner_name))
+        self.assertFalse(self._is_role_member(unrelated_name, owner_name))
+        self.assertEqual(self._runtime_like_memberships(self._membership_snapshot()), ())
+
+        # 6. The migrator and the unrelated role hold no direct grant option on the
+        #    database or schema that could satisfy the owner-only operations.
+        for role_name in (migrator_name, unrelated_name):
+            self.assertFalse(self._has_database_privilege(role_name, "CONNECT WITH GRANT OPTION"))
+            self.assertFalse(self._has_database_privilege(role_name, "CREATE WITH GRANT OPTION"))
+            self.assertFalse(self._has_database_privilege(role_name, "TEMPORARY WITH GRANT OPTION"))
+            self.assertFalse(self._has_schema_privilege(role_name, "USAGE WITH GRANT OPTION"))
+            self.assertFalse(self._has_schema_privilege(role_name, "CREATE WITH GRANT OPTION"))
+
+        # 7. sqag_runtime starts with no direct database CONNECT or schema USAGE ACL entry.
+        self.assertIsNone(self._raw_database_acl_entry(runtime_name, "CONNECT"))
+        self.assertIsNone(self._raw_schema_acl_entry(runtime_name, "USAGE"))
+
+        owner_only_sql = (
+            f"grant connect on database {_quote_identifier(self.database_name)} to \"sqag_runtime\"",
+            "grant usage on schema public to \"sqag_runtime\"",
+            f"revoke temporary on database {_quote_identifier(self.database_name)} from public",
+        )
+
+        # 8. The migrator cannot perform the owner-only operations. PostgreSQL 17
+        #    applies the documented no-op-with-warning GRANT/REVOKE denial for
+        #    database/schema ACL statements from a non-owner without a grant option,
+        #    so the denial is proven by the exact absence of effect on the raw ACL
+        #    rather than by a SQLSTATE that PostgreSQL does not raise for these
+        #    object classes.
+        for sql in owner_only_sql:
+            with self.as_role(migrator_name) as migrator_connection:
+                migrator_connection.execute(sql)
+                migrator_connection.commit()
+            self.assertIsNone(self._raw_database_acl_entry(runtime_name, "CONNECT"), sql)
+            self.assertIsNone(self._raw_schema_acl_entry(runtime_name, "USAGE"), sql)
+            self.assertTrue(self._has_database_privilege("public", "TEMPORARY"), sql)
+
+        # 9. An unrelated negative role cannot perform them either.
+        for sql in owner_only_sql:
+            with self.as_role(unrelated_name) as unrelated_connection:
+                unrelated_connection.execute(sql)
+                unrelated_connection.commit()
+            self.assertIsNone(self._raw_database_acl_entry(runtime_name, "CONNECT"), sql)
+            self.assertIsNone(self._raw_schema_acl_entry(runtime_name, "USAGE"), sql)
+            self.assertTrue(self._has_database_privilege("public", "TEMPORARY"), sql)
+
+        # 10. The exact database-owner authority performs the owner-only operations
+        #     and they take effect without any grant option.
+        with self.as_role(owner_name) as owner_connection:
+            owner_connection.execute(
+                f"grant connect on database {_quote_identifier(self.database_name)} to \"sqag_runtime\""
+            )
+            owner_connection.execute("grant usage on schema public to \"sqag_runtime\"")
+            owner_connection.execute(
+                f"revoke temporary on database {_quote_identifier(self.database_name)} from public"
+            )
+            owner_connection.commit()
+        self.addCleanup(
+            self._restore_public_database_privilege,
+            "TEMPORARY",
+            self._public_database_baseline["TEMPORARY"],
+        )
+        self.assertIs(self._raw_database_acl_entry(runtime_name, "CONNECT"), False)
+        self.assertIs(self._raw_schema_acl_entry(runtime_name, "USAGE"), False)
+        self.assertTrue(self._has_database_privilege(runtime_name, "CONNECT"))
+        self.assertTrue(self._has_schema_privilege(runtime_name, "USAGE"))
+        self.assertFalse(self._has_database_privilege("public", "TEMPORARY"))
+        self.assertFalse(self._has_database_privilege(runtime_name, "TEMPORARY"))
+
+        # 11. An unrelated role with database CONNECT but no owner authority still cannot grant.
+        wrong_owner = self._new_role("boundary_b_wrong_owner")
+        self._grant_database_privilege(wrong_owner, "CONNECT")
+        with self.as_role(wrong_owner) as wrong_connection:
+            wrong_connection.execute(
+                f"grant connect on database {_quote_identifier(self.database_name)} to \"sqag_runtime\""
+            )
+            wrong_connection.commit()
+        self.assertIs(self._raw_database_acl_entry(runtime_name, "CONNECT"), False)
+
+        # 12. The same database owner cannot grant authority on a different database it does not own.
+        other_database = self._create_database()
+        self.addCleanup(self._drop_extra_database, other_database)
+        with self.as_role(owner_name) as owner_connection:
+            owner_connection.execute(
+                f"grant connect on database {_quote_identifier(other_database)} to \"sqag_runtime\""
+            )
+            owner_connection.commit()
+        self.assertIsNone(self._raw_database_acl_entry(runtime_name, "CONNECT", other_database))
+
+        # 13. Object-level grants remain the correct object owner's (sqag_migrator) work, and an
+        #     unrelated role with no table privilege is denied with SQLSTATE 42501.
+        self.assertEqual(self._table_owner("sqag_profiles"), migrator_name)
+        with self.as_role(migrator_name) as migrator_connection:
+            migrator_connection.execute("grant select on table public.sqag_profiles to \"sqag_runtime\"")
+            migrator_connection.commit()
+        self.assertTrue(self._has_table_privilege(runtime_name, "sqag_profiles", "SELECT"))
+        with self.as_role(unrelated_name) as unrelated_connection:
+            try:
+                unrelated_connection.execute("grant select on table public.sqag_profiles to \"sqag_runtime\"")
+                unrelated_connection.commit()
+            except Exception as exc:
+                unrelated_connection.rollback()
+                self.assertEqual(getattr(exc, "sqlstate", None), "42501")
+            else:
+                self.fail("unrelated role unexpectedly granted an object-level table privilege")
+
+        # 14. Idempotent rerun succeeds and leaves the exact state unchanged.
+        with self.as_role(owner_name) as owner_connection:
+            owner_connection.execute(
+                f"grant connect on database {_quote_identifier(self.database_name)} to \"sqag_runtime\""
+            )
+            owner_connection.execute(
+                f"revoke temporary on database {_quote_identifier(self.database_name)} from public"
+            )
+            owner_connection.commit()
+        self.assertTrue(self._has_database_privilege(runtime_name, "CONNECT"))
+        self.assertFalse(self._has_database_privilege("public", "TEMPORARY"))
+        self.assertIs(self._raw_database_acl_entry(runtime_name, "CONNECT"), False)
+
+        # 15. Exact final runtime state: no grant options, no memberships, no default ACL drift.
+        self.assertEqual(
+            self._effective_database_privileges(runtime_name),
+            {("CONNECT", True, False), ("CREATE", False, False), ("TEMPORARY", False, False)},
+        )
+        self.assertEqual(
+            self._effective_schema_privileges(runtime_name),
+            {("USAGE", True, False), ("CREATE", False, False)},
+        )
+        self.assertEqual(self._runtime_like_memberships(self._membership_snapshot()), ())
+        self.assertEqual(self._default_acl_snapshot(), set())
+
+        # 16. Cleanup restores the exact captured PUBLIC baseline.
+        self._restore_public_database_privilege(
+            "TEMPORARY", self._public_database_baseline["TEMPORARY"]
+        )
+        self.assertIs(
+            self._has_database_privilege("public", "TEMPORARY"),
+            self._public_database_baseline["TEMPORARY"],
+        )
 
     def test_effective_runtime_matrix_missing_privilege_is_rejected(self) -> None:
         role_name = self._new_exact_matrix_role("matrix_missing")
