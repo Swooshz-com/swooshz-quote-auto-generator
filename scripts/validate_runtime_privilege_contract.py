@@ -139,9 +139,25 @@ ACCESSIBLE_TABLE_KEYS = frozenset({"class", "schema", "privileges"})
 FORBIDDEN_TABLE_KEYS = frozenset({"class", "schema", "reason"})
 PRIVILEGE_KEYS = frozenset({"select", "insert", "update", "delete"})
 
-VIEWS_KEYS = frozenset({"count", "runtime_accessible"})
+VIEWS_KEYS = frozenset({"count", "runtime_accessible", "legacy_optional", "materialized_view_rule"})
 ACCESSIBLE_VIEW_KEYS = frozenset({"schema", "class", "privileges", "production_source", "bound"})
 VIEW_PRIVILEGE_KEYS = frozenset({"select"})
+VIEW_AUTHORITY_ROW_KEYS = frozenset(
+    {
+        "relation_name",
+        "relation_kind",
+        "owner",
+        "relation_acl",
+        "runtime_select",
+        "runtime_select_grantable",
+    }
+)
+
+MATERIALIZED_VIEW_RULE = (
+    "No public materialized view is classified. Any public materialized view fails "
+    "closed: none may be owned by, effectively readable by, or grantable to "
+    "sqag_runtime, and the later live preflight must classify any before activation."
+)
 
 BOUNDARY_B_KEYS = frozenset(
     {
@@ -396,13 +412,22 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
         order by p.proname
     """,
     "view_acl": """
-        select c.relname as view_name,
-               c.relacl as view_acl
+        select c.relname as relation_name,
+               c.relkind as relation_kind,
+               r.rolname as owner,
+               c.relacl::text as relation_acl,
+               has_table_privilege('sqag_runtime', c.oid, 'SELECT') as runtime_select,
+               has_table_privilege(
+                   'sqag_runtime',
+                   c.oid,
+                   'SELECT WITH GRANT OPTION'
+               ) as runtime_select_grantable
         from pg_catalog.pg_class c
         join pg_catalog.pg_namespace n on n.oid = c.relnamespace
-        where c.relkind = 'v'
-          and n.nspname = 'public'
-        order by c.relname
+        join pg_catalog.pg_roles r on r.oid = c.relowner
+        where n.nspname = 'public'
+          and c.relkind in ('v', 'm')
+        order by c.relkind, c.relname
     """,
 }
 
@@ -568,7 +593,22 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
     ),
     "effective_runtime_schema_privileges": ("has_schema_privilege", "'public'", "'usage'", "'create'"),
     "effective_runtime_routine_privileges": ("has_function_privilege", "pg_catalog.pg_proc", "'public'", "'execute'"),
-    "view_acl": ("pg_catalog.pg_class", "pg_catalog.pg_namespace", "relname", "relacl", "relkind", "'public'", "order by"),
+    "view_acl": (
+        "pg_catalog.pg_class",
+        "pg_catalog.pg_namespace",
+        "pg_catalog.pg_roles",
+        "relname",
+        "relkind",
+        "relacl",
+        "'public'",
+        "'sqag_runtime'",
+        "'v'",
+        "'m'",
+        "has_table_privilege",
+        "runtime_select",
+        "runtime_select_grantable",
+        "order by",
+    ),
 }
 
 
@@ -1079,6 +1119,13 @@ def validate_views(manifest: dict[str, Any], errors: list[str]) -> None:
         if not isinstance(views, dict):
             return
     _exact_value(views.get("count"), 1, "view_count", errors)
+    _exact_value(views.get("legacy_optional"), True, "views_legacy_optional", errors)
+    _exact_value(
+        views.get("materialized_view_rule"),
+        MATERIALIZED_VIEW_RULE,
+        "views_materialized_view_rule",
+        errors,
+    )
     accessible = views.get("runtime_accessible")
     if not isinstance(accessible, dict):
         _add_error(errors, "runtime_accessible_views_must_be_object")
@@ -1109,6 +1156,95 @@ def validate_views(manifest: dict[str, Any], errors: list[str]) -> None:
             if not isinstance(privileges, dict):
                 continue
         _exact_value(privileges.get("select"), True, f"{label}_select", errors)
+
+
+def evaluate_view_authority(
+    manifest: dict[str, Any],
+    rows: list[dict[str, Any]],
+    *,
+    runtime_role: str = "sqag_runtime",
+) -> tuple[str, ...]:
+    """Evaluate the complete relation/view verification result without filtering rows.
+
+    Consumes the rows returned by the canonical `view_acl` query (relation name,
+    relation kind, owner, raw ACL, effective runtime SELECT, and SELECT grant
+    option). Every `public` ordinary view and materialized view is classified:
+    no relation may be owned by the runtime role, no materialized view may exist
+    unclassified (the locked contract authorises none), and ordinary-view
+    runtime authority is accepted only for the exact legacy-optional classified
+    entry with bounded SELECT and no grant option. Absent legacy-optional
+    relations are valid on a fresh canonical production-migration database.
+    """
+
+    errors: list[str] = []
+    if type(rows) is not list:
+        return ("relation_view_rows_must_be_list",)
+
+    views = manifest.get("views") if isinstance(manifest, dict) else None
+    accessible = views.get("runtime_accessible") if isinstance(views, dict) else None
+    if not isinstance(accessible, dict):
+        return ("runtime_accessible_views_must_be_object",)
+    classified = set(accessible)
+
+    legacy_rows: list[dict[str, Any]] = []
+    seen_rows: set[tuple[str, str, str, bool, bool]] = set()
+    for index, row in enumerate(rows):
+        label = f"relation_view_row_{index}"
+        if not isinstance(row, dict):
+            _add_error(errors, f"{label}_must_be_object")
+            continue
+        if not _exact_keys(row, VIEW_AUTHORITY_ROW_KEYS, label, errors):
+            continue
+        for key in ("relation_name", "relation_kind", "owner"):
+            _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
+        for key in ("runtime_select", "runtime_select_grantable"):
+            _require_type(row.get(key), bool, f"{label}_{key}", errors)
+        relation_acl = row.get("relation_acl")
+        if relation_acl is not None and type(relation_acl) is not str:
+            _add_error(errors, f"{label}_relation_acl_must_be_string_or_null")
+        if any(
+            type(row.get(key)) is not str for key in ("relation_name", "relation_kind", "owner")
+        ) or any(type(row.get(key)) is not bool for key in ("runtime_select", "runtime_select_grantable")):
+            continue
+
+        name = str(row["relation_name"])
+        kind = str(row["relation_kind"])
+        owner = str(row["owner"])
+        runtime_select = bool(row["runtime_select"])
+        grantable = bool(row["runtime_select_grantable"])
+        row_tuple = (name, kind, owner, runtime_select, grantable)
+        if row_tuple in seen_rows:
+            _add_error(errors, f"{label}_duplicate_relation_view_row")
+        seen_rows.add(row_tuple)
+
+        if owner == runtime_role:
+            _add_error(errors, f"{label}_runtime_relation_ownership_forbidden")
+        if kind not in ("v", "m"):
+            _add_error(errors, f"{label}_unknown_relation_kind_{kind}")
+            continue
+        if kind == "m":
+            _add_error(errors, f"{label}_materialized_view_unclassified")
+            if runtime_select:
+                _add_error(errors, f"{label}_materialized_view_runtime_select_forbidden")
+            if grantable:
+                _add_error(errors, f"{label}_materialized_view_runtime_grant_option_forbidden")
+            continue
+        if name in classified:
+            legacy_rows.append(row)
+            if not runtime_select:
+                _add_error(errors, f"{label}_classified_view_missing_bounded_select")
+            if grantable:
+                _add_error(errors, f"{label}_classified_view_grant_option_forbidden")
+            if kind != "v":
+                _add_error(errors, f"{label}_classified_view_must_be_ordinary_view")
+        elif runtime_select or grantable:
+            _add_error(errors, f"{label}_unclassified_ordinary_view_runtime_authority")
+
+    if len(legacy_rows) > 1:
+        names = {str(row["relation_name"]) for row in legacy_rows}
+        _add_error(errors, f"classified_relation_view_rows_must_be_at_most_one_{sorted(names)}")
+
+    return tuple(errors)
 
 
 def validate_boundary_b(manifest: dict[str, Any], errors: list[str]) -> None:

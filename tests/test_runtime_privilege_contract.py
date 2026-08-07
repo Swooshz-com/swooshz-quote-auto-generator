@@ -1,11 +1,11 @@
 """Runtime privilege contract tests.
 
 Deterministic discovery receipt for this amendment:
-  discovered methods: 178
-  static and validator methods: 116
-  PostgreSQL methods: 58
+  discovered methods: 202
+  static and validator methods: 133
+  PostgreSQL methods: 65
   requirement-map and documentation parity methods: 4
-  hosted executions: 178
+  hosted executions: 202
   hosted skips: 0
   unique locked requirement IDs: 38 (R01-R38)
 
@@ -152,7 +152,14 @@ CANONICAL_QUERY_COLUMNS = {
     ],
     "effective_runtime_schema_privileges": ["privilege_type", "effective", "is_grantable"],
     "effective_runtime_routine_privileges": ["routine_name", "effective"],
-    "view_acl": ["view_name", "view_acl"],
+    "view_acl": [
+        "relation_name",
+        "relation_kind",
+        "owner",
+        "relation_acl",
+        "runtime_select",
+        "runtime_select_grantable",
+    ],
 }
 DEFAULT_ACL_SNAPSHOT_SQL = """
 select owner_role.rolname as owner_name,
@@ -399,6 +406,9 @@ class ManifestStructureTest(unittest.TestCase):
     def test_legacy_view_inventory_is_exact(self) -> None:
         views = self.manifest["views"]
         self.assertEqual(views["count"], 1)
+        self.assertIs(views["legacy_optional"], True)
+        self.assertIn("No public materialized view is classified", views["materialized_view_rule"])
+        self.assertIn("fails closed", views["materialized_view_rule"])
         self.assertEqual(set(views["runtime_accessible"]), {"sqag_quote_artifacts"})
         entry = views["runtime_accessible"]["sqag_quote_artifacts"]
         self.assertEqual(entry["schema"], "public")
@@ -722,13 +732,59 @@ class ValidatorStaticTest(unittest.TestCase):
             "accessible_view_sqag_quote_artifacts_unknown_keys",
         )
 
-    def test_view_acl_query_must_enumerate_public_views(self) -> None:
-        query = load_manifest()["verification_queries"]["view_acl"].replace("'v'", "'r'", 1)
-        self._assert_query_fixture_rejected(
-            "view_acl",
-            query,
-            "verification_query_view_acl_executable_structure_mismatch",
+    def test_missing_legacy_optional_marker_fails_closed(self) -> None:
+        def mutate(manifest: dict[str, Any]) -> None:
+            del manifest["views"]["legacy_optional"]
+
+        self._assert_fixture_rejected(
+            json.dumps(self._mutated_fixture(mutate)),
+            "views_missing_keys",
         )
+
+    def test_materialized_view_rule_mutation_fails_closed(self) -> None:
+        def mutate(manifest: dict[str, Any]) -> None:
+            manifest["views"]["materialized_view_rule"] = "materialized views are permitted"
+
+        self._assert_fixture_rejected(
+            json.dumps(self._mutated_fixture(mutate)),
+            "views_materialized_view_rule_invalid",
+        )
+
+    def test_view_acl_query_must_enumerate_public_views(self) -> None:
+        canonical = load_manifest()["verification_queries"]["view_acl"]
+        for mutation in (
+            canonical.replace("('v', 'm')", "('v')", 1),
+            canonical.replace("('v', 'm')", "('r', 'm')", 1),
+        ):
+            self._assert_query_fixture_rejected(
+                "view_acl",
+                mutation,
+                "verification_query_view_acl_executable_structure_mismatch",
+            )
+
+    def test_view_acl_query_must_expose_runtime_select_and_grant_option(self) -> None:
+        canonical = load_manifest()["verification_queries"]["view_acl"]
+        for replaced, replacement in (
+            ("runtime_select", "runtime_missing"),
+            ("runtime_select_grantable", "grantable_missing"),
+        ):
+            self._assert_query_fixture_rejected(
+                "view_acl",
+                canonical.replace(replaced, replacement, 1),
+                "verification_query_view_acl_executable_structure_mismatch",
+            )
+
+    def test_view_acl_query_must_expose_relation_kind_and_owner(self) -> None:
+        canonical = load_manifest()["verification_queries"]["view_acl"]
+        for replaced, replacement in (
+            ("relation_kind", "kind_missing"),
+            ("owner", "owner_missing"),
+        ):
+            self._assert_query_fixture_rejected(
+                "view_acl",
+                canonical.replace(replaced, replacement, 1),
+                "verification_query_view_acl_executable_structure_mismatch",
+            )
 
     def test_boundary_b_wrong_authority_fails_closed(self) -> None:
         def mutate(manifest: dict[str, Any]) -> None:
@@ -1440,6 +1496,165 @@ class RuntimeMembershipEdgeEvaluatorTest(unittest.TestCase):
         mixed_errors = evaluate([mixed])
         self.assertIn("role_membership_row_0_role_must_be_non_empty_string", mixed_errors)
         self.assertIn("role_membership_row_0_admin_option_must_be_bool", mixed_errors)
+
+class ViewAuthorityEvaluatorTest(unittest.TestCase):
+    """Evaluator regressions for the closed ordinary/materialized view contract.
+
+    The canonical relation/view query must enumerate every `public` ordinary
+    view (`relkind='v'`) and materialized view (`relkind='m'`). The evaluator
+    must fail closed on materialized-view runtime authority, unclassified
+    ordinary-view runtime authority, runtime ownership, grant options, and any
+    posture outside the locked contract. The classified legacy view is
+    optional: absent on a fresh canonical production-migration database, and
+    when present it must be an ordinary view with exactly bounded SELECT.
+    """
+
+    def setUp(self) -> None:
+        self.manifest = load_manifest()
+
+    @staticmethod
+    def _view_row(
+        name: str,
+        *,
+        kind: str = "v",
+        owner: str = "sqag_migrator",
+        relation_acl: str | None = None,
+        runtime_select: bool = False,
+        runtime_select_grantable: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "relation_name": name,
+            "relation_kind": kind,
+            "owner": owner,
+            "relation_acl": relation_acl,
+            "runtime_select": runtime_select,
+            "runtime_select_grantable": runtime_select_grantable,
+        }
+
+    def _errors(self, rows: list[dict[str, Any]]) -> tuple[str, ...]:
+        return contract_validator.evaluate_view_authority(self.manifest, rows)
+
+    def _assert_rejected(self, rows: list[dict[str, Any]], expected_fragment: str) -> None:
+        errors = self._errors(rows)
+        self.assertTrue(
+            any(expected_fragment in error for error in errors),
+            f"missing {expected_fragment!r} in {errors!r}",
+        )
+
+    def test_fresh_migration_database_without_legacy_view_is_valid(self) -> None:
+        self.assertEqual(self._errors([]), ())
+
+    def test_legacy_ordinary_view_with_bounded_select_is_accepted(self) -> None:
+        self.assertEqual(
+            self._errors(
+                [
+                    self._view_row(
+                        "sqag_quote_artifacts",
+                        kind="v",
+                        runtime_select=True,
+                    )
+                ]
+            ),
+            (),
+        )
+
+    def test_materialized_view_effective_select_is_rejected(self) -> None:
+        self._assert_rejected(
+            [self._view_row("sqag_mat_view", kind="m", runtime_select=True)],
+            "materialized_view",
+        )
+
+    def test_materialized_view_runtime_ownership_is_rejected(self) -> None:
+        self._assert_rejected(
+            [self._view_row("sqag_mat_view", kind="m", owner="sqag_runtime")],
+            "materialized_view",
+        )
+
+    def test_materialized_view_runtime_grant_option_is_rejected(self) -> None:
+        self._assert_rejected(
+            [self._view_row("sqag_mat_view", kind="m", runtime_select_grantable=True)],
+            "materialized_view",
+        )
+
+    def test_legacy_relation_as_materialized_view_is_rejected(self) -> None:
+        self._assert_rejected(
+            [
+                self._view_row(
+                    "sqag_quote_artifacts",
+                    kind="m",
+                    runtime_select=True,
+                )
+            ],
+            "materialized_view",
+        )
+
+    def test_legacy_view_grant_option_drift_is_rejected(self) -> None:
+        self._assert_rejected(
+            [
+                self._view_row(
+                    "sqag_quote_artifacts",
+                    kind="v",
+                    runtime_select=True,
+                    runtime_select_grantable=True,
+                )
+            ],
+            "grant_option",
+        )
+
+    def test_legacy_view_ownership_drift_is_rejected(self) -> None:
+        self._assert_rejected(
+            [
+                self._view_row(
+                    "sqag_quote_artifacts",
+                    kind="v",
+                    owner="sqag_runtime",
+                    runtime_select=True,
+                )
+            ],
+            "runtime_relation_ownership",
+        )
+
+    def test_unclassified_ordinary_view_authority_is_rejected(self) -> None:
+        self._assert_rejected(
+            [self._view_row("sqag_file_artifacts", kind="v", runtime_select=True)],
+            "unclassified_ordinary_view",
+        )
+
+    def test_unrelated_ordinary_view_without_runtime_authority_is_outside_contract(self) -> None:
+        self.assertEqual(
+            self._errors([self._view_row("sqag_file_artifacts", kind="v")]),
+            (),
+        )
+
+    def test_unknown_relation_kind_fails_closed(self) -> None:
+        self._assert_rejected([self._view_row("sqag_strange", kind="r")], "unknown_relation_kind")
+
+    def test_malformed_rows_fail_closed(self) -> None:
+        def expect_category(rows: Any, category: str) -> None:
+            with self.subTest(category=category):
+                errors = contract_validator.evaluate_view_authority(
+                    self.manifest,
+                    cast(list[dict[str, Any]], rows),
+                )
+                self.assertIn(category, errors)
+
+        expect_category(None, "relation_view_rows_must_be_list")
+        expect_category("synthetic", "relation_view_rows_must_be_list")
+        expect_category({"row": self._view_row("sqag_quote_artifacts")}, "relation_view_rows_must_be_list")
+        expect_category(["synthetic"], "relation_view_row_0_must_be_object")
+        row = self._view_row("sqag_quote_artifacts")
+        for key in ("relation_name", "relation_kind", "owner", "relation_acl", "runtime_select", "runtime_select_grantable"):
+            missing = copy.deepcopy(row)
+            missing.pop(key)
+            expect_category([missing], f"relation_view_row_0_missing_keys: {key}")
+        unexpected = copy.deepcopy(row)
+        unexpected["extra"] = True
+        expect_category([unexpected], "relation_view_row_0_unknown_keys: extra")
+
+    def test_duplicate_relation_view_rows_fail_closed(self) -> None:
+        row = self._view_row("sqag_quote_artifacts", runtime_select=True)
+        self._assert_rejected([row, copy.deepcopy(row)], "duplicate_relation_view_row")
+
 
 class RequirementEvidenceMapTest(unittest.TestCase):
     def test_requirement_evidence_map_is_exact_and_discoverable(self) -> None:
@@ -2787,17 +3002,65 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         return table_name
 
     def _public_view_names(self) -> set[str]:
+        return self._public_relation_names(("v", "m"))
+
+    def _public_relation_names(self, kinds: tuple[str, ...]) -> set[str]:
         connection = self.connect()
         try:
             rows = connection.execute(
-                "select c.relname as view_name from pg_catalog.pg_class c "
+                "select c.relname as relation_name from pg_catalog.pg_class c "
                 "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
-                "where n.nspname = 'public' and c.relkind = 'v' order by c.relname"
+                "where n.nspname = 'public' and c.relkind = any(%s) order by c.relname",
+                (list(kinds),),
             ).fetchall()
-            return {str(_row_dict(row, "view_name")) for row in rows}
+            return {str(_row_dict(row, "relation_name")) for row in rows}
         finally:
             connection.rollback()
             connection.close()
+
+    def _relation_kind(self, relation_name: str) -> str:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "select c.relkind as kind from pg_catalog.pg_class c "
+                "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+                "where n.nspname = 'public' and c.relname = %s",
+                (relation_name,),
+            ).fetchone()
+            return str(_row_dict(row, "kind")) if row is not None else ""
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def _create_materialized_view(self, view_name: str) -> None:
+        connection = self.connect()
+        try:
+            connection.execute("set role \"sqag_migrator\"")
+            connection.execute(
+                f"create materialized view public.{_quote_identifier(view_name)} as "
+                "select 1 as marker"
+            )
+            connection.execute("reset role")
+            connection.commit()
+        finally:
+            connection.close()
+        self.addCleanup(
+            self._cleanup_steps,
+            [
+                (
+                    f"drop_mat_view_{view_name}",
+                    f"drop materialized view if exists public.{_quote_identifier(view_name)}",
+                )
+            ],
+        )
+
+    def _evaluate_view_authority_rows(self) -> tuple[str, ...]:
+        columns, rows = self._execute_contract_query("view_acl")
+        self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["view_acl"])
+        return contract_validator.evaluate_view_authority(
+            self.contract,
+            [dict(row) for row in rows],
+        )
 
     def _view_owner(self, view_name: str) -> str:
         connection = self.connect()
@@ -2806,7 +3069,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 "select r.rolname as owner from pg_catalog.pg_class c "
                 "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
                 "join pg_catalog.pg_roles r on r.oid = c.relowner "
-                "where n.nspname = 'public' and c.relkind = 'v' and c.relname = %s",
+                "where n.nspname = 'public' and c.relkind in ('v', 'm') and c.relname = %s",
                 (view_name,),
             ).fetchone()
             return str(_row_dict(row, "owner"))
@@ -2826,7 +3089,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 "cross join lateral pg_catalog.aclexplode("
                 "coalesce(c.relacl, pg_catalog.acldefault('r', c.relowner))) expanded "
                 "left join pg_catalog.pg_roles grantee_role on grantee_role.oid = expanded.grantee "
-                "where n.nspname = 'public' and c.relkind = 'v' and c.relname = %s "
+                "where n.nspname = 'public' and c.relkind in ('v', 'm') and c.relname = %s "
                 "order by grantee, expanded.privilege_type",
                 (view_name,),
             ).fetchall()
@@ -2853,8 +3116,9 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.assertEqual(
             self._public_view_names(),
             set(self.contract["views"]["runtime_accessible"]),
-            "public view inventory must remain closed",
+            "public view/materialized-view inventory must remain closed",
         )
+        self.assertEqual(self._relation_kind(view_name), "v", "legacy relation must be an ordinary view")
         view_owner = self._view_owner(view_name)
         actual = self._exact_view_acl_entries(view_name)
         expected = self._expected_exact_view_acl(view_owner, role_name)
@@ -2863,14 +3127,14 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         connection = self.connect()
         try:
             rows = connection.execute(
-                "select c.relname as view_name from pg_catalog.pg_class c "
+                "select c.relname as relation_name from pg_catalog.pg_class c "
                 "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
                 "cross join lateral pg_catalog.aclexplode(c.relacl) expanded "
-                "where n.nspname = 'public' and c.relkind = 'v' "
+                "where n.nspname = 'public' and c.relkind in ('v', 'm') "
                 "and expanded.grantee = (select oid from pg_catalog.pg_roles where rolname = %s)",
                 (role_name,),
             ).fetchall()
-            granted_views = {str(_row_dict(row, "view_name")) for row in rows}
+            granted_views = {str(_row_dict(row, "relation_name")) for row in rows}
         finally:
             connection.rollback()
             connection.close()
@@ -3850,7 +4114,17 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             runtime_connection.commit()
         columns, rows = self._execute_contract_query("view_acl")
         self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["view_acl"])
-        self.assertEqual({str(row["view_name"]) for row in rows}, {"sqag_quote_artifacts"})
+        self.assertEqual(
+            {str(row["relation_name"]) for row in rows},
+            {"sqag_quote_artifacts"},
+        )
+        self.assertEqual({str(row["relation_kind"]) for row in rows}, {"v"})
+        self.assertTrue(all(bool(row["runtime_select"]) for row in rows))
+        self.assertFalse(any(bool(row["runtime_select_grantable"]) for row in rows))
+        self.assertEqual(
+            contract_validator.evaluate_view_authority(self.contract, [dict(row) for row in rows]),
+            (),
+        )
         for privilege in ("INSERT", "UPDATE", "DELETE"):
             self.assertFalse(self._has_table_privilege("sqag_runtime", "sqag_quote_artifacts", privilege))
         self._execute_admin_sql("grant select on table public.sqag_quote_artifacts to public")
@@ -3925,6 +4199,104 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         )
         with self.assertRaises(AssertionError):
             self._assert_exact_runtime_view_grants("sqag_runtime")
+
+    def test_fresh_migration_database_without_legacy_view_is_valid(self) -> None:
+        self.apply_migrations()
+        self.assertEqual(self._relation_kind("sqag_quote_artifacts"), "")
+        columns, rows = self._execute_contract_query("view_acl")
+        self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["view_acl"])
+        self.assertEqual(rows, [])
+        self.assertEqual(
+            contract_validator.evaluate_view_authority(self.contract, [dict(row) for row in rows]),
+            (),
+        )
+
+    def test_materialized_view_runtime_select_escapes_old_relation_proof(self) -> None:
+        self.apply_migrations()
+        self._create_materialized_view("sqag_quote_matview")
+        self._grant_view_privilege("sqag_runtime", "sqag_quote_matview", "SELECT")
+        self.assertTrue(self._has_table_privilege("sqag_runtime", "sqag_quote_matview", "SELECT"))
+        self.assertNotEqual(
+            self._evaluate_view_authority_rows(),
+            (),
+            "materialized-view runtime SELECT must be rejected",
+        )
+
+    def test_materialized_view_runtime_ownership_is_rejected(self) -> None:
+        self.apply_migrations()
+        self._create_materialized_view("sqag_quote_owned_matview")
+        self._execute_admin_sql("alter materialized view public.sqag_quote_owned_matview owner to \"sqag_runtime\"")
+        self.assertEqual(self._relation_kind("sqag_quote_owned_matview"), "m")
+        self.assertNotEqual(
+            self._evaluate_view_authority_rows(),
+            (),
+            "materialized-view runtime ownership must be rejected",
+        )
+
+    def test_materialized_view_runtime_grant_option_is_rejected(self) -> None:
+        self.apply_migrations()
+        self._create_materialized_view("sqag_quote_grantable_matview")
+        self._grant_view_privilege("sqag_runtime", "sqag_quote_grantable_matview", "SELECT", with_grant_option=True)
+        self.assertTrue(
+            self._has_table_privilege(
+                "sqag_runtime", "sqag_quote_grantable_matview", "SELECT WITH GRANT OPTION"
+            )
+        )
+        self.assertNotEqual(
+            self._evaluate_view_authority_rows(),
+            (),
+            "materialized-view runtime grant option must be rejected",
+        )
+
+    def test_legacy_relation_as_materialized_view_is_rejected(self) -> None:
+        self.apply_migrations()
+        self._create_materialized_view("sqag_quote_artifacts")
+        self._grant_view_privilege("sqag_runtime", "sqag_quote_artifacts", "SELECT")
+        self.assertTrue(self._has_table_privilege("sqag_runtime", "sqag_quote_artifacts", "SELECT"))
+        self.assertNotEqual(
+            self._evaluate_view_authority_rows(),
+            (),
+            "legacy relation as materialized view must be rejected",
+        )
+
+    def test_legacy_view_grant_option_and_ownership_drift_are_rejected(self) -> None:
+        self.apply_migrations()
+        self._create_legacy_quote_artifacts_view()
+        self._grant_view_privilege("sqag_runtime", "sqag_quote_artifacts", "SELECT", with_grant_option=True)
+        self.assertTrue(
+            self._has_table_privilege("sqag_runtime", "sqag_quote_artifacts", "SELECT WITH GRANT OPTION")
+        )
+        self.assertNotEqual(
+            self._evaluate_view_authority_rows(),
+            (),
+            "legacy-view runtime grant option must be rejected",
+        )
+        self._revoke_view_privilege("sqag_runtime", "sqag_quote_artifacts", "SELECT")
+        self._execute_admin_sql("alter view public.sqag_quote_artifacts owner to \"sqag_runtime\"")
+        self.assertNotEqual(
+            self._evaluate_view_authority_rows(),
+            (),
+            "legacy-view runtime ownership must be rejected",
+        )
+
+    def test_legacy_ordinary_view_with_bounded_select_is_accepted(self) -> None:
+        self.apply_migrations()
+        self._create_legacy_quote_artifacts_view()
+        self._grant_manifest_view_authority("sqag_runtime")
+        self._assert_exact_runtime_view_grants("sqag_runtime")
+        columns, rows = self._execute_contract_query("view_acl")
+        self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["view_acl"])
+        self.assertEqual(
+            {str(row["relation_name"]) for row in rows},
+            {"sqag_quote_artifacts"},
+        )
+        self.assertEqual({str(row["relation_kind"]) for row in rows}, {"v"})
+        self.assertTrue(all(bool(row["runtime_select"]) for row in rows))
+        self.assertFalse(any(bool(row["runtime_select_grantable"]) for row in rows))
+        self.assertEqual(
+            contract_validator.evaluate_view_authority(self.contract, [dict(row) for row in rows]),
+            (),
+        )
 
     def test_boundary_b_owner_authority_is_required_and_exact(self) -> None:
         self.apply_migrations()

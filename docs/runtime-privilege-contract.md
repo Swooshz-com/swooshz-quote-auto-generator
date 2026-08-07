@@ -105,9 +105,11 @@ columns remain denied, no grant option is allowed, and PUBLIC or membership
 authority must not supply table-level UPDATE.
 
 The direct runtime grant total remains exactly 38: 34 table grants, one column
-grant, one database grant, one schema grant, and one legacy-view grant. The
-legacy-view grant is the `SELECT` read on `public.sqag_quote_artifacts` that the
-publication-backfill path requires under the runtime identity.
+grant, one database grant, one schema grant, and one classified legacy-view
+grant. The legacy-view grant is the bounded `SELECT` read on
+`public.sqag_quote_artifacts` that the publication-backfill path requires under
+the runtime identity; the relation itself is `legacy_optional` and no grant is
+prescribed when it is absent.
 
 ### Runtime-forbidden (5 tables)
 
@@ -125,26 +127,60 @@ When a database-backed quote session predates its publication-version row,
 `DatabaseSqagStorage.publish_quote_session_forensic_transaction` executes the
 publication backfill `INSERT ... SELECT ... FROM sqag_quote_artifacts`
 (`webapp/server.py`) under the restricted runtime role. That legacy relation is
-not a production migration table; it is read directly by the application path
-and therefore carries one bounded runtime authority.
-
-The manifest records it under `views.runtime_accessible` as the single closed
-inventory entry:
+**not** a production migration table and is **not** provisioned by
+`MIGRATION_FILE_NAMES`; `migrations/002_platform_scoped_artifacts.sql` is not
+part of the canonical PostgreSQL production migration manifest and must not be
+promoted. The manifest therefore records the relation as one closed,
+`legacy_optional` classification entry:
 
 - **Relation**: `public.sqag_quote_artifacts`
 - **Class**: `legacy_publication_backfill`
 - **Privilege**: `SELECT` only
 - **Production source**: `webapp.server.DatabaseSqagStorage.publish_quote_session_forensic_transaction`
 - **Bound**: true
+- **Optional**: absent on a fresh canonical production-migration database; the
+  contract prescribes no grant against a nonexistent relation.
 
-The direct runtime view authority is exactly one `SELECT` grant. No write
-authority, ownership, grant option, sequence, or routine authority is granted
-through this change. The canonical `view_acl` verification query enumerates
-every `public` schema view (`relkind = 'v'`) with its raw ACL; the disposable
-suite proves that the prescribed `SELECT` is effective, that any unrelated
-legacy or application view is denied, and that a revoked read restores the
-expected `42501` failure under the runtime identity. Denial of every other
-legacy or application relation is preserved by the closed view inventory.
+When the relation is **absent**, a fresh canonical production-migration
+database is valid and the `view_acl` result contains zero rows. When it is
+**present**, it must be an ordinary view (`relkind='v'`, never a materialized
+view) exposing exactly the bounded runtime `SELECT` required by the legacy
+publication-backfill path, with no grant option, no runtime ownership, no write
+authority, and no broadened PUBLIC/membership-derived authority. Unrelated
+ordinary views remain denied unless explicitly classified. The later #160 live
+preflight must determine whether the actual legacy live database contains or
+still requires this backfill view; if the live database lacks it but actual
+persisted legacy quote state still requires the publication-backfill read,
+that live state blocks activation for separate controller disposition.
+
+## Materialized-view closed authority
+
+No public materialized view is classified by this contract. The canonical
+`view_acl` verification query enumerates every `public` ordinary view
+(`relkind='v'`) **and** materialized view (`relkind='m'`) together in one
+surface, returning relation name, relation kind, owner, raw ACL, effective
+runtime `SELECT`, and `SELECT WITH GRANT OPTION` posture. The evaluator fails
+closed on:
+
+- any materialized view owned by, effectively readable by, or grantable to
+  `sqag_runtime` (every materialized view is unclassified and fails closed);
+- any ordinary-view runtime authority that is not the exact classified
+  legacy-optional entry;
+- any relation kind, owner, ACL, or effective-authority posture that differs
+  from the locked contract;
+- any runtime ownership of a public relation;
+- malformed, duplicate, or unknown relation rows. Unknown relations are never
+  silently filtered.
+
+The direct runtime view authority is exactly one bounded `SELECT` grant when
+the legacy-optional relation is present. No write authority, ownership, grant
+option, sequence, or routine authority is granted through this change. The
+disposable suite proves that the prescribed `SELECT` is effective, that any
+unrelated legacy or application view is denied, that a revoked read restores
+the expected `42501` failure under the runtime identity, and that
+materialized-view runtime authority cannot escape the relation proof. Denial
+of every other legacy or application relation is preserved by the closed
+relation inventory.
 
 ## Provider-owned routine exception
 
@@ -283,7 +319,7 @@ live-system evidence.
 | `effective_runtime_column_privileges` | `schema_name`, `table_name`, `column_name`, `privilege_type`, `effective`, `is_grantable` | fixture columns x 4 |
 | `effective_runtime_schema_privileges` | `privilege_type`, `effective`, `is_grantable` | 2 |
 | `effective_runtime_routine_privileges` | `routine_name`, `effective` | 2 |
-| `view_acl` | `view_name`, `view_acl` | 0 in the generic shape fixture; 1 when the legacy view fixture is present |
+| `view_acl` | `relation_name`, `relation_kind`, `owner`, `relation_acl`, `runtime_select`, `runtime_select_grantable` | 0 in the generic shape fixture; 1 when the legacy-optional view fixture is present |
 
 The effective database proof covers `CONNECT`, `CREATE`, and `TEMPORARY`; the
 locked runtime result is `true/false/false`, with all three grantable flags
@@ -371,9 +407,15 @@ returns the password field. The routine query must have
 the exact eight-column projection
 `proname, identity_arguments, prokind, prosecdef, proacl, proowner, owner,
 has_trigger_dependency`, the complete public-schema routine boundary, and
-deterministic identity-argument ordering. The PostgreSQL query-shape evidence
-executes all fourteen canonical queries, asserts the exact returned column
-names, and applies the documented cardinality rules.
+deterministic identity-argument ordering. The view query must project exactly
+`relation_name, relation_kind, owner, relation_acl, runtime_select,
+runtime_select_grantable`, join `pg_roles` for the owner, evaluate effective
+runtime `SELECT` and grant-option posture through
+`has_table_privilege(... 'WITH GRANT OPTION')`, cover both `relkind` values
+`'v'` and `'m'` in the `public` schema, and order deterministically. The
+PostgreSQL query-shape evidence executes all fourteen canonical queries,
+asserts the exact returned column names, and applies the documented
+cardinality rules.
 
 The remaining effective queries have the same exact-token binding. In
 particular, the membership query must preserve the complete six-field contract
@@ -502,11 +544,11 @@ The deterministic discovery receipt for this amendment is:
 
 | Receipt item | Count |
 |---|---:|
-| Discovered test methods | 178 |
-| Static and validator methods | 116 |
-| PostgreSQL methods | 58 |
+| Discovered test methods | 202 |
+| Static and validator methods | 133 |
+| PostgreSQL methods | 65 |
 | Requirement-map and documentation parity methods | 4 |
-| Hosted executions | 178 |
+| Hosted executions | 202 |
 | Hosted skips | 0 |
 | Unique locked requirement IDs | 38 (`R01`-`R38`) |
 
@@ -546,7 +588,9 @@ value is ever stored or exposed:
    application objects but not the database or `public` schema, and its
    database/schema privileges carry no grant option.
 4. **Object owner** (`sqag_migrator`) grants the exact 11-table privileges, the
-   publication-artifact column grant, and the legacy-view `SELECT` read it owns.
+   publication-artifact column grant, and, when the legacy-optional
+   `public.sqag_quote_artifacts` ordinary view is verified present, its bounded
+   `SELECT` read. No grant is prescribed against a nonexistent relation.
 5. **Database owner authority** revokes `PUBLIC TEMPORARY`; a role-specific
    revoke is insufficient because the PUBLIC grant overrides it.
 6. **Object owner** revokes `PUBLIC EXECUTE` on the two SQAG-owned trigger functions.

@@ -103,7 +103,7 @@ jobs:
       - secret-scan
       - dependency-audit
       - nixpacks-contract
-    if: always() && needs.retrospective_exact_starting_head_red.result == 'success' && needs.secret-scan.result == 'success' && needs.dependency-audit.result == 'success'
+    if: always() && needs.retrospective_exact_starting_head_red.result == 'success' && needs.secret-scan.result == 'success' && needs.dependency-audit.result == 'success' && needs.nixpacks-contract.result == 'success'
     env:
       APP_MODE: local
       LOCAL_USER_ROLE: admin

@@ -10,13 +10,23 @@ Checks that the repository enforces:
 - No Node provider, Dockerfile, Procfile or alternate runtime is configured.
 - requirements.txt is the production dependency source.
 - package.json is preserved for CI/local tooling only.
+
+The nixpacks.toml surface is parsed completely with Python 3.12 `tomllib` and
+then validated against an exact closed schema. Malformed TOML, duplicate
+keys/tables, unknown top-level or nested keys, wrong value types, wrong
+provider lists, missing keys, wrong immutable archive, branch/tag/floating
+archive references, malformed SHAs, wrong start commands, misplaced archive
+configuration, shadowing/alternate configuration, and any additional content
+that would expand the locked production build contract fail closed.
 """
 
 from __future__ import annotations
 
 import re
 import sys
+import tomllib
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -55,6 +65,16 @@ EXIT_CODE_OK = 0
 EXIT_CODE_SINGLE_ISSUE = 1
 EXIT_CODE_MULTI_ISSUE = 2
 
+TOMLDecodeError = tomllib.TOMLDecodeError  # type: ignore[attr-defined]
+
+# The exact closed Nixpacks build-contract document tree.  Only this structure
+# may appear; anything else expands the locked production build contract.
+CLOSED_NIXPACKS_SCHEMA: dict[str, Any] = {
+    "providers": ["python"],
+    "phases": {"setup": {"nixpkgsArchive": LOCKED_NIXPKGS_ARCHIVE}},
+    "start": {"cmd": LOCKED_START_CMD},
+}
+
 
 def _fail(issues: list[str]) -> int:
     for msg in issues:
@@ -64,45 +84,103 @@ def _fail(issues: list[str]) -> int:
     return EXIT_CODE_MULTI_ISSUE
 
 
-def _parse_nixpacks_toml(path: Path) -> tuple[list[str] | None, str | None, str | None]:
-    """Return (providers, start_cmd, nixpkgs_archive) or raise on parse failure."""
-    text = path.read_text(encoding="utf-8").strip()
-    if not text:
-        return None, None, None
+def parse_nixpacks_toml(path: Path) -> dict[str, Any]:
+    """Parse the complete nixpacks.toml with tomllib.
 
-    providers = None
-    start_cmd = None
-    nixpkgs_archive = None
+    Raises tomllib.TOMLDecodeError for malformed TOML, duplicate keys, and
+    duplicate/shadowing table definitions. Callers fail closed on the error.
+    """
+    with path.open("rb") as fh:
+        return tomllib.load(fh)
 
-    current_section: str | None = None
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
 
-        sec_match = re.match(r"^\[(.+)\]$", line)
-        if sec_match:
-            current_section = sec_match.group(1)
-            continue
+def _require_exact_string(value: Any, expected: str, label: str, issues: list[str]) -> None:
+    if type(value) is not str:
+        issues.append(f"nixpacks.toml: {label} must be a string")
+    elif value != expected:
+        issues.append(
+            f"nixpacks.toml: {label} is not exactly the locked value {expected!r}"
+        )
 
-        if current_section == "phases.setup":
-            m = re.match(r"^nixpkgsArchive\s*=\s*\"(.+)\"$", line)
-            if m:
-                nixpkgs_archive = m.group(1)
-            continue
 
-        if current_section == "start":
-            m = re.match(r'^cmd\s*=\s*"(.+)"$', line)
-            if m:
-                start_cmd = m.group(1)
-            continue
+def _validate_closed_schema(document: dict[str, Any], issues: list[str]) -> None:
+    """Require the parsed document to equal the exact closed build contract."""
+    if type(document) is not dict:
+        issues.append("nixpacks.toml: parsed document must be a TOML table")
+        return
 
-        m = re.match(r"^providers\s*=\s*\[(.+)\]$", line)
-        if m:
-            providers = [p.strip().strip('"').strip("'") for p in m.group(1).split(",")]
-            continue
+    unknown_top = sorted(set(document) - set(CLOSED_NIXPACKS_SCHEMA))
+    if unknown_top:
+        issues.append(f"nixpacks.toml: unknown top-level keys {unknown_top}")
+    missing_top = sorted(set(CLOSED_NIXPACKS_SCHEMA) - set(document))
+    if missing_top:
+        issues.append(f"nixpacks.toml: missing top-level keys {missing_top}")
+    if unknown_top or missing_top:
+        return
 
-    return providers, start_cmd, nixpkgs_archive
+    providers = document["providers"]
+    if type(providers) is not list:
+        issues.append("nixpacks.toml: providers must be an array")
+    elif providers != list(LOCKED_PROVIDERS):
+        issues.append(
+            f"nixpacks.toml: providers must be exactly {list(LOCKED_PROVIDERS)}, got {providers}"
+        )
+
+    phases = document["phases"]
+    if type(phases) is not dict:
+        issues.append("nixpacks.toml: phases must be a table")
+    else:
+        unknown_phases = sorted(set(phases) - set(CLOSED_NIXPACKS_SCHEMA["phases"]))
+        if unknown_phases:
+            issues.append(f"nixpacks.toml: unknown phases keys {unknown_phases}")
+        missing_phases = sorted(set(CLOSED_NIXPACKS_SCHEMA["phases"]) - set(phases))
+        if missing_phases:
+            issues.append(f"nixpacks.toml: missing phases keys {missing_phases}")
+        if not unknown_phases and not missing_phases:
+            setup = phases["setup"]
+            if type(setup) is not dict:
+                issues.append("nixpacks.toml: phases.setup must be a table")
+            else:
+                unknown_setup = sorted(set(setup) - set(CLOSED_NIXPACKS_SCHEMA["phases"]["setup"]))
+                if unknown_setup:
+                    issues.append(f"nixpacks.toml: unknown phases.setup keys {unknown_setup}")
+                missing_setup = sorted(
+                    set(CLOSED_NIXPACKS_SCHEMA["phases"]["setup"]) - set(setup)
+                )
+                if missing_setup:
+                    issues.append(
+                        f"nixpacks.toml: missing phases.setup keys {missing_setup}"
+                    )
+                if not unknown_setup and not missing_setup:
+                    archive = setup["nixpkgsArchive"]
+                    if type(archive) is not str:
+                        issues.append(
+                            "nixpacks.toml: phases.setup.nixpkgsArchive must be a string"
+                        )
+                    elif not HEX_ARCHIVE_RE.fullmatch(archive):
+                        issues.append(
+                            "nixpacks.toml: nixpkgsArchive is not exactly 40 lowercase hex chars"
+                        )
+                    elif archive != LOCKED_NIXPKGS_ARCHIVE:
+                        issues.append(
+                            f"nixpacks.toml: nixpkgsArchive does not match locked archive "
+                            f"{LOCKED_NIXPKGS_ARCHIVE}"
+                        )
+
+    start = document["start"]
+    if type(start) is not dict:
+        issues.append("nixpacks.toml: start must be a table")
+    else:
+        unknown_start = sorted(set(start) - set(CLOSED_NIXPACKS_SCHEMA["start"]))
+        if unknown_start:
+            issues.append(f"nixpacks.toml: unknown start keys {unknown_start}")
+        missing_start = sorted(set(CLOSED_NIXPACKS_SCHEMA["start"]) - set(start))
+        if missing_start:
+            issues.append(f"nixpacks.toml: missing start keys {missing_start}")
+        if not unknown_start and not missing_start:
+            _require_exact_string(
+                start["cmd"], LOCKED_START_CMD, "start.cmd", issues
+            )
 
 
 def validate() -> int:
@@ -122,54 +200,23 @@ def validate() -> int:
         if (ROOT / name).is_file():
             issues.append(f"forbidden production file present: {name}")
 
-    # -- 3. nixpacks.toml parsed ---------------------------------------------------
+    # -- 3. nixpacks.toml parsed completely and validated against the closed schema
     nixpacks_path = ROOT / "nixpacks.toml"
     if nixpacks_path.is_file() and nixpacks_path.stat().st_size > 0:
         try:
-            providers, start_cmd, nixpkgs_archive = _parse_nixpacks_toml(nixpacks_path)
-        except Exception as exc:
-            providers, start_cmd, nixpkgs_archive = None, None, None
-            issues.append(f"nixpacks.toml unparseable: {exc}")
+            document = parse_nixpacks_toml(nixpacks_path)
+        except TOMLDecodeError as exc:
+            issues.append(f"nixpacks.toml: invalid TOML rejected: {exc}")
+            document = None
+        except OSError as exc:
+            issues.append(f"nixpacks.toml: unreadable: {exc}")
+            document = None
+        if document is not None:
+            _validate_closed_schema(document, issues)
     else:
-        providers, start_cmd, nixpkgs_archive = None, None, None
+        issues.append("nixpacks.toml: missing or empty")
 
-    # -- 4. [phases.setup] section ---------------------------------------------------
-    if nixpkgs_archive is None:
-        issues.append("nixpacks.toml: [phases.setup].nixpkgsArchive absent")
-    else:
-        if not HEX_ARCHIVE_RE.fullmatch(nixpkgs_archive):
-            issues.append(
-                "nixpacks.toml: nixpkgsArchive is not exactly 40 lowercase hex chars"
-            )
-        elif nixpkgs_archive != LOCKED_NIXPKGS_ARCHIVE:
-            issues.append(
-                f"nixpacks.toml: nixpkgsArchive does not match locked archive "
-                f"{LOCKED_NIXPKGS_ARCHIVE}"
-            )
-
-    # -- 5. Providers --------------------------------------------------------------
-    if providers is None:
-        issues.append("nixpacks.toml: providers absent")
-    else:
-        if len(providers) != 1:
-            issues.append(
-                f"nixpacks.toml: expected exactly 1 provider, got {len(providers)}: {providers}"
-            )
-        elif providers[0].lower() != "python":
-            issues.append(f"nixpacks.toml: provider must be python, got {providers[0]}")
-        if "node" in [p.lower() for p in providers]:
-            issues.append("nixpacks.toml: Node provider present (forbidden)")
-
-    # -- 6. Start command ----------------------------------------------------------
-    if start_cmd is None:
-        issues.append("nixpacks.toml: start command absent")
-    elif start_cmd != LOCKED_START_CMD:
-        issues.append(
-            f'nixpacks.toml: start command "{start_cmd}" does not match '
-            f'locked "{LOCKED_START_CMD}"'
-        )
-
-    # -- 7. .python-version --------------------------------------------------------
+    # -- 4. .python-version --------------------------------------------------------
     pyver_path = ROOT / ".python-version"
     if pyver_path.is_file() and pyver_path.stat().st_size > 0:
         content = pyver_path.read_text(encoding="utf-8").strip()
@@ -180,7 +227,7 @@ def validate() -> int:
     else:
         issues.append(".python-version: missing or empty")
 
-    # -- 8. requirements.txt bound --------------------------------------------------
+    # -- 5. requirements.txt bound --------------------------------------------------
     req_path = ROOT / "requirements.txt"
     if req_path.is_file() and req_path.stat().st_size > 0:
         req_text = req_path.read_text(encoding="utf-8").strip()
@@ -189,7 +236,7 @@ def validate() -> int:
     else:
         issues.append("requirements.txt: missing or empty")
 
-    # -- 9. package.json preserved --------------------------------------------------
+    # -- 6. package.json preserved --------------------------------------------------
     pkg_path = ROOT / "package.json"
     if not pkg_path.is_file():
         issues.append("package.json: missing (allowed CI/local tooling file)")

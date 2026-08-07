@@ -19,11 +19,11 @@ sys.path.insert(0, str(ROOT))
 import scripts.validate_nixpacks_python_contract as validator  # noqa: E402
 
 
-class NixpacksTomlParsingTests(unittest.TestCase):
-    """Unit tests for the nixpacks.toml inline parser."""
+class NixpacksTomlClosedSchemaParseTests(unittest.TestCase):
+    """Unit tests for the full tomllib parse plus exact closed-schema validation."""
 
-    def test_parses_python_only_provider(self):
-        result = validator._parse_nixpacks_toml(
+    def test_parses_exact_closed_contract(self):
+        result = validator.parse_nixpacks_toml(
             _toml_text(
                 'providers = ["python"]\n'
                 '[phases.setup]\nnixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
@@ -32,64 +32,140 @@ class NixpacksTomlParsingTests(unittest.TestCase):
         )
         self.assertEqual(
             result,
-            (["python"], "python webapp/server.py", "5c994fe2b1e540ff83aa59ba370918ad5aae4776"),
+            {
+                "providers": ["python"],
+                "phases": {"setup": {"nixpkgsArchive": "5c994fe2b1e540ff83aa59ba370918ad5aae4776"}},
+                "start": {"cmd": "python webapp/server.py"},
+            },
         )
+        issues: list[str] = []
+        validator._validate_closed_schema(result, issues)
+        self.assertEqual(issues, [])
 
-    def test_parses_no_start_section(self):
-        result = validator._parse_nixpacks_toml(
-            _toml_text('providers = ["python"]')
-        )
-        self.assertEqual(result, (["python"], None, None))
+    def test_parse_rejects_invalid_toml(self):
+        with self.assertRaises(validator.TOMLDecodeError):
+            validator.parse_nixpacks_toml(
+                _toml_text(
+                    'providers = ["python"]\nthis is not toml\n'
+                    '[phases.setup]\nnixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+                    '[start]\ncmd = "python webapp/server.py"'
+                )
+            )
 
-    def test_parses_no_providers(self):
-        result = validator._parse_nixpacks_toml(
-            _toml_text('[start]\ncmd = "python webapp/server.py"')
-        )
-        self.assertEqual(result, (None, "python webapp/server.py", None))
+    def test_parse_rejects_duplicate_key(self):
+        with self.assertRaises(validator.TOMLDecodeError):
+            validator.parse_nixpacks_toml(
+                _toml_text('providers = ["python"]\nproviders = ["python"]')
+            )
 
-    def test_parses_empty(self):
-        result = validator._parse_nixpacks_toml(_toml_text(""))
-        self.assertEqual(result, (None, None, None))
+    def test_parse_rejects_duplicate_table(self):
+        with self.assertRaises(validator.TOMLDecodeError):
+            validator.parse_nixpacks_toml(
+                _toml_text(
+                    '[phases.setup]\nnixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+                    "[phases.setup]"
+                )
+            )
 
-    def test_parses_comment_lines(self):
-        result = validator._parse_nixpacks_toml(
+    def test_parse_dotted_shadowing_is_rejected_by_closed_schema(self):
+        result = validator.parse_nixpacks_toml(
             _toml_text(
-                '# comment\n'
                 'providers = ["python"]\n'
-                '# another\n'
-                '[phases.setup]\n'
-                'nixpkgsArchive = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n'
-                '[start]\ncmd = "echo hi"'
-            )
-        )
-        self.assertEqual(
-            result,
-            (["python"], "echo hi", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-        )
-
-    def test_parses_provider_with_spaces(self):
-        result = validator._parse_nixpacks_toml(
-            _toml_text(
-                'providers = [ "python" ]\n'
+                '[phases.setup]\nnixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+                'phases.setup.nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
                 '[start]\ncmd = "python webapp/server.py"'
             )
         )
-        self.assertEqual(result, (["python"], "python webapp/server.py", None))
-
-    def test_detects_node_provider(self):
-        result = validator._parse_nixpacks_toml(
-            _toml_text(
-                'providers = ["node", "python"]\n'
-                '[start]\ncmd = "python webapp/server.py"'
-            )
+        issues: list[str] = []
+        validator._validate_closed_schema(result, issues)
+        self.assertTrue(
+            any("unknown phases.setup keys" in issue for issue in issues),
+            f"dotted shadowing not detected: {issues!r}",
         )
-        self.assertEqual(result, (["node", "python"], "python webapp/server.py", None))
 
-    def test_detects_node_only(self):
-        result = validator._parse_nixpacks_toml(
-            _toml_text('providers = ["node"]')
+    def test_closed_schema_rejects_unknown_top_level_key(self):
+        issues: list[str] = []
+        validator._validate_closed_schema(
+            {
+                "providers": ["python"],
+                "phases": {"setup": {"nixpkgsArchive": validator.LOCKED_NIXPKGS_ARCHIVE}},
+                "start": {"cmd": "python webapp/server.py"},
+                "processes": {"web": "python webapp/server.py"},
+            },
+            issues,
         )
-        self.assertEqual(result, (["node"], None, None))
+        self.assertTrue(any("unknown top-level keys" in issue for issue in issues))
+
+    def test_closed_schema_rejects_unknown_nested_key(self):
+        issues: list[str] = []
+        validator._validate_closed_schema(
+            {
+                "providers": ["python"],
+                "phases": {
+                    "setup": {
+                        "nixpkgsArchive": validator.LOCKED_NIXPKGS_ARCHIVE,
+                        "install": "apt-get install nodejs",
+                    }
+                },
+                "start": {"cmd": "python webapp/server.py"},
+            },
+            issues,
+        )
+        self.assertTrue(any("unknown phases.setup keys" in issue for issue in issues))
+
+    def test_closed_schema_rejects_alternate_phase(self):
+        issues: list[str] = []
+        validator._validate_closed_schema(
+            {
+                "providers": ["python"],
+                "phases": {
+                    "setup": {"nixpkgsArchive": validator.LOCKED_NIXPKGS_ARCHIVE},
+                    "build": {"nixpkgsArchive": "1" * 40},
+                },
+                "start": {"cmd": "python webapp/server.py"},
+            },
+            issues,
+        )
+        self.assertTrue(any("unknown phases keys" in issue for issue in issues))
+
+    def test_closed_schema_rejects_missing_top_level_key(self):
+        issues: list[str] = []
+        validator._validate_closed_schema(
+            {
+                "providers": ["python"],
+                "phases": {"setup": {"nixpkgsArchive": validator.LOCKED_NIXPKGS_ARCHIVE}},
+            },
+            issues,
+        )
+        self.assertTrue(any("missing top-level keys" in issue for issue in issues))
+
+    def test_closed_schema_rejects_misplaced_archive(self):
+        issues: list[str] = []
+        validator._validate_closed_schema(
+            {
+                "providers": ["python"],
+                "nixpkgsArchive": validator.LOCKED_NIXPKGS_ARCHIVE,
+                "phases": {"setup": {}},
+                "start": {"cmd": "python webapp/server.py"},
+            },
+            issues,
+        )
+        self.assertTrue(any("unknown top-level keys" in issue for issue in issues))
+
+    def test_closed_schema_rejects_wrong_value_types(self):
+        for label, document in (
+            ("providers_string", {"providers": "python", "phases": {"setup": {"nixpkgsArchive": validator.LOCKED_NIXPKGS_ARCHIVE}}, "start": {"cmd": "python webapp/server.py"}}),
+            ("archive_integer", {"providers": ["python"], "phases": {"setup": {"nixpkgsArchive": 42}}, "start": {"cmd": "python webapp/server.py"}}),
+            ("start_cmd_array", {"providers": ["python"], "phases": {"setup": {"nixpkgsArchive": validator.LOCKED_NIXPKGS_ARCHIVE}}, "start": {"cmd": ["python", "webapp/server.py"]}}),
+            ("archive_uppercase", {"providers": ["python"], "phases": {"setup": {"nixpkgsArchive": "5C994FE2B1E540FF83AA59BA370918AD5AAE4776"}}, "start": {"cmd": "python webapp/server.py"}}),
+            ("archive_branch", {"providers": ["python"], "phases": {"setup": {"nixpkgsArchive": "nixos-unstable"}}, "start": {"cmd": "python webapp/server.py"}}),
+            ("archive_short", {"providers": ["python"], "phases": {"setup": {"nixpkgsArchive": "short"}}, "start": {"cmd": "python webapp/server.py"}}),
+            ("wrong_archive", {"providers": ["python"], "phases": {"setup": {"nixpkgsArchive": "1" * 40}}, "start": {"cmd": "python webapp/server.py"}}),
+        ):
+            with self.subTest(label=label):
+                issues: list[str] = []
+                validator._validate_closed_schema(document, issues)
+                self.assertTrue(issues, f"{label} unexpectedly accepted")
 
 
 class NixpacksPythonContractREDTests(unittest.TestCase):
@@ -339,6 +415,161 @@ class NixpacksArchiveProofTests(unittest.TestCase):
         self.assertEqual(
             validator.LOCKED_NIXPKGS_ARCHIVE,
             "5c994fe2b1e540ff83aa59ba370918ad5aae4776",
+        )
+
+
+class NixpacksClosedSchemaREDTests(unittest.TestCase):
+    """RED regressions for the closed Nixpacks TOML contract.
+
+    These cases demonstrate that a permissive line scanner accepts content that
+    a real TOML consumer rejects or that expands the locked production build
+    contract. Each must fail closed after the full tomllib parse plus
+    closed-schema validation is implemented.
+    """
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.tmp_root = Path(self._td.name)
+        self._orig_root = validator.ROOT
+
+    def tearDown(self):
+        validator.ROOT = self._orig_root
+
+    def _write(self, rel: str, content: str) -> None:
+        p = self.tmp_root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+
+    def _write_support_files(self):
+        self._write(".python-version", "3.12.13\n")
+        self._write("requirements.txt", "pyjwt==2.13.0\n")
+        self._write("package.json", '{"name":"test"}\n')
+
+    def _write_nixpacks(self, content: str) -> None:
+        self._write_support_files()
+        self._write("nixpacks.toml", content)
+        validator.ROOT = self.tmp_root
+
+    def _assert_validator_fails(self, content: str, label: str) -> None:
+        self._write_nixpacks(content)
+        result = validator.validate()
+        self.assertNotEqual(result, 0, f"{label} unexpectedly passed")
+
+    def test_invalid_toml_that_scanner_accepts_fails_closed(self):
+        self._assert_validator_fails(
+            'providers = ["python"]\n'
+            "this is not toml\n"
+            '[phases.setup]\n'
+            'nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+            '[start]\n'
+            'cmd = "python webapp/server.py"\n',
+            "invalid_toml_syntax",
+        )
+
+    def test_unknown_top_level_toml_content_fails_closed(self):
+        self._assert_validator_fails(
+            'providers = ["python"]\n'
+            '[phases.setup]\n'
+            'nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+            "[processes]\n"
+            'web = "python webapp/server.py"\n'
+            "[start]\n"
+            'cmd = "python webapp/server.py"\n',
+            "unknown_top_level_table",
+        )
+
+    def test_unknown_nested_toml_key_expands_build_contract(self):
+        self._assert_validator_fails(
+            'providers = ["python"]\n'
+            '[phases.setup]\n'
+            'nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+            'install = "apt-get install nodejs"\n'
+            "[start]\n"
+            'cmd = "python webapp/server.py"\n',
+            "unknown_nested_key",
+        )
+
+    def test_duplicate_toml_key_fails_closed(self):
+        self._assert_validator_fails(
+            'providers = ["python"]\n'
+            'providers = ["python"]\n'
+            '[phases.setup]\n'
+            'nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+            "[start]\n"
+            'cmd = "python webapp/server.py"\n',
+            "duplicate_key",
+        )
+
+    def test_duplicate_toml_table_fails_closed(self):
+        self._assert_validator_fails(
+            'providers = ["python"]\n'
+            '[phases.setup]\n'
+            'nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+            "[phases.setup]\n"
+            'nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+            "[start]\n"
+            'cmd = "python webapp/server.py"\n',
+            "duplicate_table",
+        )
+
+    def test_misplaced_archive_configuration_fails_closed(self):
+        self._assert_validator_fails(
+            'providers = ["python"]\n'
+            'nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+            "[start]\n"
+            'cmd = "python webapp/server.py"\n',
+            "misplaced_archive",
+        )
+
+    def test_alternate_shadowing_build_phase_fails_closed(self):
+        self._assert_validator_fails(
+            'providers = ["python"]\n'
+            '[phases.setup]\n'
+            'nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+            "[phases.build]\n"
+            'nixpkgsArchive = "1111111111111111111111111111111111111111"\n'
+            "[start]\n"
+            'cmd = "python webapp/server.py"\n',
+            "alternate_phase",
+        )
+
+    def test_dotted_key_shadowing_of_section_fails_closed(self):
+        self._assert_validator_fails(
+            'providers = ["python"]\n'
+            '[phases.setup]\n'
+            'nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+            'phases.setup.nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+            "[start]\n"
+            'cmd = "python webapp/server.py"\n',
+            "dotted_shadowing",
+        )
+
+    def test_extra_provider_fails_closed(self):
+        self._assert_validator_fails(
+            'providers = ["python", "node"]\n'
+            '[phases.setup]\n'
+            'nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+            "[start]\n"
+            'cmd = "python webapp/server.py"\n',
+            "extra_provider",
+        )
+
+
+class NixpacksCIGateTests(unittest.TestCase):
+    """RED regression: Validate app must explicitly gate on the Nixpacks job."""
+
+    def test_validate_app_gate_requires_nixpacks_contract_success(self):
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        validate_section = workflow.split("name: Validate app", 1)[1]
+        self.assertIn(
+            "needs.nixpacks-contract.result == 'success'",
+            validate_section.split("steps:", 1)[0],
+        )
+        self.assertIn("always()", validate_section.split("steps:", 1)[0])
+        self.assertIn(
+            "needs.retrospective_exact_starting_head_red.result == 'success'",
+            validate_section.split("steps:", 1)[0],
         )
 
 

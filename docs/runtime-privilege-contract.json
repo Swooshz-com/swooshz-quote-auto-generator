@@ -299,6 +299,8 @@
 
   "views": {
     "count": 1,
+    "legacy_optional": true,
+    "materialized_view_rule": "No public materialized view is classified. Any public materialized view fails closed: none may be owned by, effectively readable by, or grantable to sqag_runtime, and the later live preflight must classify any before activation.",
     "runtime_accessible": {
       "sqag_quote_artifacts": {
         "schema": "public",
@@ -395,6 +397,6 @@
     "effective_runtime_column_privileges": "select n.nspname as schema_name, c.relname as table_name, a.attname as column_name, p.privilege_type, has_column_privilege('sqag_runtime', c.oid, a.attname, p.privilege_type) as effective, has_column_privilege('sqag_runtime', c.oid, a.attname, p.privilege_type || ' WITH GRANT OPTION') as is_grantable from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace join pg_catalog.pg_attribute a on a.attrelid = c.oid cross join (values ('SELECT'), ('INSERT'), ('UPDATE'), ('REFERENCES')) p(privilege_type) where n.nspname = 'public' and c.relkind = 'r' and c.relname like 'sqag_' || chr(37) and a.attnum > 0 and not a.attisdropped order by n.nspname, c.relname, a.attname, p.privilege_type",
     "effective_runtime_schema_privileges": "select p.privilege_type, has_schema_privilege('sqag_runtime', 'public', p.privilege_type) as effective, has_schema_privilege('sqag_runtime', 'public', p.privilege_type || ' WITH GRANT OPTION') as is_grantable from (values ('USAGE'), ('CREATE')) p(privilege_type) order by p.privilege_type",
     "effective_runtime_routine_privileges": "select p.proname as routine_name, has_function_privilege('sqag_runtime', p.oid, 'EXECUTE') as effective from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' order by p.proname",
-    "view_acl": "select c.relname as view_name, c.relacl as view_acl from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relkind = 'v' and n.nspname = 'public' order by c.relname"
+    "view_acl": "select c.relname as relation_name, c.relkind as relation_kind, r.rolname as owner, c.relacl::text as relation_acl, has_table_privilege('sqag_runtime', c.oid, 'SELECT') as runtime_select, has_table_privilege('sqag_runtime', c.oid, 'SELECT WITH GRANT OPTION') as runtime_select_grantable from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace join pg_catalog.pg_roles r on r.oid = c.relowner where n.nspname = 'public' and c.relkind in ('v', 'm') order by c.relkind, c.relname"
   }
 }
