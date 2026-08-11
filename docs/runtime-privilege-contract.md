@@ -104,12 +104,13 @@ authority is the manifest's exact column grant on `checksum_sha256`; all other
 columns remain denied, no grant option is allowed, and PUBLIC or membership
 authority must not supply table-level UPDATE.
 
-The direct runtime grant total remains exactly 38: 34 table grants, one column
-grant, one database grant, one schema grant, and one classified legacy-view
-grant. The legacy-view grant is the bounded `SELECT` read on
+The direct runtime grant total is conditional and closed: legacy view absent is
+37 (34 table grants, one column grant, one database grant, and one schema grant);
+the exact classified legacy view present with its bounded relation-level
+`SELECT` is 38. The legacy-view grant is the bounded `SELECT` read on
 `public.sqag_quote_artifacts` that the publication-backfill path requires under
-the runtime identity; the relation itself is `legacy_optional` and no grant is
-prescribed when it is absent.
+the runtime identity; the relation itself is `legacy_optional`, and no grant is
+prescribed against a nonexistent relation.
 
 ### Runtime-forbidden (5 tables)
 
@@ -141,6 +142,18 @@ promoted. The manifest therefore records the relation as one closed,
 - **Optional**: absent on a fresh canonical production-migration database; the
   contract prescribes no grant against a nonexistent relation.
 
+When present, the classification is bound to the exact reviewed ordinary-view
+definition: canonicalized `pg_get_viewdef()` text selecting the nine ordered
+columns `workspace_id`, `session_id`, `artifact_kind`, `filename`,
+`content_type`, `size_bytes`, `content_blob`, `created_at`, and `updated_at`
+from `public.legacy_quote_artifacts_source`; the single normal dependency is
+that source table. The contract also binds each column's ordinal, PostgreSQL
+type OID/schema/name/modifier/SQL identity, an empty relation-options object,
+and `security_barrier=false`, `security_invoker=false`, and no check option.
+Any definition, dependency, column-shape/type, option, or security drift fails
+closed. The allowed runtime access remains the existing relation-level direct
+`SELECT`; a separate direct runtime column ACL is not an allowed exception.
+
 When the relation is **absent**, a fresh canonical production-migration
 database is valid and the `view_acl` result contains zero rows. When it is
 **present**, it must be an ordinary view (`relkind='v'`, never a materialized
@@ -158,10 +171,12 @@ that live state blocks activation for separate controller disposition.
 No public materialized view is classified by this contract. The canonical
 `view_acl` verification query enumerates every `public` ordinary view
 (`relkind='v'`) **and** materialized view (`relkind='m'`) together in one
-surface, returning relation name, relation kind, owner, raw ACL, effective
-runtime relation privileges, and the effective `SELECT` and `SELECT WITH GRANT
-OPTION` posture. The raw ACL is diagnostic only; acceptance consumes the
-PostgreSQL-decoded structured evidence:
+surface, returning relation name, relation kind, owner, raw ACL, structured
+relation ACLs, structured per-column ACLs, canonical definition, dependency
+set, ordered visible column/type shape, relation options, security posture,
+effective runtime relation privileges, and the effective `SELECT` and
+`SELECT WITH GRANT OPTION` posture. The raw ACL is diagnostic only; acceptance
+consumes the PostgreSQL-decoded structured evidence:
 
 - **`acl_entries`** is an ordered JSONB array with exactly `grantee`, `grantor`,
   `privilege_type`, and `is_grantable` fields. PostgreSQL `aclexplode()` supplies
@@ -172,6 +187,17 @@ PostgreSQL-decoded structured evidence:
   `DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER`, and `MAINTAIN`. Each record has
   `privilege_type`, effective runtime authority, and effective grant-option
   booleans from `has_table_privilege()`.
+- **`column_acl_entries`** covers every visible `pg_attribute` column with
+  relation identity, column number/name, PostgreSQL-decoded direct column ACL
+  entries, and the four relevant column privilege records `SELECT`, `INSERT`,
+  `UPDATE`, and `REFERENCES` from `has_column_privilege()`. Relation-level
+  `SELECT` on the classified legacy view naturally makes its columns readable;
+  an independent direct runtime column ACL is forbidden.
+- **Definition evidence** uses `pg_get_viewdef()`, rewrite/dependency catalog
+  rows, ordered visible column/type identity, `pg_options_to_table()`, and
+  security-barrier/invoker/check-option state. The classified legacy view is
+  compared to the exact reviewed definition; unclassified ordinary and all
+  materialized views remain fail closed for runtime authority.
 
 The evaluator fails closed on:
 
@@ -332,7 +358,7 @@ live-system evidence.
 | `effective_runtime_column_privileges` | `schema_name`, `table_name`, `column_name`, `privilege_type`, `effective`, `is_grantable` | fixture columns x 4 |
 | `effective_runtime_schema_privileges` | `privilege_type`, `effective`, `is_grantable` | 2 |
 | `effective_runtime_routine_privileges` | `routine_name`, `effective` | 2 |
-| `view_acl` | `relation_name`, `relation_kind`, `owner`, `relation_acl`, `acl_entries`, `runtime_privileges`, `runtime_select`, `runtime_select_grantable` | 0 in the generic shape fixture; 1 when the legacy-optional view fixture is present |
+| `view_acl` | `relation_name`, `relation_kind`, `owner`, `relation_acl`, `acl_entries`, `column_acl_entries`, `view_definition`, `view_dependencies`, `view_columns`, `relation_options`, `view_security`, `runtime_privileges`, `runtime_select`, `runtime_select_grantable` | 0 in the generic shape fixture; 1 when the legacy-optional view fixture is present |
 
 The effective database proof covers `CONNECT`, `CREATE`, and `TEMPORARY`; the
 locked runtime result is `true/false/false`, with all three grantable flags
@@ -561,11 +587,11 @@ The deterministic discovery receipt for this amendment is:
 
 | Receipt item | Count |
 |---|---:|
-| Discovered test methods | 203 |
-| Static and validator methods | 134 |
-| PostgreSQL methods | 65 |
+| Discovered test methods | 216 |
+| Static and validator methods | 143 |
+| PostgreSQL methods | 69 |
 | Requirement-map and documentation parity methods | 4 |
-| Hosted executions | 203 |
+| Hosted executions | 216 |
 | Hosted skips | 0 |
 | Unique locked requirement IDs | 38 (`R01`-`R38`) |
 

@@ -1,11 +1,11 @@
 """Runtime privilege contract tests.
 
 Deterministic discovery receipt for this amendment:
-  discovered methods: 203
-  static and validator methods: 134
-  PostgreSQL methods: 65
+  discovered methods: 216
+  static and validator methods: 143
+  PostgreSQL methods: 69
   requirement-map and documentation parity methods: 4
-  hosted executions: 203
+  hosted executions: 216
   hosted skips: 0
   unique locked requirement IDs: 38 (R01-R38)
 
@@ -158,6 +158,12 @@ CANONICAL_QUERY_COLUMNS = {
         "owner",
         "relation_acl",
         "acl_entries",
+        "column_acl_entries",
+        "view_definition",
+        "view_dependencies",
+        "view_columns",
+        "relation_options",
+        "view_security",
         "runtime_privileges",
         "runtime_select",
         "runtime_select_grantable",
@@ -404,6 +410,12 @@ class ManifestStructureTest(unittest.TestCase):
             (34, 1, 1, 1, 1),
         )
         self.assertEqual(table_grants + column_grants + database_grants + schema_grants + view_grants, 38)
+
+    def test_runtime_direct_grant_total_is_conditional_on_legacy_view_presence(self) -> None:
+        self.assertEqual(
+            self.manifest["views"]["direct_runtime_grants"],
+            {'legacy_absent': 37, 'legacy_present': 38},
+        )
 
     def test_legacy_view_inventory_is_exact(self) -> None:
         views = self.manifest["views"]
@@ -1527,6 +1539,7 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
         runtime_privileges: list[dict[str, Any]] | None = None,
         runtime_select: bool = False,
         runtime_select_grantable: bool = False,
+        include_evidence: bool = True,
     ) -> dict[str, Any]:
         if acl_entries is None:
             acl_entries = [
@@ -1556,7 +1569,7 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
                 }
                 for privilege in TABLE_PRIVILEGES
             ]
-        return {
+        row = {
             "relation_name": name,
             "relation_kind": kind,
             "owner": owner,
@@ -1566,6 +1579,76 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
             "runtime_select": runtime_select,
             "runtime_select_grantable": runtime_select_grantable,
         }
+        if include_evidence:
+            return ViewAuthorityEvaluatorTest._extended_view_row(
+                name,
+                kind=kind,
+                owner=owner,
+                runtime_select=runtime_select,
+                runtime_select_grantable=runtime_select_grantable,
+                base_row=row,
+            )
+        return row
+
+    @classmethod
+    def _extended_view_row(
+        cls,
+        name: str,
+        *,
+        kind: str = 'v',
+        owner: str = 'sqag_migrator',
+        runtime_select: bool = False,
+        runtime_select_grantable: bool = False,
+        base_row: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        row = copy.deepcopy(base_row) if base_row is not None else cls._view_row(
+            name,
+            kind=kind,
+            owner=owner,
+            runtime_select=runtime_select,
+            runtime_select_grantable=runtime_select_grantable,
+            include_evidence=False,
+        )
+        if name == 'sqag_quote_artifacts':
+            columns = [
+                {'ordinal': 1, 'name': 'workspace_id', 'type_oid': 25, 'type_schema': 'pg_catalog', 'type_name': 'text', 'type_modifier': -1, 'type_sql': 'text'},
+                {'ordinal': 2, 'name': 'session_id', 'type_oid': 25, 'type_schema': 'pg_catalog', 'type_name': 'text', 'type_modifier': -1, 'type_sql': 'text'},
+                {'ordinal': 3, 'name': 'artifact_kind', 'type_oid': 25, 'type_schema': 'pg_catalog', 'type_name': 'text', 'type_modifier': -1, 'type_sql': 'text'},
+                {'ordinal': 4, 'name': 'filename', 'type_oid': 25, 'type_schema': 'pg_catalog', 'type_name': 'text', 'type_modifier': -1, 'type_sql': 'text'},
+                {'ordinal': 5, 'name': 'content_type', 'type_oid': 25, 'type_schema': 'pg_catalog', 'type_name': 'text', 'type_modifier': -1, 'type_sql': 'text'},
+                {'ordinal': 6, 'name': 'size_bytes', 'type_oid': 20, 'type_schema': 'pg_catalog', 'type_name': 'int8', 'type_modifier': -1, 'type_sql': 'bigint'},
+                {'ordinal': 7, 'name': 'content_blob', 'type_oid': 17, 'type_schema': 'pg_catalog', 'type_name': 'bytea', 'type_modifier': -1, 'type_sql': 'bytea'},
+                {'ordinal': 8, 'name': 'created_at', 'type_oid': 25, 'type_schema': 'pg_catalog', 'type_name': 'text', 'type_modifier': -1, 'type_sql': 'text'},
+                {'ordinal': 9, 'name': 'updated_at', 'type_oid': 25, 'type_schema': 'pg_catalog', 'type_name': 'text', 'type_modifier': -1, 'type_sql': 'text'},
+            ]
+            definition = 'select workspace_id, session_id, artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at from legacy_quote_artifacts_source'
+            dependencies = [{'schema': 'public', 'relation_name': 'legacy_quote_artifacts_source', 'relation_kind': 'r', 'dependency_type': 'n'}]
+        else:
+            columns = [{'ordinal': 1, 'name': 'marker', 'type_oid': 25, 'type_schema': 'pg_catalog', 'type_name': 'text', 'type_modifier': -1, 'type_sql': 'text'}]
+            definition = 'select marker'
+            dependencies = []
+        row.update({
+            'column_acl_entries': [
+                {
+                    'relation_name': name,
+                    'relation_kind': kind,
+                    'column_number': column['ordinal'],
+                    'column_name': column['name'],
+                    'acl_entries': [],
+                    'runtime_privileges': [
+                        {'privilege_type': privilege, 'effective': runtime_select and privilege == 'SELECT', 'is_grantable': runtime_select_grantable and privilege == 'SELECT'}
+                        for privilege in COLUMN_PRIVILEGES
+                    ],
+                }
+                for column in columns
+            ],
+            'view_definition': definition,
+            'view_dependencies': dependencies,
+            'view_columns': columns,
+            'relation_options': {},
+            'view_security': {'security_barrier': False, 'security_invoker': False, 'check_option': None},
+        })
+        return row
 
     def _errors(self, rows: list[dict[str, Any]]) -> tuple[str, ...]:
         return contract_validator.evaluate_view_authority(self.manifest, rows)
@@ -1593,6 +1676,87 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
             ),
             (),
         )
+
+    def test_owner_acl_completeness_rejects_each_missing_owner_privilege(self) -> None:
+        base = self._view_row('sqag_quote_artifacts', runtime_select=True)
+        for privilege in TABLE_PRIVILEGES:
+            with self.subTest(privilege=privilege):
+                row = copy.deepcopy(base)
+                row['acl_entries'] = [
+                    entry
+                    for entry in row['acl_entries']
+                    if not (
+                        entry['grantee'] == 'sqag_migrator'
+                        and entry['privilege_type'] == privilege
+                    )
+                ]
+                self._assert_rejected([row], 'owner_acl_completeness')
+
+    def test_unclassified_ordinary_view_direct_runtime_column_select_is_rejected(self) -> None:
+        row = self._extended_view_row('sqag_file_artifacts')
+        row['column_acl_entries'][0]['acl_entries'].append(
+            {'grantee': 'sqag_runtime', 'grantor': 'sqag_migrator', 'privilege_type': 'SELECT', 'is_grantable': False}
+        )
+        self._assert_rejected([row], 'column_acl_runtime_authority_forbidden')
+
+    def test_unclassified_ordinary_view_direct_runtime_column_grant_option_is_rejected(self) -> None:
+        row = self._extended_view_row('sqag_file_artifacts')
+        row['column_acl_entries'][0]['acl_entries'].append(
+            {'grantee': 'sqag_runtime', 'grantor': 'sqag_migrator', 'privilege_type': 'SELECT', 'is_grantable': True}
+        )
+        self._assert_rejected([row], 'column_acl_runtime_grant_option_forbidden')
+
+    def test_public_column_authority_is_rejected(self) -> None:
+        row = self._extended_view_row('sqag_file_artifacts')
+        row['column_acl_entries'][0]['acl_entries'].append(
+            {'grantee': 'PUBLIC', 'grantor': 'sqag_migrator', 'privilege_type': 'SELECT', 'is_grantable': False}
+        )
+        self._assert_rejected([row], 'column_acl_public_authority_forbidden')
+
+    def test_malformed_and_duplicate_column_evidence_is_rejected(self) -> None:
+        malformed = self._extended_view_row('sqag_file_artifacts')
+        malformed['column_acl_entries'][0].pop('column_name')
+        self._assert_rejected([malformed], 'column_acl_row_0_missing_keys: column_name')
+
+        duplicate = self._extended_view_row('sqag_file_artifacts')
+        duplicate['column_acl_entries'][0]['runtime_privileges'].append(
+            copy.deepcopy(duplicate['column_acl_entries'][0]['runtime_privileges'][0])
+        )
+        self._assert_rejected([duplicate], 'column_runtime_privilege_4_duplicate')
+
+    def test_classified_view_additional_direct_column_acl_is_rejected(self) -> None:
+        row = self._extended_view_row('sqag_quote_artifacts', runtime_select=True)
+        row['column_acl_entries'][0]['acl_entries'].append(
+            {'grantee': 'sqag_runtime', 'grantor': 'sqag_migrator', 'privilege_type': 'SELECT', 'is_grantable': False}
+        )
+        self._assert_rejected([row], 'column_acl_runtime_authority_forbidden')
+
+    def test_materialized_view_column_authority_is_rejected(self) -> None:
+        row = self._extended_view_row('sqag_mat_view', kind='m')
+        row['column_acl_entries'][0]['runtime_privileges'][0]['effective'] = True
+        self._assert_rejected([row], 'materialized_view_column_authority_forbidden')
+
+    def test_classified_view_definition_binding_rejects_drift(self) -> None:
+        base = self._extended_view_row('sqag_quote_artifacts', runtime_select=True)
+        definition = copy.deepcopy(base)
+        definition['view_definition'] = 'select session_id from legacy_quote_artifacts_source'
+        self._assert_rejected([definition], 'classified_view_definition_mismatch')
+
+        dependency = copy.deepcopy(base)
+        dependency['view_dependencies'] = []
+        self._assert_rejected([dependency], 'classified_view_dependencies_mismatch')
+
+        shape = copy.deepcopy(base)
+        shape['view_columns'][0]['name'] = 'session_id'
+        self._assert_rejected([shape], 'classified_view_columns_mismatch')
+
+        options = copy.deepcopy(base)
+        options['relation_options'] = {'security_barrier': 'true'}
+        self._assert_rejected([options], 'classified_view_options_mismatch')
+
+        security = copy.deepcopy(base)
+        security['view_security']['security_invoker'] = True
+        self._assert_rejected([security], 'classified_view_security_mismatch')
 
     def test_materialized_view_effective_select_is_rejected(self) -> None:
         self._assert_rejected(
@@ -3101,12 +3265,12 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                     self._grant_view_privilege(role_name, view_name, privilege.upper())
 
     def _create_legacy_quote_artifacts_view(self) -> str:
-        table_name = f"legacy_quote_artifacts_{uuid.uuid4().hex[:8]}"
+        table_name = "legacy_quote_artifacts_source"
         self.addCleanup(
             self._cleanup_steps,
             [
-                ("drop_run55_legacy_quote_view", "drop view if exists public.sqag_quote_artifacts"),
-                ("drop_run55_legacy_quote_table", f"drop table if exists public.{_quote_identifier(table_name)}"),
+                ("drop_run73_legacy_quote_view", "drop view if exists public.sqag_quote_artifacts"),
+                ("drop_run73_legacy_quote_table", f"drop table if exists public.{_quote_identifier(table_name)}"),
             ],
         )
         connection = self.connect()
@@ -4227,6 +4391,120 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self._assert_exact_runtime_matrix("sqag_runtime")
         self._assert_exact_runtime_view_grants("sqag_runtime")
+
+    def test_owner_acl_completeness_rejects_each_missing_privilege_postgres(self) -> None:
+        self.apply_migrations()
+        self._create_legacy_quote_artifacts_view()
+        self._grant_manifest_view_authority('sqag_runtime')
+        for privilege in TABLE_PRIVILEGES:
+            self._execute_admin_sql(
+                f'revoke {privilege} on table public.sqag_quote_artifacts from {_quote_identifier("sqag_migrator")}'
+            )
+            try:
+                errors = self._evaluate_view_authority_rows()
+                self.assertTrue(any('owner_acl_completeness' in error for error in errors), (privilege, errors))
+            finally:
+                self._execute_admin_sql(
+                    f'grant {privilege} on table public.sqag_quote_artifacts to {_quote_identifier("sqag_migrator")}'
+                )
+        self.assertEqual(self._evaluate_view_authority_rows(), ())
+
+    def test_column_acl_authority_and_grant_options_fail_closed_postgres(self) -> None:
+        self.apply_migrations()
+        self._create_legacy_quote_artifacts_view()
+        self._grant_manifest_view_authority('sqag_runtime')
+        column = 'workspace_id'
+        cases = (
+            ('sqag_runtime', False, 'column_acl_runtime_authority_forbidden'),
+            ('sqag_runtime', True, 'column_acl_runtime_grant_option_forbidden'),
+            ('public', False, 'column_acl_public_authority_forbidden'),
+        )
+        for grantee, with_grant_option, expected in cases:
+            target = _quote_identifier(grantee) if grantee != 'public' else 'public'
+            grant = f'grant SELECT ({_quote_identifier(column)}) on table public.sqag_quote_artifacts to {target}'
+            if with_grant_option:
+                grant += ' with grant option'
+            self._execute_admin_sql(grant)
+            try:
+                errors = self._evaluate_view_authority_rows()
+                self.assertTrue(any(expected in error for error in errors), (grantee, with_grant_option, errors))
+            finally:
+                self._execute_admin_sql(
+                    f'revoke SELECT ({_quote_identifier(column)}) on table public.sqag_quote_artifacts from {target}'
+                )
+        self.assertEqual(self._evaluate_view_authority_rows(), ())
+
+    def test_materialized_view_column_authority_fails_closed_postgres(self) -> None:
+        self.apply_migrations()
+        view_name = 'sqag_quote_matview_columns'
+        self._create_materialized_view(view_name)
+        target = _quote_identifier('sqag_runtime')
+        self._execute_admin_sql(
+            f'grant SELECT (marker) on table public.{_quote_identifier(view_name)} to {target}'
+        )
+        try:
+            errors = self._evaluate_view_authority_rows()
+            self.assertTrue(any('materialized_view_column_authority_forbidden' in error for error in errors), errors)
+        finally:
+            self._execute_admin_sql(
+                f'revoke SELECT (marker) on table public.{_quote_identifier(view_name)} from {target}'
+            )
+
+    def test_classified_view_definition_dependency_and_option_binding_fail_closed_postgres(self) -> None:
+        self.apply_migrations()
+        self._create_legacy_quote_artifacts_view()
+        self._grant_manifest_view_authority('sqag_runtime')
+        self._execute_admin_sql(
+            'create or replace view public.sqag_quote_artifacts as '
+            'select workspace_id, session_id, artifact_kind, filename, content_type, size_bytes, '
+            'content_blob, created_at, updated_at from public.legacy_quote_artifacts_source '
+            'where workspace_id is not null'
+        )
+        try:
+            errors = self._evaluate_view_authority_rows()
+            self.assertTrue(any('classified_view_definition_mismatch' in error for error in errors), errors)
+        finally:
+            self._execute_admin_sql(
+                'create or replace view public.sqag_quote_artifacts as '
+                'select workspace_id, session_id, artifact_kind, filename, content_type, size_bytes, '
+                'content_blob, created_at, updated_at from public.legacy_quote_artifacts_source'
+            )
+
+        self._execute_admin_sql(
+            'create table public.legacy_quote_artifacts_substitute '
+            '(workspace_id text not null, session_id text not null, artifact_kind text not null, '
+            'filename text not null, content_type text not null, size_bytes bigint not null, '
+            'content_blob bytea not null, created_at text not null, updated_at text not null)'
+        )
+        self.addCleanup(
+            self._cleanup_steps,
+            [('drop_run73_legacy_substitute', 'drop table if exists public.legacy_quote_artifacts_substitute')],
+        )
+        self._execute_admin_sql(
+            'create or replace view public.sqag_quote_artifacts as '
+            'select workspace_id, session_id, artifact_kind, filename, content_type, size_bytes, '
+            'content_blob, created_at, updated_at from public.legacy_quote_artifacts_substitute'
+        )
+        try:
+            errors = self._evaluate_view_authority_rows()
+            self.assertTrue(any('classified_view_dependencies_mismatch' in error for error in errors), errors)
+        finally:
+            self._execute_admin_sql(
+                'create or replace view public.sqag_quote_artifacts as '
+                'select workspace_id, session_id, artifact_kind, filename, content_type, size_bytes, '
+                'content_blob, created_at, updated_at from public.legacy_quote_artifacts_source'
+            )
+
+        self._execute_admin_sql(
+            'alter view public.sqag_quote_artifacts set (security_barrier=true)'
+        )
+        try:
+            errors = self._evaluate_view_authority_rows()
+            self.assertTrue(any('classified_view_options_mismatch' in error for error in errors), errors)
+            self.assertTrue(any('classified_view_security_mismatch' in error for error in errors), errors)
+        finally:
+            self._execute_admin_sql('alter view public.sqag_quote_artifacts reset (security_barrier)')
+        self.assertEqual(self._evaluate_view_authority_rows(), ())
 
     def test_legacy_view_runtime_read_is_prescribed_and_verified(self) -> None:
         self.apply_migrations()

@@ -139,8 +139,8 @@ ACCESSIBLE_TABLE_KEYS = frozenset({"class", "schema", "privileges"})
 FORBIDDEN_TABLE_KEYS = frozenset({"class", "schema", "reason"})
 PRIVILEGE_KEYS = frozenset({"select", "insert", "update", "delete"})
 
-VIEWS_KEYS = frozenset({"count", "runtime_accessible", "legacy_optional", "materialized_view_rule"})
-ACCESSIBLE_VIEW_KEYS = frozenset({"schema", "class", "privileges", "production_source", "bound"})
+VIEWS_KEYS = frozenset({"count", "runtime_accessible", "legacy_optional", "materialized_view_rule", "direct_runtime_grants"})
+ACCESSIBLE_VIEW_KEYS = frozenset({"schema", "class", "privileges", "production_source", "bound", "definition"})
 VIEW_PRIVILEGE_KEYS = frozenset({"select"})
 VIEW_AUTHORITY_ROW_KEYS = frozenset(
     {
@@ -149,6 +149,12 @@ VIEW_AUTHORITY_ROW_KEYS = frozenset(
         "owner",
         "relation_acl",
         "acl_entries",
+        "column_acl_entries",
+        "view_definition",
+        "view_dependencies",
+        "view_columns",
+        "relation_options",
+        "view_security",
         "runtime_privileges",
         "runtime_select",
         "runtime_select_grantable",
@@ -156,6 +162,15 @@ VIEW_AUTHORITY_ROW_KEYS = frozenset(
 )
 VIEW_ACL_ENTRY_KEYS = frozenset({"grantee", "grantor", "privilege_type", "is_grantable"})
 VIEW_RUNTIME_PRIVILEGE_KEYS = frozenset({"privilege_type", "effective", "is_grantable"})
+VIEW_COLUMN_ACL_ROW_KEYS = frozenset(
+    {"relation_name", "relation_kind", "column_number", "column_name", "acl_entries", "runtime_privileges"}
+)
+VIEW_DEFINITION_KEYS = frozenset({"canonical_definition", "dependencies", "columns", "relation_options", "security"})
+VIEW_DEPENDENCY_KEYS = frozenset({"schema", "relation_name", "relation_kind", "dependency_type"})
+VIEW_COLUMN_KEYS = frozenset(
+    {"ordinal", "name", "type_oid", "type_schema", "type_name", "type_modifier", "type_sql"}
+)
+VIEW_SECURITY_KEYS = frozenset({"security_barrier", "security_invoker", "check_option"})
 VIEW_RELATION_PRIVILEGES = (
     "SELECT",
     "INSERT",
@@ -166,6 +181,7 @@ VIEW_RELATION_PRIVILEGES = (
     "TRIGGER",
     "MAINTAIN",
 )
+VIEW_COLUMN_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "REFERENCES")
 
 MATERIALIZED_VIEW_RULE = (
     "No public materialized view is classified. Any public materialized view fails "
@@ -476,6 +492,166 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
     """,
 }
 
+CANONICAL_VERIFICATION_QUERY_SQL['view_acl'] = '''
+        select c.relname as relation_name,
+               c.relkind as relation_kind,
+               r.rolname as owner,
+               c.relacl::text as relation_acl,
+               acl.acl_entries,
+               column_acl.column_acl_entries,
+               pg_catalog.pg_get_viewdef(c.oid, true) as view_definition,
+               dependency.view_dependencies,
+               shape.view_columns,
+               options.relation_options,
+               jsonb_build_object(
+                   'security_barrier', options.security_barrier,
+                   'security_invoker', options.security_invoker,
+                   'check_option', options.check_option
+               ) as view_security,
+               runtime.runtime_privileges,
+               runtime.runtime_select,
+               runtime.runtime_select_grantable
+        from pg_catalog.pg_class c
+        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+        join pg_catalog.pg_roles r on r.oid = c.relowner
+        cross join lateral (
+            select coalesce(
+                       jsonb_agg(
+                           jsonb_build_object(
+                               'grantee', case when expanded.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'OID:' || expanded.grantee::text) end,
+                               'grantor', coalesce(grantor_role.rolname, 'OID:' || expanded.grantor::text),
+                               'privilege_type', expanded.privilege_type,
+                               'is_grantable', expanded.is_grantable
+                           )
+                           order by expanded.grantee, expanded.grantor, expanded.privilege_type, expanded.is_grantable
+                       ) filter (where expanded.grantee is not null),
+                       '[]'::jsonb
+                   ) as acl_entries
+            from pg_catalog.aclexplode(coalesce(c.relacl, pg_catalog.acldefault('r', c.relowner))) expanded
+            left join pg_catalog.pg_roles grantee_role on grantee_role.oid = expanded.grantee and expanded.grantee <> 0
+            left join pg_catalog.pg_roles grantor_role on grantor_role.oid = expanded.grantor
+        ) acl
+        cross join lateral (
+            select coalesce(
+                       jsonb_agg(
+                           jsonb_build_object(
+                               'relation_name', c.relname,
+                               'relation_kind', c.relkind,
+                               'column_number', a.attnum,
+                               'column_name', a.attname,
+                               'acl_entries', coalesce((
+                                   select jsonb_agg(
+                                       jsonb_build_object(
+                                           'grantee', case when expanded.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'OID:' || expanded.grantee::text) end,
+                                           'grantor', coalesce(grantor_role.rolname, 'OID:' || expanded.grantor::text),
+                                           'privilege_type', expanded.privilege_type,
+                                           'is_grantable', expanded.is_grantable
+                                       )
+                                       order by expanded.grantee, expanded.grantor, expanded.privilege_type, expanded.is_grantable
+                                   )
+                                   from pg_catalog.aclexplode(a.attacl) expanded
+                                   left join pg_catalog.pg_roles grantee_role on grantee_role.oid = expanded.grantee and expanded.grantee <> 0
+                                   left join pg_catalog.pg_roles grantor_role on grantor_role.oid = expanded.grantor
+                               ), '[]'::jsonb),
+                               'runtime_privileges', (
+                                   select coalesce(
+                                              jsonb_agg(
+                                                  jsonb_build_object(
+                                                      'privilege_type', p.privilege_type,
+                                                      'effective', has_column_privilege('sqag_runtime', c.oid, a.attname, p.privilege_type),
+                                                      'is_grantable', has_column_privilege('sqag_runtime', c.oid, a.attname, p.privilege_type || ' WITH GRANT OPTION')
+                                                  )
+                                                  order by p.privilege_type
+                                              ),
+                                              '[]'::jsonb
+                                          )
+                                   from (values ('SELECT'), ('INSERT'), ('UPDATE'), ('REFERENCES')) p(privilege_type)
+                               )
+                           )
+                           order by a.attnum
+                       ),
+                       '[]'::jsonb
+                   ) as column_acl_entries
+            from pg_catalog.pg_attribute a
+            where a.attrelid = c.oid
+              and a.attnum > 0
+              and not a.attisdropped
+        ) column_acl
+        cross join lateral (
+            select coalesce(
+                       jsonb_agg(
+                           jsonb_build_object(
+                               'schema', dependency_rows.nspname,
+                               'relation_name', dependency_rows.relname,
+                               'relation_kind', dependency_rows.relkind,
+                               'dependency_type', dependency_rows.deptype
+                           )
+                           order by dependency_rows.nspname, dependency_rows.relname, dependency_rows.relkind, dependency_rows.deptype
+                       ),
+                       '[]'::jsonb
+                   ) as view_dependencies
+            from (
+                select distinct dep_n.nspname, dep_c.relname, dep_c.relkind, d.deptype
+                from pg_catalog.pg_rewrite rw
+                join pg_catalog.pg_depend d on d.classid = 'pg_rewrite'::regclass and d.objid = rw.oid
+                join pg_catalog.pg_class dep_c on dep_c.oid = d.refobjid
+                join pg_catalog.pg_namespace dep_n on dep_n.oid = dep_c.relnamespace
+                where d.refclassid = 'pg_class'::regclass
+                  and rw.ev_class = c.oid
+                  and d.refobjid <> c.oid
+            ) dependency_rows
+        ) dependency
+        cross join lateral (
+            select coalesce(
+                       jsonb_agg(
+                           jsonb_build_object(
+                               'ordinal', a.attnum,
+                               'name', a.attname,
+                               'type_oid', a.atttypid::int,
+                               'type_schema', type_n.nspname,
+                               'type_name', type_t.typname,
+                               'type_modifier', a.atttypmod,
+                               'type_sql', pg_catalog.format_type(a.atttypid, a.atttypmod)
+                           )
+                           order by a.attnum
+                       ),
+                       '[]'::jsonb
+                   ) as view_columns
+            from pg_catalog.pg_attribute a
+            join pg_catalog.pg_type type_t on type_t.oid = a.atttypid
+            join pg_catalog.pg_namespace type_n on type_n.oid = type_t.typnamespace
+            where a.attrelid = c.oid
+              and a.attnum > 0
+              and not a.attisdropped
+        ) shape
+        cross join lateral (
+            select coalesce(jsonb_object_agg(option_name, option_value order by option_name), '{}'::jsonb) as relation_options,
+                   coalesce(bool_or(option_name = 'security_barrier' and option_value = 'true'), false) as security_barrier,
+                   coalesce(bool_or(option_name = 'security_invoker' and option_value = 'true'), false) as security_invoker,
+                   max(option_value) filter (where option_name = 'check_option') as check_option
+            from pg_catalog.pg_options_to_table(coalesce(c.reloptions, array[]::text[]))
+        ) options
+        cross join lateral (
+            select coalesce(
+                       jsonb_agg(
+                           jsonb_build_object(
+                               'privilege_type', p.privilege_type,
+                               'effective', has_table_privilege('sqag_runtime', c.oid, p.privilege_type),
+                               'is_grantable', has_table_privilege('sqag_runtime', c.oid, p.privilege_type || ' WITH GRANT OPTION')
+                           )
+                           order by p.privilege_type
+                       ),
+                       '[]'::jsonb
+                   ) as runtime_privileges,
+                   has_table_privilege('sqag_runtime', c.oid, 'SELECT') as runtime_select,
+                   has_table_privilege('sqag_runtime', c.oid, 'SELECT WITH GRANT OPTION') as runtime_select_grantable
+            from (values ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE'), ('REFERENCES'), ('TRIGGER'), ('MAINTAIN')) p(privilege_type)
+        ) runtime
+        where n.nspname = 'public'
+          and c.relkind in ('v', 'm')
+        order by c.relkind, c.relname
+'''
+
 RUNTIME_TABLES = frozenset(
     {
         "sqag_profiles",
@@ -555,6 +731,31 @@ LEGACY_VIEW_DETAILS = {
         "legacy_publication_backfill",
         "webapp.server.DatabaseSqagStorage.publish_quote_session_forensic_transaction",
     ),
+}
+LEGACY_VIEW_DIRECT_GRANT_COUNTS = {"legacy_absent": 37, "legacy_present": 38}
+LEGACY_VIEW_DEFINITION = {
+    "canonical_definition": "select workspace_id, session_id, artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at from legacy_quote_artifacts_source",
+    "dependencies": [
+        {
+            "schema": "public",
+            "relation_name": "legacy_quote_artifacts_source",
+            "relation_kind": "r",
+            "dependency_type": "n",
+        }
+    ],
+    "columns": [
+        {"ordinal": 1, "name": "workspace_id", "type_oid": 25, "type_schema": "pg_catalog", "type_name": "text", "type_modifier": -1, "type_sql": "text"},
+        {"ordinal": 2, "name": "session_id", "type_oid": 25, "type_schema": "pg_catalog", "type_name": "text", "type_modifier": -1, "type_sql": "text"},
+        {"ordinal": 3, "name": "artifact_kind", "type_oid": 25, "type_schema": "pg_catalog", "type_name": "text", "type_modifier": -1, "type_sql": "text"},
+        {"ordinal": 4, "name": "filename", "type_oid": 25, "type_schema": "pg_catalog", "type_name": "text", "type_modifier": -1, "type_sql": "text"},
+        {"ordinal": 5, "name": "content_type", "type_oid": 25, "type_schema": "pg_catalog", "type_name": "text", "type_modifier": -1, "type_sql": "text"},
+        {"ordinal": 6, "name": "size_bytes", "type_oid": 20, "type_schema": "pg_catalog", "type_name": "int8", "type_modifier": -1, "type_sql": "bigint"},
+        {"ordinal": 7, "name": "content_blob", "type_oid": 17, "type_schema": "pg_catalog", "type_name": "bytea", "type_modifier": -1, "type_sql": "bytea"},
+        {"ordinal": 8, "name": "created_at", "type_oid": 25, "type_schema": "pg_catalog", "type_name": "text", "type_modifier": -1, "type_sql": "text"},
+        {"ordinal": 9, "name": "updated_at", "type_oid": 25, "type_schema": "pg_catalog", "type_name": "text", "type_modifier": -1, "type_sql": "text"},
+    ],
+    "relation_options": {},
+    "security": {"security_barrier": False, "security_invoker": False, "check_option": None},
 }
 
 BOUNDARY_B_OPERATION_AUTHORITY = {
@@ -679,6 +880,35 @@ REQUIRED_QUERY_FEATURES['view_acl'] = REQUIRED_QUERY_FEATURES['view_acl'] + (
     chr(39) + 'REFERENCES' + chr(39),
     chr(39) + 'TRIGGER' + chr(39),
     chr(39) + 'MAINTAIN' + chr(39),
+    'pg_catalog.pg_attribute',
+    'pg_catalog.pg_depend',
+    'pg_catalog.pg_rewrite',
+    'pg_catalog.pg_type',
+    'pg_catalog.pg_options_to_table',
+    'pg_catalog.pg_get_viewdef',
+    'pg_catalog.format_type',
+    'has_column_privilege',
+    'jsonb_object_agg',
+    'column_acl_entries',
+    'view_definition',
+    'view_dependencies',
+    'view_columns',
+    'relation_options',
+    'view_security',
+    'column_number',
+    'column_name',
+    'type_oid',
+    'type_schema',
+    'type_name',
+    'type_modifier',
+    'type_sql',
+    'dependency_type',
+    'security_barrier',
+    'security_invoker',
+    'check_option',
+    'refclassid',
+    'ev_class',
+    'deptype',
 )
 
 
@@ -1196,6 +1426,32 @@ def validate_views(manifest: dict[str, Any], errors: list[str]) -> None:
         "views_materialized_view_rule",
         errors,
     )
+    direct_runtime_grants = views.get("direct_runtime_grants")
+    if _exact_keys(direct_runtime_grants, frozenset(LEGACY_VIEW_DIRECT_GRANT_COUNTS), "views_direct_runtime_grants", errors):
+        tables = manifest.get("tables")
+        table_accessible = tables.get("runtime_accessible") if isinstance(tables, dict) else None
+        table_grants = sum(
+            1
+            for entry in table_accessible.values()
+            if isinstance(entry, dict)
+            for privilege in entry.get("privileges", {}).values()
+            if type(privilege) is bool and privilege
+        ) if isinstance(table_accessible, dict) else 0
+        column_privileges = manifest.get("column_privileges")
+        column_grants = sum(
+            len(privileges)
+            for privileges in column_privileges.values()
+            if isinstance(privileges, dict)
+            for privilege_columns in privileges.values()
+            if isinstance(privilege_columns, list)
+        ) if isinstance(column_privileges, dict) else 0
+        database_runtime = manifest.get("database_acl", {}).get("sqag_runtime", {})
+        schema_runtime = manifest.get("schema_acl", {}).get("sqag_runtime", {})
+        database_grants = sum(1 for value in database_runtime.values() if type(value) is bool and value) if isinstance(database_runtime, dict) else 0
+        schema_grants = sum(1 for value in schema_runtime.values() if type(value) is bool and value) if isinstance(schema_runtime, dict) else 0
+        absent_total = table_grants + column_grants + database_grants + schema_grants
+        _exact_value(direct_runtime_grants.get("legacy_absent"), absent_total, "views_direct_runtime_grants_legacy_absent", errors)
+        _exact_value(direct_runtime_grants.get("legacy_present"), absent_total + 1, "views_direct_runtime_grants_legacy_present", errors)
     accessible = views.get("runtime_accessible")
     if not isinstance(accessible, dict):
         _add_error(errors, "runtime_accessible_views_must_be_object")
@@ -1221,11 +1477,285 @@ def validate_views(manifest: dict[str, Any], errors: list[str]) -> None:
             errors,
         )
         _exact_value(entry.get("bound"), True, f"{label}_bound", errors)
+        definition = entry.get("definition")
+        if not _exact_keys(definition, VIEW_DEFINITION_KEYS, f"{label}_definition", errors):
+            if not isinstance(definition, dict):
+                continue
+        expected_definition = LEGACY_VIEW_DEFINITION if view_name == "sqag_quote_artifacts" else None
+        _exact_value(definition, expected_definition, f"{label}_definition", errors)
         privileges = entry.get("privileges")
         if not _exact_keys(privileges, VIEW_PRIVILEGE_KEYS, f"{label}_privileges", errors):
             if not isinstance(privileges, dict):
                 continue
         _exact_value(privileges.get("select"), True, f"{label}_select", errors)
+
+
+def _normalise_view_definition(value: str) -> str:
+    return ' '.join(value.split()).strip().rstrip(';').strip().lower()
+
+
+def _validate_view_columns(value: Any, label: str, errors: list[str]) -> list[tuple[int, str]]:
+    if type(value) is not list:
+        _add_error(errors, f'{label}_must_be_list')
+        return []
+    identities: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+    seen_ordinals: set[int] = set()
+    seen_names: set[str] = set()
+    for index, column in enumerate(value):
+        column_label = f'{label}_{index}'
+        if not isinstance(column, dict):
+            _add_error(errors, f'{column_label}_must_be_object')
+            continue
+        if not _exact_keys(column, VIEW_COLUMN_KEYS, column_label, errors):
+            continue
+        _require_type(column.get('ordinal'), int, f'{column_label}_ordinal', errors)
+        _require_non_empty_string(column.get('name'), f'{column_label}_name', errors)
+        _require_type(column.get('type_oid'), int, f'{column_label}_type_oid', errors)
+        _require_non_empty_string(column.get('type_schema'), f'{column_label}_type_schema', errors)
+        _require_non_empty_string(column.get('type_name'), f'{column_label}_type_name', errors)
+        _require_type(column.get('type_modifier'), int, f'{column_label}_type_modifier', errors)
+        _require_non_empty_string(column.get('type_sql'), f'{column_label}_type_sql', errors)
+        if (
+            type(column.get('ordinal')) is not int
+            or type(column.get('name')) is not str
+            or type(column.get('type_oid')) is not int
+            or type(column.get('type_schema')) is not str
+            or type(column.get('type_name')) is not str
+            or type(column.get('type_modifier')) is not int
+            or type(column.get('type_sql')) is not str
+        ):
+            continue
+        ordinal = int(column['ordinal'])
+        name = str(column['name'])
+        if ordinal <= 0:
+            _add_error(errors, f'{column_label}_ordinal_must_be_positive')
+        if column['type_oid'] <= 0:
+            _add_error(errors, f'{column_label}_type_oid_must_be_positive')
+        identity = (ordinal, name)
+        if identity in seen:
+            _add_error(errors, f'{column_label}_duplicate_identity')
+        if ordinal in seen_ordinals:
+            _add_error(errors, f'{column_label}_duplicate_ordinal')
+        if name in seen_names:
+            _add_error(errors, f'{column_label}_duplicate_name')
+        seen.add(identity)
+        seen_ordinals.add(ordinal)
+        seen_names.add(name)
+        identities.append(identity)
+    if not identities:
+        _add_error(errors, f'{label}_must_not_be_empty')
+    if identities != sorted(identities):
+        _add_error(errors, f'{label}_must_be_ordered_by_ordinal')
+    return identities
+
+
+def _validate_view_dependencies(value: Any, label: str, errors: list[str]) -> list[dict[str, Any]]:
+    if type(value) is not list:
+        _add_error(errors, f'{label}_must_be_list')
+        return []
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for index, dependency in enumerate(value):
+        dependency_label = f'{label}_{index}'
+        if not isinstance(dependency, dict):
+            _add_error(errors, f'{dependency_label}_must_be_object')
+            continue
+        if not _exact_keys(dependency, VIEW_DEPENDENCY_KEYS, dependency_label, errors):
+            continue
+        for key in ('schema', 'relation_name', 'relation_kind', 'dependency_type'):
+            _require_non_empty_string(dependency.get(key), f'{dependency_label}_{key}', errors)
+        if any(type(dependency.get(key)) is not str for key in VIEW_DEPENDENCY_KEYS):
+            continue
+        dependency_type = str(dependency['dependency_type'])
+        if dependency_type not in {'n', 'a', 'i', 'p', 'e'}:
+            _add_error(errors, f'{dependency_label}_invalid_dependency_type_{dependency_type}')
+        identity = (
+            str(dependency['schema']),
+            str(dependency['relation_name']),
+            str(dependency['relation_kind']),
+            dependency_type,
+        )
+        if identity in seen:
+            _add_error(errors, f'{dependency_label}_duplicate_identity')
+        seen.add(identity)
+        result.append(dependency)
+    return result
+
+
+def _validate_view_options_and_security(
+    relation_options: Any,
+    view_security: Any,
+    label: str,
+    errors: list[str],
+) -> tuple[dict[str, str], dict[str, Any]]:
+    options: dict[str, str] = {}
+    if type(relation_options) is not dict:
+        _add_error(errors, f'{label}_relation_options_must_be_object')
+    else:
+        for key, value in relation_options.items():
+            if type(key) is not str or not key.strip():
+                _add_error(errors, f'{label}_relation_options_invalid_key')
+            if type(value) is not str:
+                _add_error(errors, f'{label}_relation_options_invalid_value_{key}')
+            else:
+                options[str(key)] = value
+    if not _exact_keys(view_security, VIEW_SECURITY_KEYS, f'{label}_security', errors):
+        if not isinstance(view_security, dict):
+            return options, {}
+    _require_type(view_security.get('security_barrier'), bool, f'{label}_security_barrier', errors)
+    _require_type(view_security.get('security_invoker'), bool, f'{label}_security_invoker', errors)
+    check_option = view_security.get('check_option')
+    if check_option is not None and type(check_option) is not str:
+        _add_error(errors, f'{label}_check_option_must_be_string_or_null')
+    if type(check_option) is str and check_option.lower() not in {'local', 'cascaded', 'none'}:
+        _add_error(errors, f'{label}_invalid_check_option_{check_option}')
+    security = {
+        'security_barrier': view_security.get('security_barrier'),
+        'security_invoker': view_security.get('security_invoker'),
+        'check_option': check_option,
+    }
+    return options, security
+
+
+def _validate_view_column_acl(
+    row: dict[str, Any],
+    label: str,
+    *,
+    name: str,
+    kind: str,
+    owner: str,
+    runtime_role: str,
+    classified: bool,
+    runtime_select: bool,
+    runtime_select_grantable: bool,
+    column_identities: list[tuple[int, str]],
+    errors: list[str],
+) -> set[str]:
+    column_acl_entries = row.get('column_acl_entries')
+    if type(column_acl_entries) is not list:
+        _add_error(errors, f'{label}_column_acl_entries_must_be_list')
+        return set()
+    seen_columns: set[tuple[int, str]] = set()
+    effective_runtime_columns: set[str] = set()
+    for column_index, column in enumerate(column_acl_entries):
+        column_label = f'{label}_column_acl_row_{column_index}'
+        if not isinstance(column, dict):
+            _add_error(errors, f'{column_label}_must_be_object')
+            continue
+        if not _exact_keys(column, VIEW_COLUMN_ACL_ROW_KEYS, column_label, errors):
+            continue
+        _require_non_empty_string(column.get('relation_name'), f'{column_label}_relation_name', errors)
+        _require_non_empty_string(column.get('relation_kind'), f'{column_label}_relation_kind', errors)
+        _require_type(column.get('column_number'), int, f'{column_label}_column_number', errors)
+        _require_non_empty_string(column.get('column_name'), f'{column_label}_column_name', errors)
+        if (
+            type(column.get('relation_name')) is not str
+            or type(column.get('relation_kind')) is not str
+            or type(column.get('column_number')) is not int
+            or type(column.get('column_name')) is not str
+        ):
+            continue
+        identity = (int(column['column_number']), str(column['column_name']))
+        if str(column['relation_name']) != name or str(column['relation_kind']) != kind:
+            _add_error(errors, f'{column_label}_relation_identity_mismatch')
+        if identity in seen_columns:
+            _add_error(errors, f'{column_label}_duplicate_identity')
+        seen_columns.add(identity)
+        if identity not in set(column_identities):
+            _add_error(errors, f'{column_label}_unknown_column_identity_{identity!r}')
+
+        acl_entries = column.get('acl_entries')
+        if type(acl_entries) is not list:
+            _add_error(errors, f'{column_label}_acl_entries_must_be_list')
+        else:
+            seen_acl: set[tuple[str, str, str, bool]] = set()
+            for acl_index, entry in enumerate(acl_entries):
+                entry_label = f'{column_label}_acl_entry_{acl_index}'
+                if not isinstance(entry, dict):
+                    _add_error(errors, f'{entry_label}_must_be_object')
+                    continue
+                if not _exact_keys(entry, VIEW_ACL_ENTRY_KEYS, entry_label, errors):
+                    continue
+                for key in ('grantee', 'grantor', 'privilege_type'):
+                    _require_non_empty_string(entry.get(key), f'{entry_label}_{key}', errors)
+                _require_type(entry.get('is_grantable'), bool, f'{entry_label}_is_grantable', errors)
+                if any(type(entry.get(key)) is not str for key in ('grantee', 'grantor', 'privilege_type')) or type(entry.get('is_grantable')) is not bool:
+                    continue
+                grantee = str(entry['grantee'])
+                grantor = str(entry['grantor'])
+                privilege = str(entry['privilege_type'])
+                grantable = bool(entry['is_grantable'])
+                if privilege not in VIEW_COLUMN_PRIVILEGES:
+                    _add_error(errors, f'{entry_label}_invalid_privilege_type_{privilege}')
+                    continue
+                acl_identity = (grantee, grantor, privilege, grantable)
+                if acl_identity in seen_acl:
+                    _add_error(errors, f'{entry_label}_duplicate_acl_entry')
+                seen_acl.add(acl_identity)
+                if grantable:
+                    _add_error(errors, f'{entry_label}_column_acl_grant_option_forbidden')
+                if grantee == 'PUBLIC':
+                    _add_error(errors, f'{entry_label}_column_acl_public_authority_forbidden')
+                elif grantee == runtime_role:
+                    _add_error(errors, f'{entry_label}_column_acl_runtime_authority_forbidden')
+                    if grantable:
+                        _add_error(errors, f'{entry_label}_column_acl_runtime_grant_option_forbidden')
+                    if privilege != 'SELECT':
+                        _add_error(errors, f'{entry_label}_column_acl_runtime_privilege_forbidden_{privilege}')
+                    if grantor != owner:
+                        _add_error(errors, f'{entry_label}_column_acl_runtime_grantor_invalid')
+                else:
+                    _add_error(errors, f'{entry_label}_column_acl_unexpected_participant_{grantee}_{grantor}')
+
+        runtime_privileges = column.get('runtime_privileges')
+        effective: dict[str, tuple[bool, bool]] = {}
+        if type(runtime_privileges) is not list:
+            _add_error(errors, f'{column_label}_runtime_privileges_must_be_list')
+        else:
+            seen_privileges: set[str] = set()
+            for privilege_index, entry in enumerate(runtime_privileges):
+                privilege_label = f'{label}_column_runtime_privilege_{privilege_index}'
+                if not isinstance(entry, dict):
+                    _add_error(errors, f'{privilege_label}_must_be_object')
+                    continue
+                if not _exact_keys(entry, VIEW_RUNTIME_PRIVILEGE_KEYS, privilege_label, errors):
+                    continue
+                _require_non_empty_string(entry.get('privilege_type'), f'{privilege_label}_privilege_type', errors)
+                _require_type(entry.get('effective'), bool, f'{privilege_label}_effective', errors)
+                _require_type(entry.get('is_grantable'), bool, f'{privilege_label}_is_grantable', errors)
+                if type(entry.get('privilege_type')) is not str or type(entry.get('effective')) is not bool or type(entry.get('is_grantable')) is not bool:
+                    continue
+                privilege = str(entry['privilege_type'])
+                if privilege not in VIEW_COLUMN_PRIVILEGES:
+                    _add_error(errors, f'{privilege_label}_invalid_privilege_type_{privilege}')
+                    continue
+                if privilege in seen_privileges:
+                    _add_error(errors, f'{label}_column_runtime_privilege_{privilege_index}_duplicate')
+                seen_privileges.add(privilege)
+                effective[privilege] = (bool(entry['effective']), bool(entry['is_grantable']))
+            missing = set(VIEW_COLUMN_PRIVILEGES) - set(effective)
+            if missing:
+                _add_error(errors, f'{column_label}_runtime_privileges_missing_{sorted(missing)}')
+        for privilege, (is_effective, is_grantable) in effective.items():
+            if is_grantable:
+                _add_error(errors, f'{column_label}_runtime_privilege_grant_option_forbidden')
+            if is_effective:
+                effective_runtime_columns.add(privilege)
+                if kind == 'm':
+                    _add_error(errors, f'{label}_materialized_view_column_authority_forbidden')
+                elif not classified:
+                    _add_error(errors, f'{label}_column_acl_runtime_authority_forbidden')
+                elif privilege != 'SELECT' or not runtime_select:
+                    _add_error(errors, f'{label}_classified_view_column_privilege_invalid_{privilege}')
+        if classified and runtime_select_grantable:
+            _add_error(errors, f'{label}_classified_view_column_relation_grant_option_forbidden')
+    missing_columns = set(column_identities) - seen_columns
+    if missing_columns:
+        _add_error(errors, f'{label}_column_acl_entries_missing_{sorted(missing_columns)}')
+    if set(column_identities) != seen_columns:
+        _add_error(errors, f'{label}_column_acl_entries_identity_mismatch')
+    return effective_runtime_columns
 
 
 def evaluate_view_authority(
@@ -1334,6 +1864,15 @@ def evaluate_view_authority(
                 else:
                     _add_error(errors, f"{entry_label}_unexpected_acl_grantee_{grantee}")
 
+        owner_acl_semantics = {
+            (entry['grantee'], entry['grantor'], entry['privilege_type'], entry['is_grantable'])
+            for entry in valid_acl_entries
+            if entry.get('grantee') == owner
+        }
+        expected_owner_acl = {(owner, owner, privilege, False) for privilege in expected_privileges}
+        if owner_acl_semantics != expected_owner_acl:
+            _add_error(errors, f'{label}_owner_acl_completeness_expected_{sorted(expected_owner_acl)}_got_{sorted(owner_acl_semantics)}')
+
         runtime_privileges = row.get("runtime_privileges")
         effective_privileges: dict[str, tuple[bool, bool]] = {}
         runtime_privileges_valid = True
@@ -1384,6 +1923,43 @@ def evaluate_view_authority(
                 _add_error(errors, f"{label}_runtime_select_grantable_evidence_mismatch")
             if any(is_grantable for _, is_grantable in effective_privileges.values()):
                 _add_error(errors, f"{label}_runtime_privilege_grant_option_forbidden")
+
+        view_columns = _validate_view_columns(row.get('view_columns'), f'{label}_view_columns', errors)
+        view_dependencies = _validate_view_dependencies(row.get('view_dependencies'), f'{label}_view_dependencies', errors)
+        relation_options, view_security = _validate_view_options_and_security(
+            row.get('relation_options'),
+            row.get('view_security'),
+            label,
+            errors,
+        )
+        view_definition = row.get('view_definition')
+        if type(view_definition) is not str or not view_definition.strip():
+            _add_error(errors, f'{label}_view_definition_must_be_non_empty_string')
+        if name in classified:
+            expected_definition = LEGACY_VIEW_DEFINITION
+            if type(view_definition) is str and _normalise_view_definition(view_definition) != _normalise_view_definition(expected_definition['canonical_definition']):
+                _add_error(errors, f'{label}_classified_view_definition_mismatch')
+            if view_dependencies != expected_definition['dependencies']:
+                _add_error(errors, f'{label}_classified_view_dependencies_mismatch')
+            if row.get('view_columns') != expected_definition['columns']:
+                _add_error(errors, f'{label}_classified_view_columns_mismatch')
+            if relation_options != expected_definition['relation_options']:
+                _add_error(errors, f'{label}_classified_view_options_mismatch')
+            if view_security != expected_definition['security']:
+                _add_error(errors, f'{label}_classified_view_security_mismatch')
+        _validate_view_column_acl(
+            row,
+            label,
+            name=name,
+            kind=kind,
+            owner=owner,
+            runtime_role=runtime_role,
+            classified=name in classified,
+            runtime_select=runtime_select,
+            runtime_select_grantable=grantable,
+            column_identities=view_columns,
+            errors=errors,
+        )
 
         if owner == runtime_role:
             _add_error(errors, f"{label}_runtime_relation_ownership_forbidden")
@@ -2141,6 +2717,55 @@ def _validate_routine_query(query: str, errors: list[str]) -> None:
         _add_error(errors, "verification_query_routine_acl_must_order_deterministically")
 
 
+def _validate_view_query(query: str, errors: list[str]) -> None:
+    tokens = _read_only_query_tokens(query, 'view_acl', errors)
+    if tokens is None:
+        return
+    parts = _projection_parts(tokens, 'view_acl', errors)
+    if parts is not None:
+        _require_projection_shape(
+            parts,
+            [
+                'relation_name', 'relation_kind', 'owner', 'relation_acl', 'acl_entries',
+                'column_acl_entries', 'view_definition', 'view_dependencies', 'view_columns',
+                'relation_options', 'view_security', 'runtime_privileges', 'runtime_select',
+                'runtime_select_grantable',
+            ],
+            'view_acl',
+            errors,
+        )
+    required_patterns = (
+        ['from', *_qualified_pattern('pg_catalog.pg_class'), 'c'],
+        ['join', *_qualified_pattern('pg_catalog.pg_namespace'), 'n'],
+        ['join', *_qualified_pattern('pg_catalog.pg_roles'), 'r'],
+        ['pg_catalog', '.', 'pg_attribute'],
+        ['pg_catalog', '.', 'pg_depend'],
+        ['pg_catalog', '.', 'pg_type'],
+        ['pg_catalog', '.', 'pg_options_to_table'],
+        ['pg_catalog', '.', 'pg_get_viewdef'],
+        ['pg_catalog', '.', 'format_type'],
+        ['has_column_privilege'],
+        ['pg_catalog', '.', 'aclexplode'],
+        ['jsonb_agg'],
+        ['jsonb_build_object'],
+        ['jsonb_object_agg'],
+        ['cross', 'join', 'lateral'],
+        ['a', '.', 'attacl'],
+        ['d', '.', 'refclassid'],
+        ['d', '.', 'deptype'],
+        ['where', 'n', '.', 'nspname', '=', ('STRING', 'public')],
+        ['c', '.', 'relkind', 'in', '(', ('STRING_EXACT', 'v'), ',', ('STRING_EXACT', 'm'), ')'],
+        ['order', 'by', 'c', '.', 'relkind', ',', 'c', '.', 'relname'],
+    )
+    for pattern in required_patterns:
+        if not _find_token_pattern(tokens, pattern):
+            _add_error(errors, f'verification_query_view_acl_missing_structural_pattern_{pattern}')
+    if _count_token_pattern(tokens, ['pg_catalog', '.', 'aclexplode']) < 2:
+        _add_error(errors, 'verification_query_view_acl_requires_relation_and_column_aclexplode')
+    if _count_token_pattern(tokens, ['cross', 'join', 'lateral']) < 5:
+        _add_error(errors, 'verification_query_view_acl_requires_structured_lateral_evidence')
+
+
 def validate_verification_queries(manifest: dict[str, Any], errors: list[str]) -> None:
     queries = manifest.get("verification_queries")
     if set(CANONICAL_VERIFICATION_QUERY_SQL) != set(VERIFICATION_QUERY_KEYS):
@@ -2159,6 +2784,8 @@ def validate_verification_queries(manifest: dict[str, Any], errors: list[str]) -
             _validate_role_attributes_query(value, errors)
         elif key == "routine_acl":
             _validate_routine_query(value, errors)
+        elif key == 'view_acl':
+            _validate_view_query(value, errors)
         elif key in REQUIRED_QUERY_FEATURES:
             tokens = _read_only_query_tokens(value, key, errors)
             if tokens is not None:
