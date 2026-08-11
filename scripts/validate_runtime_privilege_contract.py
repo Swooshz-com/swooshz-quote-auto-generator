@@ -148,9 +148,23 @@ VIEW_AUTHORITY_ROW_KEYS = frozenset(
         "relation_kind",
         "owner",
         "relation_acl",
+        "acl_entries",
+        "runtime_privileges",
         "runtime_select",
         "runtime_select_grantable",
     }
+)
+VIEW_ACL_ENTRY_KEYS = frozenset({"grantee", "grantor", "privilege_type", "is_grantable"})
+VIEW_RUNTIME_PRIVILEGE_KEYS = frozenset({"privilege_type", "effective", "is_grantable"})
+VIEW_RELATION_PRIVILEGES = (
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "TRUNCATE",
+    "REFERENCES",
+    "TRIGGER",
+    "MAINTAIN",
 )
 
 MATERIALIZED_VIEW_RULE = (
@@ -416,15 +430,46 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                c.relkind as relation_kind,
                r.rolname as owner,
                c.relacl::text as relation_acl,
-               has_table_privilege('sqag_runtime', c.oid, 'SELECT') as runtime_select,
-               has_table_privilege(
-                   'sqag_runtime',
-                   c.oid,
-                   'SELECT WITH GRANT OPTION'
-               ) as runtime_select_grantable
+               acl.acl_entries,
+               runtime.runtime_privileges,
+               runtime.runtime_select,
+               runtime.runtime_select_grantable
         from pg_catalog.pg_class c
         join pg_catalog.pg_namespace n on n.oid = c.relnamespace
         join pg_catalog.pg_roles r on r.oid = c.relowner
+        cross join lateral (
+            select coalesce(
+                       jsonb_agg(
+                           jsonb_build_object(
+                               'grantee', case when expanded.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'OID:' || expanded.grantee::text) end,
+                               'grantor', coalesce(grantor_role.rolname, 'OID:' || expanded.grantor::text),
+                               'privilege_type', expanded.privilege_type,
+                               'is_grantable', expanded.is_grantable
+                           )
+                           order by expanded.grantee, expanded.grantor, expanded.privilege_type, expanded.is_grantable
+                       ) filter (where expanded.grantee is not null),
+                       '[]'::jsonb
+                   ) as acl_entries
+            from pg_catalog.aclexplode(coalesce(c.relacl, pg_catalog.acldefault('r', c.relowner))) expanded
+            left join pg_catalog.pg_roles grantee_role on grantee_role.oid = expanded.grantee and expanded.grantee <> 0
+            left join pg_catalog.pg_roles grantor_role on grantor_role.oid = expanded.grantor
+        ) acl
+        cross join lateral (
+            select coalesce(
+                       jsonb_agg(
+                           jsonb_build_object(
+                               'privilege_type', p.privilege_type,
+                               'effective', has_table_privilege('sqag_runtime', c.oid, p.privilege_type),
+                               'is_grantable', has_table_privilege('sqag_runtime', c.oid, p.privilege_type || ' WITH GRANT OPTION')
+                           )
+                           order by p.privilege_type
+                       ),
+                       '[]'::jsonb
+                   ) as runtime_privileges,
+                   has_table_privilege('sqag_runtime', c.oid, 'SELECT') as runtime_select,
+                   has_table_privilege('sqag_runtime', c.oid, 'SELECT WITH GRANT OPTION') as runtime_select_grantable
+            from (values ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE'), ('REFERENCES'), ('TRIGGER'), ('MAINTAIN')) p(privilege_type)
+        ) runtime
         where n.nspname = 'public'
           and c.relkind in ('v', 'm')
         order by c.relkind, c.relname
@@ -610,6 +655,31 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "order by",
     ),
 }
+
+
+REQUIRED_QUERY_FEATURES['view_acl'] = REQUIRED_QUERY_FEATURES['view_acl'] + (
+    'pg_catalog.aclexplode',
+    'pg_catalog.acldefault',
+    'jsonb_agg',
+    'jsonb_build_object',
+    'cross join lateral',
+    'acl_entries',
+    'runtime_privileges',
+    'grantee',
+    'grantor',
+    'privilege_type',
+    'is_grantable',
+    'values',
+    'filter',
+    chr(39) + 'SELECT' + chr(39),
+    chr(39) + 'INSERT' + chr(39),
+    chr(39) + 'UPDATE' + chr(39),
+    chr(39) + 'DELETE' + chr(39),
+    chr(39) + 'TRUNCATE' + chr(39),
+    chr(39) + 'REFERENCES' + chr(39),
+    chr(39) + 'TRIGGER' + chr(39),
+    chr(39) + 'MAINTAIN' + chr(39),
+)
 
 
 class DuplicateKeyError(ValueError):
@@ -1164,17 +1234,7 @@ def evaluate_view_authority(
     *,
     runtime_role: str = "sqag_runtime",
 ) -> tuple[str, ...]:
-    """Evaluate the complete relation/view verification result without filtering rows.
-
-    Consumes the rows returned by the canonical `view_acl` query (relation name,
-    relation kind, owner, raw ACL, effective runtime SELECT, and SELECT grant
-    option). Every `public` ordinary view and materialized view is classified:
-    no relation may be owned by the runtime role, no materialized view may exist
-    unclassified (the locked contract authorises none), and ordinary-view
-    runtime authority is accepted only for the exact legacy-optional classified
-    entry with bounded SELECT and no grant option. Absent legacy-optional
-    relations are valid on a fresh canonical production-migration database.
-    """
+    """Evaluate complete PostgreSQL-owned relation ACL and effective privilege evidence."""
 
     errors: list[str] = []
     if type(rows) is not list:
@@ -1185,9 +1245,12 @@ def evaluate_view_authority(
     if not isinstance(accessible, dict):
         return ("runtime_accessible_views_must_be_object",)
     classified = set(accessible)
+    boundary = manifest.get("boundary_b") if isinstance(manifest, dict) else None
+    expected_owner = boundary.get("object_owner") if isinstance(boundary, dict) else None
+    expected_privileges = set(VIEW_RELATION_PRIVILEGES)
 
     legacy_rows: list[dict[str, Any]] = []
-    seen_rows: set[tuple[str, str, str, bool, bool]] = set()
+    seen_names: set[str] = set()
     for index, row in enumerate(rows):
         label = f"relation_view_row_{index}"
         if not isinstance(row, dict):
@@ -1195,6 +1258,7 @@ def evaluate_view_authority(
             continue
         if not _exact_keys(row, VIEW_AUTHORITY_ROW_KEYS, label, errors):
             continue
+
         for key in ("relation_name", "relation_kind", "owner"):
             _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
         for key in ("runtime_select", "runtime_select_grantable"):
@@ -1202,9 +1266,12 @@ def evaluate_view_authority(
         relation_acl = row.get("relation_acl")
         if relation_acl is not None and type(relation_acl) is not str:
             _add_error(errors, f"{label}_relation_acl_must_be_string_or_null")
-        if any(
-            type(row.get(key)) is not str for key in ("relation_name", "relation_kind", "owner")
-        ) or any(type(row.get(key)) is not bool for key in ("runtime_select", "runtime_select_grantable")):
+
+        basic_types_valid = (
+            all(type(row.get(key)) is str for key in ("relation_name", "relation_kind", "owner"))
+            and all(type(row.get(key)) is bool for key in ("runtime_select", "runtime_select_grantable"))
+        )
+        if not basic_types_valid:
             continue
 
         name = str(row["relation_name"])
@@ -1212,32 +1279,156 @@ def evaluate_view_authority(
         owner = str(row["owner"])
         runtime_select = bool(row["runtime_select"])
         grantable = bool(row["runtime_select_grantable"])
-        row_tuple = (name, kind, owner, runtime_select, grantable)
-        if row_tuple in seen_rows:
-            _add_error(errors, f"{label}_duplicate_relation_view_row")
-        seen_rows.add(row_tuple)
+
+        if name in seen_names:
+            _add_error(errors, f"{label}_duplicate_relation_view_row_same_relation_name")
+        seen_names.add(name)
+
+        acl_entries = row.get("acl_entries")
+        valid_acl_entries: list[dict[str, Any]] = []
+        if type(acl_entries) is not list:
+            _add_error(errors, f"{label}_acl_entries_must_be_list")
+        else:
+            seen_acl_entries: set[tuple[str, str, str, bool]] = set()
+            for acl_index, entry in enumerate(acl_entries):
+                entry_label = f"{label}_acl_entry_{acl_index}"
+                if not isinstance(entry, dict):
+                    _add_error(errors, f"{entry_label}_must_be_object")
+                    continue
+                if not _exact_keys(entry, VIEW_ACL_ENTRY_KEYS, entry_label, errors):
+                    continue
+                for key in ("grantee", "grantor", "privilege_type"):
+                    _require_non_empty_string(entry.get(key), f"{entry_label}_{key}", errors)
+                _require_type(entry.get("is_grantable"), bool, f"{entry_label}_is_grantable", errors)
+                if (
+                    any(type(entry.get(key)) is not str for key in ("grantee", "grantor", "privilege_type"))
+                    or type(entry.get("is_grantable")) is not bool
+                ):
+                    continue
+                grantee = str(entry["grantee"])
+                grantor = str(entry["grantor"])
+                privilege = str(entry["privilege_type"])
+                is_grantable = bool(entry["is_grantable"])
+                if privilege not in expected_privileges:
+                    _add_error(errors, f"{entry_label}_invalid_privilege_type_{privilege}")
+                    continue
+                entry_key = (grantee, grantor, privilege, is_grantable)
+                if entry_key in seen_acl_entries:
+                    _add_error(errors, f"{entry_label}_duplicate_acl_entry")
+                seen_acl_entries.add(entry_key)
+                valid_acl_entries.append(entry)
+                if grantee == "PUBLIC":
+                    _add_error(errors, f"{entry_label}_public_acl_authority_forbidden")
+                elif grantee == runtime_role:
+                    if privilege != "SELECT":
+                        _add_error(errors, f"{entry_label}_runtime_acl_privilege_forbidden_{privilege}")
+                    if is_grantable:
+                        _add_error(errors, f"{entry_label}_runtime_acl_grant_option_forbidden")
+                    if grantor != owner:
+                        _add_error(errors, f"{entry_label}_runtime_acl_grantor_invalid")
+                elif grantee == owner:
+                    if grantor != owner:
+                        _add_error(errors, f"{entry_label}_owner_acl_grantor_invalid")
+                    if is_grantable:
+                        _add_error(errors, f"{entry_label}_owner_acl_grant_option_forbidden")
+                else:
+                    _add_error(errors, f"{entry_label}_unexpected_acl_grantee_{grantee}")
+
+        runtime_privileges = row.get("runtime_privileges")
+        effective_privileges: dict[str, tuple[bool, bool]] = {}
+        runtime_privileges_valid = True
+        if type(runtime_privileges) is not list:
+            _add_error(errors, f"{label}_runtime_privileges_must_be_list")
+            runtime_privileges_valid = False
+        else:
+            seen_runtime_privileges: set[str] = set()
+            for privilege_index, entry in enumerate(runtime_privileges):
+                entry_label = f"{label}_runtime_privilege_{privilege_index}"
+                if not isinstance(entry, dict):
+                    _add_error(errors, f"{entry_label}_must_be_object")
+                    runtime_privileges_valid = False
+                    continue
+                if not _exact_keys(entry, VIEW_RUNTIME_PRIVILEGE_KEYS, entry_label, errors):
+                    runtime_privileges_valid = False
+                    continue
+                _require_non_empty_string(entry.get("privilege_type"), f"{entry_label}_privilege_type", errors)
+                _require_type(entry.get("effective"), bool, f"{entry_label}_effective", errors)
+                _require_type(entry.get("is_grantable"), bool, f"{entry_label}_is_grantable", errors)
+                if (
+                    type(entry.get("privilege_type")) is not str
+                    or type(entry.get("effective")) is not bool
+                    or type(entry.get("is_grantable")) is not bool
+                ):
+                    runtime_privileges_valid = False
+                    continue
+                privilege = str(entry["privilege_type"])
+                if privilege not in expected_privileges:
+                    _add_error(errors, f"{entry_label}_invalid_privilege_type_{privilege}")
+                    runtime_privileges_valid = False
+                    continue
+                if privilege in seen_runtime_privileges:
+                    _add_error(errors, f"{entry_label}_duplicate_runtime_privilege")
+                    runtime_privileges_valid = False
+                seen_runtime_privileges.add(privilege)
+                effective_privileges[privilege] = (bool(entry["effective"]), bool(entry["is_grantable"]))
+            missing_privileges = expected_privileges - set(effective_privileges)
+            if missing_privileges:
+                _add_error(errors, f"{label}_runtime_privileges_missing_{sorted(missing_privileges)}")
+                runtime_privileges_valid = False
+
+        if runtime_privileges_valid:
+            select_effective, select_grantable = effective_privileges["SELECT"]
+            if select_effective != runtime_select:
+                _add_error(errors, f"{label}_runtime_select_evidence_mismatch")
+            if select_grantable != grantable:
+                _add_error(errors, f"{label}_runtime_select_grantable_evidence_mismatch")
+            if any(is_grantable for _, is_grantable in effective_privileges.values()):
+                _add_error(errors, f"{label}_runtime_privilege_grant_option_forbidden")
 
         if owner == runtime_role:
             _add_error(errors, f"{label}_runtime_relation_ownership_forbidden")
         if kind not in ("v", "m"):
             _add_error(errors, f"{label}_unknown_relation_kind_{kind}")
             continue
+
+        runtime_acl_entries = [entry for entry in valid_acl_entries if entry["grantee"] == runtime_role]
+        effective_runtime = {
+            privilege for privilege, (effective, _) in effective_privileges.items() if effective
+        }
         if kind == "m":
             _add_error(errors, f"{label}_materialized_view_unclassified")
-            if runtime_select:
+            if runtime_select or "SELECT" in effective_runtime:
                 _add_error(errors, f"{label}_materialized_view_runtime_select_forbidden")
-            if grantable:
+            if grantable or any(is_grantable for _, is_grantable in effective_privileges.values()):
                 _add_error(errors, f"{label}_materialized_view_runtime_grant_option_forbidden")
+            if effective_runtime - {"SELECT"}:
+                _add_error(errors, f"{label}_materialized_view_runtime_privilege_forbidden_{sorted(effective_runtime - {'SELECT'})}")
             continue
+
         if name in classified:
             legacy_rows.append(row)
+            if expected_owner is not None and owner != expected_owner:
+                _add_error(errors, f"{label}_classified_view_owner_invalid_expected_{expected_owner}_got_{owner}")
             if not runtime_select:
                 _add_error(errors, f"{label}_classified_view_missing_bounded_select")
             if grantable:
                 _add_error(errors, f"{label}_classified_view_grant_option_forbidden")
             if kind != "v":
                 _add_error(errors, f"{label}_classified_view_must_be_ordinary_view")
-        elif runtime_select or grantable:
+            if len(runtime_acl_entries) != 1:
+                _add_error(errors, f"{label}_classified_view_requires_one_direct_runtime_select")
+            else:
+                direct_entry = runtime_acl_entries[0]
+                if direct_entry["privilege_type"] != "SELECT":
+                    _add_error(errors, f"{label}_classified_view_direct_runtime_privilege_invalid")
+                if direct_entry["is_grantable"]:
+                    _add_error(errors, f"{label}_classified_view_direct_runtime_grant_option_forbidden")
+                if expected_owner is not None and direct_entry["grantor"] != expected_owner:
+                    _add_error(errors, f"{label}_classified_view_direct_runtime_grantor_invalid")
+            if runtime_privileges_valid:
+                if effective_runtime != {"SELECT"}:
+                    _add_error(errors, f"{label}_classified_view_runtime_privileges_invalid_{sorted(effective_runtime)}")
+        elif runtime_select or grantable or effective_runtime or runtime_acl_entries:
             _add_error(errors, f"{label}_unclassified_ordinary_view_runtime_authority")
 
     if len(legacy_rows) > 1:

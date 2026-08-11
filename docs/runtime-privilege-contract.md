@@ -159,8 +159,21 @@ No public materialized view is classified by this contract. The canonical
 `view_acl` verification query enumerates every `public` ordinary view
 (`relkind='v'`) **and** materialized view (`relkind='m'`) together in one
 surface, returning relation name, relation kind, owner, raw ACL, effective
-runtime `SELECT`, and `SELECT WITH GRANT OPTION` posture. The evaluator fails
-closed on:
+runtime relation privileges, and the effective `SELECT` and `SELECT WITH GRANT
+OPTION` posture. The raw ACL is diagnostic only; acceptance consumes the
+PostgreSQL-decoded structured evidence:
+
+- **`acl_entries`** is an ordered JSONB array with exactly `grantee`, `grantor`,
+  `privilege_type`, and `is_grantable` fields. PostgreSQL `aclexplode()` supplies
+  the identities, privilege type, and grantability; OID `0` is represented
+  mechanically as `PUBLIC` and unknown named roles as `OID:<oid>`.
+- **`runtime_privileges`** is an ordered JSONB array containing exactly the
+  eight PostgreSQL 17 relation privilege records `SELECT`, `INSERT`, `UPDATE`,
+  `DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER`, and `MAINTAIN`. Each record has
+  `privilege_type`, effective runtime authority, and effective grant-option
+  booleans from `has_table_privilege()`.
+
+The evaluator fails closed on:
 
 - any materialized view owned by, effectively readable by, or grantable to
   `sqag_runtime` (every materialized view is unclassified and fails closed);
@@ -319,7 +332,7 @@ live-system evidence.
 | `effective_runtime_column_privileges` | `schema_name`, `table_name`, `column_name`, `privilege_type`, `effective`, `is_grantable` | fixture columns x 4 |
 | `effective_runtime_schema_privileges` | `privilege_type`, `effective`, `is_grantable` | 2 |
 | `effective_runtime_routine_privileges` | `routine_name`, `effective` | 2 |
-| `view_acl` | `relation_name`, `relation_kind`, `owner`, `relation_acl`, `runtime_select`, `runtime_select_grantable` | 0 in the generic shape fixture; 1 when the legacy-optional view fixture is present |
+| `view_acl` | `relation_name`, `relation_kind`, `owner`, `relation_acl`, `acl_entries`, `runtime_privileges`, `runtime_select`, `runtime_select_grantable` | 0 in the generic shape fixture; 1 when the legacy-optional view fixture is present |
 
 The effective database proof covers `CONNECT`, `CREATE`, and `TEMPORARY`; the
 locked runtime result is `true/false/false`, with all three grantable flags
@@ -408,14 +421,18 @@ the exact eight-column projection
 `proname, identity_arguments, prokind, prosecdef, proacl, proowner, owner,
 has_trigger_dependency`, the complete public-schema routine boundary, and
 deterministic identity-argument ordering. The view query must project exactly
-`relation_name, relation_kind, owner, relation_acl, runtime_select,
-runtime_select_grantable`, join `pg_roles` for the owner, evaluate effective
-runtime `SELECT` and grant-option posture through
-`has_table_privilege(... 'WITH GRANT OPTION')`, cover both `relkind` values
-`'v'` and `'m'` in the `public` schema, and order deterministically. The
-PostgreSQL query-shape evidence executes all fourteen canonical queries,
-asserts the exact returned column names, and applies the documented
-cardinality rules.
+`relation_name, relation_kind, owner, relation_acl, acl_entries,
+runtime_privileges, runtime_select, runtime_select_grantable`, join `pg_roles`
+for the owner, decode relation ACLs with PostgreSQL's
+`pg_catalog.aclexplode(coalesce(relacl, pg_catalog.acldefault(...)))`, map
+grantee and grantor identities, evaluate all eight effective runtime relation
+privileges through `has_table_privilege(... 'WITH GRANT OPTION')`, cover both
+`relkind` values `'v'` and `'m'` in the `public` schema, and order both JSONB
+arrays and result rows deterministically. The PostgreSQL query-shape evidence
+executes all fourteen canonical queries, asserts the exact returned column
+names, and applies the documented cardinality rules. The evaluator rejects
+decorative-only raw ACL evidence, malformed or incomplete JSONB entries,
+unexpected ACL provenance, and any same-name relation duplicate.
 
 The remaining effective queries have the same exact-token binding. In
 particular, the membership query must preserve the complete six-field contract
@@ -544,11 +561,11 @@ The deterministic discovery receipt for this amendment is:
 
 | Receipt item | Count |
 |---|---:|
-| Discovered test methods | 202 |
-| Static and validator methods | 133 |
+| Discovered test methods | 203 |
+| Static and validator methods | 134 |
 | PostgreSQL methods | 65 |
 | Requirement-map and documentation parity methods | 4 |
-| Hosted executions | 202 |
+| Hosted executions | 203 |
 | Hosted skips | 0 |
 | Unique locked requirement IDs | 38 (`R01`-`R38`) |
 

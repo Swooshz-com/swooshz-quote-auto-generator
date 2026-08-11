@@ -1,11 +1,11 @@
 """Runtime privilege contract tests.
 
 Deterministic discovery receipt for this amendment:
-  discovered methods: 202
-  static and validator methods: 133
+  discovered methods: 203
+  static and validator methods: 134
   PostgreSQL methods: 65
   requirement-map and documentation parity methods: 4
-  hosted executions: 202
+  hosted executions: 203
   hosted skips: 0
   unique locked requirement IDs: 38 (R01-R38)
 
@@ -157,6 +157,8 @@ CANONICAL_QUERY_COLUMNS = {
         "relation_kind",
         "owner",
         "relation_acl",
+        "acl_entries",
+        "runtime_privileges",
         "runtime_select",
         "runtime_select_grantable",
     ],
@@ -767,6 +769,8 @@ class ValidatorStaticTest(unittest.TestCase):
         for replaced, replacement in (
             ("runtime_select", "runtime_missing"),
             ("runtime_select_grantable", "grantable_missing"),
+            ("acl_entries", "acl_entries_missing"),
+            ("runtime_privileges", "runtime_privileges_missing"),
         ):
             self._assert_query_fixture_rejected(
                 "view_acl",
@@ -1519,14 +1523,46 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
         kind: str = "v",
         owner: str = "sqag_migrator",
         relation_acl: str | None = None,
+        acl_entries: list[dict[str, Any]] | None = None,
+        runtime_privileges: list[dict[str, Any]] | None = None,
         runtime_select: bool = False,
         runtime_select_grantable: bool = False,
     ) -> dict[str, Any]:
+        if acl_entries is None:
+            acl_entries = [
+                {
+                    "grantee": owner,
+                    "grantor": owner,
+                    "privilege_type": privilege,
+                    "is_grantable": False,
+                }
+                for privilege in TABLE_PRIVILEGES
+            ]
+            if runtime_select:
+                acl_entries.append(
+                    {
+                        "grantee": "sqag_runtime",
+                        "grantor": owner,
+                        "privilege_type": "SELECT",
+                        "is_grantable": runtime_select_grantable,
+                    }
+                )
+        if runtime_privileges is None:
+            runtime_privileges = [
+                {
+                    "privilege_type": privilege,
+                    "effective": runtime_select and privilege == "SELECT",
+                    "is_grantable": runtime_select_grantable and privilege == "SELECT",
+                }
+                for privilege in TABLE_PRIVILEGES
+            ]
         return {
             "relation_name": name,
             "relation_kind": kind,
             "owner": owner,
             "relation_acl": relation_acl,
+            "acl_entries": copy.deepcopy(acl_entries),
+            "runtime_privileges": copy.deepcopy(runtime_privileges),
             "runtime_select": runtime_select,
             "runtime_select_grantable": runtime_select_grantable,
         }
@@ -1643,7 +1679,16 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
         expect_category({"row": self._view_row("sqag_quote_artifacts")}, "relation_view_rows_must_be_list")
         expect_category(["synthetic"], "relation_view_row_0_must_be_object")
         row = self._view_row("sqag_quote_artifacts")
-        for key in ("relation_name", "relation_kind", "owner", "relation_acl", "runtime_select", "runtime_select_grantable"):
+        for key in (
+            "relation_name",
+            "relation_kind",
+            "owner",
+            "relation_acl",
+            "acl_entries",
+            "runtime_privileges",
+            "runtime_select",
+            "runtime_select_grantable",
+        ):
             missing = copy.deepcopy(row)
             missing.pop(key)
             expect_category([missing], f"relation_view_row_0_missing_keys: {key}")
@@ -1651,9 +1696,92 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
         unexpected["extra"] = True
         expect_category([unexpected], "relation_view_row_0_unknown_keys: extra")
 
+    def test_structured_acl_and_effective_privilege_evidence_fail_closed(self) -> None:
+        base = self._view_row("sqag_quote_artifacts", runtime_select=True)
+
+        def add_acl(row: dict[str, Any], grantee: str, privilege: str, *, grantable: Any = False) -> None:
+            row["acl_entries"].append(
+                {
+                    "grantee": grantee,
+                    "grantor": "sqag_migrator",
+                    "privilege_type": privilege,
+                    "is_grantable": grantable,
+                }
+            )
+
+        def set_effective(row: dict[str, Any], privilege: str, *, effective: Any = True, grantable: Any = False) -> None:
+            entry = next(item for item in row["runtime_privileges"] if item["privilege_type"] == privilege)
+            entry["effective"] = effective
+            entry["is_grantable"] = grantable
+
+        for privilege in ("INSERT", "UPDATE", "DELETE"):
+            row = copy.deepcopy(base)
+            add_acl(row, "sqag_runtime", privilege)
+            set_effective(row, privilege)
+            self._assert_rejected([row], f"runtime_acl_privilege_forbidden_{privilege}")
+
+        public_select = copy.deepcopy(base)
+        add_acl(public_select, "PUBLIC", "SELECT")
+        self._assert_rejected([public_select], "public_acl_authority_forbidden")
+
+        public_write = copy.deepcopy(base)
+        add_acl(public_write, "PUBLIC", "INSERT")
+        set_effective(public_write, "INSERT")
+        self._assert_rejected([public_write], "public_acl_authority_forbidden")
+
+        grantable = self._view_row(
+            "sqag_quote_artifacts",
+            runtime_select=True,
+            runtime_select_grantable=True,
+        )
+        self._assert_rejected([grantable], "runtime_acl_grant_option_forbidden")
+
+        unexpected = copy.deepcopy(base)
+        add_acl(unexpected, "sqag_app", "SELECT")
+        self._assert_rejected([unexpected], "unexpected_acl_grantee_sqag_app")
+
+        malformed_acl = copy.deepcopy(base)
+        malformed_acl["acl_entries"] = "not-a-list"
+        self._assert_rejected([malformed_acl], "acl_entries_must_be_list")
+
+        missing_acl_field = copy.deepcopy(base)
+        missing_acl_field["acl_entries"][0].pop("grantor")
+        self._assert_rejected([missing_acl_field], "acl_entry_0_missing_keys: grantor")
+
+        unknown_acl_field = copy.deepcopy(base)
+        unknown_acl_field["acl_entries"][0]["extra"] = True
+        self._assert_rejected([unknown_acl_field], "acl_entry_0_unknown_keys: extra")
+
+        invalid_privilege = copy.deepcopy(base)
+        invalid_privilege["acl_entries"][0]["privilege_type"] = "DROP"
+        self._assert_rejected([invalid_privilege], "acl_entry_0_invalid_privilege_type_DROP")
+
+        invalid_grantable = copy.deepcopy(base)
+        invalid_grantable["acl_entries"][0]["is_grantable"] = "false"
+        self._assert_rejected([invalid_grantable], "acl_entry_0_is_grantable_must_be_bool")
+
+        malformed_runtime = copy.deepcopy(base)
+        malformed_runtime["runtime_privileges"] = [{"privilege_type": "SELECT", "effective": True}]
+        self._assert_rejected([malformed_runtime], "runtime_privilege_0_missing_keys: is_grantable")
+
+        unknown_runtime = copy.deepcopy(base)
+        unknown_runtime["runtime_privileges"][0]["extra"] = True
+        self._assert_rejected([unknown_runtime], "runtime_privilege_0_unknown_keys: extra")
+
+        invalid_runtime_type = copy.deepcopy(base)
+        invalid_runtime_type["runtime_privileges"][0]["is_grantable"] = "false"
+        self._assert_rejected([invalid_runtime_type], "runtime_privilege_0_is_grantable_must_be_bool")
+
     def test_duplicate_relation_view_rows_fail_closed(self) -> None:
         row = self._view_row("sqag_quote_artifacts", runtime_select=True)
-        self._assert_rejected([row, copy.deepcopy(row)], "duplicate_relation_view_row")
+        self._assert_rejected([row, copy.deepcopy(row)], "duplicate_relation_view_row_same_relation_name")
+
+        conflicting_first = self._view_row("sqag_unclassified", owner="sqag_migrator")
+        conflicting_second = self._view_row("sqag_unclassified", owner="sqag_app")
+        self._assert_rejected(
+            [conflicting_first, conflicting_second],
+            "duplicate_relation_view_row_same_relation_name",
+        )
 
 
 class RequirementEvidenceMapTest(unittest.TestCase):
