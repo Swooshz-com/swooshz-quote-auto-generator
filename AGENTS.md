@@ -63,7 +63,7 @@ Treat `MEMORY.md` as managed, non-authoritative project memory. Read it before p
 
 Authoritative sources override it. Do not create `MEMORY.md` merely because it is absent. Prefer canonical docs/source/validation/maps/ADRs, and never use memory for history, status, plans, handoffs, logs, or task tracking.
 
-Never store secrets, credentials, tokens, keys, `.env` values, private/customer data, live state, or sensitive operations. New memory needs a managed non-authoritative header and stays small.
+Never store secrets, credentials, tokens, keys, `.env` values, private/customer data, live state, or sensitive operational details. New memory needs a managed non-authoritative header and stays small.
 
 ## Safety Gates
 
@@ -122,7 +122,7 @@ Use plain ASCII punctuation for agent-facing prompts, templates, scripts, config
 
 Activate only for the active Git repo's relevant GitHub remote and same-repo activity. Skip loose, non/local-only, other-forge, and unrelated repos; Toolkit's remote never substitutes. Skipping is not an error.
 
-Same-repo issue/PR metadata sync for requested work is a scoped external-write exception. It never authorizes merge, deployment, secrets, workflows, or unrelated repos.
+Relevant read-only same-repository issue and PR inspection remains permitted. Every issue or PR metadata mutation requires explicit current-turn approval naming the relevant repository and intended write. Requested code edits, Git publication, issue association, `continue`, `next`, or similar language do not independently authorise metadata mutation.
 
 Find the smallest owner; update/reopen, never duplicate. Use `Refs` for multi-stage, UAT-pending, blocked, or follow-up PRs; `Closes`/`Fixes` only if merge completes every criterion.
 
