@@ -140,6 +140,7 @@ CANONICAL_QUERY_COLUMNS = {
         "table_name",
         "relation_kind",
         "owner",
+        "owner_select",
         "privilege_type",
         "effective",
         "is_grantable",
@@ -1197,6 +1198,16 @@ class ValidatorStaticTest(unittest.TestCase):
         source_identity_mutations = (
             ("table_acl", manifest["verification_queries"]["table_acl"]),
             ("effective_runtime_table_privileges", table_query),
+            ("effective_runtime_table_privileges", table_query.replace(
+                "has_table_privilege('sqag_migrator', c.oid, 'SELECT') as owner_select, ",
+                "",
+                1,
+            )),
+            ("effective_runtime_table_privileges", table_query.replace(
+                "has_table_privilege('sqag_migrator', c.oid, 'SELECT') as owner_select",
+                "has_table_privilege('sqag_runtime', c.oid, 'SELECT') as owner_select",
+                1,
+            )),
             ("effective_runtime_column_privileges", column_query),
         )
         for query_key, query in source_identity_mutations:
@@ -1675,6 +1686,7 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
                 "table_name": "legacy_quote_artifacts_source",
                 "relation_kind": "r",
                 "owner": "sqag_migrator",
+                "owner_select": True,
                 "privilege_type": privilege,
                 "effective": False,
                 "is_grantable": False,
@@ -1829,6 +1841,26 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
         self._assert_rejected([reordered], 'classified_view_definition_mismatch')
 
         source_table_rows, source_column_rows = self._bound_source_evidence()
+        missing_owner_select = copy.deepcopy(source_table_rows)
+        missing_owner_select[0]["owner_select"] = False
+        self._assert_source_evidence_rejected(
+            [base],
+            missing_owner_select,
+            source_column_rows,
+            "classified_view_owner_source_select_required",
+        )
+        other_source_owner = copy.deepcopy(source_table_rows)
+        for row in other_source_owner:
+            row["owner"] = "sqag_app"
+        self.assertEqual(
+            contract_validator.evaluate_runtime_authority(
+                self.manifest,
+                [base],
+                other_source_owner,
+                source_column_rows,
+            ),
+            (),
+        )
         self.assertEqual(
             contract_validator.evaluate_runtime_authority(
                 self.manifest,
@@ -1846,6 +1878,23 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
             self.manifest, [base], [], source_column_rows
         )
         self.assertTrue(any('bound_source_table_evidence_missing' in error for error in missing_source), missing_source)
+
+        wrong_source_schema = copy.deepcopy(source_table_rows)
+        wrong_source_schema[0]['schema_name'] = 'other_schema'
+        self._assert_source_evidence_rejected(
+            [base],
+            wrong_source_schema,
+            source_column_rows,
+            'bound_source_table_evidence_cardinality',
+        )
+        wrong_source_relation = copy.deepcopy(source_table_rows)
+        wrong_source_relation[0]['table_name'] = 'some_other_source'
+        self._assert_source_evidence_rejected(
+            [base],
+            wrong_source_relation,
+            source_column_rows,
+            'bound_source_table_evidence_cardinality',
+        )
         for privilege in TABLE_PRIVILEGES:
             with self.subTest(source_table_privilege=privilege):
                 table_case = copy.deepcopy(source_table_rows)
@@ -2038,6 +2087,57 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
         unexpected = copy.deepcopy(base)
         add_acl(unexpected, "sqag_app", "SELECT")
         self._assert_rejected([unexpected], "unexpected_acl_grantee_sqag_app")
+
+        classified_wrong_grantor = copy.deepcopy(base)
+        next(
+            entry
+            for entry in classified_wrong_grantor["acl_entries"]
+            if entry["grantee"] == "sqag_migrator" and entry["privilege_type"] == "SELECT"
+        )["grantor"] = "sqag_app"
+        self._assert_rejected([classified_wrong_grantor], "owner_acl_grantor_invalid")
+
+        classified_grantable = copy.deepcopy(base)
+        next(
+            entry
+            for entry in classified_grantable["acl_entries"]
+            if entry["grantee"] == "sqag_migrator" and entry["privilege_type"] == "SELECT"
+        )["is_grantable"] = True
+        self._assert_rejected([classified_grantable], "owner_acl_grant_option_forbidden")
+
+        partial_unclassified = self._extended_view_row("sqag_file_artifacts")
+        partial_unclassified["acl_entries"] = [
+            entry
+            for entry in partial_unclassified["acl_entries"]
+            if not (
+                entry["grantee"] == "sqag_migrator"
+                and entry["privilege_type"] == "SELECT"
+            )
+        ]
+        self.assertEqual(self._errors([partial_unclassified]), ())
+
+        partial_with_unrelated = copy.deepcopy(partial_unclassified)
+        partial_with_unrelated["acl_entries"].append(
+            {
+                "grantee": "unrelated_role",
+                "grantor": "unrelated_role",
+                "privilege_type": "SELECT",
+                "is_grantable": False,
+            }
+        )
+        self.assertEqual(self._errors([partial_with_unrelated]), ())
+
+        partial_materialized = self._extended_view_row("sqag_mat_view", kind="m")
+        partial_materialized["acl_entries"] = [
+            entry
+            for entry in partial_materialized["acl_entries"]
+            if not (
+                entry["grantee"] == "sqag_migrator"
+                and entry["privilege_type"] == "SELECT"
+            )
+        ]
+        materialized_errors = self._errors([partial_materialized])
+        self.assertTrue(any("materialized_view_unclassified" in error for error in materialized_errors))
+        self.assertFalse(any("owner_acl_completeness" in error for error in materialized_errors))
 
         unrelated_relation = self._extended_view_row("sqag_file_artifacts")
         unrelated_relation["acl_entries"].append(
@@ -4895,6 +4995,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.assertTrue(all(row["schema_name"] == "public" for row in source_table_evidence))
         self.assertTrue(all(row["relation_kind"] == "r" for row in source_table_evidence))
         self.assertTrue(all(row["owner"] != "sqag_runtime" for row in source_table_evidence))
+        self.assertTrue(all(row["owner_select"] for row in source_table_evidence))
         self.assertTrue(source_column_evidence)
         self.assertTrue(all(not row["effective"] and not row["is_grantable"] for row in source_table_evidence))
         self.assertTrue(all(not row["effective"] and not row["is_grantable"] for row in source_column_evidence))
@@ -4907,6 +5008,33 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.assertTrue(any("bound_source_table_evidence_missing" in error for error in missing_source), missing_source)
 
         source_ident = f"public.{_quote_identifier(source_table)}"
+        source_owner = self._new_role("legacy_source_owner")
+        self._execute_admin_sql(
+            f"alter table {source_ident} owner to {_quote_identifier(source_owner)}"
+        )
+        self._execute_admin_sql(
+            f"revoke SELECT on table {source_ident} from {_quote_identifier('sqag_migrator')}"
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(
+                any("classified_view_owner_source_select_required" in error for error in errors),
+                errors,
+            )
+            self._execute_admin_sql(
+                f"grant SELECT on table {source_ident} to {_quote_identifier('sqag_migrator')}"
+            )
+            try:
+                self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+            finally:
+                self._execute_admin_sql(
+                    f"revoke SELECT on table {source_ident} from {_quote_identifier('sqag_migrator')}"
+                )
+        finally:
+            self._execute_admin_sql(
+                f"alter table {source_ident} owner to {_quote_identifier('sqag_migrator')}"
+            )
+
         for privilege in TABLE_PRIVILEGES:
             self._execute_admin_sql(
                 f'grant {privilege} on table {source_ident} to {_quote_identifier("sqag_runtime")}'

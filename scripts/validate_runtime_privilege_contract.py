@@ -185,8 +185,18 @@ VIEW_COLUMN_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "REFERENCES")
 BOUND_SOURCE_SCHEMA = "public"
 BOUND_SOURCE_RELATION = "legacy_quote_artifacts_source"
 BOUND_SOURCE_RELKIND = "r"
+BOUND_SOURCE_VIEW_OWNER = "sqag_migrator"
 RUNTIME_TABLE_PRIVILEGE_ROW_KEYS = frozenset(
-    {"schema_name", "table_name", "relation_kind", "owner", "privilege_type", "effective", "is_grantable"}
+    {
+        "schema_name",
+        "table_name",
+        "relation_kind",
+        "owner",
+        "owner_select",
+        "privilege_type",
+        "effective",
+        "is_grantable",
+    }
 )
 RUNTIME_COLUMN_PRIVILEGE_ROW_KEYS = frozenset(
     {"schema_name", "table_name", "column_name", "privilege_type", "effective", "is_grantable"}
@@ -382,6 +392,7 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                c.relname as table_name,
                c.relkind as relation_kind,
                r.rolname as owner,
+               has_table_privilege('sqag_migrator', c.oid, 'SELECT') as owner_select,
                p.privilege_type,
                has_table_privilege('sqag_runtime', c.oid, p.privilege_type) as effective,
                has_table_privilege(
@@ -856,6 +867,8 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "'trigger'",
         "'maintain'",
         "'legacy_quote_artifacts_source'",
+        "'sqag_migrator'",
+        "owner_select",
     ),
     "effective_runtime_column_privileges": (
         "has_column_privilege",
@@ -1876,11 +1889,16 @@ def evaluate_bound_source_authority(
             continue
         for key in ("schema_name", "table_name", "relation_kind", "owner", "privilege_type"):
             _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
+        _require_type(row.get("owner_select"), bool, f"{label}_owner_select", errors)
         _require_type(row.get("effective"), bool, f"{label}_effective", errors)
         _require_type(row.get("is_grantable"), bool, f"{label}_is_grantable", errors)
         if any(type(row.get(key)) is not str for key in ("schema_name", "table_name", "relation_kind", "owner", "privilege_type")):
             continue
-        if type(row.get("effective")) is not bool or type(row.get("is_grantable")) is not bool:
+        if (
+            type(row.get("owner_select")) is not bool
+            or type(row.get("effective")) is not bool
+            or type(row.get("is_grantable")) is not bool
+        ):
             continue
         privilege = str(row["privilege_type"])
         if privilege not in expected_table_privileges:
@@ -1897,6 +1915,11 @@ def evaluate_bound_source_authority(
             _add_error(errors, f"{label}_relation_kind_invalid")
         if row["owner"] == runtime_role:
             _add_error(errors, f"{label}_runtime_owner_forbidden")
+        if not row["owner_select"]:
+            _add_error(
+                errors,
+                f"{label}_classified_view_owner_source_select_required_{BOUND_SOURCE_VIEW_OWNER}",
+            )
         if row["effective"]:
             _add_error(errors, f"{label}_runtime_privilege_forbidden_{privilege}")
         if row["is_grantable"]:
@@ -2070,14 +2093,18 @@ def evaluate_view_authority(
                 elif name in classified:
                     _add_error(errors, f"{entry_label}_unexpected_acl_grantee_{grantee}")
 
-        owner_acl_semantics = {
-            (entry['grantee'], entry['grantor'], entry['privilege_type'], entry['is_grantable'])
-            for entry in valid_acl_entries
-            if entry.get('grantee') == owner
-        }
-        expected_owner_acl = {(owner, owner, privilege, False) for privilege in expected_privileges}
-        if owner_acl_semantics != expected_owner_acl:
-            _add_error(errors, f'{label}_owner_acl_completeness_expected_{sorted(expected_owner_acl)}_got_{sorted(owner_acl_semantics)}')
+        if name in classified:
+            owner_acl_semantics = {
+                (entry['grantee'], entry['grantor'], entry['privilege_type'], entry['is_grantable'])
+                for entry in valid_acl_entries
+                if entry.get('grantee') == owner
+            }
+            expected_owner_acl = {(owner, owner, privilege, False) for privilege in expected_privileges}
+            if owner_acl_semantics != expected_owner_acl:
+                _add_error(
+                    errors,
+                    f'{label}_owner_acl_completeness_expected_{sorted(expected_owner_acl)}_got_{sorted(owner_acl_semantics)}',
+                )
 
         runtime_privileges = row.get("runtime_privileges")
         effective_privileges: dict[str, tuple[bool, bool]] = {}
@@ -3032,7 +3059,15 @@ def validate_verification_queries(manifest: dict[str, Any], errors: list[str]) -
             _require_sql_features(
                 tokens,
                 "effective_runtime_table_privileges",
-                ("has_table_privilege", "pg_catalog.pg_class", "is_grantable", "'sqag_runtime'", "'public'"),
+                (
+                    "has_table_privilege",
+                    "pg_catalog.pg_class",
+                    "is_grantable",
+                    "owner_select",
+                    "'sqag_runtime'",
+                    "'sqag_migrator'",
+                    "'public'",
+                ),
                 errors,
             )
 
