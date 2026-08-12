@@ -2028,6 +2028,12 @@ class RequirementEvidenceMapTest(unittest.TestCase):
                     f"narrative mutation {label} was not detected",
                 )
 
+        expected_view_projection = ", ".join(CANONICAL_QUERY_COLUMNS["view_acl"])
+        self.assertIn(
+            f"The view query must project exactly `{expected_view_projection}`",
+            " ".join(documentation.split()),
+        )
+
 
 @unittest.skipUnless(postgres_test_conninfo(), "isolated PostgreSQL test service is not configured")
 class PostgreSQLContractIntegrationTest(unittest.TestCase):

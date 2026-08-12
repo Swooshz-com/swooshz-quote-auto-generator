@@ -448,7 +448,9 @@ the exact eight-column projection
 has_trigger_dependency`, the complete public-schema routine boundary, and
 deterministic identity-argument ordering. The view query must project exactly
 `relation_name, relation_kind, owner, relation_acl, acl_entries,
-runtime_privileges, runtime_select, runtime_select_grantable`, join `pg_roles`
+column_acl_entries, view_definition, view_dependencies, view_columns,
+relation_options, view_security, runtime_privileges, runtime_select,
+runtime_select_grantable`, join `pg_roles`
 for the owner, decode relation ACLs with PostgreSQL's
 `pg_catalog.aclexplode(coalesce(relacl, pg_catalog.acldefault(...)))`, map
 grantee and grantor identities, evaluate all eight effective runtime relation
