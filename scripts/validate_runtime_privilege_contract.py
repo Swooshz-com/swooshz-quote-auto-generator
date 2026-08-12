@@ -182,6 +182,15 @@ VIEW_RELATION_PRIVILEGES = (
     "MAINTAIN",
 )
 VIEW_COLUMN_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "REFERENCES")
+BOUND_SOURCE_SCHEMA = "public"
+BOUND_SOURCE_RELATION = "legacy_quote_artifacts_source"
+BOUND_SOURCE_RELKIND = "r"
+RUNTIME_TABLE_PRIVILEGE_ROW_KEYS = frozenset(
+    {"schema_name", "table_name", "relation_kind", "owner", "privilege_type", "effective", "is_grantable"}
+)
+RUNTIME_COLUMN_PRIVILEGE_ROW_KEYS = frozenset(
+    {"schema_name", "table_name", "column_name", "privilege_type", "effective", "is_grantable"}
+)
 
 MATERIALIZED_VIEW_RULE = (
     "No public materialized view is classified. Any public materialized view fails "
@@ -282,7 +291,10 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
         join pg_catalog.pg_namespace n on n.oid = c.relnamespace
         where c.relkind = 'r'
           and n.nspname = 'public'
-          and c.relname like 'sqag_' || chr(37)
+          and (
+              c.relname like 'sqag_' || chr(37)
+              or c.relname = 'legacy_quote_artifacts_source'
+          )
         order by relname
     """,
     "routine_acl": """
@@ -368,6 +380,8 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
     "effective_runtime_table_privileges": """
         select n.nspname as schema_name,
                c.relname as table_name,
+               c.relkind as relation_kind,
+               r.rolname as owner,
                p.privilege_type,
                has_table_privilege('sqag_runtime', c.oid, p.privilege_type) as effective,
                has_table_privilege(
@@ -377,6 +391,7 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                ) as is_grantable
         from pg_catalog.pg_class c
         join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+        join pg_catalog.pg_roles r on r.oid = c.relowner
         cross join (
             values
                 ('SELECT'),
@@ -390,7 +405,10 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
         ) p(privilege_type)
         where n.nspname = 'public'
           and c.relkind = 'r'
-          and c.relname like 'sqag_' || chr(37)
+          and (
+              c.relname like 'sqag_' || chr(37)
+              or c.relname = 'legacy_quote_artifacts_source'
+          )
         order by n.nspname, c.relname, p.privilege_type
     """,
     "effective_runtime_column_privileges": """
@@ -417,7 +435,10 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
         ) p(privilege_type)
         where n.nspname = 'public'
           and c.relkind = 'r'
-          and c.relname like 'sqag_' || chr(37)
+          and (
+              c.relname like 'sqag_' || chr(37)
+              or c.relname = 'legacy_quote_artifacts_source'
+          )
           and a.attnum > 0
           and not a.attisdropped
         order by n.nspname, c.relname, a.attname, p.privilege_type
@@ -776,7 +797,15 @@ ROLE_DESCRIPTIONS = {
 REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
     "database_acl": ("pg_catalog.pg_database", "datname", "datacl", "current_database"),
     "schema_acl": ("pg_catalog.pg_namespace", "nspname", "nspacl", "'public'"),
-    "table_acl": ("pg_catalog.pg_class", "pg_catalog.pg_namespace", "relacl", "relkind", "'public'", "order by"),
+    "table_acl": (
+        "pg_catalog.pg_class",
+        "pg_catalog.pg_namespace",
+        "relacl",
+        "relkind",
+        "'public'",
+        "'legacy_quote_artifacts_source'",
+        "order by",
+    ),
     "role_attributes": (
         "pg_catalog.pg_roles",
         "pg_catalog.pg_authid",
@@ -812,7 +841,10 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "has_table_privilege",
         "pg_catalog.pg_class",
         "pg_catalog.pg_namespace",
+        "pg_catalog.pg_roles",
         "c.relname",
+        "relation_kind",
+        "owner",
         "is_grantable",
         "' WITH GRANT OPTION'",
         "'select'",
@@ -823,6 +855,7 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "'references'",
         "'trigger'",
         "'maintain'",
+        "'legacy_quote_artifacts_source'",
     ),
     "effective_runtime_column_privileges": (
         "has_column_privilege",
@@ -836,6 +869,7 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "'insert'",
         "'update'",
         "'references'",
+        "'legacy_quote_artifacts_source'",
     ),
     "effective_runtime_schema_privileges": ("has_schema_privilege", "'public'", "'usage'", "'create'"),
     "effective_runtime_routine_privileges": ("has_function_privilege", "pg_catalog.pg_proc", "'public'", "'execute'"),
@@ -1490,8 +1524,39 @@ def validate_views(manifest: dict[str, Any], errors: list[str]) -> None:
         _exact_value(privileges.get("select"), True, f"{label}_select", errors)
 
 
-def _normalise_view_definition(value: str) -> str:
-    return ' '.join(value.split()).strip().rstrip(';').strip().lower()
+def _normalise_view_definition(value: str) -> tuple[tuple[str, str], ...]:
+    """Canonicalize only the locked source relation's optional public qualifier."""
+
+    tokens = [token for token in lex_sql(value) if token.kind != "COMMENT"]
+    if tokens and tokens[-1].value == ";":
+        tokens.pop()
+
+    normalized: list[tuple[str, str]] = []
+    for token in tokens:
+        if token.kind == "WORD":
+            normalized.append(("WORD", token.value.lower()))
+        elif token.kind == "QUOTED_IDENTIFIER" and token.value == token.value.lower():
+            # pg_get_viewdef() may quote an already-lowercase identifier.  Do
+            # not make arbitrary quoted identifiers case-insensitive.
+            normalized.append(("WORD", token.value))
+        else:
+            normalized.append((token.kind, token.value))
+
+    source_qualification = (
+        ("WORD", BOUND_SOURCE_SCHEMA),
+        ("SYMBOL", "."),
+        ("WORD", BOUND_SOURCE_RELATION),
+    )
+    canonical: list[tuple[str, str]] = []
+    index = 0
+    while index < len(normalized):
+        if tuple(normalized[index:index + len(source_qualification)]) == source_qualification:
+            canonical.append(("WORD", BOUND_SOURCE_RELATION))
+            index += len(source_qualification)
+        else:
+            canonical.append(normalized[index])
+            index += 1
+    return tuple(canonical)
 
 
 def _validate_view_columns(value: Any, label: str, errors: list[str]) -> list[tuple[int, str]]:
@@ -1693,11 +1758,13 @@ def _validate_view_column_acl(
                 if acl_identity in seen_acl:
                     _add_error(errors, f'{entry_label}_duplicate_acl_entry')
                 seen_acl.add(acl_identity)
-                if grantable:
-                    _add_error(errors, f'{entry_label}_column_acl_grant_option_forbidden')
                 if grantee == 'PUBLIC':
+                    if grantable:
+                        _add_error(errors, f'{entry_label}_column_acl_grant_option_forbidden')
                     _add_error(errors, f'{entry_label}_column_acl_public_authority_forbidden')
                 elif grantee == runtime_role:
+                    if grantable:
+                        _add_error(errors, f'{entry_label}_column_acl_grant_option_forbidden')
                     _add_error(errors, f'{entry_label}_column_acl_runtime_authority_forbidden')
                     if grantable:
                         _add_error(errors, f'{entry_label}_column_acl_runtime_grant_option_forbidden')
@@ -1705,7 +1772,9 @@ def _validate_view_column_acl(
                         _add_error(errors, f'{entry_label}_column_acl_runtime_privilege_forbidden_{privilege}')
                     if grantor != owner:
                         _add_error(errors, f'{entry_label}_column_acl_runtime_grantor_invalid')
-                else:
+                elif classified:
+                    if grantable:
+                        _add_error(errors, f'{entry_label}_column_acl_grant_option_forbidden')
                     _add_error(errors, f'{entry_label}_column_acl_unexpected_participant_{grantee}_{grantor}')
 
         runtime_privileges = column.get('runtime_privileges')
@@ -1756,6 +1825,143 @@ def _validate_view_column_acl(
     if set(column_identities) != seen_columns:
         _add_error(errors, f'{label}_column_acl_entries_identity_mismatch')
     return effective_runtime_columns
+
+
+def evaluate_bound_source_authority(
+    manifest: dict[str, Any],
+    view_rows: list[dict[str, Any]],
+    table_privilege_rows: list[dict[str, Any]],
+    column_privilege_rows: list[dict[str, Any]],
+    *,
+    runtime_role: str = "sqag_runtime",
+) -> tuple[str, ...]:
+    """Require complete no-runtime-authority evidence for the locked source table."""
+
+    errors: list[str] = []
+    views = manifest.get("views") if isinstance(manifest, dict) else None
+    accessible = views.get("runtime_accessible") if isinstance(views, dict) else None
+    if not isinstance(accessible, dict):
+        return ("runtime_accessible_views_must_be_object",)
+    classified_names = set(accessible)
+    classified_present = any(
+        isinstance(row, dict) and row.get("relation_name") in classified_names
+        for row in view_rows
+    )
+    if not classified_present:
+        return ()
+
+    if type(table_privilege_rows) is not list:
+        errors.append("bound_source_table_evidence_must_be_list")
+        table_privilege_rows = []
+    source_table_rows = [
+        (index, row)
+        for index, row in enumerate(table_privilege_rows)
+        if isinstance(row, dict)
+        and row.get("schema_name") == BOUND_SOURCE_SCHEMA
+        and row.get("table_name") == BOUND_SOURCE_RELATION
+    ]
+    expected_table_privileges = set(VIEW_RELATION_PRIVILEGES)
+    if not source_table_rows:
+        errors.append("bound_source_table_evidence_missing")
+    if len(source_table_rows) != len(expected_table_privileges):
+        errors.append(
+            "bound_source_table_evidence_cardinality_expected_"
+            f"{len(expected_table_privileges)}_got_{len(source_table_rows)}"
+        )
+
+    seen_table_privileges: set[str] = set()
+    for index, row in source_table_rows:
+        label = f"bound_source_table_row_{index}"
+        if not _exact_keys(row, RUNTIME_TABLE_PRIVILEGE_ROW_KEYS, label, errors):
+            continue
+        for key in ("schema_name", "table_name", "relation_kind", "owner", "privilege_type"):
+            _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
+        _require_type(row.get("effective"), bool, f"{label}_effective", errors)
+        _require_type(row.get("is_grantable"), bool, f"{label}_is_grantable", errors)
+        if any(type(row.get(key)) is not str for key in ("schema_name", "table_name", "relation_kind", "owner", "privilege_type")):
+            continue
+        if type(row.get("effective")) is not bool or type(row.get("is_grantable")) is not bool:
+            continue
+        privilege = str(row["privilege_type"])
+        if privilege not in expected_table_privileges:
+            _add_error(errors, f"{label}_invalid_privilege_type_{privilege}")
+            continue
+        if privilege in seen_table_privileges:
+            _add_error(errors, f"{label}_duplicate_privilege")
+        seen_table_privileges.add(privilege)
+        if row["schema_name"] != BOUND_SOURCE_SCHEMA:
+            _add_error(errors, f"{label}_schema_invalid")
+        if row["table_name"] != BOUND_SOURCE_RELATION:
+            _add_error(errors, f"{label}_relation_invalid")
+        if row["relation_kind"] != BOUND_SOURCE_RELKIND:
+            _add_error(errors, f"{label}_relation_kind_invalid")
+        if row["owner"] == runtime_role:
+            _add_error(errors, f"{label}_runtime_owner_forbidden")
+        if row["effective"]:
+            _add_error(errors, f"{label}_runtime_privilege_forbidden_{privilege}")
+        if row["is_grantable"]:
+            _add_error(errors, f"{label}_runtime_grant_option_forbidden_{privilege}")
+    if seen_table_privileges != expected_table_privileges:
+        _add_error(
+            errors,
+            "bound_source_table_privileges_mismatch_expected_"
+            f"{sorted(expected_table_privileges)}_got_{sorted(seen_table_privileges)}",
+        )
+
+    if type(column_privilege_rows) is not list:
+        errors.append("bound_source_column_evidence_must_be_list")
+        column_privilege_rows = []
+    source_column_rows = [
+        (index, row)
+        for index, row in enumerate(column_privilege_rows)
+        if isinstance(row, dict)
+        and row.get("schema_name") == BOUND_SOURCE_SCHEMA
+        and row.get("table_name") == BOUND_SOURCE_RELATION
+    ]
+    if not source_column_rows:
+        errors.append("bound_source_column_evidence_missing")
+
+    expected_column_privileges = set(VIEW_COLUMN_PRIVILEGES)
+    expected_columns = {
+        str(column["name"])
+        for column in LEGACY_VIEW_DEFINITION["columns"]
+    }
+    seen_columns: dict[str, set[str]] = {}
+    for index, row in source_column_rows:
+        label = f"bound_source_column_row_{index}"
+        if not _exact_keys(row, RUNTIME_COLUMN_PRIVILEGE_ROW_KEYS, label, errors):
+            continue
+        for key in ("schema_name", "table_name", "column_name", "privilege_type"):
+            _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
+        _require_type(row.get("effective"), bool, f"{label}_effective", errors)
+        _require_type(row.get("is_grantable"), bool, f"{label}_is_grantable", errors)
+        if any(type(row.get(key)) is not str for key in ("schema_name", "table_name", "column_name", "privilege_type")):
+            continue
+        if type(row.get("effective")) is not bool or type(row.get("is_grantable")) is not bool:
+            continue
+        privilege = str(row["privilege_type"])
+        column_name = str(row["column_name"])
+        if privilege not in expected_column_privileges:
+            _add_error(errors, f"{label}_invalid_privilege_type_{privilege}")
+            continue
+        privileges = seen_columns.setdefault(column_name, set())
+        if privilege in privileges:
+            _add_error(errors, f"{label}_duplicate_privilege")
+        privileges.add(privilege)
+        if row["effective"]:
+            _add_error(errors, f"{label}_runtime_privilege_forbidden_{privilege}")
+        if row["is_grantable"]:
+            _add_error(errors, f"{label}_runtime_grant_option_forbidden_{privilege}")
+
+    for column_name in expected_columns:
+        actual_privileges = seen_columns.get(column_name, set())
+        if actual_privileges != expected_column_privileges:
+            _add_error(
+                errors,
+                "bound_source_column_privileges_mismatch_"
+                f"{column_name}_expected_{sorted(expected_column_privileges)}_got_{sorted(actual_privileges)}",
+            )
+    return tuple(errors)
 
 
 def evaluate_view_authority(
@@ -1861,7 +2067,7 @@ def evaluate_view_authority(
                         _add_error(errors, f"{entry_label}_owner_acl_grantor_invalid")
                     if is_grantable:
                         _add_error(errors, f"{entry_label}_owner_acl_grant_option_forbidden")
-                else:
+                elif name in classified:
                     _add_error(errors, f"{entry_label}_unexpected_acl_grantee_{grantee}")
 
         owner_acl_semantics = {
@@ -1937,8 +2143,13 @@ def evaluate_view_authority(
             _add_error(errors, f'{label}_view_definition_must_be_non_empty_string')
         if name in classified:
             expected_definition = LEGACY_VIEW_DEFINITION
-            if type(view_definition) is str and _normalise_view_definition(view_definition) != _normalise_view_definition(expected_definition['canonical_definition']):
-                _add_error(errors, f'{label}_classified_view_definition_mismatch')
+            if type(view_definition) is str:
+                try:
+                    definition_matches = _normalise_view_definition(view_definition) == _normalise_view_definition(expected_definition['canonical_definition'])
+                except SQLLexError:
+                    definition_matches = False
+                if not definition_matches:
+                    _add_error(errors, f'{label}_classified_view_definition_mismatch')
             if view_dependencies != expected_definition['dependencies']:
                 _add_error(errors, f'{label}_classified_view_dependencies_mismatch')
             if row.get('view_columns') != expected_definition['columns']:
@@ -2011,6 +2222,29 @@ def evaluate_view_authority(
         names = {str(row["relation_name"]) for row in legacy_rows}
         _add_error(errors, f"classified_relation_view_rows_must_be_at_most_one_{sorted(names)}")
 
+    return tuple(errors)
+
+
+def evaluate_runtime_authority(
+    manifest: dict[str, Any],
+    view_rows: list[dict[str, Any]],
+    table_privilege_rows: list[dict[str, Any]],
+    column_privilege_rows: list[dict[str, Any]],
+    *,
+    runtime_role: str = "sqag_runtime",
+) -> tuple[str, ...]:
+    """Evaluate view ACLs plus the conditional bound-source table proof."""
+
+    errors = list(evaluate_view_authority(manifest, view_rows, runtime_role=runtime_role))
+    errors.extend(
+        evaluate_bound_source_authority(
+            manifest,
+            view_rows,
+            table_privilege_rows,
+            column_privilege_rows,
+            runtime_role=runtime_role,
+        )
+    )
     return tuple(errors)
 
 

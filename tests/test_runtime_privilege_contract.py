@@ -138,6 +138,8 @@ CANONICAL_QUERY_COLUMNS = {
     "effective_runtime_table_privileges": [
         "schema_name",
         "table_name",
+        "relation_kind",
+        "owner",
         "privilege_type",
         "effective",
         "is_grantable",
@@ -1192,6 +1194,21 @@ class ValidatorStaticTest(unittest.TestCase):
         for query_key, mutation in mutations:
             self._assert_exact_query_rejected(query_key, mutation)
 
+        source_identity_mutations = (
+            ("table_acl", manifest["verification_queries"]["table_acl"]),
+            ("effective_runtime_table_privileges", table_query),
+            ("effective_runtime_column_privileges", column_query),
+        )
+        for query_key, query in source_identity_mutations:
+            self._assert_exact_query_rejected(
+                query_key,
+                query.replace(
+                    "c.relname = 'legacy_quote_artifacts_source'",
+                    "c.relname = 'wrong_source'",
+                    1,
+                ),
+            )
+
 
 class RuntimeMembershipEdgeEvaluatorTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -1650,11 +1667,54 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
         })
         return row
 
+    @staticmethod
+    def _bound_source_evidence() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        table_rows = [
+            {
+                "schema_name": "public",
+                "table_name": "legacy_quote_artifacts_source",
+                "relation_kind": "r",
+                "owner": "sqag_migrator",
+                "privilege_type": privilege,
+                "effective": False,
+                "is_grantable": False,
+            }
+            for privilege in TABLE_PRIVILEGES
+        ]
+        column_rows = [
+            {
+                "schema_name": "public",
+                "table_name": "legacy_quote_artifacts_source",
+                "column_name": column["name"],
+                "privilege_type": privilege,
+                "effective": False,
+                "is_grantable": False,
+            }
+            for column in contract_validator.LEGACY_VIEW_DEFINITION["columns"]
+            for privilege in COLUMN_PRIVILEGES
+        ]
+        return table_rows, column_rows
+
     def _errors(self, rows: list[dict[str, Any]]) -> tuple[str, ...]:
         return contract_validator.evaluate_view_authority(self.manifest, rows)
 
     def _assert_rejected(self, rows: list[dict[str, Any]], expected_fragment: str) -> None:
         errors = self._errors(rows)
+        self.assertTrue(
+            any(expected_fragment in error for error in errors),
+            f"missing {expected_fragment!r} in {errors!r}",
+        )
+
+    def _assert_source_evidence_rejected(
+        self,
+        view_rows: list[dict[str, Any]],
+        table_rows: list[dict[str, Any]],
+        column_rows: list[dict[str, Any]],
+        expected_fragment: str,
+    ) -> None:
+        errors = contract_validator.evaluate_runtime_authority(
+            self.manifest, view_rows, table_rows, column_rows
+        )
         self.assertTrue(
             any(expected_fragment in error for error in errors),
             f"missing {expected_fragment!r} in {errors!r}",
@@ -1741,6 +1801,81 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
         definition = copy.deepcopy(base)
         definition['view_definition'] = 'select session_id from legacy_quote_artifacts_source'
         self._assert_rejected([definition], 'classified_view_definition_mismatch')
+
+        qualified = copy.deepcopy(base)
+        qualified['view_definition'] = (
+            'select workspace_id, session_id, artifact_kind, filename, content_type, size_bytes, '
+            'content_blob, created_at, updated_at from public.legacy_quote_artifacts_source'
+        )
+        self.assertEqual(self._errors([qualified]), ())
+
+        wrong_schema = copy.deepcopy(qualified)
+        wrong_schema['view_definition'] = wrong_schema['view_definition'].replace(
+            'public.legacy_quote_artifacts_source', 'other_schema.legacy_quote_artifacts_source'
+        )
+        self._assert_rejected([wrong_schema], 'classified_view_definition_mismatch')
+
+        wrong_source = copy.deepcopy(qualified)
+        wrong_source['view_definition'] = wrong_source['view_definition'].replace(
+            'public.legacy_quote_artifacts_source', 'public.some_other_source'
+        )
+        self._assert_rejected([wrong_source], 'classified_view_definition_mismatch')
+
+        reordered = copy.deepcopy(base)
+        reordered['view_definition'] = (
+            'select session_id, workspace_id, artifact_kind, filename, content_type, size_bytes, '
+            'content_blob, created_at, updated_at from legacy_quote_artifacts_source'
+        )
+        self._assert_rejected([reordered], 'classified_view_definition_mismatch')
+
+        source_table_rows, source_column_rows = self._bound_source_evidence()
+        self.assertEqual(
+            contract_validator.evaluate_runtime_authority(
+                self.manifest,
+                [base],
+                source_table_rows,
+                source_column_rows,
+            ),
+            (),
+        )
+        self.assertEqual(
+            contract_validator.evaluate_runtime_authority(self.manifest, [], [], []),
+            (),
+        )
+        missing_source = contract_validator.evaluate_runtime_authority(
+            self.manifest, [base], [], source_column_rows
+        )
+        self.assertTrue(any('bound_source_table_evidence_missing' in error for error in missing_source), missing_source)
+        for privilege in TABLE_PRIVILEGES:
+            with self.subTest(source_table_privilege=privilege):
+                table_case = copy.deepcopy(source_table_rows)
+                next(row for row in table_case if row['privilege_type'] == privilege)['effective'] = True
+                errors = contract_validator.evaluate_runtime_authority(
+                    self.manifest, [base], table_case, source_column_rows
+                )
+                self.assertTrue(any('bound_source_table_row_' in error and 'runtime_privilege_forbidden' in error for error in errors), errors)
+
+                grant_case = copy.deepcopy(source_table_rows)
+                next(row for row in grant_case if row['privilege_type'] == privilege)['is_grantable'] = True
+                errors = contract_validator.evaluate_runtime_authority(
+                    self.manifest, [base], grant_case, source_column_rows
+                )
+                self.assertTrue(any('bound_source_table_row_' in error and 'runtime_grant_option_forbidden' in error for error in errors), errors)
+        owner_case = copy.deepcopy(source_table_rows)
+        owner_case[0]['owner'] = 'sqag_runtime'
+        self._assert_source_evidence_rejected([base], owner_case, source_column_rows, 'runtime_owner_forbidden')
+        kind_case = copy.deepcopy(source_table_rows)
+        kind_case[0]['relation_kind'] = 'v'
+        self._assert_source_evidence_rejected([base], kind_case, source_column_rows, 'relation_kind_invalid')
+        for privilege in COLUMN_PRIVILEGES:
+            with self.subTest(source_column_privilege=privilege):
+                column_case = copy.deepcopy(source_column_rows)
+                next(row for row in column_case if row['privilege_type'] == privilege)['effective'] = True
+                self._assert_source_evidence_rejected([base], source_table_rows, column_case, 'runtime_privilege_forbidden')
+
+                grant_case = copy.deepcopy(source_column_rows)
+                next(row for row in grant_case if row['privilege_type'] == privilege)['is_grantable'] = True
+                self._assert_source_evidence_rejected([base], source_table_rows, grant_case, 'runtime_grant_option_forbidden')
 
         dependency = copy.deepcopy(base)
         dependency['view_dependencies'] = []
@@ -1903,6 +2038,29 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
         unexpected = copy.deepcopy(base)
         add_acl(unexpected, "sqag_app", "SELECT")
         self._assert_rejected([unexpected], "unexpected_acl_grantee_sqag_app")
+
+        unrelated_relation = self._extended_view_row("sqag_file_artifacts")
+        unrelated_relation["acl_entries"].append(
+            {"grantee": "unrelated_role", "grantor": "unrelated_role", "privilege_type": "SELECT", "is_grantable": False}
+        )
+        self.assertEqual(self._errors([unrelated_relation]), ())
+
+        public_relation = self._extended_view_row("sqag_file_artifacts")
+        public_relation["acl_entries"].append(
+            {"grantee": "PUBLIC", "grantor": "unrelated_role", "privilege_type": "SELECT", "is_grantable": False}
+        )
+        self._assert_rejected([public_relation], "public_acl_authority_forbidden")
+
+        unrelated_column = self._extended_view_row("sqag_file_artifacts")
+        unrelated_column["column_acl_entries"][0]["acl_entries"].append(
+            {"grantee": "unrelated_role", "grantor": "unrelated_role", "privilege_type": "SELECT", "is_grantable": True}
+        )
+        self.assertEqual(self._errors([unrelated_column]), ())
+
+        effective_membership = self._extended_view_row("sqag_file_artifacts")
+        effective_membership["runtime_select"] = True
+        effective_membership["runtime_privileges"][0]["effective"] = True
+        self._assert_rejected([effective_membership], "unclassified_ordinary_view_runtime_authority")
 
         malformed_acl = copy.deepcopy(base)
         malformed_acl["acl_entries"] = "not-a-list"
@@ -2868,7 +3026,8 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
                 "cross join (values ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE'), "
                 "('REFERENCES'), ('TRIGGER'), ('MAINTAIN')) p(privilege_type) "
-                "where n.nspname = 'public' and c.relkind = 'r' and c.relname like 'sqag_' || chr(37) "
+                "where n.nspname = 'public' and c.relkind = 'r' and "
+                "(c.relname like 'sqag_' || chr(37) or c.relname = 'legacy_quote_artifacts_source') "
                 "order by n.nspname, c.relname, p.privilege_type",
                 (role_name, role_name),
             ).fetchall()
@@ -2894,8 +3053,9 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 "from pg_catalog.pg_class c "
                 "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
                 "join pg_catalog.pg_attribute a on a.attrelid = c.oid "
-                "where n.nspname = 'public' and c.relkind = 'r' "
-                "and c.relname like 'sqag_' || chr(37) and a.attnum > 0 and not a.attisdropped "
+                "where n.nspname = 'public' and c.relkind = 'r' and "
+                "(c.relname like 'sqag_' || chr(37) or c.relname = 'legacy_quote_artifacts_source') "
+                "and a.attnum > 0 and not a.attisdropped "
                 "order by c.relname, a.attnum"
             ).fetchall()
             columns: dict[str, list[str]] = {}
@@ -2919,8 +3079,9 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
                 "join pg_catalog.pg_attribute a on a.attrelid = c.oid "
                 "cross join (values ('SELECT'), ('INSERT'), ('UPDATE'), ('REFERENCES')) p(privilege_type) "
-                "where n.nspname = 'public' and c.relkind = 'r' "
-                "and c.relname like 'sqag_' || chr(37) and a.attnum > 0 and not a.attisdropped "
+                "where n.nspname = 'public' and c.relkind = 'r' and "
+                "(c.relname like 'sqag_' || chr(37) or c.relname = 'legacy_quote_artifacts_source') "
+                "and a.attnum > 0 and not a.attisdropped "
                 "order by n.nspname, c.relname, a.attname, p.privilege_type",
                 (role_name, role_name),
             ).fetchall()
@@ -3358,6 +3519,20 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         return contract_validator.evaluate_view_authority(
             self.contract,
             [dict(row) for row in rows],
+        )
+
+    def _evaluate_runtime_authority_rows(self) -> tuple[str, ...]:
+        view_columns, view_rows = self._execute_contract_query("view_acl")
+        table_columns, table_rows = self._execute_contract_query("effective_runtime_table_privileges")
+        column_columns, column_rows = self._execute_contract_query("effective_runtime_column_privileges")
+        self.assertEqual(view_columns, CANONICAL_QUERY_COLUMNS["view_acl"])
+        self.assertEqual(table_columns, CANONICAL_QUERY_COLUMNS["effective_runtime_table_privileges"])
+        self.assertEqual(column_columns, CANONICAL_QUERY_COLUMNS["effective_runtime_column_privileges"])
+        return contract_validator.evaluate_runtime_authority(
+            self.contract,
+            [dict(row) for row in view_rows],
+            [dict(row) for row in table_rows],
+            [dict(row) for row in column_rows],
         )
 
     def _view_owner(self, view_name: str) -> str:
@@ -4693,9 +4868,148 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
 
     def test_legacy_ordinary_view_with_bounded_select_is_accepted(self) -> None:
         self.apply_migrations()
-        self._create_legacy_quote_artifacts_view()
+        source_table = self._create_legacy_quote_artifacts_view()
         self._grant_manifest_view_authority("sqag_runtime")
         self._assert_exact_runtime_view_grants("sqag_runtime")
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        view_columns, view_rows = self._execute_contract_query("view_acl")
+        raw_table_columns, raw_table_rows = self._execute_contract_query("table_acl")
+        table_columns, table_rows = self._execute_contract_query("effective_runtime_table_privileges")
+        column_columns, column_rows = self._execute_contract_query("effective_runtime_column_privileges")
+        self.assertEqual(view_columns, CANONICAL_QUERY_COLUMNS["view_acl"])
+        self.assertEqual(raw_table_columns, CANONICAL_QUERY_COLUMNS["table_acl"])
+        self.assertIn(
+            source_table,
+            {str(row["relname"]) for row in raw_table_rows},
+        )
+        self.assertEqual(table_columns, CANONICAL_QUERY_COLUMNS["effective_runtime_table_privileges"])
+        self.assertEqual(column_columns, CANONICAL_QUERY_COLUMNS["effective_runtime_column_privileges"])
+        view_evidence = [dict(row) for row in view_rows]
+        table_evidence = [dict(row) for row in table_rows]
+        column_evidence = [dict(row) for row in column_rows]
+        source_table_evidence = [row for row in table_evidence if row["table_name"] == source_table]
+        source_column_evidence = [row for row in column_evidence if row["table_name"] == source_table]
+        self.assertEqual(len(source_table_evidence), len(TABLE_PRIVILEGES))
+        self.assertTrue(source_table_evidence)
+        self.assertTrue(all(row["schema_name"] == "public" for row in source_table_evidence))
+        self.assertTrue(all(row["relation_kind"] == "r" for row in source_table_evidence))
+        self.assertTrue(all(row["owner"] != "sqag_runtime" for row in source_table_evidence))
+        self.assertTrue(source_column_evidence)
+        self.assertTrue(all(not row["effective"] and not row["is_grantable"] for row in source_table_evidence))
+        self.assertTrue(all(not row["effective"] and not row["is_grantable"] for row in source_column_evidence))
+        missing_source = contract_validator.evaluate_runtime_authority(
+            self.contract,
+            view_evidence,
+            [row for row in table_evidence if row["table_name"] != source_table],
+            column_evidence,
+        )
+        self.assertTrue(any("bound_source_table_evidence_missing" in error for error in missing_source), missing_source)
+
+        source_ident = f"public.{_quote_identifier(source_table)}"
+        for privilege in TABLE_PRIVILEGES:
+            self._execute_admin_sql(
+                f'grant {privilege} on table {source_ident} to {_quote_identifier("sqag_runtime")}'
+            )
+            try:
+                errors = self._evaluate_runtime_authority_rows()
+                self.assertTrue(any("bound_source_table_row_" in error and "runtime_privilege_forbidden" in error for error in errors), (privilege, errors))
+            finally:
+                self._execute_admin_sql(
+                    f'revoke {privilege} on table {source_ident} from {_quote_identifier("sqag_runtime")}'
+                )
+
+        self._execute_admin_sql(
+            f'grant SELECT on table {source_ident} to {_quote_identifier("sqag_runtime")} with grant option'
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(any("bound_source_table_row_" in error and "runtime_grant_option_forbidden" in error for error in errors), errors)
+        finally:
+            self._execute_admin_sql(
+                f'revoke SELECT on table {source_ident} from {_quote_identifier("sqag_runtime")}'
+            )
+
+        self._execute_admin_sql(
+            f'alter table {source_ident} owner to {_quote_identifier("sqag_runtime")}'
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(any("runtime_owner_forbidden" in error for error in errors), errors)
+        finally:
+            self._execute_admin_sql(
+                f'alter table {source_ident} owner to {_quote_identifier("sqag_migrator")}'
+            )
+
+        self._execute_admin_sql(f"grant SELECT on table {source_ident} to public")
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(any("runtime_privilege_forbidden_SELECT" in error for error in errors), errors)
+        finally:
+            self._execute_admin_sql(f"revoke SELECT on table {source_ident} from public")
+
+        table_parent = self._new_role("legacy_source_table_parent")
+        self._grant_role_membership(table_parent, "sqag_runtime")
+        self._execute_admin_sql(
+            f'grant SELECT on table {source_ident} to {_quote_identifier(table_parent)}'
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(any("runtime_privilege_forbidden_SELECT" in error for error in errors), errors)
+        finally:
+            self._execute_admin_sql(
+                f'revoke SELECT on table {source_ident} from {_quote_identifier(table_parent)}'
+            )
+
+        source_column = "workspace_id"
+        for privilege in COLUMN_PRIVILEGES:
+            self._execute_admin_sql(
+                f'grant {privilege} ({_quote_identifier(source_column)}) on table {source_ident} to {_quote_identifier("sqag_runtime")}'
+            )
+            try:
+                errors = self._evaluate_runtime_authority_rows()
+                self.assertTrue(any("bound_source_column_row_" in error and "runtime_privilege_forbidden" in error for error in errors), (privilege, errors))
+            finally:
+                self._execute_admin_sql(
+                    f'revoke {privilege} ({_quote_identifier(source_column)}) on table {source_ident} from {_quote_identifier("sqag_runtime")}'
+                )
+
+        self._execute_admin_sql(
+            f'grant SELECT ({_quote_identifier(source_column)}) on table {source_ident} to {_quote_identifier("sqag_runtime")} with grant option'
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(any("bound_source_column_row_" in error and "runtime_grant_option_forbidden" in error for error in errors), errors)
+        finally:
+            self._execute_admin_sql(
+                f'revoke SELECT ({_quote_identifier(source_column)}) on table {source_ident} from {_quote_identifier("sqag_runtime")}'
+            )
+
+        self._execute_admin_sql(
+            f'grant SELECT ({_quote_identifier(source_column)}) on table {source_ident} to public'
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(any("runtime_privilege_forbidden_SELECT" in error for error in errors), errors)
+        finally:
+            self._execute_admin_sql(
+                f'revoke SELECT ({_quote_identifier(source_column)}) on table {source_ident} from public'
+            )
+
+        column_parent = self._new_role("legacy_source_column_parent")
+        self._grant_role_membership(column_parent, "sqag_runtime")
+        self._execute_admin_sql(
+            f'grant SELECT ({_quote_identifier(source_column)}) on table {source_ident} to {_quote_identifier(column_parent)}'
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(any("runtime_privilege_forbidden_SELECT" in error for error in errors), errors)
+        finally:
+            self._execute_admin_sql(
+                f'revoke SELECT ({_quote_identifier(source_column)}) on table {source_ident} from {_quote_identifier(column_parent)}'
+            )
+
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
         columns, rows = self._execute_contract_query("view_acl")
         self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["view_acl"])
         self.assertEqual(

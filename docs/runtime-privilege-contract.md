@@ -147,7 +147,18 @@ definition: canonicalized `pg_get_viewdef()` text selecting the nine ordered
 columns `workspace_id`, `session_id`, `artifact_kind`, `filename`,
 `content_type`, `size_bytes`, `content_blob`, `created_at`, and `updated_at`
 from `public.legacy_quote_artifacts_source`; the single normal dependency is
-that source table. The contract also binds each column's ordinal, PostgreSQL
+that source table. When the classified view is present, the canonical
+`effective_runtime_table_privileges` and
+`effective_runtime_column_privileges` queries also include that exact
+`public.legacy_quote_artifacts_source` identity. The table evidence must report
+schema `public`, relation kind `r`, an owner other than `sqag_runtime`, and all
+eight effective privileges and grant-option checks false. The column evidence
+must cover every visible source column and all four column privileges, with
+both effective and grant-option checks false. This source-table proof is
+conditional on the optional classified view; an absent view does not require
+the source table to exist.
+
+The contract also binds each column's ordinal, PostgreSQL
 type OID/schema/name/modifier/SQL identity, an empty relation-options object,
 and `security_barrier=false`, `security_invoker=false`, and no check option.
 Any definition, dependency, column-shape/type, option, or security drift fails
@@ -347,15 +358,15 @@ live-system evidence.
 |---|---|---:|
 | `database_acl` | `datacl` | 1 |
 | `schema_acl` | `nspacl` | 1 |
-| `table_acl` | `relname`, `relacl` | 16 |
+| `table_acl` | `relname`, `relacl` | 16 without the optional source table; 17 when it exists |
 | `routine_acl` | `proname`, `identity_arguments`, `prokind`, `prosecdef`, `proacl`, `proowner`, `owner`, `has_trigger_dependency` | 2 |
 | `default_acl` | `owner`, `namespace`, `object_type`, `grantee`, `privilege_type`, `is_grantable` | 1 |
 | `role_attributes` | `rolname`, `rolsuper`, `rolinherit`, `rolcreaterole`, `rolcreatedb`, `rolcanlogin`, `rolreplication`, `rolbypassrls`, `rolconnlimit`, `password_is_null` | 2 |
 | `role_memberships` | `role`, `member`, `grantor`, `admin_option`, `inherit_option`, `set_option` | 0 in the generic shape fixture; 1 exact runtime edge in the creator fixture |
 | `sequence_acl` | `relname`, `relacl` | 0 |
 | `effective_runtime_database_privileges` | `privilege_type`, `effective`, `is_grantable` | 3 |
-| `effective_runtime_table_privileges` | `schema_name`, `table_name`, `privilege_type`, `effective`, `is_grantable` | 128 |
-| `effective_runtime_column_privileges` | `schema_name`, `table_name`, `column_name`, `privilege_type`, `effective`, `is_grantable` | fixture columns x 4 |
+| `effective_runtime_table_privileges` | `schema_name`, `table_name`, `relation_kind`, `owner`, `privilege_type`, `effective`, `is_grantable` | 128 without the optional source table; 136 when it exists |
+| `effective_runtime_column_privileges` | `schema_name`, `table_name`, `column_name`, `privilege_type`, `effective`, `is_grantable` | fixture columns x 4, plus source columns x 4 when the source exists |
 | `effective_runtime_schema_privileges` | `privilege_type`, `effective`, `is_grantable` | 2 |
 | `effective_runtime_routine_privileges` | `routine_name`, `effective` | 2 |
 | `view_acl` | `relation_name`, `relation_kind`, `owner`, `relation_acl`, `acl_entries`, `column_acl_entries`, `view_definition`, `view_dependencies`, `view_columns`, `relation_options`, `view_security`, `runtime_privileges`, `runtime_select`, `runtime_select_grantable` | 0 in the generic shape fixture; 1 when the legacy-optional view fixture is present |
@@ -370,9 +381,15 @@ evaluated for the exact privilege rather than inferred from ACL text.
 
 The table proof evaluates every `public.sqag_*` table against the ordered
 PostgreSQL 17 set `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`,
-`REFERENCES`, `TRIGGER`, `MAINTAIN`. The column proof evaluates every
-non-dropped user column against `SELECT`, `INSERT`, `UPDATE`, and `REFERENCES`.
-Expected effective column rows are exactly those implied by the locked
+`REFERENCES`, `TRIGGER`, `MAINTAIN`, and adds only the exact
+`public.legacy_quote_artifacts_source` relation identity for the classified
+legacy view. Its evidence includes relation kind and owner so the bound source
+must be an ordinary table owned by neither `sqag_runtime` nor an authority that
+would make the source available to runtime. All eight source effective and
+grant-option results must be false. The column proof evaluates every
+non-dropped user column against `SELECT`, `INSERT`, `UPDATE`, and `REFERENCES`,
+including every visible column on the exact bound source when the classified
+view exists. Expected effective column rows are exactly those implied by the locked
 table-level matrix plus the one explicit `UPDATE(checksum_sha256)` tuple on
 `sqag_quote_publication_artifacts`. Column grants cannot add authority to a
 forbidden table, an unauthorized table-level privilege, another
@@ -465,8 +482,10 @@ unexpected ACL provenance, and any same-name relation duplicate.
 The remaining effective queries have the same exact-token binding. In
 particular, the membership query must preserve the complete six-field contract
 and aliases defined above; the table query must retain all eight privilege
-literals; the column query must retain the table, column, and privilege
-predicates; and database/schema grantability must remain a real
+literals, owner/relation-kind evidence, and the bounded exact-source identity
+predicate; the column query must retain the exact table boundary plus the same
+bound-source identity, table, column, and privilege predicates; and
+database/schema grantability must remain a real
 privilege-specific `WITH GRANT OPTION` check. Invalid SQL is still rejected by
 PostgreSQL execution even when a candidate happens to contain expected words.
 
@@ -487,9 +506,12 @@ SQLSTATE `P0001` with the exact immutable-record message while leaving the row
 unchanged. Direct calls to both trigger functions run under `SET ROLE` and
 must fail specifically with SQLSTATE `42501`.
 
-The runtime table proof constructs the expected effective set directly from
-the manifest as `(schema_name, table_name, privilege_type, is_grantable)` and
-compares it with the complete effective set. The table and column adversarial
+The runtime table proof constructs the expected `sqag_*` effective set directly
+from the manifest as `(schema_name, table_name, privilege_type, is_grantable)`
+and compares it with the complete effective set. When the classified legacy
+view exists, the separate bound-source evaluator also requires
+`relation_kind`, `owner`, and complete false effective/grant-option evidence for
+`public.legacy_quote_artifacts_source`. The table and column adversarial
 matrices independently exercise direct, grant-option, PUBLIC, and
 membership-derived authority for every PostgreSQL 17 table privilege and each
 column privilege. They also reject one-column/one-table substitutions, equal
