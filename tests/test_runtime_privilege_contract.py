@@ -141,6 +141,8 @@ CANONICAL_QUERY_COLUMNS = {
         "relation_kind",
         "owner",
         "owner_select",
+        "row_security_enabled",
+        "row_security_forced",
         "privilege_type",
         "effective",
         "is_grantable",
@@ -1208,6 +1210,16 @@ class ValidatorStaticTest(unittest.TestCase):
                 "has_table_privilege('sqag_runtime', c.oid, 'SELECT') as owner_select",
                 1,
             )),
+            ("effective_runtime_table_privileges", table_query.replace(
+                "c.relrowsecurity as row_security_enabled, ",
+                "",
+                1,
+            )),
+            ("effective_runtime_table_privileges", table_query.replace(
+                "c.relforcerowsecurity as row_security_forced, ",
+                "",
+                1,
+            )),
             ("effective_runtime_column_privileges", column_query),
         )
         for query_key, query in source_identity_mutations:
@@ -1687,6 +1699,8 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
                 "relation_kind": "r",
                 "owner": "sqag_migrator",
                 "owner_select": True,
+                "row_security_enabled": False,
+                "row_security_forced": False,
                 "privilege_type": privilege,
                 "effective": False,
                 "is_grantable": False,
@@ -1871,8 +1885,109 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
             (),
         )
         self.assertEqual(
+            contract_validator.evaluate_runtime_authority(
+                self.manifest,
+                [],
+                source_table_rows,
+                source_column_rows,
+            ),
+            (),
+        )
+        surviving_table_authority = copy.deepcopy(source_table_rows)
+        surviving_table_authority[0]["effective"] = True
+        self._assert_source_evidence_rejected(
+            [],
+            surviving_table_authority,
+            source_column_rows,
+            "runtime_privilege_forbidden",
+        )
+        surviving_column_authority = copy.deepcopy(source_column_rows)
+        surviving_column_authority[0]["effective"] = True
+        self._assert_source_evidence_rejected(
+            [],
+            source_table_rows,
+            surviving_column_authority,
+            "runtime_privilege_forbidden",
+        )
+        surviving_grant_option = copy.deepcopy(source_table_rows)
+        surviving_grant_option[0]["is_grantable"] = True
+        self._assert_source_evidence_rejected(
+            [],
+            surviving_grant_option,
+            source_column_rows,
+            "runtime_grant_option_forbidden",
+        )
+        surviving_runtime_owner = copy.deepcopy(source_table_rows)
+        surviving_runtime_owner[0]["owner"] = "sqag_runtime"
+        self._assert_source_evidence_rejected(
+            [],
+            surviving_runtime_owner,
+            source_column_rows,
+            "runtime_owner_forbidden",
+        )
+        surviving_without_owner_select = copy.deepcopy(source_table_rows)
+        for row in surviving_without_owner_select:
+            row["owner"] = "sqag_app"
+            row["owner_select"] = False
+        self.assertEqual(
+            contract_validator.evaluate_runtime_authority(
+                self.manifest,
+                [],
+                surviving_without_owner_select,
+                source_column_rows,
+            ),
+            (),
+        )
+        surviving_rls = copy.deepcopy(source_table_rows)
+        surviving_rls[0]["row_security_enabled"] = True
+        surviving_rls[0]["row_security_forced"] = True
+        self.assertEqual(
+            contract_validator.evaluate_runtime_authority(
+                self.manifest,
+                [],
+                surviving_rls,
+                source_column_rows,
+            ),
+            (),
+        )
+        malformed_rls = copy.deepcopy(source_table_rows)
+        malformed_rls[0]["row_security_enabled"] = "false"
+        self.assertTrue(
+            any(
+                "row_security_enabled_must_be_bool" in error
+                for error in contract_validator.evaluate_runtime_authority(
+                    self.manifest,
+                    [],
+                    malformed_rls,
+                    source_column_rows,
+                )
+            )
+        )
+        self.assertEqual(
             contract_validator.evaluate_runtime_authority(self.manifest, [], [], []),
             (),
+        )
+        self.assertTrue(
+            any(
+                "bound_source_column_evidence_missing" in error
+                for error in contract_validator.evaluate_runtime_authority(
+                    self.manifest,
+                    [],
+                    source_table_rows,
+                    [],
+                )
+            )
+        )
+        self.assertTrue(
+            any(
+                "bound_source_table_evidence_missing" in error
+                for error in contract_validator.evaluate_runtime_authority(
+                    self.manifest,
+                    [],
+                    [],
+                    source_column_rows,
+                )
+            )
         )
         missing_source = contract_validator.evaluate_runtime_authority(
             self.manifest, [base], [], source_column_rows
@@ -1903,6 +2018,10 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
                     self.manifest, [base], table_case, source_column_rows
                 )
                 self.assertTrue(any('bound_source_table_row_' in error and 'runtime_privilege_forbidden' in error for error in errors), errors)
+                absent_errors = contract_validator.evaluate_runtime_authority(
+                    self.manifest, [], table_case, source_column_rows
+                )
+                self.assertTrue(any('bound_source_table_row_' in error and 'runtime_privilege_forbidden' in error for error in absent_errors), absent_errors)
 
                 grant_case = copy.deepcopy(source_table_rows)
                 next(row for row in grant_case if row['privilege_type'] == privilege)['is_grantable'] = True
@@ -1910,21 +2029,41 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
                     self.manifest, [base], grant_case, source_column_rows
                 )
                 self.assertTrue(any('bound_source_table_row_' in error and 'runtime_grant_option_forbidden' in error for error in errors), errors)
+                absent_errors = contract_validator.evaluate_runtime_authority(
+                    self.manifest, [], grant_case, source_column_rows
+                )
+                self.assertTrue(any('bound_source_table_row_' in error and 'runtime_grant_option_forbidden' in error for error in absent_errors), absent_errors)
         owner_case = copy.deepcopy(source_table_rows)
         owner_case[0]['owner'] = 'sqag_runtime'
         self._assert_source_evidence_rejected([base], owner_case, source_column_rows, 'runtime_owner_forbidden')
         kind_case = copy.deepcopy(source_table_rows)
         kind_case[0]['relation_kind'] = 'v'
         self._assert_source_evidence_rejected([base], kind_case, source_column_rows, 'relation_kind_invalid')
+        for field, fragment in (
+            ("row_security_enabled", "row_security_enabled_forbidden"),
+            ("row_security_forced", "row_security_forced_forbidden"),
+        ):
+            with self.subTest(source_table_posture=field):
+                rls_case = copy.deepcopy(source_table_rows)
+                rls_case[0][field] = True
+                self._assert_source_evidence_rejected([base], rls_case, source_column_rows, fragment)
         for privilege in COLUMN_PRIVILEGES:
             with self.subTest(source_column_privilege=privilege):
                 column_case = copy.deepcopy(source_column_rows)
                 next(row for row in column_case if row['privilege_type'] == privilege)['effective'] = True
                 self._assert_source_evidence_rejected([base], source_table_rows, column_case, 'runtime_privilege_forbidden')
+                absent_errors = contract_validator.evaluate_runtime_authority(
+                    self.manifest, [], source_table_rows, column_case
+                )
+                self.assertTrue(any('bound_source_column_row_' in error and 'runtime_privilege_forbidden' in error for error in absent_errors), absent_errors)
 
                 grant_case = copy.deepcopy(source_column_rows)
                 next(row for row in grant_case if row['privilege_type'] == privilege)['is_grantable'] = True
                 self._assert_source_evidence_rejected([base], source_table_rows, grant_case, 'runtime_grant_option_forbidden')
+                absent_errors = contract_validator.evaluate_runtime_authority(
+                    self.manifest, [], source_table_rows, grant_case
+                )
+                self.assertTrue(any('bound_source_column_row_' in error and 'runtime_grant_option_forbidden' in error for error in absent_errors), absent_errors)
 
         dependency = copy.deepcopy(base)
         dependency['view_dependencies'] = []
@@ -4996,6 +5135,8 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.assertTrue(all(row["relation_kind"] == "r" for row in source_table_evidence))
         self.assertTrue(all(row["owner"] != "sqag_runtime" for row in source_table_evidence))
         self.assertTrue(all(row["owner_select"] for row in source_table_evidence))
+        self.assertTrue(all(not row["row_security_enabled"] for row in source_table_evidence))
+        self.assertTrue(all(not row["row_security_forced"] for row in source_table_evidence))
         self.assertTrue(source_column_evidence)
         self.assertTrue(all(not row["effective"] and not row["is_grantable"] for row in source_table_evidence))
         self.assertTrue(all(not row["effective"] and not row["is_grantable"] for row in source_column_evidence))
@@ -5068,6 +5209,38 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             self._execute_admin_sql(
                 f'alter table {source_ident} owner to {_quote_identifier("sqag_migrator")}'
             )
+
+        self._execute_admin_sql(
+            f'alter table {source_ident} owner to {_quote_identifier(source_owner)}'
+        )
+        try:
+            self._execute_admin_sql(
+                f'grant SELECT on table {source_ident} to {_quote_identifier("sqag_migrator")}'
+            )
+            self._execute_admin_sql(f'alter table {source_ident} enable row level security')
+            try:
+                enabled_errors = self._evaluate_runtime_authority_rows()
+                self.assertTrue(
+                    any("row_security_enabled_forbidden" in error for error in enabled_errors),
+                    enabled_errors,
+                )
+                self._execute_admin_sql(f'alter table {source_ident} force row level security')
+                forced_errors = self._evaluate_runtime_authority_rows()
+                self.assertTrue(
+                    any("row_security_forced_forbidden" in error for error in forced_errors),
+                    forced_errors,
+                )
+            finally:
+                self._execute_admin_sql(f'alter table {source_ident} no force row level security')
+                self._execute_admin_sql(f'alter table {source_ident} disable row level security')
+        finally:
+            self._execute_admin_sql(
+                f'revoke SELECT on table {source_ident} from {_quote_identifier("sqag_migrator")}'
+            )
+            self._execute_admin_sql(
+                f'alter table {source_ident} owner to {_quote_identifier("sqag_migrator")}'
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
 
         self._execute_admin_sql(f"grant SELECT on table {source_ident} to public")
         try:

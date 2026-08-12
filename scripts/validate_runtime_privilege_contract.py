@@ -193,6 +193,8 @@ RUNTIME_TABLE_PRIVILEGE_ROW_KEYS = frozenset(
         "relation_kind",
         "owner",
         "owner_select",
+        "row_security_enabled",
+        "row_security_forced",
         "privilege_type",
         "effective",
         "is_grantable",
@@ -393,6 +395,8 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                c.relkind as relation_kind,
                r.rolname as owner,
                has_table_privilege('sqag_migrator', c.oid, 'SELECT') as owner_select,
+               c.relrowsecurity as row_security_enabled,
+               c.relforcerowsecurity as row_security_forced,
                p.privilege_type,
                has_table_privilege('sqag_runtime', c.oid, p.privilege_type) as effective,
                has_table_privilege(
@@ -857,6 +861,10 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "relation_kind",
         "owner",
         "is_grantable",
+        "relrowsecurity",
+        "relforcerowsecurity",
+        "row_security_enabled",
+        "row_security_forced",
         "' WITH GRANT OPTION'",
         "'select'",
         "'insert'",
@@ -1860,8 +1868,6 @@ def evaluate_bound_source_authority(
         isinstance(row, dict) and row.get("relation_name") in classified_names
         for row in view_rows
     )
-    if not classified_present:
-        return ()
 
     if type(table_privilege_rows) is not list:
         errors.append("bound_source_table_evidence_must_be_list")
@@ -1873,14 +1879,32 @@ def evaluate_bound_source_authority(
         and row.get("schema_name") == BOUND_SOURCE_SCHEMA
         and row.get("table_name") == BOUND_SOURCE_RELATION
     ]
+
+    if type(column_privilege_rows) is not list:
+        errors.append("bound_source_column_evidence_must_be_list")
+        column_privilege_rows = []
+    source_column_rows = [
+        (index, row)
+        for index, row in enumerate(column_privilege_rows)
+        if isinstance(row, dict)
+        and row.get("schema_name") == BOUND_SOURCE_SCHEMA
+        and row.get("table_name") == BOUND_SOURCE_RELATION
+    ]
+
+    source_evidence_present = bool(source_table_rows or source_column_rows)
+    if not classified_present and not source_evidence_present:
+        return tuple(errors)
+
     expected_table_privileges = set(VIEW_RELATION_PRIVILEGES)
     if not source_table_rows:
-        errors.append("bound_source_table_evidence_missing")
+        if classified_present or source_column_rows:
+            errors.append("bound_source_table_evidence_missing")
     if len(source_table_rows) != len(expected_table_privileges):
-        errors.append(
-            "bound_source_table_evidence_cardinality_expected_"
-            f"{len(expected_table_privileges)}_got_{len(source_table_rows)}"
-        )
+        if classified_present or source_table_rows:
+            errors.append(
+                "bound_source_table_evidence_cardinality_expected_"
+                f"{len(expected_table_privileges)}_got_{len(source_table_rows)}"
+            )
 
     seen_table_privileges: set[str] = set()
     for index, row in source_table_rows:
@@ -1890,12 +1914,19 @@ def evaluate_bound_source_authority(
         for key in ("schema_name", "table_name", "relation_kind", "owner", "privilege_type"):
             _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
         _require_type(row.get("owner_select"), bool, f"{label}_owner_select", errors)
+        _require_type(row.get("row_security_enabled"), bool, f"{label}_row_security_enabled", errors)
+        _require_type(row.get("row_security_forced"), bool, f"{label}_row_security_forced", errors)
         _require_type(row.get("effective"), bool, f"{label}_effective", errors)
         _require_type(row.get("is_grantable"), bool, f"{label}_is_grantable", errors)
-        if any(type(row.get(key)) is not str for key in ("schema_name", "table_name", "relation_kind", "owner", "privilege_type")):
+        if any(
+            type(row.get(key)) is not str
+            for key in ("schema_name", "table_name", "relation_kind", "owner", "privilege_type")
+        ):
             continue
         if (
             type(row.get("owner_select")) is not bool
+            or type(row.get("row_security_enabled")) is not bool
+            or type(row.get("row_security_forced")) is not bool
             or type(row.get("effective")) is not bool
             or type(row.get("is_grantable")) is not bool
         ):
@@ -1915,33 +1946,29 @@ def evaluate_bound_source_authority(
             _add_error(errors, f"{label}_relation_kind_invalid")
         if row["owner"] == runtime_role:
             _add_error(errors, f"{label}_runtime_owner_forbidden")
-        if not row["owner_select"]:
+        if classified_present and not row["owner_select"]:
             _add_error(
                 errors,
                 f"{label}_classified_view_owner_source_select_required_{BOUND_SOURCE_VIEW_OWNER}",
             )
+        if classified_present and row["row_security_enabled"]:
+            _add_error(errors, f"{label}_classified_view_source_row_security_enabled_forbidden")
+        if classified_present and row["row_security_forced"]:
+            _add_error(errors, f"{label}_classified_view_source_row_security_forced_forbidden")
         if row["effective"]:
             _add_error(errors, f"{label}_runtime_privilege_forbidden_{privilege}")
         if row["is_grantable"]:
             _add_error(errors, f"{label}_runtime_grant_option_forbidden_{privilege}")
-    if seen_table_privileges != expected_table_privileges:
-        _add_error(
-            errors,
-            "bound_source_table_privileges_mismatch_expected_"
-            f"{sorted(expected_table_privileges)}_got_{sorted(seen_table_privileges)}",
-        )
 
-    if type(column_privilege_rows) is not list:
-        errors.append("bound_source_column_evidence_must_be_list")
-        column_privilege_rows = []
-    source_column_rows = [
-        (index, row)
-        for index, row in enumerate(column_privilege_rows)
-        if isinstance(row, dict)
-        and row.get("schema_name") == BOUND_SOURCE_SCHEMA
-        and row.get("table_name") == BOUND_SOURCE_RELATION
-    ]
-    if not source_column_rows:
+    if classified_present or source_table_rows:
+        if seen_table_privileges != expected_table_privileges:
+            _add_error(
+                errors,
+                "bound_source_table_privileges_mismatch_expected_"
+                f"{sorted(expected_table_privileges)}_got_{sorted(seen_table_privileges)}",
+            )
+
+    if not source_column_rows and (classified_present or source_table_rows):
         errors.append("bound_source_column_evidence_missing")
 
     expected_column_privileges = set(VIEW_COLUMN_PRIVILEGES)
@@ -1958,7 +1985,10 @@ def evaluate_bound_source_authority(
             _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
         _require_type(row.get("effective"), bool, f"{label}_effective", errors)
         _require_type(row.get("is_grantable"), bool, f"{label}_is_grantable", errors)
-        if any(type(row.get(key)) is not str for key in ("schema_name", "table_name", "column_name", "privilege_type")):
+        if any(
+            type(row.get(key)) is not str
+            for key in ("schema_name", "table_name", "column_name", "privilege_type")
+        ):
             continue
         if type(row.get("effective")) is not bool or type(row.get("is_grantable")) is not bool:
             continue
@@ -1976,14 +2006,15 @@ def evaluate_bound_source_authority(
         if row["is_grantable"]:
             _add_error(errors, f"{label}_runtime_grant_option_forbidden_{privilege}")
 
-    for column_name in expected_columns:
-        actual_privileges = seen_columns.get(column_name, set())
-        if actual_privileges != expected_column_privileges:
-            _add_error(
-                errors,
-                "bound_source_column_privileges_mismatch_"
-                f"{column_name}_expected_{sorted(expected_column_privileges)}_got_{sorted(actual_privileges)}",
-            )
+    if classified_present or source_column_rows:
+        for column_name in expected_columns:
+            actual_privileges = seen_columns.get(column_name, set())
+            if actual_privileges != expected_column_privileges:
+                _add_error(
+                    errors,
+                    "bound_source_column_privileges_mismatch_"
+                    f"{column_name}_expected_{sorted(expected_column_privileges)}_got_{sorted(actual_privileges)}",
+                )
     return tuple(errors)
 
 
@@ -3064,6 +3095,10 @@ def validate_verification_queries(manifest: dict[str, Any], errors: list[str]) -
                     "pg_catalog.pg_class",
                     "is_grantable",
                     "owner_select",
+                    "relrowsecurity",
+                    "relforcerowsecurity",
+                    "row_security_enabled",
+                    "row_security_forced",
                     "'sqag_runtime'",
                     "'sqag_migrator'",
                     "'public'",
