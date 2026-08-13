@@ -141,8 +141,10 @@ CANONICAL_QUERY_COLUMNS = {
         "relation_kind",
         "owner",
         "owner_select",
+        "visible_column_count",
         "row_security_enabled",
         "row_security_forced",
+        "has_inheritance_descendants",
         "privilege_type",
         "effective",
         "is_grantable",
@@ -1178,7 +1180,10 @@ class ValidatorStaticTest(unittest.TestCase):
             )
         mutations = (
             ("effective_runtime_table_privileges", table_query.replace("has_table_privilege", "has_schema_privilege", 1)),
-            ("effective_runtime_table_privileges", table_query.replace("c.relname like", "n.nspname like", 1)),
+            (
+                "effective_runtime_table_privileges",
+                table_query.replace("c.relkind in ('r', 'p', 'f')", "c.relkind in ('r', 'p')", 1),
+            ),
             ("effective_runtime_column_privileges", column_query.replace("a.attname", "c.relname", 1)),
             ("effective_runtime_column_privileges", column_query.replace("has_column_privilege", "has_table_privilege", 1)),
             (
@@ -1199,38 +1204,71 @@ class ValidatorStaticTest(unittest.TestCase):
 
         source_identity_mutations = (
             ("table_acl", manifest["verification_queries"]["table_acl"]),
-            ("effective_runtime_table_privileges", table_query),
-            ("effective_runtime_table_privileges", table_query.replace(
-                "has_table_privilege('sqag_migrator', c.oid, 'SELECT') as owner_select, ",
-                "",
-                1,
-            )),
-            ("effective_runtime_table_privileges", table_query.replace(
-                "has_table_privilege('sqag_migrator', c.oid, 'SELECT') as owner_select",
-                "has_table_privilege('sqag_runtime', c.oid, 'SELECT') as owner_select",
-                1,
-            )),
-            ("effective_runtime_table_privileges", table_query.replace(
-                "c.relrowsecurity as row_security_enabled, ",
-                "",
-                1,
-            )),
-            ("effective_runtime_table_privileges", table_query.replace(
-                "c.relforcerowsecurity as row_security_forced, ",
-                "",
-                1,
-            )),
-            ("effective_runtime_column_privileges", column_query),
-        )
-        for query_key, query in source_identity_mutations:
-            self._assert_exact_query_rejected(
-                query_key,
-                query.replace(
-                    "c.relname = 'legacy_quote_artifacts_source'",
-                    "c.relname = 'wrong_source'",
+            (
+                "effective_runtime_table_privileges",
+                table_query.replace(
+                    "c.relkind in ('r', 'p', 'f')",
+                    "c.relkind in ('r', 'p')",
                     1,
                 ),
-            )
+            ),
+            (
+                "effective_runtime_table_privileges",
+                table_query.replace(
+                    "has_table_privilege('sqag_migrator', c.oid, 'SELECT') as owner_select, ",
+                    "",
+                    1,
+                ),
+            ),
+            (
+                "effective_runtime_table_privileges",
+                table_query.replace(
+                    "has_table_privilege('sqag_migrator', c.oid, 'SELECT') as owner_select",
+                    "has_table_privilege('sqag_runtime', c.oid, 'SELECT') as owner_select",
+                    1,
+                ),
+            ),
+            (
+                "effective_runtime_table_privileges",
+                table_query.replace(
+                    "c.relrowsecurity as row_security_enabled, ",
+                    "",
+                    1,
+                ),
+            ),
+            (
+                "effective_runtime_table_privileges",
+                table_query.replace(
+                    "c.relforcerowsecurity as row_security_forced, ",
+                    "",
+                    1,
+                ),
+            ),
+            (
+                "effective_runtime_table_privileges",
+                table_query.replace(
+                    ") as has_inheritance_descendants,",
+                    "",
+                    1,
+                ),
+            ),
+            (
+                "effective_runtime_column_privileges",
+                column_query.replace(
+                    "c.relkind in ('r', 'p', 'f')",
+                    "c.relkind in ('r', 'p')",
+                    1,
+                ),
+            ),
+        )
+        for query_key, query in source_identity_mutations:
+            if query_key == "table_acl":
+                query = query.replace(
+                    "c.relname like 'sqag_' || chr(37)",
+                    "c.relname like 'wrong_source'",
+                    1,
+                )
+            self._assert_exact_query_rejected(query_key, query)
 
 
 class RuntimeMembershipEdgeEvaluatorTest(unittest.TestCase):
@@ -1699,8 +1737,10 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
                 "relation_kind": "r",
                 "owner": "sqag_migrator",
                 "owner_select": True,
+                "visible_column_count": len(contract_validator.LEGACY_VIEW_DEFINITION["columns"]),
                 "row_security_enabled": False,
                 "row_security_forced": False,
+                "has_inheritance_descendants": False,
                 "privilege_type": privilege,
                 "effective": False,
                 "is_grantable": False,
@@ -2047,6 +2087,18 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
                 rls_case = copy.deepcopy(source_table_rows)
                 rls_case[0][field] = True
                 self._assert_source_evidence_rejected([base], rls_case, source_column_rows, fragment)
+        inherited_source = copy.deepcopy(source_table_rows)
+        for row in inherited_source:
+            row["has_inheritance_descendants"] = True
+        self._assert_source_evidence_rejected(
+            [base], inherited_source, source_column_rows, "inheritance_descendants_forbidden"
+        )
+        self.assertEqual(
+            contract_validator.evaluate_runtime_authority(
+                self.manifest, [], inherited_source, source_column_rows
+            ),
+            (),
+        )
         for privilege in COLUMN_PRIVILEGES:
             with self.subTest(source_column_privilege=privilege):
                 column_case = copy.deepcopy(source_column_rows)
@@ -2300,6 +2352,66 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
         effective_membership["runtime_select"] = True
         effective_membership["runtime_privileges"][0]["effective"] = True
         self._assert_rejected([effective_membership], "unclassified_ordinary_view_runtime_authority")
+
+        base_table_rows, base_column_rows = self._bound_source_evidence()
+        for relation_kind in ("r", "p", "f"):
+            relation_name = f"unrelated_{relation_kind}_relation"
+            table_rows = copy.deepcopy(base_table_rows)
+            column_rows = copy.deepcopy(base_column_rows)
+            for row in table_rows:
+                row.update(
+                    {
+                        "table_name": relation_name,
+                        "relation_kind": relation_kind,
+                        "owner": "sqag_app",
+                    }
+                )
+            for row in column_rows:
+                row["table_name"] = relation_name
+            with self.subTest(public_relation_kind=relation_kind):
+                self.assertEqual(
+                    contract_validator.evaluate_runtime_authority(
+                        self.manifest, [], table_rows, column_rows
+                    ),
+                    (),
+                )
+                runtime_authority = copy.deepcopy(table_rows)
+                runtime_authority[0]["effective"] = True
+                self._assert_source_evidence_rejected(
+                    [], runtime_authority, column_rows, "runtime_privilege_mismatch"
+                )
+                column_authority = copy.deepcopy(column_rows)
+                column_authority[0]["effective"] = True
+                self._assert_source_evidence_rejected(
+                    [], table_rows, column_authority, "runtime_privilege_mismatch"
+                )
+                column_grantable = copy.deepcopy(column_rows)
+                column_grantable[0]["is_grantable"] = True
+                self._assert_source_evidence_rejected(
+                    [], table_rows, column_grantable, "runtime_grant_option_forbidden"
+                )
+
+        for relation_kind in ("r", "p", "f"):
+            owner_rows = copy.deepcopy(base_table_rows)
+            relation_name = f"unrelated_{relation_kind}_owner"
+            for row in owner_rows:
+                row.update({"table_name": relation_name, "relation_kind": relation_kind, "owner": "sqag_runtime"})
+            owner_columns = copy.deepcopy(base_column_rows)
+            for row in owner_columns:
+                row["table_name"] = relation_name
+            self._assert_source_evidence_rejected(
+                [], owner_rows, owner_columns, "runtime_owner_forbidden"
+            )
+        foreign_grantable = copy.deepcopy(base_table_rows)
+        for row in foreign_grantable:
+            row.update({"table_name": "unrelated_f_grantable", "relation_kind": "f"})
+        foreign_grantable[0]["is_grantable"] = True
+        foreign_columns = copy.deepcopy(base_column_rows)
+        for row in foreign_columns:
+            row["table_name"] = "unrelated_f_grantable"
+        self._assert_source_evidence_rejected(
+            [], foreign_grantable, foreign_columns, "runtime_grant_option_forbidden"
+        )
 
         malformed_acl = copy.deepcopy(base)
         malformed_acl["acl_entries"] = "not-a-list"
@@ -3265,8 +3377,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
                 "cross join (values ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE'), "
                 "('REFERENCES'), ('TRIGGER'), ('MAINTAIN')) p(privilege_type) "
-                "where n.nspname = 'public' and c.relkind = 'r' and "
-                "(c.relname like 'sqag_' || chr(37) or c.relname = 'legacy_quote_artifacts_source') "
+                "where n.nspname = 'public' and c.relkind in ('r', 'p', 'f') "
                 "order by n.nspname, c.relname, p.privilege_type",
                 (role_name, role_name),
             ).fetchall()
@@ -3292,8 +3403,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 "from pg_catalog.pg_class c "
                 "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
                 "join pg_catalog.pg_attribute a on a.attrelid = c.oid "
-                "where n.nspname = 'public' and c.relkind = 'r' and "
-                "(c.relname like 'sqag_' || chr(37) or c.relname = 'legacy_quote_artifacts_source') "
+                "where n.nspname = 'public' and c.relkind in ('r', 'p', 'f') "
                 "and a.attnum > 0 and not a.attisdropped "
                 "order by c.relname, a.attnum"
             ).fetchall()
@@ -3318,8 +3428,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
                 "join pg_catalog.pg_attribute a on a.attrelid = c.oid "
                 "cross join (values ('SELECT'), ('INSERT'), ('UPDATE'), ('REFERENCES')) p(privilege_type) "
-                "where n.nspname = 'public' and c.relkind = 'r' and "
-                "(c.relname like 'sqag_' || chr(37) or c.relname = 'legacy_quote_artifacts_source') "
+                "where n.nspname = 'public' and c.relkind in ('r', 'p', 'f') "
                 "and a.attnum > 0 and not a.attisdropped "
                 "order by n.nspname, c.relname, a.attname, p.privilege_type",
                 (role_name, role_name),
@@ -5112,6 +5221,70 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self._assert_exact_runtime_view_grants("sqag_runtime")
         self.assertEqual(self._evaluate_runtime_authority_rows(), ())
 
+        child_table = "legacy_quote_artifacts_source_child"
+        grandchild_table = "legacy_quote_artifacts_source_grandchild"
+        child_ident = _quote_identifier(child_table)
+        grandchild_ident = _quote_identifier(grandchild_table)
+        source_ident = f"public.{_quote_identifier(source_table)}"
+        self.addCleanup(
+            self._cleanup_steps,
+            [
+                ("drop_legacy_source_grandchild", f"drop table if exists public.{grandchild_ident}"),
+                ("drop_legacy_source_child", f"drop table if exists public.{child_ident}"),
+            ],
+        )
+        connection = self.connect()
+        try:
+            connection.execute("set role \"sqag_migrator\"")
+            connection.execute(
+                f"create table public.{child_ident} () inherits ({source_ident})"
+            )
+            connection.execute(
+                f"create table public.{grandchild_ident} () inherits (public.{child_ident})"
+            )
+            connection.execute(
+                f"insert into {source_ident} values "
+                "('workspace', 'session', 'kind', 'file', 'text/plain', 1, decode('00', 'hex'), 'created', 'updated')"
+            )
+            connection.execute(
+                f"insert into public.{child_ident} values "
+                "('workspace', 'session-child', 'kind', 'file-child', 'text/plain', 1, decode('00', 'hex'), 'created', 'updated')"
+            )
+            connection.execute(
+                f"insert into public.{grandchild_ident} values "
+                "('workspace', 'session-grandchild', 'kind', 'file-grandchild', 'text/plain', 1, decode('00', 'hex'), 'created', 'updated')"
+            )
+            connection.execute("reset role")
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.as_role("sqag_runtime") as runtime_connection:
+            row = runtime_connection.execute(
+                "select count(*) as row_count from public.sqag_quote_artifacts"
+            ).fetchone()
+            runtime_connection.commit()
+        self.assertEqual(int(_row_dict(row, "row_count")), 3)
+        descendant_columns, descendant_rows = self._execute_contract_query(
+            "effective_runtime_table_privileges"
+        )
+        self.assertEqual(
+            descendant_columns, CANONICAL_QUERY_COLUMNS["effective_runtime_table_privileges"]
+        )
+        source_rows = [
+            row for row in descendant_rows if str(row["table_name"]) == source_table
+        ]
+        self.assertTrue(source_rows)
+        self.assertTrue(all(bool(row["has_inheritance_descendants"]) for row in source_rows))
+        descendant_errors = self._evaluate_runtime_authority_rows()
+        self.assertTrue(
+            any("classified_view_source_inheritance_descendants_forbidden" in error for error in descendant_errors),
+            descendant_errors,
+        )
+        self._execute_admin_sql(f"drop table public.{grandchild_ident}")
+        self._execute_admin_sql(f"drop table public.{child_ident}")
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
         view_columns, view_rows = self._execute_contract_query("view_acl")
         raw_table_columns, raw_table_rows = self._execute_contract_query("table_acl")
         table_columns, table_rows = self._execute_contract_query("effective_runtime_table_privileges")
@@ -5804,26 +5977,144 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
 
     def test_effective_runtime_matrix_unexpected_table_privilege_is_rejected(self) -> None:
         role_name = self._new_exact_matrix_role("matrix_unexpected_table")
-        table_name = "sqag_rpc_unexpected_table"
-        role_ident = _quote_identifier(role_name)
-        table_ident = _quote_identifier(table_name)
+        ordinary_name = "sqag_rpc_unexpected_table"
+        partitioned_name = "sqag_rpc_unexpected_partitioned"
+        partition_name = "sqag_rpc_unexpected_partition"
+        foreign_name = "sqag_rpc_unexpected_foreign"
+        foreign_server = f"sqag_rpc_file_server_{uuid.uuid4().hex[:8]}"
+        ordinary_ident = _quote_identifier(ordinary_name)
+        partitioned_ident = _quote_identifier(partitioned_name)
+        partition_ident = _quote_identifier(partition_name)
+        foreign_ident = _quote_identifier(foreign_name)
+        foreign_server_ident = _quote_identifier(foreign_server)
+
         connection = self.connect()
         try:
             connection.execute("set role \"sqag_migrator\"")
-            connection.execute(f"create table {table_ident} (id integer not null)")
+            connection.execute(f"create table {ordinary_ident} (id integer not null)")
+            connection.execute(
+                f"create table {partitioned_ident} (id integer not null) partition by range (id)"
+            )
+            connection.execute(
+                f"create table {partition_ident} partition of {partitioned_ident} for values from (0) to (100)"
+            )
             connection.execute("reset role")
             connection.commit()
         finally:
             connection.close()
-        self._execute_admin_sql(f"grant SELECT on table {table_ident} to {role_ident}")
-        self.addCleanup(
-            self._cleanup_steps,
-            [
-                ("revoke_unexpected_table", f"revoke SELECT on table {table_ident} from {role_ident}"),
-                ("drop_unexpected_table", f"drop table {table_ident}"),
-            ],
+
+        foreign_created = False
+        try:
+            connection = self.connect()
+            available = _row_dict(
+                connection.execute(
+                    "select exists (select 1 from pg_catalog.pg_available_extensions where name = 'file_fdw') "
+                    "as available"
+                ).fetchone(),
+                "available",
+            )
+            if bool(available):
+                connection.execute("create extension if not exists file_fdw")
+                connection.execute(
+                    f"create server {foreign_server_ident} foreign data wrapper file_fdw"
+                )
+                connection.execute(
+                    f"create foreign table {foreign_ident} (id integer) server {foreign_server_ident} "
+                    "options (filename '/tmp/sqag_run82_foreign.csv', format 'csv')"
+                )
+                connection.commit()
+                foreign_created = True
+            else:
+                connection.rollback()
+        except Exception:
+            if connection is not None:
+                connection.rollback()
+        finally:
+            if 'connection' in locals() and connection is not None:
+                connection.close()
+
+        cleanup_steps = [
+            ("revoke_unexpected_table", f"revoke SELECT on table {ordinary_ident} from {_quote_identifier(role_name)}"),
+            ("revoke_unexpected_partitioned", f"revoke SELECT on table {partitioned_ident} from {_quote_identifier(role_name)}"),
+            ("drop_unexpected_partition", f"drop table if exists {partition_ident}"),
+            ("drop_unexpected_partitioned", f"drop table if exists {partitioned_ident}"),
+            ("drop_unexpected_table", f"drop table if exists {ordinary_ident}"),
+        ]
+        if foreign_created:
+            cleanup_steps = [
+                ("revoke_unexpected_foreign", f"revoke SELECT on table {foreign_ident} from {_quote_identifier(role_name)}"),
+                ("drop_unexpected_foreign", f"drop foreign table if exists {foreign_ident}"),
+                ("drop_unexpected_foreign_server", f"drop server if exists {foreign_server_ident}"),
+                *cleanup_steps,
+            ]
+        self.addCleanup(self._cleanup_steps, cleanup_steps)
+
+        self._execute_admin_sql(
+            f"grant SELECT on table {ordinary_ident} to {_quote_identifier(role_name)}"
         )
-        self._assert_isolated_matrix_mismatch(role_name, {("public", table_name, "SELECT", False)})
+        self._execute_admin_sql(
+            f"grant SELECT on table {partitioned_ident} to {_quote_identifier(role_name)}"
+        )
+        if foreign_created:
+            self._execute_admin_sql(
+                f"grant SELECT on table {foreign_ident} to {_quote_identifier(role_name)}"
+            )
+
+        fixture_names = {ordinary_name, partitioned_name, partition_name}
+        if foreign_created:
+            fixture_names.add(foreign_name)
+        actual = self._effective_table_grants(role_name)
+        unexpected = {row for row in actual if row[1] in fixture_names}
+        self.assertIn(("public", ordinary_name, "SELECT", False), unexpected)
+        self.assertIn(("public", partitioned_name, "SELECT", False), unexpected)
+        if foreign_created:
+            self.assertIn(("public", foreign_name, "SELECT", False), unexpected)
+        self._assert_isolated_matrix_mismatch(role_name, unexpected)
+
+        relation_identifiers = [(ordinary_name, ordinary_ident), (partitioned_name, partitioned_ident)]
+        if foreign_created:
+            relation_identifiers.append((foreign_name, foreign_ident))
+        for provenance in ("public", "membership"):
+            parent_name = None
+            if provenance == "membership":
+                parent_name = self._new_role("matrix_unexpected_parent")
+                self._grant_role_membership(parent_name, role_name)
+            target = "public" if provenance == "public" else _quote_identifier(parent_name)
+            for relation_name, relation_ident in relation_identifiers:
+                self._execute_admin_sql(
+                    f"grant SELECT on table {relation_ident} to {target}"
+                )
+                try:
+                    actual = self._effective_table_grants(role_name)
+                    self.assertIn(
+                        ("public", relation_name, "SELECT", False),
+                        actual,
+                        f"{provenance} authority was not effective for {relation_name}",
+                    )
+                    self._assert_isolated_matrix_mismatch(
+                        role_name,
+                        {
+                            row
+                            for row in actual
+                            if row[1] in fixture_names
+                        },
+                    )
+                finally:
+                    self._execute_admin_sql(
+                        f"revoke SELECT on table {relation_ident} from {target}"
+                    )
+
+        table_columns, table_rows = self._execute_contract_query("effective_runtime_table_privileges")
+        self.assertEqual(table_columns, CANONICAL_QUERY_COLUMNS["effective_runtime_table_privileges"])
+        relation_kinds = {
+            str(row["table_name"]): str(row["relation_kind"])
+            for row in table_rows
+            if str(row["table_name"]) in fixture_names
+        }
+        self.assertEqual(relation_kinds.get(ordinary_name), "r")
+        self.assertEqual(relation_kinds.get(partitioned_name), "p")
+        if foreign_created:
+            self.assertEqual(relation_kinds.get(foreign_name), "f")
 
     def test_effective_runtime_matrix_missing_accessible_table_is_rejected(self) -> None:
         role_name = self._new_exact_matrix_role("matrix_missing_table")

@@ -193,8 +193,10 @@ RUNTIME_TABLE_PRIVILEGE_ROW_KEYS = frozenset(
         "relation_kind",
         "owner",
         "owner_select",
+        "visible_column_count",
         "row_security_enabled",
         "row_security_forced",
+        "has_inheritance_descendants",
         "privilege_type",
         "effective",
         "is_grantable",
@@ -395,8 +397,20 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                c.relkind as relation_kind,
                r.rolname as owner,
                has_table_privilege('sqag_migrator', c.oid, 'SELECT') as owner_select,
+               (
+                   select count(*)::int
+                   from pg_catalog.pg_attribute visible_attribute
+                   where visible_attribute.attrelid = c.oid
+                     and visible_attribute.attnum > 0
+                     and not visible_attribute.attisdropped
+               ) as visible_column_count,
                c.relrowsecurity as row_security_enabled,
                c.relforcerowsecurity as row_security_forced,
+               exists (
+                   select 1
+                   from pg_catalog.pg_inherits inh
+                   where inh.inhparent = c.oid
+               ) as has_inheritance_descendants,
                p.privilege_type,
                has_table_privilege('sqag_runtime', c.oid, p.privilege_type) as effective,
                has_table_privilege(
@@ -419,11 +433,7 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                 ('MAINTAIN')
         ) p(privilege_type)
         where n.nspname = 'public'
-          and c.relkind = 'r'
-          and (
-              c.relname like 'sqag_' || chr(37)
-              or c.relname = 'legacy_quote_artifacts_source'
-          )
+          and c.relkind in ('r', 'p', 'f')
         order by n.nspname, c.relname, p.privilege_type
     """,
     "effective_runtime_column_privileges": """
@@ -449,11 +459,7 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                 ('REFERENCES')
         ) p(privilege_type)
         where n.nspname = 'public'
-          and c.relkind = 'r'
-          and (
-              c.relname like 'sqag_' || chr(37)
-              or c.relname = 'legacy_quote_artifacts_source'
-          )
+          and c.relkind in ('r', 'p', 'f')
           and a.attnum > 0
           and not a.attisdropped
         order by n.nspname, c.relname, a.attname, p.privilege_type
@@ -713,6 +719,7 @@ FORBIDDEN_TABLES = frozenset(
     }
 )
 ALL_TABLES = RUNTIME_TABLES | FORBIDDEN_TABLES
+PUBLIC_TABLE_LIKE_RELKINDS = frozenset({"r", "p", "f"})
 
 LOCKED_PRIVILEGE_MATRIX: dict[str, dict[str, bool]] = {
     "sqag_profiles": {"select": True, "insert": True, "update": True, "delete": True},
@@ -865,6 +872,14 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "relforcerowsecurity",
         "row_security_enabled",
         "row_security_forced",
+        "pg_catalog.pg_attribute",
+        "visible_column_count",
+        "pg_catalog.pg_inherits",
+        "has_inheritance_descendants",
+        "relkind",
+        "'r'",
+        "'p'",
+        "'f'",
         "' WITH GRANT OPTION'",
         "'select'",
         "'insert'",
@@ -874,7 +889,6 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "'references'",
         "'trigger'",
         "'maintain'",
-        "'legacy_quote_artifacts_source'",
         "'sqag_migrator'",
         "owner_select",
     ),
@@ -890,7 +904,6 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "'insert'",
         "'update'",
         "'references'",
-        "'legacy_quote_artifacts_source'",
     ),
     "effective_runtime_schema_privileges": ("has_schema_privilege", "'public'", "'usage'", "'create'"),
     "effective_runtime_routine_privileges": ("has_function_privilege", "pg_catalog.pg_proc", "'public'", "'execute'"),
@@ -1848,6 +1861,205 @@ def _validate_view_column_acl(
     return effective_runtime_columns
 
 
+def evaluate_public_table_like_authority(
+    manifest: dict[str, Any],
+    table_privilege_rows: list[dict[str, Any]],
+    column_privilege_rows: list[dict[str, Any]],
+    *,
+    runtime_role: str = "sqag_runtime",
+) -> tuple[str, ...]:
+    """Evaluate the complete effective authority envelope for public r/p/f relations."""
+
+    errors: list[str] = []
+    if type(table_privilege_rows) is not list:
+        errors.append("public_table_privilege_evidence_must_be_list")
+        table_privilege_rows = []
+    if type(column_privilege_rows) is not list:
+        errors.append("public_column_privilege_evidence_must_be_list")
+        column_privilege_rows = []
+
+    expected_table_privileges = set(VIEW_RELATION_PRIVILEGES)
+    expected_column_privileges = set(VIEW_COLUMN_PRIVILEGES)
+    table_groups: dict[tuple[str, str], dict[str, Any]] = {}
+    table_privilege_sets: dict[tuple[str, str], set[str]] = {}
+
+    for index, row in enumerate(table_privilege_rows):
+        label = f"public_table_row_{index}"
+        if not isinstance(row, dict):
+            _add_error(errors, f"{label}_must_be_object")
+            continue
+        if not _exact_keys(row, RUNTIME_TABLE_PRIVILEGE_ROW_KEYS, label, errors):
+            continue
+        for key in ("schema_name", "table_name", "relation_kind", "owner", "privilege_type"):
+            _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
+        _require_type(row.get("owner_select"), bool, f"{label}_owner_select", errors)
+        _require_type(row.get("visible_column_count"), int, f"{label}_visible_column_count", errors)
+        _require_type(row.get("row_security_enabled"), bool, f"{label}_row_security_enabled", errors)
+        _require_type(row.get("row_security_forced"), bool, f"{label}_row_security_forced", errors)
+        _require_type(row.get("has_inheritance_descendants"), bool, f"{label}_has_inheritance_descendants", errors)
+        _require_type(row.get("effective"), bool, f"{label}_effective", errors)
+        _require_type(row.get("is_grantable"), bool, f"{label}_is_grantable", errors)
+        if any(
+            type(row.get(key)) is not str
+            for key in ("schema_name", "table_name", "relation_kind", "owner", "privilege_type")
+        ):
+            continue
+        if (
+            type(row.get("owner_select")) is not bool
+            or type(row.get("visible_column_count")) is not int
+            or type(row.get("row_security_enabled")) is not bool
+            or type(row.get("row_security_forced")) is not bool
+            or type(row.get("has_inheritance_descendants")) is not bool
+            or type(row.get("effective")) is not bool
+            or type(row.get("is_grantable")) is not bool
+        ):
+            continue
+
+        schema_name = str(row["schema_name"])
+        table_name = str(row["table_name"])
+        relation_kind = str(row["relation_kind"])
+        privilege = str(row["privilege_type"])
+        relation_key = (schema_name, table_name)
+        if schema_name != BOUND_SOURCE_SCHEMA:
+            _add_error(errors, f"{label}_schema_invalid")
+        if relation_kind not in PUBLIC_TABLE_LIKE_RELKINDS:
+            _add_error(errors, f"{label}_unknown_relation_kind_{relation_kind}")
+        if row["visible_column_count"] < 0:
+            _add_error(errors, f"{label}_visible_column_count_invalid")
+        if privilege not in expected_table_privileges:
+            _add_error(errors, f"{label}_invalid_privilege_type_{privilege}")
+            continue
+        relation = table_groups.setdefault(
+            relation_key,
+            {
+                "relation_kind": relation_kind,
+                "visible_column_count": row["visible_column_count"],
+                "has_inheritance_descendants": row["has_inheritance_descendants"],
+            },
+        )
+        if relation["relation_kind"] != relation_kind:
+            _add_error(errors, f"{label}_relation_kind_inconsistent")
+        if relation["visible_column_count"] != row["visible_column_count"]:
+            _add_error(errors, f"{label}_visible_column_count_inconsistent")
+        if relation["has_inheritance_descendants"] != row["has_inheritance_descendants"]:
+            _add_error(errors, f"{label}_inheritance_evidence_inconsistent")
+        privileges = table_privilege_sets.setdefault(relation_key, set())
+        if privilege in privileges:
+            _add_error(errors, f"{label}_duplicate_privilege")
+        privileges.add(privilege)
+
+        if row["owner"] == runtime_role:
+            _add_error(errors, f"{label}_runtime_owner_forbidden")
+        expected_effective = False
+        tables = manifest.get("tables") if isinstance(manifest, dict) else None
+        accessible = tables.get("runtime_accessible") if isinstance(tables, dict) else None
+        if isinstance(accessible, dict) and table_name in accessible:
+            entry = accessible.get(table_name)
+            privileges_for_table = entry.get("privileges") if isinstance(entry, dict) else None
+            expected_effective = bool(
+                isinstance(privileges_for_table, dict)
+                and privileges_for_table.get(privilege.lower()) is True
+            )
+            if relation_kind != BOUND_SOURCE_RELKIND:
+                _add_error(errors, f"{label}_contract_relation_kind_invalid_{relation_kind}")
+        if bool(row["effective"]) != expected_effective:
+            _add_error(
+                errors,
+                f"{label}_runtime_privilege_mismatch_{privilege}_expected_{expected_effective}_got_{row['effective']}",
+            )
+        if row["is_grantable"]:
+            _add_error(errors, f"{label}_runtime_grant_option_forbidden_{privilege}")
+
+    for relation_key, privileges in table_privilege_sets.items():
+        if privileges != expected_table_privileges:
+            _add_error(
+                errors,
+                "public_table_privileges_mismatch_"
+                f"{relation_key[0]}.{relation_key[1]}_expected_{sorted(expected_table_privileges)}_got_{sorted(privileges)}",
+            )
+
+    column_groups: dict[tuple[str, str], dict[str, set[str]]] = {}
+    for index, row in enumerate(column_privilege_rows):
+        label = f"public_column_row_{index}"
+        if not isinstance(row, dict):
+            _add_error(errors, f"{label}_must_be_object")
+            continue
+        if not _exact_keys(row, RUNTIME_COLUMN_PRIVILEGE_ROW_KEYS, label, errors):
+            continue
+        for key in ("schema_name", "table_name", "column_name", "privilege_type"):
+            _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
+        _require_type(row.get("effective"), bool, f"{label}_effective", errors)
+        _require_type(row.get("is_grantable"), bool, f"{label}_is_grantable", errors)
+        if any(
+            type(row.get(key)) is not str
+            for key in ("schema_name", "table_name", "column_name", "privilege_type")
+        ):
+            continue
+        if type(row.get("effective")) is not bool or type(row.get("is_grantable")) is not bool:
+            continue
+        schema_name = str(row["schema_name"])
+        table_name = str(row["table_name"])
+        column_name = str(row["column_name"])
+        privilege = str(row["privilege_type"])
+        relation_key = (schema_name, table_name)
+        if schema_name != BOUND_SOURCE_SCHEMA:
+            _add_error(errors, f"{label}_schema_invalid")
+        if relation_key not in table_groups:
+            _add_error(errors, f"{label}_relation_evidence_missing")
+        if privilege not in expected_column_privileges:
+            _add_error(errors, f"{label}_invalid_privilege_type_{privilege}")
+            continue
+        columns = column_groups.setdefault(relation_key, {})
+        privileges = columns.setdefault(column_name, set())
+        if privilege in privileges:
+            _add_error(errors, f"{label}_duplicate_privilege")
+        privileges.add(privilege)
+
+        tables = manifest.get("tables") if isinstance(manifest, dict) else None
+        accessible = tables.get("runtime_accessible") if isinstance(tables, dict) else None
+        expected_effective = False
+        if isinstance(accessible, dict) and table_name in accessible:
+            entry = accessible.get(table_name)
+            table_privileges = entry.get("privileges") if isinstance(entry, dict) else None
+            expected_effective = bool(
+                isinstance(table_privileges, dict)
+                and table_privileges.get(privilege.lower()) is True
+            )
+        column_manifest = manifest.get("column_privileges") if isinstance(manifest, dict) else None
+        explicit = column_manifest.get(table_name) if isinstance(column_manifest, dict) else None
+        if isinstance(explicit, dict):
+            explicit_columns = explicit.get(privilege.lower())
+            expected_effective = expected_effective or bool(
+                isinstance(explicit_columns, list) and column_name in explicit_columns
+            )
+        if bool(row["effective"]) != expected_effective:
+            _add_error(
+                errors,
+                f"{label}_runtime_privilege_mismatch_{privilege}_expected_{expected_effective}_got_{row['effective']}",
+            )
+        if row["is_grantable"]:
+            _add_error(errors, f"{label}_runtime_grant_option_forbidden_{privilege}")
+
+    for relation_key, relation in table_groups.items():
+        expected_column_count = relation["visible_column_count"]
+        actual_columns = column_groups.get(relation_key, {})
+        if len(actual_columns) != expected_column_count:
+            _add_error(
+                errors,
+                "public_column_evidence_cardinality_"
+                f"{relation_key[0]}.{relation_key[1]}_expected_{expected_column_count}_got_{len(actual_columns)}",
+            )
+        for column_name, privileges in actual_columns.items():
+            if privileges != expected_column_privileges:
+                _add_error(
+                    errors,
+                    "public_column_privileges_mismatch_"
+                    f"{relation_key[0]}.{relation_key[1]}.{column_name}_expected_{sorted(expected_column_privileges)}_got_{sorted(privileges)}",
+                )
+
+    return tuple(errors)
+
+
 def evaluate_bound_source_authority(
     manifest: dict[str, Any],
     view_rows: list[dict[str, Any]],
@@ -1914,8 +2126,10 @@ def evaluate_bound_source_authority(
         for key in ("schema_name", "table_name", "relation_kind", "owner", "privilege_type"):
             _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
         _require_type(row.get("owner_select"), bool, f"{label}_owner_select", errors)
+        _require_type(row.get("visible_column_count"), int, f"{label}_visible_column_count", errors)
         _require_type(row.get("row_security_enabled"), bool, f"{label}_row_security_enabled", errors)
         _require_type(row.get("row_security_forced"), bool, f"{label}_row_security_forced", errors)
+        _require_type(row.get("has_inheritance_descendants"), bool, f"{label}_has_inheritance_descendants", errors)
         _require_type(row.get("effective"), bool, f"{label}_effective", errors)
         _require_type(row.get("is_grantable"), bool, f"{label}_is_grantable", errors)
         if any(
@@ -1925,8 +2139,10 @@ def evaluate_bound_source_authority(
             continue
         if (
             type(row.get("owner_select")) is not bool
+            or type(row.get("visible_column_count")) is not int
             or type(row.get("row_security_enabled")) is not bool
             or type(row.get("row_security_forced")) is not bool
+            or type(row.get("has_inheritance_descendants")) is not bool
             or type(row.get("effective")) is not bool
             or type(row.get("is_grantable")) is not bool
         ):
@@ -1953,8 +2169,15 @@ def evaluate_bound_source_authority(
             )
         if classified_present and row["row_security_enabled"]:
             _add_error(errors, f"{label}_classified_view_source_row_security_enabled_forbidden")
+        if row["visible_column_count"] != len(LEGACY_VIEW_DEFINITION["columns"]):
+            _add_error(
+                errors,
+                f"{label}_visible_column_count_invalid_expected_{len(LEGACY_VIEW_DEFINITION['columns'])}_got_{row['visible_column_count']}",
+            )
         if classified_present and row["row_security_forced"]:
             _add_error(errors, f"{label}_classified_view_source_row_security_forced_forbidden")
+        if classified_present and row["has_inheritance_descendants"]:
+            _add_error(errors, f"{label}_classified_view_source_inheritance_descendants_forbidden")
         if row["effective"]:
             _add_error(errors, f"{label}_runtime_privilege_forbidden_{privilege}")
         if row["is_grantable"]:
@@ -2294,6 +2517,14 @@ def evaluate_runtime_authority(
     """Evaluate view ACLs plus the conditional bound-source table proof."""
 
     errors = list(evaluate_view_authority(manifest, view_rows, runtime_role=runtime_role))
+    errors.extend(
+        evaluate_public_table_like_authority(
+            manifest,
+            table_privilege_rows,
+            column_privilege_rows,
+            runtime_role=runtime_role,
+        )
+    )
     errors.extend(
         evaluate_bound_source_authority(
             manifest,
@@ -3093,12 +3324,20 @@ def validate_verification_queries(manifest: dict[str, Any], errors: list[str]) -
                 (
                     "has_table_privilege",
                     "pg_catalog.pg_class",
+                    "pg_catalog.pg_attribute",
+                    "pg_catalog.pg_inherits",
                     "is_grantable",
                     "owner_select",
+                    "visible_column_count",
+                    "has_inheritance_descendants",
                     "relrowsecurity",
                     "relforcerowsecurity",
                     "row_security_enabled",
                     "row_security_forced",
+                    "relkind",
+                    "'r'",
+                    "'p'",
+                    "'f'",
                     "'sqag_runtime'",
                     "'sqag_migrator'",
                     "'public'",

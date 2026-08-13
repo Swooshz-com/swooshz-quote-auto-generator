@@ -147,17 +147,21 @@ definition: canonicalized `pg_get_viewdef()` text selecting the nine ordered
 columns `workspace_id`, `session_id`, `artifact_kind`, `filename`,
 `content_type`, `size_bytes`, `content_blob`, `created_at`, and `updated_at`
 from `public.legacy_quote_artifacts_source`; the single normal dependency is
-that source table. When the classified view is present, the canonical
-`effective_runtime_table_privileges` and
-`effective_runtime_column_privileges` queries also include that exact
-`public.legacy_quote_artifacts_source` identity. The table evidence must report
-schema `public`, relation kind `r`, an owner other than `sqag_runtime`, and
-`owner_select=true` from the exact
-`has_table_privilege('sqag_migrator', source_oid, 'SELECT')` proof. The same
-table rows bind `row_security_enabled` to `pg_class.relrowsecurity` and
-`row_security_forced` to `pg_class.relforcerowsecurity`. When the classified
-view is present, both flags must be false; when the view is absent, the flags
-are type-checked but RLS posture is not itself rejected. All eight
+that source table. The canonical `effective_runtime_table_privileges` and
+`effective_runtime_column_privileges` queries enumerate every public
+PostgreSQL table-like relation (`relkind` `r`, `p`, or `f`), so the exact source
+identity cannot escape through its name or relation kind. Table evidence also
+reports the visible-column count from `pg_attribute` and the direct-inheritance
+posture from `pg_inherits`. The source table must report schema `public`,
+relation kind `r`, an owner other than `sqag_runtime`, and `owner_select=true`
+from the exact `has_table_privilege('sqag_migrator', source_oid, 'SELECT')`
+proof. The same table rows bind `row_security_enabled` to
+`pg_class.relrowsecurity`, `row_security_forced` to
+`pg_class.relforcerowsecurity`, and `has_inheritance_descendants` to the
+exact `pg_inherits.inhparent` check. When the classified view is present, both
+RLS flags and the inheritance-descendant flag must be false; when the view is
+absent, those posture flags are type-checked but RLS and inheritance posture
+are not themselves rejected. All eight
 `sqag_runtime` effective privileges and grant-option checks must be false. The
 column evidence must cover every visible source column and all four column
 privileges, with both effective and grant-option checks false. Source evidence
@@ -371,8 +375,8 @@ live-system evidence.
 | `role_memberships` | `role`, `member`, `grantor`, `admin_option`, `inherit_option`, `set_option` | 0 in the generic shape fixture; 1 exact runtime edge in the creator fixture |
 | `sequence_acl` | `relname`, `relacl` | 0 |
 | `effective_runtime_database_privileges` | `privilege_type`, `effective`, `is_grantable` | 3 |
-| `effective_runtime_table_privileges` | `schema_name`, `table_name`, `relation_kind`, `owner`, `owner_select`, `row_security_enabled`, `row_security_forced`, `privilege_type`, `effective`, `is_grantable` | 128 without the optional source table; 136 when it exists |
-| `effective_runtime_column_privileges` | `schema_name`, `table_name`, `column_name`, `privilege_type`, `effective`, `is_grantable` | fixture columns x 4, plus source columns x 4 when the source exists |
+| `effective_runtime_table_privileges` | `schema_name`, `table_name`, `relation_kind`, `owner`, `owner_select`, `visible_column_count`, `row_security_enabled`, `row_security_forced`, `has_inheritance_descendants`, `privilege_type`, `effective`, `is_grantable` | 8 per enumerated public `r`/`p`/`f` relation; 128 in the base migrated fixture, plus 8 for each additional relation |
+| `effective_runtime_column_privileges` | `schema_name`, `table_name`, `column_name`, `privilege_type`, `effective`, `is_grantable` | 4 per visible column on each enumerated public `r`/`p`/`f` relation |
 | `effective_runtime_schema_privileges` | `privilege_type`, `effective`, `is_grantable` | 2 |
 | `effective_runtime_routine_privileges` | `routine_name`, `effective` | 2 |
 | `view_acl` | `relation_name`, `relation_kind`, `owner`, `relation_acl`, `acl_entries`, `column_acl_entries`, `view_definition`, `view_dependencies`, `view_columns`, `relation_options`, `view_security`, `runtime_privileges`, `runtime_select`, `runtime_select_grantable` | 0 in the generic shape fixture; 1 when the legacy-optional view fixture is present |
@@ -385,18 +389,19 @@ PostgreSQL's `has_*_privilege(... 'WITH GRANT OPTION')` evaluation, so direct,
 PUBLIC, membership-derived, owner-derived, and grant-option authority is
 evaluated for the exact privilege rather than inferred from ACL text.
 
-The table proof evaluates every `public.sqag_*` table against the ordered
-PostgreSQL 17 set `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`,
-`REFERENCES`, `TRIGGER`, `MAINTAIN`, and adds only the exact
-`public.legacy_quote_artifacts_source` relation identity for the classified
-legacy view. Its evidence includes relation kind, owner, the exact
-`owner_select` result for `sqag_migrator`, and the source RLS flags
-`row_security_enabled`/`row_security_forced` directly from `pg_class`. When the
-classified view is present, the bound source must be an ordinary table that
-the accepted classified-view owner can read, must have both RLS flags false,
-and must remain inaccessible to `sqag_runtime`. When the classified view is
-absent, a surviving exact source is still fully checked for runtime isolation,
-but owner access and RLS posture are not required. All eight source effective
+The table proof evaluates every public `r`/`p`/`f` relation against the
+ordered PostgreSQL 17 set `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`,
+`REFERENCES`, `TRIGGER`, `MAINTAIN`. Its evidence includes relation kind,
+owner, the exact `owner_select` result for `sqag_migrator`, visible-column
+cardinality, RLS flags, and direct inheritance-descendant posture. This complete
+public table-like boundary preserves harmless unrelated relations while
+rejecting any effective or grant-option authority that reaches
+`sqag_runtime`. When the classified view is present, the bound source must be
+an ordinary table that the accepted classified-view owner can read, must have
+both RLS flags false, must have no inheritance descendants, and must remain
+inaccessible to `sqag_runtime`. When the classified view is absent, a surviving
+exact source is still fully checked for runtime isolation, but owner access, RLS
+posture, and inheritance posture are not required. All eight source effective
 and grant-option results must be false. The column proof evaluates every
 non-dropped user column against `SELECT`, `INSERT`, `UPDATE`, and `REFERENCES`,
 including every visible column on the exact bound source when the classified
@@ -493,11 +498,11 @@ unexpected ACL provenance, and any same-name relation duplicate.
 The remaining effective queries have the same exact-token binding. In
 particular, the membership query must preserve the complete six-field contract
 and aliases defined above; the table query must retain all eight privilege
-literals, owner/relation-kind/owner-select evidence, and the bounded
-exact-source identity predicate; the column query must retain the exact table
-boundary plus the same
-bound-source identity, table, column, and privilege predicates; and
-database/schema grantability must remain a real
+literals, owner/relation-kind/owner-select evidence, visible-column
+cardinality, RLS flags, direct inheritance evidence, and the complete public
+`r`/`p`/`f` relation boundary; the column query must retain the same complete
+public table-like boundary plus the table, visible-column, and privilege
+predicates; and database/schema grantability must remain a real
 privilege-specific `WITH GRANT OPTION` check. Invalid SQL is still rejected by
 PostgreSQL execution even when a candidate happens to contain expected words.
 
@@ -518,14 +523,17 @@ SQLSTATE `P0001` with the exact immutable-record message while leaving the row
 unchanged. Direct calls to both trigger functions run under `SET ROLE` and
 must fail specifically with SQLSTATE `42501`.
 
-The runtime table proof constructs the expected `sqag_*` effective set directly
-from the manifest as `(schema_name, table_name, privilege_type, is_grantable)`
-and compares it with the complete effective set. The canonical table query
-also returns exact source RLS flags from `pg_class`. Whenever the exact bound
-source survives, the separate evaluator validates its complete table/column
-runtime-isolation evidence; when the classified legacy view exists, it additionally
-requires `relation_kind`, `owner`, `owner_select=true` for `sqag_migrator`, and
-both RLS flags false for `public.legacy_quote_artifacts_source`.
+The runtime table proof constructs the expected manifest effective set for
+classified application tables and requires every other public `r`/`p`/`f`
+relation to have zero effective and grant-option authority. It compares that
+complete table-like evidence with the complete column evidence, including the
+visible-column count, exact source RLS flags from `pg_class`, and direct
+inheritance evidence from `pg_inherits`. Whenever the exact bound source
+survives, the separate evaluator validates its complete table/column
+runtime-isolation evidence; when the classified legacy view exists, it
+additionally requires `relation_kind='r'`, owner other than `sqag_runtime`,
+`owner_select=true` for `sqag_migrator`, both RLS flags false, and no source
+inheritance descendants.
 The exact eight-privilege owner ACL completeness comparison applies to that
 classified view only; unclassified ordinary and materialized views may have
 partial owner ACLs when they have no forbidden runtime authority, while PUBLIC,
