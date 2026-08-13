@@ -73,13 +73,34 @@ The validator rejects:
 
 ## Unknown objects fail closed
 
-The validator and tests are designed so that any future object not explicitly classified fails the contract. This applies to:
-- Tables.
-- Sequences.
-- Routines (functions and procedures).
-- Default ACLs.
+The validator and tests fail closed on any `sqag_runtime` authority that is not
+explicitly authorized. This applies to schemas, table-like relations, columns,
+sequences, routines (functions and procedures), ordinary and materialized
+views, grant options, and default ACLs. Unrelated objects remain permitted only
+when every relevant effective and grant-option result is false.
 
-There is no silent adoption path. Every new production object requires a contract refresh with explicit classification.
+## Complete non-system schema authority boundary
+
+The effective table, column, schema, sequence, routine, ordinary-view, and
+materialized-view evidence enumerates every ordinary PostgreSQL user schema,
+not only `public`. The only excluded namespaces are the exact PostgreSQL system
+names `pg_catalog`, `information_schema`, and `pg_toast`, plus PostgreSQL's
+numeric managed temporary namespaces matching `pg_temp_[0-9]+` or
+`pg_toast_temp_[0-9]+`. A broad `pg_%` prefix exclusion is forbidden because an
+ordinary application schema such as `pg_application_data` must remain visible.
+
+The authorized `public` contract is unchanged. In every other ordinary schema,
+effective `sqag_runtime` schema `USAGE`/`CREATE`, table or column authority,
+sequence authority, routine execution, view authority, materialized-view
+authority, ownership, or a grant option fails closed. Evidence is ordered by
+schema and object identity so the same live state has one deterministic result.
+
+The PostgreSQL causal control creates a disposable ordinary schema whose name
+begins with `pg_application_`, then independently grants schema, table, column,
+sequence, routine, ordinary-view, and materialized-view authority with grant
+options where applicable. Each mutation is rejected, revoked in dependency
+order, and followed by both a clean evaluator result and a final no-residue
+catalog check.
 
 ## Exact table split: 11 runtime + 5 forbidden
 
@@ -148,8 +169,9 @@ columns `workspace_id`, `session_id`, `artifact_kind`, `filename`,
 `content_type`, `size_bytes`, `content_blob`, `created_at`, and `updated_at`
 from `public.legacy_quote_artifacts_source`; the single normal dependency is
 that source table. The canonical `effective_runtime_table_privileges` and
-`effective_runtime_column_privileges` queries enumerate every public
-PostgreSQL table-like relation (`relkind` `r`, `p`, or `f`), so the exact source
+`effective_runtime_column_privileges` queries enumerate every non-system
+PostgreSQL table-like relation (`relkind` `r`, `p`, or `f`) across all ordinary
+user schemas, so the exact source
 identity cannot escape through its name or relation kind. Table evidence also
 reports the visible-column count from `pg_attribute` and the direct-inheritance
 posture from `pg_inherits`. The source table must report schema `public`,
@@ -380,13 +402,13 @@ live-system evidence.
 | `default_acl` | `owner`, `namespace`, `object_type`, `grantee`, `privilege_type`, `is_grantable` | 1 |
 | `role_attributes` | `rolname`, `rolsuper`, `rolinherit`, `rolcreaterole`, `rolcreatedb`, `rolcanlogin`, `rolreplication`, `rolbypassrls`, `rolconnlimit`, `password_is_null` | 2 |
 | `role_memberships` | `role`, `member`, `grantor`, `admin_option`, `inherit_option`, `set_option` | 0 in the generic shape fixture; 1 exact runtime edge in the creator fixture |
-| `sequence_acl` | `relname`, `relacl` | 0 |
+| `sequence_acl` | `schema_name`, `sequence_name`, `sequence_acl`, `privilege_type`, `effective`, `is_grantable` | 0 in the base fixture; 3 per enumerated sequence |
 | `effective_runtime_database_privileges` | `privilege_type`, `effective`, `is_grantable` | 3 |
-| `effective_runtime_table_privileges` | `schema_name`, `table_name`, `relation_kind`, `relation_persistence`, `acl_entries`, `owner`, `owner_select`, `visible_column_count`, `row_security_enabled`, `row_security_forced`, `has_inheritance_descendants`, `privilege_type`, `effective`, `is_grantable` | 8 per enumerated public `r`/`p`/`f` relation; 128 in the base migrated fixture, plus 8 for each additional relation |
-| `effective_runtime_column_privileges` | `schema_name`, `table_name`, `column_name`, `acl_entries`, `privilege_type`, `effective`, `is_grantable` | 4 per visible column on each enumerated public `r`/`p`/`f` relation |
-| `effective_runtime_schema_privileges` | `privilege_type`, `effective`, `is_grantable` | 2 |
-| `effective_runtime_routine_privileges` | `routine_name`, `effective` | 2 |
-| `view_acl` | `relation_name`, `relation_kind`, `owner`, `relation_acl`, `acl_entries`, `column_acl_entries`, `view_definition`, `view_dependencies`, `view_columns`, `relation_options`, `view_security`, `runtime_privileges`, `runtime_select`, `runtime_select_grantable` | 0 in the generic shape fixture; 1 when the legacy-optional view fixture is present |
+| `effective_runtime_table_privileges` | `schema_name`, `table_name`, `relation_kind`, `relation_persistence`, `acl_entries`, `owner`, `owner_select`, `visible_column_count`, `column_contract`, `row_security_enabled`, `row_security_forced`, `has_inheritance_descendants`, `privilege_type`, `effective`, `is_grantable` | 8 per enumerated non-system `r`/`p`/`f` relation; 128 in the base migrated fixture, plus 8 for each additional relation |
+| `effective_runtime_column_privileges` | `schema_name`, `table_name`, `column_name`, `acl_entries`, `privilege_type`, `effective`, `is_grantable` | 4 per visible column on each enumerated non-system `r`/`p`/`f` relation |
+| `effective_runtime_schema_privileges` | `schema_name`, `privilege_type`, `effective`, `is_grantable` | 2 per enumerated non-system schema |
+| `effective_runtime_routine_privileges` | `schema_name`, `routine_name`, `identity_arguments`, `routine_kind`, `privilege_type`, `effective`, `is_grantable` | 1 per enumerated non-system routine |
+| `view_acl` | `schema_name`, `relation_name`, `relation_kind`, `owner`, `relation_acl`, `acl_entries`, `column_acl_entries`, `view_definition`, `view_dependencies`, `view_columns`, `relation_options`, `view_security`, `runtime_privileges`, `runtime_select`, `runtime_select_grantable` | 0 in the generic shape fixture; 1 when the legacy-optional view fixture is present |
 
 The effective database proof covers `CONNECT`, `CREATE`, and `TEMPORARY`; the
 locked runtime result is `true/false/false`, with all three grantable flags
@@ -396,29 +418,74 @@ PostgreSQL's `has_*_privilege(... 'WITH GRANT OPTION')` evaluation, so direct,
 PUBLIC, membership-derived, owner-derived, and grant-option authority is
 evaluated for the exact privilege rather than inferred from ACL text.
 
-The table proof evaluates every public `r`/`p`/`f` relation against the
+The table proof evaluates every non-system `r`/`p`/`f` relation against the
 ordered PostgreSQL 17 set `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`,
-`REFERENCES`, `TRIGGER`, `MAINTAIN`. Its evidence includes relation kind,
-owner, the exact `owner_select` result for `sqag_migrator`, visible-column
-cardinality, RLS flags, and direct inheritance-descendant posture. This complete
-public table-like boundary preserves harmless unrelated relations while
-rejecting any effective or grant-option authority that reaches
-`sqag_runtime`. When the classified view is present, the bound source must be
-an ordinary table that the accepted classified-view owner can read, must have
-both RLS flags false, must have no inheritance descendants, and must remain
-inaccessible to `sqag_runtime`. When the classified view is absent, a surviving
-exact source is still fully checked for runtime isolation, but owner access, RLS
-posture, and inheritance posture are not required. All eight source effective
-and grant-option results must be false. The column proof evaluates every
-non-dropped user column against `SELECT`, `INSERT`, `UPDATE`, and `REFERENCES`,
-including every visible column on the exact bound source when the classified
-view exists. Expected effective column rows are exactly those implied by the locked
-table-level matrix plus the one explicit `UPDATE(checksum_sha256)` tuple on
-`sqag_quote_publication_artifacts`. Column grants cannot add authority to a
-forbidden table, an unauthorized table-level privilege, another
-publication-artifact column, or a grant option.
+`REFERENCES`, `TRIGGER`, and `MAINTAIN`. Its evidence includes schema and
+relation identity, relation kind, owner, the exact `owner_select` result for
+`sqag_migrator`, a catalog-derived column contract, RLS flags, and direct
+inheritance-descendant posture. This complete user-schema boundary preserves
+harmless unrelated zero-authority relations while rejecting any effective or
+grant-option authority that reaches `sqag_runtime`.
 
-The classified-table evaluator treats the manifest table union (`runtime_accessible` plus `runtime_forbidden`) as a complete expected presence set: every expected public relation must be observed, while unrelated public `r`/`p`/`f` relations remain permitted when they carry no locked runtime authority. Each relation group must have one consistent owner, persistence, RLS, inheritance, and decoded ACL state across all eight privilege rows. For every classified table, the invariant requires `relkind='r'`, permanent `relation_persistence='p'`, exact owner `sqag_migrator`, `row_security_enabled=false`, `row_security_forced=false`, and no direct inheritance descendants. Its decoded ACL must contain exactly the manifest-approved direct `sqag_runtime` table privileges, with grantor `sqag_migrator`, no grant option, and no PUBLIC substitution. The decoded per-column ACL channel applies the same provenance rules to the manifest's explicit column grants, including `UPDATE(checksum_sha256)`; table-level authority does not substitute for that column evidence. These table and column ACL fields belong to the table/source authority channel and do not alter the unchanged 14-field `view_acl` projection.
+When the classified view is present, the bound source must be an ordinary
+table that the accepted classified-view owner can read, must have both RLS
+flags false, must have no inheritance descendants, and must remain inaccessible
+to `sqag_runtime`. When the classified view is absent, a surviving exact source
+is still fully checked for runtime isolation, but owner access, RLS posture, and
+inheritance posture are not required. All eight source effective and
+grant-option results must be false.
+
+The column privilege proof evaluates every non-dropped user column against
+`SELECT`, `INSERT`, `UPDATE`, and `REFERENCES`. Expected effective column rows
+are exactly those implied by the locked table-level matrix plus the one explicit
+`UPDATE(checksum_sha256)` tuple on `sqag_quote_publication_artifacts`. Column
+grants cannot add authority to a forbidden table, an unauthorized table-level
+privilege, another publication-artifact column, or a grant option.
+
+## Exact classified-table column identity contract
+
+The classified-table evaluator treats the manifest table union
+(`runtime_accessible` plus `runtime_forbidden`) as the complete expected
+presence set: every one of the 16 expected `public` relations must be observed,
+while unrelated `r`/`p`/`f` relations in any ordinary schema remain permitted
+only when they carry no locked runtime authority. Each classified relation must
+have one consistent owner, persistence, RLS, inheritance, decoded ACL, and
+column-contract state across all eight privilege rows.
+
+The expected column contract is not copied into JSON. The validator derives it
+mechanically from the canonical production migration authority: it parses the
+ordered SQL migration files locked by `MIGRATION_FILE_NAMES` and extracts the
+ledger table DDL from `_create_ledger` in `webapp/postgres_migrations.py` through
+Python AST inspection. The resulting contract covers all 16 classified tables
+and binds every physical user-column slot to ordinal position, column name,
+PostgreSQL type OID, type schema, type name, type modifier, and dropped-column
+visibility. The committed migration digests and table bindings therefore remain
+the single reviewed schema authority; the JSON manifest cannot become an
+independent column-schema truth source.
+
+For every classified table, the unchanged invariants require `relkind='r'`,
+permanent `relation_persistence='p'`, owner `sqag_migrator`,
+`row_security_enabled=false`, `row_security_forced=false`, no inheritance
+descendants, exact direct table ACL provenance, and exact explicit column ACL
+provenance. PostgreSQL controls independently prove that a same-count rename, a
+same-name wrong type, a missing expected column, and a drop-plus-replacement
+column that masks the visible count each produce a specific fail-closed result.
+
+## Fail-closed foreign-table fixture
+
+The foreign-table integration first queries genuine `file_fdw` availability.
+When unavailable, that one PostgreSQL test uses `unittest.SkipTest` with the
+precise isolated-service reason. Once availability is true, extension, server,
+foreign-table, grant, evidence, and evaluator failures propagate and fail the
+test; no broad exception handler converts them into a passing path. A separate
+causal regression injects a fixture-factory failure under positive availability
+and proves the exception is not swallowed.
+
+Cleanup records only the extension, server, foreign table, and grant created by
+the test, then revokes or drops them in dependency order without `CASCADE`. A
+cleanup failure is raised when primary work succeeded, or attached as a note to
+the original exception when primary work already failed. The successful control
+asserts that the canonical table evidence actually contains relkind `f`.
 
 ## Grantee-aware default-privilege verification
 
@@ -489,31 +556,34 @@ the exact eight-column projection
 `proname, identity_arguments, prokind, prosecdef, proacl, proowner, owner,
 has_trigger_dependency`, the complete public-schema routine boundary, and
 deterministic identity-argument ordering. The view query must project exactly
-`relation_name, relation_kind, owner, relation_acl, acl_entries,
+`schema_name, relation_name, relation_kind, owner, relation_acl, acl_entries,
 column_acl_entries, view_definition, view_dependencies, view_columns,
 relation_options, view_security, runtime_privileges, runtime_select,
-runtime_select_grantable`, join `pg_roles`
-for the owner, decode relation ACLs with PostgreSQL's
+runtime_select_grantable`, join `pg_roles` for the owner, decode relation ACLs
+with PostgreSQL's
 `pg_catalog.aclexplode(coalesce(relacl, pg_catalog.acldefault(...)))`, map
 grantee and grantor identities, evaluate all eight effective runtime relation
 privileges through `has_table_privilege(... 'WITH GRANT OPTION')`, cover both
-`relkind` values `'v'` and `'m'` in the `public` schema, and order both JSONB
-arrays and result rows deterministically. The PostgreSQL query-shape evidence
-executes all fourteen canonical queries, asserts the exact returned column
-names, and applies the documented cardinality rules. The evaluator rejects
-decorative-only raw ACL evidence, malformed or incomplete JSONB entries,
-unexpected ACL provenance, and any same-name relation duplicate.
+`relkind` values `'v'` and `'m'` in every non-system schema, and order both
+JSONB arrays and result rows deterministically. The PostgreSQL query-shape
+evidence executes all fourteen canonical queries, asserts the exact returned
+column names, and applies the documented cardinality rules. The evaluator
+rejects decorative-only raw ACL evidence, malformed or incomplete JSONB
+entries, unexpected ACL provenance, and duplicate schema-qualified relation
+identity.
 
-The remaining effective queries have the same exact-token binding. In
-particular, the membership query must preserve the complete six-field contract
-and aliases defined above; the table query must retain all eight privilege
-literals, owner/relation-kind/relation-persistence/owner-select evidence, visible-column
-cardinality, RLS flags, direct inheritance evidence, and the complete public
-`r`/`p`/`f` relation boundary; the column query must retain the same complete
-public table-like boundary plus the table, visible-column, and privilege
-predicates; and database/schema grantability must remain a real
-privilege-specific `WITH GRANT OPTION` check. Invalid SQL is still rejected by
-PostgreSQL execution even when a candidate happens to contain expected words.
+The remaining effective queries have the same exact-token binding. The
+membership query preserves its complete six-field contract. The table query
+retains all eight privilege literals, owner/relation-kind/persistence evidence,
+the exact catalog column contract, RLS and inheritance evidence, and the
+complete non-system `r`/`p`/`f` boundary. The column query retains that same
+schema boundary plus its table, visible-column, and privilege predicates.
+Schema, sequence, and routine evidence includes schema-qualified identity, each
+relevant privilege, and a real privilege-specific `WITH GRANT OPTION` result.
+Every user-schema query carries the exact system-namespace exclusion rule;
+removing it or replacing it with a broad prefix filter fails static validation.
+Invalid SQL is still rejected by PostgreSQL execution even when a candidate
+happens to contain expected words.
 
 Adversarial static fixtures cover comment-token, string-literal, and
 dollar-quote no-op attempts; multiple statements; write statements;
@@ -647,11 +717,11 @@ The deterministic discovery receipt for this amendment is:
 
 | Receipt item | Count |
 |---|---:|
-| Discovered test methods | 216 |
-| Static and validator methods | 143 |
-| PostgreSQL methods | 69 |
+| Discovered test methods | 228 |
+| Static and validator methods | 149 |
+| PostgreSQL methods | 75 |
 | Requirement-map and documentation parity methods | 4 |
-| Hosted executions | 216 |
+| Hosted executions | 228 |
 | Hosted skips | 0 |
 | Unique locked requirement IDs | 38 (`R01`-`R38`) |
 

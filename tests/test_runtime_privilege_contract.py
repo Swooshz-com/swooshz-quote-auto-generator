@@ -1,11 +1,11 @@
 """Runtime privilege contract tests.
 
 Deterministic discovery receipt for this amendment:
-  discovered methods: 216
-  static and validator methods: 143
-  PostgreSQL methods: 69
+  discovered methods: 228
+  static and validator methods: 149
+  PostgreSQL methods: 75
   requirement-map and documentation parity methods: 4
-  hosted executions: 216
+  hosted executions: 228
   hosted skips: 0
   unique locked requirement IDs: 38 (R01-R38)
 
@@ -133,7 +133,14 @@ CANONICAL_QUERY_COLUMNS = {
         "inherit_option",
         "set_option",
     ],
-    "sequence_acl": ["relname", "relacl"],
+    "sequence_acl": [
+        "schema_name",
+        "sequence_name",
+        "sequence_acl",
+        "privilege_type",
+        "effective",
+        "is_grantable",
+    ],
     "effective_runtime_database_privileges": ["privilege_type", "effective", "is_grantable"],
     "effective_runtime_table_privileges": [
         "schema_name",
@@ -144,6 +151,7 @@ CANONICAL_QUERY_COLUMNS = {
         "owner",
         "owner_select",
         "visible_column_count",
+        "column_contract",
         "row_security_enabled",
         "row_security_forced",
         "has_inheritance_descendants",
@@ -160,9 +168,23 @@ CANONICAL_QUERY_COLUMNS = {
         "effective",
         "is_grantable",
     ],
-    "effective_runtime_schema_privileges": ["privilege_type", "effective", "is_grantable"],
-    "effective_runtime_routine_privileges": ["routine_name", "effective"],
+    "effective_runtime_schema_privileges": [
+        "schema_name",
+        "privilege_type",
+        "effective",
+        "is_grantable",
+    ],
+    "effective_runtime_routine_privileges": [
+        "schema_name",
+        "routine_name",
+        "identity_arguments",
+        "routine_kind",
+        "privilege_type",
+        "effective",
+        "is_grantable",
+    ],
     "view_acl": [
+        "schema_name",
         "relation_name",
         "relation_kind",
         "owner",
@@ -231,12 +253,23 @@ def postgres_test_conninfo(database_name: str = "postgres") -> str | None:
 
 
 def _row_dict(row: object, key: str) -> object:
+
     if isinstance(row, dict):
         return row.get(key)
     try:
         return row[key]  # type: ignore[index]
     except (KeyError, TypeError, IndexError):
         return None
+
+FILE_FDW_UNAVAILABLE_REASON = (
+    "PostgreSQL file_fdw is not available in the isolated PostgreSQL test service"
+)
+
+
+def _materialize_file_fdw_fixture(available: bool, factory: Any) -> Any:
+    if not available:
+        raise unittest.SkipTest(FILE_FDW_UNAVAILABLE_REASON)
+    return factory()
 
 
 def load_manifest() -> dict[str, Any]:
@@ -253,6 +286,7 @@ def _complete_classified_authority_evidence(
     accessible_tables = tables["runtime_accessible"]
     forbidden_tables = tables["runtime_forbidden"]
     column_manifest = manifest.get("column_privileges", {})
+    column_contracts = contract_validator.classified_table_column_contract()
     table_rows: list[dict[str, Any]] = []
     column_rows: list[dict[str, Any]] = []
 
@@ -296,6 +330,7 @@ def _complete_classified_authority_evidence(
                     if type(column_name) is str:
                         explicit_columns.setdefault(column_name, set()).add(privilege.upper())
 
+        expected_contract = copy.deepcopy(column_contracts[table_name])
         for privilege in TABLE_PRIVILEGES:
             table_rows.append(
                 {
@@ -306,7 +341,8 @@ def _complete_classified_authority_evidence(
                     "acl_entries": copy.deepcopy(table_acl),
                     "owner": "sqag_migrator",
                     "owner_select": True,
-                    "visible_column_count": len(explicit_columns),
+                    "visible_column_count": len(expected_contract),
+                    "column_contract": copy.deepcopy(expected_contract),
                     "row_security_enabled": False,
                     "row_security_forced": False,
                     "has_inheritance_descendants": False,
@@ -316,7 +352,9 @@ def _complete_classified_authority_evidence(
                 }
             )
 
-        for column_name, explicit_privileges in explicit_columns.items():
+        for column in expected_contract:
+            column_name = str(column["name"])
+            explicit_privileges = explicit_columns.get(column_name, set())
             column_acl = [
                 {
                     "grantee": "sqag_runtime",
@@ -643,6 +681,23 @@ class ManifestStructureTest(unittest.TestCase):
 
 
 class ValidatorStaticTest(unittest.TestCase):
+    def test_positive_file_fdw_availability_does_not_swallow_fixture_failure(
+        self,
+    ) -> None:
+        fixture_factory = mock.Mock(
+            side_effect=RuntimeError("synthetic foreign-table fixture failure")
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, "synthetic foreign-table fixture failure"
+        ):
+            _materialize_file_fdw_fixture(True, fixture_factory)
+        fixture_factory.assert_called_once_with()
+
+        unavailable_factory = mock.Mock()
+        with self.assertRaisesRegex(unittest.SkipTest, "file_fdw is not available"):
+            _materialize_file_fdw_fixture(False, unavailable_factory)
+        unavailable_factory.assert_not_called()
+
     def _assert_fixture_rejected(self, payload: str, expected_error: str) -> None:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as fh:
             fh.write(payload)
@@ -875,17 +930,33 @@ class ValidatorStaticTest(unittest.TestCase):
             "views_materialized_view_rule_invalid",
         )
 
-    def test_view_acl_query_must_enumerate_public_views(self) -> None:
+    def test_view_acl_query_must_enumerate_all_non_system_views(self) -> None:
         canonical = load_manifest()["verification_queries"]["view_acl"]
         for mutation in (
             canonical.replace("('v', 'm')", "('v')", 1),
             canonical.replace("('v', 'm')", "('r', 'm')", 1),
+            canonical.replace(
+                "n.nspname !~ '^pg_temp_[0-9]+$'",
+                "n.nspname !~ '^pg_%'",
+                1,
+            ),
         ):
             self._assert_query_fixture_rejected(
                 "view_acl",
                 mutation,
                 "verification_query_view_acl_executable_structure_mismatch",
             )
+
+        for schema_name in (
+            "pg_catalog",
+            "information_schema",
+            "pg_toast",
+            "pg_temp_7",
+            "pg_toast_temp_42",
+        ):
+            self.assertTrue(contract_validator._is_postgresql_system_schema(schema_name))
+        for schema_name in ("public", "application", "pg_application_data", "pg_temp_backup"):
+            self.assertFalse(contract_validator._is_postgresql_system_schema(schema_name))
 
     def test_view_acl_query_must_expose_runtime_select_and_grant_option(self) -> None:
         canonical = load_manifest()["verification_queries"]["view_acl"]
@@ -1319,7 +1390,7 @@ class ValidatorStaticTest(unittest.TestCase):
             (
                 "effective_runtime_table_privileges",
                 table_query.replace(
-                    "has_table_privilege('sqag_migrator', c.oid, 'SELECT') as owner_select, ",
+                    "has_table_privilege('sqag_migrator', c.oid, 'SELECT') as owner_select,",
                     "",
                     1,
                 ),
@@ -1335,7 +1406,7 @@ class ValidatorStaticTest(unittest.TestCase):
             (
                 "effective_runtime_table_privileges",
                 table_query.replace(
-                    "c.relrowsecurity as row_security_enabled, ",
+                    "c.relrowsecurity as row_security_enabled,",
                     "",
                     1,
                 ),
@@ -1343,7 +1414,7 @@ class ValidatorStaticTest(unittest.TestCase):
             (
                 "effective_runtime_table_privileges",
                 table_query.replace(
-                    "c.relforcerowsecurity as row_security_forced, ",
+                    "c.relforcerowsecurity as row_security_forced,",
                     "",
                     1,
                 ),
@@ -1695,6 +1766,119 @@ class RuntimeMembershipEdgeEvaluatorTest(unittest.TestCase):
         self.assertIn("role_membership_row_0_role_must_be_non_empty_string", mixed_errors)
         self.assertIn("role_membership_row_0_admin_option_must_be_bool", mixed_errors)
 
+class ClassifiedTableColumnContractEvaluatorTest(unittest.TestCase):
+    """Migration-bound exact column identity regressions for all classified tables."""
+
+    def setUp(self) -> None:
+        self.manifest = load_manifest()
+        self.table_rows, self.column_rows = _complete_classified_authority_evidence(
+            self.manifest
+        )
+
+    def _errors_after_contract_mutation(
+        self, mutation
+    ) -> tuple[str, ...]:
+        table_rows = copy.deepcopy(self.table_rows)
+        target_rows = [
+            row for row in table_rows if row["table_name"] == "sqag_profiles"
+        ]
+        contract = copy.deepcopy(target_rows[0]["column_contract"])
+        mutation(contract)
+        for row in target_rows:
+            row["column_contract"] = copy.deepcopy(contract)
+            row["visible_column_count"] = sum(
+                not column["is_dropped"] for column in contract
+            )
+        return contract_validator.evaluate_public_table_like_authority(
+            self.manifest, table_rows, copy.deepcopy(self.column_rows)
+        )
+
+    def test_migration_authority_derives_all_sixteen_exact_table_contracts(self) -> None:
+        contracts = contract_validator.classified_table_column_contract()
+        self.assertEqual(set(contracts), ALL_TABLES)
+        self.assertEqual(len(contracts), 16)
+        self.assertEqual(sum(len(columns) for columns in contracts.values()), 195)
+        self.assertTrue(
+            all(
+                column["ordinal"] == ordinal
+                and column["type_schema"] == "pg_catalog"
+                and column["is_dropped"] is False
+                for columns in contracts.values()
+                for ordinal, column in enumerate(columns, start=1)
+            )
+        )
+        self.assertEqual(
+            [column["name"] for column in contracts["sqag_profiles"]],
+            ["workspace_id", "profile_id", "payload_json", "created_at", "updated_at"],
+        )
+
+    def test_classified_column_rename_with_same_visible_count_is_rejected(self) -> None:
+        errors = self._errors_after_contract_mutation(
+            lambda columns: columns[2].update({"name": "payload_json_renamed"})
+        )
+        self.assertTrue(
+            any("column_name_mismatch_ordinal_3" in error for error in errors),
+            errors,
+        )
+
+    def test_classified_column_same_name_wrong_type_is_rejected(self) -> None:
+        errors = self._errors_after_contract_mutation(
+            lambda columns: columns[2].update(
+                {
+                    "type_oid": 1043,
+                    "type_name": "varchar",
+                    "type_modifier": 68,
+                }
+            )
+        )
+        self.assertTrue(
+            any("column_type_mismatch_payload_json" in error for error in errors),
+            errors,
+        )
+
+    def test_classified_column_missing_expected_identity_is_rejected(self) -> None:
+        errors = self._errors_after_contract_mutation(
+            lambda columns: columns.pop(2)
+        )
+        self.assertTrue(
+            any("column_missing_payload_json" in error for error in errors),
+            errors,
+        )
+
+    def test_classified_column_dropped_replacement_masking_visible_count_is_rejected(self) -> None:
+        def replace(columns: list[dict[str, Any]]) -> None:
+            dropped = columns[2]
+            dropped.update(
+                {
+                    "name": "........pg.dropped.3........",
+                    "type_oid": 0,
+                    "type_schema": None,
+                    "type_name": None,
+                    "type_modifier": -1,
+                    "is_dropped": True,
+                }
+            )
+            columns.append(
+                {
+                    "ordinal": len(columns) + 1,
+                    "name": "replacement_payload_json",
+                    "type_oid": 25,
+                    "type_schema": "pg_catalog",
+                    "type_name": "text",
+                    "type_modifier": -1,
+                    "is_dropped": False,
+                }
+            )
+
+        errors = self._errors_after_contract_mutation(replace)
+        self.assertTrue(any("column_dropped_slot_3" in error for error in errors), errors)
+        self.assertTrue(any("column_missing_payload_json" in error for error in errors), errors)
+        self.assertTrue(
+            any("column_unexpected_replacement_payload_json" in error for error in errors),
+            errors,
+        )
+
+
 class ViewAuthorityEvaluatorTest(unittest.TestCase):
     """Evaluator regressions for the closed ordinary/materialized view contract.
 
@@ -1714,6 +1898,7 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
     def _view_row(
         name: str,
         *,
+        schema_name: str = "public",
         kind: str = "v",
         owner: str = "sqag_migrator",
         relation_acl: str | None = None,
@@ -1752,6 +1937,7 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
                 for privilege in TABLE_PRIVILEGES
             ]
         row = {
+            "schema_name": schema_name,
             "relation_name": name,
             "relation_kind": kind,
             "owner": owner,
@@ -1844,6 +2030,18 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
                 "owner": "sqag_migrator",
                 "owner_select": True,
                 "visible_column_count": len(contract_validator.LEGACY_VIEW_DEFINITION["columns"]),
+                "column_contract": [
+                    {
+                        "ordinal": column["ordinal"],
+                        "name": column["name"],
+                        "type_oid": column["type_oid"],
+                        "type_schema": column["type_schema"],
+                        "type_name": column["type_name"],
+                        "type_modifier": column["type_modifier"],
+                        "is_dropped": False,
+                    }
+                    for column in contract_validator.LEGACY_VIEW_DEFINITION["columns"]
+                ],
                 "row_security_enabled": False,
                 "row_security_forced": False,
                 "has_inheritance_descendants": False,
@@ -2306,6 +2504,7 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
                 'owner': 'sqag_app',
                 'owner_select': False,
                 'visible_column_count': 0,
+                'column_contract': [],
                 'row_security_enabled': True,
                 'row_security_forced': True,
                 'has_inheritance_descendants': True,
@@ -2423,12 +2622,16 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
 
         column_wrong_grantor = copy.deepcopy(column_rows)
         for row in column_wrong_grantor:
-            row['acl_entries'][0]['grantor'] = 'sqag_app'
+            if row['acl_entries']:
+                row['acl_entries'][0]['grantor'] = 'sqag_app'
+
         assert_table_case(table_rows, column_wrong_grantor, 'column_acl_runtime_grantor_invalid')
 
         column_grant_option = copy.deepcopy(column_rows)
         for row in column_grant_option:
-            row['acl_entries'][0]['is_grantable'] = True
+            if row['acl_entries']:
+                row['acl_entries'][0]['is_grantable'] = True
+
         assert_table_case(table_rows, column_grant_option, 'column_acl_runtime_grant_option_forbidden')
 
         column_missing = copy.deepcopy(column_rows)
@@ -2784,13 +2987,13 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
 
     def test_duplicate_relation_view_rows_fail_closed(self) -> None:
         row = self._view_row("sqag_quote_artifacts", runtime_select=True)
-        self._assert_rejected([row, copy.deepcopy(row)], "duplicate_relation_view_row_same_relation_name")
+        self._assert_rejected([row, copy.deepcopy(row)], "duplicate_relation_view_row_same_relation_identity")
 
         conflicting_first = self._view_row("sqag_unclassified", owner="sqag_migrator")
         conflicting_second = self._view_row("sqag_unclassified", owner="sqag_app")
         self._assert_rejected(
             [conflicting_first, conflicting_second],
-            "duplicate_relation_view_row_same_relation_name",
+            "duplicate_relation_view_row_same_relation_identity",
         )
 
 
@@ -3622,12 +3825,20 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         leftovers = [row for row in rows if row[0] in role_names or row[3] in role_names]
         self.assertEqual(leftovers, [], f"default ACL cleanup left rows: {leftovers}")
 
+    def _execute_contract_query_on(
+        self, connection, query_key: str
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        cursor = connection.execute(self.contract["verification_queries"][query_key])
+        columns = [
+            column.name if hasattr(column, "name") else column[0]
+            for column in cursor.description
+        ]
+        return columns, [dict(row) for row in cursor.fetchall()]
+
     def _execute_contract_query(self, query_key: str) -> tuple[list[str], list[dict[str, Any]]]:
         connection = self.connect()
         try:
-            cursor = connection.execute(self.contract["verification_queries"][query_key])
-            columns = [column.name if hasattr(column, "name") else column[0] for column in cursor.description]
-            return columns, [dict(row) for row in cursor.fetchall()]
+            return self._execute_contract_query_on(connection, query_key)
         finally:
             connection.rollback()
             connection.close()
@@ -4228,19 +4439,36 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             [dict(row) for row in rows],
         )
 
-    def _evaluate_runtime_authority_rows(self) -> tuple[str, ...]:
-        view_columns, view_rows = self._execute_contract_query("view_acl")
-        table_columns, table_rows = self._execute_contract_query("effective_runtime_table_privileges")
-        column_columns, column_rows = self._execute_contract_query("effective_runtime_column_privileges")
-        self.assertEqual(view_columns, CANONICAL_QUERY_COLUMNS["view_acl"])
-        self.assertEqual(table_columns, CANONICAL_QUERY_COLUMNS["effective_runtime_table_privileges"])
-        self.assertEqual(column_columns, CANONICAL_QUERY_COLUMNS["effective_runtime_column_privileges"])
+    def _evaluate_runtime_authority_on(self, connection) -> tuple[str, ...]:
+        evidence: dict[str, list[dict[str, Any]]] = {}
+        for query_key in (
+            "view_acl",
+            "effective_runtime_table_privileges",
+            "effective_runtime_column_privileges",
+            "effective_runtime_schema_privileges",
+            "sequence_acl",
+            "effective_runtime_routine_privileges",
+        ):
+            columns, rows = self._execute_contract_query_on(connection, query_key)
+            self.assertEqual(columns, CANONICAL_QUERY_COLUMNS[query_key])
+            evidence[query_key] = rows
         return contract_validator.evaluate_runtime_authority(
             self.contract,
-            [dict(row) for row in view_rows],
-            [dict(row) for row in table_rows],
-            [dict(row) for row in column_rows],
+            evidence["view_acl"],
+            evidence["effective_runtime_table_privileges"],
+            evidence["effective_runtime_column_privileges"],
+            schema_privilege_rows=evidence["effective_runtime_schema_privileges"],
+            sequence_privilege_rows=evidence["sequence_acl"],
+            routine_privilege_rows=evidence["effective_runtime_routine_privileges"],
         )
+
+    def _evaluate_runtime_authority_rows(self) -> tuple[str, ...]:
+        connection = self.connect()
+        try:
+            return self._evaluate_runtime_authority_on(connection)
+        finally:
+            connection.rollback()
+            connection.close()
 
     def _view_owner(self, view_name: str) -> str:
         connection = self.connect()
@@ -4415,6 +4643,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             {
                 (str(row["privilege_type"]), bool(row["effective"]), bool(row["is_grantable"]))
                 for row in schema_rows
+                if str(row["schema_name"]) == "public"
             },
             self._expected_runtime_schema_privileges(),
         )
@@ -4426,6 +4655,16 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 if bool(row["effective"])
             },
             self._expected_runtime_grants(),
+        )
+        observed_column_contracts = {
+            str(row["table_name"]): row["column_contract"]
+            for row in table_rows
+            if str(row["schema_name"]) == "public"
+            and str(row["privilege_type"]) == "SELECT"
+        }
+        self.assertEqual(
+            observed_column_contracts,
+            contract_validator.classified_table_column_contract(),
         )
         column_rows = results["effective_runtime_column_privileges"][1]
         self.assertEqual(
@@ -4445,6 +4684,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         routine_rows = results["effective_runtime_routine_privileges"][1]
         self.assertEqual({str(row["routine_name"]) for row in routine_rows}, set(EXPECTED_ROUTINES))
         self.assertTrue(all(bool(row["effective"]) for row in routine_rows))
+        self.assertFalse(any(bool(row["is_grantable"]) for row in routine_rows))
         self.assertEqual(self._evaluate_runtime_authority_rows(), ())
         table_acl = next(
             row['acl_entries']
@@ -4886,6 +5126,193 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.assertFalse(any(row['table_name'] == 'sqag_schema_migrations' for row in missing_table_rows))
         missing_manifest_errors = self._evaluate_runtime_authority_rows()
         self.assertTrue(any('public_table_classified_relation_missing_sqag_schema_migrations' in error for error in missing_manifest_errors), missing_manifest_errors)
+
+    def _assert_transactional_classified_column_drift(
+        self, ddl: tuple[str, ...], expected_fragment: str
+    ) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        connection = self.connect()
+        try:
+            for statement in ddl:
+                connection.execute(statement)
+            errors = self._evaluate_runtime_authority_on(connection)
+            self.assertTrue(
+                any(expected_fragment in error for error in errors),
+                errors,
+            )
+        finally:
+            connection.rollback()
+            connection.close()
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+    def test_classified_column_rename_same_count_fails_closed_postgres(self) -> None:
+        self._assert_transactional_classified_column_drift(
+            (
+                'alter table public."sqag_profiles" '
+                'rename column "payload_json" to "payload_json_renamed"',
+            ),
+            "column_name_mismatch_ordinal_3",
+        )
+
+    def test_classified_column_same_name_wrong_type_fails_closed_postgres(self) -> None:
+        self._assert_transactional_classified_column_drift(
+            (
+                'alter table public."sqag_profiles" '
+                'alter column "payload_json" type varchar(64)',
+            ),
+            "column_type_mismatch_payload_json",
+        )
+
+    def test_classified_column_missing_expected_fails_closed_postgres(self) -> None:
+        self._assert_transactional_classified_column_drift(
+            ('alter table public."sqag_profiles" drop column "payload_json"',),
+            "column_missing_payload_json",
+        )
+
+    def test_classified_column_replacement_masks_count_fails_closed_postgres(self) -> None:
+        self._assert_transactional_classified_column_drift(
+            (
+                'alter table public."sqag_profiles" drop column "payload_json"',
+                'alter table public."sqag_profiles" '
+                'add column "replacement_payload_json" text',
+            ),
+            "column_unexpected_replacement_payload_json",
+        )
+
+    def test_non_system_schema_authority_all_object_kinds_fail_closed_postgres(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        schema_name = f"pg_application_h23_{uuid.uuid4().hex[:8]}"
+        schema_ident = _quote_identifier(schema_name)
+        table_ident = f'{schema_ident}."authority_table"'
+        sequence_ident = f'{schema_ident}."authority_sequence"'
+        routine_ident = f'{schema_ident}."authority_function"()'
+        view_ident = f'{schema_ident}."authority_view"'
+        materialized_ident = f'{schema_ident}."authority_materialized"'
+
+        connection = self.connect()
+        try:
+            connection.execute(
+                f'create schema {schema_ident} authorization "sqag_migrator"'
+            )
+            connection.execute('set role "sqag_migrator"')
+            connection.execute(
+                f"create table {table_ident} (id integer not null, note text)"
+            )
+            connection.execute(f"create sequence {sequence_ident}")
+            connection.execute(
+                f"create function {routine_ident} returns integer "
+                "language sql as 'select 1'"
+            )
+            connection.execute(f"revoke execute on function {routine_ident} from public")
+            connection.execute(
+                f"create view {view_ident} as select id, note from {table_ident}"
+            )
+            connection.execute(
+                f"create materialized view {materialized_ident} "
+                f"as select id from {table_ident}"
+            )
+            connection.execute("reset role")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+        cleanup_steps = [
+            (
+                "drop_h23_materialized",
+                f"drop materialized view if exists {materialized_ident}",
+            ),
+            ("drop_h23_view", f"drop view if exists {view_ident}"),
+            ("drop_h23_routine", f"drop function if exists {routine_ident}"),
+            ("drop_h23_sequence", f"drop sequence if exists {sequence_ident}"),
+            ("drop_h23_table", f"drop table if exists {table_ident}"),
+            ("drop_h23_schema", f"drop schema if exists {schema_ident}"),
+        ]
+        try:
+            self.assertFalse(contract_validator._is_postgresql_system_schema(schema_name))
+            self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+            controls = (
+                (
+                    "schema",
+                    f'grant usage on schema {schema_ident} to "sqag_runtime" with grant option',
+                    f'revoke usage on schema {schema_ident} from "sqag_runtime"',
+                    "runtime_schema_non_public_authority",
+                ),
+                (
+                    "table",
+                    f'grant select on table {table_ident} to "sqag_runtime" with grant option',
+                    f'revoke select on table {table_ident} from "sqag_runtime"',
+                    "runtime_privilege_mismatch_SELECT_expected_False_got_True",
+                ),
+                (
+                    "column",
+                    f'grant update (note) on table {table_ident} to "sqag_runtime" with grant option',
+                    f'revoke update (note) on table {table_ident} from "sqag_runtime"',
+                    "runtime_privilege_mismatch_UPDATE_expected_False_got_True",
+                ),
+                (
+                    "sequence",
+                    f'grant usage on sequence {sequence_ident} to "sqag_runtime" with grant option',
+                    f'revoke usage on sequence {sequence_ident} from "sqag_runtime"',
+                    "runtime_sequence_non_public_authority",
+                ),
+                (
+                    "routine",
+                    f'grant execute on function {routine_ident} to "sqag_runtime" with grant option',
+                    f'revoke execute on function {routine_ident} from "sqag_runtime"',
+                    "runtime_routine_non_public_authority",
+                ),
+                (
+                    "view",
+                    f'grant select on table {view_ident} to "sqag_runtime" with grant option',
+                    f'revoke select on table {view_ident} from "sqag_runtime"',
+                    "unclassified_ordinary_view_runtime_authority",
+                ),
+                (
+                    "materialized_view",
+                    f'grant select on table {materialized_ident} to "sqag_runtime" with grant option',
+                    f'revoke select on table {materialized_ident} from "sqag_runtime"',
+                    "materialized_view_runtime_select_forbidden",
+                ),
+            )
+            for label, grant_sql, revoke_sql, expected_fragment in controls:
+                with self.subTest(h23_control=label):
+                    self._execute_admin_sql(grant_sql)
+                    try:
+                        errors = self._evaluate_runtime_authority_rows()
+                        self.assertTrue(
+                            any(expected_fragment in error for error in errors),
+                            errors,
+                        )
+                    finally:
+                        self._execute_admin_sql(revoke_sql)
+                    self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+        finally:
+            primary_failure = sys.exc_info()[1]
+            try:
+                self._cleanup_steps(cleanup_steps)
+            except Exception as cleanup_error:
+                message = f"H23 cleanup failed: {cleanup_error}"
+                if primary_failure is None:
+                    raise
+                add_note = getattr(primary_failure, "add_note", None)
+                if callable(add_note):
+                    add_note(message)
+
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "select exists (select 1 from pg_catalog.pg_namespace where nspname = %s) "
+                "as present",
+                (schema_name,),
+            ).fetchone()
+            self.assertFalse(bool(_row_dict(row, "present")))
+        finally:
+            connection.rollback()
+            connection.close()
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
 
     def test_role_membership_query_executes_and_invalid_alias_fails(self) -> None:
         invalid_query = self.contract["verification_queries"]["role_memberships"].replace(
@@ -6843,13 +7270,9 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         ordinary_name = "sqag_rpc_unexpected_table"
         partitioned_name = "sqag_rpc_unexpected_partitioned"
         partition_name = "sqag_rpc_unexpected_partition"
-        foreign_name = "sqag_rpc_unexpected_foreign"
-        foreign_server = f"sqag_rpc_file_server_{uuid.uuid4().hex[:8]}"
         ordinary_ident = _quote_identifier(ordinary_name)
         partitioned_ident = _quote_identifier(partitioned_name)
         partition_ident = _quote_identifier(partition_name)
-        foreign_ident = _quote_identifier(foreign_name)
-        foreign_server_ident = _quote_identifier(foreign_server)
 
         connection = self.connect()
         try:
@@ -6866,36 +7289,6 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         finally:
             connection.close()
 
-        foreign_created = False
-        try:
-            connection = self.connect()
-            available = _row_dict(
-                connection.execute(
-                    "select exists (select 1 from pg_catalog.pg_available_extensions where name = 'file_fdw') "
-                    "as available"
-                ).fetchone(),
-                "available",
-            )
-            if bool(available):
-                connection.execute("create extension if not exists file_fdw")
-                connection.execute(
-                    f"create server {foreign_server_ident} foreign data wrapper file_fdw"
-                )
-                connection.execute(
-                    f"create foreign table {foreign_ident} (id integer) server {foreign_server_ident} "
-                    "options (filename '/tmp/sqag_run82_foreign.csv', format 'csv')"
-                )
-                connection.commit()
-                foreign_created = True
-            else:
-                connection.rollback()
-        except Exception:
-            if connection is not None:
-                connection.rollback()
-        finally:
-            if 'connection' in locals() and connection is not None:
-                connection.close()
-
         cleanup_steps = [
             ("revoke_unexpected_table", f"revoke SELECT on table {ordinary_ident} from {_quote_identifier(role_name)}"),
             ("revoke_unexpected_partitioned", f"revoke SELECT on table {partitioned_ident} from {_quote_identifier(role_name)}"),
@@ -6903,13 +7296,6 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             ("drop_unexpected_partitioned", f"drop table if exists {partitioned_ident}"),
             ("drop_unexpected_table", f"drop table if exists {ordinary_ident}"),
         ]
-        if foreign_created:
-            cleanup_steps = [
-                ("revoke_unexpected_foreign", f"revoke SELECT on table {foreign_ident} from {_quote_identifier(role_name)}"),
-                ("drop_unexpected_foreign", f"drop foreign table if exists {foreign_ident}"),
-                ("drop_unexpected_foreign_server", f"drop server if exists {foreign_server_ident}"),
-                *cleanup_steps,
-            ]
         self.addCleanup(self._cleanup_steps, cleanup_steps)
 
         self._execute_admin_sql(
@@ -6918,25 +7304,15 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self._execute_admin_sql(
             f"grant SELECT on table {partitioned_ident} to {_quote_identifier(role_name)}"
         )
-        if foreign_created:
-            self._execute_admin_sql(
-                f"grant SELECT on table {foreign_ident} to {_quote_identifier(role_name)}"
-            )
 
         fixture_names = {ordinary_name, partitioned_name, partition_name}
-        if foreign_created:
-            fixture_names.add(foreign_name)
         actual = self._effective_table_grants(role_name)
         unexpected = {row for row in actual if row[1] in fixture_names}
         self.assertIn(("public", ordinary_name, "SELECT", False), unexpected)
         self.assertIn(("public", partitioned_name, "SELECT", False), unexpected)
-        if foreign_created:
-            self.assertIn(("public", foreign_name, "SELECT", False), unexpected)
         self._assert_isolated_matrix_mismatch(role_name, unexpected)
 
         relation_identifiers = [(ordinary_name, ordinary_ident), (partitioned_name, partitioned_ident)]
-        if foreign_created:
-            relation_identifiers.append((foreign_name, foreign_ident))
         for provenance in ("public", "membership"):
             parent_name = None
             if provenance == "membership":
@@ -6976,8 +7352,141 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         }
         self.assertEqual(relation_kinds.get(ordinary_name), "r")
         self.assertEqual(relation_kinds.get(partitioned_name), "p")
-        if foreign_created:
-            self.assertEqual(relation_kinds.get(foreign_name), "f")
+
+    def test_effective_runtime_matrix_unexpected_foreign_table_privilege_is_rejected(
+        self,
+    ) -> None:
+        availability_connection = self.connect()
+        try:
+            available = bool(
+                _row_dict(
+                    availability_connection.execute(
+                        "select exists (select 1 from pg_catalog.pg_available_extensions "
+                        "where name = 'file_fdw') as available"
+                    ).fetchone(),
+                    "available",
+                )
+            )
+        finally:
+            availability_connection.rollback()
+            availability_connection.close()
+
+        role_name = ""
+        foreign_name = f"sqag_rpc_unexpected_foreign_{uuid.uuid4().hex[:8]}"
+        foreign_server = f"sqag_rpc_file_server_{uuid.uuid4().hex[:8]}"
+        foreign_ident = _quote_identifier(foreign_name)
+        foreign_server_ident = _quote_identifier(foreign_server)
+        extension_created = False
+        server_created = False
+        foreign_created = False
+        grant_created = False
+
+        def create_fixture() -> None:
+            nonlocal extension_created, server_created, foreign_created, grant_created
+            connection = self.connect()
+            try:
+                extension_present = bool(
+                    _row_dict(
+                        connection.execute(
+                            "select exists (select 1 from pg_catalog.pg_extension "
+                            "where extname = 'file_fdw') as present"
+                        ).fetchone(),
+                        "present",
+                    )
+                )
+                if not extension_present:
+                    connection.execute("create extension file_fdw")
+                    extension_created = True
+                connection.execute(
+                    f"create server {foreign_server_ident} foreign data wrapper file_fdw"
+                )
+                server_created = True
+                connection.execute(
+                    f"create foreign table {foreign_ident} (id integer) "
+                    f"server {foreign_server_ident} options "
+                    f"(filename '/tmp/{foreign_name}.csv', format 'csv')"
+                )
+                foreign_created = True
+                connection.execute(
+                    f"grant SELECT on table {foreign_ident} "
+                    f"to {_quote_identifier(role_name)}"
+                )
+                grant_created = True
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        primary_failure: BaseException | None = None
+        try:
+            _materialize_file_fdw_fixture(available, lambda: None)
+            role_name = self._new_exact_matrix_role("matrix_unexpected_foreign")
+            _materialize_file_fdw_fixture(available, create_fixture)
+
+            actual = self._effective_table_grants(role_name)
+            unexpected = {
+                ("public", foreign_name, "SELECT", False),
+            }
+            self.assertIn(("public", foreign_name, "SELECT", False), actual)
+            self._assert_isolated_matrix_mismatch(role_name, unexpected)
+
+            columns, rows = self._execute_contract_query(
+                "effective_runtime_table_privileges"
+            )
+            self.assertEqual(
+                columns,
+                CANONICAL_QUERY_COLUMNS["effective_runtime_table_privileges"],
+            )
+            foreign_rows = [
+                row for row in rows if str(row["table_name"]) == foreign_name
+            ]
+            self.assertEqual(len(foreign_rows), 8)
+            self.assertEqual(
+                {str(row["relation_kind"]) for row in foreign_rows},
+                {"f"},
+            )
+        except BaseException as exc:
+            primary_failure = exc
+            raise
+        finally:
+            cleanup_steps: list[tuple[str, str]] = []
+            if grant_created:
+                cleanup_steps.append(
+                    (
+                        "revoke_unexpected_foreign",
+                        f"revoke SELECT on table {foreign_ident} "
+                        f"from {_quote_identifier(role_name)}",
+                    )
+                )
+            if foreign_created:
+                cleanup_steps.append(
+                    (
+                        "drop_unexpected_foreign",
+                        f"drop foreign table if exists {foreign_ident}",
+                    )
+                )
+            if server_created:
+                cleanup_steps.append(
+                    (
+                        "drop_unexpected_foreign_server",
+                        f"drop server if exists {foreign_server_ident}",
+                    )
+                )
+            if extension_created:
+                cleanup_steps.append(
+                    (
+                        "drop_test_created_file_fdw",
+                        "drop extension if exists file_fdw",
+                    )
+                )
+            try:
+                self._cleanup_steps(cleanup_steps)
+            except Exception as cleanup_error:
+                if primary_failure is None:
+                    raise
+                primary_failure.add_note(f"H25 cleanup failed: {cleanup_error}")
 
     def test_effective_runtime_matrix_missing_accessible_table_is_rejected(self) -> None:
         role_name = self._new_exact_matrix_role("matrix_missing_table")

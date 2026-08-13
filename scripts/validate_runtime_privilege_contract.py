@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import sys
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -144,6 +146,7 @@ ACCESSIBLE_VIEW_KEYS = frozenset({"schema", "class", "privileges", "production_s
 VIEW_PRIVILEGE_KEYS = frozenset({"select"})
 VIEW_AUTHORITY_ROW_KEYS = frozenset(
     {
+        "schema_name",
         "relation_name",
         "relation_kind",
         "owner",
@@ -169,6 +172,9 @@ VIEW_DEFINITION_KEYS = frozenset({"canonical_definition", "dependencies", "colum
 VIEW_DEPENDENCY_KEYS = frozenset({"schema", "relation_name", "relation_kind", "dependency_type"})
 VIEW_COLUMN_KEYS = frozenset(
     {"ordinal", "name", "type_oid", "type_schema", "type_name", "type_modifier", "type_sql"}
+)
+TABLE_COLUMN_IDENTITY_KEYS = frozenset(
+    {"ordinal", "name", "type_oid", "type_schema", "type_name", "type_modifier", "is_dropped"}
 )
 VIEW_SECURITY_KEYS = frozenset({"security_barrier", "security_invoker", "check_option"})
 VIEW_RELATION_PRIVILEGES = (
@@ -196,6 +202,7 @@ RUNTIME_TABLE_PRIVILEGE_ROW_KEYS = frozenset(
         "owner",
         "owner_select",
         "visible_column_count",
+        "column_contract",
         "row_security_enabled",
         "row_security_forced",
         "has_inheritance_descendants",
@@ -206,6 +213,23 @@ RUNTIME_TABLE_PRIVILEGE_ROW_KEYS = frozenset(
 )
 RUNTIME_COLUMN_PRIVILEGE_ROW_KEYS = frozenset(
     {"schema_name", "table_name", "column_name", "acl_entries", "privilege_type", "effective", "is_grantable"}
+)
+RUNTIME_SCHEMA_PRIVILEGE_ROW_KEYS = frozenset(
+    {"schema_name", "privilege_type", "effective", "is_grantable"}
+)
+RUNTIME_SEQUENCE_PRIVILEGE_ROW_KEYS = frozenset(
+    {"schema_name", "sequence_name", "sequence_acl", "privilege_type", "effective", "is_grantable"}
+)
+RUNTIME_ROUTINE_PRIVILEGE_ROW_KEYS = frozenset(
+    {
+        "schema_name",
+        "routine_name",
+        "identity_arguments",
+        "routine_kind",
+        "privilege_type",
+        "effective",
+        "is_grantable",
+    }
 )
 
 MATERIALIZED_VIEW_RULE = (
@@ -376,11 +400,26 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
         order by role, member, grantor
     """,
     "sequence_acl": """
-        select relname, relacl
+        select n.nspname as schema_name,
+               c.relname as sequence_name,
+               c.relacl::text as sequence_acl,
+               p.privilege_type,
+               has_sequence_privilege('sqag_runtime', c.oid, p.privilege_type) as effective,
+               has_sequence_privilege(
+                   'sqag_runtime',
+                   c.oid,
+                   p.privilege_type || ' WITH GRANT OPTION'
+               ) as is_grantable
         from pg_catalog.pg_class c
         join pg_catalog.pg_namespace n on n.oid = c.relnamespace
-        where c.relkind = 'S' and n.nspname = 'public'
-        order by relname
+        cross join (values ('USAGE'), ('SELECT'), ('UPDATE')) p(privilege_type)
+        where c.relkind = 'S'
+          and n.nspname <> 'pg_catalog'
+          and n.nspname <> 'information_schema'
+          and n.nspname <> 'pg_toast'
+          and n.nspname !~ '^pg_temp_[0-9]+$'
+          and n.nspname !~ '^pg_toast_temp_[0-9]+$'
+        order by n.nspname, c.relname, p.privilege_type
     """,
     "effective_runtime_database_privileges": """
         select p.privilege_type,
@@ -408,6 +447,28 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                      and visible_attribute.attnum > 0
                      and not visible_attribute.attisdropped
                ) as visible_column_count,
+               (
+                   select coalesce(
+                              jsonb_agg(
+                                  jsonb_build_object(
+                                      'ordinal', attribute.attnum,
+                                      'name', attribute.attname,
+                                      'type_oid', attribute.atttypid::int,
+                                      'type_schema', type_namespace.nspname,
+                                      'type_name', attribute_type.typname,
+                                      'type_modifier', attribute.atttypmod,
+                                      'is_dropped', attribute.attisdropped
+                                  )
+                                  order by attribute.attnum
+                              ),
+                              '[]'::jsonb
+                          )
+                   from pg_catalog.pg_attribute attribute
+                   left join pg_catalog.pg_type attribute_type on attribute_type.oid = attribute.atttypid
+                   left join pg_catalog.pg_namespace type_namespace on type_namespace.oid = attribute_type.typnamespace
+                   where attribute.attrelid = c.oid
+                     and attribute.attnum > 0
+               ) as column_contract,
                c.relrowsecurity as row_security_enabled,
                c.relforcerowsecurity as row_security_forced,
                exists (
@@ -453,8 +514,12 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                 ('TRIGGER'),
                 ('MAINTAIN')
         ) p(privilege_type)
-        where n.nspname = 'public'
-          and c.relkind in ('r', 'p', 'f')
+        where c.relkind in ('r', 'p', 'f')
+          and n.nspname <> 'pg_catalog'
+          and n.nspname <> 'information_schema'
+          and n.nspname <> 'pg_toast'
+          and n.nspname !~ '^pg_temp_[0-9]+$'
+          and n.nspname !~ '^pg_toast_temp_[0-9]+$'
         order by n.nspname, c.relname, p.privilege_type
     """,
     "effective_runtime_column_privileges": """
@@ -497,30 +562,55 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                 ('UPDATE'),
                 ('REFERENCES')
         ) p(privilege_type)
-        where n.nspname = 'public'
-          and c.relkind in ('r', 'p', 'f')
+        where c.relkind in ('r', 'p', 'f')
+          and n.nspname <> 'pg_catalog'
+          and n.nspname <> 'information_schema'
+          and n.nspname <> 'pg_toast'
+          and n.nspname !~ '^pg_temp_[0-9]+$'
+          and n.nspname !~ '^pg_toast_temp_[0-9]+$'
           and a.attnum > 0
           and not a.attisdropped
         order by n.nspname, c.relname, a.attname, p.privilege_type
     """,
     "effective_runtime_schema_privileges": """
-        select p.privilege_type,
-               has_schema_privilege('sqag_runtime', 'public', p.privilege_type) as effective,
+        select n.nspname as schema_name,
+               p.privilege_type,
+               has_schema_privilege('sqag_runtime', n.oid, p.privilege_type) as effective,
                has_schema_privilege(
                    'sqag_runtime',
-                   'public',
+                   n.oid,
                    p.privilege_type || ' WITH GRANT OPTION'
                ) as is_grantable
-        from (values ('USAGE'), ('CREATE')) p(privilege_type)
-        order by p.privilege_type
+        from pg_catalog.pg_namespace n
+        cross join (values ('USAGE'), ('CREATE')) p(privilege_type)
+        where n.nspname <> 'pg_catalog'
+          and n.nspname <> 'information_schema'
+          and n.nspname <> 'pg_toast'
+          and n.nspname !~ '^pg_temp_[0-9]+$'
+          and n.nspname !~ '^pg_toast_temp_[0-9]+$'
+        order by n.nspname, p.privilege_type
     """,
     "effective_runtime_routine_privileges": """
-        select p.proname as routine_name,
-               has_function_privilege('sqag_runtime', p.oid, 'EXECUTE') as effective
+        select n.nspname as schema_name,
+               p.proname as routine_name,
+               pg_catalog.pg_get_function_identity_arguments(p.oid) as identity_arguments,
+               p.prokind as routine_kind,
+               'EXECUTE'::text as privilege_type,
+               has_function_privilege('sqag_runtime', p.oid, 'EXECUTE') as effective,
+               has_function_privilege(
+                   'sqag_runtime',
+                   p.oid,
+                   'EXECUTE WITH GRANT OPTION'
+               ) as is_grantable
         from pg_catalog.pg_proc p
         join pg_catalog.pg_namespace n on n.oid = p.pronamespace
-        where n.nspname = 'public'
-        order by p.proname
+        where p.prokind in ('f', 'p', 'a', 'w')
+          and n.nspname <> 'pg_catalog'
+          and n.nspname <> 'information_schema'
+          and n.nspname <> 'pg_toast'
+          and n.nspname !~ '^pg_temp_[0-9]+$'
+          and n.nspname !~ '^pg_toast_temp_[0-9]+$'
+        order by n.nspname, p.proname, identity_arguments, p.prokind
     """,
     "view_acl": """
         select c.relname as relation_name,
@@ -574,7 +664,8 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
 }
 
 CANONICAL_VERIFICATION_QUERY_SQL['view_acl'] = '''
-        select c.relname as relation_name,
+        select n.nspname as schema_name,
+               c.relname as relation_name,
                c.relkind as relation_kind,
                r.rolname as owner,
                c.relacl::text as relation_acl,
@@ -728,9 +819,13 @@ CANONICAL_VERIFICATION_QUERY_SQL['view_acl'] = '''
                    has_table_privilege('sqag_runtime', c.oid, 'SELECT WITH GRANT OPTION') as runtime_select_grantable
             from (values ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE'), ('REFERENCES'), ('TRIGGER'), ('MAINTAIN')) p(privilege_type)
         ) runtime
-        where n.nspname = 'public'
-          and c.relkind in ('v', 'm')
-        order by c.relkind, c.relname
+        where c.relkind in ('v', 'm')
+          and n.nspname <> 'pg_catalog'
+          and n.nspname <> 'information_schema'
+          and n.nspname <> 'pg_toast'
+          and n.nspname !~ '^pg_temp_[0-9]+$'
+          and n.nspname !~ '^pg_toast_temp_[0-9]+$'
+        order by n.nspname, c.relkind, c.relname
 '''
 
 RUNTIME_TABLES = frozenset(
@@ -888,7 +983,23 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "inherit_option",
         "set_option",
     ),
-    "sequence_acl": ("pg_catalog.pg_class", "relkind", "'s'", "pg_catalog.pg_namespace", "relacl"),
+    "sequence_acl": (
+        "pg_catalog.pg_class",
+        "pg_catalog.pg_namespace",
+        "relkind",
+        "relacl",
+        "has_sequence_privilege",
+        "schema_name",
+        "sequence_name",
+        "is_grantable",
+        "' WITH GRANT OPTION'",
+        "'s'",
+        "'usage'",
+        "'select'",
+        "'update'",
+        "information_schema",
+        "pg_toast",
+    ),
     "effective_runtime_database_privileges": (
         "has_database_privilege",
         "current_database",
@@ -926,6 +1037,13 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "row_security_forced",
         "pg_catalog.pg_attribute",
         "visible_column_count",
+        "column_contract",
+        "type_oid",
+        "type_schema",
+        "type_name",
+        "type_modifier",
+        "is_dropped",
+        "pg_catalog.pg_type",
         "pg_catalog.pg_inherits",
         "has_inheritance_descendants",
         "relkind",
@@ -966,8 +1084,30 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "'update'",
         "'references'",
     ),
-    "effective_runtime_schema_privileges": ("has_schema_privilege", "'public'", "'usage'", "'create'"),
-    "effective_runtime_routine_privileges": ("has_function_privilege", "pg_catalog.pg_proc", "'public'", "'execute'"),
+    "effective_runtime_schema_privileges": (
+        "has_schema_privilege",
+        "pg_catalog.pg_namespace",
+        "schema_name",
+        "is_grantable",
+        "'usage'",
+        "'create'",
+        "information_schema",
+        "pg_toast",
+    ),
+    "effective_runtime_routine_privileges": (
+        "has_function_privilege",
+        "pg_catalog.pg_proc",
+        "pg_catalog.pg_namespace",
+        "pg_get_function_identity_arguments",
+        "schema_name",
+        "routine_name",
+        "routine_kind",
+        "is_grantable",
+        "'execute'",
+        "'execute with grant option'",
+        "information_schema",
+        "pg_toast",
+    ),
     "view_acl": (
         "pg_catalog.pg_class",
         "pg_catalog.pg_namespace",
@@ -975,8 +1115,9 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "relname",
         "relkind",
         "relacl",
-        "'public'",
         "'sqag_runtime'",
+        "information_schema",
+        "pg_toast",
         "'v'",
         "'m'",
         "has_table_privilege",
@@ -1464,6 +1605,22 @@ def validate_table_matrix(manifest: dict[str, Any], errors: list[str]) -> None:
 
     accessible = tables.get("runtime_accessible")
     forbidden = tables.get("runtime_forbidden")
+    try:
+        migration_columns = classified_table_column_contract()
+    except (OSError, SyntaxError, SQLLexError, ValueError) as exc:
+        _add_error(errors, f"classified_table_column_contract_derivation_failed:{exc}")
+        migration_columns = {}
+    manifest_classified = (
+        set(accessible) if isinstance(accessible, dict) else set()
+    ) | (
+        set(forbidden) if isinstance(forbidden, dict) else set()
+    )
+    if set(migration_columns) != manifest_classified:
+        _add_error(
+            errors,
+            "classified_table_column_contract_inventory_mismatch_"
+            f"expected_{sorted(manifest_classified)}_got_{sorted(migration_columns)}",
+        )
     if not isinstance(accessible, dict):
         _add_error(errors, "runtime_accessible_must_be_object")
     else:
@@ -1985,6 +2142,337 @@ def _classified_table_object_owner(manifest: dict[str, Any]) -> str | None:
     return owner if type(owner) is str and owner else None
 
 
+_MIGRATION_COLUMN_CONSTRAINT_WORDS = frozenset(
+    {
+        "not",
+        "null",
+        "default",
+        "primary",
+        "unique",
+        "check",
+        "references",
+        "collate",
+        "generated",
+        "constraint",
+        "create",
+        "alter",
+        "drop",
+    }
+)
+_MIGRATION_TABLE_CONSTRAINT_WORDS = frozenset(
+    {"primary", "unique", "foreign", "check", "constraint", "exclude"}
+)
+
+
+def _migration_identifier(token: SQLToken, label: str) -> str:
+    if token.kind not in {"WORD", "QUOTED_IDENTIFIER"}:
+        raise ValueError(f"{label}_identifier_invalid")
+    return token.value.lower() if token.kind == "WORD" else token.value
+
+
+def _migration_type_identity(type_tokens: tuple[SQLToken, ...], label: str) -> tuple[int, str, str, int]:
+    executable = [token for token in type_tokens if token.kind != "COMMENT"]
+    if not executable:
+        raise ValueError(f"{label}_type_missing")
+    normalised = "".join(
+        token.value.lower() if token.kind == "WORD" else token.value
+        for token in executable
+    )
+    if normalised.startswith("pg_catalog."):
+        normalised = normalised[len("pg_catalog.") :]
+    fixed = {
+        "text": (25, "pg_catalog", "text", -1),
+        "integer": (23, "pg_catalog", "int4", -1),
+        "int": (23, "pg_catalog", "int4", -1),
+        "int4": (23, "pg_catalog", "int4", -1),
+        "bigint": (20, "pg_catalog", "int8", -1),
+        "int8": (20, "pg_catalog", "int8", -1),
+        "bytea": (17, "pg_catalog", "bytea", -1),
+        "timestamptz": (1184, "pg_catalog", "timestamptz", -1),
+        "timestampwithtimezone": (1184, "pg_catalog", "timestamptz", -1),
+    }
+    if normalised in fixed:
+        return fixed[normalised]
+    sized = re.fullmatch(r"(?:char|character)\(([1-9][0-9]*)\)", normalised)
+    if sized:
+        return 1042, "pg_catalog", "bpchar", int(sized.group(1)) + 4
+    sized = re.fullmatch(r"(?:varchar|charactervarying)\(([1-9][0-9]*)\)", normalised)
+    if sized:
+        return 1043, "pg_catalog", "varchar", int(sized.group(1)) + 4
+    raise ValueError(f"{label}_unsupported_postgresql_type_{normalised}")
+
+
+def _migration_table_identity(
+    tokens: tuple[SQLToken, ...], start: int, label: str
+) -> tuple[str, int]:
+    cursor = start
+    first = _migration_identifier(tokens[cursor], label)
+    cursor += 1
+    if cursor + 1 < len(tokens) and tokens[cursor].value == ".":
+        schema_name = first
+        table_name = _migration_identifier(tokens[cursor + 1], label)
+        cursor += 2
+        if schema_name != "public":
+            raise ValueError(f"{label}_schema_must_be_public")
+        return table_name, cursor
+    return first, cursor
+
+
+def _append_migration_column(
+    columns: dict[str, list[tuple[str, int, str, str, int]]],
+    table_name: str,
+    column_name: str,
+    type_tokens: tuple[SQLToken, ...],
+) -> None:
+    type_oid, type_schema, type_name, type_modifier = _migration_type_identity(
+        type_tokens, f"migration_{table_name}_{column_name}"
+    )
+    identity = (column_name, type_oid, type_schema, type_name, type_modifier)
+    existing = columns.setdefault(table_name, [])
+    prior = next((entry for entry in existing if entry[0] == column_name), None)
+    if prior is not None:
+        if prior != identity:
+            raise ValueError(f"migration_{table_name}_{column_name}_additive_type_drift")
+        return
+    existing.append(identity)
+
+
+def _apply_migration_column_ddl(
+    sql: str, columns: dict[str, list[tuple[str, int, str, str, int]]]
+) -> None:
+    tokens = tuple(token for token in lex_sql(sql) if token.kind not in {"COMMENT", "DOLLAR_QUOTE"})
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if (
+            _token_is_word(token, "create")
+            and index + 1 < len(tokens)
+            and _token_is_word(tokens[index + 1], "table")
+        ):
+            cursor = index + 2
+            if (
+                cursor + 2 < len(tokens)
+                and _token_is_word(tokens[cursor], "if")
+                and _token_is_word(tokens[cursor + 1], "not")
+                and _token_is_word(tokens[cursor + 2], "exists")
+            ):
+                cursor += 3
+            table_name, cursor = _migration_table_identity(
+                tokens, cursor, f"migration_create_table_{index}"
+            )
+            if cursor >= len(tokens) or tokens[cursor].value != "(":
+                raise ValueError(f"migration_{table_name}_column_list_missing")
+            depth = 1
+            close = cursor + 1
+            while close < len(tokens) and depth:
+                if tokens[close].value == "(":
+                    depth += 1
+                elif tokens[close].value == ")":
+                    depth -= 1
+                close += 1
+            if depth:
+                raise ValueError(f"migration_{table_name}_column_list_unterminated")
+            body = tokens[cursor + 1 : close - 1]
+            for segment in _split_top_level(body):
+                if not segment:
+                    continue
+                first = segment[0]
+                if first.kind == "WORD" and first.value.lower() in _MIGRATION_TABLE_CONSTRAINT_WORDS:
+                    continue
+                column_name = _migration_identifier(first, f"migration_{table_name}_column")
+                type_end = len(segment)
+                depth = 0
+                for position, part in enumerate(segment[1:], start=1):
+                    if part.value == "(":
+                        depth += 1
+                    elif part.value == ")":
+                        depth -= 1
+                    elif (
+                        depth == 0
+                        and part.kind == "WORD"
+                        and part.value.lower() in _MIGRATION_COLUMN_CONSTRAINT_WORDS
+                    ):
+                        type_end = position
+                        break
+                _append_migration_column(columns, table_name, column_name, segment[1:type_end])
+            index = close
+            continue
+        if (
+            _token_is_word(token, "alter")
+            and index + 1 < len(tokens)
+            and _token_is_word(tokens[index + 1], "table")
+        ):
+            table_name, cursor = _migration_table_identity(
+                tokens, index + 2, f"migration_alter_table_{index}"
+            )
+            if cursor < len(tokens) and _token_is_word(tokens[cursor], "add"):
+                cursor += 1
+                if cursor < len(tokens) and _token_is_word(tokens[cursor], "column"):
+                    cursor += 1
+                if (
+                    cursor + 2 < len(tokens)
+                    and _token_is_word(tokens[cursor], "if")
+                    and _token_is_word(tokens[cursor + 1], "not")
+                    and _token_is_word(tokens[cursor + 2], "exists")
+                ):
+                    cursor += 3
+                column_name = _migration_identifier(
+                    tokens[cursor], f"migration_{table_name}_add_column"
+                )
+                cursor += 1
+                type_end = cursor
+                depth = 0
+                while type_end < len(tokens):
+                    part = tokens[type_end]
+                    if part.value == "(":
+                        depth += 1
+                    elif part.value == ")":
+                        depth -= 1
+                    elif (
+                        depth == 0
+                        and part.kind == "WORD"
+                        and part.value.lower() in _MIGRATION_COLUMN_CONSTRAINT_WORDS
+                    ):
+                        break
+                    elif depth == 0 and part.value == ";":
+                        break
+                    type_end += 1
+                _append_migration_column(
+                    columns, table_name, column_name, tokens[cursor:type_end]
+                )
+            index = max(cursor, index + 1)
+            continue
+        index += 1
+
+
+def _ledger_create_table_sql() -> str:
+    source_path = ROOT / "webapp" / "postgres_migrations.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name != "_create_ledger":
+            continue
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and child.func.attr == "execute"
+                and child.args
+                and isinstance(child.args[0], ast.Constant)
+                and type(child.args[0].value) is str
+                and "create table public.sqag_schema_migrations" in child.args[0].value.lower()
+            ):
+                return child.args[0].value
+    raise ValueError("migration_ledger_create_table_sql_missing")
+
+
+@lru_cache(maxsize=1)
+def _cached_classified_table_column_contract(
+) -> tuple[tuple[str, tuple[tuple[int, str, int, str, str, int, bool], ...]], ...]:
+    columns: dict[str, list[tuple[str, int, str, str, int]]] = {}
+    for migration in migration_manifest(ROOT / "migrations"):
+        _apply_migration_column_ddl(
+            migration.path.read_text(encoding="utf-8"), columns
+        )
+    _apply_migration_column_ddl(_ledger_create_table_sql(), columns)
+    if set(columns) != ALL_TABLES:
+        raise ValueError(
+            "migration_classified_table_inventory_mismatch_"
+            f"expected_{sorted(ALL_TABLES)}_got_{sorted(columns)}"
+        )
+    return tuple(
+        (
+            table_name,
+            tuple(
+                (
+                    ordinal,
+                    column_name,
+                    type_oid,
+                    type_schema,
+                    type_name,
+                    type_modifier,
+                    False,
+                )
+                for ordinal, (
+                    column_name,
+                    type_oid,
+                    type_schema,
+                    type_name,
+                    type_modifier,
+                ) in enumerate(columns[table_name], start=1)
+            ),
+        )
+        for table_name in sorted(columns)
+    )
+
+
+def classified_table_column_contract() -> dict[str, list[dict[str, Any]]]:
+    """Derive exact classified-table columns from locked production migration DDL."""
+
+    return {
+        table_name: [
+            dict(zip(
+                ("ordinal", "name", "type_oid", "type_schema", "type_name", "type_modifier", "is_dropped"),
+                identity,
+                strict=True,
+            ))
+            for identity in identities
+        ]
+        for table_name, identities in _cached_classified_table_column_contract()
+    }
+
+
+def _validate_table_column_contract(
+    value: Any, label: str, errors: list[str]
+) -> tuple[tuple[int, str, int, str | None, str | None, int, bool], ...]:
+    if type(value) is not list:
+        _add_error(errors, f"{label}_must_be_list")
+        return ()
+    result: list[tuple[int, str, int, str | None, str | None, int, bool]] = []
+    seen_ordinals: set[int] = set()
+    for index, entry in enumerate(value):
+        entry_label = f"{label}_{index}"
+        if not isinstance(entry, dict):
+            _add_error(errors, f"{entry_label}_must_be_object")
+            continue
+        if not _exact_keys(entry, TABLE_COLUMN_IDENTITY_KEYS, entry_label, errors):
+            continue
+        ordinal = entry.get("ordinal")
+        name = entry.get("name")
+        type_oid = entry.get("type_oid")
+        type_schema = entry.get("type_schema")
+        type_name = entry.get("type_name")
+        type_modifier = entry.get("type_modifier")
+        is_dropped = entry.get("is_dropped")
+        _require_type(ordinal, int, f"{entry_label}_ordinal", errors)
+        _require_non_empty_string(name, f"{entry_label}_name", errors)
+        _require_type(type_oid, int, f"{entry_label}_type_oid", errors)
+        _require_type(type_modifier, int, f"{entry_label}_type_modifier", errors)
+        _require_type(is_dropped, bool, f"{entry_label}_is_dropped", errors)
+        if type(ordinal) is not int or type(name) is not str or type(type_oid) is not int:
+            continue
+        if type(type_modifier) is not int or type(is_dropped) is not bool:
+            continue
+        if ordinal <= 0:
+            _add_error(errors, f"{entry_label}_ordinal_invalid")
+        if ordinal in seen_ordinals:
+            _add_error(errors, f"{entry_label}_ordinal_duplicate_{ordinal}")
+        seen_ordinals.add(ordinal)
+        if is_dropped:
+            if type_schema is not None or type_name is not None or type_oid != 0:
+                _add_error(errors, f"{entry_label}_dropped_type_identity_invalid")
+        else:
+            _require_non_empty_string(type_schema, f"{entry_label}_type_schema", errors)
+            _require_non_empty_string(type_name, f"{entry_label}_type_name", errors)
+            if type(type_schema) is not str or type(type_name) is not str or type_oid <= 0:
+                continue
+        result.append(
+            (ordinal, name, type_oid, type_schema, type_name, type_modifier, is_dropped)
+        )
+    if [entry[0] for entry in result] != sorted(entry[0] for entry in result):
+        _add_error(errors, f"{label}_must_be_ordinal_ordered")
+    return tuple(result)
+
+
 def _classified_table_expected_columns(
     manifest: dict[str, Any], table_name: str
 ) -> dict[str, set[str]]:
@@ -2024,6 +2512,7 @@ def evaluate_public_table_like_authority(
     accessible, forbidden = _classified_table_manifest_entries(manifest)
     classified_names = set(accessible) | set(forbidden)
     expected_owner = _classified_table_object_owner(manifest)
+    expected_column_contracts = classified_table_column_contract()
     table_groups: dict[tuple[str, str], dict[str, Any]] = {}
     table_privilege_sets: dict[tuple[str, str], set[str]] = {}
 
@@ -2036,6 +2525,9 @@ def evaluate_public_table_like_authority(
             continue
         acl_entries = _validate_runtime_acl_entries(
             row.get("acl_entries"), f"{label}_acl_entries", errors, VIEW_RELATION_PRIVILEGES
+        )
+        column_contract = _validate_table_column_contract(
+            row.get("column_contract"), f"{label}_column_contract", errors
         )
         for key in ("schema_name", "table_name", "relation_kind", "relation_persistence", "owner", "privilege_type"):
             _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
@@ -2069,8 +2561,6 @@ def evaluate_public_table_like_authority(
         relation_persistence = str(row["relation_persistence"])
         privilege = str(row["privilege_type"])
         relation_key = (schema_name, table_name)
-        if schema_name != BOUND_SOURCE_SCHEMA:
-            _add_error(errors, f"{label}_schema_invalid")
         if relation_kind not in PUBLIC_TABLE_LIKE_RELKINDS:
             _add_error(errors, f"{label}_unknown_relation_kind_{relation_kind}")
         if relation_persistence not in PUBLIC_RELATION_PERSISTENCE_VALUES:
@@ -2089,6 +2579,7 @@ def evaluate_public_table_like_authority(
                 "owner": row["owner"],
                 "owner_select": row["owner_select"],
                 "visible_column_count": row["visible_column_count"],
+                "column_contract": column_contract,
                 "row_security_enabled": row["row_security_enabled"],
                 "row_security_forced": row["row_security_forced"],
                 "has_inheritance_descendants": row["has_inheritance_descendants"],
@@ -2110,6 +2601,8 @@ def evaluate_public_table_like_authority(
             _add_error(errors, f"{label}_row_security_forced_inconsistent")
         if relation["visible_column_count"] != row["visible_column_count"]:
             _add_error(errors, f"{label}_visible_column_count_inconsistent")
+        if relation["column_contract"] != column_contract:
+            _add_error(errors, f"{label}_column_contract_inconsistent")
         if relation["has_inheritance_descendants"] != row["has_inheritance_descendants"]:
             _add_error(errors, f"{label}_inheritance_evidence_inconsistent")
         privileges = table_privilege_sets.setdefault(relation_key, set())
@@ -2122,7 +2615,11 @@ def evaluate_public_table_like_authority(
         expected_effective = False
         tables = manifest.get("tables") if isinstance(manifest, dict) else None
         accessible = tables.get("runtime_accessible") if isinstance(tables, dict) else None
-        if isinstance(accessible, dict) and table_name in accessible:
+        if (
+            schema_name == BOUND_SOURCE_SCHEMA
+            and isinstance(accessible, dict)
+            and table_name in accessible
+        ):
             entry = accessible.get(table_name)
             privileges_for_table = entry.get("privileges") if isinstance(entry, dict) else None
             expected_effective = bool(
@@ -2228,8 +2725,6 @@ def evaluate_public_table_like_authority(
         column_name = str(row["column_name"])
         privilege = str(row["privilege_type"])
         relation_key = (schema_name, table_name)
-        if schema_name != BOUND_SOURCE_SCHEMA:
-            _add_error(errors, f"{label}_schema_invalid")
         if relation_key not in table_groups:
             _add_error(errors, f"{label}_relation_evidence_missing")
         if privilege not in expected_column_privileges:
@@ -2248,7 +2743,11 @@ def evaluate_public_table_like_authority(
         tables = manifest.get("tables") if isinstance(manifest, dict) else None
         accessible = tables.get("runtime_accessible") if isinstance(tables, dict) else None
         expected_effective = False
-        if isinstance(accessible, dict) and table_name in accessible:
+        if (
+            schema_name == BOUND_SOURCE_SCHEMA
+            and isinstance(accessible, dict)
+            and table_name in accessible
+        ):
             entry = accessible.get(table_name)
             table_privileges = entry.get("privileges") if isinstance(entry, dict) else None
             expected_effective = bool(
@@ -2291,6 +2790,64 @@ def evaluate_public_table_like_authority(
         if schema_name != BOUND_SOURCE_SCHEMA or table_name not in classified_names:
             continue
         label = f"public_table_classified_{schema_name}.{table_name}"
+        expected_contract = tuple(
+            (
+                entry["ordinal"],
+                entry["name"],
+                entry["type_oid"],
+                entry["type_schema"],
+                entry["type_name"],
+                entry["type_modifier"],
+                entry["is_dropped"],
+            )
+            for entry in expected_column_contracts.get(table_name, [])
+        )
+        actual_contract = relation["column_contract"]
+        actual_visible = tuple(entry for entry in actual_contract if not entry[6])
+        if len(actual_visible) != relation["visible_column_count"]:
+            _add_error(
+                errors,
+                f"{label}_column_contract_visible_count_mismatch_"
+                f"expected_{relation['visible_column_count']}_got_{len(actual_visible)}",
+            )
+        expected_by_name = {entry[1]: entry for entry in expected_contract}
+        actual_by_name = {entry[1]: entry for entry in actual_visible}
+        actual_by_ordinal = {entry[0]: entry for entry in actual_visible}
+        for expected_identity in expected_contract:
+            expected_ordinal, expected_name = expected_identity[:2]
+            actual_identity = actual_by_name.get(expected_name)
+            if actual_identity is None:
+                _add_error(errors, f"{label}_column_missing_{expected_name}")
+            else:
+                if actual_identity[0] != expected_ordinal:
+                    _add_error(
+                        errors,
+                        f"{label}_column_ordinal_mismatch_{expected_name}_"
+                        f"expected_{expected_ordinal}_got_{actual_identity[0]}",
+                    )
+                if actual_identity[2:6] != expected_identity[2:6]:
+                    _add_error(
+                        errors,
+                        f"{label}_column_type_mismatch_{expected_name}_"
+                        f"expected_{expected_identity[2:6]}_got_{actual_identity[2:6]}",
+                    )
+            ordinal_identity = actual_by_ordinal.get(expected_ordinal)
+            if ordinal_identity is not None and ordinal_identity[1] != expected_name:
+                _add_error(
+                    errors,
+                    f"{label}_column_name_mismatch_ordinal_{expected_ordinal}_"
+                    f"expected_{expected_name}_got_{ordinal_identity[1]}",
+                )
+        for actual_identity in actual_visible:
+            if actual_identity[1] not in expected_by_name:
+                _add_error(errors, f"{label}_column_unexpected_{actual_identity[1]}")
+        for dropped_identity in (entry for entry in actual_contract if entry[6]):
+            _add_error(
+                errors,
+                f"{label}_column_dropped_slot_{dropped_identity[0]}_{dropped_identity[1]}",
+            )
+        if actual_contract != expected_contract:
+            _add_error(errors, f"{label}_column_contract_exact_mismatch")
         expected_columns = _classified_table_expected_columns(manifest, table_name)
         for column_name, acl_entries in column_acl_groups.get(relation_key, {}).items():
             expected_direct = expected_columns.get(column_name, set())
@@ -2334,7 +2891,9 @@ def evaluate_bound_source_authority(
         return ("runtime_accessible_views_must_be_object",)
     classified_names = set(accessible)
     classified_present = any(
-        isinstance(row, dict) and row.get("relation_name") in classified_names
+        isinstance(row, dict)
+        and row.get("schema_name") == BOUND_SOURCE_SCHEMA
+        and row.get("relation_name") in classified_names
         for row in view_rows
     )
 
@@ -2534,7 +3093,7 @@ def evaluate_view_authority(
     expected_privileges = set(VIEW_RELATION_PRIVILEGES)
 
     legacy_rows: list[dict[str, Any]] = []
-    seen_names: set[str] = set()
+    seen_names: set[tuple[str, str]] = set()
     for index, row in enumerate(rows):
         label = f"relation_view_row_{index}"
         if not isinstance(row, dict):
@@ -2543,7 +3102,7 @@ def evaluate_view_authority(
         if not _exact_keys(row, VIEW_AUTHORITY_ROW_KEYS, label, errors):
             continue
 
-        for key in ("relation_name", "relation_kind", "owner"):
+        for key in ("schema_name", "relation_name", "relation_kind", "owner"):
             _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
         for key in ("runtime_select", "runtime_select_grantable"):
             _require_type(row.get(key), bool, f"{label}_{key}", errors)
@@ -2552,21 +3111,27 @@ def evaluate_view_authority(
             _add_error(errors, f"{label}_relation_acl_must_be_string_or_null")
 
         basic_types_valid = (
-            all(type(row.get(key)) is str for key in ("relation_name", "relation_kind", "owner"))
+            all(
+                type(row.get(key)) is str
+                for key in ("schema_name", "relation_name", "relation_kind", "owner")
+            )
             and all(type(row.get(key)) is bool for key in ("runtime_select", "runtime_select_grantable"))
         )
         if not basic_types_valid:
             continue
 
+        schema_name = str(row["schema_name"])
         name = str(row["relation_name"])
         kind = str(row["relation_kind"])
+        classified_here = schema_name == BOUND_SOURCE_SCHEMA and name in classified
         owner = str(row["owner"])
         runtime_select = bool(row["runtime_select"])
         grantable = bool(row["runtime_select_grantable"])
 
-        if name in seen_names:
-            _add_error(errors, f"{label}_duplicate_relation_view_row_same_relation_name")
-        seen_names.add(name)
+        relation_identity = (schema_name, name)
+        if relation_identity in seen_names:
+            _add_error(errors, f"{label}_duplicate_relation_view_row_same_relation_identity")
+        seen_names.add(relation_identity)
 
         acl_entries = row.get("acl_entries")
         valid_acl_entries: list[dict[str, Any]] = []
@@ -2615,10 +3180,10 @@ def evaluate_view_authority(
                         _add_error(errors, f"{entry_label}_owner_acl_grantor_invalid")
                     if is_grantable:
                         _add_error(errors, f"{entry_label}_owner_acl_grant_option_forbidden")
-                elif name in classified:
+                elif classified_here:
                     _add_error(errors, f"{entry_label}_unexpected_acl_grantee_{grantee}")
 
-        if name in classified:
+        if classified_here:
             owner_acl_semantics = {
                 (entry['grantee'], entry['grantor'], entry['privilege_type'], entry['is_grantable'])
                 for entry in valid_acl_entries
@@ -2693,7 +3258,7 @@ def evaluate_view_authority(
         view_definition = row.get('view_definition')
         if type(view_definition) is not str or not view_definition.strip():
             _add_error(errors, f'{label}_view_definition_must_be_non_empty_string')
-        if name in classified:
+        if classified_here:
             expected_definition = LEGACY_VIEW_DEFINITION
             if type(view_definition) is str:
                 try:
@@ -2717,7 +3282,7 @@ def evaluate_view_authority(
             kind=kind,
             owner=owner,
             runtime_role=runtime_role,
-            classified=name in classified,
+            classified=classified_here,
             runtime_select=runtime_select,
             runtime_select_grantable=grantable,
             column_identities=view_columns,
@@ -2735,7 +3300,8 @@ def evaluate_view_authority(
             privilege for privilege, (effective, _) in effective_privileges.items() if effective
         }
         if kind == "m":
-            _add_error(errors, f"{label}_materialized_view_unclassified")
+            if schema_name == BOUND_SOURCE_SCHEMA:
+                _add_error(errors, f"{label}_materialized_view_unclassified")
             if runtime_select or "SELECT" in effective_runtime:
                 _add_error(errors, f"{label}_materialized_view_runtime_select_forbidden")
             if grantable or any(is_grantable for _, is_grantable in effective_privileges.values()):
@@ -2744,7 +3310,7 @@ def evaluate_view_authority(
                 _add_error(errors, f"{label}_materialized_view_runtime_privilege_forbidden_{sorted(effective_runtime - {'SELECT'})}")
             continue
 
-        if name in classified:
+        if classified_here:
             legacy_rows.append(row)
             if expected_owner is not None and owner != expected_owner:
                 _add_error(errors, f"{label}_classified_view_owner_invalid_expected_{expected_owner}_got_{owner}")
@@ -2777,12 +3343,220 @@ def evaluate_view_authority(
     return tuple(errors)
 
 
+def _is_postgresql_system_schema(schema_name: str) -> bool:
+    return schema_name in {"pg_catalog", "information_schema", "pg_toast"} or bool(
+        re.fullmatch(r"pg_(?:toast_)?temp_[0-9]+", schema_name)
+    )
+
+
+def evaluate_schema_wide_runtime_authority(
+    manifest: dict[str, Any],
+    schema_privilege_rows: list[dict[str, Any]] | None,
+    sequence_privilege_rows: list[dict[str, Any]] | None,
+    routine_privilege_rows: list[dict[str, Any]] | None,
+) -> tuple[str, ...]:
+    """Reject runtime authority in every ordinary non-system schema."""
+
+    errors: list[str] = []
+    if schema_privilege_rows is not None:
+        if type(schema_privilege_rows) is not list:
+            errors.append("runtime_schema_privilege_evidence_must_be_list")
+            schema_privilege_rows = []
+        seen_schema_rows: set[tuple[str, str]] = set()
+        public_seen: dict[str, tuple[bool, bool]] = {}
+        schema_acl = manifest.get("schema_acl") if isinstance(manifest, dict) else None
+        public_runtime = schema_acl.get("sqag_runtime") if isinstance(schema_acl, dict) else None
+        expected_public = {
+            "USAGE": bool(isinstance(public_runtime, dict) and public_runtime.get("usage") is True),
+            "CREATE": bool(isinstance(public_runtime, dict) and public_runtime.get("create") is True),
+        }
+        for index, row in enumerate(schema_privilege_rows):
+            label = f"runtime_schema_row_{index}"
+            if not isinstance(row, dict):
+                _add_error(errors, f"{label}_must_be_object")
+                continue
+            if not _exact_keys(row, RUNTIME_SCHEMA_PRIVILEGE_ROW_KEYS, label, errors):
+                continue
+            schema_name = row.get("schema_name")
+            privilege = row.get("privilege_type")
+            effective = row.get("effective")
+            grantable = row.get("is_grantable")
+            _require_non_empty_string(schema_name, f"{label}_schema_name", errors)
+            _require_non_empty_string(privilege, f"{label}_privilege_type", errors)
+            _require_type(effective, bool, f"{label}_effective", errors)
+            _require_type(grantable, bool, f"{label}_is_grantable", errors)
+            if (
+                type(schema_name) is not str
+                or type(privilege) is not str
+                or type(effective) is not bool
+                or type(grantable) is not bool
+            ):
+                continue
+            if _is_postgresql_system_schema(schema_name):
+                _add_error(errors, f"{label}_system_schema_must_be_excluded_{schema_name}")
+            if privilege not in {"USAGE", "CREATE"}:
+                _add_error(errors, f"{label}_privilege_invalid_{privilege}")
+                continue
+            identity = (schema_name, privilege)
+            if identity in seen_schema_rows:
+                _add_error(errors, f"{label}_duplicate")
+            seen_schema_rows.add(identity)
+            if schema_name == BOUND_SOURCE_SCHEMA:
+                public_seen[privilege] = (effective, grantable)
+                if effective != expected_public[privilege]:
+                    _add_error(
+                        errors,
+                        f"runtime_schema_public_{privilege}_mismatch_"
+                        f"expected_{expected_public[privilege]}_got_{effective}",
+                    )
+                if grantable:
+                    _add_error(errors, f"runtime_schema_public_{privilege}_grant_option_forbidden")
+            elif effective or grantable:
+                _add_error(
+                    errors,
+                    f"runtime_schema_non_public_authority_{schema_name}_{privilege}_"
+                    f"effective_{effective}_grantable_{grantable}",
+                )
+        for privilege in ("USAGE", "CREATE"):
+            if privilege not in public_seen:
+                _add_error(errors, f"runtime_schema_public_{privilege}_evidence_missing")
+
+    if sequence_privilege_rows is not None:
+        if type(sequence_privilege_rows) is not list:
+            errors.append("runtime_sequence_privilege_evidence_must_be_list")
+            sequence_privilege_rows = []
+        sequence_groups: dict[tuple[str, str], set[str]] = {}
+        for index, row in enumerate(sequence_privilege_rows):
+            label = f"runtime_sequence_row_{index}"
+            if not isinstance(row, dict):
+                _add_error(errors, f"{label}_must_be_object")
+                continue
+            if not _exact_keys(row, RUNTIME_SEQUENCE_PRIVILEGE_ROW_KEYS, label, errors):
+                continue
+            schema_name = row.get("schema_name")
+            sequence_name = row.get("sequence_name")
+            privilege = row.get("privilege_type")
+            effective = row.get("effective")
+            grantable = row.get("is_grantable")
+            sequence_acl = row.get("sequence_acl")
+            for key, value in (
+                ("schema_name", schema_name),
+                ("sequence_name", sequence_name),
+                ("privilege_type", privilege),
+            ):
+                _require_non_empty_string(value, f"{label}_{key}", errors)
+            _require_type(effective, bool, f"{label}_effective", errors)
+            _require_type(grantable, bool, f"{label}_is_grantable", errors)
+            if sequence_acl is not None and type(sequence_acl) is not str:
+                _add_error(errors, f"{label}_sequence_acl_must_be_string_or_null")
+            if (
+                type(schema_name) is not str
+                or type(sequence_name) is not str
+                or type(privilege) is not str
+                or type(effective) is not bool
+                or type(grantable) is not bool
+            ):
+                continue
+            if _is_postgresql_system_schema(schema_name):
+                _add_error(errors, f"{label}_system_schema_must_be_excluded_{schema_name}")
+            if privilege not in {"USAGE", "SELECT", "UPDATE"}:
+                _add_error(errors, f"{label}_privilege_invalid_{privilege}")
+                continue
+            identity = (schema_name, sequence_name)
+            seen = sequence_groups.setdefault(identity, set())
+            if privilege in seen:
+                _add_error(errors, f"{label}_duplicate")
+            seen.add(privilege)
+            if schema_name == BOUND_SOURCE_SCHEMA:
+                _add_error(errors, f"runtime_sequence_public_unclassified_{sequence_name}")
+            elif effective or grantable:
+                _add_error(
+                    errors,
+                    f"runtime_sequence_non_public_authority_{schema_name}.{sequence_name}_{privilege}_"
+                    f"effective_{effective}_grantable_{grantable}",
+                )
+        expected_sequence_privileges = {"USAGE", "SELECT", "UPDATE"}
+        for identity, privileges in sequence_groups.items():
+            if privileges != expected_sequence_privileges:
+                _add_error(
+                    errors,
+                    f"runtime_sequence_privileges_incomplete_{identity[0]}.{identity[1]}_"
+                    f"expected_{sorted(expected_sequence_privileges)}_got_{sorted(privileges)}",
+                )
+
+    if routine_privilege_rows is not None:
+        if type(routine_privilege_rows) is not list:
+            errors.append("runtime_routine_privilege_evidence_must_be_list")
+            routine_privilege_rows = []
+        seen_routines: set[tuple[str, str, str, str]] = set()
+        for index, row in enumerate(routine_privilege_rows):
+            label = f"runtime_routine_row_{index}"
+            if not isinstance(row, dict):
+                _add_error(errors, f"{label}_must_be_object")
+                continue
+            if not _exact_keys(row, RUNTIME_ROUTINE_PRIVILEGE_ROW_KEYS, label, errors):
+                continue
+            for key in (
+                "schema_name",
+                "routine_name",
+                "identity_arguments",
+                "routine_kind",
+                "privilege_type",
+            ):
+                if key == "identity_arguments":
+                    if type(row.get(key)) is not str:
+                        _add_error(errors, f"{label}_{key}_must_be_string")
+                else:
+                    _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
+            _require_type(row.get("effective"), bool, f"{label}_effective", errors)
+            _require_type(row.get("is_grantable"), bool, f"{label}_is_grantable", errors)
+            if any(
+                type(row.get(key)) is not str
+                for key in (
+                    "schema_name",
+                    "routine_name",
+                    "identity_arguments",
+                    "routine_kind",
+                    "privilege_type",
+                )
+            ) or type(row.get("effective")) is not bool or type(row.get("is_grantable")) is not bool:
+                continue
+            schema_name = str(row["schema_name"])
+            routine_name = str(row["routine_name"])
+            identity_arguments = str(row["identity_arguments"])
+            routine_kind = str(row["routine_kind"])
+            privilege = str(row["privilege_type"])
+            if _is_postgresql_system_schema(schema_name):
+                _add_error(errors, f"{label}_system_schema_must_be_excluded_{schema_name}")
+            if routine_kind not in {"f", "p", "a", "w"}:
+                _add_error(errors, f"{label}_routine_kind_invalid_{routine_kind}")
+            if privilege != "EXECUTE":
+                _add_error(errors, f"{label}_privilege_invalid_{privilege}")
+            identity = (schema_name, routine_name, identity_arguments, routine_kind)
+            if identity in seen_routines:
+                _add_error(errors, f"{label}_duplicate")
+            seen_routines.add(identity)
+            if schema_name != BOUND_SOURCE_SCHEMA and (
+                row["effective"] or row["is_grantable"]
+            ):
+                _add_error(
+                    errors,
+                    f"runtime_routine_non_public_authority_{schema_name}.{routine_name}"
+                    f"({identity_arguments})_effective_{row['effective']}_"
+                    f"grantable_{row['is_grantable']}",
+                )
+    return tuple(errors)
+
+
 def evaluate_runtime_authority(
     manifest: dict[str, Any],
     view_rows: list[dict[str, Any]],
     table_privilege_rows: list[dict[str, Any]],
     column_privilege_rows: list[dict[str, Any]],
     *,
+    schema_privilege_rows: list[dict[str, Any]] | None = None,
+    sequence_privilege_rows: list[dict[str, Any]] | None = None,
+    routine_privilege_rows: list[dict[str, Any]] | None = None,
     runtime_role: str = "sqag_runtime",
 ) -> tuple[str, ...]:
     """Evaluate view ACLs plus the conditional bound-source table proof."""
@@ -2803,6 +3577,14 @@ def evaluate_runtime_authority(
             table_privilege_rows,
             column_privilege_rows,
             runtime_role=runtime_role,
+        )
+    )
+    errors.extend(
+        evaluate_schema_wide_runtime_authority(
+            manifest,
+            schema_privilege_rows,
+            sequence_privilege_rows,
+            routine_privilege_rows,
         )
     )
     return tuple(errors)
@@ -3520,7 +4302,7 @@ def _validate_view_query(query: str, errors: list[str]) -> None:
         _require_projection_shape(
             parts,
             [
-                'relation_name', 'relation_kind', 'owner', 'relation_acl', 'acl_entries',
+                'schema_name', 'relation_name', 'relation_kind', 'owner', 'relation_acl', 'acl_entries',
                 'column_acl_entries', 'view_definition', 'view_dependencies', 'view_columns',
                 'relation_options', 'view_security', 'runtime_privileges', 'runtime_select',
                 'runtime_select_grantable',
@@ -3547,9 +4329,13 @@ def _validate_view_query(query: str, errors: list[str]) -> None:
         ['a', '.', 'attacl'],
         ['d', '.', 'refclassid'],
         ['d', '.', 'deptype'],
-        ['where', 'n', '.', 'nspname', '=', ('STRING', 'public')],
+        ['n', '.', 'nspname', '<>', ('STRING', 'pg_catalog')],
+        ['n', '.', 'nspname', '<>', ('STRING', 'information_schema')],
+        ['n', '.', 'nspname', '<>', ('STRING', 'pg_toast')],
+        ['n', '.', 'nspname', '!', '~', ('STRING_EXACT', '^pg_temp_[0-9]+$')],
+        ['n', '.', 'nspname', '!', '~', ('STRING_EXACT', '^pg_toast_temp_[0-9]+$')],
         ['c', '.', 'relkind', 'in', '(', ('STRING_EXACT', 'v'), ',', ('STRING_EXACT', 'm'), ')'],
-        ['order', 'by', 'c', '.', 'relkind', ',', 'c', '.', 'relname'],
+        ['order', 'by', 'n', '.', 'nspname', ',', 'c', '.', 'relkind', ',', 'c', '.', 'relname'],
     )
     for pattern in required_patterns:
         if not _find_token_pattern(tokens, pattern):
