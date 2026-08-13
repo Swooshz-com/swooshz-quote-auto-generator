@@ -168,6 +168,13 @@ privileges, with both effective and grant-option checks false. Source evidence
 is validated whenever the exact source survives, while source existence remains
 conditional on the optional classified view.
 
+The exact PostgreSQL persistence evidence `relation_persistence` comes from
+`pg_class.relpersistence` and is shape-limited to `p`, `u`, or `t`. When the
+classified view exists, the bound source must be permanent (`p`); UNLOGGED
+(`u`), temporary (`t`), or malformed persistence fails closed. If the view is
+absent, a surviving source may retain valid non-permanent persistence as long
+as H11 runtime isolation remains clean.
+
 The contract also binds each column's ordinal, PostgreSQL
 type OID/schema/name/modifier/SQL identity, an empty relation-options object,
 and `security_barrier=false`, `security_invoker=false`, and no check option.
@@ -375,7 +382,7 @@ live-system evidence.
 | `role_memberships` | `role`, `member`, `grantor`, `admin_option`, `inherit_option`, `set_option` | 0 in the generic shape fixture; 1 exact runtime edge in the creator fixture |
 | `sequence_acl` | `relname`, `relacl` | 0 |
 | `effective_runtime_database_privileges` | `privilege_type`, `effective`, `is_grantable` | 3 |
-| `effective_runtime_table_privileges` | `schema_name`, `table_name`, `relation_kind`, `owner`, `owner_select`, `visible_column_count`, `row_security_enabled`, `row_security_forced`, `has_inheritance_descendants`, `privilege_type`, `effective`, `is_grantable` | 8 per enumerated public `r`/`p`/`f` relation; 128 in the base migrated fixture, plus 8 for each additional relation |
+| `effective_runtime_table_privileges` | `schema_name`, `table_name`, `relation_kind`, `relation_persistence`, `owner`, `owner_select`, `visible_column_count`, `row_security_enabled`, `row_security_forced`, `has_inheritance_descendants`, `privilege_type`, `effective`, `is_grantable` | 8 per enumerated public `r`/`p`/`f` relation; 128 in the base migrated fixture, plus 8 for each additional relation |
 | `effective_runtime_column_privileges` | `schema_name`, `table_name`, `column_name`, `privilege_type`, `effective`, `is_grantable` | 4 per visible column on each enumerated public `r`/`p`/`f` relation |
 | `effective_runtime_schema_privileges` | `privilege_type`, `effective`, `is_grantable` | 2 |
 | `effective_runtime_routine_privileges` | `routine_name`, `effective` | 2 |
@@ -498,7 +505,7 @@ unexpected ACL provenance, and any same-name relation duplicate.
 The remaining effective queries have the same exact-token binding. In
 particular, the membership query must preserve the complete six-field contract
 and aliases defined above; the table query must retain all eight privilege
-literals, owner/relation-kind/owner-select evidence, visible-column
+literals, owner/relation-kind/relation-persistence/owner-select evidence, visible-column
 cardinality, RLS flags, direct inheritance evidence, and the complete public
 `r`/`p`/`f` relation boundary; the column query must retain the same complete
 public table-like boundary plus the table, visible-column, and privilege
@@ -531,7 +538,7 @@ visible-column count, exact source RLS flags from `pg_class`, and direct
 inheritance evidence from `pg_inherits`. Whenever the exact bound source
 survives, the separate evaluator validates its complete table/column
 runtime-isolation evidence; when the classified legacy view exists, it
-additionally requires `relation_kind='r'`, owner other than `sqag_runtime`,
+additionally requires `relation_kind='r'`, `relation_persistence='p'`, owner other than `sqag_runtime`,
 `owner_select=true` for `sqag_migrator`, both RLS flags false, and no source
 inheritance descendants.
 The exact eight-privilege owner ACL completeness comparison applies to that

@@ -139,6 +139,7 @@ CANONICAL_QUERY_COLUMNS = {
         "schema_name",
         "table_name",
         "relation_kind",
+        "relation_persistence",
         "owner",
         "owner_select",
         "visible_column_count",
@@ -1734,6 +1735,7 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
             {
                 "schema_name": "public",
                 "table_name": "legacy_quote_artifacts_source",
+                "relation_persistence": "p",
                 "relation_kind": "r",
                 "owner": "sqag_migrator",
                 "owner_select": True,
@@ -1896,6 +1898,38 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
 
         source_table_rows, source_column_rows = self._bound_source_evidence()
         missing_owner_select = copy.deepcopy(source_table_rows)
+        unlogged_source = copy.deepcopy(source_table_rows)
+        for row in unlogged_source:
+            row["relation_persistence"] = "u"
+        self._assert_source_evidence_rejected(
+            [base],
+            unlogged_source,
+            source_column_rows,
+            "classified_view_source_relation_persistence_invalid",
+        )
+
+        malformed_persistence = copy.deepcopy(source_table_rows)
+        for row in malformed_persistence:
+            row["relation_persistence"] = "x"
+        self._assert_source_evidence_rejected(
+            [base],
+            malformed_persistence,
+            source_column_rows,
+            "unknown_relation_persistence_x",
+        )
+
+        surviving_non_permanent = copy.deepcopy(source_table_rows)
+        for row in surviving_non_permanent:
+            row["relation_persistence"] = "u"
+        self.assertEqual(
+            contract_validator.evaluate_runtime_authority(
+                self.manifest,
+                [],
+                surviving_non_permanent,
+                source_column_rows,
+            ),
+            (),
+        )
         missing_owner_select[0]["owner_select"] = False
         self._assert_source_evidence_rejected(
             [base],
@@ -5215,13 +5249,75 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         )
 
     def test_legacy_ordinary_view_with_bounded_select_is_accepted(self) -> None:
-        self.apply_migrations()
+        self._prepare_fixed_runtime_contract_fixture()
         source_table = self._create_legacy_quote_artifacts_view()
         self._grant_manifest_view_authority("sqag_runtime")
         self._assert_exact_runtime_view_grants("sqag_runtime")
         self.assertEqual(self._evaluate_runtime_authority_rows(), ())
 
         child_table = "legacy_quote_artifacts_source_child"
+        missing_table = "sqag_profiles"
+        missing_table_ident = _quote_identifier(missing_table)
+        runtime_ident = _quote_identifier("sqag_runtime")
+        self._execute_admin_sql(
+            f"revoke SELECT on table public.{missing_table_ident} from {runtime_ident}"
+        )
+        try:
+            missing_errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(
+                any(
+                    "public_table_row_" in error
+                    and "runtime_privilege_mismatch_SELECT_expected_True_got_False" in error
+                    for error in missing_errors
+                ),
+                missing_errors,
+            )
+        finally:
+            self._execute_admin_sql(
+                f"grant SELECT on table public.{missing_table_ident} to {runtime_ident}"
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        persistence_source_ident = f"public.{_quote_identifier(source_table)}"
+        self._execute_admin_sql(f"alter table {persistence_source_ident} set unlogged")
+        try:
+            persistence_columns, persistence_rows = self._execute_contract_query(
+                "effective_runtime_table_privileges"
+            )
+            self.assertEqual(
+                persistence_columns, CANONICAL_QUERY_COLUMNS["effective_runtime_table_privileges"]
+            )
+            persistence_values = {
+                str(row["relation_persistence"])
+                for row in persistence_rows
+                if str(row["table_name"]) == source_table
+            }
+            self.assertEqual(persistence_values, {"u"})
+            unlogged_errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(
+                any(
+                    "classified_view_source_relation_persistence_invalid" in error
+                    for error in unlogged_errors
+                ),
+                unlogged_errors,
+            )
+        finally:
+            self._execute_admin_sql(f"alter table {persistence_source_ident} set logged")
+
+        restored_columns, restored_rows = self._execute_contract_query(
+            "effective_runtime_table_privileges"
+        )
+        self.assertEqual(
+            restored_columns, CANONICAL_QUERY_COLUMNS["effective_runtime_table_privileges"]
+        )
+        restored_values = {
+            str(row["relation_persistence"])
+            for row in restored_rows
+            if str(row["table_name"]) == source_table
+        }
+        self.assertEqual(restored_values, {"p"})
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
         grandchild_table = "legacy_quote_artifacts_source_grandchild"
         child_ident = _quote_identifier(child_table)
         grandchild_ident = _quote_identifier(grandchild_table)
@@ -5307,6 +5403,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.assertTrue(all(row["schema_name"] == "public" for row in source_table_evidence))
         self.assertTrue(all(row["relation_kind"] == "r" for row in source_table_evidence))
         self.assertTrue(all(row["owner"] != "sqag_runtime" for row in source_table_evidence))
+        self.assertTrue(all(row["relation_persistence"] == "p" for row in source_table_evidence))
         self.assertTrue(all(row["owner_select"] for row in source_table_evidence))
         self.assertTrue(all(not row["row_security_enabled"] for row in source_table_evidence))
         self.assertTrue(all(not row["row_security_forced"] for row in source_table_evidence))

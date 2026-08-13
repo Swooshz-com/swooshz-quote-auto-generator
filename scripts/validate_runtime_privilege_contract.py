@@ -191,6 +191,7 @@ RUNTIME_TABLE_PRIVILEGE_ROW_KEYS = frozenset(
         "schema_name",
         "table_name",
         "relation_kind",
+        "relation_persistence",
         "owner",
         "owner_select",
         "visible_column_count",
@@ -395,6 +396,7 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
         select n.nspname as schema_name,
                c.relname as table_name,
                c.relkind as relation_kind,
+               c.relpersistence as relation_persistence,
                r.rolname as owner,
                has_table_privilege('sqag_migrator', c.oid, 'SELECT') as owner_select,
                (
@@ -718,6 +720,7 @@ FORBIDDEN_TABLES = frozenset(
         "sqag_schema_migrations",
     }
 )
+PUBLIC_RELATION_PERSISTENCE_VALUES = frozenset({"p", "u", "t"})
 ALL_TABLES = RUNTIME_TABLES | FORBIDDEN_TABLES
 PUBLIC_TABLE_LIKE_RELKINDS = frozenset({"r", "p", "f"})
 
@@ -864,6 +867,8 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "pg_catalog.pg_class",
         "pg_catalog.pg_namespace",
         "pg_catalog.pg_roles",
+        "relpersistence",
+        "relation_persistence",
         "c.relname",
         "relation_kind",
         "owner",
@@ -1890,7 +1895,7 @@ def evaluate_public_table_like_authority(
             continue
         if not _exact_keys(row, RUNTIME_TABLE_PRIVILEGE_ROW_KEYS, label, errors):
             continue
-        for key in ("schema_name", "table_name", "relation_kind", "owner", "privilege_type"):
+        for key in ("schema_name", "table_name", "relation_kind", "relation_persistence", "owner", "privilege_type"):
             _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
         _require_type(row.get("owner_select"), bool, f"{label}_owner_select", errors)
         _require_type(row.get("visible_column_count"), int, f"{label}_visible_column_count", errors)
@@ -1905,7 +1910,8 @@ def evaluate_public_table_like_authority(
         ):
             continue
         if (
-            type(row.get("owner_select")) is not bool
+            type(row.get("relation_persistence")) is not str
+            or type(row.get("owner_select")) is not bool
             or type(row.get("visible_column_count")) is not int
             or type(row.get("row_security_enabled")) is not bool
             or type(row.get("row_security_forced")) is not bool
@@ -1918,12 +1924,15 @@ def evaluate_public_table_like_authority(
         schema_name = str(row["schema_name"])
         table_name = str(row["table_name"])
         relation_kind = str(row["relation_kind"])
+        relation_persistence = str(row["relation_persistence"])
         privilege = str(row["privilege_type"])
         relation_key = (schema_name, table_name)
         if schema_name != BOUND_SOURCE_SCHEMA:
             _add_error(errors, f"{label}_schema_invalid")
         if relation_kind not in PUBLIC_TABLE_LIKE_RELKINDS:
             _add_error(errors, f"{label}_unknown_relation_kind_{relation_kind}")
+        if relation_persistence not in PUBLIC_RELATION_PERSISTENCE_VALUES:
+            _add_error(errors, f"{label}_unknown_relation_persistence_{relation_persistence}")
         if row["visible_column_count"] < 0:
             _add_error(errors, f"{label}_visible_column_count_invalid")
         if privilege not in expected_table_privileges:
@@ -1933,12 +1942,15 @@ def evaluate_public_table_like_authority(
             relation_key,
             {
                 "relation_kind": relation_kind,
+                "relation_persistence": relation_persistence,
                 "visible_column_count": row["visible_column_count"],
                 "has_inheritance_descendants": row["has_inheritance_descendants"],
             },
         )
         if relation["relation_kind"] != relation_kind:
             _add_error(errors, f"{label}_relation_kind_inconsistent")
+        if relation["relation_persistence"] != relation_persistence:
+            _add_error(errors, f"{label}_relation_persistence_inconsistent")
         if relation["visible_column_count"] != row["visible_column_count"]:
             _add_error(errors, f"{label}_visible_column_count_inconsistent")
         if relation["has_inheritance_descendants"] != row["has_inheritance_descendants"]:
@@ -2123,7 +2135,7 @@ def evaluate_bound_source_authority(
         label = f"bound_source_table_row_{index}"
         if not _exact_keys(row, RUNTIME_TABLE_PRIVILEGE_ROW_KEYS, label, errors):
             continue
-        for key in ("schema_name", "table_name", "relation_kind", "owner", "privilege_type"):
+        for key in ("schema_name", "table_name", "relation_kind", "relation_persistence", "owner", "privilege_type"):
             _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
         _require_type(row.get("owner_select"), bool, f"{label}_owner_select", errors)
         _require_type(row.get("visible_column_count"), int, f"{label}_visible_column_count", errors)
@@ -2134,11 +2146,12 @@ def evaluate_bound_source_authority(
         _require_type(row.get("is_grantable"), bool, f"{label}_is_grantable", errors)
         if any(
             type(row.get(key)) is not str
-            for key in ("schema_name", "table_name", "relation_kind", "owner", "privilege_type")
+            for key in ("schema_name", "table_name", "relation_kind", "relation_persistence", "owner", "privilege_type")
         ):
             continue
         if (
-            type(row.get("owner_select")) is not bool
+            type(row.get("relation_persistence")) is not str
+            or type(row.get("owner_select")) is not bool
             or type(row.get("visible_column_count")) is not int
             or type(row.get("row_security_enabled")) is not bool
             or type(row.get("row_security_forced")) is not bool
@@ -2160,6 +2173,13 @@ def evaluate_bound_source_authority(
             _add_error(errors, f"{label}_relation_invalid")
         if row["relation_kind"] != BOUND_SOURCE_RELKIND:
             _add_error(errors, f"{label}_relation_kind_invalid")
+        if row["relation_persistence"] not in PUBLIC_RELATION_PERSISTENCE_VALUES:
+            _add_error(errors, f"{label}_unknown_relation_persistence_{row['relation_persistence']}")
+        if classified_present and row["relation_persistence"] != "p":
+            _add_error(
+                errors,
+                f"{label}_classified_view_source_relation_persistence_invalid_expected_p_got_{row['relation_persistence']}",
+            )
         if row["owner"] == runtime_role:
             _add_error(errors, f"{label}_runtime_owner_forbidden")
         if classified_present and not row["owner_select"]:
@@ -3331,6 +3351,8 @@ def validate_verification_queries(manifest: dict[str, Any], errors: list[str]) -
                     "visible_column_count",
                     "has_inheritance_descendants",
                     "relrowsecurity",
+                    "relpersistence",
+                    "relation_persistence",
                     "relforcerowsecurity",
                     "row_security_enabled",
                     "row_security_forced",
