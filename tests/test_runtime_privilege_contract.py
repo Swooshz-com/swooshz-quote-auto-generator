@@ -4573,13 +4573,39 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.assertEqual(self._evaluate_runtime_authority_rows(), ())
 
         table_grantor = self._new_role('table_grantor')
-        self._execute_admin_sql('revoke select on table public."sqag_profiles" from "sqag_runtime"')
+        table_direct_grant_may_be_missing = False
+        table_upstream_grant_may_exist = False
+        table_downstream_grant_may_exist = False
+        table_cleanup_errors: list[str] = []
+
+        def run_table_cleanup(label: str, operation) -> None:
+            try:
+                operation()
+            except Exception as exc:
+                table_cleanup_errors.append(f'{label}:{exc}')
+
+        def revoke_table_downstream() -> None:
+            with self.as_role(table_grantor) as connection:
+                connection.execute('revoke select on table public."sqag_profiles" from "sqag_runtime"')
+                connection.commit()
+
+        def revoke_table_upstream() -> None:
+            with self.as_role('sqag_migrator') as connection:
+                connection.execute(
+                    f'revoke select on table public."sqag_profiles" from {_quote_identifier(table_grantor)}'
+                )
+                connection.commit()
+
         try:
+            table_direct_grant_may_be_missing = True
+            self._execute_admin_sql('revoke select on table public."sqag_profiles" from "sqag_runtime"')
+            table_upstream_grant_may_exist = True
             with self.as_role('sqag_migrator') as connection:
                 connection.execute(
                     f'grant select on table public."sqag_profiles" to {_quote_identifier(table_grantor)} with grant option'
                 )
                 connection.commit()
+            table_downstream_grant_may_exist = True
             with self.as_role(table_grantor) as connection:
                 connection.execute('grant select on table public."sqag_profiles" to "sqag_runtime"')
                 connection.commit()
@@ -4619,13 +4645,25 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             )
             self.assertIn(expected_table_error, wrong_grantor_errors)
         finally:
-            self._execute_admin_sql('revoke select on table public."sqag_profiles" from "sqag_runtime"')
-            with self.as_role('sqag_migrator') as connection:
-                connection.execute(
-                    f'revoke select on table public."sqag_profiles" from {_quote_identifier(table_grantor)}'
+            table_original_failure = sys.exc_info()[1]
+            if table_downstream_grant_may_exist:
+                run_table_cleanup('revoke_table_downstream_as_intermediary', revoke_table_downstream)
+            if table_upstream_grant_may_exist:
+                run_table_cleanup('revoke_table_upstream_as_owner', revoke_table_upstream)
+            if table_direct_grant_may_be_missing:
+                run_table_cleanup(
+                    'restore_table_direct_as_owner',
+                    lambda: self._grant_table_privilege(
+                        'sqag_runtime', 'sqag_profiles', 'SELECT', grantor_role='sqag_migrator'
+                    ),
                 )
-                connection.commit()
-            self._grant_table_privilege('sqag_runtime', 'sqag_profiles', 'SELECT', grantor_role='sqag_migrator')
+            if table_cleanup_errors:
+                message = 'table provenance cleanup failed: ' + '; '.join(table_cleanup_errors)
+                if table_original_failure is None:
+                    raise AssertionError(message)
+                add_note = getattr(table_original_failure, 'add_note', None)
+                if callable(add_note):
+                    add_note(message)
         self.assertEqual(self._evaluate_runtime_authority_rows(), ())
         _, restored_table_rows = self._execute_contract_query('effective_runtime_table_privileges')
         restored_table_row = next(
@@ -4689,14 +4727,44 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.assertEqual(self._evaluate_runtime_authority_rows(), ())
 
         column_grantor = self._new_role('column_grantor')
-        self._execute_admin_sql('revoke update ("checksum_sha256") on table public."sqag_quote_publication_artifacts" from "sqag_runtime"')
+        column_direct_grant_may_be_missing = False
+        column_upstream_grant_may_exist = False
+        column_downstream_grant_may_exist = False
+        column_cleanup_errors: list[str] = []
+
+        def run_column_cleanup(label: str, operation) -> None:
+            try:
+                operation()
+            except Exception as exc:
+                column_cleanup_errors.append(f'{label}:{exc}')
+
+        def revoke_column_downstream() -> None:
+            with self.as_role(column_grantor) as connection:
+                connection.execute(
+                    'revoke update ("checksum_sha256") on table public."sqag_quote_publication_artifacts" '
+                    'from "sqag_runtime"'
+                )
+                connection.commit()
+
+        def revoke_column_upstream() -> None:
+            with self.as_role('sqag_migrator') as connection:
+                connection.execute(
+                    f'revoke update ("checksum_sha256") on table public."sqag_quote_publication_artifacts" '
+                    f'from {_quote_identifier(column_grantor)}'
+                )
+                connection.commit()
+
         try:
+            column_direct_grant_may_be_missing = True
+            self._execute_admin_sql('revoke update ("checksum_sha256") on table public."sqag_quote_publication_artifacts" from "sqag_runtime"')
+            column_upstream_grant_may_exist = True
             with self.as_role('sqag_migrator') as connection:
                 connection.execute(
                     f'grant update ("checksum_sha256") on table public."sqag_quote_publication_artifacts" '
                     f'to {_quote_identifier(column_grantor)} with grant option'
                 )
                 connection.commit()
+            column_downstream_grant_may_exist = True
             with self.as_role(column_grantor) as connection:
                 connection.execute(
                     'grant update ("checksum_sha256") on table public."sqag_quote_publication_artifacts" '
@@ -4757,23 +4825,29 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             )
             self.assertIn(expected_column_error, column_grantor_errors)
         finally:
-            self._execute_admin_sql(
-                'revoke update ("checksum_sha256") on table public."sqag_quote_publication_artifacts" '
-                'from "sqag_runtime"'
-            )
-            with self.as_role('sqag_migrator') as connection:
-                connection.execute(
-                    f'revoke update ("checksum_sha256") on table public."sqag_quote_publication_artifacts" '
-                    f'from {_quote_identifier(column_grantor)}'
+            column_original_failure = sys.exc_info()[1]
+            if column_downstream_grant_may_exist:
+                run_column_cleanup('revoke_column_downstream_as_intermediary', revoke_column_downstream)
+            if column_upstream_grant_may_exist:
+                run_column_cleanup('revoke_column_upstream_as_owner', revoke_column_upstream)
+            if column_direct_grant_may_be_missing:
+                run_column_cleanup(
+                    'restore_column_direct_as_owner',
+                    lambda: self._grant_column_privilege(
+                        'sqag_runtime',
+                        'sqag_quote_publication_artifacts',
+                        'checksum_sha256',
+                        'UPDATE',
+                        grantor_role='sqag_migrator',
+                    ),
                 )
-                connection.commit()
-            self._grant_column_privilege(
-                'sqag_runtime',
-                'sqag_quote_publication_artifacts',
-                'checksum_sha256',
-                'UPDATE',
-                grantor_role='sqag_migrator',
-            )
+            if column_cleanup_errors:
+                message = 'column provenance cleanup failed: ' + '; '.join(column_cleanup_errors)
+                if column_original_failure is None:
+                    raise AssertionError(message)
+                add_note = getattr(column_original_failure, 'add_note', None)
+                if callable(add_note):
+                    add_note(message)
         self.assertEqual(self._evaluate_runtime_authority_rows(), ())
         _, restored_column_rows = self._execute_contract_query('effective_runtime_column_privileges')
         restored_column_row = next(
