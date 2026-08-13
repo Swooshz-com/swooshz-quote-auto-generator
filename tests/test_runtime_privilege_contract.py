@@ -140,6 +140,7 @@ CANONICAL_QUERY_COLUMNS = {
         "table_name",
         "relation_kind",
         "relation_persistence",
+        "acl_entries",
         "owner",
         "owner_select",
         "visible_column_count",
@@ -154,6 +155,7 @@ CANONICAL_QUERY_COLUMNS = {
         "schema_name",
         "table_name",
         "column_name",
+        "acl_entries",
         "privilege_type",
         "effective",
         "is_grantable",
@@ -1736,6 +1738,7 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
                 "schema_name": "public",
                 "table_name": "legacy_quote_artifacts_source",
                 "relation_persistence": "p",
+                "acl_entries": [],
                 "relation_kind": "r",
                 "owner": "sqag_migrator",
                 "owner_select": True,
@@ -1753,6 +1756,7 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
             {
                 "schema_name": "public",
                 "table_name": "legacy_quote_artifacts_source",
+                "acl_entries": [],
                 "column_name": column["name"],
                 "privilege_type": privilege,
                 "effective": False,
@@ -2166,6 +2170,223 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
         security = copy.deepcopy(base)
         security['view_security']['security_invoker'] = True
         self._assert_rejected([security], 'classified_view_security_mismatch')
+        table_rows: list[dict[str, Any]] = []
+        column_rows: list[dict[str, Any]] = []
+        for table_name, entry in self.manifest['tables']['runtime_accessible'].items():
+            table_privileges = entry['privileges']
+            table_acl = [
+                {
+                    'grantee': 'sqag_migrator',
+                    'grantor': 'sqag_migrator',
+                    'privilege_type': privilege,
+                    'is_grantable': False,
+                }
+                for privilege in TABLE_PRIVILEGES
+            ]
+            table_acl.extend(
+                {
+                    'grantee': 'sqag_runtime',
+                    'grantor': 'sqag_migrator',
+                    'privilege_type': privilege,
+                    'is_grantable': False,
+                }
+                for privilege in TABLE_PRIVILEGES
+                if table_privileges.get(privilege.lower()) is True
+            )
+            visible_column_count = 1 if table_name == 'sqag_quote_publication_artifacts' else 0
+            for privilege in TABLE_PRIVILEGES:
+                table_rows.append(
+                    {
+                        'schema_name': 'public',
+                        'table_name': table_name,
+                        'relation_kind': 'r',
+                        'relation_persistence': 'p',
+                        'acl_entries': copy.deepcopy(table_acl),
+                        'owner': 'sqag_migrator',
+                        'owner_select': True,
+                        'visible_column_count': visible_column_count,
+                        'row_security_enabled': False,
+                        'row_security_forced': False,
+                        'has_inheritance_descendants': False,
+                        'privilege_type': privilege,
+                        'effective': table_privileges.get(privilege.lower()) is True,
+                        'is_grantable': False,
+                    }
+                )
+        for table_name in self.manifest['tables']['runtime_forbidden']:
+            table_acl = [
+                {
+                    'grantee': 'sqag_migrator',
+                    'grantor': 'sqag_migrator',
+                    'privilege_type': privilege,
+                    'is_grantable': False,
+                }
+                for privilege in TABLE_PRIVILEGES
+            ]
+            for privilege in TABLE_PRIVILEGES:
+                table_rows.append(
+                    {
+                        'schema_name': 'public',
+                        'table_name': table_name,
+                        'relation_kind': 'r',
+                        'relation_persistence': 'p',
+                        'acl_entries': copy.deepcopy(table_acl),
+                        'owner': 'sqag_migrator',
+                        'owner_select': True,
+                        'visible_column_count': 0,
+                        'row_security_enabled': False,
+                        'row_security_forced': False,
+                        'has_inheritance_descendants': False,
+                        'privilege_type': privilege,
+                        'effective': False,
+                        'is_grantable': False,
+                    }
+                )
+        publication_column_acl = [
+            {
+                'grantee': 'sqag_runtime',
+                'grantor': 'sqag_migrator',
+                'privilege_type': 'UPDATE',
+                'is_grantable': False,
+            }
+        ]
+        for privilege in COLUMN_PRIVILEGES:
+            column_rows.append(
+                {
+                    'schema_name': 'public',
+                    'table_name': 'sqag_quote_publication_artifacts',
+                    'column_name': 'checksum_sha256',
+                    'acl_entries': copy.deepcopy(publication_column_acl),
+                    'privilege_type': privilege,
+                    'effective': privilege in {'SELECT', 'INSERT', 'UPDATE'},
+                    'is_grantable': False,
+                }
+            )
+        table_rows.extend(
+            {
+                'schema_name': 'public',
+                'table_name': 'unrelated_partitioned',
+                'relation_kind': 'p',
+                'relation_persistence': 'u',
+                'acl_entries': [],
+                'owner': 'sqag_app',
+                'owner_select': False,
+                'visible_column_count': 0,
+                'row_security_enabled': True,
+                'row_security_forced': True,
+                'has_inheritance_descendants': True,
+                'privilege_type': privilege,
+                'effective': False,
+                'is_grantable': False,
+            }
+            for privilege in TABLE_PRIVILEGES
+        )
+        self.assertEqual(
+            contract_validator.evaluate_public_table_like_authority(
+                self.manifest, table_rows, column_rows
+            ),
+            (),
+        )
+
+        def assert_table_case(
+            candidate_tables: list[dict[str, Any]],
+            candidate_columns: list[dict[str, Any]],
+            fragment: str,
+        ) -> None:
+            errors = contract_validator.evaluate_public_table_like_authority(
+                self.manifest, candidate_tables, candidate_columns
+            )
+            self.assertTrue(any(fragment in error for error in errors), errors)
+
+        for missing_name in ('sqag_profiles', 'sqag_schema_migrations'):
+            with self.subTest(classified_table_missing=missing_name):
+                candidate = [row for row in table_rows if row['table_name'] != missing_name]
+                assert_table_case(candidate, column_rows, f'public_table_classified_relation_missing_{missing_name}')
+
+        for field, fragment, value in (
+            ('row_security_enabled', 'row_security_enabled_forbidden', True),
+            ('row_security_forced', 'row_security_forced_forbidden', True),
+            ('relation_persistence', 'relation_persistence_invalid', 'u'),
+            ('relation_persistence', 'relation_persistence_invalid', 'x'),
+            ('owner', 'owner_invalid', 'sqag_app'),
+            ('has_inheritance_descendants', 'inheritance_descendants_forbidden', True),
+        ):
+            with self.subTest(classified_table_state=field, value=value):
+                candidate = copy.deepcopy(table_rows)
+                next(row for row in candidate if row['table_name'] == 'sqag_profiles')[field] = value
+                assert_table_case(candidate, column_rows, f'public.sqag_profiles_{fragment}')
+
+        public_substitution = copy.deepcopy(table_rows)
+        for row in public_substitution:
+            if row['table_name'] == 'sqag_profiles':
+                row['acl_entries'] = [
+                    entry for entry in row['acl_entries']
+                    if not (entry['grantee'] == 'sqag_runtime' and entry['privilege_type'] == 'SELECT')
+                ] + [
+                    {
+                        'grantee': 'PUBLIC',
+                        'grantor': 'sqag_migrator',
+                        'privilege_type': 'SELECT',
+                        'is_grantable': False,
+                    }
+                ]
+        assert_table_case(public_substitution, column_rows, 'public.sqag_profiles_acl_public_authority_forbidden')
+
+        wrong_grantor = copy.deepcopy(table_rows)
+        for row in wrong_grantor:
+            if row['table_name'] == 'sqag_profiles':
+                for entry in row['acl_entries']:
+                    if entry['grantee'] == 'sqag_runtime' and entry['privilege_type'] == 'SELECT':
+                        entry['grantor'] = 'sqag_app'
+        assert_table_case(wrong_grantor, column_rows, 'public.sqag_profiles_acl_runtime_grantor_invalid')
+
+        table_grant_option = copy.deepcopy(table_rows)
+        for row in table_grant_option:
+            if row['table_name'] == 'sqag_profiles':
+                for entry in row['acl_entries']:
+                    if entry['grantee'] == 'sqag_runtime' and entry['privilege_type'] == 'SELECT':
+                        entry['is_grantable'] = True
+        assert_table_case(table_grant_option, column_rows, 'public.sqag_profiles_acl_runtime_grant_option_forbidden')
+
+        extra_direct = copy.deepcopy(table_rows)
+        for row in extra_direct:
+            if row['table_name'] == 'sqag_generation_evidence':
+                row['acl_entries'].append(
+                    {
+                        'grantee': 'sqag_runtime',
+                        'grantor': 'sqag_migrator',
+                        'privilege_type': 'UPDATE',
+                        'is_grantable': False,
+                    }
+                )
+        assert_table_case(extra_direct, column_rows, 'public.sqag_generation_evidence_acl_provenance_mismatch')
+
+        column_public_substitution = copy.deepcopy(column_rows)
+        for row in column_public_substitution:
+            row['acl_entries'] = [
+                {
+                    'grantee': 'PUBLIC',
+                    'grantor': 'sqag_migrator',
+                    'privilege_type': 'UPDATE',
+                    'is_grantable': False,
+                }
+            ]
+        assert_table_case(table_rows, column_public_substitution, 'column_acl_public_authority_forbidden')
+
+        column_wrong_grantor = copy.deepcopy(column_rows)
+        for row in column_wrong_grantor:
+            row['acl_entries'][0]['grantor'] = 'sqag_app'
+        assert_table_case(table_rows, column_wrong_grantor, 'column_acl_runtime_grantor_invalid')
+
+        column_grant_option = copy.deepcopy(column_rows)
+        for row in column_grant_option:
+            row['acl_entries'][0]['is_grantable'] = True
+        assert_table_case(table_rows, column_grant_option, 'column_acl_runtime_grant_option_forbidden')
+
+        column_missing = copy.deepcopy(column_rows)
+        for row in column_missing:
+            row['acl_entries'] = []
+        assert_table_case(table_rows, column_missing, 'column_acl_provenance_mismatch_checksum_sha256')
 
     def test_materialized_view_effective_select_is_rejected(self) -> None:
         self._assert_rejected(
@@ -2904,15 +3125,29 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             ]
         )
 
-    def _grant_table_privilege(self, role_name: str, table_name: str, privilege: str) -> None:
+    def _grant_table_privilege(
+        self,
+        role_name: str,
+        table_name: str,
+        privilege: str,
+        *,
+        grantor_role: str | None = None,
+    ) -> None:
         if table_name not in ALL_TABLES or privilege not in set(TABLE_PRIVILEGES):
             raise ValueError(f"invalid table grant: {table_name}:{privilege}")
         connection = self.connect()
         try:
+            if grantor_role is not None:
+                connection.execute(f"set role {_quote_identifier(grantor_role)}")
             connection.execute(
                 f"grant {privilege} on table {_quote_identifier(table_name)} to {_quote_identifier(role_name)}"
             )
+            if grantor_role is not None:
+                connection.execute("reset role")
             connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()
         self.addCleanup(self._revoke_table_privilege, role_name, table_name, privilege)
@@ -2926,6 +3161,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         *,
         grantee: str | None = None,
         with_grant_option: bool = False,
+        grantor_role: str | None = None,
     ) -> None:
         if table_name not in ALL_TABLES or privilege not in set(COLUMN_PRIVILEGES):
             raise ValueError(f"invalid column grant: {table_name}:{column_name}:{privilege}")
@@ -2934,11 +3170,18 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         option = " with grant option" if with_grant_option else ""
         connection = self.connect()
         try:
+            if grantor_role is not None:
+                connection.execute(f"set role {_quote_identifier(grantor_role)}")
             connection.execute(
                 f"grant {privilege} ({_quote_identifier(column_name)}) on table "
                 f"{_quote_identifier(table_name)} to {target_sql}{option}"
             )
+            if grantor_role is not None:
+                connection.execute("reset role")
             connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()
         self.addCleanup(
@@ -3606,11 +3849,11 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         for table_name, entry in self.contract["tables"]["runtime_accessible"].items():
             for privilege, allowed in entry["privileges"].items():
                 if allowed:
-                    self._grant_table_privilege("sqag_runtime", table_name, privilege.upper())
+                    self._grant_table_privilege("sqag_runtime", table_name, privilege.upper(), grantor_role="sqag_migrator")
         for table_name, grants in EXPLICIT_COLUMN_PRIVILEGES.items():
             for privilege, column_names in grants.items():
                 for column_name in column_names:
-                    self._grant_column_privilege("sqag_runtime", table_name, column_name, privilege)
+                    self._grant_column_privilege("sqag_runtime", table_name, column_name, privilege, grantor_role="sqag_migrator")
         self._alter_public_database_privilege("TEMPORARY", False)
         owner_name = self._new_role("query_owner")
         grantee_name = self._new_role("query_grantee")
@@ -4120,6 +4363,193 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         routine_rows = results["effective_runtime_routine_privileges"][1]
         self.assertEqual({str(row["routine_name"]) for row in routine_rows}, set(EXPECTED_ROUTINES))
         self.assertTrue(all(bool(row["effective"]) for row in routine_rows))
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+        table_acl = next(
+            row['acl_entries']
+            for row in table_rows
+            if row['table_name'] == 'sqag_profiles' and row['privilege_type'] == 'SELECT'
+        )
+        self.assertIn(
+            {
+                'grantee': 'sqag_runtime',
+                'grantor': 'sqag_migrator',
+                'privilege_type': 'SELECT',
+                'is_grantable': False,
+            },
+            table_acl,
+        )
+        column_acl = next(
+            row['acl_entries']
+            for row in column_rows
+            if row['table_name'] == 'sqag_quote_publication_artifacts'
+            and row['column_name'] == 'checksum_sha256'
+        )
+        self.assertIn(
+            {
+                'grantee': 'sqag_runtime',
+                'grantor': 'sqag_migrator',
+                'privilege_type': 'UPDATE',
+                'is_grantable': False,
+            },
+            column_acl,
+        )
+
+        self._execute_admin_sql('alter table public."sqag_profiles" enable row level security')
+        try:
+            _, rls_rows = self._execute_contract_query('effective_runtime_table_privileges')
+            self.assertTrue(
+                all(row['row_security_enabled'] for row in rls_rows if row['table_name'] == 'sqag_profiles')
+            )
+            rls_errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(any('public.sqag_profiles_row_security_enabled_forbidden' in error for error in rls_errors), rls_errors)
+        finally:
+            self._execute_admin_sql('alter table public."sqag_profiles" disable row level security')
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        self._execute_admin_sql('alter table public."sqag_profiles" enable row level security')
+        self._execute_admin_sql('alter table public."sqag_profiles" force row level security')
+        try:
+            _, forced_rows = self._execute_contract_query('effective_runtime_table_privileges')
+            self.assertTrue(
+                all(row['row_security_forced'] for row in forced_rows if row['table_name'] == 'sqag_profiles')
+            )
+            forced_errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(any('public.sqag_profiles_row_security_forced_forbidden' in error for error in forced_errors), forced_errors)
+        finally:
+            self._execute_admin_sql('alter table public."sqag_profiles" no force row level security')
+            self._execute_admin_sql('alter table public."sqag_profiles" disable row level security')
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        self._execute_admin_sql('alter table public."sqag_profiles" set unlogged')
+        try:
+            _, unlogged_rows = self._execute_contract_query('effective_runtime_table_privileges')
+            self.assertEqual(
+                {row['relation_persistence'] for row in unlogged_rows if row['table_name'] == 'sqag_profiles'},
+                {'u'},
+            )
+            unlogged_errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(any('public.sqag_profiles_relation_persistence_invalid' in error for error in unlogged_errors), unlogged_errors)
+        finally:
+            self._execute_admin_sql('alter table public."sqag_profiles" set logged')
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        wrong_owner = self._new_role('classified_table_wrong_owner')
+        self._execute_admin_sql(
+            f'alter table public."sqag_profiles" owner to {_quote_identifier(wrong_owner)}'
+        )
+        try:
+            _, wrong_owner_rows = self._execute_contract_query('effective_runtime_table_privileges')
+            self.assertEqual(
+                {row['owner'] for row in wrong_owner_rows if row['table_name'] == 'sqag_profiles'},
+                {wrong_owner},
+            )
+            wrong_owner_errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(any('public.sqag_profiles_owner_invalid' in error for error in wrong_owner_errors), wrong_owner_errors)
+        finally:
+            self._execute_admin_sql('alter table public."sqag_profiles" owner to "sqag_migrator"')
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        child_name = f'sqag_rpc_classified_child_{uuid.uuid4().hex[:8]}'
+        with self.as_role('sqag_migrator') as connection:
+            connection.execute(
+                f'create table public.{_quote_identifier(child_name)} () inherits (public."sqag_profiles")'
+            )
+            connection.commit()
+        try:
+            _, inherited_rows = self._execute_contract_query('effective_runtime_table_privileges')
+            self.assertTrue(
+                all(row['has_inheritance_descendants'] for row in inherited_rows if row['table_name'] == 'sqag_profiles')
+            )
+            inherited_errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(any('public.sqag_profiles_inheritance_descendants_forbidden' in error for error in inherited_errors), inherited_errors)
+        finally:
+            self._execute_admin_sql(f'drop table if exists public.{_quote_identifier(child_name)}')
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        self._execute_admin_sql('revoke select on table public."sqag_profiles" from "sqag_runtime"')
+        self._execute_admin_sql('grant select on table public."sqag_profiles" to public')
+        try:
+            self.assertTrue(self._has_table_privilege('sqag_runtime', 'sqag_profiles', 'SELECT'))
+            public_table_errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(any('public.sqag_profiles_acl_public_authority_forbidden' in error for error in public_table_errors), public_table_errors)
+        finally:
+            self._execute_admin_sql('revoke select on table public."sqag_profiles" from public')
+            self._grant_table_privilege('sqag_runtime', 'sqag_profiles', 'SELECT', grantor_role='sqag_migrator')
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        self._execute_admin_sql('revoke select on table public."sqag_profiles" from "sqag_runtime"')
+        with self.as_role('sqag_migrator') as connection:
+            connection.execute('grant select on table public."sqag_profiles" to "sqag_runtime" with grant option')
+            connection.commit()
+        try:
+            self.assertTrue(self._has_table_privilege('sqag_runtime', 'sqag_profiles', 'SELECT'))
+            grant_option_errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(any('public.sqag_profiles_acl_runtime_grant_option_forbidden' in error for error in grant_option_errors), grant_option_errors)
+        finally:
+            self._execute_admin_sql('revoke select on table public."sqag_profiles" from "sqag_runtime"')
+            self._grant_table_privilege('sqag_runtime', 'sqag_profiles', 'SELECT', grantor_role='sqag_migrator')
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        self._execute_admin_sql('revoke select on table public."sqag_profiles" from "sqag_runtime"')
+        self._execute_admin_sql('grant select on table public."sqag_profiles" to "sqag_runtime"')
+        try:
+            wrong_grantor_errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(any('public.sqag_profiles_acl_runtime_grantor_invalid' in error for error in wrong_grantor_errors), wrong_grantor_errors)
+        finally:
+            self._execute_admin_sql('revoke select on table public."sqag_profiles" from "sqag_runtime"')
+            self._grant_table_privilege('sqag_runtime', 'sqag_profiles', 'SELECT', grantor_role='sqag_migrator')
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        with self.as_role('sqag_migrator') as connection:
+            connection.execute('grant update on table public."sqag_generation_evidence" to "sqag_runtime"')
+            connection.commit()
+        try:
+            extra_direct_errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(any('sqag_generation_evidence_acl_provenance_mismatch' in error for error in extra_direct_errors), extra_direct_errors)
+        finally:
+            self._execute_admin_sql('revoke update on table public."sqag_generation_evidence" from "sqag_runtime"')
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        self._execute_admin_sql('revoke update ("checksum_sha256") on table public."sqag_quote_publication_artifacts" from "sqag_runtime"')
+        self._execute_admin_sql('grant update ("checksum_sha256") on table public."sqag_quote_publication_artifacts" to public')
+        try:
+            self.assertTrue(self._has_column_privilege('sqag_runtime', 'sqag_quote_publication_artifacts', 'checksum_sha256', 'UPDATE'))
+            public_column_errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(any('column_acl_public_authority_forbidden' in error for error in public_column_errors), public_column_errors)
+        finally:
+            self._execute_admin_sql('revoke update ("checksum_sha256") on table public."sqag_quote_publication_artifacts" from public')
+            self._grant_column_privilege('sqag_runtime', 'sqag_quote_publication_artifacts', 'checksum_sha256', 'UPDATE', grantor_role='sqag_migrator')
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        self._execute_admin_sql('revoke update ("checksum_sha256") on table public."sqag_quote_publication_artifacts" from "sqag_runtime"')
+        with self.as_role('sqag_migrator') as connection:
+            connection.execute('grant update ("checksum_sha256") on table public."sqag_quote_publication_artifacts" to "sqag_runtime" with grant option')
+            connection.commit()
+        try:
+            column_option_errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(any('column_acl_runtime_grant_option_forbidden' in error for error in column_option_errors), column_option_errors)
+        finally:
+            self._execute_admin_sql('revoke update ("checksum_sha256") on table public."sqag_quote_publication_artifacts" from "sqag_runtime"')
+            self._grant_column_privilege('sqag_runtime', 'sqag_quote_publication_artifacts', 'checksum_sha256', 'UPDATE', grantor_role='sqag_migrator')
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        self._execute_admin_sql('revoke update ("checksum_sha256") on table public."sqag_quote_publication_artifacts" from "sqag_runtime"')
+        self._execute_admin_sql('grant update ("checksum_sha256") on table public."sqag_quote_publication_artifacts" to "sqag_runtime"')
+        try:
+            column_grantor_errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(any('column_acl_runtime_grantor_invalid' in error for error in column_grantor_errors), column_grantor_errors)
+        finally:
+            self._execute_admin_sql('revoke update ("checksum_sha256") on table public."sqag_quote_publication_artifacts" from "sqag_runtime"')
+            self._grant_column_privilege('sqag_runtime', 'sqag_quote_publication_artifacts', 'checksum_sha256', 'UPDATE', grantor_role='sqag_migrator')
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        # The migration ledger has no dependents. Drop it only at the end of this
+        # disposable test so database teardown is the guaranteed restoration.
+        self._execute_admin_sql('drop table public."sqag_schema_migrations"')
+        _, missing_table_rows = self._execute_contract_query('effective_runtime_table_privileges')
+        self.assertFalse(any(row['table_name'] == 'sqag_schema_migrations' for row in missing_table_rows))
+        missing_manifest_errors = self._evaluate_runtime_authority_rows()
+        self.assertTrue(any('public_table_classified_relation_missing_sqag_schema_migrations' in error for error in missing_manifest_errors), missing_manifest_errors)
 
     def test_role_membership_query_executes_and_invalid_alias_fails(self) -> None:
         invalid_query = self.contract["verification_queries"]["role_memberships"].replace(

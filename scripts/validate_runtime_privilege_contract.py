@@ -192,6 +192,7 @@ RUNTIME_TABLE_PRIVILEGE_ROW_KEYS = frozenset(
         "table_name",
         "relation_kind",
         "relation_persistence",
+        "acl_entries",
         "owner",
         "owner_select",
         "visible_column_count",
@@ -204,7 +205,7 @@ RUNTIME_TABLE_PRIVILEGE_ROW_KEYS = frozenset(
     }
 )
 RUNTIME_COLUMN_PRIVILEGE_ROW_KEYS = frozenset(
-    {"schema_name", "table_name", "column_name", "privilege_type", "effective", "is_grantable"}
+    {"schema_name", "table_name", "column_name", "acl_entries", "privilege_type", "effective", "is_grantable"}
 )
 
 MATERIALIZED_VIEW_RULE = (
@@ -397,6 +398,7 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                c.relname as table_name,
                c.relkind as relation_kind,
                c.relpersistence as relation_persistence,
+               acl.acl_entries,
                r.rolname as owner,
                has_table_privilege('sqag_migrator', c.oid, 'SELECT') as owner_select,
                (
@@ -423,6 +425,23 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
         from pg_catalog.pg_class c
         join pg_catalog.pg_namespace n on n.oid = c.relnamespace
         join pg_catalog.pg_roles r on r.oid = c.relowner
+        cross join lateral (
+            select coalesce(
+                       jsonb_agg(
+                           jsonb_build_object(
+                               'grantee', case when expanded.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'OID:' || expanded.grantee::text) end,
+                               'grantor', coalesce(grantor_role.rolname, 'OID:' || expanded.grantor::text),
+                               'privilege_type', expanded.privilege_type,
+                               'is_grantable', expanded.is_grantable
+                           )
+                           order by expanded.grantee, expanded.grantor, expanded.privilege_type, expanded.is_grantable
+                       ),
+                       '[]'::jsonb
+                   ) as acl_entries
+            from pg_catalog.aclexplode(coalesce(c.relacl, pg_catalog.acldefault('r', c.relowner))) expanded
+            left join pg_catalog.pg_roles grantee_role on grantee_role.oid = expanded.grantee and expanded.grantee <> 0
+            left join pg_catalog.pg_roles grantor_role on grantor_role.oid = expanded.grantor
+        ) acl
         cross join (
             values
                 ('SELECT'),
@@ -442,6 +461,7 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
         select n.nspname as schema_name,
                c.relname as table_name,
                a.attname as column_name,
+               acl.acl_entries,
                p.privilege_type,
                has_column_privilege('sqag_runtime', c.oid, a.attname, p.privilege_type) as effective,
                has_column_privilege(
@@ -453,6 +473,23 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
         from pg_catalog.pg_class c
         join pg_catalog.pg_namespace n on n.oid = c.relnamespace
         join pg_catalog.pg_attribute a on a.attrelid = c.oid
+        cross join lateral (
+            select coalesce(
+                       jsonb_agg(
+                           jsonb_build_object(
+                               'grantee', case when expanded.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'OID:' || expanded.grantee::text) end,
+                               'grantor', coalesce(grantor_role.rolname, 'OID:' || expanded.grantor::text),
+                               'privilege_type', expanded.privilege_type,
+                               'is_grantable', expanded.is_grantable
+                           )
+                           order by expanded.grantee, expanded.grantor, expanded.privilege_type, expanded.is_grantable
+                       ),
+                       '[]'::jsonb
+                   ) as acl_entries
+            from pg_catalog.aclexplode(a.attacl) expanded
+            left join pg_catalog.pg_roles grantee_role on grantee_role.oid = expanded.grantee and expanded.grantee <> 0
+            left join pg_catalog.pg_roles grantor_role on grantor_role.oid = expanded.grantor
+        ) acl
         cross join (
             values
                 ('SELECT'),
@@ -867,6 +904,16 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "pg_catalog.pg_class",
         "pg_catalog.pg_namespace",
         "pg_catalog.pg_roles",
+        "relacl",
+        "pg_catalog.aclexplode",
+        "pg_catalog.acldefault",
+        "jsonb_agg",
+        "jsonb_build_object",
+        "cross join lateral",
+        "acl_entries",
+        "grantee",
+        "grantor",
+        "privilege_type",
         "relpersistence",
         "relation_persistence",
         "c.relname",
@@ -900,6 +947,15 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
     "effective_runtime_column_privileges": (
         "has_column_privilege",
         "pg_catalog.pg_attribute",
+        "pg_catalog.aclexplode",
+        "jsonb_agg",
+        "jsonb_build_object",
+        "cross join lateral",
+        "acl_entries",
+        "grantee",
+        "grantor",
+        "privilege_type",
+        "a.attacl",
         "attname",
         "attnum",
         "attisdropped",
@@ -1866,6 +1922,86 @@ def _validate_view_column_acl(
     return effective_runtime_columns
 
 
+def _validate_runtime_acl_entries(
+    value: Any,
+    label: str,
+    errors: list[str],
+    allowed_privileges: tuple[str, ...],
+) -> tuple[tuple[str, str, str, bool], ...]:
+    if type(value) is not list:
+        _add_error(errors, f"{label}_must_be_list")
+        return ()
+    entries: list[tuple[str, str, str, bool]] = []
+    seen: set[tuple[str, str, str, bool]] = set()
+    allowed = set(allowed_privileges)
+    for index, entry in enumerate(value):
+        entry_label = f"{label}_{index}"
+        if not isinstance(entry, dict):
+            _add_error(errors, f"{entry_label}_must_be_object")
+            continue
+        if not _exact_keys(entry, VIEW_ACL_ENTRY_KEYS, entry_label, errors):
+            continue
+        for key in ("grantee", "grantor", "privilege_type"):
+            _require_non_empty_string(entry.get(key), f"{entry_label}_{key}", errors)
+        _require_type(entry.get("is_grantable"), bool, f"{entry_label}_is_grantable", errors)
+        if (
+            any(type(entry.get(key)) is not str for key in ("grantee", "grantor", "privilege_type"))
+            or type(entry.get("is_grantable")) is not bool
+        ):
+            continue
+        acl_entry = (
+            str(entry["grantee"]),
+            str(entry["grantor"]),
+            str(entry["privilege_type"]),
+            bool(entry["is_grantable"]),
+        )
+        if acl_entry[2] not in allowed:
+            _add_error(errors, f"{entry_label}_invalid_privilege_type_{acl_entry[2]}")
+            continue
+        if acl_entry in seen:
+            _add_error(errors, f"{entry_label}_duplicate_acl_entry")
+        seen.add(acl_entry)
+        entries.append(acl_entry)
+    return tuple(entries)
+
+
+def _classified_table_manifest_entries(
+    manifest: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    tables = manifest.get("tables") if isinstance(manifest, dict) else None
+    if not isinstance(tables, dict):
+        return {}, {}
+    accessible = tables.get("runtime_accessible")
+    forbidden = tables.get("runtime_forbidden")
+    return (
+        accessible if isinstance(accessible, dict) else {},
+        forbidden if isinstance(forbidden, dict) else {},
+    )
+
+
+def _classified_table_object_owner(manifest: dict[str, Any]) -> str | None:
+    boundary = manifest.get("boundary_b") if isinstance(manifest, dict) else None
+    owner = boundary.get("object_owner") if isinstance(boundary, dict) else None
+    return owner if type(owner) is str and owner else None
+
+
+def _classified_table_expected_columns(
+    manifest: dict[str, Any], table_name: str
+) -> dict[str, set[str]]:
+    column_privileges = manifest.get("column_privileges") if isinstance(manifest, dict) else None
+    table_entry = column_privileges.get(table_name) if isinstance(column_privileges, dict) else None
+    if not isinstance(table_entry, dict):
+        return {}
+    expected: dict[str, set[str]] = {}
+    for privilege, columns in table_entry.items():
+        if type(privilege) is not str or type(columns) is not list:
+            continue
+        for column_name in columns:
+            if type(column_name) is str:
+                expected.setdefault(column_name, set()).add(privilege.upper())
+    return expected
+
+
 def evaluate_public_table_like_authority(
     manifest: dict[str, Any],
     table_privilege_rows: list[dict[str, Any]],
@@ -1885,6 +2021,9 @@ def evaluate_public_table_like_authority(
 
     expected_table_privileges = set(VIEW_RELATION_PRIVILEGES)
     expected_column_privileges = set(VIEW_COLUMN_PRIVILEGES)
+    accessible, forbidden = _classified_table_manifest_entries(manifest)
+    classified_names = set(accessible) | set(forbidden)
+    expected_owner = _classified_table_object_owner(manifest)
     table_groups: dict[tuple[str, str], dict[str, Any]] = {}
     table_privilege_sets: dict[tuple[str, str], set[str]] = {}
 
@@ -1895,6 +2034,9 @@ def evaluate_public_table_like_authority(
             continue
         if not _exact_keys(row, RUNTIME_TABLE_PRIVILEGE_ROW_KEYS, label, errors):
             continue
+        acl_entries = _validate_runtime_acl_entries(
+            row.get("acl_entries"), f"{label}_acl_entries", errors, VIEW_RELATION_PRIVILEGES
+        )
         for key in ("schema_name", "table_name", "relation_kind", "relation_persistence", "owner", "privilege_type"):
             _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
         _require_type(row.get("owner_select"), bool, f"{label}_owner_select", errors)
@@ -1943,7 +2085,12 @@ def evaluate_public_table_like_authority(
             {
                 "relation_kind": relation_kind,
                 "relation_persistence": relation_persistence,
+                "acl_entries": acl_entries,
+                "owner": row["owner"],
+                "owner_select": row["owner_select"],
                 "visible_column_count": row["visible_column_count"],
+                "row_security_enabled": row["row_security_enabled"],
+                "row_security_forced": row["row_security_forced"],
                 "has_inheritance_descendants": row["has_inheritance_descendants"],
             },
         )
@@ -1951,6 +2098,16 @@ def evaluate_public_table_like_authority(
             _add_error(errors, f"{label}_relation_kind_inconsistent")
         if relation["relation_persistence"] != relation_persistence:
             _add_error(errors, f"{label}_relation_persistence_inconsistent")
+        if relation["acl_entries"] != acl_entries:
+            _add_error(errors, f"{label}_acl_entries_inconsistent")
+        if relation["owner"] != row["owner"]:
+            _add_error(errors, f"{label}_owner_inconsistent")
+        if relation["owner_select"] != row["owner_select"]:
+            _add_error(errors, f"{label}_owner_select_inconsistent")
+        if relation["row_security_enabled"] != row["row_security_enabled"]:
+            _add_error(errors, f"{label}_row_security_enabled_inconsistent")
+        if relation["row_security_forced"] != row["row_security_forced"]:
+            _add_error(errors, f"{label}_row_security_forced_inconsistent")
         if relation["visible_column_count"] != row["visible_column_count"]:
             _add_error(errors, f"{label}_visible_column_count_inconsistent")
         if relation["has_inheritance_descendants"] != row["has_inheritance_descendants"]:
@@ -1991,6 +2148,60 @@ def evaluate_public_table_like_authority(
             )
 
     column_groups: dict[tuple[str, str], dict[str, set[str]]] = {}
+    column_acl_groups: dict[tuple[str, str], dict[str, tuple[tuple[str, str, str, bool], ...]]] = {}
+    for relation_key, relation in table_groups.items():
+        schema_name, table_name = relation_key
+        if schema_name != BOUND_SOURCE_SCHEMA or table_name not in classified_names:
+            continue
+        label = f"public_table_classified_{schema_name}.{table_name}"
+        if relation["relation_kind"] != BOUND_SOURCE_RELKIND:
+            _add_error(errors, f"{label}_relation_kind_invalid_{relation['relation_kind']}")
+        if relation["relation_persistence"] != "p":
+            _add_error(errors, f"{label}_relation_persistence_invalid_expected_p_got_{relation['relation_persistence']}")
+        if expected_owner is None or relation["owner"] != expected_owner:
+            _add_error(errors, f"{label}_owner_invalid_expected_{expected_owner}_got_{relation['owner']}")
+        if relation["row_security_enabled"]:
+            _add_error(errors, f"{label}_row_security_enabled_forbidden")
+        if relation["row_security_forced"]:
+            _add_error(errors, f"{label}_row_security_forced_forbidden")
+        if relation["has_inheritance_descendants"]:
+            _add_error(errors, f"{label}_inheritance_descendants_forbidden")
+
+        expected_direct: set[str] = set()
+        accessible_entry = accessible.get(table_name)
+        if isinstance(accessible_entry, dict):
+            privileges = accessible_entry.get("privileges")
+            if isinstance(privileges, dict):
+                expected_direct = {
+                    privilege.upper()
+                    for privilege, allowed_value in privileges.items()
+                    if type(privilege) is str and allowed_value is True
+                }
+        actual_direct: set[str] = set()
+        for grantee, grantor, privilege, is_grantable in relation["acl_entries"]:
+            if grantee == "PUBLIC":
+                _add_error(errors, f"{label}_acl_public_authority_forbidden_{privilege}")
+            if grantee != runtime_role:
+                continue
+            actual_direct.add(privilege)
+            if expected_owner is None or grantor != expected_owner:
+                _add_error(errors, f"{label}_acl_runtime_grantor_invalid_{privilege}_{grantor}")
+            if is_grantable:
+                _add_error(errors, f"{label}_acl_runtime_grant_option_forbidden_{privilege}")
+        if actual_direct != expected_direct:
+            _add_error(
+                errors,
+                f"{label}_acl_provenance_mismatch_expected_{sorted(expected_direct)}_got_{sorted(actual_direct)}",
+            )
+
+    observed_classified = {
+        table_name
+        for schema_name, table_name in table_groups
+        if schema_name == BOUND_SOURCE_SCHEMA and table_name in classified_names
+    }
+    for missing_name in sorted(classified_names - observed_classified):
+        _add_error(errors, f"public_table_classified_relation_missing_{missing_name}")
+
     for index, row in enumerate(column_privilege_rows):
         label = f"public_column_row_{index}"
         if not isinstance(row, dict):
@@ -1998,6 +2209,9 @@ def evaluate_public_table_like_authority(
             continue
         if not _exact_keys(row, RUNTIME_COLUMN_PRIVILEGE_ROW_KEYS, label, errors):
             continue
+        acl_entries = _validate_runtime_acl_entries(
+            row.get("acl_entries"), f"{label}_acl_entries", errors, VIEW_COLUMN_PRIVILEGES
+        )
         for key in ("schema_name", "table_name", "column_name", "privilege_type"):
             _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
         _require_type(row.get("effective"), bool, f"{label}_effective", errors)
@@ -2026,6 +2240,10 @@ def evaluate_public_table_like_authority(
         if privilege in privileges:
             _add_error(errors, f"{label}_duplicate_privilege")
         privileges.add(privilege)
+        relation_acl = column_acl_groups.setdefault(relation_key, {})
+        if column_name in relation_acl and relation_acl[column_name] != acl_entries:
+            _add_error(errors, f"{label}_acl_entries_inconsistent")
+        relation_acl[column_name] = acl_entries
 
         tables = manifest.get("tables") if isinstance(manifest, dict) else None
         accessible = tables.get("runtime_accessible") if isinstance(tables, dict) else None
@@ -2067,6 +2285,33 @@ def evaluate_public_table_like_authority(
                     errors,
                     "public_column_privileges_mismatch_"
                     f"{relation_key[0]}.{relation_key[1]}.{column_name}_expected_{sorted(expected_column_privileges)}_got_{sorted(privileges)}",
+                )
+
+        schema_name, table_name = relation_key
+        if schema_name != BOUND_SOURCE_SCHEMA or table_name not in classified_names:
+            continue
+        label = f"public_table_classified_{schema_name}.{table_name}"
+        expected_columns = _classified_table_expected_columns(manifest, table_name)
+        for column_name, acl_entries in column_acl_groups.get(relation_key, {}).items():
+            expected_direct = expected_columns.get(column_name, set())
+            actual_direct: set[str] = set()
+            for grantee, grantor, privilege, is_grantable in acl_entries:
+                if grantee == "PUBLIC":
+                    _add_error(errors, f"{label}_column_acl_public_authority_forbidden_{column_name}_{privilege}")
+                if grantee != runtime_role:
+                    continue
+                actual_direct.add(privilege)
+                if expected_owner is None or grantor != expected_owner:
+                    _add_error(
+                        errors,
+                        f"{label}_column_acl_runtime_grantor_invalid_{column_name}_{privilege}_{grantor}",
+                    )
+                if is_grantable:
+                    _add_error(errors, f"{label}_column_acl_runtime_grant_option_forbidden_{column_name}_{privilege}")
+            if actual_direct != expected_direct:
+                _add_error(
+                    errors,
+                    f"{label}_column_acl_provenance_mismatch_{column_name}_expected_{sorted(expected_direct)}_got_{sorted(actual_direct)}",
                 )
 
     return tuple(errors)
@@ -2135,6 +2380,9 @@ def evaluate_bound_source_authority(
         label = f"bound_source_table_row_{index}"
         if not _exact_keys(row, RUNTIME_TABLE_PRIVILEGE_ROW_KEYS, label, errors):
             continue
+        _validate_runtime_acl_entries(
+            row.get("acl_entries"), f"{label}_acl_entries", errors, VIEW_RELATION_PRIVILEGES
+        )
         for key in ("schema_name", "table_name", "relation_kind", "relation_persistence", "owner", "privilege_type"):
             _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
         _require_type(row.get("owner_select"), bool, f"{label}_owner_select", errors)
@@ -2224,6 +2472,9 @@ def evaluate_bound_source_authority(
         label = f"bound_source_column_row_{index}"
         if not _exact_keys(row, RUNTIME_COLUMN_PRIVILEGE_ROW_KEYS, label, errors):
             continue
+        _validate_runtime_acl_entries(
+            row.get("acl_entries"), f"{label}_acl_entries", errors, VIEW_COLUMN_PRIVILEGES
+        )
         for key in ("schema_name", "table_name", "column_name", "privilege_type"):
             _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
         _require_type(row.get("effective"), bool, f"{label}_effective", errors)

@@ -382,8 +382,8 @@ live-system evidence.
 | `role_memberships` | `role`, `member`, `grantor`, `admin_option`, `inherit_option`, `set_option` | 0 in the generic shape fixture; 1 exact runtime edge in the creator fixture |
 | `sequence_acl` | `relname`, `relacl` | 0 |
 | `effective_runtime_database_privileges` | `privilege_type`, `effective`, `is_grantable` | 3 |
-| `effective_runtime_table_privileges` | `schema_name`, `table_name`, `relation_kind`, `relation_persistence`, `owner`, `owner_select`, `visible_column_count`, `row_security_enabled`, `row_security_forced`, `has_inheritance_descendants`, `privilege_type`, `effective`, `is_grantable` | 8 per enumerated public `r`/`p`/`f` relation; 128 in the base migrated fixture, plus 8 for each additional relation |
-| `effective_runtime_column_privileges` | `schema_name`, `table_name`, `column_name`, `privilege_type`, `effective`, `is_grantable` | 4 per visible column on each enumerated public `r`/`p`/`f` relation |
+| `effective_runtime_table_privileges` | `schema_name`, `table_name`, `relation_kind`, `relation_persistence`, `acl_entries`, `owner`, `owner_select`, `visible_column_count`, `row_security_enabled`, `row_security_forced`, `has_inheritance_descendants`, `privilege_type`, `effective`, `is_grantable` | 8 per enumerated public `r`/`p`/`f` relation; 128 in the base migrated fixture, plus 8 for each additional relation |
+| `effective_runtime_column_privileges` | `schema_name`, `table_name`, `column_name`, `acl_entries`, `privilege_type`, `effective`, `is_grantable` | 4 per visible column on each enumerated public `r`/`p`/`f` relation |
 | `effective_runtime_schema_privileges` | `privilege_type`, `effective`, `is_grantable` | 2 |
 | `effective_runtime_routine_privileges` | `routine_name`, `effective` | 2 |
 | `view_acl` | `relation_name`, `relation_kind`, `owner`, `relation_acl`, `acl_entries`, `column_acl_entries`, `view_definition`, `view_dependencies`, `view_columns`, `relation_options`, `view_security`, `runtime_privileges`, `runtime_select`, `runtime_select_grantable` | 0 in the generic shape fixture; 1 when the legacy-optional view fixture is present |
@@ -417,6 +417,8 @@ table-level matrix plus the one explicit `UPDATE(checksum_sha256)` tuple on
 `sqag_quote_publication_artifacts`. Column grants cannot add authority to a
 forbidden table, an unauthorized table-level privilege, another
 publication-artifact column, or a grant option.
+
+The classified-table evaluator treats the manifest table union (`runtime_accessible` plus `runtime_forbidden`) as a complete expected presence set: every expected public relation must be observed, while unrelated public `r`/`p`/`f` relations remain permitted when they carry no locked runtime authority. Each relation group must have one consistent owner, persistence, RLS, inheritance, and decoded ACL state across all eight privilege rows. For every classified table, the invariant requires `relkind='r'`, permanent `relation_persistence='p'`, exact owner `sqag_migrator`, `row_security_enabled=false`, `row_security_forced=false`, and no direct inheritance descendants. Its decoded ACL must contain exactly the manifest-approved direct `sqag_runtime` table privileges, with grantor `sqag_migrator`, no grant option, and no PUBLIC substitution. The decoded per-column ACL channel applies the same provenance rules to the manifest's explicit column grants, including `UPDATE(checksum_sha256)`; table-level authority does not substitute for that column evidence. These table and column ACL fields belong to the table/source authority channel and do not alter the unchanged 14-field `view_acl` projection.
 
 ## Grantee-aware default-privilege verification
 
