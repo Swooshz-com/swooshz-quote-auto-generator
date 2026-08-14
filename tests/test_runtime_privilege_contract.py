@@ -8536,7 +8536,9 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 errors,
             )
         finally:
-            self._execute_admin_sql('revoke usage on schema public from "sqag_runtime"')
+            with self.as_role(wrong_grantor) as wrong_connection:
+                wrong_connection.execute('revoke usage on schema public from "sqag_runtime"')
+                wrong_connection.commit()
             self._execute_admin_sql(
                 f'revoke all privileges on schema public from {_quote_identifier(wrong_grantor)}'
             )
