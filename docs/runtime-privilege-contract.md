@@ -374,9 +374,14 @@ keys. Each key has an independent repository-owned executable-token contract;
 candidate manifest text cannot redefine its expected query. The PostgreSQL
 integration contract executes every key once, checks the exact returned column
 names and order, and applies the row-cardinality rule for its disposable
-fixture. The generic shape fixture has no runtime edge; the dedicated
-non-superuser `CREATEROLE` fixture produces exactly one automatic edge and is
-the acceptance proof for the complete tuple.
+fixture. The clean migrated fixture creates `sqag_runtime` through the
+provider-role `CREATEROLE` path, so its complete membership result contains
+the captured PostgreSQL baseline rows plus the one observed automatic
+provider-control edge. The local fixture passes the observed bootstrap
+grantor only to the test-boundary identity mode; production validation keeps
+the manifest's exact provider identity and grantor binding. The dedicated
+non-superuser `CREATEROLE` fixture remains the acceptance proof for the
+complete tuple.
 
 ### Membership-query narrative contract
 
@@ -416,11 +421,11 @@ live-system evidence.
 |---|---|---:|
 | `database_acl` | `database_name`, `database_owner`, `datacl`, `acl_entries` | 1 |
 | `schema_acl` | `schema_name`, `schema_owner`, `database_owner`, `acl_entries` | 1 |
-| `table_acl` | `schema_name`, `relname`, `relacl`, `table_columns`, `table_constraints`, `index_contracts` | 16 without the optional source table; 17 when it exists |
+| `table_acl` | `schema_name`, `relname`, `relacl`, `table_columns`, `table_constraints`, `index_contracts`, `trigger_bindings` | 16 without the optional source table; 17 when it exists |
 | `routine_acl` | `schema_name`, `routine_name`, `identity_arguments`, `routine_kind`, `security_definer`, `owner`, `language`, `routine_definition`, `routine_configuration`, `acl_entries`, `has_trigger_dependency`, `trigger_bindings` | 2 without the provider fixture; 3 when `show_db_tree()` is present |
 | `default_acl` | `owner`, `namespace`, `object_type`, `grantee`, `privilege_type`, `is_grantable` | 1 |
-| `role_attributes` | `rolname`, `rolsuper`, `rolinherit`, `rolcreaterole`, `rolcreatedb`, `rolcanlogin`, `rolreplication`, `rolbypassrls`, `rolconnlimit`, `password_is_null` | 2 |
-| `role_memberships` | `role`, `member`, `grantor`, `admin_option`, `inherit_option`, `set_option` | 0 in the generic shape fixture; 1 exact runtime edge in the creator fixture |
+| `role_attributes` | `rolname`, `rolsuper`, `rolinherit`, `rolcreaterole`, `rolcreatedb`, `rolcanlogin`, `rolreplication`, `rolbypassrls`, `rolconnlimit`, `password_is_null` | 3 |
+| `role_memberships` | `role`, `member`, `grantor`, `admin_option`, `inherit_option`, `set_option` | captured PostgreSQL baseline rows plus 1 exact runtime edge in the clean fixture; 1 exact edge in the dedicated creator fixture |
 | `sequence_acl` | `schema_name`, `sequence_name`, `sequence_acl`, `privilege_type`, `effective`, `is_grantable` | 0 in the base fixture; 3 per enumerated sequence |
 | `effective_runtime_database_privileges` | `privilege_type`, `effective`, `is_grantable` | 3 |
 | `effective_runtime_table_privileges` | `schema_name`, `table_name`, `relation_kind`, `relation_persistence`, `acl_entries`, `owner`, `owner_select`, `visible_column_count`, `column_contract`, `row_security_enabled`, `row_security_forced`, `has_inheritance_descendants`, `privilege_type`, `effective`, `is_grantable` | 8 per enumerated non-system `r`/`p`/`f` relation; 128 in the base migrated fixture, plus 8 for each additional relation |
@@ -695,12 +700,13 @@ parameter authority residue, and the final evaluator result is clean.
 
 The routine ACL query now binds each public routine to its catalog language,
 source body, configuration array, and decoded trigger-binding array. The
-migration-derived structural contract supplies the expected language, normalized
-body, empty configuration, and exact trigger set for both SQAG trigger
-functions. A provider routine is not allowed to acquire a trigger binding.
-Changing the body, language, configuration, target relation, function identity,
-timing, event, update-column list, row/statement level, enabled posture, or
-WHEN expression fails the final evaluator.
+migration-derived structural contract supplies the expected language, cast-
+preserving normalized body, empty configuration, and exact trigger set for
+both SQAG trigger functions. A provider routine is not allowed to acquire a
+trigger binding. Changing the body, including a cast, language,
+configuration, target relation, function identity, timing, event,
+update-column list, row/statement level, enabled posture, or WHEN expression
+fails the final evaluator.
 
 ### H32: trigger-binding structural guard
 
@@ -735,9 +741,11 @@ table_acl now carries ordered columns with nullability and default expressions,
 semantic table constraints, and index contracts. The validator derives the
 expected table structure from the locked PostgreSQL migrations and the ledger
 DDL, including primary, unique, foreign-key, check, not-null, and default
-semantics. Publication-version primary/unique constraints and foreign-key
-relationships therefore cannot be removed or altered without a final-gate
-failure.
+semantics. CHECK column references are derived from the expression, and every
+constraint must have `convalidated=true`; a RED NOT VALID constraint is
+therefore a final-gate failure. Publication-version primary/unique constraints
+and foreign-key relationships cannot be removed or altered without a
+final-gate failure.
 
 ### H36: large-object posture remains deferred
 
@@ -760,10 +768,14 @@ proof.
 
 For every standalone migration index, table_acl carries target schema and
 relation, uniqueness, validity, readiness, ordered key expressions, included
-columns, and normalized predicate. The validator compares each index by
-migration-derived identity and rejects wrong target relations, key order or
-content, uniqueness drift, invalid or unready posture, included-column drift,
-and predicate drift.
+columns, constraint-backed status, and normalized predicate. The validator
+compares each index by migration-derived identity and rejects wrong target
+relations, key order or content, uniqueness drift, invalid or unready posture,
+included-column drift, and predicate drift. An unexpected standalone unique
+index is rejected even when it is absent from the migration index set;
+constraint-backed indexes are tracked separately so a primary or unique
+constraint is not double-counted, while an unlisted nonunique performance
+index remains outside this specific semantic guard.
 The runtime table proof constructs the expected manifest effective set for
 classified application tables and requires every other public `r`/`p`/`f`
 relation to have zero effective and grant-option authority. It compares that
@@ -803,6 +815,55 @@ The proof also checks database `CONNECT`, `CREATE`, and `TEMPORARY`, schema
 authority, cross-privilege substitutions, and all five forbidden tables. It
 asserts exact tuples for each negative case, so aggregate counts are never
 acceptance evidence.
+
+### H39: target-relation trigger inventory
+
+`table_acl` now inventories every external trigger from the target relation,
+including target identity, function schema and identity arguments, timing,
+events, update columns, level, enabled posture, and WHEN expression. The
+validator compares the relation-owned inventory to the migration-derived
+trigger contract, so a function-side trigger dependency cannot hide a trigger
+attached to another relation or omit an unexpected trigger. The PostgreSQL
+RED regression mutates the function schema while keeping the trigger attached
+to the target relation and proves the exact failure path.
+
+### H40: standalone unique-index guard
+
+Migration-derived table evidence distinguishes constraint-backed indexes from
+standalone indexes. The validator rejects an unexpected standalone unique
+index at minimum, while retaining unlisted nonunique indexes as permissible
+performance objects and avoiding a second count of primary/unique
+constraint-backed indexes. The PostgreSQL RED regression creates a standalone
+unique index and proves it is rejected.
+
+### H41: validated constraint posture
+
+Constraint evidence includes `pg_constraint.convalidated` and requires it to
+be true. A RED NOT VALID foreign-key or CHECK constraint therefore fails
+closed even when its name, type, columns, and expression otherwise match.
+
+### H42: PUBLIC default-privilege guard
+
+Default-ACL evidence rejects PUBLIC grants across every covered object class
+and privilege, regardless of grant-option state. The PostgreSQL RED regression
+uses a PUBLIC default privilege without grant option and proves that the
+object-class-specific guard is not bypassed by the grant-option bit.
+
+### H43: cast-preserving routine normalizer
+
+Routine body comparison uses a dedicated normalizer that preserves casts.
+The constraint-expression normalizer is not reused for routine definitions, so
+a cast mutation remains visible and fails closed. The PostgreSQL RED regression
+changes a trigger routine body only by its cast spelling and proves the
+mutation is rejected.
+
+### H44: manifest-prescribed PUBLIC CONNECT ACL
+
+Database ACL evidence requires the exact manifest-prescribed PUBLIC CONNECT
+entry, including its owner grantor and non-grantable state, in addition to the
+direct runtime CONNECT row. Direct runtime CONNECT alone is insufficient; the
+PostgreSQL RED regression removes the PUBLIC evidence and proves the final
+evaluator rejects the incomplete ACL packet.
 
 ## PUBLIC ACL baseline and cleanup proof
 

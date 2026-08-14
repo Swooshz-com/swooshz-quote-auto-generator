@@ -1,11 +1,11 @@
 """Runtime privilege contract tests.
 
 Deterministic discovery receipt for this amendment:
-  discovered methods: 246
+  discovered methods: 252
   static and validator methods: 159
-  PostgreSQL methods: 83
+  PostgreSQL methods: 89
   requirement-map and documentation parity methods: 4
-  hosted executions: 246
+  hosted executions: 252
   hosted skips: 0
   unique locked requirement IDs: 38 (R01-R38)
 
@@ -109,6 +109,7 @@ CANONICAL_QUERY_COLUMNS = {
         "table_columns",
         "table_constraints",
         "index_contracts",
+        "trigger_bindings",
     ],
     "routine_acl": [
         "schema_name",
@@ -1314,6 +1315,11 @@ class ValidatorStaticTest(unittest.TestCase):
                     for index_contract in structural["indexes"].values()
                     if index_contract["target_table"] == table_name
                 ]
+                triggers = [
+                    copy.deepcopy(trigger)
+                    for trigger in structural["triggers"].values()
+                    if trigger["target_relation"] == table_name
+                ]
                 rows.append(
                     {
                         "schema_name": "public",
@@ -1321,6 +1327,7 @@ class ValidatorStaticTest(unittest.TestCase):
                         "relacl": [],
                         "table_columns": copy.deepcopy(table["columns"]),
                         "table_constraints": constraints,
+                        "trigger_bindings": triggers,
                         "index_contracts": indexes,
                     }
                 )
@@ -1331,6 +1338,7 @@ class ValidatorStaticTest(unittest.TestCase):
                     "relacl": [],
                     "table_columns": [],
                     "table_constraints": [],
+                    "trigger_bindings": [],
                     "index_contracts": [],
                 }
             )
@@ -1426,7 +1434,13 @@ class ValidatorStaticTest(unittest.TestCase):
                     "grantor": "database_owner",
                     "privilege_type": "CONNECT",
                     "is_grantable": False,
-                }
+                },
+                {
+                    "grantee": "PUBLIC",
+                    "grantor": "database_owner",
+                    "privilege_type": "CONNECT",
+                    "is_grantable": False,
+                },
             ],
         }
         errors: list[str] = []
@@ -3893,6 +3907,11 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.database_name = self._create_database()
+        self.contract = copy.deepcopy(type(self).contract)
+        self._local_bootstrap_role = self._current_session_user()
+        self.contract["roles"]["runtime"]["provider_control_edges"][0]["grantor"] = (
+            self._local_bootstrap_role
+        )
         self._membership_baseline = self._membership_snapshot()
         self._public_database_baseline = {
             privilege: self._has_database_privilege("public", privilege)
@@ -3903,7 +3922,9 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.addCleanup(self._audit_and_drop_database)
         self.addCleanup(self._assert_membership_baseline_restored)
         self._create_role("sqag_migrator")
-        self._create_role("sqag_runtime")
+        provider_name = self._create_role("neondb_owner")
+        self._execute_admin_sql(f"alter role {_quote_identifier(provider_name)} createrole")
+        self._create_role("sqag_runtime", creator_role=provider_name)
         self._grant_database_privilege("sqag_migrator", "CONNECT")
         self._grant_database_privilege("sqag_migrator", "CREATE")
         self._grant_database_privilege("sqag_migrator", "TEMPORARY")
@@ -3923,6 +3944,17 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             row_factory=self.dict_row,
         )
         return PostgresConnectionAdapter(raw)
+
+    def _current_session_user(self) -> str:
+        connection = self.connect()
+        try:
+            row = connection.execute("select session_user as session_user").fetchone()
+            value = _row_dict(row, "session_user")
+            self.assertIsInstance(value, str)
+            return str(value)
+        finally:
+            connection.rollback()
+            connection.close()
 
     @staticmethod
     def _membership_tuples(
@@ -3961,6 +3993,16 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
     def _assert_membership_baseline_restored(self) -> None:
         self.assertEqual(self._membership_snapshot(), self._membership_baseline)
 
+    def _expected_provider_edge(self) -> tuple[str, str, str, bool, bool, bool]:
+        return (
+            "sqag_runtime",
+            "neondb_owner",
+            self._local_bootstrap_role,
+            True,
+            False,
+            False,
+        )
+
     def _cleanup_steps(self, steps: list[tuple[str, str]], database_name: str | None = None) -> None:
         errors: list[str] = []
         for label, sql in steps:
@@ -3979,10 +4021,14 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         if errors:
             raise AssertionError("cleanup failed: " + "; ".join(errors))
 
-    def _create_role(self, role_name: str) -> str:
+    def _create_role(self, role_name: str, *, creator_role: str | None = None) -> str:
         _quote_identifier(role_name)
+        if creator_role is not None:
+            _quote_identifier(creator_role)
         connection = self.connect()
         try:
+            if creator_role is not None:
+                connection.execute(f"set session authorization {_quote_identifier(creator_role)}")
             connection.execute(
                 f"create role {_quote_identifier(role_name)} NOLOGIN NOSUPERUSER NOCREATEDB "
                 f"NOCREATEROLE NOREPLICATION NOBYPASSRLS INHERIT CONNECTION LIMIT -1"
@@ -5177,6 +5223,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         return contract_validator.evaluate_final_runtime_authority(
             self.contract,
             evidence,
+            enforce_production_identity=False,
         )
     def _evaluate_runtime_authority_rows(self) -> tuple[str, ...]:
         connection = self.connect()
@@ -5300,8 +5347,8 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             "table_acl": 16,
             "routine_acl": 2,
             "default_acl": 1,
-            "role_attributes": 2,
-            "role_memberships": len(self._membership_baseline),
+            "role_attributes": 3,
+            "role_memberships": len(self._membership_baseline) + 1,
             "sequence_acl": 0,
             "effective_runtime_database_privileges": 3,
             "effective_runtime_table_privileges": len(ALL_TABLES) * len(TABLE_PRIVILEGES),
@@ -5341,14 +5388,28 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             default_rows,
         )
         role_rows = results["role_attributes"][1]
-        self.assertEqual({str(row["rolname"]) for row in role_rows}, {"sqag_migrator", "sqag_runtime"})
+        self.assertEqual(
+            {str(row["rolname"]) for row in role_rows},
+            {"neondb_owner", "sqag_migrator", "sqag_runtime"},
+        )
         self.assertTrue(all(isinstance(row["password_is_null"], bool) for row in role_rows))
         self.assertTrue(all(row["password_is_null"] for row in role_rows))
         self.assertTrue(all("rolpassword" not in row for row in role_rows))
         membership_rows = results["role_memberships"][1]
         membership_tuples = self._membership_tuples(membership_rows)
-        self.assertEqual(membership_tuples, self._membership_baseline)
-        self.assertEqual(self._runtime_like_memberships(membership_tuples), ())
+        expected_provider_edge = (
+            "sqag_runtime",
+            "neondb_owner",
+            self._local_bootstrap_role,
+            True,
+            False,
+            False,
+        )
+        self.assertEqual(
+            membership_tuples,
+            tuple(sorted((*self._membership_baseline, expected_provider_edge))),
+        )
+        self.assertEqual(self._runtime_like_memberships(membership_tuples), (expected_provider_edge,))
         database_rows = results["effective_runtime_database_privileges"][1]
         self.assertEqual(
             {
@@ -5509,8 +5570,8 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             routine_row = routine_acl_by_name[routine_name[1]]
             self.assertEqual(routine_row["language"], expected_routine["language"])
             self.assertEqual(
-                contract_validator._normalise_constraint_expression(routine_row["routine_definition"]),
-                contract_validator._normalise_constraint_expression(expected_routine["routine_definition"]),
+                contract_validator._normalise_routine_definition(routine_row["routine_definition"]),
+                contract_validator._normalise_routine_definition(expected_routine["routine_definition"]),
             )
             self.assertEqual(routine_row["routine_configuration"], expected_routine["routine_configuration"])
             expected_bindings = sorted(
@@ -6320,8 +6381,10 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
 
         columns, rows = self._execute_contract_query("role_memberships")
         self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["role_memberships"])
-        self.assertEqual(self._membership_tuples(rows), self._membership_baseline)
-        self.assertEqual(self._runtime_like_memberships(self._membership_tuples(rows)), ())
+        expected_provider_edge = self._expected_provider_edge()
+        expected_baseline = tuple(sorted((*self._membership_baseline, expected_provider_edge)))
+        self.assertEqual(self._membership_tuples(rows), expected_baseline)
+        self.assertEqual(self._runtime_like_memberships(self._membership_tuples(rows)), (expected_provider_edge,))
 
         parent_name = self._new_role("membership_parent")
         self._grant_role_membership(parent_name, "sqag_runtime", admin_option=False)
@@ -6330,12 +6393,12 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         columns, rows = self._execute_contract_query("role_memberships")
         self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["role_memberships"])
         actual = self._membership_tuples(rows)
-        added = tuple(row for row in actual if row not in self._membership_baseline)
+        added = tuple(row for row in actual if row not in expected_baseline)
         self.assertEqual({row[0] for row in added}, {parent_name, admin_parent_name})
         self.assertEqual({row[1] for row in added}, {"sqag_runtime"})
         self.assertEqual({row[3] for row in added}, {False, True})
         self.assertTrue(all(type(option) is bool for row in added for option in row[3:]))
-        self.assertEqual(self._runtime_like_memberships(actual), tuple(sorted(added)))
+        self.assertEqual(self._runtime_like_memberships(actual), tuple(sorted((expected_provider_edge, *added))))
         membership_errors = contract_validator.validate_runtime_membership_edges(
             self.contract,
             rows,
@@ -6665,7 +6728,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
 
     def test_provider_show_db_tree_is_only_bounded_exception(self) -> None:
         runtime_name = self._new_role("provider_runtime")
-        provider_name = self._create_role("neondb_owner")
+        provider_name = "neondb_owner"
         self._grant_database_privilege(runtime_name, "CONNECT")
         self._grant_schema_privilege(runtime_name, "USAGE")
         self._grant_schema_privilege(provider_name, "CREATE")
@@ -6704,7 +6767,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
 
     def test_provider_exception_posture_substitutions_fail_closed_postgres(self) -> None:
         self._prepare_fixed_runtime_contract_fixture()
-        provider_name = self._create_role("neondb_owner")
+        provider_name = "neondb_owner"
         self._grant_schema_privilege(provider_name, "CREATE")
         connection = self.connect()
         try:
@@ -6754,7 +6817,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
 
     def test_public_routine_authority_controls_fail_closed_postgres(self) -> None:
         self._prepare_fixed_runtime_contract_fixture()
-        provider_name = self._create_role("neondb_owner")
+        provider_name = "neondb_owner"
         self._grant_schema_privilege(provider_name, "CREATE")
         connection = self.connect()
         try:
@@ -6930,7 +6993,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 "select conname from pg_catalog.pg_constraint "
                 "where conrelid = 'public.sqag_quote_publication_versions'::regclass "
                 "and contype = 'c' "
-                "and pg_catalog.pg_get_constraintdef(oid, true) ilike '%state%' "
+                "and pg_catalog.pg_get_constraintdef(oid, true) ilike '%%state%%' "
                 "order by conname limit 1"
             ).fetchone()
         finally:
@@ -6980,6 +7043,114 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             )
         self.assertEqual(self._evaluate_runtime_authority_rows(), ())
 
+    def test_target_relation_trigger_inventory_rejects_external_function_schema_postgres(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        schema_name = f"sqag_h39_{uuid.uuid4().hex[:8]}"
+        function_name = f"guard_{uuid.uuid4().hex[:8]}"
+        trigger_name = f"sqag_h39_trigger_{uuid.uuid4().hex[:8]}"
+        self._execute_admin_sql(f"create schema {_quote_identifier(schema_name)}")
+        self._execute_admin_sql(
+            f"create function {_quote_identifier(schema_name)}.{_quote_identifier(function_name)}() "
+            "returns trigger language plpgsql as $$ begin return new; end $$"
+        )
+        self._execute_admin_sql(
+            f"create trigger {_quote_identifier(trigger_name)} before update "
+            f"on public.{_quote_identifier('sqag_profiles')} for each row "
+            f"execute function {_quote_identifier(schema_name)}.{_quote_identifier(function_name)}()"
+        )
+        self.addCleanup(
+            self._cleanup_steps,
+            [
+                (
+                    "drop_h39_schema",
+                    f"drop schema {_quote_identifier(schema_name)} cascade",
+                )
+            ],
+        )
+        errors = self._evaluate_runtime_authority_rows()
+        self.assertIn(
+            "table_structural_trigger_binding_contract_mismatch_sqag_profiles",
+            errors,
+        )
+
+    def test_unexpected_standalone_unique_index_is_rejected_postgres(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        index_name = f"sqag_h40_unique_{uuid.uuid4().hex[:8]}"
+        self._execute_admin_sql(
+            f"create unique index {_quote_identifier(index_name)} on public.{_quote_identifier('sqag_profiles')} "
+            "(workspace_id)"
+        )
+        self.addCleanup(
+            self._cleanup_steps,
+            [
+                (
+                    "drop_h40_index",
+                    f"drop index public.{_quote_identifier(index_name)}",
+                )
+            ],
+        )
+        errors = self._evaluate_runtime_authority_rows()
+        self.assertIn(f"table_structural_unexpected_unique_index_{index_name}", errors)
+
+    def test_not_valid_constraint_is_rejected_postgres(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        constraint_name = f"sqag_h41_not_valid_{uuid.uuid4().hex[:8]}"
+        self._execute_admin_sql(
+            f"alter table public.{_quote_identifier('sqag_profiles')} add constraint "
+            f"{_quote_identifier(constraint_name)} check (workspace_id is not null) not valid"
+        )
+        self.addCleanup(
+            self._cleanup_steps,
+            [
+                (
+                    "drop_h41_constraint",
+                    f"alter table public.{_quote_identifier('sqag_profiles')} drop constraint "
+                    f"{_quote_identifier(constraint_name)}",
+                )
+            ],
+        )
+        errors = self._evaluate_runtime_authority_rows()
+        self.assertIn(
+            f"table_structural_constraint_not_valid_sqag_profiles_{constraint_name}",
+            errors,
+        )
+
+    def test_public_default_privilege_is_rejected_even_without_grant_option_postgres(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        owner_name = self._new_role("h42_default_owner")
+        self._register_default_acl_audit({owner_name})
+        self._alter_default_privilege(owner_name, "PUBLIC", "SELECT", "TABLES")
+        errors = self._evaluate_runtime_authority_rows()
+        self.assertIn(
+            "default_acl_evidence_row_0_public_default_privilege_forbidden_r_SELECT",
+            errors,
+        )
+
+    def test_routine_body_cast_mutation_is_rejected_postgres(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        mutated_sql = (
+            'create or replace function public."sqag_reject_immutable_change"() '
+            "returns trigger language plpgsql as $$ begin perform current_timestamp::text; "
+            "raise exception 'SQAG immutable record cannot be changed'; end $$"
+        )
+        restore_sql = (
+            'create or replace function public."sqag_reject_immutable_change"() '
+            "returns trigger language plpgsql as $$ begin raise exception "
+            "'SQAG immutable record cannot be changed'; end $$"
+        )
+        self._execute_admin_sql(mutated_sql)
+        self.addCleanup(self._execute_admin_sql, restore_sql)
+        errors = self._evaluate_runtime_authority_rows()
+        self.assertIn(
+            "routine_structural_definition_mismatch_sqag_reject_immutable_change",
+            errors,
+        )
+
+    def test_public_connect_acl_is_required_in_addition_to_direct_runtime_connect_postgres(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        self._alter_public_database_privilege("CONNECT", False)
+        errors = self._evaluate_runtime_authority_rows()
+        self.assertIn("database_acl_public_connect_evidence_missing_or_duplicate", errors)
     def test_runtime_role_attributes_memberships_and_ownership_are_exact(self) -> None:
         self.apply_migrations()
         role_name = self._new_role("attributes")
@@ -7980,6 +8151,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             self._execute_admin_sql(
                 f'revoke SELECT on table {source_ident} from {_quote_identifier(table_parent)}'
             )
+            self._revoke_role_memberships(table_parent)
 
         source_column = "workspace_id"
         for privilege in COLUMN_PRIVILEGES:
@@ -8028,6 +8200,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             self._execute_admin_sql(
                 f'revoke SELECT ({_quote_identifier(source_column)}) on table {source_ident} from {_quote_identifier(column_parent)}'
             )
+            self._revoke_role_memberships(column_parent)
 
         self.assertEqual(self._evaluate_runtime_authority_rows(), ())
         columns, rows = self._execute_contract_query("view_acl")
@@ -8098,7 +8271,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.assertFalse(self._is_role_member(migrator_name, "pg_database_owner"))
         self.assertFalse(self._is_role_member(runtime_name, owner_name))
         self.assertFalse(self._is_role_member(unrelated_name, owner_name))
-        self.assertEqual(self._runtime_like_memberships(self._membership_snapshot()), ())
+        self.assertEqual(self._runtime_like_memberships(self._membership_snapshot()), (self._expected_provider_edge(),))
 
         # 6. The migrator and the unrelated role hold no direct grant option on the
         #    database or schema that could satisfy the owner-only operations.
@@ -8224,7 +8397,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             self._effective_schema_privileges(runtime_name),
             {("USAGE", True, False), ("CREATE", False, False)},
         )
-        self.assertEqual(self._runtime_like_memberships(self._membership_snapshot()), ())
+        self.assertEqual(self._runtime_like_memberships(self._membership_snapshot()), (self._expected_provider_edge(),))
         self.assertEqual(self._default_acl_snapshot(), set())
 
         # 16. Cleanup restores the exact captured PUBLIC baseline.
@@ -8872,6 +9045,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             self._execute_admin_sql(
                 f'revoke all privileges on schema public from {_quote_identifier(parent_role)}'
             )
+            self._revoke_role_memberships(parent_role)
             self._execute_admin_sql('grant usage on schema public to "sqag_runtime"')
         self.assertEqual(self._evaluate_runtime_authority_rows(), ())
 
@@ -8961,6 +9135,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             self._execute_admin_sql(
                 f'revoke set on parameter session_replication_role from {_quote_identifier(parent_role)}'
             )
+        self._revoke_role_memberships(parent_role)
         self.assertEqual(self._evaluate_runtime_authority_rows(), ())
 
         direct_alter_system = 'grant alter system on parameter session_replication_role to "sqag_runtime"'
@@ -9501,7 +9676,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             self.assertEqual(actual_membership, set())
 
     def test_provider_default_acl_state_is_identical_before_and_after_migrations(self) -> None:
-        provider_name = self._create_role("neondb_owner")
+        provider_name = "neondb_owner"
         grantee_name = self._new_role("provider_default_grantee")
         self._register_default_acl_audit({provider_name, grantee_name})
         self._alter_default_privilege(provider_name, grantee_name, "SELECT", "TABLES")

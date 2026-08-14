@@ -274,7 +274,7 @@ DATABASE_ACL_EVIDENCE_ROW_KEYS = frozenset(
     {"database_name", "database_owner", "datacl", "acl_entries"}
 )
 TABLE_ACL_EVIDENCE_ROW_KEYS = frozenset(
-    {"schema_name", "relname", "relacl", "table_columns", "table_constraints", "index_contracts"}
+    {"schema_name", "relname", "relacl", "table_columns", "table_constraints", "index_contracts", "trigger_bindings"}
 )
 TABLE_STRUCTURE_COLUMN_KEYS = frozenset(
     {
@@ -302,6 +302,7 @@ TABLE_CONSTRAINT_EVIDENCE_KEYS = frozenset(
         "check_expression",
         "is_deferrable",
         "is_deferred",
+        "is_validated",
     }
 )
 INDEX_CONTRACT_EVIDENCE_KEYS = frozenset(
@@ -315,6 +316,7 @@ INDEX_CONTRACT_EVIDENCE_KEYS = frozenset(
         "key_columns",
         "included_columns",
         "predicate",
+        "is_constraint_backed",
     }
 )
 TRIGGER_BINDING_KEYS = frozenset(
@@ -560,7 +562,8 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                                           else null
                                       end,
                                       'is_deferrable', constraint_row.condeferrable,
-                                      'is_deferred', constraint_row.condeferred
+                                      'is_deferred', constraint_row.condeferred,
+                                      'is_validated', constraint_row.convalidated
                                   )
                                   order by constraint_row.conname, constraint_row.oid
                               ),
@@ -598,7 +601,12 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                                       'predicate', case
                                           when index_row.indpred is null then null
                                           else pg_catalog.pg_get_expr(index_row.indpred, index_row.indrelid, true)
-                                      end
+                                      end,
+                                      'is_constraint_backed', exists (
+                                          select 1
+                                          from pg_catalog.pg_constraint constraint_index
+                                          where constraint_index.conindid = index_row.indexrelid
+                                      )
                                   )
                                   order by index_relation.relname
                               ),
@@ -609,7 +617,70 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                    join pg_catalog.pg_class target_relation on target_relation.oid = index_row.indrelid
                    join pg_catalog.pg_namespace target_namespace on target_namespace.oid = target_relation.relnamespace
                    where index_row.indrelid = c.oid
-               ) as index_contracts
+               ) as index_contracts,
+               (
+                   select coalesce(
+                              jsonb_agg(
+                                  jsonb_build_object(
+                                      'trigger_name', trigger_row.trigger_name,
+                                      'target_schema', trigger_row.target_schema,
+                                      'target_relation', trigger_row.target_relation,
+                                      'function_schema', trigger_row.function_schema,
+                                      'function_name', trigger_row.function_name,
+                                      'function_identity_arguments', trigger_row.function_identity_arguments,
+                                      'timing', trigger_row.timing,
+                                      'events', trigger_row.events,
+                                      'update_columns', trigger_row.update_columns,
+                                      'level', trigger_row.level,
+                                      'enabled', trigger_row.enabled,
+                                      'when', trigger_row.trigger_when
+                                  )
+                                  order by trigger_row.trigger_name
+                              ),
+                              '[]'::jsonb
+                          )
+                   from (
+                       select t.tgname as trigger_name,
+                              target_namespace.nspname as target_schema,
+                              target_relation.relname as target_relation,
+                              function_namespace.nspname as function_schema,
+                              trigger_function.proname as function_name,
+                              pg_catalog.pg_get_function_identity_arguments(trigger_function.oid) as function_identity_arguments,
+                              case
+                                  when (t.tgtype & 64) <> 0 then 'INSTEAD OF'
+                                  when (t.tgtype & 2) <> 0 then 'BEFORE'
+                                  else 'AFTER'
+                              end as timing,
+                              coalesce((
+                                  select jsonb_agg(event_name order by event_name)
+                                  from (
+                                      values
+                                          ('DELETE', 8),
+                                          ('INSERT', 4),
+                                          ('TRUNCATE', 32),
+                                          ('UPDATE', 16)
+                                  ) event(event_name, event_bit)
+                                  where (t.tgtype & event.event_bit) <> 0
+                              ), '[]'::jsonb) as events,
+                              coalesce((
+                                  select jsonb_agg(update_attribute.attname order by update_column.ordinality)
+                                  from unnest(t.tgattr) with ordinality as update_column(attnum, ordinality)
+                                  join pg_catalog.pg_attribute update_attribute
+                                    on update_attribute.attrelid = t.tgrelid
+                                   and update_attribute.attnum = update_column.attnum
+                              ), '[]'::jsonb) as update_columns,
+                              case when (t.tgtype & 1) <> 0 then 'ROW' else 'STATEMENT' end as level,
+                              t.tgenabled as enabled,
+                              pg_catalog.pg_get_expr(t.tgqual, t.tgrelid, true) as trigger_when
+                       from pg_catalog.pg_trigger t
+                       join pg_catalog.pg_class target_relation on target_relation.oid = t.tgrelid
+                       join pg_catalog.pg_namespace target_namespace on target_namespace.oid = target_relation.relnamespace
+                       join pg_catalog.pg_proc trigger_function on trigger_function.oid = t.tgfoid
+                       join pg_catalog.pg_namespace function_namespace on function_namespace.oid = trigger_function.pronamespace
+                       where t.tgrelid = c.oid
+                         and not t.tgisinternal
+                   ) trigger_row
+               ) as trigger_bindings
         from pg_catalog.pg_class c
         join pg_catalog.pg_namespace n on n.oid = c.relnamespace
         where c.relkind = 'r'
@@ -1474,6 +1545,8 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "pg_catalog.pg_type",
         "pg_catalog.pg_attrdef",
         "pg_catalog.pg_constraint",
+        "pg_catalog.pg_trigger",
+        "pg_catalog.pg_get_function_identity_arguments",
         "pg_catalog.pg_index",
         "pg_catalog.pg_get_expr",
         "pg_catalog.pg_get_indexdef",
@@ -1497,6 +1570,30 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "key_columns",
         "included_columns",
         "predicate",
+        "is_constraint_backed",
+        "is_validated",
+        "convalidated",
+        "conindid",
+        "trigger_bindings",
+        "trigger_name",
+        "target_relation",
+        "function_schema",
+        "function_name",
+        "function_identity_arguments",
+        "timing",
+        "events",
+        "update_columns",
+        "level",
+        "enabled",
+        "when",
+        "tgname",
+        "tgrelid",
+        "tgisinternal",
+        "tgtype",
+        "tgattr",
+        "tgenabled",
+        "tgqual",
+        "tgfoid",
         "conkey",
         "confkey",
         "confupdtype",
@@ -1899,6 +1996,7 @@ def validate_runtime_membership_edges(
     rows: list[dict[str, Any]],
     *,
     enforce_production_identity: bool = True,
+    protect_provider_grantor: bool = True,
 ) -> tuple[str, ...]:
     """Evaluate the complete membership result without pre-filtering rows.
 
@@ -1907,6 +2005,11 @@ def validate_runtime_membership_edges(
     protected-role row, or a truly unrelated row before the complete graph is
     evaluated. A row with a protected participant is never ignored because the
     runtime is absent from its parent/member positions.
+
+    Production identity and provider-grantor protection remain enabled by
+    default. Disposable local PostgreSQL fixtures may disable identity binding
+    so their observed bootstrap grantor can be compared mechanically; the
+    manifest edge shape and all option checks remain enforced.
     """
 
     errors: list[str] = []
@@ -1935,11 +2038,12 @@ def validate_runtime_membership_edges(
     identity_protected_roles = (
         PROTECTED_PRODUCTION_ROLES if enforce_production_identity else frozenset()
     )
-    protected_roles = identity_protected_roles | {
+    protected_roles = set(identity_protected_roles) | {
         str(edge["parent_role"]),
         str(edge["member_role"]),
-        str(edge["grantor"]),
     }
+    if protect_provider_grantor:
+        protected_roles.add(str(edge["grantor"]))
     runtime_rows: list[dict[str, Any]] = []
     protected_rows: list[dict[str, Any]] = []
     seen_rows: set[tuple[str, str, str, bool, bool, bool]] = set()
@@ -3137,6 +3241,7 @@ def _structural_constraint(
     check_expression: str | None = None,
     is_deferrable: bool = False,
     is_deferred: bool = False,
+    is_validated: bool = True,
 ) -> dict[str, Any]:
     return {
         "constraint_name": name,
@@ -3150,6 +3255,7 @@ def _structural_constraint(
         "check_expression": check_expression,
         "is_deferrable": is_deferrable,
         "is_deferred": is_deferred,
+        "is_validated": is_validated,
     }
 
 
@@ -3514,6 +3620,7 @@ def _structural_parse_index(
         "key_columns": key_columns,
         "included_columns": [],
         "predicate": predicate,
+        "is_constraint_backed": False,
     }
 
 
@@ -3647,6 +3754,44 @@ def _structural_parse_trigger(
     }
 
 
+def _structural_check_columns(
+    expression: str | None,
+    columns: list[dict[str, Any]],
+) -> list[str]:
+    if type(expression) is not str:
+        return []
+    column_names = {
+        str(column["name"]).lower(): str(column["name"])
+        for column in columns
+        if type(column.get("name")) is str
+    }
+    if not column_names:
+        return []
+    tokens = lex_sql(expression)
+    referenced: list[str] = []
+    for index, token in enumerate(tokens):
+        if token.kind not in {"WORD", "QUOTED_IDENTIFIER"}:
+            continue
+        name = column_names.get(token.value.lower())
+        if name is None:
+            continue
+        if index + 1 < len(tokens) and tokens[index + 1].value == "(":
+            continue
+        previous_index = index - 1
+        if previous_index >= 0 and tokens[previous_index].value == "::":
+            continue
+        if previous_index >= 0 and tokens[previous_index].value == ".":
+            previous_index -= 1
+            while previous_index >= 0 and (
+                tokens[previous_index].value in {".", "[", "]"}
+                or tokens[previous_index].kind in {"WORD", "QUOTED_IDENTIFIER"}
+            ):
+                previous_index -= 1
+            if previous_index >= 0 and tokens[previous_index].value == "::":
+                continue
+        if name not in referenced:
+            referenced.append(name)
+    return referenced
 @lru_cache(maxsize=1)
 def _cached_classified_table_structure_contract() -> dict[str, Any]:
     structure: dict[str, dict[str, Any]] = {}
@@ -3670,6 +3815,12 @@ def _cached_classified_table_structure_contract() -> dict[str, Any]:
             "migration_structural_table_inventory_mismatch_"
             f"expected_{sorted(ALL_TABLES)}_got_{sorted(structure)}"
         )
+    for table in structure.values():
+        for constraint in table["constraints"]:
+            if constraint["constraint_type"] == "c" and not constraint["columns"]:
+                constraint["columns"] = _structural_check_columns(
+                    constraint["check_expression"], table["columns"]
+                )
     for table in structure.values():
         primary_keys = [
             column
@@ -3738,10 +3889,18 @@ def _normalise_constraint_expression(value: Any) -> str:
     normalised = normalised.replace("= any(array[", "in(")
     normalised = normalised.replace("]", ")")
     return _normalise_structural_sql(normalised)
+
+def _normalise_routine_definition(value: Any) -> str:
+    """Normalize executable routine text without stripping casts."""
+
+    return _normalise_structural_sql(value)
 def _constraint_signature(entry: dict[str, Any]) -> tuple[Any, ...]:
+    columns = tuple(entry.get("columns", []))
+    if entry.get("constraint_type") == "c":
+        columns = tuple(sorted(columns))
     return (
         entry.get("constraint_type"),
-        tuple(entry.get("columns", [])),
+        columns,
         entry.get("referenced_schema"),
         entry.get("referenced_table"),
         tuple(entry.get("referenced_columns", [])),
@@ -3750,6 +3909,7 @@ def _constraint_signature(entry: dict[str, Any]) -> tuple[Any, ...]:
         _normalise_constraint_expression(entry.get("check_expression")),
         bool(entry.get("is_deferrable")),
         bool(entry.get("is_deferred")),
+        bool(entry.get("is_validated")),
     )
 
 
@@ -3839,9 +3999,14 @@ def _validate_table_structure_evidence(
             for key in ("update_action", "delete_action"):
                 if constraint.get(key) not in {"a", "r", "c", "n", "d"}:
                     _add_error(errors, f"{constraint_label}_{key}_invalid")
-            for key in ("is_deferrable", "is_deferred"):
+            for key in ("is_deferrable", "is_deferred", "is_validated"):
                 if type(constraint.get(key)) is not bool:
                     _add_error(errors, f"{constraint_label}_{key}_must_be_bool")
+            if constraint.get("is_validated") is False and type(constraint.get("constraint_name")) is str:
+                _add_error(
+                    errors,
+                    f"table_structural_constraint_not_valid_{table_name}_{constraint['constraint_name']}",
+                )
             observed_constraints.append(constraint)
         indexes = row.get("index_contracts")
         if type(indexes) is not list:
@@ -3866,6 +4031,7 @@ def _validate_table_structure_evidence(
                 or any(type(value) is not str for value in index_row.get("key_columns", []))
                 or any(type(value) is not str for value in index_row.get("included_columns", []))
                 or (index_row.get("predicate") is not None and type(index_row.get("predicate")) is not str)
+                or type(index_row.get("is_constraint_backed")) is not bool
             ):
                 _add_error(errors, f"{index_label}_field_type_invalid")
                 continue
@@ -3873,9 +4039,19 @@ def _validate_table_structure_evidence(
             if index_name in observed_indexes:
                 _add_error(errors, f"{index_label}_duplicate_{index_name}")
             observed_indexes[index_name] = index_row
+        trigger_bindings = _validate_trigger_bindings(
+            row.get("trigger_bindings"), f"{label}_trigger_bindings", errors
+        )
+        for binding in trigger_bindings:
+            if binding["target_schema"] != schema_name or binding["target_relation"] != table_name:
+                _add_error(
+                    errors,
+                    f"table_structural_trigger_binding_target_mismatch_{table_name}",
+                )
         observed_tables[table_name] = {
             "columns": observed_columns,
             "constraints": observed_constraints,
+            "trigger_bindings": trigger_bindings,
         }
     for table_name, expected_table in expected_tables.items():
         observed = observed_tables.get(table_name)
@@ -3924,12 +4100,27 @@ def _validate_table_structure_evidence(
         )
         if actual_constraints != expected_constraints:
             _add_error(errors, f"table_structural_constraint_contract_mismatch_{table_name}")
+        actual_trigger_bindings = sorted(
+            (_trigger_binding_signature(binding) for binding in observed["trigger_bindings"]),
+            key=repr,
+        )
+        expected_trigger_bindings = sorted(
+            (
+                _trigger_binding_signature(trigger)
+                for trigger in expected["triggers"].values()
+                if trigger["target_schema"] == BOUND_SOURCE_SCHEMA
+                and trigger["target_relation"] == table_name
+            ),
+            key=repr,
+        )
+        if actual_trigger_bindings != expected_trigger_bindings:
+            _add_error(errors, f"table_structural_trigger_binding_contract_mismatch_{table_name}")
     for index_name, expected_index in expected["indexes"].items():
         actual_index = observed_indexes.get(index_name)
         if actual_index is None:
             _add_error(errors, f"table_structural_index_missing_{index_name}")
             continue
-        for key in ("target_schema", "target_table", "is_unique", "is_valid", "is_ready"):
+        for key in ("target_schema", "target_table", "is_unique", "is_valid", "is_ready", "is_constraint_backed"):
             if actual_index.get(key) != expected_index.get(key):
                 _add_error(errors, f"table_structural_index_{index_name}_{key}_mismatch")
         actual_keys = [_normalise_structural_sql(value) for value in actual_index.get("key_columns", [])]
@@ -3944,6 +4135,14 @@ def _validate_table_structure_evidence(
         if actual_predicate != expected_predicate:
             _add_error(errors, f"table_structural_index_{index_name}_predicate_mismatch")
 
+    expected_index_names = set(expected["indexes"])
+    for index_name, index_row in observed_indexes.items():
+        if (
+            index_name not in expected_index_names
+            and index_row["is_unique"]
+            and not index_row["is_constraint_backed"]
+        ):
+            _add_error(errors, f"table_structural_unexpected_unique_index_{index_name}")
 def _validate_table_column_contract(
     value: Any, label: str, errors: list[str]
 ) -> tuple[tuple[int, str, int, str | None, str | None, int, bool], ...]:
@@ -4899,12 +5098,17 @@ def _validate_trigger_bindings(
             "target_relation",
             "function_schema",
             "function_name",
-            "function_identity_arguments",
             "timing",
             "level",
             "enabled",
         ):
             _require_non_empty_string(binding.get(key), f"{binding_label}_{key}", errors)
+        _require_type(
+            binding.get("function_identity_arguments"),
+            str,
+            f"{binding_label}_function_identity_arguments",
+            errors,
+        )
         for key in ("events", "update_columns"):
             _require_string_list(binding.get(key), f"{binding_label}_{key}", errors)
         if binding.get("when") is not None and type(binding.get("when")) is not str:
@@ -5730,7 +5934,7 @@ def _validate_routine_structural_evidence(
             continue
         if evidence.get("language") != expected.get("language"):
             _add_error(errors, f"routine_structural_language_mismatch_{identity[1]}")
-        if _normalise_constraint_expression(evidence.get("routine_definition")) != _normalise_constraint_expression(expected.get("routine_definition")):
+        if _normalise_routine_definition(evidence.get("routine_definition")) != _normalise_routine_definition(expected.get("routine_definition")):
             _add_error(errors, f"routine_structural_definition_mismatch_{identity[1]}")
         if evidence.get("routine_configuration") != expected.get("routine_configuration"):
             _add_error(errors, f"routine_structural_configuration_mismatch_{identity[1]}")
@@ -5818,6 +6022,7 @@ def _validate_database_acl_evidence(
     errors: list[str],
     *,
     runtime_role: str,
+    manifest: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, tuple[tuple[str, str, str, bool], ...]]:
     if type(rows) is not list:
         _add_error(errors, "database_acl_evidence_must_be_list")
@@ -5844,6 +6049,30 @@ def _validate_database_acl_evidence(
     if type(row.get("database_name")) is not str or type(row.get("database_owner")) is not str:
         return row, entries
     owner = str(row["database_owner"])
+    public_contract = (
+        manifest.get("database_acl", {}).get("public", {})
+        if isinstance(manifest, dict)
+        and isinstance(manifest.get("database_acl"), dict)
+        and isinstance(manifest.get("database_acl", {}).get("public"), dict)
+        else {"connect": True}
+    )
+    expected_public_connect = public_contract.get("connect") is True
+    public_connect = [
+        entry for entry in entries if entry[0] == "PUBLIC" and entry[2] == "CONNECT"
+    ]
+    if expected_public_connect:
+        if len(public_connect) != 1:
+            _add_error(errors, "database_acl_public_connect_evidence_missing_or_duplicate")
+        else:
+            if public_connect[0][1] != owner:
+                _add_error(
+                    errors,
+                    f"database_acl_public_connect_grantor_invalid_expected_{owner}_got_{public_connect[0][1]}",
+                )
+            if public_connect[0][3]:
+                _add_error(errors, "database_acl_public_connect_grant_option_forbidden")
+    elif public_connect:
+        _add_error(errors, "database_acl_public_connect_forbidden")
     direct_connect = [
         entry for entry in entries if entry[0] == runtime_role and entry[2] == "CONNECT"
     ]
@@ -6033,8 +6262,12 @@ def _validate_default_acl_evidence(
             _add_error(errors, f"{label}_runtime_role_default_acl_forbidden")
         if row["grantee"] == runtime_role and row["is_grantable"]:
             _add_error(errors, f"{label}_runtime_role_grant_option_forbidden")
-        if row["grantee"] == "PUBLIC" and row["is_grantable"]:
-            _add_error(errors, f"{label}_public_grant_option_forbidden")
+        if row["grantee"] == "PUBLIC":
+            if row["object_type"] in DEFAULT_ACL_OBJECT_CLASSES:
+                _add_error(
+                    errors,
+                    f"{label}_public_default_privilege_forbidden_{row['object_type']}_{row['privilege_type']}",
+                )
 
 
 def evaluate_final_runtime_authority(
@@ -6042,6 +6275,7 @@ def evaluate_final_runtime_authority(
     evidence: dict[str, Any],
     *,
     runtime_role: str = "sqag_runtime",
+    enforce_production_identity: bool = True,
 ) -> tuple[str, ...]:
     """Evaluate the complete fifteen-query exact-state evidence packet."""
 
@@ -6069,6 +6303,7 @@ def evaluate_final_runtime_authority(
         collections["database_acl"],
         errors,
         runtime_role=runtime_role,
+        manifest=manifest,
     )
     _validate_effective_database_evidence(
         collections["effective_runtime_database_privileges"],
@@ -6086,6 +6321,8 @@ def evaluate_final_runtime_authority(
         validate_runtime_membership_edges(
             manifest,
             collections["role_memberships"],
+            enforce_production_identity=enforce_production_identity,
+            protect_provider_grantor=enforce_production_identity,
         )
     )
     errors.extend(
