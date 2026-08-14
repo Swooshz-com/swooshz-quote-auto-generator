@@ -414,10 +414,10 @@ live-system evidence.
 
 | Key | Exact result columns | Fixture cardinality |
 |---|---|---:|
-| `database_acl` | `datacl` | 1 |
+| `database_acl` | `database_name`, `database_owner`, `datacl`, `acl_entries` | 1 |
 | `schema_acl` | `schema_name`, `schema_owner`, `database_owner`, `acl_entries` | 1 |
-| `table_acl` | `relname`, `relacl` | 16 without the optional source table; 17 when it exists |
-| `routine_acl` | `schema_name`, `routine_name`, `identity_arguments`, `routine_kind`, `security_definer`, `owner`, `acl_entries`, `has_trigger_dependency` | 2 without the provider fixture; 3 when `show_db_tree()` is present |
+| `table_acl` | `schema_name`, `relname`, `relacl`, `table_columns`, `table_constraints`, `index_contracts` | 16 without the optional source table; 17 when it exists |
+| `routine_acl` | `schema_name`, `routine_name`, `identity_arguments`, `routine_kind`, `security_definer`, `owner`, `language`, `routine_definition`, `routine_configuration`, `acl_entries`, `has_trigger_dependency`, `trigger_bindings` | 2 without the provider fixture; 3 when `show_db_tree()` is present |
 | `default_acl` | `owner`, `namespace`, `object_type`, `grantee`, `privilege_type`, `is_grantable` | 1 |
 | `role_attributes` | `rolname`, `rolsuper`, `rolinherit`, `rolcreaterole`, `rolcreatedb`, `rolcanlogin`, `rolreplication`, `rolbypassrls`, `rolconnlimit`, `password_is_null` | 2 |
 | `role_memberships` | `role`, `member`, `grantor`, `admin_option`, `inherit_option`, `set_option` | 0 in the generic shape fixture; 1 exact runtime edge in the creator fixture |
@@ -427,7 +427,7 @@ live-system evidence.
 | `effective_runtime_column_privileges` | `schema_name`, `table_name`, `column_name`, `acl_entries`, `privilege_type`, `effective`, `is_grantable` | 4 per visible column on each enumerated non-system `r`/`p`/`f` relation |
 | `effective_runtime_schema_privileges` | `schema_name`, `privilege_type`, `effective`, `is_grantable` | 2 per enumerated non-system schema |
 | `effective_runtime_routine_privileges` | `schema_name`, `routine_name`, `identity_arguments`, `routine_kind`, `privilege_type`, `direct_runtime_execute`, `public_execute`, `effective`, `is_grantable` | 1 per enumerated non-system routine |
-| `effective_runtime_parameter_privileges` | `parameter_name`, `acl_entries`, `effective_set`, `effective_alter_system`, `set_grantable`, `alter_system_grantable` | One row per parameter in the sorted `pg_settings`/`pg_parameter_acl` inventory union, including `session_replication_role` |
+| `effective_runtime_parameter_privileges` | `parameter_name`, `acl_entries`, `startup_defaults`, `effective_set`, `effective_alter_system`, `set_grantable`, `alter_system_grantable` | One row per parameter in the sorted `pg_settings`/`pg_parameter_acl` inventory union, including `session_replication_role` |
 | `view_acl` | `schema_name`, `relation_name`, `relation_kind`, `owner`, `relation_acl`, `acl_entries`, `column_acl_entries`, `view_definition`, `view_dependencies`, `view_columns`, `relation_options`, `view_security`, `runtime_privileges`, `runtime_select`, `runtime_select_grantable` | 0 in the generic shape fixture; 1 when the legacy-optional view fixture is present |
 
 The effective database proof covers `CONNECT`, `CREATE`, and `TEMPORARY`; the
@@ -574,9 +574,10 @@ boundary, the PUBLIC case mapping, and deterministic ordering. The
 role-attribute query must join `pg_roles` to the authoritative `pg_authid`
 catalog and project only the boolean `password_is_null` assertion; it never
 returns the password field. The routine query must have
-the exact eight-column projection
-`schema_name, routine_name, identity_arguments, routine_kind, security_definer, owner,
-acl_entries, has_trigger_dependency`, the complete public-schema routine boundary, decoded
+the exact twelve-column projection
+`schema_name, routine_name, identity_arguments, routine_kind, security_definer, owner, language,
+routine_definition, routine_configuration, acl_entries, has_trigger_dependency, trigger_bindings`,
+the complete public-schema routine boundary, decoded
 ACL identities, owner/security posture, trigger dependency posture, and deterministic
 identity ordering. The schema query must project the decoded public-schema ACL together
 with the exact schema owner and current database owner used as independent provenance evidence; the recorded schema-owner role is the required direct-grant ACL grantor. The view query must project exactly
@@ -690,6 +691,79 @@ baseline, direct/PUBLIC/membership-derived `SET` on
 mutation is revoked or restored, the final catalog contains no runtime
 parameter authority residue, and the final evaluator result is clean.
 
+### H31: exact routine body, language, configuration, and binding evidence
+
+The routine ACL query now binds each public routine to its catalog language,
+source body, configuration array, and decoded trigger-binding array. The
+migration-derived structural contract supplies the expected language, normalized
+body, empty configuration, and exact trigger set for both SQAG trigger
+functions. A provider routine is not allowed to acquire a trigger binding.
+Changing the body, language, configuration, target relation, function identity,
+timing, event, update-column list, row/statement level, enabled posture, or
+WHEN expression fails the final evaluator.
+
+### H32: trigger-binding structural guard
+
+Trigger evidence is correlated from pg_trigger, the target relation, the
+trigger function, tgtype event bits, tgattr update columns, tgenabled, and
+tgqual. The evaluator compares the complete binding rather than trusting a
+trigger name or has_trigger_dependency alone. Static regressions cover
+re-binding a trigger to another relation, changing the function, event,
+timing, update-column list, and disabled posture; the PostgreSQL final path
+uses the same exact evidence and restores each disposable mutation.
+
+### H33: documentation and query-parity closure
+
+The manifest, validator, tests, and CI-status narrative retain exactly fifteen
+canonical query keys. Existing query keys were extended in place for structural
+and startup-default evidence, so the key count and execution order remain
+stable while the documented result projections stay synchronized.
+
+### H34: startup-default precedence guard
+
+Parameter evidence includes every applicable pg_db_role_setting row for the
+current database and sqag_runtime, classified as database_global precedence 1,
+role_global precedence 2, or role_database precedence 3. The highest applicable
+setting is resolved for session_replication_role. A replica value, an ambiguous
+highest-precedence value, or malformed scope/precedence evidence fails closed;
+origin and local are the permitted safe values. Disposable PostgreSQL controls
+exercise all three scopes and restore the role/database settings.
+
+### H35: migration-derived table structure guard
+
+table_acl now carries ordered columns with nullability and default expressions,
+semantic table constraints, and index contracts. The validator derives the
+expected table structure from the locked PostgreSQL migrations and the ledger
+DDL, including primary, unique, foreign-key, check, not-null, and default
+semantics. Publication-version primary/unique constraints and foreign-key
+relationships therefore cannot be removed or altered without a final-gate
+failure.
+
+### H36: large-object posture remains deferred
+
+Large-object privilege evidence remains outside this bounded recovery. No
+large-object catalog query, fixture, or claim is added by this run; H36 remains
+DEFERRED_NONBLOCKING_UNCHANGED and is not used to weaken the exact table,
+routine, parameter, or role evidence.
+
+### H37: complete exact-state final gate
+
+The final CI evaluator requires the exact fifteen-key evidence packet. Every
+collection must be present and a list, and database ACL, effective database
+privileges, schema, sequence, routine, parameter, default-ACL, role-attribute,
+membership, table, view, column, and table-structure evidence are consumed.
+Missing schema, sequence, routine, parameter, database, role, or membership
+collections fail closed; the narrow partial evaluator is not the completion
+proof.
+
+### H38: migration-bound index integrity
+
+For every standalone migration index, table_acl carries target schema and
+relation, uniqueness, validity, readiness, ordered key expressions, included
+columns, and normalized predicate. The validator compares each index by
+migration-derived identity and rejects wrong target relations, key order or
+content, uniqueness drift, invalid or unready posture, included-column drift,
+and predicate drift.
 The runtime table proof constructs the expected manifest effective set for
 classified application tables and requires every other public `r`/`p`/`f`
 relation to have zero effective and grant-option authority. It compares that
@@ -805,11 +879,11 @@ The deterministic discovery receipt for this amendment is:
 
 | Receipt item | Count |
 |---|---:|
-| Discovered test methods | 238 |
-| Static and validator methods | 154 |
-| PostgreSQL methods | 80 |
+| Discovered test methods | 246 |
+| Static and validator methods | 159 |
+| PostgreSQL methods | 83 |
 | Requirement-map and documentation parity methods | 4 |
-| Hosted executions | 238 |
+| Hosted executions | 246 |
 | Hosted skips | 0 |
 | Unique locked requirement IDs | 38 (`R01`-`R38`) |
 

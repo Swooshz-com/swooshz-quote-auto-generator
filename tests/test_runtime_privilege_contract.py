@@ -1,11 +1,11 @@
 """Runtime privilege contract tests.
 
 Deterministic discovery receipt for this amendment:
-  discovered methods: 238
-  static and validator methods: 154
-  PostgreSQL methods: 80
+  discovered methods: 246
+  static and validator methods: 159
+  PostgreSQL methods: 83
   requirement-map and documentation parity methods: 4
-  hosted executions: 238
+  hosted executions: 246
   hosted skips: 0
   unique locked requirement IDs: 38 (R01-R38)
 
@@ -100,9 +100,16 @@ CANONICAL_QUERY_KEYS = (
     "view_acl",
 )
 CANONICAL_QUERY_COLUMNS = {
-    "database_acl": ["datacl"],
+    "database_acl": ["database_name", "database_owner", "datacl", "acl_entries"],
     "schema_acl": ["schema_name", "schema_owner", "database_owner", "acl_entries"],
-    "table_acl": ["relname", "relacl"],
+    "table_acl": [
+        "schema_name",
+        "relname",
+        "relacl",
+        "table_columns",
+        "table_constraints",
+        "index_contracts",
+    ],
     "routine_acl": [
         "schema_name",
         "routine_name",
@@ -110,8 +117,12 @@ CANONICAL_QUERY_COLUMNS = {
         "routine_kind",
         "security_definer",
         "owner",
+        "language",
+        "routine_definition",
+        "routine_configuration",
         "acl_entries",
         "has_trigger_dependency",
+        "trigger_bindings",
     ],
     "default_acl": ["owner", "namespace", "object_type", "grantee", "privilege_type", "is_grantable"],
     "role_attributes": [
@@ -189,6 +200,7 @@ CANONICAL_QUERY_COLUMNS = {
     "effective_runtime_parameter_privileges": [
         "parameter_name",
         "acl_entries",
+        "startup_defaults",
         "effective_set",
         "effective_alter_system",
         "set_grantable",
@@ -820,8 +832,12 @@ class ValidatorStaticTest(unittest.TestCase):
                 "routine_kind": routine_kind,
                 "security_definer": security_definer,
                 "owner": owner,
+                "language": "plpgsql",
+                "routine_definition": "",
+                "routine_configuration": [],
                 "acl_entries": acl_entries,
                 "has_trigger_dependency": has_trigger_dependency,
+                "trigger_bindings": [],
             }
 
         rows = [
@@ -1175,6 +1191,7 @@ class ValidatorStaticTest(unittest.TestCase):
                 "effective_alter_system": effective_alter_system,
                 "set_grantable": set_grantable,
                 "alter_system_grantable": alter_system_grantable,
+                "startup_defaults": [],
             }
 
         baseline = [parameter_row("application_name"), parameter_row("session_replication_role")]
@@ -1216,6 +1233,217 @@ class ValidatorStaticTest(unittest.TestCase):
         malformed[-1]["acl_entries"] = [{"grantee": "PUBLIC"}]
         errors = contract_validator.evaluate_parameter_authority(manifest, malformed)
         self.assertTrue(any("acl_entries" in error for error in errors), errors)
+
+    def test_final_authority_requires_each_canonical_query_collection(self) -> None:
+        manifest = load_manifest()
+        evidence = {key: [] for key in CANONICAL_QUERY_KEYS}
+        for required_key in (
+            "database_acl",
+            "effective_runtime_database_privileges",
+            "schema_acl",
+            "sequence_acl",
+            "effective_runtime_routine_privileges",
+            "effective_runtime_parameter_privileges",
+        ):
+            candidate = copy.deepcopy(evidence)
+            del candidate[required_key]
+            errors = contract_validator.evaluate_final_runtime_authority(manifest, candidate)
+            self.assertTrue(
+                any(
+                    f"final_runtime_evidence_missing_queries" in error
+                    and required_key in error
+                    for error in errors
+                ),
+                (required_key, errors),
+            )
+
+    def test_parameter_startup_default_precedence_rejects_replica(self) -> None:
+        manifest = load_manifest()
+        def parameter_row(parameter_name: str, startup_defaults: list[dict[str, Any]]) -> dict[str, Any]:
+            return {
+                "parameter_name": parameter_name,
+                "acl_entries": [],
+                "startup_defaults": startup_defaults,
+                "effective_set": False,
+                "effective_alter_system": False,
+                "set_grantable": False,
+                "alter_system_grantable": False,
+            }
+
+        baseline = [
+            parameter_row("application_name", []),
+            parameter_row(
+                "session_replication_role",
+                [
+                    {"scope": "database_global", "precedence": 1, "setting": "session_replication_role=origin"},
+                ],
+            ),
+        ]
+        self.assertEqual(contract_validator.evaluate_parameter_authority(manifest, baseline), ())
+        unsafe = copy.deepcopy(baseline)
+        unsafe[-1]["startup_defaults"].append(
+            {"scope": "role_global", "precedence": 2, "setting": "session_replication_role=replica"}
+        )
+        unsafe[-1]["startup_defaults"].sort(key=lambda entry: (entry["precedence"], entry["setting"]))
+        errors = contract_validator.evaluate_parameter_authority(manifest, unsafe)
+        self.assertTrue(
+            any("runtime_parameter_unsafe_startup_default_session_replication_role" in error for error in errors),
+            errors,
+        )
+        restored = copy.deepcopy(unsafe)
+        restored[-1]["startup_defaults"][-1] = {
+            "scope": "role_database",
+            "precedence": 3,
+            "setting": "session_replication_role=origin",
+        }
+        self.assertEqual(contract_validator.evaluate_parameter_authority(manifest, restored), ())
+
+    def test_migration_derived_structural_contract_rejects_constraint_and_index_drift(self) -> None:
+        structural = contract_validator.classified_table_structure_contract()
+
+        def evidence_rows() -> list[dict[str, Any]]:
+            rows: list[dict[str, Any]] = []
+            for table_name, table in structural["tables"].items():
+                constraints = []
+                for index, constraint in enumerate(copy.deepcopy(table["constraints"])):
+                    if constraint["constraint_name"] is None:
+                        constraint["constraint_name"] = f"fixture_{table_name}_{index}"
+                    constraints.append(constraint)
+                indexes = [
+                    copy.deepcopy(index_contract)
+                    for index_contract in structural["indexes"].values()
+                    if index_contract["target_table"] == table_name
+                ]
+                rows.append(
+                    {
+                        "schema_name": "public",
+                        "relname": table_name,
+                        "relacl": [],
+                        "table_columns": copy.deepcopy(table["columns"]),
+                        "table_constraints": constraints,
+                        "index_contracts": indexes,
+                    }
+                )
+            rows.append(
+                {
+                    "schema_name": "public",
+                    "relname": "legacy_quote_artifacts_source",
+                    "relacl": [],
+                    "table_columns": [],
+                    "table_constraints": [],
+                    "index_contracts": [],
+                }
+            )
+            return rows
+
+        baseline = evidence_rows()
+        errors: list[str] = []
+        contract_validator._validate_table_structure_evidence(baseline, errors)
+        self.assertEqual(errors, [])
+        publication = next(
+            row for row in baseline if row["relname"] == "sqag_quote_publication_versions"
+        )
+        publication["table_constraints"] = [
+            constraint
+            for constraint in publication["table_constraints"]
+            if constraint["constraint_type"] != "p"
+        ]
+        errors = []
+        contract_validator._validate_table_structure_evidence(baseline, errors)
+        self.assertTrue(
+            any("table_structural_constraint_contract_mismatch_sqag_quote_publication_versions" in error for error in errors),
+            errors,
+        )
+        baseline = evidence_rows()
+        index_row = next(
+            row
+            for row in baseline
+            if any(index["index_name"] == "sqag_feedback_publication_idx" for index in row["index_contracts"])
+        )
+        next(
+            index
+            for index in index_row["index_contracts"]
+            if index["index_name"] == "sqag_feedback_publication_idx"
+        )["target_table"] = "sqag_feedback_status_history"
+        errors = []
+        contract_validator._validate_table_structure_evidence(baseline, errors)
+        self.assertTrue(
+            any("table_structural_index_sqag_feedback_publication_idx_target_table_mismatch" in error for error in errors),
+            errors,
+        )
+
+    def test_migration_derived_routine_contract_rejects_body_and_trigger_drift(self) -> None:
+        structural = contract_validator.classified_table_structure_contract()
+        evidence = {
+            identity: {
+                **copy.deepcopy(routine),
+                "security_definer": False,
+                "owner": "sqag_migrator",
+                "has_trigger_dependency": bool(
+                    any(
+                        trigger["function_name"] == identity[1]
+                        and trigger["function_identity_arguments"] == identity[2]
+                        for trigger in structural["triggers"].values()
+                    )
+                ),
+                "acl_entries": [],
+                "trigger_bindings": [
+                    copy.deepcopy(trigger)
+                    for trigger in structural["triggers"].values()
+                    if trigger["function_name"] == identity[1]
+                    and trigger["function_identity_arguments"] == identity[2]
+                ],
+            }
+            for identity, routine in structural["routines"].items()
+        }
+        errors: list[str] = []
+        contract_validator._validate_routine_structural_evidence(evidence, errors)
+        self.assertEqual(errors, [])
+        mutated = copy.deepcopy(evidence)
+        mutated[("public", "sqag_reject_immutable_change", "", "f")]["language"] = "sql"
+        errors = []
+        contract_validator._validate_routine_structural_evidence(mutated, errors)
+        self.assertIn("routine_structural_language_mismatch_sqag_reject_immutable_change", errors)
+        mutated = copy.deepcopy(evidence)
+        mutated[("public", "sqag_reject_immutable_change", "", "f")]["trigger_bindings"][0]["target_relation"] = "sqag_feedback"
+        errors = []
+        contract_validator._validate_routine_structural_evidence(mutated, errors)
+        self.assertIn("routine_structural_trigger_binding_mismatch_sqag_reject_immutable_change", errors)
+        mutated = copy.deepcopy(evidence)
+        mutated[("public", "sqag_reject_immutable_change", "", "f")]["trigger_bindings"][0]["enabled"] = "D"
+        errors = []
+        contract_validator._validate_routine_structural_evidence(mutated, errors)
+        self.assertIn("routine_structural_trigger_binding_mismatch_sqag_reject_immutable_change", errors)
+
+    def test_database_acl_exact_state_rejects_public_create(self) -> None:
+        row = {
+            "database_name": "fixture",
+            "database_owner": "database_owner",
+            "datacl": [],
+            "acl_entries": [
+                {
+                    "grantee": "sqag_runtime",
+                    "grantor": "database_owner",
+                    "privilege_type": "CONNECT",
+                    "is_grantable": False,
+                }
+            ],
+        }
+        errors: list[str] = []
+        contract_validator._validate_database_acl_evidence([row], errors, runtime_role="sqag_runtime")
+        self.assertEqual(errors, [])
+        mutated = copy.deepcopy(row)
+        mutated["acl_entries"].append(
+            {
+                "grantee": "PUBLIC",
+                "grantor": "database_owner",
+                "privilege_type": "CREATE",
+                "is_grantable": False,
+            }
+        )
+        errors = []
+        contract_validator._validate_database_acl_evidence([mutated], errors, runtime_role="sqag_runtime")
+        self.assertIn("database_acl_public_create_forbidden", errors)
 
     def test_schema_scoped_explicit_column_exception_rejects_shadow_schema(self) -> None:
         manifest = copy.deepcopy(load_manifest())
@@ -1609,7 +1837,7 @@ class ValidatorStaticTest(unittest.TestCase):
         self._assert_exact_query_rejected(
             "routine_acl",
             query.replace(
-                "p.proname as routine_name,\n       pg_catalog.pg_get_function_identity_arguments",
+                "p.proname as routine_name,\n               pg_catalog.pg_get_function_identity_arguments",
                 "sqag_user_defined(p.proname) as routine_name,\n       pg_catalog.pg_get_function_identity_arguments",
                 1,
             ),
@@ -1620,9 +1848,9 @@ class ValidatorStaticTest(unittest.TestCase):
         self._assert_exact_query_rejected(
             "default_acl",
             query.replace(
-                "('r', 'S', 'f', 'n', 'T') order by",
-                "('r', 'S', 'f', 'n', 'T') and exists (select 1, nextval('sqag_probe') "
-                "from pg_catalog.pg_roles probe) order by",
+                "where d.defaclobjtype in ('r', 'S', 'f', 'n', 'T')",
+                "where d.defaclobjtype in ('r', 'S', 'f', 'n', 'T') and exists (select 1, nextval('sqag_probe') "
+                "from pg_catalog.pg_roles probe)",
                 1,
             ),
         )
@@ -1652,8 +1880,8 @@ class ValidatorStaticTest(unittest.TestCase):
             query.replace(", expanded.is_grantable", "", 1),
             query.replace("select owner.rolname as owner,", "select owner.rolname as owner, 1 as extra,", 1),
             query.replace(
-                "owner.rolname as owner, coalesce(ns.nspname, '<global>') as namespace",
-                "coalesce(ns.nspname, '<global>') as namespace, owner.rolname as owner",
+                "owner.rolname as owner,\n               coalesce(ns.nspname, '<global>') as namespace",
+                "coalesce(ns.nspname, '<global>') as namespace,\n               owner.rolname as owner",
                 1,
             ),
         )
@@ -1783,7 +2011,7 @@ class ValidatorStaticTest(unittest.TestCase):
         )
         self._assert_query_fixture_rejected(
             "default_acl",
-            default_query.replace("case when expanded.grantee = 0 then 'PUBLIC'", "case when expanded.grantee = 0 then 'PRIVATE'", 1),
+            default_query.replace("when expanded.grantee = 0 then 'PUBLIC'", "when expanded.grantee = 0 then 'PRIVATE'", 1),
             "verification_query_default_acl_projection_grantee_missing_public_mapping",
         )
 
@@ -1812,7 +2040,7 @@ class ValidatorStaticTest(unittest.TestCase):
         mutations = (
             query.replace("am.admin_option", "a.admin_option", 1),
             query.replace("am.admin_option", "am.grant_option", 1),
-            query.replace(", am.admin_option", "", 1),
+            query.replace("am.admin_option,\n", "", 1),
             query.replace("grantor.rolname as grantor,", "", 1),
             query.replace("am.inherit_option,", "", 1),
             query.replace("am.set_option", "false as set_option", 1),
@@ -3525,7 +3753,7 @@ class RequirementEvidenceMapTest(unittest.TestCase):
         self.assertIn("- name: Validate runtime privilege contract", workflow)
         self.assertIn("run: python scripts/validate_runtime_privilege_contract.py", workflow)
         self.assertIn("Runtime privilege-contract static validation", documentation)
-        self.assertIn("Disposable PostgreSQL 17 runtime privilege-contract tests exercise the fourteen canonical query keys", documentation)
+        self.assertIn("Disposable PostgreSQL 17 runtime privilege-contract tests exercise the fifteen canonical query keys", documentation)
         self.assertIn("creator-admin control edge with ADMIN true, INHERIT false, and SET false", documentation)
         self.assertIn("Boundary A remains repository-only", documentation)
         self.assertIn("Green CI does not authorise Boundary B or #160", documentation)
@@ -4942,33 +5170,14 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
 
     def _evaluate_runtime_authority_on(self, connection) -> tuple[str, ...]:
         evidence: dict[str, list[dict[str, Any]]] = {}
-        for query_key in (
-            "view_acl",
-            "effective_runtime_table_privileges",
-            "effective_runtime_column_privileges",
-            "effective_runtime_schema_privileges",
-            "sequence_acl",
-            "effective_runtime_routine_privileges",
-            "schema_acl",
-            "routine_acl",
-            "effective_runtime_parameter_privileges",
-        ):
+        for query_key in CANONICAL_QUERY_KEYS:
             columns, rows = self._execute_contract_query_on(connection, query_key)
             self.assertEqual(columns, CANONICAL_QUERY_COLUMNS[query_key])
             evidence[query_key] = rows
-        return contract_validator.evaluate_runtime_authority(
+        return contract_validator.evaluate_final_runtime_authority(
             self.contract,
-            evidence["view_acl"],
-            evidence["effective_runtime_table_privileges"],
-            evidence["effective_runtime_column_privileges"],
-            schema_privilege_rows=evidence["effective_runtime_schema_privileges"],
-            sequence_privilege_rows=evidence["sequence_acl"],
-            routine_privilege_rows=evidence["effective_runtime_routine_privileges"],
-            schema_acl_rows=evidence["schema_acl"],
-            routine_acl_rows=evidence["routine_acl"],
-            parameter_privilege_rows=evidence["effective_runtime_parameter_privileges"],
+            evidence,
         )
-
     def _evaluate_runtime_authority_rows(self) -> tuple[str, ...]:
         connection = self.connect()
         try:
@@ -5148,6 +5357,32 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             },
             self._expected_runtime_database_privileges(),
         )
+        database_acl_rows = results["database_acl"][1]
+        self.assertEqual(len(database_acl_rows), 1)
+        database_acl_row = database_acl_rows[0]
+        self.assertEqual(database_acl_row["database_name"], self.database_name)
+        self.assertTrue(str(database_acl_row["database_owner"]))
+        self.assertIsInstance(database_acl_row["acl_entries"], list)
+        self.assertIn(
+            {
+                "grantee": "sqag_runtime",
+                "grantor": database_acl_row["database_owner"],
+                "privilege_type": "CONNECT",
+                "is_grantable": False,
+            },
+            database_acl_row["acl_entries"],
+        )
+        self.assertFalse(
+            any(
+                entry["grantee"] in {"PUBLIC", "sqag_runtime"}
+                and entry["privilege_type"] in {"CREATE", "TEMPORARY"}
+                for entry in database_acl_row["acl_entries"]
+            )
+        )
+        raw_table_rows = results["table_acl"][1]
+        structural_errors: list[str] = []
+        contract_validator._validate_table_structure_evidence(raw_table_rows, structural_errors)
+        self.assertEqual(structural_errors, [])
         schema_rows = results["effective_runtime_schema_privileges"][1]
         self.assertEqual(
             {
@@ -5256,9 +5491,11 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                     row["routine_kind"],
                     row["owner"],
                     row["security_definer"],
+                    row["language"],
+                    row["routine_configuration"],
                     row["has_trigger_dependency"],
                 ),
-                ("public", "", "f", "sqag_migrator", False, True),
+                ("public", "", "f", "sqag_migrator", False, "plpgsql", [], True),
             )
             self.assertFalse(
                 any(
@@ -5267,6 +5504,30 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                     for entry in row["acl_entries"]
                 )
             )
+        structural = contract_validator.classified_table_structure_contract()
+        for routine_name, expected_routine in structural["routines"].items():
+            routine_row = routine_acl_by_name[routine_name[1]]
+            self.assertEqual(routine_row["language"], expected_routine["language"])
+            self.assertEqual(
+                contract_validator._normalise_constraint_expression(routine_row["routine_definition"]),
+                contract_validator._normalise_constraint_expression(expected_routine["routine_definition"]),
+            )
+            self.assertEqual(routine_row["routine_configuration"], expected_routine["routine_configuration"])
+            expected_bindings = sorted(
+                contract_validator._trigger_binding_signature(trigger)
+                for trigger in structural["triggers"].values()
+                if (
+                    trigger["function_schema"],
+                    trigger["function_name"],
+                    trigger["function_identity_arguments"],
+                    "f",
+                ) == routine_name
+            )
+            observed_bindings = sorted(
+                contract_validator._trigger_binding_signature(binding)
+                for binding in routine_row["trigger_bindings"]
+            )
+            self.assertEqual(observed_bindings, expected_bindings)
         parameter_columns, parameter_rows = results["effective_runtime_parameter_privileges"]
         self.assertEqual(
             parameter_columns,
@@ -5276,6 +5537,8 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             row for row in parameter_rows if row["parameter_name"] == "session_replication_role"
         ]
         self.assertEqual(len(session_replication_rows), 1)
+        self.assertTrue(all(isinstance(row["startup_defaults"], list) for row in parameter_rows))
+        self.assertEqual(session_replication_rows[0]["startup_defaults"], [])
         self.assertEqual(
             {
                 (
@@ -6605,6 +6868,117 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 ("sqag_audit_events_guard_delete", "sqag_audit_events", "sqag_require_retention_delete_authorization"),
             },
         )
+
+    def test_routine_trigger_binding_structural_controls_fail_closed_postgres(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+        trigger_name = "sqag_generation_evidence_no_update"
+        source_table = "sqag_generation_evidence"
+        rebound_table = "sqag_feedback"
+        self._execute_admin_sql(
+            f'drop trigger "{trigger_name}" on public."{source_table}"'
+        )
+        self._execute_admin_sql(
+            f'create trigger "{trigger_name}" before update on public."{rebound_table}" '
+            'for each row execute function public.sqag_reject_immutable_change()'
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(
+                any(
+                    "routine_structural_trigger_binding_mismatch_sqag_reject_immutable_change"
+                    in error
+                    for error in errors
+                ),
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(
+                f'drop trigger "{trigger_name}" on public."{rebound_table}"'
+            )
+            self._execute_admin_sql(
+                f'create trigger "{trigger_name}" before update on public."{source_table}" '
+                'for each row execute function public.sqag_reject_immutable_change()'
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        self._execute_admin_sql(
+            f'alter table public."{source_table}" disable trigger "{trigger_name}"'
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(
+                any(
+                    "routine_structural_trigger_binding_mismatch_sqag_reject_immutable_change"
+                    in error
+                    for error in errors
+                ),
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(
+                f'alter table public."{source_table}" enable trigger "{trigger_name}"'
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+    def test_migration_derived_table_structure_controls_fail_closed_postgres(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "select conname from pg_catalog.pg_constraint "
+                "where conrelid = 'public.sqag_quote_publication_versions'::regclass "
+                "and contype = 'c' "
+                "and pg_catalog.pg_get_constraintdef(oid, true) ilike '%state%' "
+                "order by conname limit 1"
+            ).fetchone()
+        finally:
+            connection.rollback()
+            connection.close()
+        if row is None:
+            self.fail('publication state check constraint was not found')
+        constraint_name = str(_row_dict(row, 'conname'))
+        self._execute_admin_sql(
+            f'alter table public."sqag_quote_publication_versions" drop constraint {_quote_identifier(constraint_name)}'
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(
+                any(
+                    'table_structural_constraint_contract_mismatch_sqag_quote_publication_versions'
+                    in error
+                    for error in errors
+                ),
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(
+                f'alter table public."sqag_quote_publication_versions" add constraint '
+                f'{_quote_identifier(constraint_name)} check '
+                "(state in ('staged','published','superseded','failed'))"
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        index_name = 'sqag_generation_runs_workspace_job_uidx'
+        self._execute_admin_sql(f'drop index public.{_quote_identifier(index_name)}')
+        self._execute_admin_sql(
+            f'create index {_quote_identifier(index_name)} on public."sqag_generation_runs" '
+            '(workspace_id, job_id) where job_id is not null'
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertIn(
+                f'table_structural_index_{index_name}_is_unique_mismatch',
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(f'drop index public.{_quote_identifier(index_name)}')
+            self._execute_admin_sql(
+                f'create unique index {_quote_identifier(index_name)} on public."sqag_generation_runs" '
+                '(workspace_id, job_id) where job_id is not null'
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
 
     def test_runtime_role_attributes_memberships_and_ownership_are_exact(self) -> None:
         self.apply_migrations()
@@ -8649,6 +9023,43 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             )
         )
         self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+    def test_parameter_startup_default_scopes_fail_closed_postgres(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+        controls = (
+            (
+                "role_global",
+                'alter role "sqag_runtime" set session_replication_role = replica',
+                'alter role "sqag_runtime" reset session_replication_role',
+            ),
+            (
+                "database_global",
+                f'alter database {_quote_identifier(self.database_name)} set session_replication_role = replica',
+                f'alter database {_quote_identifier(self.database_name)} reset session_replication_role',
+            ),
+            (
+                "role_database",
+                f'alter role "sqag_runtime" in database {_quote_identifier(self.database_name)} set session_replication_role = replica',
+                f'alter role "sqag_runtime" in database {_quote_identifier(self.database_name)} reset session_replication_role',
+            ),
+        )
+        for scope, apply_sql, restore_sql in controls:
+            with self.subTest(scope=scope):
+                self._execute_admin_sql(apply_sql)
+                try:
+                    errors = self._evaluate_runtime_authority_rows()
+                    self.assertTrue(
+                        any(
+                            "runtime_parameter_unsafe_startup_default_session_replication_role"
+                            in error
+                            for error in errors
+                        ),
+                        (scope, errors),
+                    )
+                finally:
+                    self._execute_admin_sql(restore_sql)
+                self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
     def test_database_privilege_matrix_direct_public_membership_and_cross_substitution(self) -> None:
         self._alter_public_database_privilege("CONNECT", False)
         self._alter_public_database_privilege("TEMPORARY", False)

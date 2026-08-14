@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT))
 from webapp.postgres_migrations import (  # noqa: E402
     EXPECTED_ROUTINES,
     EXPECTED_TABLES,
+    EXPECTED_TRIGGERS,
     MIGRATION_FILE_NAMES,
     MIGRATION_TABLES,
     migration_manifest,
@@ -250,8 +251,12 @@ ROUTINE_ACL_EVIDENCE_ROW_KEYS = frozenset(
         "routine_kind",
         "security_definer",
         "owner",
+        "language",
+        "routine_definition",
+        "routine_configuration",
         "acl_entries",
         "has_trigger_dependency",
+        "trigger_bindings",
     }
 )
 RUNTIME_PARAMETER_PRIVILEGE_ROW_KEYS = frozenset(
@@ -262,8 +267,73 @@ RUNTIME_PARAMETER_PRIVILEGE_ROW_KEYS = frozenset(
         "effective_alter_system",
         "set_grantable",
         "alter_system_grantable",
+        "startup_defaults",
     }
 )
+DATABASE_ACL_EVIDENCE_ROW_KEYS = frozenset(
+    {"database_name", "database_owner", "datacl", "acl_entries"}
+)
+TABLE_ACL_EVIDENCE_ROW_KEYS = frozenset(
+    {"schema_name", "relname", "relacl", "table_columns", "table_constraints", "index_contracts"}
+)
+TABLE_STRUCTURE_COLUMN_KEYS = frozenset(
+    {
+        "ordinal",
+        "name",
+        "type_oid",
+        "type_schema",
+        "type_name",
+        "type_modifier",
+        "is_dropped",
+        "is_nullable",
+        "default_expression",
+    }
+)
+TABLE_CONSTRAINT_EVIDENCE_KEYS = frozenset(
+    {
+        "constraint_name",
+        "constraint_type",
+        "columns",
+        "referenced_schema",
+        "referenced_table",
+        "referenced_columns",
+        "update_action",
+        "delete_action",
+        "check_expression",
+        "is_deferrable",
+        "is_deferred",
+    }
+)
+INDEX_CONTRACT_EVIDENCE_KEYS = frozenset(
+    {
+        "index_name",
+        "target_schema",
+        "target_table",
+        "is_unique",
+        "is_valid",
+        "is_ready",
+        "key_columns",
+        "included_columns",
+        "predicate",
+    }
+)
+TRIGGER_BINDING_KEYS = frozenset(
+    {
+        "trigger_name",
+        "target_schema",
+        "target_relation",
+        "function_schema",
+        "function_name",
+        "function_identity_arguments",
+        "timing",
+        "events",
+        "update_columns",
+        "level",
+        "enabled",
+        "when",
+    }
+)
+STARTUP_DEFAULT_KEYS = frozenset({"scope", "precedence", "setting"})
 
 MATERIALIZED_VIEW_RULE = (
     "No public materialized view is classified. Any public materialized view fails "
@@ -362,9 +432,31 @@ VERIFICATION_QUERY_KEYS = frozenset(
 # its own admission contract.
 CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
     "database_acl": """
-        select datacl
-        from pg_catalog.pg_database
-        where datname = current_database()
+        select d.datname as database_name,
+               database_owner.rolname as database_owner,
+               d.datacl,
+               acl.acl_entries
+        from pg_catalog.pg_database d
+        join pg_catalog.pg_roles database_owner on database_owner.oid = d.datdba
+        cross join lateral (
+            select coalesce(
+                       jsonb_agg(
+                           jsonb_build_object(
+                               'grantee', case when expanded.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'OID:' || expanded.grantee::text) end,
+                               'grantor', coalesce(grantor_role.rolname, 'OID:' || expanded.grantor::text),
+                               'privilege_type', expanded.privilege_type,
+                               'is_grantable', expanded.is_grantable
+                           )
+                           order by expanded.grantee, expanded.grantor, expanded.privilege_type, expanded.is_grantable
+                       ),
+                       '[]'::jsonb
+                   ) as acl_entries
+            from pg_catalog.aclexplode(coalesce(d.datacl, pg_catalog.acldefault('d', d.datdba))) expanded
+            left join pg_catalog.pg_roles grantee_role on grantee_role.oid = expanded.grantee and expanded.grantee <> 0
+            left join pg_catalog.pg_roles grantor_role on grantor_role.oid = expanded.grantor
+        ) acl
+        where d.datname = current_database()
+        order by d.datname
     """,
     "schema_acl": """
         select n.nspname as schema_name,
@@ -396,7 +488,128 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
         order by n.nspname
     """,
     "table_acl": """
-        select relname, relacl
+        select n.nspname as schema_name,
+               c.relname,
+               c.relacl,
+               (
+                   select coalesce(
+                              jsonb_agg(
+                                  jsonb_build_object(
+                                      'ordinal', attribute.attnum,
+                                      'name', attribute.attname,
+                                      'type_oid', attribute.atttypid::int,
+                                      'type_schema', type_namespace.nspname,
+                                      'type_name', attribute_type.typname,
+                                      'type_modifier', attribute.atttypmod,
+                                      'is_dropped', attribute.attisdropped,
+                                      'is_nullable', not attribute.attnotnull,
+                                      'default_expression', case
+                                          when default_definition.oid is null then null
+                                          else pg_catalog.pg_get_expr(default_definition.adbin, default_definition.adrelid, true)
+                                      end
+                                  )
+                                  order by attribute.attnum
+                              ),
+                              '[]'::jsonb
+                          )
+                   from pg_catalog.pg_attribute attribute
+                   left join pg_catalog.pg_type attribute_type on attribute_type.oid = attribute.atttypid
+                   left join pg_catalog.pg_namespace type_namespace on type_namespace.oid = attribute_type.typnamespace
+                   left join pg_catalog.pg_attrdef default_definition
+                     on default_definition.adrelid = attribute.attrelid
+                    and default_definition.adnum = attribute.attnum
+                   where attribute.attrelid = c.oid
+                     and attribute.attnum > 0
+               ) as table_columns,
+               (
+                   select coalesce(
+                              jsonb_agg(
+                                  jsonb_build_object(
+                                      'constraint_name', constraint_row.conname,
+                                      'constraint_type', constraint_row.contype,
+                                      'columns', coalesce(
+                                          (
+                                              select jsonb_agg(constrained_attribute.attname order by constrained.ordinality)
+                                              from unnest(constraint_row.conkey) with ordinality as constrained(attnum, ordinality)
+                                              join pg_catalog.pg_attribute constrained_attribute
+                                                on constrained_attribute.attrelid = constraint_row.conrelid
+                                               and constrained_attribute.attnum = constrained.attnum
+                                          ),
+                                          '[]'::jsonb
+                                      ),
+                                      'referenced_schema', referenced_namespace.nspname,
+                                      'referenced_table', referenced_relation.relname,
+                                      'referenced_columns', case
+                                          when constraint_row.contype = 'f' then coalesce(
+                                              (
+                                                  select jsonb_agg(referenced_attribute.attname order by referenced.ordinality)
+                                                  from unnest(constraint_row.confkey) with ordinality as referenced(attnum, ordinality)
+                                                  join pg_catalog.pg_attribute referenced_attribute
+                                                    on referenced_attribute.attrelid = constraint_row.confrelid
+                                                   and referenced_attribute.attnum = referenced.attnum
+                                              ),
+                                              '[]'::jsonb
+                                          )
+                                          else '[]'::jsonb
+                                      end,
+                                      'update_action', case when constraint_row.contype = 'f' then constraint_row.confupdtype else 'a' end,
+                                      'delete_action', case when constraint_row.contype = 'f' then constraint_row.confdeltype else 'a' end,
+                                      'check_expression', case
+                                          when constraint_row.contype = 'c'
+                                          then pg_catalog.pg_get_expr(constraint_row.conbin, constraint_row.conrelid, true)
+                                          else null
+                                      end,
+                                      'is_deferrable', constraint_row.condeferrable,
+                                      'is_deferred', constraint_row.condeferred
+                                  )
+                                  order by constraint_row.conname, constraint_row.oid
+                              ),
+                              '[]'::jsonb
+                          )
+                   from pg_catalog.pg_constraint constraint_row
+                   left join pg_catalog.pg_class referenced_relation on referenced_relation.oid = constraint_row.confrelid
+                   left join pg_catalog.pg_namespace referenced_namespace on referenced_namespace.oid = referenced_relation.relnamespace
+                   where constraint_row.conrelid = c.oid
+               ) as table_constraints,
+               (
+                   select coalesce(
+                              jsonb_agg(
+                                  jsonb_build_object(
+                                      'index_name', index_relation.relname,
+                                      'target_schema', target_namespace.nspname,
+                                      'target_table', target_relation.relname,
+                                      'is_unique', index_row.indisunique,
+                                      'is_valid', index_row.indisvalid,
+                                      'is_ready', index_row.indisready,
+                                      'key_columns', coalesce(
+                                          (
+                                              select jsonb_agg(pg_catalog.pg_get_indexdef(index_row.indexrelid, key_position.ordinality::integer, true) order by key_position.ordinality)
+                                              from generate_series(1, index_row.indnkeyatts) as key_position(ordinality)
+                                          ),
+                                          '[]'::jsonb
+                                      ),
+                                      'included_columns', coalesce(
+                                          (
+                                              select jsonb_agg(pg_catalog.pg_get_indexdef(index_row.indexrelid, included_position.ordinality::integer, true) order by included_position.ordinality)
+                                              from generate_series(index_row.indnkeyatts + 1, index_row.indnatts) as included_position(ordinality)
+                                          ),
+                                          '[]'::jsonb
+                                      ),
+                                      'predicate', case
+                                          when index_row.indpred is null then null
+                                          else pg_catalog.pg_get_expr(index_row.indpred, index_row.indrelid, true)
+                                      end
+                                  )
+                                  order by index_relation.relname
+                              ),
+                              '[]'::jsonb
+                          )
+                   from pg_catalog.pg_index index_row
+                   join pg_catalog.pg_class index_relation on index_relation.oid = index_row.indexrelid
+                   join pg_catalog.pg_class target_relation on target_relation.oid = index_row.indrelid
+                   join pg_catalog.pg_namespace target_namespace on target_namespace.oid = target_relation.relnamespace
+                   where index_row.indrelid = c.oid
+               ) as index_contracts
         from pg_catalog.pg_class c
         join pg_catalog.pg_namespace n on n.oid = c.relnamespace
         where c.relkind = 'r'
@@ -405,7 +618,7 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
               c.relname like 'sqag_' || chr(37)
               or c.relname = 'legacy_quote_artifacts_source'
           )
-        order by relname
+        order by n.nspname, c.relname
     """,
     "routine_acl": """
         select n.nspname as schema_name,
@@ -414,16 +627,21 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                p.prokind as routine_kind,
                p.prosecdef as security_definer,
                r.rolname as owner,
+               language.lanname as language,
+               p.prosrc as routine_definition,
+               coalesce(to_jsonb(p.proconfig), '[]'::jsonb) as routine_configuration,
                acl.acl_entries,
                exists (
                    select 1
                    from pg_catalog.pg_trigger t
                    where t.tgfoid = p.oid
                      and not t.tgisinternal
-               ) as has_trigger_dependency
+               ) as has_trigger_dependency,
+               trigger_evidence.trigger_bindings
         from pg_catalog.pg_proc p
         join pg_catalog.pg_namespace n on n.oid = p.pronamespace
         join pg_catalog.pg_roles r on r.oid = p.proowner
+        join pg_catalog.pg_language language on language.oid = p.prolang
         cross join lateral (
             select coalesce(
                        jsonb_agg(
@@ -441,6 +659,69 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
             left join pg_catalog.pg_roles grantee_role on grantee_role.oid = expanded.grantee and expanded.grantee <> 0
             left join pg_catalog.pg_roles grantor_role on grantor_role.oid = expanded.grantor
         ) acl
+        cross join lateral (
+            select coalesce(
+                       jsonb_agg(
+                           jsonb_build_object(
+                               'trigger_name', trigger_row.trigger_name,
+                               'target_schema', trigger_row.target_schema,
+                               'target_relation', trigger_row.target_relation,
+                               'function_schema', trigger_row.function_schema,
+                               'function_name', trigger_row.function_name,
+                               'function_identity_arguments', trigger_row.function_identity_arguments,
+                               'timing', trigger_row.timing,
+                               'events', trigger_row.events,
+                               'update_columns', trigger_row.update_columns,
+                               'level', trigger_row.level,
+                               'enabled', trigger_row.enabled,
+                               'when', trigger_row.trigger_when
+                           )
+                           order by trigger_row.trigger_name
+                       ),
+                       '[]'::jsonb
+                   ) as trigger_bindings
+            from (
+                select t.tgname as trigger_name,
+                       target_namespace.nspname as target_schema,
+                       target_relation.relname as target_relation,
+                       function_namespace.nspname as function_schema,
+                       trigger_function.proname as function_name,
+                       pg_catalog.pg_get_function_identity_arguments(trigger_function.oid) as function_identity_arguments,
+                       case
+                           when (t.tgtype & 64) <> 0 then 'INSTEAD OF'
+                           when (t.tgtype & 2) <> 0 then 'BEFORE'
+                           else 'AFTER'
+                       end as timing,
+                       coalesce((
+                           select jsonb_agg(event_name order by event_name)
+                           from (
+                               values
+                                   ('DELETE', 8),
+                                   ('INSERT', 4),
+                                   ('TRUNCATE', 32),
+                                   ('UPDATE', 16)
+                           ) event(event_name, event_bit)
+                           where (t.tgtype & event.event_bit) <> 0
+                       ), '[]'::jsonb) as events,
+                       coalesce((
+                           select jsonb_agg(update_attribute.attname order by update_column.ordinality)
+                           from unnest(t.tgattr) with ordinality as update_column(attnum, ordinality)
+                           join pg_catalog.pg_attribute update_attribute
+                             on update_attribute.attrelid = t.tgrelid
+                            and update_attribute.attnum = update_column.attnum
+                       ), '[]'::jsonb) as update_columns,
+                       case when (t.tgtype & 1) <> 0 then 'ROW' else 'STATEMENT' end as level,
+                       t.tgenabled as enabled,
+                       pg_catalog.pg_get_expr(t.tgqual, t.tgrelid, true) as trigger_when
+                from pg_catalog.pg_trigger t
+                join pg_catalog.pg_class target_relation on target_relation.oid = t.tgrelid
+                join pg_catalog.pg_namespace target_namespace on target_namespace.oid = target_relation.relnamespace
+                join pg_catalog.pg_proc trigger_function on trigger_function.oid = t.tgfoid
+                join pg_catalog.pg_namespace function_namespace on function_namespace.oid = trigger_function.pronamespace
+                where t.tgfoid = p.oid
+                  and not t.tgisinternal
+            ) trigger_row
+        ) trigger_evidence
         where n.nspname = 'public'
           and p.prokind in ('f', 'p', 'a', 'w')
         order by n.nspname, p.proname, identity_arguments, p.prokind
@@ -715,6 +996,7 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
     "effective_runtime_parameter_privileges": """
         select parameter_names.parameter_name as parameter_name,
                acl.acl_entries,
+               startup.startup_defaults,
                has_parameter_privilege('sqag_runtime', parameter_names.parameter_name, 'SET') as effective_set,
                has_parameter_privilege('sqag_runtime', parameter_names.parameter_name, 'ALTER SYSTEM') as effective_alter_system,
                has_parameter_privilege('sqag_runtime', parameter_names.parameter_name, 'SET WITH GRANT OPTION') as set_grantable,
@@ -747,6 +1029,55 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
             left join pg_catalog.pg_roles grantee_role on grantee_role.oid = expanded.grantee and expanded.grantee <> 0
             left join pg_catalog.pg_roles grantor_role on grantor_role.oid = expanded.grantor
         ) acl
+        cross join lateral (
+            select coalesce(
+                       jsonb_agg(
+                           jsonb_build_object(
+                               'scope', startup_setting.scope,
+                               'precedence', startup_setting.precedence,
+                               'setting', startup_setting.setting
+                           )
+                           order by startup_setting.precedence, startup_setting.setting
+                       ),
+                       '[]'::jsonb
+                   ) as startup_defaults
+            from (
+                select 'database_global'::text as scope,
+                       1::integer as precedence,
+                       database_setting.setting
+                from pg_catalog.pg_db_role_setting setting_row
+                join pg_catalog.pg_database d
+                  on d.oid = setting_row.setdatabase
+                 and d.datname = current_database(),
+                     unnest(coalesce(setting_row.setconfig, array[]::text[])) as database_setting(setting)
+                where setting_row.setrole = 0
+                union all
+                select 'role_global'::text as scope,
+                       2::integer as precedence,
+                       role_setting.setting
+                from pg_catalog.pg_db_role_setting setting_row
+                join pg_catalog.pg_roles role_row
+                  on role_row.oid = setting_row.setrole
+                 and role_row.rolname = 'sqag_runtime',
+                     unnest(coalesce(setting_row.setconfig, array[]::text[])) as role_setting(setting)
+                where setting_row.setdatabase = 0
+                union all
+                select 'role_database'::text as scope,
+                       3::integer as precedence,
+                       database_role_setting.setting
+                from pg_catalog.pg_db_role_setting setting_row
+                join pg_catalog.pg_database d
+                  on d.oid = setting_row.setdatabase
+                 and d.datname = current_database()
+                join pg_catalog.pg_roles role_row
+                  on role_row.oid = setting_row.setrole
+                 and role_row.rolname = 'sqag_runtime',
+                     unnest(coalesce(setting_row.setconfig, array[]::text[])) as database_role_setting(setting)
+                where setting_row.setdatabase <> 0
+                  and setting_row.setrole <> 0
+            ) startup_setting
+            where split_part(startup_setting.setting, '=', 1) = parameter_names.parameter_name
+        ) startup
         order by parameter_names.parameter_name
     """,
     "view_acl": """
@@ -1089,8 +1420,29 @@ ROLE_DESCRIPTIONS = {
 }
 
 REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
-    "database_acl": ("pg_catalog.pg_database", "datname", "datacl", "current_database"),
-    "schema_acl": (
+    "database_acl": (
+        "pg_catalog.pg_database",
+        "pg_catalog.pg_roles",
+        "datname",
+        "datdba",
+        "database_name",
+        "database_owner",
+        "datacl",
+        "pg_catalog.aclexplode",
+        "pg_catalog.acldefault",
+        "jsonb_agg",
+        "jsonb_build_object",
+        "cross join lateral",
+        "acl_entries",
+        "grantee",
+        "grantor",
+        "privilege_type",
+        "is_grantable",
+        "current_database",
+        "'d'",
+        "'public'",
+        "order by",
+    ),    "schema_acl": (
         "pg_catalog.pg_namespace",
         "pg_catalog.pg_roles",
         "pg_catalog.pg_database",
@@ -1118,13 +1470,48 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
     "table_acl": (
         "pg_catalog.pg_class",
         "pg_catalog.pg_namespace",
+        "pg_catalog.pg_attribute",
+        "pg_catalog.pg_type",
+        "pg_catalog.pg_attrdef",
+        "pg_catalog.pg_constraint",
+        "pg_catalog.pg_index",
+        "pg_catalog.pg_get_expr",
+        "pg_catalog.pg_get_indexdef",
+        "generate_series",
+        "unnest",
+        "jsonb_agg",
+        "jsonb_build_object",
         "relacl",
         "relkind",
+        "schema_name",
+        "relname",
+        "table_columns",
+        "table_constraints",
+        "index_contracts",
+        "index_name",
+        "target_schema",
+        "target_table",
+        "is_unique",
+        "is_valid",
+        "is_ready",
+        "key_columns",
+        "included_columns",
+        "predicate",
+        "conkey",
+        "confkey",
+        "confupdtype",
+        "confdeltype",
+        "conbin",
+        "condeferrable",
+        "condeferred",
+        "contype",
+        "indnkeyatts",
+        "indnatts",
+        "indpred",
         "'public'",
         "'legacy_quote_artifacts_source'",
         "order by",
-    ),
-    "role_attributes": (
+    ),    "role_attributes": (
         "pg_catalog.pg_roles",
         "pg_catalog.pg_authid",
         "rolname",
@@ -1275,20 +1662,31 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "'execute with grant option'",
         "information_schema",
         "pg_toast",
-    ),
-    "effective_runtime_parameter_privileges": (
+    ),    "effective_runtime_parameter_privileges": (
         "pg_catalog.pg_settings",
         "pg_catalog.pg_parameter_acl",
+        "pg_catalog.pg_database",
+        "pg_catalog.pg_db_role_setting",
         "pg_catalog.pg_roles",
         "pg_catalog.aclexplode",
         "jsonb_agg",
         "jsonb_build_object",
         "cross join lateral",
+        "unnest",
+        "coalesce",
+        "setconfig",
+        "setdatabase",
+        "setrole",
+        "split_part",
         "has_parameter_privilege",
         "parameter_name",
         "parname",
         "paracl",
         "acl_entries",
+        "startup_defaults",
+        "scope",
+        "precedence",
+        "setting",
         "grantee",
         "grantor",
         "privilege_type",
@@ -1298,14 +1696,12 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "set_grantable",
         "alter_system_grantable",
         "union",
-        "'SET'",
-        "'ALTER SYSTEM'",
-        "'SET WITH GRANT OPTION'",
-        "'ALTER SYSTEM WITH GRANT OPTION'",
+        "'database_global'",
+        "'role_global'",
+        "'role_database'",
         "'session_replication_role'",
         "order by",
-    ),
-    "view_acl": (
+    ),    "view_acl": (
         "pg_catalog.pg_class",
         "pg_catalog.pg_namespace",
         "pg_catalog.pg_roles",
@@ -2618,6 +3014,936 @@ def classified_table_column_contract() -> dict[str, list[dict[str, Any]]]:
     }
 
 
+def _normalise_structural_tokens(tokens: tuple[SQLToken, ...] | list[SQLToken]) -> str:
+    parts: list[str] = []
+    for token in tokens:
+        if token.kind == "COMMENT":
+            continue
+        if token.kind == "WORD":
+            parts.append(token.value.lower())
+        elif token.kind == "STRING":
+            parts.append("'" + token.value.replace("'", "''") + "'")
+        else:
+            parts.append(token.value)
+    text = " ".join(parts)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s*([(),.;])\s*", r"\1", text)
+    text = re.sub(r"\s*(::|\|\||<=|>=|<>|!=|=|<|>)\s*", r" \1 ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    while text.startswith("(") and text.endswith(")"):
+        depth = 0
+        balanced = True
+        for index, char in enumerate(text):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0 and index != len(text) - 1:
+                    balanced = False
+                    break
+        if balanced and depth == 0:
+            text = text[1:-1].strip()
+        else:
+            break
+    return text
+
+
+def _normalise_structural_sql(value: str) -> str:
+    if type(value) is not str:
+        return ""
+    return _normalise_structural_tokens(lex_sql(value))
+
+
+def _structural_statements(sql: str) -> tuple[tuple[SQLToken, ...], ...]:
+    sql = re.sub(r"(?im)^\s*--\s*SQAG_STATEMENT_BOUNDARY\s*$", ";", sql)
+    tokens = tuple(token for token in lex_sql(sql) if token.kind != "COMMENT")
+    statements: list[tuple[SQLToken, ...]] = []
+    start = 0
+    depth = 0
+    for index, token in enumerate(tokens):
+        if token.value == "(":
+            depth += 1
+        elif token.value == ")":
+            depth -= 1
+        elif token.value == ";" and depth == 0:
+            statement = tokens[start:index]
+            if statement:
+                statements.append(statement)
+            start = index + 1
+    trailing = tokens[start:]
+    if trailing:
+        statements.append(trailing)
+    return tuple(statements)
+
+
+def _structural_matching_paren(tokens: tuple[SQLToken, ...] | list[SQLToken], open_index: int) -> int:
+    if open_index >= len(tokens) or tokens[open_index].value != "(":
+        raise ValueError("structural_parenthesis_open_missing")
+    depth = 0
+    for index in range(open_index, len(tokens)):
+        if tokens[index].value == "(":
+            depth += 1
+        elif tokens[index].value == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    raise ValueError("structural_parenthesis_unterminated")
+
+
+def _structural_identifier_list(
+    tokens: tuple[SQLToken, ...] | list[SQLToken], open_index: int, label: str
+) -> tuple[list[str], int]:
+    close = _structural_matching_paren(tokens, open_index)
+    values: list[str] = []
+    for part in _split_top_level(tokens[open_index + 1 : close]):
+        if not part:
+            continue
+        if len(part) == 1 and part[0].kind in {"WORD", "QUOTED_IDENTIFIER"}:
+            values.append(_migration_identifier(part[0], label))
+        else:
+            values.append(_normalise_structural_tokens(part))
+    return values, close + 1
+
+
+def _structural_column_position(
+    tokens: tuple[SQLToken, ...] | list[SQLToken], start: int
+) -> int:
+    depth = 0
+    for index in range(start, len(tokens)):
+        token = tokens[index]
+        if token.value == "(":
+            depth += 1
+        elif token.value == ")":
+            depth -= 1
+        elif (
+            depth == 0
+            and token.kind == "WORD"
+            and token.value.lower() in _MIGRATION_COLUMN_CONSTRAINT_WORDS
+        ):
+            return index
+    return len(tokens)
+
+
+def _structural_constraint(
+    *,
+    name: str | None,
+    constraint_type: str,
+    columns: list[str] | None = None,
+    referenced_schema: str | None = None,
+    referenced_table: str | None = None,
+    referenced_columns: list[str] | None = None,
+    update_action: str = "a",
+    delete_action: str = "a",
+    check_expression: str | None = None,
+    is_deferrable: bool = False,
+    is_deferred: bool = False,
+) -> dict[str, Any]:
+    return {
+        "constraint_name": name,
+        "constraint_type": constraint_type,
+        "columns": [] if columns is None else list(columns),
+        "referenced_schema": referenced_schema,
+        "referenced_table": referenced_table,
+        "referenced_columns": [] if referenced_columns is None else list(referenced_columns),
+        "update_action": update_action,
+        "delete_action": delete_action,
+        "check_expression": check_expression,
+        "is_deferrable": is_deferrable,
+        "is_deferred": is_deferred,
+    }
+
+
+def _structural_reference_constraint(
+    tokens: tuple[SQLToken, ...] | list[SQLToken],
+    reference_index: int,
+    *,
+    name: str | None,
+    columns: list[str],
+    table_name: str,
+) -> tuple[dict[str, Any], int]:
+    referenced_table, cursor = _migration_table_identity(
+        tuple(tokens), reference_index + 1, f"migration_{table_name}_reference"
+    )
+    referenced_columns: list[str] = []
+    if cursor < len(tokens) and tokens[cursor].value == "(":
+        referenced_columns, cursor = _structural_identifier_list(
+            tokens, cursor, f"migration_{table_name}_referenced_column"
+        )
+    update_action = "a"
+    delete_action = "a"
+    is_deferrable = False
+    is_deferred = False
+    while cursor < len(tokens):
+        if _token_is_word(tokens[cursor], "on") and cursor + 1 < len(tokens):
+            action_kind = tokens[cursor + 1].value.lower()
+            if action_kind in {"update", "delete"}:
+                action = "a"
+                action_cursor = cursor + 2
+                if action_cursor + 1 < len(tokens) and _token_is_word(tokens[action_cursor], "no") and _token_is_word(tokens[action_cursor + 1], "action"):
+                    action = "a"
+                    action_cursor += 2
+                elif action_cursor < len(tokens) and tokens[action_cursor].kind == "WORD":
+                    action = {
+                        "restrict": "r",
+                        "cascade": "c",
+                        "set": "n",
+                    }.get(tokens[action_cursor].value.lower(), action)
+                    if _token_is_word(tokens[action_cursor], "set") and action_cursor + 1 < len(tokens):
+                        if _token_is_word(tokens[action_cursor + 1], "default"):
+                            action = "d"
+                        elif _token_is_word(tokens[action_cursor + 1], "null"):
+                            action = "n"
+                        action_cursor += 1
+                if action_kind == "update":
+                    update_action = action
+                else:
+                    delete_action = action
+                cursor = action_cursor + 1
+                continue
+        if _token_is_word(tokens[cursor], "deferrable"):
+            is_deferrable = True
+        elif _token_is_word(tokens[cursor], "initially") and cursor + 1 < len(tokens) and _token_is_word(tokens[cursor + 1], "deferred"):
+            is_deferred = True
+        cursor += 1
+    return (
+        _structural_constraint(
+            name=name,
+            constraint_type="f",
+            columns=columns,
+            referenced_schema="public",
+            referenced_table=referenced_table,
+            referenced_columns=referenced_columns,
+            update_action=update_action,
+            delete_action=delete_action,
+            is_deferrable=is_deferrable,
+            is_deferred=is_deferred,
+        ),
+        len(tokens),
+    )
+
+
+def _structural_parse_constraint_tail(
+    tokens: tuple[SQLToken, ...] | list[SQLToken],
+    *,
+    table_name: str,
+    column_name: str | None = None,
+    initial_name: str | None = None,
+) -> tuple[list[dict[str, Any]], bool, str | None]:
+    constraints: list[dict[str, Any]] = []
+    nullable = True
+    default_expression: str | None = None
+    index = 0
+    declared_name = initial_name
+    while index < len(tokens):
+        if _token_is_word(tokens[index], "constraint"):
+            if index + 1 < len(tokens):
+                declared_name = _migration_identifier(tokens[index + 1], f"migration_{table_name}_constraint_name")
+                index += 2
+            else:
+                break
+        if index >= len(tokens):
+            break
+        if _token_is_word(tokens[index], "not"):
+            if index + 1 < len(tokens) and _token_is_word(tokens[index + 1], "null"):
+                nullable = False
+                index += 2
+                continue
+        if _token_is_word(tokens[index], "null"):
+            index += 1
+            continue
+        if _token_is_word(tokens[index], "default"):
+            start = index + 1
+            end = _structural_column_position(tokens, start)
+            default_expression = _normalise_structural_tokens(tokens[start:end]) or None
+            index = end
+            continue
+        if _token_is_word(tokens[index], "primary"):
+            cursor = index + 1
+            if cursor < len(tokens) and _token_is_word(tokens[cursor], "key"):
+                cursor += 1
+            columns = [column_name] if column_name is not None else []
+            if cursor < len(tokens) and tokens[cursor].value == "(":
+                columns, cursor = _structural_identifier_list(tokens, cursor, f"migration_{table_name}_primary_column")
+            constraints.append(_structural_constraint(name=declared_name, constraint_type="p", columns=columns))
+            declared_name = None
+            index = cursor
+            continue
+        if _token_is_word(tokens[index], "unique"):
+            cursor = index + 1
+            columns = [column_name] if column_name is not None else []
+            if cursor < len(tokens) and tokens[cursor].value == "(":
+                columns, cursor = _structural_identifier_list(tokens, cursor, f"migration_{table_name}_unique_column")
+            constraints.append(_structural_constraint(name=declared_name, constraint_type="u", columns=columns))
+            declared_name = None
+            index = cursor
+            continue
+        if _token_is_word(tokens[index], "foreign"):
+            cursor = index + 1
+            if cursor < len(tokens) and _token_is_word(tokens[cursor], "key"):
+                cursor += 1
+            columns = [column_name] if column_name is not None else []
+            if cursor < len(tokens) and tokens[cursor].value == "(":
+                columns, cursor = _structural_identifier_list(tokens, cursor, f"migration_{table_name}_foreign_column")
+            reference_index = next(
+                (position for position in range(cursor, len(tokens)) if _token_is_word(tokens[position], "references")),
+                None,
+            )
+            if reference_index is not None:
+                constraint, _ = _structural_reference_constraint(
+                    tokens,
+                    reference_index,
+                    name=declared_name,
+                    columns=columns,
+                    table_name=table_name,
+                )
+                constraints.append(constraint)
+            declared_name = None
+            index = len(tokens)
+            continue
+        if _token_is_word(tokens[index], "references"):
+            if column_name is None:
+                index += 1
+                continue
+            constraint, _ = _structural_reference_constraint(
+                tokens,
+                index,
+                name=declared_name,
+                columns=[column_name],
+                table_name=table_name,
+            )
+            constraints.append(constraint)
+            declared_name = None
+            index = len(tokens)
+            continue
+        if _token_is_word(tokens[index], "check"):
+            cursor = index + 1
+            if cursor < len(tokens) and tokens[cursor].value == "(":
+                close = _structural_matching_paren(tokens, cursor)
+                expression = _normalise_structural_tokens(tokens[cursor + 1 : close]) or None
+                constraints.append(
+                    _structural_constraint(
+                        name=declared_name,
+                        constraint_type="c",
+                        check_expression=expression,
+                    )
+                )
+                declared_name = None
+                index = close + 1
+                continue
+        if _token_is_word(tokens[index], "collate"):
+            index += 2
+            continue
+        if _token_is_word(tokens[index], "generated"):
+            index += 1
+            continue
+        index += 1
+    return constraints, nullable, default_expression
+
+
+def _structural_add_column(
+    structure: dict[str, dict[str, Any]],
+    table_name: str,
+    column_name: str,
+    type_tokens: tuple[SQLToken, ...],
+    tail_tokens: tuple[SQLToken, ...],
+) -> None:
+    type_oid, type_schema, type_name, type_modifier = _migration_type_identity(
+        type_tokens, f"migration_{table_name}_{column_name}"
+    )
+    constraints, nullable, default_expression = _structural_parse_constraint_tail(
+        tail_tokens,
+        table_name=table_name,
+        column_name=column_name,
+    )
+    table = structure.setdefault(table_name, {"columns": [], "constraints": []})
+    identity = {
+        "ordinal": len(table["columns"]) + 1,
+        "name": column_name,
+        "type_oid": type_oid,
+        "type_schema": type_schema,
+        "type_name": type_name,
+        "type_modifier": type_modifier,
+        "is_dropped": False,
+        "is_nullable": nullable,
+        "default_expression": default_expression,
+    }
+    prior = next((entry for entry in table["columns"] if entry["name"] == column_name), None)
+    if prior is None:
+        table["columns"].append(identity)
+    elif {
+        key: prior[key]
+        for key in ("name", "type_oid", "type_schema", "type_name", "type_modifier")
+    } != {
+        key: identity[key]
+        for key in ("name", "type_oid", "type_schema", "type_name", "type_modifier")
+    }:
+        raise ValueError(f"migration_{table_name}_{column_name}_structural_type_drift")
+    for constraint in constraints:
+        if constraint not in table["constraints"]:
+            table["constraints"].append(constraint)
+
+
+def _structural_parse_create_table(
+    tokens: tuple[SQLToken, ...], structure: dict[str, dict[str, Any]]
+) -> None:
+    create_index = next(
+        (index for index in range(len(tokens) - 1) if _token_is_word(tokens[index], "create") and _token_is_word(tokens[index + 1], "table")),
+        None,
+    )
+    if create_index is None:
+        return
+    cursor = create_index + 2
+    if cursor + 2 < len(tokens) and all(
+        _token_is_word(tokens[cursor + offset], word)
+        for offset, word in enumerate(("if", "not", "exists"))
+    ):
+        cursor += 3
+    table_name, cursor = _migration_table_identity(tokens, cursor, "migration_create_table_structural")
+    if cursor >= len(tokens) or tokens[cursor].value != "(":
+        raise ValueError(f"migration_{table_name}_structural_columns_missing")
+    close = _structural_matching_paren(tokens, cursor)
+    table = structure.setdefault(table_name, {"columns": [], "constraints": []})
+    for segment in _split_top_level(tokens[cursor + 1 : close]):
+        if not segment:
+            continue
+        first = segment[0]
+        if first.kind == "WORD" and first.value.lower() in _MIGRATION_TABLE_CONSTRAINT_WORDS:
+            constraints, _nullable, _default = _structural_parse_constraint_tail(
+                segment,
+                table_name=table_name,
+            )
+            for constraint in constraints:
+                if constraint not in table["constraints"]:
+                    table["constraints"].append(constraint)
+            continue
+        column_name = _migration_identifier(first, f"migration_{table_name}_column")
+        type_end = _structural_column_position(segment, 1)
+        _structural_add_column(
+            structure,
+            table_name,
+            column_name,
+            segment[1:type_end],
+            segment[type_end:],
+        )
+
+
+def _structural_parse_alter_table(
+    tokens: tuple[SQLToken, ...], structure: dict[str, dict[str, Any]]
+) -> None:
+    alter_index = next(
+        (index for index in range(len(tokens) - 1) if _token_is_word(tokens[index], "alter") and _token_is_word(tokens[index + 1], "table")),
+        None,
+    )
+    if alter_index is None:
+        return
+    table_name, cursor = _migration_table_identity(tokens, alter_index + 2, "migration_alter_table_structural")
+    if cursor >= len(tokens) or not _token_is_word(tokens[cursor], "add"):
+        return
+    cursor += 1
+    if cursor < len(tokens) and _token_is_word(tokens[cursor], "column"):
+        cursor += 1
+    if cursor + 2 < len(tokens) and all(
+        _token_is_word(tokens[cursor + offset], word)
+        for offset, word in enumerate(("if", "not", "exists"))
+    ):
+        cursor += 3
+    column_name = _migration_identifier(tokens[cursor], f"migration_{table_name}_add_column")
+    type_end = _structural_column_position(tokens, cursor + 1)
+    _structural_add_column(
+        structure,
+        table_name,
+        column_name,
+        tokens[cursor + 1 : type_end],
+        tokens[type_end:],
+    )
+
+
+def _structural_parse_index(
+    tokens: tuple[SQLToken, ...], indexes: dict[str, dict[str, Any]]
+) -> None:
+    create_index = next(
+        (index for index in range(len(tokens) - 1) if _token_is_word(tokens[index], "create") and _token_is_word(tokens[index + 1], "index")),
+        None,
+    )
+    unique = False
+    if create_index is None:
+        create_index = next(
+            (index for index in range(len(tokens) - 2) if _token_is_word(tokens[index], "create") and _token_is_word(tokens[index + 1], "unique") and _token_is_word(tokens[index + 2], "index")),
+            None,
+        )
+        unique = create_index is not None
+    if create_index is None:
+        return
+    cursor = create_index + (3 if unique else 2)
+    if cursor + 2 < len(tokens) and all(
+        _token_is_word(tokens[cursor + offset], word)
+        for offset, word in enumerate(("if", "not", "exists"))
+    ):
+        cursor += 3
+    index_name = _migration_identifier(tokens[cursor], "migration_index_name")
+    cursor += 1
+    on_index = next((index for index in range(cursor, len(tokens)) if _token_is_word(tokens[index], "on")), None)
+    if on_index is None:
+        raise ValueError(f"migration_{index_name}_index_target_missing")
+    table_name, cursor = _migration_table_identity(tokens, on_index + 1, f"migration_{index_name}_index_target")
+    open_index = next((index for index in range(cursor, len(tokens)) if tokens[index].value == "("), None)
+    if open_index is None:
+        raise ValueError(f"migration_{index_name}_index_columns_missing")
+    close = _structural_matching_paren(tokens, open_index)
+    key_columns = [
+        _normalise_structural_tokens(part)
+        for part in _split_top_level(tokens[open_index + 1 : close])
+        if part
+    ]
+    where_index = next(
+        (index for index in range(close + 1, len(tokens)) if _token_is_word(tokens[index], "where")),
+        None,
+    )
+    predicate = (
+        _normalise_structural_tokens(tokens[where_index + 1 :])
+        if where_index is not None
+        else None
+    )
+    indexes[index_name] = {
+        "index_name": index_name,
+        "target_schema": "public",
+        "target_table": table_name,
+        "is_unique": unique,
+        "is_valid": True,
+        "is_ready": True,
+        "key_columns": key_columns,
+        "included_columns": [],
+        "predicate": predicate,
+    }
+
+
+def _structural_parse_function(
+    tokens: tuple[SQLToken, ...], routines: dict[tuple[str, str, str, str], dict[str, Any]]
+) -> None:
+    function_index = next(
+        (
+            index
+            for index, token in enumerate(tokens)
+            if _token_is_word(token, "function")
+            and index > 0
+            and (
+                _token_is_word(tokens[index - 1], "create")
+                or _token_is_word(tokens[index - 1], "replace")
+            )
+        ),
+        None,
+    )
+    if function_index is None or function_index + 1 >= len(tokens):
+        return
+    routine_name, cursor = _migration_table_identity(tokens, function_index + 1, "migration_function_name")
+    open_index = next((index for index in range(cursor, len(tokens)) if tokens[index].value == "("), None)
+    if open_index is None:
+        return
+    close = _structural_matching_paren(tokens, open_index)
+    identity_arguments = _normalise_structural_tokens(tokens[open_index + 1 : close])
+    language_index = next(
+        (index for index in range(close + 1, len(tokens)) if _token_is_word(tokens[index], "language")),
+        None,
+    )
+    language = (
+        _migration_identifier(tokens[language_index + 1], "migration_function_language")
+        if language_index is not None and language_index + 1 < len(tokens)
+        else ""
+    )
+    body_index = next(
+        (index for index in range(close + 1, len(tokens)) if tokens[index].kind == "DOLLAR_QUOTE"),
+        None,
+    )
+    body = _normalise_structural_sql(tokens[body_index].value) if body_index is not None else ""
+    routines[("public", routine_name, identity_arguments, "f")] = {
+        "schema_name": "public",
+        "routine_name": routine_name,
+        "identity_arguments": identity_arguments,
+        "routine_kind": "f",
+        "language": language.lower(),
+        "routine_definition": body,
+        "routine_configuration": [],
+    }
+
+
+def _structural_parse_trigger(
+    tokens: tuple[SQLToken, ...], triggers: dict[str, dict[str, Any]]
+) -> None:
+    trigger_index = next(
+        (index for index, token in enumerate(tokens) if _token_is_word(token, "trigger")),
+        None,
+    )
+    if trigger_index is None or trigger_index + 1 >= len(tokens):
+        return
+    cursor = trigger_index + 1
+    if cursor + 2 < len(tokens) and all(
+        _token_is_word(tokens[cursor + offset], word)
+        for offset, word in enumerate(("if", "not", "exists"))
+    ):
+        cursor += 3
+    trigger_name = _migration_identifier(tokens[cursor], "migration_trigger_name")
+    on_index = next((index for index in range(cursor + 1, len(tokens)) if _token_is_word(tokens[index], "on")), None)
+    if on_index is None:
+        return
+    target_relation, target_cursor = _migration_table_identity(tokens, on_index + 1, "migration_trigger_target")
+    target_schema = "public"
+    event_tokens = tokens[cursor + 1 : on_index]
+    timing = "AFTER"
+    if any(_token_is_word(token, "instead") for token in event_tokens):
+        timing = "INSTEAD OF"
+    elif any(_token_is_word(token, "before") for token in event_tokens):
+        timing = "BEFORE"
+    events: list[str] = []
+    update_columns: list[str] = []
+    for index, token in enumerate(event_tokens):
+        if token.kind == "WORD" and token.value.upper() in {"INSERT", "DELETE", "UPDATE", "TRUNCATE"}:
+            event = token.value.upper()
+            events.append(event)
+            if event == "UPDATE" and index + 1 < len(event_tokens) and _token_is_word(event_tokens[index + 1], "of"):
+                column_cursor = index + 2
+                while column_cursor < len(event_tokens):
+                    candidate = event_tokens[column_cursor]
+                    if candidate.kind in {"WORD", "QUOTED_IDENTIFIER"}:
+                        update_columns.append(_migration_identifier(candidate, "migration_trigger_update_column"))
+                    column_cursor += 1
+    function_index = next(
+        (index for index in range(on_index, len(tokens)) if _token_is_word(tokens[index], "function") or _token_is_word(tokens[index], "procedure")),
+        None,
+    )
+    if function_index is None:
+        return
+    function_name, function_cursor = _migration_table_identity(tokens, function_index + 1, "migration_trigger_function")
+    function_identity_arguments = ""
+    function_open = next((index for index in range(function_cursor, len(tokens)) if tokens[index].value == "("), None)
+    if function_open is not None:
+        function_close = _structural_matching_paren(tokens, function_open)
+        function_identity_arguments = _normalise_structural_tokens(tokens[function_open + 1 : function_close])
+    when_index = next(
+        (index for index in range(on_index, function_index) if _token_is_word(tokens[index], "when")),
+        None,
+    )
+    trigger_when = (
+        _normalise_structural_tokens(tokens[when_index + 1 : function_index])
+        if when_index is not None
+        else None
+    )
+    level = "ROW" if any(
+        _token_is_word(tokens[index], "row")
+        for index in range(on_index, function_index)
+    ) else "STATEMENT"
+    triggers[trigger_name] = {
+        "trigger_name": trigger_name,
+        "target_schema": target_schema,
+        "target_relation": target_relation,
+        "function_schema": "public",
+        "function_name": function_name,
+        "function_identity_arguments": function_identity_arguments,
+        "timing": timing,
+        "events": sorted(set(events)),
+        "update_columns": update_columns,
+        "level": level,
+        "enabled": "O",
+        "when": trigger_when,
+    }
+
+
+@lru_cache(maxsize=1)
+def _cached_classified_table_structure_contract() -> dict[str, Any]:
+    structure: dict[str, dict[str, Any]] = {}
+    indexes: dict[str, dict[str, Any]] = {}
+    routines: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    triggers: dict[str, dict[str, Any]] = {}
+    sources = [
+        migration.path.read_text(encoding="utf-8")
+        for migration in migration_manifest(ROOT / "migrations")
+    ]
+    sources.append(_ledger_create_table_sql())
+    for source in sources:
+        for statement in _structural_statements(source):
+            _structural_parse_create_table(statement, structure)
+            _structural_parse_alter_table(statement, structure)
+            _structural_parse_index(statement, indexes)
+            _structural_parse_function(statement, routines)
+            _structural_parse_trigger(statement, triggers)
+    if set(structure) != ALL_TABLES:
+        raise ValueError(
+            "migration_structural_table_inventory_mismatch_"
+            f"expected_{sorted(ALL_TABLES)}_got_{sorted(structure)}"
+        )
+    for table in structure.values():
+        primary_keys = [
+            column
+            for constraint in table["constraints"]
+            if constraint["constraint_type"] == "p"
+            for column in constraint["columns"]
+        ]
+        for column in table["columns"]:
+            if column["name"] in primary_keys:
+                column["is_nullable"] = False
+        table["columns"].sort(key=lambda entry: entry["ordinal"])
+        table["constraints"].sort(
+            key=lambda entry: (
+                entry["constraint_type"],
+                tuple(entry["columns"]),
+                entry["referenced_table"] or "",
+                tuple(entry["referenced_columns"]),
+                entry["check_expression"] or "",
+            )
+        )
+    if set(routines) != {
+        ("public", "sqag_reject_immutable_change", "", "f"),
+        ("public", "sqag_require_retention_delete_authorization", "", "f"),
+    }:
+        raise ValueError(
+            "migration_structural_routine_inventory_mismatch_"
+            f"got_{sorted(routines)}"
+        )
+    if set(triggers) != set(EXPECTED_TRIGGERS):
+        raise ValueError(
+            "migration_structural_trigger_inventory_mismatch_"
+            f"expected_{sorted(EXPECTED_TRIGGERS)}_got_{sorted(triggers)}"
+        )
+    return {
+        "tables": structure,
+        "indexes": dict(sorted(indexes.items())),
+        "routines": dict(sorted(routines.items())),
+        "triggers": dict(sorted(triggers.items())),
+    }
+
+
+def classified_table_structure_contract() -> dict[str, Any]:
+    """Derive columns, constraints, routines, triggers and indexes from locked DDL."""
+
+    return _cached_classified_table_structure_contract()
+
+def _normalise_constraint_expression(value: Any) -> str:
+    if type(value) is not str:
+        return ""
+    without_catalog_casts = re.sub(
+        r"::\s*[a-z_][a-z0-9_.]*(?:\s*\[\s*\])?",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    normalised = _normalise_structural_sql(without_catalog_casts)
+    normalised = re.sub(r"\s*([\[\]])\s*", r"\1", normalised)
+    normalised = re.sub(r"\s*([(),])\s*", r"\1", normalised)
+    normalised = re.sub(
+        r"=\s*any\(array\[(.*?)\]\)",
+        r"in(\1)",
+        normalised,
+        flags=re.IGNORECASE,
+    )
+    normalised = normalised.replace("=any(array[", "in(")
+    normalised = normalised.replace("= any(array[", "in(")
+    normalised = normalised.replace("]", ")")
+    return _normalise_structural_sql(normalised)
+def _constraint_signature(entry: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        entry.get("constraint_type"),
+        tuple(entry.get("columns", [])),
+        entry.get("referenced_schema"),
+        entry.get("referenced_table"),
+        tuple(entry.get("referenced_columns", [])),
+        entry.get("update_action"),
+        entry.get("delete_action"),
+        _normalise_constraint_expression(entry.get("check_expression")),
+        bool(entry.get("is_deferrable")),
+        bool(entry.get("is_deferred")),
+    )
+
+
+def _validate_table_structure_evidence(
+    table_acl_rows: list[dict[str, Any]] | None,
+    errors: list[str],
+) -> None:
+    if type(table_acl_rows) is not list:
+        _add_error(errors, "table_structural_evidence_must_be_list")
+        return
+    expected = classified_table_structure_contract()
+    expected_tables = expected["tables"]
+    observed_tables: dict[str, dict[str, Any]] = {}
+    observed_indexes: dict[str, dict[str, Any]] = {}
+    for index, row in enumerate(table_acl_rows):
+        label = f"table_structural_row_{index}"
+        if not isinstance(row, dict):
+            _add_error(errors, f"{label}_must_be_object")
+            continue
+        if not _exact_keys(row, TABLE_ACL_EVIDENCE_ROW_KEYS, label, errors):
+            continue
+        schema_name = row.get("schema_name")
+        table_name = row.get("relname")
+        if type(schema_name) is not str or type(table_name) is not str:
+            _add_error(errors, f"{label}_identity_must_be_string")
+            continue
+        if schema_name != BOUND_SOURCE_SCHEMA:
+            _add_error(errors, f"{label}_schema_must_be_public")
+        if table_name == BOUND_SOURCE_RELATION:
+            continue
+        if table_name not in expected_tables:
+            _add_error(errors, f"{label}_unexpected_table_{table_name}")
+            continue
+        if table_name in observed_tables:
+            _add_error(errors, f"{label}_duplicate_table_{table_name}")
+            continue
+        if row.get("relacl") is not None and type(row.get("relacl")) is not list:
+            _add_error(errors, f"{label}_relacl_must_be_list_or_null")
+        columns = row.get("table_columns")
+        if type(columns) is not list:
+            _add_error(errors, f"{label}_table_columns_must_be_list")
+            columns = []
+        observed_columns: list[dict[str, Any]] = []
+        for column_index, column in enumerate(columns):
+            column_label = f"{label}_column_{column_index}"
+            if not isinstance(column, dict):
+                _add_error(errors, f"{column_label}_must_be_object")
+                continue
+            if not _exact_keys(column, TABLE_STRUCTURE_COLUMN_KEYS, column_label, errors):
+                continue
+            if (
+                type(column.get("ordinal")) is not int
+                or type(column.get("name")) is not str
+                or type(column.get("type_oid")) is not int
+                or type(column.get("type_schema")) is not str
+                or type(column.get("type_name")) is not str
+                or type(column.get("type_modifier")) is not int
+                or type(column.get("is_dropped")) is not bool
+                or type(column.get("is_nullable")) is not bool
+                or (column.get("default_expression") is not None and type(column.get("default_expression")) is not str)
+            ):
+                _add_error(errors, f"{column_label}_field_type_invalid")
+                continue
+            observed_columns.append(column)
+        constraints = row.get("table_constraints")
+        if type(constraints) is not list:
+            _add_error(errors, f"{label}_table_constraints_must_be_list")
+            constraints = []
+        observed_constraints: list[dict[str, Any]] = []
+        for constraint_index, constraint in enumerate(constraints):
+            constraint_label = f"{label}_constraint_{constraint_index}"
+            if not isinstance(constraint, dict):
+                _add_error(errors, f"{constraint_label}_must_be_object")
+                continue
+            if not _exact_keys(constraint, TABLE_CONSTRAINT_EVIDENCE_KEYS, constraint_label, errors):
+                continue
+            if type(constraint.get("constraint_name")) is not str:
+                _add_error(errors, f"{constraint_label}_constraint_name_must_be_string")
+            if constraint.get("constraint_type") not in {"p", "u", "f", "c"}:
+                _add_error(errors, f"{constraint_label}_constraint_type_invalid")
+            for key in ("columns", "referenced_columns"):
+                if type(constraint.get(key)) is not list or any(type(value) is not str for value in constraint.get(key, [])):
+                    _add_error(errors, f"{constraint_label}_{key}_must_be_string_list")
+            for key in ("referenced_schema", "referenced_table", "check_expression"):
+                if constraint.get(key) is not None and type(constraint.get(key)) is not str:
+                    _add_error(errors, f"{constraint_label}_{key}_must_be_string_or_null")
+            for key in ("update_action", "delete_action"):
+                if constraint.get(key) not in {"a", "r", "c", "n", "d"}:
+                    _add_error(errors, f"{constraint_label}_{key}_invalid")
+            for key in ("is_deferrable", "is_deferred"):
+                if type(constraint.get(key)) is not bool:
+                    _add_error(errors, f"{constraint_label}_{key}_must_be_bool")
+            observed_constraints.append(constraint)
+        indexes = row.get("index_contracts")
+        if type(indexes) is not list:
+            _add_error(errors, f"{label}_index_contracts_must_be_list")
+            indexes = []
+        for index_index, index_row in enumerate(indexes):
+            index_label = f"{label}_index_{index_index}"
+            if not isinstance(index_row, dict):
+                _add_error(errors, f"{index_label}_must_be_object")
+                continue
+            if not _exact_keys(index_row, INDEX_CONTRACT_EVIDENCE_KEYS, index_label, errors):
+                continue
+            if (
+                type(index_row.get("index_name")) is not str
+                or type(index_row.get("target_schema")) is not str
+                or type(index_row.get("target_table")) is not str
+                or type(index_row.get("is_unique")) is not bool
+                or type(index_row.get("is_valid")) is not bool
+                or type(index_row.get("is_ready")) is not bool
+                or type(index_row.get("key_columns")) is not list
+                or type(index_row.get("included_columns")) is not list
+                or any(type(value) is not str for value in index_row.get("key_columns", []))
+                or any(type(value) is not str for value in index_row.get("included_columns", []))
+                or (index_row.get("predicate") is not None and type(index_row.get("predicate")) is not str)
+            ):
+                _add_error(errors, f"{index_label}_field_type_invalid")
+                continue
+            index_name = str(index_row["index_name"])
+            if index_name in observed_indexes:
+                _add_error(errors, f"{index_label}_duplicate_{index_name}")
+            observed_indexes[index_name] = index_row
+        observed_tables[table_name] = {
+            "columns": observed_columns,
+            "constraints": observed_constraints,
+        }
+    for table_name, expected_table in expected_tables.items():
+        observed = observed_tables.get(table_name)
+        if observed is None:
+            _add_error(errors, f"table_structural_evidence_missing_{table_name}")
+            continue
+        expected_columns = expected_table["columns"]
+        actual_columns = sorted(observed["columns"], key=lambda value: value.get("ordinal", -1))
+        actual_column_signature = [
+            (
+                value["ordinal"],
+                value["name"],
+                value["type_oid"],
+                value["type_schema"],
+                value["type_name"],
+                value["type_modifier"],
+                value["is_dropped"],
+                value["is_nullable"],
+                _normalise_constraint_expression(value["default_expression"]) if value["default_expression"] is not None else None,
+            )
+            for value in actual_columns
+        ]
+        expected_column_signature = [
+            (
+                value["ordinal"],
+                value["name"],
+                value["type_oid"],
+                value["type_schema"],
+                value["type_name"],
+                value["type_modifier"],
+                value["is_dropped"],
+                value["is_nullable"],
+                _normalise_constraint_expression(value["default_expression"]) if value["default_expression"] is not None else None,
+            )
+            for value in expected_columns
+        ]
+        if actual_column_signature != expected_column_signature:
+            _add_error(errors, f"table_structural_column_contract_mismatch_{table_name}")
+        actual_constraints = sorted(
+            (_constraint_signature(value) for value in observed["constraints"]),
+            key=repr,
+        )
+        expected_constraints = sorted(
+            (_constraint_signature(value) for value in expected_table["constraints"]),
+            key=repr,
+        )
+        if actual_constraints != expected_constraints:
+            _add_error(errors, f"table_structural_constraint_contract_mismatch_{table_name}")
+    for index_name, expected_index in expected["indexes"].items():
+        actual_index = observed_indexes.get(index_name)
+        if actual_index is None:
+            _add_error(errors, f"table_structural_index_missing_{index_name}")
+            continue
+        for key in ("target_schema", "target_table", "is_unique", "is_valid", "is_ready"):
+            if actual_index.get(key) != expected_index.get(key):
+                _add_error(errors, f"table_structural_index_{index_name}_{key}_mismatch")
+        actual_keys = [_normalise_structural_sql(value) for value in actual_index.get("key_columns", [])]
+        expected_keys = [_normalise_structural_sql(value) for value in expected_index.get("key_columns", [])]
+        if actual_keys != expected_keys:
+            _add_error(errors, f"table_structural_index_{index_name}_key_columns_mismatch")
+        actual_included = [_normalise_structural_sql(value) for value in actual_index.get("included_columns", [])]
+        if actual_included != expected_index.get("included_columns", []):
+            _add_error(errors, f"table_structural_index_{index_name}_included_columns_mismatch")
+        actual_predicate = _normalise_constraint_expression(actual_index.get("predicate"))
+        expected_predicate = _normalise_constraint_expression(expected_index.get("predicate"))
+        if actual_predicate != expected_predicate:
+            _add_error(errors, f"table_structural_index_{index_name}_predicate_mismatch")
+
 def _validate_table_column_contract(
     value: Any, label: str, errors: list[str]
 ) -> tuple[tuple[int, str, int, str | None, str | None, int, bool], ...]:
@@ -3550,6 +4876,79 @@ def _is_postgresql_system_schema(schema_name: str) -> bool:
     )
 
 
+def _validate_trigger_bindings(
+    value: Any,
+    label: str,
+    errors: list[str],
+) -> list[dict[str, Any]]:
+    if type(value) is not list:
+        _add_error(errors, f"{label}_must_be_list")
+        return []
+    bindings: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for index, binding in enumerate(value):
+        binding_label = f"{label}_{index}"
+        if not isinstance(binding, dict):
+            _add_error(errors, f"{binding_label}_must_be_object")
+            continue
+        if not _exact_keys(binding, TRIGGER_BINDING_KEYS, binding_label, errors):
+            continue
+        for key in (
+            "trigger_name",
+            "target_schema",
+            "target_relation",
+            "function_schema",
+            "function_name",
+            "function_identity_arguments",
+            "timing",
+            "level",
+            "enabled",
+        ):
+            _require_non_empty_string(binding.get(key), f"{binding_label}_{key}", errors)
+        for key in ("events", "update_columns"):
+            _require_string_list(binding.get(key), f"{binding_label}_{key}", errors)
+        if binding.get("when") is not None and type(binding.get("when")) is not str:
+            _add_error(errors, f"{binding_label}_when_must_be_string_or_null")
+        if any(
+            type(binding.get(key)) is not str
+            for key in (
+                "trigger_name",
+                "target_schema",
+                "target_relation",
+                "function_schema",
+                "function_name",
+                "function_identity_arguments",
+                "timing",
+                "level",
+                "enabled",
+            )
+        ) or any(
+            type(binding.get(key)) is not list
+            or any(type(value) is not str for value in binding.get(key, []))
+            for key in ("events", "update_columns")
+        ):
+            continue
+        if binding["trigger_name"] in seen_names:
+            _add_error(errors, f"{binding_label}_duplicate")
+        seen_names.add(binding["trigger_name"])
+        if binding["timing"] not in {"BEFORE", "AFTER", "INSTEAD OF"}:
+            _add_error(errors, f"{binding_label}_timing_invalid")
+        if binding["level"] not in {"ROW", "STATEMENT"}:
+            _add_error(errors, f"{binding_label}_level_invalid")
+        if binding["enabled"] not in {"O", "D", "R", "A"}:
+            _add_error(errors, f"{binding_label}_enabled_invalid")
+        if not binding["events"]:
+            _add_error(errors, f"{binding_label}_events_must_not_be_empty")
+        if any(event not in {"INSERT", "DELETE", "UPDATE", "TRUNCATE"} for event in binding["events"]):
+            _add_error(errors, f"{binding_label}_events_invalid")
+        if len(set(binding["events"])) != len(binding["events"]):
+            _add_error(errors, f"{binding_label}_events_duplicate")
+        if len(set(binding["update_columns"])) != len(binding["update_columns"]):
+            _add_error(errors, f"{binding_label}_update_columns_duplicate")
+        bindings.append(dict(binding))
+    return bindings
+
+
 def _validate_routine_acl_evidence(
     routine_acl_rows: list[dict[str, Any]] | None,
     errors: list[str],
@@ -3571,6 +4970,8 @@ def _validate_routine_acl_evidence(
         identity_arguments = row.get("identity_arguments")
         routine_kind = row.get("routine_kind")
         owner = row.get("owner")
+        language = row.get("language")
+        routine_definition = row.get("routine_definition")
         security_definer = row.get("security_definer")
         has_trigger_dependency = row.get("has_trigger_dependency")
         _require_non_empty_string(schema_name, f"{label}_schema_name", errors)
@@ -3579,11 +4980,25 @@ def _validate_routine_acl_evidence(
             _add_error(errors, f"{label}_identity_arguments_must_be_string")
         _require_non_empty_string(routine_kind, f"{label}_routine_kind", errors)
         _require_non_empty_string(owner, f"{label}_owner", errors)
+        _require_non_empty_string(language, f"{label}_language", errors)
+        if type(routine_definition) is not str:
+            _add_error(errors, f"{label}_routine_definition_must_be_string")
         _require_type(security_definer, bool, f"{label}_security_definer", errors)
         _require_type(has_trigger_dependency, bool, f"{label}_has_trigger_dependency", errors)
+        configuration = row.get("routine_configuration")
+        if type(configuration) is not list or any(type(value) is not str for value in configuration):
+            _add_error(errors, f"{label}_routine_configuration_must_be_string_list")
         if any(
             type(value) is not str
-            for value in (schema_name, routine_name, identity_arguments, routine_kind, owner)
+            for value in (
+                schema_name,
+                routine_name,
+                identity_arguments,
+                routine_kind,
+                owner,
+                language,
+                routine_definition,
+            )
         ) or type(security_definer) is not bool or type(has_trigger_dependency) is not bool:
             continue
         if schema_name != BOUND_SOURCE_SCHEMA:
@@ -3602,14 +5017,22 @@ def _validate_routine_acl_evidence(
             errors,
             ("EXECUTE",),
         )
+        trigger_bindings = _validate_trigger_bindings(
+            row.get("trigger_bindings"),
+            f"{label}_trigger_bindings",
+            errors,
+        )
         evidence[identity] = {
             "owner": owner,
             "security_definer": security_definer,
+            "language": language,
+            "routine_definition": routine_definition,
+            "routine_configuration": list(configuration) if isinstance(configuration, list) else [],
             "has_trigger_dependency": has_trigger_dependency,
+            "trigger_bindings": trigger_bindings,
             "acl_entries": acl_entries,
         }
     return evidence
-
 
 def _validate_schema_acl_evidence(
     manifest: dict[str, Any],
@@ -3654,6 +5077,55 @@ def _validate_schema_acl_evidence(
         ("USAGE", "CREATE"),
     )
     return row, acl_entries
+
+
+def _validate_startup_defaults(
+    value: Any,
+    parameter_name: str,
+    label: str,
+    errors: list[str],
+) -> list[dict[str, Any]]:
+    if type(value) is not list:
+        _add_error(errors, f"{label}_must_be_list")
+        return []
+    defaults: list[dict[str, Any]] = []
+    previous: tuple[int, str] | None = None
+    for index, entry in enumerate(value):
+        entry_label = f"{label}_{index}"
+        if not isinstance(entry, dict):
+            _add_error(errors, f"{entry_label}_must_be_object")
+            continue
+        if not _exact_keys(entry, STARTUP_DEFAULT_KEYS, entry_label, errors):
+            continue
+        scope = entry.get("scope")
+        precedence = entry.get("precedence")
+        setting = entry.get("setting")
+        _require_non_empty_string(scope, f"{entry_label}_scope", errors)
+        _require_non_empty_string(setting, f"{entry_label}_setting", errors)
+        if type(precedence) is not int:
+            _add_error(errors, f"{entry_label}_precedence_must_be_int")
+        if (
+            type(scope) is not str
+            or type(precedence) is not int
+            or type(setting) is not str
+        ):
+            continue
+        if scope not in {"database_global", "role_global", "role_database"}:
+            _add_error(errors, f"{entry_label}_scope_invalid")
+        expected_precedence = {
+            "database_global": 1,
+            "role_global": 2,
+            "role_database": 3,
+        }.get(scope)
+        if expected_precedence != precedence:
+            _add_error(errors, f"{entry_label}_precedence_invalid")
+        if "=" not in setting or setting.split("=", 1)[0] != parameter_name:
+            _add_error(errors, f"{entry_label}_setting_parameter_mismatch")
+        if previous is not None and (precedence, setting) < previous:
+            _add_error(errors, f"{entry_label}_ordering_not_deterministic")
+        previous = (precedence, setting)
+        defaults.append(dict(entry))
+    return defaults
 
 
 def evaluate_parameter_authority(
@@ -3715,6 +5187,12 @@ def evaluate_parameter_authority(
             errors,
             ("SET", "ALTER SYSTEM"),
         )
+        startup_defaults = _validate_startup_defaults(
+            row.get("startup_defaults"),
+            parameter_name,
+            f"{label}_startup_defaults",
+            errors,
+        )
         direct_set = any(
             grantee == runtime_role and privilege == "SET"
             for grantee, _grantor, privilege, _grantable in acl_entries
@@ -3738,6 +5216,19 @@ def evaluate_parameter_authority(
             _add_error(errors, f"runtime_parameter_set_grant_option_forbidden_{parameter_name}")
         if row["alter_system_grantable"]:
             _add_error(errors, f"runtime_parameter_alter_system_grant_option_forbidden_{parameter_name}")
+        if parameter_name == "session_replication_role" and startup_defaults:
+            highest_precedence = max(entry["precedence"] for entry in startup_defaults)
+            highest = [
+                entry for entry in startup_defaults if entry["precedence"] == highest_precedence
+            ]
+            settings = {entry["setting"].split("=", 1)[1].lower() for entry in highest}
+            if len(settings) != 1:
+                _add_error(errors, f"{label}_startup_default_ambiguous")
+            elif settings != {"origin"} and settings != {"local"}:
+                _add_error(
+                    errors,
+                    f"runtime_parameter_unsafe_startup_default_session_replication_role_{sorted(settings)}",
+                )
     missing = set(required_parameters) - seen_parameters
     if missing:
         _add_error(errors, f"runtime_parameter_required_evidence_missing_{sorted(missing)}")
@@ -4195,6 +5686,78 @@ def evaluate_schema_wide_runtime_authority(
     return tuple(errors)
 
 
+def _trigger_binding_signature(binding: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        binding.get("trigger_name"),
+        binding.get("target_schema"),
+        binding.get("target_relation"),
+        binding.get("function_schema"),
+        binding.get("function_name"),
+        binding.get("function_identity_arguments"),
+        binding.get("timing"),
+        tuple(binding.get("events", [])),
+        tuple(binding.get("update_columns", [])),
+        binding.get("level"),
+        binding.get("enabled"),
+        _normalise_constraint_expression(binding.get("when")),
+    )
+
+
+def _validate_routine_structural_evidence(
+    routine_acl_evidence: dict[tuple[str, str, str, str], dict[str, Any]],
+    errors: list[str],
+) -> None:
+    try:
+        structural = classified_table_structure_contract()
+    except Exception as exc:
+        _add_error(errors, f"routine_structural_contract_derivation_failed:{exc}")
+        return
+    expected_routines = structural["routines"]
+    expected_triggers = structural["triggers"]
+    trigger_groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    for trigger in expected_triggers.values():
+        identity = (
+            trigger["function_schema"],
+            trigger["function_name"],
+            trigger["function_identity_arguments"],
+            "f",
+        )
+        trigger_groups.setdefault(identity, []).append(trigger)
+    for identity, expected in expected_routines.items():
+        evidence = routine_acl_evidence.get(identity)
+        if evidence is None:
+            _add_error(errors, f"routine_structural_evidence_missing_{identity[1]}")
+            continue
+        if evidence.get("language") != expected.get("language"):
+            _add_error(errors, f"routine_structural_language_mismatch_{identity[1]}")
+        if _normalise_constraint_expression(evidence.get("routine_definition")) != _normalise_constraint_expression(expected.get("routine_definition")):
+            _add_error(errors, f"routine_structural_definition_mismatch_{identity[1]}")
+        if evidence.get("routine_configuration") != expected.get("routine_configuration"):
+            _add_error(errors, f"routine_structural_configuration_mismatch_{identity[1]}")
+        actual_bindings = sorted(
+            (_trigger_binding_signature(binding) for binding in evidence.get("trigger_bindings", [])),
+            key=repr,
+        )
+        expected_bindings = sorted(
+            (_trigger_binding_signature(binding) for binding in trigger_groups.get(identity, [])),
+            key=repr,
+        )
+        if actual_bindings != expected_bindings:
+            _add_error(errors, f"routine_structural_trigger_binding_mismatch_{identity[1]}")
+        if bool(evidence.get("has_trigger_dependency")) != bool(expected_bindings):
+            _add_error(errors, f"routine_structural_trigger_dependency_mismatch_{identity[1]}")
+    provider_identity = ("public", "show_db_tree", "", "f")
+    provider = routine_acl_evidence.get(provider_identity)
+    if provider is not None and provider.get("trigger_bindings"):
+        _add_error(errors, "routine_structural_provider_trigger_binding_forbidden_show_db_tree")
+    protected_identities = set(expected_routines)
+    for identity, evidence in routine_acl_evidence.items():
+        if identity not in protected_identities and identity != provider_identity and evidence.get("trigger_bindings"):
+            _add_error(
+                errors,
+                f"routine_structural_unclassified_trigger_binding_{identity[0]}.{identity[1]}",
+            )
+
 def evaluate_runtime_authority(
     manifest: dict[str, Any],
     view_rows: list[dict[str, Any]],
@@ -4249,6 +5812,304 @@ def evaluate_runtime_authority(
         )
     return tuple(errors)
 
+
+def _validate_database_acl_evidence(
+    rows: list[dict[str, Any]] | None,
+    errors: list[str],
+    *,
+    runtime_role: str,
+) -> tuple[dict[str, Any] | None, tuple[tuple[str, str, str, bool], ...]]:
+    if type(rows) is not list:
+        _add_error(errors, "database_acl_evidence_must_be_list")
+        return None, ()
+    if len(rows) != 1:
+        _add_error(errors, f"database_acl_evidence_row_count_invalid_expected_1_got_{len(rows)}")
+        return None, ()
+    row = rows[0]
+    if not isinstance(row, dict):
+        _add_error(errors, "database_acl_evidence_row_0_must_be_object")
+        return None, ()
+    if not _exact_keys(row, DATABASE_ACL_EVIDENCE_ROW_KEYS, "database_acl_evidence_row_0", errors):
+        return None, ()
+    for key in ("database_name", "database_owner"):
+        _require_non_empty_string(row.get(key), f"database_acl_evidence_{key}", errors)
+    if row.get("datacl") is not None and type(row.get("datacl")) is not list:
+        _add_error(errors, "database_acl_evidence_datacl_must_be_list_or_null")
+    entries = _validate_runtime_acl_entries(
+        row.get("acl_entries"),
+        "database_acl_evidence_acl_entries",
+        errors,
+        ("CONNECT", "CREATE", "TEMPORARY"),
+    )
+    if type(row.get("database_name")) is not str or type(row.get("database_owner")) is not str:
+        return row, entries
+    owner = str(row["database_owner"])
+    direct_connect = [
+        entry for entry in entries if entry[0] == runtime_role and entry[2] == "CONNECT"
+    ]
+    if len(direct_connect) != 1:
+        _add_error(errors, "database_acl_runtime_connect_direct_evidence_missing_or_duplicate")
+    else:
+        if direct_connect[0][1] != owner:
+            _add_error(
+                errors,
+                f"database_acl_runtime_connect_grantor_invalid_expected_{owner}_got_{direct_connect[0][1]}",
+            )
+        if direct_connect[0][3]:
+            _add_error(errors, "database_acl_runtime_connect_grant_option_forbidden")
+    for grantee, _grantor, privilege, grantable in entries:
+        if grantee == runtime_role and privilege in {"CREATE", "TEMPORARY"}:
+            _add_error(errors, f"database_acl_runtime_{privilege.lower()}_forbidden")
+        if grantee == "PUBLIC" and privilege in {"CREATE", "TEMPORARY"}:
+            _add_error(errors, f"database_acl_public_{privilege.lower()}_forbidden")
+        if grantee in {runtime_role, "PUBLIC"} and grantable:
+            _add_error(errors, f"database_acl_{grantee}_{privilege.lower()}_grant_option_forbidden")
+    return row, entries
+
+
+def _validate_effective_database_evidence(
+    rows: list[dict[str, Any]] | None,
+    manifest: dict[str, Any],
+    errors: list[str],
+    *,
+    runtime_role: str,
+) -> None:
+    if type(rows) is not list:
+        _add_error(errors, "effective_database_privilege_evidence_must_be_list")
+        return
+    expected_manifest = manifest.get("database_acl", {})
+    runtime_contract = expected_manifest.get(runtime_role, {}) if isinstance(expected_manifest, dict) else {}
+    expected = {
+        "CONNECT": runtime_contract.get("connect") is True,
+        "CREATE": runtime_contract.get("create") is True,
+        "TEMPORARY": runtime_contract.get("temporary") is True,
+    }
+    seen: set[str] = set()
+    for index, row in enumerate(rows):
+        label = f"effective_database_row_{index}"
+        if not isinstance(row, dict):
+            _add_error(errors, f"{label}_must_be_object")
+            continue
+        keys = frozenset({"privilege_type", "effective", "is_grantable"})
+        if not _exact_keys(row, keys, label, errors):
+            continue
+        privilege = row.get("privilege_type")
+        _require_non_empty_string(privilege, f"{label}_privilege_type", errors)
+        _require_type(row.get("effective"), bool, f"{label}_effective", errors)
+        _require_type(row.get("is_grantable"), bool, f"{label}_is_grantable", errors)
+        if type(privilege) is not str or type(row.get("effective")) is not bool or type(row.get("is_grantable")) is not bool:
+            continue
+        if privilege not in expected:
+            _add_error(errors, f"{label}_privilege_invalid_{privilege}")
+            continue
+        if privilege in seen:
+            _add_error(errors, f"{label}_duplicate")
+        seen.add(privilege)
+        if bool(row["effective"]) != expected[privilege]:
+            _add_error(errors, f"effective_database_{privilege}_mismatch")
+        if row["is_grantable"]:
+            _add_error(errors, f"effective_database_{privilege}_grant_option_forbidden")
+    for privilege in expected:
+        if privilege not in seen:
+            _add_error(errors, f"effective_database_{privilege}_evidence_missing")
+
+
+def _validate_role_attribute_evidence(
+    rows: list[dict[str, Any]] | None,
+    manifest: dict[str, Any],
+    errors: list[str],
+) -> None:
+    if type(rows) is not list:
+        _add_error(errors, "role_attribute_evidence_must_be_list")
+        return
+    expected_keys = frozenset(
+        {
+            "rolname",
+            "rolsuper",
+            "rolinherit",
+            "rolcreaterole",
+            "rolcreatedb",
+            "rolcanlogin",
+            "rolreplication",
+            "rolbypassrls",
+            "rolconnlimit",
+            "password_is_null",
+        }
+    )
+    required = {"sqag_runtime", "sqag_migrator"}
+    seen: set[str] = set()
+    for index, row in enumerate(rows):
+        label = f"role_attribute_row_{index}"
+        if not isinstance(row, dict):
+            _add_error(errors, f"{label}_must_be_object")
+            continue
+        if not _exact_keys(row, expected_keys, label, errors):
+            continue
+        role_name = row.get("rolname")
+        _require_non_empty_string(role_name, f"{label}_rolname", errors)
+        for key in (
+            "rolsuper",
+            "rolinherit",
+            "rolcreaterole",
+            "rolcreatedb",
+            "rolcanlogin",
+            "rolreplication",
+            "rolbypassrls",
+            "password_is_null",
+        ):
+            _require_type(row.get(key), bool, f"{label}_{key}", errors)
+        _require_type(row.get("rolconnlimit"), int, f"{label}_rolconnlimit", errors)
+        if type(role_name) is not str:
+            continue
+        if role_name in seen:
+            _add_error(errors, f"{label}_duplicate")
+        seen.add(role_name)
+        if any(
+            type(row.get(key)) is not bool
+            for key in (
+                "rolsuper",
+                "rolinherit",
+                "rolcreaterole",
+                "rolcreatedb",
+                "rolcanlogin",
+                "rolreplication",
+                "rolbypassrls",
+                "password_is_null",
+            )
+        ) or type(row.get("rolconnlimit")) is not int:
+            continue
+        if role_name == "sqag_runtime":
+            attributes = (
+                manifest.get("roles", {}).get("runtime", {}).get("attributes", {})
+                if isinstance(manifest.get("roles"), dict)
+                else {}
+            )
+            expected_values = {
+                "rolcanlogin": attributes.get("login"),
+                "rolsuper": attributes.get("superuser"),
+                "rolcreatedb": attributes.get("createdb"),
+                "rolcreaterole": attributes.get("createrole"),
+                "rolreplication": attributes.get("replication"),
+                "rolbypassrls": attributes.get("bypassrls"),
+                "rolinherit": attributes.get("inherit"),
+                "rolconnlimit": attributes.get("connection_limit"),
+                "password_is_null": attributes.get("password") is None,
+            }
+            for key, expected in expected_values.items():
+                if type(expected) is not type(row[key]) or row[key] != expected:
+                    _add_error(errors, f"{label}_{key}_mismatch")
+        if role_name in {"sqag_runtime", "sqag_migrator"}:
+            for key in ("rolsuper", "rolcreaterole", "rolcreatedb", "rolreplication", "rolbypassrls"):
+                if row[key]:
+                    _add_error(errors, f"{label}_{key}_privileged_forbidden")
+    missing = required - seen
+    if missing:
+        _add_error(errors, f"role_attribute_required_evidence_missing_{sorted(missing)}")
+
+
+def _validate_default_acl_evidence(
+    rows: list[dict[str, Any]] | None,
+    errors: list[str],
+    *,
+    runtime_role: str,
+) -> None:
+    if type(rows) is not list:
+        _add_error(errors, "default_acl_evidence_must_be_list")
+        return
+    expected_keys = frozenset({"owner", "namespace", "object_type", "grantee", "privilege_type", "is_grantable"})
+    for index, row in enumerate(rows):
+        label = f"default_acl_evidence_row_{index}"
+        if not isinstance(row, dict):
+            _add_error(errors, f"{label}_must_be_object")
+            continue
+        if not _exact_keys(row, expected_keys, label, errors):
+            continue
+        for key in ("owner", "namespace", "object_type", "grantee", "privilege_type"):
+            _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
+        _require_type(row.get("is_grantable"), bool, f"{label}_is_grantable", errors)
+        if any(type(row.get(key)) is not str for key in ("owner", "namespace", "object_type", "grantee", "privilege_type")):
+            continue
+        if row["grantee"] == runtime_role or row["owner"] == runtime_role:
+            _add_error(errors, f"{label}_runtime_role_default_acl_forbidden")
+        if row["grantee"] == runtime_role and row["is_grantable"]:
+            _add_error(errors, f"{label}_runtime_role_grant_option_forbidden")
+        if row["grantee"] == "PUBLIC" and row["is_grantable"]:
+            _add_error(errors, f"{label}_public_grant_option_forbidden")
+
+
+def evaluate_final_runtime_authority(
+    manifest: dict[str, Any],
+    evidence: dict[str, Any],
+    *,
+    runtime_role: str = "sqag_runtime",
+) -> tuple[str, ...]:
+    """Evaluate the complete fifteen-query exact-state evidence packet."""
+
+    errors: list[str] = []
+    if not isinstance(evidence, dict):
+        return ("final_runtime_evidence_must_be_object",)
+    expected_keys = set(VERIFICATION_QUERY_KEYS)
+    actual_keys = set(evidence)
+    if actual_keys != expected_keys:
+        missing = sorted(expected_keys - actual_keys)
+        unexpected = sorted(actual_keys - expected_keys)
+        if missing:
+            _add_error(errors, f"final_runtime_evidence_missing_queries_{missing}")
+        if unexpected:
+            _add_error(errors, f"final_runtime_evidence_unexpected_queries_{unexpected}")
+    collections: dict[str, list[dict[str, Any]]] = {}
+    for key in VERIFICATION_QUERY_KEYS:
+        value = evidence.get(key)
+        if type(value) is not list:
+            _add_error(errors, f"final_runtime_evidence_{key}_must_be_list")
+            collections[key] = []
+        else:
+            collections[key] = value
+    _validate_database_acl_evidence(
+        collections["database_acl"],
+        errors,
+        runtime_role=runtime_role,
+    )
+    _validate_effective_database_evidence(
+        collections["effective_runtime_database_privileges"],
+        manifest,
+        errors,
+        runtime_role=runtime_role,
+    )
+    _validate_role_attribute_evidence(collections["role_attributes"], manifest, errors)
+    _validate_default_acl_evidence(
+        collections["default_acl"],
+        errors,
+        runtime_role=runtime_role,
+    )
+    errors.extend(
+        validate_runtime_membership_edges(
+            manifest,
+            collections["role_memberships"],
+        )
+    )
+    errors.extend(
+        evaluate_runtime_authority(
+            manifest,
+            collections["view_acl"],
+            collections["effective_runtime_table_privileges"],
+            collections["effective_runtime_column_privileges"],
+            schema_privilege_rows=collections["effective_runtime_schema_privileges"],
+            sequence_privilege_rows=collections["sequence_acl"],
+            routine_privilege_rows=collections["effective_runtime_routine_privileges"],
+            schema_acl_rows=collections["schema_acl"],
+            routine_acl_rows=collections["routine_acl"],
+            parameter_privilege_rows=collections["effective_runtime_parameter_privileges"],
+            runtime_role=runtime_role,
+        )
+    )
+    _validate_table_structure_evidence(collections["table_acl"], errors)
+    routine_acl_evidence = _validate_routine_acl_evidence(
+        collections["routine_acl"],
+        errors,
+    )
+    _validate_routine_structural_evidence(routine_acl_evidence, errors)
+    return tuple(errors)
 
 def validate_boundary_b(manifest: dict[str, Any], errors: list[str]) -> None:
     boundary = manifest.get("boundary_b")
@@ -4927,25 +6788,52 @@ def _validate_routine_query(query: str, errors: list[str]) -> None:
         "pg_catalog.pg_proc",
         "pg_catalog.pg_namespace",
         "pg_catalog.pg_roles",
+        "pg_catalog.pg_language",
         "pg_catalog.pg_trigger",
+        "pg_catalog.pg_class",
+        "pg_catalog.pg_attribute",
         "pg_catalog.aclexplode",
         "pg_catalog.acldefault",
         "pg_catalog.pg_get_function_identity_arguments",
+        "pg_catalog.pg_get_expr",
         "proname",
         "prokind",
         "prosecdef",
         "proowner",
+        "prolang",
+        "prosrc",
+        "proconfig",
+        "lanname",
         "identity_arguments",
         "routine_kind",
         "security_definer",
         "owner",
+        "language",
+        "routine_definition",
+        "routine_configuration",
         "acl_entries",
         "has_trigger_dependency",
+        "trigger_bindings",
         "tgfoid",
         "tgisinternal",
+        "tgname",
+        "tgtype",
+        "tgattr",
+        "tgenabled",
+        "tgqual",
+        "target_schema",
+        "target_relation",
+        "function_schema",
+        "function_name",
+        "function_identity_arguments",
+        "timing",
+        "events",
+        "update_columns",
+        "level",
+        "enabled",
+        "trigger_when",
         "jsonb_agg",
         "jsonb_build_object",
-        "cross join lateral",
         "grantee",
         "grantor",
         "privilege_type",
@@ -4964,8 +6852,12 @@ def _validate_routine_query(query: str, errors: list[str]) -> None:
                 "routine_kind",
                 "security_definer",
                 "owner",
+                "language",
+                "routine_definition",
+                "routine_configuration",
                 "acl_entries",
                 "has_trigger_dependency",
+                "trigger_bindings",
             ],
             "routine_acl",
             errors,
@@ -4988,8 +6880,12 @@ def _validate_routine_query(query: str, errors: list[str]) -> None:
             3: ["p", ".", "prokind", "as", "routine_kind"],
             4: ["p", ".", "prosecdef", "as", "security_definer"],
             5: ["r", ".", "rolname", "as", "owner"],
-            6: ["acl", ".", "acl_entries"],
-            7: ["exists", "(", "select", "1", "from", *_qualified_pattern("pg_catalog.pg_trigger"), "t"],
+            6: ["language", ".", "lanname", "as", "language"],
+            7: ["p", ".", "prosrc", "as", "routine_definition"],
+            8: ["coalesce", "(", "to_jsonb", "(", "p", ".", "proconfig", ")"],
+            9: ["acl", ".", "acl_entries"],
+            10: ["exists", "(", "select", "1", "from", *_qualified_pattern("pg_catalog.pg_trigger"), "t"],
+            11: ["trigger_evidence", ".", "trigger_bindings"],
         }
         for index, pattern in projection_patterns.items():
             if index < len(parts) and not _find_token_pattern(parts[index], pattern):
@@ -5000,9 +6896,15 @@ def _validate_routine_query(query: str, errors: list[str]) -> None:
         _add_error(errors, "verification_query_routine_acl_must_join_namespace")
     if not _find_token_pattern(tokens, ["join", *_qualified_pattern("pg_catalog.pg_roles"), "r"]):
         _add_error(errors, "verification_query_routine_acl_must_join_owner_roles")
+    if not _find_token_pattern(tokens, ["join", *_qualified_pattern("pg_catalog.pg_language"), "language"]):
+        _add_error(errors, "verification_query_routine_acl_must_join_language")
     if not _find_token_pattern(tokens, ["from", *_qualified_pattern("pg_catalog.pg_trigger"), "t"]):
         _add_error(errors, "verification_query_routine_acl_must_read_trigger_catalog")
-    if _count_token_pattern(tokens, ["cross", "join", "lateral"]) != 1:
+    if not _find_token_pattern(tokens, ["join", *_qualified_pattern("pg_catalog.pg_class"), "target_relation"]):
+        _add_error(errors, "verification_query_routine_acl_must_join_trigger_target_relation")
+    if not _find_token_pattern(tokens, ["join", *_qualified_pattern("pg_catalog.pg_proc"), "trigger_function"]):
+        _add_error(errors, "verification_query_routine_acl_must_join_trigger_function")
+    if _count_token_pattern(tokens, ["cross", "join", "lateral"]) != 2:
         _add_error(errors, "verification_query_routine_acl_requires_exactly_one_structured_acl_lateral")
     if _count_token_pattern(tokens, ["pg_catalog", ".", "aclexplode"]) != 1:
         _add_error(errors, "verification_query_routine_acl_requires_one_decoded_acl_surface")
@@ -5018,7 +6920,6 @@ def _validate_routine_query(query: str, errors: list[str]) -> None:
         _add_error(errors, "verification_query_routine_acl_must_not_prefix_filter_routines")
     if not _find_token_pattern(tokens, ["order", "by", "n", ".", "nspname", ",", "p", ".", "proname", ",", "identity_arguments", ",", "p", ".", "prokind"]):
         _add_error(errors, "verification_query_routine_acl_must_order_deterministically")
-
 
 def _validate_schema_acl_query(query: str, errors: list[str]) -> None:
     tokens = _read_only_query_tokens(query, "schema_acl", errors)
@@ -5080,16 +6981,27 @@ def _validate_parameter_query(query: str, errors: list[str]) -> None:
     required = (
         "pg_catalog.pg_settings",
         "pg_catalog.pg_parameter_acl",
+        "pg_catalog.pg_database",
+        "pg_catalog.pg_db_role_setting",
         "pg_catalog.pg_roles",
         "pg_catalog.aclexplode",
         "jsonb_agg",
         "jsonb_build_object",
         "cross join lateral",
+        "unnest",
+        "setconfig",
+        "setdatabase",
+        "setrole",
+        "split_part",
         "has_parameter_privilege",
         "parameter_name",
         "parname",
         "paracl",
         "acl_entries",
+        "startup_defaults",
+        "scope",
+        "precedence",
+        "setting",
         "effective_set",
         "effective_alter_system",
         "set_grantable",
@@ -5100,6 +7012,9 @@ def _validate_parameter_query(query: str, errors: list[str]) -> None:
         "is_grantable",
         "union",
         "order by",
+        "'database_global'",
+        "'role_global'",
+        "'role_database'",
         "'session_replication_role'",
     )
     _require_sql_features(tokens, "effective_runtime_parameter_privileges", required, errors)
@@ -5110,6 +7025,7 @@ def _validate_parameter_query(query: str, errors: list[str]) -> None:
             [
                 "parameter_name",
                 "acl_entries",
+                "startup_defaults",
                 "effective_set",
                 "effective_alter_system",
                 "set_grantable",
@@ -5120,20 +7036,24 @@ def _validate_parameter_query(query: str, errors: list[str]) -> None:
         )
     if _count_token_pattern(tokens, ["has_parameter_privilege"]) != 4:
         _add_error(errors, "verification_query_parameter_privileges_requires_four_effective_checks")
+    if _count_token_pattern(tokens, ["cross", "join", "lateral"]) != 2:
+        _add_error(errors, "verification_query_parameter_privileges_requires_two_structured_laterals")
     for pattern, label in (
         (["from", *_qualified_pattern("pg_catalog.pg_settings")], "settings"),
         (["from", *_qualified_pattern("pg_catalog.pg_parameter_acl")], "parameter_acl"),
+        (["join", *_qualified_pattern("pg_catalog.pg_database")], "database_settings"),
+        (["from", *_qualified_pattern("pg_catalog.pg_db_role_setting")], "role_database_settings"),
         (["from", *_qualified_pattern("pg_catalog.aclexplode"), "("], "decoded_acl"),
         (["left", "join", *_qualified_pattern("pg_catalog.pg_roles"), "grantee_role"], "grantee_roles"),
         (["left", "join", *_qualified_pattern("pg_catalog.pg_roles"), "grantor_role"], "grantor_roles"),
         (["union"], "union_inventory"),
+        (["split_part"], "setting_parameter_filter"),
         (["order", "by", "parameter_names", ".", "parameter_name"], "ordering"),
     ):
         if not _find_token_pattern(tokens, pattern):
             _add_error(errors, f"verification_query_parameter_privileges_missing_{label}_pattern")
     if not _find_token_pattern(tokens, [("STRING_EXACT", "session_replication_role")]):
         _add_error(errors, "verification_query_parameter_privileges_must_cover_session_replication_role")
-
 
 def _validate_view_query(query: str, errors: list[str]) -> None:
     tokens = _read_only_query_tokens(query, 'view_acl', errors)
