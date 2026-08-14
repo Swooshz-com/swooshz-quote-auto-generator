@@ -369,7 +369,7 @@ edge, different identity or grantor, mutated option, recursive path, protected
 SQAG/provider role, unknown classification, missing field, duplicate edge, or
 membership-derived effective privilege fails closed.
 
-The manifest and validator bind exactly fourteen canonical verification-query
+The manifest and validator bind exactly fifteen canonical verification-query
 keys. Each key has an independent repository-owned executable-token contract;
 candidate manifest text cannot redefine its expected query. The PostgreSQL
 integration contract executes every key once, checks the exact returned column
@@ -415,9 +415,9 @@ live-system evidence.
 | Key | Exact result columns | Fixture cardinality |
 |---|---|---:|
 | `database_acl` | `datacl` | 1 |
-| `schema_acl` | `nspacl` | 1 |
+| `schema_acl` | `schema_name`, `schema_owner`, `database_owner`, `acl_entries` | 1 |
 | `table_acl` | `relname`, `relacl` | 16 without the optional source table; 17 when it exists |
-| `routine_acl` | `proname`, `identity_arguments`, `prokind`, `prosecdef`, `proacl`, `proowner`, `owner`, `has_trigger_dependency` | 2 |
+| `routine_acl` | `schema_name`, `routine_name`, `identity_arguments`, `routine_kind`, `security_definer`, `owner`, `acl_entries`, `has_trigger_dependency` | 2 without the provider fixture; 3 when `show_db_tree()` is present |
 | `default_acl` | `owner`, `namespace`, `object_type`, `grantee`, `privilege_type`, `is_grantable` | 1 |
 | `role_attributes` | `rolname`, `rolsuper`, `rolinherit`, `rolcreaterole`, `rolcreatedb`, `rolcanlogin`, `rolreplication`, `rolbypassrls`, `rolconnlimit`, `password_is_null` | 2 |
 | `role_memberships` | `role`, `member`, `grantor`, `admin_option`, `inherit_option`, `set_option` | 0 in the generic shape fixture; 1 exact runtime edge in the creator fixture |
@@ -427,6 +427,7 @@ live-system evidence.
 | `effective_runtime_column_privileges` | `schema_name`, `table_name`, `column_name`, `acl_entries`, `privilege_type`, `effective`, `is_grantable` | 4 per visible column on each enumerated non-system `r`/`p`/`f` relation |
 | `effective_runtime_schema_privileges` | `schema_name`, `privilege_type`, `effective`, `is_grantable` | 2 per enumerated non-system schema |
 | `effective_runtime_routine_privileges` | `schema_name`, `routine_name`, `identity_arguments`, `routine_kind`, `privilege_type`, `direct_runtime_execute`, `public_execute`, `effective`, `is_grantable` | 1 per enumerated non-system routine |
+| `effective_runtime_parameter_privileges` | `parameter_name`, `acl_entries`, `effective_set`, `effective_alter_system`, `set_grantable`, `alter_system_grantable` | One row per parameter in the sorted `pg_settings`/`pg_parameter_acl` inventory union, including `session_replication_role` |
 | `view_acl` | `schema_name`, `relation_name`, `relation_kind`, `owner`, `relation_acl`, `acl_entries`, `column_acl_entries`, `view_definition`, `view_dependencies`, `view_columns`, `relation_options`, `view_security`, `runtime_privileges`, `runtime_select`, `runtime_select_grantable` | 0 in the generic shape fixture; 1 when the legacy-optional view fixture is present |
 
 The effective database proof covers `CONNECT`, `CREATE`, and `TEMPORARY`; the
@@ -574,9 +575,11 @@ role-attribute query must join `pg_roles` to the authoritative `pg_authid`
 catalog and project only the boolean `password_is_null` assertion; it never
 returns the password field. The routine query must have
 the exact eight-column projection
-`proname, identity_arguments, prokind, prosecdef, proacl, proowner, owner,
-has_trigger_dependency`, the complete public-schema routine boundary, and
-deterministic identity-argument ordering. The view query must project exactly
+`schema_name, routine_name, identity_arguments, routine_kind, security_definer, owner,
+acl_entries, has_trigger_dependency`, the complete public-schema routine boundary, decoded
+ACL identities, owner/security posture, trigger dependency posture, and deterministic
+identity ordering. The schema query must project the decoded public-schema ACL together
+with the exact schema owner and current database owner used for direct-grant provenance. The view query must project exactly
 `schema_name, relation_name, relation_kind, owner, relation_acl, acl_entries,
 column_acl_entries, view_definition, view_dependencies, view_columns,
 relation_options, view_security, runtime_privileges, runtime_select,
@@ -587,7 +590,7 @@ grantee and grantor identities, evaluate all eight effective runtime relation
 privileges through `has_table_privilege(... 'WITH GRANT OPTION')`, cover both
 `relkind` values `'v'` and `'m'` in every non-system schema, and order both
 JSONB arrays and result rows deterministically. The PostgreSQL query-shape
-evidence executes all fourteen canonical queries, asserts the exact returned
+evidence executes all fifteen canonical queries, asserts the exact returned
 column names, and applies the documented cardinality rules. The evaluator
 rejects decorative-only raw ACL evidence, malformed or incomplete JSONB
 entries, unexpected ACL provenance, and duplicate schema-qualified relation
@@ -626,6 +629,61 @@ and the exact table privileges needed by the fixture. A permitted
 SQLSTATE `P0001` with the exact immutable-record message while leaving the row
 unchanged. Direct calls to both trigger functions run under `SET ROLE` and
 must fail specifically with SQLSTATE `42501`.
+
+### H28: correlated public routine exception proof
+
+The public routine exception is accepted only from one correlated evidence
+surface. `routine_acl` enumerates every user-defined routine in `public` and
+binds schema, exact name, identity arguments, routine kind, owner,
+invoker/security-definer posture, decoded ACL entries, and trigger dependency
+posture to the corresponding effective routine row. Missing, duplicate,
+malformed, or uncorrelated evidence fails closed.
+
+The two SQAG trigger routines must remain exact `sqag_migrator`-owned,
+invoker, trigger-dependent functions with zero direct, PUBLIC, effective, and
+grantable runtime `EXECUTE`. The only accepted public exception is
+`public.show_db_tree()` with exact zero-argument function identity, manifest
+owner `neondb_owner`, invoker/non-`SECURITY DEFINER` posture, no trigger
+dependency, no direct runtime `EXECUTE`, bounded PUBLIC/effective `EXECUTE`,
+and no grant option. Any second or unclassified public routine with effective
+authority, or any owner, security, dependency, argument, routine-kind, direct
+ACL, PUBLIC ACL, or grant-option substitution, is rejected. PostgreSQL
+controls exercise the direct/PUBLIC/effective/grantable boundaries and restore
+the provider posture after owner and security-definer substitutions.
+
+### H29: direct public-schema grant provenance
+
+The public schema proof distinguishes effective `USAGE` from the required
+ACL provenance. The decoded `schema_acl` row must identify schema `public`,
+manifest schema owner `pg_database_owner`, and the current database owner.
+It must contain exactly one direct `sqag_runtime` `USAGE` entry, granted by
+that database owner, without grant option; runtime `CREATE` remains denied.
+The independently classified PUBLIC `USAGE` posture must also be present in
+the decoded ACL. Effective authority supplied by PUBLIC, membership, or any
+other path cannot substitute for the prescribed direct runtime entry, and
+malformed or duplicate relevant ACL evidence fails closed. Disposable
+PostgreSQL controls revoke and restore the direct grant, exercise wrong
+grantor, grant-option, runtime-`CREATE`, PUBLIC, and membership-derived
+substitutions, and finish with a clean re-evaluation.
+
+### H30: PostgreSQL parameter privilege proof
+
+`effective_runtime_parameter_privileges` mechanically inventories the
+PostgreSQL 17 parameter surface from `pg_settings` and `pg_parameter_acl`,
+adds the required `session_replication_role` row explicitly, decodes ACL
+identities with `aclexplode`, and orders every row and ACL array
+deterministically. It evaluates effective and grantable `SET` and `ALTER
+SYSTEM` authority for `sqag_runtime`, regardless of direct, PUBLIC, or
+membership-derived provenance. There are no classified runtime parameter
+exceptions: any effective `SET`, effective `ALTER SYSTEM`, or corresponding
+grant option fails closed. Only PostgreSQL-required non-applicable mechanics
+may be excluded; no broad parameter-name prefix is an escape.
+
+Static and PostgreSQL 17 causal controls cover the clean zero-authority
+baseline, direct/PUBLIC/membership-derived `SET` on
+`session_replication_role`, `ALTER SYSTEM`, and grant-option paths. Every
+mutation is revoked or restored, the final catalog contains no runtime
+parameter authority residue, and the final evaluator result is clean.
 
 The runtime table proof constructs the expected manifest effective set for
 classified application tables and requires every other public `r`/`p`/`f`
@@ -742,11 +800,11 @@ The deterministic discovery receipt for this amendment is:
 
 | Receipt item | Count |
 |---|---:|
-| Discovered test methods | 228 |
-| Static and validator methods | 149 |
-| PostgreSQL methods | 75 |
+| Discovered test methods | 238 |
+| Static and validator methods | 154 |
+| PostgreSQL methods | 80 |
 | Requirement-map and documentation parity methods | 4 |
-| Hosted executions | 228 |
+| Hosted executions | 238 |
 | Hosted skips | 0 |
 | Unique locked requirement IDs | 38 (`R01`-`R38`) |
 

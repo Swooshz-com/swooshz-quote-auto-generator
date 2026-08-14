@@ -42,6 +42,7 @@ TOP_LEVEL_KEYS = frozenset(
         "views",
         "sequences",
         "routines",
+        "parameter_privileges",
         "default_privileges",
         "boundary_b",
         "verification_queries",
@@ -127,7 +128,15 @@ DATABASE_MIGRATOR_KEYS = frozenset({"connect", "create", "temporary"})
 DATABASE_APP_KEYS = frozenset({"connect"})
 DATABASE_RUNTIME_KEYS = frozenset({"connect", "create", "temporary"})
 SCHEMA_ACL_KEYS = frozenset(
-    {"schema_name", "public", "pg_database_owner", "sqag_app", "sqag_runtime"}
+    {
+        "schema_name",
+        "schema_owner",
+        "authorized_grantor",
+        "public",
+        "pg_database_owner",
+        "sqag_app",
+        "sqag_runtime",
+    }
 )
 SCHEMA_PUBLIC_KEYS = frozenset({"usage"})
 SCHEMA_OWNER_KEYS = frozenset({"create", "usage"})
@@ -233,6 +242,28 @@ RUNTIME_ROUTINE_PRIVILEGE_ROW_KEYS = frozenset(
         "is_grantable",
     }
 )
+ROUTINE_ACL_EVIDENCE_ROW_KEYS = frozenset(
+    {
+        "schema_name",
+        "routine_name",
+        "identity_arguments",
+        "routine_kind",
+        "security_definer",
+        "owner",
+        "acl_entries",
+        "has_trigger_dependency",
+    }
+)
+RUNTIME_PARAMETER_PRIVILEGE_ROW_KEYS = frozenset(
+    {
+        "parameter_name",
+        "acl_entries",
+        "effective_set",
+        "effective_alter_system",
+        "set_grantable",
+        "alter_system_grantable",
+    }
+)
 
 MATERIALIZED_VIEW_RULE = (
     "No public materialized view is classified. Any public materialized view fails "
@@ -273,6 +304,7 @@ TRIGGER_ROUTINE_KEYS = frozenset(
         "identity_arguments",
         "routine_kind",
         "security_mode",
+        "has_trigger_dependency",
         "class",
         "direct_runtime_execute",
         "public_execute_after_boundary_b",
@@ -285,12 +317,17 @@ PROVIDER_EXCEPTION_KEYS = frozenset(
         "owner",
         "identity_arguments",
         "routine_kind",
+        "security_mode",
+        "has_trigger_dependency",
         "class",
         "direct_runtime_grant",
         "public_execute",
         "effective_runtime_execution",
         "grant_option",
     }
+)
+PARAMETER_PRIVILEGES_KEYS = frozenset(
+    {"runtime_role", "classified_runtime_privileges", "required_parameters", "rule"}
 )
 DEFAULT_PRIVILEGES_KEYS = frozenset(
     {"object_classes", "sqag_runtime", "sqag_migrator_to_sqag_app", "provider_controlled", "verification_rule"}
@@ -314,6 +351,7 @@ VERIFICATION_QUERY_KEYS = frozenset(
         "effective_runtime_column_privileges",
         "effective_runtime_schema_privileges",
         "effective_runtime_routine_privileges",
+        "effective_runtime_parameter_privileges",
         "view_acl",
     }
 )
@@ -329,9 +367,33 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
         where datname = current_database()
     """,
     "schema_acl": """
-        select nspacl
-        from pg_catalog.pg_namespace
-        where nspname = 'public'
+        select n.nspname as schema_name,
+               schema_owner.rolname as schema_owner,
+               database_owner.rolname as database_owner,
+               acl.acl_entries
+        from pg_catalog.pg_namespace n
+        join pg_catalog.pg_roles schema_owner on schema_owner.oid = n.nspowner
+        join pg_catalog.pg_database d on d.datname = current_database()
+        join pg_catalog.pg_roles database_owner on database_owner.oid = d.datdba
+        cross join lateral (
+            select coalesce(
+                       jsonb_agg(
+                           jsonb_build_object(
+                               'grantee', case when expanded.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'OID:' || expanded.grantee::text) end,
+                               'grantor', coalesce(grantor_role.rolname, 'OID:' || expanded.grantor::text),
+                               'privilege_type', expanded.privilege_type,
+                               'is_grantable', expanded.is_grantable
+                           )
+                           order by expanded.grantee, expanded.grantor, expanded.privilege_type, expanded.is_grantable
+                       ),
+                       '[]'::jsonb
+                   ) as acl_entries
+            from pg_catalog.aclexplode(coalesce(n.nspacl, pg_catalog.acldefault('n', n.nspowner))) expanded
+            left join pg_catalog.pg_roles grantee_role on grantee_role.oid = expanded.grantee and expanded.grantee <> 0
+            left join pg_catalog.pg_roles grantor_role on grantor_role.oid = expanded.grantor
+        ) acl
+        where n.nspname = 'public'
+        order by n.nspname
     """,
     "table_acl": """
         select relname, relacl
@@ -346,13 +408,13 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
         order by relname
     """,
     "routine_acl": """
-        select p.proname,
-               pg_get_function_identity_arguments(p.oid) as identity_arguments,
-               p.prokind,
-               p.prosecdef,
-               p.proacl,
-               p.proowner,
+        select n.nspname as schema_name,
+               p.proname as routine_name,
+               pg_catalog.pg_get_function_identity_arguments(p.oid) as identity_arguments,
+               p.prokind as routine_kind,
+               p.prosecdef as security_definer,
                r.rolname as owner,
+               acl.acl_entries,
                exists (
                    select 1
                    from pg_catalog.pg_trigger t
@@ -362,9 +424,26 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
         from pg_catalog.pg_proc p
         join pg_catalog.pg_namespace n on n.oid = p.pronamespace
         join pg_catalog.pg_roles r on r.oid = p.proowner
+        cross join lateral (
+            select coalesce(
+                       jsonb_agg(
+                           jsonb_build_object(
+                               'grantee', case when expanded.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'OID:' || expanded.grantee::text) end,
+                               'grantor', coalesce(grantor_role.rolname, 'OID:' || expanded.grantor::text),
+                               'privilege_type', expanded.privilege_type,
+                               'is_grantable', expanded.is_grantable
+                           )
+                           order by expanded.grantee, expanded.grantor, expanded.privilege_type, expanded.is_grantable
+                       ),
+                       '[]'::jsonb
+                   ) as acl_entries
+            from pg_catalog.aclexplode(coalesce(p.proacl, pg_catalog.acldefault('f', p.proowner))) expanded
+            left join pg_catalog.pg_roles grantee_role on grantee_role.oid = expanded.grantee and expanded.grantee <> 0
+            left join pg_catalog.pg_roles grantor_role on grantor_role.oid = expanded.grantor
+        ) acl
         where n.nspname = 'public'
           and p.prokind in ('f', 'p', 'a', 'w')
-        order by p.proname, identity_arguments
+        order by n.nspname, p.proname, identity_arguments, p.prokind
     """,
     "default_acl": """
         select owner.rolname as owner,
@@ -632,6 +711,43 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
           and n.nspname !~ '^pg_temp_[0-9]+$'
           and n.nspname !~ '^pg_toast_temp_[0-9]+$'
         order by n.nspname, p.proname, identity_arguments, p.prokind
+    """,
+    "effective_runtime_parameter_privileges": """
+        select parameter_names.parameter_name as parameter_name,
+               acl.acl_entries,
+               has_parameter_privilege('sqag_runtime', parameter_names.parameter_name, 'SET') as effective_set,
+               has_parameter_privilege('sqag_runtime', parameter_names.parameter_name, 'ALTER SYSTEM') as effective_alter_system,
+               has_parameter_privilege('sqag_runtime', parameter_names.parameter_name, 'SET WITH GRANT OPTION') as set_grantable,
+               has_parameter_privilege('sqag_runtime', parameter_names.parameter_name, 'ALTER SYSTEM WITH GRANT OPTION') as alter_system_grantable
+        from (
+            select name as parameter_name
+            from pg_catalog.pg_settings
+            union
+            select parname as parameter_name
+            from pg_catalog.pg_parameter_acl
+            union
+            select 'session_replication_role'::text as parameter_name
+        ) parameter_names
+        left join pg_catalog.pg_parameter_acl parameter_acl
+          on parameter_acl.parname = parameter_names.parameter_name
+        cross join lateral (
+            select coalesce(
+                       jsonb_agg(
+                           jsonb_build_object(
+                               'grantee', case when expanded.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'OID:' || expanded.grantee::text) end,
+                               'grantor', coalesce(grantor_role.rolname, 'OID:' || expanded.grantor::text),
+                               'privilege_type', expanded.privilege_type,
+                               'is_grantable', expanded.is_grantable
+                           )
+                           order by expanded.grantee, expanded.grantor, expanded.privilege_type, expanded.is_grantable
+                       ),
+                       '[]'::jsonb
+                   ) as acl_entries
+            from pg_catalog.aclexplode(parameter_acl.paracl) expanded
+            left join pg_catalog.pg_roles grantee_role on grantee_role.oid = expanded.grantee and expanded.grantee <> 0
+            left join pg_catalog.pg_roles grantor_role on grantor_role.oid = expanded.grantor
+        ) acl
+        order by parameter_names.parameter_name
     """,
     "view_acl": """
         select c.relname as relation_name,
@@ -974,7 +1090,31 @@ ROLE_DESCRIPTIONS = {
 
 REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
     "database_acl": ("pg_catalog.pg_database", "datname", "datacl", "current_database"),
-    "schema_acl": ("pg_catalog.pg_namespace", "nspname", "nspacl", "'public'"),
+    "schema_acl": (
+        "pg_catalog.pg_namespace",
+        "pg_catalog.pg_roles",
+        "pg_catalog.pg_database",
+        "nspname",
+        "nspowner",
+        "nspacl",
+        "datdba",
+        "schema_owner",
+        "database_owner",
+        "current_database",
+        "pg_catalog.aclexplode",
+        "pg_catalog.acldefault",
+        "jsonb_agg",
+        "jsonb_build_object",
+        "cross join lateral",
+        "acl_entries",
+        "grantee",
+        "grantor",
+        "privilege_type",
+        "is_grantable",
+        "'n'",
+        "'public'",
+        "order by",
+    ),
     "table_acl": (
         "pg_catalog.pg_class",
         "pg_catalog.pg_namespace",
@@ -1122,7 +1262,7 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "pg_catalog.pg_roles",
         "pg_catalog.aclexplode",
         "pg_catalog.acldefault",
-        "pg_get_function_identity_arguments",
+        "pg_catalog.pg_get_function_identity_arguments",
         "schema_name",
         "routine_name",
         "routine_kind",
@@ -1135,6 +1275,35 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "'execute with grant option'",
         "information_schema",
         "pg_toast",
+    ),
+    "effective_runtime_parameter_privileges": (
+        "pg_catalog.pg_settings",
+        "pg_catalog.pg_parameter_acl",
+        "pg_catalog.pg_roles",
+        "pg_catalog.aclexplode",
+        "jsonb_agg",
+        "jsonb_build_object",
+        "cross join lateral",
+        "has_parameter_privilege",
+        "parameter_name",
+        "parname",
+        "paracl",
+        "acl_entries",
+        "grantee",
+        "grantor",
+        "privilege_type",
+        "is_grantable",
+        "effective_set",
+        "effective_alter_system",
+        "set_grantable",
+        "alter_system_grantable",
+        "union",
+        "'SET'",
+        "'ALTER SYSTEM'",
+        "'SET WITH GRANT OPTION'",
+        "'ALTER SYSTEM WITH GRANT OPTION'",
+        "'session_replication_role'",
+        "order by",
     ),
     "view_acl": (
         "pg_catalog.pg_class",
@@ -3381,15 +3550,225 @@ def _is_postgresql_system_schema(schema_name: str) -> bool:
     )
 
 
+def _validate_routine_acl_evidence(
+    routine_acl_rows: list[dict[str, Any]] | None,
+    errors: list[str],
+) -> dict[tuple[str, str, str, str], dict[str, Any]]:
+    if type(routine_acl_rows) is not list:
+        _add_error(errors, "routine_acl_evidence_must_be_list")
+        return {}
+    evidence: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    previous_identity: tuple[str, str, str, str] | None = None
+    for index, row in enumerate(routine_acl_rows):
+        label = f"routine_acl_row_{index}"
+        if not isinstance(row, dict):
+            _add_error(errors, f"{label}_must_be_object")
+            continue
+        if not _exact_keys(row, ROUTINE_ACL_EVIDENCE_ROW_KEYS, label, errors):
+            continue
+        schema_name = row.get("schema_name")
+        routine_name = row.get("routine_name")
+        identity_arguments = row.get("identity_arguments")
+        routine_kind = row.get("routine_kind")
+        owner = row.get("owner")
+        security_definer = row.get("security_definer")
+        has_trigger_dependency = row.get("has_trigger_dependency")
+        _require_non_empty_string(schema_name, f"{label}_schema_name", errors)
+        _require_non_empty_string(routine_name, f"{label}_routine_name", errors)
+        if type(identity_arguments) is not str:
+            _add_error(errors, f"{label}_identity_arguments_must_be_string")
+        _require_non_empty_string(routine_kind, f"{label}_routine_kind", errors)
+        _require_non_empty_string(owner, f"{label}_owner", errors)
+        _require_type(security_definer, bool, f"{label}_security_definer", errors)
+        _require_type(has_trigger_dependency, bool, f"{label}_has_trigger_dependency", errors)
+        if any(
+            type(value) is not str
+            for value in (schema_name, routine_name, identity_arguments, routine_kind, owner)
+        ) or type(security_definer) is not bool or type(has_trigger_dependency) is not bool:
+            continue
+        if schema_name != BOUND_SOURCE_SCHEMA:
+            _add_error(errors, f"{label}_schema_must_be_public")
+        if routine_kind not in {"f", "p", "a", "w"}:
+            _add_error(errors, f"{label}_routine_kind_invalid_{routine_kind}")
+        identity = (schema_name, routine_name, identity_arguments, routine_kind)
+        if previous_identity is not None and identity < previous_identity:
+            _add_error(errors, f"{label}_ordering_not_deterministic")
+        previous_identity = identity
+        if identity in evidence:
+            _add_error(errors, f"{label}_duplicate")
+        acl_entries = _validate_runtime_acl_entries(
+            row.get("acl_entries"),
+            f"{label}_acl_entries",
+            errors,
+            ("EXECUTE",),
+        )
+        evidence[identity] = {
+            "owner": owner,
+            "security_definer": security_definer,
+            "has_trigger_dependency": has_trigger_dependency,
+            "acl_entries": acl_entries,
+        }
+    return evidence
+
+
+def _validate_schema_acl_evidence(
+    manifest: dict[str, Any],
+    schema_acl_rows: list[dict[str, Any]] | None,
+    errors: list[str],
+) -> tuple[dict[str, Any], tuple[tuple[str, str, str, bool], ...]] | None:
+    if type(schema_acl_rows) is not list:
+        _add_error(errors, "schema_acl_evidence_must_be_list")
+        return None
+    if len(schema_acl_rows) != 1:
+        _add_error(errors, f"schema_acl_evidence_row_count_invalid_expected_1_got_{len(schema_acl_rows)}")
+        return None
+    row = schema_acl_rows[0]
+    label = "schema_acl_evidence_row_0"
+    expected_keys = frozenset({"schema_name", "schema_owner", "database_owner", "acl_entries"})
+    if not _exact_keys(row, expected_keys, label, errors):
+        return None
+    schema_name = row.get("schema_name")
+    schema_owner = row.get("schema_owner")
+    database_owner = row.get("database_owner")
+    _require_non_empty_string(schema_name, f"{label}_schema_name", errors)
+    _require_non_empty_string(schema_owner, f"{label}_schema_owner", errors)
+    _require_non_empty_string(database_owner, f"{label}_database_owner", errors)
+    if any(type(value) is not str for value in (schema_name, schema_owner, database_owner)):
+        return None
+    if schema_name != BOUND_SOURCE_SCHEMA:
+        _add_error(errors, f"{label}_schema_must_be_public")
+    expected_schema_owner = (
+        manifest.get("schema_acl", {}).get("schema_owner")
+        if isinstance(manifest.get("schema_acl"), dict)
+        else None
+    )
+    if schema_owner != expected_schema_owner:
+        _add_error(
+            errors,
+            f"{label}_schema_owner_mismatch_expected_{expected_schema_owner}_got_{schema_owner}",
+        )
+    acl_entries = _validate_runtime_acl_entries(
+        row.get("acl_entries"),
+        f"{label}_acl_entries",
+        errors,
+        ("USAGE", "CREATE"),
+    )
+    return row, acl_entries
+
+
+def evaluate_parameter_authority(
+    manifest: dict[str, Any],
+    parameter_privilege_rows: list[dict[str, Any]],
+    *,
+    runtime_role: str = "sqag_runtime",
+) -> tuple[str, ...]:
+    errors: list[str] = []
+    parameter_contract = manifest.get("parameter_privileges")
+    if not isinstance(parameter_contract, dict):
+        _add_error(errors, "parameter_privilege_manifest_must_be_object")
+        required_parameters: list[str] = []
+    else:
+        expected_role = parameter_contract.get("runtime_role")
+        if expected_role != runtime_role:
+            _add_error(
+                errors,
+                f"parameter_runtime_role_mismatch_expected_{expected_role}_got_{runtime_role}",
+            )
+        required_parameters_value = parameter_contract.get("required_parameters")
+        if type(required_parameters_value) is not list or any(
+            type(value) is not str or not value.strip() for value in required_parameters_value
+        ):
+            _add_error(errors, "parameter_required_parameters_must_be_non_empty_string_list")
+            required_parameters = []
+        else:
+            required_parameters = list(required_parameters_value)
+    if type(parameter_privilege_rows) is not list:
+        _add_error(errors, "runtime_parameter_privilege_evidence_must_be_list")
+        return tuple(errors)
+    seen_parameters: set[str] = set()
+    previous_parameter: str | None = None
+    for index, row in enumerate(parameter_privilege_rows):
+        label = f"runtime_parameter_row_{index}"
+        if not isinstance(row, dict):
+            _add_error(errors, f"{label}_must_be_object")
+            continue
+        if not _exact_keys(row, RUNTIME_PARAMETER_PRIVILEGE_ROW_KEYS, label, errors):
+            continue
+        parameter_name = row.get("parameter_name")
+        _require_non_empty_string(parameter_name, f"{label}_parameter_name", errors)
+        for key in ("effective_set", "effective_alter_system", "set_grantable", "alter_system_grantable"):
+            _require_type(row.get(key), bool, f"{label}_{key}", errors)
+        if type(parameter_name) is not str or any(
+            type(row.get(key)) is not bool
+            for key in ("effective_set", "effective_alter_system", "set_grantable", "alter_system_grantable")
+        ):
+            continue
+        if previous_parameter is not None and parameter_name <= previous_parameter:
+            _add_error(errors, f"{label}_ordering_or_duplicate")
+        previous_parameter = parameter_name
+        if parameter_name in seen_parameters:
+            _add_error(errors, f"{label}_duplicate")
+        seen_parameters.add(parameter_name)
+        acl_entries = _validate_runtime_acl_entries(
+            row.get("acl_entries"),
+            f"{label}_acl_entries",
+            errors,
+            ("SET", "ALTER SYSTEM"),
+        )
+        direct_set = any(
+            grantee == runtime_role and privilege == "SET"
+            for grantee, _grantor, privilege, _grantable in acl_entries
+        )
+        direct_alter_system = any(
+            grantee == runtime_role and privilege == "ALTER SYSTEM"
+            for grantee, _grantor, privilege, _grantable in acl_entries
+        )
+        if direct_set and not row["effective_set"]:
+            _add_error(errors, f"{label}_direct_set_effective_mismatch")
+        if direct_alter_system and not row["effective_alter_system"]:
+            _add_error(errors, f"{label}_direct_alter_system_effective_mismatch")
+        for grantee, _grantor, privilege, is_grantable in acl_entries:
+            if grantee in {runtime_role, "PUBLIC"} and is_grantable:
+                _add_error(errors, f"{label}_{privilege.lower().replace(' ', '_')}_acl_grant_option_forbidden")
+        if row["effective_set"]:
+            _add_error(errors, f"runtime_parameter_effective_set_forbidden_{parameter_name}")
+        if row["effective_alter_system"]:
+            _add_error(errors, f"runtime_parameter_effective_alter_system_forbidden_{parameter_name}")
+        if row["set_grantable"]:
+            _add_error(errors, f"runtime_parameter_set_grant_option_forbidden_{parameter_name}")
+        if row["alter_system_grantable"]:
+            _add_error(errors, f"runtime_parameter_alter_system_grant_option_forbidden_{parameter_name}")
+    missing = set(required_parameters) - seen_parameters
+    if missing:
+        _add_error(errors, f"runtime_parameter_required_evidence_missing_{sorted(missing)}")
+    return tuple(errors)
+
 def evaluate_schema_wide_runtime_authority(
     manifest: dict[str, Any],
     schema_privilege_rows: list[dict[str, Any]] | None,
     sequence_privilege_rows: list[dict[str, Any]] | None,
     routine_privilege_rows: list[dict[str, Any]] | None,
+    *,
+    schema_acl_rows: list[dict[str, Any]] | None = None,
+    routine_acl_rows: list[dict[str, Any]] | None = None,
 ) -> tuple[str, ...]:
     """Reject runtime authority in every ordinary non-system schema."""
 
     errors: list[str] = []
+    schema_acl_evidence = None
+    if schema_privilege_rows is not None and schema_acl_rows is None:
+        _add_error(errors, "schema_acl_evidence_required")
+    if schema_acl_rows is not None:
+        schema_acl_evidence = _validate_schema_acl_evidence(manifest, schema_acl_rows, errors)
+        if schema_privilege_rows is None:
+            _add_error(errors, "schema_acl_evidence_requires_effective_schema_evidence")
+    routine_acl_evidence = None
+    if routine_privilege_rows is not None and routine_acl_rows is None:
+        _add_error(errors, "routine_acl_evidence_required")
+    if routine_acl_rows is not None:
+        routine_acl_evidence = _validate_routine_acl_evidence(routine_acl_rows, errors)
+        if routine_privilege_rows is None:
+            _add_error(errors, "routine_acl_evidence_requires_effective_routine_evidence")
     if schema_privilege_rows is not None:
         if type(schema_privilege_rows) is not list:
             errors.append("runtime_schema_privilege_evidence_must_be_list")
@@ -3452,6 +3831,48 @@ def evaluate_schema_wide_runtime_authority(
         for privilege in ("USAGE", "CREATE"):
             if privilege not in public_seen:
                 _add_error(errors, f"runtime_schema_public_{privilege}_evidence_missing")
+
+    if schema_acl_evidence is not None:
+        schema_row, schema_entries = schema_acl_evidence
+        runtime_schema_entries = [
+            entry for entry in schema_entries if entry[0] == "sqag_runtime"
+        ]
+        runtime_usage_entries = [
+            entry for entry in runtime_schema_entries if entry[2] == "USAGE"
+        ]
+        if len(runtime_usage_entries) != 1:
+            _add_error(
+                errors,
+                "runtime_schema_direct_usage_evidence_missing_or_duplicate",
+            )
+        else:
+            direct_usage = runtime_usage_entries[0]
+            if direct_usage[1] != schema_row["database_owner"]:
+                _add_error(
+                    errors,
+                    "runtime_schema_direct_usage_grantor_invalid_expected_"
+                    f"{schema_row['database_owner']}_got_{direct_usage[1]}",
+                )
+            if direct_usage[3]:
+                _add_error(errors, "runtime_schema_direct_usage_grant_option_forbidden")
+        for entry in runtime_schema_entries:
+            if entry[2] != "USAGE":
+                _add_error(
+                    errors,
+                    f"runtime_schema_direct_privilege_forbidden_{entry[2]}",
+                )
+            if entry[3]:
+                _add_error(errors, "runtime_schema_direct_grant_option_forbidden")
+        expected_public_usage = bool(
+            isinstance(schema_acl, dict)
+            and isinstance(schema_acl.get("public"), dict)
+            and schema_acl["public"].get("usage") is True
+        )
+        if expected_public_usage and not any(
+            entry[0] == "PUBLIC" and entry[2] == "USAGE" and not entry[3]
+            for entry in schema_entries
+        ):
+            _add_error(errors, "runtime_schema_public_usage_acl_evidence_missing")
 
     if sequence_privilege_rows is not None:
         if type(sequence_privilege_rows) is not list:
@@ -3640,6 +4061,90 @@ def evaluate_schema_wide_runtime_authority(
             if schema_name != BOUND_SOURCE_SCHEMA:
                 continue
             trigger_name = expected_trigger_identities.get(identity)
+            if routine_acl_evidence is not None:
+                acl_row = routine_acl_evidence.get(identity)
+                if acl_row is None:
+                    _add_error(
+                        errors,
+                        f"runtime_public_routine_acl_evidence_missing_{routine_name}"
+                        f".{identity_arguments}_{routine_kind}",
+                    )
+                else:
+                    acl_entries = acl_row["acl_entries"]
+                    direct_from_acl = any(
+                        grantee == "sqag_runtime" and privilege == "EXECUTE"
+                        for grantee, _grantor, privilege, _grantable in acl_entries
+                    )
+                    public_from_acl = any(
+                        grantee == "PUBLIC" and privilege == "EXECUTE"
+                        for grantee, _grantor, privilege, _grantable in acl_entries
+                    )
+                    if direct_from_acl != direct_runtime_execute:
+                        _add_error(
+                            errors,
+                            f"runtime_public_routine_acl_direct_evidence_mismatch_{routine_name}",
+                        )
+                    if public_from_acl != public_execute:
+                        _add_error(
+                            errors,
+                            f"runtime_public_routine_acl_public_evidence_mismatch_{routine_name}",
+                        )
+                    acl_grantable = any(
+                        grantee in {"sqag_runtime", "PUBLIC"}
+                        and privilege == "EXECUTE"
+                        and is_grantable
+                        for grantee, _grantor, privilege, is_grantable in acl_entries
+                    )
+                    if acl_grantable != is_grantable:
+                        _add_error(
+                            errors,
+                            f"runtime_public_routine_acl_grant_option_evidence_mismatch_{routine_name}",
+                        )
+                    if trigger_name is not None and isinstance(trigger_manifest, dict):
+                        expected_trigger = trigger_manifest.get(trigger_name)
+                        if isinstance(expected_trigger, dict):
+                            if acl_row["owner"] != expected_trigger.get("owner"):
+                                _add_error(
+                                    errors,
+                                    f"runtime_public_trigger_acl_owner_mismatch_{trigger_name}",
+                                )
+                            if acl_row["security_definer"] != (
+                                expected_trigger.get("security_mode") == "security_definer"
+                            ):
+                                _add_error(
+                                    errors,
+                                    f"runtime_public_trigger_acl_security_mismatch_{trigger_name}",
+                                )
+                            if acl_row["has_trigger_dependency"] != expected_trigger.get(
+                                "has_trigger_dependency"
+                            ):
+                                _add_error(
+                                    errors,
+                                    f"runtime_public_trigger_acl_dependency_mismatch_{trigger_name}",
+                                )
+                    elif provider_identity is not None and identity == provider_identity:
+                        if not isinstance(provider_entry, dict):
+                            _add_error(errors, "runtime_provider_exception_acl_manifest_missing_show_db_tree")
+                        else:
+                            if acl_row["owner"] != provider_entry.get("owner"):
+                                _add_error(
+                                    errors,
+                                    "runtime_provider_exception_acl_owner_mismatch_show_db_tree",
+                                )
+                            if acl_row["security_definer"] != (
+                                provider_entry.get("security_mode") == "security_definer"
+                            ):
+                                _add_error(
+                                    errors,
+                                    "runtime_provider_exception_acl_security_mismatch_show_db_tree",
+                                )
+                            if acl_row["has_trigger_dependency"] != provider_entry.get(
+                                "has_trigger_dependency"
+                            ):
+                                _add_error(
+                                    errors,
+                                    "runtime_provider_exception_acl_dependency_mismatch_show_db_tree",
+                                )
             if trigger_name is not None:
                 if direct_runtime_execute:
                     _add_error(errors, f"runtime_public_trigger_direct_execute_forbidden_{trigger_name}")
@@ -3674,6 +4179,14 @@ def evaluate_schema_wide_runtime_authority(
                     f"runtime_public_trigger_routine_evidence_missing_{routine_name}"
                     f".{identity[2]}_{identity[3]}",
                 )
+    if routine_acl_evidence is not None and routine_privilege_rows is not None:
+        for identity in routine_acl_evidence:
+            if identity not in seen_routines:
+                _add_error(
+                    errors,
+                    f"runtime_public_routine_acl_identity_without_effective_row_"
+                    f"{identity[0]}.{identity[1]}({identity[2]})_{identity[3]}",
+                )
     return tuple(errors)
 
 
@@ -3686,6 +4199,9 @@ def evaluate_runtime_authority(
     schema_privilege_rows: list[dict[str, Any]] | None = None,
     sequence_privilege_rows: list[dict[str, Any]] | None = None,
     routine_privilege_rows: list[dict[str, Any]] | None = None,
+    schema_acl_rows: list[dict[str, Any]] | None = None,
+    routine_acl_rows: list[dict[str, Any]] | None = None,
+    parameter_privilege_rows: list[dict[str, Any]] | None = None,
     runtime_role: str = "sqag_runtime",
 ) -> tuple[str, ...]:
     """Evaluate view ACLs plus the conditional bound-source table proof."""
@@ -3714,8 +4230,18 @@ def evaluate_runtime_authority(
             schema_privilege_rows,
             sequence_privilege_rows,
             routine_privilege_rows,
+            schema_acl_rows=schema_acl_rows,
+            routine_acl_rows=routine_acl_rows,
         )
     )
+    if parameter_privilege_rows is not None:
+        errors.extend(
+            evaluate_parameter_authority(
+                manifest,
+                parameter_privilege_rows,
+                runtime_role=runtime_role,
+            )
+        )
     return tuple(errors)
 
 
@@ -3789,6 +4315,7 @@ def validate_routines(manifest: dict[str, Any], errors: list[str]) -> None:
             if not _exact_keys(entry, TRIGGER_ROUTINE_KEYS, label, errors):
                 if not isinstance(entry, dict):
                     continue
+            _exact_value(entry.get("has_trigger_dependency"), True, f"{label}_has_trigger_dependency", errors)
             _exact_value(entry.get("schema"), "public", f"{label}_schema", errors)
             _exact_value(entry.get("owner"), "sqag_migrator", f"{label}_owner", errors)
             _exact_value(entry.get("identity_arguments"), "", f"{label}_identity_arguments", errors)
@@ -3815,6 +4342,8 @@ def validate_routines(manifest: dict[str, Any], errors: list[str]) -> None:
         if not _exact_keys(entry, PROVIDER_EXCEPTION_KEYS, label, errors):
             if not isinstance(entry, dict):
                 return
+        _exact_value(entry.get("security_mode"), "invoker", f"{label}_security_mode", errors)
+        _exact_value(entry.get("has_trigger_dependency"), False, f"{label}_has_trigger_dependency", errors)
         _exact_value(entry.get("schema"), "public", f"{label}_schema", errors)
         _exact_value(entry.get("identity_arguments"), "", f"{label}_identity_arguments", errors)
         _exact_value(entry.get("routine_kind"), "f", f"{label}_routine_kind", errors)
@@ -3854,6 +4383,8 @@ def validate_schema_acl(manifest: dict[str, Any], errors: list[str]) -> None:
     if not _exact_keys(acl, SCHEMA_ACL_KEYS, "schema_acl", errors):
         if not isinstance(acl, dict):
             return
+    _exact_value(acl.get("schema_owner"), "pg_database_owner", "schema_owner", errors)
+    _exact_value(acl.get("authorized_grantor"), "database_owner_authority", "authorized_grantor", errors)
     _exact_value(acl.get("schema_name"), "public", "schema_name", errors)
     expected = {
         "public": (SCHEMA_PUBLIC_KEYS, {"usage": True}),
@@ -3867,6 +4398,16 @@ def validate_schema_acl(manifest: dict[str, Any], errors: list[str]) -> None:
             for key, value in values.items():
                 _exact_value(actor_acl.get(key), value, f"schema_acl_{actor}_{key}", errors)
 
+
+def validate_parameter_privileges(manifest: dict[str, Any], errors: list[str]) -> None:
+    parameter_privileges = manifest.get("parameter_privileges")
+    if not _exact_keys(parameter_privileges, PARAMETER_PRIVILEGES_KEYS, "parameter_privileges", errors):
+        if not isinstance(parameter_privileges, dict):
+            return
+    _exact_value(parameter_privileges.get("runtime_role"), "sqag_runtime", "parameter_runtime_role", errors)
+    _check_exact_string_list(parameter_privileges.get("classified_runtime_privileges"), [], "parameter_classified_runtime_privileges", errors)
+    _check_exact_string_list(parameter_privileges.get("required_parameters"), ["session_replication_role"], "parameter_required_parameters", errors)
+    _exact_value(parameter_privileges.get("rule"), "No effective SET or ALTER SYSTEM authority, or corresponding grant option, is classified for sqag_runtime; every PostgreSQL parameter is enumerated and any such authority fails closed.", "parameter_privilege_rule", errors)
 
 def validate_default_privileges(manifest: dict[str, Any], errors: list[str]) -> None:
     default_privileges = manifest.get("default_privileges")
@@ -4382,29 +4923,67 @@ def _validate_routine_query(query: str, errors: list[str]) -> None:
         "pg_catalog.pg_namespace",
         "pg_catalog.pg_roles",
         "pg_catalog.pg_trigger",
-        "pg_get_function_identity_arguments",
+        "pg_catalog.aclexplode",
+        "pg_catalog.acldefault",
+        "pg_catalog.pg_get_function_identity_arguments",
         "proname",
-        "proacl",
-        "proowner",
-        "prosecdef",
         "prokind",
+        "prosecdef",
+        "proowner",
+        "identity_arguments",
+        "routine_kind",
+        "security_definer",
+        "owner",
+        "acl_entries",
+        "has_trigger_dependency",
         "tgfoid",
         "tgisinternal",
+        "jsonb_agg",
+        "jsonb_build_object",
+        "cross join lateral",
+        "grantee",
+        "grantor",
+        "privilege_type",
+        "is_grantable",
         "order by",
     )
     _require_sql_features(tokens, "routine_acl", required, errors)
     parts = _projection_parts(tokens, "routine_acl", errors)
     if parts is not None:
-        expected_aliases = ["proname", "identity_arguments", "prokind", "prosecdef", "proacl", "proowner", "owner", "has_trigger_dependency"]
-        _require_projection_shape(parts, expected_aliases, "routine_acl", errors)
+        _require_projection_shape(
+            parts,
+            [
+                "schema_name",
+                "routine_name",
+                "identity_arguments",
+                "routine_kind",
+                "security_definer",
+                "owner",
+                "acl_entries",
+                "has_trigger_dependency",
+            ],
+            "routine_acl",
+            errors,
+        )
         projection_patterns = {
-            0: _qualified_pattern("p.proname"),
-            1: ["pg_get_function_identity_arguments", "(", "p", ".", "oid", ")", "as", "identity_arguments"],
-            2: _qualified_pattern("p.prokind"),
-            3: _qualified_pattern("p.prosecdef"),
-            4: _qualified_pattern("p.proacl"),
-            5: _qualified_pattern("p.proowner"),
-            6: ["r", ".", "rolname", "as", "owner"],
+            0: _qualified_pattern("n.nspname"),
+            1: _qualified_pattern("p.proname"),
+            2: [
+                "pg_catalog",
+                ".",
+                "pg_get_function_identity_arguments",
+                "(",
+                "p",
+                ".",
+                "oid",
+                ")",
+                "as",
+                "identity_arguments",
+            ],
+            3: ["p", ".", "prokind", "as", "routine_kind"],
+            4: ["p", ".", "prosecdef", "as", "security_definer"],
+            5: ["r", ".", "rolname", "as", "owner"],
+            6: ["acl", ".", "acl_entries"],
             7: ["exists", "(", "select", "1", "from", *_qualified_pattern("pg_catalog.pg_trigger"), "t"],
         }
         for index, pattern in projection_patterns.items():
@@ -4418,14 +4997,137 @@ def _validate_routine_query(query: str, errors: list[str]) -> None:
         _add_error(errors, "verification_query_routine_acl_must_join_owner_roles")
     if not _find_token_pattern(tokens, ["from", *_qualified_pattern("pg_catalog.pg_trigger"), "t"]):
         _add_error(errors, "verification_query_routine_acl_must_read_trigger_catalog")
+    if _count_token_pattern(tokens, ["cross", "join", "lateral"]) != 1:
+        _add_error(errors, "verification_query_routine_acl_requires_exactly_one_structured_acl_lateral")
+    if _count_token_pattern(tokens, ["pg_catalog", ".", "aclexplode"]) != 1:
+        _add_error(errors, "verification_query_routine_acl_requires_one_decoded_acl_surface")
+    if not _find_token_pattern(tokens, ["left", "join", *_qualified_pattern("pg_catalog.pg_roles"), "grantee_role"]):
+        _add_error(errors, "verification_query_routine_acl_must_left_join_named_grantees")
+    if not _find_token_pattern(tokens, ["left", "join", *_qualified_pattern("pg_catalog.pg_roles"), "grantor_role"]):
+        _add_error(errors, "verification_query_routine_acl_must_left_join_named_grantors")
     if not _find_token_pattern(tokens, ["where", "n", ".", "nspname", "=", ("STRING", "public")]):
         _add_error(errors, "verification_query_routine_acl_must_define_public_schema_boundary")
     if not _find_token_pattern(tokens, ["p", ".", "prokind", "in", "(", ("STRING_EXACT", "f"), ",", ("STRING_EXACT", "p"), ",", ("STRING_EXACT", "a"), ",", ("STRING_EXACT", "w"), ")"]):
         _add_error(errors, "verification_query_routine_acl_must_cover_all_user_defined_routine_kinds")
     if _find_token_pattern(tokens, ["proname", "like"]):
         _add_error(errors, "verification_query_routine_acl_must_not_prefix_filter_routines")
-    if not _find_token_pattern(tokens, ["order", "by", "p", ".", "proname", ",", "identity_arguments"]):
+    if not _find_token_pattern(tokens, ["order", "by", "n", ".", "nspname", ",", "p", ".", "proname", ",", "identity_arguments", ",", "p", ".", "prokind"]):
         _add_error(errors, "verification_query_routine_acl_must_order_deterministically")
+
+
+def _validate_schema_acl_query(query: str, errors: list[str]) -> None:
+    tokens = _read_only_query_tokens(query, "schema_acl", errors)
+    if tokens is None:
+        return
+    required = (
+        "pg_catalog.pg_namespace",
+        "pg_catalog.pg_roles",
+        "pg_catalog.pg_database",
+        "pg_catalog.aclexplode",
+        "pg_catalog.acldefault",
+        "nspname",
+        "nspowner",
+        "datdba",
+        "schema_owner",
+        "database_owner",
+        "acl_entries",
+        "jsonb_agg",
+        "jsonb_build_object",
+        "cross join lateral",
+        "grantee",
+        "grantor",
+        "privilege_type",
+        "is_grantable",
+        "current_database",
+        "order by",
+    )
+    _require_sql_features(tokens, "schema_acl", required, errors)
+    parts = _projection_parts(tokens, "schema_acl", errors)
+    if parts is not None:
+        _require_projection_shape(
+            parts,
+            ["schema_name", "schema_owner", "database_owner", "acl_entries"],
+            "schema_acl",
+            errors,
+        )
+    if not _find_token_pattern(tokens, ["from", *_qualified_pattern("pg_catalog.pg_namespace"), "n"]):
+        _add_error(errors, "verification_query_schema_acl_must_read_namespace")
+    if not _find_token_pattern(tokens, ["join", *_qualified_pattern("pg_catalog.pg_roles"), "schema_owner"]):
+        _add_error(errors, "verification_query_schema_acl_must_join_schema_owner")
+    if not _find_token_pattern(tokens, ["join", *_qualified_pattern("pg_catalog.pg_database"), "d"]):
+        _add_error(errors, "verification_query_schema_acl_must_read_current_database")
+    if not _find_token_pattern(tokens, ["join", *_qualified_pattern("pg_catalog.pg_roles"), "database_owner"]):
+        _add_error(errors, "verification_query_schema_acl_must_join_database_owner")
+    if _count_token_pattern(tokens, ["cross", "join", "lateral"]) != 1:
+        _add_error(errors, "verification_query_schema_acl_requires_one_structured_acl_lateral")
+    if not _find_token_pattern(tokens, ["from", *_qualified_pattern("pg_catalog.aclexplode"), "("]):
+        _add_error(errors, "verification_query_schema_acl_must_decode_acl_entries")
+    if not _find_token_pattern(tokens, ["where", "n", ".", "nspname", "=", ("STRING", "public")]):
+        _add_error(errors, "verification_query_schema_acl_must_define_public_schema_boundary")
+    if not _find_token_pattern(tokens, ["order", "by", "n", ".", "nspname"]):
+        _add_error(errors, "verification_query_schema_acl_must_order_deterministically")
+
+
+def _validate_parameter_query(query: str, errors: list[str]) -> None:
+    tokens = _read_only_query_tokens(query, "effective_runtime_parameter_privileges", errors)
+    if tokens is None:
+        return
+    required = (
+        "pg_catalog.pg_settings",
+        "pg_catalog.pg_parameter_acl",
+        "pg_catalog.pg_roles",
+        "pg_catalog.aclexplode",
+        "jsonb_agg",
+        "jsonb_build_object",
+        "cross join lateral",
+        "has_parameter_privilege",
+        "parameter_name",
+        "parname",
+        "paracl",
+        "acl_entries",
+        "effective_set",
+        "effective_alter_system",
+        "set_grantable",
+        "alter_system_grantable",
+        "grantee",
+        "grantor",
+        "privilege_type",
+        "is_grantable",
+        "union",
+        "order by",
+        "'session_replication_role'",
+    )
+    _require_sql_features(tokens, "effective_runtime_parameter_privileges", required, errors)
+    parts = _projection_parts(tokens, "effective_runtime_parameter_privileges", errors)
+    if parts is not None:
+        _require_projection_shape(
+            parts,
+            [
+                "parameter_name",
+                "acl_entries",
+                "effective_set",
+                "effective_alter_system",
+                "set_grantable",
+                "alter_system_grantable",
+            ],
+            "effective_runtime_parameter_privileges",
+            errors,
+        )
+    if _count_token_pattern(tokens, ["has_parameter_privilege"]) != 4:
+        _add_error(errors, "verification_query_parameter_privileges_requires_four_effective_checks")
+    for pattern, label in (
+        (["from", *_qualified_pattern("pg_catalog.pg_settings")], "settings"),
+        (["from", *_qualified_pattern("pg_catalog.pg_parameter_acl")], "parameter_acl"),
+        (["from", *_qualified_pattern("pg_catalog.aclexplode"), "("], "decoded_acl"),
+        (["left", "join", *_qualified_pattern("pg_catalog.pg_roles"), "grantee_role"], "grantee_roles"),
+        (["left", "join", *_qualified_pattern("pg_catalog.pg_roles"), "grantor_role"], "grantor_roles"),
+        (["union"], "union_inventory"),
+        (["order", "by", "parameter_names", ".", "parameter_name"], "ordering"),
+    ):
+        if not _find_token_pattern(tokens, pattern):
+            _add_error(errors, f"verification_query_parameter_privileges_missing_{label}_pattern")
+    if not _find_token_pattern(tokens, [("STRING_EXACT", "session_replication_role")]):
+        _add_error(errors, "verification_query_parameter_privileges_must_cover_session_replication_role")
 
 
 def _validate_view_query(query: str, errors: list[str]) -> None:
@@ -4497,8 +5199,12 @@ def validate_verification_queries(manifest: dict[str, Any], errors: list[str]) -
             _validate_default_acl_query(value, errors)
         elif key == "role_attributes":
             _validate_role_attributes_query(value, errors)
+        elif key == "schema_acl":
+            _validate_schema_acl_query(value, errors)
         elif key == "routine_acl":
             _validate_routine_query(value, errors)
+        elif key == "effective_runtime_parameter_privileges":
+            _validate_parameter_query(value, errors)
         elif key == 'view_acl':
             _validate_view_query(value, errors)
         elif key in REQUIRED_QUERY_FEATURES:
@@ -4571,6 +5277,7 @@ def validate_manifest_strictly(manifest_path: str) -> int:
     validate_routines(manifest, errors)
     validate_database_acl(manifest, errors)
     validate_schema_acl(manifest, errors)
+    validate_parameter_privileges(manifest, errors)
     validate_default_privileges(manifest, errors)
     validate_boundary_b(manifest, errors)
     validate_verification_queries(manifest, errors)
