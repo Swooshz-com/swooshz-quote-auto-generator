@@ -579,7 +579,7 @@ the exact eight-column projection
 acl_entries, has_trigger_dependency`, the complete public-schema routine boundary, decoded
 ACL identities, owner/security posture, trigger dependency posture, and deterministic
 identity ordering. The schema query must project the decoded public-schema ACL together
-with the exact schema owner and current database owner used for direct-grant provenance. The view query must project exactly
+with the exact schema owner and current database owner used as independent provenance evidence; the recorded schema-owner role is the required direct-grant ACL grantor. The view query must project exactly
 `schema_name, relation_name, relation_kind, owner, relation_acl, acl_entries,
 column_acl_entries, view_definition, view_dependencies, view_columns,
 relation_options, view_security, runtime_privileges, runtime_select,
@@ -656,8 +656,13 @@ the provider posture after owner and security-definer substitutions.
 The public schema proof distinguishes effective `USAGE` from the required
 ACL provenance. The decoded `schema_acl` row must identify schema `public`,
 manifest schema owner `pg_database_owner`, and the current database owner.
-It must contain exactly one direct `sqag_runtime` `USAGE` entry, granted by
-that database owner, without grant option; runtime `CREATE` remains denied.
+The current database-owner login must be non-empty and is retained as
+independent authority evidence. PostgreSQL's mechanically decoded ACL grantor
+for the prescribed direct entry must be the recorded schema-owner role
+`pg_database_owner`, not the concrete database-owner login. It must contain
+exactly one direct `sqag_runtime` `USAGE` entry with that grantor and without
+grant option; runtime `CREATE` remains denied. These identities are related
+authority evidence but are not required to be the same textual role name.
 The independently classified PUBLIC `USAGE` posture must also be present in
 the decoded ACL. Effective authority supplied by PUBLIC, membership, or any
 other path cannot substitute for the prescribed direct runtime entry, and

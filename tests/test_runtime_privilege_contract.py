@@ -1055,7 +1055,7 @@ class ValidatorStaticTest(unittest.TestCase):
         }
         direct_runtime_usage = {
             "grantee": "sqag_runtime",
-            "grantor": "db_owner",
+            "grantor": "pg_database_owner",
             "privilege_type": "USAGE",
             "is_grantable": False,
         }
@@ -1086,7 +1086,7 @@ class ValidatorStaticTest(unittest.TestCase):
         self.assertIn("runtime_schema_direct_usage_evidence_missing_or_duplicate", errors)
 
         wrong_grantor = copy.deepcopy(clean_entries)
-        wrong_grantor[-1]["grantor"] = "pg_database_owner"
+        wrong_grantor[-1]["grantor"] = "db_owner"
         errors = contract_validator.evaluate_schema_wide_runtime_authority(
             manifest,
             effective_rows,
@@ -1094,7 +1094,7 @@ class ValidatorStaticTest(unittest.TestCase):
             None,
             schema_acl_rows=schema_evidence(wrong_grantor),
         )
-        self.assertIn("runtime_schema_direct_usage_grantor_invalid_expected_db_owner_got_pg_database_owner", errors)
+        self.assertIn("runtime_schema_direct_usage_grantor_invalid_expected_pg_database_owner_got_db_owner", errors)
 
         grant_option = copy.deepcopy(clean_entries)
         grant_option[-1]["is_grantable"] = True
@@ -5165,10 +5165,11 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.assertEqual(schema_acl_row["schema_owner"], "pg_database_owner")
         database_owner = str(schema_acl_row["database_owner"])
         self.assertTrue(database_owner)
+        self.assertNotEqual(database_owner, schema_acl_row["schema_owner"])
         self.assertIn(
             {
                 "grantee": "PUBLIC",
-                "grantor": database_owner,
+                "grantor": "pg_database_owner",
                 "privilege_type": "USAGE",
                 "is_grantable": False,
             },
@@ -5180,7 +5181,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 for entry in schema_acl_row["acl_entries"]
                 if entry["grantee"] == "sqag_runtime" and entry["privilege_type"] == "USAGE"
             ],
-            [(database_owner, False)],
+            [("pg_database_owner", False)],
         )
         self.assertFalse(
             any(
@@ -8462,6 +8463,8 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         schema_row = rows[0]
         self.assertEqual(schema_row["schema_owner"], "pg_database_owner")
         database_owner = str(schema_row["database_owner"])
+        self.assertTrue(database_owner)
+        self.assertNotEqual(database_owner, schema_row["schema_owner"])
         direct_usage = [
             entry
             for entry in schema_row["acl_entries"]
@@ -8469,7 +8472,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         ]
         self.assertEqual(
             [(entry["grantor"], entry["is_grantable"]) for entry in direct_usage],
-            [(database_owner, False)],
+            [("pg_database_owner", False)],
         )
 
         self._execute_admin_sql('revoke usage on schema public from "sqag_runtime"')

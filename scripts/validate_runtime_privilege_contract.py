@@ -3847,11 +3847,16 @@ def evaluate_schema_wide_runtime_authority(
             )
         else:
             direct_usage = runtime_usage_entries[0]
-            if direct_usage[1] != schema_row["database_owner"]:
+            # PostgreSQL 17 records the public-schema owner role as the
+            # decoded ACL grantor.  The concrete database-owner login is
+            # retained as independent authority evidence and must not be
+            # substituted for that recorded role identity.
+            expected_schema_grantor = schema_row["schema_owner"]
+            if direct_usage[1] != expected_schema_grantor:
                 _add_error(
                     errors,
                     "runtime_schema_direct_usage_grantor_invalid_expected_"
-                    f"{schema_row['database_owner']}_got_{direct_usage[1]}",
+                    f"{expected_schema_grantor}_got_{direct_usage[1]}",
                 )
             if direct_usage[3]:
                 _add_error(errors, "runtime_schema_direct_usage_grant_option_forbidden")
