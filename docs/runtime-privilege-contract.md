@@ -369,7 +369,7 @@ edge, different identity or grantor, mutated option, recursive path, protected
 SQAG/provider role, unknown classification, missing field, duplicate edge, or
 membership-derived effective privilege fails closed.
 
-The manifest and validator bind exactly fifteen canonical verification-query
+The manifest and validator bind exactly sixteen canonical verification-query
 keys. Each key has an independent repository-owned executable-token contract;
 candidate manifest text cannot redefine its expected query. The PostgreSQL
 integration contract executes every key once, checks the exact returned column
@@ -421,10 +421,10 @@ live-system evidence.
 |---|---|---:|
 | `database_acl` | `database_name`, `database_owner`, `datacl`, `acl_entries` | 1 |
 | `schema_acl` | `schema_name`, `schema_owner`, `database_owner`, `acl_entries` | 1 |
-| `table_acl` | `schema_name`, `relname`, `relacl`, `table_columns`, `table_constraints`, `index_contracts`, `trigger_bindings` | 16 without the optional source table; 17 when it exists |
+| `table_acl` | `schema_name`, `relname`, `relacl`, `table_columns`, `table_constraints`, `index_contracts`, `trigger_bindings`, `rule_bindings` | 16 without the optional source table; 17 when it exists |
 | `routine_acl` | `schema_name`, `routine_name`, `identity_arguments`, `routine_kind`, `security_definer`, `owner`, `language`, `routine_definition`, `routine_configuration`, `acl_entries`, `has_trigger_dependency`, `trigger_bindings` | 2 without the provider fixture; 3 when `show_db_tree()` is present |
 | `default_acl` | `owner`, `namespace`, `object_type`, `grantee`, `privilege_type`, `is_grantable` | 1 |
-| `role_attributes` | `rolname`, `rolsuper`, `rolinherit`, `rolcreaterole`, `rolcreatedb`, `rolcanlogin`, `rolreplication`, `rolbypassrls`, `rolconnlimit`, `password_is_null` | 3 |
+| `role_attributes` | `rolname`, `rolsuper`, `rolinherit`, `rolcreaterole`, `rolcreatedb`, `rolcanlogin`, `rolreplication`, `rolbypassrls`, `rolconnlimit`, `password_is_null` | 4 |
 | `role_memberships` | `role`, `member`, `grantor`, `admin_option`, `inherit_option`, `set_option` | captured PostgreSQL baseline rows plus 1 exact runtime edge in the clean fixture; 1 exact edge in the dedicated creator fixture |
 | `sequence_acl` | `schema_name`, `sequence_name`, `sequence_acl`, `privilege_type`, `effective`, `is_grantable` | 0 in the base fixture; 3 per enumerated sequence |
 | `effective_runtime_database_privileges` | `privilege_type`, `effective`, `is_grantable` | 3 |
@@ -432,8 +432,9 @@ live-system evidence.
 | `effective_runtime_column_privileges` | `schema_name`, `table_name`, `column_name`, `acl_entries`, `privilege_type`, `effective`, `is_grantable` | 4 per visible column on each enumerated non-system `r`/`p`/`f` relation |
 | `effective_runtime_schema_privileges` | `schema_name`, `privilege_type`, `effective`, `is_grantable` | 2 per enumerated non-system schema |
 | `effective_runtime_routine_privileges` | `schema_name`, `routine_name`, `identity_arguments`, `routine_kind`, `privilege_type`, `direct_runtime_execute`, `public_execute`, `effective`, `is_grantable` | 1 per enumerated non-system routine |
-| `effective_runtime_parameter_privileges` | `parameter_name`, `acl_entries`, `startup_defaults`, `effective_set`, `effective_alter_system`, `set_grantable`, `alter_system_grantable` | One row per parameter in the sorted `pg_settings`/`pg_parameter_acl` inventory union, including `session_replication_role` |
+| `effective_runtime_parameter_privileges` | `parameter_name`, `acl_entries`, `startup_defaults`, `effective_set`, `effective_alter_system`, `set_grantable`, `alter_system_grantable` | One row per parameter in the sorted `pg_settings`/`pg_parameter_acl`/applicable-startup-setting inventory union, including every observed runtime startup-default parameter |
 | `view_acl` | `schema_name`, `relation_name`, `relation_kind`, `owner`, `relation_acl`, `acl_entries`, `column_acl_entries`, `view_definition`, `view_dependencies`, `view_columns`, `relation_options`, `view_security`, `runtime_privileges`, `runtime_select`, `runtime_select_grantable` | 0 in the generic shape fixture; 1 when the legacy-optional view fixture is present |
+| `system_relation_acl` | `schema_name`, `relation_name`, `relation_kind`, `current_acl_entries`, `initial_acl_entries`, `initial_privilege_types` | one metadata row per system relation with explicit ACL or PostgreSQL initial-privilege provenance |
 
 The effective database proof covers `CONNECT`, `CREATE`, and `TEMPORARY`; the
 locked runtime result is `true/false/false`, with all three grantable flags
@@ -596,7 +597,7 @@ grantee and grantor identities, evaluate all eight effective runtime relation
 privileges through `has_table_privilege(... 'WITH GRANT OPTION')`, cover both
 `relkind` values `'v'` and `'m'` in every non-system schema, and order both
 JSONB arrays and result rows deterministically. The PostgreSQL query-shape
-evidence executes all fifteen canonical queries, asserts the exact returned
+evidence executes all sixteen canonical queries, asserts the exact returned
 column names, and applies the documented cardinality rules. The evaluator
 rejects decorative-only raw ACL evidence, malformed or incomplete JSONB
 entries, unexpected ACL provenance, and duplicate schema-qualified relation
@@ -680,22 +681,28 @@ substitutions, and finish with a clean re-evaluation.
 ### H30: PostgreSQL parameter privilege proof
 
 `effective_runtime_parameter_privileges` mechanically inventories the
-PostgreSQL 17 parameter surface from `pg_settings` and `pg_parameter_acl`,
-adds the required `session_replication_role` row explicitly, decodes ACL
-identities with `aclexplode`, and orders every row and ACL array
-deterministically. It evaluates effective and grantable `SET` and `ALTER
-SYSTEM` authority for `sqag_runtime`, regardless of direct, PUBLIC, or
-membership-derived provenance. There are no classified runtime parameter
-exceptions: any effective `SET`, effective `ALTER SYSTEM`, or corresponding
-grant option fails closed. Only PostgreSQL-required non-applicable mechanics
-may be excluded; no broad parameter-name prefix is an escape.
+PostgreSQL 17 parameter surface from `pg_settings`, `pg_parameter_acl`, and
+every applicable `pg_db_role_setting` startup-setting name for the current
+database and `sqag_runtime`. ACL identities are decoded with `aclexplode`,
+and every parameter row, startup-default row, scope, precedence, and ACL array
+is ordered deterministically. No applicable startup setting is filtered before
+semantic classification.
 
-Static and PostgreSQL 17 causal controls cover the clean zero-authority
-baseline, direct/PUBLIC/membership-derived `SET` on
-`session_replication_role`, `ALTER SYSTEM`, and grant-option paths. Every
-mutation is revoked or restored, the final catalog contains no runtime
-parameter authority residue, and the final evaluator result is clean.
+The manifest defines a closed-world startup-default policy for each monitored
+parameter: an exact allowed semantic value set or an explicit
+no-startup-default posture. The evaluator resolves PostgreSQL precedence as
+role/database over role-global over database-global, rejects conflicting or
+ambiguous highest-precedence values, and fails closed on unknown parameters,
+unsafe values, effective `SET`/`ALTER SYSTEM`, or any corresponding grant
+option. `default_transaction_read_only=on` cannot be accepted as runtime
+posture, while the explicitly safe `session_replication_role` values remain
+`origin` and `local` only.
 
+Static and PostgreSQL 17 causal controls cover the clean baseline, all three
+startup-default scopes, precedence hiding, ambiguity, unknown parameters,
+safe and unsafe `session_replication_role` values, direct/PUBLIC/membership-
+derived `SET`, `ALTER SYSTEM`, and grant-option paths. Every mutation is
+restored exactly and the final evaluator result is clean.
 ### H31: exact routine body, language, configuration, and binding evidence
 
 The routine ACL query now binds each public routine to its catalog language,
@@ -720,21 +727,26 @@ uses the same exact evidence and restores each disposable mutation.
 
 ### H33: documentation and query-parity closure
 
-The manifest, validator, tests, and CI-status narrative retain exactly fifteen
-canonical query keys. Existing query keys were extended in place for structural
-and startup-default evidence, so the key count and execution order remain
-stable while the documented result projections stay synchronized.
+The manifest, validator, tests, and CI-status narrative retain exactly sixteen
+canonical query keys. Existing table evidence is extended in place for
+rewrite-rule and foreign-key match semantics, and one separate metadata-only
+system-relation ACL key binds PostgreSQL initial-privilege provenance. The
+documented result projections remain synchronized.
 
-### H34: startup-default precedence guard
+### H34: closed-world startup-default precedence guard
 
-Parameter evidence includes every applicable pg_db_role_setting row for the
-current database and sqag_runtime, classified as database_global precedence 1,
-role_global precedence 2, or role_database precedence 3. The highest applicable
-setting is resolved for session_replication_role. A replica value, an ambiguous
-highest-precedence value, or malformed scope/precedence evidence fails closed;
-origin and local are the permitted safe values. Disposable PostgreSQL controls
-exercise all three scopes and restore the role/database settings.
-
+Parameter evidence includes every applicable `pg_db_role_setting` row for the
+current database and `sqag_runtime`, classified as database-global precedence
+1, role-global precedence 2, or role/database precedence 3. The highest
+applicable setting is resolved for every monitored parameter, not only
+`session_replication_role`. The manifest explicitly permits only
+`session_replication_role` values `origin` and `local`, and
+`default_transaction_read_only` value `off`; any unknown, unclassified,
+unsafe, conflicting, or ambiguous startup setting fails closed. A parameter
+with no safe startup-default posture cannot be silently accepted. Disposable
+PostgreSQL controls exercise all three scopes, precedence hiding, duplicate
+highest-precedence values, unknown settings, safe values, unsafe values, and
+restore the role/database settings exactly.
 ### H35: migration-derived table structure guard
 
 table_acl now carries ordered columns with nullability and default expressions,
@@ -756,7 +768,7 @@ routine, parameter, or role evidence.
 
 ### H37: complete exact-state final gate
 
-The final CI evaluator requires the exact fifteen-key evidence packet. Every
+The final CI evaluator requires the exact sixteen-key evidence packet. Every
 collection must be present and a list, and database ACL, effective database
 privileges, schema, sequence, routine, parameter, default-ACL, role-attribute,
 membership, table, view, column, and table-structure evidence are consumed.
@@ -864,7 +876,99 @@ entry, including its owner grantor and non-grantable state, in addition to the
 direct runtime CONNECT row. Direct runtime CONNECT alone is insufficient; the
 PostgreSQL RED regression removes the PUBLIC evidence and proves the final
 evaluator rejects the incomplete ACL packet.
+### H46: classified-table rewrite-rule integrity
 
+The migration-derived classified-table structural model now derives the
+expected non-view rewrite-rule inventory from locked migrations. The existing
+`table_acl` query inventories `pg_rewrite` rules on each classified ordinary
+table, including rule identity, target, event, INSTEAD posture, enabled state,
+and normalized definition. PostgreSQL view `_RETURN` mechanics remain outside
+this ordinary-table rule contract, and rules on unrelated relations are not
+rejected merely because they exist. With no locked migration rules, the
+derived expected inventory is mechanically empty. An unexpected SELECT,
+INSERT, UPDATE, or DELETE rule therefore fails closed. A disposable
+`DO INSTEAD NOTHING` rule regression proves clean pass, RED failure, exact
+drop, and clean pass again.
+
+### H47: foreign-key match semantics
+
+The existing migration-derived foreign-key signature binds `MATCH SIMPLE`,
+`MATCH FULL`, or `MATCH PARTIAL` as a deterministic semantic field.
+An omitted migration clause derives PostgreSQL's `MATCH SIMPLE` default.
+Live evidence projects `pg_constraint.confmatchtype` and retains the existing
+columns, referenced columns, actions, validation, and deferrability checks.
+A disposable composite foreign key changes only the match mode to `FULL`,
+proves the structural evaluator rejects the mismatch, restores the exact
+baseline `SIMPLE` posture, and passes again.
+
+### H48: direct migrator database ACL completeness
+
+Database ACL evidence now requires exactly one direct `sqag_migrator` entry
+for each manifest-prescribed `CONNECT`, `CREATE`, and `TEMPORARY` privilege.
+Each entry must be granted by the recorded database owner and must not carry
+grant option. PUBLIC, membership, effective privilege, or another grantee
+cannot substitute for the direct entry. Existing PUBLIC `CONNECT`, direct
+runtime `CONNECT`, runtime `CREATE`/`TEMPORARY` denial, PUBLIC
+`CREATE`/`TEMPORARY` posture, and retained `sqag_app` handling remain bound.
+Disposable controls remove each migrator privilege, substitute a wrong
+grantor, add grant option, restore each exact entry, and require a clean pass.
+
+### H49: PostgreSQL 17 system-relation ACL drift boundary
+
+The separate `system_relation_acl` query is metadata-only and is bounded to
+PostgreSQL 17 `pg_catalog` relations with authoritative `pg_init_privs`
+initial or extension-owned provenance. It does not select any catalog
+contents. Ordinary built-in catalogue visibility remains accepted when it is
+baseline-backed, while an exceptional explicit `sqag_runtime` or newly
+broadening PUBLIC grant, including grant option, fails closed. Namespaces
+without interpretable initial-privilege provenance are not treated as clean
+under this proof. The disposable PostgreSQL 17 control grants SELECT
+metadata-only to a protected system relation, exercises the direct runtime
+and PUBLIC cases, checks grant option rejection, restores the exact ACL, and
+reruns the clean evaluator. No protected catalog rows, credential material,
+password verifiers, or private values are selected or emitted. H36
+large-object work remains `DEFERRED_NONBLOCKING_UNCHANGED`.
+
+### H50: closed-world runtime startup-default semantics
+
+The runtime startup-default contract is closed-world. The canonical parameter
+query surfaces every applicable database-global, role-global, and
+role/database startup setting for `sqag_runtime`; the evaluator does not
+silently discard a setting because it is outside the previously monitored
+parameter list. Each monitored parameter has an explicit semantic policy in
+the manifest, and role/database, role-global, and database-global precedence
+is resolved exactly. Missing policy, unknown parameter, conflicting or
+ambiguous highest-precedence values, and unsafe values fail closed. The
+PostgreSQL 17 causal fixture covers clean baseline, unsafe read-only defaults
+at each scope, precedence hiding, ambiguity, unknown settings, safe
+`session_replication_role` values, unsafe `session_replication_role`, and exact
+restoration.
+
+### H51: cast-preserving CHECK semantics
+
+Migration-derived CHECK expressions retain executable cast, collation, operator,
+and type semantics. The structural expression normalizer removes only
+whitespace, redundant wrapper presentation, and PostgreSQL's proven implicit
+`text` decoration on string literals emitted by catalog deparsing; it does not
+strip explicit `::type` or `CAST(... AS ...)` expressions. Live PostgreSQL 17
+controls mutate a checksum CHECK with `::name`, `CAST(... AS name)`, and a
+length-changing cast, reject each semantic drift, accept harmless catalog
+formatting, and restore the exact migration-defined expression. Routine-body
+cast preservation and the existing FK, default, nullability, index, and trigger
+contracts remain unchanged.
+
+### H52: retained rollback-role completeness
+
+While `roles.legacy.status` is `retained_until_retirement`, the exact role
+contract requires `sqag_app` to exist with explicit retained attributes:
+LOGIN, INHERIT, connection limit `-1`, and no SUPERUSER, CREATEDB, CREATEROLE,
+REPLICATION, or BYPASSRLS. Missing evidence, missing role, NOLOGIN, or any
+forbidden elevated attribute fails closed. The evaluator cannot infer a future
+retirement from role absence or invent retirement authority; retirement still
+requires a separately gated manifest/controller contract change. PostgreSQL 17
+controls omit and drop the synthetic retained role, test NOLOGIN and each
+forbidden attribute, test a premature retired status, restore the exact role,
+and finish clean.
 ## PUBLIC ACL baseline and cleanup proof
 
 Before any disposable test mutates a PUBLIC database privilege or routine
@@ -940,11 +1044,11 @@ The deterministic discovery receipt for this amendment is:
 
 | Receipt item | Count |
 |---|---:|
-| Discovered test methods | 246 |
-| Static and validator methods | 159 |
-| PostgreSQL methods | 83 |
+| Discovered test methods | 260 |
+| Static and validator methods | 164 |
+| PostgreSQL methods | 92 |
 | Requirement-map and documentation parity methods | 4 |
-| Hosted executions | 246 |
+| Hosted executions | 260 |
 | Hosted skips | 0 |
 | Unique locked requirement IDs | 38 (`R01`-`R38`) |
 
@@ -1015,7 +1119,7 @@ For this reason, Boundary B does not drop the runtime role on failure unless abs
 # Validate the manifest statically
 python scripts/validate_runtime_privilege_contract.py
 
-# Run all contract tests (static tests always run; PostgreSQL tests skip when no test service is configured)
+# Run all contract tests (the disposable PostgreSQL 17 service is required; a PostgreSQL skip is not a Gate 3 pass)
 python -m unittest tests.test_runtime_privilege_contract -v
 
 # Run the full Python test suite

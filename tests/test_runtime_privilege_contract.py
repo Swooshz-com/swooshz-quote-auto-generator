@@ -1,11 +1,11 @@
 """Runtime privilege contract tests.
 
 Deterministic discovery receipt for this amendment:
-  discovered methods: 252
-  static and validator methods: 159
-  PostgreSQL methods: 89
+  discovered methods: 260
+  static and validator methods: 164
+  PostgreSQL methods: 92
   requirement-map and documentation parity methods: 4
-  hosted executions: 252
+  hosted executions: 260
   hosted skips: 0
   unique locked requirement IDs: 38 (R01-R38)
 
@@ -98,6 +98,7 @@ CANONICAL_QUERY_KEYS = (
     "effective_runtime_routine_privileges",
     "effective_runtime_parameter_privileges",
     "view_acl",
+    "system_relation_acl",
 )
 CANONICAL_QUERY_COLUMNS = {
     "database_acl": ["database_name", "database_owner", "datacl", "acl_entries"],
@@ -110,6 +111,7 @@ CANONICAL_QUERY_COLUMNS = {
         "table_constraints",
         "index_contracts",
         "trigger_bindings",
+        "rule_bindings",
     ],
     "routine_acl": [
         "schema_name",
@@ -223,6 +225,14 @@ CANONICAL_QUERY_COLUMNS = {
         "runtime_privileges",
         "runtime_select",
         "runtime_select_grantable",
+    ],
+    "system_relation_acl": [
+        "schema_name",
+        "relation_name",
+        "relation_kind",
+        "current_acl_entries",
+        "initial_acl_entries",
+        "initial_privilege_types",
     ],
 }
 DEFAULT_ACL_SNAPSHOT_SQL = """
@@ -510,6 +520,26 @@ class ManifestStructureTest(unittest.TestCase):
         self.assertEqual(runtime["ownership"], [])
         self.assertEqual(runtime["grant_options"], [])
 
+    def test_retained_legacy_role_posture_is_explicit(self) -> None:
+        self.assertEqual(
+            self.manifest["roles"]["legacy"],
+            {
+                "name": "sqag_app",
+                "description": "Legacy active rollback role. Retained until separately gated retirement after #160 switch and observation window.",
+                "status": "retained_until_retirement",
+                "retained_attributes": {
+                    "login": True,
+                    "superuser": False,
+                    "createdb": False,
+                    "createrole": False,
+                    "replication": False,
+                    "bypassrls": False,
+                    "inherit": True,
+                    "connection_limit": -1,
+                },
+            },
+        )
+
     def test_migrator_cannot_create_roles(self) -> None:
         self.assertIs(self.manifest["roles"]["migrator"]["can_create_roles"], False)
 
@@ -699,7 +729,17 @@ class ManifestStructureTest(unittest.TestCase):
                 "runtime_role": "sqag_runtime",
                 "classified_runtime_privileges": [],
                 "required_parameters": ["session_replication_role"],
-                "rule": "No effective SET or ALTER SYSTEM authority, or corresponding grant option, is classified for sqag_runtime; every PostgreSQL parameter is enumerated and any such authority fails closed.",
+                "startup_default_policies": {
+                    "default_transaction_read_only": {
+                        "posture": "allowed_values",
+                        "allowed_values": ["off"],
+                    },
+                    "session_replication_role": {
+                        "posture": "allowed_values",
+                        "allowed_values": ["local", "origin"],
+                    },
+                },
+                "rule": "No effective SET or ALTER SYSTEM authority, or corresponding grant option, is classified for sqag_runtime; every PostgreSQL parameter is enumerated and every applicable startup default is semantically classified; any unsafe, ambiguous, unknown, or grantable authority fails closed.",
             },
         )
 
@@ -1235,6 +1275,65 @@ class ValidatorStaticTest(unittest.TestCase):
         errors = contract_validator.evaluate_parameter_authority(manifest, malformed)
         self.assertTrue(any("acl_entries" in error for error in errors), errors)
 
+    def test_retained_rollback_role_evidence_is_required_and_bounded(self) -> None:
+        manifest = load_manifest()
+
+        def role_row(
+            name: str,
+            *,
+            login: bool,
+            superuser: bool = False,
+            createdb: bool = False,
+            createrole: bool = False,
+            replication: bool = False,
+            bypassrls: bool = False,
+        ) -> dict[str, Any]:
+            return {
+                "rolname": name,
+                "rolsuper": superuser,
+                "rolinherit": True,
+                "rolcreaterole": createrole,
+                "rolcreatedb": createdb,
+                "rolcanlogin": login,
+                "rolreplication": replication,
+                "rolbypassrls": bypassrls,
+                "rolconnlimit": -1,
+                "password_is_null": True,
+            }
+
+        baseline = [
+            role_row("sqag_app", login=True),
+            role_row("sqag_migrator", login=False),
+            role_row("sqag_runtime", login=False),
+        ]
+        errors: list[str] = []
+        contract_validator._validate_role_attribute_evidence(baseline, manifest, errors)
+        self.assertEqual(errors, [])
+
+        omitted = [row for row in baseline if row["rolname"] != "sqag_app"]
+        errors = []
+        contract_validator._validate_role_attribute_evidence(omitted, manifest, errors)
+        self.assertTrue(any("role_attribute_required_evidence_missing" in error for error in errors), errors)
+
+        no_login = copy.deepcopy(baseline)
+        no_login[0]["rolcanlogin"] = False
+        errors = []
+        contract_validator._validate_role_attribute_evidence(no_login, manifest, errors)
+        self.assertIn("role_attribute_row_0_rolcanlogin_mismatch", errors)
+
+        elevated = copy.deepcopy(baseline)
+        elevated[0]["rolsuper"] = True
+        errors = []
+        contract_validator._validate_role_attribute_evidence(elevated, manifest, errors)
+        self.assertIn("role_attribute_row_0_rolsuper_mismatch", errors)
+        self.assertIn("role_attribute_row_0_rolsuper_privileged_forbidden", errors)
+
+        retired_without_contract = copy.deepcopy(manifest)
+        retired_without_contract["roles"]["legacy"]["status"] = "retired"
+        errors = []
+        contract_validator._validate_role_attribute_evidence(omitted, retired_without_contract, errors)
+        self.assertIn("legacy_role_status_not_explicitly_retained", errors)
+        self.assertTrue(any("role_attribute_required_evidence_missing" in error for error in errors), errors)
     def test_final_authority_requires_each_canonical_query_collection(self) -> None:
         manifest = load_manifest()
         evidence = {key: [] for key in CANONICAL_QUERY_KEYS}
@@ -1299,6 +1398,87 @@ class ValidatorStaticTest(unittest.TestCase):
         }
         self.assertEqual(contract_validator.evaluate_parameter_authority(manifest, restored), ())
 
+    def test_startup_default_policy_is_closed_world_and_precedence_aware(self) -> None:
+        manifest = load_manifest()
+
+        def parameter_row(parameter_name: str, startup_defaults: list[dict[str, Any]]) -> dict[str, Any]:
+            return {
+                "parameter_name": parameter_name,
+                "acl_entries": [],
+                "startup_defaults": startup_defaults,
+                "effective_set": False,
+                "effective_alter_system": False,
+                "set_grantable": False,
+                "alter_system_grantable": False,
+            }
+
+        baseline = [
+            parameter_row("application_name", []),
+            parameter_row("default_transaction_read_only", []),
+            parameter_row("session_replication_role", []),
+        ]
+        self.assertEqual(contract_validator.evaluate_parameter_authority(manifest, baseline), ())
+
+        safe = copy.deepcopy(baseline)
+        safe[2]["startup_defaults"] = [
+            {"scope": "role_global", "precedence": 2, "setting": "session_replication_role=local"}
+        ]
+        safe[1]["startup_defaults"] = [
+            {"scope": "database_global", "precedence": 1, "setting": "default_transaction_read_only=off"}
+        ]
+        self.assertEqual(contract_validator.evaluate_parameter_authority(manifest, safe), ())
+
+        unsafe_read_only = copy.deepcopy(baseline)
+        unsafe_read_only[1]["startup_defaults"] = [
+            {"scope": "role_global", "precedence": 2, "setting": "default_transaction_read_only=on"}
+        ]
+        errors = contract_validator.evaluate_parameter_authority(manifest, unsafe_read_only)
+        self.assertIn(
+            "runtime_parameter_unsafe_startup_default_default_transaction_read_only_on",
+            errors,
+        )
+
+        precedence = copy.deepcopy(baseline)
+        precedence[1]["startup_defaults"] = [
+            {"scope": "database_global", "precedence": 1, "setting": "default_transaction_read_only=off"},
+            {"scope": "role_global", "precedence": 2, "setting": "default_transaction_read_only=on"},
+        ]
+        errors = contract_validator.evaluate_parameter_authority(manifest, precedence)
+        self.assertIn(
+            "runtime_parameter_unsafe_startup_default_default_transaction_read_only_on",
+            errors,
+        )
+
+        ambiguous = copy.deepcopy(baseline)
+        ambiguous[1]["startup_defaults"] = [
+            {"scope": "role_global", "precedence": 2, "setting": "default_transaction_read_only=off"},
+            {"scope": "role_global", "precedence": 2, "setting": "default_transaction_read_only=on"},
+        ]
+        errors = contract_validator.evaluate_parameter_authority(manifest, ambiguous)
+        self.assertIn("runtime_parameter_row_1_startup_default_ambiguous", errors)
+
+        unknown = copy.deepcopy(baseline)
+        unknown.append(
+            parameter_row(
+                "sqag_h50_unknown.setting",
+                [{"scope": "role_global", "precedence": 2, "setting": "sqag_h50_unknown.setting=on"}],
+            )
+        )
+        errors = contract_validator.evaluate_parameter_authority(manifest, unknown)
+        self.assertIn(
+            "runtime_parameter_startup_default_unclassified_sqag_h50_unknown.setting",
+            errors,
+        )
+
+        unsafe_session = copy.deepcopy(baseline)
+        unsafe_session[2]["startup_defaults"] = [
+            {"scope": "role_global", "precedence": 2, "setting": "session_replication_role=replica"}
+        ]
+        errors = contract_validator.evaluate_parameter_authority(manifest, unsafe_session)
+        self.assertTrue(
+            any("runtime_parameter_unsafe_startup_default_session_replication_role" in error for error in errors),
+            errors,
+        )
     def test_migration_derived_structural_contract_rejects_constraint_and_index_drift(self) -> None:
         structural = contract_validator.classified_table_structure_contract()
 
@@ -1329,6 +1509,7 @@ class ValidatorStaticTest(unittest.TestCase):
                         "table_constraints": constraints,
                         "trigger_bindings": triggers,
                         "index_contracts": indexes,
+                        "rule_bindings": copy.deepcopy(structural["rules"].get(table_name, [])),
                     }
                 )
             rows.append(
@@ -1340,6 +1521,7 @@ class ValidatorStaticTest(unittest.TestCase):
                     "table_constraints": [],
                     "trigger_bindings": [],
                     "index_contracts": [],
+                    "rule_bindings": [],
                 }
             )
             return rows
@@ -1348,6 +1530,87 @@ class ValidatorStaticTest(unittest.TestCase):
         errors: list[str] = []
         contract_validator._validate_table_structure_evidence(baseline, errors)
         self.assertEqual(errors, [])
+        self.assertEqual(structural["rules"], {})
+        rule_row = next(row for row in baseline if row["relname"] == "sqag_profiles")
+        rule_row["rule_bindings"] = [
+            {
+                "rule_name": "sqag_h46_unexpected_rule",
+                "target_schema": "public",
+                "target_relation": "sqag_profiles",
+                "event": "INSERT",
+                "is_instead": True,
+                "enabled": "O",
+                "definition": "create rule sqag_h46_unexpected_rule as on insert to public.sqag_profiles do instead nothing",
+            }
+        ]
+        errors = []
+        contract_validator._validate_table_structure_evidence(baseline, errors)
+        self.assertIn(
+            "table_structural_rule_binding_contract_mismatch_sqag_profiles",
+            errors,
+        )
+        baseline = evidence_rows()
+        composite_fk = next(
+            constraint
+            for row in baseline
+            for constraint in row["table_constraints"]
+            if constraint["constraint_type"] == "f"
+            and len(constraint["columns"]) > 1
+        )
+        self.assertEqual(composite_fk["match_type"], "SIMPLE")
+        composite_fk["match_type"] = "FULL"
+        errors = []
+        contract_validator._validate_table_structure_evidence(baseline, errors)
+        self.assertTrue(
+            any("table_structural_constraint_contract_mismatch_" in error for error in errors),
+            errors,
+        )
+        baseline = evidence_rows()
+        publication_artifacts = next(
+            row for row in baseline if row["relname"] == "sqag_quote_publication_artifacts"
+        )
+        checksum_check = next(
+            constraint
+            for constraint in publication_artifacts["table_constraints"]
+            if constraint["constraint_type"] == "c"
+            and "checksum_sha256" in str(constraint["check_expression"])
+        )
+        clean_expression = checksum_check["check_expression"]
+        for cast_expression in (
+            clean_expression.replace("checksum_sha256", "checksum_sha256::name"),
+            clean_expression.replace("checksum_sha256", "CAST(checksum_sha256 AS name)"),
+            clean_expression.replace("checksum_sha256", "checksum_sha256::char(64)"),
+        ):
+            mutated = evidence_rows()
+            mutated_check = next(
+                constraint
+                for row in mutated
+                if row["relname"] == "sqag_quote_publication_artifacts"
+                for constraint in row["table_constraints"]
+                if constraint["constraint_type"] == "c"
+                and "checksum_sha256" in str(constraint["check_expression"])
+            )
+            mutated_check["check_expression"] = cast_expression
+            errors = []
+            contract_validator._validate_table_structure_evidence(mutated, errors)
+            self.assertIn(
+                "table_structural_constraint_contract_mismatch_sqag_quote_publication_artifacts",
+                errors,
+            )
+        harmless_formatting = evidence_rows()
+        harmless_check = next(
+            constraint
+            for row in harmless_formatting
+            if row["relname"] == "sqag_quote_publication_artifacts"
+            for constraint in row["table_constraints"]
+            if constraint["constraint_type"] == "c"
+            and "checksum_sha256" in str(constraint["check_expression"])
+        )
+        harmless_check["check_expression"] = " length ( checksum_sha256 ) = 64 "
+        errors = []
+        contract_validator._validate_table_structure_evidence(harmless_formatting, errors)
+        self.assertEqual(errors, [])
+        baseline = evidence_rows()
         publication = next(
             row for row in baseline if row["relname"] == "sqag_quote_publication_versions"
         )
@@ -1441,6 +1704,24 @@ class ValidatorStaticTest(unittest.TestCase):
                     "privilege_type": "CONNECT",
                     "is_grantable": False,
                 },
+                {
+                    "grantee": "sqag_migrator",
+                    "grantor": "database_owner",
+                    "privilege_type": "CONNECT",
+                    "is_grantable": False,
+                },
+                {
+                    "grantee": "sqag_migrator",
+                    "grantor": "database_owner",
+                    "privilege_type": "CREATE",
+                    "is_grantable": False,
+                },
+                {
+                    "grantee": "sqag_migrator",
+                    "grantor": "database_owner",
+                    "privilege_type": "TEMPORARY",
+                    "is_grantable": False,
+                },
             ],
         }
         errors: list[str] = []
@@ -1458,6 +1739,127 @@ class ValidatorStaticTest(unittest.TestCase):
         errors = []
         contract_validator._validate_database_acl_evidence([mutated], errors, runtime_role="sqag_runtime")
         self.assertIn("database_acl_public_create_forbidden", errors)
+
+    def test_database_acl_requires_migrator_direct_provenance(self) -> None:
+        row = {
+            "database_name": "fixture",
+            "database_owner": "database_owner",
+            "datacl": [],
+            "acl_entries": [
+                {"grantee": "PUBLIC", "grantor": "database_owner", "privilege_type": "CONNECT", "is_grantable": False},
+                {"grantee": "sqag_runtime", "grantor": "database_owner", "privilege_type": "CONNECT", "is_grantable": False},
+                {"grantee": "sqag_migrator", "grantor": "database_owner", "privilege_type": "CONNECT", "is_grantable": False},
+                {"grantee": "sqag_migrator", "grantor": "database_owner", "privilege_type": "CREATE", "is_grantable": False},
+                {"grantee": "sqag_migrator", "grantor": "database_owner", "privilege_type": "TEMPORARY", "is_grantable": False},
+            ],
+        }
+        self.assertEqual(
+            contract_validator._validate_database_acl_evidence(
+                [row], [], runtime_role="sqag_runtime"
+            )[1],
+            tuple(
+                (entry["grantee"], entry["grantor"], entry["privilege_type"], entry["is_grantable"])
+                for entry in row["acl_entries"]
+            ),
+        )
+        for privilege in ("CONNECT", "CREATE", "TEMPORARY"):
+            mutated = copy.deepcopy(row)
+            mutated["acl_entries"] = [
+                entry
+                for entry in mutated["acl_entries"]
+                if not (entry["grantee"] == "sqag_migrator" and entry["privilege_type"] == privilege)
+            ]
+            errors: list[str] = []
+            contract_validator._validate_database_acl_evidence([mutated], errors, runtime_role="sqag_runtime")
+            self.assertIn(
+                f"database_acl_migrator_{privilege.lower()}_direct_evidence_missing_or_duplicate",
+                errors,
+            )
+        wrong_grantee = copy.deepcopy(row)
+        next(
+            entry
+            for entry in wrong_grantee["acl_entries"]
+            if entry["grantee"] == "sqag_migrator" and entry["privilege_type"] == "CREATE"
+        )["grantee"] = "sqag_wrong_grantee"
+        errors = []
+        contract_validator._validate_database_acl_evidence([wrong_grantee], errors, runtime_role="sqag_runtime")
+        self.assertIn("database_acl_migrator_create_direct_evidence_missing_or_duplicate", errors)
+        wrong_grantor = copy.deepcopy(row)
+        next(
+            entry
+            for entry in wrong_grantor["acl_entries"]
+            if entry["grantee"] == "sqag_migrator" and entry["privilege_type"] == "CREATE"
+        )["grantor"] = "PUBLIC"
+        errors = []
+        contract_validator._validate_database_acl_evidence([wrong_grantor], errors, runtime_role="sqag_runtime")
+        self.assertIn("database_acl_migrator_create_grantor_invalid_expected_database_owner_got_PUBLIC", errors)
+        grantable = copy.deepcopy(row)
+        next(
+            entry
+            for entry in grantable["acl_entries"]
+            if entry["grantee"] == "sqag_migrator" and entry["privilege_type"] == "TEMPORARY"
+        )["is_grantable"] = True
+        errors = []
+        contract_validator._validate_database_acl_evidence([grantable], errors, runtime_role="sqag_runtime")
+        self.assertIn("database_acl_migrator_temporary_grant_option_forbidden", errors)
+
+    def test_system_relation_acl_provenance_rejects_exceptional_runtime_and_public_grants(self) -> None:
+        baseline_entry = {
+            "grantee": "postgres",
+            "grantor": "postgres",
+            "privilege_type": "SELECT",
+            "is_grantable": False,
+        }
+        baseline = [
+            {
+                "schema_name": "pg_catalog",
+                "relation_name": "fixture_catalog",
+                "relation_kind": "r",
+                "current_acl_entries": [copy.deepcopy(baseline_entry)],
+                "initial_acl_entries": [copy.deepcopy(baseline_entry)],
+                "initial_privilege_types": ["i"],
+            }
+        ]
+        errors: list[str] = []
+        contract_validator._validate_system_relation_acl_evidence(
+            baseline, errors, runtime_role="sqag_runtime"
+        )
+        self.assertEqual(errors, [])
+        for grantee in ("sqag_runtime", "PUBLIC"):
+            mutated = copy.deepcopy(baseline)
+            mutated[0]["current_acl_entries"].append(
+                {
+                    "grantee": grantee,
+                    "grantor": "postgres",
+                    "privilege_type": "SELECT",
+                    "is_grantable": False,
+                }
+            )
+            errors = []
+            contract_validator._validate_system_relation_acl_evidence(
+                mutated, errors, runtime_role="sqag_runtime"
+            )
+            self.assertTrue(
+                any(f"system_relation_acl_exceptional_{grantee}_select_pg_catalog.fixture_catalog" in error for error in errors),
+                errors,
+            )
+        grantable = copy.deepcopy(baseline)
+        grantable[0]["current_acl_entries"].append(
+            {
+                "grantee": "PUBLIC",
+                "grantor": "postgres",
+                "privilege_type": "SELECT",
+                "is_grantable": True,
+            }
+        )
+        errors = []
+        contract_validator._validate_system_relation_acl_evidence(
+            grantable, errors, runtime_role="sqag_runtime"
+        )
+        self.assertIn(
+            "system_relation_acl_grant_option_forbidden_PUBLIC_select_pg_catalog.fixture_catalog",
+            errors,
+        )
 
     def test_schema_scoped_explicit_column_exception_rejects_shadow_schema(self) -> None:
         manifest = copy.deepcopy(load_manifest())
@@ -3767,7 +4169,7 @@ class RequirementEvidenceMapTest(unittest.TestCase):
         self.assertIn("- name: Validate runtime privilege contract", workflow)
         self.assertIn("run: python scripts/validate_runtime_privilege_contract.py", workflow)
         self.assertIn("Runtime privilege-contract static validation", documentation)
-        self.assertIn("Disposable PostgreSQL 17 runtime privilege-contract tests exercise the fifteen canonical query keys", documentation)
+        self.assertIn("Disposable PostgreSQL 17 runtime privilege-contract tests exercise the sixteen canonical query keys", documentation)
         self.assertIn("creator-admin control edge with ADMIN true, INHERIT false, and SET false", documentation)
         self.assertIn("Boundary A remains repository-only", documentation)
         self.assertIn("Green CI does not authorise Boundary B or #160", documentation)
@@ -3855,7 +4257,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                     str(_row_dict(row, "rolname"))
                     for row in connection.execute(
                         "select rolname from pg_catalog.pg_roles "
-                        "where rolname in ('sqag_runtime', 'sqag_migrator', 'neondb_owner') or rolname like %s "
+                        "where rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_app', 'neondb_owner') or rolname like %s "
                         "order by rolname",
                         ("sqag_rpc_role_%",),
                     ).fetchall()
@@ -3865,8 +4267,8 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                     "from pg_catalog.pg_auth_members am "
                     "join pg_catalog.pg_roles parent on parent.oid = am.roleid "
                     "join pg_catalog.pg_roles member on member.oid = am.member "
-                    "where parent.rolname in ('sqag_runtime', 'sqag_migrator', 'neondb_owner') "
-                    "or member.rolname in ('sqag_runtime', 'sqag_migrator', 'neondb_owner') "
+                    "where parent.rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_app', 'neondb_owner') "
+                    "or member.rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_app', 'neondb_owner') "
                     "or parent.rolname like %s or member.rolname like %s",
                     ("sqag_rpc_role_%", "sqag_rpc_role_%"),
                 ).fetchall()
@@ -3890,7 +4292,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                                 "where owner_role.rolname in ('sqag_migrator', 'neondb_owner') "
                                 "or owner_role.rolname = 'sqag_runtime' "
                                 "or owner_role.rolname like %s "
-                                "or grantee_role.rolname in ('sqag_runtime', 'sqag_migrator', 'neondb_owner') "
+                                "or grantee_role.rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_app', 'neondb_owner') "
                                 "or grantee_role.rolname like %s",
                                 ("sqag_rpc_role_%", "sqag_rpc_role_%"),
                             ).fetchall()
@@ -3922,6 +4324,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.addCleanup(self._audit_and_drop_database)
         self.addCleanup(self._assert_membership_baseline_restored)
         self._create_role("sqag_migrator")
+        self._create_role("sqag_app", login=True)
         provider_name = self._create_role("neondb_owner")
         self._execute_admin_sql(f"alter role {_quote_identifier(provider_name)} createrole")
         self._create_role("sqag_runtime", creator_role=provider_name)
@@ -4021,7 +4424,13 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         if errors:
             raise AssertionError("cleanup failed: " + "; ".join(errors))
 
-    def _create_role(self, role_name: str, *, creator_role: str | None = None) -> str:
+    def _create_role(
+        self,
+        role_name: str,
+        *,
+        creator_role: str | None = None,
+        login: bool = False,
+    ) -> str:
         _quote_identifier(role_name)
         if creator_role is not None:
             _quote_identifier(creator_role)
@@ -4029,8 +4438,9 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         try:
             if creator_role is not None:
                 connection.execute(f"set session authorization {_quote_identifier(creator_role)}")
+            login_clause = "LOGIN" if login else "NOLOGIN"
             connection.execute(
-                f"create role {_quote_identifier(role_name)} NOLOGIN NOSUPERUSER NOCREATEDB "
+                f"create role {_quote_identifier(role_name)} {login_clause} NOSUPERUSER NOCREATEDB "
                 f"NOCREATEROLE NOREPLICATION NOBYPASSRLS INHERIT CONNECTION LIMIT -1"
             )
             connection.commit()
@@ -4099,7 +4509,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             connection = self.connect()
             leftover_roles = connection.execute(
                 "select rolname from pg_catalog.pg_roles "
-                "where rolname in ('sqag_runtime', 'sqag_migrator', 'neondb_owner') or rolname like %s "
+                "where rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_app', 'neondb_owner') or rolname like %s "
                 "order by rolname",
                 ("sqag_rpc_role_%",),
             ).fetchall()
@@ -4111,9 +4521,9 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 "join pg_catalog.pg_roles owner_role on owner_role.oid = d.defaclrole "
                 "cross join lateral pg_catalog.aclexplode(d.defaclacl) expanded "
                 "left join pg_catalog.pg_roles grantee_role on grantee_role.oid = expanded.grantee "
-                "where owner_role.rolname in ('sqag_runtime', 'sqag_migrator', 'neondb_owner') "
+                "where owner_role.rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_app', 'neondb_owner') "
                 "or owner_role.rolname like %s "
-                "or grantee_role.rolname in ('sqag_runtime', 'sqag_migrator', 'neondb_owner') "
+                "or grantee_role.rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_app', 'neondb_owner') "
                 "or grantee_role.rolname like %s",
                 ("sqag_rpc_role_%", "sqag_rpc_role_%"),
             ).fetchall()
@@ -4885,7 +5295,11 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.assertFalse(any(row[3] for row in actual), f"grant options found: {actual}")
 
     def _execute_admin_sql(self, sql: str) -> None:
-        connection = self.connect()
+        connection = self.psycopg.connect(
+            postgres_test_conninfo(self.database_name),
+            row_factory=self.dict_row,
+            options="-c default_transaction_read_only=off",
+        )
         try:
             connection.execute(sql)
             connection.commit()
@@ -5347,7 +5761,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             "table_acl": 16,
             "routine_acl": 2,
             "default_acl": 1,
-            "role_attributes": 3,
+            "role_attributes": 4,
             "role_memberships": len(self._membership_baseline) + 1,
             "sequence_acl": 0,
             "effective_runtime_database_privileges": 3,
@@ -5365,12 +5779,12 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             results[query_key] = self._execute_contract_query(query_key)
 
         self.assertEqual(executed, list(CANONICAL_QUERY_KEYS))
-        self.assertEqual(len(executed), 15)
+        self.assertEqual(len(executed), 16)
         self.assertEqual(set(executed), set(self.contract["verification_queries"]))
         for query_key in CANONICAL_QUERY_KEYS:
             columns, rows = results[query_key]
             self.assertEqual(columns, CANONICAL_QUERY_COLUMNS[query_key], query_key)
-            if query_key == "effective_runtime_parameter_privileges":
+            if query_key in {"effective_runtime_parameter_privileges", "system_relation_acl"}:
                 self.assertGreater(len(rows), 0, query_key)
             else:
                 self.assertEqual(len(rows), expected_cardinality[query_key], query_key)
@@ -5390,7 +5804,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         role_rows = results["role_attributes"][1]
         self.assertEqual(
             {str(row["rolname"]) for row in role_rows},
-            {"neondb_owner", "sqag_migrator", "sqag_runtime"},
+            {"neondb_owner", "sqag_app", "sqag_migrator", "sqag_runtime"},
         )
         self.assertTrue(all(isinstance(row["password_is_null"], bool) for row in role_rows))
         self.assertTrue(all(row["password_is_null"] for row in role_rows))
@@ -6683,10 +7097,10 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         manifest_keys = tuple(self.contract["verification_queries"])
         self.assertEqual(manifest_keys, CANONICAL_QUERY_KEYS)
         self.assertEqual(set(CANONICAL_QUERY_KEYS), set(self.contract["verification_queries"]))
-        self.assertEqual(len(CANONICAL_QUERY_KEYS), 15)
-        self.assertEqual(len(set(CANONICAL_QUERY_KEYS)), 15)
-        self.assertEqual(len(self.contract["verification_queries"]), 15)
-        self.assertEqual(len(set(self.contract["verification_queries"])), 15)
+        self.assertEqual(len(CANONICAL_QUERY_KEYS), 16)
+        self.assertEqual(len(set(CANONICAL_QUERY_KEYS)), 16)
+        self.assertEqual(len(self.contract["verification_queries"]), 16)
+        self.assertEqual(len(set(self.contract["verification_queries"])), 16)
         self.assertIn("view_acl", CANONICAL_QUERY_KEYS)
         for query_key in CANONICAL_QUERY_KEYS:
             self.assertIn(query_key, CANONICAL_QUERY_COLUMNS)
@@ -7043,6 +7457,89 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             )
         self.assertEqual(self._evaluate_runtime_authority_rows(), ())
 
+
+        rule_name = f"sqag_h46_unexpected_{uuid.uuid4().hex[:8]}"
+        self._execute_admin_sql(
+            f'create rule {_quote_identifier(rule_name)} as on insert '
+            'to public."sqag_profiles" do instead nothing'
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertIn(
+                "table_structural_rule_binding_contract_mismatch_sqag_profiles",
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(
+                f'drop rule if exists {_quote_identifier(rule_name)} '
+                'on public."sqag_profiles"'
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "select c.conname, relation.relname as table_name, "
+                "pg_catalog.pg_get_constraintdef(c.oid, true) as definition, "
+                "c.convalidated, c.condeferrable, c.condeferred "
+                "from pg_catalog.pg_constraint c "
+                "join pg_catalog.pg_class relation on relation.oid = c.conrelid "
+                "join pg_catalog.pg_namespace namespace on namespace.oid = relation.relnamespace "
+                "where c.contype = 'f' and array_length(c.conkey, 1) = 2 "
+                "and namespace.nspname = 'public' and relation.relname like 'sqag_' || chr(37) "
+                "order by relation.relname, c.conname limit 1"
+            ).fetchone()
+        finally:
+            connection.rollback()
+            connection.close()
+        if row is None:
+            self.fail("composite migration-defined foreign key was not found")
+        constraint_name = str(_row_dict(row, "conname"))
+        table_name = str(_row_dict(row, "table_name"))
+        baseline_definition = str(_row_dict(row, "definition"))
+        self.assertTrue(bool(_row_dict(row, "convalidated")))
+        table_columns, table_rows = self._execute_contract_query("table_acl")
+        self.assertEqual(table_columns, CANONICAL_QUERY_COLUMNS["table_acl"])
+        table_row = next(item for item in table_rows if item["relname"] == table_name)
+        constraint_row = next(
+            item for item in table_row["table_constraints"]
+            if item["constraint_name"] == constraint_name
+        )
+        self.assertEqual(constraint_row["match_type"], "SIMPLE")
+        full_definition = re.sub(
+            r"\s+(DEFERRABLE|NOT DEFERRABLE)\b",
+            r" MATCH FULL\1",
+            baseline_definition,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        if full_definition == baseline_definition:
+            full_definition = f"{baseline_definition} MATCH FULL"
+        table_ident = _quote_identifier(table_name)
+        constraint_ident = _quote_identifier(constraint_name)
+        self._execute_admin_sql(
+            f'alter table public.{table_ident} drop constraint {constraint_ident}'
+        )
+        try:
+            self._execute_admin_sql(
+                f'alter table public.{table_ident} add constraint {constraint_ident} '
+                f'{full_definition}'
+            )
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertIn(
+                f"table_structural_constraint_contract_mismatch_{table_name}",
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(
+                f'alter table public.{table_ident} drop constraint if exists {constraint_ident}'
+            )
+            self._execute_admin_sql(
+                f'alter table public.{table_ident} add constraint {constraint_ident} '
+                f'{baseline_definition}'
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
     def test_target_relation_trigger_inventory_rejects_external_function_schema_postgres(self) -> None:
         self._prepare_fixed_runtime_contract_fixture()
         schema_name = f"sqag_h39_{uuid.uuid4().hex[:8]}"
@@ -7115,6 +7612,122 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             errors,
         )
 
+    def test_check_constraint_cast_semantics_are_preserved_postgres(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        table_name = "sqag_quote_publication_artifacts"
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "select conname from pg_catalog.pg_constraint "
+                "where conrelid = 'public.sqag_quote_publication_artifacts'::regclass "
+                "and contype = 'c' and conname like '%%checksum%%' "
+                "order by conname"
+            ).fetchone()
+        finally:
+            connection.rollback()
+            connection.close()
+        constraint_name = str(_row_dict(row, "conname")) if row is not None else ""
+        self.assertTrue(constraint_name)
+        constraint_ident = _quote_identifier(constraint_name)
+        table_ident = _quote_identifier(table_name)
+        baseline_expression = "length(checksum_sha256) = 64"
+
+        def replace_check(expression: str) -> None:
+            self._execute_admin_sql(
+                f"alter table public.{table_ident} drop constraint if exists {constraint_ident}"
+            )
+            self._execute_admin_sql(
+                f"alter table public.{table_ident} add constraint {constraint_ident} check ({expression})"
+            )
+
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+        for expression in (
+            "length(checksum_sha256::name) = 64",
+            "length(CAST(checksum_sha256 AS name)) = 64",
+            "length(checksum_sha256::char(64)) = 64",
+        ):
+            with self.subTest(h51_cast_expression=expression):
+                replace_check(expression)
+                try:
+                    errors = self._evaluate_runtime_authority_rows()
+                    self.assertIn(
+                        f"table_structural_constraint_contract_mismatch_{table_name}",
+                        errors,
+                    )
+                finally:
+                    replace_check(baseline_expression)
+                self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        replace_check("length ( checksum_sha256 ) = 64")
+        try:
+            self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+        finally:
+            replace_check(baseline_expression)
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+    def test_retained_rollback_role_controls_fail_closed_postgres(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        def role_errors(rows: list[dict[str, Any]] | None = None) -> tuple[str, ...]:
+            if rows is None:
+                columns, rows = self._execute_contract_query("role_attributes")
+                self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["role_attributes"])
+            errors: list[str] = []
+            contract_validator._validate_role_attribute_evidence(rows, self.contract, errors)
+            return tuple(errors)
+
+        self.assertEqual(role_errors(), ())
+        _, baseline_rows = self._execute_contract_query("role_attributes")
+        omitted = [row for row in baseline_rows if row["rolname"] != "sqag_app"]
+        omitted_errors = role_errors(omitted)
+        self.assertTrue(any("role_attribute_required_evidence_missing" in error for error in omitted_errors), omitted_errors)
+
+        self._execute_admin_sql('drop role "sqag_app"')
+        try:
+            _, dropped_rows = self._execute_contract_query("role_attributes")
+            self.assertFalse(any(row["rolname"] == "sqag_app" for row in dropped_rows))
+            dropped_errors = role_errors(dropped_rows)
+            self.assertTrue(any("role_attribute_required_evidence_missing" in error for error in dropped_errors), dropped_errors)
+        finally:
+            self._execute_admin_sql(
+                'create role "sqag_app" LOGIN NOSUPERUSER NOCREATEDB '
+                'NOCREATEROLE NOREPLICATION NOBYPASSRLS INHERIT CONNECTION LIMIT -1'
+            )
+        self.assertEqual(role_errors(), ())
+
+        self._execute_admin_sql('alter role "sqag_app" nologin')
+        try:
+            errors = role_errors()
+            self.assertTrue(any("rolcanlogin_mismatch" in error for error in errors), errors)
+        finally:
+            self._execute_admin_sql('alter role "sqag_app" login')
+        self.assertEqual(role_errors(), ())
+
+        elevated_controls = (
+            ("superuser", "nosuperuser", "rolsuper"),
+            ("createdb", "nocreatedb", "rolcreatedb"),
+            ("createrole", "nocreaterole", "rolcreaterole"),
+            ("replication", "noreplication", "rolreplication"),
+            ("bypassrls", "nobypassrls", "rolbypassrls"),
+        )
+        for enable_clause, restore_clause, field in elevated_controls:
+            with self.subTest(h52_elevated_attribute=enable_clause):
+                self._execute_admin_sql(f'alter role "sqag_app" {enable_clause}')
+                try:
+                    errors = role_errors()
+                    self.assertTrue(any(field + "_mismatch" in error for error in errors), errors)
+                    self.assertTrue(any(field + "_privileged_forbidden" in error for error in errors), errors)
+                finally:
+                    self._execute_admin_sql(f'alter role "sqag_app" {restore_clause}')
+                self.assertEqual(role_errors(), ())
+
+        future_retirement = copy.deepcopy(self.contract)
+        future_retirement["roles"]["legacy"]["status"] = "retired"
+        errors: list[str] = []
+        contract_validator._validate_role_attribute_evidence(omitted, future_retirement, errors)
+        self.assertIn("legacy_role_status_not_explicitly_retained", errors)
+        self.assertTrue(any("role_attribute_required_evidence_missing" in error for error in errors), errors)
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
     def test_public_default_privilege_is_rejected_even_without_grant_option_postgres(self) -> None:
         self._prepare_fixed_runtime_contract_fixture()
         owner_name = self._new_role("h42_default_owner")
@@ -7151,6 +7764,172 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self._alter_public_database_privilege("CONNECT", False)
         errors = self._evaluate_runtime_authority_rows()
         self.assertIn("database_acl_public_connect_evidence_missing_or_duplicate", errors)
+    def test_database_migrator_and_system_relation_acl_controls_fail_closed_postgres(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+        database_ident = _quote_identifier(self.database_name)
+
+        for privilege in ("CONNECT", "CREATE", "TEMPORARY"):
+            with self.subTest(h48_missing_privilege=privilege):
+                self._execute_admin_sql(
+                    f'revoke {privilege} on database {database_ident} from "sqag_migrator"'
+                )
+                try:
+                    errors = self._evaluate_runtime_authority_rows()
+                    self.assertIn(
+                        f"database_acl_migrator_{privilege.lower()}_direct_evidence_missing_or_duplicate",
+                        errors,
+                    )
+                finally:
+                    self._execute_admin_sql(
+                        f'grant {privilege} on database {database_ident} to "sqag_migrator"'
+                    )
+                self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        wrong_grantee = self._new_role("h48_wrong_grantee")
+        self._execute_admin_sql(
+            f'revoke CREATE on database {database_ident} from "sqag_migrator"'
+        )
+        self._execute_admin_sql(
+            f'grant CREATE on database {database_ident} to {_quote_identifier(wrong_grantee)}'
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertIn(
+                "database_acl_migrator_create_direct_evidence_missing_or_duplicate",
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(
+                f'revoke CREATE on database {database_ident} from {_quote_identifier(wrong_grantee)}'
+            )
+            self._execute_admin_sql(
+                f'grant CREATE on database {database_ident} to "sqag_migrator"'
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        wrong_grantor = self._new_role("h48_wrong_grantor")
+        self._execute_admin_sql(
+            f'grant CONNECT on database {database_ident} to '
+            f'{_quote_identifier(wrong_grantor)} with grant option'
+        )
+        with self.as_role(wrong_grantor) as connection:
+            connection.execute(
+                f'grant CONNECT on database {database_ident} to "sqag_migrator"'
+            )
+            connection.commit()
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(
+                any(
+                    error.startswith("database_acl_migrator_connect_grantor_invalid_expected_")
+                    or error == "database_acl_migrator_connect_direct_evidence_missing_or_duplicate"
+                    for error in errors
+                ),
+                errors,
+            )
+        finally:
+            with self.as_role(wrong_grantor) as connection:
+                connection.execute(
+                    f'revoke CONNECT on database {database_ident} from "sqag_migrator"'
+                )
+                connection.commit()
+            self._execute_admin_sql(
+                f'revoke CONNECT on database {database_ident} from {_quote_identifier(wrong_grantor)}'
+            )
+            self._execute_admin_sql(
+                f'grant CONNECT on database {database_ident} to "sqag_migrator"'
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        self._execute_admin_sql(
+            f'grant TEMPORARY on database {database_ident} to "sqag_migrator" with grant option'
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertIn(
+                "database_acl_migrator_temporary_grant_option_forbidden",
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(
+                f'revoke TEMPORARY on database {database_ident} from "sqag_migrator"'
+            )
+            self._execute_admin_sql(
+                f'grant TEMPORARY on database {database_ident} to "sqag_migrator"'
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        columns, system_rows = self._execute_contract_query("system_relation_acl")
+        self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["system_relation_acl"])
+        candidate = next(
+            (
+                row
+                for row in system_rows
+                if row["schema_name"] == "pg_catalog"
+                and row["relation_kind"] in {"r", "p"}
+                and row["relation_name"] not in {"pg_authid", "pg_shadow", "pg_roles", "pg_user"}
+                and not any(
+                    entry["grantee"] in {"PUBLIC", "sqag_runtime"}
+                    and entry["privilege_type"] == "SELECT"
+                    for entry in row["initial_acl_entries"]
+                )
+                and not any(
+                    entry["grantee"] in {"PUBLIC", "sqag_runtime"}
+                    and entry["privilege_type"] == "SELECT"
+                    for entry in row["current_acl_entries"]
+                )
+            ),
+            None,
+        )
+        self.assertIsNotNone(candidate, "no suitable PostgreSQL 17 system relation baseline fixture")
+        relation_name = str(candidate["relation_name"])
+        relation_ident = f'pg_catalog.{_quote_identifier(relation_name)}'
+
+        self._execute_admin_sql(
+            f'grant SELECT on table {relation_ident} to "sqag_runtime"'
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertIn(
+                f"system_relation_acl_exceptional_sqag_runtime_select_pg_catalog.{relation_name}",
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(
+                f'revoke SELECT on table {relation_ident} from "sqag_runtime"'
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        self._execute_admin_sql(f"grant SELECT on table {relation_ident} to public")
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertIn(
+                f"system_relation_acl_exceptional_PUBLIC_select_pg_catalog.{relation_name}",
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(f"revoke SELECT on table {relation_ident} from public")
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        grant_option_applied = True
+        try:
+            self._execute_admin_sql(
+                f"grant SELECT on table {relation_ident} to public with grant option"
+            )
+        except self.psycopg.errors.InvalidGrantOperation:
+            grant_option_applied = False
+        if grant_option_applied:
+            try:
+                errors = self._evaluate_runtime_authority_rows()
+                self.assertIn(
+                    f"system_relation_acl_grant_option_forbidden_PUBLIC_select_pg_catalog.{relation_name}",
+                    errors,
+                )
+            finally:
+                self._execute_admin_sql(f"revoke SELECT on table {relation_ident} from public")
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
     def test_runtime_role_attributes_memberships_and_ownership_are_exact(self) -> None:
         self.apply_migrations()
         role_name = self._new_role("attributes")
@@ -9198,43 +9977,151 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             )
         )
         self.assertEqual(self._evaluate_runtime_authority_rows(), ())
-    def test_parameter_startup_default_scopes_fail_closed_postgres(self) -> None:
+    def test_parameter_startup_defaults_are_closed_world_postgres(self) -> None:
         self._prepare_fixed_runtime_contract_fixture()
         self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+        database_ident = _quote_identifier(self.database_name)
+
         controls = (
             (
-                "role_global",
+                "role_global_session_replication",
                 'alter role "sqag_runtime" set session_replication_role = replica',
                 'alter role "sqag_runtime" reset session_replication_role',
+                "runtime_parameter_unsafe_startup_default_session_replication_role",
             ),
             (
-                "database_global",
-                f'alter database {_quote_identifier(self.database_name)} set session_replication_role = replica',
-                f'alter database {_quote_identifier(self.database_name)} reset session_replication_role',
+                "database_global_session_replication",
+                f"alter database {database_ident} set session_replication_role = replica",
+                f"alter database {database_ident} reset session_replication_role",
+                "runtime_parameter_unsafe_startup_default_session_replication_role",
             ),
             (
-                "role_database",
-                f'alter role "sqag_runtime" in database {_quote_identifier(self.database_name)} set session_replication_role = replica',
-                f'alter role "sqag_runtime" in database {_quote_identifier(self.database_name)} reset session_replication_role',
+                "role_database_session_replication",
+                f"alter role \"sqag_runtime\" in database {database_ident} set session_replication_role = replica",
+                f"alter role \"sqag_runtime\" in database {database_ident} reset session_replication_role",
+                "runtime_parameter_unsafe_startup_default_session_replication_role",
+            ),
+            (
+                "role_global_read_only",
+                'alter role "sqag_runtime" set default_transaction_read_only = on',
+                'alter role "sqag_runtime" reset default_transaction_read_only',
+                "runtime_parameter_unsafe_startup_default_default_transaction_read_only_on",
+            ),
+            (
+                "database_global_read_only",
+                f"alter database {database_ident} set default_transaction_read_only = on",
+                f"alter database {database_ident} reset default_transaction_read_only",
+                "runtime_parameter_unsafe_startup_default_default_transaction_read_only_on",
+            ),
+            (
+                "role_database_read_only",
+                f"alter role \"sqag_runtime\" in database {database_ident} set default_transaction_read_only = on",
+                f"alter role \"sqag_runtime\" in database {database_ident} reset default_transaction_read_only",
+                "runtime_parameter_unsafe_startup_default_default_transaction_read_only_on",
             ),
         )
-        for scope, apply_sql, restore_sql in controls:
-            with self.subTest(scope=scope):
+        for scope, apply_sql, restore_sql, expected_error in controls:
+            with self.subTest(h50_scope=scope):
                 self._execute_admin_sql(apply_sql)
                 try:
                     errors = self._evaluate_runtime_authority_rows()
-                    self.assertTrue(
-                        any(
-                            "runtime_parameter_unsafe_startup_default_session_replication_role"
-                            in error
-                            for error in errors
-                        ),
-                        (scope, errors),
-                    )
+                    self.assertTrue(any(expected_error in error for error in errors), (scope, errors))
                 finally:
                     self._execute_admin_sql(restore_sql)
                 self.assertEqual(self._evaluate_runtime_authority_rows(), ())
 
+        self._execute_admin_sql(
+            f"alter database {database_ident} set default_transaction_read_only = off"
+        )
+        self._execute_admin_sql(
+            'alter role "sqag_runtime" set default_transaction_read_only = on'
+        )
+        try:
+            _, parameter_rows = self._execute_contract_query("effective_runtime_parameter_privileges")
+            read_only_row = next(
+                row for row in parameter_rows if row["parameter_name"] == "default_transaction_read_only"
+            )
+            observed_settings = {entry["setting"] for entry in read_only_row["startup_defaults"]}
+            self.assertEqual(
+                observed_settings,
+                {"default_transaction_read_only=off", "default_transaction_read_only=on"},
+            )
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertIn(
+                "runtime_parameter_unsafe_startup_default_default_transaction_read_only_on",
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(
+                'alter role "sqag_runtime" reset default_transaction_read_only'
+            )
+            self._execute_admin_sql(
+                f"alter database {database_ident} reset default_transaction_read_only"
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        self._execute_admin_sql(
+            'alter role "sqag_runtime" set default_transaction_read_only = on'
+        )
+        try:
+            self._execute_admin_sql(
+                "update pg_catalog.pg_db_role_setting setting_row "
+                "set setconfig = array['default_transaction_read_only=off', "
+                "'default_transaction_read_only=on']::text[] "
+                "where setting_row.setrole = (select oid from pg_catalog.pg_roles "
+                "where rolname = 'sqag_runtime') and setting_row.setdatabase = 0"
+            )
+            _, parameter_rows = self._execute_contract_query("effective_runtime_parameter_privileges")
+            read_only_row = next(
+                row for row in parameter_rows if row["parameter_name"] == "default_transaction_read_only"
+            )
+            self.assertEqual(len(read_only_row["startup_defaults"]), 2)
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(any("startup_default_ambiguous" in error for error in errors), errors)
+        finally:
+            self._execute_admin_sql(
+                'alter role "sqag_runtime" reset default_transaction_read_only'
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        unknown_parameter = f"sqag_h50_unknown_{uuid.uuid4().hex[:8]}.setting"
+        self._execute_admin_sql(
+            f'alter role "sqag_runtime" set {unknown_parameter} = \'on\''
+        )
+        try:
+            _, parameter_rows = self._execute_contract_query("effective_runtime_parameter_privileges")
+            unknown_row = next(
+                row for row in parameter_rows if row["parameter_name"] == unknown_parameter
+            )
+            self.assertEqual(
+                unknown_row["startup_defaults"],
+                [{"scope": "role_global", "precedence": 2, "setting": f"{unknown_parameter}=on"}],
+            )
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertIn(
+                f"runtime_parameter_startup_default_unclassified_{unknown_parameter}",
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(
+                f'alter role "sqag_runtime" reset {unknown_parameter}'
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        for safe_value in ("origin", "local"):
+            with self.subTest(h50_safe_session_replication=safe_value):
+                self._execute_admin_sql(
+                    f'alter role "sqag_runtime" set session_replication_role = {safe_value}'
+                )
+                try:
+                    self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+                finally:
+                    self._execute_admin_sql(
+                        'alter role "sqag_runtime" reset session_replication_role'
+                    )
+                self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
     def test_database_privilege_matrix_direct_public_membership_and_cross_substitution(self) -> None:
         self._alter_public_database_privilege("CONNECT", False)
         self._alter_public_database_privilege("TEMPORARY", False)

@@ -66,7 +66,19 @@ RUNTIME_ROLE_KEYS = frozenset(
     }
 )
 MIGRATOR_ROLE_KEYS = frozenset({"name", "description", "can_create_roles"})
-LEGACY_ROLE_KEYS = frozenset({"name", "description", "status"})
+LEGACY_ROLE_KEYS = frozenset({"name", "description", "status", "retained_attributes"})
+LEGACY_ROLE_ATTRIBUTE_KEYS = frozenset(
+    {
+        "login",
+        "superuser",
+        "createdb",
+        "createrole",
+        "replication",
+        "bypassrls",
+        "inherit",
+        "connection_limit",
+    }
+)
 PROVIDER_ROLE_KEYS = frozenset({"name", "description", "status"})
 RUNTIME_ROLE_ATTRIBUTE_KEYS = frozenset(
     {
@@ -274,7 +286,16 @@ DATABASE_ACL_EVIDENCE_ROW_KEYS = frozenset(
     {"database_name", "database_owner", "datacl", "acl_entries"}
 )
 TABLE_ACL_EVIDENCE_ROW_KEYS = frozenset(
-    {"schema_name", "relname", "relacl", "table_columns", "table_constraints", "index_contracts", "trigger_bindings"}
+    {
+        "schema_name",
+        "relname",
+        "relacl",
+        "table_columns",
+        "table_constraints",
+        "index_contracts",
+        "trigger_bindings",
+        "rule_bindings",
+    }
 )
 TABLE_STRUCTURE_COLUMN_KEYS = frozenset(
     {
@@ -297,6 +318,7 @@ TABLE_CONSTRAINT_EVIDENCE_KEYS = frozenset(
         "referenced_schema",
         "referenced_table",
         "referenced_columns",
+        "match_type",
         "update_action",
         "delete_action",
         "check_expression",
@@ -333,6 +355,27 @@ TRIGGER_BINDING_KEYS = frozenset(
         "level",
         "enabled",
         "when",
+    }
+)
+RULE_BINDING_KEYS = frozenset(
+    {
+        "rule_name",
+        "target_schema",
+        "target_relation",
+        "event",
+        "is_instead",
+        "enabled",
+        "definition",
+    }
+)
+SYSTEM_RELATION_ACL_EVIDENCE_ROW_KEYS = frozenset(
+    {
+        "schema_name",
+        "relation_name",
+        "relation_kind",
+        "current_acl_entries",
+        "initial_acl_entries",
+        "initial_privilege_types",
     }
 )
 STARTUP_DEFAULT_KEYS = frozenset({"scope", "precedence", "setting"})
@@ -399,8 +442,15 @@ PROVIDER_EXCEPTION_KEYS = frozenset(
     }
 )
 PARAMETER_PRIVILEGES_KEYS = frozenset(
-    {"runtime_role", "classified_runtime_privileges", "required_parameters", "rule"}
+    {
+        "runtime_role",
+        "classified_runtime_privileges",
+        "required_parameters",
+        "startup_default_policies",
+        "rule",
+    }
 )
+STARTUP_DEFAULT_POLICY_KEYS = frozenset({"posture", "allowed_values"})
 DEFAULT_PRIVILEGES_KEYS = frozenset(
     {"object_classes", "sqag_runtime", "sqag_migrator_to_sqag_app", "provider_controlled", "verification_rule"}
 )
@@ -425,6 +475,7 @@ VERIFICATION_QUERY_KEYS = frozenset(
         "effective_runtime_routine_privileges",
         "effective_runtime_parameter_privileges",
         "view_acl",
+        "system_relation_acl",
     }
 )
 
@@ -554,6 +605,14 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                                           )
                                           else '[]'::jsonb
                                       end,
+                                      'match_type', case
+                                          when constraint_row.contype = 'f' then case constraint_row.confmatchtype
+                                              when 'f' then 'FULL'
+                                              when 'p' then 'PARTIAL'
+                                              else 'SIMPLE'
+                                          end
+                                          else null
+                                      end,
                                       'update_action', case when constraint_row.contype = 'f' then constraint_row.confupdtype else 'a' end,
                                       'delete_action', case when constraint_row.contype = 'f' then constraint_row.confdeltype else 'a' end,
                                       'check_expression', case
@@ -681,6 +740,43 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                          and not t.tgisinternal
                    ) trigger_row
                ) as trigger_bindings
+               ,(
+                   select coalesce(
+                              jsonb_agg(
+                                  jsonb_build_object(
+                                      'rule_name', rule_row.rule_name,
+                                      'target_schema', rule_row.target_schema,
+                                      'target_relation', rule_row.target_relation,
+                                      'event', rule_row.event,
+                                      'is_instead', rule_row.is_instead,
+                                      'enabled', rule_row.enabled,
+                                      'definition', rule_row.definition
+                                  )
+                                  order by rule_row.rule_name, rule_row.rule_oid
+                              ),
+                              '[]'::jsonb
+                          )
+                   from (
+                       select rw.oid as rule_oid,
+                              rw.rulename as rule_name,
+                              target_namespace.nspname as target_schema,
+                              target_relation.relname as target_relation,
+                              case rw.ev_type
+                                  when '1' then 'SELECT'
+                                  when '2' then 'UPDATE'
+                                  when '3' then 'INSERT'
+                                  when '4' then 'DELETE'
+                                  else 'UNKNOWN'
+                              end as event,
+                              rw.is_instead,
+                              rw.ev_enabled as enabled,
+                              pg_catalog.pg_get_ruledef(rw.oid, true) as definition
+                       from pg_catalog.pg_rewrite rw
+                       join pg_catalog.pg_class target_relation on target_relation.oid = rw.ev_class
+                       join pg_catalog.pg_namespace target_namespace on target_namespace.oid = target_relation.relnamespace
+                       where rw.ev_class = c.oid
+                   ) rule_row
+               ) as rule_bindings
         from pg_catalog.pg_class c
         join pg_catalog.pg_namespace n on n.oid = c.relnamespace
         where c.relkind = 'r'
@@ -690,6 +786,81 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
               or c.relname = 'legacy_quote_artifacts_source'
           )
         order by n.nspname, c.relname
+    """,
+    "system_relation_acl": """
+        select n.nspname as schema_name,
+               c.relname as relation_name,
+               c.relkind as relation_kind,
+               coalesce(
+                   (
+                       select jsonb_agg(
+                                  jsonb_build_object(
+                                      'grantee', case when expanded.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'OID:' || expanded.grantee::text) end,
+                                      'grantor', coalesce(grantor_role.rolname, 'OID:' || expanded.grantor::text),
+                                      'privilege_type', expanded.privilege_type,
+                                      'is_grantable', expanded.is_grantable
+                                  )
+                                  order by expanded.grantee, expanded.grantor, expanded.privilege_type, expanded.is_grantable
+                              )
+                       from pg_catalog.aclexplode(c.relacl) expanded
+                       left join pg_catalog.pg_roles grantee_role
+                         on grantee_role.oid = expanded.grantee and expanded.grantee <> 0
+                       left join pg_catalog.pg_roles grantor_role
+                         on grantor_role.oid = expanded.grantor
+                   ),
+                   '[]'::jsonb
+               ) as current_acl_entries,
+               coalesce(
+                   (
+                       select jsonb_agg(
+                                  jsonb_build_object(
+                                      'grantee', case when expanded.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'OID:' || expanded.grantee::text) end,
+                                      'grantor', coalesce(grantor_role.rolname, 'OID:' || expanded.grantor::text),
+                                      'privilege_type', expanded.privilege_type,
+                                      'is_grantable', expanded.is_grantable
+                                  )
+                                  order by expanded.grantee, expanded.grantor, expanded.privilege_type, expanded.is_grantable
+                              )
+                       from pg_catalog.pg_init_privs init
+                       cross join lateral pg_catalog.aclexplode(init.initprivs) expanded
+                       left join pg_catalog.pg_roles grantee_role
+                         on grantee_role.oid = expanded.grantee and expanded.grantee <> 0
+                       left join pg_catalog.pg_roles grantor_role
+                         on grantor_role.oid = expanded.grantor
+                       where init.classoid = 'pg_class'::regclass
+                         and init.objoid = c.oid
+                         and init.objsubid = 0
+                         and init.privtype in ('i', 'e')
+                   ),
+                   '[]'::jsonb
+               ) as initial_acl_entries,
+               coalesce(
+                   (
+                       select jsonb_agg(init.privtype order by init.privtype)
+                       from pg_catalog.pg_init_privs init
+                       where init.classoid = 'pg_class'::regclass
+                         and init.objoid = c.oid
+                         and init.objsubid = 0
+                         and init.privtype in ('i', 'e')
+                   ),
+                   '[]'::jsonb
+               ) as initial_privilege_types
+        from pg_catalog.pg_class c
+        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+        where n.nspname = 'pg_catalog'
+          and (
+              c.relacl is not null
+              or exists (
+                  select 1
+                  from pg_catalog.pg_init_privs init
+                  where init.classoid = 'pg_class'::regclass
+                    and init.objoid = c.oid
+                    and init.objsubid = 0
+                    and init.privtype in ('i', 'e')
+              )
+          )
+          and c.relkind in ('r', 'p', 'f', 'v', 'm', 'S')
+        order by n.nspname, c.relname, c.relkind
     """,
     "routine_acl": """
         select n.nspname as schema_name,
@@ -1080,6 +1251,37 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
             from pg_catalog.pg_parameter_acl
             union
             select 'session_replication_role'::text as parameter_name
+            union
+            select split_part(startup_parameter.setting, '=', 1) as parameter_name
+            from (
+                select database_setting.setting
+                from pg_catalog.pg_db_role_setting setting_row
+                join pg_catalog.pg_database d
+                  on d.oid = setting_row.setdatabase
+                 and d.datname = current_database(),
+                     unnest(coalesce(setting_row.setconfig, array[]::text[])) as database_setting(setting)
+                where setting_row.setrole = 0
+                union all
+                select role_setting.setting
+                from pg_catalog.pg_db_role_setting setting_row
+                join pg_catalog.pg_roles role_row
+                  on role_row.oid = setting_row.setrole
+                 and role_row.rolname = 'sqag_runtime',
+                     unnest(coalesce(setting_row.setconfig, array[]::text[])) as role_setting(setting)
+                where setting_row.setdatabase = 0
+                union all
+                select database_role_setting.setting
+                from pg_catalog.pg_db_role_setting setting_row
+                join pg_catalog.pg_database d
+                  on d.oid = setting_row.setdatabase
+                 and d.datname = current_database()
+                join pg_catalog.pg_roles role_row
+                  on role_row.oid = setting_row.setrole
+                 and role_row.rolname = 'sqag_runtime',
+                     unnest(coalesce(setting_row.setconfig, array[]::text[])) as database_role_setting(setting)
+                where setting_row.setdatabase <> 0
+                  and setting_row.setrole <> 0
+            ) startup_parameter
         ) parameter_names
         left join pg_catalog.pg_parameter_acl parameter_acl
           on parameter_acl.parname = parameter_names.parameter_name
@@ -1546,6 +1748,8 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "pg_catalog.pg_attrdef",
         "pg_catalog.pg_constraint",
         "pg_catalog.pg_trigger",
+        "pg_catalog.pg_rewrite",
+        "pg_catalog.pg_get_ruledef",
         "pg_catalog.pg_get_function_identity_arguments",
         "pg_catalog.pg_index",
         "pg_catalog.pg_get_expr",
@@ -1573,8 +1777,14 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "is_constraint_backed",
         "is_validated",
         "convalidated",
+        "confmatchtype",
         "conindid",
         "trigger_bindings",
+        "rule_bindings",
+        "rule_name",
+        "event",
+        "is_instead",
+        "definition",
         "trigger_name",
         "target_relation",
         "function_schema",
@@ -1605,6 +1815,8 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "indnkeyatts",
         "indnatts",
         "indpred",
+        "ev_class",
+        "ev_type",
         "'public'",
         "'legacy_quote_artifacts_source'",
         "order by",
@@ -1813,6 +2025,30 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "has_table_privilege",
         "runtime_select",
         "runtime_select_grantable",
+        "order by",
+    ),
+    "system_relation_acl": (
+        "pg_catalog.pg_class",
+        "pg_catalog.pg_namespace",
+        "pg_catalog.pg_roles",
+        "pg_catalog.pg_init_privs",
+        "pg_catalog.aclexplode",
+        "jsonb_agg",
+        "jsonb_build_object",
+        "cross join lateral",
+        "current_acl_entries",
+        "initial_acl_entries",
+        "initial_privilege_types",
+        "relacl",
+        "relkind",
+        "classoid",
+        "objoid",
+        "objsubid",
+        "initprivs",
+        "privtype",
+        "'pg_class'",
+        "regclass",
+        "pg_catalog",
         "order by",
     ),
 }
@@ -2238,6 +2474,25 @@ def validate_roles(manifest: dict[str, Any], errors: list[str]) -> None:
         _exact_value(legacy.get("name"), "sqag_app", "legacy_role_name", errors)
         _exact_value(legacy.get("description"), ROLE_DESCRIPTIONS["legacy"], "legacy_role_description", errors)
         _exact_value(legacy.get("status"), "retained_until_retirement", "legacy_role_status", errors)
+        retained_attributes = legacy.get("retained_attributes")
+        if _exact_keys(retained_attributes, LEGACY_ROLE_ATTRIBUTE_KEYS, "legacy_retained_attributes", errors):
+            expected_retained_attributes = {
+                "login": True,
+                "superuser": False,
+                "createdb": False,
+                "createrole": False,
+                "replication": False,
+                "bypassrls": False,
+                "inherit": True,
+                "connection_limit": -1,
+            }
+            for key, expected in expected_retained_attributes.items():
+                _exact_value(
+                    retained_attributes.get(key),
+                    expected,
+                    f"legacy_retained_attribute_{key}",
+                    errors,
+                )
 
     provider = roles.get("provider") if isinstance(roles, dict) else None
     if _exact_keys(provider, PROVIDER_ROLE_KEYS, "provider_role", errors):
@@ -3236,6 +3491,7 @@ def _structural_constraint(
     referenced_schema: str | None = None,
     referenced_table: str | None = None,
     referenced_columns: list[str] | None = None,
+    match_type: str | None = None,
     update_action: str = "a",
     delete_action: str = "a",
     check_expression: str | None = None,
@@ -3250,6 +3506,7 @@ def _structural_constraint(
         "referenced_schema": referenced_schema,
         "referenced_table": referenced_table,
         "referenced_columns": [] if referenced_columns is None else list(referenced_columns),
+        "match_type": match_type,
         "update_action": update_action,
         "delete_action": delete_action,
         "check_expression": check_expression,
@@ -3271,6 +3528,7 @@ def _structural_reference_constraint(
         tuple(tokens), reference_index + 1, f"migration_{table_name}_reference"
     )
     referenced_columns: list[str] = []
+    match_type = "SIMPLE"
     if cursor < len(tokens) and tokens[cursor].value == "(":
         referenced_columns, cursor = _structural_identifier_list(
             tokens, cursor, f"migration_{table_name}_referenced_column"
@@ -3280,6 +3538,12 @@ def _structural_reference_constraint(
     is_deferrable = False
     is_deferred = False
     while cursor < len(tokens):
+        if _token_is_word(tokens[cursor], "match") and cursor + 1 < len(tokens):
+            candidate = tokens[cursor + 1].value.lower()
+            if candidate in {"simple", "full", "partial"}:
+                match_type = candidate.upper()
+                cursor += 2
+                continue
         if _token_is_word(tokens[cursor], "on") and cursor + 1 < len(tokens):
             action_kind = tokens[cursor + 1].value.lower()
             if action_kind in {"update", "delete"}:
@@ -3319,6 +3583,7 @@ def _structural_reference_constraint(
             referenced_schema="public",
             referenced_table=referenced_table,
             referenced_columns=referenced_columns,
+            match_type=match_type,
             update_action=update_action,
             delete_action=delete_action,
             is_deferrable=is_deferrable,
@@ -3624,6 +3889,99 @@ def _structural_parse_index(
     }
 
 
+def _structural_parse_rule(
+    tokens: tuple[SQLToken, ...], rules: dict[str, list[dict[str, Any]]]
+) -> None:
+    create_index = next(
+        (
+            index
+            for index in range(len(tokens) - 1)
+            if _token_is_word(tokens[index], "create")
+            and _token_is_word(tokens[index + 1], "rule")
+        ),
+        None,
+    )
+    if create_index is None:
+        create_index = next(
+            (
+                index
+                for index in range(len(tokens) - 3)
+                if _token_is_word(tokens[index], "create")
+                and _token_is_word(tokens[index + 1], "or")
+                and _token_is_word(tokens[index + 2], "replace")
+                and _token_is_word(tokens[index + 3], "rule")
+            ),
+            None,
+        )
+    if create_index is None:
+        return
+    cursor = create_index + (4 if _token_is_word(tokens[create_index + 1], "or") else 2)
+    if cursor + 2 < len(tokens) and all(
+        _token_is_word(tokens[cursor + offset], word)
+        for offset, word in enumerate(("if", "not", "exists"))
+    ):
+        cursor += 3
+    if cursor >= len(tokens):
+        raise ValueError("migration_rule_name_missing")
+    rule_name = _migration_identifier(tokens[cursor], "migration_rule_name")
+    as_index = next(
+        (index for index in range(cursor + 1, len(tokens)) if _token_is_word(tokens[index], "as")),
+        None,
+    )
+    if as_index is None:
+        raise ValueError(f"migration_{rule_name}_rule_as_missing")
+    event_index = next(
+        (
+            index
+            for index in range(as_index + 1, len(tokens))
+            if tokens[index].kind == "WORD"
+            and tokens[index].value.upper() in {"SELECT", "INSERT", "UPDATE", "DELETE"}
+        ),
+        None,
+    )
+    if event_index is None:
+        raise ValueError(f"migration_{rule_name}_rule_event_missing")
+    event = tokens[event_index].value.upper()
+    to_index = next(
+        (index for index in range(event_index + 1, len(tokens)) if _token_is_word(tokens[index], "to")),
+        None,
+    )
+    if to_index is None:
+        raise ValueError(f"migration_{rule_name}_rule_target_missing")
+    target_relation, target_cursor = _migration_table_identity(
+        tokens, to_index + 1, f"migration_{rule_name}_rule_target"
+    )
+    do_index = next(
+        (index for index in range(target_cursor, len(tokens)) if _token_is_word(tokens[index], "do")),
+        None,
+    )
+    if do_index is None or do_index + 1 >= len(tokens):
+        raise ValueError(f"migration_{rule_name}_rule_action_missing")
+    action_cursor = do_index + 1
+    is_instead = False
+    if _token_is_word(tokens[action_cursor], "instead"):
+        is_instead = True
+        action_cursor += 1
+    action = _normalise_structural_tokens(tokens[action_cursor:])
+    if not action:
+        raise ValueError(f"migration_{rule_name}_rule_action_empty")
+    definition = _normalise_structural_sql(
+        f"create rule {rule_name} as on {event.lower()} to public.{target_relation} do "
+        f"{'instead ' if is_instead else ''}{action}"
+    )
+    rules.setdefault(target_relation, []).append(
+        {
+            "rule_name": rule_name,
+            "target_schema": "public",
+            "target_relation": target_relation,
+            "event": event,
+            "is_instead": is_instead,
+            "enabled": "O",
+            "definition": definition,
+        }
+    )
+
+
 def _structural_parse_function(
     tokens: tuple[SQLToken, ...], routines: dict[tuple[str, str, str, str], dict[str, Any]]
 ) -> None:
@@ -3798,6 +4156,7 @@ def _cached_classified_table_structure_contract() -> dict[str, Any]:
     indexes: dict[str, dict[str, Any]] = {}
     routines: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     triggers: dict[str, dict[str, Any]] = {}
+    rules: dict[str, list[dict[str, Any]]] = {}
     sources = [
         migration.path.read_text(encoding="utf-8")
         for migration in migration_manifest(ROOT / "migrations")
@@ -3808,6 +4167,7 @@ def _cached_classified_table_structure_contract() -> dict[str, Any]:
             _structural_parse_create_table(statement, structure)
             _structural_parse_alter_table(statement, structure)
             _structural_parse_index(statement, indexes)
+            _structural_parse_rule(statement, rules)
             _structural_parse_function(statement, routines)
             _structural_parse_trigger(statement, triggers)
     if set(structure) != ALL_TABLES:
@@ -3838,9 +4198,12 @@ def _cached_classified_table_structure_contract() -> dict[str, Any]:
                 tuple(entry["columns"]),
                 entry["referenced_table"] or "",
                 tuple(entry["referenced_columns"]),
+                entry.get("match_type") or "",
                 entry["check_expression"] or "",
             )
         )
+    for table_name, table_rules in rules.items():
+        table_rules.sort(key=lambda entry: (entry["rule_name"], entry["event"], entry["definition"]))
     if set(routines) != {
         ("public", "sqag_reject_immutable_change", "", "f"),
         ("public", "sqag_require_retention_delete_authorization", "", "f"),
@@ -3859,6 +4222,7 @@ def _cached_classified_table_structure_contract() -> dict[str, Any]:
         "indexes": dict(sorted(indexes.items())),
         "routines": dict(sorted(routines.items())),
         "triggers": dict(sorted(triggers.items())),
+        "rules": {table_name: list(table_rules) for table_name, table_rules in sorted(rules.items())},
     }
 
 
@@ -3867,16 +4231,12 @@ def classified_table_structure_contract() -> dict[str, Any]:
 
     return _cached_classified_table_structure_contract()
 
-def _normalise_constraint_expression(value: Any) -> str:
+def _normalise_structural_expression(value: Any) -> str:
+    """Normalize catalogue presentation without erasing executable semantics."""
+
     if type(value) is not str:
         return ""
-    without_catalog_casts = re.sub(
-        r"::\s*[a-z_][a-z0-9_.]*(?:\s*\[\s*\])?",
-        "",
-        value,
-        flags=re.IGNORECASE,
-    )
-    normalised = _normalise_structural_sql(without_catalog_casts)
+    normalised = _normalise_structural_sql(value)
     normalised = re.sub(r"\s*([\[\]])\s*", r"\1", normalised)
     normalised = re.sub(r"\s*([(),])\s*", r"\1", normalised)
     normalised = re.sub(
@@ -3890,23 +4250,44 @@ def _normalise_constraint_expression(value: Any) -> str:
     normalised = normalised.replace("]", ")")
     return _normalise_structural_sql(normalised)
 
+def _normalise_catalogue_structural_expression(value: Any) -> str:
+    """Normalize only PostgreSQL's implicit text-literal catalogue decoration."""
+
+    normalised = _normalise_structural_expression(value)
+    return re.sub(
+        r"('(?:''|[^'])*')\s*::\s*(?:pg_catalog\.)?text\b",
+        r"\1",
+        normalised,
+        flags=re.IGNORECASE,
+    )
+
 def _normalise_routine_definition(value: Any) -> str:
     """Normalize executable routine text without stripping casts."""
 
     return _normalise_structural_sql(value)
-def _constraint_signature(entry: dict[str, Any]) -> tuple[Any, ...]:
+def _constraint_signature(
+    entry: dict[str, Any],
+    *,
+    catalogue: bool = False,
+) -> tuple[Any, ...]:
     columns = tuple(entry.get("columns", []))
     if entry.get("constraint_type") == "c":
         columns = tuple(sorted(columns))
+    expression_normaliser = (
+        _normalise_catalogue_structural_expression
+        if catalogue
+        else _normalise_structural_expression
+    )
     return (
         entry.get("constraint_type"),
         columns,
         entry.get("referenced_schema"),
         entry.get("referenced_table"),
         tuple(entry.get("referenced_columns", [])),
+        entry.get("match_type"),
         entry.get("update_action"),
         entry.get("delete_action"),
-        _normalise_constraint_expression(entry.get("check_expression")),
+        expression_normaliser(entry.get("check_expression")),
         bool(entry.get("is_deferrable")),
         bool(entry.get("is_deferred")),
         bool(entry.get("is_validated")),
@@ -3996,6 +4377,12 @@ def _validate_table_structure_evidence(
             for key in ("referenced_schema", "referenced_table", "check_expression"):
                 if constraint.get(key) is not None and type(constraint.get(key)) is not str:
                     _add_error(errors, f"{constraint_label}_{key}_must_be_string_or_null")
+            match_type = constraint.get("match_type")
+            if constraint.get("constraint_type") == "f":
+                if match_type not in {"SIMPLE", "FULL", "PARTIAL"}:
+                    _add_error(errors, f"{constraint_label}_match_type_invalid")
+            elif match_type is not None:
+                _add_error(errors, f"{constraint_label}_non_foreign_match_type_must_be_null")
             for key in ("update_action", "delete_action"):
                 if constraint.get(key) not in {"a", "r", "c", "n", "d"}:
                     _add_error(errors, f"{constraint_label}_{key}_invalid")
@@ -4048,10 +4435,20 @@ def _validate_table_structure_evidence(
                     errors,
                     f"table_structural_trigger_binding_target_mismatch_{table_name}",
                 )
+        rule_bindings = _validate_rule_bindings(
+            row.get("rule_bindings"), f"{label}_rule_bindings", errors
+        )
+        for binding in rule_bindings:
+            if binding["target_schema"] != schema_name or binding["target_relation"] != table_name:
+                _add_error(
+                    errors,
+                    f"table_structural_rule_binding_target_mismatch_{table_name}",
+                )
         observed_tables[table_name] = {
             "columns": observed_columns,
             "constraints": observed_constraints,
             "trigger_bindings": trigger_bindings,
+            "rule_bindings": rule_bindings,
         }
     for table_name, expected_table in expected_tables.items():
         observed = observed_tables.get(table_name)
@@ -4070,7 +4467,7 @@ def _validate_table_structure_evidence(
                 value["type_modifier"],
                 value["is_dropped"],
                 value["is_nullable"],
-                _normalise_constraint_expression(value["default_expression"]) if value["default_expression"] is not None else None,
+                _normalise_catalogue_structural_expression(value["default_expression"]) if value["default_expression"] is not None else None,
             )
             for value in actual_columns
         ]
@@ -4084,14 +4481,14 @@ def _validate_table_structure_evidence(
                 value["type_modifier"],
                 value["is_dropped"],
                 value["is_nullable"],
-                _normalise_constraint_expression(value["default_expression"]) if value["default_expression"] is not None else None,
+                _normalise_structural_expression(value["default_expression"]) if value["default_expression"] is not None else None,
             )
             for value in expected_columns
         ]
         if actual_column_signature != expected_column_signature:
             _add_error(errors, f"table_structural_column_contract_mismatch_{table_name}")
         actual_constraints = sorted(
-            (_constraint_signature(value) for value in observed["constraints"]),
+            (_constraint_signature(value, catalogue=True) for value in observed["constraints"]),
             key=repr,
         )
         expected_constraints = sorted(
@@ -4115,6 +4512,19 @@ def _validate_table_structure_evidence(
         )
         if actual_trigger_bindings != expected_trigger_bindings:
             _add_error(errors, f"table_structural_trigger_binding_contract_mismatch_{table_name}")
+        actual_rule_bindings = sorted(
+            (_rule_binding_signature(binding) for binding in observed["rule_bindings"]),
+            key=repr,
+        )
+        expected_rule_bindings = sorted(
+            (
+                _rule_binding_signature(rule)
+                for rule in expected["rules"].get(table_name, [])
+            ),
+            key=repr,
+        )
+        if actual_rule_bindings != expected_rule_bindings:
+            _add_error(errors, f"table_structural_rule_binding_contract_mismatch_{table_name}")
     for index_name, expected_index in expected["indexes"].items():
         actual_index = observed_indexes.get(index_name)
         if actual_index is None:
@@ -4130,8 +4540,8 @@ def _validate_table_structure_evidence(
         actual_included = [_normalise_structural_sql(value) for value in actual_index.get("included_columns", [])]
         if actual_included != expected_index.get("included_columns", []):
             _add_error(errors, f"table_structural_index_{index_name}_included_columns_mismatch")
-        actual_predicate = _normalise_constraint_expression(actual_index.get("predicate"))
-        expected_predicate = _normalise_constraint_expression(expected_index.get("predicate"))
+        actual_predicate = _normalise_structural_expression(actual_index.get("predicate"))
+        expected_predicate = _normalise_structural_expression(expected_index.get("predicate"))
         if actual_predicate != expected_predicate:
             _add_error(errors, f"table_structural_index_{index_name}_predicate_mismatch")
 
@@ -5075,6 +5485,86 @@ def _is_postgresql_system_schema(schema_name: str) -> bool:
     )
 
 
+def _validate_system_relation_acl_evidence(
+    rows: list[dict[str, Any]] | None,
+    errors: list[str],
+    *,
+    runtime_role: str,
+) -> None:
+    if type(rows) is not list:
+        _add_error(errors, "system_relation_acl_evidence_must_be_list")
+        return
+    relation_privileges = tuple(VIEW_RELATION_PRIVILEGES) + ("USAGE",)
+    seen_relations: set[tuple[str, str, str]] = set()
+    previous_identity: tuple[str, str, str] | None = None
+    for index, row in enumerate(rows):
+        label = f"system_relation_acl_row_{index}"
+        if not isinstance(row, dict):
+            _add_error(errors, f"{label}_must_be_object")
+            continue
+        if not _exact_keys(row, SYSTEM_RELATION_ACL_EVIDENCE_ROW_KEYS, label, errors):
+            continue
+        schema_name = row.get("schema_name")
+        relation_name = row.get("relation_name")
+        relation_kind = row.get("relation_kind")
+        for key in ("schema_name", "relation_name", "relation_kind"):
+            _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
+        if any(type(row.get(key)) is not str for key in ("schema_name", "relation_name", "relation_kind")):
+            continue
+        if not _is_postgresql_system_schema(schema_name):
+            _add_error(errors, f"{label}_non_system_namespace")
+        if relation_kind not in {"r", "p", "f", "v", "m", "S"}:
+            _add_error(errors, f"{label}_relation_kind_invalid_{relation_kind}")
+        identity = (schema_name, relation_name, relation_kind)
+        if previous_identity is not None and identity < previous_identity:
+            _add_error(errors, f"{label}_ordering_not_deterministic")
+        previous_identity = identity
+        if identity in seen_relations:
+            _add_error(errors, f"{label}_duplicate")
+        seen_relations.add(identity)
+        current_entries = _validate_runtime_acl_entries(
+            row.get("current_acl_entries"),
+            f"{label}_current_acl_entries",
+            errors,
+            relation_privileges,
+        )
+        initial_entries = _validate_runtime_acl_entries(
+            row.get("initial_acl_entries"),
+            f"{label}_initial_acl_entries",
+            errors,
+            relation_privileges,
+        )
+        initial_types = row.get("initial_privilege_types")
+        if type(initial_types) is not list or any(type(value) is not str for value in initial_types):
+            _add_error(errors, f"{label}_initial_privilege_types_must_be_string_list")
+            initial_types = []
+        if initial_types and initial_types != sorted(set(initial_types)):
+            _add_error(errors, f"{label}_initial_privilege_types_not_deterministic")
+        if any(value not in {"i", "e"} for value in initial_types):
+            _add_error(errors, f"{label}_initial_privilege_types_invalid")
+        if not initial_types:
+            _add_error(errors, f"{label}_initial_privilege_baseline_missing")
+        if initial_types and not initial_entries:
+            _add_error(errors, f"{label}_initial_privilege_baseline_empty")
+        if any(
+            grantee.startswith("OID:") or grantor.startswith("OID:")
+            for grantee, grantor, _privilege, _grantable in current_entries + initial_entries
+        ):
+            _add_error(errors, f"{label}_acl_identity_provenance_uninterpretable")
+        baseline = set(initial_entries)
+        for grantee, _grantor, privilege, is_grantable in current_entries:
+            if is_grantable and grantee in {runtime_role, "PUBLIC"}:
+                _add_error(
+                    errors,
+                    f"system_relation_acl_grant_option_forbidden_{grantee}_{privilege.lower()}_{schema_name}.{relation_name}",
+                )
+            if (grantee, _grantor, privilege, is_grantable) not in baseline and grantee in {runtime_role, "PUBLIC"}:
+                _add_error(
+                    errors,
+                    f"system_relation_acl_exceptional_{grantee}_{privilege.lower()}_{schema_name}.{relation_name}",
+                )
+
+
 def _validate_trigger_bindings(
     value: Any,
     label: str,
@@ -5340,6 +5830,7 @@ def evaluate_parameter_authority(
 ) -> tuple[str, ...]:
     errors: list[str] = []
     parameter_contract = manifest.get("parameter_privileges")
+    startup_default_policies: dict[str, dict[str, Any]] = {}
     if not isinstance(parameter_contract, dict):
         _add_error(errors, "parameter_privilege_manifest_must_be_object")
         required_parameters: list[str] = []
@@ -5358,6 +5849,37 @@ def evaluate_parameter_authority(
             required_parameters = []
         else:
             required_parameters = list(required_parameters_value)
+        policy_value = parameter_contract.get("startup_default_policies")
+        if type(policy_value) is not dict:
+            _add_error(errors, "parameter_startup_default_policies_must_be_object")
+        else:
+            for policy_name, policy in policy_value.items():
+                policy_label = f"parameter_startup_default_policy_{policy_name}"
+                if type(policy_name) is not str or not policy_name.strip():
+                    _add_error(errors, f"{policy_label}_name_invalid")
+                    continue
+                if not _exact_keys(policy, STARTUP_DEFAULT_POLICY_KEYS, policy_label, errors):
+                    continue
+                posture = policy.get("posture")
+                allowed_values = policy.get("allowed_values")
+                if posture not in {"allowed_values", "no_startup_default"}:
+                    _add_error(errors, f"{policy_label}_posture_invalid")
+                    continue
+                if type(allowed_values) is not list or any(
+                    type(value) is not str or not value.strip() for value in allowed_values
+                ):
+                    _add_error(errors, f"{policy_label}_allowed_values_must_be_string_list")
+                    continue
+                if posture == "allowed_values" and not allowed_values:
+                    _add_error(errors, f"{policy_label}_allowed_values_must_be_non_empty")
+                    continue
+                if posture == "no_startup_default" and allowed_values:
+                    _add_error(errors, f"{policy_label}_no_startup_default_must_have_no_values")
+                    continue
+                startup_default_policies[policy_name] = {
+                    "posture": posture,
+                    "allowed_values": tuple(value.strip().lower() for value in allowed_values),
+                }
     if type(parameter_privilege_rows) is not list:
         _add_error(errors, "runtime_parameter_privilege_evidence_must_be_list")
         return tuple(errors)
@@ -5420,19 +5942,38 @@ def evaluate_parameter_authority(
             _add_error(errors, f"runtime_parameter_set_grant_option_forbidden_{parameter_name}")
         if row["alter_system_grantable"]:
             _add_error(errors, f"runtime_parameter_alter_system_grant_option_forbidden_{parameter_name}")
-        if parameter_name == "session_replication_role" and startup_defaults:
-            highest_precedence = max(entry["precedence"] for entry in startup_defaults)
-            highest = [
-                entry for entry in startup_defaults if entry["precedence"] == highest_precedence
-            ]
-            settings = {entry["setting"].split("=", 1)[1].lower() for entry in highest}
-            if len(settings) != 1:
-                _add_error(errors, f"{label}_startup_default_ambiguous")
-            elif settings != {"origin"} and settings != {"local"}:
-                _add_error(
-                    errors,
-                    f"runtime_parameter_unsafe_startup_default_session_replication_role_{sorted(settings)}",
-                )
+        if startup_defaults:
+            policy = startup_default_policies.get(parameter_name)
+            if policy is None:
+                _add_error(errors, f"runtime_parameter_startup_default_unclassified_{parameter_name}")
+            else:
+                highest_precedence = max(entry["precedence"] for entry in startup_defaults)
+                highest = [
+                    entry for entry in startup_defaults if entry["precedence"] == highest_precedence
+                ]
+                if len(highest) != 1:
+                    _add_error(errors, f"{label}_startup_default_ambiguous")
+                else:
+                    setting = highest[0]["setting"]
+                    if "=" not in setting:
+                        continue
+                    setting_value = setting.split("=", 1)[1].strip().lower()
+                    if policy["posture"] == "no_startup_default":
+                        _add_error(
+                            errors,
+                            f"runtime_parameter_startup_default_forbidden_{parameter_name}",
+                        )
+                    elif setting_value not in policy["allowed_values"]:
+                        if parameter_name == "session_replication_role":
+                            _add_error(
+                                errors,
+                                f"runtime_parameter_unsafe_startup_default_session_replication_role_{[setting_value]}",
+                            )
+                        else:
+                            _add_error(
+                                errors,
+                                f"runtime_parameter_unsafe_startup_default_{parameter_name}_{setting_value}",
+                            )
     missing = set(required_parameters) - seen_parameters
     if missing:
         _add_error(errors, f"runtime_parameter_required_evidence_missing_{sorted(missing)}")
@@ -5903,8 +6444,57 @@ def _trigger_binding_signature(binding: dict[str, Any]) -> tuple[Any, ...]:
         tuple(binding.get("update_columns", [])),
         binding.get("level"),
         binding.get("enabled"),
-        _normalise_constraint_expression(binding.get("when")),
+        _normalise_structural_expression(binding.get("when")),
     )
+
+
+def _rule_binding_signature(binding: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        binding.get("rule_name"),
+        binding.get("target_schema"),
+        binding.get("target_relation"),
+        binding.get("event"),
+        bool(binding.get("is_instead")),
+        binding.get("enabled"),
+        _normalise_structural_sql(binding.get("definition", "")),
+    )
+
+
+def _validate_rule_bindings(
+    value: Any,
+    label: str,
+    errors: list[str],
+) -> list[dict[str, Any]]:
+    if type(value) is not list:
+        _add_error(errors, f"{label}_must_be_list")
+        return []
+    bindings: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, binding in enumerate(value):
+        binding_label = f"{label}_{index}"
+        if not isinstance(binding, dict):
+            _add_error(errors, f"{binding_label}_must_be_object")
+            continue
+        if not _exact_keys(binding, RULE_BINDING_KEYS, binding_label, errors):
+            continue
+        for key in ("rule_name", "target_schema", "target_relation", "event", "enabled", "definition"):
+            _require_non_empty_string(binding.get(key), f"{binding_label}_{key}", errors)
+        _require_type(binding.get("is_instead"), bool, f"{binding_label}_is_instead", errors)
+        if any(
+            type(binding.get(key)) is not str
+            for key in ("rule_name", "target_schema", "target_relation", "event", "enabled", "definition")
+        ) or type(binding.get("is_instead")) is not bool:
+            continue
+        identity = (binding["rule_name"], binding["event"])
+        if identity in seen:
+            _add_error(errors, f"{binding_label}_duplicate")
+        seen.add(identity)
+        if binding["event"] not in {"SELECT", "INSERT", "UPDATE", "DELETE"}:
+            _add_error(errors, f"{binding_label}_event_invalid")
+        if binding["enabled"] not in {"O", "D", "R", "A"}:
+            _add_error(errors, f"{binding_label}_enabled_invalid")
+        bindings.append(dict(binding))
+    return bindings
 
 
 def _validate_routine_structural_evidence(
@@ -6073,6 +6663,42 @@ def _validate_database_acl_evidence(
                 _add_error(errors, "database_acl_public_connect_grant_option_forbidden")
     elif public_connect:
         _add_error(errors, "database_acl_public_connect_forbidden")
+    migrator_contract = (
+        manifest.get("database_acl", {}).get("sqag_migrator", {})
+        if isinstance(manifest, dict)
+        and isinstance(manifest.get("database_acl"), dict)
+        and isinstance(manifest.get("database_acl", {}).get("sqag_migrator"), dict)
+        else {"connect": True, "create": True, "temporary": True}
+    )
+    for manifest_key, privilege in (
+        ("connect", "CONNECT"),
+        ("create", "CREATE"),
+        ("temporary", "TEMPORARY"),
+    ):
+        if migrator_contract.get(manifest_key) is not True:
+            _add_error(errors, f"database_acl_migrator_manifest_{manifest_key}_must_be_true")
+            continue
+        direct_migrator = [
+            entry
+            for entry in entries
+            if entry[0] == "sqag_migrator" and entry[2] == privilege
+        ]
+        if len(direct_migrator) != 1:
+            _add_error(
+                errors,
+                f"database_acl_migrator_{privilege.lower()}_direct_evidence_missing_or_duplicate",
+            )
+        else:
+            if direct_migrator[0][1] != owner:
+                _add_error(
+                    errors,
+                    f"database_acl_migrator_{privilege.lower()}_grantor_invalid_expected_{owner}_got_{direct_migrator[0][1]}",
+                )
+            if direct_migrator[0][3]:
+                _add_error(
+                    errors,
+                    f"database_acl_migrator_{privilege.lower()}_grant_option_forbidden",
+                )
     direct_connect = [
         entry for entry in entries if entry[0] == runtime_role and entry[2] == "CONNECT"
     ]
@@ -6165,7 +6791,21 @@ def _validate_role_attribute_evidence(
             "password_is_null",
         }
     )
-    required = {"sqag_runtime", "sqag_migrator"}
+    legacy_contract = (
+        manifest.get("roles", {}).get("legacy", {})
+        if isinstance(manifest.get("roles"), dict)
+        else {}
+    )
+    legacy_name = legacy_contract.get("name")
+    if type(legacy_name) is not str or not legacy_name.strip():
+        _add_error(errors, "legacy_role_name_missing_for_role_evidence")
+        legacy_name = "sqag_app"
+    if legacy_contract.get("status") != "retained_until_retirement":
+        _add_error(errors, "legacy_role_status_not_explicitly_retained")
+    retained_attributes = legacy_contract.get("retained_attributes")
+    if not _exact_keys(retained_attributes, LEGACY_ROLE_ATTRIBUTE_KEYS, "legacy_retained_attributes_evidence", errors):
+        retained_attributes = {}
+    required = {"sqag_runtime", "sqag_migrator", legacy_name}
     seen: set[str] = set()
     for index, row in enumerate(rows):
         label = f"role_attribute_row_{index}"
@@ -6227,7 +6867,21 @@ def _validate_role_attribute_evidence(
             for key, expected in expected_values.items():
                 if type(expected) is not type(row[key]) or row[key] != expected:
                     _add_error(errors, f"{label}_{key}_mismatch")
-        if role_name in {"sqag_runtime", "sqag_migrator"}:
+        if role_name == legacy_name:
+            expected_values = {
+                "rolcanlogin": retained_attributes.get("login"),
+                "rolsuper": retained_attributes.get("superuser"),
+                "rolcreatedb": retained_attributes.get("createdb"),
+                "rolcreaterole": retained_attributes.get("createrole"),
+                "rolreplication": retained_attributes.get("replication"),
+                "rolbypassrls": retained_attributes.get("bypassrls"),
+                "rolinherit": retained_attributes.get("inherit"),
+                "rolconnlimit": retained_attributes.get("connection_limit"),
+            }
+            for key, expected in expected_values.items():
+                if type(expected) is not type(row[key]) or row[key] != expected:
+                    _add_error(errors, f"{label}_{key}_mismatch")
+        if role_name in {"sqag_runtime", "sqag_migrator", legacy_name}:
             for key in ("rolsuper", "rolcreaterole", "rolcreatedb", "rolreplication", "rolbypassrls"):
                 if row[key]:
                     _add_error(errors, f"{label}_{key}_privileged_forbidden")
@@ -6277,7 +6931,7 @@ def evaluate_final_runtime_authority(
     runtime_role: str = "sqag_runtime",
     enforce_production_identity: bool = True,
 ) -> tuple[str, ...]:
-    """Evaluate the complete fifteen-query exact-state evidence packet."""
+    """Evaluate the complete sixteen-query exact-state evidence packet."""
 
     errors: list[str] = []
     if not isinstance(evidence, dict):
@@ -6344,6 +6998,11 @@ def evaluate_final_runtime_authority(
     routine_acl_evidence = _validate_routine_acl_evidence(
         collections["routine_acl"],
         errors,
+    )
+    _validate_system_relation_acl_evidence(
+        collections["system_relation_acl"],
+        errors,
+        runtime_role=runtime_role,
     )
     _validate_routine_structural_evidence(routine_acl_evidence, errors)
     return tuple(errors)
@@ -6510,7 +7169,38 @@ def validate_parameter_privileges(manifest: dict[str, Any], errors: list[str]) -
     _exact_value(parameter_privileges.get("runtime_role"), "sqag_runtime", "parameter_runtime_role", errors)
     _check_exact_string_list(parameter_privileges.get("classified_runtime_privileges"), [], "parameter_classified_runtime_privileges", errors)
     _check_exact_string_list(parameter_privileges.get("required_parameters"), ["session_replication_role"], "parameter_required_parameters", errors)
-    _exact_value(parameter_privileges.get("rule"), "No effective SET or ALTER SYSTEM authority, or corresponding grant option, is classified for sqag_runtime; every PostgreSQL parameter is enumerated and any such authority fails closed.", "parameter_privilege_rule", errors)
+    startup_default_policies = parameter_privileges.get("startup_default_policies")
+    expected_startup_default_policies = {
+        "default_transaction_read_only": {
+            "posture": "allowed_values",
+            "allowed_values": ["off"],
+        },
+        "session_replication_role": {
+            "posture": "allowed_values",
+            "allowed_values": ["local", "origin"],
+        },
+    }
+    if not isinstance(startup_default_policies, dict):
+        _add_error(errors, "parameter_startup_default_policies_must_be_object")
+    elif set(startup_default_policies) != set(expected_startup_default_policies):
+        _add_error(errors, "parameter_startup_default_policy_set_mismatch")
+    else:
+        for policy_name, expected_policy in expected_startup_default_policies.items():
+            policy = startup_default_policies.get(policy_name)
+            if _exact_keys(policy, STARTUP_DEFAULT_POLICY_KEYS, f"parameter_startup_default_policy_{policy_name}", errors):
+                _exact_value(
+                    policy.get("posture"),
+                    expected_policy["posture"],
+                    f"parameter_startup_default_policy_{policy_name}_posture",
+                    errors,
+                )
+                _check_exact_string_list(
+                    policy.get("allowed_values"),
+                    expected_policy["allowed_values"],
+                    f"parameter_startup_default_policy_{policy_name}_allowed_values",
+                    errors,
+                )
+    _exact_value(parameter_privileges.get("rule"), "No effective SET or ALTER SYSTEM authority, or corresponding grant option, is classified for sqag_runtime; every PostgreSQL parameter is enumerated and every applicable startup default is semantically classified; any unsafe, ambiguous, unknown, or grantable authority fails closed.", "parameter_privilege_rule", errors)
 
 def validate_default_privileges(manifest: dict[str, Any], errors: list[str]) -> None:
     default_privileges = manifest.get("default_privileges")
