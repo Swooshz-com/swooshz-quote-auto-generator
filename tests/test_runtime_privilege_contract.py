@@ -1,11 +1,11 @@
 """Runtime privilege contract tests.
 
 Deterministic discovery receipt for this amendment:
-  discovered methods: 228
-  static and validator methods: 149
-  PostgreSQL methods: 75
+  discovered methods: 232
+  static and validator methods: 151
+  PostgreSQL methods: 77
   requirement-map and documentation parity methods: 4
-  hosted executions: 228
+  hosted executions: 232
   hosted skips: 0
   unique locked requirement IDs: 38 (R01-R38)
 
@@ -180,6 +180,8 @@ CANONICAL_QUERY_COLUMNS = {
         "identity_arguments",
         "routine_kind",
         "privilege_type",
+        "direct_runtime_execute",
+        "public_execute",
         "effective",
         "is_grantable",
     ],
@@ -752,6 +754,119 @@ class ValidatorStaticTest(unittest.TestCase):
     def test_extra_provider_exception_fixture_fails(self) -> None:
         manifest = self._mutated_fixture(lambda m: m["routines"]["provider_owned_exceptions"].update({"extra": {}}))
         self._assert_fixture_rejected(json.dumps(manifest), "provider_exception_set_must_be_exactly_show_db_tree")
+
+    def test_public_routine_authority_classification_is_exact(self) -> None:
+        manifest = load_manifest()
+
+        def routine(
+            schema_name: str,
+            routine_name: str,
+            identity_arguments: str,
+            routine_kind: str,
+            direct_runtime_execute: bool,
+            public_execute: bool,
+            effective: bool,
+            is_grantable: bool,
+        ) -> dict[str, Any]:
+            return {
+                "schema_name": schema_name,
+                "routine_name": routine_name,
+                "identity_arguments": identity_arguments,
+                "routine_kind": routine_kind,
+                "privilege_type": "EXECUTE",
+                "direct_runtime_execute": direct_runtime_execute,
+                "public_execute": public_execute,
+                "effective": effective,
+                "is_grantable": is_grantable,
+            }
+
+        rows = [
+            routine("public", name, "", "f", False, False, False, False)
+            for name in EXPECTED_ROUTINES
+        ]
+        rows.extend(
+            [
+                routine("public", "show_db_tree", "", "f", False, True, True, False),
+                routine("public", "unrelated_public", "", "f", False, False, False, False),
+            ]
+        )
+        self.assertEqual(
+            contract_validator.evaluate_schema_wide_runtime_authority(
+                manifest,
+                None,
+                None,
+                rows,
+            ),
+            (),
+        )
+
+        controls = (
+            (0, "direct_runtime_execute", True, "runtime_public_trigger_direct_execute_forbidden_"),
+            (0, "public_execute", True, "runtime_public_trigger_public_execute_forbidden_"),
+            (0, "effective", True, "runtime_public_trigger_effective_execute_forbidden_"),
+            (0, "is_grantable", True, "runtime_public_trigger_grant_option_forbidden_"),
+        )
+        for index, key, value, expected in controls:
+            mutated = copy.deepcopy(rows)
+            mutated[index][key] = value
+            errors = contract_validator.evaluate_schema_wide_runtime_authority(
+                manifest,
+                None,
+                None,
+                mutated,
+            )
+            self.assertTrue(any(expected in error for error in errors), errors)
+
+        mutated = copy.deepcopy(rows)
+        mutated[-1]["effective"] = True
+        mutated[-1]["public_execute"] = True
+        errors = contract_validator.evaluate_schema_wide_runtime_authority(manifest, None, None, mutated)
+        self.assertTrue(any("runtime_public_unclassified_authority_public.unrelated_public" in error for error in errors), errors)
+
+        mutated = copy.deepcopy(rows)
+        mutated[-2]["identity_arguments"] = "integer"
+        errors = contract_validator.evaluate_schema_wide_runtime_authority(manifest, None, None, mutated)
+        self.assertTrue(any("runtime_public_unclassified_authority_public.show_db_tree" in error for error in errors), errors)
+
+        mutated = copy.deepcopy(rows)
+        mutated[-2]["is_grantable"] = True
+        errors = contract_validator.evaluate_schema_wide_runtime_authority(manifest, None, None, mutated)
+        self.assertIn("runtime_provider_exception_grant_option_forbidden_show_db_tree", errors)
+
+    def test_schema_scoped_explicit_column_exception_rejects_shadow_schema(self) -> None:
+        manifest = copy.deepcopy(load_manifest())
+        manifest["tables"]["runtime_accessible"] = {}
+        manifest["tables"]["runtime_forbidden"] = {}
+
+        def column(schema_name: str, effective: bool) -> dict[str, Any]:
+            return {
+                "schema_name": schema_name,
+                "table_name": "sqag_quote_publication_artifacts",
+                "column_name": "checksum_sha256",
+                "acl_entries": [],
+                "privilege_type": "UPDATE",
+                "effective": effective,
+                "is_grantable": False,
+            }
+
+        shadow_errors = contract_validator.evaluate_public_table_like_authority(
+            manifest,
+            [],
+            [column("application_h27_synthetic", True)],
+        )
+        self.assertTrue(
+            any("runtime_privilege_mismatch_UPDATE_expected_False_got_True" in error for error in shadow_errors),
+            shadow_errors,
+        )
+        public_errors = contract_validator.evaluate_public_table_like_authority(
+            manifest,
+            [],
+            [column("public", True)],
+        )
+        self.assertFalse(
+            any("runtime_privilege_mismatch_UPDATE_expected_False_got_True" in error for error in public_errors),
+            public_errors,
+        )
 
     def test_missing_public_database_acl_fixture_fails(self) -> None:
         def mutate(manifest: dict[str, Any]) -> None:
@@ -4148,6 +4263,8 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 for column_name in column_names:
                     self._grant_column_privilege("sqag_runtime", table_name, column_name, privilege, grantor_role="sqag_migrator")
         self._alter_public_database_privilege("TEMPORARY", False)
+        self._revoke_public_execute("sqag_reject_immutable_change")
+        self._revoke_public_execute("sqag_require_retention_delete_authorization")
         owner_name = self._new_role("query_owner")
         grantee_name = self._new_role("query_grantee")
         self._alter_default_privilege(owner_name, grantee_name, "SELECT", "TABLES")
@@ -4683,8 +4800,24 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         )
         routine_rows = results["effective_runtime_routine_privileges"][1]
         self.assertEqual({str(row["routine_name"]) for row in routine_rows}, set(EXPECTED_ROUTINES))
-        self.assertTrue(all(bool(row["effective"]) for row in routine_rows))
-        self.assertFalse(any(bool(row["is_grantable"]) for row in routine_rows))
+        self.assertEqual(
+            {
+                (
+                    str(row["routine_name"]),
+                    str(row["identity_arguments"]),
+                    str(row["routine_kind"]),
+                    bool(row["direct_runtime_execute"]),
+                    bool(row["public_execute"]),
+                    bool(row["effective"]),
+                    bool(row["is_grantable"]),
+                )
+                for row in routine_rows
+            },
+            {
+                (routine_name, "", "f", False, False, False, False)
+                for routine_name in EXPECTED_ROUTINES
+            },
+        )
         self.assertEqual(self._evaluate_runtime_authority_rows(), ())
         table_acl = next(
             row['acl_entries']
@@ -5181,7 +5314,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
 
     def test_non_system_schema_authority_all_object_kinds_fail_closed_postgres(self) -> None:
         self._prepare_fixed_runtime_contract_fixture()
-        schema_name = f"pg_application_h23_{uuid.uuid4().hex[:8]}"
+        schema_name = f"application_h23_{uuid.uuid4().hex[:8]}"
         schema_ident = _quote_identifier(schema_name)
         table_ident = f'{schema_ident}."authority_table"'
         sequence_ident = f'{schema_ident}."authority_sequence"'
@@ -5238,6 +5371,12 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                     "schema",
                     f'grant usage on schema {schema_ident} to "sqag_runtime" with grant option',
                     f'revoke usage on schema {schema_ident} from "sqag_runtime"',
+                    "runtime_schema_non_public_authority",
+                ),
+                (
+                    "schema_create",
+                    f'grant create on schema {schema_ident} to "sqag_runtime" with grant option',
+                    f'revoke create on schema {schema_ident} from "sqag_runtime"',
                     "runtime_schema_non_public_authority",
                 ),
                 (
@@ -5309,6 +5448,121 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 (schema_name,),
             ).fetchone()
             self.assertFalse(bool(_row_dict(row, "present")))
+        finally:
+            connection.rollback()
+            connection.close()
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+    def test_explicit_checksum_column_exception_is_schema_scoped_postgres(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        schema_name = f"application_h27_{uuid.uuid4().hex[:8]}"
+        schema_ident = _quote_identifier(schema_name)
+        shadow_table_ident = f'{schema_ident}."sqag_quote_publication_artifacts"'
+        wrong_table_name = f"h27_wrong_table_{uuid.uuid4().hex[:8]}"
+        wrong_table_ident = f'public.{_quote_identifier(wrong_table_name)}'
+        connection = self.connect()
+        try:
+            connection.execute(f'create schema {schema_ident} authorization "sqag_migrator"')
+            connection.execute('set role "sqag_migrator"')
+            connection.execute(
+                f'create table {shadow_table_ident} '
+                '(checksum_sha256 text, note text)'
+            )
+            connection.execute(
+                f'create table {wrong_table_ident} '
+                '(checksum_sha256 text, note text)'
+            )
+            connection.execute("reset role")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+        cleanup_steps = [
+            ("drop_h27_wrong_table", f"drop table if exists {wrong_table_ident}"),
+            ("drop_h27_shadow_table", f"drop table if exists {shadow_table_ident}"),
+            ("drop_h27_shadow_schema", f"drop schema if exists {schema_ident}"),
+        ]
+        try:
+            self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+            controls = (
+                (
+                    "shadow_checksum",
+                    f'grant usage on schema {schema_ident} to "sqag_runtime"',
+                    f'grant update ("checksum_sha256") on table {shadow_table_ident} to "sqag_runtime"',
+                    f'revoke update ("checksum_sha256") on table {shadow_table_ident} from "sqag_runtime"',
+                    f'revoke usage on schema {schema_ident} from "sqag_runtime"',
+                    "runtime_privilege_mismatch_UPDATE_expected_False_got_True",
+                ),
+                (
+                    "shadow_wrong_column",
+                    f'grant usage on schema {schema_ident} to "sqag_runtime"',
+                    f'grant update ("note") on table {shadow_table_ident} to "sqag_runtime"',
+                    f'revoke update ("note") on table {shadow_table_ident} from "sqag_runtime"',
+                    f'revoke usage on schema {schema_ident} from "sqag_runtime"',
+                    "runtime_privilege_mismatch_UPDATE_expected_False_got_True",
+                ),
+                (
+                    "shadow_checksum_grant_option",
+                    f'grant usage on schema {schema_ident} to "sqag_runtime"',
+                    f'grant update ("checksum_sha256") on table {shadow_table_ident} to "sqag_runtime" with grant option',
+                    f'revoke update ("checksum_sha256") on table {shadow_table_ident} from "sqag_runtime"',
+                    f'revoke usage on schema {schema_ident} from "sqag_runtime"',
+                    "runtime_grant_option_forbidden_UPDATE",
+                ),
+                (
+                    "public_wrong_table",
+                    "",
+                    "grant update (\"checksum_sha256\") on table " + wrong_table_ident + ' to "sqag_runtime"',
+                    "revoke update (\"checksum_sha256\") on table " + wrong_table_ident + ' from "sqag_runtime"',
+                    "",
+                    "runtime_privilege_mismatch_UPDATE_expected_False_got_True",
+                ),
+            )
+            for label, pre_sql, grant_sql, revoke_sql, post_sql, expected_fragment in controls:
+                with self.subTest(h27_control=label):
+                    if pre_sql:
+                        self._execute_admin_sql(pre_sql)
+                    self._execute_admin_sql(grant_sql)
+                    try:
+                        errors = self._evaluate_runtime_authority_rows()
+                        self.assertTrue(
+                            any(expected_fragment in error for error in errors),
+                            errors,
+                        )
+                    finally:
+                        self._execute_admin_sql(revoke_sql)
+                        if post_sql:
+                            self._execute_admin_sql(post_sql)
+                    self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+        finally:
+            primary_failure = sys.exc_info()[1]
+            try:
+                self._cleanup_steps(cleanup_steps)
+            except Exception as cleanup_error:
+                message = f"H27 cleanup failed: {cleanup_error}"
+                if primary_failure is None:
+                    raise
+                add_note = getattr(primary_failure, "add_note", None)
+                if callable(add_note):
+                    add_note(message)
+
+        connection = self.connect()
+        try:
+            namespace_row = connection.execute(
+                "select exists (select 1 from pg_catalog.pg_namespace where nspname = %s) as present",
+                (schema_name,),
+            ).fetchone()
+            wrong_table_row = connection.execute(
+                "select exists (select 1 from pg_catalog.pg_class c "
+                "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+                "where n.nspname = 'public' and c.relname = %s) as present",
+                (wrong_table_name,),
+            ).fetchone()
+            self.assertFalse(bool(_row_dict(namespace_row, "present")))
+            self.assertFalse(bool(_row_dict(wrong_table_row, "present")))
         finally:
             connection.rollback()
             connection.close()
@@ -5710,6 +5964,105 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         self.assertEqual(provider_row["owner"], "neondb_owner")
         self.assertTrue(provider_row["public_execute"])
         self.assertEqual(self._public_function_execute("show_db_tree"), before_public_execute)
+
+    def test_public_routine_authority_controls_fail_closed_postgres(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        provider_name = self._create_role("neondb_owner")
+        self._grant_schema_privilege(provider_name, "CREATE")
+        connection = self.connect()
+        try:
+            connection.execute(f"set role {_quote_identifier(provider_name)}")
+            connection.execute(
+                "create function public.show_db_tree() returns jsonb "
+                "language sql as $$ select '{}'::jsonb $$"
+            )
+            connection.execute("reset role")
+            connection.commit()
+        finally:
+            connection.close()
+        provider_public_before = self._public_function_execute("show_db_tree")
+        self.assertTrue(provider_public_before)
+        self.addCleanup(
+            self._restore_and_drop_public_function,
+            "show_db_tree",
+            provider_public_before,
+        )
+
+        unrelated_name = "h26_unrelated_public"
+        connection = self.connect()
+        try:
+            connection.execute('set role "sqag_migrator"')
+            connection.execute(
+                f"create function public.{_quote_identifier(unrelated_name)}() returns integer "
+                "language sql as 'select 1'"
+            )
+            connection.execute("reset role")
+            connection.commit()
+        finally:
+            connection.close()
+        unrelated_public_before = self._public_function_execute(unrelated_name)
+        self.assertTrue(unrelated_public_before)
+        self.addCleanup(
+            self._restore_and_drop_public_function,
+            unrelated_name,
+            unrelated_public_before,
+        )
+        self._revoke_public_execute(unrelated_name, register_cleanup=False)
+
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        controls = (
+            (
+                'grant execute on function public."sqag_reject_immutable_change"() to "sqag_runtime"',
+                'revoke execute on function public."sqag_reject_immutable_change"() from "sqag_runtime"',
+                "runtime_public_trigger_direct_execute_forbidden_sqag_reject_immutable_change",
+            ),
+            (
+                'grant execute on function public."sqag_reject_immutable_change"() to public',
+                'revoke execute on function public."sqag_reject_immutable_change"() from public',
+                "runtime_public_trigger_public_execute_forbidden_sqag_reject_immutable_change",
+            ),
+            (
+                f'grant execute on function public."{unrelated_name}"() to "sqag_runtime"',
+                f'revoke execute on function public."{unrelated_name}"() from "sqag_runtime"',
+                "runtime_public_unclassified_authority_public.h26_unrelated_public",
+            ),
+            (
+                f'grant execute on function public."{unrelated_name}"() to "sqag_runtime" with grant option',
+                f'revoke execute on function public."{unrelated_name}"() from "sqag_runtime"',
+                "runtime_public_unclassified_authority_public.h26_unrelated_public",
+            ),
+            (
+                'grant execute on function public."show_db_tree"() to "sqag_runtime"',
+                'revoke execute on function public."show_db_tree"() from "sqag_runtime"',
+                "runtime_provider_exception_direct_execute_forbidden_show_db_tree",
+            ),
+        )
+        for grant_sql, revoke_sql, expected_fragment in controls:
+            with self.subTest(h26_control=expected_fragment):
+                self._execute_admin_sql(grant_sql)
+                try:
+                    errors = self._evaluate_runtime_authority_rows()
+                    self.assertTrue(any(expected_fragment in error for error in errors), errors)
+                finally:
+                    self._execute_admin_sql(revoke_sql)
+                self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        _, routine_rows = self._execute_contract_query("effective_runtime_routine_privileges")
+        substituted_rows = [dict(row) for row in routine_rows]
+        provider_row = next(row for row in substituted_rows if row["routine_name"] == "show_db_tree")
+        provider_row["identity_arguments"] = "integer"
+        substitution_errors = contract_validator.evaluate_schema_wide_runtime_authority(
+            self.contract,
+            None,
+            None,
+            substituted_rows,
+        )
+        self.assertTrue(
+            any("runtime_public_unclassified_authority_public.show_db_tree" in error for error in substitution_errors),
+            substitution_errors,
+        )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
 
     def test_trigger_dependencies_match_migrated_routine_classification(self) -> None:
         self.apply_migrations()

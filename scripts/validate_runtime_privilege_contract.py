@@ -227,6 +227,8 @@ RUNTIME_ROUTINE_PRIVILEGE_ROW_KEYS = frozenset(
         "identity_arguments",
         "routine_kind",
         "privilege_type",
+        "direct_runtime_execute",
+        "public_execute",
         "effective",
         "is_grantable",
     }
@@ -268,20 +270,26 @@ TRIGGER_ROUTINE_KEYS = frozenset(
     {
         "schema",
         "owner",
+        "identity_arguments",
+        "routine_kind",
         "security_mode",
         "class",
         "direct_runtime_execute",
         "public_execute_after_boundary_b",
+        "grant_option",
     }
 )
 PROVIDER_EXCEPTION_KEYS = frozenset(
     {
         "schema",
         "owner",
+        "identity_arguments",
+        "routine_kind",
         "class",
         "direct_runtime_grant",
         "public_execute",
         "effective_runtime_execution",
+        "grant_option",
     }
 )
 DEFAULT_PRIVILEGES_KEYS = frozenset(
@@ -596,6 +604,19 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                pg_catalog.pg_get_function_identity_arguments(p.oid) as identity_arguments,
                p.prokind as routine_kind,
                'EXECUTE'::text as privilege_type,
+               exists (
+                   select 1
+                   from pg_catalog.aclexplode(
+                       coalesce(p.proacl, pg_catalog.acldefault('f', p.proowner))
+                   ) expanded
+                   where expanded.grantee = (
+                       select runtime_role.oid
+                       from pg_catalog.pg_roles runtime_role
+                       where runtime_role.rolname = 'sqag_runtime'
+                   )
+                     and expanded.privilege_type = 'EXECUTE'
+               ) as direct_runtime_execute,
+               has_function_privilege('public', p.oid, 'EXECUTE') as public_execute,
                has_function_privilege('sqag_runtime', p.oid, 'EXECUTE') as effective,
                has_function_privilege(
                    'sqag_runtime',
@@ -1098,11 +1119,18 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "has_function_privilege",
         "pg_catalog.pg_proc",
         "pg_catalog.pg_namespace",
+        "pg_catalog.pg_roles",
+        "pg_catalog.aclexplode",
+        "pg_catalog.acldefault",
         "pg_get_function_identity_arguments",
         "schema_name",
         "routine_name",
         "routine_kind",
+        "direct_runtime_execute",
+        "public_execute",
         "is_grantable",
+        "grantee",
+        "privilege_type",
         "'execute'",
         "'execute with grant option'",
         "information_schema",
@@ -2755,7 +2783,11 @@ def evaluate_public_table_like_authority(
                 and table_privileges.get(privilege.lower()) is True
             )
         column_manifest = manifest.get("column_privileges") if isinstance(manifest, dict) else None
-        explicit = column_manifest.get(table_name) if isinstance(column_manifest, dict) else None
+        explicit = (
+            column_manifest.get(table_name)
+            if schema_name == BOUND_SOURCE_SCHEMA and isinstance(column_manifest, dict)
+            else None
+        )
         if isinstance(explicit, dict):
             explicit_columns = explicit.get(privilege.lower())
             expected_effective = expected_effective or bool(
@@ -3489,6 +3521,48 @@ def evaluate_schema_wide_runtime_authority(
             errors.append("runtime_routine_privilege_evidence_must_be_list")
             routine_privilege_rows = []
         seen_routines: set[tuple[str, str, str, str]] = set()
+        trigger_manifest = (
+            manifest.get("routines", {}).get("sqag_owned_triggers")
+            if isinstance(manifest.get("routines"), dict)
+            else None
+        )
+        expected_trigger_identities: dict[tuple[str, str, str, str], str] = {}
+        if isinstance(trigger_manifest, dict):
+            for routine_name in EXPECTED_ROUTINES:
+                entry = trigger_manifest.get(routine_name)
+                if not isinstance(entry, dict):
+                    _add_error(errors, f"runtime_public_trigger_manifest_missing_{routine_name}")
+                    continue
+                identity = (
+                    entry.get("schema"),
+                    routine_name,
+                    entry.get("identity_arguments"),
+                    entry.get("routine_kind"),
+                )
+                if all(type(value) is str for value in identity):
+                    expected_trigger_identities[identity] = routine_name
+                else:
+                    _add_error(errors, f"runtime_public_trigger_manifest_identity_invalid_{routine_name}")
+        else:
+            _add_error(errors, "runtime_public_trigger_manifest_missing")
+        provider_entry = None
+        provider_exceptions = (
+            manifest.get("routines", {}).get("provider_owned_exceptions")
+            if isinstance(manifest.get("routines"), dict)
+            else None
+        )
+        if isinstance(provider_exceptions, dict):
+            provider_entry = provider_exceptions.get("show_db_tree")
+        provider_identity: tuple[str, str, str, str] | None = None
+        if isinstance(provider_entry, dict):
+            candidate_provider_identity = (
+                provider_entry.get("schema"),
+                "show_db_tree",
+                provider_entry.get("identity_arguments"),
+                provider_entry.get("routine_kind"),
+            )
+            if all(type(value) is str for value in candidate_provider_identity):
+                provider_identity = candidate_provider_identity
         for index, row in enumerate(routine_privilege_rows):
             label = f"runtime_routine_row_{index}"
             if not isinstance(row, dict):
@@ -3508,8 +3582,13 @@ def evaluate_schema_wide_runtime_authority(
                         _add_error(errors, f"{label}_{key}_must_be_string")
                 else:
                     _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
-            _require_type(row.get("effective"), bool, f"{label}_effective", errors)
-            _require_type(row.get("is_grantable"), bool, f"{label}_is_grantable", errors)
+            for key in (
+                "direct_runtime_execute",
+                "public_execute",
+                "effective",
+                "is_grantable",
+            ):
+                _require_type(row.get(key), bool, f"{label}_{key}", errors)
             if any(
                 type(row.get(key)) is not str
                 for key in (
@@ -3519,13 +3598,25 @@ def evaluate_schema_wide_runtime_authority(
                     "routine_kind",
                     "privilege_type",
                 )
-            ) or type(row.get("effective")) is not bool or type(row.get("is_grantable")) is not bool:
+            ) or any(
+                type(row.get(key)) is not bool
+                for key in (
+                    "direct_runtime_execute",
+                    "public_execute",
+                    "effective",
+                    "is_grantable",
+                )
+            ):
                 continue
             schema_name = str(row["schema_name"])
             routine_name = str(row["routine_name"])
             identity_arguments = str(row["identity_arguments"])
             routine_kind = str(row["routine_kind"])
             privilege = str(row["privilege_type"])
+            direct_runtime_execute = bool(row["direct_runtime_execute"])
+            public_execute = bool(row["public_execute"])
+            effective = bool(row["effective"])
+            is_grantable = bool(row["is_grantable"])
             if _is_postgresql_system_schema(schema_name):
                 _add_error(errors, f"{label}_system_schema_must_be_excluded_{schema_name}")
             if routine_kind not in {"f", "p", "a", "w"}:
@@ -3537,13 +3628,51 @@ def evaluate_schema_wide_runtime_authority(
                 _add_error(errors, f"{label}_duplicate")
             seen_routines.add(identity)
             if schema_name != BOUND_SOURCE_SCHEMA and (
-                row["effective"] or row["is_grantable"]
+                direct_runtime_execute or public_execute or effective or is_grantable
             ):
                 _add_error(
                     errors,
                     f"runtime_routine_non_public_authority_{schema_name}.{routine_name}"
-                    f"({identity_arguments})_effective_{row['effective']}_"
-                    f"grantable_{row['is_grantable']}",
+                    f"({identity_arguments})_direct_{direct_runtime_execute}_"
+                    f"public_{public_execute}_effective_{effective}_grantable_{is_grantable}",
+                )
+                continue
+            if schema_name != BOUND_SOURCE_SCHEMA:
+                continue
+            trigger_name = expected_trigger_identities.get(identity)
+            if trigger_name is not None:
+                if direct_runtime_execute:
+                    _add_error(errors, f"runtime_public_trigger_direct_execute_forbidden_{trigger_name}")
+                if public_execute:
+                    _add_error(errors, f"runtime_public_trigger_public_execute_forbidden_{trigger_name}")
+                if effective:
+                    _add_error(errors, f"runtime_public_trigger_effective_execute_forbidden_{trigger_name}")
+                if is_grantable:
+                    _add_error(errors, f"runtime_public_trigger_grant_option_forbidden_{trigger_name}")
+                continue
+            if provider_identity is not None and identity == provider_identity:
+                if direct_runtime_execute:
+                    _add_error(errors, "runtime_provider_exception_direct_execute_forbidden_show_db_tree")
+                if not public_execute:
+                    _add_error(errors, "runtime_provider_exception_public_execute_required_show_db_tree")
+                if not effective:
+                    _add_error(errors, "runtime_provider_exception_effective_execute_required_show_db_tree")
+                if is_grantable:
+                    _add_error(errors, "runtime_provider_exception_grant_option_forbidden_show_db_tree")
+                continue
+            if direct_runtime_execute or public_execute or effective or is_grantable:
+                _add_error(
+                    errors,
+                    f"runtime_public_unclassified_authority_{schema_name}.{routine_name}"
+                    f"({identity_arguments})_direct_{direct_runtime_execute}_"
+                    f"public_{public_execute}_effective_{effective}_grantable_{is_grantable}",
+                )
+        for identity, routine_name in expected_trigger_identities.items():
+            if identity not in seen_routines:
+                _add_error(
+                    errors,
+                    f"runtime_public_trigger_routine_evidence_missing_{routine_name}"
+                    f".{identity[2]}_{identity[3]}",
                 )
     return tuple(errors)
 
@@ -3662,6 +3791,8 @@ def validate_routines(manifest: dict[str, Any], errors: list[str]) -> None:
                     continue
             _exact_value(entry.get("schema"), "public", f"{label}_schema", errors)
             _exact_value(entry.get("owner"), "sqag_migrator", f"{label}_owner", errors)
+            _exact_value(entry.get("identity_arguments"), "", f"{label}_identity_arguments", errors)
+            _exact_value(entry.get("routine_kind"), "f", f"{label}_routine_kind", errors)
             _exact_value(entry.get("security_mode"), "invoker", f"{label}_security_mode", errors)
             _exact_value(entry.get("class"), "trigger_only", f"{label}_class", errors)
             _exact_value(entry.get("direct_runtime_execute"), False, f"{label}_direct_runtime_execute", errors)
@@ -3671,6 +3802,7 @@ def validate_routines(manifest: dict[str, Any], errors: list[str]) -> None:
                 f"{label}_public_execute_after_boundary_b",
                 errors,
             )
+            _exact_value(entry.get("grant_option"), False, f"{label}_grant_option", errors)
 
     provider_exceptions = routines.get("provider_owned_exceptions")
     if not isinstance(provider_exceptions, dict):
@@ -3684,6 +3816,8 @@ def validate_routines(manifest: dict[str, Any], errors: list[str]) -> None:
             if not isinstance(entry, dict):
                 return
         _exact_value(entry.get("schema"), "public", f"{label}_schema", errors)
+        _exact_value(entry.get("identity_arguments"), "", f"{label}_identity_arguments", errors)
+        _exact_value(entry.get("routine_kind"), "f", f"{label}_routine_kind", errors)
         _exact_value(entry.get("owner"), "neondb_owner", f"{label}_owner", errors)
         _exact_value(entry.get("class"), "provider_diagnostic_exception", f"{label}_class", errors)
         _exact_value(entry.get("direct_runtime_grant"), False, f"{label}_direct_runtime_grant", errors)
@@ -3695,6 +3829,7 @@ def validate_routines(manifest: dict[str, Any], errors: list[str]) -> None:
             errors,
         )
 
+        _exact_value(entry.get("grant_option"), False, f"{label}_grant_option", errors)
 
 def validate_database_acl(manifest: dict[str, Any], errors: list[str]) -> None:
     acl = manifest.get("database_acl")

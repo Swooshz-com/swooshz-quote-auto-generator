@@ -95,8 +95,9 @@ sequence authority, routine execution, view authority, materialized-view
 authority, ownership, or a grant option fails closed. Evidence is ordered by
 schema and object identity so the same live state has one deterministic result.
 
-The PostgreSQL causal control creates a disposable ordinary schema whose name
-begins with `pg_application_`, then independently grants schema, table, column,
+The PostgreSQL causal control creates a disposable ordinary schema whose valid
+identifier begins with `application_h23_` (and never with the reserved `pg_`
+prefix), then independently grants schema, table, column,
 sequence, routine, ordinary-view, and materialized-view authority with grant
 options where applicable. Each mutation is rejected, revoked in dependency
 order, and followed by both a clean evaluator result and a final no-residue
@@ -121,9 +122,11 @@ catalog check.
 | `sqag_quote_publication_artifacts` | mutable | SELECT, INSERT, DELETE; column-only UPDATE on `checksum_sha256` |
 
 The publication-artifact table has no table-level `UPDATE`. The only update
-authority is the manifest's exact column grant on `checksum_sha256`; all other
-columns remain denied, no grant option is allowed, and PUBLIC or membership
-authority must not supply table-level UPDATE.
+authority is the manifest's exact schema-qualified column grant on
+`public.sqag_quote_publication_artifacts.checksum_sha256`; the same table and
+column name in another schema is not an exception. All other columns remain
+denied, no grant option is allowed, and PUBLIC or membership authority must not
+supply table-level UPDATE.
 
 The direct runtime grant total is conditional and closed: legacy view absent is
 37 (34 table grants, one column grant, one database grant, and one schema grant);
@@ -277,21 +280,37 @@ The function `public.show_db_tree()` is owned by the Neon provider role `neondb_
 
 The manifest records it as the single `provider_owned_exceptions` entry with these properties:
 - **Owner**: `neondb_owner`.
+- **Exact identity**: schema `public`, name `show_db_tree`, zero identity
+  arguments, routine kind `f` (function).
 - **Class**: `provider_diagnostic_exception`.
 - **Direct runtime grant**: none.
 - **PUBLIC EXECUTE**: unchanged (Boundary A and Boundary B must not mutate it).
 - **Effective runtime execution**: a bounded PUBLIC exception. The runtime role can invoke it through inherited PUBLIC EXECUTE, and this is the only routine for which this is accepted.
+- **Grant option**: false.
+
+The two SQAG trigger routines are exact `public` zero-argument functions with
+routine kind `f`, owned by `sqag_migrator`, classified as trigger-only
+invoker routines. After Boundary B, direct runtime EXECUTE, PUBLIC EXECUTE,
+effective runtime EXECUTE, and grant option must all be false for both. Every
+other public routine is allowed only with zero direct, PUBLIC, effective, and
+grant-option runtime authority; an unrelated routine's mere existence is not a
+failure. Any routine in any other ordinary schema remains fail-closed whenever
+one of those authority results is true.
 
 The validator fails when:
 - The exception is omitted from the manifest.
 - The exception is broadened to another routine.
 - The exception is represented as having no effective runtime execution.
+- A direct runtime grant or grant option is present on the exact provider
+  routine.
 
 Routine inventory is defined by the user-created/public-schema boundary: every
 `pg_proc` row whose namespace is `public` and whose `prokind` is a routine kind
 (`f`, `p`, `a`, or `w`) is included. The proof checks owner, invoker security
-mode, trigger dependency, ACL posture, and deterministic identity-argument
-ordering. Stock PostgreSQL must contain no `show_db_tree()` routine. A
+mode, exact schema/name/identity-argument/kind binding, direct ACL, PUBLIC
+ACL, effective ACL, grant option, trigger dependency, and deterministic
+identity-argument ordering. Stock PostgreSQL must contain no `show_db_tree()`
+routine. A
 provider-compatible fixture may add exactly that one routine and no other
 public routine.
 
@@ -407,7 +426,7 @@ live-system evidence.
 | `effective_runtime_table_privileges` | `schema_name`, `table_name`, `relation_kind`, `relation_persistence`, `acl_entries`, `owner`, `owner_select`, `visible_column_count`, `column_contract`, `row_security_enabled`, `row_security_forced`, `has_inheritance_descendants`, `privilege_type`, `effective`, `is_grantable` | 8 per enumerated non-system `r`/`p`/`f` relation; 128 in the base migrated fixture, plus 8 for each additional relation |
 | `effective_runtime_column_privileges` | `schema_name`, `table_name`, `column_name`, `acl_entries`, `privilege_type`, `effective`, `is_grantable` | 4 per visible column on each enumerated non-system `r`/`p`/`f` relation |
 | `effective_runtime_schema_privileges` | `schema_name`, `privilege_type`, `effective`, `is_grantable` | 2 per enumerated non-system schema |
-| `effective_runtime_routine_privileges` | `schema_name`, `routine_name`, `identity_arguments`, `routine_kind`, `privilege_type`, `effective`, `is_grantable` | 1 per enumerated non-system routine |
+| `effective_runtime_routine_privileges` | `schema_name`, `routine_name`, `identity_arguments`, `routine_kind`, `privilege_type`, `direct_runtime_execute`, `public_execute`, `effective`, `is_grantable` | 1 per enumerated non-system routine |
 | `view_acl` | `schema_name`, `relation_name`, `relation_kind`, `owner`, `relation_acl`, `acl_entries`, `column_acl_entries`, `view_definition`, `view_dependencies`, `view_columns`, `relation_options`, `view_security`, `runtime_privileges`, `runtime_select`, `runtime_select_grantable` | 0 in the generic shape fixture; 1 when the legacy-optional view fixture is present |
 
 The effective database proof covers `CONNECT`, `CREATE`, and `TEMPORARY`; the
@@ -438,9 +457,11 @@ grant-option results must be false.
 The column privilege proof evaluates every non-dropped user column against
 `SELECT`, `INSERT`, `UPDATE`, and `REFERENCES`. Expected effective column rows
 are exactly those implied by the locked table-level matrix plus the one explicit
-`UPDATE(checksum_sha256)` tuple on `sqag_quote_publication_artifacts`. Column
-grants cannot add authority to a forbidden table, an unauthorized table-level
-privilege, another publication-artifact column, or a grant option.
+`UPDATE(checksum_sha256)` tuple on
+`public.sqag_quote_publication_artifacts`. The schema-qualified identity is
+mandatory: a same-named table in another schema, a wrong table or column, or a
+grant option is rejected. Column grants cannot add authority to a forbidden
+table or an unauthorized table-level privilege.
 
 ## Exact classified-table column identity contract
 
@@ -580,6 +601,10 @@ complete non-system `r`/`p`/`f` boundary. The column query retains that same
 schema boundary plus its table, visible-column, and privilege predicates.
 Schema, sequence, and routine evidence includes schema-qualified identity, each
 relevant privilege, and a real privilege-specific `WITH GRANT OPTION` result.
+Routine evidence additionally exposes whether EXECUTE is directly granted to
+`sqag_runtime`, inherited from PUBLIC, effective for `sqag_runtime`, and
+grantable. The evaluator applies the exact public routine classifications above
+instead of treating the whole `public` routine namespace as exempt.
 Every user-schema query carries the exact system-namespace exclusion rule;
 removing it or replacing it with a broad prefix filter fails static validation.
 Invalid SQL is still rejected by PostgreSQL execution even when a candidate
