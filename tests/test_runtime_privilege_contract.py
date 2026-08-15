@@ -101,7 +101,7 @@ CANONICAL_QUERY_KEYS = (
     "system_relation_acl",
 )
 CANONICAL_QUERY_COLUMNS = {
-    "database_acl": ["database_name", "database_owner", "datacl", "acl_entries"],
+    "database_acl": ["database_name", "database_owner", "datallowconn", "datconnlimit", "datacl", "acl_entries"],
     "schema_acl": ["schema_name", "schema_owner", "database_owner", "acl_entries"],
     "table_acl": [
         "schema_name",
@@ -170,6 +170,9 @@ CANONICAL_QUERY_COLUMNS = {
         "row_security_enabled",
         "row_security_forced",
         "has_inheritance_descendants",
+        "has_inheritance_parents",
+        "is_partition",
+        "partition_bound",
         "privilege_type",
         "effective",
         "is_grantable",
@@ -380,6 +383,9 @@ def _complete_classified_authority_evidence(
                     "row_security_enabled": False,
                     "row_security_forced": False,
                     "has_inheritance_descendants": False,
+                    "has_inheritance_parents": False,
+                    "is_partition": False,
+                    "partition_bound": None,
                     "privilege_type": privilege,
                     "effective": table_privileges.get(privilege.lower()) is True,
                     "is_grantable": False,
@@ -707,7 +713,9 @@ class ManifestStructureTest(unittest.TestCase):
 
     def test_database_and_schema_acl_targets(self) -> None:
         database = self.manifest["database_acl"]
-        self.assertEqual(set(database), {"public", "sqag_migrator", "sqag_app", "sqag_runtime"})
+        self.assertEqual(set(database), {"operability", "public", "sqag_migrator", "sqag_app", "sqag_runtime"})
+        self.assertIs(database["operability"]["datallowconn"], True)
+        self.assertEqual(database["operability"]["datconnlimit"], -1)
         self.assertIs(database["public"]["connect"], True)
         self.assertIs(database["public"]["create"], False)
         self.assertEqual(database["public"]["temporary"], "forbidden_after_boundary_b")
@@ -1690,6 +1698,8 @@ class ValidatorStaticTest(unittest.TestCase):
         row = {
             "database_name": "fixture",
             "database_owner": "database_owner",
+            "datallowconn": True,
+            "datconnlimit": -1,
             "datacl": [],
             "acl_entries": [
                 {
@@ -1744,6 +1754,8 @@ class ValidatorStaticTest(unittest.TestCase):
         row = {
             "database_name": "fixture",
             "database_owner": "database_owner",
+            "datallowconn": True,
+            "datconnlimit": -1,
             "datacl": [],
             "acl_entries": [
                 {"grantee": "PUBLIC", "grantor": "database_owner", "privilege_type": "CONNECT", "is_grantable": False},
@@ -2589,6 +2601,64 @@ class ValidatorStaticTest(unittest.TestCase):
             self._assert_exact_query_rejected(query_key, query)
 
 
+    def test_h54_database_operability_controls_fail_closed(self) -> None:
+        manifest = load_manifest()
+        base = {
+            "database_name": "fixture",
+            "database_owner": "database_owner",
+            "datallowconn": True,
+            "datconnlimit": -1,
+            "datacl": [],
+            "acl_entries": [
+                {"grantee": "PUBLIC", "grantor": "database_owner", "privilege_type": "CONNECT", "is_grantable": False},
+                {"grantee": "sqag_runtime", "grantor": "database_owner", "privilege_type": "CONNECT", "is_grantable": False},
+                {"grantee": "sqag_migrator", "grantor": "database_owner", "privilege_type": "CONNECT", "is_grantable": False},
+                {"grantee": "sqag_migrator", "grantor": "database_owner", "privilege_type": "CREATE", "is_grantable": False},
+                {"grantee": "sqag_migrator", "grantor": "database_owner", "privilege_type": "TEMPORARY", "is_grantable": False},
+            ],
+        }
+
+        def errors_for(candidate: dict[str, Any], candidate_manifest: dict[str, Any] = manifest) -> list[str]:
+            errors: list[str] = []
+            contract_validator._validate_database_acl_evidence(
+                [candidate],
+                errors,
+                runtime_role="sqag_runtime",
+                manifest=candidate_manifest,
+            )
+            return errors
+
+        self.assertEqual(errors_for(base), [])
+        disallowed_connections = copy.deepcopy(base)
+        disallowed_connections["datallowconn"] = False
+        self.assertIn("database_acl_datallowconn_forbidden", errors_for(disallowed_connections))
+        unlimited_block = copy.deepcopy(base)
+        unlimited_block["datconnlimit"] = 0
+        self.assertTrue(
+            any("datconnlimit_policy_mismatch" in error for error in errors_for(unlimited_block)),
+            errors_for(unlimited_block),
+        )
+        outside_policy = copy.deepcopy(base)
+        outside_policy["datconnlimit"] = 1
+        self.assertTrue(
+            any("datconnlimit_policy_mismatch" in error for error in errors_for(outside_policy)),
+            errors_for(outside_policy),
+        )
+        missing = copy.deepcopy(base)
+        missing.pop("datallowconn")
+        self.assertTrue(any("missing_keys: datallowconn" in error for error in errors_for(missing)), errors_for(missing))
+        malformed = copy.deepcopy(base)
+        malformed["datconnlimit"] = "unlimited"
+        self.assertIn("database_acl_evidence_datconnlimit_must_be_int", errors_for(malformed))
+        contradictory_manifest = copy.deepcopy(manifest)
+        contradictory_manifest["database_acl"]["operability"]["datconnlimit"] = 1
+        self.assertTrue(
+            any("database_acl_operability_datconnlimit_invalid" in error for error in errors_for(base, contradictory_manifest)),
+            errors_for(base, contradictory_manifest),
+        )
+        self.assertEqual(errors_for(base), [])
+
+
 class RuntimeMembershipEdgeEvaluatorTest(unittest.TestCase):
     def setUp(self) -> None:
         self.manifest = load_manifest()
@@ -2998,6 +3068,7 @@ class ClassifiedTableColumnContractEvaluatorTest(unittest.TestCase):
                     "type_schema": None,
                     "type_name": None,
                     "type_modifier": -1,
+                    "collation": "none",
                     "is_dropped": True,
                 }
             )
@@ -3009,6 +3080,7 @@ class ClassifiedTableColumnContractEvaluatorTest(unittest.TestCase):
                     "type_schema": "pg_catalog",
                     "type_name": "text",
                     "type_modifier": -1,
+                    "collation": "database_default",
                     "is_dropped": False,
                 }
             )
@@ -3020,6 +3092,67 @@ class ClassifiedTableColumnContractEvaluatorTest(unittest.TestCase):
             any("column_unexpected_replacement_payload_json" in error for error in errors),
             errors,
         )
+
+
+    def test_collation_identity_is_explicit_and_fixture_stable(self) -> None:
+        contracts = contract_validator.classified_table_column_contract()
+        collatable = [
+            column
+            for columns in contracts.values()
+            for column in columns
+            if column["type_name"] in {"text", "varchar", "bpchar", "name"}
+        ]
+        non_collatable = [
+            column
+            for columns in contracts.values()
+            for column in columns
+            if column["type_name"] not in {"text", "varchar", "bpchar", "name"}
+        ]
+        self.assertTrue(collatable)
+        self.assertTrue(non_collatable)
+        self.assertTrue(all(column["collation"] == "database_default" for column in collatable))
+        self.assertTrue(all(column["collation"] == "none" for column in non_collatable))
+        self.assertEqual(
+            contracts,
+            contract_validator.classified_table_column_contract(),
+        )
+
+    def test_behaviour_changing_collation_identity_is_rejected(self) -> None:
+        errors = self._errors_after_contract_mutation(
+            lambda columns: columns[2].update({"collation": "pg_catalog.C"})
+        )
+        self.assertTrue(
+            any("column_collation_mismatch_payload_json" in error for error in errors),
+            errors,
+        )
+
+    def test_non_collatable_column_cannot_claim_collation(self) -> None:
+        table_rows = copy.deepcopy(self.table_rows)
+        target_rows = [
+            row for row in table_rows if row["table_name"] == "sqag_quote_publication_artifacts"
+        ]
+        contract = copy.deepcopy(target_rows[0]["column_contract"])
+        content_blob = next(column for column in contract if column["name"] == "content_blob")
+        content_blob["collation"] = "database_default"
+        for row in target_rows:
+            row["column_contract"] = copy.deepcopy(contract)
+        errors = contract_validator.evaluate_public_table_like_authority(
+            self.manifest, table_rows, copy.deepcopy(self.column_rows)
+        )
+        self.assertTrue(
+            any("column_collation_mismatch_content_blob" in error for error in errors),
+            errors,
+        )
+
+    def test_missing_or_malformed_collation_identity_fails_closed(self) -> None:
+        missing_errors = self._errors_after_contract_mutation(
+            lambda columns: columns[0].pop("collation")
+        )
+        self.assertTrue(any("missing_keys: collation" in error for error in missing_errors), missing_errors)
+        malformed_errors = self._errors_after_contract_mutation(
+            lambda columns: columns[0].update({"collation": None})
+        )
+        self.assertTrue(any("collation_must_be_non_empty_string" in error for error in malformed_errors), malformed_errors)
 
 
 class ViewAuthorityEvaluatorTest(unittest.TestCase):
@@ -3181,6 +3314,11 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
                         "type_schema": column["type_schema"],
                         "type_name": column["type_name"],
                         "type_modifier": column["type_modifier"],
+                        "collation": (
+                            "database_default"
+                            if column["type_name"] in {"text", "varchar", "bpchar", "name"}
+                            else "none"
+                        ),
                         "is_dropped": False,
                     }
                     for column in contract_validator.LEGACY_VIEW_DEFINITION["columns"]
@@ -3188,6 +3326,9 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
                 "row_security_enabled": False,
                 "row_security_forced": False,
                 "has_inheritance_descendants": False,
+                "has_inheritance_parents": False,
+                "is_partition": False,
+                "partition_bound": None,
                 "privilege_type": privilege,
                 "effective": False,
                 "is_grantable": False,
@@ -3651,6 +3792,9 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
                 'row_security_enabled': True,
                 'row_security_forced': True,
                 'has_inheritance_descendants': True,
+                'has_inheritance_parents': False,
+                'is_partition': False,
+                'partition_bound': None,
                 'privilege_type': privilege,
                 'effective': False,
                 'is_grantable': False,
@@ -3700,6 +3844,9 @@ class ViewAuthorityEvaluatorTest(unittest.TestCase):
             ('relation_persistence', 'relation_persistence_invalid', 'x'),
             ('owner', 'owner_invalid', 'sqag_app'),
             ('has_inheritance_descendants', 'inheritance_descendants_forbidden', True),
+            ('has_inheritance_parents', 'inheritance_parents_forbidden', True),
+            ('is_partition', 'partition_forbidden', True),
+            ('partition_bound', 'partition_bound_forbidden', 'FOR VALUES FROM (MINVALUE) TO (MAXVALUE)'),
         ):
             with self.subTest(classified_table_state=field, value=value):
                 candidate = copy.deepcopy(table_rows)
@@ -4224,6 +4371,69 @@ class RequirementEvidenceMapTest(unittest.TestCase):
         self.assertIn(
             f"The view query must project exactly `{expected_view_projection}`",
             " ".join(documentation.split()),
+        )
+
+
+    def test_h55_hierarchy_identity_is_closed_world(self) -> None:
+        manifest = load_manifest()
+        table_rows, column_rows = _complete_classified_authority_evidence(manifest)
+        self.assertEqual(
+            contract_validator.evaluate_public_table_like_authority(
+                manifest, table_rows, column_rows
+            ),
+            (),
+        )
+        for field, value, fragment in (
+            ("has_inheritance_parents", True, "inheritance_parents_forbidden"),
+            ("is_partition", True, "partition_forbidden"),
+            ("partition_bound", "FOR VALUES FROM (MINVALUE) TO (MAXVALUE)", "partition_bound_forbidden"),
+        ):
+            candidate = copy.deepcopy(table_rows)
+            for row in candidate:
+                if row["table_name"] == "sqag_profiles":
+                    row[field] = value
+            errors = contract_validator.evaluate_public_table_like_authority(
+                manifest, candidate, copy.deepcopy(column_rows)
+            )
+            self.assertTrue(
+                any(f"public.sqag_profiles_{fragment}" in error for error in errors),
+                errors,
+            )
+        unrelated = copy.deepcopy(table_rows)
+        unrelated.extend(
+            {
+                "schema_name": "public",
+                "table_name": "h55_unrelated_parent",
+                "relation_kind": "p",
+                "relation_persistence": "p",
+                "acl_entries": [],
+                "owner": "sqag_app",
+                "owner_select": False,
+                "visible_column_count": 0,
+                "column_contract": [],
+                "row_security_enabled": False,
+                "row_security_forced": False,
+                "has_inheritance_descendants": True,
+                "has_inheritance_parents": False,
+                "is_partition": False,
+                "partition_bound": None,
+                "privilege_type": privilege,
+                "effective": False,
+                "is_grantable": False,
+            }
+            for privilege in TABLE_PRIVILEGES
+        )
+        self.assertEqual(
+            contract_validator.evaluate_public_table_like_authority(
+                manifest, unrelated, copy.deepcopy(column_rows)
+            ),
+            (),
+        )
+        self.assertEqual(
+            contract_validator.evaluate_public_table_like_authority(
+                manifest, table_rows, column_rows
+            ),
+            (),
         )
 
 
@@ -7537,6 +7747,251 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             self._execute_admin_sql(
                 f'alter table public.{table_ident} add constraint {constraint_ident} '
                 f'{baseline_definition}'
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+    def test_h53_collation_identity_controls_fail_closed_postgres(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+        columns, rows = self._execute_contract_query("effective_runtime_table_privileges")
+        self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["effective_runtime_table_privileges"])
+        baseline_row = next(
+            row
+            for row in rows
+            if row["schema_name"] == "public"
+            and row["table_name"] == "sqag_feedback"
+            and row["privilege_type"] == "SELECT"
+        )
+        baseline_columns = {entry["name"]: entry for entry in baseline_row["column_contract"]}
+        self.assertEqual(baseline_columns["support_reference"]["collation"], "database_default")
+        self.assertEqual(baseline_columns["legal_hold"]["collation"], "none")
+
+        table_ident = 'public."sqag_feedback"'
+        default_collation = 'pg_catalog."default"'
+
+        def assert_collation_rejected(collation: str) -> None:
+            self._execute_admin_sql(
+                f'alter table {table_ident} alter column "support_reference" '
+                f"type text collate {collation}"
+            )
+            try:
+                mutated_columns, mutated_rows = self._execute_contract_query(
+                    "effective_runtime_table_privileges"
+                )
+                self.assertEqual(
+                    mutated_columns,
+                    CANONICAL_QUERY_COLUMNS["effective_runtime_table_privileges"],
+                )
+                errors = contract_validator.evaluate_public_table_like_authority(
+                    self.contract,
+                    mutated_rows,
+                    self._execute_contract_query("effective_runtime_column_privileges")[1],
+                )
+                self.assertTrue(
+                    any(
+                        "public_table_classified_public.sqag_feedback_column_collation_mismatch_support_reference"
+                        in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+            finally:
+                self._execute_admin_sql(
+                    f'alter table {table_ident} alter column "support_reference" '
+                    f"type text collate {default_collation}"
+                )
+
+        # A distinct deterministic collation proves the H53-C3 identity boundary.
+        assert_collation_rejected('pg_catalog."C"')
+
+        capability_connection = self.connect()
+        try:
+            capability_row = capability_connection.execute(
+                "select exists ("
+                "select 1 from pg_catalog.pg_collation where collprovider = 'i'"
+                ") as icu_available"
+            ).fetchone()
+            icu_available = bool(_row_dict(capability_row, "icu_available"))
+        finally:
+            capability_connection.rollback()
+            capability_connection.close()
+
+        custom_collation_name = f"sqag_h53_nondeterministic_{uuid.uuid4().hex[:8]}"
+        custom_collation = f"public.{_quote_identifier(custom_collation_name)}"
+        custom_collation_created = False
+        if icu_available:
+            self._execute_admin_sql(
+                f"create collation {custom_collation} "
+                "(provider = icu, locale = 'und-u-ks-level2', deterministic = false)"
+            )
+            custom_collation_created = True
+        else:
+            # A PostgreSQL build without ICU uses the executable deterministic
+            # identity mutation above rather than skipping H53-C2.
+            custom_collation = 'pg_catalog."C"'
+        try:
+            assert_collation_rejected(custom_collation)
+        finally:
+            if custom_collation_created:
+                self._execute_admin_sql(f"drop collation if exists {custom_collation}")
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+    def test_h54_database_operability_controls_fail_closed_postgres(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+        database_ident = _quote_identifier(self.database_name)
+
+        def target_database_sql(sql: str) -> None:
+            connection = self.psycopg.connect(
+                postgres_test_conninfo(),
+                row_factory=self.dict_row,
+                options="-c default_transaction_read_only=off",
+            )
+            try:
+                connection.execute(sql)
+                connection.commit()
+            finally:
+                connection.close()
+
+        def database_errors(connection) -> tuple[str, ...]:
+            columns, rows = self._execute_contract_query_on(connection, "database_acl")
+            self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["database_acl"])
+            errors: list[str] = []
+            contract_validator._validate_database_acl_evidence(
+                rows,
+                errors,
+                runtime_role="sqag_runtime",
+                manifest=self.contract,
+            )
+            return tuple(errors)
+
+        connection = self.connect()
+        try:
+            columns, rows = self._execute_contract_query_on(connection, "database_acl")
+            self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["database_acl"])
+            self.assertEqual(len(rows), 1)
+            self.assertIs(rows[0]["datallowconn"], True)
+            self.assertEqual(rows[0]["datconnlimit"], -1)
+
+            target_database_sql(f"alter database {database_ident} with allow_connections false")
+            try:
+                self.assertIn("database_acl_datallowconn_forbidden", database_errors(connection))
+            finally:
+                target_database_sql(f"alter database {database_ident} with allow_connections true")
+            self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+            for limit in (0, 1):
+                target_database_sql(f"alter database {database_ident} with connection limit {limit}")
+                try:
+                    errors = database_errors(connection)
+                    self.assertTrue(
+                        any("database_acl_datconnlimit_policy_mismatch" in error for error in errors),
+                        errors,
+                    )
+                finally:
+                    target_database_sql(f"alter database {database_ident} with connection limit -1")
+                self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+            _, restored_rows = self._execute_contract_query_on(connection, "database_acl")
+            self.assertIs(restored_rows[0]["datallowconn"], True)
+            self.assertEqual(restored_rows[0]["datconnlimit"], -1)
+        finally:
+            target_database_sql(f"alter database {database_ident} with allow_connections true connection limit -1")
+            connection.rollback()
+            connection.close()
+
+        columns, restored_rows = self._execute_contract_query("database_acl")
+        self.assertEqual(columns, CANONICAL_QUERY_COLUMNS["database_acl"])
+        restored = copy.deepcopy(restored_rows[0])
+        missing = copy.deepcopy(restored)
+        missing.pop("datallowconn")
+        malformed = copy.deepcopy(restored)
+        malformed["datconnlimit"] = "unlimited"
+        for candidate in (missing, malformed):
+            errors: list[str] = []
+            contract_validator._validate_database_acl_evidence(
+                [candidate],
+                errors,
+                runtime_role="sqag_runtime",
+                manifest=self.contract,
+            )
+            self.assertTrue(errors, candidate)
+
+    def test_h55_relation_hierarchy_identity_controls_fail_closed_postgres(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+        suffix = uuid.uuid4().hex[:8]
+        inheritance_child = f"sqag_h55_inheritance_child_{suffix}"
+        partition_parent = f"sqag_h55_partition_parent_{suffix}"
+        unrelated_parent = f"h55_unrelated_parent_{suffix}"
+        unrelated_child = f"h55_unrelated_child_{suffix}"
+
+        self._execute_admin_sql(
+            f'create table public.{_quote_identifier(inheritance_child)} () '
+            'inherits (public."sqag_profiles")'
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertIn(
+                "public_table_classified_public.sqag_profiles_inheritance_descendants_forbidden",
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(
+                f'drop table if exists public.{_quote_identifier(inheritance_child)}'
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        self._execute_admin_sql(
+            f'create table public.{_quote_identifier(partition_parent)} '
+            '(workspace_id text not null, profile_id text not null, payload_json text not null, '
+            'created_at text not null, updated_at text not null) '
+            'partition by range (workspace_id)'
+        )
+        try:
+            self._execute_admin_sql(
+                f'alter table public.{_quote_identifier(partition_parent)} attach partition '
+                'public."sqag_profiles" for values from (minvalue) to (maxvalue)'
+            )
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertIn(
+                "public_table_classified_public.sqag_profiles_inheritance_parents_forbidden",
+                errors,
+            )
+            self.assertIn(
+                "public_table_classified_public.sqag_profiles_partition_forbidden",
+                errors,
+            )
+            self.assertIn(
+                "public_table_classified_public.sqag_profiles_partition_bound_forbidden",
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(
+                f'alter table public.{_quote_identifier(partition_parent)} detach partition '
+                'public."sqag_profiles"'
+            )
+            self._execute_admin_sql(
+                f'drop table if exists public.{_quote_identifier(partition_parent)}'
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        self._execute_admin_sql(
+            f'create table public.{_quote_identifier(unrelated_parent)} (id integer) '
+            'partition by range (id)'
+        )
+        self._execute_admin_sql(
+            f'create table public.{_quote_identifier(unrelated_child)} partition of '
+            f'public.{_quote_identifier(unrelated_parent)} for values from (0) to (100)'
+        )
+        try:
+            self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+        finally:
+            self._execute_admin_sql(
+                f'drop table if exists public.{_quote_identifier(unrelated_child)}'
+            )
+            self._execute_admin_sql(
+                f'drop table if exists public.{_quote_identifier(unrelated_parent)}'
             )
         self.assertEqual(self._evaluate_runtime_authority_rows(), ())
 

@@ -419,7 +419,7 @@ live-system evidence.
 
 | Key | Exact result columns | Fixture cardinality |
 |---|---|---:|
-| `database_acl` | `database_name`, `database_owner`, `datacl`, `acl_entries` | 1 |
+| `database_acl` | `database_name`, `database_owner`, `datallowconn`, `datconnlimit`, `datacl`, `acl_entries` | 1 |
 | `schema_acl` | `schema_name`, `schema_owner`, `database_owner`, `acl_entries` | 1 |
 | `table_acl` | `schema_name`, `relname`, `relacl`, `table_columns`, `table_constraints`, `index_contracts`, `trigger_bindings`, `rule_bindings` | 16 without the optional source table; 17 when it exists |
 | `routine_acl` | `schema_name`, `routine_name`, `identity_arguments`, `routine_kind`, `security_definer`, `owner`, `language`, `routine_definition`, `routine_configuration`, `acl_entries`, `has_trigger_dependency`, `trigger_bindings` | 2 without the provider fixture; 3 when `show_db_tree()` is present |
@@ -428,7 +428,7 @@ live-system evidence.
 | `role_memberships` | `role`, `member`, `grantor`, `admin_option`, `inherit_option`, `set_option` | captured PostgreSQL baseline rows plus 1 exact runtime edge in the clean fixture; 1 exact edge in the dedicated creator fixture |
 | `sequence_acl` | `schema_name`, `sequence_name`, `sequence_acl`, `privilege_type`, `effective`, `is_grantable` | 0 in the base fixture; 3 per enumerated sequence |
 | `effective_runtime_database_privileges` | `privilege_type`, `effective`, `is_grantable` | 3 |
-| `effective_runtime_table_privileges` | `schema_name`, `table_name`, `relation_kind`, `relation_persistence`, `acl_entries`, `owner`, `owner_select`, `visible_column_count`, `column_contract`, `row_security_enabled`, `row_security_forced`, `has_inheritance_descendants`, `privilege_type`, `effective`, `is_grantable` | 8 per enumerated non-system `r`/`p`/`f` relation; 128 in the base migrated fixture, plus 8 for each additional relation |
+| `effective_runtime_table_privileges` | `schema_name`, `table_name`, `relation_kind`, `relation_persistence`, `acl_entries`, `owner`, `owner_select`, `visible_column_count`, `column_contract`, `row_security_enabled`, `row_security_forced`, `has_inheritance_descendants`, `has_inheritance_parents`, `is_partition`, `partition_bound`, `privilege_type`, `effective`, `is_grantable` | 8 per enumerated non-system `r`/`p`/`f` relation; 128 in the base migrated fixture, plus 8 for each additional relation |
 | `effective_runtime_column_privileges` | `schema_name`, `table_name`, `column_name`, `acl_entries`, `privilege_type`, `effective`, `is_grantable` | 4 per visible column on each enumerated non-system `r`/`p`/`f` relation |
 | `effective_runtime_schema_privileges` | `schema_name`, `privilege_type`, `effective`, `is_grantable` | 2 per enumerated non-system schema |
 | `effective_runtime_routine_privileges` | `schema_name`, `routine_name`, `identity_arguments`, `routine_kind`, `privilege_type`, `direct_runtime_execute`, `public_execute`, `effective`, `is_grantable` | 1 per enumerated non-system routine |
@@ -436,10 +436,14 @@ live-system evidence.
 | `view_acl` | `schema_name`, `relation_name`, `relation_kind`, `owner`, `relation_acl`, `acl_entries`, `column_acl_entries`, `view_definition`, `view_dependencies`, `view_columns`, `relation_options`, `view_security`, `runtime_privileges`, `runtime_select`, `runtime_select_grantable` | 0 in the generic shape fixture; 1 when the legacy-optional view fixture is present |
 | `system_relation_acl` | `schema_name`, `relation_name`, `relation_kind`, `current_acl_entries`, `initial_acl_entries`, `initial_privilege_types` | one metadata row per system relation with explicit ACL or PostgreSQL initial-privilege provenance |
 
-The effective database proof covers `CONNECT`, `CREATE`, and `TEMPORARY`; the
-locked runtime result is `true/false/false`, with all three grantable flags
-false. The effective schema proof covers `USAGE` and `CREATE` with the locked
-result `true/false`, again with both grantable flags false. Both queries use
+The database proof binds `datallowconn=true` and `datconnlimit=-1` as the
+manifest-defined clean application-database operability posture. It also
+covers `CONNECT`, `CREATE`, and `TEMPORARY`; the locked runtime result is
+`true/false/false`, with all three grantable flags false. A database that
+cannot accept connections, or whose explicit connection limit is outside the
+manifest policy, fails closed before activation-capable runtime use. The
+effective schema proof covers `USAGE` and `CREATE` with the locked result
+`true/false`, again with both grantable flags false. Both queries use
 PostgreSQL's `has_*_privilege(... 'WITH GRANT OPTION')` evaluation, so direct,
 PUBLIC, membership-derived, owner-derived, and grant-option authority is
 evaluated for the exact privilege rather than inferred from ACL text.
@@ -448,10 +452,11 @@ The table proof evaluates every non-system `r`/`p`/`f` relation against the
 ordered PostgreSQL 17 set `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`,
 `REFERENCES`, `TRIGGER`, and `MAINTAIN`. Its evidence includes schema and
 relation identity, relation kind, owner, the exact `owner_select` result for
-`sqag_migrator`, a catalog-derived column contract, RLS flags, and direct
-inheritance-descendant posture. This complete user-schema boundary preserves
-harmless unrelated zero-authority relations while rejecting any effective or
-grant-option authority that reaches `sqag_runtime`.
+`sqag_migrator`, a catalog-derived column contract, RLS flags, both directions
+of inheritance, partition status, and partition-bound identity. Classified
+tables must remain unpartitioned and unattached; harmless unrelated
+zero-authority hierarchies remain accepted while any effective or
+grant-option authority that reaches `sqag_runtime` is rejected.
 
 When the classified view is present, the bound source must be an ordinary
 table that the accepted classified-view owner can read, must have both RLS
@@ -486,10 +491,13 @@ ordered SQL migration files locked by `MIGRATION_FILE_NAMES` and extracts the
 ledger table DDL from `_create_ledger` in `webapp/postgres_migrations.py` through
 Python AST inspection. The resulting contract covers all 16 classified tables
 and binds every physical user-column slot to ordinal position, column name,
-PostgreSQL type OID, type schema, type name, type modifier, and dropped-column
-visibility. The committed migration digests and table bindings therefore remain
-the single reviewed schema authority; the JSON manifest cannot become an
-independent column-schema truth source.
+PostgreSQL type OID, type schema, type name, type modifier, stable collation
+identity, and dropped-column visibility. For collatable columns, the accepted
+identities are `database_default` or an explicit schema-qualified collation
+name; non-collatable and dropped slots use `none`. The committed migration
+digests and table bindings therefore remain the single reviewed schema
+authority; the JSON manifest cannot become an independent column-schema truth
+source.
 
 For every classified table, the unchanged invariants require `relkind='r'`,
 permanent `relation_persistence='p'`, owner `sqag_migrator`,
@@ -969,6 +977,52 @@ requires a separately gated manifest/controller contract change. PostgreSQL 17
 controls omit and drop the synthetic retained role, test NOLOGIN and each
 forbidden attribute, test a premature retired status, restore the exact role,
 and finish clean.
+
+### H53: canonical column collation identity
+
+Migration-derived and live classified-column signatures bind a stable collation
+identity in addition to ordinal, name, type, modifier, dropped posture,
+nullability, and default semantics. Non-collatable columns carry the explicit
+identity `none`; collatable PostgreSQL/database-default columns carry
+`database_default`; explicit collations carry their stable
+`schema.collation_name` identity rather than a database-local OID. A missing,
+malformed, unknown, or inconsistent collation value fails closed. Disposable
+PostgreSQL 17 controls cover the clean migration-derived baseline, a
+nondeterministic ICU identity change when ICU is available, an executable
+distinct deterministic identity change on installations without ICU, a
+different deterministic collation identity, non-collatable columns, stable
+database-default evidence, malformed evidence, and exact restoration without
+skipping the causal boundary.
+
+### H54: database operability identity
+
+The existing `database_acl` evidence binds the database owner and complete ACL
+provenance together with `datallowconn` and `datconnlimit`. The manifest's
+accepted activation-capable application-database posture is exactly
+`datallowconn=true` and `datconnlimit=-1`: connections are allowed and no
+connection-limit posture prevents `sqag_runtime` from obtaining an
+application connection. A false `datallowconn`, a zero or other
+manifest-outside connection limit, missing or malformed evidence, or a
+contradictory manifest fails closed. Direct runtime `CONNECT`, direct
+migrator `CONNECT/CREATE/TEMPORARY`, PUBLIC `CONNECT`, prohibited
+`CREATE/TEMPORARY`, and all grantor/grant-option provenance remain exact.
+Disposable PostgreSQL 17 controls mutate each operability field, exercise
+missing and malformed evidence, restore the exact posture, and rerun the
+complete evaluator.
+
+### H55: relation hierarchy and partition identity
+
+Classified relation evidence binds both directions of `pg_inherits`, the
+`relispartition` flag, and a stable `relpartbound` expression. Every
+manifest-classified application table must remain an ordinary permanent
+relation with no inheritance descendants, no inheritance parent, no partition
+attachment, and no partition bound. An `r` relkind alone is insufficient.
+The closed-world evaluator continues to permit unrelated relation hierarchies
+only when they carry no locked runtime authority, and the optional legacy
+source/view posture remains conditional as previously defined. Disposable
+PostgreSQL 17 controls cover an ordinary inheritance child, a classified
+partition with a restrictive bound, the existing descendant prohibition, a
+valid unrelated hierarchy, and exact detach/drop restoration.
 ## PUBLIC ACL baseline and cleanup proof
 
 Before any disposable test mutates a PUBLIC database privilege or routine

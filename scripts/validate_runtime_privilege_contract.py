@@ -135,7 +135,8 @@ PRODUCTION_PROVIDER_CONTROL_EDGE = {
 }
 
 MIGRATION_KEYS = frozenset({"path", "sequence_no", "sha256", "tables"})
-DATABASE_ACL_KEYS = frozenset({"public", "sqag_migrator", "sqag_app", "sqag_runtime"})
+DATABASE_ACL_KEYS = frozenset({"operability", "public", "sqag_migrator", "sqag_app", "sqag_runtime"})
+DATABASE_OPERABILITY_KEYS = frozenset({"datallowconn", "datconnlimit"})
 DATABASE_PUBLIC_KEYS = frozenset({"connect", "temporary", "create"})
 DATABASE_MIGRATOR_KEYS = frozenset({"connect", "create", "temporary"})
 DATABASE_APP_KEYS = frozenset({"connect"})
@@ -196,7 +197,7 @@ VIEW_COLUMN_KEYS = frozenset(
     {"ordinal", "name", "type_oid", "type_schema", "type_name", "type_modifier", "type_sql"}
 )
 TABLE_COLUMN_IDENTITY_KEYS = frozenset(
-    {"ordinal", "name", "type_oid", "type_schema", "type_name", "type_modifier", "is_dropped"}
+    {"ordinal", "name", "type_oid", "type_schema", "type_name", "type_modifier", "collation", "is_dropped"}
 )
 VIEW_SECURITY_KEYS = frozenset({"security_barrier", "security_invoker", "check_option"})
 VIEW_RELATION_PRIVILEGES = (
@@ -228,6 +229,9 @@ RUNTIME_TABLE_PRIVILEGE_ROW_KEYS = frozenset(
         "row_security_enabled",
         "row_security_forced",
         "has_inheritance_descendants",
+        "has_inheritance_parents",
+        "is_partition",
+        "partition_bound",
         "privilege_type",
         "effective",
         "is_grantable",
@@ -283,7 +287,7 @@ RUNTIME_PARAMETER_PRIVILEGE_ROW_KEYS = frozenset(
     }
 )
 DATABASE_ACL_EVIDENCE_ROW_KEYS = frozenset(
-    {"database_name", "database_owner", "datacl", "acl_entries"}
+    {"database_name", "database_owner", "datallowconn", "datconnlimit", "datacl", "acl_entries"}
 )
 TABLE_ACL_EVIDENCE_ROW_KEYS = frozenset(
     {
@@ -305,6 +309,7 @@ TABLE_STRUCTURE_COLUMN_KEYS = frozenset(
         "type_schema",
         "type_name",
         "type_modifier",
+        "collation",
         "is_dropped",
         "is_nullable",
         "default_expression",
@@ -487,6 +492,8 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
     "database_acl": """
         select d.datname as database_name,
                database_owner.rolname as database_owner,
+               d.datallowconn as datallowconn,
+               d.datconnlimit as datconnlimit,
                d.datacl,
                acl.acl_entries
         from pg_catalog.pg_database d
@@ -554,6 +561,14 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                                       'type_schema', type_namespace.nspname,
                                       'type_name', attribute_type.typname,
                                       'type_modifier', attribute.atttypmod,
+                                      'collation', case
+                                          when attribute.attisdropped or attribute.attcollation = 0 then 'none'
+                                          when collation_row.collname = 'default'
+                                           and collation_namespace.nspname = 'pg_catalog'
+                                           and collation_row.collprovider = 'd' then 'database_default'
+                                          when collation_namespace.nspname is null or collation_row.collname is null then null
+                                          else collation_namespace.nspname || '.' || collation_row.collname
+                                      end,
                                       'is_dropped', attribute.attisdropped,
                                       'is_nullable', not attribute.attnotnull,
                                       'default_expression', case
@@ -568,6 +583,8 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                    from pg_catalog.pg_attribute attribute
                    left join pg_catalog.pg_type attribute_type on attribute_type.oid = attribute.atttypid
                    left join pg_catalog.pg_namespace type_namespace on type_namespace.oid = attribute_type.typnamespace
+                   left join pg_catalog.pg_collation collation_row on collation_row.oid = attribute.attcollation
+                   left join pg_catalog.pg_namespace collation_namespace on collation_namespace.oid = collation_row.collnamespace
                    left join pg_catalog.pg_attrdef default_definition
                      on default_definition.adrelid = attribute.attrelid
                     and default_definition.adnum = attribute.attnum
@@ -1067,6 +1084,14 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                                       'type_schema', type_namespace.nspname,
                                       'type_name', attribute_type.typname,
                                       'type_modifier', attribute.atttypmod,
+                                      'collation', case
+                                          when attribute.attisdropped or attribute.attcollation = 0 then 'none'
+                                          when collation_row.collname = 'default'
+                                           and collation_namespace.nspname = 'pg_catalog'
+                                           and collation_row.collprovider = 'd' then 'database_default'
+                                          when collation_namespace.nspname is null or collation_row.collname is null then null
+                                          else collation_namespace.nspname || '.' || collation_row.collname
+                                      end,
                                       'is_dropped', attribute.attisdropped
                                   )
                                   order by attribute.attnum
@@ -1076,6 +1101,8 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                    from pg_catalog.pg_attribute attribute
                    left join pg_catalog.pg_type attribute_type on attribute_type.oid = attribute.atttypid
                    left join pg_catalog.pg_namespace type_namespace on type_namespace.oid = attribute_type.typnamespace
+                   left join pg_catalog.pg_collation collation_row on collation_row.oid = attribute.attcollation
+                   left join pg_catalog.pg_namespace collation_namespace on collation_namespace.oid = collation_row.collnamespace
                    where attribute.attrelid = c.oid
                      and attribute.attnum > 0
                ) as column_contract,
@@ -1086,6 +1113,16 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                    from pg_catalog.pg_inherits inh
                    where inh.inhparent = c.oid
                ) as has_inheritance_descendants,
+               exists (
+                   select 1
+                   from pg_catalog.pg_inherits inh
+                   where inh.inhrelid = c.oid
+               ) as has_inheritance_parents,
+               c.relispartition as is_partition,
+               case
+                   when c.relpartbound is null then null
+                   else pg_catalog.pg_get_expr(c.relpartbound, c.oid, true)
+               end as partition_bound,
                p.privilege_type,
                has_table_privilege('sqag_runtime', c.oid, p.privilege_type) as effective,
                has_table_privilege(
@@ -1700,6 +1737,8 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "datdba",
         "database_name",
         "database_owner",
+        "datallowconn",
+        "datconnlimit",
         "datacl",
         "pg_catalog.aclexplode",
         "pg_catalog.acldefault",
@@ -1746,6 +1785,7 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "pg_catalog.pg_attribute",
         "pg_catalog.pg_type",
         "pg_catalog.pg_attrdef",
+        "pg_catalog.pg_collation",
         "pg_catalog.pg_constraint",
         "pg_catalog.pg_trigger",
         "pg_catalog.pg_rewrite",
@@ -1900,9 +1940,19 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "type_name",
         "type_modifier",
         "is_dropped",
+        "collation",
+        "attcollation",
+        "collname",
+        "collnamespace",
+        "collprovider",
+        "database_default",
         "pg_catalog.pg_type",
         "pg_catalog.pg_inherits",
+        "pg_catalog.pg_get_expr",
         "has_inheritance_descendants",
+        "has_inheritance_parents",
+        "is_partition",
+        "partition_bound",
         "relkind",
         "'r'",
         "'p'",
@@ -3170,16 +3220,47 @@ def _migration_table_identity(
     return first, cursor
 
 
+def _migration_collation_identity(
+    type_tokens: tuple[SQLToken, ...],
+    definition_tokens: tuple[SQLToken, ...],
+    label: str,
+) -> str:
+    _type_oid, _type_schema, type_name, _type_modifier = _migration_type_identity(type_tokens, label)
+    collation_index = next(
+        (index for index, token in enumerate(definition_tokens) if _token_is_word(token, "collate")),
+        None,
+    )
+    if collation_index is None:
+        return "database_default" if type_name in {"text", "varchar", "bpchar", "name"} else "none"
+    cursor = collation_index + 1
+    if cursor >= len(definition_tokens):
+        raise ValueError(f"{label}_collation_missing")
+    first = definition_tokens[cursor]
+    if first.value.lower() == "default":
+        return "database_default"
+    first_name = _migration_identifier(first, f"{label}_collation")
+    cursor += 1
+    if cursor + 1 < len(definition_tokens) and definition_tokens[cursor].value == ".":
+        second_name = _migration_identifier(definition_tokens[cursor + 1], f"{label}_collation")
+        return f"{first_name}.{second_name}"
+    return f"pg_catalog.{first_name}"
+
+
 def _append_migration_column(
-    columns: dict[str, list[tuple[str, int, str, str, int]]],
+    columns: dict[str, list[tuple[str, int, str, str, int, str]]],
     table_name: str,
     column_name: str,
-    type_tokens: tuple[SQLToken, ...],
+    definition_tokens: tuple[SQLToken, ...],
 ) -> None:
+    type_end = _structural_column_position(definition_tokens, 0)
+    type_tokens = definition_tokens[:type_end]
     type_oid, type_schema, type_name, type_modifier = _migration_type_identity(
         type_tokens, f"migration_{table_name}_{column_name}"
     )
-    identity = (column_name, type_oid, type_schema, type_name, type_modifier)
+    collation = _migration_collation_identity(
+        type_tokens, definition_tokens, f"migration_{table_name}_{column_name}"
+    )
+    identity = (column_name, type_oid, type_schema, type_name, type_modifier, collation)
     existing = columns.setdefault(table_name, [])
     prior = next((entry for entry in existing if entry[0] == column_name), None)
     if prior is not None:
@@ -3190,7 +3271,7 @@ def _append_migration_column(
 
 
 def _apply_migration_column_ddl(
-    sql: str, columns: dict[str, list[tuple[str, int, str, str, int]]]
+    sql: str, columns: dict[str, list[tuple[str, int, str, str, int, str]]]
 ) -> None:
     tokens = tuple(token for token in lex_sql(sql) if token.kind not in {"COMMENT", "DOLLAR_QUOTE"})
     index = 0
@@ -3246,7 +3327,7 @@ def _apply_migration_column_ddl(
                     ):
                         type_end = position
                         break
-                _append_migration_column(columns, table_name, column_name, segment[1:type_end])
+                _append_migration_column(columns, table_name, column_name, segment[1:])
             index = close
             continue
         if (
@@ -3289,8 +3370,11 @@ def _apply_migration_column_ddl(
                     elif depth == 0 and part.value == ";":
                         break
                     type_end += 1
+                definition_end = type_end
+                while definition_end < len(tokens) and tokens[definition_end].value != ";":
+                    definition_end += 1
                 _append_migration_column(
-                    columns, table_name, column_name, tokens[cursor:type_end]
+                    columns, table_name, column_name, tokens[cursor:definition_end]
                 )
             index = max(cursor, index + 1)
             continue
@@ -3319,8 +3403,8 @@ def _ledger_create_table_sql() -> str:
 
 @lru_cache(maxsize=1)
 def _cached_classified_table_column_contract(
-) -> tuple[tuple[str, tuple[tuple[int, str, int, str, str, int, bool], ...]], ...]:
-    columns: dict[str, list[tuple[str, int, str, str, int]]] = {}
+) -> tuple[tuple[str, tuple[tuple[int, str, int, str, str, int, str, bool], ...]], ...]:
+    columns: dict[str, list[tuple[str, int, str, str, int, str]]] = {}
     for migration in migration_manifest(ROOT / "migrations"):
         _apply_migration_column_ddl(
             migration.path.read_text(encoding="utf-8"), columns
@@ -3342,6 +3426,7 @@ def _cached_classified_table_column_contract(
                     type_schema,
                     type_name,
                     type_modifier,
+                    collation,
                     False,
                 )
                 for ordinal, (
@@ -3350,6 +3435,7 @@ def _cached_classified_table_column_contract(
                     type_schema,
                     type_name,
                     type_modifier,
+                    collation,
                 ) in enumerate(columns[table_name], start=1)
             ),
         )
@@ -3363,7 +3449,7 @@ def classified_table_column_contract() -> dict[str, list[dict[str, Any]]]:
     return {
         table_name: [
             dict(zip(
-                ("ordinal", "name", "type_oid", "type_schema", "type_name", "type_modifier", "is_dropped"),
+                ("ordinal", "name", "type_oid", "type_schema", "type_name", "type_modifier", "collation", "is_dropped"),
                 identity,
                 strict=True,
             ))
@@ -3721,6 +3807,9 @@ def _structural_add_column(
     type_oid, type_schema, type_name, type_modifier = _migration_type_identity(
         type_tokens, f"migration_{table_name}_{column_name}"
     )
+    collation = _migration_collation_identity(
+        type_tokens, tuple(type_tokens) + tuple(tail_tokens), f"migration_{table_name}_{column_name}"
+    )
     constraints, nullable, default_expression = _structural_parse_constraint_tail(
         tail_tokens,
         table_name=table_name,
@@ -3734,6 +3823,7 @@ def _structural_add_column(
         "type_schema": type_schema,
         "type_name": type_name,
         "type_modifier": type_modifier,
+        "collation": collation,
         "is_dropped": False,
         "is_nullable": nullable,
         "default_expression": default_expression,
@@ -3743,10 +3833,10 @@ def _structural_add_column(
         table["columns"].append(identity)
     elif {
         key: prior[key]
-        for key in ("name", "type_oid", "type_schema", "type_name", "type_modifier")
+        for key in ("name", "type_oid", "type_schema", "type_name", "type_modifier", "collation")
     } != {
         key: identity[key]
-        for key in ("name", "type_oid", "type_schema", "type_name", "type_modifier")
+        for key in ("name", "type_oid", "type_schema", "type_name", "type_modifier", "collation")
     }:
         raise ValueError(f"migration_{table_name}_{column_name}_structural_type_drift")
     for constraint in constraints:
@@ -4348,6 +4438,8 @@ def _validate_table_structure_evidence(
                 or type(column.get("type_schema")) is not str
                 or type(column.get("type_name")) is not str
                 or type(column.get("type_modifier")) is not int
+                or type(column.get("collation")) is not str
+                or not column.get("collation", "").strip()
                 or type(column.get("is_dropped")) is not bool
                 or type(column.get("is_nullable")) is not bool
                 or (column.get("default_expression") is not None and type(column.get("default_expression")) is not str)
@@ -4465,6 +4557,7 @@ def _validate_table_structure_evidence(
                 value["type_schema"],
                 value["type_name"],
                 value["type_modifier"],
+                value["collation"],
                 value["is_dropped"],
                 value["is_nullable"],
                 _normalise_catalogue_structural_expression(value["default_expression"]) if value["default_expression"] is not None else None,
@@ -4479,6 +4572,7 @@ def _validate_table_structure_evidence(
                 value["type_schema"],
                 value["type_name"],
                 value["type_modifier"],
+                value["collation"],
                 value["is_dropped"],
                 value["is_nullable"],
                 _normalise_structural_expression(value["default_expression"]) if value["default_expression"] is not None else None,
@@ -4555,11 +4649,11 @@ def _validate_table_structure_evidence(
             _add_error(errors, f"table_structural_unexpected_unique_index_{index_name}")
 def _validate_table_column_contract(
     value: Any, label: str, errors: list[str]
-) -> tuple[tuple[int, str, int, str | None, str | None, int, bool], ...]:
+) -> tuple[tuple[int, str, int, str | None, str | None, int, str, bool], ...]:
     if type(value) is not list:
         _add_error(errors, f"{label}_must_be_list")
         return ()
-    result: list[tuple[int, str, int, str | None, str | None, int, bool]] = []
+    result: list[tuple[int, str, int, str | None, str | None, int, str, bool]] = []
     seen_ordinals: set[int] = set()
     for index, entry in enumerate(value):
         entry_label = f"{label}_{index}"
@@ -4574,15 +4668,17 @@ def _validate_table_column_contract(
         type_schema = entry.get("type_schema")
         type_name = entry.get("type_name")
         type_modifier = entry.get("type_modifier")
+        collation = entry.get("collation")
         is_dropped = entry.get("is_dropped")
         _require_type(ordinal, int, f"{entry_label}_ordinal", errors)
         _require_non_empty_string(name, f"{entry_label}_name", errors)
         _require_type(type_oid, int, f"{entry_label}_type_oid", errors)
         _require_type(type_modifier, int, f"{entry_label}_type_modifier", errors)
+        _require_non_empty_string(collation, f"{entry_label}_collation", errors)
         _require_type(is_dropped, bool, f"{entry_label}_is_dropped", errors)
         if type(ordinal) is not int or type(name) is not str or type(type_oid) is not int:
             continue
-        if type(type_modifier) is not int or type(is_dropped) is not bool:
+        if type(type_modifier) is not int or type(collation) is not str or type(is_dropped) is not bool:
             continue
         if ordinal <= 0:
             _add_error(errors, f"{entry_label}_ordinal_invalid")
@@ -4592,13 +4688,15 @@ def _validate_table_column_contract(
         if is_dropped:
             if type_schema is not None or type_name is not None or type_oid != 0:
                 _add_error(errors, f"{entry_label}_dropped_type_identity_invalid")
+            if collation != "none":
+                _add_error(errors, f"{entry_label}_dropped_collation_identity_invalid")
         else:
             _require_non_empty_string(type_schema, f"{entry_label}_type_schema", errors)
             _require_non_empty_string(type_name, f"{entry_label}_type_name", errors)
             if type(type_schema) is not str or type(type_name) is not str or type_oid <= 0:
                 continue
         result.append(
-            (ordinal, name, type_oid, type_schema, type_name, type_modifier, is_dropped)
+            (ordinal, name, type_oid, type_schema, type_name, type_modifier, collation, is_dropped)
         )
     if [entry[0] for entry in result] != sorted(entry[0] for entry in result):
         _add_error(errors, f"{label}_must_be_ordinal_ordered")
@@ -4668,6 +4766,10 @@ def evaluate_public_table_like_authority(
         _require_type(row.get("row_security_enabled"), bool, f"{label}_row_security_enabled", errors)
         _require_type(row.get("row_security_forced"), bool, f"{label}_row_security_forced", errors)
         _require_type(row.get("has_inheritance_descendants"), bool, f"{label}_has_inheritance_descendants", errors)
+        _require_type(row.get("has_inheritance_parents"), bool, f"{label}_has_inheritance_parents", errors)
+        _require_type(row.get("is_partition"), bool, f"{label}_is_partition", errors)
+        if row.get("partition_bound") is not None and type(row.get("partition_bound")) is not str:
+            _add_error(errors, f"{label}_partition_bound_must_be_string_or_null")
         _require_type(row.get("effective"), bool, f"{label}_effective", errors)
         _require_type(row.get("is_grantable"), bool, f"{label}_is_grantable", errors)
         if any(
@@ -4682,6 +4784,9 @@ def evaluate_public_table_like_authority(
             or type(row.get("row_security_enabled")) is not bool
             or type(row.get("row_security_forced")) is not bool
             or type(row.get("has_inheritance_descendants")) is not bool
+            or type(row.get("has_inheritance_parents")) is not bool
+            or type(row.get("is_partition")) is not bool
+            or (row.get("partition_bound") is not None and type(row.get("partition_bound")) is not str)
             or type(row.get("effective")) is not bool
             or type(row.get("is_grantable")) is not bool
         ):
@@ -4715,6 +4820,9 @@ def evaluate_public_table_like_authority(
                 "row_security_enabled": row["row_security_enabled"],
                 "row_security_forced": row["row_security_forced"],
                 "has_inheritance_descendants": row["has_inheritance_descendants"],
+                "has_inheritance_parents": row["has_inheritance_parents"],
+                "is_partition": row["is_partition"],
+                "partition_bound": row["partition_bound"],
             },
         )
         if relation["relation_kind"] != relation_kind:
@@ -4737,6 +4845,14 @@ def evaluate_public_table_like_authority(
             _add_error(errors, f"{label}_column_contract_inconsistent")
         if relation["has_inheritance_descendants"] != row["has_inheritance_descendants"]:
             _add_error(errors, f"{label}_inheritance_evidence_inconsistent")
+        if relation["has_inheritance_parents"] != row["has_inheritance_parents"]:
+            _add_error(errors, f"{label}_inheritance_parent_evidence_inconsistent")
+        if relation["is_partition"] != row["is_partition"]:
+            _add_error(errors, f"{label}_partition_evidence_inconsistent")
+        if relation["partition_bound"] != row["partition_bound"]:
+            _add_error(errors, f"{label}_partition_bound_evidence_inconsistent")
+        if row["is_partition"] != (row["partition_bound"] is not None):
+            _add_error(errors, f"{label}_partition_bound_consistency_invalid")
         privileges = table_privilege_sets.setdefault(relation_key, set())
         if privilege in privileges:
             _add_error(errors, f"{label}_duplicate_privilege")
@@ -4795,6 +4911,12 @@ def evaluate_public_table_like_authority(
             _add_error(errors, f"{label}_row_security_forced_forbidden")
         if relation["has_inheritance_descendants"]:
             _add_error(errors, f"{label}_inheritance_descendants_forbidden")
+        if relation["has_inheritance_parents"]:
+            _add_error(errors, f"{label}_inheritance_parents_forbidden")
+        if relation["is_partition"]:
+            _add_error(errors, f"{label}_partition_forbidden")
+        if relation["partition_bound"] is not None:
+            _add_error(errors, f"{label}_partition_bound_forbidden")
 
         expected_direct: set[str] = set()
         accessible_entry = accessible.get(table_name)
@@ -4934,12 +5056,13 @@ def evaluate_public_table_like_authority(
                 entry["type_schema"],
                 entry["type_name"],
                 entry["type_modifier"],
+                entry["collation"],
                 entry["is_dropped"],
             )
             for entry in expected_column_contracts.get(table_name, [])
         )
         actual_contract = relation["column_contract"]
-        actual_visible = tuple(entry for entry in actual_contract if not entry[6])
+        actual_visible = tuple(entry for entry in actual_contract if not entry[7])
         if len(actual_visible) != relation["visible_column_count"]:
             _add_error(
                 errors,
@@ -4967,6 +5090,12 @@ def evaluate_public_table_like_authority(
                         f"{label}_column_type_mismatch_{expected_name}_"
                         f"expected_{expected_identity[2:6]}_got_{actual_identity[2:6]}",
                     )
+                if actual_identity[6] != expected_identity[6]:
+                    _add_error(
+                        errors,
+                        f"{label}_column_collation_mismatch_{expected_name}_"
+                        f"expected_{expected_identity[6]}_got_{actual_identity[6]}",
+                    )
             ordinal_identity = actual_by_ordinal.get(expected_ordinal)
             if ordinal_identity is not None and ordinal_identity[1] != expected_name:
                 _add_error(
@@ -4977,7 +5106,7 @@ def evaluate_public_table_like_authority(
         for actual_identity in actual_visible:
             if actual_identity[1] not in expected_by_name:
                 _add_error(errors, f"{label}_column_unexpected_{actual_identity[1]}")
-        for dropped_identity in (entry for entry in actual_contract if entry[6]):
+        for dropped_identity in (entry for entry in actual_contract if entry[7]):
             _add_error(
                 errors,
                 f"{label}_column_dropped_slot_{dropped_identity[0]}_{dropped_identity[1]}",
@@ -5078,6 +5207,7 @@ def evaluate_bound_source_authority(
         _validate_runtime_acl_entries(
             row.get("acl_entries"), f"{label}_acl_entries", errors, VIEW_RELATION_PRIVILEGES
         )
+        _validate_table_column_contract(row.get("column_contract"), f"{label}_column_contract", errors)
         for key in ("schema_name", "table_name", "relation_kind", "relation_persistence", "owner", "privilege_type"):
             _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
         _require_type(row.get("owner_select"), bool, f"{label}_owner_select", errors)
@@ -5085,6 +5215,10 @@ def evaluate_bound_source_authority(
         _require_type(row.get("row_security_enabled"), bool, f"{label}_row_security_enabled", errors)
         _require_type(row.get("row_security_forced"), bool, f"{label}_row_security_forced", errors)
         _require_type(row.get("has_inheritance_descendants"), bool, f"{label}_has_inheritance_descendants", errors)
+        _require_type(row.get("has_inheritance_parents"), bool, f"{label}_has_inheritance_parents", errors)
+        _require_type(row.get("is_partition"), bool, f"{label}_is_partition", errors)
+        if row.get("partition_bound") is not None and type(row.get("partition_bound")) is not str:
+            _add_error(errors, f"{label}_partition_bound_must_be_string_or_null")
         _require_type(row.get("effective"), bool, f"{label}_effective", errors)
         _require_type(row.get("is_grantable"), bool, f"{label}_is_grantable", errors)
         if any(
@@ -5099,6 +5233,9 @@ def evaluate_bound_source_authority(
             or type(row.get("row_security_enabled")) is not bool
             or type(row.get("row_security_forced")) is not bool
             or type(row.get("has_inheritance_descendants")) is not bool
+            or type(row.get("has_inheritance_parents")) is not bool
+            or type(row.get("is_partition")) is not bool
+            or (row.get("partition_bound") is not None and type(row.get("partition_bound")) is not str)
             or type(row.get("effective")) is not bool
             or type(row.get("is_grantable")) is not bool
         ):
@@ -5141,6 +5278,12 @@ def evaluate_bound_source_authority(
             _add_error(errors, f"{label}_classified_view_source_row_security_forced_forbidden")
         if classified_present and row["has_inheritance_descendants"]:
             _add_error(errors, f"{label}_classified_view_source_inheritance_descendants_forbidden")
+        if classified_present and row["has_inheritance_parents"]:
+            _add_error(errors, f"{label}_classified_view_source_inheritance_parents_forbidden")
+        if classified_present and row["is_partition"]:
+            _add_error(errors, f"{label}_classified_view_source_partition_forbidden")
+        if classified_present and row["partition_bound"] is not None:
+            _add_error(errors, f"{label}_classified_view_source_partition_bound_forbidden")
         if row["effective"]:
             _add_error(errors, f"{label}_runtime_privilege_forbidden_{privilege}")
         if row["is_grantable"]:
@@ -6628,6 +6771,9 @@ def _validate_database_acl_evidence(
         return None, ()
     for key in ("database_name", "database_owner"):
         _require_non_empty_string(row.get(key), f"database_acl_evidence_{key}", errors)
+    _require_type(row.get("datallowconn"), bool, "database_acl_evidence_datallowconn", errors)
+    if type(row.get("datconnlimit")) is not int:
+        _add_error(errors, "database_acl_evidence_datconnlimit_must_be_int")
     if row.get("datacl") is not None and type(row.get("datacl")) is not list:
         _add_error(errors, "database_acl_evidence_datacl_must_be_list_or_null")
     entries = _validate_runtime_acl_entries(
@@ -6638,6 +6784,20 @@ def _validate_database_acl_evidence(
     )
     if type(row.get("database_name")) is not str or type(row.get("database_owner")) is not str:
         return row, entries
+    if manifest is not None:
+        operability = (
+            manifest.get("database_acl", {}).get("operability")
+            if isinstance(manifest, dict) and isinstance(manifest.get("database_acl"), dict)
+            else None
+        )
+        if not _exact_keys(operability, DATABASE_OPERABILITY_KEYS, "database_acl_operability", errors):
+            operability = {}
+        _exact_value(operability.get("datallowconn"), True, "database_acl_operability_datallowconn", errors)
+        _exact_value(operability.get("datconnlimit"), -1, "database_acl_operability_datconnlimit", errors)
+        if type(row.get("datallowconn")) is bool and row.get("datallowconn") is not True:
+            _add_error(errors, "database_acl_datallowconn_forbidden")
+        if type(row.get("datconnlimit")) is int and row.get("datconnlimit") != -1:
+            _add_error(errors, f"database_acl_datconnlimit_policy_mismatch_expected_-1_got_{row['datconnlimit']}")
     owner = str(row["database_owner"])
     public_contract = (
         manifest.get("database_acl", {}).get("public", {})
@@ -7127,6 +7287,10 @@ def validate_database_acl(manifest: dict[str, Any], errors: list[str]) -> None:
     if not _exact_keys(acl, DATABASE_ACL_KEYS, "database_acl", errors):
         if not isinstance(acl, dict):
             return
+    operability = acl.get("operability")
+    if _exact_keys(operability, DATABASE_OPERABILITY_KEYS, "database_acl_operability", errors):
+        _exact_value(operability.get("datallowconn"), True, "database_acl_operability_datallowconn", errors)
+        _exact_value(operability.get("datconnlimit"), -1, "database_acl_operability_datconnlimit", errors)
     expected = {
         "public": (DATABASE_PUBLIC_KEYS, {"connect": True, "temporary": "forbidden_after_boundary_b", "create": False}),
         "sqag_migrator": (DATABASE_MIGRATOR_KEYS, {"connect": True, "create": True, "temporary": True}),
@@ -7848,6 +8012,40 @@ def _validate_routine_query(query: str, errors: list[str]) -> None:
     if not _find_token_pattern(tokens, ["order", "by", "n", ".", "nspname", ",", "p", ".", "proname", ",", "identity_arguments", ",", "p", ".", "prokind"]):
         _add_error(errors, "verification_query_routine_acl_must_order_deterministically")
 
+def _validate_database_acl_query(query: str, errors: list[str]) -> None:
+    tokens = _read_only_query_tokens(query, "database_acl", errors)
+    if tokens is None:
+        return
+    _require_sql_features(
+        tokens,
+        "database_acl",
+        (
+            "pg_catalog.pg_database",
+            "pg_catalog.pg_roles",
+            "datname",
+            "datdba",
+            "datallowconn",
+            "datconnlimit",
+            "database_name",
+            "database_owner",
+            "datacl",
+            "acl_entries",
+            "pg_catalog.aclexplode",
+            "pg_catalog.acldefault",
+            "current_database",
+        ),
+        errors,
+    )
+    parts = _projection_parts(tokens, "database_acl", errors)
+    if parts is not None:
+        _require_projection_shape(
+            parts,
+            ["database_name", "database_owner", "datallowconn", "datconnlimit", "datacl", "acl_entries"],
+            "database_acl",
+            errors,
+        )
+
+
 def _validate_schema_acl_query(query: str, errors: list[str]) -> None:
     tokens = _read_only_query_tokens(query, "schema_acl", errors)
     if tokens is None:
@@ -8047,7 +8245,9 @@ def validate_verification_queries(manifest: dict[str, Any], errors: list[str]) -
         _require_non_empty_string(value, f"verification_query_{key}", errors)
         if type(value) is not str or not value.strip():
             continue
-        if key == "default_acl":
+        if key == "database_acl":
+            _validate_database_acl_query(value, errors)
+        elif key == "default_acl":
             _validate_default_acl_query(value, errors)
         elif key == "role_attributes":
             _validate_role_attributes_query(value, errors)
@@ -8080,6 +8280,16 @@ def validate_verification_queries(manifest: dict[str, Any], errors: list[str]) -
                     "owner_select",
                     "visible_column_count",
                     "has_inheritance_descendants",
+                    "has_inheritance_parents",
+                    "is_partition",
+                    "partition_bound",
+                    "relispartition",
+                    "relpartbound",
+                    "attcollation",
+                    "collname",
+                    "collnamespace",
+                    "collprovider",
+                    "collation",
                     "relrowsecurity",
                     "relpersistence",
                     "relation_persistence",
