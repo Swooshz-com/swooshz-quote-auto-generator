@@ -199,7 +199,9 @@ CANONICAL_QUERY_COLUMNS = {
         "routine_kind",
         "privilege_type",
         "direct_runtime_execute",
+        "baseline_public_execute",
         "public_execute",
+        "public_execute_grantable",
         "effective",
         "is_grantable",
     ],
@@ -851,6 +853,9 @@ class ValidatorStaticTest(unittest.TestCase):
             public_execute: bool,
             effective: bool,
             is_grantable: bool,
+            *,
+            baseline_public_execute: bool | None = None,
+            public_execute_grantable: bool = False,
         ) -> dict[str, Any]:
             return {
                 "schema_name": schema_name,
@@ -860,6 +865,10 @@ class ValidatorStaticTest(unittest.TestCase):
                 "privilege_type": "EXECUTE",
                 "direct_runtime_execute": direct_runtime_execute,
                 "public_execute": public_execute,
+                "baseline_public_execute": (
+                    public_execute if baseline_public_execute is None else baseline_public_execute
+                ),
+                "public_execute_grantable": public_execute_grantable,
                 "effective": effective,
                 "is_grantable": is_grantable,
             }
@@ -2029,6 +2038,18 @@ class ValidatorStaticTest(unittest.TestCase):
             "role_attributes",
             query,
             "verification_query_role_attributes_password_state_must_be_boolean_null_assertion",
+        )
+
+    def test_role_attributes_query_binds_literal_sqag_prefix(self) -> None:
+        query = load_manifest()["verification_queries"]["role_attributes"].replace(
+            "left(r.rolname, 5) = 'sqag_'",
+            "r.rolname like 'sqag_' || chr(37)",
+            1,
+        )
+        self._assert_query_fixture_rejected(
+            "role_attributes",
+            query,
+            "verification_query_role_attributes_must_enumerate_sqag_namespace",
         )
 
     def test_missing_legacy_view_fails_closed(self) -> None:
@@ -4469,7 +4490,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                         "select rolname from pg_catalog.pg_roles "
                         "where rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_app', 'neondb_owner') or rolname like %s "
                         "order by rolname",
-                        ("sqag_rpc_role_%",),
+                        ("rpc_role_%",),
                     ).fetchall()
                 ]
                 leftover_memberships = connection.execute(
@@ -4480,7 +4501,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                     "where parent.rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_app', 'neondb_owner') "
                     "or member.rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_app', 'neondb_owner') "
                     "or parent.rolname like %s or member.rolname like %s",
-                    ("sqag_rpc_role_%", "sqag_rpc_role_%"),
+                    ("rpc_role_%", "rpc_role_%"),
                 ).fetchall()
                 if leftover_databases:
                     errors.append(f"leftover_test_databases:{leftover_databases}")
@@ -4504,7 +4525,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                                 "or owner_role.rolname like %s "
                                 "or grantee_role.rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_app', 'neondb_owner') "
                                 "or grantee_role.rolname like %s",
-                                ("sqag_rpc_role_%", "sqag_rpc_role_%"),
+                                ("rpc_role_%", "rpc_role_%"),
                             ).fetchall()
                             if rows:
                                 errors.append(f"leftover_test_default_acl:{database_name}:{rows}")
@@ -4661,7 +4682,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         return role_name
 
     def _new_role(self, purpose: str) -> str:
-        role_name = f"sqag_rpc_role_{purpose}_{uuid.uuid4().hex[:8]}"
+        role_name = f"rpc_role_{purpose}_{uuid.uuid4().hex[:8]}"
         return self._create_role(role_name)
 
     def _drop_role(self, role_name: str) -> None:
@@ -4721,7 +4742,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 "select rolname from pg_catalog.pg_roles "
                 "where rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_app', 'neondb_owner') or rolname like %s "
                 "order by rolname",
-                ("sqag_rpc_role_%",),
+                ("rpc_role_%",),
             ).fetchall()
             if leftover_roles:
                 errors.append(f"leftover_roles:{leftover_roles}")
@@ -4735,7 +4756,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                 "or owner_role.rolname like %s "
                 "or grantee_role.rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_app', 'neondb_owner') "
                 "or grantee_role.rolname like %s",
-                ("sqag_rpc_role_%", "sqag_rpc_role_%"),
+                ("rpc_role_%", "rpc_role_%"),
             ).fetchall()
             if leftover_acl:
                 errors.append(f"leftover_default_acl:{leftover_acl}")
@@ -5978,7 +5999,6 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             "effective_runtime_table_privileges": len(ALL_TABLES) * len(TABLE_PRIVILEGES),
             "effective_runtime_column_privileges": sum(len(columns) for columns in self._user_columns().values()) * len(COLUMN_PRIVILEGES),
             "effective_runtime_schema_privileges": 2,
-            "effective_runtime_routine_privileges": 2,
             "view_acl": 0,
         }
         executed: list[str] = []
@@ -5994,7 +6014,11 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
         for query_key in CANONICAL_QUERY_KEYS:
             columns, rows = results[query_key]
             self.assertEqual(columns, CANONICAL_QUERY_COLUMNS[query_key], query_key)
-            if query_key in {"effective_runtime_parameter_privileges", "system_relation_acl"}:
+            if query_key in {
+                "effective_runtime_parameter_privileges",
+                "effective_runtime_routine_privileges",
+                "system_relation_acl",
+            }:
                 self.assertGreater(len(rows), 0, query_key)
             else:
                 self.assertEqual(len(rows), expected_cardinality[query_key], query_key)
@@ -6144,7 +6168,28 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             self._expected_runtime_column_grants(),
         )
         routine_rows = results["effective_runtime_routine_privileges"][1]
-        self.assertEqual({str(row["routine_name"]) for row in routine_rows}, set(EXPECTED_ROUTINES))
+        public_routine_rows = [
+            row for row in routine_rows if str(row["schema_name"]) == "public"
+        ]
+        self.assertEqual(
+            {str(row["routine_name"]) for row in public_routine_rows},
+            set(EXPECTED_ROUTINES),
+        )
+        self.assertTrue(all(type(row["baseline_public_execute"]) is bool for row in routine_rows))
+        self.assertTrue(all(type(row["public_execute_grantable"]) is bool for row in routine_rows))
+        self.assertTrue(all(not row["public_execute_grantable"] for row in routine_rows))
+        read_file = next(
+            row
+            for row in routine_rows
+            if row["schema_name"] == "pg_catalog"
+            and row["routine_name"] == "pg_read_file"
+            and row["identity_arguments"] == "text"
+        )
+        self.assertFalse(read_file["direct_runtime_execute"])
+        self.assertFalse(read_file["baseline_public_execute"])
+        self.assertFalse(read_file["public_execute"])
+        self.assertFalse(read_file["effective"])
+        self.assertFalse(read_file["is_grantable"])
         self.assertEqual(
             {
                 (
@@ -6156,7 +6201,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
                     bool(row["effective"]),
                     bool(row["is_grantable"]),
                 )
-                for row in routine_rows
+                for row in public_routine_rows
             },
             {
                 (routine_name, "", "f", False, False, False, False)
@@ -7045,7 +7090,7 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
 
         creator_name = self._new_role("pg17_creator")
         self._execute_admin_sql(f"alter role {_quote_identifier(creator_name)} createrole")
-        runtime_name = f"sqag_rpc_role_pg17_runtime_{uuid.uuid4().hex[:8]}"
+        runtime_name = f"rpc_role_pg17_runtime_{uuid.uuid4().hex[:8]}"
         _quote_identifier(runtime_name)
         connection = self.connect()
         try:
@@ -7992,6 +8037,222 @@ class PostgreSQLContractIntegrationTest(unittest.TestCase):
             )
             self._execute_admin_sql(
                 f'drop table if exists public.{_quote_identifier(unrelated_parent)}'
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+    def test_h56_generated_and_identity_column_modes_fail_closed_postgres(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+        table_ident = 'public."sqag_generation_runs"'
+        column_name = "attempt_number"
+
+        self._execute_admin_sql(
+            "update pg_catalog.pg_attribute set attgenerated = 's' "
+            "where attrelid = %s::regclass and attname = %s and not attisdropped"
+            % (repr(table_ident), repr(column_name))
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertIn(
+                "table_structural_column_contract_mismatch_sqag_generation_runs",
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(
+                "update pg_catalog.pg_attribute set attgenerated = '' "
+                "where attrelid = %s::regclass and attname = %s and not attisdropped"
+                % (repr(table_ident), repr(column_name))
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        self._execute_admin_sql(
+            "update pg_catalog.pg_attribute set attidentity = 'a' "
+            "where attrelid = %s::regclass and attname = %s and not attisdropped"
+            % (repr(table_ident), repr(column_name))
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertIn(
+                "table_structural_column_contract_mismatch_sqag_generation_runs",
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(
+                "update pg_catalog.pg_attribute set attidentity = '' "
+                "where attrelid = %s::regclass and attname = %s and not attisdropped"
+                % (repr(table_ident), repr(column_name))
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+        _, table_rows = self._execute_contract_query("table_acl")
+        attempt_number = next(
+            column
+            for table in table_rows
+            if table["relname"] == "sqag_generation_runs"
+            for column in table["table_columns"]
+            if column["name"] == column_name
+        )
+        self.assertEqual(attempt_number["attgenerated"], "")
+        self.assertEqual(attempt_number["attidentity"], "")
+        self.assertEqual(attempt_number["default_expression"], "1")
+
+    def test_h57_system_routine_baseline_delta_controls_fail_closed_postgres(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+        _, routine_rows = self._execute_contract_query(
+            "effective_runtime_routine_privileges"
+        )
+        read_file = next(
+            row
+            for row in routine_rows
+            if row["schema_name"] == "pg_catalog"
+            and row["routine_name"] == "pg_read_file"
+            and row["identity_arguments"] == "text"
+        )
+        self.assertFalse(read_file["baseline_public_execute"])
+        self.assertFalse(read_file["public_execute"])
+        baseline_builtin = next(
+            row
+            for row in routine_rows
+            if row["schema_name"] == "pg_catalog"
+            and row["baseline_public_execute"]
+        )
+        self.assertTrue(baseline_builtin["public_execute"])
+        self.assertFalse(baseline_builtin["public_execute_grantable"])
+        self.assertFalse(baseline_builtin["is_grantable"])
+
+        routine_sql = "pg_catalog.pg_read_file(text)"
+        self._execute_admin_sql(
+            f'grant execute on function {routine_sql} to "sqag_runtime"'
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(
+                any(
+                    "runtime_system_routine_direct_execute_forbidden_pg_catalog.pg_read_file(text)"
+                    in error
+                    for error in errors
+                ),
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(
+                f'revoke execute on function {routine_sql} from "sqag_runtime"'
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        self._execute_admin_sql(
+            f"grant execute on function {routine_sql} to public"
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(
+                any(
+                    "runtime_system_routine_public_execute_beyond_baseline_pg_catalog.pg_read_file(text)"
+                    in error
+                    for error in errors
+                ),
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(
+                f"revoke execute on function {routine_sql} from public"
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        self._execute_admin_sql(
+            f'grant execute on function {routine_sql} to "sqag_runtime" with grant option'
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(
+                any(
+                    "runtime_system_routine_grant_option_forbidden_pg_catalog.pg_read_file(text)"
+                    in error
+                    for error in errors
+                ),
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(
+                f'revoke execute on function {routine_sql} from "sqag_runtime"'
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        parent_name = self._new_role("h57_parent")
+        self._execute_admin_sql(
+            f"grant execute on function {routine_sql} to {_quote_identifier(parent_name)}"
+        )
+        self._grant_role_membership(parent_name, "sqag_runtime")
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(
+                any(
+                    "runtime_system_routine_effective_execute_beyond_baseline_pg_catalog.pg_read_file(text)"
+                    in error
+                    for error in errors
+                ),
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(
+                f'revoke {_quote_identifier(parent_name)} from "sqag_runtime"'
+            )
+            self._execute_admin_sql(
+                f"revoke execute on function {routine_sql} from {_quote_identifier(parent_name)}"
+            )
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+    def test_h58_sqag_role_identity_is_closed_world_postgres(self) -> None:
+        self._prepare_fixed_runtime_contract_fixture()
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+        _, clean_rows = self._execute_contract_query("role_attributes")
+        clean_names = {str(row["rolname"]) for row in clean_rows}
+        self.assertIn("neondb_owner", clean_names)
+        self.assertEqual(
+            {name for name in clean_names if name.startswith("sqag_")},
+            {"sqag_runtime", "sqag_migrator", "sqag_app"},
+        )
+
+        self._execute_admin_sql('create role "sqag_maintenance"')
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(
+                any("forbidden_identity_present_sqag_maintenance" in error for error in errors),
+                errors,
+            )
+        finally:
+            self._execute_admin_sql('drop role "sqag_maintenance"')
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        extra_role = f"sqag_h58_extra_{uuid.uuid4().hex[:8]}"
+        self._execute_admin_sql(f"create role {_quote_identifier(extra_role)}")
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(
+                any(f"unclassified_sqag_identity_{extra_role}" in error for error in errors),
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(f"drop role {_quote_identifier(extra_role)}")
+        self.assertEqual(self._evaluate_runtime_authority_rows(), ())
+
+        renamed_role = "rpc_role_h58_missing"
+        self._execute_admin_sql(
+            f'alter role "sqag_app" rename to {_quote_identifier(renamed_role)}'
+        )
+        try:
+            errors = self._evaluate_runtime_authority_rows()
+            self.assertTrue(
+                any(
+                    "role_attribute_required_evidence_missing" in error
+                    and "sqag_app" in error
+                    for error in errors
+                ),
+                errors,
+            )
+        finally:
+            self._execute_admin_sql(
+                f'alter role {_quote_identifier(renamed_role)} rename to "sqag_app"'
             )
         self.assertEqual(self._evaluate_runtime_authority_rows(), ())
 

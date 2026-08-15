@@ -81,13 +81,25 @@ when every relevant effective and grant-option result is false.
 
 ## Complete non-system schema authority boundary
 
-The effective table, column, schema, sequence, routine, ordinary-view, and
+The effective table, column, schema, sequence, ordinary-view, and
 materialized-view evidence enumerates every ordinary PostgreSQL user schema,
-not only `public`. The only excluded namespaces are the exact PostgreSQL system
-names `pg_catalog`, `information_schema`, and `pg_toast`, plus PostgreSQL's
-numeric managed temporary namespaces matching `pg_temp_[0-9]+` or
-`pg_toast_temp_[0-9]+`. A broad `pg_%` prefix exclusion is forbidden because an
-ordinary application schema such as `pg_application_data` must remain visible.
+not only `public`. For those non-routine collections, the only excluded
+namespaces are the exact PostgreSQL system names `pg_catalog`,
+`information_schema`, and `pg_toast`, plus PostgreSQL's numeric managed
+temporary namespaces matching `pg_temp_[0-9]+` or `pg_toast_temp_[0-9]+`. A
+broad `pg_%` prefix exclusion is forbidden because an ordinary application
+schema such as `pg_application_data` must remain visible.
+
+Routine authority is a deliberate system-catalog exception: the
+`effective_runtime_routine_privileges` query enumerates persistent routines in
+`pg_catalog` and other system schemas as well, excluding only the numeric
+managed temporary namespaces. For each system routine, `baseline_public_execute`
+is derived from PostgreSQL 17 `pg_init_privs` with an `acldefault` fallback when
+no initial-privilege row exists. Current PUBLIC execution, PUBLIC grant option,
+direct runtime execution, effective runtime execution, and grant option are
+compared as a baseline/delta proof. Normal stock built-in PUBLIC execution is
+therefore accepted, while any exceptional runtime, PUBLIC-beyond-baseline,
+inherited, or grant-option authority fails closed.
 
 The authorized `public` contract is unchanged. In every other ordinary schema,
 effective `sqag_runtime` schema `USAGE`/`CREATE`, table or column authority,
@@ -431,7 +443,7 @@ live-system evidence.
 | `effective_runtime_table_privileges` | `schema_name`, `table_name`, `relation_kind`, `relation_persistence`, `acl_entries`, `owner`, `owner_select`, `visible_column_count`, `column_contract`, `row_security_enabled`, `row_security_forced`, `has_inheritance_descendants`, `has_inheritance_parents`, `is_partition`, `partition_bound`, `privilege_type`, `effective`, `is_grantable` | 8 per enumerated non-system `r`/`p`/`f` relation; 128 in the base migrated fixture, plus 8 for each additional relation |
 | `effective_runtime_column_privileges` | `schema_name`, `table_name`, `column_name`, `acl_entries`, `privilege_type`, `effective`, `is_grantable` | 4 per visible column on each enumerated non-system `r`/`p`/`f` relation |
 | `effective_runtime_schema_privileges` | `schema_name`, `privilege_type`, `effective`, `is_grantable` | 2 per enumerated non-system schema |
-| `effective_runtime_routine_privileges` | `schema_name`, `routine_name`, `identity_arguments`, `routine_kind`, `privilege_type`, `direct_runtime_execute`, `public_execute`, `effective`, `is_grantable` | 1 per enumerated non-system routine |
+| `effective_runtime_routine_privileges` | `schema_name`, `routine_name`, `identity_arguments`, `routine_kind`, `privilege_type`, `direct_runtime_execute`, `baseline_public_execute`, `public_execute`, `public_execute_grantable`, `effective`, `is_grantable` | 1 per enumerated persistent routine, including system routines |
 | `effective_runtime_parameter_privileges` | `parameter_name`, `acl_entries`, `startup_defaults`, `effective_set`, `effective_alter_system`, `set_grantable`, `alter_system_grantable` | One row per parameter in the sorted `pg_settings`/`pg_parameter_acl`/applicable-startup-setting inventory union, including every observed runtime startup-default parameter |
 | `view_acl` | `schema_name`, `relation_name`, `relation_kind`, `owner`, `relation_acl`, `acl_entries`, `column_acl_entries`, `view_definition`, `view_dependencies`, `view_columns`, `relation_options`, `view_security`, `runtime_privileges`, `runtime_select`, `runtime_select_grantable` | 0 in the generic shape fixture; 1 when the legacy-optional view fixture is present |
 | `system_relation_acl` | `schema_name`, `relation_name`, `relation_kind`, `current_acl_entries`, `initial_acl_entries`, `initial_privilege_types` | one metadata row per system relation with explicit ACL or PostgreSQL initial-privilege provenance |
@@ -492,12 +504,21 @@ ledger table DDL from `_create_ledger` in `webapp/postgres_migrations.py` throug
 Python AST inspection. The resulting contract covers all 16 classified tables
 and binds every physical user-column slot to ordinal position, column name,
 PostgreSQL type OID, type schema, type name, type modifier, stable collation
-identity, and dropped-column visibility. For collatable columns, the accepted
-identities are `database_default` or an explicit schema-qualified collation
-name; non-collatable and dropped slots use `none`. The committed migration
-digests and table bindings therefore remain the single reviewed schema
-authority; the JSON manifest cannot become an independent column-schema truth
-source.
+identity, dropped-column visibility, nullability, default expression, and the
+`attgenerated`/`attidentity` semantic modes. For collatable columns, the
+accepted identities are `database_default` or an explicit schema-qualified
+collation name; non-collatable and dropped slots use `none`. The committed
+migration digests and table bindings therefore remain the single reviewed
+schema authority; the JSON manifest cannot become an independent column-schema
+truth source.
+
+Generated and identity posture is closed through the migration-derived model:
+ordinary columns use `attgenerated=""` and `attidentity=""`, stored generated
+columns use `attgenerated="s"`, and identity columns use `attidentity="a"` or
+`"d"`. A normal default expression is never equivalent to generated or identity
+posture; identity defaults are represented without treating their sequence
+expression as an ordinary default. Unprescribed generated or identity modes
+fail closed for every classified column, not only a named fixture column.
 
 For every classified table, the unchanged invariants require `relkind='r'`,
 permanent `relation_persistence='p'`, owner `sqag_migrator`,
@@ -757,8 +778,9 @@ highest-precedence values, unknown settings, safe values, unsafe values, and
 restore the role/database settings exactly.
 ### H35: migration-derived table structure guard
 
-table_acl now carries ordered columns with nullability and default expressions,
-semantic table constraints, and index contracts. The validator derives the
+table_acl now carries ordered columns with nullability, default expressions, and
+`attgenerated`/`attidentity` semantic modes, plus semantic table constraints and index
+contracts. The validator derives the
 expected table structure from the locked PostgreSQL migrations and the ledger
 DDL, including primary, unique, foreign-key, check, not-null, and default
 semantics. CHECK column references are derived from the expression, and every
@@ -1023,6 +1045,38 @@ source/view posture remains conditional as previously defined. Disposable
 PostgreSQL 17 controls cover an ordinary inheritance child, a classified
 partition with a restrictive bound, the existing descendant prohibition, a
 valid unrelated hierarchy, and exact detach/drop restoration.
+
+### H56: closed semantic column identity
+
+Classified-column structural identity now binds PostgreSQL `attgenerated` and
+`attidentity` in addition to ordinal/name, type schema/name, typmod, collation,
+dropped posture, nullability, and default expression. The migration-derived
+model distinguishes ordinary columns, stored generated columns, and always or
+by-default identity columns. A clean PostgreSQL 17 schema passes; direct
+catalog mutations to generated or identity posture fail with a deterministic
+structural mismatch; ordinary valid defaults remain accepted; exact catalog
+restoration returns the evaluator to green.
+
+### H57: baseline-aware system-routine authority
+
+Routine evidence includes persistent `pg_catalog`/system routines and derives
+normal PUBLIC EXECUTE posture from PostgreSQL 17 `pg_init_privs`, with
+`acldefault` used when initial privilege rows are absent. The evaluator accepts
+stock built-in baseline authority but rejects exceptional direct runtime
+EXECUTE, PUBLIC EXECUTE beyond baseline, effective membership-derived EXECUTE,
+and any EXECUTE grant option. Disposable controls exercise each applicable
+delta and restore the exact baseline before the final green assertion.
+
+### H58: closed-world SQAG role identity
+
+Role evidence enumerates the complete `sqag_*` universe plus the explicit
+provider/control-plane identity. Every required manifest-authorised SQAG role
+must be present, every manifest-forbidden identity must be absent, and any
+additional unclassified `sqag_*` identity fails closed. The retained
+`sqag_app` rollback-role contract and runtime/migrator attributes remain
+unchanged; provider roles outside the SQAG namespace are not reclassified.
+PostgreSQL 17 controls cover forbidden-role presence, an additional SQAG role,
+missing required role evidence, and exact cleanup/drop restoration.
 ## PUBLIC ACL baseline and cleanup proof
 
 Before any disposable test mutates a PUBLIC database privilege or routine

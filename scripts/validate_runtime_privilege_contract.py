@@ -255,6 +255,8 @@ RUNTIME_ROUTINE_PRIVILEGE_ROW_KEYS = frozenset(
         "privilege_type",
         "direct_runtime_execute",
         "public_execute",
+        "baseline_public_execute",
+        "public_execute_grantable",
         "effective",
         "is_grantable",
     }
@@ -311,6 +313,8 @@ TABLE_STRUCTURE_COLUMN_KEYS = frozenset(
         "type_modifier",
         "collation",
         "is_dropped",
+        "attgenerated",
+        "attidentity",
         "is_nullable",
         "default_expression",
     }
@@ -570,8 +574,11 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                                           else collation_namespace.nspname || '.' || collation_row.collname
                                       end,
                                       'is_dropped', attribute.attisdropped,
+                                      'attgenerated', attribute.attgenerated,
+                                      'attidentity', attribute.attidentity,
                                       'is_nullable', not attribute.attnotnull,
                                       'default_expression', case
+                                          when attribute.attidentity <> '' then null
                                           when default_definition.oid is null then null
                                           else pg_catalog.pg_get_expr(default_definition.adbin, default_definition.adrelid, true)
                                       end
@@ -1010,7 +1017,8 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                a.rolpassword is null as password_is_null
         from pg_catalog.pg_roles r
         join pg_catalog.pg_authid a on a.oid = r.oid
-        where r.rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_app', 'neondb_owner')
+        where left(r.rolname, 5) = 'sqag_'
+           or r.rolname = 'neondb_owner'
         order by r.rolname
     """,
     "role_memberships": """
@@ -1255,7 +1263,34 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
                    )
                      and expanded.privilege_type = 'EXECUTE'
                ) as direct_runtime_execute,
+               exists (
+                   select 1
+                   from pg_catalog.pg_init_privs initial_privilege
+                   cross join lateral pg_catalog.aclexplode(initial_privilege.initprivs) baseline_acl
+                   where initial_privilege.classoid = 'pg_proc'::pg_catalog.regclass
+                     and initial_privilege.objoid = p.oid
+                     and initial_privilege.objsubid = 0
+                     and initial_privilege.privtype in ('i', 'e')
+                     and baseline_acl.grantee = 0
+                     and baseline_acl.privilege_type = 'EXECUTE'
+               )
+               or (
+                   not exists (
+                       select 1
+                       from pg_catalog.pg_init_privs initial_privilege
+                       where initial_privilege.classoid = 'pg_proc'::pg_catalog.regclass
+                         and initial_privilege.objoid = p.oid
+                         and initial_privilege.objsubid = 0
+                   )
+                   and exists (
+                       select 1
+                       from pg_catalog.aclexplode(pg_catalog.acldefault('f', p.proowner)) baseline_acl
+                       where baseline_acl.grantee = 0
+                         and baseline_acl.privilege_type = 'EXECUTE'
+                   )
+               ) as baseline_public_execute,
                has_function_privilege('public', p.oid, 'EXECUTE') as public_execute,
+               has_function_privilege('public', p.oid, 'EXECUTE WITH GRANT OPTION') as public_execute_grantable,
                has_function_privilege('sqag_runtime', p.oid, 'EXECUTE') as effective,
                has_function_privilege(
                    'sqag_runtime',
@@ -1265,9 +1300,6 @@ CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
         from pg_catalog.pg_proc p
         join pg_catalog.pg_namespace n on n.oid = p.pronamespace
         where p.prokind in ('f', 'p', 'a', 'w')
-          and n.nspname <> 'pg_catalog'
-          and n.nspname <> 'information_schema'
-          and n.nspname <> 'pg_toast'
           and n.nspname !~ '^pg_temp_[0-9]+$'
           and n.nspname !~ '^pg_toast_temp_[0-9]+$'
         order by n.nspname, p.proname, identity_arguments, p.prokind
@@ -1783,6 +1815,8 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "pg_catalog.pg_class",
         "pg_catalog.pg_namespace",
         "pg_catalog.pg_attribute",
+        "attgenerated",
+        "attidentity",
         "pg_catalog.pg_type",
         "pg_catalog.pg_attrdef",
         "pg_catalog.pg_collation",
@@ -1869,6 +1903,8 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "rolconnlimit",
         "rolpassword",
         "password_is_null",
+        "left",
+        "5",
         "is",
         "null",
     ),
@@ -2006,21 +2042,28 @@ REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
         "pg_catalog.pg_proc",
         "pg_catalog.pg_namespace",
         "pg_catalog.pg_roles",
+        "pg_catalog.pg_init_privs",
         "pg_catalog.aclexplode",
         "pg_catalog.acldefault",
         "pg_catalog.pg_get_function_identity_arguments",
+        "pg_catalog.regclass",
+        "classoid",
+        "objoid",
+        "objsubid",
+        "initprivs",
+        "privtype",
         "schema_name",
         "routine_name",
         "routine_kind",
         "direct_runtime_execute",
         "public_execute",
+        "baseline_public_execute",
+        "public_execute_grantable",
         "is_grantable",
         "grantee",
         "privilege_type",
         "'execute'",
         "'execute with grant option'",
-        "information_schema",
-        "pg_toast",
     ),    "effective_runtime_parameter_privileges": (
         "pg_catalog.pg_settings",
         "pg_catalog.pg_parameter_acl",
@@ -3685,10 +3728,12 @@ def _structural_parse_constraint_tail(
     table_name: str,
     column_name: str | None = None,
     initial_name: str | None = None,
-) -> tuple[list[dict[str, Any]], bool, str | None]:
+) -> tuple[list[dict[str, Any]], bool, str | None, str, str]:
     constraints: list[dict[str, Any]] = []
     nullable = True
     default_expression: str | None = None
+    attgenerated = ""
+    attidentity = ""
     index = 0
     declared_name = initial_name
     while index < len(tokens):
@@ -3791,10 +3836,38 @@ def _structural_parse_constraint_tail(
             index += 2
             continue
         if _token_is_word(tokens[index], "generated"):
-            index += 1
+            mode_index = index + 1
+            if mode_index >= len(tokens) or not (
+                _token_is_word(tokens[mode_index], "always")
+                or _token_is_word(tokens[mode_index], "by")
+            ):
+                raise ValueError(f"migration_{table_name}_{column_name or 'table'}_generated_mode_missing")
+            mode = tokens[mode_index].value.lower()
+            as_index = mode_index + 1
+            if as_index >= len(tokens) or not _token_is_word(tokens[as_index], "as"):
+                raise ValueError(f"migration_{table_name}_{column_name or 'table'}_generated_as_missing")
+            posture_index = as_index + 1
+            if posture_index < len(tokens) and _token_is_word(tokens[posture_index], "identity"):
+                if attgenerated:
+                    raise ValueError(f"migration_{table_name}_{column_name or 'table'}_generated_identity_conflict")
+                attidentity = "a" if mode == "always" else "d"
+                index = posture_index + 1
+                continue
+            if posture_index >= len(tokens) or tokens[posture_index].value != "(":
+                raise ValueError(f"migration_{table_name}_{column_name or 'table'}_generated_expression_missing")
+            expression_close = _structural_matching_paren(tokens, posture_index)
+            if expression_close + 1 >= len(tokens) or not _token_is_word(tokens[expression_close + 1], "stored"):
+                raise ValueError(f"migration_{table_name}_{column_name or 'table'}_generated_stored_missing")
+            if attidentity:
+                raise ValueError(f"migration_{table_name}_{column_name or 'table'}_generated_identity_conflict")
+            attgenerated = "s"
+            default_expression = _normalise_structural_tokens(
+                tokens[posture_index + 1 : expression_close]
+            ) or None
+            index = expression_close + 2
             continue
         index += 1
-    return constraints, nullable, default_expression
+    return constraints, nullable, default_expression, attgenerated, attidentity
 
 
 def _structural_add_column(
@@ -3810,7 +3883,7 @@ def _structural_add_column(
     collation = _migration_collation_identity(
         type_tokens, tuple(type_tokens) + tuple(tail_tokens), f"migration_{table_name}_{column_name}"
     )
-    constraints, nullable, default_expression = _structural_parse_constraint_tail(
+    constraints, nullable, default_expression, attgenerated, attidentity = _structural_parse_constraint_tail(
         tail_tokens,
         table_name=table_name,
         column_name=column_name,
@@ -3825,6 +3898,8 @@ def _structural_add_column(
         "type_modifier": type_modifier,
         "collation": collation,
         "is_dropped": False,
+        "attgenerated": attgenerated,
+        "attidentity": attidentity,
         "is_nullable": nullable,
         "default_expression": default_expression,
     }
@@ -3833,10 +3908,16 @@ def _structural_add_column(
         table["columns"].append(identity)
     elif {
         key: prior[key]
-        for key in ("name", "type_oid", "type_schema", "type_name", "type_modifier", "collation")
+        for key in (
+            "name", "type_oid", "type_schema", "type_name", "type_modifier", "collation",
+            "attgenerated", "attidentity", "is_nullable", "default_expression",
+        )
     } != {
         key: identity[key]
-        for key in ("name", "type_oid", "type_schema", "type_name", "type_modifier", "collation")
+        for key in (
+            "name", "type_oid", "type_schema", "type_name", "type_modifier", "collation",
+            "attgenerated", "attidentity", "is_nullable", "default_expression",
+        )
     }:
         raise ValueError(f"migration_{table_name}_{column_name}_structural_type_drift")
     for constraint in constraints:
@@ -3869,7 +3950,7 @@ def _structural_parse_create_table(
             continue
         first = segment[0]
         if first.kind == "WORD" and first.value.lower() in _MIGRATION_TABLE_CONSTRAINT_WORDS:
-            constraints, _nullable, _default = _structural_parse_constraint_tail(
+            constraints, _nullable, _default, _attgenerated, _attidentity = _structural_parse_constraint_tail(
                 segment,
                 table_name=table_name,
             )
@@ -4441,11 +4522,19 @@ def _validate_table_structure_evidence(
                 or type(column.get("collation")) is not str
                 or not column.get("collation", "").strip()
                 or type(column.get("is_dropped")) is not bool
+                or type(column.get("attgenerated")) is not str
+                or type(column.get("attidentity")) is not str
                 or type(column.get("is_nullable")) is not bool
                 or (column.get("default_expression") is not None and type(column.get("default_expression")) is not str)
             ):
                 _add_error(errors, f"{column_label}_field_type_invalid")
                 continue
+            if column["attgenerated"] not in {"", "s"}:
+                _add_error(errors, f"{column_label}_attgenerated_invalid")
+            if column["attidentity"] not in {"", "a", "d"}:
+                _add_error(errors, f"{column_label}_attidentity_invalid")
+            if column["attgenerated"] and column["attidentity"]:
+                _add_error(errors, f"{column_label}_generated_identity_conflict")
             observed_columns.append(column)
         constraints = row.get("table_constraints")
         if type(constraints) is not list:
@@ -4559,6 +4648,8 @@ def _validate_table_structure_evidence(
                 value["type_modifier"],
                 value["collation"],
                 value["is_dropped"],
+                value["attgenerated"],
+                value["attidentity"],
                 value["is_nullable"],
                 _normalise_catalogue_structural_expression(value["default_expression"]) if value["default_expression"] is not None else None,
             )
@@ -4574,6 +4665,8 @@ def _validate_table_structure_evidence(
                 value["type_modifier"],
                 value["collation"],
                 value["is_dropped"],
+                value["attgenerated"],
+                value["attidentity"],
                 value["is_nullable"],
                 _normalise_structural_expression(value["default_expression"]) if value["default_expression"] is not None else None,
             )
@@ -6390,6 +6483,8 @@ def evaluate_schema_wide_runtime_authority(
             for key in (
                 "direct_runtime_execute",
                 "public_execute",
+                "baseline_public_execute",
+                "public_execute_grantable",
                 "effective",
                 "is_grantable",
             ):
@@ -6408,6 +6503,8 @@ def evaluate_schema_wide_runtime_authority(
                 for key in (
                     "direct_runtime_execute",
                     "public_execute",
+                    "baseline_public_execute",
+                    "public_execute_grantable",
                     "effective",
                     "is_grantable",
                 )
@@ -6420,10 +6517,10 @@ def evaluate_schema_wide_runtime_authority(
             privilege = str(row["privilege_type"])
             direct_runtime_execute = bool(row["direct_runtime_execute"])
             public_execute = bool(row["public_execute"])
+            baseline_public_execute = bool(row["baseline_public_execute"])
+            public_execute_grantable = bool(row["public_execute_grantable"])
             effective = bool(row["effective"])
             is_grantable = bool(row["is_grantable"])
-            if _is_postgresql_system_schema(schema_name):
-                _add_error(errors, f"{label}_system_schema_must_be_excluded_{schema_name}")
             if routine_kind not in {"f", "p", "a", "w"}:
                 _add_error(errors, f"{label}_routine_kind_invalid_{routine_kind}")
             if privilege != "EXECUTE":
@@ -6432,6 +6529,19 @@ def evaluate_schema_wide_runtime_authority(
             if identity in seen_routines:
                 _add_error(errors, f"{label}_duplicate")
             seen_routines.add(identity)
+            if _is_postgresql_system_schema(schema_name):
+                routine_label = f"{schema_name}.{routine_name}({identity_arguments})"
+                if direct_runtime_execute:
+                    _add_error(errors, f"runtime_system_routine_direct_execute_forbidden_{routine_label}")
+                if public_execute and not baseline_public_execute:
+                    _add_error(errors, f"runtime_system_routine_public_execute_beyond_baseline_{routine_label}")
+                if public_execute_grantable:
+                    _add_error(errors, f"runtime_system_routine_public_grant_option_forbidden_{routine_label}")
+                if effective and not baseline_public_execute:
+                    _add_error(errors, f"runtime_system_routine_effective_execute_beyond_baseline_{routine_label}")
+                if is_grantable:
+                    _add_error(errors, f"runtime_system_routine_grant_option_forbidden_{routine_label}")
+                continue
             if schema_name != BOUND_SOURCE_SCHEMA and (
                 direct_runtime_execute or public_execute or effective or is_grantable
             ):
@@ -6951,11 +7061,23 @@ def _validate_role_attribute_evidence(
             "password_is_null",
         }
     )
-    legacy_contract = (
-        manifest.get("roles", {}).get("legacy", {})
-        if isinstance(manifest.get("roles"), dict)
-        else {}
-    )
+    roles_contract = manifest.get("roles") if isinstance(manifest.get("roles"), dict) else {}
+    runtime_contract = roles_contract.get("runtime") if isinstance(roles_contract.get("runtime"), dict) else {}
+    migrator_contract = roles_contract.get("migrator") if isinstance(roles_contract.get("migrator"), dict) else {}
+    provider_contract = roles_contract.get("provider") if isinstance(roles_contract.get("provider"), dict) else {}
+    runtime_name = runtime_contract.get("name")
+    if type(runtime_name) is not str or not runtime_name.strip():
+        _add_error(errors, "runtime_role_name_missing_for_role_evidence")
+        runtime_name = "sqag_runtime"
+    migrator_name = migrator_contract.get("name")
+    if type(migrator_name) is not str or not migrator_name.strip():
+        _add_error(errors, "migrator_role_name_missing_for_role_evidence")
+        migrator_name = "sqag_migrator"
+    provider_name = provider_contract.get("name")
+    if type(provider_name) is not str or not provider_name.strip():
+        _add_error(errors, "provider_role_name_missing_for_role_evidence")
+        provider_name = "neondb_owner"
+    legacy_contract = roles_contract.get("legacy", {}) if isinstance(roles_contract.get("legacy"), dict) else {}
     legacy_name = legacy_contract.get("name")
     if type(legacy_name) is not str or not legacy_name.strip():
         _add_error(errors, "legacy_role_name_missing_for_role_evidence")
@@ -6965,7 +7087,17 @@ def _validate_role_attribute_evidence(
     retained_attributes = legacy_contract.get("retained_attributes")
     if not _exact_keys(retained_attributes, LEGACY_ROLE_ATTRIBUTE_KEYS, "legacy_retained_attributes_evidence", errors):
         retained_attributes = {}
-    required = {"sqag_runtime", "sqag_migrator", legacy_name}
+    forbidden_contract = roles_contract.get("forbidden")
+    if not isinstance(forbidden_contract, list) or any(
+        type(role_name) is not str or not role_name.strip()
+        for role_name in (forbidden_contract if isinstance(forbidden_contract, list) else [])
+    ):
+        _add_error(errors, "forbidden_role_identity_list_invalid")
+        forbidden_names: set[str] = set()
+    else:
+        forbidden_names = {str(role_name) for role_name in forbidden_contract}
+    required = {runtime_name, migrator_name, legacy_name}
+    authorized_sqag_names = required
     seen: set[str] = set()
     for index, row in enumerate(rows):
         label = f"role_attribute_row_{index}"
@@ -6993,6 +7125,11 @@ def _validate_role_attribute_evidence(
         if role_name in seen:
             _add_error(errors, f"{label}_duplicate")
         seen.add(role_name)
+        if role_name.startswith("sqag_"):
+            if role_name in forbidden_names:
+                _add_error(errors, f"{label}_forbidden_identity_present_{role_name}")
+            elif role_name not in authorized_sqag_names:
+                _add_error(errors, f"{label}_unclassified_sqag_identity_{role_name}")
         if any(
             type(row.get(key)) is not bool
             for key in (
@@ -7007,12 +7144,8 @@ def _validate_role_attribute_evidence(
             )
         ) or type(row.get("rolconnlimit")) is not int:
             continue
-        if role_name == "sqag_runtime":
-            attributes = (
-                manifest.get("roles", {}).get("runtime", {}).get("attributes", {})
-                if isinstance(manifest.get("roles"), dict)
-                else {}
-            )
+        if role_name == runtime_name:
+            attributes = runtime_contract.get("attributes", {})
             expected_values = {
                 "rolcanlogin": attributes.get("login"),
                 "rolsuper": attributes.get("superuser"),
@@ -7041,13 +7174,16 @@ def _validate_role_attribute_evidence(
             for key, expected in expected_values.items():
                 if type(expected) is not type(row[key]) or row[key] != expected:
                     _add_error(errors, f"{label}_{key}_mismatch")
-        if role_name in {"sqag_runtime", "sqag_migrator", legacy_name}:
+        if role_name in {runtime_name, migrator_name, legacy_name}:
             for key in ("rolsuper", "rolcreaterole", "rolcreatedb", "rolreplication", "rolbypassrls"):
                 if row[key]:
                     _add_error(errors, f"{label}_{key}_privileged_forbidden")
     missing = required - seen
     if missing:
         _add_error(errors, f"role_attribute_required_evidence_missing_{sorted(missing)}")
+    present_forbidden = forbidden_names & seen
+    if present_forbidden:
+        _add_error(errors, f"role_attribute_forbidden_identity_set_present_{sorted(present_forbidden)}")
 
 
 def _validate_default_acl_evidence(
@@ -7865,8 +8001,16 @@ def _validate_role_attributes_query(query: str, errors: list[str]) -> None:
         _add_error(errors, "verification_query_role_attributes_must_read_pg_authid")
     if not _find_token_pattern(tokens, ["on", "a", ".", "oid", "=", "r", ".", "oid"]):
         _add_error(errors, "verification_query_role_attributes_must_join_authid_by_oid")
-    if not _find_token_pattern(tokens, ["where", "r", ".", "rolname", "in"]):
-        _add_error(errors, "verification_query_role_attributes_must_filter_declared_roles")
+    if not _find_token_pattern(
+        tokens,
+        ["where", "left", "(", "r", ".", "rolname", ",", "5", ")", "=", ("STRING_EXACT", "sqag_")],
+    ):
+        _add_error(errors, "verification_query_role_attributes_must_enumerate_sqag_namespace")
+    if not _find_token_pattern(
+        tokens,
+        ["or", "r", ".", "rolname", "=", ("STRING_EXACT", "neondb_owner")],
+    ):
+        _add_error(errors, "verification_query_role_attributes_must_retain_provider_identity")
     if not _find_token_pattern(tokens, ["order", "by", "r", ".", "rolname"]):
         _add_error(errors, "verification_query_role_attributes_must_order_by_role_name")
 
