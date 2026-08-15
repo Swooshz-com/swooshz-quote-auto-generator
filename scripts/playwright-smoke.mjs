@@ -2310,6 +2310,7 @@ async function main() {
     }
     let duplicateDetailRequestCount = 0;
     let releaseInitialDuplicateRequest = null;
+    let resolveDuplicateRecoveryDetailRequest = null;
     const duplicateDetailPattern = `**/api/quote-sessions/${currentDashboardSessionId}`;
     const duplicateDetailRoute = async (route) => {
       if (route.request().method() !== "GET") {
@@ -2317,6 +2318,7 @@ async function main() {
         return;
       }
       duplicateDetailRequestCount += 1;
+      if (duplicateDetailRequestCount >= 2) resolveDuplicateRecoveryDetailRequest?.();
       if (duplicateDetailRequestCount === 1) {
         await new Promise((resolve) => { releaseInitialDuplicateRequest = resolve; });
         await route.abort("aborted");
@@ -2331,9 +2333,24 @@ async function main() {
     const interruptedDuplicateOperation = await page.evaluate(() => JSON.parse(
       window.localStorage.getItem("swooshz_dashboard_operation_v1") || "null"
     ));
-    if (!interruptedDuplicateOperation?.targetSessionId) {
-      throw new Error(`Expected duplicate operation recovery state before refresh, found ${JSON.stringify(interruptedDuplicateOperation)}.`);
+    if (
+      interruptedDuplicateOperation?.type !== "duplicate"
+      || interruptedDuplicateOperation.sourceSessionId !== currentDashboardSessionId
+      || !/^quote-[A-Za-z0-9_-]{3,64}$/.test(interruptedDuplicateOperation.targetSessionId || "")
+      || interruptedDuplicateOperation.targetSessionId === currentDashboardSessionId
+      || typeof interruptedDuplicateOperation.browserRecoveryScope !== "string"
+      || !interruptedDuplicateOperation.browserRecoveryScope.trim()
+      || !Number.isFinite(Date.parse(interruptedDuplicateOperation.startedAt || ""))
+    ) {
+      throw new Error(`Expected persisted duplicate recovery state with exact source/target identity and valid metadata, found ${JSON.stringify(interruptedDuplicateOperation)}.`);
     }
+    const duplicateRecoveryDetailRequest = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Timed out waiting for duplicate refresh recovery source detail request.")), 15000);
+      resolveDuplicateRecoveryDetailRequest = () => {
+        clearTimeout(timeout);
+        resolve();
+      };
+    });
     const duplicateReload = page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForTimeout(100);
     if (typeof releaseInitialDuplicateRequest !== "function") {
@@ -2341,8 +2358,11 @@ async function main() {
     }
     releaseInitialDuplicateRequest();
     await duplicateReload;
+    await duplicateRecoveryDetailRequest;
+    if (duplicateDetailRequestCount < 2) {
+      throw new Error(`Duplicate refresh recovery should issue a subsequent source detail request, observed ${duplicateDetailRequestCount}.`);
+    }
     await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
-    await page.locator("#dashboardLoadingTitle", { hasText: "Duplicating quote" }).waitFor({ state: "visible", timeout: 15000 });
     const duplicatedTargetCard = page.locator(`.dashboard-session-card[data-quote-session-id="${interruptedDuplicateOperation.targetSessionId}"]`);
     await duplicatedTargetCard.waitFor({ state: "visible", timeout: 15000 });
     await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 15000 });
