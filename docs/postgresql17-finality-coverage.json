@@ -1,0 +1,104 @@
+{
+  "$schema": "sqag-postgresql17-finality-coverage-v1",
+  "schema_version": 1,
+  "engine_version": "a23-g3-real-reference-v1",
+  "postgres_major": 17,
+  "collector_mode": "live_postgresql17",
+  "catalogue_universe": {
+    "derivation": "live_pg_class_pg_attribute",
+    "schemas": ["pg_catalog"],
+    "relation_kinds": ["r", "t", "p"],
+    "field_filter": ["attnum > 0", "attisdropped = false"],
+    "empty_relation_rule": "explicit_authorized_typed_boundary",
+    "manual_catalogue_inventory": false,
+    "manual_catalogue_count": false,
+    "authority_boundaries": ["pg_toast schema ACL and live relation ACL digests"]
+  },
+  "observation_schema": {
+    "required_provenance": ["reference_id", "catalogue", "row_identity", "field_identity"],
+    "required_type_metadata": ["postgres_type", "typmod", "collation", "attnum", "not_null", "storage", "generated", "presence", "applicability"],
+    "required_safety_metadata": ["raw_shape", "policy_id", "normalized_value_or_edge", "capability", "classification"],
+    "unknowns": "fail_closed",
+    "raw_oid_in_semantic_digest": false
+  },
+  "policy_registry": {
+    "exactly_one_executable_policy_per_derived_field": true,
+    "bidirectional_closure": true,
+    "classes": [
+      "exact_semantic_value",
+      "stable_normalized_identity_reference_edge",
+      "canonicalized_collection_set_order",
+      "postgresql_maintained_dynamic_estimate_maintenance_state",
+      "provider_managed_normalized_state",
+      "secret_redacted_shape_capability_state",
+      "explicit_deferred_external_boundary"
+    ]
+  },
+  "identity_and_edges": {
+    "raw_oid_role": "resolver_input_only",
+    "unresolved_nonzero_reference": "RED",
+    "ambiguous_nonzero_reference": "RED",
+    "incidental_ordinal_identity": "forbidden",
+    "trigger_target": "generic_reference_suffix_resolution",
+    "dependency_endpoints": "classid_objid_reference_resolution"
+  },
+  "dynamic_state": {
+    "classification": "generic_postgresql_maintained_estimate_or_maintenance_semantics",
+    "raw_variance": "public_safe_variance_receipt_only",
+    "exact_semantic_drift_as_dynamic": "RED"
+  },
+  "large_objects": {
+    "manifest_or_seed_identity_required": true,
+    "owner_acl_content_shape_is_identity": false,
+    "collision_prone_content_fingerprint_is_identity": false,
+    "unidentified_object": "RED"
+  },
+  "historical_provenance": {
+    "H59": {
+      "review_thread": "PRRT_kwDOSw17V86Zhibp",
+      "finding_class": "TOAST/system exceptional authority",
+      "generic_mechanism": "live pg_toast schema/relation ACL boundary receipts plus authority digest; page rows remain outside the semantic universe"
+    },
+    "H60": {
+      "review_thread": "PRRT_kwDOSw17V86Zhibt",
+      "finding_class": "column storage semantics",
+      "generic_mechanism": "live pg_attribute storage metadata in the derived field universe"
+    },
+    "H61": {
+      "review_thread": "PRRT_kwDOSw17V86Zhibv",
+      "finding_class": "inbound/reverse FK dependency",
+      "generic_mechanism": "generic pg_constraint reference and dependency-edge normalization"
+    },
+    "H62": {
+      "review_thread": "PRRT_kwDOSw17V86Zhibw",
+      "finding_class": "publication/export membership",
+      "generic_mechanism": "derived pg_publication and membership catalogue rows with authority classification"
+    },
+    "trigger_target": {
+      "finding_class": "trigger attachment target",
+      "generic_mechanism": "generic relation-reference suffix resolver for trigger catalogue fields"
+    }
+  },
+  "reference_gate": {
+    "labels": ["A", "B", "C", "P"],
+    "minimum_independence_unit": "fresh_postgresql17_container_and_volume",
+    "required_receipt_fields": [
+      "collector_mode",
+      "synthetic",
+      "real_connection",
+      "executed_fields_count",
+      "field_values_count",
+      "reference_independence_verified",
+      "cleanup_verified"
+    ],
+    "maintenance_reference": "P",
+    "maintenance_operation": "VACUUM_ANALYZE",
+    "maintenance_residue_rule": "restored semantic snapshot equality"
+  },
+  "validation": {
+    "synthetic_tests_use_production_interfaces": true,
+    "synthetic_receipts_satisfy_real_gate": false,
+    "ci_real_path_must_not_skip": true,
+    "public_safe_receipts": true
+  }
+}

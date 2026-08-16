@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-08-02
+Last updated: 2026-08-16
 
 Source of truth: `.github/workflows/ci.yml`
 
@@ -42,6 +42,14 @@ Source of truth: `.github/workflows/ci.yml`
 - `Secret scan`: checks the repository with Gitleaks before validation work proceeds.
 - `Dependency audit`: installs Node dependencies with `npm ci` and runs `npm audit --audit-level=high`.
 - `Validate app`: runs after retrospective fixture integrity/result and security gates pass.
+- `A23 real PostgreSQL-17 A/B/C/P finality`: a mandatory exact-head job that installs the pinned Python dependencies, runs the focused finality regressions, then creates four fresh disposable PostgreSQL 17 containers and volumes. It replays the canonical migration manifest, derives the whole live `pg_catalog` field universe, records hashed `pg_toast` authority boundaries, proves semantic/reference/authority convergence across A/B/C, performs P's bounded insert/`VACUUM (ANALYZE)`/delete restoration witness, and verifies cleanup. It never contacts a provider, production database, credential, deployment, or external service.
+
+## A23 PostgreSQL-17 Finality Job
+
+- The `postgresql17-finality` job is a separate required gate and is not allowed to pass by skipping the real path.
+- It runs `python scripts/validate_postgresql17_finality.py --real-references --json` on PostgreSQL 17 only. Synthetic contract output is retained for unit coverage but cannot satisfy the live gate.
+- The live receipt must report labels A/B/C/P, distinct container/volume/cluster identities, nonzero executed fields and values, exact canonical migration replay, public-safe authority boundaries, P maintenance variance, restored semantic equality, and verified cleanup.
+- This job is local/disposable proof only; a green result does not authorize provider, production, deployment, or issue/tracker mutations.
 
 ## Validate App Checks
 
