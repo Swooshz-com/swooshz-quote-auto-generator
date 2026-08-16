@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import re
 import sys
 from dataclasses import dataclass
@@ -1892,6 +1894,1145 @@ def validate_manifest_strictly(manifest_path: str) -> int:
     _ok("Runtime privilege contract manifest passes strict validation.")
     return 0
 
+# A22R2 finality coverage and comparison-policy closure
+FINALITY_MANIFEST_PATH = ROOT / "docs" / "postgresql17-finality-coverage.json"
+FINALITY_TOP_LEVEL_KEYS = frozenset(
+    {
+        "$schema",
+        "schema_version",
+        "contract_type",
+        "repository",
+        "design_lock",
+        "postgresql_major",
+        "source",
+        "queries",
+        "handling_classes",
+        "comparison_policies",
+        "field_registry",
+        "reference_proof",
+        "historical_review_mapping",
+        "class_level_red_receipts",
+    }
+)
+FINALITY_CLASS_IDS = (
+    "exact_semantic_value",
+    "stable_normalized_identity_reference_edge",
+    "canonicalized_collection_set_order",
+    "postgresql_maintained_dynamic_estimate",
+    "provider_managed_normalized_state",
+    "secret_redacted_shape_capability",
+    "deferred_external_boundary",
+)
+FINALITY_POLICY_IDS = (
+    "exact-semantic-v1",
+    "stable-reference-edge-v1",
+    "canonical-collection-v1",
+    "postgresql-maintained-dynamic-v1",
+    "provider-normalized-v1",
+    "secret-redacted-v1",
+    "deferred-external-boundary-v1",
+)
+FINALITY_NORMALIZER_NAMES = frozenset(
+    {
+        "normalize_exact_value",
+        "normalize_reference_edge",
+        "normalize_canonical_collection",
+        "normalize_system_dynamic",
+        "normalize_provider_state",
+        "normalize_secret_shape",
+        "normalize_deferred_boundary",
+    }
+)
+FINALITY_REVIEW_COMMENT_IDS = frozenset(
+    {
+        3775760589,
+        3775760599,
+        3775760605,
+        3776937010,
+        3776937028,
+        3780236879,
+        3780236883,
+        3780236885,
+        3780956750,
+        3780956759,
+        3780956762,
+        3780956766,
+        3780956774,
+        3780956777,
+        3780956781,
+        3781482901,
+        3782398217,
+        3782398228,
+        3782398237,
+        3782398258,
+        3782398242,
+        3782398246,
+        3782398256,
+        3783697275,
+        3783697278,
+        3783697281,
+        3783697283,
+        3785318729,
+        3785318741,
+        3785318751,
+        3786071378,
+        3786071396,
+        3786071404,
+        3789189421,
+        3789189424,
+        3789189427,
+        3789793670,
+        3789793674,
+        3789793678,
+        3789793681,
+    }
+)
+
+
+FINALITY_ALLOWED_DYNAMIC_FIELD_IDS = frozenset(
+    {
+        ("pg_catalog.pg_class", "relpages"),
+        ("pg_catalog.pg_class", "reltuples"),
+        ("pg_catalog.pg_class", "relallvisible"),
+        ("pg_catalog.pg_class", "relfrozenxid"),
+        ("pg_catalog.pg_class", "relminmxid"),
+        ("pg_catalog.pg_class", "relfilenode"),
+    }
+)
+
+
+def _finality_canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _finality_safe_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value):
+            return {"shape": "float", "value": "nan"}
+        if math.isinf(value):
+            return {"shape": "float", "value": "infinity" if value > 0 else "-infinity"}
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+        return {
+            "shape": "binary",
+            "length": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+    if isinstance(value, dict):
+        return {
+            str(key): _finality_safe_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_finality_safe_value(item) for item in value]
+    if isinstance(value, set):
+        return sorted(
+            (_finality_safe_value(item) for item in value),
+            key=_finality_canonical_json,
+        )
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        return {"shape": type(value).__name__, "value": isoformat()}
+    return {
+        "shape": type(value).__name__,
+        "repr_sha256": hashlib.sha256(type(value).__name__.encode("utf-8")).hexdigest(),
+    }
+
+
+def _finality_digest(value: Any) -> str:
+    return hashlib.sha256(
+        _finality_canonical_json(_finality_safe_value(value)).encode("utf-8")
+    ).hexdigest()
+
+
+def _finality_error(errors: list[str], message: str) -> None:
+    if message not in errors:
+        errors.append(message)
+
+
+def _finality_exact_keys(
+    value: Any,
+    expected: frozenset[str],
+    label: str,
+    errors: list[str],
+) -> bool:
+    if not isinstance(value, dict):
+        _finality_error(errors, f"{label}_must_be_object")
+        return False
+    missing = sorted(expected - set(value))
+    extra = sorted(set(value) - expected)
+    if missing:
+        _finality_error(errors, f"{label}_missing_keys:{','.join(missing)}")
+    if extra:
+        _finality_error(errors, f"{label}_unknown_keys:{','.join(extra)}")
+    return not missing and not extra
+
+
+def _finality_non_empty_string(value: Any, label: str, errors: list[str]) -> None:
+    if not isinstance(value, str) or not value.strip():
+        _finality_error(errors, f"{label}_must_be_non_empty_string")
+
+
+def _finality_catalogue_id(value: dict[str, Any]) -> str:
+    if "catalogue" in value:
+        return str(value["catalogue"])
+    return f"{value.get('schema_name', '')}.{value.get('catalogue_name', '')}"
+
+
+def _finality_field_id(value: dict[str, Any]) -> tuple[str, str]:
+    return _finality_catalogue_id(value), str(value.get("field_name", value.get("field")))
+
+
+def _finality_policy_map(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(policy["id"]): policy
+        for policy in manifest.get("comparison_policies", [])
+        if isinstance(policy, dict) and "id" in policy
+    }
+
+
+def _finality_registry_entries(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    registry = manifest.get("field_registry", {})
+    entries: list[dict[str, Any]] = []
+    for key in ("special_fields", "relationship_fields", "provider_fields", "deferred_fields"):
+        values = registry.get(key, []) if isinstance(registry, dict) else []
+        if isinstance(values, list):
+            entries.extend(item for item in values if isinstance(item, dict))
+    return entries
+
+
+def _finality_forbidden_policy_form(value: Any, path: str = "") -> list[str]:
+    findings: list[str] = []
+    if isinstance(value, str):
+        lowered = value.lower()
+        if value == "*" or "ignore pg_" in lowered or "ignore volatile" in lowered or "wildcard" in lowered:
+            findings.append(path or "<root>")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            findings.extend(_finality_forbidden_policy_form(item, f"{path}.{key}"))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            findings.extend(_finality_forbidden_policy_form(item, f"{path}[{index}]"))
+    return findings
+
+def validate_finality_manifest(manifest: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    _finality_exact_keys(manifest, FINALITY_TOP_LEVEL_KEYS, "finality_manifest", errors)
+    if manifest.get("$schema") != "postgresql17-finality-coverage-schema-v1":
+        _finality_error(errors, "finality_schema_identifier_invalid")
+    if manifest.get("schema_version") != 1:
+        _finality_error(errors, "finality_schema_version_invalid")
+    if manifest.get("contract_type") != "postgresql17_finality_coverage":
+        _finality_error(errors, "finality_contract_type_invalid")
+    if manifest.get("repository") != "Swooshz-com/swooshz-quote-auto-generator":
+        _finality_error(errors, "finality_repository_invalid")
+    if manifest.get("design_lock") != "DL-160-POSTMERGE-026-A22R2":
+        _finality_error(errors, "finality_design_lock_invalid")
+    if manifest.get("postgresql_major") != 17:
+        _finality_error(errors, "finality_postgresql_major_must_be_17")
+
+    source = manifest.get("source")
+    if _finality_exact_keys(
+        source,
+        frozenset(
+            {
+                "runtime_contract",
+                "migration_provenance",
+                "extractor_id",
+                "normalizer_id",
+                "policy_registry_id",
+                "reference_topology",
+            }
+        ),
+        "finality_source",
+        errors,
+    ):
+        if source.get("runtime_contract") != "docs/runtime-privilege-contract.json":
+            _finality_error(errors, "finality_source_runtime_contract_invalid")
+        if source.get("migration_provenance") != "docs/runtime-privilege-contract.json#/production_migrations":
+            _finality_error(errors, "finality_source_migration_provenance_invalid")
+
+    queries = manifest.get("queries")
+    if _finality_exact_keys(
+        queries,
+        frozenset({"catalogue_universe", "field_universe"}),
+        "finality_queries",
+        errors,
+    ):
+        required_query_parts = {
+            "catalogue_universe": (
+                "select",
+                "pg_catalog.pg_class",
+                "pg_catalog.pg_namespace",
+                "relkind",
+                "relispartition",
+            ),
+            "field_universe": (
+                "select",
+                "pg_catalog.pg_attribute",
+                "pg_catalog.pg_class",
+                "pg_catalog.pg_namespace",
+                "pg_catalog.pg_type",
+                "attnum",
+                "attisdropped",
+                "attstorage",
+            ),
+        }
+        for key, required in required_query_parts.items():
+            query = queries.get(key)
+            _finality_non_empty_string(query, f"finality_query_{key}", errors)
+            if not isinstance(query, str):
+                continue
+            lowered = query.lower()
+            if not lowered.lstrip().startswith("select"):
+                _finality_error(errors, f"finality_query_{key}_must_be_select")
+            if ";" in query:
+                _finality_error(errors, f"finality_query_{key}_must_be_single_statement")
+            if any(
+                token in lowered
+                for token in (
+                    "insert ",
+                    "update ",
+                    "delete ",
+                    "drop ",
+                    "alter ",
+                    "create ",
+                    "copy ",
+                    "call ",
+                )
+            ):
+                _finality_error(errors, f"finality_query_{key}_contains_mutation_keyword")
+            for required_part in required:
+                if required_part not in lowered:
+                    _finality_error(
+                        errors,
+                        f"finality_query_{key}_missing_{required_part.replace('.', '_')}",
+                    )
+
+    classes = manifest.get("handling_classes")
+    class_ids = [
+        item.get("id")
+        for item in classes
+        if isinstance(item, dict)
+    ] if isinstance(classes, list) else []
+    if tuple(class_ids) != FINALITY_CLASS_IDS:
+        _finality_error(errors, "finality_handling_classes_must_match_closed_registry")
+
+    policies = manifest.get("comparison_policies")
+    policy_ids = [
+        item.get("id")
+        for item in policies
+        if isinstance(item, dict)
+    ] if isinstance(policies, list) else []
+    if tuple(policy_ids) != FINALITY_POLICY_IDS:
+        _finality_error(errors, "finality_comparison_policies_must_match_closed_registry")
+    policy_map = _finality_policy_map(manifest)
+    for policy_id in FINALITY_POLICY_IDS:
+        policy = policy_map.get(policy_id)
+        if not policy:
+            continue
+        _finality_exact_keys(
+            policy,
+            frozenset(
+                {
+                    "id",
+                    "handling_class",
+                    "normalizer",
+                    "allow_raw_variance",
+                    "shape_fields",
+                    "public_receipt",
+                }
+            ),
+            f"finality_policy_{policy_id}",
+            errors,
+        )
+        if policy.get("normalizer") not in FINALITY_NORMALIZER_NAMES:
+            _finality_error(errors, f"finality_policy_{policy_id}_normalizer_not_executable")
+        if policy.get("handling_class") not in FINALITY_CLASS_IDS:
+            _finality_error(errors, f"finality_policy_{policy_id}_handling_class_unknown")
+        if not isinstance(policy.get("allow_raw_variance"), bool):
+            _finality_error(errors, f"finality_policy_{policy_id}_variance_flag_invalid")
+        if not isinstance(policy.get("shape_fields"), list) or not policy["shape_fields"]:
+            _finality_error(errors, f"finality_policy_{policy_id}_shape_contract_missing")
+
+    registry = manifest.get("field_registry")
+    if _finality_exact_keys(
+        registry,
+        frozenset(
+            {
+                "mode",
+                "binding_keys",
+                "default_policy_id",
+                "default_handling_class",
+                "special_fields",
+                "relationship_fields",
+                "provider_fields",
+                "deferred_fields",
+            }
+        ),
+        "finality_field_registry",
+        errors,
+    ):
+        if registry.get("mode") != "reference_derived_exact_tuple":
+            _finality_error(errors, "finality_field_registry_mode_invalid")
+        if registry.get("default_policy_id") != "exact-semantic-v1":
+            _finality_error(errors, "finality_default_policy_must_be_exact_semantic")
+        if registry.get("default_handling_class") != "exact_semantic_value":
+            _finality_error(errors, "finality_default_handling_class_invalid")
+        selector_keys: set[tuple[str, str, str]] = set()
+        for entry in _finality_registry_entries(manifest):
+            selector = (
+                str(entry.get("schema_name", "")),
+                str(entry.get("catalogue_name", "")),
+                str(entry.get("field_name", "")),
+            )
+            if selector in selector_keys:
+                _finality_error(errors, f"finality_duplicate_field_policy:{'.'.join(selector)}")
+            selector_keys.add(selector)
+            policy_id = entry.get("policy_id")
+            if policy_id not in policy_map:
+                _finality_error(errors, f"finality_field_policy_unknown:{selector}:{policy_id}")
+            binding_kind = entry.get("binding_kind")
+            if binding_kind == "system_dynamic":
+                field_id = (f"{selector[0]}.{selector[1]}", selector[2])
+                if field_id not in FINALITY_ALLOWED_DYNAMIC_FIELD_IDS:
+                    _finality_error(errors, f"finality_dynamic_field_not_authorized:{selector}")
+                if policy_id != "postgresql-maintained-dynamic-v1":
+                    _finality_error(errors, f"finality_dynamic_field_policy_invalid:{selector}")
+                if not isinstance(entry.get("semantic_family"), str) or not entry["semantic_family"]:
+                    _finality_error(errors, f"finality_dynamic_field_family_missing:{selector}")
+                if not isinstance(entry.get("allowed_postgres_types"), list) or not entry["allowed_postgres_types"]:
+                    _finality_error(errors, f"finality_dynamic_field_types_missing:{selector}")
+            elif binding_kind == "reference_edge":
+                if policy_id != "stable-reference-edge-v1":
+                    _finality_error(errors, f"finality_edge_field_policy_invalid:{selector}")
+                if not entry.get("edge_kind") or not entry.get("target_catalogue"):
+                    _finality_error(errors, f"finality_edge_field_shape_missing:{selector}")
+            elif binding_kind == "secret_shape":
+                if policy_id != "secret-redacted-v1":
+                    _finality_error(errors, f"finality_secret_field_policy_invalid:{selector}")
+            elif binding_kind not in {"provider_shape", "deferred_boundary"}:
+                _finality_error(errors, f"finality_field_binding_kind_unknown:{selector}:{binding_kind}")
+
+    proof = manifest.get("reference_proof")
+    if _finality_exact_keys(
+        proof,
+        frozenset(
+            {
+                "minimum_clean_references",
+                "raw_variance_receipt",
+                "normalized_digest",
+                "maintenance_perturbation",
+            }
+        ),
+        "finality_reference_proof",
+        errors,
+    ):
+        if proof.get("minimum_clean_references") != 3:
+            _finality_error(errors, "finality_requires_three_clean_references")
+        receipt = proof.get("raw_variance_receipt")
+        if _finality_exact_keys(
+            receipt,
+            frozenset({"encoding", "required_fields", "raw_values_emitted"}),
+            "finality_raw_variance_receipt",
+            errors,
+        ) and receipt.get("raw_values_emitted") is not False:
+            _finality_error(errors, "finality_raw_variance_must_not_be_emitted")
+        perturbation = proof.get("maintenance_perturbation")
+        if _finality_exact_keys(
+            perturbation,
+            frozenset(
+                {
+                    "required",
+                    "disposable_only",
+                    "accepted_semantic_change",
+                    "operation_family",
+                    "expected_result",
+                }
+            ),
+            "finality_maintenance_perturbation",
+            errors,
+        ):
+            if perturbation.get("required") is not True or perturbation.get("disposable_only") is not True:
+                _finality_error(errors, "finality_maintenance_perturbation_must_be_disposable_and_required")
+            if perturbation.get("accepted_semantic_change") is not False:
+                _finality_error(errors, "finality_maintenance_perturbation_semantic_change_forbidden")
+
+    mapping = manifest.get("historical_review_mapping")
+    if not isinstance(mapping, list):
+        _finality_error(errors, "finality_historical_review_mapping_must_be_list")
+    else:
+        comment_ids: list[int] = []
+        current = 0
+        outdated = 0
+        for item in mapping:
+            if not isinstance(item, dict):
+                _finality_error(errors, "finality_historical_review_mapping_entry_not_object")
+                continue
+            _finality_exact_keys(
+                item,
+                frozenset(
+                    {
+                        "thread_id",
+                        "comment_id",
+                        "is_outdated",
+                        "mechanism_class",
+                        "causal_red_receipt",
+                        "disposition",
+                    }
+                ),
+                "finality_historical_review_mapping_entry",
+                errors,
+            )
+            comment_id = item.get("comment_id")
+            if not isinstance(comment_id, int):
+                _finality_error(errors, "finality_historical_review_mapping_comment_id_invalid")
+            else:
+                comment_ids.append(comment_id)
+            if item.get("is_outdated") is True:
+                outdated += 1
+            elif item.get("is_outdated") is False:
+                current += 1
+            else:
+                _finality_error(errors, "finality_historical_review_mapping_state_invalid")
+            _finality_non_empty_string(item.get("mechanism_class"), "finality_historical_review_mapping_mechanism", errors)
+            _finality_non_empty_string(item.get("causal_red_receipt"), "finality_historical_review_mapping_receipt", errors)
+            if item.get("disposition") != "material_generic_mapping":
+                _finality_error(errors, "finality_historical_review_mapping_disposition_invalid")
+        if len(mapping) != 40 or set(comment_ids) != FINALITY_REVIEW_COMMENT_IDS:
+            _finality_error(errors, "finality_historical_review_mapping_must_cover_live_40_thread_corpus")
+        if current != 26 or outdated != 14:
+            _finality_error(errors, "finality_historical_review_mapping_current_outdated_totals_invalid")
+
+    red_receipts = manifest.get("class_level_red_receipts")
+    red_ids = [
+        item.get("id")
+        for item in red_receipts
+        if isinstance(item, dict)
+    ] if isinstance(red_receipts, list) else []
+    if red_ids != ["H59", "H60", "H61", "H62"]:
+        _finality_error(errors, "finality_historical_class_red_receipts_incomplete")
+    if isinstance(red_receipts, list):
+        for item in red_receipts:
+            if not isinstance(item, dict) or item.get("expected_result") != "RED":
+                _finality_error(errors, "finality_historical_class_red_receipt_not_red")
+
+    for finding in _finality_forbidden_policy_form(manifest):
+        _finality_error(errors, f"finality_forbidden_broad_policy_form:{finding}")
+    return errors
+
+
+def load_finality_coverage_manifest(path: Path | None = None) -> dict[str, Any]:
+    manifest_path = path or FINALITY_MANIFEST_PATH
+    raw = manifest_path.read_text(encoding="utf-8")
+    value = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+    if not isinstance(value, dict):
+        raise ValueError("finality_manifest_must_be_object")
+    return value
+
+
+def validate_finality_manifest_strictly(path: str | None = None) -> int:
+    manifest_path = Path(path) if path else FINALITY_MANIFEST_PATH
+    try:
+        manifest = load_finality_coverage_manifest(manifest_path)
+    except DuplicateKeyError as exc:
+        print(f"FAIL: finality_manifest_duplicate_json_key:{exc}", file=sys.stderr)
+        return 2
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        print(f"FAIL: finality_manifest_invalid:{exc}", file=sys.stderr)
+        return 2
+    errors = validate_finality_manifest(manifest)
+    if errors:
+        for error in errors:
+            print(f"FAIL: {error}", file=sys.stderr)
+        return 2
+    print("PASS: PostgreSQL 17 finality coverage and A22R2 policy registry pass strict validation.")
+    return 0
+
+def derive_finality_catalogue_universe(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+    derived: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("catalogue_universe_row_not_object")
+        required = ("schema_name", "catalogue_name", "relkind", "relpersistence", "relispartition")
+        if any(key not in row for key in required):
+            raise ValueError(f"catalogue_universe_row_missing_field:{required}")
+        item = {
+            "schema_name": str(row["schema_name"]),
+            "catalogue_name": str(row["catalogue_name"]),
+            "catalogue": f"{row['schema_name']}.{row['catalogue_name']}",
+            "object_kind": str(row["relkind"]),
+            "relpersistence": str(row["relpersistence"]),
+            "relispartition": bool(row["relispartition"]),
+        }
+        key = tuple(item[key] for key in ("catalogue", "object_kind", "relpersistence", "relispartition"))
+        if key in seen:
+            raise ValueError(f"duplicate_catalogue_universe_entry:{key}")
+        seen.add(key)
+        derived.append(item)
+    return tuple(sorted(derived, key=_finality_canonical_json))
+
+
+def derive_finality_field_universe(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+    derived: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("field_universe_row_not_object")
+        required = (
+            "schema_name",
+            "catalogue_name",
+            "field_name",
+            "ordinal_position",
+            "postgres_type",
+            "relkind",
+            "relpersistence",
+            "relispartition",
+            "attnotnull",
+            "attgenerated",
+            "attidentity",
+            "attstorage",
+        )
+        if any(key not in row for key in required):
+            raise ValueError(f"field_universe_row_missing_field:{required}")
+        item = {
+            "schema_name": str(row["schema_name"]),
+            "catalogue_name": str(row["catalogue_name"]),
+            "catalogue": f"{row['schema_name']}.{row['catalogue_name']}",
+            "field_name": str(row["field_name"]),
+            "ordinal_position": int(row["ordinal_position"]),
+            "postgres_type": str(row["postgres_type"]),
+            "object_kind": str(row["relkind"]),
+            "relpersistence": str(row["relpersistence"]),
+            "relispartition": bool(row["relispartition"]),
+            "attnotnull": bool(row["attnotnull"]),
+            "attgenerated": str(row["attgenerated"] or ""),
+            "attidentity": str(row["attidentity"] or ""),
+            "attstorage": str(row["attstorage"]),
+            "applicability": "catalogue_relation",
+        }
+        key = (item["catalogue"], item["field_name"])
+        if key in seen:
+            raise ValueError(f"duplicate_field_universe_entry:{key[0]}.{key[1]}")
+        seen.add(key)
+        derived.append(item)
+    return tuple(
+        sorted(
+            derived,
+            key=lambda item: (item["catalogue"], item["ordinal_position"], item["field_name"]),
+        )
+    )
+
+
+def _finality_special_entry(
+    manifest: dict[str, Any],
+    field_id: tuple[str, str],
+) -> dict[str, Any] | None:
+    matches = [
+        item
+        for item in _finality_registry_entries(manifest)
+        if (
+            f"{item.get('schema_name')}.{item.get('catalogue_name')}",
+            str(item.get("field_name")),
+        ) == field_id
+    ]
+    if len(matches) > 1:
+        raise ValueError(f"ambiguous_field_policy:{field_id[0]}.{field_id[1]}")
+    return matches[0] if matches else None
+
+
+def build_finality_field_bindings(
+    field_rows: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    manifest: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], ...]:
+    active_manifest = manifest or load_finality_coverage_manifest()
+    fields = (
+        tuple(field_rows)
+        if field_rows and "catalogue" in field_rows[0] and "field_name" in field_rows[0]
+        else derive_finality_field_universe(list(field_rows))
+    )
+    policy_map = _finality_policy_map(active_manifest)
+    class_roles = {
+        item["id"]: item["output_role"]
+        for item in active_manifest["handling_classes"]
+    }
+    bindings: list[dict[str, Any]] = []
+    for field in fields:
+        field_id = _finality_field_id(field)
+        special = _finality_special_entry(active_manifest, field_id)
+        policy_id = special["policy_id"] if special else active_manifest["field_registry"]["default_policy_id"]
+        policy = policy_map.get(policy_id)
+        if policy is None:
+            raise ValueError(f"field_policy_not_found:{field_id}:{policy_id}")
+        binding_kind = str(special["binding_kind"]) if special else "exact"
+        semantic_family = special.get("semantic_family") if special else None
+        edge_kind = special.get("edge_kind") if special else None
+        target_catalogue = special.get("target_catalogue") if special else None
+        if special:
+            allowed_types = special.get("allowed_postgres_types", [])
+            if allowed_types and field["postgres_type"] not in allowed_types:
+                raise ValueError(
+                    f"field_policy_type_mismatch:{field_id[0]}.{field_id[1]}:"
+                    f"{field['postgres_type']}:{allowed_types}"
+                )
+        bindings.append(
+            {
+                "binding_id": f"reference-field:{field_id[0]}:{field_id[1]}",
+                "catalogue": field_id[0],
+                "field": field_id[1],
+                "postgres_type": field["postgres_type"],
+                "object_kind": field["object_kind"],
+                "applicability": field["applicability"],
+                "handling_class": policy["handling_class"],
+                "policy_id": policy_id,
+                "normalizer": policy["normalizer"],
+                "binding_kind": binding_kind,
+                "semantic_family": semantic_family,
+                "edge_kind": edge_kind,
+                "target_catalogue": target_catalogue,
+                "output_role": class_roles[policy["handling_class"]],
+            }
+        )
+    return tuple(bindings)
+
+
+def validate_finality_field_binding_closure(
+    derived_fields: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    bindings: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    consumed_fields: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+) -> list[str]:
+    errors: list[str] = []
+    field_ids = {_finality_field_id(field) for field in derived_fields}
+    binding_ids = [_finality_field_id(binding) for binding in bindings]
+    if len(binding_ids) != len(set(binding_ids)):
+        _finality_error(errors, "field_binding_duplicate")
+    binding_set = set(binding_ids)
+    if field_ids - binding_set:
+        _finality_error(errors, f"field_binding_missing:{sorted(field_ids - binding_set)}")
+    if binding_set - field_ids:
+        _finality_error(errors, f"field_binding_extra:{sorted(binding_set - field_ids)}")
+    for binding in bindings:
+        if binding.get("policy_id") not in FINALITY_POLICY_IDS:
+            _finality_error(errors, f"field_binding_policy_unknown:{binding.get('binding_id')}")
+        if binding.get("normalizer") not in FINALITY_NORMALIZER_NAMES:
+            _finality_error(errors, f"field_binding_normalizer_unknown:{binding.get('binding_id')}")
+        if not binding.get("binding_id") or not binding.get("output_role"):
+            _finality_error(errors, f"field_binding_identity_or_output_missing:{binding}")
+    if consumed_fields is not None:
+        consumed_ids = {_finality_field_id(field) for field in consumed_fields}
+        if consumed_ids - field_ids:
+            _finality_error(errors, f"executed_but_unregistered:{sorted(consumed_ids - field_ids)}")
+        if field_ids - consumed_ids:
+            _finality_error(errors, f"listed_but_unused:{sorted(field_ids - consumed_ids)}")
+    return errors
+
+
+def _finality_observation_shape(binding: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "field_present": bool(observation.get("field_present", True)),
+        "postgres_type": str(observation.get("postgres_type", binding["postgres_type"])),
+        "object_kind": str(observation.get("object_kind", binding["object_kind"])),
+        "applicability": str(observation.get("applicability", binding["applicability"])),
+        "policy_id": binding["policy_id"],
+        "semantic_family": binding.get("semantic_family"),
+        "edge_kind": binding.get("edge_kind"),
+        "capability_shape": _finality_safe_value(observation.get("capability_shape")),
+        "secret_shape": _finality_safe_value(observation.get("secret_shape")),
+        "boundary_id": observation.get("boundary_id"),
+    }
+
+
+def normalize_exact_value(binding: dict[str, Any], observation: dict[str, Any]) -> Any:
+    return _finality_safe_value(observation.get("raw_value"))
+
+
+def normalize_reference_edge(binding: dict[str, Any], observation: dict[str, Any]) -> Any:
+    raw_value = observation.get("raw_value")
+    if raw_value in (None, 0, "0"):
+        return {"edge_state": "none"}
+    target = observation.get("target_identity")
+    if not isinstance(target, str) or not target:
+        raise ValueError("reference_edge_target_identity_missing")
+    return {
+        "edge_kind": binding.get("edge_kind"),
+        "target_catalogue": binding.get("target_catalogue"),
+        "target_identity": target,
+    }
+
+
+def normalize_canonical_collection(binding: dict[str, Any], observation: dict[str, Any]) -> Any:
+    value = observation.get("raw_value")
+    if not isinstance(value, (list, tuple, set)):
+        raise ValueError("collection_policy_requires_collection_value")
+    values = [_finality_safe_value(item) for item in value]
+    return sorted(values, key=_finality_canonical_json)
+
+
+def normalize_system_dynamic(binding: dict[str, Any], observation: dict[str, Any]) -> Any:
+    return {
+        "state": "postgresql_maintained",
+        "semantic_family": binding.get("semantic_family"),
+        "field_present": bool(observation.get("field_present", True)),
+        "postgres_type": binding["postgres_type"],
+        "object_kind": binding["object_kind"],
+        "applicability": binding["applicability"],
+        "policy_id": binding["policy_id"],
+    }
+
+
+def normalize_provider_state(binding: dict[str, Any], observation: dict[str, Any]) -> Any:
+    return {
+        "state": "provider_managed",
+        "capability_shape": _finality_safe_value(observation.get("capability_shape")),
+        "field_present": bool(observation.get("field_present", True)),
+        "postgres_type": binding["postgres_type"],
+        "object_kind": binding["object_kind"],
+        "applicability": binding["applicability"],
+        "policy_id": binding["policy_id"],
+    }
+
+
+def normalize_secret_shape(binding: dict[str, Any], observation: dict[str, Any]) -> Any:
+    raw_value = observation.get("raw_value")
+    return {
+        "state": "secret_redacted",
+        "field_present": bool(observation.get("field_present", True)),
+        "postgres_type": binding["postgres_type"],
+        "object_kind": binding["object_kind"],
+        "applicability": binding["applicability"],
+        "policy_id": binding["policy_id"],
+        "secret_shape": _finality_safe_value(observation.get("secret_shape"))
+        or {
+            "present": raw_value is not None,
+            "value_type": type(raw_value).__name__ if raw_value is not None else "null",
+        },
+    }
+
+
+def normalize_deferred_boundary(binding: dict[str, Any], observation: dict[str, Any]) -> Any:
+    return {
+        "state": "deferred_external_boundary",
+        "boundary_id": observation.get("boundary_id"),
+        "field_present": bool(observation.get("field_present", True)),
+        "postgres_type": binding["postgres_type"],
+        "object_kind": binding["object_kind"],
+        "applicability": binding["applicability"],
+        "policy_id": binding["policy_id"],
+    }
+
+def _finality_normalizer(name: str) -> Any:
+    function = globals().get(name)
+    if not callable(function) or name not in FINALITY_NORMALIZER_NAMES:
+        raise ValueError(f"normalizer_not_executable:{name}")
+    return function
+
+
+def normalize_finality_reference(
+    snapshot: dict[str, Any],
+    manifest: dict[str, Any] | None = None,
+    reference_id: str = "reference",
+) -> dict[str, Any]:
+    active_manifest = manifest or load_finality_coverage_manifest()
+    errors: list[str] = []
+    try:
+        catalogue_universe = derive_finality_catalogue_universe(snapshot.get("catalogue_rows", []))
+        field_universe = derive_finality_field_universe(snapshot.get("field_rows", []))
+        bindings = build_finality_field_bindings(field_universe, active_manifest)
+    except (KeyError, TypeError, ValueError) as exc:
+        return {
+            "reference_id": reference_id,
+            "errors": [f"reference_derivation_failed:{exc}"],
+            "graph_digest": None,
+            "raw_observations": (),
+        }
+
+    consumed_fields = snapshot.get("executed_fields")
+    if consumed_fields is None:
+        consumed_fields = [
+            {"catalogue": field["catalogue"], "field_name": field["field_name"]}
+            for field in field_universe
+        ]
+    errors.extend(validate_finality_field_binding_closure(field_universe, bindings, consumed_fields))
+
+    binding_map = {_finality_field_id(binding): binding for binding in bindings}
+    observations = snapshot.get("field_values", [])
+    if not isinstance(observations, list):
+        errors.append("field_values_must_be_list")
+        observations = []
+    normalized_nodes: list[dict[str, Any]] = []
+    raw_observations: list[dict[str, Any]] = []
+    seen_observations: set[tuple[str, str, str]] = set()
+    observed_field_ids: set[tuple[str, str]] = set()
+    for observation in observations:
+        if not isinstance(observation, dict):
+            errors.append("field_observation_not_object")
+            continue
+        field_id = _finality_field_id(observation)
+        observed_field_ids.add(field_id)
+        binding = binding_map.get(field_id)
+        if binding is None:
+            errors.append(f"executed_but_unregistered:{field_id}")
+            continue
+        object_identity = str(observation.get("object_identity", "<catalogue>"))
+        observation_key = (object_identity, field_id[0], field_id[1])
+        if observation_key in seen_observations:
+            errors.append(f"duplicate_field_observation:{observation_key}")
+            continue
+        seen_observations.add(observation_key)
+        shape = _finality_observation_shape(binding, observation)
+        if shape["postgres_type"] != binding["postgres_type"]:
+            errors.append(
+                f"field_shape_type_drift:{field_id}:{shape['postgres_type']}:{binding['postgres_type']}"
+            )
+        if shape["object_kind"] != binding["object_kind"]:
+            errors.append(f"field_shape_object_kind_drift:{field_id}")
+        if shape["applicability"] != binding["applicability"]:
+            errors.append(f"field_shape_applicability_drift:{field_id}")
+        try:
+            normalized_value = _finality_normalizer(binding["normalizer"])(binding, observation)
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append(f"field_normalization_failed:{field_id}:{exc}")
+            normalized_value = {"normalization_error": str(exc)}
+        normalized_nodes.append(
+            {
+                "object_identity": object_identity,
+                "catalogue": field_id[0],
+                "field": field_id[1],
+                "shape": shape,
+                "normalized_value": normalized_value,
+            }
+        )
+        raw_observations.append(
+            {
+                "observation_key": observation_key,
+                "field_id": field_id,
+                "policy_id": binding["policy_id"],
+                "shape": shape,
+                "value_digest": _finality_digest(observation.get("raw_value")),
+            }
+        )
+    field_ids = set(binding_map)
+    if observed_field_ids - field_ids:
+        errors.append(f"executed_but_unregistered:{sorted(observed_field_ids - field_ids)}")
+    if field_ids - observed_field_ids:
+        errors.append(f"listed_but_unused:{sorted(field_ids - observed_field_ids)}")
+
+    allowed_edge_kinds = {
+        str(item.get("edge_kind"))
+        for item in active_manifest["field_registry"].get("relationship_fields", [])
+    }
+    edges: list[dict[str, Any]] = []
+    for edge in snapshot.get("edges", []):
+        if not isinstance(edge, dict):
+            errors.append("relationship_edge_not_object")
+            continue
+        if edge.get("edge_kind") not in allowed_edge_kinds:
+            errors.append(f"unknown_relationship_edge:{edge.get('edge_kind')}")
+            continue
+        edges.append(_finality_safe_value(edge))
+    graph = {
+        "catalogue_universe": list(catalogue_universe),
+        "field_universe": list(field_universe),
+        "bindings": [
+            {
+                "binding_id": binding["binding_id"],
+                "catalogue": binding["catalogue"],
+                "field": binding["field"],
+                "policy_id": binding["policy_id"],
+                "normalizer": binding["normalizer"],
+                "handling_class": binding["handling_class"],
+                "output_role": binding["output_role"],
+                "binding_kind": binding["binding_kind"],
+                "semantic_family": binding["semantic_family"],
+                "edge_kind": binding["edge_kind"],
+                "target_catalogue": binding["target_catalogue"],
+            }
+            for binding in bindings
+        ],
+        "normalized_nodes": sorted(normalized_nodes, key=_finality_canonical_json),
+        "normalized_edges": sorted(edges, key=_finality_canonical_json),
+        "capability_graph": _finality_safe_value(snapshot.get("capability_graph", {})),
+        "secret_safe_state": _finality_safe_value(snapshot.get("secret_safe_state", {})),
+        "deferred_boundaries": _finality_safe_value(snapshot.get("deferred_boundaries", [])),
+    }
+    return {
+        "reference_id": reference_id,
+        "catalogue_count": len(catalogue_universe),
+        "field_count": len(field_universe),
+        "catalogue_universe": catalogue_universe,
+        "field_universe": field_universe,
+        "bindings": bindings,
+        "graph": graph,
+        "graph_digest": _finality_digest(graph),
+        "raw_observations": tuple(raw_observations),
+        "errors": tuple(sorted(set(errors))),
+    }
+
+
+def compare_finality_references(
+    snapshots: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    manifest: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    active_manifest = manifest or load_finality_coverage_manifest()
+    errors: list[str] = []
+    minimum = int(active_manifest["reference_proof"]["minimum_clean_references"])
+    if len(snapshots) < minimum:
+        errors.append(f"clean_reference_count_below_minimum:{len(snapshots)}:{minimum}")
+    normalized = [
+        normalize_finality_reference(
+            snapshot,
+            active_manifest,
+            str(snapshot.get("reference_id", f"reference-{index + 1}")),
+        )
+        for index, snapshot in enumerate(snapshots)
+    ]
+    for result in normalized:
+        errors.extend(result.get("errors", ()))
+    if normalized:
+        base = normalized[0]
+        for result in normalized[1:]:
+            if result.get("catalogue_universe") != base.get("catalogue_universe"):
+                errors.append(f"catalogue_universe_drift:{base['reference_id']}:{result['reference_id']}")
+            if result.get("field_universe") != base.get("field_universe"):
+                errors.append(f"field_universe_drift:{base['reference_id']}:{result['reference_id']}")
+            if result.get("bindings") != base.get("bindings"):
+                errors.append(f"binding_registry_drift:{base['reference_id']}:{result['reference_id']}")
+
+    raw_by_key: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for result in normalized:
+        for observation in result.get("raw_observations", ()):
+            raw_by_key.setdefault(tuple(observation["observation_key"]), []).append(
+                {**observation, "reference_id": result["reference_id"]}
+            )
+    expected_reference_count = len(normalized)
+    for observation_key, values in sorted(raw_by_key.items()):
+        if len(values) != expected_reference_count:
+            errors.append(
+                f"field_observation_presence_drift:{observation_key}:"
+                f"{len(values)}:{expected_reference_count}"
+            )
+    variance_inventory: list[dict[str, Any]] = []
+    policy_map = _finality_policy_map(active_manifest)
+    for observation_key, values in sorted(raw_by_key.items()):
+        shapes = {_finality_canonical_json(value["shape"]) for value in values}
+        if len(shapes) > 1:
+            errors.append(f"field_shape_drift:{observation_key}")
+        value_digests = sorted({value["value_digest"] for value in values})
+        if len(value_digests) <= 1:
+            continue
+        policy = policy_map.get(values[0]["policy_id"], {})
+        receipt = {
+            "reference_ids": sorted(value["reference_id"] for value in values),
+            "object_identity": observation_key[0],
+            "catalogue": observation_key[1],
+            "field": observation_key[2],
+            "policy_id": values[0]["policy_id"],
+            "value_digests": value_digests,
+            "distinct_value_count": len(value_digests),
+        }
+        variance_inventory.append(receipt)
+        if policy.get("allow_raw_variance") is not True:
+            errors.append(f"raw_variance_unclassified:{observation_key}:{values[0]['policy_id']}")
+    normalized_digests = [result.get("graph_digest") for result in normalized]
+    if len(set(normalized_digests)) > 1:
+        errors.append("normalized_graph_digest_drift")
+    return {
+        "ok": not errors,
+        "errors": tuple(sorted(set(errors))),
+        "references": tuple(result["reference_id"] for result in normalized),
+        "catalogue_count_receipt": tuple(result.get("catalogue_count") for result in normalized),
+        "field_count_receipt": tuple(result.get("field_count") for result in normalized),
+        "variance_inventory": tuple(variance_inventory),
+        "normalized_digests": tuple(normalized_digests),
+        "policy_registry": tuple(
+            (
+                policy["id"],
+                policy["normalizer"],
+                bool(policy["allow_raw_variance"]),
+            )
+            for policy in active_manifest["comparison_policies"]
+        ),
+    }
+
+def collect_finality_reference_metadata(
+    connection: Any,
+    manifest: dict[str, Any] | None = None,
+    reference_id: str = "postgresql17-reference",
+) -> dict[str, Any]:
+    active_manifest = manifest or load_finality_coverage_manifest()
+    version_cursor = connection.execute(
+        "select current_setting('server_version_num')::int as server_version_num"
+    )
+    version_row = version_cursor.fetchone()
+    version_number = int(
+        version_row[0]
+        if not isinstance(version_row, dict)
+        else version_row["server_version_num"]
+    )
+    if version_number // 10000 != 17:
+        raise ValueError(f"postgresql_major_mismatch:{version_number}")
+    query_rows: dict[str, list[dict[str, Any]]] = {}
+    for key, query in active_manifest["queries"].items():
+        cursor = connection.execute(query)
+        rows = cursor.fetchall()
+        description = getattr(cursor, "description", None) or ()
+        columns = []
+        for column in description:
+            column_name = getattr(column, "name", None)
+            if column_name is None:
+                column_name = column[0] if isinstance(column, (tuple, list)) else str(column)
+            columns.append(str(column_name))
+        query_rows[key] = [
+            dict(row)
+            if isinstance(row, dict)
+            else dict(zip(columns, row))
+            for row in rows
+        ]
+    return {
+        "reference_id": reference_id,
+        "postgresql_major": 17,
+        "catalogue_rows": query_rows["catalogue_universe"],
+        "field_rows": query_rows["field_universe"],
+        "executed_fields": [],
+        "field_values": [],
+        "capability_graph": {},
+        "secret_safe_state": {},
+        "deferred_boundaries": [],
+    }
+
+
+def validate_historical_review_mapping(manifest: dict[str, Any] | None = None) -> list[str]:
+    active_manifest = manifest or load_finality_coverage_manifest()
+    return [
+        error
+        for error in validate_finality_manifest(active_manifest)
+        if "historical_review_mapping" in error
+    ]
+
+
+def validate_historical_class_red_receipts(manifest: dict[str, Any] | None = None) -> list[str]:
+    active_manifest = manifest or load_finality_coverage_manifest()
+    return [
+        error
+        for error in validate_finality_manifest(active_manifest)
+        if "historical_class_red" in error
+    ]
+
+
+def validate_all_contracts() -> int:
+    runtime_result = validate_manifest_strictly(str(MANIFEST_PATH))
+    finality_result = validate_finality_manifest_strictly()
+    return 0 if runtime_result == 0 and finality_result == 0 else 2
 
 if __name__ == "__main__":
-    raise SystemExit(validate_manifest_strictly(str(MANIFEST_PATH)))
+    raise SystemExit(validate_all_contracts())

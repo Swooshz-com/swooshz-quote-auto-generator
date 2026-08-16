@@ -502,11 +502,11 @@ The deterministic discovery receipt for this amendment is:
 
 | Receipt item | Count |
 |---|---:|
-| Discovered test methods | 178 |
-| Static and validator methods | 116 |
+| Discovered test methods | 187 |
+| Static and validator methods | 125 |
 | PostgreSQL methods | 58 |
 | Requirement-map and documentation parity methods | 4 |
-| Hosted executions | 178 |
+| Hosted executions | 187 |
 | Hosted skips | 0 |
 | Unique locked requirement IDs | 38 (`R01`-`R38`) |
 
@@ -517,6 +517,43 @@ discovery before updating this section or the PR body:
 ```powershell
 python -c "import unittest; s=unittest.defaultTestLoader.loadTestsFromName('tests.test_runtime_privilege_contract'); print(s.countTestCases())"
 ```
+
+## PostgreSQL 17 reference-variance normalization closure (A22R2)
+
+The separate `docs/postgresql17-finality-coverage.json` manifest closes the
+reference-variance axis without weakening the exact privilege contract above.
+Its read-only PostgreSQL 17 catalogue query derives the relation universe from
+`pg_catalog.pg_class` and its field query derives the field universe from
+`pg_catalog.pg_attribute` and the related type/catalogue metadata. The derived
+tuples, not a customer fixture or a hand-maintained field list, are the input
+to binding construction.
+
+Every derived field receives exactly one executable binding, one closed policy,
+one normalizer, and one output role. The seven closed handling classes are
+exact semantic value, stable normalized identity/reference edge, canonical
+collection, PostgreSQL-maintained dynamic state, provider-managed normalized
+state, secret-redacted shape/capability, and deferred external boundary.
+The dynamic registry is data-backed and bounded to PostgreSQL-maintained
+catalogue state; `pg_class.relallvisible` is handled through the same generic
+dynamic normalizer as the other permitted system-maintained fields. Raw OIDs
+are never used as semantic identity: fields such as `pg_trigger.tgrelid` and
+`pg_class.reltoastrelid` become normalized relationship edges.
+
+A clean closure requires at least three reference snapshots with equal
+catalogue/field universes, exact binding equality, complete field execution,
+stable shape, and equal normalized graph digests. Allowed raw variance is
+reported only as canonical SHA-256 receipts with reference IDs, catalogue,
+field, policy, and distinct-count metadata; raw values and secret-bearing
+values are never emitted. A bounded disposable VACUUM/ANALYZE-style
+maintenance perturbation may change PostgreSQL-maintained raw estimates only
+when the normalized semantic digest remains equal.
+
+The closure includes anti-false-normalization REDs for exact semantic drift,
+shape/presence drift, unknown relationship edges, unclassified variance,
+dynamic-policy removal, and unauthorized dynamic reclassification. The live
+PR review corpus is mapped completely: 40 unresolved #169 comments, split
+26 current and 14 outdated, with generic mechanism and causal RED receipts;
+H59-H62 remain explicit class-level RED receipts.
 
 ## Boundary A versus Boundary B versus #160
 

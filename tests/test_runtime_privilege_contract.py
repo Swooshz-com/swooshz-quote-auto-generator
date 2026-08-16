@@ -1,11 +1,11 @@
 """Runtime privilege contract tests.
 
 Deterministic discovery receipt for this amendment:
-  discovered methods: 178
-  static and validator methods: 116
+  discovered methods: 187
+  static and validator methods: 125
   PostgreSQL methods: 58
   requirement-map and documentation parity methods: 4
-  hosted executions: 178
+  hosted executions: 187
   hosted skips: 0
   unique locked requirement IDs: 38 (R01-R38)
 
@@ -1119,6 +1119,445 @@ class ValidatorStaticTest(unittest.TestCase):
         )
         for query_key, mutation in mutations:
             self._assert_exact_query_rejected(query_key, mutation)
+
+
+class FinalityNormalizationClosureTest(unittest.TestCase):
+    @staticmethod
+    def _catalogue_row(catalogue_name: str) -> dict[str, Any]:
+        return {
+            "schema_name": "pg_catalog",
+            "catalogue_name": catalogue_name,
+            "relkind": "r",
+            "relpersistence": "p",
+            "relispartition": False,
+        }
+
+    @staticmethod
+    def _field_row(
+        catalogue_name: str,
+        field_name: str,
+        ordinal_position: int,
+        postgres_type: str,
+    ) -> dict[str, Any]:
+        return {
+            "schema_name": "pg_catalog",
+            "catalogue_name": catalogue_name,
+            "field_name": field_name,
+            "ordinal_position": ordinal_position,
+            "postgres_type": postgres_type,
+            "relkind": "r",
+            "relpersistence": "p",
+            "relispartition": False,
+            "attnotnull": False,
+            "attgenerated": "",
+            "attidentity": "",
+            "attstorage": "p",
+        }
+
+    @classmethod
+    def _snapshot(cls, ordinal: int) -> dict[str, Any]:
+        catalogue_rows = [
+            cls._catalogue_row("pg_class"),
+            cls._catalogue_row("pg_trigger"),
+            cls._catalogue_row("pg_authid"),
+        ]
+        field_rows = [
+            cls._field_row("pg_class", "relname", 1, "name"),
+            cls._field_row("pg_class", "relallvisible", 2, "int4"),
+            cls._field_row("pg_class", "relfilenode", 3, "oid"),
+            cls._field_row("pg_class", "reltoastrelid", 4, "oid"),
+            cls._field_row("pg_trigger", "tgrelid", 1, "oid"),
+            cls._field_row("pg_authid", "rolpassword", 1, "text"),
+        ]
+        raw_values = {
+            ("pg_class", "relname"): "sqag_profiles",
+            ("pg_class", "relallvisible"): 50 + ordinal,
+            ("pg_class", "relfilenode"): 500 + ordinal,
+            ("pg_class", "reltoastrelid"): 0,
+            ("pg_trigger", "tgrelid"): 700 + ordinal,
+            ("pg_authid", "rolpassword"): f"secret-{ordinal:02d}",
+        }
+        object_identities = {
+            "pg_class": "relation:profile",
+            "pg_trigger": "trigger:guard",
+            "pg_authid": "role:runtime",
+        }
+        field_values: list[dict[str, Any]] = []
+        for field in field_rows:
+            key = (field["catalogue_name"], field["field_name"])
+            observation = {
+                "catalogue": f"{field['schema_name']}.{field['catalogue_name']}",
+                "field_name": field["field_name"],
+                "object_identity": object_identities[field["catalogue_name"]],
+                "postgres_type": field["postgres_type"],
+                "object_kind": field["relkind"],
+                "applicability": "catalogue_relation",
+                "raw_value": raw_values[key],
+            }
+            if key == ("pg_trigger", "tgrelid"):
+                observation["target_identity"] = "relation:profile"
+            if key == ("pg_authid", "rolpassword"):
+                observation["secret_shape"] = {
+                    "present": True,
+                    "value_type": "str",
+                    "length": len(str(raw_values[key])),
+                }
+            field_values.append(observation)
+        return {
+            "reference_id": f"reference-{ordinal}",
+            "postgresql_major": 17,
+            "catalogue_rows": catalogue_rows,
+            "field_rows": field_rows,
+            "executed_fields": [
+                {
+                    "catalogue": f"{field['schema_name']}.{field['catalogue_name']}",
+                    "field_name": field["field_name"],
+                }
+                for field in field_rows
+            ],
+            "field_values": field_values,
+            "edges": [
+                {
+                    "edge_kind": "trigger_targets_relation",
+                    "source_identity": "trigger:guard",
+                    "target_identity": "relation:profile",
+                }
+            ],
+            "capability_graph": {
+                "provider_state": "managed",
+                "capability_shape": "bounded",
+            },
+            "secret_safe_state": {
+                "password_verifier": {
+                    "present": True,
+                    "value_type": "str",
+                }
+            },
+            "deferred_boundaries": [],
+        }
+
+    @classmethod
+    def _snapshots(cls) -> list[dict[str, Any]]:
+        return [cls._snapshot(index) for index in (1, 2, 3)]
+
+    def test_three_reference_sweep_and_maintenance_perturbation_converge(self) -> None:
+        snapshots = self._snapshots()
+        result = contract_validator.compare_finality_references(snapshots)
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(result["references"], ("reference-1", "reference-2", "reference-3"))
+        self.assertEqual(result["catalogue_count_receipt"], (3, 3, 3))
+        self.assertEqual(result["field_count_receipt"], (6, 6, 6))
+        self.assertEqual(len(set(result["normalized_digests"])), 1)
+        variance_fields = {
+            (receipt["catalogue"], receipt["field"])
+            for receipt in result["variance_inventory"]
+        }
+        self.assertIn(("pg_catalog.pg_class", "relallvisible"), variance_fields)
+        self.assertIn(("pg_catalog.pg_class", "relfilenode"), variance_fields)
+        self.assertIn(("pg_catalog.pg_trigger", "tgrelid"), variance_fields)
+        self.assertIn(("pg_catalog.pg_authid", "rolpassword"), variance_fields)
+        self.assertNotIn("secret-1", repr(result))
+        perturbed = self._snapshot(99)
+        perturbed_result = contract_validator.compare_finality_references(snapshots + [perturbed])
+        self.assertTrue(perturbed_result["ok"], perturbed_result["errors"])
+        self.assertEqual(len(set(perturbed_result["normalized_digests"])), 1)
+
+    def test_relallvisible_uses_generic_manifest_policy_without_field_branch(self) -> None:
+        manifest = contract_validator.load_finality_coverage_manifest()
+        relallvisible = [
+            item
+            for item in manifest["field_registry"]["special_fields"]
+            if item["field_name"] == "relallvisible"
+        ]
+        self.assertEqual(len(relallvisible), 1)
+        self.assertEqual(relallvisible[0]["binding_kind"], "system_dynamic")
+        self.assertEqual(relallvisible[0]["policy_id"], "postgresql-maintained-dynamic-v1")
+        self.assertIn(
+            ("pg_catalog.pg_class", "relallvisible"),
+            contract_validator.FINALITY_ALLOWED_DYNAMIC_FIELD_IDS,
+        )
+        source = Path(contract_validator.__file__).read_text(encoding="utf-8")
+        self.assertNotIn('field_name == "relallvisible"', source)
+
+    def test_manifest_and_field_binding_closure_are_exact(self) -> None:
+        manifest = contract_validator.load_finality_coverage_manifest()
+        snapshot = self._snapshot(1)
+        fields = contract_validator.derive_finality_field_universe(snapshot["field_rows"])
+        bindings = contract_validator.build_finality_field_bindings(fields, manifest)
+        self.assertEqual(len(bindings), len(fields))
+        self.assertEqual(
+            len({binding["binding_id"] for binding in bindings}),
+            len(fields),
+        )
+        self.assertEqual(
+            {
+                (binding["catalogue"], binding["field"])
+                for binding in bindings
+            },
+            {
+                (field["catalogue"], field["field_name"])
+                for field in fields
+            },
+        )
+        for binding in bindings:
+            self.assertTrue(
+                callable(contract_validator._finality_normalizer(binding["normalizer"]))
+            )
+        self.assertEqual(
+            contract_validator.validate_finality_field_binding_closure(
+                fields,
+                bindings,
+                snapshot["executed_fields"],
+            ),
+            [],
+        )
+        self.assertIn(
+            "field_binding_missing",
+            " ".join(
+                contract_validator.validate_finality_field_binding_closure(
+                    fields,
+                    bindings[:-1],
+                )
+            ),
+        )
+        extra = dict(bindings[0])
+        extra["catalogue"] = "pg_catalog.pg_class"
+        extra["field"] = "unknown_field"
+        self.assertIn(
+            "field_binding_extra",
+            " ".join(
+                contract_validator.validate_finality_field_binding_closure(
+                    fields,
+                    list(bindings) + [extra],
+                )
+            ),
+        )
+
+    def test_historical_corpus_and_class_red_receipts_are_complete(self) -> None:
+        manifest = contract_validator.load_finality_coverage_manifest()
+        self.assertEqual(
+            len(manifest["historical_review_mapping"]),
+            40,
+        )
+        self.assertEqual(
+            sum(
+                not item["is_outdated"]
+                for item in manifest["historical_review_mapping"]
+            ),
+            26,
+        )
+        self.assertEqual(
+            sum(
+                item["is_outdated"]
+                for item in manifest["historical_review_mapping"]
+            ),
+            14,
+        )
+        self.assertEqual(
+            [item["id"] for item in manifest["class_level_red_receipts"]],
+            ["H59", "H60", "H61", "H62"],
+        )
+        self.assertEqual(contract_validator.validate_historical_review_mapping(manifest), [])
+        self.assertEqual(contract_validator.validate_historical_class_red_receipts(manifest), [])
+
+    def test_closed_seven_policy_registry_and_safe_normalizers(self) -> None:
+        manifest = contract_validator.load_finality_coverage_manifest()
+        self.assertEqual(
+            tuple(policy["id"] for policy in manifest["comparison_policies"]),
+            contract_validator.FINALITY_POLICY_IDS,
+        )
+        self.assertEqual(
+            tuple(item["id"] for item in manifest["handling_classes"]),
+            contract_validator.FINALITY_CLASS_IDS,
+        )
+        for policy in manifest["comparison_policies"]:
+            self.assertTrue(callable(contract_validator._finality_normalizer(policy["normalizer"])))
+        exact_binding = {
+            "postgres_type": "text",
+            "object_kind": "r",
+            "applicability": "catalogue_relation",
+            "policy_id": "exact-semantic-v1",
+            "semantic_family": None,
+        }
+        self.assertEqual(
+            contract_validator.normalize_exact_value(
+                exact_binding,
+                {"raw_value": {"b": 2, "a": 1}},
+            ),
+            {"a": 1, "b": 2},
+        )
+        self.assertEqual(
+            contract_validator.normalize_canonical_collection(
+                exact_binding,
+                {"raw_value": ["b", "a"]},
+            ),
+            ["a", "b"],
+        )
+        provider = contract_validator.normalize_provider_state(
+            {
+                **exact_binding,
+                "postgres_type": "jsonb",
+                "policy_id": "provider-normalized-v1",
+            },
+            {"raw_value": "provider-secret", "capability_shape": {"version": "v1"}},
+        )
+        self.assertNotIn("provider-secret", repr(provider))
+        secret = contract_validator.normalize_secret_shape(
+            {
+                **exact_binding,
+                "policy_id": "secret-redacted-v1",
+            },
+            {
+                "raw_value": "password-verifier-not-for-receipt",
+                "secret_shape": {"present": True, "value_type": "str"},
+            },
+        )
+        self.assertNotIn("password-verifier-not-for-receipt", repr(secret))
+        deferred = contract_validator.normalize_deferred_boundary(
+            {
+                **exact_binding,
+                "policy_id": "deferred-external-boundary-v1",
+            },
+            {"raw_value": "external-state", "boundary_id": "publication-membership"},
+        )
+        self.assertNotIn("external-state", repr(deferred))
+
+    def test_dynamic_policy_removal_is_red(self) -> None:
+        manifest = contract_validator.load_finality_coverage_manifest()
+        manifest["field_registry"]["special_fields"] = [
+            item
+            for item in manifest["field_registry"]["special_fields"]
+            if item["field_name"] != "relallvisible"
+        ]
+        result = contract_validator.compare_finality_references(
+            self._snapshots(),
+            manifest,
+        )
+        self.assertFalse(result["ok"])
+        self.assertTrue(
+            any(
+                "raw_variance_unclassified" in error
+                and "relallvisible" in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+
+    def test_exact_semantic_shape_and_edge_drift_are_red(self) -> None:
+        exact_drift = self._snapshots()
+        next(
+            item
+            for item in exact_drift[1]["field_values"]
+            if item["field_name"] == "relname"
+        )["raw_value"] = "sqag_profiles_changed"
+        exact_result = contract_validator.compare_finality_references(exact_drift)
+        self.assertFalse(exact_result["ok"])
+        self.assertIn("normalized_graph_digest_drift", exact_result["errors"])
+        self.assertTrue(
+            any("raw_variance_unclassified" in error for error in exact_result["errors"])
+        )
+
+        shape_drift = self._snapshots()
+        next(
+            item
+            for item in shape_drift[1]["field_values"]
+            if item["field_name"] == "relallvisible"
+        )["postgres_type"] = "text"
+        shape_result = contract_validator.compare_finality_references(shape_drift)
+        self.assertFalse(shape_result["ok"])
+        self.assertTrue(
+            any("field_shape_type_drift" in error for error in shape_result["errors"])
+        )
+
+        edge_drift = self._snapshots()
+        next(
+            item
+            for item in edge_drift[1]["field_values"]
+            if item["field_name"] == "tgrelid"
+        )["target_identity"] = "relation:other"
+        edge_result = contract_validator.compare_finality_references(edge_drift)
+        self.assertFalse(edge_result["ok"])
+        self.assertIn("normalized_graph_digest_drift", edge_result["errors"])
+
+    def test_unknown_fields_presence_and_edges_fail_closed(self) -> None:
+        missing = self._snapshots()
+        missing[1]["field_values"] = [
+            item
+            for item in missing[1]["field_values"]
+            if item["field_name"] != "relallvisible"
+        ]
+        missing_result = contract_validator.compare_finality_references(missing)
+        self.assertFalse(missing_result["ok"])
+        self.assertTrue(
+            any("field_observation_presence_drift" in error for error in missing_result["errors"])
+        )
+        self.assertTrue(
+            any("listed_but_unused" in error for error in missing_result["errors"])
+        )
+
+        universe_removed = self._snapshots()
+        universe_removed[1]["field_rows"] = [
+            item
+            for item in universe_removed[1]["field_rows"]
+            if item["field_name"] != "relallvisible"
+        ]
+        universe_result = contract_validator.compare_finality_references(universe_removed)
+        self.assertFalse(universe_result["ok"])
+        self.assertIn("field_universe_drift", " ".join(universe_result["errors"]))
+        self.assertTrue(
+            any("executed_but_unregistered" in error for error in universe_result["errors"])
+        )
+        unknown = self._snapshots()
+        unknown[0]["executed_fields"].append(
+            {
+                "catalogue": "pg_catalog.pg_class",
+                "field_name": "not_in_derived_universe",
+            }
+        )
+        for snapshot in unknown:
+            snapshot["edges"].append(
+                {
+                    "edge_kind": "unregistered_edge",
+                    "source_identity": "trigger:guard",
+                    "target_identity": "relation:profile",
+                }
+            )
+        unknown_result = contract_validator.compare_finality_references(unknown)
+        self.assertFalse(unknown_result["ok"])
+        self.assertTrue(
+            any("executed_but_unregistered" in error for error in unknown_result["errors"])
+        )
+        self.assertTrue(
+            any("unknown_relationship_edge" in error for error in unknown_result["errors"])
+        )
+
+    def test_dynamic_field_authorization_and_broad_ignore_forms_are_red(self) -> None:
+        manifest = contract_validator.load_finality_coverage_manifest()
+        dynamic_reclassification = copy.deepcopy(manifest)
+        dynamic_reclassification["field_registry"]["special_fields"].append(
+            {
+                "schema_name": "pg_catalog",
+                "catalogue_name": "pg_class",
+                "field_name": "relname",
+                "binding_kind": "system_dynamic",
+                "policy_id": "postgresql-maintained-dynamic-v1",
+                "semantic_family": "planner_estimate",
+                "allowed_postgres_types": ["name"],
+            }
+        )
+        dynamic_errors = contract_validator.validate_finality_manifest(dynamic_reclassification)
+        self.assertTrue(
+            any("finality_dynamic_field_not_authorized" in error for error in dynamic_errors),
+            dynamic_errors,
+        )
+        broad_ignore = copy.deepcopy(manifest)
+        broad_ignore["source"]["reference_topology"] = "ignore pg_ volatile"
+        broad_errors = contract_validator.validate_finality_manifest(broad_ignore)
+        self.assertTrue(
+            any("finality_forbidden_broad_policy_form" in error for error in broad_errors),
+            broad_errors,
+        )
+
 
 
 class RuntimeMembershipEdgeEvaluatorTest(unittest.TestCase):

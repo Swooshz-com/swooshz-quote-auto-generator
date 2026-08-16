@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-08-02
+Last updated: 2026-08-16
 
 Source of truth: `.github/workflows/ci.yml`
 
@@ -66,6 +66,8 @@ Source of truth: `.github/workflows/ci.yml`
 - Runs `python scripts/validate_dynamic_pricing_reference_rules.py` to keep pricing-reference matching data-driven and block source-code semantic family/synonym packs.
 - Runs `python scripts/scan_sensitive_fixtures.py --fail-on-review` so review-level sensitive fixture findings fail CI.
 - Runtime privilege-contract static validation runs `python scripts/validate_runtime_privilege_contract.py`; the canonical manifest, complete unfiltered protected-role membership evaluation across parent/member/grantor positions, closed runtime-as-member/provider-control schema, exact six-column membership tuple, fourteen-key bounded verification-query set, independent executable-token contracts, exact publication-artifact column authority, the legacy `sqag_quote_artifacts` view read, the Boundary B owner-authority model, complete `r`/`S`/`f`/`n`/`T` default-ACL object-class binding, and repository requirement binding fail closed.
+- A22R2 reference-variance closure is enforced by the same validator through `docs/postgresql17-finality-coverage.json`: the PostgreSQL 17 catalogue and field universes are derived from read-only system-catalogue queries, every derived field receives one executable binding and policy, the seven closed handling classes/policies are explicit, relationship edges such as `pg_trigger.tgrelid` normalize to stable identities, unknown fields/edges and shape/presence drift fail closed, and secret-bearing values emit only safe shape/digest receipts.
+- The A22R2 focused regression proof requires three clean synthetic reference sweeps, accepts only the bounded PostgreSQL-maintained dynamic variance (including `pg_class.relallvisible`) and normalized reference-edge variance, exercises a disposable maintenance perturbation, and contains RED regressions for false normalization, missing policy coverage, unknown edges, and field-shape/presence drift. Full unittest discovery includes this closure proof.
 - Disposable PostgreSQL 17 runtime privilege-contract tests exercise the fourteen canonical query keys, exact result shapes, the automatic creator-admin control edge with ADMIN true, INHERIT false, and SET false, creator REVOKE non-removability, absence of inherited/SET/effective runtime authority, the real publication checksum-backfill path and its prescribed legacy `sqag_quote_artifacts` view read, the exact Boundary B owner authority split for database/schema ACL and PUBLIC TEMPORARY operations, complete table/column privilege matrices, complete default-ACL object classes, and database/schema grant-option semantics with disposable service databases and roles only. The hosted exact-head evidence must report zero skips.
 - Boundary A remains repository-only. It performs no live database, provider, credential, Coolify, deployment, or activation mutation.
 - Green CI does not authorise Boundary B or #160; those scopes require their own exact-head authority and verification.

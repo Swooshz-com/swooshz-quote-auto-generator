@@ -1,0 +1,113 @@
+{
+  "$schema": "postgresql17-finality-coverage-schema-v1",
+  "schema_version": 1,
+  "contract_type": "postgresql17_finality_coverage",
+  "repository": "Swooshz-com/swooshz-quote-auto-generator",
+  "design_lock": "DL-160-POSTMERGE-026-A22R2",
+  "postgresql_major": 17,
+  "source": {
+    "runtime_contract": "docs/runtime-privilege-contract.json",
+    "migration_provenance": "docs/runtime-privilege-contract.json#/production_migrations",
+    "extractor_id": "postgresql17-system-catalogue-v1",
+    "normalizer_id": "postgresql17-finality-normalizer-v1",
+    "policy_registry_id": "postgresql17-comparison-policy-registry-v1",
+    "reference_topology": "exact canonical migration bytes, order, checksums, ledger provenance, and controlled accepted role/ACL topology"
+  },
+  "queries": {
+    "catalogue_universe": "select n.nspname as schema_name, c.relname as catalogue_name, c.relkind, c.relpersistence, c.relispartition from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'pg_catalog' and c.relkind in ('r', 'p', 'v', 'm', 'f', 'c', 'S', 't') order by n.nspname, c.relname, c.relkind",
+    "field_universe": "select n.nspname as schema_name, c.relname as catalogue_name, a.attname as field_name, a.attnum as ordinal_position, t.typname as postgres_type, c.relkind, c.relpersistence, c.relispartition, a.attnotnull, a.attgenerated, a.attidentity, a.attstorage from pg_catalog.pg_attribute a join pg_catalog.pg_class c on c.oid = a.attrelid join pg_catalog.pg_namespace n on n.oid = c.relnamespace join pg_catalog.pg_type t on t.oid = a.atttypid where n.nspname = 'pg_catalog' and c.relkind in ('r', 'p', 'v', 'm', 'f', 'c', 'S', 't') and a.attnum > 0 and not a.attisdropped order by n.nspname, c.relname, a.attnum"
+  },
+  "handling_classes": [
+    {"id": "exact_semantic_value", "description": "Raw value is repository semantic state and must compare exactly.", "output_role": "semantic.value"},
+    {"id": "stable_normalized_identity_reference_edge", "description": "OID and reference values become stable semantic identities or relationship edges.", "output_role": "semantic.edge"},
+    {"id": "canonicalized_collection_set_order", "description": "Collection values compare after deterministic set and order canonicalization.", "output_role": "semantic.collection"},
+    {"id": "postgresql_maintained_dynamic_estimate", "description": "PostgreSQL-maintained estimate or maintenance state retains typed shape while raw values may vary under an explicit bounded policy.", "output_role": "semantic.system_state_shape"},
+    {"id": "provider_managed_normalized_state", "description": "Provider-managed state retains only the normalized capability and shape needed by the repository boundary.", "output_role": "semantic.provider_state_shape"},
+    {"id": "secret_redacted_shape_capability", "description": "Secret-bearing values are never emitted; presence, type, and capability shape remain comparable.", "output_role": "semantic.secret_shape"},
+    {"id": "deferred_external_boundary", "description": "An explicitly deferred external boundary is represented as a typed, fail-closed boundary receipt.", "output_role": "semantic.deferred_boundary"}
+  ],
+  "comparison_policies": [
+    {"id": "exact-semantic-v1", "handling_class": "exact_semantic_value", "normalizer": "normalize_exact_value", "allow_raw_variance": false, "shape_fields": ["field_present", "postgres_type", "object_kind", "applicability", "policy_id"], "public_receipt": "exact-value-digest"},
+    {"id": "stable-reference-edge-v1", "handling_class": "stable_normalized_identity_reference_edge", "normalizer": "normalize_reference_edge", "allow_raw_variance": true, "shape_fields": ["field_present", "postgres_type", "object_kind", "applicability", "policy_id", "edge_kind"], "public_receipt": "edge-identity-digest"},
+    {"id": "canonical-collection-v1", "handling_class": "canonicalized_collection_set_order", "normalizer": "normalize_canonical_collection", "allow_raw_variance": false, "shape_fields": ["field_present", "postgres_type", "object_kind", "applicability", "policy_id"], "public_receipt": "collection-digest"},
+    {"id": "postgresql-maintained-dynamic-v1", "handling_class": "postgresql_maintained_dynamic_estimate", "normalizer": "normalize_system_dynamic", "allow_raw_variance": true, "shape_fields": ["field_present", "postgres_type", "object_kind", "applicability", "policy_id", "semantic_family"], "public_receipt": "typed-raw-variance-digest"},
+    {"id": "provider-normalized-v1", "handling_class": "provider_managed_normalized_state", "normalizer": "normalize_provider_state", "allow_raw_variance": true, "shape_fields": ["field_present", "postgres_type", "object_kind", "applicability", "policy_id", "capability_shape"], "public_receipt": "provider-shape-digest"},
+    {"id": "secret-redacted-v1", "handling_class": "secret_redacted_shape_capability", "normalizer": "normalize_secret_shape", "allow_raw_variance": true, "shape_fields": ["field_present", "postgres_type", "object_kind", "applicability", "policy_id", "secret_shape"], "public_receipt": "secret-safe-shape-digest"},
+    {"id": "deferred-external-boundary-v1", "handling_class": "deferred_external_boundary", "normalizer": "normalize_deferred_boundary", "allow_raw_variance": true, "shape_fields": ["field_present", "postgres_type", "object_kind", "applicability", "policy_id", "boundary_id"], "public_receipt": "deferred-boundary-shape-digest"}
+  ],
+  "field_registry": {
+    "mode": "reference_derived_exact_tuple",
+    "binding_keys": ["schema_name", "catalogue_name", "field_name", "ordinal_position", "postgres_type", "object_kind", "applicability"],
+    "default_policy_id": "exact-semantic-v1",
+    "default_handling_class": "exact_semantic_value",
+    "special_fields": [
+      {"schema_name": "pg_catalog", "catalogue_name": "pg_class", "field_name": "relpages", "binding_kind": "system_dynamic", "policy_id": "postgresql-maintained-dynamic-v1", "semantic_family": "planner_estimate", "allowed_postgres_types": ["int4"], "semantic_reason": "PostgreSQL documents this as a planner estimate maintained by VACUUM, ANALYZE, and selected DDL."},
+      {"schema_name": "pg_catalog", "catalogue_name": "pg_class", "field_name": "reltuples", "binding_kind": "system_dynamic", "policy_id": "postgresql-maintained-dynamic-v1", "semantic_family": "planner_estimate", "allowed_postgres_types": ["float4"], "semantic_reason": "PostgreSQL documents this as a planner estimate maintained by VACUUM, ANALYZE, and selected DDL."},
+      {"schema_name": "pg_catalog", "catalogue_name": "pg_class", "field_name": "relallvisible", "binding_kind": "system_dynamic", "policy_id": "postgresql-maintained-dynamic-v1", "semantic_family": "visibility_maintenance_estimate", "allowed_postgres_types": ["int4"], "semantic_reason": "PostgreSQL documents this as the estimated number of all-visible pages maintained by VACUUM, ANALYZE, and selected DDL."},
+      {"schema_name": "pg_catalog", "catalogue_name": "pg_class", "field_name": "relfrozenxid", "binding_kind": "system_dynamic", "policy_id": "postgresql-maintained-dynamic-v1", "semantic_family": "transaction_age_maintenance_marker", "allowed_postgres_types": ["xid"], "semantic_reason": "The value is maintained by PostgreSQL vacuum/freeze maintenance and is not application identity."},
+      {"schema_name": "pg_catalog", "catalogue_name": "pg_class", "field_name": "relminmxid", "binding_kind": "system_dynamic", "policy_id": "postgresql-maintained-dynamic-v1", "semantic_family": "transaction_age_maintenance_marker", "allowed_postgres_types": ["xid"], "semantic_reason": "The value is maintained by PostgreSQL multixact freeze maintenance and is not application identity."},
+      {"schema_name": "pg_catalog", "catalogue_name": "pg_class", "field_name": "relfilenode", "binding_kind": "system_dynamic", "policy_id": "postgresql-maintained-dynamic-v1", "semantic_family": "physical_locator", "allowed_postgres_types": ["oid"], "semantic_reason": "The physical file locator can be reassigned by PostgreSQL storage operations; relation identity remains separately normalized."},
+      {"schema_name": "pg_catalog", "catalogue_name": "pg_authid", "field_name": "rolpassword", "binding_kind": "secret_shape", "policy_id": "secret-redacted-v1", "semantic_family": "secret_verifier_shape", "allowed_postgres_types": ["text"], "semantic_reason": "Password verifiers are secret-bearing and are represented only by safe presence/type/shape metadata."}
+    ],
+    "relationship_fields": [
+      {"schema_name": "pg_catalog", "catalogue_name": "pg_trigger", "field_name": "tgrelid", "binding_kind": "reference_edge", "policy_id": "stable-reference-edge-v1", "edge_kind": "trigger_targets_relation", "target_catalogue": "pg_catalog.pg_class", "allowed_postgres_types": ["oid"], "semantic_reason": "The trigger target is a stable relation identity edge; raw OID equality is not the semantic contract."},
+      {"schema_name": "pg_catalog", "catalogue_name": "pg_class", "field_name": "reltoastrelid", "binding_kind": "reference_edge", "policy_id": "stable-reference-edge-v1", "edge_kind": "relation_has_toast_relation", "target_catalogue": "pg_catalog.pg_class", "allowed_postgres_types": ["oid"], "semantic_reason": "The TOAST relation is a normalized relation identity edge, not a raw OID identity."}
+    ],
+    "provider_fields": [],
+    "deferred_fields": []
+  },
+  "reference_proof": {
+    "minimum_clean_references": 3,
+    "raw_variance_receipt": {"encoding": "sha256-canonical-safe-value", "required_fields": ["reference_ids", "catalogue", "field", "object_identity", "policy_id", "value_digests", "distinct_value_count"], "raw_values_emitted": false},
+    "normalized_digest": "sha256-canonical-json",
+    "maintenance_perturbation": {"required": true, "disposable_only": true, "accepted_semantic_change": false, "operation_family": "bounded_vacuum_or_analyze_on_disposable_reference", "expected_result": "dynamic raw variance may change while normalized semantic digest remains equal"}
+  },
+  "historical_review_mapping": [
+    {"thread_id": "PRRT_kwDOSw17V86Y8pVY", "comment_id": 3775760599, "is_outdated": false, "mechanism_class": "column_shape", "causal_red_receipt": "classified_column_identity_or_type_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86Y_vGr", "comment_id": 3776937010, "is_outdated": false, "mechanism_class": "authority_capability", "causal_red_receipt": "unexpected_public_routine_authority", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZITfu", "comment_id": 3780236879, "is_outdated": false, "mechanism_class": "provider_normalized_state", "causal_red_receipt": "provider_routine_security_shape_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZITfx", "comment_id": 3780236883, "is_outdated": false, "mechanism_class": "authority_capability", "causal_red_receipt": "missing_direct_schema_grant_provenance", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZITf0", "comment_id": 3780236885, "is_outdated": false, "mechanism_class": "authority_capability", "causal_red_receipt": "unsafe_parameter_authority", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZKJ34", "comment_id": 3780956750, "is_outdated": false, "mechanism_class": "exact_semantic_value", "causal_red_receipt": "routine_definition_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZKJ3_", "comment_id": 3780956759, "is_outdated": false, "mechanism_class": "stable_normalized_identity_reference_edge", "causal_red_receipt": "trigger_attachment_target_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZKJ4H", "comment_id": 3780956766, "is_outdated": false, "mechanism_class": "authority_capability", "causal_red_receipt": "unsafe_startup_default", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZKJ4N", "comment_id": 3780956774, "is_outdated": false, "mechanism_class": "exact_semantic_value", "causal_red_receipt": "constraint_contract_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZKJ4Q", "comment_id": 3780956777, "is_outdated": false, "mechanism_class": "authority_capability", "causal_red_receipt": "large_object_authority_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZKJ4T", "comment_id": 3780956781, "is_outdated": false, "mechanism_class": "authority_capability", "causal_red_receipt": "missing_canonical_evidence_collection", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZLkPC", "comment_id": 3781482901, "is_outdated": false, "mechanism_class": "exact_semantic_value", "causal_red_receipt": "standalone_index_contract_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZN7_k", "comment_id": 3782398217, "is_outdated": false, "mechanism_class": "stable_normalized_identity_reference_edge", "causal_red_receipt": "classified_trigger_attachment_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZN7_r", "comment_id": 3782398228, "is_outdated": false, "mechanism_class": "exact_semantic_value", "causal_red_receipt": "unexpected_unique_index", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZN7_7", "comment_id": 3782398256, "is_outdated": false, "mechanism_class": "authority_capability", "causal_red_receipt": "missing_public_connect_provenance", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZRWNf", "comment_id": 3783697278, "is_outdated": false, "mechanism_class": "stable_normalized_identity_reference_edge", "causal_red_receipt": "foreign_key_match_semantics_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZRWNh", "comment_id": 3783697281, "is_outdated": false, "mechanism_class": "authority_capability", "causal_red_receipt": "missing_migrator_database_grant", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZRWNi", "comment_id": 3783697283, "is_outdated": false, "mechanism_class": "authority_capability", "causal_red_receipt": "exceptional_system_catalog_authority", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZXysN", "comment_id": 3786071378, "is_outdated": false, "mechanism_class": "exact_semantic_value", "causal_red_receipt": "column_collation_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZXysZ", "comment_id": 3786071396, "is_outdated": false, "mechanism_class": "authority_capability", "causal_red_receipt": "database_connection_posture_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZXyse", "comment_id": 3786071404, "is_outdated": false, "mechanism_class": "exact_semantic_value", "causal_red_receipt": "partition_relation_shape_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86Zf5VH", "comment_id": 3789189421, "is_outdated": false, "mechanism_class": "exact_semantic_value", "causal_red_receipt": "generated_column_mode_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86Zhibp", "comment_id": 3789793670, "is_outdated": false, "mechanism_class": "authority_capability", "causal_red_receipt": "toast_system_authority_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86Zhibt", "comment_id": 3789793674, "is_outdated": false, "mechanism_class": "exact_semantic_value", "causal_red_receipt": "column_storage_mode_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86Zhibv", "comment_id": 3789793678, "is_outdated": false, "mechanism_class": "stable_normalized_identity_reference_edge", "causal_red_receipt": "inbound_foreign_key_dependency_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86Zhibw", "comment_id": 3789793681, "is_outdated": false, "mechanism_class": "deferred_external_boundary", "causal_red_receipt": "publication_export_membership_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86Y8pVR", "comment_id": 3775760589, "is_outdated": true, "mechanism_class": "authority_capability", "causal_red_receipt": "authority_outside_classified_schema", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86Y8pVc", "comment_id": 3775760605, "is_outdated": true, "mechanism_class": "deferred_external_boundary", "causal_red_receipt": "fixture_capability_failure", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86Y_vG8", "comment_id": 3776937028, "is_outdated": true, "mechanism_class": "exact_semantic_value", "causal_red_receipt": "schema_scoped_column_authority_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZKJ4C", "comment_id": 3780956762, "is_outdated": true, "mechanism_class": "exact_semantic_value", "causal_red_receipt": "verification_query_provenance_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZN7_w", "comment_id": 3782398237, "is_outdated": true, "mechanism_class": "exact_semantic_value", "causal_red_receipt": "unvalidated_constraint_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZN7_z", "comment_id": 3782398242, "is_outdated": true, "mechanism_class": "authority_capability", "causal_red_receipt": "public_default_privilege_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZN7_2", "comment_id": 3782398246, "is_outdated": true, "mechanism_class": "exact_semantic_value", "causal_red_receipt": "routine_cast_semantics_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZN7_9", "comment_id": 3782398258, "is_outdated": true, "mechanism_class": "deferred_external_boundary", "causal_red_receipt": "design_lock_identity_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZRWNc", "comment_id": 3783697275, "is_outdated": true, "mechanism_class": "exact_semantic_value", "causal_red_receipt": "rewrite_rule_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZV046", "comment_id": 3785318729, "is_outdated": true, "mechanism_class": "authority_capability", "causal_red_receipt": "unsafe_runtime_startup_default", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZV05A", "comment_id": 3785318741, "is_outdated": true, "mechanism_class": "exact_semantic_value", "causal_red_receipt": "constraint_cast_semantics_drift", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86ZV05I", "comment_id": 3785318751, "is_outdated": true, "mechanism_class": "authority_capability", "causal_red_receipt": "retained_rollback_role_missing", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86Zf5VK", "comment_id": 3789189424, "is_outdated": true, "mechanism_class": "authority_capability", "causal_red_receipt": "exceptional_system_routine_authority", "disposition": "material_generic_mapping"},
+    {"thread_id": "PRRT_kwDOSw17V86Zf5VM", "comment_id": 3789189427, "is_outdated": true, "mechanism_class": "authority_capability", "causal_red_receipt": "forbidden_maintenance_role_present", "disposition": "material_generic_mapping"}
+  ],
+  "class_level_red_receipts": [
+    {"id": "H59", "mechanism_class": "authority_capability", "scenario": "exceptional pg_toast or system-catalog authority", "expected_result": "RED"},
+    {"id": "H60", "mechanism_class": "exact_semantic_value", "scenario": "column storage or shape drift", "expected_result": "RED"},
+    {"id": "H61", "mechanism_class": "stable_normalized_identity_reference_edge", "scenario": "inbound reverse dependency drift", "expected_result": "RED"},
+    {"id": "H62", "mechanism_class": "deferred_external_boundary", "scenario": "publication or export membership drift", "expected_result": "RED"}
+  ]
+}
