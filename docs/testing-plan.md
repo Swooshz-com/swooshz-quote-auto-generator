@@ -45,6 +45,8 @@ npm run playwright:smoke
   a cookie, and browser positive/negative flows. Provider behavior must use
   local synthetic adapters only.
 - CI/CD, package scripts, dependency setup, or workflow files: validate the YAML/script syntax when possible, run the nearest local command, and update `docs/current-cicd-status.md`.
+- A23 PostgreSQL finality engine, live catalogue collector, reference harness, coverage manifest, or CI gate: run `python -m unittest tests.test_postgresql17_finality_engine tests.test_postgresql17_reference_harness`, `python scripts/validate_postgresql17_finality.py --json`, and the mandatory disposable `python scripts/validate_postgresql17_finality.py --real-references --json` proof. The real proof must use fresh PostgreSQL 17 containers/volumes, exact canonical migration replay, live `pg_catalog` derivation, hashed `pg_toast` authority boundaries, semantic/reference/authority convergence, P maintenance variance with restored equality, and verified cleanup; synthetic output never satisfies this gate.
+- The A23 collector does not change application migrations or runtime privilege contracts; its controlled reference setup is test-only and must not be pointed at provider or production PostgreSQL.
 - PostgreSQL migration manifest, ledger, preflight, or operator command: run
   `tests.test_postgres_migration_ledger` against the isolated CI PostgreSQL
   service and require fresh apply, complete schema, exact checksums, no-op

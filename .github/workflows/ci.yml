@@ -95,6 +95,32 @@ jobs:
       - name: Run Nixpacks Python contract tests
         run: python -m unittest tests.test_nixpacks_python_contract
 
+  postgresql17-finality:
+    name: A23 real PostgreSQL-17 A/B/C/P finality
+    runs-on: ubuntu-latest
+    needs:
+      - retrospective_exact_starting_head_red
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact workflow head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.13"
+
+      - name: Install Python dependencies
+        run: python -m pip install --only-binary=:all: -r requirements.txt
+
+      - name: Run A23 regression tests
+        run: python -m unittest tests.test_postgresql17_finality_engine tests.test_postgresql17_reference_harness
+
+      - name: Run real PostgreSQL-17 A/B/C/P finality proof
+        run: python scripts/validate_postgresql17_finality.py --real-references --json
+
   validate:
     name: Validate app
     runs-on: ubuntu-latest
@@ -103,7 +129,8 @@ jobs:
       - secret-scan
       - dependency-audit
       - nixpacks-contract
-    if: always() && needs.retrospective_exact_starting_head_red.result == 'success' && needs.secret-scan.result == 'success' && needs.dependency-audit.result == 'success'
+      - postgresql17-finality
+    if: always() && needs.retrospective_exact_starting_head_red.result == 'success' && needs.secret-scan.result == 'success' && needs.dependency-audit.result == 'success' && needs.nixpacks-contract.result == 'success' && needs.postgresql17-finality.result == 'success'
     env:
       APP_MODE: local
       LOCAL_USER_ROLE: admin
@@ -166,7 +193,7 @@ jobs:
 
       - name: Check Python syntax
         run: |
-          python -m py_compile webapp/server.py webapp/internal_google_auth.py webapp/postgres_migrations.py tests/internal_google_browser_harness.py tests/test_runtime_privilege_contract.py scripts/migrate_sqag_storage.py scripts/preflight_sqag_migrations.py scripts/generate_quote.py scripts/live_ai_basis_chat_smoke.py scripts/build_pricing_catalog.py scripts/pricing_reference_cleanup.py scripts/pricing_reference_enrichment.py scripts/validate_dynamic_pricing_reference_rules.py scripts/validate_local_pdf_dependency_usage.py scripts/validate_runtime_privilege_contract.py scripts/assert_postgres17.py
+          python -m py_compile webapp/server.py webapp/internal_google_auth.py webapp/postgres_migrations.py tests/internal_google_browser_harness.py tests/test_runtime_privilege_contract.py scripts/migrate_sqag_storage.py scripts/preflight_sqag_migrations.py scripts/generate_quote.py scripts/live_ai_basis_chat_smoke.py scripts/build_pricing_catalog.py scripts/pricing_reference_cleanup.py scripts/pricing_reference_enrichment.py scripts/validate_dynamic_pricing_reference_rules.py scripts/validate_local_pdf_dependency_usage.py scripts/validate_runtime_privilege_contract.py scripts/assert_postgres17.py scripts/postgresql17_finality_engine.py scripts/postgresql17_reference_harness.py scripts/validate_postgresql17_finality.py tests/test_postgresql17_finality_engine.py tests/test_postgresql17_reference_harness.py
 
       - name: Guard local PDF dependency usage
         run: python scripts/validate_local_pdf_dependency_usage.py
@@ -179,6 +206,9 @@ jobs:
 
       - name: Validate runtime privilege contract
         run: python scripts/validate_runtime_privilege_contract.py
+
+      - name: Run A23 regression tests
+        run: python -m unittest tests.test_postgresql17_finality_engine tests.test_postgresql17_reference_harness
 
       - name: Run Python tests
         run: python -m unittest discover -s tests

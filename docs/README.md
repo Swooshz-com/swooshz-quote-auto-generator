@@ -55,6 +55,7 @@ platform concerns belong in `Swooshz-com/swooshz-platform`.
   blockers, not internal RC implementation work.
 - `docs/current-cicd-status.md`: active GitHub Actions workflow, CI checks, and
   maintenance rule for CI/CD changes.
+- `docs/postgresql17-finality-coverage.json`: canonical A23 live PostgreSQL 17 catalogue, policy, identity, authority-boundary, maintenance, and A/B/C/P receipt contract.
 - `docs/pr-checks/quote-generator-pr-checklist.md`: PR review checklist and
   SQAG module boundary reminder.
 - `docs/agent-playbooks/`: portable AI-agent playbooks referenced by `AGENTS.md`.
