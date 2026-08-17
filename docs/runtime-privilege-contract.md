@@ -593,3 +593,9 @@ The `Validate app` job in `.github/workflows/ci.yml` runs:
 - The disposable PostgreSQL integration tests (both migration-ledger and privilege-contract).
 
 A contract failure fails the CI job. No live database or provider mutations occur in CI.
+
+## A24 disposable reference privilege boundary
+
+The A24 proof harness may create only four disposable PostgreSQL 17 containers and their exact temporary data volumes. It uses the canonical immutable image digest, replays the repository migration manifest, and creates fixed no-login proof roles inside those disposable clusters. It does not connect to Neon, production, a provider, or customer data.
+
+The finality engine loads the reviewed authority package before its first database read. It discovers only explicit pg_catalog and pg_toast metadata, validates D/S/A closure, compiles explicit safe projections, then performs typed observations. Secret, credential, statistic-sample, TOAST-payload, large-object-payload, raw-OID, ordinal, and untyped fallback reads are forbidden. Only server-derived shape/count projections and the explicitly declared maintenance dynamic witness can appear in a public-safe receipt.

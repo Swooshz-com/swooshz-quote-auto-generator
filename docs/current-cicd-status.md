@@ -185,3 +185,9 @@ Source of truth: `.github/workflows/ci.yml`
 ## Maintenance Rule
 
 Update this file whenever CI/CD jobs, triggers, required checks, branch protection, deployment behavior, secret requirements, or security gates change.
+
+## A24 G3 semantic-authority finality
+
+A24 adds one required CI job, `a24-postgresql17-finality`, before the existing app validation job. It runs workflow linting, the closed-world package validator, focused unit tests, and four independent disposable PostgreSQL 17 clusters labelled A/B/C/P. The harness replays the canonical PostgreSQL migration manifest and emits only a public-safe receipt.
+
+This is a repository and disposable-CI boundary. A green CI result is not Web acceptance, G4, Ready, merge approval, deployment, provider authorization, or production authority. The authority package is regenerated only through the explicit reviewed-universe command; normal CI validation never regenerates it.

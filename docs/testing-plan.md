@@ -62,3 +62,15 @@ A fix is not complete until the failing behavior has a regression test at the ri
 - CI checks for repository-wide syntax, unit, and smoke coverage.
 
 When production code changes without a matching automated test, the final report must say which affected feature remains manually tested or untested and why.
+
+## A24 PostgreSQL 17 semantic-authority finality tests
+
+Affected paths are the closed-world authority validator, descriptor/observation engine, reference-cluster harness, policy and coverage package, and CI dependency. The focused checks are:
+
+- Python syntax compilation for all four implementation modules and three focused test modules.
+- Static authority validation, including dropped and negative attributes, pg_toast attachment metadata, explicit safety modes, semantic comparators, source digests, and package digest.
+- Actionlint or the repository-equivalent workflow validator.
+- Four real independent disposable PostgreSQL 17 clusters (A/B/C/P), exact canonical migration replay and checksum ledger verification, maintenance-witness variance for P, cleanup verification, and public-safe receipt checks.
+- The normal repository unit-test suite remains the broader regression gate.
+
+No live, provider, customer, deployment, or production database is in scope. A missing descriptor, unknown field, raw secret/statistics/TOAST/large-object projection, non-typed serializer, unordered positional vector, or unauthorized dynamic variance is a red condition.

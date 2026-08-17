@@ -103,3 +103,9 @@ Private profile and pricing files stay outside the repository:
 Do not commit runtime stores, private uploads, generated workbooks, generated
 PDFs, real logos, workbook rows/cells, bank/payment data, customer data, or
 private local paths.
+
+## SQAG A24 PostgreSQL 17 semantic-authority finality
+
+The A24 finality package is the bounded G3 implementation surface for disposable PostgreSQL 17 reference validation. The reviewed coverage and policy files are `postgresql17-finality-coverage.json` and `postgresql17-finality-policy-authority.json`. The package is closed-world: a discovered descriptor must already be present in the reviewed universe, with an explicit safety binding, semantic binding, typed observation, and safe projection or metadata boundary.
+
+Use `scripts/validate_postgresql17_finality.py --ci` for package/static validation and `scripts/postgresql17_reference_harness.py --real` only for the disposable A/B/C/P proof. This surface does not authorize Web acceptance, G4, merge, deployment, provider access, or production data.
