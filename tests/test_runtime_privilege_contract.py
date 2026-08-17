@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT))
 
 from scripts import validate_runtime_privilege_contract as contract
 from webapp import server as webapp
+from scripts import preflight_sqag_migrations as preflight
 from webapp.forensics import ForensicStore
 from webapp.postgres_migrations import (
     EXPECTED_INDEXES,
@@ -195,6 +196,156 @@ class RuntimePrivilegeContractStaticTest(unittest.TestCase):
             case._cleanup_fixture()
         self.assertIn("CLEANUP_UNKNOWN", str(raised.exception))
 
+
+class _FakeIdentityCursor:
+    def __init__(self, row):
+        self.row = row
+
+    def fetchone(self):
+        return self.row
+
+
+class _FakeIdentityRawConnection:
+    def __init__(self, current_user: str):
+        self.current_user = current_user
+        self.statements: list[str] = []
+        self.rollback_calls = 0
+        self.closed = False
+
+    def execute(self, sql, params=()):
+        _ = params
+        self.statements.append(sql)
+        if sql == "select current_user as role":
+            return _FakeIdentityCursor({"role": self.current_user})
+        return _FakeIdentityCursor({"ok": True})
+
+    def rollback(self):
+        self.rollback_calls += 1
+
+    def close(self):
+        self.closed = True
+
+
+class RuntimeSessionIdentityBindingTest(unittest.TestCase):
+    DATABASE_URL = "postgresql://sqag_runtime:synthetic-secret@db.example.test/sqag"
+
+    def _preflight(self, current_user: str, *, maintenance: bool = False):
+        raw = _FakeIdentityRawConnection(current_user)
+        connect = lambda _database_url: raw
+        with (
+            mock.patch.object(webapp, "postgres_driver_connection_factory", return_value=connect),
+            mock.patch.object(preflight, "inspect_postgres_migrations", return_value={"status": "ready"}),
+            mock.patch.object(preflight, "validate_migration_report"),
+            mock.patch.object(preflight, "verify_postgres_privilege_contract", return_value={"status": "verified"}),
+        ):
+            result = preflight._inspect(
+                self.DATABASE_URL,
+                [],
+                {},
+                require_maintenance_role=maintenance,
+            )
+        return result, raw
+
+    def _runtime_storage(self, current_user: str):
+        raw = _FakeIdentityRawConnection(current_user)
+        connect = lambda _database_url: raw
+        with mock.patch.object(webapp, "postgres_driver_connection_factory", return_value=connect):
+            storage = webapp.DatabaseSqagStorage(
+                self.DATABASE_URL,
+                "workspace-runtime-identity",
+                expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+            )
+            with storage.connection() as connection:
+                connection.execute("select application_sql")
+        return raw
+
+    def test_runtime_preflight_accepts_exact_server_authoritative_identity(self):
+        result, raw = self._preflight(webapp.SQAG_RUNTIME_DATABASE_ROLE)
+        self.assertEqual(result[0]["status"], "ready")
+        self.assertEqual(result[1]["status"], "verified")
+        self.assertEqual(
+            raw.statements[:2],
+            ["select current_user as role", "set transaction read only"],
+        )
+        self.assertEqual(raw.rollback_calls, 1)
+        self.assertTrue(raw.closed)
+
+    def test_runtime_preflight_rejects_admin_migrator_and_maintenance_identities(self):
+        for current_user in ("postgres", "sqag_migrator", "sqag_maintenance"):
+            with self.subTest(current_user=current_user):
+                with self.assertRaises(webapp.SqagStorageAccessError):
+                    self._preflight(current_user)
+                _, raw = self._preflight_rejected(current_user)
+                self.assertEqual(raw.statements, ["select current_user as role"])
+                self.assertEqual(raw.rollback_calls, 0)
+                self.assertTrue(raw.closed)
+
+    def _preflight_rejected(self, current_user: str):
+        raw = _FakeIdentityRawConnection(current_user)
+        connect = lambda _database_url: raw
+        with (
+            mock.patch.object(webapp, "postgres_driver_connection_factory", return_value=connect),
+            mock.patch.object(preflight, "inspect_postgres_migrations"),
+            mock.patch.object(preflight, "validate_migration_report"),
+            mock.patch.object(preflight, "verify_postgres_privilege_contract"),
+        ):
+            with self.assertRaises(webapp.SqagStorageAccessError):
+                preflight._inspect(self.DATABASE_URL, [], {})
+        return None, raw
+
+    def test_runtime_storage_accepts_exact_identity_before_application_sql(self):
+        raw = self._runtime_storage(webapp.SQAG_RUNTIME_DATABASE_ROLE)
+        self.assertEqual(
+            raw.statements,
+            ["select current_user as role", "select application_sql"],
+        )
+        self.assertTrue(raw.closed)
+
+    def test_runtime_storage_rejects_non_runtime_identity_before_application_sql(self):
+        for current_user in ("postgres", "sqag_migrator", "sqag_maintenance"):
+            with self.subTest(current_user=current_user):
+                raw = _FakeIdentityRawConnection(current_user)
+                connect = lambda _database_url: raw
+                with mock.patch.object(webapp, "postgres_driver_connection_factory", return_value=connect):
+                    storage = webapp.DatabaseSqagStorage(
+                        self.DATABASE_URL,
+                        "workspace-runtime-identity",
+                        expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+                    )
+                    with self.assertRaises(webapp.SqagStorageAccessError) as raised:
+                        with storage.connection():
+                            self.fail("application SQL must not run after a runtime identity mismatch")
+                self.assertEqual(raw.statements, ["select current_user as role"])
+                self.assertTrue(raw.closed)
+                message = str(raised.exception)
+                self.assertNotIn(self.DATABASE_URL, message)
+                self.assertNotIn("db.example.test", message)
+                self.assertNotIn("synthetic-secret", message)
+                self.assertNotIn(current_user, message)
+
+    def test_runtime_identity_binding_is_fixed_and_covers_application_paths(self):
+        source = (ROOT / "webapp" / "server.py").read_text(encoding="utf-8")
+        self.assertIn('SQAG_RUNTIME_DATABASE_ROLE = "sqag_runtime"', source)
+        self.assertEqual(source.count("expected_session_role=SQAG_RUNTIME_DATABASE_ROLE"), 4)
+        self.assertIn(
+            "return postgres_storage_connection(self.database_url, expected_role=self.expected_session_role)",
+            source,
+        )
+        self.assertNotIn("SQAG_RUNTIME_DATABASE_ROLE_ENV_NAME", source)
+        self.assertNotIn("read_dotenv_value(SQAG_RUNTIME_DATABASE_ROLE", source)
+
+    def test_maintenance_preflight_accepts_only_exact_maintenance_identity(self):
+        result, raw = self._preflight(
+            webapp.SQAG_MAINTENANCE_DATABASE_ROLE,
+            maintenance=True,
+        )
+        self.assertEqual(result[0]["status"], "ready")
+        self.assertEqual(
+            raw.statements[:2],
+            ["select current_user as role", "set transaction read only"],
+        )
+        with self.assertRaises(webapp.SqagStorageAccessError):
+            self._preflight(webapp.SQAG_RUNTIME_DATABASE_ROLE, maintenance=True)
 
 @unittest.skipUnless(
     postgres_test_enabled(),

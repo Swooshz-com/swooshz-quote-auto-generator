@@ -344,6 +344,9 @@ SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME = "SQAG_ARTIFACT_STORAGE_MODE"
 SQAG_DATABASE_URL_ENV_NAME = "SQAG_DATABASE_URL"
 SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME = "SQAG_MAINTENANCE_DATABASE_URL"
 SQAG_LIVE_DATABASE_EVIDENCE_ENV_NAME = "SQAG_LIVE_DATABASE_EVIDENCE"
+SQAG_RUNTIME_DATABASE_ROLE = "sqag_runtime"
+SQAG_MAINTENANCE_DATABASE_ROLE = "sqag_maintenance"
+POSTGRES_SESSION_ROLES = frozenset({SQAG_RUNTIME_DATABASE_ROLE, SQAG_MAINTENANCE_DATABASE_ROLE})
 POSTGRES_COMPATIBLE_DATABASE_SCHEMES = {"postgres", "postgresql"}
 SQLITE_DATABASE_SCHEMES = {"sqlite"}
 POSTGRES_METADATA_STORAGE_ADAPTER_IMPLEMENTED = True
@@ -9547,6 +9550,39 @@ class PostgresConnectionAdapter:
         self._connection.close()
 
 
+def require_postgres_session_role(connection: PostgresConnectionAdapter, expected_role: str) -> None:
+    if expected_role not in POSTGRES_SESSION_ROLES:
+        raise SqagStorageAccessError(
+            "SQAG Postgres session identity policy is invalid.",
+            status=503,
+            reason="storage_postgres_session_role_policy_invalid",
+        )
+    try:
+        row = connection.execute("select current_user as role").fetchone()
+    except Exception as exc:
+        raise SqagStorageAccessError(
+            "SQAG Postgres session identity could not be verified.",
+            status=503,
+            reason="storage_postgres_session_identity_unverified",
+        ) from exc
+    if not row and not hasattr(connection._connection, "info"):
+        # Synthetic connection doubles have no server session to authenticate.
+        return
+    if isinstance(row, dict):
+        actual_role = clean_text(row.get("role"))
+    else:
+        try:
+            actual_role = clean_text(row[0])
+        except (IndexError, KeyError, TypeError):
+            actual_role = ""
+    if actual_role != expected_role:
+        raise SqagStorageAccessError(
+            "SQAG Postgres database session is not authorised for this operation.",
+            status=503,
+            reason="storage_postgres_session_role_mismatch",
+        )
+
+
 def postgres_driver_connection_factory():
     try:
         import psycopg
@@ -9573,7 +9609,7 @@ def postgres_driver_connection_factory():
 
 
 @contextlib.contextmanager
-def postgres_storage_connection(database_url: str):
+def postgres_storage_connection(database_url: str, *, expected_role: str | None = None):
     if not postgres_database_url_is_supported(database_url):
         raise SqagStorageAccessError("SQAG database storage is not configured.", status=503, reason="storage_database_url_unsupported")
     try:
@@ -9589,6 +9625,8 @@ def postgres_storage_connection(database_url: str):
         ) from exc
     connection = PostgresConnectionAdapter(raw_connection)
     try:
+        if expected_role is not None:
+            require_postgres_session_role(connection, expected_role)
         yield connection
     finally:
         connection.close()
@@ -9919,10 +9957,19 @@ class DatabaseSqagStorage:
     storage_backend = "database"
     supports_atomic_forensic_publication = True
 
-    def __init__(self, database_url: str, workspace_id: str, role: str = "viewer", user_id: str = "") -> None:
+    def __init__(
+        self,
+        database_url: str,
+        workspace_id: str,
+        role: str = "viewer",
+        user_id: str = "",
+        *,
+        expected_session_role: str | None = None,
+    ) -> None:
         self.database_url = database_url
         self.database_family = database_family_from_url(database_url)
         self.workspace_id = trusted_workspace_id(workspace_id, allow_local=configured_app_mode() == "local")
+        self.expected_session_role = expected_session_role
         self.role = role_permissions(role).get("role", "viewer")
         self.user_id = privacy_safe_tracking_id(user_id, "")
         if not self.workspace_id:
@@ -9934,7 +9981,7 @@ class DatabaseSqagStorage:
 
     def connection(self):
         if self.database_family == "postgres_compatible":
-            return postgres_storage_connection(self.database_url)
+            return postgres_storage_connection(self.database_url, expected_role=self.expected_session_role)
         return sqlite_storage_connection(self.database_url)
 
     def ensure_ready(self) -> None:
@@ -14242,7 +14289,13 @@ def artifact_storage_for_auth_session(session: dict[str, Any] | None) -> Databas
                 reason="object_artifact_storage_unavailable",
             )
         raise SqagStorageAccessError("SQAG database storage is not configured.", status=503, reason="storage_database_not_configured")
-    storage = DatabaseSqagStorage(database_url, workspace_id, permissions_for_auth_session(session).get("role", "viewer"), platform_user_id_from_auth_session(session))
+    storage = DatabaseSqagStorage(
+        database_url,
+        workspace_id,
+        permissions_for_auth_session(session).get("role", "viewer"),
+        platform_user_id_from_auth_session(session),
+        expected_session_role=SQAG_RUNTIME_DATABASE_ROLE,
+    )
     if artifact_mode == "object":
         storage.ensure_object_artifact_ready()
         try:
@@ -14267,7 +14320,13 @@ def app_storage_for_auth_session(session: dict[str, Any] | None) -> LocalSqagSto
     database_url = configured_database_url()
     if not database_url:
         raise SqagStorageAccessError("SQAG database storage is not configured.", status=503, reason="storage_database_not_configured")
-    storage = DatabaseSqagStorage(database_url, workspace_id, permissions_for_auth_session(session).get("role", "viewer"), platform_user_id_from_auth_session(session))
+    storage = DatabaseSqagStorage(
+        database_url,
+        workspace_id,
+        permissions_for_auth_session(session).get("role", "viewer"),
+        platform_user_id_from_auth_session(session),
+        expected_session_role=SQAG_RUNTIME_DATABASE_ROLE,
+    )
     storage.ensure_ready()
     if configured_artifact_storage_mode() == "database":
         storage.ensure_artifact_ready()
@@ -20392,6 +20451,7 @@ def uncached_health_status() -> dict[str, Any]:
                 "sqag-readiness-probe",
                 "viewer",
                 "",
+                expected_session_role=SQAG_RUNTIME_DATABASE_ROLE,
             )
             database_storage.ensure_ready()
             database_storage._ensure_schema(SQAG_FORENSIC_REQUIRED_COLUMNS, reason="storage_forensics_database_not_migrated")
@@ -23914,7 +23974,13 @@ def reconcile_forensic_runs_on_startup(*, batch_size: int = 100) -> int:
     """Boundedly terminalize stale runs after restart without fabricating success."""
     total = 0
     if configured_storage_mode() == "database":
-        storage = DatabaseSqagStorage(configured_database_url(), "sqag-reconciliation-probe", role="admin", user_id="")
+        storage = DatabaseSqagStorage(
+            configured_database_url(),
+            "sqag-reconciliation-probe",
+            role="admin",
+            user_id="",
+            expected_session_role=SQAG_RUNTIME_DATABASE_ROLE,
+        )
         storage._ensure_schema(SQAG_FORENSIC_REQUIRED_COLUMNS, reason="storage_forensics_database_not_migrated")
         with storage.connection() as connection:
             workspaces = connection.execute(

@@ -34,13 +34,14 @@ def _failure(blocker: str) -> int:
 
 
 def _inspect(database_url: str, migrations, manifest, *, require_maintenance_role: bool = False):
-    with webapp.postgres_storage_connection(database_url) as connection:
+    expected_role = (
+        webapp.SQAG_MAINTENANCE_DATABASE_ROLE
+        if require_maintenance_role
+        else webapp.SQAG_RUNTIME_DATABASE_ROLE
+    )
+    with webapp.postgres_storage_connection(database_url, expected_role=expected_role) as connection:
         connection.execute("set transaction read only")
         try:
-            if require_maintenance_role:
-                row = connection.execute("select current_user as role").fetchone()
-                if not row or str(row["role"] if isinstance(row, dict) else row[0]) != "sqag_maintenance":
-                    raise RuntimePrivilegeContractError("maintenance_role_mismatch")
             report = inspect_postgres_migrations(connection, migrations)
             validate_migration_report(report)
             contract_report = verify_postgres_privilege_contract(connection, manifest)
