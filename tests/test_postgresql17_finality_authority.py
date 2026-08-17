@@ -73,5 +73,39 @@ class AuthorityTests(unittest.TestCase):
             authority.canonical_json({"bad": float("nan")})
 
 
+    def test_source_digest_lf_and_crlf_are_equivalent(self) -> None:
+        lf = b"line1\nline2\n"
+        crlf = b"line1\r\nline2\r\n"
+        self.assertEqual(authority.canonical_source_digest(lf), authority.canonical_source_digest(crlf))
+
+    def test_source_digest_lf_and_lone_cr_are_equivalent(self) -> None:
+        lf = b"line1\nline2\n"
+        lone_cr = b"line1\rline2\r"
+        self.assertEqual(authority.canonical_source_digest(lf), authority.canonical_source_digest(lone_cr))
+
+    def test_source_digest_mixed_newlines_are_equivalent(self) -> None:
+        lf = b"line1\nline2\nline3\n"
+        mixed = b"line1\r\nline2\rline3\n"
+        self.assertEqual(authority.canonical_source_digest(lf), authority.canonical_source_digest(mixed))
+
+    def test_source_digest_non_eol_mutation_is_red(self) -> None:
+        original = b"line1\nline2\n"
+        mutated = b"line1\nchanged\n"
+        self.assertNotEqual(authority.canonical_source_digest(original), authority.canonical_source_digest(mutated))
+
+    def test_source_digest_final_newline_is_authoritative(self) -> None:
+        with_newline = b"line1\n"
+        without_newline = b"line1"
+        self.assertNotEqual(authority.canonical_source_digest(with_newline), authority.canonical_source_digest(without_newline))
+
+    def test_stale_implementation_registry_fails_closed(self) -> None:
+        coverage, policy = authority.load_authority_package()
+        stale = copy.deepcopy(policy)
+        stale["implementation_registry"]["authority"]["sha256"] = "0" * 64
+        with self.assertRaises(authority.AuthorityError) as error:
+            authority.validate_policy(coverage, stale)
+        self.assertEqual(error.exception.code, "implementation_digest_mismatch")
+
+
 if __name__ == "__main__":
     unittest.main()

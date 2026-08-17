@@ -59,6 +59,15 @@ def digest_json(value: Any) -> str:
     return sha256_bytes(canonical_json(value))
 
 
+def canonical_source_bytes(raw: bytes) -> bytes:
+    """Canonicalize source line endings without changing any other bytes."""
+    return raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+
+
+def canonical_source_digest(raw: bytes) -> str:
+    return sha256_bytes(canonical_source_bytes(raw))
+
+
 def load_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -165,7 +174,7 @@ def validate_coverage(coverage: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _source_digest(relative_path: str) -> str:
     try:
-        return sha256_bytes((ROOT / relative_path).read_bytes())
+        return canonical_source_digest((ROOT / relative_path).read_bytes())
     except OSError as exc:
         raise AuthorityError("implementation_source_missing", relative_path) from exc
 
