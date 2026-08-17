@@ -326,7 +326,7 @@ class RuntimeSessionIdentityBindingTest(unittest.TestCase):
     def test_runtime_identity_binding_is_fixed_and_covers_application_paths(self):
         source = (ROOT / "webapp" / "server.py").read_text(encoding="utf-8")
         self.assertIn('SQAG_RUNTIME_DATABASE_ROLE = "sqag_runtime"', source)
-        self.assertEqual(source.count("expected_session_role=SQAG_RUNTIME_DATABASE_ROLE"), 4)
+        self.assertEqual(source.count("expected_session_role=SQAG_RUNTIME_DATABASE_ROLE"), 5)
         self.assertIn(
             "return postgres_storage_connection(self.database_url, expected_role=self.expected_session_role)",
             source,

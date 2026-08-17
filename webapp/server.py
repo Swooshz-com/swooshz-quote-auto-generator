@@ -20794,6 +20794,7 @@ def forensic_store_for_auth_session(auth_session: dict[str, Any] | None = None):
             workspace_id,
             role=current_permissions().get("role", "viewer"),
             user_id=actor_source,
+            expected_session_role=SQAG_RUNTIME_DATABASE_ROLE,
         )
         storage.ensure_ready()
         storage._ensure_schema(SQAG_FORENSIC_REQUIRED_COLUMNS, reason="storage_forensics_database_not_migrated")
