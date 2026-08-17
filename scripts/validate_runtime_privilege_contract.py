@@ -1,1897 +1,613 @@
 #!/usr/bin/env python3
-"""Validate the runtime privilege contract manifest against repository authority."""
+"""Fail-closed A25 runtime capability and PostgreSQL provenance verifier.
+
+The contract binds only the reviewed SQAG application namespace. Git commit
+and tree admission belongs to CI/deployment; this module does not copy source
+revisions or maintain an implementation digest registry.
+"""
 
 from __future__ import annotations
 
 import json
 import re
 import sys
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from webapp.postgres_migrations import (  # noqa: E402
+    EXPECTED_INDEXES,
     EXPECTED_ROUTINES,
     EXPECTED_TABLES,
-    MIGRATION_FILE_NAMES,
+    LEDGER_TABLE,
     MIGRATION_TABLES,
     migration_manifest,
 )
 
-MANIFEST_PATH = ROOT / "docs" / "runtime-privilege-contract.json"
 
-TOP_LEVEL_KEYS = frozenset(
-    {
-        "$schema",
-        "schema_version",
-        "contract_type",
-        "repository",
-        "canonical_source_revision",
-        "canonical_source_tree",
-        "roles",
-        "production_migrations",
-        "database_acl",
-        "schema_acl",
-        "tables",
-        "column_privileges",
-        "views",
-        "sequences",
-        "routines",
-        "default_privileges",
-        "boundary_b",
-        "verification_queries",
-    }
+CONTRACT_PATH = ROOT / "docs" / "runtime-privilege-contract.json"
+SOURCE_SQL_FILES = (
+    "webapp/server.py",
+    "webapp/forensics.py",
+    "scripts/enforce_forensic_retention.py",
 )
-
-ROLE_KEYS = frozenset({"runtime", "migrator", "legacy", "provider", "forbidden"})
-RUNTIME_ROLE_KEYS = frozenset(
-    {
-        "name",
-        "description",
-        "attributes",
-        "memberships_as_member",
-        "inherited_roles",
-        "set_assumable_roles",
-        "membership_derived_privileges",
-        "provider_control_edges",
-        "ownership",
-        "grant_options",
-    }
+UNSUPPORTED_SOURCE_RELATIONS = frozenset({"sqag_file_artifacts", "sqag_quote_artifacts"})
+SQL_RELATION_RE = re.compile(
+    r'\b(?:delete\s+from|from|join|into|update)\s+(?:public\.)?([a-z_][a-z0-9_]*)',
+    re.IGNORECASE,
 )
-MIGRATOR_ROLE_KEYS = frozenset({"name", "description", "can_create_roles"})
-LEGACY_ROLE_KEYS = frozenset({"name", "description", "status"})
-PROVIDER_ROLE_KEYS = frozenset({"name", "description", "status"})
-RUNTIME_ROLE_ATTRIBUTE_KEYS = frozenset(
-    {
-        "login",
-        "password",
-        "superuser",
-        "createdb",
-        "createrole",
-        "replication",
-        "bypassrls",
-        "inherit",
-        "connection_limit",
-    }
+DYNAMIC_RELATION_RE = re.compile(
+    r'\b(?:delete\s+from|from|join|into|update)\s+\{([a-z_][a-z0-9_]*)\}',
+    re.IGNORECASE,
 )
-PROVIDER_CONTROL_EDGE_KEYS = frozenset(
-    {
-        "parent_role",
-        "member_role",
-        "grantor",
-        "admin_option",
-        "inherit_option",
-        "set_option",
-        "classification",
-        "security_rationale",
-    }
+DATABASE_PRIVILEGES = ("CONNECT", "CREATE", "TEMPORARY")
+SCHEMA_PRIVILEGES = ("USAGE", "CREATE")
+TABLE_PRIVILEGES = (
+    "SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN",
 )
-MEMBERSHIP_ROW_KEYS = frozenset(
-    {"role", "member", "grantor", "admin_option", "inherit_option", "set_option"}
-)
-PROTECTED_PRODUCTION_ROLES = frozenset(
-    {
-        "sqag_runtime",
-        "sqag_migrator",
-        "sqag_app",
-        "neondb_owner",
-        "neon_superuser",
-        "cloud_admin",
-    }
-)
-PROVIDER_CONTROL_CLASSIFICATION = "postgresql17_creator_admin_control"
-PROVIDER_CONTROL_SECURITY_RATIONALE = (
-    "PostgreSQL 17 system-generated creator-admin control for the provider administrator; "
-    "it grants no privilege, inheritance, or SET-role path to sqag_runtime."
-)
-PRODUCTION_PROVIDER_CONTROL_EDGE = {
-    "parent_role": "sqag_runtime",
-    "member_role": "neondb_owner",
-    "grantor": "cloud_admin",
-    "admin_option": True,
-    "inherit_option": False,
-    "set_option": False,
-    "classification": PROVIDER_CONTROL_CLASSIFICATION,
-    "security_rationale": PROVIDER_CONTROL_SECURITY_RATIONALE,
+RUNTIME_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
+    "sqag_profiles": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+    "sqag_pricing_references": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+    "sqag_quote_sessions": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+    "sqag_generation_runs": ("SELECT", "INSERT", "UPDATE"),
+    "sqag_generation_evidence": ("SELECT", "INSERT"),
+    "sqag_audit_events": ("SELECT", "INSERT"),
+    "sqag_feedback": ("SELECT", "INSERT", "UPDATE"),
+    "sqag_feedback_status_history": ("SELECT", "INSERT"),
+    "sqag_object_artifacts": ("SELECT", "INSERT", "UPDATE"),
+    "sqag_quote_publication_versions": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+    "sqag_quote_publication_artifacts": ("SELECT", "INSERT", "DELETE"),
 }
-
-MIGRATION_KEYS = frozenset({"path", "sequence_no", "sha256", "tables"})
-DATABASE_ACL_KEYS = frozenset({"public", "sqag_migrator", "sqag_app", "sqag_runtime"})
-DATABASE_PUBLIC_KEYS = frozenset({"connect", "temporary", "create"})
-DATABASE_MIGRATOR_KEYS = frozenset({"connect", "create", "temporary"})
-DATABASE_APP_KEYS = frozenset({"connect"})
-DATABASE_RUNTIME_KEYS = frozenset({"connect", "create", "temporary"})
-SCHEMA_ACL_KEYS = frozenset(
-    {"schema_name", "public", "pg_database_owner", "sqag_app", "sqag_runtime"}
-)
-SCHEMA_PUBLIC_KEYS = frozenset({"usage"})
-SCHEMA_OWNER_KEYS = frozenset({"create", "usage"})
-SCHEMA_APP_KEYS = frozenset({"usage"})
-SCHEMA_RUNTIME_KEYS = frozenset({"usage", "create"})
-
-TABLES_KEYS = frozenset(
-    {"rw_count", "forbidden_count", "total_count", "runtime_accessible", "runtime_forbidden"}
-)
-ACCESSIBLE_TABLE_KEYS = frozenset({"class", "schema", "privileges"})
-FORBIDDEN_TABLE_KEYS = frozenset({"class", "schema", "reason"})
-PRIVILEGE_KEYS = frozenset({"select", "insert", "update", "delete"})
-
-VIEWS_KEYS = frozenset({"count", "runtime_accessible"})
-ACCESSIBLE_VIEW_KEYS = frozenset({"schema", "class", "privileges", "production_source", "bound"})
-VIEW_PRIVILEGE_KEYS = frozenset({"select"})
-
-BOUNDARY_B_KEYS = frozenset(
-    {
-        "requires_postgresql17",
-        "runtime_role",
-        "object_owner",
-        "database_owner_authority",
-        "authority_input_model",
-        "fail_closed",
-        "idempotent_rerun",
-        "operations",
-    }
-)
-BOUNDARY_B_OPERATION_KEYS = frozenset(
-    {
-        "database_acl_grant",
-        "schema_acl_grant",
-        "public_temporary_revoke",
-        "object_privilege_grants",
-        "public_trigger_execute_revoke",
-    }
-)
-
-SEQUENCE_KEYS = frozenset({"user_defined_public_count", "runtime_privileges", "rule"})
-ROUTINES_KEYS = frozenset(
-    {"sqag_owned_triggers", "sqag_owned_count", "provider_owned_exceptions", "total_count", "rule"}
-)
-TRIGGER_ROUTINE_KEYS = frozenset(
-    {
-        "schema",
-        "owner",
-        "security_mode",
-        "class",
-        "direct_runtime_execute",
-        "public_execute_after_boundary_b",
-    }
-)
-PROVIDER_EXCEPTION_KEYS = frozenset(
-    {
-        "schema",
-        "owner",
-        "class",
-        "direct_runtime_grant",
-        "public_execute",
-        "effective_runtime_execution",
-    }
-)
-DEFAULT_PRIVILEGES_KEYS = frozenset(
-    {"object_classes", "sqag_runtime", "sqag_migrator_to_sqag_app", "provider_controlled", "verification_rule"}
-)
-RUNTIME_DEFAULT_KEYS = frozenset({"tables", "sequences", "routines"})
-COLUMN_PRIVILEGES_TABLE_KEYS = frozenset({"sqag_quote_publication_artifacts"})
-COLUMN_PRIVILEGE_ENTRY_KEYS = frozenset({"update"})
-DEFAULT_ACL_OBJECT_CLASSES = ["r", "S", "f", "n", "T"]
-VERIFICATION_QUERY_KEYS = frozenset(
-    {
-        "database_acl",
-        "schema_acl",
-        "table_acl",
-        "routine_acl",
-        "default_acl",
-        "role_attributes",
-        "role_memberships",
-        "sequence_acl",
-        "effective_runtime_database_privileges",
-        "effective_runtime_table_privileges",
-        "effective_runtime_column_privileges",
-        "effective_runtime_schema_privileges",
-        "effective_runtime_routine_privileges",
-        "view_acl",
-    }
-)
-
-# These SQL strings are the reviewed executable-query contracts.  They are
-# intentionally kept separate from the manifest: deriving the expected
-# sequence from a candidate manifest would allow a query mutation to redefine
-# its own admission contract.
-CANONICAL_VERIFICATION_QUERY_SQL: dict[str, str] = {
-    "database_acl": """
-        select datacl
-        from pg_catalog.pg_database
-        where datname = current_database()
-    """,
-    "schema_acl": """
-        select nspacl
-        from pg_catalog.pg_namespace
-        where nspname = 'public'
-    """,
-    "table_acl": """
-        select relname, relacl
-        from pg_catalog.pg_class c
-        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
-        where c.relkind = 'r'
-          and n.nspname = 'public'
-          and c.relname like 'sqag_' || chr(37)
-        order by relname
-    """,
-    "routine_acl": """
-        select p.proname,
-               pg_get_function_identity_arguments(p.oid) as identity_arguments,
-               p.prokind,
-               p.prosecdef,
-               p.proacl,
-               p.proowner,
-               r.rolname as owner,
-               exists (
-                   select 1
-                   from pg_catalog.pg_trigger t
-                   where t.tgfoid = p.oid
-                     and not t.tgisinternal
-               ) as has_trigger_dependency
-        from pg_catalog.pg_proc p
-        join pg_catalog.pg_namespace n on n.oid = p.pronamespace
-        join pg_catalog.pg_roles r on r.oid = p.proowner
-        where n.nspname = 'public'
-          and p.prokind in ('f', 'p', 'a', 'w')
-        order by p.proname, identity_arguments
-    """,
-    "default_acl": """
-        select owner.rolname as owner,
-               coalesce(ns.nspname, '<global>') as namespace,
-               d.defaclobjtype as object_type,
-               case
-                   when expanded.grantee = 0 then 'PUBLIC'
-                   else coalesce(grantee_role.rolname, 'OID:' || expanded.grantee::text)
-               end as grantee,
-               expanded.privilege_type,
-               expanded.is_grantable
-        from pg_catalog.pg_default_acl d
-        join pg_catalog.pg_roles owner on owner.oid = d.defaclrole
-        left join pg_catalog.pg_namespace ns on ns.oid = d.defaclnamespace
-        cross join lateral pg_catalog.aclexplode(d.defaclacl) expanded
-        left join pg_catalog.pg_roles grantee_role
-          on grantee_role.oid = expanded.grantee and expanded.grantee <> 0
-        where d.defaclobjtype in ('r', 'S', 'f', 'n', 'T')
-        order by owner, namespace, object_type, grantee, expanded.privilege_type, expanded.is_grantable
-    """,
-    "role_attributes": """
-        select r.rolname, r.rolsuper, r.rolinherit, r.rolcreaterole, r.rolcreatedb,
-               r.rolcanlogin, r.rolreplication, r.rolbypassrls, r.rolconnlimit,
-               a.rolpassword is null as password_is_null
-        from pg_catalog.pg_roles r
-        join pg_catalog.pg_authid a on a.oid = r.oid
-        where r.rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_app', 'neondb_owner')
-        order by r.rolname
-    """,
-    "role_memberships": """
-        select r.rolname as role,
-               m.rolname as member,
-               grantor.rolname as grantor,
-               am.admin_option,
-               am.inherit_option,
-               am.set_option
-        from pg_catalog.pg_auth_members am
-        join pg_catalog.pg_roles r on r.oid = am.roleid
-        join pg_catalog.pg_roles m on m.oid = am.member
-        join pg_catalog.pg_roles grantor on grantor.oid = am.grantor
-        order by role, member, grantor
-    """,
-    "sequence_acl": """
-        select relname, relacl
-        from pg_catalog.pg_class c
-        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
-        where c.relkind = 'S' and n.nspname = 'public'
-        order by relname
-    """,
-    "effective_runtime_database_privileges": """
-        select p.privilege_type,
-               has_database_privilege('sqag_runtime', current_database(), p.privilege_type) as effective,
-               has_database_privilege(
-                   'sqag_runtime',
-                   current_database(),
-                   p.privilege_type || ' WITH GRANT OPTION'
-               ) as is_grantable
-        from (values ('CONNECT'), ('CREATE'), ('TEMPORARY')) p(privilege_type)
-        order by p.privilege_type
-    """,
-    "effective_runtime_table_privileges": """
-        select n.nspname as schema_name,
-               c.relname as table_name,
-               p.privilege_type,
-               has_table_privilege('sqag_runtime', c.oid, p.privilege_type) as effective,
-               has_table_privilege(
-                   'sqag_runtime',
-                   c.oid,
-                   p.privilege_type || ' WITH GRANT OPTION'
-               ) as is_grantable
-        from pg_catalog.pg_class c
-        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
-        cross join (
-            values
-                ('SELECT'),
-                ('INSERT'),
-                ('UPDATE'),
-                ('DELETE'),
-                ('TRUNCATE'),
-                ('REFERENCES'),
-                ('TRIGGER'),
-                ('MAINTAIN')
-        ) p(privilege_type)
-        where n.nspname = 'public'
-          and c.relkind = 'r'
-          and c.relname like 'sqag_' || chr(37)
-        order by n.nspname, c.relname, p.privilege_type
-    """,
-    "effective_runtime_column_privileges": """
-        select n.nspname as schema_name,
-               c.relname as table_name,
-               a.attname as column_name,
-               p.privilege_type,
-               has_column_privilege('sqag_runtime', c.oid, a.attname, p.privilege_type) as effective,
-               has_column_privilege(
-                   'sqag_runtime',
-                   c.oid,
-                   a.attname,
-                   p.privilege_type || ' WITH GRANT OPTION'
-               ) as is_grantable
-        from pg_catalog.pg_class c
-        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
-        join pg_catalog.pg_attribute a on a.attrelid = c.oid
-        cross join (
-            values
-                ('SELECT'),
-                ('INSERT'),
-                ('UPDATE'),
-                ('REFERENCES')
-        ) p(privilege_type)
-        where n.nspname = 'public'
-          and c.relkind = 'r'
-          and c.relname like 'sqag_' || chr(37)
-          and a.attnum > 0
-          and not a.attisdropped
-        order by n.nspname, c.relname, a.attname, p.privilege_type
-    """,
-    "effective_runtime_schema_privileges": """
-        select p.privilege_type,
-               has_schema_privilege('sqag_runtime', 'public', p.privilege_type) as effective,
-               has_schema_privilege(
-                   'sqag_runtime',
-                   'public',
-                   p.privilege_type || ' WITH GRANT OPTION'
-               ) as is_grantable
-        from (values ('USAGE'), ('CREATE')) p(privilege_type)
-        order by p.privilege_type
-    """,
-    "effective_runtime_routine_privileges": """
-        select p.proname as routine_name,
-               has_function_privilege('sqag_runtime', p.oid, 'EXECUTE') as effective
-        from pg_catalog.pg_proc p
-        join pg_catalog.pg_namespace n on n.oid = p.pronamespace
-        where n.nspname = 'public'
-        order by p.proname
-    """,
-    "view_acl": """
-        select c.relname as view_name,
-               c.relacl as view_acl
-        from pg_catalog.pg_class c
-        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
-        where c.relkind = 'v'
-          and n.nspname = 'public'
-        order by c.relname
-    """,
+MAINTENANCE_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
+    "sqag_quote_sessions": ("SELECT", "DELETE"),
+    "sqag_object_artifacts": ("SELECT", "UPDATE"),
+    "sqag_generation_runs": ("SELECT", "UPDATE", "DELETE"),
+    "sqag_generation_evidence": ("SELECT", "DELETE"),
+    "sqag_audit_events": ("SELECT", "INSERT", "DELETE"),
+    "sqag_feedback": ("SELECT", "UPDATE", "DELETE"),
+    "sqag_feedback_status_history": ("SELECT", "DELETE"),
+    "sqag_legal_holds": ("SELECT", "INSERT", "UPDATE"),
+    "sqag_retention_delete_authorizations": ("SELECT", "INSERT", "DELETE"),
+    "sqag_deletion_receipts": ("SELECT", "INSERT", "DELETE"),
+    "sqag_retention_scan_cursors": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+    "sqag_quote_publication_versions": ("SELECT", "DELETE"),
+    "sqag_quote_publication_artifacts": ("SELECT", "DELETE"),
 }
-
-RUNTIME_TABLES = frozenset(
-    {
-        "sqag_profiles",
-        "sqag_pricing_references",
-        "sqag_quote_sessions",
-        "sqag_generation_runs",
-        "sqag_generation_evidence",
-        "sqag_audit_events",
-        "sqag_feedback",
-        "sqag_feedback_status_history",
-        "sqag_object_artifacts",
-        "sqag_quote_publication_versions",
-        "sqag_quote_publication_artifacts",
-    }
-)
-FORBIDDEN_TABLES = frozenset(
-    {
-        "sqag_legal_holds",
-        "sqag_retention_delete_authorizations",
-        "sqag_deletion_receipts",
-        "sqag_retention_scan_cursors",
-        "sqag_schema_migrations",
-    }
-)
-ALL_TABLES = RUNTIME_TABLES | FORBIDDEN_TABLES
-
-LOCKED_PRIVILEGE_MATRIX: dict[str, dict[str, bool]] = {
-    "sqag_profiles": {"select": True, "insert": True, "update": True, "delete": True},
-    "sqag_pricing_references": {"select": True, "insert": True, "update": True, "delete": True},
-    "sqag_quote_sessions": {"select": True, "insert": True, "update": True, "delete": True},
-    "sqag_generation_runs": {"select": True, "insert": True, "update": True, "delete": False},
-    "sqag_generation_evidence": {"select": True, "insert": True, "update": False, "delete": False},
-    "sqag_audit_events": {"select": True, "insert": True, "update": False, "delete": False},
-    "sqag_feedback": {"select": True, "insert": True, "update": True, "delete": False},
-    "sqag_feedback_status_history": {"select": True, "insert": True, "update": False, "delete": False},
-    "sqag_object_artifacts": {"select": True, "insert": True, "update": True, "delete": False},
-    "sqag_quote_publication_versions": {"select": True, "insert": True, "update": True, "delete": True},
-    "sqag_quote_publication_artifacts": {"select": True, "insert": True, "update": False, "delete": True},
-}
-
-ACCESSIBLE_TABLE_CLASSES = {
-    "sqag_profiles": "mutable",
-    "sqag_pricing_references": "mutable",
-    "sqag_quote_sessions": "mutable",
-    "sqag_generation_runs": "append_and_status",
-    "sqag_generation_evidence": "immutable_evidence",
-    "sqag_audit_events": "immutable_audit",
-    "sqag_feedback": "mutable_feedback",
-    "sqag_feedback_status_history": "append_only_history",
-    "sqag_object_artifacts": "mutable_metadata",
-    "sqag_quote_publication_versions": "mutable",
-    "sqag_quote_publication_artifacts": "mutable",
-}
-FORBIDDEN_TABLE_DETAILS = {
-    "sqag_legal_holds": ("operator_only", "No runtime privilege. Operator/retention-only."),
-    "sqag_retention_delete_authorizations": (
-        "retention_only",
-        "No runtime privilege. Retention-only internal mechanism.",
-    ),
-    "sqag_deletion_receipts": (
-        "retention_only",
-        "No runtime privilege. Retention-only internal mechanism.",
-    ),
-    "sqag_retention_scan_cursors": (
-        "retention_only",
-        "No runtime privilege. Retention-only internal mechanism.",
-    ),
-    "sqag_schema_migrations": (
-        "migration_only",
-        "No runtime privilege. Migration ledger owned by sqag_migrator.",
-    ),
-}
-
-LEGACY_VIEWS = frozenset({"sqag_quote_artifacts"})
-LEGACY_VIEW_DETAILS = {
-    "sqag_quote_artifacts": (
-        "legacy_publication_backfill",
-        "webapp.server.DatabaseSqagStorage.publish_quote_session_forensic_transaction",
-    ),
-}
-
-BOUNDARY_B_OPERATION_AUTHORITY = {
-    "database_acl_grant": "database_owner_authority",
-    "schema_acl_grant": "database_owner_authority",
-    "public_temporary_revoke": "database_owner_authority",
-    "object_privilege_grants": "object_owner",
-    "public_trigger_execute_revoke": "object_owner",
-}
-
-ROLE_DESCRIPTIONS = {
-    "runtime": "Restricted application runtime role. Dormant NOLOGIN during Boundary A/B. Activated with LOGIN in #160 only after independent verification.",
-    "migrator": "Owner/operator authority. Owns all application database objects. Applies ACL changes. Cannot create roles.",
-    "legacy": "Legacy active rollback role. Retained until separately gated retirement after #160 switch and observation window.",
-    "provider": "Provider/control-plane role. Creates/alters roles through separately authorised provider authority. Unchanged by SQAG.",
-}
-
-REQUIRED_QUERY_FEATURES: dict[str, tuple[str, ...]] = {
-    "database_acl": ("pg_catalog.pg_database", "datname", "datacl", "current_database"),
-    "schema_acl": ("pg_catalog.pg_namespace", "nspname", "nspacl", "'public'"),
-    "table_acl": ("pg_catalog.pg_class", "pg_catalog.pg_namespace", "relacl", "relkind", "'public'", "order by"),
-    "role_attributes": (
-        "pg_catalog.pg_roles",
-        "pg_catalog.pg_authid",
-        "rolname",
-        "rolsuper",
-        "rolcanlogin",
-        "rolconnlimit",
-        "rolpassword",
-        "password_is_null",
-        "is",
-        "null",
-    ),
-    "role_memberships": (
-        "pg_catalog.pg_auth_members",
-        "pg_catalog.pg_roles",
-        "grantor",
-        "admin_option",
-        "inherit_option",
-        "set_option",
-    ),
-    "sequence_acl": ("pg_catalog.pg_class", "relkind", "'s'", "pg_catalog.pg_namespace", "relacl"),
-    "effective_runtime_database_privileges": (
-        "has_database_privilege",
-        "current_database",
-        "privilege_type",
-        "is_grantable",
-        "' WITH GRANT OPTION'",
-        "'connect'",
-        "'create'",
-        "'temporary'",
-    ),
-    "effective_runtime_table_privileges": (
-        "has_table_privilege",
-        "pg_catalog.pg_class",
-        "pg_catalog.pg_namespace",
-        "c.relname",
-        "is_grantable",
-        "' WITH GRANT OPTION'",
-        "'select'",
-        "'insert'",
-        "'update'",
-        "'delete'",
-        "'truncate'",
-        "'references'",
-        "'trigger'",
-        "'maintain'",
-    ),
-    "effective_runtime_column_privileges": (
-        "has_column_privilege",
-        "pg_catalog.pg_attribute",
-        "attname",
-        "attnum",
-        "attisdropped",
-        "is_grantable",
-        "' WITH GRANT OPTION'",
-        "'select'",
-        "'insert'",
-        "'update'",
-        "'references'",
-    ),
-    "effective_runtime_schema_privileges": ("has_schema_privilege", "'public'", "'usage'", "'create'"),
-    "effective_runtime_routine_privileges": ("has_function_privilege", "pg_catalog.pg_proc", "'public'", "'execute'"),
-    "view_acl": ("pg_catalog.pg_class", "pg_catalog.pg_namespace", "relname", "relacl", "relkind", "'public'", "order by"),
+RUNTIME_FORBIDDEN_TABLES = frozenset({
+    "sqag_legal_holds", "sqag_retention_delete_authorizations", "sqag_deletion_receipts",
+    "sqag_retention_scan_cursors", LEDGER_TABLE,
+})
+DECLARED_ROLES = ("sqag_runtime", "sqag_migrator", "sqag_maintenance")
+RUNTIME_ROLES = ("sqag_runtime", "sqag_maintenance")
+EXPECTED_ROUTINE_KEYS = {
+    ("sqag_reject_immutable_change", ""),
+    ("sqag_require_retention_delete_authorization", ""),
 }
 
 
-class DuplicateKeyError(ValueError):
-    """Raised when a JSON object repeats a key."""
+class RuntimePrivilegeContractError(RuntimeError):
+    """A static or runtime contract observation failed closed."""
+
+
+ContractError = RuntimePrivilegeContractError
+
+
+class DuplicateKeyError(RuntimePrivilegeContractError):
+    pass
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise DuplicateKeyError(key)
+            raise DuplicateKeyError(f"duplicate_json_key:{key}")
         result[key] = value
     return result
 
 
-def _fail(message: str) -> int:
-    print(f"FAIL: {message}", file=sys.stderr)
-    return 2
+def _row_value(row: Any, key: str, index: int = 0) -> Any:
+    if isinstance(row, Mapping):
+        return row.get(key)
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return row[index]
 
 
-def _ok(message: str) -> None:
-    print(f"OK: {message}")
+def _rows(connection: Any, sql: str, params: Sequence[Any] = ()) -> list[Any]:
+    return list(connection.execute(sql, tuple(params)).fetchall())
 
 
-def _add_error(errors: list[str], message: str) -> None:
-    errors.append(message)
+def _clean(value: Any) -> str:
+    return str(value or "").strip()
 
 
-def _exact_keys(value: Any, expected: frozenset[str], label: str, errors: list[str]) -> bool:
+def _exact_keys(value: Any, expected: set[str], label: str, errors: list[str]) -> None:
+    if not isinstance(value, Mapping):
+        errors.append(f"{label}:object_required")
+        return
+    actual = {str(key) for key in value}
+    if expected - actual:
+        errors.append(f"{label}:missing:{','.join(sorted(expected - actual))}")
+    if actual - expected:
+        errors.append(f"{label}:unexpected:{','.join(sorted(actual - expected))}")
+
+
+def _string_list(value: Any, label: str, errors: list[str]) -> list[str]:
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
+        errors.append(f"{label}:string_list_required")
+        return []
+    result = list(value)
+    if len(result) != len(set(result)):
+        errors.append(f"{label}:duplicates")
+    return result
+
+
+def load_manifest(path: Path = CONTRACT_PATH) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimePrivilegeContractError(f"contract_unreadable:{path.name}") from exc
     if not isinstance(value, dict):
-        _add_error(errors, f"{label}_must_be_object")
-        return False
-    actual = set(value)
-    unknown = actual - expected
-    missing = expected - actual
-    if unknown:
-        _add_error(errors, f"{label}_unknown_keys: {','.join(sorted(unknown))}")
-    if missing:
-        _add_error(errors, f"{label}_missing_keys: {','.join(sorted(missing))}")
-    return not unknown and not missing
+        raise RuntimePrivilegeContractError("contract_root_object_required")
+    return value
 
 
-def _exact_value(value: Any, expected: Any, label: str, errors: list[str]) -> None:
-    if expected is None:
-        valid = value is None
-    else:
-        valid = type(value) is type(expected) and value == expected
-    if not valid:
-        _add_error(errors, f"{label}_invalid_expected_{expected!r}_got_{value!r}")
-
-
-def _require_type(value: Any, expected_type: type, label: str, errors: list[str]) -> None:
-    if type(value) is not expected_type:
-        _add_error(errors, f"{label}_must_be_{expected_type.__name__}")
-
-
-def _require_non_empty_string(value: Any, label: str, errors: list[str]) -> None:
-    if type(value) is not str or not value.strip():
-        _add_error(errors, f"{label}_must_be_non_empty_string")
-
-
-def _require_string_list(value: Any, label: str, errors: list[str], *, unique: bool = True) -> None:
-    if type(value) is not list:
-        _add_error(errors, f"{label}_must_be_list")
+def _validate_roles(roles: Any, errors: list[str]) -> None:
+    _exact_keys(roles, {"runtime", "migrator", "maintenance"}, "roles", errors)
+    if not isinstance(roles, Mapping):
         return
-    for index, item in enumerate(value):
-        if type(item) is not str:
-            _add_error(errors, f"{label}_{index}_must_be_string")
-    if unique and len(value) != len(set(value)):
-        _add_error(errors, f"{label}_must_not_contain_duplicates")
-
-
-def _check_exact_string_list(
-    value: Any, expected: list[str], label: str, errors: list[str]
-) -> None:
-    _require_string_list(value, label, errors)
-    if type(value) is list and value != expected:
-        _add_error(errors, f"{label}_invalid_expected_{expected!r}_got_{value!r}")
-
-
-def _validate_provider_control_edge_policy(
-    runtime: Any,
-    errors: list[str],
-    *,
-    enforce_production_identity: bool = True,
-) -> dict[str, Any] | None:
-    if not isinstance(runtime, dict):
-        _add_error(errors, "runtime_role_must_be_object")
-        return None
-    edges = runtime.get("provider_control_edges")
-    if type(edges) is not list:
-        _add_error(errors, "provider_control_edges_must_be_list")
-        return None
-    if len(edges) != 1:
-        _add_error(errors, f"provider_control_edges_count_invalid_expected_1_got_{len(edges)}")
-    if not edges:
-        return None
-    edge = edges[0]
-    if not _exact_keys(edge, PROVIDER_CONTROL_EDGE_KEYS, "provider_control_edge_0", errors):
-        return None
-    for key in ("parent_role", "member_role", "grantor"):
-        _require_non_empty_string(edge.get(key), f"provider_control_edge_0_{key}", errors)
-    for key, expected in {
-        "admin_option": True,
-        "inherit_option": False,
-        "set_option": False,
-        "classification": PROVIDER_CONTROL_CLASSIFICATION,
-        "security_rationale": PROVIDER_CONTROL_SECURITY_RATIONALE,
-    }.items():
-        _exact_value(edge.get(key), expected, f"provider_control_edge_0_{key}", errors)
-    if enforce_production_identity:
-        for key in ("parent_role", "member_role", "grantor"):
-            _exact_value(
-                edge.get(key),
-                PRODUCTION_PROVIDER_CONTROL_EDGE[key],
-                f"provider_control_edge_0_{key}",
-                errors,
-            )
-    return edge
-
-
-def validate_runtime_membership_edges(
-    manifest: dict[str, Any],
-    rows: list[dict[str, Any]],
-    *,
-    enforce_production_identity: bool = True,
-) -> tuple[str, ...]:
-    """Evaluate the complete membership result without pre-filtering rows.
-
-    Unrelated cluster membership rows are retained during the scan. Every
-    well-formed row is classified as the exact provider-control edge, a
-    protected-role row, or a truly unrelated row before the complete graph is
-    evaluated. A row with a protected participant is never ignored because the
-    runtime is absent from its parent/member positions.
-    """
-
-    errors: list[str] = []
-    roles = manifest.get("roles") if isinstance(manifest, dict) else None
-    runtime = roles.get("runtime") if isinstance(roles, dict) else None
-    edge = _validate_provider_control_edge_policy(
-        runtime,
-        errors,
-        enforce_production_identity=enforce_production_identity,
-    )
-    if edge is None:
-        return tuple(errors)
-
-    expected_row = {
-        "role": edge["parent_role"],
-        "member": edge["member_role"],
-        "grantor": edge["grantor"],
-        "admin_option": edge["admin_option"],
-        "inherit_option": edge["inherit_option"],
-        "set_option": edge["set_option"],
+    attributes = {
+        key: {
+            "login": True, "superuser": False, "createdb": False, "createrole": False,
+            "replication": False, "bypassrls": False, "inherit": False, "connection_limit": -1,
+        }
+        for key in ("runtime", "migrator", "maintenance")
     }
-    if type(rows) is not list:
-        return (*errors, "role_membership_rows_must_be_list")
-
-    runtime_name = str(edge["parent_role"])
-    identity_protected_roles = (
-        PROTECTED_PRODUCTION_ROLES if enforce_production_identity else frozenset()
-    )
-    protected_roles = identity_protected_roles | {
-        str(edge["parent_role"]),
-        str(edge["member_role"]),
-        str(edge["grantor"]),
-    }
-    runtime_rows: list[dict[str, Any]] = []
-    protected_rows: list[dict[str, Any]] = []
-    seen_rows: set[tuple[str, str, str, bool, bool, bool]] = set()
-    graph: dict[str, set[str]] = {}
-    for index, row in enumerate(rows):
-        label = f"role_membership_row_{index}"
-        if not _exact_keys(row, MEMBERSHIP_ROW_KEYS, label, errors):
+    names = {"runtime": "sqag_runtime", "migrator": "sqag_migrator", "maintenance": "sqag_maintenance"}
+    role_keys = {"name", "attributes", "memberships_as_member", "owned_objects", "grant_options"}
+    for key, name in names.items():
+        role = roles.get(key)
+        _exact_keys(role, role_keys, f"roles.{key}", errors)
+        if not isinstance(role, Mapping):
             continue
-        for key in ("role", "member", "grantor"):
-            _require_non_empty_string(row.get(key), f"{label}_{key}", errors)
-        for key in ("admin_option", "inherit_option", "set_option"):
-            _require_type(row.get(key), bool, f"{label}_{key}", errors)
-        if any(type(row.get(key)) is not str for key in ("role", "member", "grantor")):
-            continue
-        if any(type(row.get(key)) is not bool for key in ("admin_option", "inherit_option", "set_option")):
-            continue
-
-        parent = str(row["role"])
-        member = str(row["member"])
-        grantor = str(row["grantor"])
-        row_tuple = (
-            parent,
-            member,
-            grantor,
-            row["admin_option"],
-            row["inherit_option"],
-            row["set_option"],
-        )
-        if row_tuple in seen_rows:
-            _add_error(errors, f"{label}_duplicate_role_membership_row")
-        seen_rows.add(row_tuple)
-
-        graph.setdefault(member, set()).add(parent)
-        participants = {parent, member, grantor}
-        is_expected_edge = row == expected_row
-        protected_participants = participants & protected_roles
-        if is_expected_edge or protected_participants:
-            protected_rows.append(row)
-        if runtime_name in participants:
-            runtime_rows.append(row)
-        if is_expected_edge:
-            continue
-
-        if member == runtime_name:
-            _add_error(errors, f"{label}_runtime_as_member_forbidden")
-            _add_error(errors, f"{label}_runtime_privilege_membership_path_forbidden")
-            if row["inherit_option"]:
-                _add_error(errors, f"{label}_runtime_inherit_path_forbidden")
-            if row["set_option"]:
-                _add_error(errors, f"{label}_runtime_set_path_forbidden")
-
-        if protected_participants:
-            _add_error(errors, f"{label}_protected_role_edge_forbidden")
-            if grantor in protected_roles:
-                _add_error(errors, f"{label}_protected_grantor_forbidden")
-            if row["admin_option"]:
-                _add_error(errors, f"{label}_protected_admin_option_forbidden")
-            if row["inherit_option"]:
-                _add_error(errors, f"{label}_protected_inherit_option_forbidden")
-            if row["set_option"]:
-                _add_error(errors, f"{label}_protected_set_option_forbidden")
-            for participant in sorted(participants - protected_roles):
-                _add_error(
-                    errors,
-                    f"{label}_unknown_protected_edge_participant_{participant}",
-                )
-            for forbidden_role in ("neon_superuser", "sqag_app", "sqag_migrator"):
-                if forbidden_role in {parent, member}:
-                    _add_error(errors, f"{label}_forbidden_provider_control_role_{forbidden_role}")
-
-    if len(runtime_rows) != 1:
-        _add_error(errors, f"runtime_edge_count_invalid_expected_1_got_{len(runtime_rows)}")
-    if len(runtime_rows) == 1 and runtime_rows[0] != expected_row:
-        _add_error(errors, "provider_control_edge_tuple_mismatch")
-    elif len(runtime_rows) > 1:
-        for index, row in enumerate(runtime_rows):
-            if row != expected_row:
-                _add_error(errors, f"provider_control_edge_tuple_mismatch_at_runtime_edge_{index}")
-
-    if len(protected_rows) != 1:
-        _add_error(
-            errors,
-            f"protected_role_row_count_invalid_expected_1_got_{len(protected_rows)}",
-        )
-
-    def reachable_cycle(start: str) -> bool:
-        visited: set[str] = set()
-        active: set[str] = set()
-
-        def visit(current: str) -> bool:
-            if current in active:
-                return True
-            if current in visited:
-                return False
-            visited.add(current)
-            active.add(current)
-            try:
-                return any(visit(parent) for parent in graph.get(current, set()))
-            finally:
-                active.remove(current)
-
-        return visit(start)
-
-    for protected_role in sorted(protected_roles):
-        if reachable_cycle(protected_role):
-            _add_error(
-                errors,
-                f"recursive_protected_role_membership_path_forbidden_{protected_role}",
-            )
-            if protected_role == runtime_name:
-                _add_error(errors, "recursive_runtime_membership_path_forbidden")
-
-    return tuple(errors)
+        if role.get("name") != name:
+            errors.append(f"roles.{key}.name:unexpected")
+        attrs = role.get("attributes")
+        _exact_keys(attrs, set(attributes[key]), f"roles.{key}.attributes", errors)
+        if isinstance(attrs, Mapping) and dict(attrs) != attributes[key]:
+            errors.append(f"roles.{key}.attributes:unexpected")
+        for field in ("memberships_as_member", "grant_options"):
+            items = _string_list(role.get(field), f"roles.{key}.{field}", errors)
+            if items:
+                errors.append(f"roles.{key}.{field}:must_be_empty")
+        if key == "migrator":
+            if role.get("owned_objects") != "all_declared_namespace_objects":
+                errors.append("roles.migrator.owned_objects:unexpected")
+        elif role.get("owned_objects") != []:
+            errors.append(f"roles.{key}.owned_objects:must_be_empty")
 
 
-def validate_top_level_keys(manifest: dict[str, Any], errors: list[str]) -> None:
-    _exact_keys(manifest, TOP_LEVEL_KEYS, "top_level", errors)
-
-
-def validate_schema_version(manifest: dict[str, Any], errors: list[str]) -> None:
-    _exact_value(manifest.get("schema_version"), 1, "schema_version", errors)
-    _exact_value(manifest.get("$schema"), "runtime-privilege-contract-schema-v1", "schema_identifier", errors)
-    _exact_value(manifest.get("contract_type"), "runtime_privilege_contract", "contract_type", errors)
-
-
-def validate_source_binding(manifest: dict[str, Any], errors: list[str]) -> None:
-    _exact_value(manifest.get("repository"), "Swooshz-com/swooshz-quote-auto-generator", "repository", errors)
-    _exact_value(
-        manifest.get("canonical_source_revision"),
-        "cc53c685ff617aaa5bf1eb24e8a62c1273570779",
-        "source_revision",
-        errors,
-    )
-    _exact_value(
-        manifest.get("canonical_source_tree"),
-        "68d67a9a08c4c3d9e86460e24060f31fdc0eaa27",
-        "source_tree",
-        errors,
-    )
-
-
-def validate_roles(manifest: dict[str, Any], errors: list[str]) -> None:
-    roles = manifest.get("roles")
-    if not _exact_keys(roles, ROLE_KEYS, "roles", errors):
-        if not isinstance(roles, dict):
-            return
-
-    runtime = roles.get("runtime") if isinstance(roles, dict) else None
-    if _exact_keys(runtime, RUNTIME_ROLE_KEYS, "runtime_role", errors):
-        _exact_value(runtime.get("name"), "sqag_runtime", "runtime_role_name", errors)
-        _exact_value(runtime.get("description"), ROLE_DESCRIPTIONS["runtime"], "runtime_role_description", errors)
-        attributes = runtime.get("attributes")
-        if _exact_keys(attributes, RUNTIME_ROLE_ATTRIBUTE_KEYS, "runtime_attributes", errors):
-            expected_attributes = {
-                "login": False,
-                "password": None,
-                "superuser": False,
-                "createdb": False,
-                "createrole": False,
-                "replication": False,
-                "bypassrls": False,
-                "inherit": True,
-                "connection_limit": -1,
-            }
-            for key, expected in expected_attributes.items():
-                _exact_value(attributes.get(key), expected, f"runtime_attribute_{key}", errors)
-        _check_exact_string_list(
-            runtime.get("memberships_as_member"), [], "runtime_memberships_as_member", errors
-        )
-        _check_exact_string_list(runtime.get("inherited_roles"), [], "runtime_inherited_roles", errors)
-        _check_exact_string_list(
-            runtime.get("set_assumable_roles"), [], "runtime_set_assumable_roles", errors
-        )
-        _check_exact_string_list(
-            runtime.get("membership_derived_privileges"),
-            [],
-            "runtime_membership_derived_privileges",
-            errors,
-        )
-        _validate_provider_control_edge_policy(runtime, errors)
-        _check_exact_string_list(runtime.get("ownership"), [], "runtime_ownership", errors)
-        _check_exact_string_list(runtime.get("grant_options"), [], "runtime_grant_options", errors)
-
-    migrator = roles.get("migrator") if isinstance(roles, dict) else None
-    if _exact_keys(migrator, MIGRATOR_ROLE_KEYS, "migrator_role", errors):
-        _exact_value(migrator.get("name"), "sqag_migrator", "migrator_role_name", errors)
-        _exact_value(migrator.get("description"), ROLE_DESCRIPTIONS["migrator"], "migrator_role_description", errors)
-        _exact_value(migrator.get("can_create_roles"), False, "migrator_can_create_roles", errors)
-
-    legacy = roles.get("legacy") if isinstance(roles, dict) else None
-    if _exact_keys(legacy, LEGACY_ROLE_KEYS, "legacy_role", errors):
-        _exact_value(legacy.get("name"), "sqag_app", "legacy_role_name", errors)
-        _exact_value(legacy.get("description"), ROLE_DESCRIPTIONS["legacy"], "legacy_role_description", errors)
-        _exact_value(legacy.get("status"), "retained_until_retirement", "legacy_role_status", errors)
-
-    provider = roles.get("provider") if isinstance(roles, dict) else None
-    if _exact_keys(provider, PROVIDER_ROLE_KEYS, "provider_role", errors):
-        _exact_value(provider.get("name"), "neondb_owner", "provider_role_name", errors)
-        _exact_value(provider.get("description"), ROLE_DESCRIPTIONS["provider"], "provider_role_description", errors)
-        _exact_value(provider.get("status"), "provider_unchanged", "provider_role_status", errors)
-
-    forbidden = roles.get("forbidden") if isinstance(roles, dict) else None
-    _check_exact_string_list(forbidden, ["sqag_maintenance"], "forbidden_roles", errors)
-
-
-def validate_production_migrations(manifest: dict[str, Any], errors: list[str]) -> None:
-    migrations = manifest.get("production_migrations")
-    if type(migrations) is not list:
-        _add_error(errors, "production_migrations_must_be_list")
+def _validate_migrations(value: Any, errors: list[str]) -> None:
+    if not isinstance(value, list):
+        errors.append("production_migrations:list_required")
         return
-
-    repo_manifest = migration_manifest(ROOT / "migrations")
-    expected_count = len(MIGRATION_FILE_NAMES)
-    if len(migrations) != expected_count:
-        _add_error(errors, f"production_migrations_count_mismatch_expected_{expected_count}_got_{len(migrations)}")
-
-    for index, entry in enumerate(migrations):
-        label = f"migration_{index}"
-        if not _exact_keys(entry, MIGRATION_KEYS, label, errors):
-            if not isinstance(entry, dict):
-                continue
-
-        if index >= expected_count or index >= len(repo_manifest):
-            continue
-        expected_name = MIGRATION_FILE_NAMES[index]
-        expected_path = f"migrations/{expected_name}"
-        _exact_value(entry.get("path"), expected_path, f"{label}_path", errors)
-        _exact_value(entry.get("sequence_no"), index + 1, f"{label}_sequence_no", errors)
-        digest = entry.get("sha256")
-        if type(digest) is not str or not re.fullmatch(r"[0-9a-f]{64}", digest):
-            _add_error(errors, f"{label}_sha256_must_be_lowercase_hex_64")
-        else:
-            _exact_value(digest, repo_manifest[index].checksum_sha256, f"{label}_sha256", errors)
-
-        tables = entry.get("tables")
-        _require_string_list(tables, f"{label}_tables", errors)
-        if type(tables) is list:
-            actual_tables = set(tables)
-            expected_tables = set(MIGRATION_TABLES[expected_name])
-            if actual_tables != expected_tables:
-                _add_error(
-                    errors,
-                    f"{label}_table_binding_mismatch_expected_{sorted(expected_tables)}_got_{sorted(actual_tables)}",
-                )
-
-
-def validate_table_matrix(manifest: dict[str, Any], errors: list[str]) -> None:
-    tables = manifest.get("tables")
-    if not _exact_keys(tables, TABLES_KEYS, "tables", errors):
-        if not isinstance(tables, dict):
-            return
-
-    _exact_value(tables.get("total_count"), 16, "total_table_count", errors)
-    _exact_value(tables.get("rw_count"), 11, "runtime_accessible_count", errors)
-    _exact_value(tables.get("forbidden_count"), 5, "forbidden_count", errors)
-
-    accessible = tables.get("runtime_accessible")
-    forbidden = tables.get("runtime_forbidden")
-    if not isinstance(accessible, dict):
-        _add_error(errors, "runtime_accessible_must_be_object")
-    else:
-        actual_accessible = set(accessible)
-        if actual_accessible != RUNTIME_TABLES:
-            _add_error(
-                errors,
-                f"runtime_accessible_table_set_mismatch_extra_{actual_accessible - RUNTIME_TABLES}_missing_{RUNTIME_TABLES - actual_accessible}",
-            )
-        for table_name, entry in accessible.items():
-            label = f"accessible_table_{table_name}"
-            if not _exact_keys(entry, ACCESSIBLE_TABLE_KEYS, label, errors):
-                if not isinstance(entry, dict):
-                    continue
-            _exact_value(entry.get("class"), ACCESSIBLE_TABLE_CLASSES.get(table_name), f"{label}_class", errors)
-            _exact_value(entry.get("schema"), "public", f"{label}_schema", errors)
-            privileges = entry.get("privileges")
-            if not _exact_keys(privileges, PRIVILEGE_KEYS, f"{label}_privileges", errors):
-                if not isinstance(privileges, dict):
-                    continue
-            locked = LOCKED_PRIVILEGE_MATRIX.get(table_name)
-            for privilege_name in sorted(PRIVILEGE_KEYS):
-                expected = locked.get(privilege_name) if locked is not None else None
-                _exact_value(privileges.get(privilege_name), expected, f"{label}_{privilege_name}", errors)
-
-    if not isinstance(forbidden, dict):
-        _add_error(errors, "runtime_forbidden_must_be_object")
-    else:
-        actual_forbidden = set(forbidden)
-        if actual_forbidden != FORBIDDEN_TABLES:
-            _add_error(
-                errors,
-                f"forbidden_table_set_mismatch_extra_{actual_forbidden - FORBIDDEN_TABLES}_missing_{FORBIDDEN_TABLES - actual_forbidden}",
-            )
-        for table_name, entry in forbidden.items():
-            label = f"forbidden_table_{table_name}"
-            if not _exact_keys(entry, FORBIDDEN_TABLE_KEYS, label, errors):
-                if not isinstance(entry, dict):
-                    continue
-            expected_class, expected_reason = FORBIDDEN_TABLE_DETAILS.get(table_name, (None, None))
-            _exact_value(entry.get("class"), expected_class, f"{label}_class", errors)
-            _exact_value(entry.get("schema"), "public", f"{label}_schema", errors)
-            _require_non_empty_string(entry.get("reason"), f"{label}_reason", errors)
-            _exact_value(entry.get("reason"), expected_reason, f"{label}_reason", errors)
-
-
-def validate_column_privileges(manifest: dict[str, Any], errors: list[str]) -> None:
-    column_privileges = manifest.get("column_privileges")
-    if not _exact_keys(column_privileges, COLUMN_PRIVILEGES_TABLE_KEYS, "column_privileges", errors):
-        if not isinstance(column_privileges, dict):
-            return
-    entry = column_privileges.get("sqag_quote_publication_artifacts")
-    label = "column_privileges_sqag_quote_publication_artifacts"
-    if not _exact_keys(entry, COLUMN_PRIVILEGE_ENTRY_KEYS, label, errors):
-        if not isinstance(entry, dict):
-            return
-    _check_exact_string_list(
-        entry.get("update"),
-        ["checksum_sha256"],
-        f"{label}_update",
-        errors,
-    )
-    tables = manifest.get("tables")
-    runtime_accessible = tables.get("runtime_accessible") if isinstance(tables, dict) else None
-    table_entry = (
-        runtime_accessible.get("sqag_quote_publication_artifacts", {})
-        if isinstance(runtime_accessible, dict)
-        else {}
-    )
-    table_privileges = table_entry.get("privileges", {}) if isinstance(table_entry, dict) else {}
-    _exact_value(
-        table_privileges.get("update"),
-        False,
-        "column_privileges_publication_artifacts_table_update",
-        errors,
-    )
-
-
-def validate_views(manifest: dict[str, Any], errors: list[str]) -> None:
-    views = manifest.get("views")
-    if not _exact_keys(views, VIEWS_KEYS, "views", errors):
-        if not isinstance(views, dict):
-            return
-    _exact_value(views.get("count"), 1, "view_count", errors)
-    accessible = views.get("runtime_accessible")
-    if not isinstance(accessible, dict):
-        _add_error(errors, "runtime_accessible_views_must_be_object")
-        return
-    actual = set(accessible)
-    if actual != LEGACY_VIEWS:
-        _add_error(
-            errors,
-            f"view_set_mismatch_extra_{sorted(actual - LEGACY_VIEWS)}_missing_{sorted(LEGACY_VIEWS - actual)}",
-        )
-    for view_name, entry in accessible.items():
-        label = f"accessible_view_{view_name}"
-        if not _exact_keys(entry, ACCESSIBLE_VIEW_KEYS, label, errors):
-            if not isinstance(entry, dict):
-                continue
-        expected_class, expected_source = LEGACY_VIEW_DETAILS.get(view_name, (None, None))
-        _exact_value(entry.get("schema"), "public", f"{label}_schema", errors)
-        _exact_value(entry.get("class"), expected_class, f"{label}_class", errors)
-        _exact_value(
-            entry.get("production_source"),
-            expected_source,
-            f"{label}_production_source",
-            errors,
-        )
-        _exact_value(entry.get("bound"), True, f"{label}_bound", errors)
-        privileges = entry.get("privileges")
-        if not _exact_keys(privileges, VIEW_PRIVILEGE_KEYS, f"{label}_privileges", errors):
-            if not isinstance(privileges, dict):
-                continue
-        _exact_value(privileges.get("select"), True, f"{label}_select", errors)
-
-
-def validate_boundary_b(manifest: dict[str, Any], errors: list[str]) -> None:
-    boundary = manifest.get("boundary_b")
-    if not _exact_keys(boundary, BOUNDARY_B_KEYS, "boundary_b", errors):
-        if not isinstance(boundary, dict):
-            return
-    _exact_value(boundary.get("requires_postgresql17"), True, "boundary_b_requires_postgresql17", errors)
-    _exact_value(boundary.get("runtime_role"), "sqag_runtime", "boundary_b_runtime_role", errors)
-    _exact_value(boundary.get("object_owner"), "sqag_migrator", "boundary_b_object_owner", errors)
-    _exact_value(
-        boundary.get("database_owner_authority"),
-        "database_owner",
-        "boundary_b_database_owner_authority",
-        errors,
-    )
-    _exact_value(
-        boundary.get("authority_input_model"),
-        "variable_reference_only",
-        "boundary_b_authority_input_model",
-        errors,
-    )
-    _exact_value(boundary.get("fail_closed"), True, "boundary_b_fail_closed", errors)
-    _exact_value(boundary.get("idempotent_rerun"), True, "boundary_b_idempotent_rerun", errors)
-    operations = boundary.get("operations")
-    if not _exact_keys(operations, BOUNDARY_B_OPERATION_KEYS, "boundary_b_operations", errors):
-        if not isinstance(operations, dict):
-            return
-    for operation, authority in BOUNDARY_B_OPERATION_AUTHORITY.items():
-        _exact_value(operations.get(operation), authority, f"boundary_b_{operation}", errors)
-
-
-def validate_sequences(manifest: dict[str, Any], errors: list[str]) -> None:
-    sequence = manifest.get("sequences")
-    if not _exact_keys(sequence, SEQUENCE_KEYS, "sequences", errors):
-        if not isinstance(sequence, dict):
-            return
-    _exact_value(sequence.get("user_defined_public_count"), 0, "sequence_count", errors)
-    _exact_value(sequence.get("runtime_privileges"), "none", "runtime_sequence_privileges", errors)
-    _exact_value(
-        sequence.get("rule"),
-        "Any future production sequence must be explicitly classified before CI passes.",
-        "sequence_rule",
-        errors,
-    )
-
-
-def validate_routines(manifest: dict[str, Any], errors: list[str]) -> None:
-    routines = manifest.get("routines")
-    if not _exact_keys(routines, ROUTINES_KEYS, "routines", errors):
-        if not isinstance(routines, dict):
-            return
-    _exact_value(routines.get("total_count"), 3, "total_routine_count", errors)
-    _exact_value(routines.get("sqag_owned_count"), 2, "sqag_owned_routine_count", errors)
-    _exact_value(
-        routines.get("rule"),
-        "No direct runtime routine grants. Every future routine must be explicitly classified before CI passes.",
-        "routine_rule",
-        errors,
-    )
-
-    triggers = routines.get("sqag_owned_triggers")
-    if not isinstance(triggers, dict):
-        _add_error(errors, "sqag_owned_triggers_must_be_object")
-    else:
-        if set(triggers) != set(EXPECTED_ROUTINES):
-            _add_error(errors, "sqag_trigger_routine_set_mismatch")
-        for name, entry in triggers.items():
-            label = f"trigger_routine_{name}"
-            if not _exact_keys(entry, TRIGGER_ROUTINE_KEYS, label, errors):
-                if not isinstance(entry, dict):
-                    continue
-            _exact_value(entry.get("schema"), "public", f"{label}_schema", errors)
-            _exact_value(entry.get("owner"), "sqag_migrator", f"{label}_owner", errors)
-            _exact_value(entry.get("security_mode"), "invoker", f"{label}_security_mode", errors)
-            _exact_value(entry.get("class"), "trigger_only", f"{label}_class", errors)
-            _exact_value(entry.get("direct_runtime_execute"), False, f"{label}_direct_runtime_execute", errors)
-            _exact_value(
-                entry.get("public_execute_after_boundary_b"),
-                False,
-                f"{label}_public_execute_after_boundary_b",
-                errors,
-            )
-
-    provider_exceptions = routines.get("provider_owned_exceptions")
-    if not isinstance(provider_exceptions, dict):
-        _add_error(errors, "provider_owned_exceptions_must_be_object")
-    else:
-        if set(provider_exceptions) != {"show_db_tree"}:
-            _add_error(errors, "provider_exception_set_must_be_exactly_show_db_tree")
-        entry = provider_exceptions.get("show_db_tree")
-        label = "provider_exception_show_db_tree"
-        if not _exact_keys(entry, PROVIDER_EXCEPTION_KEYS, label, errors):
-            if not isinstance(entry, dict):
-                return
-        _exact_value(entry.get("schema"), "public", f"{label}_schema", errors)
-        _exact_value(entry.get("owner"), "neondb_owner", f"{label}_owner", errors)
-        _exact_value(entry.get("class"), "provider_diagnostic_exception", f"{label}_class", errors)
-        _exact_value(entry.get("direct_runtime_grant"), False, f"{label}_direct_runtime_grant", errors)
-        _exact_value(entry.get("public_execute"), "unchanged", f"{label}_public_execute", errors)
-        _exact_value(
-            entry.get("effective_runtime_execution"),
-            "bounded_public_exception",
-            f"{label}_effective_runtime_execution",
-            errors,
-        )
-
-
-def validate_database_acl(manifest: dict[str, Any], errors: list[str]) -> None:
-    acl = manifest.get("database_acl")
-    if not _exact_keys(acl, DATABASE_ACL_KEYS, "database_acl", errors):
-        if not isinstance(acl, dict):
-            return
-    expected = {
-        "public": (DATABASE_PUBLIC_KEYS, {"connect": True, "temporary": "forbidden_after_boundary_b", "create": False}),
-        "sqag_migrator": (DATABASE_MIGRATOR_KEYS, {"connect": True, "create": True, "temporary": True}),
-        "sqag_app": (DATABASE_APP_KEYS, {"connect": "retained_until_retirement"}),
-        "sqag_runtime": (DATABASE_RUNTIME_KEYS, {"connect": True, "create": False, "temporary": False}),
-    }
-    for actor, (keys, values) in expected.items():
-        actor_acl = acl.get(actor)
-        if _exact_keys(actor_acl, keys, f"database_acl_{actor}", errors):
-            for key, value in values.items():
-                _exact_value(actor_acl.get(key), value, f"database_acl_{actor}_{key}", errors)
-
-
-def validate_schema_acl(manifest: dict[str, Any], errors: list[str]) -> None:
-    acl = manifest.get("schema_acl")
-    if not _exact_keys(acl, SCHEMA_ACL_KEYS, "schema_acl", errors):
-        if not isinstance(acl, dict):
-            return
-    _exact_value(acl.get("schema_name"), "public", "schema_name", errors)
-    expected = {
-        "public": (SCHEMA_PUBLIC_KEYS, {"usage": True}),
-        "pg_database_owner": (SCHEMA_OWNER_KEYS, {"create": True, "usage": True}),
-        "sqag_app": (SCHEMA_APP_KEYS, {"usage": "retained_until_retirement"}),
-        "sqag_runtime": (SCHEMA_RUNTIME_KEYS, {"usage": True, "create": False}),
-    }
-    for actor, (keys, values) in expected.items():
-        actor_acl = acl.get(actor)
-        if _exact_keys(actor_acl, keys, f"schema_acl_{actor}", errors):
-            for key, value in values.items():
-                _exact_value(actor_acl.get(key), value, f"schema_acl_{actor}_{key}", errors)
-
-
-def validate_default_privileges(manifest: dict[str, Any], errors: list[str]) -> None:
-    default_privileges = manifest.get("default_privileges")
-    if not _exact_keys(default_privileges, DEFAULT_PRIVILEGES_KEYS, "default_privileges", errors):
-        if not isinstance(default_privileges, dict):
-            return
-    _check_exact_string_list(
-        default_privileges.get("object_classes"),
-        DEFAULT_ACL_OBJECT_CLASSES,
-        "default_privilege_object_classes",
-        errors,
-    )
-    runtime = default_privileges.get("sqag_runtime")
-    if _exact_keys(runtime, RUNTIME_DEFAULT_KEYS, "runtime_default_privileges", errors):
-        for key in sorted(RUNTIME_DEFAULT_KEYS):
-            _exact_value(runtime.get(key), "none", f"runtime_default_{key}", errors)
-    _exact_value(
-        default_privileges.get("sqag_migrator_to_sqag_app"),
-        "preserved_during_boundary_a_and_initial_boundary_b",
-        "migrator_default_privileges",
-        errors,
-    )
-    _exact_value(
-        default_privileges.get("provider_controlled"),
-        "unchanged",
-        "provider_default_privileges",
-        errors,
-    )
-    _exact_value(
-        default_privileges.get("verification_rule"),
-        "Must expand defaclacl through aclexplode() or equivalent grantee-aware operation. Checking defaclrole alone is insufficient.",
-        "default_privileges_verification_rule",
-        errors,
-    )
-
-
-class SQLLexError(ValueError):
-    """Raised when a verification query cannot be lexed deterministically."""
-
-
-@dataclass(frozen=True)
-class SQLToken:
-    kind: str
-    value: str
-    position: int
-
-
-_DOLLAR_QUOTE_TAG = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$")
-_SQL_MULTI_SYMBOLS = ("::", "||", "<=", ">=", "<>", "!=", "=>", "->", "#>")
-_READ_ONLY_FORBIDDEN_WORDS = frozenset(
-    {
-        "insert",
-        "update",
-        "delete",
-        "merge",
-        "truncate",
-        "create",
-        "alter",
-        "drop",
-        "grant",
-        "revoke",
-        "comment",
-        "call",
-        "copy",
-        "begin",
-        "start",
-        "commit",
-        "rollback",
-        "abort",
-        "savepoint",
-        "release",
-        "set",
-        "set_config",
-        "reset",
-        "show",
-        "prepare",
-        "execute",
-        "do",
-        "vacuum",
-        "analyze",
-        "refresh",
-        "lock",
-        "listen",
-        "notify",
-        "discard",
-    }
-)
-
-
-def lex_sql(query: str) -> tuple[SQLToken, ...]:
-    """Tokenize only the bounded SQL needed by the read-only contract.
-
-    Comments and quoted bodies are represented as non-code tokens, so words
-    inside them cannot satisfy a catalog/query-shape assertion. This is a
-    lexer, not a general SQL parser.
-    """
-
-    if type(query) is not str:
-        raise SQLLexError("query_not_string")
-    tokens: list[SQLToken] = []
-    index = 0
-    length = len(query)
-    while index < length:
-        char = query[index]
-        if char.isspace():
-            index += 1
-            continue
-        if query.startswith("--", index):
-            newline = query.find("\n", index + 2)
-            index = length if newline < 0 else newline + 1
-            continue
-        if query.startswith("/*", index):
-            start = index
-            index += 2
-            depth = 1
-            while index < length and depth:
-                if query.startswith("/*", index):
-                    depth += 1
-                    index += 2
-                elif query.startswith("*/", index):
-                    depth -= 1
-                    index += 2
-                else:
-                    index += 1
-            if depth:
-                raise SQLLexError(f"unterminated_block_comment_at_{start}")
-            tokens.append(SQLToken("COMMENT", "", start))
-            continue
-        if char == "'":
-            start = index
-            index += 1
-            value: list[str] = []
-            closed = False
-            while index < length:
-                if query[index] == "\\" and index + 1 < length:
-                    value.extend((query[index], query[index + 1]))
-                    index += 2
-                elif query[index] == "'":
-                    if index + 1 < length and query[index + 1] == "'":
-                        value.append("'")
-                        index += 2
-                    else:
-                        index += 1
-                        closed = True
-                        break
-                else:
-                    value.append(query[index])
-                    index += 1
-            if not closed:
-                raise SQLLexError(f"unterminated_single_quote_at_{start}")
-            tokens.append(SQLToken("STRING", "".join(value), start))
-            continue
-        if char == '"':
-            start = index
-            index += 1
-            value = []
-            closed = False
-            while index < length:
-                if query[index] == '"':
-                    if index + 1 < length and query[index + 1] == '"':
-                        value.append('"')
-                        index += 2
-                    else:
-                        index += 1
-                        closed = True
-                        break
-                else:
-                    value.append(query[index])
-                    index += 1
-            if not closed:
-                raise SQLLexError(f"unterminated_double_quote_at_{start}")
-            tokens.append(SQLToken("QUOTED_IDENTIFIER", "".join(value), start))
-            continue
-        if char == "$":
-            match = _DOLLAR_QUOTE_TAG.match(query, index)
-            if match:
-                delimiter = match.group(0)
-                start = index
-                body_start = index + len(delimiter)
-                body_end = query.find(delimiter, body_start)
-                if body_end < 0:
-                    raise SQLLexError(f"unterminated_dollar_quote_at_{start}")
-                tokens.append(SQLToken("DOLLAR_QUOTE", query[body_start:body_end], start))
-                index = body_end + len(delimiter)
-                continue
-        if char.isalpha() or char == "_":
-            start = index
-            index += 1
-            while index < length and (query[index].isalnum() or query[index] in {"_", "$"}):
-                index += 1
-            tokens.append(SQLToken("WORD", query[start:index], start))
-            continue
-        if char.isdigit():
-            start = index
-            index += 1
-            while index < length and (query[index].isdigit() or query[index] == "."):
-                index += 1
-            tokens.append(SQLToken("NUMBER", query[start:index], start))
-            continue
-        matched_symbol = next((symbol for symbol in _SQL_MULTI_SYMBOLS if query.startswith(symbol, index)), None)
-        if matched_symbol is not None:
-            tokens.append(SQLToken("SYMBOL", matched_symbol, index))
-            index += len(matched_symbol)
-            continue
-        tokens.append(SQLToken("SYMBOL", char, index))
-        index += 1
-    return tuple(tokens)
-
-
-def _token_is_word(token: SQLToken, value: str) -> bool:
-    return token.kind == "WORD" and token.value.lower() == value.lower()
-
-
-def _token_matches(token: SQLToken, expected: str | tuple[str, str]) -> bool:
-    if isinstance(expected, tuple):
-        kind, value = expected
-        if kind == "STRING_EXACT":
-            return token.kind == "STRING" and token.value == value
-        if kind == "STRING":
-            return token.kind == "STRING" and token.value.lower() == value.lower()
-        return token.kind == kind and token.value.lower() == value.lower()
-    if token.kind == "WORD":
-        return token.value.lower() == expected.lower()
-    return token.value == expected
-
-
-def _normalise_executable_tokens(tokens: tuple[SQLToken, ...] | list[SQLToken]) -> tuple[tuple[str, str], ...]:
-    """Return the executable structure with presentation-only differences removed."""
-    return tuple(
-        (
-            token.kind,
-            token.value.lower() if token.kind == "WORD" else token.value,
-        )
-        for token in tokens
-        if token.kind != "COMMENT"
-    )
-
-
-def _find_token_pattern(
-    tokens: tuple[SQLToken, ...] | list[SQLToken], pattern: list[str | tuple[str, str]]
-) -> bool:
-    if not pattern or len(tokens) < len(pattern):
-        return False
-    return any(
-        all(_token_matches(tokens[index + offset], expected) for offset, expected in enumerate(pattern))
-        for index in range(len(tokens) - len(pattern) + 1)
-    )
-
-
-def _count_token_pattern(
-    tokens: tuple[SQLToken, ...] | list[SQLToken], pattern: list[str | tuple[str, str]]
-) -> int:
-    if not pattern or len(tokens) < len(pattern):
-        return 0
-    return sum(
-        all(_token_matches(tokens[index + offset], expected) for offset, expected in enumerate(pattern))
-        for index in range(len(tokens) - len(pattern) + 1)
-    )
-
-
-def _qualified_pattern(value: str) -> list[str]:
-    return [part for index, part in enumerate(value.split(".")) for part in (([".", part] if index else [part]))]
-
-
-def _feature_pattern(feature: str) -> list[str | tuple[str, str]]:
-    if len(feature) >= 2 and feature[0] == "'" and feature[-1] == "'":
-        return [("STRING", feature[1:-1])]
-    if " " in feature:
-        return feature.lower().split()
-    if "." in feature:
-        return _qualified_pattern(feature.lower())
-    return [feature.lower()]
-
-
-def _require_sql_features(
-    tokens: tuple[SQLToken, ...], key: str, features: tuple[str, ...], errors: list[str]
-) -> None:
-    for feature in features:
-        if not _find_token_pattern(tokens, _feature_pattern(feature)):
-            _add_error(errors, f"verification_query_{key}_missing_semantic_feature_{feature}")
-
-
-def _read_only_query_tokens(query: str, key: str, errors: list[str]) -> tuple[SQLToken, ...] | None:
     try:
-        tokens = [token for token in lex_sql(query) if token.kind != "COMMENT"]
-    except SQLLexError as exc:
-        _add_error(errors, f"verification_query_{key}_lexical_error_{exc}")
-        return None
-    semicolons = [index for index, token in enumerate(tokens) if token.value == ";"]
-    if semicolons:
-        if len(semicolons) != 1 or semicolons[0] != len(tokens) - 1:
-            _add_error(errors, f"verification_query_{key}_must_be_single_executable_statement")
-            return None
-        tokens.pop()
-    if not tokens:
-        _add_error(errors, f"verification_query_{key}_must_contain_one_read_only_query")
-        return None
-    if not _token_is_word(tokens[0], "select"):
-        _add_error(errors, f"verification_query_{key}_must_be_single_read_only_select")
-    forbidden = sorted(
+        canonical = migration_manifest(ROOT / "migrations")
+    except Exception as exc:
+        errors.append(f"production_migrations:source_unreadable:{type(exc).__name__}")
+        return
+    actual: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            errors.append("production_migrations:item_object_required")
+            continue
+        _exact_keys(item, {"path", "sequence_no", "sha256", "tables"}, "production_migrations.item", errors)
+        actual.append(dict(item))
+    expected = [
         {
-            token.value.lower()
-            for token in tokens
-            if token.kind in {"WORD", "QUOTED_IDENTIFIER"} and token.value.lower() in _READ_ONLY_FORBIDDEN_WORDS
+            "path": f"migrations/{item.migration_id}",
+            "sequence_no": item.sequence_no,
+            "sha256": item.checksum_sha256,
+            "tables": sorted(MIGRATION_TABLES[item.migration_id]),
         }
-    )
-    if forbidden:
-        _add_error(errors, f"verification_query_{key}_contains_forbidden_executable_words_{','.join(forbidden)}")
-    return tuple(tokens)
+        for item in canonical
+    ]
+    if actual != expected:
+        errors.append("production_migrations:does_not_match_canonical_manifest")
 
 
-EXPECTED_VERIFICATION_QUERY_TOKENS: dict[str, tuple[tuple[str, str], ...]] = {
-    key: _normalise_executable_tokens(lex_sql(query))
-    for key, query in CANONICAL_VERIFICATION_QUERY_SQL.items()
-}
-
-
-def _validate_exact_query_contract(query: str, key: str, errors: list[str]) -> None:
-    """Require the complete reviewed executable token sequence for one key."""
-    tokens = _read_only_query_tokens(query, key, errors)
-    if tokens is None:
-        return
-    expected = EXPECTED_VERIFICATION_QUERY_TOKENS.get(key)
-    if expected is None or _normalise_executable_tokens(tokens) != expected:
-        _add_error(errors, f"verification_query_{key}_executable_structure_mismatch")
-
-
-def _top_level_index(tokens: tuple[SQLToken, ...], word: str) -> int | None:
-    depth = 0
-    for index, token in enumerate(tokens):
-        if token.value == "(":
-            depth += 1
-        elif token.value == ")":
-            depth -= 1
-        elif depth == 0 and _token_is_word(token, word):
-            return index
-    return None
-
-
-def _split_top_level(tokens: tuple[SQLToken, ...]) -> list[tuple[SQLToken, ...]]:
-    parts: list[tuple[SQLToken, ...]] = []
-    current: list[SQLToken] = []
-    depth = 0
-    for token in tokens:
-        if token.value == "(":
-            depth += 1
-        elif token.value == ")":
-            depth -= 1
-        if token.value == "," and depth == 0:
-            parts.append(tuple(current))
-            current = []
-        else:
-            current.append(token)
-    parts.append(tuple(current))
-    return parts
-
-
-def _projection_alias(part: tuple[SQLToken, ...]) -> str | None:
-    for index in range(len(part) - 2, -1, -1):
-        if _token_is_word(part[index], "as") and part[index + 1].kind in {"WORD", "QUOTED_IDENTIFIER"}:
-            return part[index + 1].value.lower()
-    for token in reversed(part):
-        if token.kind in {"WORD", "QUOTED_IDENTIFIER"}:
-            return token.value.lower()
-    return None
-
-
-def _projection_parts(tokens: tuple[SQLToken, ...], key: str, errors: list[str]) -> list[tuple[SQLToken, ...]] | None:
-    from_index = _top_level_index(tokens, "from")
-    if from_index is None or from_index <= 1:
-        _add_error(errors, f"verification_query_{key}_must_have_top_level_from")
-        return None
-    parts = _split_top_level(tokens[1:from_index])
-    if any(not part for part in parts):
-        _add_error(errors, f"verification_query_{key}_projection_contains_empty_column")
-        return None
-    return parts
-
-
-def _require_projection_shape(
-    parts: list[tuple[SQLToken, ...]],
-    expected_aliases: list[str],
-    key: str,
-    errors: list[str],
-) -> None:
-    aliases = [_projection_alias(part) for part in parts]
-    if aliases != expected_aliases:
-        _add_error(errors, f"verification_query_{key}_projected_columns_invalid_expected_{expected_aliases}_got_{aliases}")
-
-
-def _validate_default_acl_query(query: str, errors: list[str]) -> None:
-    tokens = _read_only_query_tokens(query, "default_acl", errors)
-    if tokens is None:
-        return
-    required = (
-        "pg_catalog.pg_default_acl",
-        "defaclrole",
-        "defaclnamespace",
-        "defaclobjtype",
-        "defaclacl",
-        "privilege_type",
-        "is_grantable",
-        "grantee",
-        "owner",
-        "namespace",
-        "order by",
-    )
-    _require_sql_features(tokens, "default_acl", required, errors)
-    parts = _projection_parts(tokens, "default_acl", errors)
-    if parts is not None:
-        _require_projection_shape(parts, ["owner", "namespace", "object_type", "grantee", "privilege_type", "is_grantable"], "default_acl", errors)
-        for index, pattern in {
-            0: _qualified_pattern("owner.rolname"),
-            1: _qualified_pattern("ns.nspname"),
-            2: _qualified_pattern("d.defaclobjtype"),
-            4: _qualified_pattern("expanded.privilege_type"),
-            5: _qualified_pattern("expanded.is_grantable"),
-        }.items():
-            if index < len(parts) and not _find_token_pattern(parts[index], pattern):
-                _add_error(errors, f"verification_query_default_acl_projection_{index}_missing_expected_expression")
-        if len(parts) > 3 and (
-            not _find_token_pattern(
-                parts[3],
-                ["case", "when", *_qualified_pattern("expanded.grantee"), "=", "0", "then", ("STRING", "public")],
-            )
-            or not _find_token_pattern(parts[3], ["end", "as", "grantee"])
-        ):
-            _add_error(errors, "verification_query_default_acl_projection_grantee_missing_public_mapping")
-    if not _find_token_pattern(tokens, ["from", *_qualified_pattern("pg_catalog.pg_default_acl"), "d"]):
-        _add_error(errors, "verification_query_default_acl_must_read_pg_default_acl")
-    if not _find_token_pattern(tokens, ["join", *_qualified_pattern("pg_catalog.pg_roles"), "owner"]):
-        _add_error(errors, "verification_query_default_acl_must_join_owner_role")
-    if not _find_token_pattern(tokens, ["left", "join", *_qualified_pattern("pg_catalog.pg_namespace"), "ns"]):
-        _add_error(errors, "verification_query_default_acl_must_left_join_namespace")
-    lateral_pattern = ["cross", "join", "lateral", *_qualified_pattern("pg_catalog.aclexplode"), "("]
-    if _count_token_pattern(tokens, lateral_pattern) != 1:
-        _add_error(errors, "verification_query_default_acl_requires_exactly_one_cross_join_lateral_aclexplode")
-    if not _find_token_pattern(tokens, ["left", "join", *_qualified_pattern("pg_catalog.pg_roles"), "grantee_role"]):
-        _add_error(errors, "verification_query_default_acl_must_left_join_named_grantees")
-    if not _find_token_pattern(
-        tokens,
-        [
-            "where", "d", ".", "defaclobjtype", "in", "(",
-            ("STRING_EXACT", "r"), ",", ("STRING_EXACT", "S"), ",",
-            ("STRING_EXACT", "f"), ",", ("STRING_EXACT", "n"), ",",
-            ("STRING_EXACT", "T"), ")",
-        ],
-    ):
-        _add_error(errors, "verification_query_default_acl_must_cover_r_s_f_n_T_object_types")
-    if _find_token_pattern(tokens, ["::", "regrole"]) or _find_token_pattern(tokens, ["::", "name"]):
-        _add_error(errors, "verification_query_default_acl_must_not_cast_absent_role_names")
-    if not _find_token_pattern(tokens, ["order", "by", "owner", ",", "namespace", ",", "object_type", ",", "grantee", ",", "expanded", ".", "privilege_type", ",", "expanded", ".", "is_grantable"]):
-        _add_error(errors, "verification_query_default_acl_must_order_deterministically")
-
-
-def _validate_role_attributes_query(query: str, errors: list[str]) -> None:
-    tokens = _read_only_query_tokens(query, "role_attributes", errors)
-    if tokens is None:
-        return
-    required = (
-        "pg_catalog.pg_roles",
-        "pg_catalog.pg_authid",
-        "rolname",
-        "rolsuper",
-        "rolinherit",
-        "rolcreaterole",
-        "rolcreatedb",
-        "rolcanlogin",
-        "rolreplication",
-        "rolbypassrls",
-        "rolconnlimit",
-        "rolpassword",
-        "password_is_null",
-        "order by",
-    )
-    _require_sql_features(tokens, "role_attributes", required, errors)
-    parts = _projection_parts(tokens, "role_attributes", errors)
-    if parts is not None:
-        _require_projection_shape(
-            parts,
-            [
-                "rolname", "rolsuper", "rolinherit", "rolcreaterole", "rolcreatedb",
-                "rolcanlogin", "rolreplication", "rolbypassrls", "rolconnlimit",
-                "password_is_null",
-            ],
-            "role_attributes",
-            errors,
-        )
-        if parts and not _find_token_pattern(parts[0], ["r", ".", "rolname"]):
-            _add_error(errors, "verification_query_role_attributes_projection_role_name_invalid")
-        if len(parts) > 9 and not _find_token_pattern(
-            parts[9], ["a", ".", "rolpassword", "is", "null", "as", "password_is_null"]
-        ):
-            _add_error(errors, "verification_query_role_attributes_password_state_must_be_boolean_null_assertion")
-    if not _find_token_pattern(tokens, ["from", *_qualified_pattern("pg_catalog.pg_roles"), "r"]):
-        _add_error(errors, "verification_query_role_attributes_must_read_pg_roles")
-    if not _find_token_pattern(tokens, ["join", *_qualified_pattern("pg_catalog.pg_authid"), "a"]):
-        _add_error(errors, "verification_query_role_attributes_must_read_pg_authid")
-    if not _find_token_pattern(tokens, ["on", "a", ".", "oid", "=", "r", ".", "oid"]):
-        _add_error(errors, "verification_query_role_attributes_must_join_authid_by_oid")
-    if not _find_token_pattern(tokens, ["where", "r", ".", "rolname", "in"]):
-        _add_error(errors, "verification_query_role_attributes_must_filter_declared_roles")
-    if not _find_token_pattern(tokens, ["order", "by", "r", ".", "rolname"]):
-        _add_error(errors, "verification_query_role_attributes_must_order_by_role_name")
-
-
-def _validate_routine_query(query: str, errors: list[str]) -> None:
-    tokens = _read_only_query_tokens(query, "routine_acl", errors)
-    if tokens is None:
-        return
-    required = (
-        "pg_catalog.pg_proc",
-        "pg_catalog.pg_namespace",
-        "pg_catalog.pg_roles",
-        "pg_catalog.pg_trigger",
-        "pg_get_function_identity_arguments",
-        "proname",
-        "proacl",
-        "proowner",
-        "prosecdef",
-        "prokind",
-        "tgfoid",
-        "tgisinternal",
-        "order by",
-    )
-    _require_sql_features(tokens, "routine_acl", required, errors)
-    parts = _projection_parts(tokens, "routine_acl", errors)
-    if parts is not None:
-        expected_aliases = ["proname", "identity_arguments", "prokind", "prosecdef", "proacl", "proowner", "owner", "has_trigger_dependency"]
-        _require_projection_shape(parts, expected_aliases, "routine_acl", errors)
-        projection_patterns = {
-            0: _qualified_pattern("p.proname"),
-            1: ["pg_get_function_identity_arguments", "(", "p", ".", "oid", ")", "as", "identity_arguments"],
-            2: _qualified_pattern("p.prokind"),
-            3: _qualified_pattern("p.prosecdef"),
-            4: _qualified_pattern("p.proacl"),
-            5: _qualified_pattern("p.proowner"),
-            6: ["r", ".", "rolname", "as", "owner"],
-            7: ["exists", "(", "select", "1", "from", *_qualified_pattern("pg_catalog.pg_trigger"), "t"],
-        }
-        for index, pattern in projection_patterns.items():
-            if index < len(parts) and not _find_token_pattern(parts[index], pattern):
-                _add_error(errors, f"verification_query_routine_acl_projection_{index}_missing_expected_expression")
-    if not _find_token_pattern(tokens, ["from", *_qualified_pattern("pg_catalog.pg_proc"), "p"]):
-        _add_error(errors, "verification_query_routine_acl_must_read_pg_proc")
-    if not _find_token_pattern(tokens, ["join", *_qualified_pattern("pg_catalog.pg_namespace"), "n"]):
-        _add_error(errors, "verification_query_routine_acl_must_join_namespace")
-    if not _find_token_pattern(tokens, ["join", *_qualified_pattern("pg_catalog.pg_roles"), "r"]):
-        _add_error(errors, "verification_query_routine_acl_must_join_owner_roles")
-    if not _find_token_pattern(tokens, ["from", *_qualified_pattern("pg_catalog.pg_trigger"), "t"]):
-        _add_error(errors, "verification_query_routine_acl_must_read_trigger_catalog")
-    if not _find_token_pattern(tokens, ["where", "n", ".", "nspname", "=", ("STRING", "public")]):
-        _add_error(errors, "verification_query_routine_acl_must_define_public_schema_boundary")
-    if not _find_token_pattern(tokens, ["p", ".", "prokind", "in", "(", ("STRING_EXACT", "f"), ",", ("STRING_EXACT", "p"), ",", ("STRING_EXACT", "a"), ",", ("STRING_EXACT", "w"), ")"]):
-        _add_error(errors, "verification_query_routine_acl_must_cover_all_user_defined_routine_kinds")
-    if _find_token_pattern(tokens, ["proname", "like"]):
-        _add_error(errors, "verification_query_routine_acl_must_not_prefix_filter_routines")
-    if not _find_token_pattern(tokens, ["order", "by", "p", ".", "proname", ",", "identity_arguments"]):
-        _add_error(errors, "verification_query_routine_acl_must_order_deterministically")
-
-
-def validate_verification_queries(manifest: dict[str, Any], errors: list[str]) -> None:
-    queries = manifest.get("verification_queries")
-    if set(CANONICAL_VERIFICATION_QUERY_SQL) != set(VERIFICATION_QUERY_KEYS):
-        _add_error(errors, "repository_expected_verification_query_contract_keys_mismatch")
-    if not _exact_keys(queries, VERIFICATION_QUERY_KEYS, "verification_queries", errors):
-        if not isinstance(queries, dict):
-            return
-    for key in VERIFICATION_QUERY_KEYS:
-        value = queries.get(key)
-        _require_non_empty_string(value, f"verification_query_{key}", errors)
-        if type(value) is not str or not value.strip():
+def _validate_privilege_maps(manifest: Mapping[str, Any], errors: list[str]) -> None:
+    expected_db = {
+        "public": {"connect": True, "create": False, "temporary": False},
+        "runtime": {"connect": True, "create": False, "temporary": False},
+        "migrator": {"connect": True, "create": False, "temporary": False},
+        "maintenance": {"connect": True, "create": False, "temporary": False},
+    }
+    expected_schema = {
+        "public": {"usage": True, "create": False},
+        "runtime": {"usage": True, "create": False},
+        "migrator": {"usage": True, "create": True},
+        "maintenance": {"usage": True, "create": False},
+    }
+    for field, expected in (("database_privileges", expected_db), ("schema_privileges", expected_schema)):
+        value = manifest.get(field)
+        _exact_keys(value, set(expected), field, errors)
+        if not isinstance(value, Mapping):
             continue
-        if key == "default_acl":
-            _validate_default_acl_query(value, errors)
-        elif key == "role_attributes":
-            _validate_role_attributes_query(value, errors)
-        elif key == "routine_acl":
-            _validate_routine_query(value, errors)
-        elif key in REQUIRED_QUERY_FEATURES:
-            tokens = _read_only_query_tokens(value, key, errors)
-            if tokens is not None:
-                _require_sql_features(tokens, key, REQUIRED_QUERY_FEATURES[key], errors)
-        _validate_exact_query_contract(value, key, errors)
-    table_query = queries.get("effective_runtime_table_privileges")
-    if type(table_query) is str and table_query.strip():
-        tokens = _read_only_query_tokens(table_query, "effective_runtime_table_privileges", errors)
-        if tokens is not None:
-            _require_sql_features(
-                tokens,
-                "effective_runtime_table_privileges",
-                ("has_table_privilege", "pg_catalog.pg_class", "is_grantable", "'sqag_runtime'", "'public'"),
-                errors,
-            )
+        keys = set(expected["public"])
+        for role, role_expected in expected.items():
+            item = value.get(role)
+            _exact_keys(item, keys, f"{field}.{role}", errors)
+            if isinstance(item, Mapping) and dict(item) != role_expected:
+                errors.append(f"{field}.{role}:unexpected")
 
 
-def validate_manifest_strictly(manifest_path: str) -> int:
-    try:
-        raw = Path(manifest_path).read_text(encoding="utf-8")
-    except OSError as exc:
-        return _fail(f"cannot_read_manifest: {exc}")
+def _validate_table_map(value: Any, expected: Mapping[str, tuple[str, ...]], label: str, errors: list[str]) -> None:
+    _exact_keys(value, set(expected), label, errors)
+    if not isinstance(value, Mapping):
+        return
+    for table, privileges in expected.items():
+        item = value.get(table)
+        _exact_keys(item, {"privileges"}, f"{label}.{table}", errors)
+        if isinstance(item, Mapping) and tuple(_string_list(item.get("privileges"), f"{label}.{table}.privileges", errors)) != privileges:
+            errors.append(f"{label}.{table}.privileges:unexpected")
 
-    try:
-        manifest = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
-    except DuplicateKeyError as exc:
-        return _fail(f"manifest_duplicate_json_key: {exc}")
-    except json.JSONDecodeError as exc:
-        return _fail(f"manifest_invalid_json: {exc}")
-    except ValueError as exc:
-        return _fail(f"manifest_invalid_json: {exc}")
 
-    if not isinstance(manifest, dict):
-        return _fail("manifest_must_be_JSON_object")
-
+def validate_source_bindings(manifest: Mapping[str, Any], *, source_texts: Mapping[str, str] | None = None) -> list[str]:
     errors: list[str] = []
-    validate_top_level_keys(manifest, errors)
-    validate_schema_version(manifest, errors)
-    validate_source_binding(manifest, errors)
-    validate_roles(manifest, errors)
-    validate_production_migrations(manifest, errors)
-    validate_table_matrix(manifest, errors)
-    validate_column_privileges(manifest, errors)
-    validate_views(manifest, errors)
-    validate_sequences(manifest, errors)
-    validate_routines(manifest, errors)
-    validate_database_acl(manifest, errors)
-    validate_schema_acl(manifest, errors)
-    validate_default_privileges(manifest, errors)
-    validate_boundary_b(manifest, errors)
-    validate_verification_queries(manifest, errors)
+    binding = manifest.get("source_binding")
+    _exact_keys(binding, {"files", "allowed_sql_relations", "unsupported_sql_relations", "dynamic_sql_variables"}, "source_binding", errors)
+    if not isinstance(binding, Mapping):
+        return errors
+    if tuple(_string_list(binding.get("files"), "source_binding.files", errors)) != SOURCE_SQL_FILES:
+        errors.append("source_binding.files:unexpected")
+    if set(_string_list(binding.get("allowed_sql_relations"), "source_binding.allowed_sql_relations", errors)) != set(EXPECTED_TABLES):
+        errors.append("source_binding.allowed_sql_relations:unexpected")
+    if set(_string_list(binding.get("unsupported_sql_relations"), "source_binding.unsupported_sql_relations", errors)) != set(UNSUPPORTED_SOURCE_RELATIONS):
+        errors.append("source_binding.unsupported_sql_relations:unexpected")
+    dynamic = binding.get("dynamic_sql_variables")
+    if not isinstance(dynamic, Mapping):
+        errors.append("source_binding.dynamic_sql_variables:object_required")
+        dynamic = {}
+    texts = dict(source_texts or {})
+    for path in SOURCE_SQL_FILES:
+        if path not in texts:
+            try:
+                texts[path] = (ROOT / path).read_text(encoding="utf-8")
+            except OSError:
+                errors.append(f"source_binding.file_missing:{path}")
+                continue
+        literal = {m.group(1).lower() for m in SQL_RELATION_RE.finditer(texts[path]) if m.group(1).lower().startswith("sqag_")}
+        allowed = set(EXPECTED_TABLES) | set(UNSUPPORTED_SOURCE_RELATIONS)
+        unknown = sorted(literal - allowed)
+        if unknown:
+            errors.append(f"source_binding.unknown_sql_relation:{path}:{','.join(unknown)}")
+        found_dynamic = {m.group(1) for m in DYNAMIC_RELATION_RE.finditer(texts[path])}
+        declared_dynamic = set(_string_list(dynamic.get(path, []), f"source_binding.dynamic_sql_variables.{path}", errors))
+        if found_dynamic - declared_dynamic:
+            errors.append(f"source_binding.unbounded_dynamic_sql:{path}")
+    return errors
 
+
+def _validate_manifest_document(manifest: Mapping[str, Any]) -> None:
+    errors: list[str] = []
+    top = {
+        "$schema", "schema_version", "contract_type", "repository", "namespace", "roles",
+        "production_migrations", "database_privileges", "schema_privileges", "runtime_tables",
+        "maintenance_tables", "runtime_forbidden_tables", "source_binding", "observation", "policy",
+    }
+    _exact_keys(manifest, top, "contract", errors)
+    if {"canonical_source_revision", "canonical_source_tree", "implementation_registry", "source_digest", "source_sha256"}.intersection(manifest):
+        errors.append("contract:source_identity_or_digest_registry_forbidden")
+    if manifest.get("$schema") != "runtime-privilege-contract-schema-v2" or manifest.get("schema_version") != 2:
+        errors.append("contract:schema_version_unexpected")
+    if manifest.get("contract_type") != "runtime_privilege_contract" or manifest.get("repository") != "Swooshz-com/swooshz-quote-auto-generator":
+        errors.append("contract:identity_unexpected")
+    namespace = manifest.get("namespace")
+    _exact_keys(namespace, {"schema", "search_path", "tables", "indexes", "routines", "sequences", "views", "materialized_views"}, "namespace", errors)
+    if isinstance(namespace, Mapping):
+        if namespace.get("schema") != "public" or namespace.get("search_path") != ["public", "pg_catalog"]:
+            errors.append("namespace:fixed_public_search_path_required")
+        if set(_string_list(namespace.get("tables"), "namespace.tables", errors)) != set(EXPECTED_TABLES) | {LEDGER_TABLE}:
+            errors.append("namespace.tables:unexpected")
+        if set(_string_list(namespace.get("indexes"), "namespace.indexes", errors)) != set(EXPECTED_INDEXES):
+            errors.append("namespace.indexes:unexpected")
+        routines = namespace.get("routines")
+        if not isinstance(routines, list):
+            errors.append("namespace.routines:list_required")
+        else:
+            keys: set[tuple[str, str]] = set()
+            for item in routines:
+                if not isinstance(item, Mapping):
+                    errors.append("namespace.routines:item_required")
+                    continue
+                _exact_keys(item, {"name", "identity_arguments", "owner", "security_mode", "direct_execute", "trigger_only"}, "namespace.routines.item", errors)
+                keys.add((_clean(item.get("name")), _clean(item.get("identity_arguments"))))
+                if item.get("owner") != "sqag_migrator" or item.get("security_mode") != "invoker" or item.get("direct_execute") is not False or item.get("trigger_only") is not True:
+                    errors.append("namespace.routines:unsafe_properties")
+            if keys != EXPECTED_ROUTINE_KEYS:
+                errors.append("namespace.routines:unexpected")
+        for field in ("sequences", "views", "materialized_views"):
+            if namespace.get(field) != []:
+                errors.append(f"namespace.{field}:must_be_empty")
+    _validate_roles(manifest.get("roles"), errors)
+    _validate_migrations(manifest.get("production_migrations"), errors)
+    _validate_privilege_maps(manifest, errors)
+    _validate_table_map(manifest.get("runtime_tables"), RUNTIME_TABLE_PRIVILEGES, "runtime_tables", errors)
+    _validate_table_map(manifest.get("maintenance_tables"), MAINTENANCE_TABLE_PRIVILEGES, "maintenance_tables", errors)
+    forbidden = manifest.get("runtime_forbidden_tables")
+    _exact_keys(forbidden, set(RUNTIME_FORBIDDEN_TABLES), "runtime_forbidden_tables", errors)
+    if isinstance(forbidden, Mapping):
+        for table, item in forbidden.items():
+            _exact_keys(item, {"reason"}, f"runtime_forbidden_tables.{table}", errors)
+            if not isinstance(item, Mapping) or not isinstance(item.get("reason"), str) or not item["reason"].strip():
+                errors.append(f"runtime_forbidden_tables.{table}:reason_required")
+    errors.extend(validate_source_bindings(manifest))
+    observation = manifest.get("observation")
+    _exact_keys(observation, {"allowed", "forbidden"}, "observation", errors)
+    if isinstance(observation, Mapping):
+        allowed = set(_string_list(observation.get("allowed"), "observation.allowed", errors))
+        required = {"server_major", "database_identity", "search_path", "migration_ledger", "named_namespace_metadata", "normalized_acl_provenance", "role_attributes", "bounded_memberships", "effective_privileges", "sanitized_counts"}
+        if not required.issubset(allowed):
+            errors.append("observation.allowed:missing")
+        forbidden_words = ("password", "credential", "token", "customer", "raw_acl")
+        if any(any(word in item.lower() for word in forbidden_words) for item in _string_list(observation.get("forbidden"), "observation.forbidden", errors)):
+            errors.append("observation.forbidden:unsafe_terms")
+    policy = manifest.get("policy")
+    _exact_keys(policy, {"fail_closed", "no_source_digest_registry", "unknown_sqag_object_red", "dynamic_sql_requires_allowlist", "supported_server_major"}, "policy", errors)
+    if isinstance(policy, Mapping) and (policy.get("fail_closed") is not True or policy.get("no_source_digest_registry") is not True or policy.get("unknown_sqag_object_red") is not True or policy.get("dynamic_sql_requires_allowlist") is not True or policy.get("supported_server_major") != 17):
+        errors.append("policy:unsafe")
     if errors:
-        for error in errors:
-            print(f"FAIL: {error}", file=sys.stderr)
-        return 2
+        raise RuntimePrivilegeContractError(";".join(errors[:60]))
 
-    _ok("Runtime privilege contract manifest passes strict validation.")
+
+def validate_manifest(manifest: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    value = dict(manifest) if manifest is not None else load_manifest()
+    _validate_manifest_document(value)
+    return value
+
+
+def validate_manifest_strictly(manifest_path: str | Path = CONTRACT_PATH) -> int:
+    try:
+        validate_manifest(load_manifest(Path(manifest_path)))
+    except RuntimePrivilegeContractError:
+        return 1
+    return 0
+
+
+def validate_runtime_membership_edges(manifest: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    declared = set(DECLARED_ROLES)
+    errors: list[str] = []
+    seen: set[tuple[Any, ...]] = set()
+    for row in rows:
+        role, member, grantor = (_clean(row.get(key)) for key in ("role", "member", "grantor"))
+        key = (role, member, grantor, bool(row.get("admin_option")), bool(row.get("inherit_option")), bool(row.get("set_option")))
+        if key in seen:
+            errors.append("membership:duplicate")
+        seen.add(key)
+        if role in declared or member in declared or grantor in declared:
+            errors.append(f"membership:unexpected:{role}:{member}")
+    return errors
+
+
+def validate_server_version(server_version_num: int) -> None:
+    if not 170000 <= int(server_version_num) < 180000:
+        raise RuntimePrivilegeContractError("postgresql_major_mismatch")
+
+
+def _normalize_search_path(value: Any) -> list[str]:
+    return [part.strip().strip('"') for part in str(value or "").split(",") if part.strip()]
+
+
+def _acl_grantee(row: Any) -> str:
+    return _clean(_row_value(row, "grantee")) or "UNKNOWN"
+
+
+def _acl_privilege(row: Any) -> str:
+    return _clean(_row_value(row, "privilege_type")).upper()
+
+
+def _grantable(row: Any) -> bool:
+    return bool(_row_value(row, "is_grantable"))
+
+
+def _check_role_attributes(connection: Any, manifest: Mapping[str, Any], errors: list[str]) -> None:
+    rows = _rows(connection, "select rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolreplication, rolbypassrls, rolconnlimit from pg_catalog.pg_roles where rolname in (?, ?, ?) order by rolname", DECLARED_ROLES)
+    actual = {_clean(_row_value(row, "rolname")): row for row in rows}
+    for key, role_name in (("runtime", "sqag_runtime"), ("migrator", "sqag_migrator"), ("maintenance", "sqag_maintenance")):
+        row = actual.get(role_name)
+        if row is None:
+            errors.append(f"role_missing:{role_name}")
+            continue
+        observed = {
+            "login": bool(_row_value(row, "rolcanlogin")), "superuser": bool(_row_value(row, "rolsuper")),
+            "createdb": bool(_row_value(row, "rolcreatedb")), "createrole": bool(_row_value(row, "rolcreaterole")),
+            "replication": bool(_row_value(row, "rolreplication")), "bypassrls": bool(_row_value(row, "rolbypassrls")),
+            "inherit": bool(_row_value(row, "rolinherit")), "connection_limit": int(_row_value(row, "rolconnlimit")),
+        }
+        if observed != manifest["roles"][key]["attributes"]:
+            errors.append(f"role_attributes_mismatch:{role_name}")
+
+
+def _check_memberships(connection: Any, errors: list[str]) -> None:
+    rows = _rows(connection, "select parent.rolname as role, member.rolname as member, grantor.rolname as grantor, am.admin_option, am.inherit_option, am.set_option from pg_catalog.pg_auth_members am join pg_catalog.pg_roles parent on parent.oid = am.roleid join pg_catalog.pg_roles member on member.oid = am.member join pg_catalog.pg_roles grantor on grantor.oid = am.grantor where parent.rolname in (?, ?, ?) or member.rolname in (?, ?, ?) or grantor.rolname in (?, ?, ?) order by parent.rolname, member.rolname, grantor.rolname", DECLARED_ROLES * 3)
+    errors.extend(validate_runtime_membership_edges({}, [
+        {key: _row_value(row, key) for key in ("role", "member", "grantor", "admin_option", "inherit_option", "set_option")}
+        for row in rows
+    ]))
+
+
+def _check_relation_inventory(connection: Any, errors: list[str]) -> None:
+    rows = _rows(connection, "select c.relname, c.relkind, owner.rolname as owner, (c.relkind = 'i' and con.oid is not null) as generated_index from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace join pg_catalog.pg_roles owner on owner.oid = c.relowner left join pg_catalog.pg_index idx on idx.indexrelid = c.oid left join pg_catalog.pg_constraint con on con.conindid = c.oid where n.nspname = 'public' and c.relname like 'sqag_' || chr(37) and c.relkind in ('r', 'i', 'S', 'v', 'm', 'f', 'p') order by c.relname")
+    expected = {name: "r" for name in set(EXPECTED_TABLES) | {LEDGER_TABLE}}
+    expected.update({name: "i" for name in EXPECTED_INDEXES})
+    actual = {_clean(_row_value(row, "relname")): (_clean(_row_value(row, "relkind")), _clean(_row_value(row, "owner"))) for row in rows if not (_clean(_row_value(row, "relkind")) == "i" and bool(_row_value(row, "generated_index")))}
+    if set(actual) != set(expected):
+        errors.append("namespace_relation_inventory_mismatch")
+    for name, kind in expected.items():
+        observed = actual.get(name)
+        if observed is None:
+            errors.append(f"namespace_relation_missing:{name}")
+        elif observed != (kind, "sqag_migrator"):
+            errors.append(f"namespace_relation_properties_mismatch:{name}")
+
+
+def _check_container_ownership(connection: Any, errors: list[str]) -> None:
+    rows = _rows(connection, "select 'database' as object_type, d.datname as object_name, owner.rolname as owner from pg_catalog.pg_database d join pg_catalog.pg_roles owner on owner.oid = d.datdba where d.datname = current_database() union all select 'schema' as object_type, n.nspname as object_name, owner.rolname as owner from pg_catalog.pg_namespace n join pg_catalog.pg_roles owner on owner.oid = n.nspowner where n.nspname = 'public'")
+    for row in rows:
+        object_type = _clean(_row_value(row, "object_type"))
+        object_name = _clean(_row_value(row, "object_name"))
+        owner = _clean(_row_value(row, "owner"))
+        if owner in {"sqag_runtime", "sqag_maintenance", "sqag_migrator"}:
+            errors.append(f"{object_type}_owner_is_declared_runtime_role:{object_name}")
+
+
+def _check_routines(connection: Any, errors: list[str]) -> None:
+    rows = _rows(connection, "select p.proname, pg_get_function_identity_arguments(p.oid) as identity_arguments, p.prosecdef, owner.rolname as owner, exists (select 1 from pg_catalog.pg_trigger t where t.tgfoid = p.oid and not t.tgisinternal) as has_trigger_dependency, case when acl.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'UNKNOWN') end as grantee, acl.privilege_type, acl.is_grantable from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace join pg_catalog.pg_roles owner on owner.oid = p.proowner left join lateral aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) acl on true left join pg_catalog.pg_roles grantee_role on grantee_role.oid = acl.grantee and acl.grantee <> 0 where n.nspname = 'public' and p.prokind in ('f', 'p', 'a', 'w') order by p.proname, identity_arguments, grantee, acl.privilege_type")
+    grouped: dict[tuple[str, str], list[Any]] = {}
+    for row in rows:
+        grouped.setdefault((_clean(_row_value(row, "proname")), _clean(_row_value(row, "identity_arguments"))), []).append(row)
+    if set(grouped) != EXPECTED_ROUTINE_KEYS:
+        errors.append("routine_inventory_mismatch")
+    for key in EXPECTED_ROUTINE_KEYS:
+        for row in grouped.get(key, []):
+            if _clean(_row_value(row, "owner")) != "sqag_migrator" or bool(_row_value(row, "prosecdef")) or not bool(_row_value(row, "has_trigger_dependency")):
+                errors.append(f"routine_properties_mismatch:{key[0]}")
+            if _acl_grantee(row) != "sqag_migrator" or _acl_privilege(row) != "EXECUTE":
+                errors.append(f"routine_acl_mismatch:{key[0]}")
+            if _acl_grantee(row) in {"PUBLIC", "sqag_runtime", "sqag_maintenance"} or (_grantable(row) and _acl_grantee(row) != "sqag_migrator"):
+                errors.append(f"routine_escalation:{key[0]}")
+
+
+def _check_table_acls(connection: Any, errors: list[str]) -> None:
+    rows = _rows(connection, "select c.relname, owner.rolname as owner, case when acl.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'UNKNOWN') end as grantee, acl.privilege_type, acl.is_grantable from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace join pg_catalog.pg_roles owner on owner.oid = c.relowner left join lateral aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) acl on true left join pg_catalog.pg_roles grantee_role on grantee_role.oid = acl.grantee and acl.grantee <> 0 where n.nspname = 'public' and c.relkind = 'r' and c.relname like 'sqag_' || chr(37) order by c.relname, grantee, acl.privilege_type")
+    grouped: dict[str, dict[str, set[str]]] = {}
+    owners: dict[str, str] = {}
+    grantable: set[tuple[str, str, str]] = set()
+    for row in rows:
+        table, grantee, privilege = _clean(_row_value(row, "relname")), _acl_grantee(row), _acl_privilege(row)
+        owners[table] = _clean(_row_value(row, "owner"))
+        grouped.setdefault(table, {}).setdefault(grantee, set()).add(privilege)
+        if _grantable(row):
+            grantable.add((table, grantee, privilege))
+    expected_tables = set(RUNTIME_TABLE_PRIVILEGES) | set(MAINTENANCE_TABLE_PRIVILEGES) | RUNTIME_FORBIDDEN_TABLES
+    for table in expected_tables:
+        if owners.get(table) != "sqag_migrator":
+            errors.append(f"table_acl_owner_mismatch:{table}")
+        table_grants = grouped.get(table, {})
+        if table_grants.get("PUBLIC"):
+            errors.append(f"table_acl_public:{table}")
+        if any(grantee not in {"sqag_migrator", "sqag_runtime", "sqag_maintenance", "PUBLIC"} for grantee in table_grants):
+            errors.append(f"table_acl_unknown_grantee:{table}")
+        if table_grants.get("sqag_runtime", set()) != set(RUNTIME_TABLE_PRIVILEGES.get(table, ())):
+            errors.append(f"runtime_direct_privilege_mismatch:{table}")
+        if table_grants.get("sqag_maintenance", set()) != set(MAINTENANCE_TABLE_PRIVILEGES.get(table, ())):
+            errors.append(f"maintenance_direct_privilege_mismatch:{table}")
+        if any(table_name == table and grantee in {"sqag_runtime", "sqag_maintenance"} for table_name, grantee, _ in grantable):
+            errors.append(f"table_grant_option:{table}")
+
+
+def _check_database_schema_acls(connection: Any, errors: list[str]) -> None:
+    db_rows = _rows(connection, "select case when acl.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'UNKNOWN') end as grantee, acl.privilege_type, acl.is_grantable from pg_catalog.pg_database d left join lateral aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) acl on true left join pg_catalog.pg_roles grantee_role on grantee_role.oid = acl.grantee and acl.grantee <> 0 where d.datname = current_database() order by grantee, acl.privilege_type")
+    schema_rows = _rows(connection, "select case when acl.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'UNKNOWN') end as grantee, acl.privilege_type, acl.is_grantable from pg_catalog.pg_namespace n left join lateral aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) acl on true left join pg_catalog.pg_roles grantee_role on grantee_role.oid = acl.grantee and acl.grantee <> 0 where n.nspname = 'public' order by grantee, acl.privilege_type")
+    expected = {
+        "database": {"PUBLIC": {"CONNECT"}, "sqag_runtime": {"CONNECT"}, "sqag_migrator": {"CONNECT"}, "sqag_maintenance": {"CONNECT"}},
+        "schema": {"PUBLIC": {"USAGE"}, "sqag_runtime": {"USAGE"}, "sqag_migrator": {"USAGE", "CREATE"}, "sqag_maintenance": {"USAGE"}},
+    }
+    for label, rows, required in (("database", db_rows, expected["database"]), ("schema", schema_rows, expected["schema"])):
+        observed: dict[str, set[str]] = {}
+        for row in rows:
+            grantee = _acl_grantee(row)
+            observed.setdefault(grantee, set()).add(_acl_privilege(row))
+            if grantee in {"sqag_runtime", "sqag_maintenance"} and _grantable(row):
+                errors.append(f"{label}_grant_option:{grantee}")
+        for grantee, privileges in required.items():
+            if observed.get(grantee, set()) != privileges:
+                errors.append(f"{label}_direct_privilege_mismatch:{grantee}")
+        if any(grantee not in set(required) | {"postgres", "pg_database_owner", "sqag_database_owner", "UNKNOWN"} for grantee in observed):
+            errors.append(f"{label}_unknown_grantee")
+
+
+def _check_default_acls(connection: Any, errors: list[str]) -> None:
+    rows = _rows(connection, "select case when acl.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'UNKNOWN') end as grantee, acl.privilege_type, acl.is_grantable from pg_catalog.pg_default_acl d left join lateral aclexplode(d.defaclacl) acl on true left join pg_catalog.pg_roles grantee_role on grantee_role.oid = acl.grantee and acl.grantee <> 0 where d.defaclrole in (select oid from pg_catalog.pg_roles where rolname in (?, ?, ?))", DECLARED_ROLES)
+    for row in rows:
+        grantee = _acl_grantee(row)
+        if grantee in {"PUBLIC", "sqag_runtime", "sqag_maintenance"} or (_grantable(row) and grantee != "sqag_migrator"):
+            errors.append(f"default_acl_escalation:{grantee}")
+
+
+def _check_columns(connection: Any, errors: list[str]) -> None:
+    rows = _rows(connection, "select table_name, grantee, privilege_type, is_grantable from information_schema.role_column_grants where table_schema = 'public' and table_name like 'sqag_' || chr(37)")
+    for row in rows:
+        if _clean(_row_value(row, "grantee")) in {"sqag_runtime", "sqag_maintenance", "PUBLIC"}:
+            errors.append(f"column_privilege:{_clean(_row_value(row, 'table_name'))}")
+
+
+def _check_effective(connection: Any, errors: list[str]) -> None:
+    for role in RUNTIME_ROLES:
+        for privilege, expected in (("CONNECT", True), ("CREATE", False), ("TEMPORARY", False)):
+            row = _rows(connection, "select has_database_privilege(?, current_database(), ?) as effective, has_database_privilege(?, current_database(), ?) as grantable", (role, privilege, role, f"{privilege} WITH GRANT OPTION"))[0]
+            if bool(_row_value(row, "effective")) != expected or bool(_row_value(row, "grantable")):
+                errors.append(f"effective_database_privilege:{role}:{privilege}")
+        for privilege, expected in (("USAGE", True), ("CREATE", False)):
+            row = _rows(connection, "select has_schema_privilege(?, 'public', ?) as effective, has_schema_privilege(?, 'public', ?) as grantable", (role, privilege, role, f"{privilege} WITH GRANT OPTION"))[0]
+            if bool(_row_value(row, "effective")) != expected or bool(_row_value(row, "grantable")):
+                errors.append(f"effective_schema_privilege:{role}:{privilege}")
+        for table in sorted(set(EXPECTED_TABLES) | {LEDGER_TABLE}):
+            allowed = set(RUNTIME_TABLE_PRIVILEGES.get(table, ())) if role == "sqag_runtime" else set(MAINTENANCE_TABLE_PRIVILEGES.get(table, ()))
+            for privilege in TABLE_PRIVILEGES:
+                qualified = f"public.{table}"
+                row = _rows(connection, "select has_table_privilege(?, ?, ?) as effective, has_table_privilege(?, ?, ?) as grantable", (role, qualified, privilege, role, qualified, f"{privilege} WITH GRANT OPTION"))[0]
+                if bool(_row_value(row, "effective")) != (privilege in allowed) or bool(_row_value(row, "grantable")):
+                    errors.append(f"effective_table_privilege:{role}:{table}:{privilege}")
+        for routine_name, identity_arguments in sorted(EXPECTED_ROUTINE_KEYS):
+            rows = _rows(connection, "select has_function_privilege(?, p.oid, 'EXECUTE') as effective from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' and p.proname = ? and pg_get_function_identity_arguments(p.oid) = ?", (role, routine_name, identity_arguments))
+            if any(bool(_row_value(row, "effective")) for row in rows):
+                errors.append(f"effective_routine_privilege:{role}:{routine_name}")
+
+
+def verify_postgres_privilege_contract(connection: Any, manifest: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    contract = validate_manifest(manifest)
+    errors: list[str] = []
+    try:
+        validate_server_version(int(_row_value(_rows(connection, "select current_setting('server_version_num') as server_version_num")[0], "server_version_num")))
+    except (TypeError, ValueError, RuntimePrivilegeContractError):
+        errors.append("postgresql_major_mismatch")
+    if not _rows(connection, "show search_path") or _normalize_search_path(_row_value(_rows(connection, "show search_path")[0], "search_path", 0)) != ["public", "pg_catalog"]:
+        errors.append("search_path_not_fixed")
+    _check_role_attributes(connection, contract, errors)
+    _check_memberships(connection, errors)
+    _check_relation_inventory(connection, errors)
+    _check_routines(connection, errors)
+    _check_table_acls(connection, errors)
+    _check_database_schema_acls(connection, errors)
+    _check_default_acls(connection, errors)
+    _check_container_ownership(connection, errors)
+    _check_columns(connection, errors)
+    _check_effective(connection, errors)
+    if errors:
+        raise RuntimePrivilegeContractError(";".join(errors[:80]))
+    return {"status": "verified", "postgres_major": 17, "search_path": ["public", "pg_catalog"], "declared_roles": 3, "declared_tables": len(EXPECTED_TABLES) + 1, "declared_indexes": len(EXPECTED_INDEXES), "declared_routines": len(EXPECTED_ROUTINES), "raw_values_materialized": False}
+
+
+def validate_migration_report(report: Mapping[str, Any]) -> None:
+    if report.get("safeToApply") is not True or report.get("status") != "ready" or report.get("pendingMigrationIds") or report.get("blockers"):
+        raise RuntimePrivilegeContractError("migration_state_not_final")
+
+
+def main() -> int:
+    try:
+        validate_manifest()
+    except RuntimePrivilegeContractError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+    print("OK: A25 runtime privilege contract is structurally valid and source-bound without a digest registry.")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(validate_manifest_strictly(str(MANIFEST_PATH)))
+    raise SystemExit(main())

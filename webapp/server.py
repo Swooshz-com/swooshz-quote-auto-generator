@@ -342,6 +342,7 @@ QUOTE_DATA_ROOT_ENV_NAME = "QUOTE_DATA_ROOT"
 SQAG_STORAGE_MODE_ENV_NAME = "SQAG_STORAGE_MODE"
 SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME = "SQAG_ARTIFACT_STORAGE_MODE"
 SQAG_DATABASE_URL_ENV_NAME = "SQAG_DATABASE_URL"
+SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME = "SQAG_MAINTENANCE_DATABASE_URL"
 SQAG_LIVE_DATABASE_EVIDENCE_ENV_NAME = "SQAG_LIVE_DATABASE_EVIDENCE"
 POSTGRES_COMPATIBLE_DATABASE_SCHEMES = {"postgres", "postgresql"}
 SQLITE_DATABASE_SCHEMES = {"sqlite"}
@@ -699,6 +700,7 @@ def scrub_sensitive_text(text: str) -> str:
         )
     for env_name in (
         SQAG_DATABASE_URL_ENV_NAME,
+        SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME,
         OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME,
         OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME,
         OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME,
@@ -1579,6 +1581,11 @@ def configured_object_storage_backend() -> ObjectStorageBackend:
 
 def configured_database_url() -> str:
     return clean_text(read_dotenv_value(SQAG_DATABASE_URL_ENV_NAME))
+
+
+def configured_maintenance_database_url() -> str:
+    """Return the retention-only PostgreSQL projection without fallback."""
+    return clean_text(read_dotenv_value(SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME))
 
 
 def database_url_from_env(env: Mapping[str, str]) -> str:
@@ -9552,7 +9559,15 @@ def postgres_driver_connection_factory():
         ) from exc
 
     def connect(database_url: str):
-        return psycopg.connect(database_url, row_factory=dict_row)
+        # Bind every supported connection to the declared application
+        # namespace before any application SQL runs. Using libpq options
+        # avoids issuing a statement before callers can establish a read-only
+        # transaction for preflight/evidence collection.
+        return psycopg.connect(
+            database_url,
+            row_factory=dict_row,
+            options="-c search_path=public,pg_catalog",
+        )
 
     return connect
 

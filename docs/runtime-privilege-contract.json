@@ -1,400 +1,168 @@
 {
-  "$schema": "runtime-privilege-contract-schema-v1",
-  "schema_version": 1,
+  "$schema": "runtime-privilege-contract-schema-v2",
+  "schema_version": 2,
   "contract_type": "runtime_privilege_contract",
   "repository": "Swooshz-com/swooshz-quote-auto-generator",
-  "canonical_source_revision": "cc53c685ff617aaa5bf1eb24e8a62c1273570779",
-  "canonical_source_tree": "68d67a9a08c4c3d9e86460e24060f31fdc0eaa27",
-
+  "namespace": {
+    "schema": "public",
+    "search_path": ["public", "pg_catalog"],
+    "tables": [
+      "sqag_audit_events",
+      "sqag_deletion_receipts",
+      "sqag_feedback",
+      "sqag_feedback_status_history",
+      "sqag_generation_evidence",
+      "sqag_generation_runs",
+      "sqag_legal_holds",
+      "sqag_object_artifacts",
+      "sqag_pricing_references",
+      "sqag_profiles",
+      "sqag_quote_publication_artifacts",
+      "sqag_quote_publication_versions",
+      "sqag_quote_sessions",
+      "sqag_retention_delete_authorizations",
+      "sqag_retention_scan_cursors",
+      "sqag_schema_migrations"
+    ],
+    "indexes": [
+      "sqag_audit_events_actor_idx",
+      "sqag_audit_events_feedback_idx",
+      "sqag_audit_events_retention_idx",
+      "sqag_audit_events_run_idx",
+      "sqag_deletion_receipts_retention_idx",
+      "sqag_feedback_history_parent_idx",
+      "sqag_feedback_publication_idx",
+      "sqag_feedback_retention_idx",
+      "sqag_feedback_support_idx",
+      "sqag_feedback_workspace_status_idx",
+      "sqag_generation_evidence_retention_idx",
+      "sqag_generation_evidence_run_idx",
+      "sqag_generation_runs_actor_idx",
+      "sqag_generation_runs_retention_idx",
+      "sqag_generation_runs_workspace_idempotency_uidx",
+      "sqag_generation_runs_workspace_job_uidx",
+      "sqag_generation_runs_workspace_started_idx",
+      "sqag_legal_holds_active_target_uidx",
+      "sqag_legal_holds_state_idx",
+      "sqag_quote_publication_artifacts_session_idx",
+      "sqag_quote_publication_versions_retention_idx",
+      "sqag_quote_publication_versions_session_idx"
+    ],
+    "routines": [
+      {
+        "name": "sqag_reject_immutable_change",
+        "identity_arguments": "",
+        "owner": "sqag_migrator",
+        "security_mode": "invoker",
+        "direct_execute": false,
+        "trigger_only": true
+      },
+      {
+        "name": "sqag_require_retention_delete_authorization",
+        "identity_arguments": "",
+        "owner": "sqag_migrator",
+        "security_mode": "invoker",
+        "direct_execute": false,
+        "trigger_only": true
+      }
+    ],
+    "sequences": [],
+    "views": [],
+    "materialized_views": []
+  },
   "roles": {
     "runtime": {
       "name": "sqag_runtime",
-      "description": "Restricted application runtime role. Dormant NOLOGIN during Boundary A/B. Activated with LOGIN in #160 only after independent verification.",
-      "attributes": {
-        "login": false,
-        "password": null,
-        "superuser": false,
-        "createdb": false,
-        "createrole": false,
-        "replication": false,
-        "bypassrls": false,
-        "inherit": true,
-        "connection_limit": -1
-      },
+      "attributes": {"login": true, "superuser": false, "createdb": false, "createrole": false, "replication": false, "bypassrls": false, "inherit": false, "connection_limit": -1},
       "memberships_as_member": [],
-      "inherited_roles": [],
-      "set_assumable_roles": [],
-      "membership_derived_privileges": [],
-      "provider_control_edges": [
-        {
-          "parent_role": "sqag_runtime",
-          "member_role": "neondb_owner",
-          "grantor": "cloud_admin",
-          "admin_option": true,
-          "inherit_option": false,
-          "set_option": false,
-          "classification": "postgresql17_creator_admin_control",
-          "security_rationale": "PostgreSQL 17 system-generated creator-admin control for the provider administrator; it grants no privilege, inheritance, or SET-role path to sqag_runtime."
-        }
-      ],
-      "ownership": [],
+      "owned_objects": [],
       "grant_options": []
     },
     "migrator": {
       "name": "sqag_migrator",
-      "description": "Owner/operator authority. Owns all application database objects. Applies ACL changes. Cannot create roles.",
-      "can_create_roles": false
+      "attributes": {"login": true, "superuser": false, "createdb": false, "createrole": false, "replication": false, "bypassrls": false, "inherit": false, "connection_limit": -1},
+      "memberships_as_member": [],
+      "owned_objects": "all_declared_namespace_objects",
+      "grant_options": []
     },
-    "legacy": {
-      "name": "sqag_app",
-      "description": "Legacy active rollback role. Retained until separately gated retirement after #160 switch and observation window.",
-      "status": "retained_until_retirement"
-    },
-    "provider": {
-      "name": "neondb_owner",
-      "description": "Provider/control-plane role. Creates/alters roles through separately authorised provider authority. Unchanged by SQAG.",
-      "status": "provider_unchanged"
-    },
-    "forbidden": ["sqag_maintenance"]
+    "maintenance": {
+      "name": "sqag_maintenance",
+      "attributes": {"login": true, "superuser": false, "createdb": false, "createrole": false, "replication": false, "bypassrls": false, "inherit": false, "connection_limit": -1},
+      "memberships_as_member": [],
+      "owned_objects": [],
+      "grant_options": []
+    }
   },
-
   "production_migrations": [
-    {
-      "path": "migrations/001_platform_scoped_storage.sql",
-      "sequence_no": 1,
-      "sha256": "7ee6e622ba1f99d5d1ae192e0ca979a660ba9a398b67b4ce6e0113bc9c09a8a4",
-      "tables": ["sqag_profiles", "sqag_pricing_references", "sqag_quote_sessions"]
-    },
-    {
-      "path": "migrations/003_object_artifact_metadata.sql",
-      "sequence_no": 2,
-      "sha256": "df3e7bb40865d9b11dbe7dfb9e6a721937680c4401341f0ddf255dab5627ac19",
-      "tables": ["sqag_object_artifacts"]
-    },
-    {
-      "path": "migrations/004_generation_forensics_feedback_retention_postgres.sql",
-      "sequence_no": 3,
-      "sha256": "17e3e779891e76197db477305d0d5d436fb3f25f9ea508993063ce9bd7b39933",
-      "tables": [
-        "sqag_generation_runs",
-        "sqag_generation_evidence",
-        "sqag_audit_events",
-        "sqag_feedback",
-        "sqag_feedback_status_history",
-        "sqag_legal_holds",
-        "sqag_retention_delete_authorizations",
-        "sqag_deletion_receipts",
-        "sqag_retention_scan_cursors"
-      ]
-    },
-    {
-      "path": "migrations/005_forensic_postgres_delete_guards.sql",
-      "sequence_no": 4,
-      "sha256": "e4a8d9ce7aceeb59b896dcf621dd04e760a8820891eea258d9edc12f7c0de057",
-      "tables": []
-    },
-    {
-      "path": "migrations/006_quote_publication_versions_postgres.sql",
-      "sequence_no": 5,
-      "sha256": "a66f620733c171571dfe44d078ef4bd37d2f8425bdc39d5278703af948d8e2f2",
-      "tables": ["sqag_quote_publication_versions", "sqag_quote_publication_artifacts"]
-    },
-    {
-      "path": "migrations/007_feedback_publication_binding_postgres.sql",
-      "sequence_no": 6,
-      "sha256": "886faa1a4cc76c942decbe02834662961fa336ca670d88f159ab3c5523cccc78",
-      "tables": []
-    }
+    {"path": "migrations/001_platform_scoped_storage.sql", "sequence_no": 1, "sha256": "7ee6e622ba1f99d5d1ae192e0ca979a660ba9a398b67b4ce6e0113bc9c09a8a4", "tables": ["sqag_pricing_references", "sqag_profiles", "sqag_quote_sessions"]},
+    {"path": "migrations/003_object_artifact_metadata.sql", "sequence_no": 2, "sha256": "df3e7bb40865d9b11dbe7dfb9e6a721937680c4401341f0ddf255dab5627ac19", "tables": ["sqag_object_artifacts"]},
+    {"path": "migrations/004_generation_forensics_feedback_retention_postgres.sql", "sequence_no": 3, "sha256": "17e3e779891e76197db477305d0d5d436fb3f25f9ea508993063ce9bd7b39933", "tables": ["sqag_audit_events", "sqag_deletion_receipts", "sqag_feedback", "sqag_feedback_status_history", "sqag_generation_evidence", "sqag_generation_runs", "sqag_legal_holds", "sqag_retention_delete_authorizations", "sqag_retention_scan_cursors"]},
+    {"path": "migrations/005_forensic_postgres_delete_guards.sql", "sequence_no": 4, "sha256": "e4a8d9ce7aceeb59b896dcf621dd04e760a8820891eea258d9edc12f7c0de057", "tables": []},
+    {"path": "migrations/006_quote_publication_versions_postgres.sql", "sequence_no": 5, "sha256": "a66f620733c171571dfe44d078ef4bd37d2f8425bdc39d5278703af948d8e2f2", "tables": ["sqag_quote_publication_artifacts", "sqag_quote_publication_versions"]},
+    {"path": "migrations/007_feedback_publication_binding_postgres.sql", "sequence_no": 6, "sha256": "886faa1a4cc76c942decbe02834662961fa336ca670d88f159ab3c5523cccc78", "tables": []}
   ],
-
-  "database_acl": {
-    "public": {
-      "connect": true,
-      "temporary": "forbidden_after_boundary_b",
-      "create": false
-    },
-    "sqag_migrator": {
-      "connect": true,
-      "create": true,
-      "temporary": true
-    },
-    "sqag_app": {
-      "connect": "retained_until_retirement"
-    },
-    "sqag_runtime": {
-      "connect": true,
-      "create": false,
-      "temporary": false
-    }
+  "database_privileges": {
+    "public": {"connect": true, "create": false, "temporary": false},
+    "runtime": {"connect": true, "create": false, "temporary": false},
+    "migrator": {"connect": true, "create": false, "temporary": false},
+    "maintenance": {"connect": true, "create": false, "temporary": false}
   },
-
-  "schema_acl": {
-    "schema_name": "public",
-    "public": {
-      "usage": true
-    },
-    "pg_database_owner": {
-      "create": true,
-      "usage": true
-    },
-    "sqag_app": {
-      "usage": "retained_until_retirement"
-    },
-    "sqag_runtime": {
-      "usage": true,
-      "create": false
-    }
+  "schema_privileges": {
+    "public": {"usage": true, "create": false},
+    "runtime": {"usage": true, "create": false},
+    "migrator": {"usage": true, "create": true},
+    "maintenance": {"usage": true, "create": false}
   },
-
-  "tables": {
-    "rw_count": 11,
-    "forbidden_count": 5,
-    "total_count": 16,
-    "runtime_accessible": {
-      "sqag_profiles": {
-        "class": "mutable",
-        "schema": "public",
-        "privileges": {
-          "select": true,
-          "insert": true,
-          "update": true,
-          "delete": true
-        }
-      },
-      "sqag_pricing_references": {
-        "class": "mutable",
-        "schema": "public",
-        "privileges": {
-          "select": true,
-          "insert": true,
-          "update": true,
-          "delete": true
-        }
-      },
-      "sqag_quote_sessions": {
-        "class": "mutable",
-        "schema": "public",
-        "privileges": {
-          "select": true,
-          "insert": true,
-          "update": true,
-          "delete": true
-        }
-      },
-      "sqag_generation_runs": {
-        "class": "append_and_status",
-        "schema": "public",
-        "privileges": {
-          "select": true,
-          "insert": true,
-          "update": true,
-          "delete": false
-        }
-      },
-      "sqag_generation_evidence": {
-        "class": "immutable_evidence",
-        "schema": "public",
-        "privileges": {
-          "select": true,
-          "insert": true,
-          "update": false,
-          "delete": false
-        }
-      },
-      "sqag_audit_events": {
-        "class": "immutable_audit",
-        "schema": "public",
-        "privileges": {
-          "select": true,
-          "insert": true,
-          "update": false,
-          "delete": false
-        }
-      },
-      "sqag_feedback": {
-        "class": "mutable_feedback",
-        "schema": "public",
-        "privileges": {
-          "select": true,
-          "insert": true,
-          "update": true,
-          "delete": false
-        }
-      },
-      "sqag_feedback_status_history": {
-        "class": "append_only_history",
-        "schema": "public",
-        "privileges": {
-          "select": true,
-          "insert": true,
-          "update": false,
-          "delete": false
-        }
-      },
-      "sqag_object_artifacts": {
-        "class": "mutable_metadata",
-        "schema": "public",
-        "privileges": {
-          "select": true,
-          "insert": true,
-          "update": true,
-          "delete": false
-        }
-      },
-      "sqag_quote_publication_versions": {
-        "class": "mutable",
-        "schema": "public",
-        "privileges": {
-          "select": true,
-          "insert": true,
-          "update": true,
-          "delete": true
-        }
-      },
-      "sqag_quote_publication_artifacts": {
-        "class": "mutable",
-        "schema": "public",
-        "privileges": {
-          "select": true,
-          "insert": true,
-          "update": false,
-          "delete": true
-        }
-      }
-    },
-    "runtime_forbidden": {
-      "sqag_legal_holds": {
-        "class": "operator_only",
-        "schema": "public",
-        "reason": "No runtime privilege. Operator/retention-only."
-      },
-      "sqag_retention_delete_authorizations": {
-        "class": "retention_only",
-        "schema": "public",
-        "reason": "No runtime privilege. Retention-only internal mechanism."
-      },
-      "sqag_deletion_receipts": {
-        "class": "retention_only",
-        "schema": "public",
-        "reason": "No runtime privilege. Retention-only internal mechanism."
-      },
-      "sqag_retention_scan_cursors": {
-        "class": "retention_only",
-        "schema": "public",
-        "reason": "No runtime privilege. Retention-only internal mechanism."
-      },
-      "sqag_schema_migrations": {
-        "class": "migration_only",
-        "schema": "public",
-        "reason": "No runtime privilege. Migration ledger owned by sqag_migrator."
-      }
-    }
+  "runtime_tables": {
+    "sqag_profiles": {"privileges": ["SELECT", "INSERT", "UPDATE", "DELETE"]},
+    "sqag_pricing_references": {"privileges": ["SELECT", "INSERT", "UPDATE", "DELETE"]},
+    "sqag_quote_sessions": {"privileges": ["SELECT", "INSERT", "UPDATE", "DELETE"]},
+    "sqag_generation_runs": {"privileges": ["SELECT", "INSERT", "UPDATE"]},
+    "sqag_generation_evidence": {"privileges": ["SELECT", "INSERT"]},
+    "sqag_audit_events": {"privileges": ["SELECT", "INSERT"]},
+    "sqag_feedback": {"privileges": ["SELECT", "INSERT", "UPDATE"]},
+    "sqag_feedback_status_history": {"privileges": ["SELECT", "INSERT"]},
+    "sqag_object_artifacts": {"privileges": ["SELECT", "INSERT", "UPDATE"]},
+    "sqag_quote_publication_versions": {"privileges": ["SELECT", "INSERT", "UPDATE", "DELETE"]},
+    "sqag_quote_publication_artifacts": {"privileges": ["SELECT", "INSERT", "DELETE"]}
   },
-
-  "column_privileges": {
-    "sqag_quote_publication_artifacts": {
-      "update": ["checksum_sha256"]
-    }
+  "maintenance_tables": {
+    "sqag_quote_sessions": {"privileges": ["SELECT", "DELETE"]},
+    "sqag_object_artifacts": {"privileges": ["SELECT", "UPDATE"]},
+    "sqag_generation_runs": {"privileges": ["SELECT", "UPDATE", "DELETE"]},
+    "sqag_generation_evidence": {"privileges": ["SELECT", "DELETE"]},
+    "sqag_audit_events": {"privileges": ["SELECT", "INSERT", "DELETE"]},
+    "sqag_feedback": {"privileges": ["SELECT", "UPDATE", "DELETE"]},
+    "sqag_feedback_status_history": {"privileges": ["SELECT", "DELETE"]},
+    "sqag_legal_holds": {"privileges": ["SELECT", "INSERT", "UPDATE"]},
+    "sqag_retention_delete_authorizations": {"privileges": ["SELECT", "INSERT", "DELETE"]},
+    "sqag_deletion_receipts": {"privileges": ["SELECT", "INSERT", "DELETE"]},
+    "sqag_retention_scan_cursors": {"privileges": ["SELECT", "INSERT", "UPDATE", "DELETE"]},
+    "sqag_quote_publication_versions": {"privileges": ["SELECT", "DELETE"]},
+    "sqag_quote_publication_artifacts": {"privileges": ["SELECT", "DELETE"]}
   },
-
-  "views": {
-    "count": 1,
-    "runtime_accessible": {
-      "sqag_quote_artifacts": {
-        "schema": "public",
-        "class": "legacy_publication_backfill",
-        "privileges": {
-          "select": true
-        },
-        "production_source": "webapp.server.DatabaseSqagStorage.publish_quote_session_forensic_transaction",
-        "bound": true
-      }
-    }
+  "runtime_forbidden_tables": {
+    "sqag_legal_holds": {"reason": "maintenance-only legal-hold state"},
+    "sqag_retention_delete_authorizations": {"reason": "maintenance-only delete guard input"},
+    "sqag_deletion_receipts": {"reason": "maintenance-only deletion receipts"},
+    "sqag_retention_scan_cursors": {"reason": "maintenance-only retention cursor"},
+    "sqag_schema_migrations": {"reason": "migrator-only schema ledger"}
   },
-
-  "sequences": {
-    "user_defined_public_count": 0,
-    "runtime_privileges": "none",
-    "rule": "Any future production sequence must be explicitly classified before CI passes."
+  "source_binding": {
+    "files": ["webapp/server.py", "webapp/forensics.py", "scripts/enforce_forensic_retention.py"],
+    "allowed_sql_relations": ["sqag_audit_events", "sqag_deletion_receipts", "sqag_feedback", "sqag_feedback_status_history", "sqag_generation_evidence", "sqag_generation_runs", "sqag_legal_holds", "sqag_object_artifacts", "sqag_pricing_references", "sqag_profiles", "sqag_quote_publication_artifacts", "sqag_quote_publication_versions", "sqag_quote_sessions", "sqag_retention_delete_authorizations", "sqag_retention_scan_cursors"],
+    "unsupported_sql_relations": ["sqag_file_artifacts", "sqag_quote_artifacts"],
+    "dynamic_sql_variables": {"webapp/server.py": ["table"], "webapp/forensics.py": ["table"], "scripts/enforce_forensic_retention.py": []}
   },
-
-  "routines": {
-    "sqag_owned_triggers": {
-      "sqag_reject_immutable_change": {
-        "schema": "public",
-        "owner": "sqag_migrator",
-        "security_mode": "invoker",
-        "class": "trigger_only",
-        "direct_runtime_execute": false,
-        "public_execute_after_boundary_b": false
-      },
-      "sqag_require_retention_delete_authorization": {
-        "schema": "public",
-        "owner": "sqag_migrator",
-        "security_mode": "invoker",
-        "class": "trigger_only",
-        "direct_runtime_execute": false,
-        "public_execute_after_boundary_b": false
-      }
-    },
-    "sqag_owned_count": 2,
-    "provider_owned_exceptions": {
-      "show_db_tree": {
-        "schema": "public",
-        "owner": "neondb_owner",
-        "class": "provider_diagnostic_exception",
-        "direct_runtime_grant": false,
-        "public_execute": "unchanged",
-        "effective_runtime_execution": "bounded_public_exception"
-      }
-    },
-    "total_count": 3,
-    "rule": "No direct runtime routine grants. Every future routine must be explicitly classified before CI passes."
+  "observation": {
+    "allowed": ["server_major", "database_identity", "search_path", "migration_ledger", "named_namespace_metadata", "normalized_acl_provenance", "role_attributes", "bounded_memberships", "effective_privileges", "sanitized_counts"],
+    "forbidden": ["authentication_material", "business_rows", "private_provider_values", "object_bytes", "query_text", "sensitive_statistics", "raw_catalogue_graphs"]
   },
-
-  "default_privileges": {
-    "object_classes": ["r", "S", "f", "n", "T"],
-    "sqag_runtime": {
-      "tables": "none",
-      "sequences": "none",
-      "routines": "none"
-    },
-    "sqag_migrator_to_sqag_app": "preserved_during_boundary_a_and_initial_boundary_b",
-    "provider_controlled": "unchanged",
-    "verification_rule": "Must expand defaclacl through aclexplode() or equivalent grantee-aware operation. Checking defaclrole alone is insufficient."
-  },
-
-  "boundary_b": {
-    "requires_postgresql17": true,
-    "runtime_role": "sqag_runtime",
-    "object_owner": "sqag_migrator",
-    "database_owner_authority": "database_owner",
-    "authority_input_model": "variable_reference_only",
+  "policy": {
     "fail_closed": true,
-    "idempotent_rerun": true,
-    "operations": {
-      "database_acl_grant": "database_owner_authority",
-      "schema_acl_grant": "database_owner_authority",
-      "public_temporary_revoke": "database_owner_authority",
-      "object_privilege_grants": "object_owner",
-      "public_trigger_execute_revoke": "object_owner"
-    }
-  },
-
-  "verification_queries": {
-    "database_acl": "select datacl from pg_catalog.pg_database where datname = current_database()",
-    "schema_acl": "select nspacl from pg_catalog.pg_namespace where nspname = 'public'",
-    "table_acl": "select relname, relacl from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relkind = 'r' and n.nspname = 'public' and c.relname like 'sqag_' || chr(37) order by relname",
-    "routine_acl": "select p.proname, pg_get_function_identity_arguments(p.oid) as identity_arguments, p.prokind, p.prosecdef, p.proacl, p.proowner, r.rolname as owner, exists (select 1 from pg_catalog.pg_trigger t where t.tgfoid = p.oid and not t.tgisinternal) as has_trigger_dependency from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace join pg_catalog.pg_roles r on r.oid = p.proowner where n.nspname = 'public' and p.prokind in ('f', 'p', 'a', 'w') order by p.proname, identity_arguments",
-    "default_acl": "select owner.rolname as owner, coalesce(ns.nspname, '<global>') as namespace, d.defaclobjtype as object_type, case when expanded.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'OID:' || expanded.grantee::text) end as grantee, expanded.privilege_type, expanded.is_grantable from pg_catalog.pg_default_acl d join pg_catalog.pg_roles owner on owner.oid = d.defaclrole left join pg_catalog.pg_namespace ns on ns.oid = d.defaclnamespace cross join lateral pg_catalog.aclexplode(d.defaclacl) expanded left join pg_catalog.pg_roles grantee_role on grantee_role.oid = expanded.grantee and expanded.grantee <> 0 where d.defaclobjtype in ('r', 'S', 'f', 'n', 'T') order by owner, namespace, object_type, grantee, expanded.privilege_type, expanded.is_grantable",
-    "role_attributes": "select r.rolname, r.rolsuper, r.rolinherit, r.rolcreaterole, r.rolcreatedb, r.rolcanlogin, r.rolreplication, r.rolbypassrls, r.rolconnlimit, a.rolpassword is null as password_is_null from pg_catalog.pg_roles r join pg_catalog.pg_authid a on a.oid = r.oid where r.rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_app', 'neondb_owner') order by r.rolname",
-    "role_memberships": "select r.rolname as role, m.rolname as member, grantor.rolname as grantor, am.admin_option, am.inherit_option, am.set_option from pg_catalog.pg_auth_members am join pg_catalog.pg_roles r on r.oid = am.roleid join pg_catalog.pg_roles m on m.oid = am.member join pg_catalog.pg_roles grantor on grantor.oid = am.grantor order by role, member, grantor",
-    "sequence_acl": "select relname, relacl from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relkind = 'S' and n.nspname = 'public' order by relname",
-    "effective_runtime_database_privileges": "select p.privilege_type, has_database_privilege('sqag_runtime', current_database(), p.privilege_type) as effective, has_database_privilege('sqag_runtime', current_database(), p.privilege_type || ' WITH GRANT OPTION') as is_grantable from (values ('CONNECT'), ('CREATE'), ('TEMPORARY')) p(privilege_type) order by p.privilege_type",
-    "effective_runtime_table_privileges": "select n.nspname as schema_name, c.relname as table_name, p.privilege_type, has_table_privilege('sqag_runtime', c.oid, p.privilege_type) as effective, has_table_privilege('sqag_runtime', c.oid, p.privilege_type || ' WITH GRANT OPTION') as is_grantable from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace cross join (values ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE'), ('REFERENCES'), ('TRIGGER'), ('MAINTAIN')) p(privilege_type) where n.nspname = 'public' and c.relkind = 'r' and c.relname like 'sqag_' || chr(37) order by n.nspname, c.relname, p.privilege_type",
-    "effective_runtime_column_privileges": "select n.nspname as schema_name, c.relname as table_name, a.attname as column_name, p.privilege_type, has_column_privilege('sqag_runtime', c.oid, a.attname, p.privilege_type) as effective, has_column_privilege('sqag_runtime', c.oid, a.attname, p.privilege_type || ' WITH GRANT OPTION') as is_grantable from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace join pg_catalog.pg_attribute a on a.attrelid = c.oid cross join (values ('SELECT'), ('INSERT'), ('UPDATE'), ('REFERENCES')) p(privilege_type) where n.nspname = 'public' and c.relkind = 'r' and c.relname like 'sqag_' || chr(37) and a.attnum > 0 and not a.attisdropped order by n.nspname, c.relname, a.attname, p.privilege_type",
-    "effective_runtime_schema_privileges": "select p.privilege_type, has_schema_privilege('sqag_runtime', 'public', p.privilege_type) as effective, has_schema_privilege('sqag_runtime', 'public', p.privilege_type || ' WITH GRANT OPTION') as is_grantable from (values ('USAGE'), ('CREATE')) p(privilege_type) order by p.privilege_type",
-    "effective_runtime_routine_privileges": "select p.proname as routine_name, has_function_privilege('sqag_runtime', p.oid, 'EXECUTE') as effective from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' order by p.proname",
-    "view_acl": "select c.relname as view_name, c.relacl as view_acl from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relkind = 'v' and n.nspname = 'public' order by c.relname"
+    "no_source_digest_registry": true,
+    "unknown_sqag_object_red": true,
+    "dynamic_sql_requires_allowlist": true,
+    "supported_server_major": 17
   }
 }

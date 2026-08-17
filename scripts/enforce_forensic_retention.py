@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Process a bounded batch of expired SQAG forensic records for one workspace.")
     parser.add_argument("--workspace-id", required=True)
     parser.add_argument("--database-url", help="Explicit local SQLite URL only. Use --use-configured-database for Postgres.")
-    parser.add_argument("--use-configured-database", action="store_true", help="Use SQAG_DATABASE_URL from the configured environment.")
+    parser.add_argument("--use-configured-database", action="store_true", help="Use SQAG_MAINTENANCE_DATABASE_URL from the configured environment.")
     parser.add_argument("--apply", action="store_true", help="Perform deletion and create receipts.")
     parser.add_argument("--dry-run", action="store_true", help="Report candidates without deletion.")
     parser.add_argument("--batch-size", type=int, default=100, help="Maximum parent graphs to inspect (1-500).")
@@ -97,7 +97,16 @@ def _main() -> int:
     if args.database_url and not argv_database_url_allowed(args.database_url):
         print(json.dumps(blocked("database_url_argv_requires_sqlite"), indent=2, sort_keys=True))
         return 2
-    database_url = args.database_url or (webapp.configured_database_url() if args.use_configured_database else "")
+    if args.use_configured_database:
+        database_url = webapp.configured_maintenance_database_url()
+        if not database_url:
+            print(json.dumps(blocked("maintenance_database_url_absent"), indent=2, sort_keys=True))
+            return 2
+        if not webapp.postgres_database_url_is_supported(database_url):
+            print(json.dumps(blocked("maintenance_database_url_requires_postgres"), indent=2, sort_keys=True))
+            return 2
+    else:
+        database_url = args.database_url or ""
     now = parsed_now(args.now)
     batch_size = max(1, min(args.batch_size, 500))
 
