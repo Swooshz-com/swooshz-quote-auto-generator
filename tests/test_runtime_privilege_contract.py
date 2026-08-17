@@ -246,6 +246,18 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                 )
                 self.created_roles.append(role)
 
+        with self._admin_connection() as connection:
+            before_grant = connection.execute(
+                "select has_schema_privilege(%s, %s, %s)",
+                ("sqag_migrator", "public", "CREATE"),
+            ).fetchone()
+            self.assertFalse(before_grant["has_schema_privilege"])
+            connection.execute("grant usage, create on schema public to sqag_migrator")
+            after_grant = connection.execute(
+                "select has_schema_privilege(%s, %s, %s)",
+                ("sqag_migrator", "public", "CREATE"),
+            ).fetchone()
+            self.assertTrue(after_grant["has_schema_privilege"])
         migrator_url = safe_postgres_url("sqag_migrator", self.database_name)
         with webapp.postgres_storage_connection(migrator_url) as connection:
             result = apply_postgres_migrations(connection, self.manifest)
