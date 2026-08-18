@@ -2314,9 +2314,33 @@ async function main() {
     const firstDuplicateRequestPaused = new Promise((resolve) => {
       markFirstDuplicateRequestPaused = resolve;
     });
+    let recoveryPhaseArmed = false;
+    let recoveryDetailRequestCount = 0;
+    let releaseRecoveryDuplicateRequest = null;
+    let markRecoveryDuplicateRequestPaused = null;
+    let recoveryRequestPauseReached = false;
+    let recoveryHandshakeFailed = false;
+    const recoveryDuplicateRequestPaused = new Promise((resolve) => {
+      markRecoveryDuplicateRequestPaused = resolve;
+    });
     const awaitFirstDuplicateRequestPaused = () => new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error("First duplicate detail request pause was not reached.")), 15000);
       firstDuplicateRequestPaused.then(() => {
+        clearTimeout(timeout);
+        resolve();
+      }, (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+    });
+    const awaitRecoveryDuplicateRequestPaused = () => new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        recoveryHandshakeFailed = true;
+        recoveryPhaseArmed = false;
+        if (typeof releaseRecoveryDuplicateRequest === "function") releaseRecoveryDuplicateRequest();
+        reject(new Error("Recovery duplicate detail request pause was not reached."));
+      }, 15000);
+      recoveryDuplicateRequestPaused.then(() => {
         clearTimeout(timeout);
         resolve();
       }, (error) => {
@@ -2353,6 +2377,12 @@ async function main() {
         app_busy: appState.appBusy,
         restore_busy: appState.restoreBusy,
         first_request_pause_reached: firstRequestPauseReached,
+        recovery_detail_request_count: recoveryDetailRequestCount,
+        recovery_phase_armed: recoveryPhaseArmed,
+        recovery_request_pause_reached: recoveryRequestPauseReached,
+        first_request_release_authority_present: typeof releaseInitialDuplicateRequest === "function",
+        recovery_request_release_authority_present: typeof releaseRecoveryDuplicateRequest === "function",
+        recovery_handshake_failed: recoveryHandshakeFailed,
       };
     };
     const failDuplicateInterruption = async (message, firstRequestPauseReached) => {
@@ -2374,9 +2404,20 @@ async function main() {
         await route.abort("aborted");
         return;
       }
+      if (recoveryPhaseArmed && !recoveryHandshakeFailed && recoveryDetailRequestCount === 0) {
+        recoveryDetailRequestCount += 1;
+        await new Promise((resolve) => {
+          releaseRecoveryDuplicateRequest = resolve;
+          markRecoveryDuplicateRequestPaused();
+        });
+        await route.continue();
+        return;
+      }
       await route.continue();
     };
     await page.route(duplicateDetailPattern, duplicateDetailRoute);
+    let duplicatedTargetCard;
+    try {
     await currentDashboardCard.click();
     await page.locator('[data-dashboard-panel-action="duplicate-session"]', { hasText: "Duplicate Quote" }).click();
     let firstRequestPauseReached = false;
@@ -2406,6 +2447,7 @@ async function main() {
     if (!dashboardLoadingModalVisible || !dashboardLoadingTitleExpected) {
       await failDuplicateInterruption("Duplicate interruption loading contract failed.", firstRequestPauseReached);
     }
+    recoveryPhaseArmed = true;
     const duplicateReload = page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForTimeout(100);
     if (typeof releaseInitialDuplicateRequest !== "function") {
@@ -2414,15 +2456,53 @@ async function main() {
     releaseInitialDuplicateRequest();
     await duplicateReload;
     await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
-    await page.locator("#dashboardLoadingTitle", { hasText: "Duplicating quote" }).waitFor({ state: "visible", timeout: 15000 });
-    const duplicatedTargetCard = page.locator(`.dashboard-session-card[data-quote-session-id="${interruptedDuplicateOperation.targetSessionId}"]`);
+    await awaitRecoveryDuplicateRequestPaused();
+    recoveryRequestPauseReached = true;
+    const recoveryDuplicateOperation = await page.evaluate(() => JSON.parse(
+      window.localStorage.getItem("swooshz_dashboard_operation_v1") || "null"
+    ));
+    const recoveryDuplicateOperationContractValid = Boolean(
+      recoveryDuplicateOperation
+      && recoveryDuplicateOperation.type === "duplicate"
+      && recoveryDuplicateOperation.sourceSessionId === currentDashboardSessionId
+      && typeof recoveryDuplicateOperation.targetSessionId === "string"
+      && recoveryDuplicateOperation.targetSessionId.length > 0
+      && recoveryDuplicateOperation.targetSessionId !== currentDashboardSessionId
+      && recoveryDuplicateOperation.targetSessionId === interruptedDuplicateOperation.targetSessionId
+    );
+    if (!recoveryDuplicateOperationContractValid) {
+      throw new Error("Post-reload duplicate operation contract failed.");
+    }
+    const recoveryLoadingModalVisible = await page.locator("#dashboardLoadingModal").isVisible();
+    const recoveryLoadingTitle = page.locator("#dashboardLoadingTitle");
+    const recoveryLoadingTitleVisible = await recoveryLoadingTitle.isVisible();
+    const recoveryLoadingTitleText = recoveryLoadingTitleVisible ? (await recoveryLoadingTitle.innerText()).trim() : "";
+    if (!recoveryLoadingModalVisible || !recoveryLoadingTitleVisible || recoveryLoadingTitleText !== "Duplicating quote") {
+      throw new Error("Post-reload duplicate loading contract failed.");
+    }
+    if (typeof releaseRecoveryDuplicateRequest !== "function") {
+      throw new Error("Recovery duplicate detail request was not held.");
+    }
+    recoveryPhaseArmed = false;
+    releaseRecoveryDuplicateRequest();
+    releaseRecoveryDuplicateRequest = null;
+    duplicatedTargetCard = page.locator(`.dashboard-session-card[data-quote-session-id="${interruptedDuplicateOperation.targetSessionId}"]`);
     await duplicatedTargetCard.waitFor({ state: "visible", timeout: 15000 });
     await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 15000 });
     await page.waitForFunction(() => !window.localStorage.getItem("swooshz_dashboard_operation_v1"));
     if (await duplicatedTargetCard.count() !== 1) {
       throw new Error(`Duplicate refresh should create exactly one target ${interruptedDuplicateOperation.targetSessionId}.`);
     }
-    await page.unroute(duplicateDetailPattern, duplicateDetailRoute);
+    } catch (error) {
+      recoveryPhaseArmed = false;
+      recoveryHandshakeFailed = true;
+      if (typeof releaseInitialDuplicateRequest === "function") releaseInitialDuplicateRequest();
+      if (typeof releaseRecoveryDuplicateRequest === "function") releaseRecoveryDuplicateRequest();
+      throw error;
+    } finally {
+      recoveryPhaseArmed = false;
+      await page.unroute(duplicateDetailPattern, duplicateDetailRoute);
+    }
     await duplicatedTargetCard.click();
     await page.locator('[data-dashboard-panel-action="delete-session"]').click();
     await page.locator("#confirmQuoteSessionDeleteButton").click();
