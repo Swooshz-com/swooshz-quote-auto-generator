@@ -274,6 +274,7 @@ def _build_default_storage(database_url: str, workspace_id: str) -> Any:
         workspace_id,
         role="admin",
         user_id=f"{workspace_id}-synthetic-user",
+        expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
     )
 
 

@@ -144,6 +144,23 @@ class RuntimePrivilegeContractStaticTest(unittest.TestCase):
         self.assertIn("configured_maintenance_database_url", retention_source)
         self.assertNotIn("configured_database_url()", retention_source)
 
+    def test_migrator_projection_never_falls_back_to_runtime_or_maintenance_database_url(self):
+        values = {
+            webapp.SQAG_DATABASE_URL_ENV_NAME: "postgresql://runtime.example/sqag",
+            webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME: "postgresql://maintenance.example/sqag",
+            webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME: "",
+        }
+
+        def read_value(name: str) -> str:
+            return values.get(name, "")
+
+        with mock.patch.object(webapp, "read_dotenv_value", side_effect=read_value):
+            self.assertEqual(webapp.configured_migrator_database_url(), "")
+        preflight_source = (ROOT / "scripts" / "preflight_sqag_migrations.py").read_text(encoding="utf-8")
+        self.assertIn("configured_migrator_database_url", preflight_source)
+        self.assertNotIn("migrator_url = webapp.configured_database_url()", preflight_source)
+        self.assertNotIn("migrator_url = webapp.configured_maintenance_database_url()", preflight_source)
+
     def test_retention_readiness_is_limited_to_forensic_surfaces(self):
         storage = webapp.DatabaseSqagStorage(
             "sqlite:///:memory:",
@@ -237,8 +254,9 @@ class _FakeIdentityCursor:
 
 
 class _FakeIdentityRawConnection:
-    def __init__(self, current_user: str):
+    def __init__(self, current_user: str, session_user: str | None = None):
         self.current_user = current_user
+        self.session_user = session_user or current_user
         self.statements: list[str] = []
         self.rollback_calls = 0
         self.closed = False
@@ -246,8 +264,13 @@ class _FakeIdentityRawConnection:
     def execute(self, sql, params=()):
         _ = params
         self.statements.append(sql)
-        if sql == "select current_user as role":
-            return _FakeIdentityCursor({"role": self.current_user})
+        if sql == "select session_user as session_role, current_user as active_role":
+            return _FakeIdentityCursor(
+                {
+                    "session_role": self.session_user,
+                    "active_role": self.current_user,
+                }
+            )
         return _FakeIdentityCursor({"ok": True})
 
     def rollback(self):
@@ -260,8 +283,14 @@ class _FakeIdentityRawConnection:
 class RuntimeSessionIdentityBindingTest(unittest.TestCase):
     DATABASE_URL = "postgresql://sqag_runtime:synthetic-secret@db.example.test/sqag"
 
-    def _preflight(self, current_user: str, *, maintenance: bool = False):
-        raw = _FakeIdentityRawConnection(current_user)
+    def _preflight(
+        self,
+        current_user: str,
+        *,
+        maintenance: bool = False,
+        session_user: str | None = None,
+    ):
+        raw = _FakeIdentityRawConnection(current_user, session_user=session_user)
         connect = lambda _database_url: raw
         with (
             mock.patch.object(webapp, "postgres_driver_connection_factory", return_value=connect),
@@ -277,8 +306,8 @@ class RuntimeSessionIdentityBindingTest(unittest.TestCase):
             )
         return result, raw
 
-    def _runtime_storage(self, current_user: str):
-        raw = _FakeIdentityRawConnection(current_user)
+    def _runtime_storage(self, current_user: str, *, session_user: str | None = None):
+        raw = _FakeIdentityRawConnection(current_user, session_user=session_user)
         connect = lambda _database_url: raw
         with mock.patch.object(webapp, "postgres_driver_connection_factory", return_value=connect):
             storage = webapp.DatabaseSqagStorage(
@@ -292,11 +321,11 @@ class RuntimeSessionIdentityBindingTest(unittest.TestCase):
 
     def test_runtime_preflight_accepts_exact_server_authoritative_identity(self):
         result, raw = self._preflight(webapp.SQAG_RUNTIME_DATABASE_ROLE)
-        self.assertEqual(result[0]["status"], "ready")
+        self.assertIsNone(result[0])
         self.assertEqual(result[1]["status"], "verified")
         self.assertEqual(
             raw.statements[:2],
-            ["select current_user as role", "set transaction read only"],
+            ["select session_user as session_role, current_user as active_role", "set transaction read only"],
         )
         self.assertEqual(raw.rollback_calls, 1)
         self.assertTrue(raw.closed)
@@ -307,7 +336,7 @@ class RuntimeSessionIdentityBindingTest(unittest.TestCase):
                 with self.assertRaises(webapp.SqagStorageAccessError):
                     self._preflight(current_user)
                 _, raw = self._preflight_rejected(current_user)
-                self.assertEqual(raw.statements, ["select current_user as role"])
+                self.assertEqual(raw.statements, ["select session_user as session_role, current_user as active_role"])
                 self.assertEqual(raw.rollback_calls, 0)
                 self.assertTrue(raw.closed)
 
@@ -328,7 +357,7 @@ class RuntimeSessionIdentityBindingTest(unittest.TestCase):
         raw = self._runtime_storage(webapp.SQAG_RUNTIME_DATABASE_ROLE)
         self.assertEqual(
             raw.statements,
-            ["select current_user as role", "select application_sql"],
+            ["select session_user as session_role, current_user as active_role", "select application_sql"],
         )
         self.assertTrue(raw.closed)
 
@@ -346,7 +375,7 @@ class RuntimeSessionIdentityBindingTest(unittest.TestCase):
                     with self.assertRaises(webapp.SqagStorageAccessError) as raised:
                         with storage.connection():
                             self.fail("application SQL must not run after a runtime identity mismatch")
-                self.assertEqual(raw.statements, ["select current_user as role"])
+                self.assertEqual(raw.statements, ["select session_user as session_role, current_user as active_role"])
                 self.assertTrue(raw.closed)
                 message = str(raised.exception)
                 self.assertNotIn(self.DATABASE_URL, message)
@@ -365,15 +394,35 @@ class RuntimeSessionIdentityBindingTest(unittest.TestCase):
         self.assertNotIn("SQAG_RUNTIME_DATABASE_ROLE_ENV_NAME", source)
         self.assertNotIn("read_dotenv_value(SQAG_RUNTIME_DATABASE_ROLE", source)
 
+    def test_assumed_role_is_rejected_before_protected_sql_for_every_fixed_role(self):
+        identity_query = "select session_user as session_role, current_user as active_role"
+        for expected_role in (
+            webapp.SQAG_RUNTIME_DATABASE_ROLE,
+            webapp.SQAG_MIGRATOR_DATABASE_ROLE,
+            webapp.SQAG_MAINTENANCE_DATABASE_ROLE,
+        ):
+            with self.subTest(expected_role=expected_role):
+                raw = _FakeIdentityRawConnection(expected_role, session_user="synthetic_login")
+                connect = lambda _database_url: raw
+                with mock.patch.object(webapp, "postgres_driver_connection_factory", return_value=connect):
+                    with self.assertRaises(webapp.SqagStorageAccessError):
+                        with webapp.postgres_storage_connection(
+                            self.DATABASE_URL,
+                            expected_role=expected_role,
+                        ) as connection:
+                            connection.execute("protected_sql_must_not_run")
+                self.assertEqual(raw.statements, [identity_query])
+                self.assertTrue(raw.closed)
+
     def test_maintenance_preflight_accepts_only_exact_maintenance_identity(self):
         result, raw = self._preflight(
             webapp.SQAG_MAINTENANCE_DATABASE_ROLE,
             maintenance=True,
         )
-        self.assertEqual(result[0]["status"], "ready")
+        self.assertIsNone(result[0])
         self.assertEqual(
             raw.statements[:2],
-            ["select current_user as role", "set transaction read only"],
+            ["select session_user as session_role, current_user as active_role", "set transaction read only"],
         )
         with self.assertRaises(webapp.SqagStorageAccessError):
             self._preflight(webapp.SQAG_RUNTIME_DATABASE_ROLE, maintenance=True)
@@ -403,6 +452,18 @@ class StructuralSessionAuthorityTest(unittest.TestCase):
         self.assertIn("expected_session_role=SQAG_RUNTIME_DATABASE_ROLE", server_source)
         self.assertIn("expected_session_role=webapp.SQAG_MAINTENANCE_DATABASE_ROLE", retention_source)
 
+    def test_production_postgres_caller_inventory_is_semantic_and_fails_closed_on_missing_binding(self):
+        self.assertEqual(contract.validate_session_authority_source(), [])
+        for relative_path, spec in contract.PRODUCTION_POSTGRES_CALLER_SPECS.items():
+            source = (ROOT / relative_path).read_text(encoding="utf-8")
+            self.assertTrue(all(str(role) in source for role in (*spec["storage_roles"], *spec["connection_roles"])))
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "unbound.py"
+            path.write_text("from webapp import server as webapp\nwebapp.DatabaseSqagStorage(url, 'workspace')\n", encoding="utf-8")
+            spec = contract.PRODUCTION_POSTGRES_CALLER_SPECS["scripts/verify_production_database_provider.py"]
+            errors = contract._validate_production_postgres_caller(path, spec)
+        self.assertTrue(any("storage_call_site_unbound" in item for item in errors))
+
     def test_omitted_postgres_expected_role_cannot_open_a_storage_connection(self):
         storage = webapp.DatabaseSqagStorage(self.DATABASE_URL, "workspace-omitted-role")
         with self.assertRaises(webapp.SqagStorageAccessError) as raised:
@@ -424,7 +485,7 @@ class StructuralSessionAuthorityTest(unittest.TestCase):
         )
         self.assertEqual(
             accepted.statements,
-            ["select current_user as role", "delete from public.sqag_generation_runs"],
+            ["select session_user as session_role, current_user as active_role", "delete from public.sqag_generation_runs"],
         )
         for current_user in ("postgres", "sqag_migrator", "sqag_runtime"):
             with self.subTest(current_user=current_user):
@@ -440,7 +501,7 @@ class StructuralSessionAuthorityTest(unittest.TestCase):
                     with self.assertRaises(webapp.SqagStorageAccessError) as raised:
                         with storage.connection():
                             self.fail("destructive SQL must not run after maintenance identity mismatch")
-                self.assertEqual(raw.statements, ["select current_user as role"])
+                self.assertEqual(raw.statements, ["select session_user as session_role, current_user as active_role"])
                 self.assertTrue(raw.closed)
                 message = str(raised.exception)
                 self.assertNotIn(self.DATABASE_URL, message)
@@ -457,7 +518,7 @@ class StructuralSessionAuthorityTest(unittest.TestCase):
                 expected_role=webapp.SQAG_MIGRATOR_DATABASE_ROLE,
             ) as connection:
                 connection.execute("select migration_sql")
-        self.assertEqual(raw.statements, ["select current_user as role", "select migration_sql"])
+        self.assertEqual(raw.statements, ["select session_user as session_role, current_user as active_role", "select migration_sql"])
         for current_user in (webapp.SQAG_RUNTIME_DATABASE_ROLE, webapp.SQAG_MAINTENANCE_DATABASE_ROLE):
             raw = _FakeIdentityRawConnection(current_user)
             connect = lambda _database_url: raw
@@ -468,7 +529,7 @@ class StructuralSessionAuthorityTest(unittest.TestCase):
                         expected_role=webapp.SQAG_MIGRATOR_DATABASE_ROLE,
                     ):
                         self.fail("migration identity mismatch must stop before migration SQL")
-            self.assertEqual(raw.statements, ["select current_user as role"])
+            self.assertEqual(raw.statements, ["select session_user as session_role, current_user as active_role"])
 
     def test_maintenance_preflight_rejects_all_nonmaintenance_identities(self):
         case = RuntimeSessionIdentityBindingTest("runTest")
@@ -690,6 +751,183 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         finally:
             restore()
         self.assertEqual(self._verify()["status"], "verified")
+
+    def _restore_canonical_forensic_routines(self):
+        for trigger, table in (
+            ("sqag_generation_evidence_no_update", "sqag_generation_evidence"),
+            ("sqag_audit_events_no_update", "sqag_audit_events"),
+            ("sqag_feedback_linkage_no_update", "sqag_feedback"),
+            ("sqag_generation_evidence_guard_delete", "sqag_generation_evidence"),
+            ("sqag_audit_events_guard_delete", "sqag_audit_events"),
+        ):
+            self._execute_admin(f"drop trigger if exists {trigger} on public.{table}")
+        self._execute_admin("drop routine if exists public.sqag_reject_immutable_change()")
+        self._execute_admin("drop routine if exists public.sqag_require_retention_delete_authorization()")
+        self._execute_admin("create function public.sqag_reject_immutable_change() returns trigger language plpgsql security invoker as $$ begin return old; end $$;")
+        self._execute_admin("create function public.sqag_require_retention_delete_authorization() returns trigger language plpgsql security invoker as $$ begin return old; end $$;")
+        for routine in ("sqag_reject_immutable_change", "sqag_require_retention_delete_authorization"):
+            self._execute_admin(f"alter function public.{routine}() owner to sqag_migrator")
+            self._execute_admin(f"revoke all privileges on function public.{routine}() from public, sqag_runtime, sqag_maintenance")
+            self._execute_admin(f"grant execute on function public.{routine}() to sqag_migrator")
+        self._execute_admin("create trigger sqag_generation_evidence_no_update before update on public.sqag_generation_evidence for each row execute function public.sqag_reject_immutable_change()")
+        self._execute_admin("create trigger sqag_audit_events_no_update before update on public.sqag_audit_events for each row execute function public.sqag_reject_immutable_change()")
+        self._execute_admin("create trigger sqag_feedback_linkage_no_update before update of run_id, session_id, publication_version_id, link_resolution_source, link_resolved_at on public.sqag_feedback for each row execute function public.sqag_reject_immutable_change()")
+        self._execute_admin("create trigger sqag_generation_evidence_guard_delete before delete on public.sqag_generation_evidence for each row execute function public.sqag_require_retention_delete_authorization()")
+        self._execute_admin("create trigger sqag_audit_events_guard_delete before delete on public.sqag_audit_events for each row execute function public.sqag_require_retention_delete_authorization()")
+
+    def test_real_pg17_authenticated_and_active_identity_invariant(self):
+        for expected_role in (
+            webapp.SQAG_RUNTIME_DATABASE_ROLE,
+            webapp.SQAG_MIGRATOR_DATABASE_ROLE,
+            webapp.SQAG_MAINTENANCE_DATABASE_ROLE,
+        ):
+            with self.subTest(expected_role=expected_role):
+                with webapp.postgres_storage_connection(
+                    safe_postgres_url(expected_role, self.database_name),
+                    expected_role=expected_role,
+                ) as connection:
+                    row = connection.execute(
+                        "select session_user as session_role, current_user as active_role"
+                    ).fetchone()
+                self.assertEqual(row["session_role"], expected_role)
+                self.assertEqual(row["active_role"], expected_role)
+        for expected_role in (
+            webapp.SQAG_RUNTIME_DATABASE_ROLE,
+            webapp.SQAG_MIGRATOR_DATABASE_ROLE,
+            webapp.SQAG_MAINTENANCE_DATABASE_ROLE,
+        ):
+            with self.subTest(assumed_role=expected_role):
+                with self.psycopg.connect(
+                    safe_postgres_url("postgres", self.database_name),
+                    row_factory=self.dict_row,
+                    options="-c search_path=public,pg_catalog",
+                    autocommit=True,
+                ) as raw:
+                    raw.execute(
+                        self.sql.SQL("set role {}").format(self.sql.Identifier(expected_role))
+                    )
+                    adapter = webapp.PostgresConnectionAdapter(raw)
+                    with self.assertRaises(webapp.SqagStorageAccessError):
+                        webapp.require_postgres_session_role(adapter, expected_role)
+
+    def test_real_pg17_canonical_routine_identity_passes(self):
+        self.assertEqual(self._verify()["status"], "verified")
+
+    def test_real_pg17_routine_identity_negative_matrix(self):
+        def restore_overload():
+            self._execute_admin("drop function if exists public.sqag_reject_immutable_change(integer)")
+            self._restore_canonical_forensic_routines()
+
+        def restore_decoy():
+            self._execute_admin("drop function if exists public.sqag_reject_immutable_change(integer)")
+            self._restore_canonical_forensic_routines()
+
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "create function public.sqag_reject_immutable_change(integer) returns integer "
+                "language sql immutable as $$ select 1 $$;"
+            ),
+            restore_overload,
+            "routine overload",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "alter function public.sqag_reject_immutable_change() owner to sqag_runtime"
+            ),
+            self._restore_canonical_forensic_routines,
+            "routine owner",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "create or replace function public.sqag_reject_immutable_change() "
+                "returns trigger language plpgsql security definer as $$ begin return old; end $$;"
+            ),
+            self._restore_canonical_forensic_routines,
+            "security definer",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "drop trigger sqag_generation_evidence_no_update on public.sqag_generation_evidence"
+            ),
+            self._restore_canonical_forensic_routines,
+            "missing trigger",
+        )
+        self._red_then_restore(
+            lambda: (
+                self._execute_admin(
+                    "drop trigger sqag_generation_evidence_no_update on public.sqag_generation_evidence"
+                ),
+                self._execute_admin(
+                    "create trigger sqag_generation_evidence_no_update before update "
+                    "on public.sqag_generation_evidence for each row execute function "
+                    "public.sqag_require_retention_delete_authorization()"
+                ),
+            ),
+            self._restore_canonical_forensic_routines,
+            "wrong trigger linkage",
+        )
+        self._red_then_restore(
+            lambda: (
+                self._execute_admin(
+                    "create function public.sqag_reject_immutable_change(integer) returns integer "
+                    "language sql immutable as $$ select 1 $$;"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_generation_evidence_no_update on public.sqag_generation_evidence"
+                ),
+                self._execute_admin(
+                    "create trigger sqag_generation_evidence_no_update before update "
+                    "on public.sqag_generation_evidence for each row execute function "
+                    "public.sqag_require_retention_delete_authorization()"
+                ),
+            ),
+            restore_decoy,
+            "same-name decoy linkage",
+        )
+        self._red_then_restore(
+            lambda: (
+                self._execute_admin(
+                    "drop trigger sqag_generation_evidence_no_update on public.sqag_generation_evidence"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_audit_events_no_update on public.sqag_audit_events"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_feedback_linkage_no_update on public.sqag_feedback"
+                ),
+                self._execute_admin(
+                    "drop function public.sqag_reject_immutable_change()"
+                ),
+                self._execute_admin(
+                    "create function public.sqag_reject_immutable_change() returns integer "
+                    "language sql immutable as $$ select 1 $$;"
+                ),
+            ),
+            self._restore_canonical_forensic_routines,
+            "wrong return type",
+        )
+        self._red_then_restore(
+            lambda: (
+                self._execute_admin(
+                    "drop trigger sqag_generation_evidence_no_update on public.sqag_generation_evidence"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_audit_events_no_update on public.sqag_audit_events"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_feedback_linkage_no_update on public.sqag_feedback"
+                ),
+                self._execute_admin(
+                    "drop function public.sqag_reject_immutable_change()"
+                ),
+                self._execute_admin(
+                    "create procedure public.sqag_reject_immutable_change() "
+                    "language plpgsql as $$ begin null; end $$;"
+                ),
+            ),
+            self._restore_canonical_forensic_routines,
+            "wrong routine kind",
+        )
 
     def test_real_pg17_migrations_capabilities_provenance_and_workspace_isolation(self):
         evidence = self._verify()
@@ -1038,6 +1276,46 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                 ("workspace-retention", "run-retention-alpha"),
             ).fetchone()
         self.assertIsNone(remaining)
+
+    def test_real_pg17_migrator_only_ledger_and_role_projections(self):
+        runtime_url = safe_postgres_url("sqag_runtime", self.database_name)
+        maintenance_url = safe_postgres_url("sqag_maintenance", self.database_name)
+        migrator_url = safe_postgres_url("sqag_migrator", self.database_name)
+        for database_url, expected_role in (
+            (runtime_url, webapp.SQAG_RUNTIME_DATABASE_ROLE),
+            (maintenance_url, webapp.SQAG_MAINTENANCE_DATABASE_ROLE),
+        ):
+            with webapp.postgres_storage_connection(database_url, expected_role=expected_role) as connection:
+                with self.assertRaises(Exception):
+                    connection.execute("select 1 from public.sqag_schema_migrations")
+        runtime_report = preflight._inspect_privilege_projection(
+            runtime_url, self.manifest, webapp.SQAG_RUNTIME_DATABASE_ROLE
+        )
+        maintenance_report = preflight._inspect_privilege_projection(
+            maintenance_url, self.manifest, webapp.SQAG_MAINTENANCE_DATABASE_ROLE
+        )
+        self.assertEqual(runtime_report["status"], "verified")
+        self.assertEqual(maintenance_report["status"], "verified")
+        migrator_report = preflight._inspect_migration_ledger(migrator_url, self.migrations)
+        self.assertEqual(migrator_report["status"], "ready")
+        with self.assertRaises(webapp.SqagStorageAccessError):
+            preflight._inspect_migration_ledger(runtime_url, self.migrations)
+        with self._admin_connection() as connection:
+            runtime_ledger = connection.execute(
+                "select has_table_privilege(%s, %s, 'SELECT') as allowed",
+                (webapp.SQAG_RUNTIME_DATABASE_ROLE, "public.sqag_schema_migrations"),
+            ).fetchone()
+            maintenance_ledger = connection.execute(
+                "select has_table_privilege(%s, %s, 'SELECT') as allowed",
+                (webapp.SQAG_MAINTENANCE_DATABASE_ROLE, "public.sqag_schema_migrations"),
+            ).fetchone()
+            migrator_ledger = connection.execute(
+                "select has_table_privilege(%s, %s, 'SELECT') as allowed",
+                (webapp.SQAG_MIGRATOR_DATABASE_ROLE, "public.sqag_schema_migrations"),
+            ).fetchone()
+        self.assertFalse(runtime_ledger["allowed"])
+        self.assertFalse(maintenance_ledger["allowed"])
+        self.assertTrue(migrator_ledger["allowed"])
 
     def _execute_admin(self, statement: str, params=()):
         with self._admin_connection() as connection:

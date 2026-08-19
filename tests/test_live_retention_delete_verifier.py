@@ -41,7 +41,8 @@ def local_test_directory():
 def complete_env() -> dict[str, str]:
     return {
         "SQAG_LIVE_RETENTION_DELETE_EVIDENCE": "1",
-        "SQAG_DATABASE_URL": "REDACTED_DB_TARGET_MARKER",
+        "SQAG_MAINTENANCE_DATABASE_URL": "REDACTED_DB_TARGET_MARKER",
+        "SQAG_MIGRATOR_DATABASE_URL": "REDACTED_MIGRATOR_DB_TARGET_MARKER",
         "SQAG_OBJECT_STORAGE_PROVIDER": "REDACTED_PROVIDER_MARKER",
         "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "REDACTED_ENDPOINT_MARKER",
         "SQAG_OBJECT_STORAGE_BUCKET": "REDACTED_BUCKET_MARKER",
@@ -383,7 +384,8 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
 
         self.assertEqual(report["status"], "blocked")
         self.assertIn("SQAG_LIVE_RETENTION_DELETE_EVIDENCE", report["missing_env_names"])
-        self.assertIn("SQAG_DATABASE_URL", report["missing_env_names"])
+        self.assertIn(webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME, report["missing_env_names"])
+        self.assertIn(webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME, report["missing_env_names"])
         self.assertFalse(report["live_retention_delete_evidence_supported"])
         self.assertEqual(report["privacy"]["output"], "metadata-only")
         self.assertNotIn("REDACTED_DB_TARGET_MARKER", text)
@@ -493,7 +495,8 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
     def test_legacy_database_url_alone_does_not_satisfy_database_requirement(self):
         verifier = load_verifier()
         env = complete_env()
-        env.pop("SQAG_DATABASE_URL")
+        env.pop(webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME)
+        env.pop(webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME)
         legacy_database_url = "K" + "QAG_DATABASE_URL"
         env[legacy_database_url] = "LEGACY_DB_TARGET_MARKER"
 
@@ -501,7 +504,8 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
         text = json.dumps(report, sort_keys=True)
 
         self.assertEqual(report["status"], "blocked")
-        self.assertIn("SQAG_DATABASE_URL", report["missing_env_names"])
+        self.assertIn(webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME, report["missing_env_names"])
+        self.assertIn(webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME, report["missing_env_names"])
         self.assertFalse(report["checks"]["active_database_target_present"])
         self.assertEqual(report["active_db_synthetic_rows_written"], 0)
         self.assertEqual(report["active_object_synthetic_objects_written"], 0)
@@ -713,7 +717,7 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
 
         expected = trusted_migration_report(verifier)
         with (
-            mock.patch.object(verifier.webapp, "postgres_storage_connection", return_value=ConnectionContext()),
+            mock.patch.object(verifier.webapp, "postgres_storage_connection", return_value=ConnectionContext()) as storage_connection,
             mock.patch.object(verifier, "migration_manifest", return_value=(object(),)),
             mock.patch.object(verifier, "inspect_postgres_migrations", return_value=expected) as inspect,
         ):
@@ -722,6 +726,7 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
         self.assertEqual(report, expected)
         self.assertEqual(statements, ["set transaction read only", "rollback"])
         inspect.assert_called_once()
+        storage_connection.assert_called_once_with("PRIVATE-CONNECTION-DETAIL", expected_role=webapp.SQAG_MIGRATOR_DATABASE_ROLE)
 
     def test_pending_migration_blocks_before_evidence_writes(self):
         verifier = load_verifier()
@@ -825,7 +830,7 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
         with local_test_directory() as temp_dir:
             database_url = f"sqlite:///{(Path(temp_dir) / 'sqag.sqlite3').as_posix()}"
             env = complete_env()
-            env[webapp.SQAG_DATABASE_URL_ENV_NAME] = database_url
+            env[webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME] = database_url
             backend = webapp.InMemoryObjectStorageBackend()
             with mock.patch.dict(os.environ, env, clear=True):
                 webapp.apply_sqag_storage_migrations(database_url)
@@ -860,7 +865,7 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
         with local_test_directory() as temp_dir:
             database_url = f"sqlite:///{(Path(temp_dir) / 'sqag.sqlite3').as_posix()}"
             env = complete_env()
-            env[webapp.SQAG_DATABASE_URL_ENV_NAME] = database_url
+            env[webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME] = database_url
             backend = webapp.InMemoryObjectStorageBackend()
             with mock.patch.dict(os.environ, env, clear=True):
                 webapp.apply_sqag_storage_migrations(database_url)

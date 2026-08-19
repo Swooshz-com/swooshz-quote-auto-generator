@@ -83,6 +83,7 @@ from webapp.object_storage import (
     object_artifact_key,
     object_storage_provider_status,
 )
+from webapp.postgres_migrations import EXPECTED_TRIGGER_ROUTINE_LINKS
 from webapp.internal_google_auth import (
     GOOGLE_ISSUER,
     INTERNAL_AUTH_MODE,
@@ -342,6 +343,7 @@ QUOTE_DATA_ROOT_ENV_NAME = "QUOTE_DATA_ROOT"
 SQAG_STORAGE_MODE_ENV_NAME = "SQAG_STORAGE_MODE"
 SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME = "SQAG_ARTIFACT_STORAGE_MODE"
 SQAG_DATABASE_URL_ENV_NAME = "SQAG_DATABASE_URL"
+SQAG_MIGRATOR_DATABASE_URL_ENV_NAME = "SQAG_MIGRATOR_DATABASE_URL"
 SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME = "SQAG_MAINTENANCE_DATABASE_URL"
 SQAG_LIVE_DATABASE_EVIDENCE_ENV_NAME = "SQAG_LIVE_DATABASE_EVIDENCE"
 SQAG_RUNTIME_DATABASE_ROLE = "sqag_runtime"
@@ -709,6 +711,7 @@ def scrub_sensitive_text(text: str) -> str:
             scrubbed,
         )
     for env_name in (
+        SQAG_MIGRATOR_DATABASE_URL_ENV_NAME,
         SQAG_DATABASE_URL_ENV_NAME,
         SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME,
         OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME,
@@ -1591,6 +1594,11 @@ def configured_object_storage_backend() -> ObjectStorageBackend:
 
 def configured_database_url() -> str:
     return clean_text(read_dotenv_value(SQAG_DATABASE_URL_ENV_NAME))
+
+
+def configured_migrator_database_url() -> str:
+    """Return the migration-ledger-only PostgreSQL projection without fallback."""
+    return clean_text(read_dotenv_value(SQAG_MIGRATOR_DATABASE_URL_ENV_NAME))
 
 
 def configured_maintenance_database_url() -> str:
@@ -3188,6 +3196,8 @@ def live_retention_delete_evidence_summary(
         "required_env_names": [
             "SQAG_LIVE_RETENTION_DELETE_EVIDENCE",
             SQAG_DATABASE_URL_ENV_NAME,
+            SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME,
+            SQAG_MIGRATOR_DATABASE_URL_ENV_NAME,
             SQAG_STORAGE_MODE_ENV_NAME,
             SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME,
             OBJECT_STORAGE_PROVIDER_ENV_NAME,
@@ -3212,7 +3222,7 @@ def live_retention_delete_evidence_summary(
         ],
         "live_retention_delete_evidence_supported": supported,
         "notes": [
-            "Evidence is opt-in and requires SQAG_LIVE_RETENTION_DELETE_EVIDENCE=1, SQAG_DATABASE_URL, SQAG_STORAGE_MODE=database, SQAG_ARTIFACT_STORAGE_MODE=object, and canonical SQAG_OBJECT_STORAGE_* env names.",
+            "Evidence is opt-in and requires SQAG_LIVE_RETENTION_DELETE_EVIDENCE=1, SQAG_MAINTENANCE_DATABASE_URL, SQAG_MIGRATOR_DATABASE_URL, SQAG_STORAGE_MODE=database, SQAG_ARTIFACT_STORAGE_MODE=object, and canonical SQAG_OBJECT_STORAGE_* env names.",
             "It uses synthetic namespaced rows and one tiny synthetic generated artifact object only.",
             "It fails closed on missing env or wrong runtime mode before synthetic writes, and also fails closed on metadata/object mismatch, tombstone/delete mismatch, wrong-workspace access, missing-object handling, or cleanup failure.",
             "It does not print DB URLs, provider values, bucket names, object keys, credentials, artifact bytes, tenant data, generated quote contents, backup dumps, or restore dumps.",
@@ -9565,7 +9575,9 @@ def require_postgres_session_role(connection: PostgresConnectionAdapter, expecte
             reason="storage_postgres_session_role_policy_invalid",
         )
     try:
-        row = connection.execute("select current_user as role").fetchone()
+        row = connection.execute(
+            "select session_user as session_role, current_user as active_role"
+        ).fetchone()
     except Exception as exc:
         raise SqagStorageAccessError(
             "SQAG Postgres session identity could not be verified.",
@@ -9573,13 +9585,20 @@ def require_postgres_session_role(connection: PostgresConnectionAdapter, expecte
             reason="storage_postgres_session_identity_unverified",
         ) from exc
     if isinstance(row, dict):
-        actual_role = clean_text(row.get("role"))
+        session_role = clean_text(row.get("session_role"))
+        active_role = clean_text(row.get("active_role"))
     else:
         try:
-            actual_role = clean_text(row[0])
+            session_role = clean_text(row[0])
+            active_role = clean_text(row[1])
         except (IndexError, KeyError, TypeError):
-            actual_role = ""
-    if actual_role != expected_role:
+            session_role = ""
+            active_role = ""
+    if (
+        session_role != expected_role
+        or active_role != expected_role
+        or session_role != active_role
+    ):
         raise SqagStorageAccessError(
             "SQAG Postgres database session is not authorised for this operation.",
             status=503,
@@ -10134,21 +10153,76 @@ class DatabaseSqagStorage:
 
     def _postgres_forensic_schema_objects(self, connection: Any) -> dict[str, set[str]]:
         index_rows = connection.execute(
-            "select indexname as name, indexdef as definition from pg_indexes "
-            "where schemaname = current_schema()"
+            "select indexname as name, indexdef as definition from pg_catalog.pg_indexes "
+            "where schemaname = 'public'"
         ).fetchall()
         trigger_rows = connection.execute(
-            "select distinct trigger_name as name from information_schema.triggers "
-            "where trigger_schema = current_schema()"
+            "select t.tgname as name, n.nspname as table_schema, c.relname as table_name, "
+            "p.oid as function_oid, p.proname as function_name "
+            "from pg_catalog.pg_trigger t "
+            "join pg_catalog.pg_class c on c.oid = t.tgrelid "
+            "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+            "join pg_catalog.pg_proc p on p.oid = t.tgfoid "
+            "where n.nspname = 'public' and not t.tgisinternal"
         ).fetchall()
         routine_names = sorted(SQAG_FORENSIC_POSTGRES_REQUIRED_ROUTINES)
         routine_placeholders = ", ".join("?" for _ in routine_names)
         routine_rows = connection.execute(
-            "select p.proname as name from pg_catalog.pg_proc p "
+            "select p.oid as function_oid, n.nspname as schema_name, p.proname as name, "
+            "p.prokind as kind, "
+            "pg_get_function_identity_arguments(p.oid) as identity_arguments, "
+            "pg_get_function_result(p.oid) as result_type, "
+            "p.prosecdef as security_definer, owner.rolname as owner "
+            "from pg_catalog.pg_proc p "
             "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
-            f"where n.nspname = current_schema() and p.proname in ({routine_placeholders})",
+            "join pg_catalog.pg_roles owner on owner.oid = p.proowner "
+            f"where n.nspname = 'public' and p.proname in ({routine_placeholders}) "
+            "order by p.proname, p.oid",
             tuple(routine_names),
         ).fetchall()
+        routine_by_name: dict[str, list[Any]] = {}
+        for row in routine_rows:
+            routine_by_name.setdefault(clean_text(row["name"]), []).append(row)
+        canonical_routines = True
+        routine_oids: dict[str, Any] = {}
+        for routine_name in routine_names:
+            candidates = routine_by_name.get(routine_name, [])
+            if len(candidates) != 1:
+                canonical_routines = False
+                continue
+            row = candidates[0]
+            if (
+                clean_text(row["schema_name"]) != "public"
+                or clean_text(row["kind"]) != "f"
+                or clean_text(row["identity_arguments"])
+                or clean_text(row["result_type"]).lower() != "trigger"
+                or clean_text(row["owner"]) != SQAG_MIGRATOR_DATABASE_ROLE
+                or bool(row["security_definer"])
+            ):
+                canonical_routines = False
+            routine_oids[routine_name] = row["function_oid"]
+        expected_links = {
+            (trigger_name, table_name, routine_oids[routine_name])
+            for routine_name, links in EXPECTED_TRIGGER_ROUTINE_LINKS.items()
+            for trigger_name, table_name in links
+            if routine_name in routine_oids
+        }
+        actual_links = {
+            (
+                clean_text(row["name"]),
+                clean_text(row["table_name"]),
+                row["function_oid"],
+            )
+            for row in trigger_rows
+            if clean_text(row["name"]) in {
+                trigger_name
+                for links in EXPECTED_TRIGGER_ROUTINE_LINKS.values()
+                for trigger_name, _table_name in links
+            }
+            or row["function_oid"] in set(routine_oids.values())
+        }
+        if actual_links != expected_links:
+            canonical_routines = False
         indexes = {clean_text(row["name"]) for row in index_rows}
         unique_indexes = {
             clean_text(row["name"])
@@ -10159,8 +10233,9 @@ class DatabaseSqagStorage:
             "indexes": indexes,
             "unique_indexes": unique_indexes,
             "triggers": {clean_text(row["name"]) for row in trigger_rows},
-            "routines": {clean_text(row["name"]) for row in routine_rows},
+            "routines": set(routine_names) if canonical_routines else set(),
         }
+
     def workspace(self) -> dict[str, Any]:
         runtime = default_runtime_workspace()
         runtime["workspace"].update({"id": self.workspace_id, "slug": self.workspace_id, "display_name": self.workspace_id, "storage_backend": self.storage_backend})

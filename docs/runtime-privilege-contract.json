@@ -71,7 +71,7 @@
     "materialized_views": []
   },
   "session_authority": {
-    "current_user_query": "select current_user as role",
+    "session_identity_query": "select session_user as session_role, current_user as active_role",
     "runtime_role": "sqag_runtime",
     "maintenance_role": "sqag_maintenance",
     "migration_role": "sqag_migrator",

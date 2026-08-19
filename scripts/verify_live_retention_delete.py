@@ -66,7 +66,8 @@ RUNTIME_MODE_ENV_NAMES = [
 ]
 REQUIRED_ENV_NAMES = [
     LIVE_RETENTION_DELETE_ENV_NAME,
-    webapp.SQAG_DATABASE_URL_ENV_NAME,
+    webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME,
+    webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME,
     *RUNTIME_MODE_ENV_NAMES,
     *ACTIVE_OBJECT_ENV_NAMES,
 ]
@@ -241,14 +242,14 @@ def _report(
             "It fails closed unless explicit live retention/delete evidence env names are present.",
             "It never reports private target values, object keys, artifact bytes, tenant data, generated quote contents, or secrets.",
             "A test-injected backend exercises verifier logic only and is not live production evidence.",
-            "This verifier has no migration authority and requires a read-only preflight with a trusted zero-pending ledger.",
+            "This verifier has no migration-application authority and requires a read-only migrator preflight with a trusted zero-pending ledger.",
         ],
     }
 
 
 def _inspect_migration_readiness(database_url: str) -> Mapping[str, Any]:
     migrations = migration_manifest(ROOT / "migrations")
-    with webapp.postgres_storage_connection(database_url) as connection:
+    with webapp.postgres_storage_connection(database_url, expected_role=webapp.SQAG_MIGRATOR_DATABASE_ROLE) as connection:
         try:
             connection.execute("set transaction read only")
             return inspect_postgres_migrations(connection, migrations)
@@ -295,6 +296,7 @@ def _build_default_storage(database_url: str, workspace_id: str) -> Any:
         workspace_id,
         role="admin",
         user_id=f"{workspace_id}-synthetic-user",
+        expected_session_role=webapp.SQAG_MAINTENANCE_DATABASE_ROLE,
     )
 
 
@@ -509,7 +511,7 @@ def _persist_synthetic_published_session(
 
 def _runtime_env_names() -> list[str]:
     return [
-        webapp.SQAG_DATABASE_URL_ENV_NAME,
+        webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME,
         webapp.SQAG_STORAGE_MODE_ENV_NAME,
         webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME,
         *ACTIVE_OBJECT_ENV_NAMES,
@@ -707,7 +709,7 @@ def _run_drill(
     runtime_download_diagnostics: dict[str, str],
 ) -> tuple[dict[str, bool], list[str], int, int, int]:
     ids = _synthetic_ids()
-    database_url = _clean(env.get(webapp.SQAG_DATABASE_URL_ENV_NAME))
+    database_url = _clean(env.get(webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME))
     storage = None
     backend = None
     metadata = None
@@ -870,7 +872,7 @@ def run_verification(
     runtime_object_artifact_mode_enabled = _runtime_object_artifact_mode_enabled(effective_env)
     checks = _default_checks(
         live_opt_in_enabled=live_opt_in_enabled,
-        database_present=_present(effective_env, webapp.SQAG_DATABASE_URL_ENV_NAME),
+        database_present=_present(effective_env, webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME),
         object_present=all(_present(effective_env, name) for name in ACTIVE_OBJECT_ENV_NAMES),
         runtime_database_mode_enabled=runtime_database_mode_enabled,
         runtime_object_artifact_mode_enabled=runtime_object_artifact_mode_enabled,
@@ -898,7 +900,7 @@ def run_verification(
     checks["migration_preflight_attempted"] = True
     try:
         migration_report = (migration_inspector or _inspect_migration_readiness)(
-            _clean(effective_env.get(webapp.SQAG_DATABASE_URL_ENV_NAME))
+            _clean(effective_env.get(webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME))
         )
         migration_blockers = _migration_preflight_blockers(migration_report)
     except Exception:

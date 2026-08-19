@@ -33,21 +33,43 @@ def _failure(blocker: str) -> int:
     return 2
 
 
+def _inspect_migration_ledger(database_url: str, migrations):
+    """Inspect the migrator-owned ledger through an exact migrator session."""
+    with webapp.postgres_storage_connection(
+        database_url,
+        expected_role=webapp.SQAG_MIGRATOR_DATABASE_ROLE,
+    ) as connection:
+        connection.execute("set transaction read only")
+        try:
+            report = inspect_postgres_migrations(connection, migrations)
+            validate_migration_report(report)
+            return report
+        finally:
+            connection.rollback()
+
+
+def _inspect_privilege_projection(database_url: str, manifest, expected_role: str):
+    """Inspect only one role's capability projection; never inspect the ledger."""
+    with webapp.postgres_storage_connection(
+        database_url,
+        expected_role=expected_role,
+    ) as connection:
+        connection.execute("set transaction read only")
+        try:
+            return verify_postgres_privilege_contract(connection, manifest)
+        finally:
+            connection.rollback()
+
+
 def _inspect(database_url: str, migrations, manifest, *, require_maintenance_role: bool = False):
+    """Compatibility wrapper for a role projection without ledger access."""
+    _ = migrations
     expected_role = (
         webapp.SQAG_MAINTENANCE_DATABASE_ROLE
         if require_maintenance_role
         else webapp.SQAG_RUNTIME_DATABASE_ROLE
     )
-    with webapp.postgres_storage_connection(database_url, expected_role=expected_role) as connection:
-        connection.execute("set transaction read only")
-        try:
-            report = inspect_postgres_migrations(connection, migrations)
-            validate_migration_report(report)
-            contract_report = verify_postgres_privilege_contract(connection, manifest)
-            return report, contract_report
-        finally:
-            connection.rollback()
+    return None, _inspect_privilege_projection(database_url, manifest, expected_role)
 
 
 def main() -> int:
@@ -57,6 +79,7 @@ def main() -> int:
         return _failure("runtime_contract_static_invalid")
     database_url = webapp.configured_database_url()
     maintenance_url = webapp.configured_maintenance_database_url()
+    migrator_url = webapp.configured_migrator_database_url()
     if not database_url:
         return _failure("database_url_absent")
     if not webapp.postgres_database_url_is_supported(database_url):
@@ -65,11 +88,22 @@ def main() -> int:
         return _failure("maintenance_database_url_absent")
     if not webapp.postgres_database_url_is_supported(maintenance_url):
         return _failure("maintenance_database_url_requires_postgres")
+    if not migrator_url:
+        return _failure("migrator_database_url_absent")
+    if not webapp.postgres_database_url_is_supported(migrator_url):
+        return _failure("migrator_database_url_requires_postgres")
     try:
         migrations = migration_manifest(ROOT / "migrations")
-        migration_report, runtime_report = _inspect(database_url, migrations, manifest)
-        _maintenance_report, maintenance_contract_report = _inspect(
-            maintenance_url, migrations, manifest, require_maintenance_role=True
+        migration_report = _inspect_migration_ledger(migrator_url, migrations)
+        runtime_report = _inspect_privilege_projection(
+            database_url,
+            manifest,
+            webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        )
+        maintenance_contract_report = _inspect_privilege_projection(
+            maintenance_url,
+            manifest,
+            webapp.SQAG_MAINTENANCE_DATABASE_ROLE,
         )
     except Exception:
         return _failure("preflight_failed")

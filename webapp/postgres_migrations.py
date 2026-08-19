@@ -79,6 +79,21 @@ EXPECTED_TRIGGERS = frozenset(
 EXPECTED_ROUTINES = frozenset(
     {"sqag_reject_immutable_change", "sqag_require_retention_delete_authorization"}
 )
+EXPECTED_TRIGGER_ROUTINE_LINKS = {
+    "sqag_reject_immutable_change": frozenset(
+        {
+            ("sqag_generation_evidence_no_update", "sqag_generation_evidence"),
+            ("sqag_audit_events_no_update", "sqag_audit_events"),
+            ("sqag_feedback_linkage_no_update", "sqag_feedback"),
+        }
+    ),
+    "sqag_require_retention_delete_authorization": frozenset(
+        {
+            ("sqag_generation_evidence_guard_delete", "sqag_generation_evidence"),
+            ("sqag_audit_events_guard_delete", "sqag_audit_events"),
+        }
+    ),
+}
 MIGRATION_TABLES = {
     "001_platform_scoped_storage.sql": frozenset(
         {"sqag_profiles", "sqag_pricing_references", "sqag_quote_sessions"}

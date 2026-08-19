@@ -23,6 +23,7 @@ from webapp.postgres_migrations import (  # noqa: E402
     EXPECTED_INDEXES,
     EXPECTED_ROUTINES,
     EXPECTED_TABLES,
+    EXPECTED_TRIGGER_ROUTINE_LINKS,
     LEDGER_TABLE,
     MIGRATION_TABLES,
     migration_manifest,
@@ -87,6 +88,40 @@ EXPECTED_ROUTINE_KEYS = {
     ("sqag_reject_immutable_change", ""),
     ("sqag_require_retention_delete_authorization", ""),
 }
+PRODUCTION_POSTGRES_CALLER_SPECS = {
+    "scripts/verify_production_database_provider.py": {
+        "storage_roles": ("SQAG_RUNTIME_DATABASE_ROLE",),
+        "connection_roles": ("SQAG_RUNTIME_DATABASE_ROLE",),
+        "required_source_tokens": (),
+        "forbidden_source_tokens": (),
+    },
+    "scripts/verify_live_retention_delete.py": {
+        "storage_roles": ("SQAG_MAINTENANCE_DATABASE_ROLE",),
+        "connection_roles": ("SQAG_MIGRATOR_DATABASE_ROLE",),
+        "required_source_tokens": (
+            "SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME",
+            "SQAG_MIGRATOR_DATABASE_URL_ENV_NAME",
+        ),
+        "forbidden_source_tokens": (
+            "SQAG_DATABASE_URL_ENV_NAME",
+            "configured_database_url",
+        ),
+    },
+    "scripts/verify_live_db_object_backup_restore.py": {
+        "storage_roles": ("SQAG_RUNTIME_DATABASE_ROLE",),
+        "connection_roles": (),
+        "required_source_tokens": ("apply_sqag_storage_migrations",),
+        "forbidden_source_tokens": (),
+    },
+    "scripts/migrate_inline_draft_files_to_object_storage.py": {
+        "storage_roles": ("SQAG_RUNTIME_DATABASE_ROLE",),
+        "connection_roles": (),
+        "required_source_tokens": (),
+        "forbidden_source_tokens": (),
+    },
+}
+
+
 
 
 class RuntimePrivilegeContractError(RuntimeError):
@@ -336,9 +371,9 @@ def _validate_manifest_document(manifest: Mapping[str, Any]) -> None:
             if namespace.get(field) != []:
                 errors.append(f"namespace.{field}:must_be_empty")
     session_authority = manifest.get("session_authority")
-    _exact_keys(session_authority, {"current_user_query", "runtime_role", "maintenance_role", "migration_role", "required_before_sql", "expected_role_overrides", "url_username_inference", "set_role_substitution"}, "session_authority", errors)
+    _exact_keys(session_authority, {"session_identity_query", "runtime_role", "maintenance_role", "migration_role", "required_before_sql", "expected_role_overrides", "url_username_inference", "set_role_substitution"}, "session_authority", errors)
     if isinstance(session_authority, Mapping) and session_authority != {
-        "current_user_query": "select current_user as role",
+        "session_identity_query": "select session_user as session_role, current_user as active_role",
         "runtime_role": "sqag_runtime",
         "maintenance_role": "sqag_maintenance",
         "migration_role": "sqag_migrator",
@@ -415,9 +450,46 @@ def _constructor_default_is_required(tree: ast.Module, function_name: str, argum
     return False
 
 
+def _validate_production_postgres_caller(path: Path, spec: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
+    try:
+        source = path.read_text(encoding="utf-8")
+        ast.parse(source, filename=str(path))
+    except (OSError, SyntaxError) as exc:
+        return [f"production_postgres_source_unreadable:{path.as_posix()}:{type(exc).__name__}"]
+    storage_calls, storage_errors = _ast_call_sites(path, "DatabaseSqagStorage")
+    connection_calls, connection_errors = _ast_call_sites(path, "postgres_storage_connection")
+    errors.extend(storage_errors)
+    errors.extend(connection_errors)
+    storage_roles = tuple(str(item) for item in spec.get("storage_roles", ()))
+    connection_roles = tuple(str(item) for item in spec.get("connection_roles", ()))
+    if not storage_calls:
+        errors.append(f"production_postgres_storage_call_sites_missing:{path.as_posix()}")
+    for call in storage_calls:
+        if not any(_fixed_keyword(call, "expected_session_role", role) for role in storage_roles):
+            errors.append(f"production_postgres_storage_call_site_unbound:{path.as_posix()}:{call.lineno}")
+    if connection_roles and not connection_calls:
+        errors.append(f"production_postgres_connection_call_sites_missing:{path.as_posix()}")
+    if not connection_roles and connection_calls:
+        errors.append(f"production_postgres_connection_call_sites_unexpected:{path.as_posix()}")
+    for call in connection_calls:
+        if not any(_fixed_keyword(call, "expected_role", role) for role in connection_roles):
+            errors.append(f"production_postgres_connection_call_site_unbound:{path.as_posix()}:{call.lineno}")
+    for token in tuple(str(item) for item in spec.get("required_source_tokens", ())):
+        if token not in source:
+            errors.append(f"production_postgres_source_token_missing:{path.as_posix()}:{token}")
+    for token in tuple(str(item) for item in spec.get("forbidden_source_tokens", ())):
+        if token in source:
+            errors.append(f"production_postgres_source_token_forbidden:{path.as_posix()}:{token}")
+    return errors
+
+
 def validate_session_authority_source() -> list[str]:
     """Fail closed if a current PostgreSQL storage call site loses fixed authority."""
     errors: list[str] = []
+    for relative_path, spec in PRODUCTION_POSTGRES_CALLER_SPECS.items():
+        errors.extend(_validate_production_postgres_caller(ROOT / relative_path, spec))
+
     server_path = ROOT / "webapp" / "server.py"
     retention_path = ROOT / "scripts" / "enforce_forensic_retention.py"
     server_calls, server_errors = _ast_call_sites(server_path, "DatabaseSqagStorage")
@@ -550,20 +622,96 @@ def _check_container_ownership(connection: Any, errors: list[str]) -> None:
 
 
 def _check_routines(connection: Any, errors: list[str]) -> None:
-    rows = _rows(connection, "select p.proname, pg_get_function_identity_arguments(p.oid) as identity_arguments, p.prosecdef, owner.rolname as owner, exists (select 1 from pg_catalog.pg_trigger t where t.tgfoid = p.oid and not t.tgisinternal) as has_trigger_dependency, case when acl.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'UNKNOWN') end as grantee, acl.privilege_type, acl.is_grantable from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace join pg_catalog.pg_roles owner on owner.oid = p.proowner left join lateral aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) acl on true left join pg_catalog.pg_roles grantee_role on grantee_role.oid = acl.grantee and acl.grantee <> 0 where n.nspname = 'public' and p.prokind in ('f', 'p', 'a', 'w') order by p.proname, identity_arguments, grantee, acl.privilege_type")
+    routine_names = sorted({name for name, _identity_arguments in EXPECTED_ROUTINE_KEYS})
+    placeholders = ", ".join("?" for _ in routine_names)
+    routine_rows = _rows(
+        connection,
+        "select p.oid as function_oid, n.nspname as schema_name, p.proname, "
+        "p.prokind, pg_get_function_identity_arguments(p.oid) as identity_arguments, "
+        "pg_get_function_result(p.oid) as result_type, p.prosecdef, owner.rolname as owner "
+        "from pg_catalog.pg_proc p "
+        "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+        "join pg_catalog.pg_roles owner on owner.oid = p.proowner "
+        f"where n.nspname = 'public' and p.proname in ({placeholders}) "
+        "order by p.proname, identity_arguments, p.oid",
+        routine_names,
+    )
     grouped: dict[tuple[str, str], list[Any]] = {}
-    for row in rows:
-        grouped.setdefault((_clean(_row_value(row, "proname")), _clean(_row_value(row, "identity_arguments"))), []).append(row)
+    for row in routine_rows:
+        grouped.setdefault(
+            (_clean(_row_value(row, "proname")), _clean(_row_value(row, "identity_arguments"))),
+            [],
+        ).append(row)
     if set(grouped) != EXPECTED_ROUTINE_KEYS:
         errors.append("routine_inventory_mismatch")
+    routine_oids: dict[str, Any] = {}
     for key in EXPECTED_ROUTINE_KEYS:
-        for row in grouped.get(key, []):
-            if _clean(_row_value(row, "owner")) != "sqag_migrator" or bool(_row_value(row, "prosecdef")) or not bool(_row_value(row, "has_trigger_dependency")):
-                errors.append(f"routine_properties_mismatch:{key[0]}")
-            if _acl_grantee(row) != "sqag_migrator" or _acl_privilege(row) != "EXECUTE":
-                errors.append(f"routine_acl_mismatch:{key[0]}")
-            if _acl_grantee(row) in {"PUBLIC", "sqag_runtime", "sqag_maintenance"} or (_grantable(row) and _acl_grantee(row) != "sqag_migrator"):
-                errors.append(f"routine_escalation:{key[0]}")
+        candidates = grouped.get(key, [])
+        if len(candidates) != 1:
+            errors.append(f"routine_identity_ambiguous:{key[0]}")
+            continue
+        row = candidates[0]
+        if (
+            _clean(_row_value(row, "schema_name")) != "public"
+            or _clean(_row_value(row, "prokind")) != "f"
+            or _clean(_row_value(row, "identity_arguments"))
+            or _clean(_row_value(row, "result_type")).lower() != "trigger"
+            or _clean(_row_value(row, "owner")) != "sqag_migrator"
+            or bool(_row_value(row, "prosecdef"))
+        ):
+            errors.append(f"routine_properties_mismatch:{key[0]}")
+        routine_oids[key[0]] = _row_value(row, "function_oid")
+
+    trigger_rows = _rows(
+        connection,
+        "select t.tgname as trigger_name, n.nspname as table_schema, "
+        "c.relname as table_name, p.oid as function_oid, p.proname as function_name "
+        "from pg_catalog.pg_trigger t "
+        "join pg_catalog.pg_class c on c.oid = t.tgrelid "
+        "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+        "join pg_catalog.pg_proc p on p.oid = t.tgfoid "
+        f"where n.nspname = 'public' and not t.tgisinternal and p.proname in ({placeholders})",
+        routine_names,
+    )
+    expected_links = {
+        (routine_name, trigger_name, table_name, routine_oids[routine_name])
+        for routine_name, links in EXPECTED_TRIGGER_ROUTINE_LINKS.items()
+        for trigger_name, table_name in links
+        if routine_name in routine_oids
+    }
+    actual_links = {
+        (
+            _clean(_row_value(row, "function_name")),
+            _clean(_row_value(row, "trigger_name")),
+            _clean(_row_value(row, "table_name")),
+            _row_value(row, "function_oid"),
+        )
+        for row in trigger_rows
+    }
+    if actual_links != expected_links:
+        errors.append("routine_trigger_linkage_mismatch")
+
+    acl_rows = _rows(
+        connection,
+        "select p.proname, pg_get_function_identity_arguments(p.oid) as identity_arguments, "
+        "case when acl.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'UNKNOWN') end as grantee, "
+        "acl.privilege_type, acl.is_grantable "
+        "from pg_catalog.pg_proc p "
+        "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+        "left join lateral aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) acl on true "
+        "left join pg_catalog.pg_roles grantee_role on grantee_role.oid = acl.grantee and acl.grantee <> 0 "
+        f"where n.nspname = 'public' and p.proname in ({placeholders}) "
+        "order by p.proname, identity_arguments, grantee, acl.privilege_type",
+        routine_names,
+    )
+    for row in acl_rows:
+        key = (_clean(_row_value(row, "proname")), _clean(_row_value(row, "identity_arguments")))
+        if key not in EXPECTED_ROUTINE_KEYS:
+            continue
+        if _acl_grantee(row) != "sqag_migrator" or _acl_privilege(row) != "EXECUTE":
+            errors.append(f"routine_acl_mismatch:{key[0]}")
+        if _acl_grantee(row) in {"PUBLIC", "sqag_runtime", "sqag_maintenance"} or (_grantable(row) and _acl_grantee(row) != "sqag_migrator"):
+            errors.append(f"routine_escalation:{key[0]}")
 
 
 def _check_table_acls(connection: Any, errors: list[str]) -> None:

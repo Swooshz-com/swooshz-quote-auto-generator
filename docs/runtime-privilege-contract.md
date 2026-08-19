@@ -47,9 +47,9 @@ transaction before collecting observations.
 
 ## Mandatory session authority
 
-Every PostgreSQL application or maintenance storage connection must admit the server-authoritative `current_user` before yielding a connection to application or destructive SQL. The expected role is explicit and fixed at the call site: `sqag_runtime` for all application-runtime paths and `sqag_maintenance` for retention. An omitted or unexpected role fails closed without exposing the DSN, host, credential, or observed role.
+Every PostgreSQL application, migration, or maintenance connection must admit the server-authoritative pair `session_user` and `current_user` before yielding a connection to protected SQL. The expected role is explicit and fixed at the call site: `sqag_runtime` for application-runtime metadata, `sqag_migrator` for migration-ledger/schema inspection or application, and `sqag_maintenance` for destructive retention. The invariant is `session_user == current_user == expected_role`; an omitted, assumed, or unexpected role fails closed without exposing the DSN, host, credential, or observed role.
 
-Migration tooling is a separate explicit `sqag_migrator` path and is not accepted by `DatabaseSqagStorage`. The DSN username, environment, and `SET ROLE` cannot redefine application or maintenance authority. SQLite remains a separate local connection path and does not execute the PostgreSQL `current_user` check.
+Migration tooling is a separate explicit `sqag_migrator` path and is not accepted by `DatabaseSqagStorage`. The migration-ledger preflight requires the separately configured `SQAG_MIGRATOR_DATABASE_URL`; it never falls back to `SQAG_DATABASE_URL` or `SQAG_MAINTENANCE_DATABASE_URL`. The DSN username, environment, and `SET ROLE` cannot redefine application, migration, or maintenance authority. SQLite remains a separate local connection path and does not execute the PostgreSQL session-identity check.
 
 ## Roles and capabilities
 
@@ -85,7 +85,7 @@ verifier also observes, only for the declared namespace and roles:
 - explicit column ACL provenance from `pg_attribute.attacl`, expanded without
   a default ACL;
 - grant-option flags;
-- ownership of every declared table, index, and routine;
+- ownership of every declared table, index, and routine, plus exact `pg_proc` identity and `pg_trigger.tgfoid` linkage for every forensic trigger routine;
 - nonsecret role attributes;
 - direct membership rows involving declared roles, including ADMIN, INHERIT,
   and SET options;
@@ -109,7 +109,7 @@ validator output contain only safe statuses, counts, and fixed identifiers.
 `production_migrations` is mechanically compared with
 `webapp.postgres_migrations.migration_manifest`. A migration must be at the
 canonical head with no checksum drift, missing table, unexpected pending table,
-missing index, missing trigger, or missing routine before the capability proof
+missing index, missing trigger, ambiguous/wrong routine identity, or wrong trigger linkage before the capability proof
 can pass.
 
 The verifier performs a small source binding over the actual SQL relation names
