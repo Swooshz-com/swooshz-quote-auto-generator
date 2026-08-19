@@ -67,11 +67,12 @@ class FakePostgresConnection:
         "sqag_object_artifacts",
     }
 
-    def __init__(self, *, missing_tables=None):
+    def __init__(self, *, missing_tables=None, current_user=webapp.SQAG_RUNTIME_DATABASE_ROLE):
         self.closed = False
         self.commits = 0
         self.queries = []
         self.missing_tables = set(missing_tables or [])
+        self.current_user = current_user
         self.profiles = {}
         self.pricing_references = {}
         self.quote_sessions = {}
@@ -81,6 +82,8 @@ class FakePostgresConnection:
         params = tuple(params or ())
         self.queries.append((sql, params))
         normalized = " ".join(sql.lower().split())
+        if normalized == "select current_user as role":
+            return FakePostgresCursor([{"role": self.current_user}])
         if "pg_try_advisory_xact_lock" in normalized:
             return FakePostgresCursor([{"lock_acquired": True}])
         if "information_schema.columns" in normalized:
@@ -238,16 +241,19 @@ class FakePostgresConnection:
 class PsycopgParsingConnection:
     """Exercise psycopg's real client placeholder parser without a database."""
 
-    def __init__(self):
+    def __init__(self, current_user=webapp.SQAG_MIGRATOR_DATABASE_ROLE):
         self.closed = False
         self.commits = 0
         self.queries = []
+        self.current_user = current_user
 
     def execute(self, sql, params=None):
         query = PostgresQuery(Transformer())
         query.convert(sql, tuple(params or ()))
         rendered = query.query.decode("utf-8")
         self.queries.append((rendered, tuple(params or ())))
+        if rendered.strip().lower() == "select current_user as role":
+            return FakePostgresCursor([{"role": self.current_user}])
         return FakePostgresCursor()
 
     def commit(self):
