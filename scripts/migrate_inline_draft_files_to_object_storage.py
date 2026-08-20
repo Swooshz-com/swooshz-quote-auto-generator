@@ -56,6 +56,7 @@ def main() -> int:
             args.workspace_id,
             role="admin",
             user_id="inline-draft-recovery",
+            expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
         )
         if args.apply:
             result = storage.migrate_workspace_inline_draft_files_to_object_storage(

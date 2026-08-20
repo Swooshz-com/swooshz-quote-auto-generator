@@ -48,6 +48,8 @@ from webapp.object_storage import (
 
 LIVE_DB_OBJECT_BACKUP_RESTORE_ENV_NAME = "SQAG_LIVE_DB_OBJECT_BACKUP_RESTORE_EVIDENCE"
 RESTORE_DATABASE_URL_ENV_NAME = "SQAG_RESTORE_DATABASE_URL"
+RESTORE_MIGRATOR_DATABASE_URL_ENV_NAME = "SQAG_RESTORE_MIGRATOR_DATABASE_URL"
+RESTORE_MAINTENANCE_DATABASE_URL_ENV_NAME = "SQAG_RESTORE_MAINTENANCE_DATABASE_URL"
 RESTORE_OBJECT_STORAGE_PROVIDER_ENV_NAME = "SQAG_RESTORE_OBJECT_STORAGE_PROVIDER"
 RESTORE_OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME = "SQAG_RESTORE_OBJECT_STORAGE_ENDPOINT_URL"
 RESTORE_OBJECT_STORAGE_BUCKET_ENV_NAME = "SQAG_RESTORE_OBJECT_STORAGE_BUCKET"
@@ -76,8 +78,12 @@ RESTORE_OBJECT_ENV_NAMES = [
 REQUIRED_ENV_NAMES = [
     LIVE_DB_OBJECT_BACKUP_RESTORE_ENV_NAME,
     webapp.SQAG_DATABASE_URL_ENV_NAME,
+    webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME,
+    webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME,
     *ACTIVE_OBJECT_ENV_NAMES,
     RESTORE_DATABASE_URL_ENV_NAME,
+    RESTORE_MIGRATOR_DATABASE_URL_ENV_NAME,
+    RESTORE_MAINTENANCE_DATABASE_URL_ENV_NAME,
     *RESTORE_OBJECT_ENV_NAMES,
     BACKUP_RESTORE_DECISION_ID_ENV_NAME,
     BACKUP_RESTORE_WINDOW_ID_ENV_NAME,
@@ -268,13 +274,29 @@ def _report(
     }
 
 
-def _build_default_storage(database_url: str, workspace_id: str) -> Any:
+def _build_runtime_storage(database_url: str, workspace_id: str) -> Any:
     return webapp.DatabaseSqagStorage(
         database_url,
         workspace_id,
         role="admin",
         user_id=f"{workspace_id}-synthetic-user",
+        expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
     )
+
+
+def _build_maintenance_storage(database_url: str, workspace_id: str) -> Any:
+    return webapp.DatabaseSqagStorage(
+        database_url,
+        workspace_id,
+        role="admin",
+        user_id=f"{workspace_id}-synthetic-user",
+        expected_session_role=webapp.SQAG_MAINTENANCE_DATABASE_ROLE,
+    )
+
+
+def _build_default_storage(database_url: str, workspace_id: str) -> Any:
+    """Retain the test helper name while making its default authority runtime."""
+    return _build_runtime_storage(database_url, workspace_id)
 
 
 def _build_s3_backend(env: Mapping[str, str]) -> S3CompatibleObjectStorageBackend:
@@ -467,10 +489,11 @@ def _restore_database_cannot_read_active_synthetic_rows(
 def _cleanup_storage(storage: object, *, profile_id: str, pricing_id: str, session_id: str) -> bool:
     if hasattr(storage, "connection"):
         with storage.connection() as connection:
-            connection.execute(
-                "delete from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
-                (storage.workspace_id, "generated_quote", session_id, "xlsx"),
-            )
+            if getattr(storage, "database_family", "") != "postgres_compatible":
+                connection.execute(
+                    "delete from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+                    (storage.workspace_id, "generated_quote", session_id, "xlsx"),
+                )
             connection.execute(
                 "delete from sqag_quote_sessions where workspace_id = ? and session_id = ?",
                 (storage.workspace_id, session_id),
@@ -492,12 +515,23 @@ def _cleanup_storage(storage: object, *, profile_id: str, pricing_id: str, sessi
     return ok
 
 
+def _with_configured_backend(backend: ObjectStorageBackend, callback: Callable[[], Any]) -> Any:
+    original_backend_factory = getattr(webapp, "configured_object_storage_backend", None)
+    try:
+        webapp.configured_object_storage_backend = lambda: backend  # type: ignore[assignment]
+        return callback()
+    finally:
+        if original_backend_factory is not None:
+            webapp.configured_object_storage_backend = original_backend_factory  # type: ignore[assignment]
+
 def _cleanup(
     *,
     active_storage_a: object | None,
     active_storage_b: object | None,
     restore_storage_a: object | None,
     restore_storage_b: object | None,
+    active_maintenance_storage: object | None,
+    restore_maintenance_storage: object | None,
     active_backend: ObjectStorageBackend | None,
     restore_backend: ObjectStorageBackend | None,
     active_metadata: ObjectArtifactMetadata | None,
@@ -505,6 +539,29 @@ def _cleanup(
     ids: Mapping[str, str],
 ) -> bool:
     ok = True
+    for maintenance_storage, backend, metadata, workspace_key in (
+        (active_maintenance_storage, active_backend, active_metadata, "workspace_a"),
+        (restore_maintenance_storage, restore_backend, restore_metadata, "workspace_a"),
+    ):
+        if (
+            maintenance_storage is None
+            or backend is None
+            or metadata is None
+            or not hasattr(maintenance_storage, "tombstone_object_quote_artifacts")
+        ):
+            continue
+        try:
+            tombstoned = int(
+                _with_configured_backend(
+                    backend,
+                    lambda: maintenance_storage.tombstone_object_quote_artifacts(ids["session_a"]),
+                )
+                or 0
+            )
+            if tombstoned == 0 and _object_artifact_row(maintenance_storage, ids["session_a"], "xlsx") is not None:
+                raise ObjectStorageContractError("Synthetic artifact tombstone was not applied.")
+        except Exception:
+            ok = False
     for backend, metadata, workspace_key in (
         (active_backend, active_metadata, "workspace_a"),
         (restore_backend, restore_metadata, "workspace_a"),
@@ -542,14 +599,21 @@ def _run_drill(
     blockers: list[str],
     active_storage_factory: StorageFactory,
     restore_storage_factory: StorageFactory,
+    active_maintenance_storage_factory: StorageFactory,
+    restore_maintenance_storage_factory: StorageFactory,
     active_backend_factory: BackendFactory,
     restore_backend_factory: BackendFactory,
     migration_applier: MigrationApplier,
 ) -> tuple[dict[str, bool], list[str], int, int, int, int]:
     ids = _synthetic_ids()
     active_db_url = _clean(env.get(webapp.SQAG_DATABASE_URL_ENV_NAME))
+    active_migrator_db_url = _clean(env.get(webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME))
+    active_maintenance_db_url = _clean(env.get(webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME))
     restore_db_url = _clean(env.get(RESTORE_DATABASE_URL_ENV_NAME))
+    restore_migrator_db_url = _clean(env.get(RESTORE_MIGRATOR_DATABASE_URL_ENV_NAME))
+    restore_maintenance_db_url = _clean(env.get(RESTORE_MAINTENANCE_DATABASE_URL_ENV_NAME))
     active_storage_a = active_storage_b = restore_storage_a = restore_storage_b = None
+    active_maintenance_storage = restore_maintenance_storage = None
     active_backend = restore_backend = None
     active_metadata = restore_metadata = None
     active_db_rows = active_object_count = restore_db_rows = restore_object_count = 0
@@ -558,14 +622,18 @@ def _run_drill(
     try:
         checks["connection_attempted"] = True
         try:
-            migration_applier(active_db_url)
-            migration_applier(restore_db_url)
+            migration_applier(active_migrator_db_url)
+            migration_applier(restore_migrator_db_url)
             active_storage_a = active_storage_factory(active_db_url, ids["workspace_a"])
             active_storage_b = active_storage_factory(active_db_url, ids["workspace_b"])
             restore_storage_a = restore_storage_factory(restore_db_url, ids["workspace_a"])
             restore_storage_b = restore_storage_factory(restore_db_url, ids["workspace_b"])
+            active_maintenance_storage = active_maintenance_storage_factory(active_maintenance_db_url, ids["workspace_a"])
+            restore_maintenance_storage = restore_maintenance_storage_factory(restore_maintenance_db_url, ids["workspace_a"])
             for storage in (active_storage_a, active_storage_b, restore_storage_a, restore_storage_b):
                 storage.ensure_ready()
+                storage.ensure_object_artifact_ready()
+            for storage in (active_maintenance_storage, restore_maintenance_storage):
                 storage.ensure_object_artifact_ready()
         except Exception:
             blockers.append("database_connection_or_schema_failed")
@@ -712,6 +780,8 @@ def _run_drill(
             active_storage_b=active_storage_b,
             restore_storage_a=restore_storage_a,
             restore_storage_b=restore_storage_b,
+            active_maintenance_storage=active_maintenance_storage,
+            restore_maintenance_storage=restore_maintenance_storage,
             active_backend=active_backend,
             restore_backend=restore_backend,
             active_metadata=active_metadata,
@@ -728,6 +798,8 @@ def run_verification(
     env: Mapping[str, str] | None = None,
     active_storage_factory: StorageFactory | None = None,
     restore_storage_factory: StorageFactory | None = None,
+    active_maintenance_storage_factory: StorageFactory | None = None,
+    restore_maintenance_storage_factory: StorageFactory | None = None,
     active_backend_factory: BackendFactory | None = None,
     restore_backend_factory: BackendFactory | None = None,
     migration_applier: MigrationApplier | None = None,
@@ -779,6 +851,14 @@ def run_verification(
         blockers=blockers,
         active_storage_factory=active_storage_factory or _build_default_storage,
         restore_storage_factory=restore_storage_factory or _build_default_storage,
+        active_maintenance_storage_factory=(
+            active_maintenance_storage_factory
+            or (_build_maintenance_storage if active_storage_factory is None else active_storage_factory)
+        ),
+        restore_maintenance_storage_factory=(
+            restore_maintenance_storage_factory
+            or (_build_maintenance_storage if restore_storage_factory is None else restore_storage_factory)
+        ),
         active_backend_factory=active_backend_factory or _active_backend_factory,
         restore_backend_factory=restore_backend_factory or _restore_backend_factory,
         migration_applier=migration_applier or webapp.apply_sqag_storage_migrations,

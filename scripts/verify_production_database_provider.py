@@ -155,7 +155,7 @@ def schema_status_from_information_schema_rows(
 def postgres_schema_status(database_url: str) -> dict[str, object]:
     tables = set(REQUIRED_METADATA_TABLES)
     placeholders = ", ".join("?" for _ in tables)
-    with webapp.postgres_storage_connection(database_url) as connection:
+    with webapp.postgres_storage_connection(database_url, expected_role=webapp.SQAG_RUNTIME_DATABASE_ROLE) as connection:
         rows = connection.execute(
             f"select table_name, column_name from information_schema.columns where table_schema = current_schema() and table_name in ({placeholders})",
             tuple(sorted(tables)),
@@ -249,7 +249,7 @@ def _cleanup_synthetic_metadata(database_url: str, ids: dict[str, str]) -> bool:
         ("workspace_a", "profile_a", "pricing_a", "session_a"),
         ("workspace_b", "profile_b", "pricing_b", "session_b"),
     ):
-        storage = webapp.DatabaseSqagStorage(database_url, ids[workspace_key], role="admin", user_id=f"{ids[workspace_key]}-user")
+        storage = webapp.DatabaseSqagStorage(database_url, ids[workspace_key], role="admin", user_id=f"{ids[workspace_key]}-user", expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE)
         try:
             _delete_synthetic_workspace_metadata(
                 storage,
@@ -270,8 +270,8 @@ def live_metadata_operations_status(database_url: str) -> dict[str, object]:
     updates = 0
     deletes = 0
     try:
-        storage_a = webapp.DatabaseSqagStorage(database_url, ids["workspace_a"], role="admin", user_id=f"{ids['workspace_a']}-user")
-        storage_b = webapp.DatabaseSqagStorage(database_url, ids["workspace_b"], role="admin", user_id=f"{ids['workspace_b']}-user")
+        storage_a = webapp.DatabaseSqagStorage(database_url, ids["workspace_a"], role="admin", user_id=f"{ids['workspace_a']}-user", expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE)
+        storage_b = webapp.DatabaseSqagStorage(database_url, ids["workspace_b"], role="admin", user_id=f"{ids['workspace_b']}-user", expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE)
         storage_a.ensure_ready()
         storage_a.ensure_object_artifact_ready()
         storage_b.ensure_ready()
