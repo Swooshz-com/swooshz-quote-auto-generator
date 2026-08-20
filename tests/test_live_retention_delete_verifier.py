@@ -41,6 +41,7 @@ def local_test_directory():
 def complete_env() -> dict[str, str]:
     return {
         "SQAG_LIVE_RETENTION_DELETE_EVIDENCE": "1",
+        "SQAG_DATABASE_URL": "REDACTED_RUNTIME_DB_TARGET_MARKER",
         "SQAG_MAINTENANCE_DATABASE_URL": "REDACTED_DB_TARGET_MARKER",
         "SQAG_MIGRATOR_DATABASE_URL": "REDACTED_MIGRATOR_DB_TARGET_MARKER",
         "SQAG_OBJECT_STORAGE_PROVIDER": "REDACTED_PROVIDER_MARKER",
@@ -372,6 +373,7 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
 
         with (
             mock.patch.object(verifier, "_build_default_storage", new=storage_factory),
+            mock.patch.object(verifier, "_build_maintenance_storage", new=storage_factory),
             mock.patch.object(verifier, "_build_s3_backend", new=backend_factory),
             mock.patch.object(verifier, "_inspect_migration_readiness", new=migration_inspector),
         ):
@@ -830,6 +832,7 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
         with local_test_directory() as temp_dir:
             database_url = f"sqlite:///{(Path(temp_dir) / 'sqag.sqlite3').as_posix()}"
             env = complete_env()
+            env[webapp.SQAG_DATABASE_URL_ENV_NAME] = database_url
             env[webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME] = database_url
             backend = webapp.InMemoryObjectStorageBackend()
             with mock.patch.dict(os.environ, env, clear=True):
@@ -865,6 +868,7 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
         with local_test_directory() as temp_dir:
             database_url = f"sqlite:///{(Path(temp_dir) / 'sqag.sqlite3').as_posix()}"
             env = complete_env()
+            env[webapp.SQAG_DATABASE_URL_ENV_NAME] = database_url
             env[webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME] = database_url
             backend = webapp.InMemoryObjectStorageBackend()
             with mock.patch.dict(os.environ, env, clear=True):

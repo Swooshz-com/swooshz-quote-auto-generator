@@ -66,6 +66,7 @@ RUNTIME_MODE_ENV_NAMES = [
 ]
 REQUIRED_ENV_NAMES = [
     LIVE_RETENTION_DELETE_ENV_NAME,
+    webapp.SQAG_DATABASE_URL_ENV_NAME,
     webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME,
     webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME,
     *RUNTIME_MODE_ENV_NAMES,
@@ -290,7 +291,17 @@ def _migration_preflight_blockers(report: Mapping[str, Any]) -> list[str]:
     return []
 
 
-def _build_default_storage(database_url: str, workspace_id: str) -> Any:
+def _build_runtime_storage(database_url: str, workspace_id: str) -> Any:
+    return webapp.DatabaseSqagStorage(
+        database_url,
+        workspace_id,
+        role="admin",
+        user_id=f"{workspace_id}-synthetic-user",
+        expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+    )
+
+
+def _build_maintenance_storage(database_url: str, workspace_id: str) -> Any:
     return webapp.DatabaseSqagStorage(
         database_url,
         workspace_id,
@@ -298,6 +309,11 @@ def _build_default_storage(database_url: str, workspace_id: str) -> Any:
         user_id=f"{workspace_id}-synthetic-user",
         expected_session_role=webapp.SQAG_MAINTENANCE_DATABASE_ROLE,
     )
+
+
+def _build_default_storage(database_url: str, workspace_id: str) -> Any:
+    """Retain the test helper name while making its default authority runtime."""
+    return _build_runtime_storage(database_url, workspace_id)
 
 
 def _build_s3_backend(env: Mapping[str, str]) -> S3CompatibleObjectStorageBackend:
@@ -509,19 +525,25 @@ def _persist_synthetic_published_session(
         connection.commit()
 
 
-def _runtime_env_names() -> list[str]:
+def _runtime_env_names(database_url_name: str = webapp.SQAG_DATABASE_URL_ENV_NAME) -> list[str]:
     return [
-        webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME,
+        database_url_name,
         webapp.SQAG_STORAGE_MODE_ENV_NAME,
         webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME,
         *ACTIVE_OBJECT_ENV_NAMES,
     ]
 
 
-def _with_runtime_env(env: Mapping[str, str], callback: Callable[[], Any]) -> Any:
-    previous = {name: os.environ.get(name) for name in _runtime_env_names()}
+def _with_runtime_env(
+    env: Mapping[str, str],
+    callback: Callable[[], Any],
+    *,
+    database_url_name: str = webapp.SQAG_DATABASE_URL_ENV_NAME,
+) -> Any:
+    names = _runtime_env_names(database_url_name)
+    previous = {name: os.environ.get(name) for name in names}
     try:
-        for name in _runtime_env_names():
+        for name in names:
             value = env.get(name)
             if value is None:
                 os.environ.pop(name, None)
@@ -653,10 +675,11 @@ def _repeated_delete_safe(backend: ObjectStorageBackend, metadata: ObjectArtifac
 def _cleanup_storage(storage: object, session_id: str) -> bool:
     if hasattr(storage, "connection"):
         with storage.connection() as connection:
-            connection.execute(
-                "delete from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
-                (storage.workspace_id, "generated_quote", session_id, "xlsx"),
-            )
+            if getattr(storage, "database_family", "") != "postgres_compatible":
+                connection.execute(
+                    "delete from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+                    (storage.workspace_id, "generated_quote", session_id, "xlsx"),
+                )
             connection.execute(
                 "delete from sqag_quote_sessions where workspace_id = ? and session_id = ?",
                 (storage.workspace_id, session_id),
@@ -668,11 +691,33 @@ def _cleanup_storage(storage: object, session_id: str) -> bool:
     return True
 
 
-def _cleanup(*, storage: object | None, backend: ObjectStorageBackend | None, metadata: ObjectArtifactMetadata | None, ids: Mapping[str, str]) -> bool:
+def _cleanup(
+    *,
+    storage: object | None,
+    backend: ObjectStorageBackend | None,
+    metadata: ObjectArtifactMetadata | None,
+    ids: Mapping[str, str],
+    maintenance_storage: object | None = None,
+    env: Mapping[str, str] | None = None,
+) -> bool:
     ok = True
     object_absence_confirmed = True
     if backend is not None and metadata is not None:
         try:
+            if maintenance_storage is not None and hasattr(maintenance_storage, "tombstone_object_quote_artifacts"):
+                tombstoned = int(
+                    _with_runtime_env(
+                        env or {},
+                        lambda: _with_configured_backend(
+                            backend,
+                            lambda: maintenance_storage.tombstone_object_quote_artifacts(ids["session_a"]),
+                        ),
+                        database_url_name=webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME,
+                    )
+                    or 0
+                )
+                if tombstoned == 0 and _object_artifact_row(maintenance_storage, ids["session_a"], "xlsx") is not None:
+                    raise ObjectStorageContractError("Synthetic artifact tombstone was not applied.")
             removed, confirmed_missing = _delete_object_or_confirm_missing(backend, metadata)
             object_absence_confirmed = bool(removed and confirmed_missing)
             ok = object_absence_confirmed
@@ -704,13 +749,16 @@ def _run_drill(
     env: Mapping[str, str],
     checks: dict[str, bool],
     blockers: list[str],
-    storage_factory: StorageFactory,
+    runtime_storage_factory: StorageFactory,
+    maintenance_storage_factory: StorageFactory,
     backend_factory: BackendFactory,
     runtime_download_diagnostics: dict[str, str],
 ) -> tuple[dict[str, bool], list[str], int, int, int]:
     ids = _synthetic_ids()
-    database_url = _clean(env.get(webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME))
-    storage = None
+    runtime_database_url = _clean(env.get(webapp.SQAG_DATABASE_URL_ENV_NAME))
+    maintenance_database_url = _clean(env.get(webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME))
+    runtime_storage = None
+    maintenance_storage = None
     backend = None
     metadata = None
     active_db_rows = 0
@@ -721,9 +769,14 @@ def _run_drill(
     try:
         checks["connection_attempted"] = True
         try:
-            storage = storage_factory(database_url, ids["workspace_a"])
-            storage.ensure_ready()
-            storage.ensure_object_artifact_ready()
+            runtime_storage = runtime_storage_factory(runtime_database_url, ids["workspace_a"])
+            if runtime_storage_factory is maintenance_storage_factory:
+                maintenance_storage = runtime_storage
+            else:
+                maintenance_storage = maintenance_storage_factory(maintenance_database_url, ids["workspace_a"])
+            for storage in (runtime_storage, maintenance_storage):
+                storage.ensure_ready()
+                storage.ensure_object_artifact_ready()
         except Exception:
             blockers.append("database_connection_or_schema_failed")
             return checks, blockers, active_db_rows, active_object_count, active_object_deleted_count
@@ -747,7 +800,7 @@ def _run_drill(
                 content=payload,
             )
             active_object_count = 1
-            active_db_rows = _write_synthetic_metadata(storage, ids, metadata)
+            active_db_rows = _write_synthetic_metadata(runtime_storage, ids, metadata)
         except Exception:
             blockers.append("object_write_failed")
             return checks, blockers, active_db_rows, active_object_count, active_object_deleted_count
@@ -765,10 +818,10 @@ def _run_drill(
             and metadata.content_type == SYNTHETIC_CONTENT_TYPE
             and checks["checksum_match"]
         )
-        checks["metadata_object_pairing_verified"] = _metadata_object_pairing_ok(storage, ids["session_a"], metadata)
-        checks["db_metadata_active_verified"] = checks["metadata_object_pairing_verified"] and storage.get_quote_session(ids["session_a"]) is not None
+        checks["metadata_object_pairing_verified"] = _metadata_object_pairing_ok(runtime_storage, ids["session_a"], metadata)
+        checks["db_metadata_active_verified"] = checks["metadata_object_pairing_verified"] and runtime_storage.get_quote_session(ids["session_a"]) is not None
         checks["active_runtime_download_verified"] = _runtime_download_verified(
-            storage=storage,
+            storage=runtime_storage,
             session_id=ids["session_a"],
             backend=backend,
             env=env,
@@ -800,19 +853,20 @@ def _run_drill(
                     env,
                     lambda: _with_configured_backend(
                         backend,
-                        lambda: storage.tombstone_object_quote_artifacts(ids["session_a"]),
+                        lambda: maintenance_storage.tombstone_object_quote_artifacts(ids["session_a"]),
                     ),
+                    database_url_name=webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME,
                 )
                 or 0
             )
-            checks["tombstone_metadata_verified"] = tombstoned > 0 and _tombstone_verified(storage, ids["session_a"])
+            checks["tombstone_metadata_verified"] = tombstoned > 0 and _tombstone_verified(maintenance_storage, ids["session_a"])
         except Exception:
             blockers.append("tombstone_metadata_failed")
             return checks, blockers, active_db_rows, active_object_count, active_object_deleted_count
 
         checks["deleted_metadata_download_denied"] = bool(
             checks["active_runtime_download_verified"]
-            and _runtime_download_denied(storage, ids["session_a"], backend, env)
+            and _runtime_download_denied(runtime_storage, ids["session_a"], backend, env)
         )
 
         checks["delete_attempted"] = True
@@ -841,7 +895,7 @@ def _run_drill(
             blockers.append("repeated_delete_not_safe")
         return checks, blockers, active_db_rows, active_object_count, active_object_deleted_count
     finally:
-        cleanup_completed = _cleanup(storage=storage, backend=backend, metadata=metadata, ids=ids)
+        cleanup_completed = _cleanup(storage=runtime_storage, maintenance_storage=maintenance_storage, backend=backend, metadata=metadata, ids=ids, env=env)
         checks["cleanup_completed"] = cleanup_completed
         if not cleanup_completed and "cleanup_failed" not in blockers:
             blockers.append("cleanup_failed")
@@ -851,6 +905,7 @@ def run_verification(
     *,
     env: Mapping[str, str] | None = None,
     storage_factory: StorageFactory | None = None,
+    maintenance_storage_factory: StorageFactory | None = None,
     backend_factory: BackendFactory | None = None,
     migration_inspector: MigrationInspector | None = None,
     execute_live_drill: bool = True,
@@ -860,6 +915,7 @@ def run_verification(
         dependency is not None
         for dependency in (
             storage_factory,
+            maintenance_storage_factory,
             backend_factory,
             migration_inspector,
         )
@@ -872,7 +928,14 @@ def run_verification(
     runtime_object_artifact_mode_enabled = _runtime_object_artifact_mode_enabled(effective_env)
     checks = _default_checks(
         live_opt_in_enabled=live_opt_in_enabled,
-        database_present=_present(effective_env, webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME),
+        database_present=all(
+            _present(effective_env, name)
+            for name in (
+                webapp.SQAG_DATABASE_URL_ENV_NAME,
+                webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME,
+                webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME,
+            )
+        ),
         object_present=all(_present(effective_env, name) for name in ACTIVE_OBJECT_ENV_NAMES),
         runtime_database_mode_enabled=runtime_database_mode_enabled,
         runtime_object_artifact_mode_enabled=runtime_object_artifact_mode_enabled,
@@ -921,7 +984,11 @@ def run_verification(
         env=effective_env,
         checks=checks,
         blockers=blockers,
-        storage_factory=storage_factory or _build_default_storage,
+        runtime_storage_factory=storage_factory or _build_default_storage,
+        maintenance_storage_factory=(
+            maintenance_storage_factory
+            or (_build_maintenance_storage if storage_factory is None else storage_factory)
+        ),
         backend_factory=backend_factory or _build_s3_backend,
         runtime_download_diagnostics=runtime_download_diagnostics,
     )

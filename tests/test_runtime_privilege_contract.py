@@ -60,6 +60,16 @@ def safe_postgres_url(user: str, database_name: str) -> str:
     )
 
 
+def load_script_module(filename: str, module_name: str):
+    path = ROOT / "scripts" / filename
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"script module is missing: {filename}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _sql_grantee(sql_module, name: str):
     return sql_module.SQL("PUBLIC") if name == "PUBLIC" else sql_module.Identifier(name)
 
@@ -564,6 +574,7 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.database_name = "sqag_a25_runtime_" + uuid.uuid4().hex
         self.roles = ("sqag_runtime", "sqag_migrator", "sqag_maintenance")
+        self.created_database_names: list[str] = []
         self.created_roles: list[str] = []
         self.database_created = False
         self.cleanup_done = False
@@ -586,6 +597,7 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                 )
             )
             self.database_created = True
+            self.created_database_names.append(self.database_name)
             for role in self.roles:
                 connection.execute(
                     self.sql.SQL(
@@ -622,16 +634,16 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         cleanup_error = None
         try:
             with self.psycopg.connect(postgres_test_conninfo(), autocommit=True) as connection:
-                if self.database_created:
+                for database_name in self.created_database_names:
                     connection.execute(
                         "select pg_catalog.pg_terminate_backend(pid) "
                         "from pg_catalog.pg_stat_activity "
                         "where datname = %s and pid <> pg_catalog.pg_backend_pid()",
-                        (self.database_name,),
+                        (database_name,),
                     )
                     connection.execute(
                         self.sql.SQL("drop database if exists {}").format(
-                            self.sql.Identifier(self.database_name)
+                            self.sql.Identifier(database_name)
                         )
                     )
                 for role in self.created_roles:
@@ -640,24 +652,25 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                             self.sql.Identifier(role)
                         )
                     )
-                residual_database = connection.execute(
-                    "select 1 from pg_catalog.pg_database where datname = %s",
-                    (self.database_name,),
-                ).fetchone()
+                residual_databases = connection.execute(
+                    "select 1 from pg_catalog.pg_database where datname = any(%s)",
+                    (self.created_database_names,),
+                ).fetchall()
                 residual_roles = connection.execute(
                     "select 1 from pg_catalog.pg_roles where rolname = any(%s)",
                     (self.created_roles,),
                 ).fetchall()
-                if residual_database or residual_roles:
+                if residual_databases or residual_roles:
                     cleanup_error = "CLEANUP_UNKNOWN"
         except Exception:
             cleanup_error = "CLEANUP_UNKNOWN"
         if cleanup_error:
             self.fail(cleanup_error)
 
-    def _admin_connection(self):
+    def _admin_connection(self, database_name: str | None = None):
+        target_database = database_name or self.database_name
         return self.psycopg.connect(
-            safe_postgres_url("postgres", self.database_name),
+            safe_postgres_url("postgres", target_database),
             row_factory=self.dict_row,
             options="-c search_path=public,pg_catalog",
             autocommit=True,
@@ -669,10 +682,11 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
             row_factory=self.dict_row,
         )
 
-    def _configure_acl_contract(self):
+    def _configure_acl_contract(self, database_name: str | None = None):
+        target_database = database_name or self.database_name
         tables = sorted(set(EXPECTED_TABLES) | {contract.LEDGER_TABLE})
-        with self._admin_connection() as connection:
-            database = self.sql.Identifier(self.database_name)
+        with self._admin_connection(target_database) as connection:
+            database = self.sql.Identifier(target_database)
             for grantee in ("PUBLIC", *self.roles):
                 connection.execute(
                     self.sql.SQL("revoke all privileges on database {} from {}").format(
@@ -732,6 +746,34 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                 "alter default privileges for role sqag_migrator in schema public "
                 "revoke all on functions from PUBLIC"
             )
+
+    def _create_isolated_database_fixture(self) -> str:
+        database_name = "sqag_a25_restore_" + uuid.uuid4().hex
+        with self.psycopg.connect(postgres_test_conninfo(), autocommit=True) as connection:
+            existing_database = connection.execute(
+                "select 1 from pg_catalog.pg_database where datname = %s",
+                (database_name,),
+            ).fetchone()
+            if existing_database:
+                raise RuntimeError("CLEANUP_UNKNOWN")
+            connection.execute(
+                self.sql.SQL("create database {}").format(
+                    self.sql.Identifier(database_name)
+                )
+            )
+        self.created_database_names.append(database_name)
+        with self._admin_connection(database_name) as connection:
+            connection.execute("grant usage, create on schema public to sqag_migrator")
+        migrator_url = safe_postgres_url("sqag_migrator", database_name)
+        with webapp.postgres_storage_connection(
+            migrator_url,
+            expected_role=webapp.SQAG_MIGRATOR_DATABASE_ROLE,
+        ) as connection:
+            result = apply_postgres_migrations(connection, self.migrations)
+            connection.commit()
+        self.assertEqual(result["expectedHead"], self.migrations[-1].migration_id)
+        self._configure_acl_contract(database_name)
+        return database_name
 
     def _verify(self):
         with self._admin_connection() as raw_connection:
@@ -811,6 +853,26 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                         webapp.require_postgres_session_role(adapter, expected_role)
 
     def test_real_pg17_canonical_routine_identity_passes(self):
+        self.assertEqual(self._verify()["status"], "verified")
+
+    def test_real_pg17_unexpected_public_sqag_routine_default_public_execute_is_rejected(self):
+        self._execute_admin(
+            "create function public.sqag_unexpected_inventory() returns integer "
+            "language sql immutable as $$ select 1 $$;"
+        )
+        try:
+            with self.assertRaises(contract.RuntimePrivilegeContractError) as raised:
+                self._verify()
+            message = str(raised.exception)
+            self.assertIn("routine_inventory_mismatch", message)
+            self.assertIn("routine_escalation:sqag_unexpected_inventory", message)
+            effective = self._admin_row(
+                "select has_function_privilege(%s, %s, 'EXECUTE') as effective",
+                ("sqag_runtime", "public.sqag_unexpected_inventory()"),
+            )
+            self.assertTrue(effective["effective"])
+        finally:
+            self._execute_admin("drop function if exists public.sqag_unexpected_inventory()")
         self.assertEqual(self._verify()["status"], "verified")
 
     def test_real_pg17_routine_identity_negative_matrix(self):
@@ -928,6 +990,97 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
             self._restore_canonical_forensic_routines,
             "wrong routine kind",
         )
+
+    def test_real_pg17_retention_verifier_uses_operation_specific_default_factories(self):
+        verifier = load_script_module(
+            "verify_live_retention_delete.py",
+            "run146_verify_live_retention_delete",
+        )
+        env = {
+            verifier.LIVE_RETENTION_DELETE_ENV_NAME: "1",
+            webapp.SQAG_DATABASE_URL_ENV_NAME: safe_postgres_url("sqag_runtime", self.database_name),
+            webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME: safe_postgres_url(
+                "sqag_maintenance", self.database_name
+            ),
+            webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME: safe_postgres_url(
+                "sqag_migrator", self.database_name
+            ),
+            webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+            webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "object",
+            webapp.OBJECT_STORAGE_PROVIDER_ENV_NAME: "s3_compatible",
+            webapp.OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME: "https://synthetic.example",
+            webapp.OBJECT_STORAGE_BUCKET_ENV_NAME: "synthetic-retention-bucket",
+            webapp.OBJECT_STORAGE_REGION_ENV_NAME: "ap-southeast-1",
+            webapp.OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME: "REDACTED",
+            webapp.OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME: "REDACTED",
+        }
+        backend = webapp.InMemoryObjectStorageBackend()
+        with mock.patch.dict(os.environ, env, clear=True):
+            report = verifier.run_verification(
+                env=env,
+                backend_factory=lambda _env: backend,
+                test_injected_backend=True,
+            )
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["blockers"], [])
+        self.assertTrue(report["checks"]["active_runtime_download_verified"])
+        self.assertTrue(report["checks"]["tombstone_metadata_verified"])
+
+    def test_real_pg17_backup_restore_verifier_uses_operation_specific_default_factories(self):
+        verifier = load_script_module(
+            "verify_live_db_object_backup_restore.py",
+            "run146_verify_live_db_object_backup_restore",
+        )
+        restore_database_name = self._create_isolated_database_fixture()
+        env = {
+            verifier.LIVE_DB_OBJECT_BACKUP_RESTORE_ENV_NAME: "1",
+            webapp.SQAG_DATABASE_URL_ENV_NAME: safe_postgres_url("sqag_runtime", self.database_name),
+            webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME: safe_postgres_url(
+                "sqag_migrator", self.database_name
+            ),
+            webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME: safe_postgres_url(
+                "sqag_maintenance", self.database_name
+            ),
+            verifier.RESTORE_DATABASE_URL_ENV_NAME: safe_postgres_url(
+                "sqag_runtime", restore_database_name
+            ),
+            verifier.RESTORE_MIGRATOR_DATABASE_URL_ENV_NAME: safe_postgres_url(
+                "sqag_migrator", restore_database_name
+            ),
+            verifier.RESTORE_MAINTENANCE_DATABASE_URL_ENV_NAME: safe_postgres_url(
+                "sqag_maintenance", restore_database_name
+            ),
+            webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+            webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "object",
+            webapp.OBJECT_STORAGE_PROVIDER_ENV_NAME: "s3_compatible",
+            webapp.OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME: "https://synthetic-active.example",
+            webapp.OBJECT_STORAGE_BUCKET_ENV_NAME: "synthetic-active-bucket",
+            webapp.OBJECT_STORAGE_REGION_ENV_NAME: "ap-southeast-1",
+            webapp.OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME: "REDACTED",
+            webapp.OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME: "REDACTED",
+            verifier.RESTORE_OBJECT_STORAGE_PROVIDER_ENV_NAME: "s3_compatible",
+            verifier.RESTORE_OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME: "https://synthetic-restore.example",
+            verifier.RESTORE_OBJECT_STORAGE_BUCKET_ENV_NAME: "synthetic-restore-bucket",
+            verifier.RESTORE_OBJECT_STORAGE_REGION_ENV_NAME: "ap-southeast-1",
+            verifier.RESTORE_OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME: "REDACTED",
+            verifier.RESTORE_OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME: "REDACTED",
+            verifier.BACKUP_RESTORE_DECISION_ID_ENV_NAME: "synthetic-decision",
+            verifier.BACKUP_RESTORE_WINDOW_ID_ENV_NAME: "synthetic-window",
+        }
+        active_backend = webapp.InMemoryObjectStorageBackend()
+        restore_backend = webapp.InMemoryObjectStorageBackend()
+        with mock.patch.dict(os.environ, env, clear=True):
+            report = verifier.run_verification(
+                env=env,
+                active_backend_factory=lambda _env: active_backend,
+                restore_backend_factory=lambda _env: restore_backend,
+                test_injected_backend=True,
+            )
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["blockers"], [])
+        self.assertTrue(report["checks"]["active_db_write_read_verified"])
+        self.assertTrue(report["checks"]["restore_db_write_read_verified"])
+        self.assertTrue(report["checks"]["restore_object_write_read_verified"])
 
     def test_real_pg17_migrations_capabilities_provenance_and_workspace_isolation(self):
         evidence = self._verify()

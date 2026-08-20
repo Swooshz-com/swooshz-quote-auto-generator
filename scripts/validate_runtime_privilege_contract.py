@@ -96,21 +96,25 @@ PRODUCTION_POSTGRES_CALLER_SPECS = {
         "forbidden_source_tokens": (),
     },
     "scripts/verify_live_retention_delete.py": {
-        "storage_roles": ("SQAG_MAINTENANCE_DATABASE_ROLE",),
+        "storage_roles": ("SQAG_RUNTIME_DATABASE_ROLE", "SQAG_MAINTENANCE_DATABASE_ROLE"),
         "connection_roles": ("SQAG_MIGRATOR_DATABASE_ROLE",),
         "required_source_tokens": (
+            "SQAG_DATABASE_URL_ENV_NAME",
             "SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME",
             "SQAG_MIGRATOR_DATABASE_URL_ENV_NAME",
         ),
-        "forbidden_source_tokens": (
-            "SQAG_DATABASE_URL_ENV_NAME",
-            "configured_database_url",
-        ),
+        "forbidden_source_tokens": ("configured_database_url",),
     },
     "scripts/verify_live_db_object_backup_restore.py": {
-        "storage_roles": ("SQAG_RUNTIME_DATABASE_ROLE",),
+        "storage_roles": ("SQAG_RUNTIME_DATABASE_ROLE", "SQAG_MAINTENANCE_DATABASE_ROLE"),
         "connection_roles": (),
-        "required_source_tokens": ("apply_sqag_storage_migrations",),
+        "required_source_tokens": (
+            "apply_sqag_storage_migrations",
+            "SQAG_MIGRATOR_DATABASE_URL_ENV_NAME",
+            "SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME",
+            "RESTORE_MIGRATOR_DATABASE_URL_ENV_NAME",
+            "RESTORE_MAINTENANCE_DATABASE_URL_ENV_NAME",
+        ),
         "forbidden_source_tokens": (),
     },
     "scripts/migrate_inline_draft_files_to_object_storage.py": {
@@ -621,6 +625,59 @@ def _check_container_ownership(connection: Any, errors: list[str]) -> None:
             errors.append(f"{object_type}_owner_is_declared_runtime_role:{object_name}")
 
 
+def _check_complete_public_sqag_routine_inventory(connection: Any, errors: list[str]) -> None:
+    routine_rows = _rows(
+        connection,
+        "select p.oid as function_oid, p.proname, "
+        "pg_get_function_identity_arguments(p.oid) as identity_arguments "
+        "from pg_catalog.pg_proc p "
+        "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+        "where n.nspname = 'public' and left(p.proname, 5) = 'sqag_' "
+        "order by p.proname, identity_arguments, p.oid",
+    )
+    grouped: dict[tuple[str, str], list[Any]] = {}
+    for row in routine_rows:
+        grouped.setdefault(
+            (_clean(_row_value(row, "proname")), _clean(_row_value(row, "identity_arguments"))),
+            [],
+        ).append(row)
+    if set(grouped) != EXPECTED_ROUTINE_KEYS:
+        errors.append("routine_inventory_mismatch")
+
+    acl_rows = _rows(
+        connection,
+        "select p.proname, pg_get_function_identity_arguments(p.oid) as identity_arguments, "
+        "case when acl.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'UNKNOWN') end as grantee, "
+        "acl.privilege_type, acl.is_grantable "
+        "from pg_catalog.pg_proc p "
+        "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+        "left join lateral aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) acl on true "
+        "left join pg_catalog.pg_roles grantee_role on grantee_role.oid = acl.grantee and acl.grantee <> 0 "
+        "where n.nspname = 'public' and left(p.proname, 5) = 'sqag_' "
+        "order by p.proname, identity_arguments, grantee, acl.privilege_type",
+    )
+    for row in acl_rows:
+        key = (_clean(_row_value(row, "proname")), _clean(_row_value(row, "identity_arguments")))
+        if _acl_grantee(row) != "sqag_migrator" or _acl_privilege(row) != "EXECUTE":
+            errors.append(f"routine_acl_mismatch:{key[0]}")
+        if _acl_grantee(row) in {"PUBLIC", "sqag_runtime", "sqag_maintenance"} or (
+            _grantable(row) and _acl_grantee(row) != "sqag_migrator"
+        ):
+            errors.append(f"routine_escalation:{key[0]}")
+
+    for role in RUNTIME_ROLES:
+        for row in routine_rows:
+            routine_name = _clean(_row_value(row, "proname"))
+            function_oid = _row_value(row, "function_oid")
+            effective_rows = _rows(
+                connection,
+                "select has_function_privilege(?, ?, 'EXECUTE') as effective",
+                (role, function_oid),
+            )
+            if any(bool(_row_value(effective_row, "effective")) for effective_row in effective_rows):
+                errors.append(f"effective_routine_privilege:{role}:{routine_name}")
+
+
 def _check_routines(connection: Any, errors: list[str]) -> None:
     routine_names = sorted({name for name, _identity_arguments in EXPECTED_ROUTINE_KEYS})
     placeholders = ", ".join("?" for _ in routine_names)
@@ -820,6 +877,7 @@ def verify_postgres_privilege_contract(connection: Any, manifest: Mapping[str, A
     _check_role_attributes(connection, contract, errors)
     _check_memberships(connection, errors)
     _check_relation_inventory(connection, errors)
+    _check_complete_public_sqag_routine_inventory(connection, errors)
     _check_routines(connection, errors)
     _check_table_acls(connection, errors)
     _check_database_schema_acls(connection, errors)
