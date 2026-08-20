@@ -630,8 +630,10 @@ def _run_drill(
             restore_storage_b = restore_storage_factory(restore_db_url, ids["workspace_b"])
             active_maintenance_storage = active_maintenance_storage_factory(active_maintenance_db_url, ids["workspace_a"])
             restore_maintenance_storage = restore_maintenance_storage_factory(restore_maintenance_db_url, ids["workspace_a"])
-            for storage in (active_storage_a, active_storage_b, restore_storage_a, restore_storage_b, active_maintenance_storage, restore_maintenance_storage):
+            for storage in (active_storage_a, active_storage_b, restore_storage_a, restore_storage_b):
                 storage.ensure_ready()
+                storage.ensure_object_artifact_ready()
+            for storage in (active_maintenance_storage, restore_maintenance_storage):
                 storage.ensure_object_artifact_ready()
         except Exception:
             blockers.append("database_connection_or_schema_failed")

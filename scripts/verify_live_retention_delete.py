@@ -774,9 +774,14 @@ def _run_drill(
                 maintenance_storage = runtime_storage
             else:
                 maintenance_storage = maintenance_storage_factory(maintenance_database_url, ids["workspace_a"])
-            for storage in (runtime_storage, maintenance_storage):
-                storage.ensure_ready()
-                storage.ensure_object_artifact_ready()
+            runtime_storage.ensure_ready()
+            runtime_storage.ensure_object_artifact_ready()
+            maintenance_ready = getattr(maintenance_storage, "ensure_retention_ready", None)
+            if callable(maintenance_ready):
+                maintenance_ready()
+            else:
+                maintenance_storage.ensure_ready()
+            maintenance_storage.ensure_object_artifact_ready()
         except Exception:
             blockers.append("database_connection_or_schema_failed")
             return checks, blockers, active_db_rows, active_object_count, active_object_deleted_count
