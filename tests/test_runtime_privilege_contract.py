@@ -1821,7 +1821,7 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         self._red_then_restore(
             lambda: self._execute_admin_database(
                 "postgres",
-                self.sql.SQL("alter database {} owner to postgres").format(
+                self.sql.SQL("alter database {} owner to cloud_admin").format(
                     self.sql.Identifier(self.database_name)
                 ),
             ),
@@ -1834,7 +1834,7 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
             "database owner mismatch",
         )
         self._red_then_restore(
-            lambda: self._execute_admin("alter schema public owner to postgres"),
+            lambda: self._execute_admin("alter schema public owner to cloud_admin"),
             lambda: self._execute_admin("alter schema public owner to pg_database_owner"),
             "public schema owner mismatch",
         )
