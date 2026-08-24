@@ -853,8 +853,30 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         )
         with self._admin_connection() as connection:
             authority = connection.execute(
-                "select pg_has_role(%s, %s, 'ADMIN') as has_admin",
-                (grantor, role),
+                """
+                select
+                    pg_has_role(%s, %s, 'MEMBER WITH ADMIN OPTION')
+                    and (
+                        exists (
+                            select 1
+                            from pg_catalog.pg_roles as grantor_role
+                            where grantor_role.rolname = %s
+                              and grantor_role.rolsuper
+                        )
+                        or exists (
+                            select 1
+                            from pg_catalog.pg_auth_members as membership
+                            join pg_catalog.pg_roles as granted_role
+                              on granted_role.oid = membership.roleid
+                            join pg_catalog.pg_roles as member_role
+                              on member_role.oid = membership.member
+                            where granted_role.rolname = %s
+                              and member_role.rolname = %s
+                              and membership.admin_option
+                        )
+                    ) as has_admin
+                """,
+                (grantor, role, grantor, role, grantor),
             ).fetchone()
         self.assertTrue(
             authority["has_admin"],
