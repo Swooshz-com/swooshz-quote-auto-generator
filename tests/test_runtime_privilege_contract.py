@@ -842,13 +842,23 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         set_option: bool = False,
     ):
         statement = self.sql.SQL(
-            "grant {} to {} with admin {}, inherit {}, set {}"
+            "grant {} to {} with admin {}, inherit {}, set {} granted by {}"
         ).format(
             self.sql.Identifier(role),
             self.sql.Identifier(member),
             self.sql.SQL("true" if admin else "false"),
             self.sql.SQL("true" if inherit else "false"),
             self.sql.SQL("true" if set_option else "false"),
+            self.sql.Identifier(grantor),
+        )
+        with self._admin_connection() as connection:
+            authority = connection.execute(
+                "select pg_has_role(%s, %s, 'ADMIN') as has_admin",
+                (grantor, role),
+            ).fetchone()
+        self.assertTrue(
+            authority["has_admin"],
+            f"fixture grantor lacks ADMIN OPTION: {grantor} -> {role}",
         )
         return self._execute_as_role(grantor, statement)
 
@@ -858,9 +868,10 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         member: str = "neondb_owner",
         grantor: str = "cloud_admin",
     ):
-        statement = self.sql.SQL("revoke {} from {}").format(
+        statement = self.sql.SQL("revoke {} from {} granted by {}").format(
             self.sql.Identifier(role),
             self.sql.Identifier(member),
+            self.sql.Identifier(grantor),
         )
         return self._execute_as_role(grantor, statement)
 
@@ -1754,7 +1765,6 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         )
         self._red_then_restore(
             lambda: (
-                self._revoke_provider_edge("sqag_runtime"),
                 self._grant_provider_edge(
                     "sqag_runtime", "sqag_migrator", grantor="neondb_owner"
                 ),
@@ -1763,7 +1773,6 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                 self._revoke_provider_edge(
                     "sqag_runtime", "sqag_migrator", grantor="neondb_owner"
                 ),
-                self._grant_provider_edge("sqag_runtime"),
             ),
             "wrong grantor",
         )
