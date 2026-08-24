@@ -1,6 +1,6 @@
 {
-  "$schema": "runtime-privilege-contract-schema-v2",
-  "schema_version": 2,
+  "$schema": "runtime-privilege-contract-schema-v3",
+  "schema_version": 3,
   "contract_type": "runtime_privilege_contract",
   "repository": "Swooshz-com/swooshz-quote-auto-generator",
   "namespace": {
@@ -102,6 +102,39 @@
       "owned_objects": [],
       "grant_options": []
     }
+  },
+  "provider_controlled_memberships": {
+    "protected_roles": ["sqag_runtime", "sqag_migrator", "sqag_maintenance"],
+    "allowed_edges": [
+      {
+        "role": "sqag_runtime",
+        "member": "neondb_owner",
+        "grantor": "cloud_admin",
+        "admin_option": true,
+        "inherit_option": false,
+        "set_option": false
+      },
+      {
+        "role": "sqag_migrator",
+        "member": "neondb_owner",
+        "grantor": "cloud_admin",
+        "admin_option": true,
+        "inherit_option": false,
+        "set_option": false
+      },
+      {
+        "role": "sqag_maintenance",
+        "member": "neondb_owner",
+        "grantor": "cloud_admin",
+        "admin_option": true,
+        "inherit_option": false,
+        "set_option": false
+      }
+    ]
+  },
+  "ownership": {
+    "database_owner": "neondb_owner",
+    "public_schema_owner": "pg_database_owner"
   },
   "production_migrations": [
     {"path": "migrations/001_platform_scoped_storage.sql", "sequence_no": 1, "sha256": "7ee6e622ba1f99d5d1ae192e0ca979a660ba9a398b67b4ce6e0113bc9c09a8a4", "tables": ["sqag_pricing_references", "sqag_profiles", "sqag_quote_sessions"]},

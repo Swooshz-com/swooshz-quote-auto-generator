@@ -110,16 +110,19 @@ jobs:
       CI: "true"
       SQAG_TEST_POSTGRES_HOST: 127.0.0.1
       SQAG_TEST_POSTGRES_PORT: "5432"
-      SQAG_TEST_POSTGRES_USER: postgres
+      SQAG_TEST_POSTGRES_USER: cloud_admin
+      SQAG_TEST_POSTGRES_DB: postgres
     services:
       postgres:
         image: postgres:17
         env:
+          POSTGRES_USER: cloud_admin
+          POSTGRES_DB: postgres
           POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U postgres"
+          --health-cmd "pg_isready -U cloud_admin -d postgres"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5

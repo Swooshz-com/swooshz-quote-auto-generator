@@ -4,10 +4,12 @@
 
 This contract is the small repository boundary for the SQAG PostgreSQL runtime.
 It proves the reviewed application namespace, the canonical migration head, the
-capabilities actually used by the application, and the bounded provenance of
-those capabilities. Exact Git commit/tree admission remains a CI and deployment
-preflight concern. The contract deliberately contains no source revision pin,
-source digest mirror, provider role exception, or self-referential package hash.
+capabilities actually used by the application, the exact Option-A provider-control
+membership tuples, container ownership, and the bounded provenance of those
+capabilities. Exact Git commit/tree admission remains a CI and deployment
+preflight concern. The provider-control rows are explicit schema-v3 contract data,
+not a hidden verifier exception; the contract contains no source revision pin,
+source digest mirror, or self-referential package hash.
 
 The machine-readable authority is
 [`docs/runtime-privilege-contract.json`](runtime-privilege-contract.json).
@@ -28,9 +30,12 @@ The declared set is deliberately bounded to `public.sqag_*` application objects:
 - the reviewed runtime and maintenance capability matrices.
 
 Any missing, extra, malformed, differently owned, or otherwise unclassified
-`public.sqag_*` relation or routine is RED. Provider-created administration and
-system role topology is not silently adopted by this repository contract; it is
-admitted separately at deployment.
+`public.sqag_*` relation or routine is RED. The canonical provider-control
+membership collection is exactly three rows: each protected role is granted to
+`neondb_owner` by `cloud_admin` with `ADMIN=true`, `INHERIT=false`, and
+`SET=false`. `ADMIN=true` is real administrative authority; this narrow
+exception is accepted only because `neondb_owner` is outside the
+application-runtime trust boundary.
 
 ## Fixed connection namespace
 
@@ -55,10 +60,22 @@ Migration tooling is a separate explicit `sqag_migrator` path and is not accepte
 
 The three declared roles are `sqag_runtime`, `sqag_migrator`, and
 `sqag_maintenance`. All are non-superuser, non-CREATEDB, non-CREATEROLE,
-non-replication, non-bypass-RLS, `NOINHERIT`, and have no declared memberships.
-The migrator owns the declared namespace. Runtime and maintenance own no
-application objects and have no grant options.
+non-replication, non-bypass-RLS, `NOINHERIT`, and have empty
+`memberships_as_member` declarations. The migrator owns every declared
+namespace object. Runtime and maintenance own no application objects and have
+no grant options.
 
+## Provider control, ownership, and effective database privileges
+
+The exact ownership contract is database owner `neondb_owner` and public schema
+owner `pg_database_owner`. Every declared `public.sqag_*` namespace object
+is owned by `sqag_migrator`; `sqag_runtime` and `sqag_maintenance` own no
+public application object. Unknown `sqag_*` objects remain RED.
+
+For each of `sqag_runtime`, `sqag_migrator`, and `sqag_maintenance`, the
+effective database privileges are exactly `CONNECT=true`,
+`CREATE=false`, and `TEMPORARY=false`, with no database grant option.
+Database ownership must not make a broader effective privilege projection pass.
 The runtime role has only `CONNECT`, public-schema `USAGE`, and the operations
 listed under `runtime_tables` in the JSON contract. It has no CREATE or
 TEMPORARY database privilege, no schema CREATE, no sequence, routine, view,
@@ -87,8 +104,8 @@ verifier also observes, only for the declared namespace and roles:
 - grant-option flags;
 - ownership of every declared table, index, and routine, plus exact `pg_proc` identity and `pg_trigger.tgfoid` linkage for every forensic trigger routine;
 - nonsecret role attributes;
-- direct membership rows involving declared roles, including ADMIN, INHERIT,
-  and SET options;
+- the complete bounded membership collection involving protected roles, matched
+  exactly against the manifest role/member/grantor/ADMIN/INHERIT/SET tuples;
 - relevant default ACL entries;
 - the absence of runtime/maintenance explicit column grants and public
   application grants.
@@ -123,11 +140,12 @@ generated, stored, refreshed, or compared.
 ## Failure behavior
 
 Unknown PostgreSQL major, wrong database identity, unsafe search path, migration
-drift, unexpected namespace object, ownership change, missing capability,
-unexpected capability, PUBLIC drift, grant option, membership, INHERIT/SET/Admin
-path, default-ACL drift, routine authority, or sensitive-observation boundary
-failure is fail-closed. The preflight emits `safeToApply: false` and a generic
-blocker; it never prints a connection value.
+drift, unexpected namespace object, wrong database/schema/object owner, missing
+or extra provider tuple, changed member/grantor/ADMIN/INHERIT/SET option,
+missing capability, unexpected capability, PUBLIC drift, grant option,
+membership, default-ACL drift, routine authority, or sensitive-observation
+boundary failure is fail-closed. The preflight emits `safeToApply: false` and
+a generic blocker; it never prints a connection value.
 
 ## Evidence and teardown
 
@@ -143,7 +161,7 @@ is `CLEANUP_UNKNOWN`, never PASS, and the uncertain fixture is never reused.
 ## Review rule
 
 Adding a migration, application relation, routine, privilege, search-path entry,
-role edge, or source SQL relation requires an explicit reviewed contract change
-and corresponding real-runtime evidence. Provider/system role edges and live
-deployment credentials remain outside repository finality and require a later
-deployment admission boundary.
+role edge, ownership, or source SQL relation requires an explicit reviewed
+contract change and corresponding real-runtime evidence. The three provider-
+control rows are repository contract data and must remain an exact match; live
+owner/ACL repair and deployment credentials remain separately gated.
