@@ -16,6 +16,7 @@ from urllib.parse import quote
 
 
 ROOT = Path(__file__).resolve().parents[1]
+DISPOSABLE_BOOTSTRAP_ROLE = "cloud_admin"
 sys.path.insert(0, str(ROOT))
 
 from scripts import validate_runtime_privilege_contract as contract
@@ -683,7 +684,12 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.database_name = "sqag_a25_runtime_" + uuid.uuid4().hex
         self.roles = ("sqag_runtime", "sqag_migrator", "sqag_maintenance")
-        self.provider_roles = ("neondb_owner", "cloud_admin")
+        self.provider_roles = ("neondb_owner",)
+        self.bootstrap_role = os.getenv("SQAG_TEST_POSTGRES_USER", "").strip()
+        if self.bootstrap_role != DISPOSABLE_BOOTSTRAP_ROLE:
+            raise AssertionError(
+                "disposable PostgreSQL test identity must be cloud_admin"
+            )
         self.created_database_names: list[str] = []
         self.created_roles: list[str] = []
         self.database_created = False
@@ -691,6 +697,20 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         self.addCleanup(self._cleanup_fixture)
         self.fixture_ready = False
         with self.psycopg.connect(postgres_test_conninfo(), autocommit=True) as connection:
+            bootstrap = connection.execute(
+                """
+                select current_user, role.rolname, role.oid, role.rolsuper
+                from pg_catalog.pg_roles as role
+                where role.rolname = %s
+                """,
+                (self.bootstrap_role,),
+            ).fetchone()
+            if bootstrap is None:
+                raise AssertionError("disposable bootstrap role is missing")
+            self.assertEqual(bootstrap[0], DISPOSABLE_BOOTSTRAP_ROLE)
+            self.assertEqual(bootstrap[1], DISPOSABLE_BOOTSTRAP_ROLE)
+            self.assertEqual(bootstrap[2], 10)
+            self.assertTrue(bootstrap[3])
             existing_database = connection.execute(
                 "select 1 from pg_catalog.pg_database where datname = %s",
                 (self.database_name,),
@@ -710,8 +730,6 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
             self.database_created = True
             self.created_database_names.append(self.database_name)
             role_options = {
-                "cloud_admin": "nologin superuser nocreatedb createrole "
-                "noreplication nobypassrls noinherit connection limit -1",
                 "neondb_owner": "nologin nosuperuser nocreatedb nocreaterole "
                 "noreplication nobypassrls noinherit connection limit -1",
             }
@@ -795,7 +813,7 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
     def _admin_connection(self, database_name: str | None = None):
         target_database = database_name or self.database_name
         return self.psycopg.connect(
-            safe_postgres_url("postgres", target_database),
+            safe_postgres_url(self.bootstrap_role, target_database),
             row_factory=self.dict_row,
             options="-c search_path=public,pg_catalog",
             autocommit=True,
@@ -831,45 +849,6 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         for role in self.roles:
             self._grant_provider_edge(role)
 
-    def _ensure_provider_grantor_authority(self, role: str, grantor: str):
-        with self._admin_connection() as connection:
-            authority = connection.execute(
-                """
-                select exists (
-                    select 1
-                    from pg_catalog.pg_auth_members as membership
-                    join pg_catalog.pg_roles as granted_role
-                      on granted_role.oid = membership.roleid
-                    join pg_catalog.pg_roles as member_role
-                      on member_role.oid = membership.member
-                    where granted_role.rolname = %s
-                      and member_role.rolname = %s
-                      and membership.admin_option
-                ) as has_direct_admin_option
-                """,
-                (role, grantor),
-            ).fetchone()
-            if authority["has_direct_admin_option"]:
-                return False
-            connection.execute(
-                self.sql.SQL(
-                    "grant {} to {} with admin true, inherit false, set false"
-                ).format(
-                    self.sql.Identifier(role),
-                    self.sql.Identifier(grantor),
-                )
-            )
-        return True
-
-    def _revoke_provider_grantor_authority(self, role: str, grantor: str):
-        with self._admin_connection() as connection:
-            connection.execute(
-                self.sql.SQL("revoke {} from {}").format(
-                    self.sql.Identifier(role),
-                    self.sql.Identifier(grantor),
-                )
-            )
-
     def _grant_provider_edge(
         self,
         role: str,
@@ -890,35 +869,7 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
             self.sql.SQL("true" if set_option else "false"),
             self.sql.Identifier(grantor),
         )
-        bootstrapped = self._ensure_provider_grantor_authority(role, grantor)
-        try:
-            with self._admin_connection() as connection:
-                authority = connection.execute(
-                    """
-                    select
-                        pg_has_role(%s, %s, 'MEMBER WITH ADMIN OPTION')
-                        and exists (
-                            select 1
-                            from pg_catalog.pg_auth_members as membership
-                            join pg_catalog.pg_roles as granted_role
-                              on granted_role.oid = membership.roleid
-                            join pg_catalog.pg_roles as member_role
-                              on member_role.oid = membership.member
-                            where granted_role.rolname = %s
-                              and member_role.rolname = %s
-                              and membership.admin_option
-                        ) as has_admin
-                    """,
-                    (grantor, role, role, grantor),
-                ).fetchone()
-            self.assertTrue(
-                authority["has_admin"],
-                f"fixture grantor lacks ADMIN OPTION: {grantor} -> {role}",
-            )
-            return self._execute_as_role(grantor, statement)
-        finally:
-            if bootstrapped:
-                self._revoke_provider_grantor_authority(role, grantor)
+        return self._execute_as_role(grantor, statement)
 
     def _revoke_provider_edge(
         self,
@@ -931,12 +882,7 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
             self.sql.Identifier(member),
             self.sql.Identifier(grantor),
         )
-        bootstrapped = self._ensure_provider_grantor_authority(role, grantor)
-        try:
-            return self._execute_as_role(grantor, statement)
-        finally:
-            if bootstrapped:
-                self._revoke_provider_grantor_authority(role, grantor)
+        return self._execute_as_role(grantor, statement)
 
     def _revoke_provider_admin_option(
         self,
@@ -948,12 +894,7 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
             self.sql.Identifier(role),
             self.sql.Identifier(member),
         )
-        bootstrapped = self._ensure_provider_grantor_authority(role, grantor)
-        try:
-            return self._execute_as_role(grantor, statement)
-        finally:
-            if bootstrapped:
-                self._revoke_provider_grantor_authority(role, grantor)
+        return self._execute_as_role(grantor, statement)
 
     def _configure_acl_contract(self, database_name: str | None = None):
         target_database = database_name or self.database_name
@@ -1114,7 +1055,7 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         ):
             with self.subTest(assumed_role=expected_role):
                 with self.psycopg.connect(
-                    safe_postgres_url("postgres", self.database_name),
+                    safe_postgres_url(self.bootstrap_role, self.database_name),
                     row_factory=self.dict_row,
                     options="-c search_path=public,pg_catalog",
                     autocommit=True,
@@ -1637,7 +1578,7 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         )
 
         with self.psycopg.connect(
-            safe_postgres_url("postgres", self.database_name),
+            safe_postgres_url(self.bootstrap_role, self.database_name),
             options='-c search_path="$user",public',
             row_factory=self.dict_row,
         ) as raw:
@@ -1754,6 +1695,21 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
             if row is None:
                 raise AssertionError("fixture row missing")
             return row
+
+    def test_real_pg17_bootstrap_identity_is_oid_10_superuser(self):
+        version = self._admin_row(
+            "select current_setting('server_version_num') as server_version_num"
+        )
+        self.assertTrue(str(version["server_version_num"]).startswith("17"))
+        row = self._admin_row(
+            "select current_user, role.rolname, role.oid, role.rolsuper "
+            "from pg_catalog.pg_roles as role where role.rolname = %s",
+            (self.bootstrap_role,),
+        )
+        self.assertEqual(row["current_user"], DISPOSABLE_BOOTSTRAP_ROLE)
+        self.assertEqual(row["rolname"], DISPOSABLE_BOOTSTRAP_ROLE)
+        self.assertEqual(row["oid"], 10)
+        self.assertTrue(row["rolsuper"])
 
     def test_real_pg17_option_a_provider_rows_and_effective_database_matrix(self):
         self.assertEqual(self._verify()["status"], "verified")
