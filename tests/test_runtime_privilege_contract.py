@@ -820,11 +820,12 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
     def _execute_as_role(self, role: str, statement, params=()):
         with self._admin_connection() as connection:
             connection.execute(
-                self.sql.SQL("set role {}").format(self.sql.Identifier(role))
+                self.sql.SQL("set session authorization {}").format(self.sql.Identifier(role))
             )
-            result = connection.execute(statement, params)
-            connection.execute("reset role")
-            return result
+            identity = connection.execute("select session_user, current_user").fetchone()
+            self.assertEqual(identity["session_user"], role)
+            self.assertEqual(identity["current_user"], role)
+            return connection.execute(statement, params)
 
     def _configure_provider_memberships(self):
         for role in self.roles:
