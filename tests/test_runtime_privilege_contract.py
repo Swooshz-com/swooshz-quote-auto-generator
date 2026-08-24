@@ -831,6 +831,45 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         for role in self.roles:
             self._grant_provider_edge(role)
 
+    def _ensure_provider_grantor_authority(self, role: str, grantor: str):
+        with self._admin_connection() as connection:
+            authority = connection.execute(
+                """
+                select exists (
+                    select 1
+                    from pg_catalog.pg_auth_members as membership
+                    join pg_catalog.pg_roles as granted_role
+                      on granted_role.oid = membership.roleid
+                    join pg_catalog.pg_roles as member_role
+                      on member_role.oid = membership.member
+                    where granted_role.rolname = %s
+                      and member_role.rolname = %s
+                      and membership.admin_option
+                ) as has_direct_admin_option
+                """,
+                (role, grantor),
+            ).fetchone()
+            if authority["has_direct_admin_option"]:
+                return False
+            connection.execute(
+                self.sql.SQL(
+                    "grant {} to {} with admin true, inherit false, set false"
+                ).format(
+                    self.sql.Identifier(role),
+                    self.sql.Identifier(grantor),
+                )
+            )
+        return True
+
+    def _revoke_provider_grantor_authority(self, role: str, grantor: str):
+        with self._admin_connection() as connection:
+            connection.execute(
+                self.sql.SQL("revoke {} from {}").format(
+                    self.sql.Identifier(role),
+                    self.sql.Identifier(grantor),
+                )
+            )
+
     def _grant_provider_edge(
         self,
         role: str,
@@ -851,19 +890,14 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
             self.sql.SQL("true" if set_option else "false"),
             self.sql.Identifier(grantor),
         )
-        with self._admin_connection() as connection:
-            authority = connection.execute(
-                """
-                select
-                    pg_has_role(%s, %s, 'MEMBER WITH ADMIN OPTION')
-                    and (
-                        exists (
-                            select 1
-                            from pg_catalog.pg_roles as grantor_role
-                            where grantor_role.rolname = %s
-                              and grantor_role.rolsuper
-                        )
-                        or exists (
+        bootstrapped = self._ensure_provider_grantor_authority(role, grantor)
+        try:
+            with self._admin_connection() as connection:
+                authority = connection.execute(
+                    """
+                    select
+                        pg_has_role(%s, %s, 'MEMBER WITH ADMIN OPTION')
+                        and exists (
                             select 1
                             from pg_catalog.pg_auth_members as membership
                             join pg_catalog.pg_roles as granted_role
@@ -873,16 +907,18 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                             where granted_role.rolname = %s
                               and member_role.rolname = %s
                               and membership.admin_option
-                        )
-                    ) as has_admin
-                """,
-                (grantor, role, grantor, role, grantor),
-            ).fetchone()
-        self.assertTrue(
-            authority["has_admin"],
-            f"fixture grantor lacks ADMIN OPTION: {grantor} -> {role}",
-        )
-        return self._execute_as_role(grantor, statement)
+                        ) as has_admin
+                    """,
+                    (grantor, role, role, grantor),
+                ).fetchone()
+            self.assertTrue(
+                authority["has_admin"],
+                f"fixture grantor lacks ADMIN OPTION: {grantor} -> {role}",
+            )
+            return self._execute_as_role(grantor, statement)
+        finally:
+            if bootstrapped:
+                self._revoke_provider_grantor_authority(role, grantor)
 
     def _revoke_provider_edge(
         self,
@@ -895,7 +931,29 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
             self.sql.Identifier(member),
             self.sql.Identifier(grantor),
         )
-        return self._execute_as_role(grantor, statement)
+        bootstrapped = self._ensure_provider_grantor_authority(role, grantor)
+        try:
+            return self._execute_as_role(grantor, statement)
+        finally:
+            if bootstrapped:
+                self._revoke_provider_grantor_authority(role, grantor)
+
+    def _revoke_provider_admin_option(
+        self,
+        role: str,
+        member: str,
+        grantor: str = "cloud_admin",
+    ):
+        statement = self.sql.SQL("revoke admin option for {} from {}").format(
+            self.sql.Identifier(role),
+            self.sql.Identifier(member),
+        )
+        bootstrapped = self._ensure_provider_grantor_authority(role, grantor)
+        try:
+            return self._execute_as_role(grantor, statement)
+        finally:
+            if bootstrapped:
+                self._revoke_provider_grantor_authority(role, grantor)
 
     def _configure_acl_contract(self, database_name: str | None = None):
         target_database = database_name or self.database_name
@@ -1754,13 +1812,7 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
             "extra provider edge",
         )
         self._red_then_restore(
-            lambda: self._execute_as_role(
-                "cloud_admin",
-                self.sql.SQL("revoke admin option for {} from {}").format(
-                    self.sql.Identifier("sqag_runtime"),
-                    self.sql.Identifier("neondb_owner"),
-                ),
-            ),
+            lambda: self._revoke_provider_admin_option("sqag_runtime", "neondb_owner"),
             lambda: self._grant_provider_edge("sqag_runtime"),
             "ADMIN drift",
         )
