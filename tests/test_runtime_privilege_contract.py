@@ -77,7 +77,7 @@ def _sql_grantee(sql_module, name: str):
 class RuntimePrivilegeContractStaticTest(unittest.TestCase):
     def test_manifest_is_strict_a25_contract_without_source_digest_mirrors(self):
         manifest = contract.validate_manifest()
-        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(manifest["schema_version"], 3)
         self.assertNotIn("canonical_source_revision", manifest)
         self.assertNotIn("canonical_source_tree", manifest)
         self.assertNotIn("implementation_registry", manifest)
@@ -88,6 +88,115 @@ class RuntimePrivilegeContractStaticTest(unittest.TestCase):
         self.assertEqual(set(manifest["runtime_tables"]), set(contract.RUNTIME_TABLE_PRIVILEGES))
         self.assertEqual(set(manifest["maintenance_tables"]), set(contract.MAINTENANCE_TABLE_PRIVILEGES))
 
+    def test_option_a_provider_control_and_ownership_contract_is_exact(self):
+        manifest = contract.validate_manifest()
+        self.assertEqual(manifest["$schema"], "runtime-privilege-contract-schema-v3")
+        self.assertEqual(
+            manifest["provider_controlled_memberships"]["protected_roles"],
+            ["sqag_runtime", "sqag_migrator", "sqag_maintenance"],
+        )
+        self.assertEqual(
+            manifest["provider_controlled_memberships"]["allowed_edges"],
+            [
+                {
+                    "role": role,
+                    "member": "neondb_owner",
+                    "grantor": "cloud_admin",
+                    "admin_option": True,
+                    "inherit_option": False,
+                    "set_option": False,
+                }
+                for role in ("sqag_runtime", "sqag_migrator", "sqag_maintenance")
+            ],
+        )
+        self.assertEqual(
+            manifest["ownership"],
+            {
+                "database_owner": "neondb_owner",
+                "public_schema_owner": "pg_database_owner",
+            },
+        )
+
+    def test_option_a_static_contract_drift_is_fail_closed(self):
+        manifest = contract.validate_manifest()
+        edge = manifest["provider_controlled_memberships"]["allowed_edges"][0]
+
+        mutations = {
+            "unknown_top_level_key": lambda candidate: candidate.update(unexpected=True),
+            "missing_edge": lambda candidate: candidate["provider_controlled_memberships"]["allowed_edges"].pop(),
+            "fourth_edge": lambda candidate: candidate["provider_controlled_memberships"]["allowed_edges"].append(copy.deepcopy(edge)),
+            "wrong_schema_version": lambda candidate: candidate.update(schema_version=2),
+            "admin_drift": lambda candidate: candidate["provider_controlled_memberships"]["allowed_edges"][0].update(admin_option=False),
+            "inherit_drift": lambda candidate: candidate["provider_controlled_memberships"]["allowed_edges"][0].update(inherit_option=True),
+            "set_drift": lambda candidate: candidate["provider_controlled_memberships"]["allowed_edges"][0].update(set_option=True),
+            "wrong_member": lambda candidate: candidate["provider_controlled_memberships"]["allowed_edges"][0].update(member="cloud_admin"),
+            "wrong_grantor": lambda candidate: candidate["provider_controlled_memberships"]["allowed_edges"][0].update(grantor="neondb_owner"),
+            "unknown_edge_key": lambda candidate: candidate["provider_controlled_memberships"]["allowed_edges"][0].update(unexpected=True),
+            "unknown_provider_key": lambda candidate: candidate["provider_controlled_memberships"].update(unexpected=True),
+            "unknown_role": lambda candidate: candidate["provider_controlled_memberships"]["allowed_edges"][0].update(role="sqag_unknown"),
+            "protected_role_set_drift": lambda candidate: candidate["provider_controlled_memberships"]["protected_roles"].append("sqag_unknown"),
+            "unknown_ownership_key": lambda candidate: candidate["ownership"].update(unexpected=True),
+            "malformed_ownership": lambda candidate: candidate.update(ownership={"database_owner": "neondb_owner"}),
+            "wrong_database_owner": lambda candidate: candidate["ownership"].update(database_owner="postgres"),
+            "wrong_public_schema_owner": lambda candidate: candidate["ownership"].update(public_schema_owner="postgres"),
+        }
+        for label, mutate in mutations.items():
+            candidate = copy.deepcopy(manifest)
+            mutate(candidate)
+            with self.assertRaises(contract.RuntimePrivilegeContractError, msg=label):
+                contract.validate_manifest(candidate)
+
+    def test_option_a_runtime_membership_collection_matches_manifest_exactly(self):
+        manifest = contract.validate_manifest()
+        expected = copy.deepcopy(manifest["provider_controlled_memberships"]["allowed_edges"])
+        self.assertEqual(contract.validate_runtime_membership_edges(manifest, expected), [])
+
+        mutations = {
+            "missing_edge": lambda rows: rows.pop(),
+            "fourth_edge": lambda rows: rows.append({
+                "role": "sqag_runtime",
+                "member": "sqag_migrator",
+                "grantor": "cloud_admin",
+                "admin_option": True,
+                "inherit_option": False,
+                "set_option": False,
+            }),
+            "duplicate_edge": lambda rows: rows.append(copy.deepcopy(rows[0])),
+            "admin_drift": lambda rows: rows[0].update(admin_option=False),
+            "inherit_drift": lambda rows: rows[0].update(inherit_option=True),
+            "set_drift": lambda rows: rows[0].update(set_option=True),
+            "wrong_member": lambda rows: rows[0].update(member="sqag_migrator"),
+            "wrong_grantor": lambda rows: rows[0].update(grantor="neondb_owner"),
+            "outgoing_protected_role": lambda rows: rows.append({
+                "role": "sqag_runtime",
+                "member": "sqag_migrator",
+                "grantor": "cloud_admin",
+                "admin_option": True,
+                "inherit_option": False,
+                "set_option": False,
+            }),
+            "unexpected_protected_grantor": lambda rows: rows.append({
+                "role": "sqag_runtime",
+                "member": "neondb_owner",
+                "grantor": "sqag_migrator",
+                "admin_option": True,
+                "inherit_option": False,
+                "set_option": False,
+            }),
+            "application_membership": lambda rows: rows.append({
+                "role": "sqag_migrator",
+                "member": "sqag_runtime",
+                "grantor": "cloud_admin",
+                "admin_option": True,
+                "inherit_option": False,
+                "set_option": False,
+            }),
+            "non_boolean_option": lambda rows: rows[0].update(admin_option="true"),
+        }
+        for label, mutate in mutations.items():
+            rows = copy.deepcopy(expected)
+            mutate(rows)
+            self.assertTrue(contract.validate_runtime_membership_edges(manifest, rows), label)
     def test_migration_manifest_cannot_be_used_as_runtime_contract_mapping(self):
         migrations = migration_manifest(ROOT / "migrations")
         self.assertIsInstance(migrations, tuple)
@@ -574,6 +683,7 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.database_name = "sqag_a25_runtime_" + uuid.uuid4().hex
         self.roles = ("sqag_runtime", "sqag_migrator", "sqag_maintenance")
+        self.provider_roles = ("neondb_owner", "cloud_admin")
         self.created_database_names: list[str] = []
         self.created_roles: list[str] = []
         self.database_created = False
@@ -585,9 +695,10 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                 "select 1 from pg_catalog.pg_database where datname = %s",
                 (self.database_name,),
             ).fetchone()
+            all_roles = (*self.roles, *self.provider_roles)
             existing_roles = connection.execute(
                 "select rolname from pg_catalog.pg_roles where rolname = any(%s)",
-                (list(self.roles),),
+                (list(all_roles),),
             ).fetchall()
             if existing_database or existing_roles:
                 raise RuntimeError("CLEANUP_UNKNOWN")
@@ -598,14 +709,28 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
             )
             self.database_created = True
             self.created_database_names.append(self.database_name)
-            for role in self.roles:
+            role_options = {
+                "cloud_admin": "nologin nosuperuser nocreatedb createrole "
+                "noreplication nobypassrls noinherit connection limit -1",
+                "neondb_owner": "nologin nosuperuser nocreatedb nocreaterole "
+                "noreplication nobypassrls noinherit connection limit -1",
+            }
+            for role in (*self.provider_roles, *self.roles):
+                options = role_options.get(
+                    role,
+                    "login nosuperuser nocreatedb nocreaterole "
+                    "noreplication nobypassrls noinherit connection limit -1",
+                )
                 connection.execute(
-                    self.sql.SQL(
-                        "create role {} login nosuperuser nocreatedb nocreaterole "
-                        "noreplication nobypassrls noinherit connection limit -1"
-                    ).format(self.sql.Identifier(role))
+                    self.sql.SQL("create role {} {}").format(
+                        self.sql.Identifier(role),
+                        self.sql.SQL(options),
+                    )
                 )
                 self.created_roles.append(role)
+
+        self._configure_provider_ownership(self.database_name)
+        self._configure_provider_memberships()
 
         with self._admin_connection() as connection:
             before_grant = connection.execute(
@@ -681,6 +806,62 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
             safe_postgres_url(role, self.database_name),
             row_factory=self.dict_row,
         )
+
+    def _configure_provider_ownership(self, database_name: str):
+        with self._admin_connection("postgres") as connection:
+            connection.execute(
+                self.sql.SQL("alter database {} owner to neondb_owner").format(
+                    self.sql.Identifier(database_name)
+                )
+            )
+        with self._admin_connection(database_name) as connection:
+            connection.execute("alter schema public owner to pg_database_owner")
+
+    def _execute_as_role(self, role: str, statement, params=()):
+        with self._admin_connection() as connection:
+            connection.execute(
+                self.sql.SQL("set role {}").format(self.sql.Identifier(role))
+            )
+            result = connection.execute(statement, params)
+            connection.execute("reset role")
+            return result
+
+    def _configure_provider_memberships(self):
+        for role in self.roles:
+            self._grant_provider_edge(role)
+
+    def _grant_provider_edge(
+        self,
+        role: str,
+        member: str = "neondb_owner",
+        grantor: str = "cloud_admin",
+        *,
+        admin: bool = True,
+        inherit: bool = False,
+        set_option: bool = False,
+    ):
+        statement = self.sql.SQL(
+            "grant {} to {} with admin {}, inherit {}, set {}"
+        ).format(
+            self.sql.Identifier(role),
+            self.sql.Identifier(member),
+            self.sql.SQL("true" if admin else "false"),
+            self.sql.SQL("true" if inherit else "false"),
+            self.sql.SQL("true" if set_option else "false"),
+        )
+        return self._execute_as_role(grantor, statement)
+
+    def _revoke_provider_edge(
+        self,
+        role: str,
+        member: str = "neondb_owner",
+        grantor: str = "cloud_admin",
+    ):
+        statement = self.sql.SQL("revoke {} from {}").format(
+            self.sql.Identifier(role),
+            self.sql.Identifier(member),
+        )
+        return self._execute_as_role(grantor, statement)
 
     def _configure_acl_contract(self, database_name: str | None = None):
         target_database = database_name or self.database_name
@@ -762,6 +943,7 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                 )
             )
         self.created_database_names.append(database_name)
+        self._configure_provider_ownership(database_name)
         with self._admin_connection(database_name) as connection:
             connection.execute("grant usage, create on schema public to sqag_migrator")
         migrator_url = safe_postgres_url("sqag_migrator", database_name)
@@ -1480,6 +1662,212 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
             if row is None:
                 raise AssertionError("fixture row missing")
             return row
+
+    def test_real_pg17_option_a_provider_rows_and_effective_database_matrix(self):
+        self.assertEqual(self._verify()["status"], "verified")
+        rows = self._admin_rows(
+            "select parent.rolname as role, member.rolname as member, "
+            "grantor.rolname as grantor, am.admin_option, am.inherit_option, am.set_option "
+            "from pg_catalog.pg_auth_members am "
+            "join pg_catalog.pg_roles parent on parent.oid = am.roleid "
+            "join pg_catalog.pg_roles member on member.oid = am.member "
+            "join pg_catalog.pg_roles grantor on grantor.oid = am.grantor "
+            "where parent.rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_maintenance') "
+            "or member.rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_maintenance') "
+            "or grantor.rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_maintenance') "
+            "order by parent.rolname, member.rolname, grantor.rolname"
+        )
+        self.assertEqual(
+            [
+                tuple(row[key] for key in (
+                    "role", "member", "grantor",
+                    "admin_option", "inherit_option", "set_option",
+                ))
+                for row in rows
+            ],
+            [
+                (role, "neondb_owner", "cloud_admin", True, False, False)
+                for role in sorted(self.roles)
+            ],
+        )
+        with self._admin_connection() as connection:
+            for role in self.roles:
+                row = connection.execute(
+                    "select has_database_privilege(%s, current_database(), 'CONNECT') as connect, "
+                    "has_database_privilege(%s, current_database(), 'CREATE') as create_privilege, "
+                    "has_database_privilege(%s, current_database(), 'TEMPORARY') as temporary, "
+                    "has_database_privilege(%s, current_database(), 'CONNECT WITH GRANT OPTION') as connect_grantable, "
+                    "has_database_privilege(%s, current_database(), 'CREATE WITH GRANT OPTION') as create_grantable, "
+                    "has_database_privilege(%s, current_database(), 'TEMPORARY WITH GRANT OPTION') as temporary_grantable",
+                    (role, role, role, role, role, role),
+                ).fetchone()
+                self.assertTrue(row["connect"], role)
+                self.assertFalse(row["create_privilege"], role)
+                self.assertFalse(row["temporary"], role)
+                self.assertFalse(row["connect_grantable"], role)
+                self.assertFalse(row["create_grantable"], role)
+                self.assertFalse(row["temporary_grantable"], role)
+
+    def test_real_pg17_option_a_provider_membership_negative_matrix(self):
+        self._red_then_restore(
+            lambda: self._revoke_provider_edge("sqag_runtime"),
+            lambda: self._grant_provider_edge("sqag_runtime"),
+            "missing provider edge",
+        )
+        self._red_then_restore(
+            lambda: self._grant_provider_edge("sqag_runtime", "sqag_migrator"),
+            lambda: self._revoke_provider_edge("sqag_runtime", "sqag_migrator"),
+            "extra provider edge",
+        )
+        self._red_then_restore(
+            lambda: self._execute_as_role(
+                "cloud_admin",
+                self.sql.SQL("revoke admin option for {} from {}").format(
+                    self.sql.Identifier("sqag_runtime"),
+                    self.sql.Identifier("neondb_owner"),
+                ),
+            ),
+            lambda: self._grant_provider_edge("sqag_runtime"),
+            "ADMIN drift",
+        )
+        self._red_then_restore(
+            lambda: self._grant_provider_edge("sqag_runtime", inherit=True),
+            lambda: self._grant_provider_edge("sqag_runtime"),
+            "INHERIT drift",
+        )
+        self._red_then_restore(
+            lambda: self._grant_provider_edge("sqag_runtime", set_option=True),
+            lambda: self._grant_provider_edge("sqag_runtime"),
+            "SET drift",
+        )
+        self._red_then_restore(
+            lambda: (
+                self._revoke_provider_edge("sqag_runtime"),
+                self._grant_provider_edge("sqag_runtime", "sqag_migrator"),
+            ),
+            lambda: (
+                self._revoke_provider_edge("sqag_runtime", "sqag_migrator"),
+                self._grant_provider_edge("sqag_runtime"),
+            ),
+            "wrong member",
+        )
+        self._red_then_restore(
+            lambda: (
+                self._revoke_provider_edge("sqag_runtime"),
+                self._grant_provider_edge(
+                    "sqag_runtime", "sqag_migrator", grantor="neondb_owner"
+                ),
+            ),
+            lambda: (
+                self._revoke_provider_edge(
+                    "sqag_runtime", "sqag_migrator", grantor="neondb_owner"
+                ),
+                self._grant_provider_edge("sqag_runtime"),
+            ),
+            "wrong grantor",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin("grant cloud_admin to sqag_runtime"),
+            lambda: self._execute_admin("revoke cloud_admin from sqag_runtime"),
+            "protected role as member elsewhere",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin("grant sqag_runtime to cloud_admin"),
+            lambda: self._execute_admin("revoke sqag_runtime from cloud_admin"),
+            "provider-control role in an unapproved position",
+        )
+
+    def test_real_pg17_option_a_ownership_and_database_privilege_negative_matrix(self):
+        self._red_then_restore(
+            lambda: self._execute_admin_database(
+                "postgres",
+                self.sql.SQL("alter database {} owner to postgres").format(
+                    self.sql.Identifier(self.database_name)
+                ),
+            ),
+            lambda: self._execute_admin_database(
+                "postgres",
+                self.sql.SQL("alter database {} owner to neondb_owner").format(
+                    self.sql.Identifier(self.database_name)
+                ),
+            ),
+            "database owner mismatch",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin("alter schema public owner to postgres"),
+            lambda: self._execute_admin("alter schema public owner to pg_database_owner"),
+            "public schema owner mismatch",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "alter table public.sqag_profiles owner to neondb_owner"
+            ),
+            lambda: self._execute_admin(
+                "alter table public.sqag_profiles owner to sqag_migrator"
+            ),
+            "migrator object owner mismatch",
+        )
+        self._red_then_restore(
+            lambda: (
+                self._execute_admin("create table public.runtime_owned_probe (id integer)"),
+                self._execute_admin(
+                    "alter table public.runtime_owned_probe owner to sqag_runtime"
+                ),
+            ),
+            lambda: self._execute_admin("drop table if exists public.runtime_owned_probe"),
+            "runtime-owned public object",
+        )
+        self._red_then_restore(
+            lambda: (
+                self._execute_admin("create table public.maintenance_owned_probe (id integer)"),
+                self._execute_admin(
+                    "alter table public.maintenance_owned_probe owner to sqag_maintenance"
+                ),
+            ),
+            lambda: self._execute_admin("drop table if exists public.maintenance_owned_probe"),
+            "maintenance-owned public object",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                self.sql.SQL("grant create on database {} to sqag_migrator").format(
+                    self.sql.Identifier(self.database_name)
+                )
+            ),
+            lambda: self._execute_admin(
+                self.sql.SQL("revoke create on database {} from sqag_migrator").format(
+                    self.sql.Identifier(self.database_name)
+                )
+            ),
+            "migrator effective CREATE",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                self.sql.SQL("grant temporary on database {} to sqag_migrator").format(
+                    self.sql.Identifier(self.database_name)
+                )
+            ),
+            lambda: self._execute_admin(
+                self.sql.SQL("revoke temporary on database {} from sqag_migrator").format(
+                    self.sql.Identifier(self.database_name)
+                )
+            ),
+            "migrator effective TEMPORARY",
+        )
+
+    def test_real_pg17_role_attribute_drift_remains_red(self):
+        self._red_then_restore(
+            lambda: self._execute_admin("alter role sqag_runtime inherit"),
+            lambda: self._execute_admin("alter role sqag_runtime noinherit"),
+            "role attribute drift",
+        )
+
+    def _execute_admin_database(self, database_name: str, statement, params=()):
+        with self._admin_connection(database_name) as connection:
+            return connection.execute(statement, params)
+
+    def _admin_rows(self, statement, params=()):
+        with self._admin_connection() as connection:
+            return connection.execute(statement, params).fetchall()
 
 
 if __name__ == "__main__":
