@@ -710,7 +710,7 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
             self.database_created = True
             self.created_database_names.append(self.database_name)
             role_options = {
-                "cloud_admin": "nologin nosuperuser nocreatedb createrole "
+                "cloud_admin": "nologin superuser nocreatedb createrole "
                 "noreplication nobypassrls noinherit connection limit -1",
                 "neondb_owner": "nologin nosuperuser nocreatedb nocreaterole "
                 "noreplication nobypassrls noinherit connection limit -1",
