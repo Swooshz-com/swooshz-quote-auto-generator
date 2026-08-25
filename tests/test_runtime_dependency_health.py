@@ -239,6 +239,83 @@ class RuntimeDependencyHealthPostgresIntegrationTest(unittest.TestCase):
         checks = self.assert_health_matrix(status, overall="ok")
         self.assertTrue(all(checks.values()))
 
+    def test_genuine_runtime_reconciliation_and_forensic_store_use_runtime_projection(self):
+        with disposable_privilege_fixture() as fixture:
+            environment = self.health_env(fixture)
+            self.assert_runtime_can_read_only_runtime_forensics(fixture)
+            with mock.patch.dict(os.environ, environment, clear=True):
+                self.assertEqual(webapp.reconcile_forensic_runs_on_startup(), 0)
+                auth_session = {
+                    "user": {
+                        "platform": {
+                            "workspace": {"workspaceId": "workspace-runtime"},
+                            "user": {"userId": "user-runtime"},
+                        }
+                    }
+                }
+                with webapp.forensic_store_for_auth_session(auth_session) as store:
+                    self.assertEqual(store.workspace_id, "workspace-runtime")
+
+    def test_genuine_deploy_startup_reaches_listener_after_real_health_and_reconciliation(self):
+        with disposable_privilege_fixture() as fixture:
+            environment = self.health_env(fixture)
+            with tempfile.TemporaryDirectory() as temporary:
+                output_root = Path(temporary) / "output"
+                tmp_root = Path(temporary) / "tmp"
+                server = mock.Mock()
+                server.serve_forever.side_effect = KeyboardInterrupt
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(mock.patch.dict(os.environ, environment, clear=True))
+                    stack.enter_context(
+                        mock.patch.object(
+                            webapp,
+                            "configured_object_storage_backend",
+                            return_value=webapp.InMemoryObjectStorageBackend(),
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(webapp, "deploy_requires_auth_guard", return_value=False)
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            webapp,
+                            "deploy_requires_platform_workspace_guard",
+                            return_value=False,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            webapp,
+                            "deploy_requires_trusted_proxy_guard",
+                            return_value=False,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(webapp, "deploy_requires_storage_guard", return_value=False)
+                    )
+                    stack.enter_context(
+                        mock.patch.object(webapp, "configured_output_root", return_value=output_root)
+                    )
+                    stack.enter_context(
+                        mock.patch.object(webapp, "configured_tmp_root", return_value=tmp_root)
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            sys,
+                            "argv",
+                            ["server.py", "--host", "127.0.0.1", "--port", "0"],
+                        )
+                    )
+                    server_factory = stack.enter_context(
+                        mock.patch.object(webapp, "ThreadingHTTPServer", return_value=server)
+                    )
+                    result = webapp.main()
+
+                self.assertEqual(result, 0)
+                server_factory.assert_called_once()
+                server.serve_forever.assert_called_once_with()
+                server.server_close.assert_called_once_with()
+
 
 class RuntimeDependencyHealthDeployGateTest(unittest.TestCase):
     def common_deploy_patches(self, health):

@@ -20938,7 +20938,7 @@ def forensic_store_for_auth_session(auth_session: dict[str, Any] | None = None):
             expected_session_role=SQAG_RUNTIME_DATABASE_ROLE,
         )
         storage.ensure_ready()
-        storage._ensure_schema(SQAG_FORENSIC_REQUIRED_COLUMNS, reason="storage_forensics_database_not_migrated")
+        storage.ensure_runtime_forensic_ready()
         with storage.connection() as connection:
             yield ForensicStore(connection, workspace_id, actor_tracking_id, actor_key_version_value=clean_text(read_dotenv_value(TRACKING_HMAC_KEY_VERSION_ENV_NAME)))
         return
@@ -24123,7 +24123,7 @@ def reconcile_forensic_runs_on_startup(*, batch_size: int = 100) -> int:
             user_id="",
             expected_session_role=SQAG_RUNTIME_DATABASE_ROLE,
         )
-        storage._ensure_schema(SQAG_FORENSIC_REQUIRED_COLUMNS, reason="storage_forensics_database_not_migrated")
+        storage.ensure_runtime_forensic_ready()
         with storage.connection() as connection:
             workspaces = connection.execute(
                 "select distinct workspace_id from sqag_generation_runs where status in ('received','queued','running') order by workspace_id limit ?",
