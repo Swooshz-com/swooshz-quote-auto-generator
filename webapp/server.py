@@ -22496,10 +22496,11 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
     server_version = "SwooshzQuoteGenerator/0.1"
 
     def do_GET(self) -> None:
-        if self.block_untrusted_host():
-            return
         parsed = urlparse(self.path)
         path = parsed.path
+        is_exact_health_get = path == "/api/health"
+        if not is_exact_health_get and self.block_untrusted_host():
+            return
         if path == "/login":
             self.handle_login()
             return
