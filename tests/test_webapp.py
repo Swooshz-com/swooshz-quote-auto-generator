@@ -13813,7 +13813,7 @@ eval(extractAsyncFunction("confirmQuoteDependencyChange"));
         self.assertIn('class="pricing-reference-source-badge">Repo catalog</span>', html)
         self.assertIn('id="selectedPricingReferenceSummary">Managed in Settings.</p>', html)
         self.assertIn('source: state.pricingReferenceSource || "bundled"', js)
-        self.assertNotIn("pricingReferenceSourceLabel(reference)", js)
+        self.assertIn("pricingReferenceSourceLabel(reference)", js)
         self.assertNotIn("canManageSettings()", js)
         self.assertIn("Saved from the Quote Company panel.", js)
         self.assertIn("Exported from the Swooshz Quote Company panel.", js)
@@ -17628,6 +17628,7 @@ eval([
   "pricingReferenceSelectionFromValue",
   "sortedPricingReferencesForDisplay",
   "currentProfile",
+  "pricingReferenceSourceIsManageable",
   "protectedPricingReferenceReason",
   "deletionPricingReference",
   "pricingReferenceExportBlockReason",
@@ -17643,6 +17644,120 @@ assert.ok(select.innerHTML.includes("Synthetic Fixture"));
 assert.strictEqual(select.value, "local::synthetic-exhibition-fixture-pricing");
 assert.strictEqual(pricingReferenceEditBlockReason(deletionPricingReference()), "");
 assert.strictEqual(protectedPricingReferenceReason(deletionPricingReference()), "Default pricing references cannot be deleted.");
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_static_pricing_reference_manage_accepts_company_and_keeps_source_badge_truthful(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const marker = `function ${name}(`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const DEFAULT_PRICING_REFERENCE_ID = "bundled-default";
+const state = {
+  permissions: { canManagePricingReferences: true },
+  profileId: "workspace-profile",
+  profiles: [{ id: "workspace-profile", default_pricing_reference: DEFAULT_PRICING_REFERENCE_ID }],
+  pricingReferences: [
+    { id: "company-saved", label: "Company Saved", source: "company", item_count: 2 },
+    { id: "local-saved", label: "Local Saved", source: "local", item_count: 2 },
+    { id: DEFAULT_PRICING_REFERENCE_ID, label: "Repo Default", source: "bundled", item_count: 2 },
+  ],
+};
+const select = { value: "", innerHTML: "" };
+const button = {
+  disabled: false,
+  title: "",
+  hidden: false,
+  setAttribute(name, value) { this[name] = value; },
+};
+const elements = {
+  deletePricingReferenceSelect: select,
+  deletePricingReferenceButton: button,
+  exportPricingReferenceButton: { ...button },
+  pricingReferenceDeleteSection: { hidden: false },
+};
+function escapeHtml(value = "") { return String(value); }
+function canManagePricingReferences() { return true; }
+function pricingReferenceNoAccessReason() { return "No access"; }
+function pricingReferenceOperationBusy() { return false; }
+function updatePricingReferenceExportButton() {}
+function currentProfile() { return state.profiles[0]; }
+
+eval([
+  "pricingReferenceSelectValue",
+  "pricingReferenceSelectionFromValue",
+  "sortedPricingReferencesForDisplay",
+  "pricingReferenceSourceIsManageable",
+  "pricingReferenceSourceLabel",
+  "protectedPricingReferenceReason",
+  "deletionPricingReference",
+  "pricingReferenceExportBlockReason",
+  "pricingReferenceEditBlockReason",
+  "updatePricingReferenceDeleteButton",
+  "renderPricingReferenceDeleteOptions",
+].map(extractFunction).join("\n"));
+
+renderPricingReferenceDeleteOptions();
+assert.ok(select.innerHTML.includes("company::company-saved"));
+assert.ok(select.innerHTML.includes("local::local-saved"));
+assert.ok(select.innerHTML.includes("bundled::bundled-default"));
+assert.strictEqual(select.value, "company::company-saved");
+
+const company = state.pricingReferences[0];
+const local = state.pricingReferences[1];
+const bundled = state.pricingReferences[2];
+assert.strictEqual(pricingReferenceSourceIsManageable(company), true);
+assert.strictEqual(pricingReferenceSourceIsManageable(local), true);
+assert.strictEqual(pricingReferenceSourceIsManageable(bundled), false);
+assert.strictEqual(protectedPricingReferenceReason(company), "");
+assert.strictEqual(pricingReferenceEditBlockReason(company), "");
+assert.strictEqual(pricingReferenceExportBlockReason(company), "");
+assert.strictEqual(protectedPricingReferenceReason(local), "");
+assert.strictEqual(pricingReferenceEditBlockReason(local), "");
+assert.strictEqual(pricingReferenceExportBlockReason(local), "");
+assert.strictEqual(protectedPricingReferenceReason(bundled), "Bundled pricing reference packs are read-only.");
+assert.notStrictEqual(pricingReferenceEditBlockReason(bundled), "");
+assert.notStrictEqual(pricingReferenceExportBlockReason(bundled), "");
+
+assert.strictEqual(pricingReferenceSourceLabel(company), "Workspace catalog");
+assert.strictEqual(pricingReferenceSourceLabel(local), "Local catalog");
+assert.strictEqual(pricingReferenceSourceLabel(bundled), "Repo catalog");
+const summaryBody = source.split("function renderSelectedPricingReferenceSummary()")[1].split("function todayDateInputValue")[0];
+assert.ok(summaryBody.includes("elements.pricingReferenceSourceBadge.textContent = pricingReferenceSourceLabel(reference);"));
+
+state.pricingReferences = [];
+const reloaded = [company];
+state.pricingReferences = reloaded.filter((reference) => ["bundled", "company", "local"].includes(reference.source));
+const reloadedSelection = pricingReferenceSelectionFromValue(pricingReferenceSelectValue(state.pricingReferences[0]));
+assert.deepStrictEqual(reloadedSelection, { pricingReferenceId: "company-saved", source: "company" });
 """
         completed = subprocess.run(
             [node, "-e", script],

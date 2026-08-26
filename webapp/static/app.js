@@ -554,6 +554,7 @@ const elements = {
   pricingReferenceCurrency: qs("#pricingReferenceCurrency"),
   pricingReferenceCurrencyCustom: qs("#pricingReferenceCurrencyCustom"),
   selectedPricingReferenceSummary: qs("#selectedPricingReferenceSummary"),
+  pricingReferenceSourceBadge: qs(".pricing-reference-source-badge"),
   selectedPricingReferenceCurrency: qs("#selectedPricingReferenceCurrency"),
   selectedPricingReferenceTax: qs("#selectedPricingReferenceTax"),
   outputSortMode: qs("#outputSortMode"),
@@ -613,6 +614,18 @@ function pricingReferenceSelectValue(reference = {}) {
       ? "company"
       : reference.source === "local" ? "local" : "bundled";
   return `${source}::${referenceId}`;
+}
+
+function pricingReferenceSourceIsManageable(reference = {}) {
+  const source = String(reference?.source || "bundled").trim();
+  return source === "company" || source === "local";
+}
+
+function pricingReferenceSourceLabel(reference = {}) {
+  const source = String(reference?.source || "bundled").trim();
+  if (source === "company") return "Workspace catalog";
+  if (source === "local") return "Local catalog";
+  return "Repo catalog";
 }
 
 function pricingReferenceSelectionFromValue(value = "") {
@@ -2314,6 +2327,9 @@ function renderSelectedPricingReferenceSummary() {
   const tax = selectedPricingReferenceTax();
   const currency = selectedPricingReferenceCurrency();
   const taxText = selectedPricingReferenceTaxText();
+  if (elements.pricingReferenceSourceBadge) {
+    elements.pricingReferenceSourceBadge.textContent = pricingReferenceSourceLabel(reference);
+  }
   if (elements.selectedPricingReferenceSummary) {
     elements.selectedPricingReferenceSummary.textContent = reference
       ? "Managed in Settings."
@@ -4731,8 +4747,9 @@ function pricingReferenceNoAccessReason() {
 function protectedPricingReferenceReason(reference = currentPricingReference()) {
   if (!reference) return "Select a pricing reference first.";
   if (!canManagePricingReferences()) return pricingReferenceNoAccessReason();
-  if (String(reference.source || "bundled") === "bundled") return "Bundled pricing reference packs are read-only.";
-  if (String(reference.source || "bundled") !== "local") return "Only local pricing reference packs can be deleted here.";
+  const source = String(reference.source || "bundled").trim();
+  if (source === "bundled") return "Bundled pricing reference packs are read-only.";
+  if (!pricingReferenceSourceIsManageable(reference)) return "Only company or local pricing reference packs can be managed here.";
   const referenceId = String(reference.id || "").trim();
   if (!referenceId) return "Select a pricing reference first.";
   const profileDefault = String(currentProfile()?.default_pricing_reference || state.defaultPricingReferenceId || DEFAULT_PRICING_REFERENCE_ID).trim();
@@ -4757,7 +4774,7 @@ function canDeleteSelectedPricingReference() {
 function pricingReferenceExportBlockReason(reference = deletionPricingReference()) {
   if (!reference) return "Select a pricing reference first.";
   if (!canManagePricingReferences()) return pricingReferenceNoAccessReason();
-  if (String(reference.source || "bundled") !== "local") return "Only local pricing reference packs can be exported here.";
+  if (!pricingReferenceSourceIsManageable(reference)) return "Only company or local pricing reference packs can be exported here.";
   if (!String(reference.id || "").trim()) return "Select a pricing reference first.";
   return "";
 }
@@ -4778,7 +4795,7 @@ function updatePricingReferenceExportButton() {
 function pricingReferenceEditBlockReason(reference = deletionPricingReference()) {
   if (!reference) return "Select a pricing reference first.";
   if (!canManagePricingReferences()) return pricingReferenceNoAccessReason();
-  if (String(reference.source || "bundled") !== "local") return "Only local pricing reference packs can be edited here.";
+  if (!pricingReferenceSourceIsManageable(reference)) return "Only company or local pricing reference packs can be edited here.";
   const knownItemCount = Array.isArray(reference.items) ? reference.items.length : Number(reference.item_count);
   if (Number.isFinite(knownItemCount) && knownItemCount <= 0) return "This pricing reference has no editable rows.";
   return "";
@@ -4998,7 +5015,7 @@ function renderPricingReferenceDeleteOptions() {
   if (!select) return;
   const previousValue = select.value;
   const references = sortedPricingReferencesForDisplay(
-    state.pricingReferences.filter((reference) => ["local", "bundled"].includes(String(reference?.source || "bundled")))
+    state.pricingReferences.filter((reference) => ["company", "local", "bundled"].includes(String(reference?.source || "bundled")))
   );
   select.innerHTML = references.map((reference) => `
     <option value="${escapeHtml(pricingReferenceSelectValue(reference))}">${escapeHtml(reference.label || reference.id || "Pricing reference")}</option>
@@ -5021,7 +5038,7 @@ function updatePricingReferenceDeleteButton() {
   const reason = protectedPricingReferenceReason(reference);
   const busy = pricingReferenceOperationBusy();
   button.disabled = Boolean(reason) || busy;
-  button.title = busy ? "Pricing reference operation is still running." : reason || "Delete this local pricing reference.";
+  button.title = busy ? "Pricing reference operation is still running." : reason || "Delete this saved pricing reference.";
   button.setAttribute("aria-disabled", String(button.disabled));
   if (typeof updatePricingReferenceExportButton === "function") updatePricingReferenceExportButton();
 }
@@ -5058,7 +5075,7 @@ function renderPricingReferenceDeleteConfirm() {
     elements.pricingReferenceDeleteConfirmTitle.textContent = `Delete ${label}?`;
   }
   if (elements.pricingReferenceDeleteConfirmText) {
-    elements.pricingReferenceDeleteConfirmText.textContent = "This removes the saved local pricing reference pack from this app. Existing quotes already generated from it are not changed.";
+    elements.pricingReferenceDeleteConfirmText.textContent = "This removes the saved pricing reference from this workspace. Existing quotes already generated from it are not changed.";
   }
   if (elements.pricingReferenceDeleteError) {
     const message = String(state.pricingReferenceDeleteError || "").trim();
