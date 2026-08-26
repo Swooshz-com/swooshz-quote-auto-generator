@@ -9202,6 +9202,17 @@ SQAG_FORENSIC_REQUIRED_COLUMNS = {
     },
 }
 
+SQAG_RUNTIME_FORENSIC_REQUIRED_COLUMNS = {
+    table: SQAG_FORENSIC_REQUIRED_COLUMNS[table]
+    for table in (
+        "sqag_generation_runs",
+        "sqag_generation_evidence",
+        "sqag_audit_events",
+        "sqag_feedback",
+        "sqag_feedback_status_history",
+    )
+}
+
 SQAG_FORENSIC_REQUIRED_INDEXES = {
     "sqag_generation_runs_workspace_job_uidx",
     "sqag_generation_runs_workspace_idempotency_uidx",
@@ -10040,6 +10051,13 @@ class DatabaseSqagStorage:
         self._ensure_schema(
             SQAG_FORENSIC_REQUIRED_COLUMNS,
             reason="storage_forensics_database_not_migrated",
+        )
+
+    def ensure_runtime_forensic_ready(self) -> None:
+        """Check only the forensic surfaces visible to ordinary runtime."""
+        self._ensure_schema(
+            SQAG_RUNTIME_FORENSIC_REQUIRED_COLUMNS,
+            reason="storage_runtime_forensics_not_migrated",
         )
 
     def ensure_artifact_ready(self) -> None:
@@ -20559,6 +20577,7 @@ def uncached_health_status() -> dict[str, Any]:
     database_storage: DatabaseSqagStorage | None = None
     database_metadata_ready = storage_mode != "database"
 
+    forensic_ready = storage_mode != "database"
     if storage_mode == "database":
         try:
             database_storage = DatabaseSqagStorage(
@@ -20568,21 +20587,28 @@ def uncached_health_status() -> dict[str, Any]:
                 "",
                 expected_session_role=SQAG_RUNTIME_DATABASE_ROLE,
             )
-            database_storage.ensure_ready()
-            database_storage._ensure_schema(SQAG_FORENSIC_REQUIRED_COLUMNS, reason="storage_forensics_database_not_migrated")
-            database_metadata_ready = True
         except Exception:
             database_storage = None
-            database_metadata_ready = False
+        if database_storage is not None:
+            try:
+                database_storage.ensure_ready()
+                database_metadata_ready = True
+            except Exception:
+                database_metadata_ready = False
+            try:
+                database_storage.ensure_runtime_forensic_ready()
+                forensic_ready = True
+            except Exception:
+                forensic_ready = False
         checks.append({"name": "database_metadata_schema", "ok": database_metadata_ready})
-        checks.append({"name": "forensic_schema", "ok": database_metadata_ready})
+        checks.append({"name": "forensic_schema", "ok": forensic_ready})
         tracking_ready = configured_app_mode() != "deploy" or (bool(clean_text(read_dotenv_value(TRACKING_HMAC_KEY_ENV_NAME))) and bool(re.fullmatch(r"[A-Za-z0-9._-]{1,24}", clean_text(read_dotenv_value(TRACKING_HMAC_KEY_VERSION_ENV_NAME)))))
         checks.append({"name": "forensic_tracking_configuration", "ok": tracking_ready})
         checks.append({"name": "forensic_local_fallback_disabled", "ok": storage_mode == "database"})
 
     if artifact_mode in {"database", "object"}:
         artifact_metadata_ready = False
-        if database_storage is not None and database_metadata_ready:
+        if database_storage is not None:
             try:
                 if artifact_mode == "database":
                     database_storage.ensure_artifact_ready()
@@ -20912,7 +20938,7 @@ def forensic_store_for_auth_session(auth_session: dict[str, Any] | None = None):
             expected_session_role=SQAG_RUNTIME_DATABASE_ROLE,
         )
         storage.ensure_ready()
-        storage._ensure_schema(SQAG_FORENSIC_REQUIRED_COLUMNS, reason="storage_forensics_database_not_migrated")
+        storage.ensure_runtime_forensic_ready()
         with storage.connection() as connection:
             yield ForensicStore(connection, workspace_id, actor_tracking_id, actor_key_version_value=clean_text(read_dotenv_value(TRACKING_HMAC_KEY_VERSION_ENV_NAME)))
         return
@@ -24097,7 +24123,7 @@ def reconcile_forensic_runs_on_startup(*, batch_size: int = 100) -> int:
             user_id="",
             expected_session_role=SQAG_RUNTIME_DATABASE_ROLE,
         )
-        storage._ensure_schema(SQAG_FORENSIC_REQUIRED_COLUMNS, reason="storage_forensics_database_not_migrated")
+        storage.ensure_runtime_forensic_ready()
         with storage.connection() as connection:
             workspaces = connection.execute(
                 "select distinct workspace_id from sqag_generation_runs where status in ('received','queued','running') order by workspace_id limit ?",
