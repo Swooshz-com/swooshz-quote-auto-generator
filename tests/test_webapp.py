@@ -5259,6 +5259,79 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(health_error.exception.code, 503)
         self.assertEqual(body, blocked)
 
+    def test_exact_health_get_accepts_localhost_host_after_host_gate_repair(self):
+        runtime_root = Path(tempfile.gettempdir()) / f"sqag-health-host-positive-{time.time_ns()}"
+        env = self.platform_launch_env(QUOTE_LOG_ROOT=str(runtime_root / "logs"))
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "health_status", return_value={"status": "ok"}) as health,
+            LocalRunnerServer(allow_any_host=False, canonical_origin=False) as runner,
+        ):
+            response = self.http_json(runner, "GET", "/api/health", headers={"Host": "localhost"})
+
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(response["body"], {"status": "ok"})
+        health.assert_called_once_with()
+
+    def test_exact_health_route_host_matrix_preserves_non_health_admission(self):
+        health_payload = {"status": "ok", "generator_available": True, "checks": []}
+        runtime_root = Path(tempfile.gettempdir()) / f"sqag-health-host-matrix-{time.time_ns()}"
+        env = self.platform_launch_env(QUOTE_LOG_ROOT=str(runtime_root / "logs"))
+
+        def raw_get_status(runner, path, *host_values):
+            parsed = urllib.parse.urlparse(runner.base_url)
+            connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
+            try:
+                connection.putrequest("GET", path, skip_host=True)
+                for host_value in host_values:
+                    connection.putheader("Host", host_value)
+                connection.endheaders()
+                response = connection.getresponse()
+                response.read()
+                return response.status
+            finally:
+                connection.close()
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "health_status", return_value=health_payload) as health,
+            LocalRunnerServer(allow_any_host=False, canonical_origin=False) as runner,
+        ):
+            for host in ("localhost", "localhost:8765", "127.0.0.1:8765", "[::1]:8765", "quote.swooshz.com"):
+                with self.subTest(host=host):
+                    response = self.http_json(runner, "GET", "/api/health", headers={"Host": host})
+                    self.assertEqual(response["status"], 200)
+                    self.assertEqual(response["body"], health_payload)
+
+            query_response = self.http_json(
+                runner,
+                "GET",
+                "/api/health?probe=run252",
+                headers={"Host": "localhost"},
+            )
+            self.assertEqual(query_response["status"], 200)
+            self.assertEqual(query_response["body"], health_payload)
+
+            for path in ("/api/health/", "/api/health-other", "/api/health/ready", "/api/session"):
+                with self.subTest(path=path):
+                    response = self.http_json(runner, "GET", path, headers={"Host": "localhost"})
+                    self.assertEqual(response["status"], 403)
+
+            post_response = self.http_json(
+                runner,
+                "POST",
+                "/api/health",
+                body={},
+                headers={"Host": "localhost"},
+            )
+            self.assertEqual(post_response["status"], 403)
+
+            self.assertEqual(raw_get_status(runner, "/api/session"), 403)
+            self.assertEqual(raw_get_status(runner, "/api/session", "quote.swooshz.com:bad"), 403)
+            self.assertEqual(raw_get_status(runner, "/api/session", "localhost", "localhost"), 403)
+
+        self.assertEqual(health.call_count, 6)
+
     def test_deploy_main_probes_dependencies_before_server_construction(self):
         env = self.platform_launch_env()
         blocked = {
