@@ -327,7 +327,8 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
                     "select p.proname, pg_get_function_identity_arguments(p.oid) as identity_arguments "
                     "from pg_catalog.pg_proc p "
                     "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
-                    "where n.nspname = 'public' and p.proname like 'sqag_%'"
+                    "where n.nspname = 'public' and p.proname like ?",
+                    ("sqag_%",),
                 ).fetchall()
             }
         finally:

@@ -1003,13 +1003,17 @@ def _check_complete_public_sqag_routine_inventory(connection: Any, errors: list[
     for role in RUNTIME_ROLES:
         for row in routine_rows:
             routine_name = _clean(_row_value(row, "proname"))
+            routine_key = (
+                routine_name,
+                _clean(_row_value(row, "identity_arguments")),
+            )
             function_oid = _row_value(row, "function_oid")
             effective_rows = _rows(
                 connection,
                 "select has_function_privilege(?, ?, 'EXECUTE') as effective",
                 (role, function_oid),
             )
-            expected = role == "sqag_runtime" and key in EXPECTED_CALLABLE_ROUTINE_KEYS
+            expected = role == "sqag_runtime" and routine_key in EXPECTED_CALLABLE_ROUTINE_KEYS
             observed = any(bool(_row_value(effective_row, "effective")) for effective_row in effective_rows)
             if observed != expected:
                 errors.append(f"effective_routine_privilege:{role}:{routine_name}")
