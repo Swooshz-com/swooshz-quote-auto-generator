@@ -130,6 +130,26 @@ class RuntimePrivilegeContractStaticTest(unittest.TestCase):
         )
         self.assertEqual(contract.validate_source_bindings(manifest), [])
 
+    def test_callable_session_hold_body_normalizes_formatting_but_not_semantics(self):
+        canonical_body = contract._canonical_callable_routine_body()
+        self.assertTrue(canonical_body)
+        formatting_only = canonical_body.replace("\n", " \t") + "\n-- formatting-only comment"
+        self.assertEqual(
+            contract._semantic_sql_tokens(canonical_body),
+            contract._semantic_sql_tokens(formatting_only),
+        )
+        semantic_mutation = canonical_body.replace(
+            "or (select blocked from hold_state)",
+            "and (select blocked from hold_state)",
+            1,
+        )
+        self.assertNotEqual(
+            contract._semantic_sql_tokens(canonical_body),
+            contract._semantic_sql_tokens(semantic_mutation),
+        )
+        verifier_source = (ROOT / "scripts" / "validate_runtime_privilege_contract.py").read_text(encoding="utf-8")
+        self.assertIn("p.prosrc as function_body", verifier_source)
+
     def test_option_a_static_contract_drift_is_fail_closed(self):
         manifest = contract.validate_manifest()
         edge = manifest["provider_controlled_memberships"]["allowed_edges"][0]
@@ -1028,6 +1048,54 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
             restore()
         self.assertEqual(self._verify()["status"], "verified")
 
+    def _workspace_deletion_snapshot(self, workspace_id: str) -> dict[str, list[tuple[object, ...]]]:
+        queries = {
+            "sessions": (
+                "select * from public.sqag_quote_sessions "
+                "where workspace_id = %s order by session_id",
+            ),
+            "publication_versions": (
+                "select * from public.sqag_quote_publication_versions "
+                "where workspace_id = %s order by session_id, run_id",
+            ),
+            "publication_artifacts": (
+                "select * from public.sqag_quote_publication_artifacts "
+                "where workspace_id = %s order by session_id, run_id, artifact_kind",
+            ),
+            "object_artifacts": (
+                "select * from public.sqag_object_artifacts "
+                "where workspace_id = %s order by artifact_id",
+            ),
+            "generation_runs": (
+                "select * from public.sqag_generation_runs "
+                "where workspace_id = %s order by run_id",
+            ),
+            "generation_evidence": (
+                "select * from public.sqag_generation_evidence "
+                "where workspace_id = %s order by evidence_id",
+            ),
+            "audit_events": (
+                "select * from public.sqag_audit_events "
+                "where workspace_id = %s order by event_id",
+            ),
+            "feedback": (
+                "select * from public.sqag_feedback "
+                "where workspace_id = %s order by feedback_id",
+            ),
+            "feedback_status_history": (
+                "select * from public.sqag_feedback_status_history "
+                "where workspace_id = %s order by history_id",
+            ),
+            "legal_holds": (
+                "select * from public.sqag_legal_holds "
+                "where workspace_id = %s order by hold_id",
+            ),
+        }
+        return {
+            name: [tuple(row.values()) for row in self._admin_rows(statement, (workspace_id,))]
+            for name, (statement,) in queries.items()
+        }
+
     def _restore_canonical_forensic_routines(self):
         for trigger, table in (
             ("sqag_generation_evidence_no_update", "sqag_generation_evidence"),
@@ -1164,6 +1232,37 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
             self._verify()
         self.assertIn("callable_routine_relation_inventory_mismatch", str(raised.exception))
 
+    def test_real_pg17_callable_session_hold_semantic_body_drift_is_rejected_and_restored(self):
+        canonical_body = contract._canonical_callable_routine_body()
+        semantic_mutation = canonical_body.replace(
+            "or (select blocked from hold_state)",
+            "and (select blocked from hold_state)",
+            1,
+        )
+        self.assertNotEqual(canonical_body, semantic_mutation)
+        self._execute_admin(
+            "create or replace function public.sqag_quote_session_deletion_hold_blocked(text, text) "
+            "returns boolean language sql stable parallel unsafe security definer "
+            "set search_path = pg_catalog, public as $sqag$"
+            + semantic_mutation
+            + "$sqag$"
+        )
+        try:
+            with self.assertRaises(contract.RuntimePrivilegeContractError) as raised:
+                self._verify()
+            failure = str(raised.exception)
+            self.assertIn("callable_routine_body_mismatch", failure)
+            self.assertNotIn("callable_routine_relation_inventory_mismatch", failure)
+        finally:
+            self._execute_admin(
+                "create or replace function public.sqag_quote_session_deletion_hold_blocked(text, text) "
+                "returns boolean language sql stable parallel unsafe security definer "
+                "set search_path = pg_catalog, public as $sqag$"
+                + canonical_body
+                + "$sqag$"
+            )
+        self.assertEqual(self._verify()["status"], "verified")
+
     def test_real_pg17_callable_session_hold_acl_drift_is_rejected(self):
         self._execute_admin(
             "grant execute on function public.sqag_quote_session_deletion_hold_blocked(text, text) "
@@ -1273,6 +1372,278 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                 )
             self.assertTrue(deleted)
             self.assertIsNone(storage.get_quote_session(session_id))
+
+    def test_run302_pg17_held_session_delete_preserves_every_graph_surface(self):
+        runtime_url = safe_postgres_url("sqag_runtime", self.database_name)
+        maintenance_url = safe_postgres_url("sqag_maintenance", self.database_name)
+        workspace_id = "workspace-run302-held"
+        session_id = "quote-run302-held-session"
+        target_run_id = "run-run302-held-session"
+        unrelated_run_id = "run-run302-unrelated"
+        target_job_id = "job-run302-held-session"
+        unrelated_job_id = "job-run302-unrelated"
+        held_event_id = "audit-run302-dangling-link"
+        malformed_event_id = "audit-run302-malformed-link"
+        now = "2026-08-28T00:00:00Z"
+        expiry = "2099-08-28T00:00:00Z"
+        storage = webapp.DatabaseSqagStorage(
+            runtime_url,
+            workspace_id,
+            role="admin",
+            user_id="user-run302-held",
+            expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+            },
+            clear=False,
+        ):
+            storage.create_or_update_quote_session(
+                {"session_id": session_id, "client": {"name": "synthetic"}},
+                result=None,
+            )
+
+        with webapp.postgres_storage_connection(
+            runtime_url,
+            expected_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        ) as connection:
+            forensic = ForensicStore(
+                connection,
+                workspace_id,
+                "actor-run302-held",
+                actor_key_version_value="test-v1",
+            )
+            recorded_target_run_id = forensic.record_run_started(
+                "generate",
+                {"image_count": 1, "synthetic": True},
+                run_id=target_run_id,
+                job_id=target_job_id,
+                quote_session_id=session_id,
+                now=dt.datetime(2026, 8, 28, tzinfo=dt.timezone.utc),
+            )
+            forensic.finish_run(
+                recorded_target_run_id,
+                "completed",
+                result_summary={"status": "completed", "synthetic": True},
+                now=dt.datetime(2026, 8, 28, tzinfo=dt.timezone.utc),
+            )
+            feedback = forensic.submit_feedback(
+                {
+                    "category": "bug",
+                    "title": "Synthetic held-session feedback",
+                    "message": "Synthetic evidence for Run-302.",
+                    "impact": "medium",
+                    "include_link": True,
+                    "link_choice": "automatic",
+                    "run_id": target_run_id,
+                    "validated_session_id": session_id,
+                }
+            )
+            self.assertTrue(feedback["feedback_id"])
+            unrelated_forensic = ForensicStore(
+                connection,
+                workspace_id,
+                "actor-run302-unrelated",
+                actor_key_version_value="test-v1",
+            )
+            unrelated_forensic.record_run_started(
+                "generate",
+                {"image_count": 0, "synthetic": True},
+                run_id=unrelated_run_id,
+                job_id=unrelated_job_id,
+                quote_session_id="quote-run302-unrelated-session",
+                now=dt.datetime(2026, 8, 28, tzinfo=dt.timezone.utc),
+            )
+
+        self._execute_admin(
+            "insert into public.sqag_audit_events "
+            "(event_id, run_id, feedback_id, session_id, workspace_id, "
+            "actor_tracking_id, actor_key_version, event_type, event_json, "
+            "event_sha256, created_at, retention_expires_at, "
+            "original_retention_expires_at, legal_hold) "
+            "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                held_event_id,
+                unrelated_run_id,
+                "feedback-run302-dangling",
+                session_id,
+                workspace_id,
+                "actor-run302-direct",
+                "test-v1",
+                "run302_direct_dangling",
+                '{"synthetic":true}',
+                "0" * 64,
+                now,
+                expiry,
+                expiry,
+                0,
+            ),
+        )
+        self._execute_admin(
+            "insert into public.sqag_audit_events "
+            "(event_id, run_id, feedback_id, session_id, workspace_id, "
+            "actor_tracking_id, actor_key_version, event_type, event_json, "
+            "event_sha256, created_at, retention_expires_at, "
+            "original_retention_expires_at, legal_hold) "
+            "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                malformed_event_id,
+                unrelated_run_id,
+                "not a feedback id",
+                session_id,
+                workspace_id,
+                "actor-run302-direct",
+                "test-v1",
+                "run302_direct_malformed",
+                '{"synthetic":true}',
+                "0" * 64,
+                now,
+                expiry,
+                expiry,
+                0,
+            ),
+        )
+
+        publication_metadata = json.dumps(
+            {
+                "session_id": session_id,
+                "publication": {
+                    "state": "published",
+                    "run_id": target_run_id,
+                    "job_id": target_job_id,
+                },
+                "synthetic": True,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        self._execute_admin(
+            "insert into public.sqag_quote_publication_versions "
+            "(workspace_id, session_id, run_id, job_id, state, "
+            "artifact_storage_mode, artifact_source, metadata_json, error_code, "
+            "created_at, updated_at, promoted_at, failed_at, retention_expires_at, "
+            "original_retention_expires_at, legal_hold, deletion_state, "
+            "deletion_error_code, deletion_claimed_at) "
+            "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                workspace_id,
+                session_id,
+                target_run_id,
+                target_job_id,
+                "published",
+                "object",
+                "version",
+                publication_metadata,
+                None,
+                now,
+                now,
+                now,
+                None,
+                expiry,
+                expiry,
+                0,
+                "active",
+                None,
+                None,
+            ),
+        )
+        publication_bytes = b"synthetic-run302-publication"
+        self._execute_admin(
+            "insert into public.sqag_quote_publication_artifacts "
+            "(workspace_id, session_id, run_id, artifact_kind, filename, "
+            "content_type, size_bytes, checksum_sha256, content_blob, created_at, "
+            "updated_at) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                workspace_id,
+                session_id,
+                target_run_id,
+                "xlsx",
+                "quotation.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                len(publication_bytes),
+                "0" * 64,
+                publication_bytes,
+                now,
+                now,
+            ),
+        )
+        self._execute_admin(
+            "insert into public.sqag_object_artifacts "
+            "(artifact_id, workspace_id, owner_type, owner_id, platform_user_id, "
+            "session_id, job_id, artifact_kind, filename, content_type, size_bytes, "
+            "checksum_sha256, object_provider_type, object_key_ref, status, "
+            "retention_status, created_at, updated_at, deleted_at) "
+            "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                "artifact-run302-held-xlsx",
+                workspace_id,
+                "generated_quote_version",
+                target_run_id,
+                "synthetic-user",
+                session_id,
+                target_job_id,
+                "xlsx",
+                "quotation.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                len(publication_bytes),
+                "0" * 64,
+                "synthetic",
+                "synthetic/run302/quotation.xlsx",
+                "active",
+                "active",
+                now,
+                now,
+                None,
+            ),
+        )
+
+        with webapp.postgres_storage_connection(
+            maintenance_url,
+            expected_role=webapp.SQAG_MAINTENANCE_DATABASE_ROLE,
+        ) as connection:
+            maintenance_forensic = ForensicStore(
+                connection,
+                workspace_id,
+                "actor-run302-maintenance",
+                actor_key_version_value="test-v1",
+            )
+            self.assertTrue(
+                maintenance_forensic.set_legal_hold(
+                    "sqag_audit_events",
+                    "event_id",
+                    held_event_id,
+                    True,
+                    reason_code="run302_direct_audit",
+                    case_reference="RUN-302",
+                )
+            )
+
+        active_hold = self._admin_row(
+            "select enabled, target_type, target_id from public.sqag_legal_holds "
+            "where workspace_id = %s and target_type = %s and target_id = %s",
+            (workspace_id, "audit_event", held_event_id),
+        )
+        self.assertEqual(
+            (active_hold["enabled"], active_hold["target_type"], active_hold["target_id"]),
+            (1, "audit_event", held_event_id),
+        )
+        before = self._workspace_deletion_snapshot(workspace_id)
+        with mock.patch.dict(
+            os.environ,
+            {
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+            },
+            clear=False,
+        ):
+            deleted = storage.delete_quote_session(session_id)
+        self.assertFalse(deleted)
+        after = self._workspace_deletion_snapshot(workspace_id)
+        self.assertEqual(before, after)
+        self.assertIsNotNone(storage.get_quote_session(session_id))
 
     def test_real_pg17_unexpected_public_sqag_routine_default_public_execute_is_rejected(self):
         self._execute_admin(

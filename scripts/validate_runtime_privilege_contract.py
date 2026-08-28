@@ -28,6 +28,8 @@ from webapp.postgres_migrations import (  # noqa: E402
     EXPECTED_TRIGGER_ROUTINE_LINKS,
     LEDGER_TABLE,
     MIGRATION_TABLES,
+    MigrationSafetyError,
+    canonical_migration_payload,
     migration_manifest,
 )
 
@@ -132,6 +134,15 @@ EXPECTED_ROUTINE_KEYS = EXPECTED_TRIGGER_ROUTINE_KEYS | EXPECTED_CALLABLE_ROUTIN
 CALLABLE_ROUTINE_NAME = "sqag_quote_session_deletion_hold_blocked"
 CALLABLE_ROUTINE_IDENTITY_ARGUMENTS = "text, text"
 CALLABLE_ROUTINE_MIGRATION_PATH = "migrations/008_quote_session_deletion_hold_authority_postgres.sql"
+CALLABLE_ROUTINE_HEADER_RE = re.compile(
+    r"\bcreate\s+(?:or\s+replace\s+)?function\s+public\s*\.\s*"
+    r"sqag_quote_session_deletion_hold_blocked\s*\(\s*text\s*,\s*text\s*\)"
+    r".*?\bas\s+(?P<delimiter>\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$)",
+    re.IGNORECASE | re.DOTALL,
+)
+DOLLAR_QUOTE_RE = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
+SQL_NUMBER_RE = re.compile(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
+SQL_OPERATOR_CHARS = frozenset("+-*/<>=~!@#%^&|?:")
 CALLABLE_ROUTINE_REFERENCED_RELATIONS = (
     "sqag_audit_events",
     "sqag_feedback",
@@ -241,6 +252,153 @@ def _rows(connection: Any, sql: str, params: Sequence[Any] = ()) -> list[Any]:
 
 def _clean(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _consume_sql_quoted_token(
+    source: str,
+    quote_start: int,
+    quote: str,
+    *,
+    backslash_escapes: bool = False,
+) -> int:
+    index = quote_start + 1
+    while index < len(source):
+        character = source[index]
+        if character == quote:
+            if index + 1 < len(source) and source[index + 1] == quote:
+                index += 2
+                continue
+            return index + 1
+        if backslash_escapes and character == "\\":
+            index += 2
+        else:
+            index += 1
+    return len(source)
+
+
+def _semantic_sql_tokens(source: str) -> tuple[tuple[str, str], ...]:
+    """Normalize only SQL formatting while retaining semantic-sensitive tokens."""
+
+    tokens: list[tuple[str, str]] = []
+    index = 0
+    while index < len(source):
+        character = source[index]
+        if character.isspace():
+            index += 1
+            continue
+        if source.startswith("--", index):
+            newline = source.find("\n", index + 2)
+            index = len(source) if newline < 0 else newline + 1
+            continue
+        if source.startswith("/*", index):
+            comment_start = index
+            depth = 1
+            index += 2
+            while index < len(source) and depth:
+                if source.startswith("/*", index):
+                    depth += 1
+                    index += 2
+                elif source.startswith("*/", index):
+                    depth -= 1
+                    index += 2
+                else:
+                    index += 1
+            if depth:
+                tokens.append(("unterminated_comment", source[comment_start:]))
+                break
+            continue
+        literal_start = index
+        if character in "'\"":
+            index = _consume_sql_quoted_token(source, index, character)
+            tokens.append(("literal", source[literal_start:index]))
+            continue
+        if character in "eE" and index + 1 < len(source) and source[index + 1] == "'":
+            index = _consume_sql_quoted_token(
+                source,
+                index + 1,
+                "'",
+                backslash_escapes=True,
+            )
+            tokens.append(("literal", source[literal_start:index]))
+            continue
+        if character == "$":
+            if index + 1 < len(source) and source[index + 1].isdigit():
+                end = index + 2
+                while end < len(source) and source[end].isdigit():
+                    end += 1
+                tokens.append(("parameter", source[index:end]))
+                index = end
+                continue
+            dollar_quote = DOLLAR_QUOTE_RE.match(source, index)
+            if dollar_quote:
+                delimiter = dollar_quote.group(0)
+                end = source.find(delimiter, dollar_quote.end())
+                if end < 0:
+                    tokens.append(("unterminated_literal", source[index:]))
+                    break
+                end += len(delimiter)
+                tokens.append(("literal", source[index:end]))
+                index = end
+                continue
+        if character == "_" or character.isalpha():
+            end = index + 1
+            while end < len(source) and (
+                source[end] == "_"
+                or source[end] == "$"
+                or source[end].isalnum()
+            ):
+                end += 1
+            tokens.append(("identifier", source[index:end].lower()))
+            index = end
+            continue
+        number = SQL_NUMBER_RE.match(source, index)
+        if number:
+            end = number.end()
+            tokens.append(("number", source[index:end]))
+            index = end
+            continue
+        if character in SQL_OPERATOR_CHARS:
+            end = index + 1
+            while end < len(source) and source[end] in SQL_OPERATOR_CHARS:
+                end += 1
+            tokens.append(("operator", source[index:end]))
+            index = end
+            continue
+        tokens.append(("punctuation", character))
+        index += 1
+    return tuple(tokens)
+
+
+def _extract_callable_routine_body(source: str) -> str:
+    matches = list(CALLABLE_ROUTINE_HEADER_RE.finditer(source))
+    if len(matches) != 1:
+        raise RuntimePrivilegeContractError(
+            "callable_routine_source_body:declaration_count"
+        )
+    header = matches[0]
+    delimiter = header.group("delimiter")
+    body_end = source.find(delimiter, header.end())
+    if body_end < 0:
+        raise RuntimePrivilegeContractError(
+            "callable_routine_source_body:delimiter_missing"
+        )
+    body = source[header.end():body_end]
+    if not _semantic_sql_tokens(body):
+        raise RuntimePrivilegeContractError(
+            "callable_routine_source_body:empty"
+        )
+    return body
+
+
+def _canonical_callable_routine_body() -> str:
+    path = ROOT / CALLABLE_ROUTINE_MIGRATION_PATH
+    try:
+        source = canonical_migration_payload(path).decode("utf-8")
+        return _extract_callable_routine_body(source)
+    except (MigrationSafetyError, UnicodeDecodeError, OSError) as exc:
+        raise RuntimePrivilegeContractError(
+            "callable_routine_source_body:unavailable"
+        ) from exc
 
 
 def _exact_keys(value: Any, expected: set[str], label: str, errors: list[str]) -> None:
@@ -456,11 +614,15 @@ def _validate_callable_routine_source(
     texts = dict(source_texts or {})
     if path not in texts:
         try:
-            texts[path] = (ROOT / path).read_text(encoding="utf-8")
-        except OSError:
+            texts[path] = canonical_migration_payload(ROOT / path).decode("utf-8")
+        except (MigrationSafetyError, UnicodeDecodeError, OSError):
             errors.append(f"source_binding.file_missing:{path}")
             return
     text = texts[path]
+    try:
+        _extract_callable_routine_body(text)
+    except RuntimePrivilegeContractError as exc:
+        errors.append(f"source_binding.callable_routine_source.body:{exc}")
     literal = {
         match.group(1).lower()
         for match in SQL_RELATION_RE.finditer(text)
@@ -1028,6 +1190,14 @@ def _routine_proconfig(value: Any) -> list[str]:
 
 
 def _check_callable_routine_definition(row: Any, errors: list[str]) -> None:
+    try:
+        canonical_body = _canonical_callable_routine_body()
+    except RuntimePrivilegeContractError:
+        errors.append("callable_routine_source_body_unavailable")
+    else:
+        installed_body = _row_value(row, "function_body")
+        if _semantic_sql_tokens(str(installed_body or "")) != _semantic_sql_tokens(canonical_body):
+            errors.append("callable_routine_body_mismatch")
     definition = _clean(_row_value(row, "function_definition"))
     relations = {
         match.group(1).lower()
@@ -1049,6 +1219,7 @@ def _check_routines(connection: Any, errors: list[str]) -> None:
         "p.prokind, pg_get_function_identity_arguments(p.oid) as identity_arguments, "
         "pg_get_function_result(p.oid) as result_type, p.prosecdef, "
         "p.provolatile, p.proparallel, p.proleakproof, p.proconfig, "
+        "p.prosrc as function_body, "
         "pg_get_functiondef(p.oid) as function_definition, l.lanname as language, "
         "owner.rolname as owner "
         "from pg_catalog.pg_proc p "

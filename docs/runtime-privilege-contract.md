@@ -112,7 +112,11 @@ verifier also observes, only for the declared namespace and roles:
   application grants.
 - the callable routine's exact SQL-language, STABLE, PARALLEL UNSAFE,
   SECURITY DEFINER metadata, fixed `pg_catalog, public` function search path,
-  schema-qualified eight-relation body, and runtime-only EXECUTE ACL;
+  schema-qualified eight-relation body, and runtime-only EXECUTE ACL. Its
+  installed `pg_proc.prosrc` body is compared with the canonical body extracted
+  directly from the checksum-locked migration; only whitespace and SQL comments
+  are normalized, so token, operator, literal, control-flow, and result changes
+  fail closed;
 
 The information-schema column-grant view is effective authority, so table-level
 grants may appear there as per-column rows. It is not used as proof of explicit
@@ -131,8 +135,11 @@ validator output contain only safe statuses, counts, and fixed identifiers.
 `webapp.postgres_migrations.migration_manifest`. A migration must be at the
 canonical head with no checksum drift, missing table, unexpected pending table,
 missing index, missing trigger, ambiguous/wrong routine identity, wrong trigger
-linkage, callable-body relation drift, or callable ACL drift before the capability
-proof can pass. Runtime may call only
+linkage, callable-body relation or semantic-body drift, or callable ACL drift
+before the capability proof can pass. The verifier derives the expected callable
+body from the checksum-locked migration source and compares it with PostgreSQL
+`pg_proc.prosrc`; it does not maintain a second body hash or source-digest
+registry. Runtime may call only
 `public.sqag_quote_session_deletion_hold_blocked(text, text)` for the hosted
 session-deletion decision; it remains denied direct access to
 `public.sqag_legal_holds`. Maintenance retains its direct forensic authority.

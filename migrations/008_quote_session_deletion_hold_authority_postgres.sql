@@ -95,13 +95,17 @@ feedback_rows as (
       )
     )
 ),
-standalone_audits as (
-  select a.event_id, a.legal_hold
+session_audits as (
+  select a.workspace_id, a.event_id, a.legal_hold, a.run_id, a.feedback_id
   from public.sqag_audit_events a
   where (select valid from input_state)
     and a.workspace_id = $1
     and a.session_id = $2
-    and a.run_id is null
+),
+standalone_audits as (
+  select a.event_id, a.legal_hold
+  from session_audits a
+  where a.run_id is null
     and a.feedback_id is null
 ),
 feedback_session_runs as (
@@ -224,6 +228,46 @@ run_graph_detail as (
       )
     ) as blocked
   from run_candidates c
+),
+session_audit_state as (
+  select coalesce(bool_or(
+    a.event_id is null
+    or a.event_id !~ '^audit-[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+    or a.legal_hold is null
+    or a.legal_hold not in (0, 1)
+    or a.legal_hold = 1
+    or (a.run_id is not null and (
+      a.run_id !~ '^run-[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+      or not exists (
+        select 1
+        from run_candidates c
+        where c.run_id = a.run_id
+      )
+      or exists (
+        select 1
+        from run_graph_detail g
+        where g.run_id = a.run_id
+          and g.blocked
+      )
+    ))
+    or (a.feedback_id is not null and (
+      a.feedback_id !~ '^feedback-[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+      or not exists (
+        select 1
+        from feedback_rows f
+        where f.feedback_id = a.feedback_id
+      )
+    ))
+    or exists (
+      select 1
+      from public.sqag_legal_holds h
+      where h.workspace_id = a.workspace_id
+        and h.target_type = 'audit_event'
+        and h.target_id = a.event_id
+        and h.enabled = 1
+    )
+  ), false) as blocked
+  from session_audits a
 ),
 feedback_session_run_state as (
   select f.feedback_id,
@@ -434,6 +478,7 @@ select (
   or (select blocked from publication_version_state)
   or exists (select 1 from run_graph_detail where blocked)
   or (select blocked from feedback_state)
+  or (select blocked from session_audit_state)
   or (select blocked from standalone_audit_state)
   or (select blocked from hold_state)
 ) as hold_blocked
