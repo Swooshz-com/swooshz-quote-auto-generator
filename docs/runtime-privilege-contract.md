@@ -7,7 +7,7 @@ It proves the reviewed application namespace, the canonical migration head, the
 capabilities actually used by the application, the exact Option-A provider-control
 membership tuples, container ownership, and the bounded provenance of those
 capabilities. Exact Git commit/tree admission remains a CI and deployment
-preflight concern. The provider-control rows are explicit schema-v3 contract data,
+preflight concern. The provider-control rows are explicit schema-v4 contract data,
 not a hidden verifier exception; the contract contains no source revision pin,
 source digest mirror, or self-referential package hash.
 
@@ -22,10 +22,11 @@ The read-only admission path is
 
 The declared set is deliberately bounded to `public.sqag_*` application objects:
 
-- six canonical PostgreSQL migrations and their canonical migration-ledger checksums;
+- seven canonical PostgreSQL migrations and their canonical migration-ledger checksums;
 - the 15 application tables plus `sqag_schema_migrations`;
 - the 22 canonical indexes;
-- the two migrator-owned invoker trigger routines;
+- the two migrator-owned invoker trigger routines and one migrator-owned,
+  runtime-callable security-definer hold-decision routine;
 - the fixed connection search path `public, pg_catalog`;
 - the reviewed runtime and maintenance capability matrices.
 
@@ -109,6 +110,9 @@ verifier also observes, only for the declared namespace and roles:
 - relevant default ACL entries;
 - the absence of runtime/maintenance explicit column grants and public
   application grants.
+- the callable routine's exact SQL-language, STABLE, PARALLEL UNSAFE,
+  SECURITY DEFINER metadata, fixed `pg_catalog, public` function search path,
+  schema-qualified eight-relation body, and runtime-only EXECUTE ACL;
 
 The information-schema column-grant view is effective authority, so table-level
 grants may appear there as per-column rows. It is not used as proof of explicit
@@ -126,8 +130,12 @@ validator output contain only safe statuses, counts, and fixed identifiers.
 `production_migrations` is mechanically compared with
 `webapp.postgres_migrations.migration_manifest`. A migration must be at the
 canonical head with no checksum drift, missing table, unexpected pending table,
-missing index, missing trigger, ambiguous/wrong routine identity, or wrong trigger linkage before the capability proof
-can pass.
+missing index, missing trigger, ambiguous/wrong routine identity, wrong trigger
+linkage, callable-body relation drift, or callable ACL drift before the capability
+proof can pass. Runtime may call only
+`public.sqag_quote_session_deletion_hold_blocked(text, text)` for the hosted
+session-deletion decision; it remains denied direct access to
+`public.sqag_legal_holds`. Maintenance retains its direct forensic authority.
 
 The verifier performs a small source binding over the actual SQL relation names
 in the canonical application files. Supported PostgreSQL relations must be in

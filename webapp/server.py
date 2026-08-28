@@ -9129,6 +9129,7 @@ SQAG_POSTGRES_METADATA_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "005_forensic_postgres_delete_guards.sql",
     PROJECT_ROOT / "migrations" / "006_quote_publication_versions_postgres.sql",
     PROJECT_ROOT / "migrations" / "007_feedback_publication_binding_postgres.sql",
+    PROJECT_ROOT / "migrations" / "008_quote_session_deletion_hold_authority_postgres.sql",
 ]
 SQAG_PUBLICATION_VERSION_REQUIRED_COLUMNS = {
     "workspace_id", "session_id", "run_id", "job_id", "state",
@@ -14057,6 +14058,29 @@ class DatabaseSqagStorage:
         )
         forensic_store._acquire_transaction_locks(*lock_identities)
         versions, runs, feedback, standalone_audits = load_graph()
+        if (
+            self.database_family == "postgres_compatible"
+            and self.expected_session_role == SQAG_RUNTIME_DATABASE_ROLE
+        ):
+            hold_row = connection.execute(
+                "select public.sqag_quote_session_deletion_hold_blocked("
+                "cast(? as text), cast(? as text)) as hold_blocked",
+                (self.workspace_id, safe_id),
+            ).fetchone()
+            if isinstance(hold_row, Mapping):
+                hold_blocked = hold_row.get("hold_blocked")
+            else:
+                try:
+                    hold_blocked = hold_row[0]
+                except (IndexError, KeyError, TypeError):
+                    hold_blocked = None
+            if type(hold_blocked) is not bool:
+                raise SqagStorageAccessError(
+                    "Postgres session deletion hold authority is unavailable.",
+                    status=503,
+                    reason="storage_postgres_session_delete_hold_unavailable",
+                )
+            return hold_blocked
         if any(bool(row["legal_hold"]) for row in versions):
             return True
         for row in versions:

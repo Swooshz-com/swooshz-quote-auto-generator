@@ -78,7 +78,7 @@ def _sql_grantee(sql_module, name: str):
 class RuntimePrivilegeContractStaticTest(unittest.TestCase):
     def test_manifest_is_strict_a25_contract_without_source_digest_mirrors(self):
         manifest = contract.validate_manifest()
-        self.assertEqual(manifest["schema_version"], 3)
+        self.assertEqual(manifest["schema_version"], 4)
         self.assertNotIn("canonical_source_revision", manifest)
         self.assertNotIn("canonical_source_tree", manifest)
         self.assertNotIn("implementation_registry", manifest)
@@ -91,7 +91,7 @@ class RuntimePrivilegeContractStaticTest(unittest.TestCase):
 
     def test_option_a_provider_control_and_ownership_contract_is_exact(self):
         manifest = contract.validate_manifest()
-        self.assertEqual(manifest["$schema"], "runtime-privilege-contract-schema-v3")
+        self.assertEqual(manifest["$schema"], "runtime-privilege-contract-schema-v4")
         self.assertEqual(
             manifest["provider_controlled_memberships"]["protected_roles"],
             ["sqag_runtime", "sqag_migrator", "sqag_maintenance"],
@@ -117,6 +117,18 @@ class RuntimePrivilegeContractStaticTest(unittest.TestCase):
                 "public_schema_owner": "pg_database_owner",
             },
         )
+
+    def test_callable_session_hold_authority_contract_is_exact(self):
+        manifest = contract.validate_manifest()
+        self.assertEqual(
+            manifest["namespace"]["callable_routines"],
+            [contract.EXPECTED_CALLABLE_ROUTINE_DOCUMENT],
+        )
+        self.assertEqual(
+            manifest["source_binding"]["callable_routine_source"]["routine"],
+            "public.sqag_quote_session_deletion_hold_blocked(text, text)",
+        )
+        self.assertEqual(contract.validate_source_bindings(manifest), [])
 
     def test_option_a_static_contract_drift_is_fail_closed(self):
         manifest = contract.validate_manifest()
@@ -946,10 +958,17 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                     )
             connection.execute("revoke all privileges on all sequences in schema public from PUBLIC, sqag_runtime, sqag_maintenance")
             connection.execute("revoke all privileges on all functions in schema public from PUBLIC, sqag_runtime, sqag_maintenance")
-            for routine, _identity_arguments in contract.EXPECTED_ROUTINE_KEYS:
+            for routine, _identity_arguments in contract.EXPECTED_TRIGGER_ROUTINE_KEYS:
                 connection.execute(
                     self.sql.SQL("grant execute on function public.{}() to sqag_migrator").format(
                         self.sql.Identifier(routine)
+                    )
+                )
+            for routine, identity_arguments in contract.EXPECTED_CALLABLE_ROUTINE_KEYS:
+                connection.execute(
+                    self.sql.SQL("grant execute on function public.{}({}) to sqag_runtime").format(
+                        self.sql.Identifier(routine),
+                        self.sql.SQL(identity_arguments),
                     )
                 )
             connection.execute(
@@ -1069,6 +1088,191 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
 
     def test_real_pg17_canonical_routine_identity_passes(self):
         self.assertEqual(self._verify()["status"], "verified")
+
+    def test_real_pg17_callable_session_hold_authority_metadata_and_acl_are_exact(self):
+        row = self._admin_row(
+            "select p.prokind, pg_get_function_identity_arguments(p.oid) as identity_arguments, "
+            "pg_get_function_result(p.oid) as result_type, l.lanname as language, "
+            "p.prosecdef, p.provolatile, p.proparallel, p.proleakproof, p.proconfig, "
+            "owner.rolname as owner "
+            "from pg_catalog.pg_proc p "
+            "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+            "join pg_catalog.pg_language l on l.oid = p.prolang "
+            "join pg_catalog.pg_roles owner on owner.oid = p.proowner "
+            "where n.nspname = 'public' and p.proname = %s "
+            "and pg_get_function_identity_arguments(p.oid) = %s",
+            (contract.CALLABLE_ROUTINE_NAME, contract.CALLABLE_ROUTINE_IDENTITY_ARGUMENTS),
+        )
+        self.assertEqual(row["prokind"], "f")
+        self.assertEqual(row["identity_arguments"], "text, text")
+        self.assertEqual(row["result_type"].lower(), "boolean")
+        self.assertEqual(row["language"], "sql")
+        self.assertTrue(row["prosecdef"])
+        self.assertEqual(row["provolatile"], "s")
+        self.assertEqual(row["proparallel"], "u")
+        self.assertFalse(row["proleakproof"])
+        self.assertEqual(row["proconfig"], ["search_path=pg_catalog, public"])
+        self.assertEqual(row["owner"], "sqag_migrator")
+
+        with self._admin_connection() as connection:
+            acl_rows = connection.execute(
+                "select case when acl.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'UNKNOWN') end as grantee, "
+                "acl.privilege_type, acl.is_grantable "
+                "from pg_catalog.pg_proc p "
+                "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+                "left join lateral aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) acl on true "
+                "left join pg_catalog.pg_roles grantee_role on grantee_role.oid = acl.grantee and acl.grantee <> 0 "
+                "where n.nspname = 'public' and p.proname = %s "
+                "and pg_get_function_identity_arguments(p.oid) = %s "
+                "order by grantee, acl.privilege_type",
+                (contract.CALLABLE_ROUTINE_NAME, contract.CALLABLE_ROUTINE_IDENTITY_ARGUMENTS),
+            ).fetchall()
+        self.assertEqual(
+            {
+                (row["grantee"], row["privilege_type"], row["is_grantable"])
+                for row in acl_rows
+            },
+            {("sqag_migrator", "EXECUTE", False), ("sqag_runtime", "EXECUTE", False)},
+        )
+        for role, expected in (
+            ("sqag_runtime", True),
+            ("sqag_maintenance", False),
+        ):
+            effective = self._admin_row(
+                "select has_function_privilege(%s, %s, 'EXECUTE') as effective",
+                (role, "public.sqag_quote_session_deletion_hold_blocked(text, text)"),
+            )
+            self.assertEqual(effective["effective"], expected, role)
+        self.assertEqual(self._verify()["status"], "verified")
+
+    def test_real_pg17_callable_session_hold_metadata_drift_is_rejected(self):
+        self._execute_admin(
+            "alter function public.sqag_quote_session_deletion_hold_blocked(text, text) "
+            "set search_path = public"
+        )
+        with self.assertRaises(contract.RuntimePrivilegeContractError) as raised:
+            self._verify()
+        self.assertIn("callable_routine_properties_mismatch", str(raised.exception))
+
+    def test_real_pg17_callable_session_hold_body_relation_drift_is_rejected(self):
+        self._execute_admin(
+            "create or replace function public.sqag_quote_session_deletion_hold_blocked(text, text) "
+            "returns boolean language sql stable parallel unsafe security definer "
+            "set search_path = pg_catalog, public as $$ select false $$"
+        )
+        with self.assertRaises(contract.RuntimePrivilegeContractError) as raised:
+            self._verify()
+        self.assertIn("callable_routine_relation_inventory_mismatch", str(raised.exception))
+
+    def test_real_pg17_callable_session_hold_acl_drift_is_rejected(self):
+        self._execute_admin(
+            "grant execute on function public.sqag_quote_session_deletion_hold_blocked(text, text) "
+            "to sqag_maintenance"
+        )
+        with self.assertRaises(contract.RuntimePrivilegeContractError) as raised:
+            self._verify()
+        failure = str(raised.exception)
+        self.assertIn("routine_acl_mismatch:sqag_quote_session_deletion_hold_blocked", failure)
+        self.assertIn("routine_escalation:sqag_quote_session_deletion_hold_blocked", failure)
+
+    def test_run297_pg17_runtime_session_delete_crossing_is_repaired(self):
+        runtime_url = safe_postgres_url("sqag_runtime", self.database_name)
+        workspace_id = "workspace-run297-red"
+        session_id = "quote-run297-red-session"
+        run_id = "run-run297-red-session"
+        storage = webapp.DatabaseSqagStorage(
+            runtime_url,
+            workspace_id,
+            role="admin",
+            user_id="user-run297-red",
+            expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+            },
+            clear=False,
+        ):
+            storage.create_or_update_quote_session(
+                {"session_id": session_id, "client": {"name": "synthetic"}},
+                result=None,
+            )
+            with webapp.postgres_storage_connection(
+                runtime_url,
+                expected_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+            ) as connection:
+                forensic = ForensicStore(
+                    connection,
+                    workspace_id,
+                    "actor-run297-red",
+                    actor_key_version_value="test-v1",
+                )
+                recorded_run_id = forensic.record_run_started(
+                    "generate",
+                    {"image_count": 0, "synthetic": True},
+                    run_id=run_id,
+                    job_id="job-run297-red-session",
+                    quote_session_id=session_id,
+                    now=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+                )
+                forensic.finish_run(
+                    recorded_run_id,
+                    "completed",
+                    now=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+                )
+
+            with self._role_connection("sqag_runtime") as connection:
+                with self.assertRaises(Exception):
+                    connection.execute(
+                        "select 1 from public.sqag_legal_holds"
+                    ).fetchone()
+                connection.rollback()
+
+            deletion_error = None
+            try:
+                deleted = storage.delete_quote_session(session_id)
+            except webapp.SqagStorageAccessError as exc:
+                deletion_error = exc
+                deleted = False
+            if deletion_error is not None:
+                self.assertEqual(deletion_error.status, 503)
+                self.assertEqual(
+                    deletion_error.reason,
+                    "object_artifact_storage_unavailable",
+                )
+                self.assertNotIn("sqag_legal_holds", str(deletion_error))
+                preserved = self._admin_row(
+                    "select "
+                    "(select count(*) from public.sqag_quote_sessions "
+                    "where workspace_id = %s and session_id = %s) as sessions, "
+                    "(select count(*) from public.sqag_quote_publication_versions "
+                    "where workspace_id = %s and session_id = %s) as versions, "
+                    "(select count(*) from public.sqag_quote_publication_artifacts "
+                    "where workspace_id = %s and session_id = %s) as publication_artifacts, "
+                    "(select count(*) from public.sqag_object_artifacts "
+                    "where workspace_id = %s and session_id = %s) as object_artifacts",
+                    (
+                        workspace_id,
+                        session_id,
+                        workspace_id,
+                        session_id,
+                        workspace_id,
+                        session_id,
+                        workspace_id,
+                        session_id,
+                    ),
+                )
+                self.assertEqual(preserved["sessions"], 1)
+                self.assertEqual(preserved["versions"], 0)
+                self.assertEqual(preserved["publication_artifacts"], 0)
+                self.assertEqual(preserved["object_artifacts"], 0)
+                self.fail(
+                    "G3 RED: runtime deletion crossed maintenance-only legal-hold authority"
+                )
+            self.assertTrue(deleted)
+            self.assertIsNone(storage.get_quote_session(session_id))
 
     def test_real_pg17_unexpected_public_sqag_routine_default_public_execute_is_rejected(self):
         self._execute_admin(

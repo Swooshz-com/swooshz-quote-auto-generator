@@ -1,6 +1,6 @@
 {
-  "$schema": "runtime-privilege-contract-schema-v3",
-  "schema_version": 3,
+  "$schema": "runtime-privilege-contract-schema-v4",
+  "schema_version": 4,
   "contract_type": "runtime_privilege_contract",
   "repository": "Swooshz-com/swooshz-quote-auto-generator",
   "namespace": {
@@ -64,6 +64,41 @@
         "security_mode": "invoker",
         "direct_execute": false,
         "trigger_only": true
+      }
+    ],
+    "callable_routines": [
+      {
+        "name": "sqag_quote_session_deletion_hold_blocked",
+        "identity_arguments": "text, text",
+        "argument_types": ["text", "text"],
+        "result_type": "boolean",
+        "language": "sql",
+        "owner": "sqag_migrator",
+        "security_mode": "definer",
+        "volatility": "stable",
+        "parallel": "unsafe",
+        "leakproof": false,
+        "direct_execute": true,
+        "trigger_only": false,
+        "function_search_path": ["pg_catalog", "public"],
+        "schema_qualified_relations": true,
+        "referenced_relations": [
+          "sqag_audit_events",
+          "sqag_feedback",
+          "sqag_feedback_status_history",
+          "sqag_generation_evidence",
+          "sqag_generation_runs",
+          "sqag_legal_holds",
+          "sqag_quote_publication_versions",
+          "sqag_quote_sessions"
+        ],
+        "explicit_execute_roles": ["sqag_runtime"],
+        "owner_execute": true,
+        "public_execute": false,
+        "maintenance_execute": false,
+        "default_public_execute": false,
+        "grant_options": false,
+        "fail_closed": true
       }
     ],
     "sequences": [],
@@ -142,7 +177,8 @@
     {"path": "migrations/004_generation_forensics_feedback_retention_postgres.sql", "sequence_no": 3, "sha256": "17e3e779891e76197db477305d0d5d436fb3f25f9ea508993063ce9bd7b39933", "tables": ["sqag_audit_events", "sqag_deletion_receipts", "sqag_feedback", "sqag_feedback_status_history", "sqag_generation_evidence", "sqag_generation_runs", "sqag_legal_holds", "sqag_retention_delete_authorizations", "sqag_retention_scan_cursors"]},
     {"path": "migrations/005_forensic_postgres_delete_guards.sql", "sequence_no": 4, "sha256": "e4a8d9ce7aceeb59b896dcf621dd04e760a8820891eea258d9edc12f7c0de057", "tables": []},
     {"path": "migrations/006_quote_publication_versions_postgres.sql", "sequence_no": 5, "sha256": "a66f620733c171571dfe44d078ef4bd37d2f8425bdc39d5278703af948d8e2f2", "tables": ["sqag_quote_publication_artifacts", "sqag_quote_publication_versions"]},
-    {"path": "migrations/007_feedback_publication_binding_postgres.sql", "sequence_no": 6, "sha256": "886faa1a4cc76c942decbe02834662961fa336ca670d88f159ab3c5523cccc78", "tables": []}
+    {"path": "migrations/007_feedback_publication_binding_postgres.sql", "sequence_no": 6, "sha256": "886faa1a4cc76c942decbe02834662961fa336ca670d88f159ab3c5523cccc78", "tables": []},
+    {"path": "migrations/008_quote_session_deletion_hold_authority_postgres.sql", "sequence_no": 7, "sha256": "61a9257a19492e3bf4a81196f6b909fa99557ec6759b8ad6b5526db5b3ea5046", "tables": []}
   ],
   "database_privileges": {
     "public": {"connect": true, "create": false, "temporary": false},
@@ -195,7 +231,21 @@
     "files": ["webapp/server.py", "webapp/forensics.py", "scripts/enforce_forensic_retention.py"],
     "allowed_sql_relations": ["sqag_audit_events", "sqag_deletion_receipts", "sqag_feedback", "sqag_feedback_status_history", "sqag_generation_evidence", "sqag_generation_runs", "sqag_legal_holds", "sqag_object_artifacts", "sqag_pricing_references", "sqag_profiles", "sqag_quote_publication_artifacts", "sqag_quote_publication_versions", "sqag_quote_sessions", "sqag_retention_delete_authorizations", "sqag_retention_scan_cursors"],
     "unsupported_sql_relations": ["sqag_file_artifacts", "sqag_quote_artifacts"],
-    "dynamic_sql_variables": {"webapp/server.py": ["table"], "webapp/forensics.py": ["table"], "scripts/enforce_forensic_retention.py": []}
+    "dynamic_sql_variables": {"webapp/server.py": ["table"], "webapp/forensics.py": ["table"], "scripts/enforce_forensic_retention.py": []},
+    "callable_routine_source": {
+      "path": "migrations/008_quote_session_deletion_hold_authority_postgres.sql",
+      "routine": "public.sqag_quote_session_deletion_hold_blocked(text, text)",
+      "allowed_relations": [
+        "sqag_audit_events",
+        "sqag_feedback",
+        "sqag_feedback_status_history",
+        "sqag_generation_evidence",
+        "sqag_generation_runs",
+        "sqag_legal_holds",
+        "sqag_quote_publication_versions",
+        "sqag_quote_sessions"
+      ]
+    }
   },
   "observation": {
     "allowed": ["server_major", "database_identity", "search_path", "migration_ledger", "named_namespace_metadata", "normalized_acl_provenance", "role_attributes", "bounded_memberships", "effective_privileges", "sanitized_counts"],
