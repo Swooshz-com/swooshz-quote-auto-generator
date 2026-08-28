@@ -14015,11 +14015,14 @@ class DatabaseSqagStorage:
                 connection.execute(
                     "select distinct feedback_id, legal_hold from sqag_feedback "
                     "where workspace_id = ? and (session_id = ? or run_id in ("
-                    "select run_id from sqag_generation_runs where workspace_id = ? "
-                    "and quote_session_id = ?) or publication_version_id in ("
+                    "select run_id from sqag_generation_runs where workspace_id = ? and ("
+                    "quote_session_id = ? or run_id in (select run_id from "
+                    "sqag_quote_publication_versions where workspace_id = ? and session_id = ?))) "
+                    "or publication_version_id in ("
                     "select run_id from sqag_quote_publication_versions "
                     "where workspace_id = ? and session_id = ?)) order by feedback_id",
                     (self.workspace_id, safe_id, self.workspace_id, safe_id,
+                     self.workspace_id, safe_id,
                      self.workspace_id, safe_id),
                 ).fetchall()
             )

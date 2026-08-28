@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import uuid
 from pathlib import Path
@@ -1940,6 +1941,327 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         ):
             self.assertTrue(storage.delete_quote_session(session_id))
         self.assertIsNone(storage.get_quote_session(session_id))
+
+    def test_run306_pg17_publication_derived_feedback_hold_serializes_session_delete(self):
+        runtime_url = safe_postgres_url("sqag_runtime", self.database_name)
+        deletion_application_name = "sqag_run306_delete"
+        deletion_url = runtime_url + "?application_name=" + deletion_application_name
+        maintenance_url = safe_postgres_url("sqag_maintenance", self.database_name)
+        workspace_id = "workspace-run306-publication-feedback"
+        session_id = "quote-run306-publication-feedback"
+        run_id = "run-run306-publication-derived"
+        job_id = "job-run306-publication-derived"
+        feedback_id = "feedback-run306-publication-derived"
+        now = "2026-08-28T00:00:00Z"
+        expiry = "2099-08-28T00:00:00Z"
+        storage = webapp.DatabaseSqagStorage(
+            deletion_url,
+            workspace_id,
+            role="admin",
+            user_id="user-run306-publication-feedback",
+            expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+            },
+            clear=False,
+        ):
+            storage.create_or_update_quote_session(
+                {"session_id": session_id, "client": {"name": "synthetic"}},
+                result=None,
+            )
+        with webapp.postgres_storage_connection(
+            runtime_url,
+            expected_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        ) as connection:
+            forensic = ForensicStore(
+                connection,
+                workspace_id,
+                "actor-run306-runtime",
+                actor_key_version_value="test-v1",
+            )
+            recorded_run_id = forensic.record_run_started(
+                "generate",
+                {"image_count": 0, "synthetic": True},
+                run_id=run_id,
+                job_id=job_id,
+                now=dt.datetime(2026, 8, 28, tzinfo=dt.timezone.utc),
+            )
+            self.assertEqual(recorded_run_id, run_id)
+            self.assertTrue(
+                forensic.finish_run(
+                    recorded_run_id,
+                    "completed",
+                    now=dt.datetime(2026, 8, 28, tzinfo=dt.timezone.utc),
+                )
+            )
+
+        publication_metadata = json.dumps(
+            {
+                "session_id": session_id,
+                "publication": {
+                    "state": "published",
+                    "run_id": run_id,
+                    "job_id": job_id,
+                },
+                "synthetic": True,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        self._execute_admin(
+            "insert into public.sqag_quote_publication_versions "
+            "(workspace_id, session_id, run_id, job_id, state, "
+            "artifact_storage_mode, artifact_source, metadata_json, error_code, "
+            "created_at, updated_at, promoted_at, failed_at, retention_expires_at, "
+            "original_retention_expires_at, legal_hold, deletion_state, "
+            "deletion_error_code, deletion_claimed_at) "
+            "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+            "%s, %s, %s, %s, %s, %s)",
+            (
+                workspace_id,
+                session_id,
+                run_id,
+                job_id,
+                "published",
+                "database",
+                "version",
+                publication_metadata,
+                None,
+                now,
+                now,
+                now,
+                None,
+                expiry,
+                expiry,
+                0,
+                "active",
+                None,
+                None,
+            ),
+        )
+        self._insert_synthetic_feedback(
+            workspace_id=workspace_id,
+            feedback_id=feedback_id,
+            support_reference="SQAG-RUN306-PUBLICATION-FEEDBACK",
+            run_id=run_id,
+            session_id=None,
+            now=now,
+            expiry=expiry,
+        )
+        publication_run = self._admin_row(
+            "select r.quote_session_id, v.session_id "
+            "from public.sqag_generation_runs r "
+            "join public.sqag_quote_publication_versions v "
+            "on v.workspace_id = r.workspace_id and v.run_id = r.run_id "
+            "where r.workspace_id = %s and r.run_id = %s",
+            (workspace_id, run_id),
+        )
+        self.assertIsNone(publication_run["quote_session_id"])
+        self.assertEqual(publication_run["session_id"], session_id)
+        feedback_link = self._admin_row(
+            "select session_id, run_id, publication_version_id "
+            "from public.sqag_feedback where workspace_id = %s and feedback_id = %s",
+            (workspace_id, feedback_id),
+        )
+        self.assertEqual(
+            (
+                feedback_link["session_id"],
+                feedback_link["run_id"],
+                feedback_link["publication_version_id"],
+            ),
+            (None, run_id, None),
+        )
+
+        release_maintenance = threading.Event()
+        maintenance_lock_acquired = threading.Event()
+        maintenance_hold_committed = threading.Event()
+        maintenance_done = threading.Event()
+        deletion_started = threading.Event()
+        deletion_done = threading.Event()
+        post_lock_reload_seen = threading.Event()
+        callable_executed = threading.Event()
+        release_callable = threading.Event()
+        maintenance_pids: list[int] = []
+        maintenance_errors: list[BaseException] = []
+        deletion_errors: list[BaseException] = []
+        deletion_results: list[bool] = []
+        feedback_discovery_count = 0
+        observation_lock = threading.Lock()
+        deletion_thread_name = "run306-session-delete"
+        original_execute = webapp.PostgresConnectionAdapter.execute
+
+        def observed_execute(adapter, statement, params=()):
+            nonlocal feedback_discovery_count
+            result = original_execute(adapter, statement, params)
+            if threading.current_thread().name != deletion_thread_name:
+                return result
+            normalized = " ".join(statement.lower().split())
+            if normalized.startswith(
+                "select distinct feedback_id, legal_hold from sqag_feedback"
+            ):
+                with observation_lock:
+                    feedback_discovery_count += 1
+                    if feedback_discovery_count == 2:
+                        post_lock_reload_seen.set()
+            if "sqag_quote_session_deletion_hold_blocked" in normalized:
+                callable_executed.set()
+                if not release_callable.wait(10):
+                    raise AssertionError("Run-306 callable observation barrier timed out")
+            return result
+
+        def maintenance_worker():
+            try:
+                with webapp.postgres_storage_connection(
+                    maintenance_url,
+                    expected_role=webapp.SQAG_MAINTENANCE_DATABASE_ROLE,
+                ) as connection:
+                    pid_row = connection.execute(
+                        "select pg_backend_pid() as backend_pid"
+                    ).fetchone()
+                    maintenance_pids.append(int(pid_row["backend_pid"]))
+                    forensic = ForensicStore(
+                        connection,
+                        workspace_id,
+                        "actor-run306-maintenance",
+                        actor_key_version_value="test-v1",
+                    )
+                    forensic._acquire_transaction_locks(("feedback", feedback_id))
+                    maintenance_lock_acquired.set()
+                    if not release_maintenance.wait(10):
+                        raise AssertionError("Run-306 maintenance barrier timed out")
+                    if not forensic.set_legal_hold(
+                        "sqag_feedback",
+                        "feedback_id",
+                        feedback_id,
+                        True,
+                        reason_code="run306_publication_feedback",
+                        case_reference="RUN-306",
+                    ):
+                        raise AssertionError("Run-306 feedback hold was not applied")
+                    maintenance_hold_committed.set()
+            except BaseException as exc:
+                maintenance_errors.append(exc)
+            finally:
+                maintenance_done.set()
+
+        def deletion_worker():
+            try:
+                deletion_started.set()
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                        webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+                    },
+                    clear=False,
+                ):
+                    deletion_results.append(storage.delete_quote_session(session_id))
+            except BaseException as exc:
+                deletion_errors.append(exc)
+            finally:
+                deletion_done.set()
+
+        maintenance_thread = threading.Thread(
+            target=maintenance_worker,
+            name="run306-maintenance-hold",
+            daemon=True,
+        )
+        deletion_thread = threading.Thread(
+            target=deletion_worker,
+            name=deletion_thread_name,
+            daemon=True,
+        )
+        held_snapshot = None
+        observed_wait = None
+        try:
+            with mock.patch.object(
+                webapp.PostgresConnectionAdapter,
+                "execute",
+                new=observed_execute,
+            ):
+                maintenance_thread.start()
+                self.assertTrue(
+                    maintenance_lock_acquired.wait(10),
+                    "maintenance did not acquire F2's feedback advisory lock",
+                )
+                self.assertEqual(len(maintenance_pids), 1)
+                deletion_thread.start()
+                self.assertTrue(deletion_started.wait(10))
+                for _attempt in range(200):
+                    rows = self._admin_rows(
+                        "select pid, wait_event_type, wait_event, "
+                        "pg_catalog.pg_blocking_pids(pid) as blocking_pids "
+                        "from pg_catalog.pg_stat_activity "
+                        "where datname = %s and application_name = %s",
+                        (self.database_name, deletion_application_name),
+                    )
+                    observed_wait = next(
+                        (
+                            row
+                            for row in rows
+                            if row["wait_event_type"] == "Lock"
+                            and str(row["wait_event"]).lower() == "advisory"
+                            and maintenance_pids[0] in row["blocking_pids"]
+                        ),
+                        None,
+                    )
+                    if observed_wait is not None or deletion_done.wait(0.05):
+                        break
+                self.assertIsNotNone(
+                    observed_wait,
+                    "deletion did not serialize on maintenance's F2 feedback lock",
+                )
+                release_maintenance.set()
+                self.assertTrue(
+                    maintenance_hold_committed.wait(10),
+                    "maintenance did not commit the enabled feedback hold",
+                )
+                self.assertTrue(
+                    callable_executed.wait(10),
+                    "deletion did not reach the post-lock hold callable",
+                )
+                self.assertTrue(post_lock_reload_seen.is_set())
+                held_snapshot = self._workspace_deletion_snapshot(workspace_id)
+                release_callable.set()
+                self.assertTrue(
+                    deletion_done.wait(10),
+                    "deletion did not resume after maintenance committed",
+                )
+        finally:
+            release_maintenance.set()
+            release_callable.set()
+            maintenance_thread.join(timeout=10)
+            deletion_thread.join(timeout=10)
+
+        self.assertFalse(maintenance_thread.is_alive())
+        self.assertFalse(deletion_thread.is_alive())
+        self.assertTrue(maintenance_done.is_set())
+        self.assertEqual(maintenance_errors, [])
+        self.assertEqual(deletion_errors, [])
+        self.assertEqual(deletion_results, [False])
+        self.assertEqual(feedback_discovery_count, 2)
+        self.assertIsNotNone(held_snapshot)
+        active_hold = self._admin_row(
+            "select enabled, target_type, target_id from public.sqag_legal_holds "
+            "where workspace_id = %s and target_type = %s and target_id = %s",
+            (workspace_id, "feedback", feedback_id),
+        )
+        self.assertEqual(
+            (active_hold["enabled"], active_hold["target_type"], active_hold["target_id"]),
+            (1, "feedback", feedback_id),
+        )
+        after = self._workspace_deletion_snapshot(workspace_id)
+        self.assertEqual(held_snapshot, after)
+        self.assertEqual(len(after["sessions"]), 1)
+        self.assertEqual(len(after["publication_versions"]), 1)
+        self.assertEqual(len(after["generation_runs"]), 1)
+        self.assertEqual(len(after["feedback"]), 1)
+        self.assertEqual(len(after["legal_holds"]), 1)
+        self.assertIsNotNone(storage.get_quote_session(session_id))
 
     def test_real_pg17_unexpected_public_sqag_routine_default_public_execute_is_rejected(self):
         self._execute_admin(
