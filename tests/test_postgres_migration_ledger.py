@@ -15,8 +15,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from webapp.postgres_migrations import (
+    EXPECTED_CALLABLE_ROUTINE_KEYS,
     EXPECTED_INDEXES,
     EXPECTED_ROUTINES,
+    EXPECTED_ROUTINE_KEYS,
+    EXPECTED_TRIGGER_ROUTINE_KEYS,
     EXPECTED_TABLES,
     EXPECTED_TRIGGERS,
     LEDGER_TABLE,
@@ -278,12 +281,27 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
                     "select routine_name from information_schema.routines where routine_schema = 'public'"
                 ).fetchall()
             }
+            routine_identities = {
+                (row["proname"], row["identity_arguments"])
+                for row in connection.execute(
+                    "select p.proname, pg_get_function_identity_arguments(p.oid) as identity_arguments "
+                    "from pg_catalog.pg_proc p "
+                    "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+                    "where n.nspname = 'public' and p.proname like 'sqag_%'"
+                ).fetchall()
+            }
         finally:
             connection.rollback()
             connection.close()
         self.assertTrue(EXPECTED_INDEXES.issubset(indexes))
         self.assertTrue(EXPECTED_TRIGGERS.issubset(triggers))
         self.assertTrue(EXPECTED_ROUTINES.issubset(routines))
+        self.assertEqual(routine_identities & EXPECTED_ROUTINE_KEYS, EXPECTED_ROUTINE_KEYS)
+        self.assertEqual(EXPECTED_CALLABLE_ROUTINE_KEYS, {("sqag_quote_session_deletion_hold_blocked", "text, text")})
+        self.assertEqual(EXPECTED_TRIGGER_ROUTINE_KEYS, {
+            ("sqag_reject_immutable_change", ""),
+            ("sqag_require_retention_delete_authorization", ""),
+        })
 
     def test_lf_and_crlf_create_equivalent_stored_routine_definitions(self):
         with tempfile.TemporaryDirectory() as temp_dir:

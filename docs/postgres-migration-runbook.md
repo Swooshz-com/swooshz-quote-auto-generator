@@ -16,6 +16,7 @@ history.
 4. `005_forensic_postgres_delete_guards.sql`
 5. `006_quote_publication_versions_postgres.sql`
 6. `007_feedback_publication_binding_postgres.sql`
+7. `008_quote_session_deletion_hold_authority_postgres.sql`
 
 Successful applications are recorded in `public.sqag_schema_migrations` with
 the sequence number, migration ID, SHA-256 source checksum, and database-applied
@@ -105,8 +106,10 @@ production connectivity or provider credentials. The integration tests prove:
 - fail-closed checksum drift and unexpected ledger entries;
 - advisory-lock serialization;
 - a mutation-free read-only preflight;
-- transaction rollback without a false success ledger row; and
-- refusal to adopt an existing unledgered schema.
+- transaction rollback without a false success ledger row;
+- refusal to adopt an existing unledgered schema; and
+- the runtime-only callable hold-decision authority with direct legal-hold
+  table access still denied.
 
 ## Rollback
 
