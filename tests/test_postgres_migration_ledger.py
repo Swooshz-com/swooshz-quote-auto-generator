@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+MIGRATOR_ROLE = "sqag_migrator"
 sys.path.insert(0, str(ROOT))
 
 from webapp.postgres_migrations import (
@@ -178,7 +179,43 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
 
     def setUp(self):
         self.database_names = []
+        self.migrator_role_created = False
+        self.addCleanup(self._cleanup_migrator_role)
+        self._create_migrator_role()
         self.database_name = self.create_database()
+
+    def _create_migrator_role(self):
+        with self.psycopg.connect(postgres_test_conninfo(), autocommit=True) as connection:
+            existing = connection.execute(
+                "select 1 from pg_catalog.pg_roles where rolname = %s",
+                (MIGRATOR_ROLE,),
+            ).fetchone()
+            if existing is not None:
+                raise RuntimeError("CLEANUP_UNKNOWN")
+            connection.execute(
+                self.sql.SQL(
+                    "create role {} nologin nosuperuser nocreatedb nocreaterole "
+                    "noreplication nobypassrls noinherit connection limit -1"
+                ).format(self.sql.Identifier(MIGRATOR_ROLE))
+            )
+        self.migrator_role_created = True
+
+    def _cleanup_migrator_role(self):
+        if not self.migrator_role_created:
+            return
+        with self.psycopg.connect(postgres_test_conninfo(), autocommit=True) as connection:
+            connection.execute(
+                self.sql.SQL("drop role if exists {}").format(
+                    self.sql.Identifier(MIGRATOR_ROLE)
+                )
+            )
+            residual = connection.execute(
+                "select 1 from pg_catalog.pg_roles where rolname = %s",
+                (MIGRATOR_ROLE,),
+            ).fetchone()
+            if residual is not None:
+                raise RuntimeError("CLEANUP_UNKNOWN")
+        self.migrator_role_created = False
 
     def create_database(self) -> str:
         database_name = "sqag_migration_test_" + uuid.uuid4().hex

@@ -2,8 +2,8 @@
 -- The callable is deliberately read-only and returns only a boolean decision.
 -- SQAG_STATEMENT_BOUNDARY
 create function public.sqag_quote_session_deletion_hold_blocked(
-  p_workspace_id text,
-  p_session_id text
+  text,
+  text
 ) returns boolean
 language sql
 stable
@@ -14,27 +14,27 @@ as $sqag$
 with
 input_state as (
   select (
-    p_workspace_id is not null
-    and p_session_id is not null
-    and p_workspace_id = btrim(p_workspace_id)
-    and p_workspace_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
-    and p_session_id = btrim(p_session_id)
-    and p_session_id ~ '^quote-[A-Za-z0-9_-]{3,64}$'
+    $1 is not null
+    and $2 is not null
+    and $1 = btrim($1)
+    and $1 ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+    and $2 = btrim($2)
+    and $2 ~ '^quote-[A-Za-z0-9_-]{3,64}$'
   ) as valid
 ),
 session_rows as (
   select s.workspace_id, s.session_id
   from public.sqag_quote_sessions s
   where (select valid from input_state)
-    and s.workspace_id = p_workspace_id
-    and s.session_id = p_session_id
+    and s.workspace_id = $1
+    and s.session_id = $2
 ),
 publication_versions as (
   select v.workspace_id, v.session_id, v.run_id, v.legal_hold
   from public.sqag_quote_publication_versions v
   where (select valid from input_state)
-    and v.workspace_id = p_workspace_id
-    and v.session_id = p_session_id
+    and v.workspace_id = $1
+    and v.session_id = $2
 ),
 publication_version_state as (
   select coalesce(bool_or(
@@ -64,9 +64,9 @@ session_runs as (
   select distinct r.run_id, r.legal_hold
   from public.sqag_generation_runs r
   where (select valid from input_state)
-    and r.workspace_id = p_workspace_id
+    and r.workspace_id = $1
     and (
-      r.quote_session_id = p_session_id
+      r.quote_session_id = $2
       or exists (
         select 1
         from publication_versions v
@@ -80,14 +80,14 @@ feedback_rows as (
     f.publication_version_id
   from public.sqag_feedback f
   where (select valid from input_state)
-    and f.workspace_id = p_workspace_id
+    and f.workspace_id = $1
     and (
-      f.session_id = p_session_id
+      f.session_id = $2
       or f.run_id in (
         select r.run_id
         from public.sqag_generation_runs r
-        where r.workspace_id = p_workspace_id
-          and r.quote_session_id = p_session_id
+        where r.workspace_id = $1
+          and r.quote_session_id = $2
       )
       or f.publication_version_id in (
         select v.run_id
@@ -99,8 +99,8 @@ standalone_audits as (
   select a.event_id, a.legal_hold
   from public.sqag_audit_events a
   where (select valid from input_state)
-    and a.workspace_id = p_workspace_id
-    and a.session_id = p_session_id
+    and a.workspace_id = $1
+    and a.session_id = $2
     and a.run_id is null
     and a.feedback_id is null
 ),
@@ -108,7 +108,7 @@ feedback_session_runs as (
   select f.feedback_id, r.run_id
   from feedback_rows f
   join public.sqag_generation_runs r
-    on r.workspace_id = p_workspace_id
+    on r.workspace_id = $1
    and r.quote_session_id = f.session_id
   where f.session_id is not null
 ),
@@ -131,13 +131,13 @@ run_graph_detail as (
       or not exists (
         select 1
         from public.sqag_generation_runs r
-        where r.workspace_id = p_workspace_id
+        where r.workspace_id = $1
           and r.run_id = c.run_id
       )
       or exists (
         select 1
         from public.sqag_generation_runs r
-        where r.workspace_id = p_workspace_id
+        where r.workspace_id = $1
           and r.run_id = c.run_id
           and (
             r.legal_hold is null
@@ -165,7 +165,7 @@ run_graph_detail as (
       or exists (
         select 1
         from public.sqag_generation_evidence e
-        where e.workspace_id = p_workspace_id
+        where e.workspace_id = $1
           and e.run_id = c.run_id
           and (
             e.evidence_id is null
@@ -186,7 +186,7 @@ run_graph_detail as (
       or exists (
         select 1
         from public.sqag_audit_events a
-        where a.workspace_id = p_workspace_id
+        where a.workspace_id = $1
           and a.run_id = c.run_id
           and (
             a.event_id is null
@@ -242,7 +242,7 @@ feedback_state as (
     or exists (
       select 1
       from public.sqag_legal_holds h
-      where h.workspace_id = p_workspace_id
+      where h.workspace_id = $1
         and h.target_type = 'feedback'
         and h.target_id = f.feedback_id
         and h.enabled = 1
@@ -290,7 +290,7 @@ feedback_state as (
         select 1
         from public.sqag_quote_publication_versions v
         where v.workspace_id = f.workspace_id
-          and v.session_id = p_session_id
+          and v.session_id = $2
           and v.run_id = f.publication_version_id
       )
     ))
@@ -367,7 +367,7 @@ standalone_audit_state as (
     or exists (
       select 1
       from public.sqag_legal_holds h
-      where h.workspace_id = p_workspace_id
+      where h.workspace_id = $1
         and h.target_type = 'audit_event'
         and h.target_id = a.event_id
         and h.enabled = 1
@@ -426,7 +426,7 @@ hold_state as (
     ))
   ), false) as blocked
   from public.sqag_legal_holds h
-  where h.workspace_id = p_workspace_id
+  where h.workspace_id = $1
 )
 select (
   not (select valid from input_state)

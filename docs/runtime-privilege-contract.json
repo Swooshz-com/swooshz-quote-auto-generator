@@ -178,7 +178,7 @@
     {"path": "migrations/005_forensic_postgres_delete_guards.sql", "sequence_no": 4, "sha256": "e4a8d9ce7aceeb59b896dcf621dd04e760a8820891eea258d9edc12f7c0de057", "tables": []},
     {"path": "migrations/006_quote_publication_versions_postgres.sql", "sequence_no": 5, "sha256": "a66f620733c171571dfe44d078ef4bd37d2f8425bdc39d5278703af948d8e2f2", "tables": ["sqag_quote_publication_artifacts", "sqag_quote_publication_versions"]},
     {"path": "migrations/007_feedback_publication_binding_postgres.sql", "sequence_no": 6, "sha256": "886faa1a4cc76c942decbe02834662961fa336ca670d88f159ab3c5523cccc78", "tables": []},
-    {"path": "migrations/008_quote_session_deletion_hold_authority_postgres.sql", "sequence_no": 7, "sha256": "847dbc5405f6904b307ae49f434f38849947aaf7495b76579fab74961e311281", "tables": []}
+    {"path": "migrations/008_quote_session_deletion_hold_authority_postgres.sql", "sequence_no": 7, "sha256": "61a9257a19492e3bf4a81196f6b909fa99557ec6759b8ad6b5526db5b3ea5046", "tables": []}
   ],
   "database_privileges": {
     "public": {"connect": true, "create": false, "temporary": false},
