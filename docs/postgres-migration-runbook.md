@@ -55,10 +55,16 @@ python scripts/preflight_sqag_migrations.py --phase post-apply
 `pre-apply` is the admission check before forward migration. It connects only
 through `SQAG_MIGRATOR_DATABASE_URL`, binds the server-authoritative
 `session_user` and `current_user` to `sqag_migrator`, starts a read-only
-transaction, and reads only the canonical manifest partition and migration
-ledger. It does not require tables, routines, indexes, or ACLs belonging to a
-pending migration. A safe result may therefore contain a non-empty pending
-set, but that set must be the exact untouched suffix after the applied prefix.
+transaction, and reads the canonical per-migration manifest/object model and
+ledger. It verifies that the ledger is an exact contiguous applied prefix,
+that every already-applied table, column mutation, index, trigger, and routine
+has the expected schema, definition, identity, ownership, and migration-defined
+ACL facts, and that pending-only objects are absent. A safe result may
+therefore contain a non-empty pending set, but that set must be the exact
+untouched suffix after the applied prefix. Missing-ledger state is safe only
+when no reserved `public.sqag_*` object exists; an empty ledger is safe only
+when no managed or pending object exists. The check is read-only and never
+normalizes ACLs or repairs schema.
 
 `post-apply` is the final readiness check. It requires all three dedicated
 URLs, uses the migrator URL for the read-only ledger inspection, requires zero
@@ -87,7 +93,8 @@ new empty PostgreSQL database, follow this exact sequence:
 4. Have the controller record and approve the exact pending migration suffix
    returned by `pre-apply`; stop on any blocker, prefix drift, or unexpected
    object state.
-5. Run `python scripts/migrate_sqag_storage.py` exactly once. For PostgreSQL,
+5. Run `python scripts/migrate_sqag_storage.py` exactly once for the approved
+   forward application. For PostgreSQL,
    this command uses only `SQAG_MIGRATOR_DATABASE_URL`. If the configured
    runtime URL is explicitly a local SQLite URL, it preserves the separate
    local SQLite branch and does not use PostgreSQL at all.
@@ -144,6 +151,9 @@ production connectivity or provider credentials. The integration tests prove:
 - a mutation-free read-only preflight;
 - transaction rollback without a false success ledger row;
 - refusal to adopt an existing unledgered schema;
+- applied-prefix index, trigger, and routine drift controls;
+- no-ledger reserved-namespace and exact-empty-state controls;
+- actual-CLI wrong-authority and assumed-role zero-mutation controls; and
 - the runtime-only callable hold-decision authority with direct legal-hold
   table access still denied; and
 - the causal operator transition from canonical 001-007, through an exact

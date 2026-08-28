@@ -40,8 +40,6 @@ def _report_fields(report: Mapping[str, object] | None) -> dict[str, object]:
     fields: dict[str, object] = {}
     for key in REPORT_FIELDS:
         value = report.get(key) if isinstance(report, Mapping) else None
-        if key in REPORT_LIST_FIELDS and value is not None:
-            value = list(value) if isinstance(value, (list, tuple)) else value
         fields[key] = value
     return fields
 
@@ -62,8 +60,8 @@ def _failure(
     )
     blockers = payload.get("blockers")
     if not isinstance(blockers, list):
-        blockers = []
-    if blocker not in blockers:
+        blockers = [blocker]
+    elif blocker not in blockers:
         blockers.append(blocker)
     payload["blockers"] = blockers
     print(json.dumps(payload, sort_keys=True, default=str))
@@ -117,18 +115,33 @@ def _parse_phase(argv: list[str] | None = None) -> str | None:
 def validate_pre_apply_migration_report(report: Mapping[str, object], migrations) -> None:
     """Require a safe report whose ledger is an exact canonical prefix."""
 
+    if not isinstance(report, Mapping) or set(report) != set(REPORT_FIELDS):
+        raise RuntimePrivilegeContractError("migration_pre_apply_state_not_safe")
     expected_ids = [migration.migration_id for migration in migrations]
     applied_ids = report.get("appliedMigrationIds")
     pending_ids = report.get("pendingMigrationIds")
     if (
         report.get("status") != "ready"
         or report.get("safeToApply") is not True
-        or report.get("blockers")
-        or not isinstance(applied_ids, list)
-        or not isinstance(pending_ids, list)
+        or report.get("blockers") != []
+        or any(
+            type(report.get(key)) is not list
+            or any(not isinstance(item, str) for item in report.get(key))
+            for key in REPORT_LIST_FIELDS
+        )
+        or type(report.get("ledgerState")) is not str
+        or report.get("ledgerState") not in {"missing", "present"}
+        or report.get("expectedHead")
+        not in ({expected_ids[-1]} if expected_ids else {None})
+        or report.get("appliedHead")
+        not in ({None} | set(expected_ids))
     ):
         raise RuntimePrivilegeContractError("migration_pre_apply_state_not_safe")
-    if applied_ids != expected_ids[: len(applied_ids)]:
+    if (
+        applied_ids != expected_ids[: len(applied_ids)]
+        or len(set(applied_ids)) != len(applied_ids)
+        or len(set(pending_ids)) != len(pending_ids)
+    ):
         raise RuntimePrivilegeContractError("migration_ledger_not_canonical_prefix")
     if pending_ids != expected_ids[len(applied_ids) :]:
         raise RuntimePrivilegeContractError("migration_pending_set_not_canonical_suffix")
