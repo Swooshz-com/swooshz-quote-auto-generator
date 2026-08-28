@@ -12,11 +12,15 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+MIGRATION_ROLES = ("sqag_migrator", "sqag_runtime", "sqag_maintenance")
 sys.path.insert(0, str(ROOT))
 
 from webapp.postgres_migrations import (
+    EXPECTED_CALLABLE_ROUTINE_KEYS,
     EXPECTED_INDEXES,
     EXPECTED_ROUTINES,
+    EXPECTED_ROUTINE_KEYS,
+    EXPECTED_TRIGGER_ROUTINE_KEYS,
     EXPECTED_TABLES,
     EXPECTED_TRIGGERS,
     LEDGER_TABLE,
@@ -175,7 +179,28 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
 
     def setUp(self):
         self.database_names = []
+        self.created_roles = []
+        self.cleanup_done = False
+        self.addCleanup(self._cleanup_fixture)
+        self._create_roles()
         self.database_name = self.create_database()
+
+    def _create_roles(self):
+        with self.psycopg.connect(postgres_test_conninfo(), autocommit=True) as connection:
+            existing = connection.execute(
+                "select rolname from pg_catalog.pg_roles where rolname = any(%s)",
+                (list(MIGRATION_ROLES),),
+            ).fetchall()
+            if existing:
+                raise RuntimeError("CLEANUP_UNKNOWN")
+            for role in MIGRATION_ROLES:
+                connection.execute(
+                    self.sql.SQL(
+                        "create role {} nologin nosuperuser nocreatedb nocreaterole "
+                        "noreplication nobypassrls noinherit connection limit -1"
+                    ).format(self.sql.Identifier(role))
+                )
+                self.created_roles.append(role)
 
     def create_database(self) -> str:
         database_name = "sqag_migration_test_" + uuid.uuid4().hex
@@ -185,6 +210,12 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
         return database_name
 
     def tearDown(self):
+        self._cleanup_fixture()
+
+    def _cleanup_fixture(self):
+        if self.cleanup_done:
+            return
+        self.cleanup_done = True
         with self.psycopg.connect(postgres_test_conninfo(), autocommit=True) as connection:
             for database_name in reversed(self.database_names):
                 connection.execute(
@@ -195,6 +226,18 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
                 connection.execute(
                     self.sql.SQL("drop database if exists {}").format(self.sql.Identifier(database_name))
                 )
+            for role in reversed(self.created_roles):
+                connection.execute(
+                    self.sql.SQL("drop role if exists {}").format(
+                        self.sql.Identifier(role)
+                    )
+                )
+            residual_roles = connection.execute(
+                "select rolname from pg_catalog.pg_roles where rolname = any(%s)",
+                (list(MIGRATION_ROLES),),
+            ).fetchall() if len(self.created_roles) == len(MIGRATION_ROLES) else []
+            if residual_roles:
+                raise RuntimeError("CLEANUP_UNKNOWN")
 
     def connect(self, database_name=None) -> PostgresConnectionAdapter:
         raw = self.psycopg.connect(
@@ -278,12 +321,34 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
                     "select routine_name from information_schema.routines where routine_schema = 'public'"
                 ).fetchall()
             }
+            routine_identities = {
+                (row["proname"], row["identity_arguments"])
+                for row in connection.execute(
+                    "select p.proname, pg_get_function_identity_arguments(p.oid) as identity_arguments "
+                    "from pg_catalog.pg_proc p "
+                    "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+                    "where n.nspname = 'public' and p.proname like ?",
+                    ("sqag_%",),
+                ).fetchall()
+            }
         finally:
             connection.rollback()
             connection.close()
         self.assertTrue(EXPECTED_INDEXES.issubset(indexes))
         self.assertTrue(EXPECTED_TRIGGERS.issubset(triggers))
         self.assertTrue(EXPECTED_ROUTINES.issubset(routines))
+        self.assertEqual(routine_identities & EXPECTED_ROUTINE_KEYS, EXPECTED_ROUTINE_KEYS)
+        self.assertEqual(
+            EXPECTED_CALLABLE_ROUTINE_KEYS,
+            {("sqag_quote_session_deletion_hold_blocked", "text, text")},
+        )
+        self.assertEqual(
+            EXPECTED_TRIGGER_ROUTINE_KEYS,
+            {
+                ("sqag_reject_immutable_change", ""),
+                ("sqag_require_retention_delete_authorization", ""),
+            },
+        )
 
     def test_lf_and_crlf_create_equivalent_stored_routine_definitions(self):
         with tempfile.TemporaryDirectory() as temp_dir:

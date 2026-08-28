@@ -389,6 +389,7 @@ class SqliteSqagMigrationTest(unittest.TestCase):
             "005_forensic_postgres_delete_guards.sql",
             "006_quote_publication_versions_postgres.sql",
             "007_feedback_publication_binding_postgres.sql",
+            "008_quote_session_deletion_hold_authority_postgres.sql",
         ]
 
         with mock.patch(

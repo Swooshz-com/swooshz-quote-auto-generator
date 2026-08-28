@@ -21,6 +21,7 @@ MIGRATION_FILE_NAMES = (
     "005_forensic_postgres_delete_guards.sql",
     "006_quote_publication_versions_postgres.sql",
     "007_feedback_publication_binding_postgres.sql",
+    "008_quote_session_deletion_hold_authority_postgres.sql",
 )
 EXPECTED_TABLES = frozenset(
     {
@@ -77,8 +78,22 @@ EXPECTED_TRIGGERS = frozenset(
     }
 )
 EXPECTED_ROUTINES = frozenset(
-    {"sqag_reject_immutable_change", "sqag_require_retention_delete_authorization"}
+    {
+        "sqag_reject_immutable_change",
+        "sqag_require_retention_delete_authorization",
+        "sqag_quote_session_deletion_hold_blocked",
+    }
 )
+EXPECTED_TRIGGER_ROUTINE_KEYS = frozenset(
+    {
+        ("sqag_reject_immutable_change", ""),
+        ("sqag_require_retention_delete_authorization", ""),
+    }
+)
+EXPECTED_CALLABLE_ROUTINE_KEYS = frozenset(
+    {("sqag_quote_session_deletion_hold_blocked", "text, text")}
+)
+EXPECTED_ROUTINE_KEYS = EXPECTED_TRIGGER_ROUTINE_KEYS | EXPECTED_CALLABLE_ROUTINE_KEYS
 EXPECTED_TRIGGER_ROUTINE_LINKS = {
     "sqag_reject_immutable_change": frozenset(
         {
@@ -117,6 +132,7 @@ MIGRATION_TABLES = {
         {"sqag_quote_publication_versions", "sqag_quote_publication_artifacts"}
     ),
     "007_feedback_publication_binding_postgres.sql": frozenset(),
+    "008_quote_session_deletion_hold_authority_postgres.sql": frozenset(),
 }
 if tuple(MIGRATION_TABLES) != MIGRATION_FILE_NAMES:
     raise RuntimeError("SQAG PostgreSQL migration table map must match the ordered manifest.")
