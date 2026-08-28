@@ -1178,6 +1178,27 @@ def _semantic_sql_tokens(value: str | None, *, expression: bool = False) -> tupl
     tokens = _SQL_TOKEN_RE.findall(normalized)
     if expression:
         tokens = _strip_outer_sql_parentheses(tokens)
+        changed = True
+        while changed:
+            changed = False
+            collapsed: list[str] = []
+            index = 0
+            while index < len(tokens):
+                if (
+                    index + 2 < len(tokens)
+                    and tokens[index] == "("
+                    and tokens[index + 2] == ")"
+                    and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", tokens[index + 1])
+                ):
+                    collapsed.append(tokens[index + 1])
+                    index += 3
+                    changed = True
+                    continue
+                collapsed.append(tokens[index])
+                index += 1
+            tokens = collapsed
+        if tokens == ["now", "(", ")"]:
+            tokens = ["current_timestamp"]
     return tuple(
         token.lower()
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", token)

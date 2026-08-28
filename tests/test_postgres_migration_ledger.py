@@ -337,6 +337,7 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
             postgres_test_conninfo(database_name or self.database_name),
             row_factory=self.dict_row,
         )
+        raw.execute("set session authorization sqag_migrator")
         return PostgresConnectionAdapter(raw)
 
     def apply(self, migrations=None, database_name=None):
@@ -598,8 +599,11 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
         try:
             connection.execute(
                 "create table public.sqag_schema_migrations ("
-                "sequence_no integer unique, migration_id text primary key, "
-                "checksum_sha256 char(64), applied_at timestamptz default current_timestamp)"
+                "sequence_no integer not null unique check (sequence_no > 0), "
+                "migration_id text primary key, "
+                "checksum_sha256 char(64) not null check "
+                "(checksum_sha256 ~ '^[0-9a-f]{64}$'), "
+                "applied_at timestamptz not null default current_timestamp)"
             )
             connection.execute("create table sqag_profiles (id integer)")
             connection.commit()
