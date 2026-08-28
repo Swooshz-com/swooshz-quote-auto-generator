@@ -76,7 +76,7 @@ session_runs as (
     )
 ),
 feedback_rows as (
-  select distinct f.feedback_id, f.legal_hold, f.run_id, f.session_id,
+  select distinct f.workspace_id, f.feedback_id, f.legal_hold, f.run_id, f.session_id,
     f.publication_version_id
   from public.sqag_feedback f
   where (select valid from input_state)
