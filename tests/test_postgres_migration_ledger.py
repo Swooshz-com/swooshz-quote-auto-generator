@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_ROLES = ("sqag_migrator", "sqag_runtime", "sqag_maintenance")
 sys.path.insert(0, str(ROOT))
 
+from scripts import preflight_sqag_migrations as preflight
 from webapp.postgres_migrations import (
     EXPECTED_CALLABLE_ROUTINE_KEYS,
     EXPECTED_INDEXES,
@@ -162,6 +163,21 @@ class MigrationPayloadCanonicalizationTest(unittest.TestCase):
             raised.exception.blocker,
             f"migration_source_changed_during_run:{MIGRATION_FILE_NAMES[0]}",
         )
+
+    def test_pre_apply_validator_accepts_a_canonical_prefix_and_pending_suffix(self):
+        manifest = migration_manifest(ROOT / "migrations")
+        applied = [migration.migration_id for migration in manifest[:-1]]
+        report = {
+            "status": "ready",
+            "safeToApply": True,
+            "ledgerState": "present",
+            "expectedHead": manifest[-1].migration_id,
+            "appliedHead": manifest[-2].migration_id,
+            "appliedMigrationIds": applied,
+            "pendingMigrationIds": [manifest[-1].migration_id],
+            "blockers": [],
+        }
+        preflight.validate_pre_apply_migration_report(report, manifest)
 
 
 @unittest.skipUnless(postgres_test_conninfo(), "isolated PostgreSQL test service is not configured")

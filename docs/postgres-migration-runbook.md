@@ -1,10 +1,19 @@
 # SQAG PostgreSQL Migration Runbook
 
 SQAG PostgreSQL migrations are explicit operator actions. Application startup,
-ordinary pull-request CI, health checks, and readiness probes do not apply them.
-The only required environment-variable name is `SQAG_DATABASE_URL`; its value
-must be supplied outside source control, chat, logs, screenshots, and command
-history.
+ordinary pull-request CI, health checks, and readiness probes do not apply
+them. The URL values must be supplied outside source control, chat, logs,
+screenshots, and command history.
+
+The operator roles are deliberately separate:
+
+- `SQAG_MIGRATOR_DATABASE_URL` is the only PostgreSQL migration and ledger
+  authority. It must authenticate as `sqag_migrator`.
+- `SQAG_DATABASE_URL` is the runtime projection. The migration CLI uses it
+  only when it is explicitly a local SQLite URL; it is never a PostgreSQL
+  migration target or fallback.
+- `SQAG_MAINTENANCE_DATABASE_URL` is the maintenance projection used by the
+  post-apply readiness check. It is never a migration target or fallback.
 
 ## Ledger Contract
 
@@ -34,50 +43,77 @@ complete ledger whose required tables are missing, or any existing public
 schema without the trusted ledger. It never silently baselines an existing
 schema.
 
-## Read-only Preflight
+## Two-Phase Read-only Preflight
 
-Run the preflight before proposing any database mutation:
+The phase is mandatory. There is no default:
 
 ```powershell
-python scripts/preflight_sqag_migrations.py
+python scripts/preflight_sqag_migrations.py --phase pre-apply
+python scripts/preflight_sqag_migrations.py --phase post-apply
 ```
 
-The command starts a read-only transaction, reads catalog and ledger metadata,
-rolls the transaction back, and prints only non-secret migration metadata:
-expected head, applied head, applied IDs, pending IDs, ledger state, and safe
-blocker identifiers. It exits non-zero when migration would be unsafe.
+`pre-apply` is the admission check before forward migration. It connects only
+through `SQAG_MIGRATOR_DATABASE_URL`, binds the server-authoritative
+`session_user` and `current_user` to `sqag_migrator`, starts a read-only
+transaction, and reads only the canonical manifest partition and migration
+ledger. It does not require tables, routines, indexes, or ACLs belonging to a
+pending migration. A safe result may therefore contain a non-empty pending
+set, but that set must be the exact untouched suffix after the applied prefix.
 
-A missing ledger on a truly empty public schema is reported as `ledgerState` =
-`missing` with all IDs pending and is safe for a separately approved first
-application. A missing ledger with any existing public table is unsafe and is
-reported as `existing_schema_without_trusted_ledger`.
+`post-apply` is the final readiness check. It requires all three dedicated
+URLs, uses the migrator URL for the read-only ledger inspection, requires zero
+pending migrations and the unchanged strict final-state migration validator,
+then verifies the complete v4 runtime and maintenance projections. That
+verification includes the canonical callable routine body, ownership, ACLs,
+runtime direct denial of protected legal-hold table access, and the required
+PostgreSQL-17 contract.
 
-## Future Approved First Application
+Both phases roll back their read-only transactions and print deterministic,
+privacy-safe JSON containing the actual phase, ledger state, expected and
+applied heads, applied IDs, pending IDs, and blockers. `post-apply` also
+contains the runtime and maintenance contract summaries. No URL value is
+printed.
+
+## Future Approved Application Sequence
 
 No database or provider operation is authorized by this runbook. After an
 operator receives separate approval naming an isolated empty Neon branch or a
-new empty PostgreSQL database:
+new empty PostgreSQL database, follow this exact sequence:
 
-1. Supply `SQAG_DATABASE_URL` through the approved secret/configuration path.
-2. Run the read-only preflight and retain its sanitized metadata output.
-3. Require `safeToApply=true`, a missing or empty trusted ledger, and the
-   expected pending IDs.
-4. Run `python scripts/migrate_sqag_storage.py` once.
-5. Run the read-only preflight again and require no pending IDs, exact expected
-   and applied heads, no blockers, and `safeToApply=true`.
-6. Run the existing read-only schema/readiness checks before deploying app code.
+1. Confirm the approved provider rollback/recovery point and recovery plan.
+2. Confirm the canonical repository migration source and ordered manifest.
+3. Supply only `SQAG_MIGRATOR_DATABASE_URL` through the approved secret or
+   configuration path and run `pre-apply`.
+4. Have the controller record and approve the exact pending migration suffix
+   returned by `pre-apply`; stop on any blocker, prefix drift, or unexpected
+   object state.
+5. Run `python scripts/migrate_sqag_storage.py` exactly once. For PostgreSQL,
+   this command uses only `SQAG_MIGRATOR_DATABASE_URL`. If the configured
+   runtime URL is explicitly a local SQLite URL, it preserves the separate
+   local SQLite branch and does not use PostgreSQL at all.
+6. Supply the dedicated runtime and maintenance URLs, run `post-apply`, and
+   require zero pending IDs, the exact final heads, no blockers, and verified
+   v4 runtime and maintenance contracts.
+7. Run the existing readiness checks and proceed to deployment only through a
+   separately approved deployment authority.
 
-The migration command reports migration IDs only. It does not print the target
+Do not run a down migration, delete ledger rows, edit checksums, issue manual
+SQL, create missing objects by hand, invoke startup as a migration mechanism,
+or skip either phase. A failed forward transaction rolls back its own SQL and
+ledger rows; an approved provider rollback/recovery point remains the recovery
+authority for an already committed application.
+
+The migration command reports migration IDs only. It does not print any target
 connection value.
 
 ## Evidence Verifier Boundary
 
 Live retention/delete verification is not a migration action. Before that
-evidence can be separately authorized, run the read-only migration preflight
-and require a present exact ordered ledger, zero pending migrations, and ready
-tables, indexes, triggers, and routines. If migrations are pending, stop and
-obtain separate authorization for migration application, then repeat the
-read-only preflight.
+evidence can be separately authorized, run `post-apply` and require a present
+exact ordered ledger, zero pending migrations, and ready tables, indexes,
+triggers, routines, callable body, and ACLs. If migrations are pending, stop
+and obtain separate authorization for migration application, then repeat the
+two-phase sequence.
 
 Verification commands never grant themselves migration authority. They do not
 create or populate the ledger, run DDL, execute migration files, or silently
@@ -86,18 +122,18 @@ repair schema state.
 ## Existing Unledgered Schema
 
 The production schema described before this change has no trusted ledger. Do
-not run the migration command against it. Adoption requires a separate proposal
-and approval for all of the following: an isolated clone or branch, exact schema
-comparison against repository expectations, checksum and object inventory,
-review of existing data, an explicit baseline operation, and a rollback point.
-This repository intentionally contains no automatic `mark current`, repair, or
-baseline shortcut. Canonical migration bytes remove cross-platform EOL drift;
-they do not prove equivalence for an existing unledgered schema and do not
-authorize production baselining.
+not run the migration command against it. Adoption requires a separate
+proposal and approval for all of the following: an isolated clone or branch,
+exact schema comparison against repository expectations, checksum and object
+inventory, review of existing data, an explicit baseline operation, and a
+rollback point. This repository intentionally contains no automatic `mark
+current`, repair, or baseline shortcut. Canonical migration bytes remove
+cross-platform EOL drift; they do not prove equivalence for an existing
+unledgered schema and do not authorize production baselining.
 
 ## CI Evidence
 
-Pull-request CI starts an isolated disposable PostgreSQL service with no
+Pull-request CI starts an isolated disposable PostgreSQL-17 service with no
 production connectivity or provider credentials. The integration tests prove:
 
 - fresh first application and complete expected tables;
@@ -107,9 +143,12 @@ production connectivity or provider credentials. The integration tests prove:
 - advisory-lock serialization;
 - a mutation-free read-only preflight;
 - transaction rollback without a false success ledger row;
-- refusal to adopt an existing unledgered schema; and
+- refusal to adopt an existing unledgered schema;
 - the runtime-only callable hold-decision authority with direct legal-hold
-  table access still denied.
+  table access still denied; and
+- the causal operator transition from canonical 001-007, through an exact
+  pending 008 preflight, to one real migrator-bound 008 application, complete
+  post-apply v4 verification, and a ledger-preserving second no-op.
 
 ## Rollback
 
@@ -119,4 +158,4 @@ rows automatically. After a successful forward migration, do not delete ledger
 rows, edit checksums, or run ad hoc down migrations. Roll application code back
 only when its previous release is verified compatible with the applied schema;
 otherwise restore or switch to the approved pre-migration database rollback
-point. Re-run read-only preflight after any rollback decision.
+point. Re-run the two-phase read-only preflight after any rollback decision.

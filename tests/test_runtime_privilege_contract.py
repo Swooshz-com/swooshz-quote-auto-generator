@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import datetime as dt
+import io
 import importlib.util
 import json
 import os
@@ -11,6 +12,8 @@ import tempfile
 import threading
 import unittest
 import uuid
+from contextlib import redirect_stdout
+from hashlib import sha256
 from pathlib import Path
 from unittest import mock
 from urllib.parse import quote
@@ -21,8 +24,10 @@ DISPOSABLE_BOOTSTRAP_ROLE = "cloud_admin"
 sys.path.insert(0, str(ROOT))
 
 from scripts import validate_runtime_privilege_contract as contract
+from scripts import migrate_sqag_storage as migrate_cli
 from webapp import server as webapp
 from scripts import preflight_sqag_migrations as preflight
+from webapp import postgres_migrations as postgres_migration_module
 from webapp.forensics import ForensicStore
 from webapp.postgres_migrations import (
     EXPECTED_INDEXES,
@@ -357,6 +362,71 @@ class RuntimePrivilegeContractStaticTest(unittest.TestCase):
         self.assertIn("configured_maintenance_database_url", source)
         self.assertIn("verify_postgres_privilege_contract", source)
         self.assertIn("validate_migration_report", source)
+
+    def test_preflight_phase_is_required_before_any_database_access(self):
+        for arguments, blocker in (
+            ([], "phase_required"),
+            (["--phase", "pre-apply", "--phase", "post-apply"], "phase_duplicate"),
+            (["--phase", "during-apply"], "phase_invalid"),
+            (["--phase", "pre-apply", "--unknown"], "unknown_argument"),
+        ):
+            output = io.StringIO()
+            with mock.patch.object(webapp, "configured_migrator_database_url") as configured_url:
+                with redirect_stdout(output):
+                    result = preflight.main(arguments)
+            self.assertEqual(result, 2, arguments)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["status"], "unsafe")
+            self.assertEqual(payload["blockers"], [blocker])
+            configured_url.assert_not_called()
+
+    def test_preflight_accepts_only_an_exact_canonical_pending_suffix(self):
+        migrations = migration_manifest(ROOT / "migrations")
+        applied = [migration.migration_id for migration in migrations[:-1]]
+        valid = {
+            "status": "ready",
+            "safeToApply": True,
+            "ledgerState": "present",
+            "expectedHead": migrations[-1].migration_id,
+            "appliedHead": migrations[-2].migration_id,
+            "appliedMigrationIds": applied,
+            "pendingMigrationIds": [migrations[-1].migration_id],
+            "blockers": [],
+        }
+        preflight.validate_pre_apply_migration_report(valid, migrations)
+        for mutation in (
+            {"appliedMigrationIds": [migrations[0].migration_id, migrations[2].migration_id]},
+            {"pendingMigrationIds": [migrations[5].migration_id]},
+            {"appliedHead": migrations[4].migration_id},
+            {"ledgerState": "missing"},
+        ):
+            candidate = dict(valid)
+            candidate.update(mutation)
+            with self.assertRaises(contract.RuntimePrivilegeContractError):
+                preflight.validate_pre_apply_migration_report(candidate, migrations)
+
+    def test_postgres_migration_cli_binds_only_to_the_dedicated_migrator_url(self):
+        with mock.patch.object(webapp, "configured_database_url", return_value="postgresql://runtime.example/sqag"), \
+            mock.patch.object(webapp, "configured_migrator_database_url", return_value="postgresql://migrator.example/sqag"), \
+            mock.patch.object(webapp, "configured_maintenance_database_url", side_effect=AssertionError("maintenance fallback")):
+            self.assertEqual(
+                migrate_cli._migration_database_url(),
+                "postgresql://migrator.example/sqag",
+            )
+
+    def test_postgres_migration_cli_preserves_the_explicit_local_sqlite_branch(self):
+        with mock.patch.object(webapp, "configured_database_url", return_value="sqlite:///:memory:"), \
+            mock.patch.object(webapp, "configured_migrator_database_url", side_effect=AssertionError("postgres fallback")):
+            self.assertEqual(
+                migrate_cli._migration_database_url(),
+                "sqlite:///:memory:",
+            )
+
+    def test_postgres_migration_cli_rejects_postgres_without_a_migrator_url(self):
+        with mock.patch.object(webapp, "configured_database_url", return_value="postgresql://runtime.example/sqag"), \
+            mock.patch.object(webapp, "configured_migrator_database_url", return_value=""):
+            with self.assertRaises(migrate_cli.MigrationConfigurationError):
+                migrate_cli._migration_database_url()
 
     def test_cleanup_unknown_is_fail_closed(self):
         residuals = [{"datname": "sqag_fixture_residual"}]
@@ -702,6 +772,8 @@ class StructuralSessionAuthorityTest(unittest.TestCase):
     "real disposable PostgreSQL-17 service is not configured",
 )
 class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
+    apply_full_migration_fixture = True
+
     @classmethod
     def setUpClass(cls):
         import psycopg
@@ -796,12 +868,15 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
             ).fetchone()
             self.assertTrue(after_grant["has_schema_privilege"])
         migrator_url = safe_postgres_url("sqag_migrator", self.database_name)
-        with webapp.postgres_storage_connection(migrator_url, expected_role=webapp.SQAG_MIGRATOR_DATABASE_ROLE) as connection:
-            result = apply_postgres_migrations(connection, self.migrations)
-            connection.commit()
-        self.assertEqual(result["expectedHead"], self.migrations[-1].migration_id)
-        self._configure_acl_contract()
-        self.fixture_ready = True
+        if self.apply_full_migration_fixture:
+            with webapp.postgres_storage_connection(migrator_url, expected_role=webapp.SQAG_MIGRATOR_DATABASE_ROLE) as connection:
+                result = apply_postgres_migrations(connection, self.migrations)
+                connection.commit()
+            self.assertEqual(result["expectedHead"], self.migrations[-1].migration_id)
+            self._configure_acl_contract()
+            self.fixture_ready = True
+        else:
+            self._bootstrap_prefix_migrations(migrator_url)
 
     def _cleanup_fixture(self):
         if self.cleanup_done:
@@ -3270,6 +3345,232 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
     def _admin_rows(self, statement, params=()):
         with self._admin_connection() as connection:
             return connection.execute(statement, params).fetchall()
+
+
+@unittest.skipUnless(
+    postgres_test_enabled(),
+    "real disposable PostgreSQL-17 service is not configured",
+)
+class MigrationOperatorPathPostgresIntegrationTest(unittest.TestCase):
+    """Exercise the real pre-apply, apply, post-apply, and no-op transition."""
+
+    apply_full_migration_fixture = False
+
+    @classmethod
+    def setUpClass(cls):
+        RuntimePrivilegeContractPostgresIntegrationTest.setUpClass.__func__(cls)
+
+    def setUp(self):
+        RuntimePrivilegeContractPostgresIntegrationTest.setUp(self)
+
+    _cleanup_fixture = RuntimePrivilegeContractPostgresIntegrationTest._cleanup_fixture
+    _admin_connection = RuntimePrivilegeContractPostgresIntegrationTest._admin_connection
+    _admin_row = RuntimePrivilegeContractPostgresIntegrationTest._admin_row
+    _admin_rows = RuntimePrivilegeContractPostgresIntegrationTest._admin_rows
+    _configure_acl_contract = RuntimePrivilegeContractPostgresIntegrationTest._configure_acl_contract
+    _configure_provider_memberships = RuntimePrivilegeContractPostgresIntegrationTest._configure_provider_memberships
+    _configure_provider_ownership = RuntimePrivilegeContractPostgresIntegrationTest._configure_provider_ownership
+    _execute_admin = RuntimePrivilegeContractPostgresIntegrationTest._execute_admin
+    _execute_as_role = RuntimePrivilegeContractPostgresIntegrationTest._execute_as_role
+    _grant_provider_edge = RuntimePrivilegeContractPostgresIntegrationTest._grant_provider_edge
+    _verify = RuntimePrivilegeContractPostgresIntegrationTest._verify
+
+    def _bootstrap_prefix_migrations(self, migrator_url: str) -> None:
+        with webapp.postgres_storage_connection(
+            migrator_url,
+            expected_role=webapp.SQAG_MIGRATOR_DATABASE_ROLE,
+        ) as connection:
+            connection.execute("set local search_path to public, pg_catalog")
+            connection.execute(
+                "select pg_catalog.pg_advisory_xact_lock(?)",
+                (postgres_migration_module.MIGRATION_LOCK_KEY,),
+            )
+            postgres_migration_module._create_ledger(connection)
+            for migration in self.migrations[:-1]:
+                payload = postgres_migration_module.canonical_migration_payload(migration.path)
+                self.assertEqual(sha256(payload).hexdigest(), migration.checksum_sha256)
+                postgres_migration_module.execute_migration_sql(connection, payload.decode("utf-8"))
+                connection.execute(
+                    "insert into public.sqag_schema_migrations "
+                    "(sequence_no, migration_id, checksum_sha256) values (?, ?, ?)",
+                    (migration.sequence_no, migration.migration_id, migration.checksum_sha256),
+                )
+            connection.commit()
+
+    def _operator_environment(self, *, include_runtime: bool = False) -> dict[str, str]:
+        environment = dict(os.environ)
+        for name in (
+            webapp.SQAG_DATABASE_URL_ENV_NAME,
+            webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME,
+            webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME,
+        ):
+            environment.pop(name, None)
+        environment[webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME] = safe_postgres_url(
+            "sqag_migrator", self.database_name
+        )
+        if include_runtime:
+            environment[webapp.SQAG_DATABASE_URL_ENV_NAME] = safe_postgres_url(
+                "sqag_runtime", self.database_name
+            )
+            environment[webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME] = safe_postgres_url(
+                "sqag_maintenance", self.database_name
+            )
+        return environment
+
+    def _run_operator(self, script_name: str, arguments: list[str], environment: dict[str, str]):
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / script_name), *arguments],
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, f"{script_name} failed closed")
+        return completed
+
+    def test_real_pg17_operator_phase_007_to_008_causal_transition(self):
+        migrator_url = safe_postgres_url("sqag_migrator", self.database_name)
+        runtime_url = safe_postgres_url("sqag_runtime", self.database_name)
+        last_migration = self.migrations[-1].migration_id
+        expected_ids = [migration.migration_id for migration in self.migrations]
+
+        prefix_rows = self._admin_rows(
+            "select sequence_no, migration_id, checksum_sha256 "
+            "from public.sqag_schema_migrations order by sequence_no"
+        )
+        self.assertEqual(
+            [row["migration_id"] for row in prefix_rows],
+            expected_ids[:-1],
+        )
+        callable_absent = self._admin_row(
+            "select to_regprocedure(%s) is null as absent",
+            ("public.sqag_quote_session_deletion_hold_blocked(text, text)",),
+        )
+        self.assertTrue(callable_absent["absent"])
+
+        preflight_run = self._run_operator(
+            "preflight_sqag_migrations.py",
+            ["--phase", "pre-apply"],
+            self._operator_environment(),
+        )
+        preflight_report = json.loads(preflight_run.stdout)
+        self.assertEqual(preflight_report["phase"], "pre-apply")
+        self.assertEqual(preflight_report["status"], "ready")
+        self.assertTrue(preflight_report["safeToApply"])
+        self.assertEqual(preflight_report["ledgerState"], "present")
+        self.assertEqual(preflight_report["expectedHead"], last_migration)
+        self.assertEqual(preflight_report["appliedHead"], expected_ids[-2])
+        self.assertEqual(preflight_report["appliedMigrationIds"], expected_ids[:-1])
+        self.assertEqual(preflight_report["pendingMigrationIds"], [last_migration])
+        self.assertEqual(preflight_report["blockers"], [])
+        self.assertNotIn("runtimeContract", preflight_report)
+        self.assertNotIn("maintenanceContract", preflight_report)
+
+        with webapp.postgres_storage_connection(
+            migrator_url,
+            expected_role=webapp.SQAG_MIGRATOR_DATABASE_ROLE,
+        ) as connection:
+            identity = connection.execute(
+                "select session_user as session_role, current_user as active_role"
+            ).fetchone()
+        self.assertEqual(identity["session_role"], webapp.SQAG_MIGRATOR_DATABASE_ROLE)
+        self.assertEqual(identity["active_role"], webapp.SQAG_MIGRATOR_DATABASE_ROLE)
+
+        first_apply = self._run_operator(
+            "migrate_sqag_storage.py",
+            [],
+            self._operator_environment(),
+        )
+        applied_lines = [
+            line for line in first_apply.stdout.splitlines()
+            if line.startswith("Applied migration IDs:")
+        ]
+        self.assertEqual(applied_lines, [f"Applied migration IDs: {last_migration}"])
+
+        ledger_after_apply = self._admin_rows(
+            "select sequence_no, migration_id, checksum_sha256 "
+            "from public.sqag_schema_migrations order by sequence_no"
+        )
+        self.assertEqual([row["migration_id"] for row in ledger_after_apply], expected_ids)
+        self.assertEqual(
+            [row["checksum_sha256"] for row in ledger_after_apply],
+            [migration.checksum_sha256 for migration in self.migrations],
+        )
+        callable_present = self._admin_row(
+            "select to_regprocedure(%s) is not null as present",
+            ("public.sqag_quote_session_deletion_hold_blocked(text, text)",),
+        )
+        self.assertTrue(callable_present["present"])
+
+        self._configure_acl_contract()
+        postflight_run = self._run_operator(
+            "preflight_sqag_migrations.py",
+            ["--phase", "post-apply"],
+            self._operator_environment(include_runtime=True),
+        )
+        postflight_report = json.loads(postflight_run.stdout)
+        self.assertEqual(postflight_report["phase"], "post-apply")
+        self.assertEqual(postflight_report["status"], "ready")
+        self.assertTrue(postflight_report["safeToApply"])
+        self.assertEqual(postflight_report["pendingMigrationIds"], [])
+        self.assertEqual(postflight_report["appliedMigrationIds"], expected_ids)
+        self.assertEqual(postflight_report["blockers"], [])
+        self.assertEqual(postflight_report["runtimeContract"]["status"], "verified")
+        self.assertEqual(postflight_report["maintenanceContract"]["status"], "verified")
+        self.assertEqual(self._verify()["status"], "verified")
+
+        callable_body = self._admin_row(
+            "select p.prosrc as function_body "
+            "from pg_catalog.pg_proc p "
+            "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+            "where n.nspname = 'public' and p.proname = %s "
+            "and pg_get_function_identity_arguments(p.oid) = %s",
+            (contract.CALLABLE_ROUTINE_NAME, contract.CALLABLE_ROUTINE_IDENTITY_ARGUMENTS),
+        )
+        self.assertEqual(
+            contract._semantic_sql_tokens(callable_body["function_body"]),
+            contract._semantic_sql_tokens(contract._canonical_callable_routine_body()),
+        )
+        callable_runtime_acl = self._admin_row(
+            "select has_function_privilege(%s, %s, 'EXECUTE') as allowed",
+            (webapp.SQAG_RUNTIME_DATABASE_ROLE, "public.sqag_quote_session_deletion_hold_blocked(text, text)"),
+        )
+        callable_maintenance_acl = self._admin_row(
+            "select has_function_privilege(%s, %s, 'EXECUTE') as allowed",
+            (webapp.SQAG_MAINTENANCE_DATABASE_ROLE, "public.sqag_quote_session_deletion_hold_blocked(text, text)"),
+        )
+        self.assertTrue(callable_runtime_acl["allowed"])
+        self.assertFalse(callable_maintenance_acl["allowed"])
+
+        with webapp.postgres_storage_connection(
+            runtime_url,
+            expected_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        ) as connection:
+            with self.assertRaises(Exception):
+                connection.execute("select 1 from public.sqag_legal_holds").fetchone()
+            connection.rollback()
+
+        ledger_before_noop = self._admin_rows(
+            "select sequence_no, migration_id, checksum_sha256, applied_at "
+            "from public.sqag_schema_migrations order by sequence_no"
+        )
+        second_apply = self._run_operator(
+            "migrate_sqag_storage.py",
+            [],
+            self._operator_environment(include_runtime=True),
+        )
+        second_applied_lines = [
+            line for line in second_apply.stdout.splitlines()
+            if line.startswith("Applied migration IDs:")
+        ]
+        self.assertEqual(second_applied_lines, ["Applied migration IDs: none"])
+        ledger_after_noop = self._admin_rows(
+            "select sequence_no, migration_id, checksum_sha256, applied_at "
+            "from public.sqag_schema_migrations order by sequence_no"
+        )
+        self.assertEqual(ledger_after_noop, ledger_before_noop)
+        print("RUN313_PG17_CAUSAL_TRANSITION_EXECUTED")
 
 
 if __name__ == "__main__":

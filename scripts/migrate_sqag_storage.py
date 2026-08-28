@@ -13,10 +13,36 @@ if str(ROOT) not in sys.path:
 from webapp import server as webapp
 
 
+class MigrationConfigurationError(RuntimeError):
+    """Raised when the operator path cannot bind an authorized database URL."""
+
+
+def _migration_database_url() -> str:
+    """Select SQLite locally or the dedicated migrator URL for PostgreSQL."""
+
+    configured_url = webapp.configured_database_url()
+    configured_family = webapp.database_family_from_url(configured_url)
+    if configured_family == "sqlite":
+        return configured_url
+    if configured_family == "unsupported":
+        raise MigrationConfigurationError("runtime_database_url_unsupported")
+
+    migrator_url = webapp.configured_migrator_database_url()
+    if not migrator_url:
+        raise MigrationConfigurationError("migrator_database_url_absent")
+    if not webapp.postgres_database_url_is_supported(migrator_url):
+        raise MigrationConfigurationError("migrator_database_url_requires_postgres")
+    return migrator_url
+
+
 def main() -> int:
-    database_url = webapp.configured_database_url()
-    if not database_url:
-        print("SQAG_DATABASE_URL is required for the storage migration.", file=sys.stderr)
+    try:
+        database_url = _migration_database_url()
+    except MigrationConfigurationError:
+        print(
+            "SQAG migration configuration is invalid; the operator path failed closed.",
+            file=sys.stderr,
+        )
         return 2
     try:
         result = webapp.apply_sqag_storage_migrations(database_url)
