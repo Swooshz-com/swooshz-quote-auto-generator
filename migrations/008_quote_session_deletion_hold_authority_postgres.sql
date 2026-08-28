@@ -85,9 +85,7 @@ feedback_rows as (
       f.session_id = $2
       or f.run_id in (
         select r.run_id
-        from public.sqag_generation_runs r
-        where r.workspace_id = $1
-          and r.quote_session_id = $2
+        from session_runs r
       )
       or f.publication_version_id in (
         select v.run_id
@@ -119,13 +117,6 @@ feedback_session_runs as (
 run_candidates as (
   select r.run_id
   from session_runs r
-  union
-  select f.run_id
-  from feedback_rows f
-  where f.run_id is not null
-  union
-  select r.run_id
-  from feedback_session_runs r
 ),
 run_graph_detail as (
   select c.run_id,
@@ -229,6 +220,39 @@ run_graph_detail as (
     ) as blocked
   from run_candidates c
 ),
+feedback_target_state as (
+  select f.feedback_id,
+    (
+      (f.session_id is not null and (
+        f.session_id !~ '^quote-[A-Za-z0-9_-]{3,64}$'
+        or not exists (
+          select 1
+          from session_rows s
+          where s.workspace_id = f.workspace_id
+            and s.session_id = f.session_id
+        )
+      ))
+      or (f.run_id is not null and (
+        f.run_id !~ '^run-[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+        or not exists (
+          select 1
+          from run_candidates c
+          where c.run_id = f.run_id
+        )
+      ))
+      or (f.publication_version_id is not null and (
+        f.publication_version_id !~ '^run-[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+        or not exists (
+          select 1
+          from publication_versions v
+          where v.workspace_id = f.workspace_id
+            and v.session_id = $2
+            and v.run_id = f.publication_version_id
+        )
+      ))
+    ) as blocked
+  from feedback_rows f
+),
 session_audit_state as (
   select coalesce(bool_or(
     a.event_id is null
@@ -254,8 +278,9 @@ session_audit_state as (
       a.feedback_id !~ '^feedback-[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
       or not exists (
         select 1
-        from feedback_rows f
+        from feedback_target_state f
         where f.feedback_id = a.feedback_id
+          and not f.blocked
       )
     ))
     or exists (
@@ -285,36 +310,26 @@ feedback_state as (
     or f.legal_hold = 1
     or exists (
       select 1
+      from feedback_target_state target
+      where target.feedback_id = f.feedback_id
+        and target.blocked
+    )
+    or exists (
+      select 1
       from public.sqag_legal_holds h
       where h.workspace_id = $1
         and h.target_type = 'feedback'
         and h.target_id = f.feedback_id
         and h.enabled = 1
     )
-    or (f.run_id is not null and (
-      f.run_id !~ '^run-[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
-      or not exists (
-        select 1
-        from public.sqag_generation_runs r
-        where r.workspace_id = f.workspace_id
-          and r.run_id = f.run_id
-      )
-      or exists (
-        select 1
-        from run_graph_detail g
-        where g.run_id = f.run_id
-          and g.blocked
-      )
+    or (f.run_id is not null and exists (
+      select 1
+      from run_graph_detail g
+      where g.run_id = f.run_id
+        and g.blocked
     ))
     or (f.session_id is not null and (
-      f.session_id !~ '^quote-[A-Za-z0-9_-]{3,64}$'
-      or not exists (
-        select 1
-        from public.sqag_quote_sessions s
-        where s.workspace_id = f.workspace_id
-          and s.session_id = f.session_id
-      )
-      or exists (
+      exists (
         select 1
         from feedback_session_run_state rs
         where rs.feedback_id = f.feedback_id
@@ -326,16 +341,6 @@ feedback_state as (
         join run_graph_detail g on g.run_id = fsr.run_id
         where fsr.feedback_id = f.feedback_id
           and g.blocked
-      )
-    ))
-    or (f.publication_version_id is not null and (
-      f.publication_version_id !~ '^run-[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
-      or not exists (
-        select 1
-        from public.sqag_quote_publication_versions v
-        where v.workspace_id = f.workspace_id
-          and v.session_id = $2
-          and v.run_id = f.publication_version_id
       )
     ))
     or exists (

@@ -1096,6 +1096,104 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
             for name, (statement,) in queries.items()
         }
 
+    def _insert_synthetic_feedback(
+        self,
+        *,
+        workspace_id: str,
+        feedback_id: str,
+        support_reference: str,
+        run_id: str | None,
+        session_id: str | None,
+        now: str,
+        expiry: str,
+    ) -> None:
+        self._execute_admin(
+            "insert into public.sqag_feedback "
+            "(feedback_id, support_reference, workspace_id, "
+            "reporter_tracking_id, reporter_key_version, run_id, session_id, "
+            "category, title, message, expected_result, actual_result, "
+            "reproduction_steps, impact, link_choice, manual_reference_text, "
+            "manual_reference_status, resolved_reference_type, resolved_reference_id, "
+            "publication_version_id, link_resolution_source, link_resolved_at, "
+            "diagnostic_metadata_json, status, created_at, updated_at, "
+            "retention_expires_at, original_retention_expires_at, "
+            "submission_retention_expires_at, retention_policy_version, "
+            "legal_hold, deletion_state) "
+            "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+            "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+            "%s, %s, %s, %s, %s, %s)",
+            (
+                feedback_id,
+                support_reference,
+                workspace_id,
+                "actor-run304-fixture",
+                "test-v1",
+                run_id,
+                session_id,
+                "bug",
+                "Synthetic Run-304 feedback",
+                "Synthetic feedback fixture.",
+                None,
+                None,
+                None,
+                "medium",
+                "automatic",
+                None,
+                "none",
+                "generation_run" if run_id else None,
+                run_id,
+                None,
+                "current_run" if run_id else "current_session",
+                now if run_id else None,
+                '{"synthetic":true}',
+                "open",
+                now,
+                now,
+                expiry,
+                expiry,
+                expiry,
+                "test-v1",
+                0,
+                "active",
+            ),
+        )
+
+    def _insert_synthetic_audit(
+        self,
+        *,
+        workspace_id: str,
+        event_id: str,
+        run_id: str,
+        feedback_id: str,
+        session_id: str,
+        now: str,
+        expiry: str,
+    ) -> None:
+        self._execute_admin(
+            "insert into public.sqag_audit_events "
+            "(event_id, run_id, feedback_id, session_id, workspace_id, "
+            "actor_tracking_id, actor_key_version, event_type, event_json, "
+            "event_sha256, created_at, retention_expires_at, "
+            "original_retention_expires_at, legal_hold) "
+            "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                event_id,
+                run_id,
+                feedback_id,
+                session_id,
+                workspace_id,
+                "actor-run304-fixture",
+                "test-v1",
+                "run304_direct_audit",
+                '{"synthetic":true}',
+                "0" * 64,
+                now,
+                expiry,
+                expiry,
+                0,
+            ),
+        )
+
     def _restore_canonical_forensic_routines(self):
         for trigger, table in (
             ("sqag_generation_evidence_no_update", "sqag_generation_evidence"),
@@ -1644,6 +1742,204 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         after = self._workspace_deletion_snapshot(workspace_id)
         self.assertEqual(before, after)
         self.assertIsNotNone(storage.get_quote_session(session_id))
+
+    def test_run304_pg17_valid_id_cross_session_feedback_cannot_expand_target_graph(self):
+        runtime_url = safe_postgres_url("sqag_runtime", self.database_name)
+        workspace_id = "workspace-run304-cross-session"
+        target_session_id = "quote-run304-cross-session-target"
+        unrelated_session_id = "quote-run304-cross-session-other"
+        unrelated_run_id = "run-run304-cross-session-other"
+        feedback_id = "feedback-run304-cross-session"
+        audit_id = "audit-run304-cross-session"
+        now = "2026-08-28T00:00:00Z"
+        expiry = "2099-08-28T00:00:00Z"
+        storage = webapp.DatabaseSqagStorage(
+            runtime_url,
+            workspace_id,
+            role="admin",
+            user_id="user-run304-cross-session",
+            expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+            },
+            clear=False,
+        ):
+            storage.create_or_update_quote_session(
+                {"session_id": target_session_id, "client": {"name": "synthetic"}},
+                result=None,
+            )
+            storage.create_or_update_quote_session(
+                {"session_id": unrelated_session_id, "client": {"name": "synthetic"}},
+                result=None,
+            )
+            with webapp.postgres_storage_connection(
+                runtime_url,
+                expected_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+            ) as connection:
+                forensic = ForensicStore(
+                    connection,
+                    workspace_id,
+                    "actor-run304-cross-session",
+                    actor_key_version_value="test-v1",
+                )
+                recorded_run_id = forensic.record_run_started(
+                    "generate",
+                    {"image_count": 0, "synthetic": True},
+                    run_id=unrelated_run_id,
+                    job_id="job-run304-cross-session-other",
+                    quote_session_id=unrelated_session_id,
+                    now=dt.datetime(2026, 8, 28, tzinfo=dt.timezone.utc),
+                )
+                forensic.finish_run(
+                    recorded_run_id,
+                    "completed",
+                    now=dt.datetime(2026, 8, 28, tzinfo=dt.timezone.utc),
+                )
+
+        self._insert_synthetic_feedback(
+            workspace_id=workspace_id,
+            feedback_id=feedback_id,
+            support_reference="SQAG-RUN304-CROSS-SESSION",
+            run_id=unrelated_run_id,
+            session_id=target_session_id,
+            now=now,
+            expiry=expiry,
+        )
+        self._insert_synthetic_audit(
+            workspace_id=workspace_id,
+            event_id=audit_id,
+            run_id=unrelated_run_id,
+            feedback_id=feedback_id,
+            session_id=target_session_id,
+            now=now,
+            expiry=expiry,
+        )
+        self.assertEqual(
+            self._admin_row(
+                "select session_id, run_id from public.sqag_feedback "
+                "where workspace_id = %s and feedback_id = %s",
+                (workspace_id, feedback_id),
+            )["session_id"],
+            target_session_id,
+        )
+        self.assertEqual(
+            self._admin_row(
+                "select session_id, run_id, feedback_id from public.sqag_audit_events "
+                "where workspace_id = %s and event_id = %s",
+                (workspace_id, audit_id),
+            )["run_id"],
+            unrelated_run_id,
+        )
+
+        before = self._workspace_deletion_snapshot(workspace_id)
+        with mock.patch.dict(
+            os.environ,
+            {
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+            },
+            clear=False,
+        ):
+            deleted = storage.delete_quote_session(target_session_id)
+        self.assertFalse(deleted)
+        after = self._workspace_deletion_snapshot(workspace_id)
+        self.assertEqual(before, after)
+        self.assertIsNotNone(storage.get_quote_session(target_session_id))
+
+    def test_run304_pg17_consistent_target_graph_is_not_blocked_by_links(self):
+        runtime_url = safe_postgres_url("sqag_runtime", self.database_name)
+        workspace_id = "workspace-run304-consistent"
+        session_id = "quote-run304-consistent-session"
+        run_id = "run-run304-consistent-session"
+        feedback_id = "feedback-run304-consistent"
+        audit_id = "audit-run304-consistent"
+        now = "2026-08-28T00:00:00Z"
+        expiry = "2099-08-28T00:00:00Z"
+        storage = webapp.DatabaseSqagStorage(
+            runtime_url,
+            workspace_id,
+            role="admin",
+            user_id="user-run304-consistent",
+            expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+            },
+            clear=False,
+        ):
+            storage.create_or_update_quote_session(
+                {"session_id": session_id, "client": {"name": "synthetic"}},
+                result=None,
+            )
+            with webapp.postgres_storage_connection(
+                runtime_url,
+                expected_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+            ) as connection:
+                forensic = ForensicStore(
+                    connection,
+                    workspace_id,
+                    "actor-run304-consistent",
+                    actor_key_version_value="test-v1",
+                )
+                recorded_run_id = forensic.record_run_started(
+                    "generate",
+                    {"image_count": 0, "synthetic": True},
+                    run_id=run_id,
+                    job_id="job-run304-consistent-session",
+                    quote_session_id=session_id,
+                    now=dt.datetime(2026, 8, 28, tzinfo=dt.timezone.utc),
+                )
+                forensic.finish_run(
+                    recorded_run_id,
+                    "completed",
+                    now=dt.datetime(2026, 8, 28, tzinfo=dt.timezone.utc),
+                )
+
+        self._insert_synthetic_feedback(
+            workspace_id=workspace_id,
+            feedback_id=feedback_id,
+            support_reference="SQAG-RUN304-CONSISTENT",
+            run_id=run_id,
+            session_id=session_id,
+            now=now,
+            expiry=expiry,
+        )
+        self._insert_synthetic_audit(
+            workspace_id=workspace_id,
+            event_id=audit_id,
+            run_id=run_id,
+            feedback_id=feedback_id,
+            session_id=session_id,
+            now=now,
+            expiry=expiry,
+        )
+        with webapp.postgres_storage_connection(
+            runtime_url,
+            expected_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        ) as connection:
+            hold_row = connection.execute(
+                "select public.sqag_quote_session_deletion_hold_blocked("
+                "cast(? as text), cast(? as text)) as hold_blocked",
+                (workspace_id, session_id),
+            ).fetchone()
+        self.assertFalse(hold_row["hold_blocked"])
+        with mock.patch.dict(
+            os.environ,
+            {
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+            },
+            clear=False,
+        ):
+            self.assertTrue(storage.delete_quote_session(session_id))
+        self.assertIsNone(storage.get_quote_session(session_id))
 
     def test_real_pg17_unexpected_public_sqag_routine_default_public_execute_is_rejected(self):
         self._execute_admin(
