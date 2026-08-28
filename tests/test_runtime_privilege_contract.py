@@ -1164,9 +1164,9 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         *,
         workspace_id: str,
         event_id: str,
-        run_id: str,
-        feedback_id: str,
-        session_id: str,
+        run_id: str | None,
+        feedback_id: str | None,
+        session_id: str | None,
         now: str,
         expiry: str,
     ) -> None:
@@ -1193,6 +1193,103 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                 expiry,
                 0,
             ),
+        )
+
+    def _prepare_run308_two_session_graph(self, suffix: str):
+        runtime_url = safe_postgres_url("sqag_runtime", self.database_name)
+        workspace_id = f"workspace-run308-{suffix}"
+        target_session_id = f"quote-run308-{suffix}-target"
+        unrelated_session_id = f"quote-run308-{suffix}-other"
+        target_run_id = f"run-run308-{suffix}-target"
+        unrelated_run_id = f"run-run308-{suffix}-other"
+        storage = webapp.DatabaseSqagStorage(
+            runtime_url,
+            workspace_id,
+            role="admin",
+            user_id=f"user-run308-{suffix}",
+            expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        )
+        now = dt.datetime(2026, 8, 28, tzinfo=dt.timezone.utc)
+        with mock.patch.dict(
+            os.environ,
+            {
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+            },
+            clear=False,
+        ):
+            storage.create_or_update_quote_session(
+                {"session_id": target_session_id, "client": {"name": "synthetic"}},
+                result=None,
+            )
+            storage.create_or_update_quote_session(
+                {"session_id": unrelated_session_id, "client": {"name": "synthetic"}},
+                result=None,
+            )
+        with webapp.postgres_storage_connection(
+            runtime_url,
+            expected_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        ) as connection:
+            for actor, run_id, session_id in (
+                ("target", target_run_id, target_session_id),
+                ("unrelated", unrelated_run_id, unrelated_session_id),
+            ):
+                forensic = ForensicStore(
+                    connection,
+                    workspace_id,
+                    f"actor-run308-{suffix}-{actor}",
+                    actor_key_version_value="test-v1",
+                )
+                recorded_run_id = forensic.record_run_started(
+                    "generate",
+                    {"image_count": 0, "synthetic": True},
+                    run_id=run_id,
+                    job_id=f"job-run308-{suffix}-{actor}",
+                    quote_session_id=session_id,
+                    now=now,
+                )
+                forensic.finish_run(
+                    recorded_run_id,
+                    "completed",
+                    now=now,
+                )
+        return {
+            "runtime_url": runtime_url,
+            "workspace_id": workspace_id,
+            "target_session_id": target_session_id,
+            "unrelated_session_id": unrelated_session_id,
+            "target_run_id": target_run_id,
+            "unrelated_run_id": unrelated_run_id,
+            "storage": storage,
+            "now": "2026-08-28T00:00:00Z",
+            "expiry": "2099-08-28T00:00:00Z",
+        }
+
+    def _assert_run308_deletion_blocked_without_hold(self, fixture) -> None:
+        no_active_hold = self._admin_row(
+            "select count(*) as count from public.sqag_legal_holds "
+            "where workspace_id = %s and enabled = 1",
+            (fixture["workspace_id"],),
+        )
+        self.assertEqual(no_active_hold["count"], 0)
+        before = self._workspace_deletion_snapshot(fixture["workspace_id"])
+        with mock.patch.dict(
+            os.environ,
+            {
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+            },
+            clear=False,
+        ):
+            self.assertFalse(
+                fixture["storage"].delete_quote_session(
+                    fixture["target_session_id"]
+                )
+            )
+        after = self._workspace_deletion_snapshot(fixture["workspace_id"])
+        self.assertEqual(before, after)
+        self.assertIsNotNone(
+            fixture["storage"].get_quote_session(fixture["target_session_id"])
         )
 
     def _restore_canonical_forensic_routines(self):
@@ -1941,6 +2038,78 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         ):
             self.assertTrue(storage.delete_quote_session(session_id))
         self.assertIsNone(storage.get_quote_session(session_id))
+
+    def test_run308_pg17_target_run_audit_rejects_existing_unrelated_feedback(self):
+        fixture = self._prepare_run308_two_session_graph("run-feedback")
+        unrelated_feedback_id = "feedback-run308-run-feedback-other"
+        audit_id = "audit-run308-run-feedback-mixed"
+        self._insert_synthetic_feedback(
+            workspace_id=fixture["workspace_id"],
+            feedback_id=unrelated_feedback_id,
+            support_reference="SQAG-RUN308-RUN-FEEDBACK",
+            run_id=fixture["unrelated_run_id"],
+            session_id=fixture["unrelated_session_id"],
+            now=fixture["now"],
+            expiry=fixture["expiry"],
+        )
+        self._insert_synthetic_audit(
+            workspace_id=fixture["workspace_id"],
+            event_id=audit_id,
+            run_id=fixture["target_run_id"],
+            feedback_id=unrelated_feedback_id,
+            session_id=None,
+            now=fixture["now"],
+            expiry=fixture["expiry"],
+        )
+        self._assert_run308_deletion_blocked_without_hold(fixture)
+
+    def test_run308_pg17_target_feedback_audit_rejects_existing_unrelated_run(self):
+        fixture = self._prepare_run308_two_session_graph("feedback-run")
+        target_feedback_id = "feedback-run308-feedback-run-target"
+        audit_id = "audit-run308-feedback-run-mixed"
+        self._insert_synthetic_feedback(
+            workspace_id=fixture["workspace_id"],
+            feedback_id=target_feedback_id,
+            support_reference="SQAG-RUN308-FEEDBACK-RUN",
+            run_id=fixture["target_run_id"],
+            session_id=fixture["target_session_id"],
+            now=fixture["now"],
+            expiry=fixture["expiry"],
+        )
+        self._insert_synthetic_audit(
+            workspace_id=fixture["workspace_id"],
+            event_id=audit_id,
+            run_id=fixture["unrelated_run_id"],
+            feedback_id=target_feedback_id,
+            session_id=None,
+            now=fixture["now"],
+            expiry=fixture["expiry"],
+        )
+        self._assert_run308_deletion_blocked_without_hold(fixture)
+
+    def test_run308_pg17_target_audit_rejects_existing_unrelated_session(self):
+        fixture = self._prepare_run308_two_session_graph("audit-session")
+        target_feedback_id = "feedback-run308-audit-session-target"
+        audit_id = "audit-run308-audit-session-mixed"
+        self._insert_synthetic_feedback(
+            workspace_id=fixture["workspace_id"],
+            feedback_id=target_feedback_id,
+            support_reference="SQAG-RUN308-AUDIT-SESSION",
+            run_id=fixture["target_run_id"],
+            session_id=fixture["target_session_id"],
+            now=fixture["now"],
+            expiry=fixture["expiry"],
+        )
+        self._insert_synthetic_audit(
+            workspace_id=fixture["workspace_id"],
+            event_id=audit_id,
+            run_id=fixture["target_run_id"],
+            feedback_id=target_feedback_id,
+            session_id=fixture["unrelated_session_id"],
+            now=fixture["now"],
+            expiry=fixture["expiry"],
+        )
+        self._assert_run308_deletion_blocked_without_hold(fixture)
 
     def test_run306_pg17_publication_derived_feedback_hold_serializes_session_delete(self):
         runtime_url = safe_postgres_url("sqag_runtime", self.database_name)

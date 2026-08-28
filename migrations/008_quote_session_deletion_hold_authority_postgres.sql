@@ -75,6 +75,10 @@ session_runs as (
       )
     )
 ),
+run_candidates as (
+  select r.run_id
+  from session_runs r
+),
 feedback_rows as (
   select distinct f.workspace_id, f.feedback_id, f.legal_hold, f.run_id, f.session_id,
     f.publication_version_id
@@ -94,7 +98,7 @@ feedback_rows as (
     )
 ),
 session_audits as (
-  select a.workspace_id, a.event_id, a.legal_hold, a.run_id, a.feedback_id
+  select a.workspace_id, a.event_id, a.legal_hold, a.run_id, a.feedback_id, a.session_id
   from public.sqag_audit_events a
   where (select valid from input_state)
     and a.workspace_id = $1
@@ -114,9 +118,38 @@ feedback_session_runs as (
    and r.quote_session_id = f.session_id
   where f.session_id is not null
 ),
-run_candidates as (
-  select r.run_id
-  from session_runs r
+feedback_target_state as (
+  select f.feedback_id,
+    (
+      (f.session_id is not null and (
+        f.session_id !~ '^quote-[A-Za-z0-9_-]{3,64}$'
+        or not exists (
+          select 1
+          from session_rows s
+          where s.workspace_id = f.workspace_id
+            and s.session_id = f.session_id
+        )
+      ))
+      or (f.run_id is not null and (
+        f.run_id !~ '^run-[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+        or not exists (
+          select 1
+          from run_candidates c
+          where c.run_id = f.run_id
+        )
+      ))
+      or (f.publication_version_id is not null and (
+        f.publication_version_id !~ '^run-[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+        or not exists (
+          select 1
+          from publication_versions v
+          where v.workspace_id = f.workspace_id
+            and v.session_id = $2
+            and v.run_id = f.publication_version_id
+        )
+      ))
+    ) as blocked
+  from feedback_rows f
 ),
 run_graph_detail as (
   select c.run_id,
@@ -193,16 +226,16 @@ run_graph_detail as (
               a.feedback_id !~ '^feedback-[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
               or not exists (
                 select 1
-                from public.sqag_feedback f
-                where f.workspace_id = a.workspace_id
-                  and f.feedback_id = a.feedback_id
+                from feedback_target_state f
+                where f.feedback_id = a.feedback_id
+                  and not f.blocked
               )
             ))
             or (a.session_id is not null and (
               a.session_id !~ '^quote-[A-Za-z0-9_-]{3,64}$'
               or not exists (
                 select 1
-                from public.sqag_quote_sessions s
+                from session_rows s
                 where s.workspace_id = a.workspace_id
                   and s.session_id = a.session_id
               )
@@ -220,39 +253,6 @@ run_graph_detail as (
     ) as blocked
   from run_candidates c
 ),
-feedback_target_state as (
-  select f.feedback_id,
-    (
-      (f.session_id is not null and (
-        f.session_id !~ '^quote-[A-Za-z0-9_-]{3,64}$'
-        or not exists (
-          select 1
-          from session_rows s
-          where s.workspace_id = f.workspace_id
-            and s.session_id = f.session_id
-        )
-      ))
-      or (f.run_id is not null and (
-        f.run_id !~ '^run-[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
-        or not exists (
-          select 1
-          from run_candidates c
-          where c.run_id = f.run_id
-        )
-      ))
-      or (f.publication_version_id is not null and (
-        f.publication_version_id !~ '^run-[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
-        or not exists (
-          select 1
-          from publication_versions v
-          where v.workspace_id = f.workspace_id
-            and v.session_id = $2
-            and v.run_id = f.publication_version_id
-        )
-      ))
-    ) as blocked
-  from feedback_rows f
-),
 session_audit_state as (
   select coalesce(bool_or(
     a.event_id is null
@@ -260,6 +260,15 @@ session_audit_state as (
     or a.legal_hold is null
     or a.legal_hold not in (0, 1)
     or a.legal_hold = 1
+    or (a.session_id is not null and (
+      a.session_id !~ '^quote-[A-Za-z0-9_-]{3,64}$'
+      or not exists (
+        select 1
+        from session_rows s
+        where s.workspace_id = a.workspace_id
+          and s.session_id = a.session_id
+      )
+    ))
     or (a.run_id is not null and (
       a.run_id !~ '^run-[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
       or not exists (
@@ -375,20 +384,34 @@ feedback_state as (
           or a.legal_hold is null
           or a.legal_hold not in (0, 1)
           or a.legal_hold = 1
+          or (a.feedback_id is not null and (
+            a.feedback_id !~ '^feedback-[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+            or not exists (
+              select 1
+              from feedback_target_state target
+              where target.feedback_id = a.feedback_id
+                and not target.blocked
+            )
+          ))
           or (a.run_id is not null and (
             a.run_id !~ '^run-[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
             or not exists (
               select 1
-              from public.sqag_generation_runs r
-              where r.workspace_id = a.workspace_id
-                and r.run_id = a.run_id
+              from run_candidates c
+              where c.run_id = a.run_id
+            )
+            or exists (
+              select 1
+              from run_graph_detail g
+              where g.run_id = a.run_id
+                and g.blocked
             )
           ))
           or (a.session_id is not null and (
             a.session_id !~ '^quote-[A-Za-z0-9_-]{3,64}$'
             or not exists (
               select 1
-              from public.sqag_quote_sessions s
+              from session_rows s
               where s.workspace_id = a.workspace_id
                 and s.session_id = a.session_id
             )
