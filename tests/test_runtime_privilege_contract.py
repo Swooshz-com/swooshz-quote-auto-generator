@@ -1070,6 +1070,105 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
     def test_real_pg17_canonical_routine_identity_passes(self):
         self.assertEqual(self._verify()["status"], "verified")
 
+    def test_run297_pg17_runtime_session_delete_crossing_is_repaired(self):
+        runtime_url = safe_postgres_url("sqag_runtime", self.database_name)
+        workspace_id = "workspace-run297-red"
+        session_id = "quote-run297-red-session"
+        run_id = "run-run297-red-session"
+        storage = webapp.DatabaseSqagStorage(
+            runtime_url,
+            workspace_id,
+            role="admin",
+            user_id="user-run297-red",
+            expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+            },
+            clear=False,
+        ):
+            storage.create_or_update_quote_session(
+                {"session_id": session_id, "client": {"name": "synthetic"}},
+                result=None,
+            )
+            with webapp.postgres_storage_connection(
+                runtime_url,
+                expected_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+            ) as connection:
+                forensic = ForensicStore(
+                    connection,
+                    workspace_id,
+                    "actor-run297-red",
+                    actor_key_version_value="test-v1",
+                )
+                recorded_run_id = forensic.record_run_started(
+                    "generate",
+                    {"image_count": 0, "synthetic": True},
+                    run_id=run_id,
+                    job_id="job-run297-red-session",
+                    quote_session_id=session_id,
+                    now=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+                )
+                forensic.finish_run(
+                    recorded_run_id,
+                    "completed",
+                    now=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+                )
+
+            with self._role_connection("sqag_runtime") as connection:
+                with self.assertRaises(Exception):
+                    connection.execute(
+                        "select 1 from public.sqag_legal_holds"
+                    ).fetchone()
+                connection.rollback()
+
+            deletion_error = None
+            try:
+                deleted = storage.delete_quote_session(session_id)
+            except webapp.SqagStorageAccessError as exc:
+                deletion_error = exc
+                deleted = False
+            if deletion_error is not None:
+                self.assertEqual(deletion_error.status, 503)
+                self.assertEqual(
+                    deletion_error.reason,
+                    "object_artifact_storage_unavailable",
+                )
+                self.assertNotIn("sqag_legal_holds", str(deletion_error))
+                preserved = self._admin_row(
+                    "select "
+                    "(select count(*) from public.sqag_quote_sessions "
+                    "where workspace_id = %s and session_id = %s) as sessions, "
+                    "(select count(*) from public.sqag_quote_publication_versions "
+                    "where workspace_id = %s and session_id = %s) as versions, "
+                    "(select count(*) from public.sqag_quote_publication_artifacts "
+                    "where workspace_id = %s and session_id = %s) as publication_artifacts, "
+                    "(select count(*) from public.sqag_object_artifacts "
+                    "where workspace_id = %s and session_id = %s) as object_artifacts",
+                    (
+                        workspace_id,
+                        session_id,
+                        workspace_id,
+                        session_id,
+                        workspace_id,
+                        session_id,
+                        workspace_id,
+                        session_id,
+                    ),
+                )
+                self.assertEqual(preserved["sessions"], 1)
+                self.assertEqual(preserved["versions"], 0)
+                self.assertEqual(preserved["publication_artifacts"], 0)
+                self.assertEqual(preserved["object_artifacts"], 0)
+                self.fail(
+                    "G3 RED: runtime deletion crossed maintenance-only legal-hold authority"
+                )
+            self.assertTrue(deleted)
+            self.assertIsNone(storage.get_quote_session(session_id))
+
     def test_real_pg17_unexpected_public_sqag_routine_default_public_execute_is_rejected(self):
         self._execute_admin(
             "create function public.sqag_unexpected_inventory() returns integer "
