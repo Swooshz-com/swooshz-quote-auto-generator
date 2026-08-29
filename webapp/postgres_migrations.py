@@ -1127,8 +1127,12 @@ order by table_class.relname, c.oid
                 tuple(str(item) for item in _as_tuple(_row_value(row, "columns"))),
                 _row_value(row, "referenced_table"),
                 tuple(str(item) for item in _as_tuple(_row_value(row, "referenced_columns"))),
-                str(_row_value(row, "on_delete") or "a"),
-                str(_row_value(row, "on_update") or "a"),
+                # pg_constraint stores a blank char for the FK-only action
+                # fields on non-FK constraints.  Treat that catalog sentinel
+                # as the contract's default action instead of comparing the
+                # padding character to the semantic value.
+                str(_row_value(row, "on_delete") or "").strip() or "a",
+                str(_row_value(row, "on_update") or "").strip() or "a",
                 _semantic_sql_tokens(str(_row_value(row, "expression") or ""), expression=True) if kind == "c" else (),
                 bool(_row_value(row, "convalidated")),
                 bool(_row_value(row, "condeferrable")),
