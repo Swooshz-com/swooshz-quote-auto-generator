@@ -16,6 +16,8 @@ MIGRATION_ROLES = ("sqag_migrator", "sqag_runtime", "sqag_maintenance")
 sys.path.insert(0, str(ROOT))
 
 from webapp.postgres_migrations import (
+    CatalogProjectionError,
+    ColumnSpec,
     EXPECTED_CALLABLE_ROUTINE_KEYS,
     EXPECTED_INDEXES,
     EXPECTED_ROUTINES,
@@ -28,6 +30,10 @@ from webapp.postgres_migrations import (
     MIGRATION_FILE_NAMES,
     Migration,
     MigrationSafetyError,
+    TableSpec,
+    _fetch_public_indexes,
+    canonicalize_check_expression,
+    execute_migration_sql,
     apply_postgres_migrations,
     canonical_migration_payload,
     inspect_postgres_migrations,
@@ -43,6 +49,23 @@ def postgres_test_conninfo(database_name: str = "postgres") -> str | None:
     if not host or not port or not user:
         return None
     return f"host={host} port={port} user={user} dbname={database_name}"
+
+
+def safe_postgres_url(user: str, database_name: str) -> str:
+    conninfo = postgres_test_conninfo(database_name)
+    if not conninfo:
+        raise unittest.SkipTest("disposable PostgreSQL-17 service is not configured")
+    parts = {
+        item.split("=", 1)[0]: item.split("=", 1)[1]
+        for item in conninfo.split()
+        if "=" in item
+    }
+    from urllib.parse import quote
+
+    return (
+        f"postgresql://{quote(user, safe='')}@{quote(parts['host'], safe='')}:{quote(parts['port'], safe='')}/"
+        f"{quote(database_name, safe='')}"
+    )
 
 
 def write_migration_copy(destination: Path, line_ending: bytes) -> tuple[Migration, ...]:
@@ -63,6 +86,140 @@ class RecordingConnection:
 
 
 class MigrationPayloadCanonicalizationTest(unittest.TestCase):
+    def test_check_deparse_canonicalizer_allows_only_bounded_equivalences(self):
+        table = TableSpec(
+            "fixture",
+            (
+                ColumnSpec("varchar_value", "varchar"),
+                ColumnSpec("char_value", "char(64)"),
+                ColumnSpec("integer_value", "integer"),
+            ),
+        )
+        equivalent = (
+            (
+                "varchar_value::text ~ '^[a-z]+$'",
+                "varchar_value ~ '^[a-z]+$'",
+            ),
+            (
+                "char_value::text !~ 'x'",
+                "char_value !~ 'x'",
+            ),
+            (
+                "'received'::text",
+                "'received'",
+            ),
+            (
+                "now()",
+                "current_timestamp",
+            ),
+            (
+                "status = ANY (ARRAY['received', 'queued'])",
+                "status IN ('received', 'queued')",
+            ),
+            (
+                "status = ANY (ARRAY['received'::text, 'queued'::text]::text[])",
+                "status IN ('received', 'queued')",
+            ),
+            (
+                "((status = 'received'))",
+                "status = 'received'",
+            ),
+        )
+        for first, second in equivalent:
+            with self.subTest(first=first):
+                self.assertEqual(
+                    canonicalize_check_expression(first, table),
+                    canonicalize_check_expression(second, table),
+                )
+
+        semantic_drift = (
+            ("varchar_value::text = 'x'", "varchar_value = 'x'"),
+            ("char_value::text = 'x'", "char_value = 'x'"),
+            ("integer_value::text = '1'", "integer_value = '1'"),
+            ("status = ANY (ARRAY[status])", "status IN (status)"),
+            ("""varchar_value COLLATE "C" = 'x'""", "varchar_value = 'x'"),
+        )
+        for first, second in semantic_drift:
+            with self.subTest(first=first):
+                self.assertNotEqual(
+                    canonicalize_check_expression(first, table),
+                    canonicalize_check_expression(second, table),
+                )
+
+        self.assertNotEqual(
+            canonicalize_check_expression("status = (", table),
+            canonicalize_check_expression("status = 'received'", table),
+        )
+
+    def test_index_catalog_projection_is_exact_and_typed(self):
+        fields = (
+            "indexrelid", "index_name", "table_name", "indisunique",
+            "indisvalid", "indisready", "constraint_backed", "owner",
+            "predicate", "key_definitions",
+        )
+
+        class Cursor:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def fetchall(self):
+                return self.rows
+
+        class Connection:
+            def __init__(self, row):
+                self.row = row
+                self.sql = ""
+
+            def execute(self, sql):
+                self.sql = sql
+                return Cursor([self.row])
+
+        valid = {
+            "indexrelid": 1,
+            "index_name": "sqag_fixture_idx",
+            "table_name": "sqag_fixture",
+            "indisunique": False,
+            "indisvalid": True,
+            "indisready": True,
+            "constraint_backed": False,
+            "owner": "sqag_migrator",
+            "predicate": None,
+            "key_definitions": ["workspace_id"],
+        }
+        connection = Connection(valid)
+        result = _fetch_public_indexes(connection)
+        self.assertEqual(result["sqag_fixture_idx"]["constraint_backed"], False)
+        self.assertIn("as constraint_backed", connection.sql)
+        self.assertIn("exists", connection.sql.lower())
+        self.assertEqual(set(valid), set(fields))
+
+        for mutation in (
+            lambda row: row.pop("constraint_backed"),
+            lambda row: row.update(unexpected_alias=True),
+            lambda row: row.update(constraint_backed="false"),
+            lambda row: row.update(key_definitions="workspace_id"),
+        ):
+            candidate = dict(valid)
+            mutation(candidate)
+            with self.subTest(candidate=candidate):
+                with self.assertRaises(CatalogProjectionError):
+                    _fetch_public_indexes(Connection(candidate))
+
+    def test_migration_splitter_preserves_dollar_quoted_routine_bodies(self):
+        connection = RecordingConnection()
+        execute_migration_sql(
+            connection,
+            "create table sqag_split_probe (id integer);"
+            "-- SQAG_STATEMENT_BOUNDARY"
+            "create function sqag_split_probe() returns trigger "
+            "language plpgsql as $$ begin raise exception 'x; y'; end $$"
+            "-- SQAG_STATEMENT_BOUNDARY"
+            "drop table sqag_split_probe",
+        )
+        self.assertEqual(len(connection.calls), 3)
+        self.assertIn("raise exception 'x; y'", connection.calls[1][0])
+        self.assertNotIn("raise exception 'x", connection.calls[0][0])
+
     def test_lf_crlf_and_bare_cr_have_identical_payloads_and_checksums(self):
         variants = (
             b"select 1;\nselect 2;\n",
@@ -196,7 +353,7 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
             for role in MIGRATION_ROLES:
                 connection.execute(
                     self.sql.SQL(
-                        "create role {} nologin nosuperuser nocreatedb nocreaterole "
+                        "create role {} login nosuperuser nocreatedb nocreaterole "
                         "noreplication nobypassrls noinherit connection limit -1"
                     ).format(self.sql.Identifier(role))
                 )
@@ -207,6 +364,23 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
         with self.psycopg.connect(postgres_test_conninfo(), autocommit=True) as connection:
             connection.execute(self.sql.SQL("create database {}").format(self.sql.Identifier(database_name)))
         self.database_names.append(database_name)
+        with self.psycopg.connect(postgres_test_conninfo(database_name), autocommit=True) as connection:
+            database = self.sql.Identifier(database_name)
+            for grantee in ("PUBLIC", *MIGRATION_ROLES):
+                connection.execute(
+                    self.sql.SQL("revoke all privileges on database {} from {}").format(
+                        database,
+                        self.sql.SQL("PUBLIC") if grantee == "PUBLIC" else self.sql.Identifier(grantee),
+                    )
+                )
+            connection.execute(
+                self.sql.SQL("grant connect on database {} to sqag_migrator").format(database)
+            )
+            connection.execute(
+                "revoke all privileges on schema public from PUBLIC, sqag_runtime, "
+                "sqag_migrator, sqag_maintenance"
+            )
+            connection.execute("grant usage, create on schema public to sqag_migrator")
         return database_name
 
     def tearDown(self):
@@ -241,10 +415,15 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
 
     def connect(self, database_name=None) -> PostgresConnectionAdapter:
         raw = self.psycopg.connect(
-            postgres_test_conninfo(database_name or self.database_name),
+            safe_postgres_url("sqag_migrator", database_name or self.database_name),
             row_factory=self.dict_row,
         )
-        return PostgresConnectionAdapter(raw)
+        connection = PostgresConnectionAdapter(raw)
+        identity = connection.execute("select session_user, current_user").fetchone()
+        if identity["session_user"] != "sqag_migrator" or identity["current_user"] != "sqag_migrator":
+            connection.close()
+            raise AssertionError("migration fixture did not establish true migrator identity")
+        return connection
 
     def apply(self, migrations=None, database_name=None):
         connection = self.connect(database_name)
