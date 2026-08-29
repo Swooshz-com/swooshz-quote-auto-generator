@@ -18,6 +18,7 @@ from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parents[1]
 DISPOSABLE_BOOTSTRAP_ROLE = "cloud_admin"
+RUN313_PG17_CAUSAL_TRANSITION_EXECUTED = "RUN313_PG17_CAUSAL_TRANSITION_EXECUTED"
 sys.path.insert(0, str(ROOT))
 
 from scripts import validate_runtime_privilege_contract as contract
@@ -27,7 +28,10 @@ from webapp.forensics import ForensicStore
 from webapp.postgres_migrations import (
     EXPECTED_INDEXES,
     EXPECTED_TABLES,
+    MIGRATION_ROUTINE_SPECS,
     MigrationSafetyError,
+    _expected_routine_body_tokens,
+    _semantic_sql_tokens,
     apply_postgres_migrations,
     inspect_postgres_migrations,
     migration_manifest,
@@ -357,6 +361,28 @@ class RuntimePrivilegeContractStaticTest(unittest.TestCase):
         self.assertIn("configured_maintenance_database_url", source)
         self.assertIn("verify_postgres_privilege_contract", source)
         self.assertIn("validate_migration_report", source)
+
+    def test_preflight_phase_grammar_and_typed_prefix_report_are_strict(self):
+        self.assertEqual(preflight._phase_from_argv(["--phase", "pre-apply"]), "pre-apply")
+        self.assertEqual(preflight._phase_from_argv(["--phase", "post-apply"]), "post-apply")
+        self.assertIsNone(preflight._phase_from_argv([]))
+        self.assertIsNone(preflight._phase_from_argv(["--phase", "pre-apply", "--extra"]))
+        migrations = migration_manifest(ROOT / "migrations")
+        report = {
+            "status": "ready",
+            "safeToApply": True,
+            "ledgerState": "missing",
+            "expectedHead": migrations[-1].migration_id,
+            "appliedHead": None,
+            "appliedMigrationIds": [],
+            "pendingMigrationIds": [item.migration_id for item in migrations],
+            "blockers": [],
+        }
+        preflight.validate_pre_apply_migration_report(report, migrations)
+        invalid = dict(report)
+        invalid["pendingMigrationIds"] = []
+        with self.assertRaises(contract.RuntimePrivilegeContractError):
+            preflight.validate_pre_apply_migration_report(invalid, migrations)
 
     def test_cleanup_unknown_is_fail_closed(self):
         residuals = [{"datname": "sqag_fixture_residual"}]
@@ -978,18 +1004,16 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                         )
                     )
             connection.execute("revoke all privileges on all sequences in schema public from PUBLIC, sqag_runtime, sqag_maintenance")
-            connection.execute("revoke all privileges on all functions in schema public from PUBLIC, sqag_runtime, sqag_maintenance")
             for routine, _identity_arguments in contract.EXPECTED_TRIGGER_ROUTINE_KEYS:
+                connection.execute(
+                    self.sql.SQL(
+                        "revoke all privileges on function public.{}() "
+                        "from PUBLIC, sqag_runtime, sqag_maintenance"
+                    ).format(self.sql.Identifier(routine))
+                )
                 connection.execute(
                     self.sql.SQL("grant execute on function public.{}() to sqag_migrator").format(
                         self.sql.Identifier(routine)
-                    )
-                )
-            for routine, identity_arguments in contract.EXPECTED_CALLABLE_ROUTINE_KEYS:
-                connection.execute(
-                    self.sql.SQL("grant execute on function public.{}({}) to sqag_runtime").format(
-                        self.sql.Identifier(routine),
-                        self.sql.SQL(identity_arguments),
                     )
                 )
             connection.execute(
@@ -3046,6 +3070,645 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         self.assertFalse(runtime_ledger["allowed"])
         self.assertFalse(maintenance_ledger["allowed"])
         self.assertTrue(migrator_ledger["allowed"])
+
+    def test_run319_pg17_causal_001_007_to_008_transition(self):
+        """Prove every prefix, then use the real CLI for 008 and the no-op."""
+
+        causal_database = "sqag_run319_causal_" + uuid.uuid4().hex
+        with self.psycopg.connect(postgres_test_conninfo(), autocommit=True) as connection:
+            existing = connection.execute(
+                "select 1 from pg_catalog.pg_database where datname = %s",
+                (causal_database,),
+            ).fetchone()
+            if existing:
+                raise RuntimeError("CLEANUP_UNKNOWN")
+            connection.execute(
+                self.sql.SQL("create database {}").format(
+                    self.sql.Identifier(causal_database)
+                )
+            )
+        self.created_database_names.append(causal_database)
+        self._configure_provider_ownership(causal_database)
+        with self._admin_connection(causal_database) as connection:
+            connection.execute("grant usage, create on schema public to sqag_migrator")
+
+        migrator_url = safe_postgres_url("sqag_migrator", causal_database)
+        for prefix_length in range(1, len(self.migrations)):
+            prefix = self.migrations[:prefix_length]
+            with webapp.postgres_storage_connection(
+                migrator_url,
+                expected_role=webapp.SQAG_MIGRATOR_DATABASE_ROLE,
+            ) as connection:
+                result = apply_postgres_migrations(connection, prefix)
+                connection.commit()
+            self.assertEqual(result["expectedHead"], prefix[-1].migration_id)
+            report = preflight._inspect_migration_ledger(migrator_url, prefix)
+            self.assertEqual(report["status"], "ready")
+            self.assertEqual(report["pendingMigrationIds"], [])
+            self.assertEqual(
+                report["appliedMigrationIds"],
+                [migration.migration_id for migration in prefix],
+            )
+
+        self._configure_acl_contract(causal_database)
+        runtime_url = safe_postgres_url("sqag_runtime", causal_database)
+        maintenance_url = safe_postgres_url("sqag_maintenance", causal_database)
+        environment = dict(os.environ)
+        environment[webapp.SQAG_DATABASE_URL_ENV_NAME] = runtime_url
+        environment[webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME] = migrator_url
+        environment[webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME] = maintenance_url
+        preflight_command = [
+            sys.executable,
+            str(ROOT / "scripts" / "preflight_sqag_migrations.py"),
+            "--phase",
+            "pre-apply",
+        ]
+        pre_apply = subprocess.run(
+            preflight_command,
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(pre_apply.returncode, 0, pre_apply.stderr[-500:])
+        pre_apply_report = json.loads(pre_apply.stdout)
+        self.assertEqual(
+            pre_apply_report["pendingMigrationIds"],
+            [self.migrations[-1].migration_id],
+        )
+        self.assertEqual(pre_apply_report["blockers"], [])
+        self.assertNotIn(migrator_url, pre_apply.stdout + pre_apply.stderr)
+
+        with self._admin_connection(causal_database) as connection:
+            before_callable = connection.execute(
+                "select pg_catalog.to_regprocedure("
+                "'public.sqag_quote_session_deletion_hold_blocked(text,text)') "
+                "as routine"
+            ).fetchone()
+        self.assertIsNone(before_callable["routine"])
+
+        migration_command = [
+            sys.executable,
+            str(ROOT / "scripts" / "migrate_sqag_storage.py"),
+        ]
+        first_apply = subprocess.run(
+            migration_command,
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(first_apply.returncode, 0, first_apply.stderr[-500:])
+        self.assertIn(self.migrations[-1].migration_id, first_apply.stdout)
+        self.assertNotIn(migrator_url, first_apply.stdout + first_apply.stderr)
+
+        with self._admin_connection(causal_database) as connection:
+            callable_row = connection.execute(
+                "select p.prokind, pg_catalog.pg_get_function_result(p.oid) as result_type, "
+                "p.prosecdef, p.provolatile, p.proparallel, p.proconfig, "
+                "owner.rolname as owner, p.prosrc "
+                "from pg_catalog.pg_proc p "
+                "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+                "join pg_catalog.pg_roles owner on owner.oid = p.proowner "
+                "where n.nspname = 'public' and p.proname = "
+                "'sqag_quote_session_deletion_hold_blocked'"
+            ).fetchone()
+            self.assertEqual(callable_row["prokind"], "f")
+            self.assertEqual(callable_row["result_type"], "boolean")
+            self.assertTrue(callable_row["prosecdef"])
+            self.assertEqual(callable_row["provolatile"], "s")
+            self.assertEqual(callable_row["proparallel"], "u")
+            self.assertEqual(callable_row["proconfig"], ["search_path=pg_catalog, public"])
+            self.assertEqual(callable_row["owner"], "sqag_migrator")
+            self.assertEqual(
+                _semantic_sql_tokens(callable_row["prosrc"]),
+                _expected_routine_body_tokens(
+                    MIGRATION_ROUTINE_SPECS[
+                        ("sqag_quote_session_deletion_hold_blocked", "text, text")
+                    ]
+                ),
+            )
+            acl_rows = connection.execute(
+                "select case when acl.grantee = 0 then 'PUBLIC' "
+                "else pg_catalog.pg_get_userbyid(acl.grantee) end as grantee, "
+                "acl.privilege_type, acl.is_grantable "
+                "from pg_catalog.pg_proc p "
+                "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+                "cross join lateral pg_catalog.aclexplode("
+                "coalesce(p.proacl, pg_catalog.acldefault('f', p.proowner))) acl "
+                "where n.nspname = 'public' and p.proname = "
+                "'sqag_quote_session_deletion_hold_blocked'"
+            ).fetchall()
+        self.assertEqual(
+            {
+                (row["grantee"], row["privilege_type"], row["is_grantable"])
+                for row in acl_rows
+            },
+            {
+                ("sqag_migrator", "EXECUTE", False),
+                ("sqag_runtime", "EXECUTE", False),
+            },
+        )
+        post_apply = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "preflight_sqag_migrations.py"),
+                "--phase",
+                "post-apply",
+            ],
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(post_apply.returncode, 0, post_apply.stderr[-500:])
+        post_report = json.loads(post_apply.stdout)
+        self.assertEqual(post_report["pendingMigrationIds"], [])
+        self.assertEqual(post_report["blockers"], [])
+        self.assertNotIn(migrator_url, post_apply.stdout + post_apply.stderr)
+
+        with webapp.postgres_storage_connection(
+            runtime_url,
+            expected_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        ) as connection:
+            with self.assertRaises(Exception):
+                connection.execute(
+                    "select 1 from public.sqag_legal_holds limit 1"
+                ).fetchone()
+            connection.rollback()
+
+        with self._admin_connection(causal_database) as connection:
+            before_noop_rows = connection.execute(
+                "select sequence_no, migration_id, checksum_sha256, applied_at "
+                "from public.sqag_schema_migrations order by sequence_no"
+            ).fetchall()
+        second_apply = subprocess.run(
+            migration_command,
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(second_apply.returncode, 0, second_apply.stderr[-500:])
+        self.assertIn("Applied migration IDs: none", second_apply.stdout)
+        with self._admin_connection(causal_database) as connection:
+            after_noop_rows = connection.execute(
+                "select sequence_no, migration_id, checksum_sha256, applied_at "
+                "from public.sqag_schema_migrations order by sequence_no"
+            ).fetchall()
+        self.assertEqual(before_noop_rows, after_noop_rows)
+        self.assertNotIn(migrator_url, second_apply.stdout + second_apply.stderr)
+        print(RUN313_PG17_CAUSAL_TRANSITION_EXECUTED)
+
+    def _constraint_name(
+        self,
+        table_name: str,
+        constraint_type: str,
+        definition_fragment: str = "",
+    ) -> str:
+        rows = self._admin_rows(
+            "select conname, pg_catalog.pg_get_constraintdef(oid) as definition "
+            "from pg_catalog.pg_constraint "
+            "where conrelid = %s::regclass and contype = %s "
+            "order by conname",
+            (f"public.{table_name}", constraint_type),
+        )
+        for row in rows:
+            if definition_fragment.lower() in str(row["definition"]).lower():
+                return str(row["conname"])
+        raise AssertionError(
+            f"constraint not found: {table_name}:{constraint_type}:{definition_fragment}"
+        )
+
+    def _ledger_snapshot(self) -> list[tuple[object, ...]]:
+        with self._admin_connection() as connection:
+            return [
+                tuple(row.values())
+                for row in connection.execute(
+                    "select sequence_no, migration_id, checksum_sha256, applied_at "
+                    "from public.sqag_schema_migrations order by sequence_no"
+                ).fetchall()
+            ]
+
+    def _assert_migration_red_and_restored(self, mutate, restore, label: str):
+        before = self._ledger_snapshot()
+        mutate()
+        try:
+            report = self._inspect()
+            self.assertFalse(report["safeToApply"], label)
+            self.assertTrue(report["blockers"], label)
+            self.assertEqual(before, self._ledger_snapshot(), label)
+        finally:
+            restore()
+        restored = self._inspect()
+        self.assertEqual(restored["status"], "ready", label)
+        self.assertEqual(restored["pendingMigrationIds"], [], label)
+
+    def test_run319_pg17_kind_specific_constraint_matrix(self):
+        """Exercise semantic drift and the nonsemantic CHECK conkey boundary."""
+
+        with self._admin_connection() as connection:
+            ledger_check_rows = connection.execute(
+                "select conkey, pg_catalog.pg_get_constraintdef(oid) as definition "
+                "from pg_catalog.pg_constraint "
+                "where conrelid = 'public.sqag_schema_migrations'::regclass "
+                "and contype = 'c' order by conname"
+            ).fetchall()
+        self.assertTrue(ledger_check_rows)
+        self.assertTrue(all(tuple(row["conkey"]) for row in ledger_check_rows))
+        self.assertEqual(self._inspect()["status"], "ready")
+
+        sequence_check = self._constraint_name(
+            "sqag_schema_migrations", "c", "sequence_no > 0"
+        )
+        self._assert_migration_red_and_restored(
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_schema_migrations drop constraint "{sequence_check}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_schema_migrations add constraint "{sequence_check}" '
+                    "check (sequence_no >= 1)"
+                ),
+            ),
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_schema_migrations drop constraint "{sequence_check}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_schema_migrations add constraint "{sequence_check}" '
+                    "check (sequence_no > 0)"
+                ),
+            ),
+            "ledger CHECK expression",
+        )
+
+        checksum_check = self._constraint_name(
+            "sqag_schema_migrations", "c", "checksum_sha256"
+        )
+        self._assert_migration_red_and_restored(
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_schema_migrations drop constraint "{checksum_check}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_schema_migrations add constraint "{checksum_check}" '
+                    "check (checksum_sha256 ~ '^[0-9a-f]{64}$') not valid"
+                ),
+            ),
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_schema_migrations drop constraint "{checksum_check}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_schema_migrations add constraint "{checksum_check}" '
+                    "check (checksum_sha256 ~ '^[0-9a-f]{64}$')"
+                ),
+            ),
+            "ledger CHECK validation",
+        )
+
+        ledger_primary_key = self._constraint_name(
+            "sqag_schema_migrations", "p"
+        )
+        self._assert_migration_red_and_restored(
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_schema_migrations drop constraint "{ledger_primary_key}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_schema_migrations add constraint "{ledger_primary_key}" '
+                    "primary key (checksum_sha256, migration_id)"
+                ),
+            ),
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_schema_migrations drop constraint "{ledger_primary_key}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_schema_migrations add constraint "{ledger_primary_key}" '
+                    "primary key (migration_id)"
+                ),
+            ),
+            "ledger PRIMARY KEY ordered columns",
+        )
+
+        ledger_unique = self._constraint_name(
+            "sqag_schema_migrations", "u"
+        )
+        self._assert_migration_red_and_restored(
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_schema_migrations drop constraint "{ledger_unique}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_schema_migrations add constraint "{ledger_unique}" '
+                    "unique (migration_id, sequence_no)"
+                ),
+            ),
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_schema_migrations drop constraint "{ledger_unique}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_schema_migrations add constraint "{ledger_unique}" '
+                    "unique (sequence_no)"
+                ),
+            ),
+            "ledger UNIQUE ordered columns",
+        )
+
+        app_check = self._constraint_name(
+            "sqag_generation_runs", "c", "attempt_number"
+        )
+        self._assert_migration_red_and_restored(
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_generation_runs drop constraint "{app_check}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_generation_runs add constraint "{app_check}" '
+                    "check (attempt_number > 0)"
+                ),
+            ),
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_generation_runs drop constraint "{app_check}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_generation_runs add constraint "{app_check}" '
+                    "check (attempt_number >= 1)"
+                ),
+            ),
+            "application CHECK expression",
+        )
+
+        profiles_primary_key = self._constraint_name(
+            "sqag_profiles", "p"
+        )
+        self._assert_migration_red_and_restored(
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_profiles drop constraint "{profiles_primary_key}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_profiles add constraint "{profiles_primary_key}" '
+                    "primary key (profile_id, workspace_id)"
+                ),
+            ),
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_profiles drop constraint "{profiles_primary_key}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_profiles add constraint "{profiles_primary_key}" '
+                    "primary key (workspace_id, profile_id)"
+                ),
+            ),
+            "application PRIMARY KEY ordered columns",
+        )
+
+        artifact_unique = self._constraint_name(
+            "sqag_object_artifacts", "u"
+        )
+        self._assert_migration_red_and_restored(
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_object_artifacts drop constraint "{artifact_unique}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_object_artifacts add constraint "{artifact_unique}" '
+                    "unique (artifact_kind, owner_id, owner_type, workspace_id)"
+                ),
+            ),
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_object_artifacts drop constraint "{artifact_unique}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_object_artifacts add constraint "{artifact_unique}" '
+                    "unique (workspace_id, owner_type, owner_id, artifact_kind)"
+                ),
+            ),
+            "application UNIQUE ordered columns",
+        )
+
+        publication_fk = self._constraint_name(
+            "sqag_quote_publication_artifacts", "f"
+        )
+        self._assert_migration_red_and_restored(
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_quote_publication_artifacts drop constraint "{publication_fk}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_quote_publication_artifacts add constraint "{publication_fk}" '
+                    "foreign key (workspace_id, run_id) references "
+                    "public.sqag_quote_publication_versions(workspace_id, run_id)"
+                ),
+            ),
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_quote_publication_artifacts drop constraint "{publication_fk}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_quote_publication_artifacts add constraint "{publication_fk}" '
+                    "foreign key (workspace_id, run_id) references "
+                    "public.sqag_quote_publication_versions(workspace_id, run_id) "
+                    "on delete cascade"
+                ),
+            ),
+            "foreign key actions",
+        )
+
+        temporary_reverse_key = "sqag_run319_reverse_publication_key"
+        self._assert_migration_red_and_restored(
+            lambda: (
+                self._execute_admin(
+                    "alter table public.sqag_quote_publication_versions "
+                    f'add constraint "{temporary_reverse_key}" unique (run_id, workspace_id)'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_quote_publication_artifacts drop constraint "{publication_fk}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_quote_publication_artifacts add constraint "{publication_fk}" '
+                    "foreign key (run_id, workspace_id) references "
+                    "public.sqag_quote_publication_versions(run_id, workspace_id) "
+                    "on delete cascade"
+                ),
+            ),
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_quote_publication_artifacts drop constraint "{publication_fk}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_quote_publication_versions drop constraint "{temporary_reverse_key}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_quote_publication_artifacts add constraint "{publication_fk}" '
+                    "foreign key (workspace_id, run_id) references "
+                    "public.sqag_quote_publication_versions(workspace_id, run_id) "
+                    "on delete cascade"
+                ),
+            ),
+            "foreign key local and referenced column order",
+        )
+
+        self._assert_migration_red_and_restored(
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_quote_publication_artifacts drop constraint "{publication_fk}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_quote_publication_artifacts add constraint "{publication_fk}" '
+                    "foreign key (workspace_id, run_id) references "
+                    "public.sqag_quote_publication_versions(workspace_id, run_id) "
+                    "match full on delete cascade"
+                ),
+            ),
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_quote_publication_artifacts drop constraint "{publication_fk}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_quote_publication_artifacts add constraint "{publication_fk}" '
+                    "foreign key (workspace_id, run_id) references "
+                    "public.sqag_quote_publication_versions(workspace_id, run_id) "
+                    "on delete cascade"
+                ),
+            ),
+            "foreign key match type",
+        )
+
+        self._assert_migration_red_and_restored(
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_quote_publication_artifacts drop constraint "{publication_fk}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_quote_publication_artifacts add constraint "{publication_fk}" '
+                    "foreign key (workspace_id, run_id) references "
+                    "public.sqag_quote_publication_versions(workspace_id, run_id) "
+                    "on delete cascade not valid"
+                ),
+            ),
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_quote_publication_artifacts drop constraint "{publication_fk}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_quote_publication_artifacts add constraint "{publication_fk}" '
+                    "foreign key (workspace_id, run_id) references "
+                    "public.sqag_quote_publication_versions(workspace_id, run_id) "
+                    "on delete cascade"
+                ),
+            ),
+            "foreign key validation",
+        )
+
+        self._assert_migration_red_and_restored(
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_quote_publication_artifacts drop constraint "{publication_fk}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_quote_publication_artifacts add constraint "{publication_fk}" '
+                    "foreign key (workspace_id, run_id) references "
+                    "public.sqag_quote_publication_versions(workspace_id, run_id) "
+                    "on delete cascade deferrable initially deferred"
+                ),
+            ),
+            lambda: (
+                self._execute_admin(
+                    f'alter table public.sqag_quote_publication_artifacts drop constraint "{publication_fk}"'
+                ),
+                self._execute_admin(
+                    f'alter table public.sqag_quote_publication_artifacts add constraint "{publication_fk}" '
+                    "foreign key (workspace_id, run_id) references "
+                    "public.sqag_quote_publication_versions(workspace_id, run_id) "
+                    "on delete cascade"
+                ),
+            ),
+            "foreign key deferrability",
+        )
+
+    def test_run319_pg17_actual_cli_wrong_authority_is_mutation_free(self):
+        database_name = "sqag_run319_authority_" + uuid.uuid4().hex
+        with self.psycopg.connect(postgres_test_conninfo(), autocommit=True) as connection:
+            connection.execute(
+                self.sql.SQL("create database {}").format(
+                    self.sql.Identifier(database_name)
+                )
+            )
+        self.created_database_names.append(database_name)
+        self._configure_provider_ownership(database_name)
+        with self._admin_connection(database_name) as connection:
+            connection.execute("grant usage, create on schema public to sqag_migrator")
+
+        runtime_url = safe_postgres_url("sqag_runtime", database_name)
+        maintenance_url = safe_postgres_url("sqag_maintenance", database_name)
+        bootstrap_url = safe_postgres_url(self.bootstrap_role, database_name)
+        provider_url = safe_postgres_url("neondb_owner", database_name)
+        baseline = None
+        with self._admin_connection(database_name) as connection:
+            baseline = (
+                connection.execute(
+                    "select pg_catalog.to_regclass('public.sqag_schema_migrations') as ledger"
+                ).fetchone()["ledger"],
+                tuple(
+                    row["relname"]
+                    for row in connection.execute(
+                        "select relname from pg_catalog.pg_class c "
+                        "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+                        "where n.nspname = 'public' and c.relname like 'sqag_%' "
+                        "order by relname"
+                    ).fetchall()
+                ),
+            )
+        for label, wrong_url in (
+            ("runtime", runtime_url),
+            ("maintenance", maintenance_url),
+            ("bootstrap", bootstrap_url),
+            ("provider", provider_url),
+        ):
+            environment = dict(os.environ)
+            environment[webapp.SQAG_DATABASE_URL_ENV_NAME] = runtime_url
+            environment[webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME] = wrong_url
+            environment[webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME] = maintenance_url
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "migrate_sqag_storage.py"),
+                ],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0, label)
+            self.assertNotIn(wrong_url, completed.stdout + completed.stderr, label)
+            with self._admin_connection(database_name) as connection:
+                current = (
+                    connection.execute(
+                        "select pg_catalog.to_regclass('public.sqag_schema_migrations') as ledger"
+                    ).fetchone()["ledger"],
+                    tuple(
+                        row["relname"]
+                        for row in connection.execute(
+                            "select relname from pg_catalog.pg_class c "
+                            "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+                            "where n.nspname = 'public' and c.relname like 'sqag_%' "
+                            "order by relname"
+                        ).fetchall()
+                    ),
+                )
+            self.assertEqual(current, baseline, label)
 
     def _execute_admin(self, statement: str, params=()):
         with self._admin_connection() as connection:

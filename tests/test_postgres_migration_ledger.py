@@ -26,12 +26,20 @@ from webapp.postgres_migrations import (
     LEDGER_TABLE,
     MIGRATION_LOCK_KEY,
     MIGRATION_FILE_NAMES,
+    MIGRATION_OBJECTS,
+    ColumnSpec,
+    ConstraintSpec,
     Migration,
     MigrationSafetyError,
     apply_postgres_migrations,
     canonical_migration_payload,
     inspect_postgres_migrations,
     migration_manifest,
+    _constraint_fingerprint,
+    _normalize_sql_text,
+    _observed_constraint_fingerprint,
+    _table_matches,
+    TableSpec,
 )
 from webapp.server import PostgresConnectionAdapter
 
@@ -164,6 +172,135 @@ class MigrationPayloadCanonicalizationTest(unittest.TestCase):
         )
 
 
+class MigrationConstraintSemanticsTest(unittest.TestCase):
+    def test_kind_specific_fingerprints_preserve_only_semantic_fields(self):
+        primary = _constraint_fingerprint(ConstraintSpec("p", columns=("a", "b")))
+        reordered_primary = _constraint_fingerprint(
+            ConstraintSpec("p", columns=("b", "a"))
+        )
+        self.assertNotEqual(primary, reordered_primary)
+
+        check_a = _constraint_fingerprint(
+            ConstraintSpec("c", columns=("a",), expression="value > 0")
+        )
+        check_b = _constraint_fingerprint(
+            ConstraintSpec("c", columns=("b",), expression="value > 0")
+        )
+        self.assertEqual(check_a, check_b)
+
+        foreign_key = ConstraintSpec(
+            "f",
+            columns=("child_id",),
+            referenced_table="sqag_parent",
+            referenced_columns=("id",),
+            match_type="simple",
+            on_delete="no_action",
+            on_update="no_action",
+        )
+        cascading_foreign_key = ConstraintSpec(
+            "f",
+            columns=("child_id",),
+            referenced_table="sqag_parent",
+            referenced_columns=("id",),
+            match_type="simple",
+            on_delete="cascade",
+            on_update="no_action",
+        )
+        self.assertNotEqual(
+            _constraint_fingerprint(foreign_key),
+            _constraint_fingerprint(cascading_foreign_key),
+        )
+
+    def test_expression_normalization_keeps_material_casts(self):
+        catalog_any = (
+            "((status)::text = ANY "
+            "(ARRAY[('received'::text), ('queued'::text)]))"
+        )
+        self.assertEqual(
+            _normalize_sql_text(catalog_any),
+            "status::text IN ('received', 'queued')",
+        )
+        self.assertNotEqual(
+            _normalize_sql_text("value::integer = 1"),
+            _normalize_sql_text("value = 1"),
+        )
+
+    def test_check_conkey_and_non_fk_sentinels_are_ignored(self):
+        expected = ConstraintSpec("c", expression="value > 0")
+        observed = {
+            "kind": "c",
+            "columns": ("a", "b"),
+            "referenced_schema": "provider_noise",
+            "referenced_table": "provider_table",
+            "referenced_columns": ("id",),
+            "match_type": "f",
+            "on_delete": "cascade",
+            "on_update": "cascade",
+            "expression": "value > 0",
+            "validated": True,
+            "deferrable": False,
+            "initially_deferred": False,
+        }
+        self.assertEqual(
+            _observed_constraint_fingerprint(observed),
+            _constraint_fingerprint(expected),
+        )
+
+    def test_constraint_multiplicity_cannot_collapse_duplicate_checks(self):
+        expected = TableSpec(
+            "sqag_synthetic",
+            (ColumnSpec("value", "integer", False),),
+            (ConstraintSpec("c", expression="value > 0"),),
+        )
+        observed = {
+            "name": "sqag_synthetic",
+            "relkind": "r",
+            "relpersistence": "p",
+            "relispartition": False,
+            "owner": "sqag_migrator",
+            "columns": [
+                {
+                    "name": "value",
+                    "type_name": "integer",
+                    "nullable": False,
+                    "default_sql": "",
+                    "identity": "",
+                    "generated": "",
+                }
+            ],
+            "constraints": [
+                {
+                    "kind": "c",
+                    "columns": ("value",),
+                    "expression": "value > 0",
+                    "validated": True,
+                    "deferrable": False,
+                    "initially_deferred": False,
+                },
+                {
+                    "kind": "c",
+                    "columns": ("other",),
+                    "expression": "value > 0",
+                    "validated": True,
+                    "deferrable": False,
+                    "initially_deferred": False,
+                },
+            ],
+        }
+        self.assertFalse(_table_matches(observed, expected))
+
+    def test_object_provenance_is_unique_and_covers_the_seven_source_ids(self):
+        provenance = [
+            (item.migration_id, item.object_kind, item.object_name)
+            for item in MIGRATION_OBJECTS
+        ]
+        self.assertEqual(len(provenance), len(set(provenance)))
+        self.assertEqual(
+            {item.migration_id for item in MIGRATION_OBJECTS},
+            set(MIGRATION_FILE_NAMES),
+        )
+
+
 @unittest.skipUnless(postgres_test_conninfo(), "isolated PostgreSQL test service is not configured")
 class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
     @classmethod
@@ -184,6 +321,15 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
         self.addCleanup(self._cleanup_fixture)
         self._create_roles()
         self.database_name = self.create_database()
+        with self.psycopg.connect(
+            postgres_test_conninfo(self.database_name),
+            autocommit=True,
+        ) as connection:
+            connection.execute(
+                self.sql.SQL("grant usage, create on schema public to {}").format(
+                    self.sql.Identifier("sqag_migrator")
+                )
+            )
 
     def _create_roles(self):
         with self.psycopg.connect(postgres_test_conninfo(), autocommit=True) as connection:
@@ -244,6 +390,7 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
             postgres_test_conninfo(database_name or self.database_name),
             row_factory=self.dict_row,
         )
+        raw.execute("set session authorization sqag_migrator")
         return PostgresConnectionAdapter(raw)
 
     def apply(self, migrations=None, database_name=None):
@@ -489,7 +636,7 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
     def test_existing_unledgered_schema_is_not_silently_adopted(self):
         connection = self.connect()
         try:
-            connection.execute("create table existing_untrusted_schema (id integer)")
+            connection.execute("create table sqag_untrusted_schema (id integer)")
             connection.commit()
         finally:
             connection.close()
@@ -498,15 +645,85 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
         self.assertEqual(report["blockers"], ["existing_schema_without_trusted_ledger"])
         with self.assertRaises(MigrationSafetyError):
             self.apply()
-        self.assertNotIn(LEDGER_TABLE, self.public_tables())
+
+    def test_unrelated_public_provider_noise_does_not_claim_sqag_namespace(self):
+        connection = self.connect()
+        try:
+            connection.execute("create table provider_noise (id integer)")
+            connection.commit()
+        finally:
+            connection.close()
+
+        report = self.inspect()
+        self.assertTrue(report["safeToApply"])
+        self.assertEqual(report["ledgerState"], "missing")
+        self.assertEqual(report["pendingMigrationIds"], [
+            migration.migration_id for migration in self.manifest
+        ])
+
+    def test_pg17_missing_ledger_reserved_namespace_matrix(self):
+        def fresh_report(setup=None):
+            database_name = self.create_database()
+            with self.psycopg.connect(postgres_test_conninfo(), autocommit=True) as connection:
+                connection.execute(
+                    self.sql.SQL("grant usage, create on schema public to {}").format(
+                        self.sql.Identifier("sqag_migrator")
+                    )
+                )
+            if setup is not None:
+                connection = self.connect(database_name)
+                try:
+                    setup(connection)
+                    connection.commit()
+                finally:
+                    connection.close()
+            return self.inspect(database_name=database_name)
+
+        self.assertTrue(fresh_report()["safeToApply"])
+        self.assertEqual(
+            fresh_report(
+                lambda connection: connection.execute(
+                    "create table sqag_profiles (workspace_id text)"
+                )
+            )["blockers"],
+            ["existing_schema_without_trusted_ledger"],
+        )
+        self.assertEqual(
+            fresh_report(
+                lambda connection: connection.execute(
+                    "create function sqag_noise() returns integer "
+                    "language sql as $$ select 1 $$"
+                )
+            )["blockers"],
+            ["existing_schema_without_trusted_ledger"],
+        )
+        self.assertEqual(
+            fresh_report(
+                lambda connection: connection.execute(
+                    "create table sqag_unexpected (id integer)"
+                )
+            )["blockers"],
+            ["existing_schema_without_trusted_ledger"],
+        )
+        provider_report = fresh_report(
+            lambda connection: connection.execute(
+                "create table provider_noise (id integer)"
+            )
+        )
+        self.assertTrue(provider_report["safeToApply"])
+        self.assertEqual(provider_report["ledgerState"], "missing")
+        self.assertEqual(provider_report["appliedMigrationIds"], [])
 
     def test_empty_ledger_does_not_adopt_preexisting_sqag_tables(self):
         connection = self.connect()
         try:
             connection.execute(
                 "create table public.sqag_schema_migrations ("
-                "sequence_no integer unique, migration_id text primary key, "
-                "checksum_sha256 char(64), applied_at timestamptz default current_timestamp)"
+                "sequence_no integer not null unique check (sequence_no > 0), "
+                "migration_id text not null primary key, "
+                "checksum_sha256 char(64) not null "
+                "check (checksum_sha256 ~ '^[0-9a-f]{64}$'), "
+                "applied_at timestamptz not null default current_timestamp)"
             )
             connection.execute("create table sqag_profiles (id integer)")
             connection.commit()
@@ -517,7 +734,32 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
         self.assertFalse(report["safeToApply"])
         self.assertEqual(
             report["blockers"],
-            ["schema_ledger_inconsistent_unapplied_tables:sqag_profiles"],
+            ["pending_suffix_present:table:sqag_profiles"],
+        )
+
+    def test_empty_ledger_rejects_pending_sqag_relation_with_wrong_kind(self):
+        connection = self.connect()
+        try:
+            connection.execute(
+                "create table public.sqag_schema_migrations ("
+                "sequence_no integer not null unique check (sequence_no > 0), "
+                "migration_id text not null primary key, "
+                "checksum_sha256 char(64) not null "
+                "check (checksum_sha256 ~ '^[0-9a-f]{64}$'), "
+                "applied_at timestamptz not null default current_timestamp)"
+            )
+            connection.execute(
+                "create view public.sqag_profiles as select 1 as placeholder"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        report = self.inspect()
+        self.assertFalse(report["safeToApply"])
+        self.assertEqual(
+            report["blockers"],
+            ["pending_suffix_present:table:sqag_profiles"],
         )
 
 
