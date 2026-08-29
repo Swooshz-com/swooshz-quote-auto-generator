@@ -1471,7 +1471,8 @@ def _fetch_index_catalog(connection: Any) -> dict[str, dict[str, Any]]:
     rows = connection.execute(
         """
 select i.indexrelid, idx.relname as index_name, tbl.relname as table_name,
-       i.indisunique, i.indisvalid, i.indisready, i.indconstraint,
+       i.indisunique, i.indisvalid, i.indisready,
+       case when count(backing_con.oid) > 0 then 1 else 0 end as constraint_oid,
        pg_catalog.pg_get_userbyid(idx.relowner) as owner,
        pg_catalog.pg_get_expr(i.indpred, i.indrelid) as predicate,
        coalesce(array_agg(pg_catalog.pg_get_indexdef(i.indexrelid, keys.n, true)
@@ -1480,10 +1481,12 @@ from pg_catalog.pg_index i
 join pg_catalog.pg_class idx on idx.oid = i.indexrelid
 join pg_catalog.pg_class tbl on tbl.oid = i.indrelid
 join pg_catalog.pg_namespace n on n.oid = idx.relnamespace
+left join pg_catalog.pg_constraint backing_con
+  on backing_con.conindid = i.indexrelid
 left join lateral pg_catalog.generate_series(1, i.indnkeyatts) keys(n) on true
 where n.nspname = 'public'
 group by i.indexrelid, idx.relname, tbl.relname, i.indisunique,
-         i.indisvalid, i.indisready, i.indconstraint, idx.relowner,
+         i.indisvalid, i.indisready, idx.relowner,
          i.indpred, i.indrelid
 order by idx.relname
 """
