@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_ROLES = ("sqag_migrator", "sqag_runtime", "sqag_maintenance")
 sys.path.insert(0, str(ROOT))
 
+from scripts import preflight_sqag_migrations as preflight
 from webapp.postgres_migrations import (
     EXPECTED_CALLABLE_ROUTINE_KEYS,
     EXPECTED_INDEXES,
@@ -26,6 +27,8 @@ from webapp.postgres_migrations import (
     LEDGER_TABLE,
     MIGRATION_LOCK_KEY,
     MIGRATION_FILE_NAMES,
+    MIGRATION_OBJECT_PROVENANCE,
+    MIGRATION_OBJECTS,
     Migration,
     MigrationSafetyError,
     apply_postgres_migrations,
@@ -63,6 +66,31 @@ class RecordingConnection:
 
 
 class MigrationPayloadCanonicalizationTest(unittest.TestCase):
+    def test_manifest_object_model_has_exact_ordered_provenance(self):
+        self.assertEqual(
+            tuple(item.migration_id for item in MIGRATION_OBJECTS),
+            MIGRATION_FILE_NAMES,
+        )
+        self.assertEqual(
+            MIGRATION_OBJECT_PROVENANCE[MIGRATION_FILE_NAMES[0]]["tables"],
+            ("sqag_profiles", "sqag_pricing_references", "sqag_quote_sessions"),
+        )
+        self.assertEqual(
+            len(MIGRATION_OBJECT_PROVENANCE[MIGRATION_FILE_NAMES[2]]["indexes"]),
+            18,
+        )
+        self.assertEqual(
+            MIGRATION_OBJECT_PROVENANCE[MIGRATION_FILE_NAMES[5]]["table_mutations"],
+            ((
+                "sqag_feedback",
+                ("publication_version_id", "link_resolution_source", "link_resolved_at"),
+            ),),
+        )
+        self.assertEqual(
+            MIGRATION_OBJECT_PROVENANCE[MIGRATION_FILE_NAMES[-1]]["routines"],
+            (("public", "sqag_quote_session_deletion_hold_blocked", "text, text"),),
+        )
+
     def test_lf_crlf_and_bare_cr_have_identical_payloads_and_checksums(self):
         variants = (
             b"select 1;\nselect 2;\n",
@@ -163,6 +191,30 @@ class MigrationPayloadCanonicalizationTest(unittest.TestCase):
             f"migration_source_changed_during_run:{MIGRATION_FILE_NAMES[0]}",
         )
 
+    def test_pre_apply_validator_accepts_only_a_canonical_prefix_and_suffix(self):
+        manifest = migration_manifest(ROOT / "migrations")
+        report = {
+            "status": "ready",
+            "safeToApply": True,
+            "ledgerState": "present",
+            "expectedHead": manifest[-1].migration_id,
+            "appliedHead": manifest[-2].migration_id,
+            "appliedMigrationIds": [item.migration_id for item in manifest[:-1]],
+            "pendingMigrationIds": [manifest[-1].migration_id],
+            "blockers": [],
+        }
+        preflight.validate_pre_apply_migration_report(report, manifest)
+        for mutation in (
+            {"pendingMigrationIds": ["not-canonical.sql"]},
+            {"appliedMigrationIds": tuple(report["appliedMigrationIds"])},
+            {"blockers": ()},
+            {"appliedHead": 6},
+        ):
+            candidate = dict(report)
+            candidate.update(mutation)
+            with self.assertRaises(Exception):
+                preflight.validate_pre_apply_migration_report(candidate, manifest)
+
 
 @unittest.skipUnless(postgres_test_conninfo(), "isolated PostgreSQL test service is not configured")
 class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
@@ -207,6 +259,11 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
         with self.psycopg.connect(postgres_test_conninfo(), autocommit=True) as connection:
             connection.execute(self.sql.SQL("create database {}").format(self.sql.Identifier(database_name)))
         self.database_names.append(database_name)
+        with self.psycopg.connect(
+            postgres_test_conninfo(database_name),
+            autocommit=True,
+        ) as connection:
+            connection.execute("grant usage, create on schema public to sqag_migrator")
         return database_name
 
     def tearDown(self):
@@ -244,6 +301,10 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
             postgres_test_conninfo(database_name or self.database_name),
             row_factory=self.dict_row,
         )
+        # The fixture intentionally exercises the same true migration role as
+        # the operator.  The explicit schema grant above prevents a bootstrap
+        # fixture from manufacturing the Run-316 permission failure.
+        raw.execute("set session authorization sqag_migrator")
         return PostgresConnectionAdapter(raw)
 
     def apply(self, migrations=None, database_name=None):
@@ -489,7 +550,7 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
     def test_existing_unledgered_schema_is_not_silently_adopted(self):
         connection = self.connect()
         try:
-            connection.execute("create table existing_untrusted_schema (id integer)")
+            connection.execute("create table public.sqag_untrusted_schema (id integer)")
             connection.commit()
         finally:
             connection.close()
@@ -505,8 +566,10 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
         try:
             connection.execute(
                 "create table public.sqag_schema_migrations ("
-                "sequence_no integer unique, migration_id text primary key, "
-                "checksum_sha256 char(64), applied_at timestamptz default current_timestamp)"
+                "sequence_no integer not null unique check (sequence_no > 0), "
+                "migration_id text primary key, checksum_sha256 char(64) not null check "
+                "(checksum_sha256 ~ '^[0-9a-f]{64}$'), "
+                "applied_at timestamptz not null default current_timestamp)"
             )
             connection.execute("create table sqag_profiles (id integer)")
             connection.commit()
@@ -517,7 +580,7 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
         self.assertFalse(report["safeToApply"])
         self.assertEqual(
             report["blockers"],
-            ["schema_ledger_inconsistent_unapplied_tables:sqag_profiles"],
+            ["pending_suffix_present:table:public.sqag_profiles"],
         )
 
 

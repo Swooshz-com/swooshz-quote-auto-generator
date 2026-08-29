@@ -2,9 +2,12 @@
 
 SQAG PostgreSQL migrations are explicit operator actions. Application startup,
 ordinary pull-request CI, health checks, and readiness probes do not apply them.
-The only required environment-variable name is `SQAG_DATABASE_URL`; its value
-must be supplied outside source control, chat, logs, screenshots, and command
-history.
+The migration authority is the dedicated `SQAG_MIGRATOR_DATABASE_URL`; its
+value must be supplied outside source control, chat, logs, screenshots, and
+command history. `SQAG_DATABASE_URL` is the runtime projection and
+`SQAG_MAINTENANCE_DATABASE_URL` is the maintenance projection. Neither is a
+PostgreSQL migration fallback. The explicit local-only SQLite branch may use
+`SQAG_DATABASE_URL`.
 
 ## Ledger Contract
 
@@ -36,21 +39,28 @@ schema.
 
 ## Read-only Preflight
 
-Run the preflight before proposing any database mutation:
+Run the required phase explicitly before and after an approved mutation:
 
 ```powershell
-python scripts/preflight_sqag_migrations.py
+python scripts/preflight_sqag_migrations.py --phase pre-apply
+# after the migration CLI and ACL setup:
+python scripts/preflight_sqag_migrations.py --phase post-apply
 ```
 
-The command starts a read-only transaction, reads catalog and ledger metadata,
-rolls the transaction back, and prints only non-secret migration metadata:
-expected head, applied head, applied IDs, pending IDs, ledger state, and safe
-blocker identifiers. It exits non-zero when migration would be unsafe.
+`pre-apply` binds only to `SQAG_MIGRATOR_DATABASE_URL`, starts a read-only
+transaction, and checks the manifest, trusted ledger prefix, pending suffix,
+and exact migration-owned PostgreSQL tables, indexes, triggers, and routines.
+`post-apply` repeats that migration check and verifies the runtime and
+maintenance v4 privilege projections through their own URLs. Both phases roll
+their read-only transactions back and print only non-secret migration metadata
+and deterministic blocker identifiers. The phase is required; an omitted or
+extra phase argument is unsafe.
 
-A missing ledger on a truly empty public schema is reported as `ledgerState` =
-`missing` with all IDs pending and is safe for a separately approved first
-application. A missing ledger with any existing public table is unsafe and is
-reported as `existing_schema_without_trusted_ledger`.
+A missing ledger on a truly empty managed namespace is reported as
+`ledgerState` = `missing` with all IDs pending and is safe for a separately
+approved first application. Unrelated provider objects are tolerated. A
+missing ledger with any reserved `public.sqag_*` table, index, trigger, or
+routine is unsafe and is reported as `existing_schema_without_trusted_ledger`.
 
 ## Future Approved First Application
 
@@ -58,14 +68,24 @@ No database or provider operation is authorized by this runbook. After an
 operator receives separate approval naming an isolated empty Neon branch or a
 new empty PostgreSQL database:
 
-1. Supply `SQAG_DATABASE_URL` through the approved secret/configuration path.
-2. Run the read-only preflight and retain its sanitized metadata output.
+1. Supply `SQAG_MIGRATOR_DATABASE_URL` through the approved secret/configuration path.
+2. Run `python scripts/preflight_sqag_migrations.py --phase pre-apply` and retain its sanitized metadata output.
 3. Require `safeToApply=true`, a missing or empty trusted ledger, and the
    expected pending IDs.
-4. Run `python scripts/migrate_sqag_storage.py` once.
-5. Run the read-only preflight again and require no pending IDs, exact expected
-   and applied heads, no blockers, and `safeToApply=true`.
-6. Run the existing read-only schema/readiness checks before deploying app code.
+4. Before the approved migration, complete only the role, database, schema,
+   table, routine, and default-ACL preparation required for the already
+   applied prefix. This preparation must not reference or normalize a
+   callable introduced by a pending migration.
+5. Run `python scripts/migrate_sqag_storage.py` once through the dedicated
+   migrator URL.
+6. Verify any newly introduced callable directly before any helper
+   normalization, then run
+   `python scripts/preflight_sqag_migrations.py --phase post-apply` with all
+   three projections present. The migration-installed callable must remain
+   untouched between its direct verification and POST-APPLY.
+7. Require no pending IDs, exact expected and applied heads, no blockers,
+   complete v4 finality, and `safeToApply=true`.
+8. Run the existing read-only schema/readiness checks before deploying app code.
 
 The migration command reports migration IDs only. It does not print the target
 connection value.
@@ -107,7 +127,11 @@ production connectivity or provider credentials. The integration tests prove:
 - advisory-lock serialization;
 - a mutation-free read-only preflight;
 - transaction rollback without a false success ledger row;
-- refusal to adopt an existing unledgered schema; and
+- refusal to adopt an existing unledgered schema;
+- exact applied-prefix RED checks for missing/drifted indexes, triggers, and
+  routines;
+- no-ledger and provider-noise matrix behavior;
+- actual CLI wrong-authority and assumed-role zero-mutation behavior; and
 - the runtime-only callable hold-decision authority with direct legal-hold
   table access still denied.
 

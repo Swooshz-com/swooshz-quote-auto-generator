@@ -14,9 +14,19 @@ from webapp import server as webapp
 
 
 def main() -> int:
-    database_url = webapp.configured_database_url()
-    if not database_url:
-        print("SQAG_DATABASE_URL is required for the storage migration.", file=sys.stderr)
+    runtime_url = webapp.configured_database_url()
+    migrator_url = webapp.configured_migrator_database_url()
+    runtime_family = webapp.database_family_from_url(runtime_url)
+
+    # SQLite is the explicit local-only exception.  Every PostgreSQL
+    # mutation must use the dedicated migration projection; the runtime and
+    # maintenance projections are never fallback authorities.
+    if runtime_family == "sqlite":
+        database_url = runtime_url
+    elif migrator_url and webapp.postgres_database_url_is_supported(migrator_url):
+        database_url = migrator_url
+    else:
+        print("SQAG storage migrations require the dedicated PostgreSQL migration URL.", file=sys.stderr)
         return 2
     try:
         result = webapp.apply_sqag_storage_migrations(database_url)
