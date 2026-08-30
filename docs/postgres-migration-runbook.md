@@ -41,6 +41,14 @@ schema, referenced table, ordered local and referenced columns, match type,
 actions, validation, and deferrability state. Index identity uses an exact
 ten-field catalog projection with positional tuple decoding and explicit
 boolean `constraint_backed` semantics.
+Trigger observations are an ordered, lossless catalog sequence. Their semantic
+identity is `(schema_name, table_name, trigger_name)`; comparison also binds
+timing, canonical event order, ordered update columns, row/statement level,
+enabled state, and the linked routine schema/name/identity arguments. Trigger
+OID is projection evidence and a deterministic query tie-breaker only. A
+second expected-named trigger on another public table is a managed extra, not
+a replacement for the canonical trigger, and duplicate observations cannot be
+collapsed by name.
 CHECK comparison ignores `conkey` and permits only the documented deterministic
 deparse/type-aware equivalences: comments, whitespace, redundant parentheses,
 `now()`/`current_timestamp`, restricted `ANY`/`IN`, redundant literal
@@ -108,11 +116,40 @@ objects, premature suffix objects, unrelated provider objects, malformed/
 out-of-order/checksum rows, rollback, advisory-lock serialization,
 applied-prefix drift, post-apply and no-op behavior, and the actual CLI under
 wrong runtime, maintenance, bootstrap, provider-like, and assumed-role
-authorities. Every wrong-authority actual-CLI run must capture deterministic
+authorities. The real PostgreSQL-17 applied-prefix matrix holds `001` through
+`007` applied with `008` pending and proves read-only RED behavior for a
+missing and drifted required index, trigger, and routine. It also proves
+lexically-before and lexically-after same-name trigger collisions, the
+canonical-missing plus wrong-table-extra case, missing-ledger known and unknown
+SQAG routines, an unrelated-provider-routine GREEN control, a managed-empty
+GREEN control, and a valid present empty ledger with the premature `008`
+callable. Every applicable inspection has an identical mutation-relevant
+BEFORE/AFTER snapshot.
+
+The assumed-role case creates one generated LOGIN role with no superuser,
+database, role-creation, inheritance, replication, or row-security bypass
+authority. It receives only target-database `CONNECT`, `SET TRUE` membership
+in `sqag_migrator` with `ADMIN FALSE` and `INHERIT FALSE`, and a
+database-local connection-time `role=sqag_migrator` setting. A direct
+connection first proves the authenticated `session_user` is the generated
+login while `current_user=sqag_migrator`. The test then invokes the unchanged
+production migration script in a child interpreter with only the migrator
+database URL among SQAG database selectors and with conflicting libpq
+`PG*` selectors removed. No URL `options=`, in-process CLI call, or patched
+connection factory is used. The CLI must exit 2 with only the generic
+privacy-safe refusal before inspector, lock, DDL, or ledger mutation.
+
+Every wrong-authority actual-CLI run must capture deterministic
 read-only BEFORE/AFTER snapshots covering ledger rows and timestamps, applied/
 pending/head state, all managed relations/tables/columns/constraints, index
-semantics, trigger linkage, routine identity/body/security/config, and ACLs;
+semantics, qualified trigger multiplicity and linkage, routine
+identity/body/security/config, and object/schema/database ACLs;
 the snapshots must be identical and the CLI must fail before mutation.
+After the assumed-role refusal, all generated-role sessions are closed, the
+database-local role setting is reset, membership and `CONNECT` are revoked,
+and the role is dropped. The test proves no role, membership, database ACL,
+`pg_db_role_setting`, shared dependency, or owned-object residue before
+rechecking the clean `001`-`007` / pending-`008` preflight.
 
 The causal transition is one disposable target and has no post-`008` helper
 repair: apply `001` through `007`, observe read-only preflight with only `008`

@@ -81,6 +81,15 @@ EXPECTED_TRIGGERS = frozenset(
         "sqag_feedback_linkage_no_update",
     }
 )
+EXPECTED_TRIGGER_KEYS = frozenset(
+    {
+        ("public", "sqag_generation_evidence", "sqag_generation_evidence_no_update"),
+        ("public", "sqag_audit_events", "sqag_audit_events_no_update"),
+        ("public", "sqag_generation_evidence", "sqag_generation_evidence_guard_delete"),
+        ("public", "sqag_audit_events", "sqag_audit_events_guard_delete"),
+        ("public", "sqag_feedback", "sqag_feedback_linkage_no_update"),
+    }
+)
 EXPECTED_ROUTINES = frozenset(
     {
         "sqag_reject_immutable_change",
@@ -543,7 +552,9 @@ TRIGGER_SPECS = (
         routine_name="sqag_reject_immutable_change",
     ),
 )
-TRIGGER_SPECS_BY_NAME = MappingProxyType({item.name: item for item in TRIGGER_SPECS})
+TRIGGER_SPECS_BY_KEY = MappingProxyType(
+    {("public", item.table_name, item.name): item for item in TRIGGER_SPECS}
+)
 
 ROUTINE_SPECS = (
     _trigger_routine("sqag_reject_immutable_change", "004_generation_forensics_feedback_retention_postgres.sql"),
@@ -623,6 +634,8 @@ if {item.name for item in INDEX_SPECS} != EXPECTED_INDEXES:
     raise RuntimeError("SQAG index provenance does not match the canonical inventory.")
 if {item.name for item in TRIGGER_SPECS} != EXPECTED_TRIGGERS:
     raise RuntimeError("SQAG trigger provenance does not match the canonical inventory.")
+if frozenset(TRIGGER_SPECS_BY_KEY) != EXPECTED_TRIGGER_KEYS:
+    raise RuntimeError("SQAG table-qualified trigger identities do not match the canonical inventory.")
 if {item.name for item in ROUTINE_SPECS} != EXPECTED_ROUTINES:
     raise RuntimeError("SQAG routine provenance does not match the canonical inventory.")
 if {item.key[1:] for item in ROUTINE_SPECS} != EXPECTED_ROUTINE_KEYS:
@@ -654,7 +667,7 @@ MIGRATION_OBJECT_PROVENANCE = MappingProxyType(
             {
                 "tables": tuple(table.name for table in item.tables),
                 "indexes": tuple(index.name for index in item.indexes),
-                "triggers": tuple(trigger.name for trigger in item.triggers),
+                "triggers": tuple(("public", trigger.table_name, trigger.name) for trigger in item.triggers),
                 "routines": tuple(routine.key for routine in item.routines),
                 "table_mutations": tuple((mutation.table_name, mutation.added_columns) for mutation in item.table_mutations),
             }
@@ -1364,7 +1377,7 @@ order by index_class.relname, index_class.oid
     return result
 
 
-def _fetch_public_triggers(connection: Any) -> dict[str, dict[str, Any]]:
+def _fetch_public_triggers(connection: Any) -> tuple[dict[str, Any], ...]:
     rows = connection.execute(
         """
 select t.oid as trigger_oid, t.tgname as trigger_name,
@@ -1387,14 +1400,14 @@ join pg_catalog.pg_namespace table_namespace on table_namespace.oid = table_clas
 join pg_catalog.pg_proc function_row on function_row.oid = t.tgfoid
 join pg_catalog.pg_namespace function_namespace on function_namespace.oid = function_row.pronamespace
 where table_namespace.nspname = 'public' and not t.tgisinternal
-order by t.tgname, table_class.relname, t.oid
+order by table_namespace.nspname, table_class.relname, t.tgname, t.oid
 """
     ).fetchall()
     fields = (
         "trigger_oid", "trigger_name", "table_schema", "table_name", "tgtype",
         "tgenabled", "columns", "function_schema", "function_name", "identity_arguments",
     )
-    result: dict[str, dict[str, Any]] = {}
+    result: list[dict[str, Any]] = []
     for row in rows:
         _require_projection(row, fields)
         if (
@@ -1412,7 +1425,7 @@ order by t.tgname, table_class.relname, t.oid
         ):
             raise CatalogProjectionError("catalog_projection_invalid")
         name = str(_row_value(row, "trigger_name"))
-        result[name] = {
+        result.append({
             "oid": _row_value(row, "trigger_oid"),
             "name": name,
             "table_schema": str(_row_value(row, "table_schema")),
@@ -1425,8 +1438,8 @@ order by t.tgname, table_class.relname, t.oid
                 str(_row_value(row, "function_name")),
                 str(_row_value(row, "identity_arguments") or ""),
             ),
-        }
-    return result
+        })
+    return tuple(result)
 
 
 def _fetch_public_routines(
@@ -1697,6 +1710,14 @@ def _trigger_matches(observed: Mapping[str, Any], spec: TriggerSpec) -> bool:
     )
 
 
+def _trigger_identity(observed: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(observed["table_schema"]),
+        str(observed["table_name"]),
+        str(observed["name"]),
+    )
+
+
 _FUNCTION_BODY_RE_TEMPLATE = (
     r"create\s+(?:or\s+replace\s+)?function\s+"
     r"(?:(?:public)\s*\.\s*)?{name}\s*\([^)]*\).*?\bas\s+"
@@ -1809,7 +1830,7 @@ def _schema_object_blockers(
     relations: Sequence[Mapping[str, Any]],
     tables: Mapping[str, dict[str, Any]],
     indexes: Mapping[str, dict[str, Any]],
-    triggers: Mapping[str, dict[str, Any]],
+    triggers: Sequence[Mapping[str, Any]],
     routines: Mapping[tuple[str, str, str], list[dict[str, Any]]],
     routine_acls: Mapping[tuple[str, str, str], list[dict[str, Any]]],
 ) -> list[str]:
@@ -1818,11 +1839,18 @@ def _schema_object_blockers(
     applied_tables = {table.name for item in applied_specs for table in item.tables}
     pending_tables = {table.name for item in pending_specs for table in item.tables}
     pending_indexes = {index.name for item in pending_specs for index in item.indexes}
-    pending_triggers = {trigger.name for item in pending_specs for trigger in item.triggers}
+    pending_triggers = {
+        ("public", trigger.table_name, trigger.name): trigger
+        for item in pending_specs
+        for trigger in item.triggers
+    }
     pending_routines = {routine.key for item in pending_specs for routine in item.routines}
 
     relation_by_name = {str(relation["name"]): relation for relation in relations}
     index_by_oid = {value["oid"]: value for value in indexes.values()}
+    triggers_by_identity: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
+    for observed_trigger in triggers:
+        triggers_by_identity.setdefault(_trigger_identity(observed_trigger), []).append(observed_trigger)
     blockers: list[str] = []
     known_relations = EXPECTED_TABLES | EXPECTED_INDEXES | {LEDGER_TABLE}
     for relation in relations:
@@ -1883,14 +1911,15 @@ def _schema_object_blockers(
 
     for item in applied_specs:
         for spec in item.triggers:
-            observed = triggers.get(spec.name)
-            if observed is None:
+            trigger_key = ("public", spec.table_name, spec.name)
+            candidates = triggers_by_identity.get(trigger_key, [])
+            if not candidates:
                 blockers.append(f"applied_prefix_missing:trigger:{_object_key('trigger', spec)}")
-            elif not _trigger_matches(observed, spec):
+            elif len(candidates) != 1 or not _trigger_matches(candidates[0], spec):
                 blockers.append(f"applied_prefix_drift:trigger:{_object_key('trigger', spec)}")
-    for trigger_name in sorted(pending_triggers):
-        if trigger_name in triggers:
-            blockers.append(f"pending_suffix_present:trigger:{_object_key('trigger', TRIGGER_SPECS_BY_NAME[trigger_name])}")
+    for trigger_key, spec in sorted(pending_triggers.items()):
+        if trigger_key in triggers_by_identity:
+            blockers.append(f"pending_suffix_present:trigger:{_object_key('trigger', spec)}")
 
     for item in applied_specs:
         for spec in item.routines:
@@ -1903,9 +1932,12 @@ def _schema_object_blockers(
         if routine_key in routines:
             blockers.append(f"pending_suffix_present:routine:{_object_key('routine', ROUTINE_SPECS_BY_KEY[routine_key])}")
 
-    for trigger_name, observed in triggers.items():
-        if trigger_name.startswith("sqag_") and trigger_name not in EXPECTED_TRIGGERS:
-            blockers.append(f"managed_namespace_extra:trigger:public.{observed['table_name']}.{trigger_name}")
+    for observed in triggers:
+        trigger_key = _trigger_identity(observed)
+        if observed["name"].startswith("sqag_") and trigger_key not in EXPECTED_TRIGGER_KEYS:
+            blockers.append(
+                f"managed_namespace_extra:trigger:{trigger_key[0]}.{trigger_key[1]}.{trigger_key[2]}"
+            )
     for routine_key in routines:
         if routine_key[1].startswith("sqag_") and routine_key[1:] not in EXPECTED_ROUTINE_KEYS:
             blockers.append(f"managed_namespace_extra:routine:{routine_key[0]}.{routine_key[1]}({routine_key[2]})")

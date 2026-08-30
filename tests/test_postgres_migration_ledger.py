@@ -5,6 +5,7 @@ import threading
 import time
 import unittest
 import uuid
+from collections import Counter
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
@@ -25,7 +26,7 @@ from webapp.postgres_migrations import (
     EXPECTED_ROUTINE_KEYS,
     EXPECTED_TRIGGER_ROUTINE_KEYS,
     EXPECTED_TABLES,
-    EXPECTED_TRIGGERS,
+    EXPECTED_TRIGGER_KEYS,
     LEDGER_TABLE,
     MIGRATION_LOCK_KEY,
     MIGRATION_FILE_NAMES,
@@ -589,12 +590,26 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
                     "select indexname from pg_catalog.pg_indexes where schemaname = 'public'"
                 ).fetchall()
             }
-            triggers = {
-                row["trigger_name"]
+            trigger_identities = [
+                (
+                    row["table_schema"],
+                    row["table_name"],
+                    row["trigger_name"],
+                )
                 for row in connection.execute(
-                    "select trigger_name from information_schema.triggers where trigger_schema = 'public'"
+                    "select table_namespace.nspname as table_schema, "
+                    "table_class.relname as table_name, trigger_row.tgname as trigger_name "
+                    "from pg_catalog.pg_trigger trigger_row "
+                    "join pg_catalog.pg_class table_class "
+                    "on table_class.oid = trigger_row.tgrelid "
+                    "join pg_catalog.pg_namespace table_namespace "
+                    "on table_namespace.oid = table_class.relnamespace "
+                    "where table_namespace.nspname = 'public' "
+                    "and not trigger_row.tgisinternal "
+                    "order by table_namespace.nspname, table_class.relname, "
+                    "trigger_row.tgname, trigger_row.oid"
                 ).fetchall()
-            }
+            ]
             routines = {
                 row["routine_name"]
                 for row in connection.execute(
@@ -615,7 +630,14 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
             connection.rollback()
             connection.close()
         self.assertTrue(EXPECTED_INDEXES.issubset(indexes))
-        self.assertTrue(EXPECTED_TRIGGERS.issubset(triggers))
+        self.assertEqual(
+            Counter(
+                identity
+                for identity in trigger_identities
+                if identity[2].startswith("sqag_")
+            ),
+            Counter(EXPECTED_TRIGGER_KEYS),
+        )
         self.assertTrue(EXPECTED_ROUTINES.issubset(routines))
         self.assertEqual(routine_identities & EXPECTED_ROUTINE_KEYS, EXPECTED_ROUTINE_KEYS)
         self.assertEqual(
