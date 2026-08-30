@@ -32,8 +32,15 @@ The runner accepts only an exact ordered prefix of the repository manifest.
 It fails closed for checksum drift, unknown or out-of-order rows, a complete
 ledger whose required objects are missing or altered, kind-specific constraint
 drift, duplicate object multiplicity, invalid catalog projections, or any
-existing public SQAG schema without the trusted ledger. The catalog comparison
-keeps `pg_catalog.pg_get_expr(conbin, conrelid)` as the observed CHECK source.
+known, premature, or unknown object in the reserved public `sqag_` namespace
+without the trusted ledger. Unrelated provider/public objects outside that
+reserved namespace do not block a first application and are not adopted. The
+catalog comparison keeps `pg_catalog.pg_get_expr(conbin, conrelid)` as the
+observed CHECK source. Foreign-key identity includes the exact referenced
+schema, referenced table, ordered local and referenced columns, match type,
+actions, validation, and deferrability state. Index identity uses an exact
+ten-field catalog projection with positional tuple decoding and explicit
+boolean `constraint_backed` semantics.
 CHECK comparison ignores `conkey` and permits only the documented deterministic
 deparse/type-aware equivalences: comments, whitespace, redundant parentheses,
 `now()`/`current_timestamp`, restricted `ANY`/`IN`, redundant literal
@@ -52,10 +59,12 @@ This opens an exact `sqag_migrator` session, starts a read-only transaction,
 reads the catalog and ledger, rolls the transaction back, and prints
 privacy-safe metadata. A ready pre-apply report may have a missing or present
 ledger and may have pending IDs, but applied IDs must be the exact manifest
-prefix and pending IDs the exact manifest suffix. A truly empty public schema
-reports all seven IDs pending and is safe for a separately approved first
-application. Existing public SQAG objects without a trusted ledger are
-unsafe.
+prefix and pending IDs the exact manifest suffix. A target with no reserved
+public `sqag_` objects reports all seven IDs pending and is safe for a
+separately approved first application, even when unrelated provider/public
+tables, indexes, routines, or triggers are present. Known premature SQAG
+objects and unknown `sqag_` objects remain fail-closed blockers; existing
+public SQAG objects without a trusted ledger are not adopted.
 
 The command fails closed when `SQAG_MIGRATOR_DATABASE_URL` is absent,
 non-PostgreSQL, or cannot establish the true `session_user` and
@@ -91,21 +100,32 @@ post-apply/no-op inspection.
 
 The disposable PostgreSQL-17 matrix must include the exact manifest and
 ledger, CHECK deparse/type-aware equivalence and drift cases, validation and
-deferrability drift, PK/UQ/FK metadata, duplicate multiplicity, standalone
-and constraint-backed indexes, exact index alias/projection mismatch, empty
-target grants, known and unknown managed objects, premature suffix objects,
-unrelated provider objects, malformed/out-of-order/checksum rows, rollback,
-advisory-lock serialization, applied-prefix drift, post-apply and no-op
-behavior, and the actual CLI under wrong runtime, maintenance, bootstrap,
-provider-like, and assumed-role authorities. Wrong-authority runs must fail
-before mutation.
+deferrability drift, PK/UQ/FK metadata, exact referenced-schema and match-type
+drift, local/referenced column order and action/state drift, duplicate
+multiplicity, standalone and constraint-backed indexes, exact index
+alias/projection mismatch, empty-target grants, known and unknown managed
+objects, premature suffix objects, unrelated provider objects, malformed/
+out-of-order/checksum rows, rollback, advisory-lock serialization,
+applied-prefix drift, post-apply and no-op behavior, and the actual CLI under
+wrong runtime, maintenance, bootstrap, provider-like, and assumed-role
+authorities. Every wrong-authority actual-CLI run must capture deterministic
+read-only BEFORE/AFTER snapshots covering ledger rows and timestamps, applied/
+pending/head state, all managed relations/tables/columns/constraints, index
+semantics, trigger linkage, routine identity/body/security/config, and ACLs;
+the snapshots must be identical and the CLI must fail before mutation.
 
-The causal transition is one disposable target: apply `001` through `007`,
-observe preflight pending `008`, apply `008` with the actual CLI through the
-dedicated migrator URL, verify callable identity/body/owner/security/search
-path/ACL, observe post-apply ready state, then verify that the runtime role is
-denied direct legal-hold SELECT. Emit
-`RUN313_PG17_CAUSAL_TRANSITION_EXECUTED` only after that final denial check.
+The causal transition is one disposable target and has no post-`008` helper
+repair: apply `001` through `007`, observe read-only preflight with only `008`
+pending, exercise every wrong-authority actual-CLI negative with immutable
+BEFORE/AFTER snapshots, apply `008` with the actual CLI through the dedicated
+migrator URL, immediately prove the migration-created callable directly from
+the catalog (schema/name/identity, boolean result, SQL/STABLE/PARALLEL
+UNSAFE/non-leakproof properties, owner, security-definer flag, exact search
+path, body/definition and relation inventory, and exact ACL), perform the
+read-only POST inspection on that same target, prove the runtime role is
+denied direct legal-hold SELECT, and run the actual CLI a second time as an
+unchanged no-op with no ledger/object/ACL mutation. Emit
+`RUN313_PG17_CAUSAL_TRANSITION_EXECUTED` only as the final causal action.
 
 Live retention/delete verification is not a migration action. Verification
 commands never grant themselves migration authority, create or populate the
@@ -113,10 +133,13 @@ ledger, execute migration files, or silently repair schema state.
 
 ## Existing Unledgered Schema
 
-Do not run the migration command against an existing unledgered schema.
-Adoption requires a separate isolated comparison, data review, explicit
-baseline proposal, and rollback point. This repository contains no automatic
-baseline or repair shortcut.
+Do not run the migration command against a target containing any public
+`sqag_` object without a trusted ledger. The reserved namespace is the
+admission boundary: known, premature, and unknown managed objects require a
+separate isolated comparison, data review, explicit baseline proposal, and
+rollback point. Unrelated provider/public objects outside the reserved
+namespace are allowed and are neither adopted nor changed. This repository
+contains no automatic baseline or repair shortcut.
 
 ## CI Evidence
 

@@ -157,6 +157,8 @@ class ConstraintSpec:
     validated: bool = True
     deferrable: bool = False
     deferred: bool = False
+    referenced_schema: str | None = None
+    match_type: str = "s"
 
 
 @dataclass(frozen=True)
@@ -250,7 +252,9 @@ def _c(
     columns: str | tuple[str, ...] = (),
     *,
     referenced_table: str | None = None,
+    referenced_schema: str | None = None,
     referenced_columns: str | tuple[str, ...] = (),
+    match_type: str = "s",
     on_delete: str = "a",
     on_update: str = "a",
     expression: str | None = None,
@@ -261,7 +265,19 @@ def _c(
         if isinstance(referenced_columns, str) and referenced_columns
         else tuple(referenced_columns)
     )
-    return ConstraintSpec(kind, local, referenced_table, foreign, on_delete, on_update, expression)
+    if kind == "f" and referenced_schema is None:
+        referenced_schema = "public"
+    return ConstraintSpec(
+        kind=kind,
+        columns=local,
+        referenced_table=referenced_table,
+        referenced_columns=foreign,
+        on_delete=on_delete,
+        on_update=on_update,
+        expression=expression,
+        referenced_schema=referenced_schema,
+        match_type=match_type,
+    )
 
 
 def _index(
@@ -699,7 +715,7 @@ def migration_manifest(migrations_dir: Path) -> tuple[Migration, ...]:
 
 
 def _row_value(row: Any, key: str, index: int = 0) -> Any:
-    if isinstance(row, dict):
+    if isinstance(row, Mapping):
         return row.get(key)
     try:
         return row[key]
@@ -708,7 +724,7 @@ def _row_value(row: Any, key: str, index: int = 0) -> Any:
 
 
 def _require_projection(row: Any, fields: Sequence[str], *, exact: bool = False) -> None:
-    if isinstance(row, dict):
+    if isinstance(row, Mapping):
         actual = set(row)
         expected = set(fields)
         valid = actual == expected if exact else expected.issubset(actual)
@@ -716,9 +732,23 @@ def _require_projection(row: Any, fields: Sequence[str], *, exact: bool = False)
             raise CatalogProjectionError("catalog_projection_invalid")
         return
     try:
-        if len(row) < len(fields):
+        if not isinstance(row, (list, tuple)):
+            raise CatalogProjectionError("catalog_projection_invalid")
+        invalid_length = len(row) != len(fields) if exact else len(row) < len(fields)
+        if invalid_length:
             raise CatalogProjectionError("catalog_projection_invalid")
     except TypeError as exc:
+        raise CatalogProjectionError("catalog_projection_invalid") from exc
+
+
+def _projection_value(row: Any, key: str, index: int) -> Any:
+    if isinstance(row, Mapping):
+        return row.get(key)
+    if not isinstance(row, (list, tuple)):
+        raise CatalogProjectionError("catalog_projection_invalid")
+    try:
+        return row[index]
+    except (IndexError, KeyError, TypeError) as exc:
         raise CatalogProjectionError("catalog_projection_invalid") from exc
 
 
@@ -1174,6 +1204,8 @@ select c.conrelid as relation_oid, c.contype,
          order by foreign_key.ordinal
        ) as referenced_columns,
        referenced_table.relname as referenced_table,
+       referenced_namespace.nspname as referenced_schema,
+       c.confmatchtype as match_type,
        c.confdeltype as on_delete, c.confupdtype as on_update,
        pg_catalog.pg_get_expr(c.conbin, c.conrelid) as expression,
        c.convalidated, c.condeferrable, c.condeferred
@@ -1181,6 +1213,7 @@ from pg_catalog.pg_constraint c
 join pg_catalog.pg_class table_class on table_class.oid = c.conrelid
 join pg_catalog.pg_namespace table_namespace on table_namespace.oid = table_class.relnamespace
 left join pg_catalog.pg_class referenced_table on referenced_table.oid = c.confrelid
+left join pg_catalog.pg_namespace referenced_namespace on referenced_namespace.oid = referenced_table.relnamespace
 where table_namespace.nspname = 'public'
   and table_class.relname like 'sqag_' || chr(37)
 order by table_class.relname, c.oid
@@ -1188,6 +1221,7 @@ order by table_class.relname, c.oid
     ).fetchall()
     constraint_fields = (
         "relation_oid", "contype", "columns", "referenced_columns", "referenced_table",
+        "referenced_schema", "match_type",
         "on_delete", "on_update", "expression", "convalidated", "condeferrable", "condeferred",
     )
     for row in rows:
@@ -1198,6 +1232,8 @@ order by table_class.relname, c.oid
             or (_row_value(row, "columns") is not None and not isinstance(_row_value(row, "columns"), (list, tuple)))
             or (_row_value(row, "referenced_columns") is not None and not isinstance(_row_value(row, "referenced_columns"), (list, tuple)))
             or (_row_value(row, "referenced_table") is not None and not isinstance(_row_value(row, "referenced_table"), str))
+            or (_row_value(row, "referenced_schema") is not None and not isinstance(_row_value(row, "referenced_schema"), str))
+            or not isinstance(_row_value(row, "match_type"), str)
             or not isinstance(_row_value(row, "on_delete"), str)
             or not isinstance(_row_value(row, "on_update"), str)
             or (_row_value(row, "expression") is not None and not isinstance(_row_value(row, "expression"), str))
@@ -1230,7 +1266,17 @@ order by table_class.relname, c.oid
                         if _row_value(row, "referenced_table") is not None
                         else None
                     ),
+                    "referenced_schema": (
+                        str(_row_value(row, "referenced_schema"))
+                        if constraint_kind == "f" and _row_value(row, "referenced_schema") is not None
+                        else None
+                    ),
                     "referenced_columns": tuple(str(item) for item in _as_tuple(_row_value(row, "referenced_columns"))),
+                    "match_type": (
+                        str(_row_value(row, "match_type"))
+                        if constraint_kind == "f"
+                        else "s"
+                    ),
                     "on_delete": on_delete,
                     "on_update": on_update,
                     "expression": _row_value(row, "expression"),
@@ -1282,34 +1328,38 @@ order by index_class.relname, index_class.oid
     result: dict[str, dict[str, Any]] = {}
     for row in rows:
         _require_projection(row, _INDEX_PROJECTION_FIELDS, exact=True)
+        values = {
+            field: _projection_value(row, field, position)
+            for position, field in enumerate(_INDEX_PROJECTION_FIELDS)
+        }
         for field in ("indisunique", "indisvalid", "indisready", "constraint_backed"):
-            if type(_row_value(row, field)) is not bool:
+            if type(values[field]) is not bool:
                 raise CatalogProjectionError("catalog_projection_invalid")
         if (
-            type(_row_value(row, "indexrelid")) is not int
-            or not isinstance(_row_value(row, "key_definitions"), (list, tuple))
-            or not all(isinstance(item, str) for item in _row_value(row, "key_definitions"))
+            type(values["indexrelid"]) is not int
+            or not isinstance(values["key_definitions"], (list, tuple))
+            or not all(isinstance(item, str) for item in values["key_definitions"])
         ):
             raise CatalogProjectionError("catalog_projection_invalid")
-        if not isinstance(_row_value(row, "index_name"), str) or not isinstance(_row_value(row, "table_name"), str):
+        if not isinstance(values["index_name"], str) or not isinstance(values["table_name"], str):
             raise CatalogProjectionError("catalog_projection_invalid")
-        if not isinstance(_row_value(row, "owner"), str):
+        if not isinstance(values["owner"], str):
             raise CatalogProjectionError("catalog_projection_invalid")
-        predicate = _row_value(row, "predicate")
+        predicate = values["predicate"]
         if predicate is not None and not isinstance(predicate, str):
             raise CatalogProjectionError("catalog_projection_invalid")
-        name = _row_value(row, "index_name")
+        name = values["index_name"]
         result[name] = {
-            "oid": _row_value(row, "indexrelid"),
+            "oid": values["indexrelid"],
             "name": name,
-            "table_name": _row_value(row, "table_name"),
-            "unique": _row_value(row, "indisunique"),
-            "valid": _row_value(row, "indisvalid"),
-            "ready": _row_value(row, "indisready"),
-            "constraint_backed": _row_value(row, "constraint_backed"),
-            "owner": _row_value(row, "owner"),
+            "table_name": values["table_name"],
+            "unique": values["indisunique"],
+            "valid": values["indisvalid"],
+            "ready": values["indisready"],
+            "constraint_backed": values["constraint_backed"],
+            "owner": values["owner"],
             "predicate": predicate,
-            "key_definitions": tuple(str(item) for item in _row_value(row, "key_definitions")),
+            "key_definitions": tuple(values["key_definitions"]),
         }
     return result
 
@@ -1535,8 +1585,9 @@ def _constraint_fingerprint(spec: ConstraintSpec, table: Any = None) -> tuple[An
         return ("c", canonicalize_check_expression(spec.expression, table), *common)
     if spec.kind == "f":
         return (
-            "f", spec.columns, spec.referenced_table, spec.referenced_columns,
-            spec.on_delete, spec.on_update, *common,
+            "f", spec.columns, spec.referenced_schema, spec.referenced_table,
+            spec.referenced_columns, spec.match_type, spec.on_delete,
+            spec.on_update, *common,
         )
     return (spec.kind, spec.columns, *common)
 
@@ -1544,16 +1595,18 @@ def _constraint_fingerprint(spec: ConstraintSpec, table: Any = None) -> tuple[An
 def _observed_constraint_fingerprint(observed: Mapping[str, Any], table: Any = None) -> tuple[Any, ...]:
     return _constraint_fingerprint(
         ConstraintSpec(
-            str(observed.get("kind") or ""),
-            tuple(str(item) for item in observed.get("columns") or ()),
-            observed.get("referenced_table"),
-            tuple(str(item) for item in observed.get("referenced_columns") or ()),
-            str(observed.get("on_delete") or "a"),
-            str(observed.get("on_update") or "a"),
-            observed.get("expression"),
-            bool(observed.get("validated")),
-            bool(observed.get("deferrable")),
-            bool(observed.get("deferred")),
+            kind=str(observed.get("kind") or ""),
+            columns=tuple(str(item) for item in observed.get("columns") or ()),
+            referenced_schema=observed.get("referenced_schema"),
+            referenced_table=observed.get("referenced_table"),
+            referenced_columns=tuple(str(item) for item in observed.get("referenced_columns") or ()),
+            match_type=str(observed.get("match_type") or ""),
+            on_delete=str(observed.get("on_delete") or "a"),
+            on_update=str(observed.get("on_update") or "a"),
+            expression=observed.get("expression"),
+            validated=bool(observed.get("validated")),
+            deferrable=bool(observed.get("deferrable")),
+            deferred=bool(observed.get("deferred")),
         ),
         table,
     )
@@ -1778,7 +1831,12 @@ def _schema_object_blockers(
             continue
         if name in known_relations:
             continue
-        if relation["relkind"] in {"i", "I"} and index_by_oid.get(relation["oid"], {}).get("constraint_backed") is True:
+        index = index_by_oid.get(relation["oid"], {})
+        if (
+            relation["relkind"] in {"i", "I"}
+            and index.get("constraint_backed") is True
+            and index.get("table_name") in EXPECTED_TABLES | {LEDGER_TABLE}
+        ):
             continue
         blockers.append(f"managed_namespace_extra:relation:public.{name}")
 
@@ -1970,10 +2028,11 @@ def inspect_postgres_migrations(connection: Any, migrations: Sequence[Migration]
                 if not blockers:
                     applied_count = len(applied_rows)
     else:
-        if any(relation["name"] != LEDGER_TABLE for relation in relations):
-            blockers.append("existing_schema_without_trusted_ledger")
-        else:
-            applied_count = 0
+        # A missing ledger reserves only the SQAG-managed public namespace.
+        # Unrelated provider/public objects do not authorise SQAG adoption and
+        # are intentionally ignored; _schema_object_blockers still rejects
+        # every known, premature, or unknown managed object.
+        applied_count = 0
 
     if applied_count is not None and not blockers:
         blockers.extend(
