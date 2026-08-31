@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import copy
+import contextlib
 import datetime as dt
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -22,6 +24,8 @@ sys.path.insert(0, str(ROOT))
 
 from scripts import validate_runtime_privilege_contract as contract
 from webapp import server as webapp
+from webapp import postgres_migrations as migration_contract
+from scripts import migrate_sqag_storage as migration_cli
 from scripts import preflight_sqag_migrations as preflight
 from webapp.forensics import ForensicStore
 from webapp.postgres_migrations import (
@@ -314,6 +318,63 @@ class RuntimePrivilegeContractStaticTest(unittest.TestCase):
         self.assertNotIn("migrator_url = webapp.configured_database_url()", preflight_source)
         self.assertNotIn("migrator_url = webapp.configured_maintenance_database_url()", preflight_source)
 
+    def test_preflight_pre_apply_accepts_pending_suffix_without_runtime_urls(self):
+        migrations = migration_manifest(ROOT / "migrations")
+        report = {
+            "status": "ready",
+            "safeToApply": True,
+            "ledgerState": "missing",
+            "expectedHead": migrations[-1].migration_id,
+            "appliedHead": None,
+            "appliedMigrationIds": [],
+            "pendingMigrationIds": [item.migration_id for item in migrations],
+            "blockers": [],
+        }
+        with (
+            mock.patch.object(preflight, "validate_manifest", return_value={}),
+            mock.patch.object(webapp, "configured_migrator_database_url", return_value="postgresql://migrator.example/db"),
+            mock.patch.object(webapp, "postgres_database_url_is_supported", return_value=True),
+            mock.patch.object(preflight, "migration_manifest", return_value=migrations),
+            mock.patch.object(preflight, "_inspect_migration_ledger", return_value=report),
+            mock.patch.object(webapp, "configured_database_url", side_effect=AssertionError("runtime URL must not be read")),
+            mock.patch.object(webapp, "configured_maintenance_database_url", side_effect=AssertionError("maintenance URL must not be read")),
+            mock.patch("builtins.print") as printed,
+        ):
+            self.assertEqual(preflight.main(["--phase", "pre-apply"]), 0)
+        output = json.loads(printed.call_args.args[0])
+        self.assertEqual(output["phase"], "pre-apply")
+        self.assertEqual(output["pendingMigrationIds"], [item.migration_id for item in migrations])
+        self.assertNotIn("runtimeContract", output)
+        self.assertNotIn("maintenanceContract", output)
+
+    def test_preflight_prefix_validator_rejects_wrong_pending_suffix(self):
+        migrations = migration_manifest(ROOT / "migrations")
+        report = {
+            "status": "ready",
+            "safeToApply": True,
+            "ledgerState": "present",
+            "expectedHead": migrations[-1].migration_id,
+            "appliedHead": migrations[0].migration_id,
+            "appliedMigrationIds": [migrations[0].migration_id],
+            "pendingMigrationIds": [migrations[2].migration_id, migrations[1].migration_id],
+            "blockers": [],
+        }
+        with self.assertRaises(contract.RuntimePrivilegeContractError):
+            preflight._validate_pre_apply_report(report, migrations)
+
+    def test_storage_migration_cli_requires_dedicated_postgres_url(self):
+        with (
+            mock.patch.object(webapp, "configured_database_url", return_value="postgresql://runtime.example/db"),
+            mock.patch.object(webapp, "configured_migrator_database_url", return_value=""),
+        ):
+            self.assertIsNone(migration_cli._migration_database_url())
+
+        with (
+            mock.patch.object(webapp, "configured_database_url", return_value="sqlite:///:memory:"),
+            mock.patch.object(webapp, "configured_migrator_database_url", side_effect=AssertionError("SQLite must not read migrator URL")),
+        ):
+            self.assertEqual(migration_cli._migration_database_url(), "sqlite:///:memory:")
+
     def test_retention_readiness_is_limited_to_forensic_surfaces(self):
         storage = webapp.DatabaseSqagStorage(
             "sqlite:///:memory:",
@@ -396,6 +457,325 @@ class RuntimePrivilegeContractStaticTest(unittest.TestCase):
         with self.assertRaises(AssertionError) as raised:
             case._cleanup_fixture()
         self.assertIn("CLEANUP_UNKNOWN", str(raised.exception))
+
+
+class PreflightCliContractTest(unittest.TestCase):
+    GRAMMAR_FAILURE = {
+        "appliedHead": None,
+        "appliedMigrationIds": None,
+        "blockers": ["invalid_cli_grammar"],
+        "expectedHead": None,
+        "ledgerState": None,
+        "pendingMigrationIds": None,
+        "phase": None,
+        "safeToApply": False,
+        "status": "unsafe",
+    }
+
+    @staticmethod
+    def _capture(argv):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = preflight.main(argv)
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def _assert_grammar_rejected(self, argv):
+        sentinel = AssertionError("grammar-invalid path reached configuration or database work")
+        with contextlib.ExitStack() as stack:
+            for target in (
+                (preflight, "validate_manifest"),
+                (webapp, "configured_migrator_database_url"),
+                (webapp, "configured_database_url"),
+                (webapp, "configured_maintenance_database_url"),
+                (webapp, "postgres_database_url_is_supported"),
+                (preflight, "migration_manifest"),
+                (preflight, "inspect_postgres_migrations"),
+                (preflight, "_inspect_migration_ledger"),
+                (preflight, "_inspect_privilege_projection"),
+                (webapp, "postgres_storage_connection"),
+                (webapp, "postgres_driver_connection_factory"),
+            ):
+                stack.enter_context(mock.patch.object(target[0], target[1], side_effect=sentinel))
+            code, stdout, stderr = self._capture(argv)
+
+        self.assertEqual(code, 2, argv)
+        self.assertEqual(stdout, json.dumps(self.GRAMMAR_FAILURE, sort_keys=True, separators=(",", ":")) + "\n")
+        self.assertEqual(stderr, "", argv)
+        self.assertEqual(stdout.count("\n"), 1, argv)
+        self.assertNotIn("usage", stdout.lower())
+        self.assertNotIn("traceback", stdout.lower())
+
+    def test_invalid_grammar_is_exact_and_has_zero_configuration_or_database_access(self):
+        invalid_argv = (
+            (),
+            ("--phase",),
+            ("--phase", "invalid"),
+            ("--phase", "pre-apply", "--phase", "pre-apply"),
+            ("--phase", "pre-apply", "--phase", "post-apply"),
+            ("--unknown", "pre-apply"),
+            ("-p", "pre-apply"),
+            ("--pha", "pre-apply"),
+            ("--phase=pre-apply",),
+            ("pre-apply",),
+            ("--PHASE", "pre-apply"),
+            ("--phase", "PRE-APPLY"),
+            ("--phase", "pre\u2011apply"),
+            ("--\uff50\uff48\uff41\uff53\uff45", "pre-apply"),
+            ("--",),
+            ("--phase", "pre-apply", "positional"),
+            ("--phase", "pre-apply", "--"),
+        )
+        for argv in invalid_argv:
+            with self.subTest(argv=argv):
+                self._assert_grammar_rejected(argv)
+
+    def test_parser_does_not_use_argparse_or_accept_last_value_wins(self):
+        source = (ROOT / "scripts" / "preflight_sqag_migrations.py").read_text(encoding="utf-8")
+        self.assertNotIn("argparse", source)
+        self.assertEqual(preflight._parse_phase(["--phase", "pre-apply"]), "pre-apply")
+        self.assertEqual(preflight._parse_phase(["--phase", "post-apply"]), "post-apply")
+        self.assertIsNone(preflight._parse_phase(["--phase", "pre-apply", "--phase", "post-apply"]))
+
+    def _assert_failure(
+        self,
+        argv,
+        *,
+        expected_blocker,
+        expected_phase,
+        expected_report=None,
+        expected_runtime=None,
+        expected_maintenance=None,
+    ):
+        code, stdout, stderr = self._capture(argv)
+        self.assertEqual(code, 2)
+        self.assertEqual(stderr, "")
+        self.assertEqual(stdout.count("\n"), 1)
+        result = json.loads(stdout)
+        self.assertEqual(result["phase"], expected_phase)
+        self.assertEqual(result["status"], "unsafe")
+        self.assertIs(result["safeToApply"], False)
+        self.assertEqual(result["blockers"], [expected_blocker])
+        report = expected_report or {}
+        for field in (
+            "ledgerState",
+            "expectedHead",
+            "appliedHead",
+            "appliedMigrationIds",
+            "pendingMigrationIds",
+        ):
+            expected = report.get(field)
+            if expected == "unknown":
+                expected = None
+            self.assertEqual(result[field], expected, field)
+        if expected_phase == "post-apply":
+            self.assertEqual(result["runtimeContract"], expected_runtime)
+            self.assertEqual(result["maintenanceContract"], expected_maintenance)
+        else:
+            self.assertNotIn("runtimeContract", result)
+            self.assertNotIn("maintenanceContract", result)
+        return result
+
+    def test_valid_pre_apply_failures_are_phase_bearing_and_truthful(self):
+        migrations = migration_manifest(ROOT / "migrations")
+        private_url = "postgresql://wrong_user:synthetic-secret@db.example.invalid/sqag"
+        cases = (
+            ("runtime_contract_static_invalid", {"validate_manifest": mock.DEFAULT}),
+            ("migrator_database_url_absent", {"migrator_url": ""}),
+            ("migrator_database_url_requires_postgres", {"migrator_url": "sqlite:///:memory:"}),
+            ("preflight_failed", {"migrator_url": private_url, "inspect_error": True}),
+        )
+        for blocker, options in cases:
+            with self.subTest(blocker=blocker):
+                patches = [
+                    mock.patch.object(preflight, "validate_manifest", return_value={}),
+                    mock.patch.object(webapp, "configured_migrator_database_url", return_value=options.get("migrator_url", private_url)),
+                    mock.patch.object(webapp, "postgres_database_url_is_supported", return_value=True),
+                    mock.patch.object(preflight, "migration_manifest", return_value=migrations),
+                    mock.patch.object(preflight, "_inspect_migration_ledger", return_value={
+                        "status": "ready",
+                        "safeToApply": True,
+                        "ledgerState": "present",
+                        "expectedHead": migrations[-1].migration_id,
+                        "appliedHead": migrations[-2].migration_id,
+                        "appliedMigrationIds": [item.migration_id for item in migrations[:-1]],
+                        "pendingMigrationIds": [migrations[-1].migration_id],
+                        "blockers": [],
+                    }),
+                ]
+                if options.get("validate_manifest") is not None:
+                    patches[0] = mock.patch.object(
+                        preflight,
+                        "validate_manifest",
+                        side_effect=contract.RuntimePrivilegeContractError("private static detail"),
+                    )
+                if blocker == "migrator_database_url_requires_postgres":
+                    patches[2] = mock.patch.object(webapp, "postgres_database_url_is_supported", return_value=False)
+                if options.get("inspect_error"):
+                    patches[4] = mock.patch.object(
+                        preflight,
+                        "_inspect_migration_ledger",
+                        side_effect=webapp.SqagStorageAccessError("private connection detail"),
+                    )
+                with contextlib.ExitStack() as stack:
+                    for patch in patches:
+                        stack.enter_context(patch)
+                    result = self._assert_failure(
+                        ["--phase", "pre-apply"],
+                        expected_blocker=blocker,
+                        expected_phase="pre-apply",
+                    )
+                self.assertNotIn("synthetic-secret", json.dumps(result))
+                self.assertNotIn("db.example.invalid", json.dumps(result))
+
+    def test_valid_post_apply_failures_include_phase_and_nullable_contract_projections(self):
+        migrations = migration_manifest(ROOT / "migrations")
+        private_urls = {
+            "migrator": "postgresql://migrator:synthetic-migrator@db.example.invalid/sqag",
+            "runtime": "postgresql://runtime:synthetic-runtime@db.example.invalid/sqag",
+            "maintenance": "postgresql://maintenance:synthetic-maintenance@db.example.invalid/sqag",
+        }
+        report = {
+            "status": "ready",
+            "safeToApply": True,
+            "ledgerState": "present",
+            "expectedHead": migrations[-1].migration_id,
+            "appliedHead": migrations[-1].migration_id,
+            "appliedMigrationIds": [item.migration_id for item in migrations],
+            "pendingMigrationIds": [],
+            "blockers": [],
+        }
+
+        cases = (
+            ("migrator_database_url_absent", {"migrator": ""}),
+            ("migrator_database_url_requires_postgres", {"migrator_unsupported": True}),
+            ("preflight_failed", {"migrator_error": True}),
+            ("database_url_absent", {"runtime": ""}),
+            ("postgres_database_required", {"runtime_unsupported": True}),
+            ("preflight_failed", {"runtime_error": True}),
+            ("maintenance_database_url_absent", {"maintenance": ""}),
+            ("maintenance_database_url_requires_postgres", {"maintenance_unsupported": True}),
+            ("preflight_failed", {"maintenance_error": True}),
+        )
+        for blocker, options in cases:
+            with self.subTest(blocker=blocker, options=options):
+                values = dict(private_urls)
+                if "migrator" in options:
+                    values["migrator"] = options["migrator"]
+                if "runtime" in options:
+                    values["runtime"] = options["runtime"]
+                if "maintenance" in options:
+                    values["maintenance"] = options["maintenance"]
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(mock.patch.object(preflight, "validate_manifest", return_value={}))
+                    stack.enter_context(mock.patch.object(webapp, "configured_migrator_database_url", return_value=values["migrator"]))
+                    stack.enter_context(mock.patch.object(webapp, "configured_database_url", return_value=values["runtime"]))
+                    stack.enter_context(mock.patch.object(webapp, "configured_maintenance_database_url", return_value=values["maintenance"]))
+                    stack.enter_context(mock.patch.object(webapp, "postgres_database_url_is_supported", return_value=True))
+                    stack.enter_context(mock.patch.object(preflight, "migration_manifest", return_value=migrations))
+                    stack.enter_context(mock.patch.object(preflight, "_inspect_migration_ledger", return_value=report))
+                    projection = stack.enter_context(
+                        mock.patch.object(
+                            preflight,
+                            "_inspect_privilege_projection",
+                            return_value={"status": "verified"},
+                        )
+                    )
+                    if options.get("migrator_unsupported"):
+                        webapp.postgres_database_url_is_supported.return_value = False
+                    if options.get("runtime_unsupported"):
+                        webapp.postgres_database_url_is_supported.side_effect = (
+                            lambda value: value == values["migrator"] or value == values["maintenance"]
+                        )
+                    if options.get("maintenance_unsupported"):
+                        webapp.postgres_database_url_is_supported.side_effect = (
+                            lambda value: value != values["maintenance"]
+                        )
+                    if options.get("migrator_error"):
+                        preflight._inspect_migration_ledger.side_effect = webapp.SqagStorageAccessError("private migrator detail")
+                    if options.get("runtime_error"):
+                        projection.side_effect = webapp.SqagStorageAccessError("private runtime detail")
+                    if options.get("maintenance_error"):
+                        def project_runtime_then_fail_maintenance(_url, _manifest, role):
+                            if role == webapp.SQAG_RUNTIME_DATABASE_ROLE:
+                                return {"status": "verified"}
+                            raise webapp.SqagStorageAccessError("private maintenance detail")
+                        projection.side_effect = project_runtime_then_fail_maintenance
+                    expected_runtime = None
+                    expected_maintenance = None
+                    if options.get("maintenance_error"):
+                        expected_runtime = {"status": "verified"}
+                    result = self._assert_failure(
+                        ["--phase", "post-apply"],
+                        expected_blocker=blocker,
+                        expected_phase="post-apply",
+                        expected_report=report if options.get("runtime_error") or options.get("maintenance_error") else None,
+                        expected_runtime=expected_runtime,
+                        expected_maintenance=expected_maintenance,
+                    )
+                self.assertNotIn("synthetic-", json.dumps(result))
+                self.assertNotIn("db.example.invalid", json.dumps(result))
+
+    def test_successful_pre_and_post_outputs_are_phase_bearing_and_use_actual_projections(self):
+        migrations = migration_manifest(ROOT / "migrations")
+        pre_report = {
+            "status": "ready",
+            "safeToApply": True,
+            "ledgerState": "missing",
+            "expectedHead": migrations[-1].migration_id,
+            "appliedHead": None,
+            "appliedMigrationIds": [],
+            "pendingMigrationIds": [item.migration_id for item in migrations],
+            "blockers": [],
+        }
+        post_report = {
+            "status": "ready",
+            "safeToApply": True,
+            "ledgerState": "present",
+            "expectedHead": migrations[-1].migration_id,
+            "appliedHead": migrations[-1].migration_id,
+            "appliedMigrationIds": [item.migration_id for item in migrations],
+            "pendingMigrationIds": [],
+            "blockers": [],
+        }
+        with (
+            mock.patch.object(preflight, "validate_manifest", return_value={}),
+            mock.patch.object(webapp, "configured_migrator_database_url", return_value="postgresql://migrator.example/sqag"),
+            mock.patch.object(webapp, "configured_database_url", side_effect=AssertionError("PRE must not read runtime URL")),
+            mock.patch.object(webapp, "configured_maintenance_database_url", side_effect=AssertionError("PRE must not read maintenance URL")),
+            mock.patch.object(webapp, "postgres_database_url_is_supported", return_value=True),
+            mock.patch.object(preflight, "migration_manifest", return_value=migrations),
+            mock.patch.object(preflight, "_inspect_migration_ledger", return_value=pre_report),
+            mock.patch("builtins.print") as printed,
+        ):
+            self.assertEqual(preflight.main(["--phase", "pre-apply"]), 0)
+        pre_output = json.loads(printed.call_args.args[0])
+        self.assertEqual(pre_output["phase"], "pre-apply")
+        self.assertEqual(pre_output["pendingMigrationIds"], pre_report["pendingMigrationIds"])
+        self.assertNotIn("runtimeContract", pre_output)
+        self.assertNotIn("maintenanceContract", pre_output)
+
+        with (
+            mock.patch.object(preflight, "validate_manifest", return_value={}),
+            mock.patch.object(webapp, "configured_migrator_database_url", return_value="postgresql://migrator.example/sqag"),
+            mock.patch.object(webapp, "configured_database_url", return_value="postgresql://runtime.example/sqag"),
+            mock.patch.object(webapp, "configured_maintenance_database_url", return_value="postgresql://maintenance.example/sqag"),
+            mock.patch.object(webapp, "postgres_database_url_is_supported", return_value=True),
+            mock.patch.object(preflight, "migration_manifest", return_value=migrations),
+            mock.patch.object(preflight, "_inspect_migration_ledger", return_value=post_report),
+            mock.patch.object(
+                preflight,
+                "_inspect_privilege_projection",
+                side_effect=[{"status": "runtime-verified"}, {"status": "maintenance-verified"}],
+            ),
+            mock.patch("builtins.print") as printed,
+        ):
+            self.assertEqual(preflight.main(["--phase", "post-apply"]), 0)
+        post_output = json.loads(printed.call_args.args[0])
+        self.assertEqual(post_output["phase"], "post-apply")
+        self.assertEqual(post_output["appliedMigrationIds"], post_report["appliedMigrationIds"])
+        self.assertEqual(post_output["runtimeContract"], {"status": "runtime-verified"})
+        self.assertEqual(post_output["maintenanceContract"], {"status": "maintenance-verified"})
 
 
 class _FakeIdentityCursor:
@@ -782,19 +1162,13 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
 
         self._configure_provider_ownership(self.database_name)
         self._configure_provider_memberships()
-
+        self._prepare_empty_target(self.database_name)
         with self._admin_connection() as connection:
-            before_grant = connection.execute(
+            prepared = connection.execute(
                 "select has_schema_privilege(%s, %s, %s)",
                 ("sqag_migrator", "public", "CREATE"),
             ).fetchone()
-            self.assertFalse(before_grant["has_schema_privilege"])
-            connection.execute("grant usage, create on schema public to sqag_migrator")
-            after_grant = connection.execute(
-                "select has_schema_privilege(%s, %s, %s)",
-                ("sqag_migrator", "public", "CREATE"),
-            ).fetchone()
-            self.assertTrue(after_grant["has_schema_privilege"])
+            self.assertTrue(prepared["has_schema_privilege"])
         migrator_url = safe_postgres_url("sqag_migrator", self.database_name)
         with webapp.postgres_storage_connection(migrator_url, expected_role=webapp.SQAG_MIGRATOR_DATABASE_ROLE) as connection:
             result = apply_postgres_migrations(connection, self.migrations)
@@ -882,6 +1256,28 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         for role in self.roles:
             self._grant_provider_edge(role)
 
+    def _prepare_empty_target(self, database_name: str):
+        """Prepare only the newly-created target for the migrator."""
+        with self._admin_connection(database_name) as connection:
+            database = self.sql.Identifier(database_name)
+            for grantee in ("PUBLIC", *self.roles):
+                connection.execute(
+                    self.sql.SQL("revoke all privileges on database {} from {}").format(
+                        database,
+                        _sql_grantee(self.sql, grantee),
+                    )
+                )
+            connection.execute(
+                self.sql.SQL("grant connect on database {} to sqag_migrator").format(
+                    database
+                )
+            )
+            connection.execute(
+                "revoke all privileges on schema public from PUBLIC, "
+                "sqag_runtime, sqag_migrator, sqag_maintenance"
+            )
+            connection.execute("grant usage, create on schema public to sqag_migrator")
+
     def _grant_provider_edge(
         self,
         role: str,
@@ -929,9 +1325,26 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         )
         return self._execute_as_role(grantor, statement)
 
-    def _configure_acl_contract(self, database_name: str | None = None):
+    def _configure_acl_contract(
+        self,
+        database_name: str | None = None,
+        *,
+        migrations=None,
+        include_callable: bool = True,
+    ):
         target_database = database_name or self.database_name
-        tables = sorted(set(EXPECTED_TABLES) | {contract.LEDGER_TABLE})
+        migration_ids = {
+            item.migration_id
+            for item in (migrations or self.migrations)
+        }
+        table_names = {contract.LEDGER_TABLE}
+        routine_keys = set()
+        for item in migration_contract.MIGRATION_OBJECTS:
+            if item.migration_id not in migration_ids:
+                continue
+            table_names.update(table.name for table in item.tables)
+            routine_keys.update(routine.key for routine in item.routines)
+        tables = sorted(table_names)
         with self._admin_connection(target_database) as connection:
             database = self.sql.Identifier(target_database)
             for grantee in ("PUBLIC", *self.roles):
@@ -979,13 +1392,18 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                     )
             connection.execute("revoke all privileges on all sequences in schema public from PUBLIC, sqag_runtime, sqag_maintenance")
             connection.execute("revoke all privileges on all functions in schema public from PUBLIC, sqag_runtime, sqag_maintenance")
-            for routine, _identity_arguments in contract.EXPECTED_TRIGGER_ROUTINE_KEYS:
+            for routine, identity_arguments in contract.EXPECTED_TRIGGER_ROUTINE_KEYS:
+                if ("public", routine, identity_arguments) not in routine_keys:
+                    continue
                 connection.execute(
-                    self.sql.SQL("grant execute on function public.{}() to sqag_migrator").format(
-                        self.sql.Identifier(routine)
+                    self.sql.SQL("grant execute on function public.{}({}) to sqag_migrator").format(
+                        self.sql.Identifier(routine),
+                        self.sql.SQL(identity_arguments),
                     )
                 )
             for routine, identity_arguments in contract.EXPECTED_CALLABLE_ROUTINE_KEYS:
+                if not include_callable or ("public", routine, identity_arguments) not in routine_keys:
+                    continue
                 connection.execute(
                     self.sql.SQL("grant execute on function public.{}({}) to sqag_runtime").format(
                         self.sql.Identifier(routine),
@@ -1001,7 +1419,27 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                 "revoke all on functions from PUBLIC"
             )
 
-    def _create_isolated_database_fixture(self) -> str:
+    def _create_isolated_database_fixture(
+        self,
+        migrations=None,
+        *,
+        configure_acl: bool = True,
+    ) -> str:
+        database_name = self._create_empty_isolated_database_fixture()
+        expected_migrations = self.migrations if migrations is None else migrations
+        migrator_url = safe_postgres_url("sqag_migrator", database_name)
+        with webapp.postgres_storage_connection(
+            migrator_url,
+            expected_role=webapp.SQAG_MIGRATOR_DATABASE_ROLE,
+        ) as connection:
+            result = apply_postgres_migrations(connection, expected_migrations)
+            connection.commit()
+        self.assertEqual(result["expectedHead"], expected_migrations[-1].migration_id)
+        if configure_acl:
+            self._configure_acl_contract(database_name)
+        return database_name
+
+    def _create_empty_isolated_database_fixture(self) -> str:
         database_name = "sqag_a25_restore_" + uuid.uuid4().hex
         with self.psycopg.connect(postgres_test_conninfo(), autocommit=True) as connection:
             existing_database = connection.execute(
@@ -1017,28 +1455,314 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
             )
         self.created_database_names.append(database_name)
         self._configure_provider_ownership(database_name)
-        with self._admin_connection(database_name) as connection:
-            connection.execute("grant usage, create on schema public to sqag_migrator")
-        migrator_url = safe_postgres_url("sqag_migrator", database_name)
-        with webapp.postgres_storage_connection(
-            migrator_url,
-            expected_role=webapp.SQAG_MIGRATOR_DATABASE_ROLE,
-        ) as connection:
-            result = apply_postgres_migrations(connection, self.migrations)
-            connection.commit()
-        self.assertEqual(result["expectedHead"], self.migrations[-1].migration_id)
-        self._configure_acl_contract(database_name)
+        self._prepare_empty_target(database_name)
         return database_name
 
-    def _verify(self):
-        with self._admin_connection() as raw_connection:
+    def _verify(self, database_name: str | None = None):
+        with self._admin_connection(database_name) as raw_connection:
             connection = webapp.PostgresConnectionAdapter(raw_connection)
             return contract.verify_postgres_privilege_contract(connection, self.manifest)
 
-    def _inspect(self):
-        with self._admin_connection() as raw_connection:
+    def _inspect(self, database_name: str | None = None):
+        with self._admin_connection(database_name) as raw_connection:
             connection = webapp.PostgresConnectionAdapter(raw_connection)
-            return inspect_postgres_migrations(connection, self.migrations)
+            connection.execute("begin read only")
+            try:
+                return inspect_postgres_migrations(connection, self.migrations)
+            finally:
+                connection.rollback()
+
+    @staticmethod
+    def _canonical_snapshot_value(value):
+        if isinstance(value, dict):
+            return {
+                str(key): RuntimePrivilegeContractPostgresIntegrationTest._canonical_snapshot_value(item)
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            }
+        if isinstance(value, (list, tuple)):
+            return [
+                RuntimePrivilegeContractPostgresIntegrationTest._canonical_snapshot_value(item)
+                for item in value
+            ]
+        return value
+
+    def _migration_mutation_snapshot(self, database_name: str):
+        with self.psycopg.connect(
+            safe_postgres_url(self.bootstrap_role, database_name),
+            row_factory=self.dict_row,
+            options="-c search_path=public,pg_catalog",
+        ) as raw_connection:
+            raw_connection.execute("set transaction read only")
+            connection = webapp.PostgresConnectionAdapter(raw_connection)
+            relations = migration_contract._fetch_public_relations(connection)
+            tables = migration_contract._fetch_public_tables(connection, relations)
+            indexes = migration_contract._fetch_public_indexes(connection)
+            triggers = migration_contract._fetch_public_triggers(connection)
+            routines, routine_acls = migration_contract._fetch_public_routines(connection)
+            ledger_rows = migration_contract._ledger_rows(connection) if any(
+                relation["name"] == migration_contract.LEDGER_TABLE
+                for relation in relations
+            ) else []
+            object_acl_rows = connection.execute(
+                """
+select 'relation' as object_kind, n.nspname as object_schema,
+       c.relname as object_name, c.relkind as object_type,
+       coalesce(c.relacl::text, '') as acl
+from pg_catalog.pg_class c
+join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+where n.nspname = 'public' and pg_catalog.left(c.relname, 5) = 'sqag_'
+union all
+select 'schema', n.nspname, '', 'n', coalesce(n.nspacl::text, '')
+from pg_catalog.pg_namespace n
+where n.nspname = 'public'
+union all
+select 'database', d.datname, '', 'd', coalesce(d.datacl::text, '')
+from pg_catalog.pg_database d
+where d.datname = pg_catalog.current_database()
+order by object_kind, object_schema, object_name, object_type
+"""
+            ).fetchall()
+            report = inspect_postgres_migrations(connection, self.migrations)
+            payload = {
+                "ledger_rows": ledger_rows,
+                "report": report,
+                "relations": [
+                    relation for relation in relations
+                    if relation["name"].startswith("sqag_")
+                ],
+                "tables": tables,
+                "indexes": {
+                    name: value for name, value in indexes.items()
+                    if name.startswith("sqag_")
+                },
+                "triggers": [
+                    {
+                        key: item
+                        for key, item in value.items()
+                        if key != "oid"
+                    }
+                    for value in triggers
+                    if value["name"].startswith("sqag_")
+                ],
+                "routines": routines,
+                "routine_acls": routine_acls,
+                "object_acls": [dict(row) for row in object_acl_rows],
+            }
+            snapshot = self._canonical_snapshot_value(payload)
+            raw_connection.rollback()
+            return json.dumps(snapshot, sort_keys=True, default=str)
+
+    @staticmethod
+    def _scrubbed_child_environment(selectors: dict[str, str]) -> dict[str, str]:
+        essential_names = {
+            "COMSPEC",
+            "PATH",
+            "PATHEXT",
+            "SYSTEMDRIVE",
+            "SYSTEMROOT",
+            "TEMP",
+            "TMP",
+            "WINDIR",
+        }
+        environment = {
+            name: value
+            for name, value in os.environ.items()
+            if name.upper() in essential_names
+        }
+        environment.update(selectors)
+        return environment
+
+    def _run_preflight_child(
+        self,
+        phase: str,
+        *,
+        migrator_url: str,
+        runtime_url: str | None = None,
+        maintenance_url: str | None = None,
+    ):
+        selectors = {
+            webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME: migrator_url,
+        }
+        if phase == "post-apply":
+            self.assertIsNotNone(runtime_url)
+            self.assertIsNotNone(maintenance_url)
+            selectors[webapp.SQAG_DATABASE_URL_ENV_NAME] = runtime_url
+            selectors[webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME] = maintenance_url
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "preflight_sqag_migrations.py"),
+                "--phase",
+                phase,
+            ],
+            cwd=ROOT,
+            env=self._scrubbed_child_environment(selectors),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr[-500:])
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(len(completed.stdout.splitlines()), 1, completed.stdout)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["phase"], phase)
+        for value in selectors.values():
+            self.assertNotIn(value, completed.stdout)
+            self.assertNotIn(value, completed.stderr)
+        return completed, result
+
+    def _create_assumed_cli_role(self, database_name: str) -> str:
+        role = "sqag_assumed_cli_" + uuid.uuid4().hex[:16]
+        with self._admin_connection("postgres") as connection:
+            connection.execute(
+                self.sql.SQL(
+                    "create role {} login nosuperuser nocreatedb nocreaterole "
+                    "noreplication nobypassrls noinherit connection limit -1"
+                ).format(self.sql.Identifier(role))
+            )
+            connection.execute(
+                self.sql.SQL("grant connect on database {} to {}").format(
+                    self.sql.Identifier(database_name),
+                    self.sql.Identifier(role),
+                )
+            )
+            connection.execute(
+                self.sql.SQL(
+                    "grant sqag_migrator to {} with admin false, inherit false, set true"
+                ).format(self.sql.Identifier(role))
+            )
+            connection.execute(
+                self.sql.SQL(
+                    "alter role {} in database {} set role = 'sqag_migrator'"
+                ).format(
+                    self.sql.Identifier(role),
+                    self.sql.Identifier(database_name),
+                )
+            )
+        self.created_roles.append(role)
+        return role
+
+    def _teardown_assumed_cli_role(self, database_name: str, role: str) -> None:
+        with self._admin_connection("postgres") as connection:
+            role_row = connection.execute(
+                "select oid from pg_catalog.pg_roles where rolname = %s",
+                (role,),
+            ).fetchone()
+            if role_row is None:
+                raise AssertionError("assumed CLI role is missing before teardown")
+            role_oid = role_row["oid"]
+            database_oid = connection.execute(
+                "select oid from pg_catalog.pg_database where datname = %s",
+                (database_name,),
+            ).fetchone()["oid"]
+            self.assertEqual(
+                connection.execute(
+                    "select 1 from pg_catalog.pg_stat_activity where usename = %s",
+                    (role,),
+                ).fetchall(),
+                [],
+            )
+            connection.execute(
+                self.sql.SQL("alter role {} in database {} reset role").format(
+                    self.sql.Identifier(role),
+                    self.sql.Identifier(database_name),
+                )
+            )
+            connection.execute(
+                self.sql.SQL("revoke sqag_migrator from {}").format(
+                    self.sql.Identifier(role)
+                )
+            )
+            connection.execute(
+                self.sql.SQL("revoke connect on database {} from {}").format(
+                    self.sql.Identifier(database_name),
+                    self.sql.Identifier(role),
+                )
+            )
+            with self._admin_connection(database_name) as target_connection:
+                owned_objects = target_connection.execute(
+                    """
+                    select 'relation' as object_kind, c.oid
+                    from pg_catalog.pg_class c
+                    where c.relowner = %s
+                    union all
+                    select 'routine', p.oid
+                    from pg_catalog.pg_proc p
+                    where p.proowner = %s
+                    union all
+                    select 'schema', n.oid
+                    from pg_catalog.pg_namespace n
+                    where n.nspowner = %s
+                    """,
+                    (role_oid, role_oid, role_oid),
+                ).fetchall()
+            self.assertEqual(owned_objects, [])
+            connection.execute(
+                self.sql.SQL("drop role {}").format(self.sql.Identifier(role))
+            )
+            self.assertIsNone(
+                connection.execute(
+                    "select 1 from pg_catalog.pg_roles where rolname = %s",
+                    (role,),
+                ).fetchone()
+            )
+            self.assertEqual(
+                connection.execute(
+                    """
+                    select 1
+                    from pg_catalog.pg_auth_members
+                    where roleid = (
+                        select oid from pg_catalog.pg_roles
+                        where rolname = 'sqag_migrator'
+                    )
+                      and member = %s
+                    """,
+                    (role_oid,),
+                ).fetchall(),
+                [],
+            )
+            self.assertEqual(
+                connection.execute(
+                    """
+                    select 1
+                    from pg_catalog.pg_db_role_setting
+                    where setrole = %s and setdatabase = %s
+                    """,
+                    (role_oid, database_oid),
+                ).fetchall(),
+                [],
+            )
+            self.assertEqual(
+                connection.execute(
+                    """
+                    select 1
+                    from pg_catalog.pg_database database_row
+                    cross join lateral pg_catalog.aclexplode(
+                        coalesce(
+                            database_row.datacl,
+                            pg_catalog.acldefault('d', database_row.datdba)
+                        )
+                    ) acl
+                    where database_row.datname = %s
+                      and (acl.grantee = %s or acl.grantor = %s)
+                    """,
+                    (database_name, role_oid, role_oid),
+                ).fetchall(),
+                [],
+            )
+            self.assertEqual(
+                connection.execute(
+                    """
+                    select 1
+                    from pg_catalog.pg_shdepend
+                    where refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass
+                      and refobjid = %s
+                    """,
+                    (role_oid,),
+                ).fetchall(),
+                [],
+            )
 
     def _red_then_restore(self, mutate, restore, expected_label: str):
         mutate()
@@ -2887,17 +3611,25 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         )
         try:
             report = self._inspect()
-            self.assertTrue(report["safeToApply"])
-            self.assertEqual(report["status"], "ready")
+            self.assertFalse(report["safeToApply"])
+            self.assertEqual(report["status"], "unsafe")
             self.assertEqual(report["pendingMigrationIds"], [last.migration_id])
-            self.assertFalse(report["blockers"])
+            self.assertEqual(
+                report["blockers"],
+                [
+                    "pending_suffix_present:routine:public.sqag_quote_session_deletion_hold_blocked(text, text)"
+                ],
+            )
         finally:
             self._execute_admin(
                 "insert into public.sqag_schema_migrations "
                 "(sequence_no, migration_id, checksum_sha256, applied_at) values (%s, %s, %s, %s)",
                 tuple(saved_row.values()),
             )
-        self.assertEqual(self._inspect()["status"], "ready")
+        restored_report = self._inspect()
+        self.assertTrue(restored_report["safeToApply"])
+        self.assertEqual(restored_report["status"], "ready")
+        self.assertFalse(restored_report["blockers"])
 
         self._execute_admin(
             "update public.sqag_schema_migrations set checksum_sha256 = %s where migration_id = %s",
@@ -3047,16 +3779,661 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         self.assertFalse(maintenance_ledger["allowed"])
         self.assertTrue(migrator_ledger["allowed"])
 
-    def _execute_admin(self, statement: str, params=()):
-        with self._admin_connection() as connection:
+    def test_real_pg17_causal_001_007_cli_008_and_runtime_hold_denial(self):
+        partial_database = self._create_isolated_database_fixture(
+            self.migrations[:6],
+            configure_acl=False,
+        )
+        self._configure_acl_contract(
+            partial_database,
+            migrations=self.migrations[:6],
+            include_callable=False,
+        )
+        migrator_url = safe_postgres_url("sqag_migrator", partial_database)
+        before_pre_apply = self._migration_mutation_snapshot(partial_database)
+        pre_apply_completed, pre_apply = self._run_preflight_child(
+            "pre-apply",
+            migrator_url=migrator_url,
+        )
+        after_pre_apply = self._migration_mutation_snapshot(partial_database)
+        self.assertEqual(before_pre_apply, after_pre_apply)
+        self.assertEqual(pre_apply["ledgerState"], "present")
+        self.assertEqual(pre_apply["status"], "ready")
+        self.assertIs(pre_apply["safeToApply"], True)
+        self.assertEqual(pre_apply["blockers"], [])
+        self.assertEqual(
+            pre_apply["appliedMigrationIds"],
+            [migration.migration_id for migration in self.migrations[:6]],
+        )
+        self.assertEqual(
+            pre_apply["pendingMigrationIds"],
+            [self.migrations[-1].migration_id],
+        )
+        self.assertEqual(pre_apply["appliedHead"], self.migrations[-2].migration_id)
+        self.assertEqual(pre_apply["expectedHead"], self.migrations[-1].migration_id)
+        self.assertNotIn("runtimeContract", pre_apply)
+        self.assertNotIn("maintenanceContract", pre_apply)
+
+        wrong_authorities = (
+            ("runtime", "sqag_runtime"),
+            ("maintenance", "sqag_maintenance"),
+            ("bootstrap", self.bootstrap_role),
+            ("provider", "neondb_owner"),
+        )
+        for label, role in wrong_authorities:
+            with self.subTest(wrong_authority=label):
+                wrong_url = safe_postgres_url(role, partial_database)
+                before = self._migration_mutation_snapshot(partial_database)
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                    str(ROOT / "scripts" / "migrate_sqag_storage.py"),
+                    ],
+                    cwd=ROOT,
+                    env=self._scrubbed_child_environment({
+                        webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME: wrong_url,
+                    }),
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=60,
+                )
+                self.assertEqual(completed.returncode, 2)
+                self.assertNotIn(wrong_url, completed.stdout)
+                self.assertNotIn(wrong_url, completed.stderr)
+                after = self._migration_mutation_snapshot(partial_database)
+                self.assertEqual(before, after)
+
+        assumed_role_baseline = self._migration_mutation_snapshot(partial_database)
+        assumed_role = self._create_assumed_cli_role(partial_database)
+        assumed_url = safe_postgres_url(assumed_role, partial_database)
+
+        with self.psycopg.connect(
+            assumed_url,
+            row_factory=self.dict_row,
+        ) as assumed_connection:
+            identity = assumed_connection.execute(
+                "select session_user as session_role, current_user as active_role"
+            ).fetchone()
+            self.assertEqual(identity["session_role"], assumed_role)
+            self.assertEqual(identity["active_role"], webapp.SQAG_MIGRATOR_DATABASE_ROLE)
+            assumed_connection.rollback()
+
+        before = self._migration_mutation_snapshot(partial_database)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "migrate_sqag_storage.py"),
+            ],
+            cwd=ROOT,
+            env=self._scrubbed_child_environment({
+                webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME: assumed_url,
+            }),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(
+            completed.stderr.strip(),
+            "SQAG storage migrations failed closed; inspect privacy-safe operator logs.",
+        )
+        self.assertNotIn(assumed_url, completed.stdout)
+        self.assertNotIn(assumed_url, completed.stderr)
+        after = self._migration_mutation_snapshot(partial_database)
+        self.assertEqual(before, after)
+
+        self._teardown_assumed_cli_role(partial_database, assumed_role)
+        before_clean_pre_apply = self._migration_mutation_snapshot(partial_database)
+        clean_pre_apply_completed, clean_pre_apply = self._run_preflight_child(
+            "pre-apply",
+            migrator_url=migrator_url,
+        )
+        after_clean_pre_apply = self._migration_mutation_snapshot(partial_database)
+        self.assertEqual(before_clean_pre_apply, after_clean_pre_apply)
+        self.assertEqual(clean_pre_apply_completed.stdout, pre_apply_completed.stdout)
+        self.assertEqual(clean_pre_apply["status"], "ready")
+        self.assertIs(clean_pre_apply["safeToApply"], True)
+        self.assertEqual(clean_pre_apply["blockers"], [])
+        self.assertEqual(
+            clean_pre_apply["appliedMigrationIds"],
+            [migration.migration_id for migration in self.migrations[:6]],
+        )
+        self.assertEqual(
+            clean_pre_apply["pendingMigrationIds"],
+            [self.migrations[-1].migration_id],
+        )
+        self.assertEqual(clean_pre_apply["appliedHead"], self.migrations[-2].migration_id)
+        self.assertEqual(clean_pre_apply["expectedHead"], self.migrations[-1].migration_id)
+        self.assertEqual(
+            self._migration_mutation_snapshot(partial_database),
+            assumed_role_baseline,
+        )
+
+        environment = self._scrubbed_child_environment({
+            webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME: migrator_url,
+        })
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "migrate_sqag_storage.py"),
+            ],
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr[-500:])
+        self.assertIn(self.migrations[-1].migration_id, completed.stdout)
+        self.assertNotIn(migrator_url, completed.stdout)
+        self.assertNotIn(migrator_url, completed.stderr)
+
+        self._assert_causal_callable_catalog_contract(partial_database)
+        runtime_url = safe_postgres_url("sqag_runtime", partial_database)
+        maintenance_url = safe_postgres_url("sqag_maintenance", partial_database)
+        before_post_apply = self._migration_mutation_snapshot(partial_database)
+        post_apply_completed, post_apply = self._run_preflight_child(
+            "post-apply",
+            migrator_url=migrator_url,
+            runtime_url=runtime_url,
+            maintenance_url=maintenance_url,
+        )
+        after_post_apply = self._migration_mutation_snapshot(partial_database)
+        self.assertEqual(before_post_apply, after_post_apply)
+        self.assertEqual(post_apply["ledgerState"], "present")
+        self.assertEqual(post_apply["pendingMigrationIds"], [])
+        self.assertEqual(post_apply["status"], "ready")
+        self.assertIs(post_apply["safeToApply"], True)
+        self.assertEqual(post_apply["blockers"], [])
+        self.assertEqual(
+            post_apply["appliedMigrationIds"],
+            [migration.migration_id for migration in self.migrations],
+        )
+        self.assertEqual(post_apply["appliedHead"], self.migrations[-1].migration_id)
+        self.assertEqual(post_apply["expectedHead"], self.migrations[-1].migration_id)
+        runtime_projection = post_apply["runtimeContract"]
+        maintenance_projection = post_apply["maintenanceContract"]
+        self.assertEqual(runtime_projection["status"], "verified")
+        self.assertEqual(maintenance_projection["status"], "verified")
+        with webapp.postgres_storage_connection(
+            runtime_url,
+            expected_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        ) as connection:
+            with self.assertRaises(Exception):
+                connection.execute("select 1 from public.sqag_legal_holds")
+
+        before_noop = self._migration_mutation_snapshot(partial_database)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "migrate_sqag_storage.py"),
+            ],
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr[-500:])
+        self.assertIn("Applied migration IDs: none", completed.stdout)
+        self.assertNotIn(migrator_url, completed.stdout)
+        self.assertNotIn(migrator_url, completed.stderr)
+        after_noop = self._migration_mutation_snapshot(partial_database)
+        self.assertEqual(before_noop, after_noop)
+        print("RUN313_PG17_CAUSAL_TRANSITION_EXECUTED")
+
+    def test_real_pg17_mandatory_applied_prefix_and_missing_ledger_matrix(self):
+        def assert_snapshot_stable(
+            database_name: str,
+            *,
+            expected_blockers: tuple[str, ...] = (),
+            ready: bool = False,
+        ):
+            before = self._migration_mutation_snapshot(database_name)
+            report = self._inspect(database_name)
+            after = self._migration_mutation_snapshot(database_name)
+            self.assertEqual(before, after)
+            if ready:
+                self.assertEqual(report["status"], "ready")
+                self.assertIs(report["safeToApply"], True)
+                self.assertEqual(report["blockers"], [])
+            else:
+                self.assertEqual(report["status"], "unsafe")
+                self.assertIs(report["safeToApply"], False)
+                for blocker in expected_blockers:
+                    self.assertIn(blocker, report["blockers"])
+            return report
+
+        def execute_many(database_name: str, statements: tuple[str, ...]) -> None:
+            for statement in statements:
+                self._execute_admin(statement, database_name=database_name)
+
+        partial_database = self._create_isolated_database_fixture(
+            self.migrations[:6],
+            configure_acl=False,
+        )
+        self._configure_acl_contract(
+            partial_database,
+            migrations=self.migrations[:6],
+            include_callable=False,
+        )
+        control = assert_snapshot_stable(partial_database, ready=True)
+        self.assertEqual(
+            control["appliedMigrationIds"],
+            [migration.migration_id for migration in self.migrations[:6]],
+        )
+        self.assertEqual(
+            control["pendingMigrationIds"],
+            [self.migrations[-1].migration_id],
+        )
+
+        expected_index = "applied_prefix_missing:index:public.sqag_feedback_publication_idx"
+        expected_index_drift = "applied_prefix_drift:index:public.sqag_feedback_publication_idx"
+        restore_index = (
+            "create index sqag_feedback_publication_idx on public.sqag_feedback "
+            "(workspace_id, publication_version_id, run_id)",
+            "alter index public.sqag_feedback_publication_idx owner to sqag_migrator",
+        )
+        self._execute_admin(
+            "drop index public.sqag_feedback_publication_idx",
+            database_name=partial_database,
+        )
+        try:
+            assert_snapshot_stable(
+                partial_database,
+                expected_blockers=(expected_index,),
+            )
+        finally:
+            execute_many(partial_database, restore_index)
+        assert_snapshot_stable(partial_database, ready=True)
+
+        execute_many(
+            partial_database,
+            (
+                "drop index public.sqag_feedback_publication_idx",
+                "create index sqag_feedback_publication_idx on public.sqag_feedback "
+                "(run_id, publication_version_id, workspace_id)",
+                "alter index public.sqag_feedback_publication_idx owner to sqag_migrator",
+            ),
+        )
+        try:
+            assert_snapshot_stable(
+                partial_database,
+                expected_blockers=(expected_index_drift,),
+            )
+        finally:
+            self._execute_admin(
+                "drop index public.sqag_feedback_publication_idx",
+                database_name=partial_database,
+            )
+            execute_many(partial_database, restore_index)
+        assert_snapshot_stable(partial_database, ready=True)
+
+        expected_trigger = (
+            "applied_prefix_missing:trigger:"
+            "public.sqag_feedback.sqag_feedback_linkage_no_update"
+        )
+        expected_trigger_drift = (
+            "applied_prefix_drift:trigger:"
+            "public.sqag_feedback.sqag_feedback_linkage_no_update"
+        )
+        restore_trigger = (
+            "create trigger sqag_feedback_linkage_no_update "
+            "before update of run_id, session_id, publication_version_id, "
+            "link_resolution_source, link_resolved_at on public.sqag_feedback "
+            "for each row execute function public.sqag_reject_immutable_change()",
+        )
+        self._execute_admin(
+            "drop trigger sqag_feedback_linkage_no_update on public.sqag_feedback",
+            database_name=partial_database,
+        )
+        try:
+            assert_snapshot_stable(
+                partial_database,
+                expected_blockers=(expected_trigger,),
+            )
+        finally:
+            execute_many(partial_database, restore_trigger)
+        assert_snapshot_stable(partial_database, ready=True)
+
+        execute_many(
+            partial_database,
+            (
+                "drop trigger sqag_feedback_linkage_no_update on public.sqag_feedback",
+                "create trigger sqag_feedback_linkage_no_update "
+                "after update of run_id, session_id, publication_version_id, "
+                "link_resolution_source, link_resolved_at on public.sqag_feedback "
+                "for each row execute function public.sqag_reject_immutable_change()",
+            ),
+        )
+        try:
+            assert_snapshot_stable(
+                partial_database,
+                expected_blockers=(expected_trigger_drift,),
+            )
+        finally:
+            self._execute_admin(
+                "drop trigger sqag_feedback_linkage_no_update on public.sqag_feedback",
+                database_name=partial_database,
+            )
+            execute_many(partial_database, restore_trigger)
+        assert_snapshot_stable(partial_database, ready=True)
+
+        expected_routine = (
+            "applied_prefix_missing:routine:public.sqag_reject_immutable_change()"
+        )
+        expected_routine_drift = (
+            "applied_prefix_drift:routine:public.sqag_reject_immutable_change()"
+        )
+        restore_routine = (
+            "create or replace function public.sqag_reject_immutable_change() "
+            "returns trigger language plpgsql volatile parallel unsafe "
+            "security invoker as $$ begin raise exception "
+            "'SQAG immutable record cannot be changed'; end $$",
+            "alter function public.sqag_reject_immutable_change() "
+            "owner to sqag_migrator",
+            "alter function public.sqag_reject_immutable_change() not leakproof",
+            "alter function public.sqag_reject_immutable_change() reset all",
+        )
+        self._execute_admin(
+            "alter function public.sqag_reject_immutable_change() "
+            "rename to provider_missing_applied_routine",
+            database_name=partial_database,
+        )
+        try:
+            assert_snapshot_stable(
+                partial_database,
+                expected_blockers=(expected_routine,),
+            )
+        finally:
+            self._execute_admin(
+                "alter function public.provider_missing_applied_routine() "
+                "rename to sqag_reject_immutable_change",
+                database_name=partial_database,
+            )
+        assert_snapshot_stable(partial_database, ready=True)
+
+        routine_drift_statements = (
+            (
+                "body",
+                "create or replace function public.sqag_reject_immutable_change() "
+                "returns trigger language plpgsql as $$ begin return old; end $$",
+            ),
+            (
+                "owner",
+                "alter function public.sqag_reject_immutable_change() owner to sqag_runtime",
+            ),
+            (
+                "security",
+                "alter function public.sqag_reject_immutable_change() security definer",
+            ),
+            (
+                "volatility",
+                "alter function public.sqag_reject_immutable_change() stable",
+            ),
+            (
+                "parallel",
+                "alter function public.sqag_reject_immutable_change() parallel safe",
+            ),
+            (
+                "leakproof",
+                "alter function public.sqag_reject_immutable_change() leakproof",
+            ),
+            (
+                "search_path",
+                "alter function public.sqag_reject_immutable_change() "
+                "set search_path = pg_catalog",
+            ),
+        )
+        for label, mutation in routine_drift_statements:
+            with self.subTest(applied_routine_drift=label):
+                self._execute_admin(mutation, database_name=partial_database)
+                try:
+                    assert_snapshot_stable(
+                        partial_database,
+                        expected_blockers=(expected_routine_drift,),
+                    )
+                finally:
+                    execute_many(partial_database, restore_routine)
+                assert_snapshot_stable(partial_database, ready=True)
+
+        for collision_table in (
+            "aa_provider_trigger_collision",
+            "zz_provider_trigger_collision",
+        ):
+            with self.subTest(trigger_collision_table=collision_table):
+                execute_many(
+                    partial_database,
+                    (
+                        f"create table public.{collision_table} (id integer)",
+                        f"create trigger sqag_feedback_linkage_no_update "
+                        f"before update on public.{collision_table} for each row "
+                        "execute function public.sqag_reject_immutable_change()",
+                    ),
+                )
+                try:
+                    assert_snapshot_stable(
+                        partial_database,
+                        expected_blockers=(
+                            "managed_namespace_extra:trigger:"
+                            f"public.{collision_table}.sqag_feedback_linkage_no_update",
+                        ),
+                    )
+                finally:
+                    self._execute_admin(
+                        f"drop table public.{collision_table}",
+                        database_name=partial_database,
+                    )
+                assert_snapshot_stable(partial_database, ready=True)
+
+        collision_table = "aa_provider_trigger_collision"
+        execute_many(
+            partial_database,
+            (
+                f"create table public.{collision_table} (id integer)",
+                f"create trigger sqag_feedback_linkage_no_update "
+                f"before update on public.{collision_table} for each row "
+                "execute function public.sqag_reject_immutable_change()",
+                "drop trigger sqag_feedback_linkage_no_update on public.sqag_feedback",
+            ),
+        )
+        try:
+            assert_snapshot_stable(
+                partial_database,
+                expected_blockers=(
+                    expected_trigger,
+                    "managed_namespace_extra:trigger:"
+                    f"public.{collision_table}.sqag_feedback_linkage_no_update",
+                ),
+            )
+        finally:
+            self._execute_admin(
+                f"drop table public.{collision_table}",
+                database_name=partial_database,
+            )
+            execute_many(partial_database, restore_trigger)
+        assert_snapshot_stable(partial_database, ready=True)
+
+        empty_database = self._create_empty_isolated_database_fixture()
+        empty_report = assert_snapshot_stable(empty_database, ready=True)
+        self.assertEqual(empty_report["ledgerState"], "missing")
+        self.assertEqual(empty_report["appliedMigrationIds"], [])
+        self.assertEqual(
+            empty_report["pendingMigrationIds"],
+            [migration.migration_id for migration in self.migrations],
+        )
+
+        self._execute_admin(
+            "create function public.provider_noise_probe() returns integer "
+            "language sql as $$ select 1 $$",
+            database_name=empty_database,
+        )
+        try:
+            assert_snapshot_stable(empty_database, ready=True)
+        finally:
+            self._execute_admin(
+                "drop function public.provider_noise_probe()",
+                database_name=empty_database,
+            )
+
+        self._execute_admin(
+            "create function public.sqag_reject_immutable_change() returns trigger "
+            "language plpgsql as $$ begin return old; end $$",
+            database_name=empty_database,
+        )
+        try:
+            assert_snapshot_stable(
+                empty_database,
+                expected_blockers=(
+                    "pending_suffix_present:routine:"
+                    "public.sqag_reject_immutable_change()",
+                ),
+            )
+        finally:
+            self._execute_admin(
+                "drop function public.sqag_reject_immutable_change()",
+                database_name=empty_database,
+            )
+
+        self._execute_admin(
+            "create function public.sqag_unknown_probe() returns integer "
+            "language sql as $$ select 1 $$",
+            database_name=empty_database,
+        )
+        try:
+            assert_snapshot_stable(
+                empty_database,
+                expected_blockers=(
+                    "managed_namespace_extra:routine:public.sqag_unknown_probe()",
+                ),
+            )
+        finally:
+            self._execute_admin(
+                "drop function public.sqag_unknown_probe()",
+                database_name=empty_database,
+            )
+        assert_snapshot_stable(empty_database, ready=True)
+
+        premature_database = self._create_isolated_database_fixture()
+        self._execute_admin(
+            "delete from public.sqag_schema_migrations",
+            database_name=premature_database,
+        )
+        premature_report = assert_snapshot_stable(
+            premature_database,
+            expected_blockers=(
+                "pending_suffix_present:routine:"
+                "public.sqag_quote_session_deletion_hold_blocked(text, text)",
+            ),
+        )
+        self.assertEqual(premature_report["ledgerState"], "present")
+        self.assertEqual(premature_report["appliedMigrationIds"], [])
+        self.assertEqual(
+            premature_report["pendingMigrationIds"],
+            [migration.migration_id for migration in self.migrations],
+        )
+
+    def _execute_admin(self, statement: str, params=(), *, database_name: str | None = None):
+        with self._admin_connection(database_name) as connection:
             return connection.execute(statement, params)
 
-    def _admin_row(self, statement: str, params=()):
-        with self._admin_connection() as connection:
+    def _admin_row(self, statement: str, params=(), *, database_name: str | None = None):
+        with self._admin_connection(database_name) as connection:
             row = connection.execute(statement, params).fetchone()
             if row is None:
                 raise AssertionError("fixture row missing")
             return row
+
+    def _assert_causal_callable_catalog_contract(self, database_name: str) -> None:
+        routine = self._admin_row(
+            "select n.nspname as schema_name, p.proname as name, "
+            "pg_get_function_identity_arguments(p.oid) as identity_arguments, "
+            "p.prokind, "
+            "pg_get_function_result(p.oid) as result_type, language_row.lanname as language, "
+            "p.prosecdef as security_definer, p.provolatile as volatility, "
+            "p.proparallel as parallel, p.proleakproof as leakproof, p.proconfig, "
+            "p.prosrc as function_body, pg_get_functiondef(p.oid) as function_definition, "
+            "owner.rolname as owner "
+            "from pg_catalog.pg_proc p "
+            "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+            "join pg_catalog.pg_language language_row on language_row.oid = p.prolang "
+            "join pg_catalog.pg_roles owner on owner.oid = p.proowner "
+            "where n.nspname = 'public' and p.proname = %s "
+            "and pg_get_function_identity_arguments(p.oid) = %s",
+            (
+                migration_contract.ROUTINE_SPECS[-1].name,
+                migration_contract.ROUTINE_SPECS[-1].identity_arguments,
+            ),
+            database_name=database_name,
+        )
+        self.assertEqual(routine["schema_name"], "public")
+        self.assertEqual(routine["name"], migration_contract.ROUTINE_SPECS[-1].name)
+        self.assertEqual(routine["identity_arguments"], "text, text")
+        self.assertEqual(routine["prokind"], "f")
+        self.assertEqual(routine["result_type"].lower(), "boolean")
+        self.assertEqual(routine["language"], "sql")
+        self.assertTrue(routine["security_definer"])
+        self.assertEqual(routine["volatility"], "s")
+        self.assertEqual(routine["parallel"], "u")
+        self.assertFalse(routine["leakproof"])
+        self.assertEqual(routine["proconfig"], ["search_path=pg_catalog, public"])
+        self.assertEqual(routine["owner"], "sqag_migrator")
+
+        canonical_body = contract._canonical_callable_routine_body()
+        self.assertEqual(
+            contract._semantic_sql_tokens(routine["function_body"]),
+            contract._semantic_sql_tokens(canonical_body),
+        )
+        relation_inventory = {
+            match.group(1).lower()
+            for match in contract.SQL_RELATION_RE.finditer(routine["function_definition"])
+            if match.group(1).lower().startswith("sqag_")
+        }
+        self.assertEqual(
+            relation_inventory,
+            set(migration_contract.ROUTINE_SPECS[-1].referenced_relations),
+        )
+        self.assertIsNone(contract.UNQUALIFIED_SQL_RELATION_RE.search(routine["function_definition"]))
+        count = self._admin_row(
+            "select count(*) as count from pg_catalog.pg_proc p "
+            "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+            "where n.nspname = 'public' and p.proname = %s",
+            (migration_contract.ROUTINE_SPECS[-1].name,),
+            database_name=database_name,
+        )
+        self.assertEqual(count["count"], 1)
+
+        acl_rows = self._admin_rows(
+            "select case when acl.grantee = 0 then 'PUBLIC' "
+            "else coalesce(grantee_role.rolname, 'UNKNOWN') end as grantee, "
+            "acl.privilege_type, acl.is_grantable "
+            "from pg_catalog.pg_proc p "
+            "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+            "left join lateral pg_catalog.aclexplode(coalesce(p.proacl, pg_catalog.acldefault('f', p.proowner))) acl on true "
+            "left join pg_catalog.pg_roles grantee_role "
+            "on grantee_role.oid = acl.grantee and acl.grantee <> 0 "
+            "where n.nspname = 'public' and p.proname = %s "
+            "and pg_get_function_identity_arguments(p.oid) = %s "
+            "order by grantee, acl.privilege_type",
+            (
+                migration_contract.ROUTINE_SPECS[-1].name,
+                migration_contract.ROUTINE_SPECS[-1].identity_arguments,
+            ),
+            database_name=database_name,
+        )
+        self.assertEqual(
+            {
+                (row["grantee"], row["privilege_type"], row["is_grantable"])
+                for row in acl_rows
+            },
+            {("sqag_migrator", "EXECUTE", False), ("sqag_runtime", "EXECUTE", False)},
+        )
+        self.assertEqual(self._verify(database_name)["status"], "verified")
 
     def test_real_pg17_bootstrap_identity_is_oid_10_superuser(self):
         version = self._admin_row(
@@ -3267,8 +4644,8 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
         with self._admin_connection(database_name) as connection:
             return connection.execute(statement, params)
 
-    def _admin_rows(self, statement, params=()):
-        with self._admin_connection() as connection:
+    def _admin_rows(self, statement, params=(), *, database_name: str | None = None):
+        with self._admin_connection(database_name) as connection:
             return connection.execute(statement, params).fetchall()
 
 

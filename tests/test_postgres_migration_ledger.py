@@ -5,6 +5,7 @@ import threading
 import time
 import unittest
 import uuid
+from collections import Counter
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
@@ -16,18 +17,27 @@ MIGRATION_ROLES = ("sqag_migrator", "sqag_runtime", "sqag_maintenance")
 sys.path.insert(0, str(ROOT))
 
 from webapp.postgres_migrations import (
+    CatalogProjectionError,
+    ColumnSpec,
+    ConstraintSpec,
     EXPECTED_CALLABLE_ROUTINE_KEYS,
     EXPECTED_INDEXES,
     EXPECTED_ROUTINES,
     EXPECTED_ROUTINE_KEYS,
     EXPECTED_TRIGGER_ROUTINE_KEYS,
     EXPECTED_TABLES,
-    EXPECTED_TRIGGERS,
+    EXPECTED_TRIGGER_KEYS,
     LEDGER_TABLE,
     MIGRATION_LOCK_KEY,
     MIGRATION_FILE_NAMES,
     Migration,
     MigrationSafetyError,
+    TableSpec,
+    _fetch_public_indexes,
+    _constraint_fingerprint,
+    _observed_constraint_fingerprint,
+    canonicalize_check_expression,
+    execute_migration_sql,
     apply_postgres_migrations,
     canonical_migration_payload,
     inspect_postgres_migrations,
@@ -43,6 +53,23 @@ def postgres_test_conninfo(database_name: str = "postgres") -> str | None:
     if not host or not port or not user:
         return None
     return f"host={host} port={port} user={user} dbname={database_name}"
+
+
+def safe_postgres_url(user: str, database_name: str) -> str:
+    conninfo = postgres_test_conninfo(database_name)
+    if not conninfo:
+        raise unittest.SkipTest("disposable PostgreSQL-17 service is not configured")
+    parts = {
+        item.split("=", 1)[0]: item.split("=", 1)[1]
+        for item in conninfo.split()
+        if "=" in item
+    }
+    from urllib.parse import quote
+
+    return (
+        f"postgresql://{quote(user, safe='')}@{quote(parts['host'], safe='')}:{quote(parts['port'], safe='')}/"
+        f"{quote(database_name, safe='')}"
+    )
 
 
 def write_migration_copy(destination: Path, line_ending: bytes) -> tuple[Migration, ...]:
@@ -63,6 +90,238 @@ class RecordingConnection:
 
 
 class MigrationPayloadCanonicalizationTest(unittest.TestCase):
+    def test_check_deparse_canonicalizer_allows_only_bounded_equivalences(self):
+        table = TableSpec(
+            "fixture",
+            (
+                ColumnSpec("varchar_value", "varchar"),
+                ColumnSpec("char_value", "char(64)"),
+                ColumnSpec("integer_value", "integer"),
+            ),
+        )
+        equivalent = (
+            (
+                "varchar_value::text ~ '^[a-z]+$'",
+                "varchar_value ~ '^[a-z]+$'",
+            ),
+            (
+                "char_value::text !~ 'x'",
+                "char_value !~ 'x'",
+            ),
+            (
+                "'received'::text",
+                "'received'",
+            ),
+            (
+                "now()",
+                "current_timestamp",
+            ),
+            (
+                "status = ANY (ARRAY['received', 'queued'])",
+                "status IN ('received', 'queued')",
+            ),
+            (
+                "status = ANY (ARRAY['received'::text, 'queued'::text]::text[])",
+                "status IN ('received', 'queued')",
+            ),
+            (
+                "((status = 'received'))",
+                "status = 'received'",
+            ),
+        )
+        for first, second in equivalent:
+            with self.subTest(first=first):
+                self.assertEqual(
+                    canonicalize_check_expression(first, table),
+                    canonicalize_check_expression(second, table),
+                )
+
+        semantic_drift = (
+            ("varchar_value::text = 'x'", "varchar_value = 'x'"),
+            ("char_value::text = 'x'", "char_value = 'x'"),
+            ("integer_value::text = '1'", "integer_value = '1'"),
+            ("status = ANY (ARRAY[status])", "status IN (status)"),
+            ("""varchar_value COLLATE "C" = 'x'""", "varchar_value = 'x'"),
+        )
+        for first, second in semantic_drift:
+            with self.subTest(first=first):
+                self.assertNotEqual(
+                    canonicalize_check_expression(first, table),
+                    canonicalize_check_expression(second, table),
+                )
+
+        self.assertNotEqual(
+            canonicalize_check_expression("status = (", table),
+            canonicalize_check_expression("status = 'received'", table),
+        )
+
+    def test_index_catalog_projection_is_exact_and_typed(self):
+        fields = (
+            "indexrelid", "index_name", "table_name", "indisunique",
+            "indisvalid", "indisready", "constraint_backed", "owner",
+            "predicate", "key_definitions",
+        )
+
+        class Cursor:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def fetchall(self):
+                return self.rows
+
+        class Connection:
+            def __init__(self, row):
+                self.row = row
+                self.sql = ""
+
+            def execute(self, sql):
+                self.sql = sql
+                return Cursor([self.row])
+
+        valid = {
+            "indexrelid": 1,
+            "index_name": "sqag_fixture_idx",
+            "table_name": "sqag_fixture",
+            "indisunique": False,
+            "indisvalid": True,
+            "indisready": True,
+            "constraint_backed": False,
+            "owner": "sqag_migrator",
+            "predicate": None,
+            "key_definitions": ["workspace_id"],
+        }
+        connection = Connection(valid)
+        result = _fetch_public_indexes(connection)
+        self.assertEqual(result["sqag_fixture_idx"]["constraint_backed"], False)
+        self.assertIn("as constraint_backed", connection.sql)
+        self.assertIn("exists", connection.sql.lower())
+        self.assertEqual(set(valid), set(fields))
+
+        for mutation in (
+            lambda row: row.pop("constraint_backed"),
+            lambda row: row.update(unexpected_alias=True),
+            lambda row: row.update(constraint_backed="false"),
+            lambda row: row.update(key_definitions="workspace_id"),
+        ):
+            candidate = dict(valid)
+            mutation(candidate)
+            with self.subTest(candidate=candidate):
+                with self.assertRaises(CatalogProjectionError):
+                    _fetch_public_indexes(Connection(candidate))
+
+        tuple_row = (
+            17,
+            "sqag_tuple_idx",
+            "sqag_tuple_table",
+            True,
+            False,
+            True,
+            False,
+            "tuple_owner",
+            "workspace_id > 0",
+            ["workspace_id", "profile_id"],
+        )
+        tuple_result = _fetch_public_indexes(Connection(tuple_row))
+        self.assertEqual(
+            tuple_result["sqag_tuple_idx"],
+            {
+                "oid": 17,
+                "name": "sqag_tuple_idx",
+                "table_name": "sqag_tuple_table",
+                "unique": True,
+                "valid": False,
+                "ready": True,
+                "constraint_backed": False,
+                "owner": "tuple_owner",
+                "predicate": "workspace_id > 0",
+                "key_definitions": ("workspace_id", "profile_id"),
+            },
+        )
+        with self.assertRaises(CatalogProjectionError):
+            _fetch_public_indexes(Connection(tuple_row[:-1]))
+        with self.assertRaises(CatalogProjectionError):
+            _fetch_public_indexes(Connection(tuple_row + ("overlong",)))
+
+        wrong_type_rows = (
+            ("17", *tuple_row[1:]),
+            (tuple_row[0], 17, *tuple_row[2:]),
+            (tuple_row[0], tuple_row[1], 17, *tuple_row[3:]),
+            (tuple_row[0], tuple_row[1], tuple_row[2], "true", *tuple_row[4:]),
+            (tuple_row[0], tuple_row[1], tuple_row[2], tuple_row[3], "false", *tuple_row[5:]),
+            (tuple_row[0], tuple_row[1], tuple_row[2], tuple_row[3], tuple_row[4], 1, *tuple_row[6:]),
+            (tuple_row[0], tuple_row[1], tuple_row[2], tuple_row[3], tuple_row[4], tuple_row[5], None, *tuple_row[7:]),
+            (tuple_row[0], tuple_row[1], tuple_row[2], tuple_row[3], tuple_row[4], tuple_row[5], tuple_row[6], None, *tuple_row[8:]),
+            (tuple_row[0], tuple_row[1], tuple_row[2], tuple_row[3], tuple_row[4], tuple_row[5], tuple_row[6], tuple_row[7], 17, tuple_row[9]),
+            (tuple_row[0], tuple_row[1], tuple_row[2], tuple_row[3], tuple_row[4], tuple_row[5], tuple_row[6], tuple_row[7], tuple_row[8], "workspace_id"),
+        )
+        for candidate in wrong_type_rows:
+            with self.subTest(candidate=candidate):
+                with self.assertRaises(CatalogProjectionError):
+                    _fetch_public_indexes(Connection(candidate))
+
+    def test_fk_identity_includes_referenced_schema_and_match_type(self):
+        expected = ConstraintSpec(
+            kind="f",
+            columns=("local_id",),
+            referenced_schema="public",
+            referenced_table="sqag_parent",
+            referenced_columns=("id",),
+            match_type="s",
+            on_delete="c",
+            on_update="a",
+        )
+        observed = {
+            "kind": "f",
+            "columns": ("local_id",),
+            "referenced_schema": "public",
+            "referenced_table": "sqag_parent",
+            "referenced_columns": ("id",),
+            "match_type": "s",
+            "on_delete": "c",
+            "on_update": "a",
+            "validated": True,
+            "deferrable": False,
+            "deferred": False,
+        }
+        self.assertEqual(
+            _constraint_fingerprint(expected),
+            _observed_constraint_fingerprint(observed),
+        )
+        for field, value in (
+            ("referenced_schema", "other_schema"),
+            ("match_type", "f"),
+            ("columns", ("other_local",)),
+            ("referenced_columns", ("other_id",)),
+            ("referenced_table", "other_parent"),
+            ("on_delete", "r"),
+            ("on_update", "c"),
+            ("validated", False),
+            ("deferrable", True),
+            ("deferred", True),
+        ):
+            candidate = dict(observed)
+            candidate[field] = value
+            with self.subTest(field=field):
+                self.assertNotEqual(
+                    _constraint_fingerprint(expected),
+                    _observed_constraint_fingerprint(candidate),
+                )
+
+    def test_migration_splitter_preserves_dollar_quoted_routine_bodies(self):
+        connection = RecordingConnection()
+        execute_migration_sql(
+            connection,
+            "create table sqag_split_probe (id integer);"
+            "-- SQAG_STATEMENT_BOUNDARY"
+            "create function sqag_split_probe() returns trigger "
+            "language plpgsql as $$ begin raise exception 'x; y'; end $$"
+            "-- SQAG_STATEMENT_BOUNDARY"
+            "drop table sqag_split_probe",
+        )
+        self.assertEqual(len(connection.calls), 3)
+        self.assertIn("raise exception 'x; y'", connection.calls[1][0])
+        self.assertNotIn("raise exception 'x", connection.calls[0][0])
+
     def test_lf_crlf_and_bare_cr_have_identical_payloads_and_checksums(self):
         variants = (
             b"select 1;\nselect 2;\n",
@@ -196,7 +455,7 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
             for role in MIGRATION_ROLES:
                 connection.execute(
                     self.sql.SQL(
-                        "create role {} nologin nosuperuser nocreatedb nocreaterole "
+                        "create role {} login nosuperuser nocreatedb nocreaterole "
                         "noreplication nobypassrls noinherit connection limit -1"
                     ).format(self.sql.Identifier(role))
                 )
@@ -207,6 +466,23 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
         with self.psycopg.connect(postgres_test_conninfo(), autocommit=True) as connection:
             connection.execute(self.sql.SQL("create database {}").format(self.sql.Identifier(database_name)))
         self.database_names.append(database_name)
+        with self.psycopg.connect(postgres_test_conninfo(database_name), autocommit=True) as connection:
+            database = self.sql.Identifier(database_name)
+            for grantee in ("PUBLIC", *MIGRATION_ROLES):
+                connection.execute(
+                    self.sql.SQL("revoke all privileges on database {} from {}").format(
+                        database,
+                        self.sql.SQL("PUBLIC") if grantee == "PUBLIC" else self.sql.Identifier(grantee),
+                    )
+                )
+            connection.execute(
+                self.sql.SQL("grant connect on database {} to sqag_migrator").format(database)
+            )
+            connection.execute(
+                "revoke all privileges on schema public from PUBLIC, sqag_runtime, "
+                "sqag_migrator, sqag_maintenance"
+            )
+            connection.execute("grant usage, create on schema public to sqag_migrator")
         return database_name
 
     def tearDown(self):
@@ -241,10 +517,15 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
 
     def connect(self, database_name=None) -> PostgresConnectionAdapter:
         raw = self.psycopg.connect(
-            postgres_test_conninfo(database_name or self.database_name),
+            safe_postgres_url("sqag_migrator", database_name or self.database_name),
             row_factory=self.dict_row,
         )
-        return PostgresConnectionAdapter(raw)
+        connection = PostgresConnectionAdapter(raw)
+        identity = connection.execute("select session_user, current_user").fetchone()
+        if identity["session_user"] != "sqag_migrator" or identity["current_user"] != "sqag_migrator":
+            connection.close()
+            raise AssertionError("migration fixture did not establish true migrator identity")
+        return connection
 
     def apply(self, migrations=None, database_name=None):
         connection = self.connect(database_name)
@@ -309,12 +590,26 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
                     "select indexname from pg_catalog.pg_indexes where schemaname = 'public'"
                 ).fetchall()
             }
-            triggers = {
-                row["trigger_name"]
+            trigger_identities = [
+                (
+                    row["table_schema"],
+                    row["table_name"],
+                    row["trigger_name"],
+                )
                 for row in connection.execute(
-                    "select trigger_name from information_schema.triggers where trigger_schema = 'public'"
+                    "select table_namespace.nspname as table_schema, "
+                    "table_class.relname as table_name, trigger_row.tgname as trigger_name "
+                    "from pg_catalog.pg_trigger trigger_row "
+                    "join pg_catalog.pg_class table_class "
+                    "on table_class.oid = trigger_row.tgrelid "
+                    "join pg_catalog.pg_namespace table_namespace "
+                    "on table_namespace.oid = table_class.relnamespace "
+                    "where table_namespace.nspname = 'public' "
+                    "and not trigger_row.tgisinternal "
+                    "order by table_namespace.nspname, table_class.relname, "
+                    "trigger_row.tgname, trigger_row.oid"
                 ).fetchall()
-            }
+            ]
             routines = {
                 row["routine_name"]
                 for row in connection.execute(
@@ -335,7 +630,14 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
             connection.rollback()
             connection.close()
         self.assertTrue(EXPECTED_INDEXES.issubset(indexes))
-        self.assertTrue(EXPECTED_TRIGGERS.issubset(triggers))
+        self.assertEqual(
+            Counter(
+                identity
+                for identity in trigger_identities
+                if identity[2].startswith("sqag_")
+            ),
+            Counter(EXPECTED_TRIGGER_KEYS),
+        )
         self.assertTrue(EXPECTED_ROUTINES.issubset(routines))
         self.assertEqual(routine_identities & EXPECTED_ROUTINE_KEYS, EXPECTED_ROUTINE_KEYS)
         self.assertEqual(
@@ -349,6 +651,133 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
                 ("sqag_require_retention_delete_authorization", ""),
             },
         )
+
+    def test_real_pg17_fk_identity_matrix_fails_closed_and_restores(self):
+        self.apply()
+        with self.psycopg.connect(
+            postgres_test_conninfo(self.database_name),
+            row_factory=self.dict_row,
+            autocommit=True,
+        ) as connection:
+            connection.execute("create schema provider_fk_schema")
+            connection.execute(
+                "create table provider_fk_schema.provider_fk_runs "
+                "(run_id text not null, workspace_id text not null, "
+                "primary key (run_id, workspace_id))"
+            )
+            connection.execute(
+                "create table public.provider_fk_runs "
+                "(run_id text not null, workspace_id text not null, "
+                "primary key (run_id, workspace_id))"
+            )
+            connection.execute(
+                "create unique index provider_fk_reverse_uidx "
+                "on public.sqag_generation_runs (workspace_id, run_id)"
+            )
+            connection.execute(
+                "grant usage on schema provider_fk_schema to sqag_migrator"
+            )
+            connection.execute(
+                "grant references on table provider_fk_schema.provider_fk_runs "
+                "to sqag_migrator"
+            )
+            connection.execute(
+                "grant references on table public.provider_fk_runs to sqag_migrator"
+            )
+            constraint_row = connection.execute(
+                "select conname from pg_catalog.pg_constraint "
+                "where conrelid = 'public.sqag_generation_evidence'::regclass "
+                "and contype = 'f'"
+            ).fetchone()
+            self.assertIsNotNone(constraint_row)
+            constraint_name = str(constraint_row["conname"])
+
+        def execute_migrator(statement):
+            with self.psycopg.connect(
+                safe_postgres_url("sqag_migrator", self.database_name),
+                row_factory=self.dict_row,
+                options="-c search_path=public,pg_catalog",
+                autocommit=True,
+            ) as connection:
+                connection.execute(statement)
+
+        def drop_constraint(name):
+            execute_migrator(
+                self.sql.SQL(
+                    "alter table public.sqag_generation_evidence "
+                    "drop constraint {}"
+                ).format(self.sql.Identifier(name))
+            )
+
+        def add_constraint(
+            name,
+            schema,
+            table,
+            local_columns="run_id, workspace_id",
+            referenced_columns="run_id, workspace_id",
+            tail="",
+        ):
+            execute_migrator(
+                self.sql.SQL(
+                    "alter table public.sqag_generation_evidence "
+                    "add constraint {} foreign key ({}) references {}.{} ({}) {}"
+                ).format(
+                    self.sql.Identifier(name),
+                    self.sql.SQL(local_columns),
+                    self.sql.Identifier(schema),
+                    self.sql.Identifier(table),
+                    self.sql.SQL(referenced_columns),
+                    self.sql.SQL(tail),
+                )
+            )
+
+        expected_table = "applied_prefix_drift:table:public.sqag_generation_evidence"
+        variants = (
+            ("referenced schema", "provider_fk_schema", "provider_fk_runs", "run_id, workspace_id", "run_id, workspace_id", "", False),
+            ("match type", "public", "sqag_generation_runs", "run_id, workspace_id", "run_id, workspace_id", "match full", False),
+            ("local and referenced order", "public", "sqag_generation_runs", "workspace_id, run_id", "workspace_id, run_id", "", False),
+            ("referenced table", "public", "provider_fk_runs", "run_id, workspace_id", "run_id, workspace_id", "", False),
+            ("delete action", "public", "sqag_generation_runs", "run_id, workspace_id", "run_id, workspace_id", "on delete cascade", False),
+            ("update action", "public", "sqag_generation_runs", "run_id, workspace_id", "run_id, workspace_id", "on update cascade", False),
+            ("validation state", "public", "sqag_generation_runs", "run_id, workspace_id", "run_id, workspace_id", "not valid", False),
+            ("deferrability state", "public", "sqag_generation_runs", "run_id, workspace_id", "run_id, workspace_id", "deferrable initially deferred", False),
+            ("duplicate multiplicity", "public", "sqag_generation_runs", "run_id, workspace_id", "run_id, workspace_id", "", True),
+        )
+        for label, schema, table, local_columns, referenced_columns, tail, duplicate in variants:
+            mutated_name = "sqag_generation_evidence_duplicate_fk" if duplicate else constraint_name
+            with self.subTest(fk_drift=label):
+                if duplicate:
+                    add_constraint(
+                        mutated_name,
+                        schema,
+                        table,
+                        local_columns,
+                        referenced_columns,
+                        tail,
+                    )
+                else:
+                    drop_constraint(constraint_name)
+                    add_constraint(
+                        mutated_name,
+                        schema,
+                        table,
+                        local_columns,
+                        referenced_columns,
+                        tail,
+                    )
+                try:
+                    report = self.inspect()
+                    self.assertFalse(report["safeToApply"])
+                    self.assertIn(expected_table, report["blockers"])
+                finally:
+                    drop_constraint(mutated_name)
+                    if not duplicate:
+                        add_constraint(
+                            constraint_name,
+                            "public",
+                            "sqag_generation_runs",
+                        )
+                self.assertTrue(self.inspect()["safeToApply"])
 
     def test_lf_and_crlf_create_equivalent_stored_routine_definitions(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -486,19 +915,81 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
         self.assertNotIn(LEDGER_TABLE, self.public_tables())
         self.assertNotIn("should_rollback", self.public_tables())
 
-    def test_existing_unledgered_schema_is_not_silently_adopted(self):
+    def test_missing_ledger_allows_unrelated_public_provider_objects(self):
         connection = self.connect()
         try:
-            connection.execute("create table existing_untrusted_schema (id integer)")
+            connection.execute("create table provider_noise (id integer)")
+            connection.execute("create index provider_noise_idx on provider_noise (id)")
+            connection.execute(
+                "create function provider_noise_trigger_function() returns trigger "
+                "language plpgsql as $$ begin return new; end $$"
+            )
+            connection.execute(
+                "create trigger provider_noise_trigger before insert on provider_noise "
+                "for each row execute function provider_noise_trigger_function()"
+            )
             connection.commit()
         finally:
             connection.close()
 
         report = self.inspect()
-        self.assertEqual(report["blockers"], ["existing_schema_without_trusted_ledger"])
-        with self.assertRaises(MigrationSafetyError):
-            self.apply()
-        self.assertNotIn(LEDGER_TABLE, self.public_tables())
+        self.assertTrue(report["safeToApply"])
+        self.assertEqual(report["ledgerState"], "missing")
+        self.assertEqual(report["appliedMigrationIds"], [])
+        self.assertEqual(
+            report["pendingMigrationIds"],
+            [migration.migration_id for migration in self.manifest],
+        )
+        self.assertEqual(report["blockers"], [])
+
+    def test_missing_ledger_rejects_known_and_unknown_sqag_namespace_objects(self):
+        connection = self.connect()
+        try:
+            connection.execute("create table public.sqag_profiles (id integer)")
+            connection.commit()
+        finally:
+            connection.close()
+
+        known_report = self.inspect()
+        self.assertFalse(known_report["safeToApply"])
+        self.assertIn(
+            "pending_suffix_present:table:public.sqag_profiles",
+            known_report["blockers"],
+        )
+
+        connection = self.connect()
+        try:
+            connection.execute("drop table public.sqag_profiles")
+            connection.execute("create table public.sqag_unexpected (id integer)")
+            connection.commit()
+        finally:
+            connection.close()
+
+        unknown_report = self.inspect()
+        self.assertFalse(unknown_report["safeToApply"])
+        self.assertIn(
+            "managed_namespace_extra:relation:public.sqag_unexpected",
+            unknown_report["blockers"],
+        )
+
+        connection = self.connect()
+        try:
+            connection.execute("drop table public.sqag_unexpected")
+            connection.execute("create table public.provider_noise (id integer)")
+            connection.execute(
+                "alter table public.provider_noise add constraint "
+                "sqag_provider_unexpected_constraint unique (id)"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        constraint_index_report = self.inspect()
+        self.assertFalse(constraint_index_report["safeToApply"])
+        self.assertIn(
+            "managed_namespace_extra:relation:public.sqag_provider_unexpected_constraint",
+            constraint_index_report["blockers"],
+        )
 
     def test_empty_ledger_does_not_adopt_preexisting_sqag_tables(self):
         connection = self.connect()
