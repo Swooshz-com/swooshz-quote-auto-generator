@@ -20,12 +20,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from webapp.postgres_migrations import (  # noqa: E402
+    EXPECTED_CALLABLE_ROUTINE_KEYS,
     EXPECTED_INDEXES,
     EXPECTED_ROUTINES,
     EXPECTED_TABLES,
+    EXPECTED_TRIGGER_ROUTINE_KEYS,
     EXPECTED_TRIGGER_ROUTINE_LINKS,
     LEDGER_TABLE,
     MIGRATION_TABLES,
+    MigrationSafetyError,
+    canonical_migration_payload,
     migration_manifest,
 )
 
@@ -43,6 +47,10 @@ SQL_RELATION_RE = re.compile(
 )
 DYNAMIC_RELATION_RE = re.compile(
     r'\b(?:delete\s+from|from|join|into|update)\s+\{([a-z_][a-z0-9_]*)\}',
+    re.IGNORECASE,
+)
+UNQUALIFIED_SQL_RELATION_RE = re.compile(
+    r'\b(?:delete\s+from|from|join|into|update)\s+(?!public\.)(sqag_[a-z_][a-z0-9_]*)',
     re.IGNORECASE,
 )
 DATABASE_PRIVILEGES = ("CONNECT", "CREATE", "TEMPORARY")
@@ -120,9 +128,54 @@ EXPECTED_OWNERSHIP = {
     "public_schema_owner": "pg_database_owner",
 }
 RUNTIME_ROLES = ("sqag_runtime", "sqag_maintenance")
-EXPECTED_ROUTINE_KEYS = {
-    ("sqag_reject_immutable_change", ""),
-    ("sqag_require_retention_delete_authorization", ""),
+EXPECTED_TRIGGER_ROUTINE_KEYS = set(EXPECTED_TRIGGER_ROUTINE_KEYS)
+EXPECTED_CALLABLE_ROUTINE_KEYS = set(EXPECTED_CALLABLE_ROUTINE_KEYS)
+EXPECTED_ROUTINE_KEYS = EXPECTED_TRIGGER_ROUTINE_KEYS | EXPECTED_CALLABLE_ROUTINE_KEYS
+CALLABLE_ROUTINE_NAME = "sqag_quote_session_deletion_hold_blocked"
+CALLABLE_ROUTINE_IDENTITY_ARGUMENTS = "text, text"
+CALLABLE_ROUTINE_MIGRATION_PATH = "migrations/008_quote_session_deletion_hold_authority_postgres.sql"
+CALLABLE_ROUTINE_HEADER_RE = re.compile(
+    r"\bcreate\s+(?:or\s+replace\s+)?function\s+public\s*\.\s*"
+    r"sqag_quote_session_deletion_hold_blocked\s*\(\s*text\s*,\s*text\s*\)"
+    r".*?\bas\s+(?P<delimiter>\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$)",
+    re.IGNORECASE | re.DOTALL,
+)
+DOLLAR_QUOTE_RE = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
+SQL_NUMBER_RE = re.compile(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
+SQL_OPERATOR_CHARS = frozenset("+-*/<>=~!@#%^&|?:")
+CALLABLE_ROUTINE_REFERENCED_RELATIONS = (
+    "sqag_audit_events",
+    "sqag_feedback",
+    "sqag_feedback_status_history",
+    "sqag_generation_evidence",
+    "sqag_generation_runs",
+    "sqag_legal_holds",
+    "sqag_quote_publication_versions",
+    "sqag_quote_sessions",
+)
+EXPECTED_CALLABLE_ROUTINE_DOCUMENT = {
+    "name": CALLABLE_ROUTINE_NAME,
+    "identity_arguments": CALLABLE_ROUTINE_IDENTITY_ARGUMENTS,
+    "argument_types": ["text", "text"],
+    "result_type": "boolean",
+    "language": "sql",
+    "owner": "sqag_migrator",
+    "security_mode": "definer",
+    "volatility": "stable",
+    "parallel": "unsafe",
+    "leakproof": False,
+    "direct_execute": True,
+    "trigger_only": False,
+    "function_search_path": ["pg_catalog", "public"],
+    "schema_qualified_relations": True,
+    "referenced_relations": list(CALLABLE_ROUTINE_REFERENCED_RELATIONS),
+    "explicit_execute_roles": ["sqag_runtime"],
+    "owner_execute": True,
+    "public_execute": False,
+    "maintenance_execute": False,
+    "default_public_execute": False,
+    "grant_options": False,
+    "fail_closed": True,
 }
 PRODUCTION_POSTGRES_CALLER_SPECS = {
     "scripts/verify_production_database_provider.py": {
@@ -199,6 +252,153 @@ def _rows(connection: Any, sql: str, params: Sequence[Any] = ()) -> list[Any]:
 
 def _clean(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _consume_sql_quoted_token(
+    source: str,
+    quote_start: int,
+    quote: str,
+    *,
+    backslash_escapes: bool = False,
+) -> int:
+    index = quote_start + 1
+    while index < len(source):
+        character = source[index]
+        if character == quote:
+            if index + 1 < len(source) and source[index + 1] == quote:
+                index += 2
+                continue
+            return index + 1
+        if backslash_escapes and character == "\\":
+            index += 2
+        else:
+            index += 1
+    return len(source)
+
+
+def _semantic_sql_tokens(source: str) -> tuple[tuple[str, str], ...]:
+    """Normalize only SQL formatting while retaining semantic-sensitive tokens."""
+
+    tokens: list[tuple[str, str]] = []
+    index = 0
+    while index < len(source):
+        character = source[index]
+        if character.isspace():
+            index += 1
+            continue
+        if source.startswith("--", index):
+            newline = source.find("\n", index + 2)
+            index = len(source) if newline < 0 else newline + 1
+            continue
+        if source.startswith("/*", index):
+            comment_start = index
+            depth = 1
+            index += 2
+            while index < len(source) and depth:
+                if source.startswith("/*", index):
+                    depth += 1
+                    index += 2
+                elif source.startswith("*/", index):
+                    depth -= 1
+                    index += 2
+                else:
+                    index += 1
+            if depth:
+                tokens.append(("unterminated_comment", source[comment_start:]))
+                break
+            continue
+        literal_start = index
+        if character in "'\"":
+            index = _consume_sql_quoted_token(source, index, character)
+            tokens.append(("literal", source[literal_start:index]))
+            continue
+        if character in "eE" and index + 1 < len(source) and source[index + 1] == "'":
+            index = _consume_sql_quoted_token(
+                source,
+                index + 1,
+                "'",
+                backslash_escapes=True,
+            )
+            tokens.append(("literal", source[literal_start:index]))
+            continue
+        if character == "$":
+            if index + 1 < len(source) and source[index + 1].isdigit():
+                end = index + 2
+                while end < len(source) and source[end].isdigit():
+                    end += 1
+                tokens.append(("parameter", source[index:end]))
+                index = end
+                continue
+            dollar_quote = DOLLAR_QUOTE_RE.match(source, index)
+            if dollar_quote:
+                delimiter = dollar_quote.group(0)
+                end = source.find(delimiter, dollar_quote.end())
+                if end < 0:
+                    tokens.append(("unterminated_literal", source[index:]))
+                    break
+                end += len(delimiter)
+                tokens.append(("literal", source[index:end]))
+                index = end
+                continue
+        if character == "_" or character.isalpha():
+            end = index + 1
+            while end < len(source) and (
+                source[end] == "_"
+                or source[end] == "$"
+                or source[end].isalnum()
+            ):
+                end += 1
+            tokens.append(("identifier", source[index:end].lower()))
+            index = end
+            continue
+        number = SQL_NUMBER_RE.match(source, index)
+        if number:
+            end = number.end()
+            tokens.append(("number", source[index:end]))
+            index = end
+            continue
+        if character in SQL_OPERATOR_CHARS:
+            end = index + 1
+            while end < len(source) and source[end] in SQL_OPERATOR_CHARS:
+                end += 1
+            tokens.append(("operator", source[index:end]))
+            index = end
+            continue
+        tokens.append(("punctuation", character))
+        index += 1
+    return tuple(tokens)
+
+
+def _extract_callable_routine_body(source: str) -> str:
+    matches = list(CALLABLE_ROUTINE_HEADER_RE.finditer(source))
+    if len(matches) != 1:
+        raise RuntimePrivilegeContractError(
+            "callable_routine_source_body:declaration_count"
+        )
+    header = matches[0]
+    delimiter = header.group("delimiter")
+    body_end = source.find(delimiter, header.end())
+    if body_end < 0:
+        raise RuntimePrivilegeContractError(
+            "callable_routine_source_body:delimiter_missing"
+        )
+    body = source[header.end():body_end]
+    if not _semantic_sql_tokens(body):
+        raise RuntimePrivilegeContractError(
+            "callable_routine_source_body:empty"
+        )
+    return body
+
+
+def _canonical_callable_routine_body() -> str:
+    path = ROOT / CALLABLE_ROUTINE_MIGRATION_PATH
+    try:
+        source = canonical_migration_payload(path).decode("utf-8")
+        return _extract_callable_routine_body(source)
+    except (MigrationSafetyError, UnicodeDecodeError, OSError) as exc:
+        raise RuntimePrivilegeContractError(
+            "callable_routine_source_body:unavailable"
+        ) from exc
 
 
 def _exact_keys(value: Any, expected: set[str], label: str, errors: list[str]) -> None:
@@ -381,10 +581,63 @@ def _validate_table_map(value: Any, expected: Mapping[str, tuple[str, ...]], lab
             errors.append(f"{label}.{table}.privileges:unexpected")
 
 
+def _validate_callable_routine_source(
+    binding: Mapping[str, Any],
+    *,
+    source_texts: Mapping[str, str] | None,
+    errors: list[str],
+) -> None:
+    source = binding.get("callable_routine_source")
+    _exact_keys(
+        source,
+        {"path", "routine", "allowed_relations"},
+        "source_binding.callable_routine_source",
+        errors,
+    )
+    if not isinstance(source, Mapping):
+        return
+    if source.get("path") != CALLABLE_ROUTINE_MIGRATION_PATH:
+        errors.append("source_binding.callable_routine_source.path:unexpected")
+    expected_routine = f"public.{CALLABLE_ROUTINE_NAME}({CALLABLE_ROUTINE_IDENTITY_ARGUMENTS})"
+    if source.get("routine") != expected_routine:
+        errors.append("source_binding.callable_routine_source.routine:unexpected")
+    declared_relations = set(_string_list(
+        source.get("allowed_relations"),
+        "source_binding.callable_routine_source.allowed_relations",
+        errors,
+    ))
+    if declared_relations != set(CALLABLE_ROUTINE_REFERENCED_RELATIONS):
+        errors.append("source_binding.callable_routine_source.allowed_relations:unexpected")
+    path = str(source.get("path") or "")
+    if not path:
+        return
+    texts = dict(source_texts or {})
+    if path not in texts:
+        try:
+            texts[path] = canonical_migration_payload(ROOT / path).decode("utf-8")
+        except (MigrationSafetyError, UnicodeDecodeError, OSError):
+            errors.append(f"source_binding.file_missing:{path}")
+            return
+    text = texts[path]
+    try:
+        _extract_callable_routine_body(text)
+    except RuntimePrivilegeContractError as exc:
+        errors.append(f"source_binding.callable_routine_source.body:{exc}")
+    literal = {
+        match.group(1).lower()
+        for match in SQL_RELATION_RE.finditer(text)
+        if match.group(1).lower().startswith("sqag_")
+    }
+    if literal != set(CALLABLE_ROUTINE_REFERENCED_RELATIONS):
+        errors.append("source_binding.callable_routine_source.relations:unexpected")
+    if UNQUALIFIED_SQL_RELATION_RE.search(text):
+        errors.append("source_binding.callable_routine_source.unqualified_relation")
+
+
 def validate_source_bindings(manifest: Mapping[str, Any], *, source_texts: Mapping[str, str] | None = None) -> list[str]:
     errors: list[str] = []
     binding = manifest.get("source_binding")
-    _exact_keys(binding, {"files", "allowed_sql_relations", "unsupported_sql_relations", "dynamic_sql_variables"}, "source_binding", errors)
+    _exact_keys(binding, {"files", "allowed_sql_relations", "unsupported_sql_relations", "dynamic_sql_variables", "callable_routine_source"}, "source_binding", errors)
     if not isinstance(binding, Mapping):
         return errors
     if tuple(_string_list(binding.get("files"), "source_binding.files", errors)) != SOURCE_SQL_FILES:
@@ -414,6 +667,7 @@ def validate_source_bindings(manifest: Mapping[str, Any], *, source_texts: Mappi
         declared_dynamic = set(_string_list(dynamic.get(path, []), f"source_binding.dynamic_sql_variables.{path}", errors))
         if found_dynamic - declared_dynamic:
             errors.append(f"source_binding.unbounded_dynamic_sql:{path}")
+    _validate_callable_routine_source(binding, source_texts=source_texts, errors=errors)
     return errors
 
 
@@ -427,12 +681,12 @@ def _validate_manifest_document(manifest: Mapping[str, Any]) -> None:
     _exact_keys(manifest, top, "contract", errors)
     if {"canonical_source_revision", "canonical_source_tree", "implementation_registry", "source_digest", "source_sha256"}.intersection(manifest):
         errors.append("contract:source_identity_or_digest_registry_forbidden")
-    if manifest.get("$schema") != "runtime-privilege-contract-schema-v3" or manifest.get("schema_version") != 3:
+    if manifest.get("$schema") != "runtime-privilege-contract-schema-v4" or manifest.get("schema_version") != 4:
         errors.append("contract:schema_version_unexpected")
     if manifest.get("contract_type") != "runtime_privilege_contract" or manifest.get("repository") != "Swooshz-com/swooshz-quote-auto-generator":
         errors.append("contract:identity_unexpected")
     namespace = manifest.get("namespace")
-    _exact_keys(namespace, {"schema", "search_path", "tables", "indexes", "routines", "sequences", "views", "materialized_views"}, "namespace", errors)
+    _exact_keys(namespace, {"schema", "search_path", "tables", "indexes", "routines", "callable_routines", "sequences", "views", "materialized_views"}, "namespace", errors)
     if isinstance(namespace, Mapping):
         if namespace.get("schema") != "public" or namespace.get("search_path") != ["public", "pg_catalog"]:
             errors.append("namespace:fixed_public_search_path_required")
@@ -453,8 +707,26 @@ def _validate_manifest_document(manifest: Mapping[str, Any]) -> None:
                 keys.add((_clean(item.get("name")), _clean(item.get("identity_arguments"))))
                 if item.get("owner") != "sqag_migrator" or item.get("security_mode") != "invoker" or item.get("direct_execute") is not False or item.get("trigger_only") is not True:
                     errors.append("namespace.routines:unsafe_properties")
-            if keys != EXPECTED_ROUTINE_KEYS:
+            if keys != EXPECTED_TRIGGER_ROUTINE_KEYS:
                 errors.append("namespace.routines:unexpected")
+        callable_routines = namespace.get("callable_routines")
+        if not isinstance(callable_routines, list):
+            errors.append("namespace.callable_routines:list_required")
+        else:
+            if len(callable_routines) != 1 or any(
+                not isinstance(item, Mapping)
+                or dict(item) != EXPECTED_CALLABLE_ROUTINE_DOCUMENT
+                for item in callable_routines
+            ):
+                for item in callable_routines:
+                    if isinstance(item, Mapping):
+                        _exact_keys(
+                            item,
+                            set(EXPECTED_CALLABLE_ROUTINE_DOCUMENT),
+                            "namespace.callable_routines.item",
+                            errors,
+                        )
+                errors.append("namespace.callable_routines:unexpected")
         for field in ("sequences", "views", "materialized_views"):
             if namespace.get(field) != []:
                 errors.append(f"namespace.{field}:must_be_empty")
@@ -878,24 +1150,64 @@ def _check_complete_public_sqag_routine_inventory(connection: Any, errors: list[
     )
     for row in acl_rows:
         key = (_clean(_row_value(row, "proname")), _clean(_row_value(row, "identity_arguments")))
-        if _acl_grantee(row) != "sqag_migrator" or _acl_privilege(row) != "EXECUTE":
+        expected_grantees = {"sqag_migrator"}
+        if key in EXPECTED_CALLABLE_ROUTINE_KEYS:
+            expected_grantees.add("sqag_runtime")
+        if _acl_grantee(row) not in expected_grantees or _acl_privilege(row) != "EXECUTE":
             errors.append(f"routine_acl_mismatch:{key[0]}")
-        if _acl_grantee(row) in {"PUBLIC", "sqag_runtime", "sqag_maintenance"} or (
-            _grantable(row) and _acl_grantee(row) != "sqag_migrator"
+        if (
+            _acl_grantee(row) in {"PUBLIC", "sqag_maintenance"}
+            or (_acl_grantee(row) == "sqag_runtime" and key not in EXPECTED_CALLABLE_ROUTINE_KEYS)
+            or _grantable(row)
         ):
             errors.append(f"routine_escalation:{key[0]}")
 
     for role in RUNTIME_ROLES:
         for row in routine_rows:
             routine_name = _clean(_row_value(row, "proname"))
+            routine_key = (
+                routine_name,
+                _clean(_row_value(row, "identity_arguments")),
+            )
             function_oid = _row_value(row, "function_oid")
             effective_rows = _rows(
                 connection,
                 "select has_function_privilege(?, ?, 'EXECUTE') as effective",
                 (role, function_oid),
             )
-            if any(bool(_row_value(effective_row, "effective")) for effective_row in effective_rows):
+            expected = role == "sqag_runtime" and routine_key in EXPECTED_CALLABLE_ROUTINE_KEYS
+            observed = any(bool(_row_value(effective_row, "effective")) for effective_row in effective_rows)
+            if observed != expected:
                 errors.append(f"effective_routine_privilege:{role}:{routine_name}")
+
+
+def _routine_proconfig(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    if value is None:
+        return []
+    return [str(value)]
+
+
+def _check_callable_routine_definition(row: Any, errors: list[str]) -> None:
+    try:
+        canonical_body = _canonical_callable_routine_body()
+    except RuntimePrivilegeContractError:
+        errors.append("callable_routine_source_body_unavailable")
+    else:
+        installed_body = _row_value(row, "function_body")
+        if _semantic_sql_tokens(str(installed_body or "")) != _semantic_sql_tokens(canonical_body):
+            errors.append("callable_routine_body_mismatch")
+    definition = _clean(_row_value(row, "function_definition"))
+    relations = {
+        match.group(1).lower()
+        for match in SQL_RELATION_RE.finditer(definition)
+        if match.group(1).lower().startswith("sqag_")
+    }
+    if relations != set(CALLABLE_ROUTINE_REFERENCED_RELATIONS):
+        errors.append("callable_routine_relation_inventory_mismatch")
+    if UNQUALIFIED_SQL_RELATION_RE.search(definition):
+        errors.append("callable_routine_unqualified_relation")
 
 
 def _check_routines(connection: Any, errors: list[str]) -> None:
@@ -905,9 +1217,14 @@ def _check_routines(connection: Any, errors: list[str]) -> None:
         connection,
         "select p.oid as function_oid, n.nspname as schema_name, p.proname, "
         "p.prokind, pg_get_function_identity_arguments(p.oid) as identity_arguments, "
-        "pg_get_function_result(p.oid) as result_type, p.prosecdef, owner.rolname as owner "
+        "pg_get_function_result(p.oid) as result_type, p.prosecdef, "
+        "p.provolatile, p.proparallel, p.proleakproof, p.proconfig, "
+        "p.prosrc as function_body, "
+        "pg_get_functiondef(p.oid) as function_definition, l.lanname as language, "
+        "owner.rolname as owner "
         "from pg_catalog.pg_proc p "
         "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+        "join pg_catalog.pg_language l on l.oid = p.prolang "
         "join pg_catalog.pg_roles owner on owner.oid = p.proowner "
         f"where n.nspname = 'public' and p.proname in ({placeholders}) "
         "order by p.proname, identity_arguments, p.oid",
@@ -921,8 +1238,8 @@ def _check_routines(connection: Any, errors: list[str]) -> None:
         ).append(row)
     if set(grouped) != EXPECTED_ROUTINE_KEYS:
         errors.append("routine_inventory_mismatch")
-    routine_oids: dict[str, Any] = {}
-    for key in EXPECTED_ROUTINE_KEYS:
+    routine_oids: dict[tuple[str, str], Any] = {}
+    for key in EXPECTED_TRIGGER_ROUTINE_KEYS:
         candidates = grouped.get(key, [])
         if len(candidates) != 1:
             errors.append(f"routine_identity_ambiguous:{key[0]}")
@@ -937,7 +1254,29 @@ def _check_routines(connection: Any, errors: list[str]) -> None:
             or bool(_row_value(row, "prosecdef"))
         ):
             errors.append(f"routine_properties_mismatch:{key[0]}")
-        routine_oids[key[0]] = _row_value(row, "function_oid")
+        routine_oids[key] = _row_value(row, "function_oid")
+    for key in EXPECTED_CALLABLE_ROUTINE_KEYS:
+        candidates = grouped.get(key, [])
+        if len(candidates) != 1:
+            errors.append(f"routine_identity_ambiguous:{key[0]}")
+            continue
+        row = candidates[0]
+        if (
+            _clean(_row_value(row, "schema_name")) != "public"
+            or _clean(_row_value(row, "prokind")) != "f"
+            or _clean(_row_value(row, "identity_arguments")) != CALLABLE_ROUTINE_IDENTITY_ARGUMENTS
+            or _clean(_row_value(row, "result_type")).lower() != "boolean"
+            or _clean(_row_value(row, "language")) != "sql"
+            or not bool(_row_value(row, "prosecdef"))
+            or _clean(_row_value(row, "owner")) != "sqag_migrator"
+            or _clean(_row_value(row, "provolatile")) != "s"
+            or _clean(_row_value(row, "proparallel")) != "u"
+            or bool(_row_value(row, "proleakproof"))
+            or _routine_proconfig(_row_value(row, "proconfig")) != ["search_path=pg_catalog, public"]
+        ):
+            errors.append(f"callable_routine_properties_mismatch:{key[0]}")
+        _check_callable_routine_definition(row, errors)
+        routine_oids[key] = _row_value(row, "function_oid")
 
     trigger_rows = _rows(
         connection,
@@ -951,10 +1290,10 @@ def _check_routines(connection: Any, errors: list[str]) -> None:
         routine_names,
     )
     expected_links = {
-        (routine_name, trigger_name, table_name, routine_oids[routine_name])
+        (routine_name, trigger_name, table_name, routine_oids[(routine_name, "")])
         for routine_name, links in EXPECTED_TRIGGER_ROUTINE_LINKS.items()
         for trigger_name, table_name in links
-        if routine_name in routine_oids
+        if (routine_name, "") in routine_oids
     }
     actual_links = {
         (
@@ -985,9 +1324,15 @@ def _check_routines(connection: Any, errors: list[str]) -> None:
         key = (_clean(_row_value(row, "proname")), _clean(_row_value(row, "identity_arguments")))
         if key not in EXPECTED_ROUTINE_KEYS:
             continue
-        if _acl_grantee(row) != "sqag_migrator" or _acl_privilege(row) != "EXECUTE":
+        expected_grantees = {"sqag_migrator"}
+        if key in EXPECTED_CALLABLE_ROUTINE_KEYS:
+            expected_grantees.add("sqag_runtime")
+        grantee = _acl_grantee(row)
+        if grantee not in expected_grantees or _acl_privilege(row) != "EXECUTE":
             errors.append(f"routine_acl_mismatch:{key[0]}")
-        if _acl_grantee(row) in {"PUBLIC", "sqag_runtime", "sqag_maintenance"} or (_grantable(row) and _acl_grantee(row) != "sqag_migrator"):
+        if grantee in {"PUBLIC", "sqag_maintenance"} or (
+            grantee == "sqag_runtime" and key not in EXPECTED_CALLABLE_ROUTINE_KEYS
+        ) or _grantable(row):
             errors.append(f"routine_escalation:{key[0]}")
 
 
@@ -1189,7 +1534,12 @@ def _check_effective(
                 "and pg_get_function_identity_arguments(p.oid) = ?",
                 (role, routine_name, identity_arguments),
             )
-            if any(bool(_row_value(row, "effective")) for row in rows):
+            observed = any(bool(_row_value(row, "effective")) for row in rows)
+            expected = role == "sqag_runtime" and (
+                routine_name,
+                identity_arguments,
+            ) in EXPECTED_CALLABLE_ROUTINE_KEYS
+            if observed != expected:
                 errors.append(f"effective_routine_privilege:{role}:{routine_name}")
 
 

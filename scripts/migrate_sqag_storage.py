@@ -13,10 +13,23 @@ if str(ROOT) not in sys.path:
 from webapp import server as webapp
 
 
+def _migration_database_url() -> str | None:
+    configured = webapp.configured_database_url()
+    if configured and webapp.database_family_from_url(configured) == "sqlite":
+        return configured
+    migrator_url = webapp.configured_migrator_database_url()
+    if migrator_url and webapp.postgres_database_url_is_supported(migrator_url):
+        return migrator_url
+    return None
+
+
 def main() -> int:
-    database_url = webapp.configured_database_url()
+    database_url = _migration_database_url()
     if not database_url:
-        print("SQAG_DATABASE_URL is required for the storage migration.", file=sys.stderr)
+        print(
+            "SQAG dedicated migrator database URL is required for PostgreSQL storage migrations.",
+            file=sys.stderr,
+        )
         return 2
     try:
         result = webapp.apply_sqag_storage_migrations(database_url)
