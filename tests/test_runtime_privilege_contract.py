@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import copy
+import contextlib
 import datetime as dt
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -340,6 +342,7 @@ class RuntimePrivilegeContractStaticTest(unittest.TestCase):
         ):
             self.assertEqual(preflight.main(["--phase", "pre-apply"]), 0)
         output = json.loads(printed.call_args.args[0])
+        self.assertEqual(output["phase"], "pre-apply")
         self.assertEqual(output["pendingMigrationIds"], [item.migration_id for item in migrations])
         self.assertNotIn("runtimeContract", output)
         self.assertNotIn("maintenanceContract", output)
@@ -454,6 +457,325 @@ class RuntimePrivilegeContractStaticTest(unittest.TestCase):
         with self.assertRaises(AssertionError) as raised:
             case._cleanup_fixture()
         self.assertIn("CLEANUP_UNKNOWN", str(raised.exception))
+
+
+class PreflightCliContractTest(unittest.TestCase):
+    GRAMMAR_FAILURE = {
+        "appliedHead": None,
+        "appliedMigrationIds": None,
+        "blockers": ["invalid_cli_grammar"],
+        "expectedHead": None,
+        "ledgerState": None,
+        "pendingMigrationIds": None,
+        "phase": None,
+        "safeToApply": False,
+        "status": "unsafe",
+    }
+
+    @staticmethod
+    def _capture(argv):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = preflight.main(argv)
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def _assert_grammar_rejected(self, argv):
+        sentinel = AssertionError("grammar-invalid path reached configuration or database work")
+        with contextlib.ExitStack() as stack:
+            for target in (
+                (preflight, "validate_manifest"),
+                (webapp, "configured_migrator_database_url"),
+                (webapp, "configured_database_url"),
+                (webapp, "configured_maintenance_database_url"),
+                (webapp, "postgres_database_url_is_supported"),
+                (preflight, "migration_manifest"),
+                (preflight, "inspect_postgres_migrations"),
+                (preflight, "_inspect_migration_ledger"),
+                (preflight, "_inspect_privilege_projection"),
+                (webapp, "postgres_storage_connection"),
+                (webapp, "postgres_driver_connection_factory"),
+            ):
+                stack.enter_context(mock.patch.object(target[0], target[1], side_effect=sentinel))
+            code, stdout, stderr = self._capture(argv)
+
+        self.assertEqual(code, 2, argv)
+        self.assertEqual(stdout, json.dumps(self.GRAMMAR_FAILURE, sort_keys=True, separators=(",", ":")) + "\n")
+        self.assertEqual(stderr, "", argv)
+        self.assertEqual(stdout.count("\n"), 1, argv)
+        self.assertNotIn("usage", stdout.lower())
+        self.assertNotIn("traceback", stdout.lower())
+
+    def test_invalid_grammar_is_exact_and_has_zero_configuration_or_database_access(self):
+        invalid_argv = (
+            (),
+            ("--phase",),
+            ("--phase", "invalid"),
+            ("--phase", "pre-apply", "--phase", "pre-apply"),
+            ("--phase", "pre-apply", "--phase", "post-apply"),
+            ("--unknown", "pre-apply"),
+            ("-p", "pre-apply"),
+            ("--pha", "pre-apply"),
+            ("--phase=pre-apply",),
+            ("pre-apply",),
+            ("--PHASE", "pre-apply"),
+            ("--phase", "PRE-APPLY"),
+            ("--phase", "pre\u2011apply"),
+            ("--\uff50\uff48\uff41\uff53\uff45", "pre-apply"),
+            ("--",),
+            ("--phase", "pre-apply", "positional"),
+            ("--phase", "pre-apply", "--"),
+        )
+        for argv in invalid_argv:
+            with self.subTest(argv=argv):
+                self._assert_grammar_rejected(argv)
+
+    def test_parser_does_not_use_argparse_or_accept_last_value_wins(self):
+        source = (ROOT / "scripts" / "preflight_sqag_migrations.py").read_text(encoding="utf-8")
+        self.assertNotIn("argparse", source)
+        self.assertEqual(preflight._parse_phase(["--phase", "pre-apply"]), "pre-apply")
+        self.assertEqual(preflight._parse_phase(["--phase", "post-apply"]), "post-apply")
+        self.assertIsNone(preflight._parse_phase(["--phase", "pre-apply", "--phase", "post-apply"]))
+
+    def _assert_failure(
+        self,
+        argv,
+        *,
+        expected_blocker,
+        expected_phase,
+        expected_report=None,
+        expected_runtime=None,
+        expected_maintenance=None,
+    ):
+        code, stdout, stderr = self._capture(argv)
+        self.assertEqual(code, 2)
+        self.assertEqual(stderr, "")
+        self.assertEqual(stdout.count("\n"), 1)
+        result = json.loads(stdout)
+        self.assertEqual(result["phase"], expected_phase)
+        self.assertEqual(result["status"], "unsafe")
+        self.assertIs(result["safeToApply"], False)
+        self.assertEqual(result["blockers"], [expected_blocker])
+        report = expected_report or {}
+        for field in (
+            "ledgerState",
+            "expectedHead",
+            "appliedHead",
+            "appliedMigrationIds",
+            "pendingMigrationIds",
+        ):
+            expected = report.get(field)
+            if expected == "unknown":
+                expected = None
+            self.assertEqual(result[field], expected, field)
+        if expected_phase == "post-apply":
+            self.assertEqual(result["runtimeContract"], expected_runtime)
+            self.assertEqual(result["maintenanceContract"], expected_maintenance)
+        else:
+            self.assertNotIn("runtimeContract", result)
+            self.assertNotIn("maintenanceContract", result)
+        return result
+
+    def test_valid_pre_apply_failures_are_phase_bearing_and_truthful(self):
+        migrations = migration_manifest(ROOT / "migrations")
+        private_url = "postgresql://wrong_user:synthetic-secret@db.example.invalid/sqag"
+        cases = (
+            ("runtime_contract_static_invalid", {"validate_manifest": mock.DEFAULT}),
+            ("migrator_database_url_absent", {"migrator_url": ""}),
+            ("migrator_database_url_requires_postgres", {"migrator_url": "sqlite:///:memory:"}),
+            ("preflight_failed", {"migrator_url": private_url, "inspect_error": True}),
+        )
+        for blocker, options in cases:
+            with self.subTest(blocker=blocker):
+                patches = [
+                    mock.patch.object(preflight, "validate_manifest", return_value={}),
+                    mock.patch.object(webapp, "configured_migrator_database_url", return_value=options.get("migrator_url", private_url)),
+                    mock.patch.object(webapp, "postgres_database_url_is_supported", return_value=True),
+                    mock.patch.object(preflight, "migration_manifest", return_value=migrations),
+                    mock.patch.object(preflight, "_inspect_migration_ledger", return_value={
+                        "status": "ready",
+                        "safeToApply": True,
+                        "ledgerState": "present",
+                        "expectedHead": migrations[-1].migration_id,
+                        "appliedHead": migrations[-2].migration_id,
+                        "appliedMigrationIds": [item.migration_id for item in migrations[:-1]],
+                        "pendingMigrationIds": [migrations[-1].migration_id],
+                        "blockers": [],
+                    }),
+                ]
+                if options.get("validate_manifest") is not None:
+                    patches[0] = mock.patch.object(
+                        preflight,
+                        "validate_manifest",
+                        side_effect=contract.RuntimePrivilegeContractError("private static detail"),
+                    )
+                if blocker == "migrator_database_url_requires_postgres":
+                    patches[2] = mock.patch.object(webapp, "postgres_database_url_is_supported", return_value=False)
+                if options.get("inspect_error"):
+                    patches[4] = mock.patch.object(
+                        preflight,
+                        "_inspect_migration_ledger",
+                        side_effect=webapp.SqagStorageAccessError("private connection detail"),
+                    )
+                with contextlib.ExitStack() as stack:
+                    for patch in patches:
+                        stack.enter_context(patch)
+                    result = self._assert_failure(
+                        ["--phase", "pre-apply"],
+                        expected_blocker=blocker,
+                        expected_phase="pre-apply",
+                    )
+                self.assertNotIn("synthetic-secret", json.dumps(result))
+                self.assertNotIn("db.example.invalid", json.dumps(result))
+
+    def test_valid_post_apply_failures_include_phase_and_nullable_contract_projections(self):
+        migrations = migration_manifest(ROOT / "migrations")
+        private_urls = {
+            "migrator": "postgresql://migrator:synthetic-migrator@db.example.invalid/sqag",
+            "runtime": "postgresql://runtime:synthetic-runtime@db.example.invalid/sqag",
+            "maintenance": "postgresql://maintenance:synthetic-maintenance@db.example.invalid/sqag",
+        }
+        report = {
+            "status": "ready",
+            "safeToApply": True,
+            "ledgerState": "present",
+            "expectedHead": migrations[-1].migration_id,
+            "appliedHead": migrations[-1].migration_id,
+            "appliedMigrationIds": [item.migration_id for item in migrations],
+            "pendingMigrationIds": [],
+            "blockers": [],
+        }
+
+        cases = (
+            ("migrator_database_url_absent", {"migrator": ""}),
+            ("migrator_database_url_requires_postgres", {"migrator_unsupported": True}),
+            ("preflight_failed", {"migrator_error": True}),
+            ("database_url_absent", {"runtime": ""}),
+            ("postgres_database_required", {"runtime_unsupported": True}),
+            ("preflight_failed", {"runtime_error": True}),
+            ("maintenance_database_url_absent", {"maintenance": ""}),
+            ("maintenance_database_url_requires_postgres", {"maintenance_unsupported": True}),
+            ("preflight_failed", {"maintenance_error": True}),
+        )
+        for blocker, options in cases:
+            with self.subTest(blocker=blocker, options=options):
+                values = dict(private_urls)
+                if "migrator" in options:
+                    values["migrator"] = options["migrator"]
+                if "runtime" in options:
+                    values["runtime"] = options["runtime"]
+                if "maintenance" in options:
+                    values["maintenance"] = options["maintenance"]
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(mock.patch.object(preflight, "validate_manifest", return_value={}))
+                    stack.enter_context(mock.patch.object(webapp, "configured_migrator_database_url", return_value=values["migrator"]))
+                    stack.enter_context(mock.patch.object(webapp, "configured_database_url", return_value=values["runtime"]))
+                    stack.enter_context(mock.patch.object(webapp, "configured_maintenance_database_url", return_value=values["maintenance"]))
+                    stack.enter_context(mock.patch.object(webapp, "postgres_database_url_is_supported", return_value=True))
+                    stack.enter_context(mock.patch.object(preflight, "migration_manifest", return_value=migrations))
+                    stack.enter_context(mock.patch.object(preflight, "_inspect_migration_ledger", return_value=report))
+                    projection = stack.enter_context(
+                        mock.patch.object(
+                            preflight,
+                            "_inspect_privilege_projection",
+                            return_value={"status": "verified"},
+                        )
+                    )
+                    if options.get("migrator_unsupported"):
+                        webapp.postgres_database_url_is_supported.return_value = False
+                    if options.get("runtime_unsupported"):
+                        webapp.postgres_database_url_is_supported.side_effect = (
+                            lambda value: value == values["migrator"] or value == values["maintenance"]
+                        )
+                    if options.get("maintenance_unsupported"):
+                        webapp.postgres_database_url_is_supported.side_effect = (
+                            lambda value: value != values["maintenance"]
+                        )
+                    if options.get("migrator_error"):
+                        preflight._inspect_migration_ledger.side_effect = webapp.SqagStorageAccessError("private migrator detail")
+                    if options.get("runtime_error"):
+                        projection.side_effect = webapp.SqagStorageAccessError("private runtime detail")
+                    if options.get("maintenance_error"):
+                        def project_runtime_then_fail_maintenance(_url, _manifest, role):
+                            if role == webapp.SQAG_RUNTIME_DATABASE_ROLE:
+                                return {"status": "verified"}
+                            raise webapp.SqagStorageAccessError("private maintenance detail")
+                        projection.side_effect = project_runtime_then_fail_maintenance
+                    expected_runtime = None
+                    expected_maintenance = None
+                    if options.get("maintenance_error"):
+                        expected_runtime = {"status": "verified"}
+                    result = self._assert_failure(
+                        ["--phase", "post-apply"],
+                        expected_blocker=blocker,
+                        expected_phase="post-apply",
+                        expected_report=report if options.get("runtime_error") or options.get("maintenance_error") else None,
+                        expected_runtime=expected_runtime,
+                        expected_maintenance=expected_maintenance,
+                    )
+                self.assertNotIn("synthetic-", json.dumps(result))
+                self.assertNotIn("db.example.invalid", json.dumps(result))
+
+    def test_successful_pre_and_post_outputs_are_phase_bearing_and_use_actual_projections(self):
+        migrations = migration_manifest(ROOT / "migrations")
+        pre_report = {
+            "status": "ready",
+            "safeToApply": True,
+            "ledgerState": "missing",
+            "expectedHead": migrations[-1].migration_id,
+            "appliedHead": None,
+            "appliedMigrationIds": [],
+            "pendingMigrationIds": [item.migration_id for item in migrations],
+            "blockers": [],
+        }
+        post_report = {
+            "status": "ready",
+            "safeToApply": True,
+            "ledgerState": "present",
+            "expectedHead": migrations[-1].migration_id,
+            "appliedHead": migrations[-1].migration_id,
+            "appliedMigrationIds": [item.migration_id for item in migrations],
+            "pendingMigrationIds": [],
+            "blockers": [],
+        }
+        with (
+            mock.patch.object(preflight, "validate_manifest", return_value={}),
+            mock.patch.object(webapp, "configured_migrator_database_url", return_value="postgresql://migrator.example/sqag"),
+            mock.patch.object(webapp, "configured_database_url", side_effect=AssertionError("PRE must not read runtime URL")),
+            mock.patch.object(webapp, "configured_maintenance_database_url", side_effect=AssertionError("PRE must not read maintenance URL")),
+            mock.patch.object(webapp, "postgres_database_url_is_supported", return_value=True),
+            mock.patch.object(preflight, "migration_manifest", return_value=migrations),
+            mock.patch.object(preflight, "_inspect_migration_ledger", return_value=pre_report),
+            mock.patch("builtins.print") as printed,
+        ):
+            self.assertEqual(preflight.main(["--phase", "pre-apply"]), 0)
+        pre_output = json.loads(printed.call_args.args[0])
+        self.assertEqual(pre_output["phase"], "pre-apply")
+        self.assertEqual(pre_output["pendingMigrationIds"], pre_report["pendingMigrationIds"])
+        self.assertNotIn("runtimeContract", pre_output)
+        self.assertNotIn("maintenanceContract", pre_output)
+
+        with (
+            mock.patch.object(preflight, "validate_manifest", return_value={}),
+            mock.patch.object(webapp, "configured_migrator_database_url", return_value="postgresql://migrator.example/sqag"),
+            mock.patch.object(webapp, "configured_database_url", return_value="postgresql://runtime.example/sqag"),
+            mock.patch.object(webapp, "configured_maintenance_database_url", return_value="postgresql://maintenance.example/sqag"),
+            mock.patch.object(webapp, "postgres_database_url_is_supported", return_value=True),
+            mock.patch.object(preflight, "migration_manifest", return_value=migrations),
+            mock.patch.object(preflight, "_inspect_migration_ledger", return_value=post_report),
+            mock.patch.object(
+                preflight,
+                "_inspect_privilege_projection",
+                side_effect=[{"status": "runtime-verified"}, {"status": "maintenance-verified"}],
+            ),
+            mock.patch("builtins.print") as printed,
+        ):
+            self.assertEqual(preflight.main(["--phase", "post-apply"]), 0)
+        post_output = json.loads(printed.call_args.args[0])
+        self.assertEqual(post_output["phase"], "post-apply")
+        self.assertEqual(post_output["appliedMigrationIds"], post_report["appliedMigrationIds"])
+        self.assertEqual(post_output["runtimeContract"], {"status": "runtime-verified"})
+        self.assertEqual(post_output["maintenanceContract"], {"status": "maintenance-verified"})
 
 
 class _FakeIdentityCursor:
@@ -1229,6 +1551,66 @@ order by object_kind, object_schema, object_name, object_type
             snapshot = self._canonical_snapshot_value(payload)
             raw_connection.rollback()
             return json.dumps(snapshot, sort_keys=True, default=str)
+
+    @staticmethod
+    def _scrubbed_child_environment(selectors: dict[str, str]) -> dict[str, str]:
+        essential_names = {
+            "COMSPEC",
+            "PATH",
+            "PATHEXT",
+            "SYSTEMDRIVE",
+            "SYSTEMROOT",
+            "TEMP",
+            "TMP",
+            "WINDIR",
+        }
+        environment = {
+            name: value
+            for name, value in os.environ.items()
+            if name.upper() in essential_names
+        }
+        environment.update(selectors)
+        return environment
+
+    def _run_preflight_child(
+        self,
+        phase: str,
+        *,
+        migrator_url: str,
+        runtime_url: str | None = None,
+        maintenance_url: str | None = None,
+    ):
+        selectors = {
+            webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME: migrator_url,
+        }
+        if phase == "post-apply":
+            self.assertIsNotNone(runtime_url)
+            self.assertIsNotNone(maintenance_url)
+            selectors[webapp.SQAG_DATABASE_URL_ENV_NAME] = runtime_url
+            selectors[webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME] = maintenance_url
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "preflight_sqag_migrations.py"),
+                "--phase",
+                phase,
+            ],
+            cwd=ROOT,
+            env=self._scrubbed_child_environment(selectors),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr[-500:])
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(len(completed.stdout.splitlines()), 1, completed.stdout)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["phase"], phase)
+        for value in selectors.values():
+            self.assertNotIn(value, completed.stdout)
+            self.assertNotIn(value, completed.stderr)
+        return completed, result
 
     def _create_assumed_cli_role(self, database_name: str) -> str:
         role = "sqag_assumed_cli_" + uuid.uuid4().hex[:16]
@@ -3408,24 +3790,29 @@ order by object_kind, object_schema, object_name, object_type
             include_callable=False,
         )
         migrator_url = safe_postgres_url("sqag_migrator", partial_database)
-        pre_apply = preflight._inspect_migration_ledger(
-            migrator_url,
-            self.migrations,
-            phase="pre-apply",
+        before_pre_apply = self._migration_mutation_snapshot(partial_database)
+        pre_apply_completed, pre_apply = self._run_preflight_child(
+            "pre-apply",
+            migrator_url=migrator_url,
+        )
+        after_pre_apply = self._migration_mutation_snapshot(partial_database)
+        self.assertEqual(before_pre_apply, after_pre_apply)
+        self.assertEqual(pre_apply["ledgerState"], "present")
+        self.assertEqual(pre_apply["status"], "ready")
+        self.assertIs(pre_apply["safeToApply"], True)
+        self.assertEqual(pre_apply["blockers"], [])
+        self.assertEqual(
+            pre_apply["appliedMigrationIds"],
+            [migration.migration_id for migration in self.migrations[:6]],
         )
         self.assertEqual(
             pre_apply["pendingMigrationIds"],
             [self.migrations[-1].migration_id],
         )
         self.assertEqual(pre_apply["appliedHead"], self.migrations[-2].migration_id)
-
-        def child_migration_environment(database_url: str) -> dict[str, str]:
-            environment = dict(os.environ)
-            for name in tuple(environment):
-                if name.upper().startswith("PG") or name.upper().startswith("SQAG_"):
-                    environment.pop(name, None)
-            environment[webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME] = database_url
-            return environment
+        self.assertEqual(pre_apply["expectedHead"], self.migrations[-1].migration_id)
+        self.assertNotIn("runtimeContract", pre_apply)
+        self.assertNotIn("maintenanceContract", pre_apply)
 
         wrong_authorities = (
             ("runtime", "sqag_runtime"),
@@ -3440,10 +3827,12 @@ order by object_kind, object_schema, object_name, object_type
                 completed = subprocess.run(
                     [
                         sys.executable,
-                        str(ROOT / "scripts" / "migrate_sqag_storage.py"),
+                    str(ROOT / "scripts" / "migrate_sqag_storage.py"),
                     ],
                     cwd=ROOT,
-                    env=child_migration_environment(wrong_url),
+                    env=self._scrubbed_child_environment({
+                        webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME: wrong_url,
+                    }),
                     text=True,
                     capture_output=True,
                     check=False,
@@ -3477,7 +3866,9 @@ order by object_kind, object_schema, object_name, object_type
                 str(ROOT / "scripts" / "migrate_sqag_storage.py"),
             ],
             cwd=ROOT,
-            env=child_migration_environment(assumed_url),
+            env=self._scrubbed_child_environment({
+                webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME: assumed_url,
+            }),
             text=True,
             capture_output=True,
             check=False,
@@ -3495,11 +3886,14 @@ order by object_kind, object_schema, object_name, object_type
         self.assertEqual(before, after)
 
         self._teardown_assumed_cli_role(partial_database, assumed_role)
-        clean_pre_apply = preflight._inspect_migration_ledger(
-            migrator_url,
-            self.migrations,
-            phase="pre-apply",
+        before_clean_pre_apply = self._migration_mutation_snapshot(partial_database)
+        clean_pre_apply_completed, clean_pre_apply = self._run_preflight_child(
+            "pre-apply",
+            migrator_url=migrator_url,
         )
+        after_clean_pre_apply = self._migration_mutation_snapshot(partial_database)
+        self.assertEqual(before_clean_pre_apply, after_clean_pre_apply)
+        self.assertEqual(clean_pre_apply_completed.stdout, pre_apply_completed.stdout)
         self.assertEqual(clean_pre_apply["status"], "ready")
         self.assertIs(clean_pre_apply["safeToApply"], True)
         self.assertEqual(clean_pre_apply["blockers"], [])
@@ -3518,7 +3912,9 @@ order by object_kind, object_schema, object_name, object_type
             assumed_role_baseline,
         )
 
-        environment = child_migration_environment(migrator_url)
+        environment = self._scrubbed_child_environment({
+            webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME: migrator_url,
+        })
         completed = subprocess.run(
             [
                 sys.executable,
@@ -3537,25 +3933,30 @@ order by object_kind, object_schema, object_name, object_type
         self.assertNotIn(migrator_url, completed.stderr)
 
         self._assert_causal_callable_catalog_contract(partial_database)
-        post_apply = preflight._inspect_migration_ledger(
-            migrator_url,
-            self.migrations,
-            phase="post-apply",
-        )
-        self.assertEqual(post_apply["pendingMigrationIds"], [])
-        self.assertEqual(post_apply["status"], "ready")
         runtime_url = safe_postgres_url("sqag_runtime", partial_database)
         maintenance_url = safe_postgres_url("sqag_maintenance", partial_database)
-        runtime_projection = preflight._inspect_privilege_projection(
-            runtime_url,
-            self.manifest,
-            webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        before_post_apply = self._migration_mutation_snapshot(partial_database)
+        post_apply_completed, post_apply = self._run_preflight_child(
+            "post-apply",
+            migrator_url=migrator_url,
+            runtime_url=runtime_url,
+            maintenance_url=maintenance_url,
         )
-        maintenance_projection = preflight._inspect_privilege_projection(
-            maintenance_url,
-            self.manifest,
-            webapp.SQAG_MAINTENANCE_DATABASE_ROLE,
+        after_post_apply = self._migration_mutation_snapshot(partial_database)
+        self.assertEqual(before_post_apply, after_post_apply)
+        self.assertEqual(post_apply["ledgerState"], "present")
+        self.assertEqual(post_apply["pendingMigrationIds"], [])
+        self.assertEqual(post_apply["status"], "ready")
+        self.assertIs(post_apply["safeToApply"], True)
+        self.assertEqual(post_apply["blockers"], [])
+        self.assertEqual(
+            post_apply["appliedMigrationIds"],
+            [migration.migration_id for migration in self.migrations],
         )
+        self.assertEqual(post_apply["appliedHead"], self.migrations[-1].migration_id)
+        self.assertEqual(post_apply["expectedHead"], self.migrations[-1].migration_id)
+        runtime_projection = post_apply["runtimeContract"]
+        maintenance_projection = post_apply["maintenanceContract"]
         self.assertEqual(runtime_projection["status"], "verified")
         self.assertEqual(maintenance_projection["status"], "verified")
         with webapp.postgres_storage_connection(
@@ -3584,13 +3985,6 @@ order by object_kind, object_schema, object_name, object_type
         self.assertNotIn(migrator_url, completed.stderr)
         after_noop = self._migration_mutation_snapshot(partial_database)
         self.assertEqual(before_noop, after_noop)
-        no_op_post_apply = preflight._inspect_migration_ledger(
-            migrator_url,
-            self.migrations,
-            phase="post-apply",
-        )
-        self.assertEqual(no_op_post_apply["pendingMigrationIds"], [])
-        self.assertEqual(no_op_post_apply["blockers"], [])
         print("RUN313_PG17_CAUSAL_TRANSITION_EXECUTED")
 
     def test_real_pg17_mandatory_applied_prefix_and_missing_ledger_matrix(self):

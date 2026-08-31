@@ -79,6 +79,38 @@ non-PostgreSQL, or cannot establish the true `session_user` and
 `current_user` identity `sqag_migrator`. It never inspects the ledger through
 the runtime or maintenance URL.
 
+### CLI Grammar and Output
+
+The preflight command accepts exactly one of these two argument sequences
+after the program name:
+
+    --phase pre-apply
+    --phase post-apply
+
+Every other form fails before manifest validation, configuration or URL
+lookups, driver or connection setup, and PostgreSQL access. This includes a
+missing or invalid phase, repeated phase options, unknown or short options,
+abbreviated or case/Unicode-variant options or values, positional or extra
+tokens, a standalone `--`, and `--phase=...`. Grammar failure exits `2` and
+prints exactly one deterministic JSON object with no usage text, traceback,
+argument echo, URL, credential, SQL, or driver detail:
+
+    {"appliedHead":null,"appliedMigrationIds":null,"blockers":["invalid_cli_grammar"],"expectedHead":null,"ledgerState":null,"pendingMigrationIds":null,"phase":null,"safeToApply":false,"status":"unsafe"}
+
+Once the exact phase grammar succeeds, every failure preserves that phase.
+Migration fields contain only observations established before the failure;
+unavailable fields are JSON `null`, never fabricated `unknown` or empty
+projections. PRE failures do not contain runtime or maintenance contract
+keys. POST failures contain both keys, each either its completed trustworthy
+verification summary or JSON `null`. Blockers use stable privacy-safe
+identifiers only.
+
+Successful PRE output contains the actual migration report, the explicit
+`"phase":"pre-apply"` field, and no runtime or maintenance contract keys.
+Successful POST output contains the actual final migration report, the
+explicit `"phase":"post-apply"` field, zero pending IDs and blockers, and
+the verified runtime and maintenance contract summaries.
+
 ## Future Approved First Application
 
 No database or provider operation is authorized by this runbook. After a
@@ -97,7 +129,12 @@ PostgreSQL database:
        python scripts/preflight_sqag_migrations.py --phase post-apply
 
 6. Require exact expected and applied heads, no pending IDs, no blockers, and
-   verified runtime and maintenance privilege projections.
+  verified runtime and maintenance privilege projections.
+
+The retained operator order is binding: rollback or recovery point, exact
+reviewed source, PRE, separate Web approval, one forward migration, POST,
+then readiness/deploy. PRE and POST are read-only evidence and do not replace
+the separate migration approval or authorize live/provider operations.
 
 The migration CLI reports migration IDs only. It does not print connection
 values. It revalidates each source checksum, uses the same transaction as
@@ -152,16 +189,30 @@ and the role is dropped. The test proves no role, membership, database ACL,
 rechecking the clean `001`-`007` / pending-`008` preflight.
 
 The causal transition is one disposable target and has no post-`008` helper
-repair: apply `001` through `007`, observe read-only preflight with only `008`
-pending, exercise every wrong-authority actual-CLI negative with immutable
-BEFORE/AFTER snapshots, apply `008` with the actual CLI through the dedicated
-migrator URL, immediately prove the migration-created callable directly from
-the catalog (schema/name/identity, boolean result, SQL/STABLE/PARALLEL
+repair: complete the ACL/default-ACL fixture first, apply `001` through `007`,
+take a mutation-relevant BEFORE snapshot, and execute the production preflight
+script in a bounded child interpreter with a scrubbed minimal environment.
+Require the actual PRE JSON to show exactly `001` through `007` applied and
+only `008` pending, with an identical BEFORE/AFTER snapshot. Exercise every
+wrong-authority actual-CLI negative, including the assumed-role
+`session_user != current_user` case, with immutable snapshots; tear down that
+role narrowly and prove no role, membership, database ACL, database-local
+setting, owned-object, or related residue. Execute the actual PRE child process
+again on the same clean target and require the same `001`-`007` / pending-`008`
+report before applying `008`.
+
+Apply `008` with the actual CLI through the dedicated migrator URL, immediately
+prove the migration-created callable directly from the catalog
+(schema/name/identity, boolean result, SQL/STABLE/PARALLEL
 UNSAFE/non-leakproof properties, owner, security-definer flag, exact search
-path, body/definition and relation inventory, and exact ACL), perform the
-read-only POST inspection on that same target, prove the runtime role is
-denied direct legal-hold SELECT, and run the actual CLI a second time as an
-unchanged no-op with no ledger/object/ACL mutation. Emit
+path, body/definition and relation inventory, and exact ACL), then take a
+pre-POST snapshot and execute the actual POST preflight child process with the
+dedicated migrator, runtime, and maintenance URLs. Require exact final heads,
+zero pending IDs and blockers, verified runtime and maintenance summaries, no
+URL/secret leakage, and an identical read-only BEFORE/AFTER snapshot. Prove
+the runtime role is denied direct legal-hold SELECT, and run the actual CLI a
+second time as an unchanged no-op with no ledger/object/ACL mutation. A second
+POST is not required. Emit
 `RUN313_PG17_CAUSAL_TRANSITION_EXECUTED` only as the final causal action.
 
 Live retention/delete verification is not a migration action. Verification

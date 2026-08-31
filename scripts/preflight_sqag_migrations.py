@@ -3,11 +3,10 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -23,18 +22,53 @@ from scripts.validate_runtime_privilege_contract import (
 )
 
 
-def _failure(blocker: str) -> int:
-    print(json.dumps({
+_MIGRATION_PROJECTION_FIELDS = (
+    "ledgerState",
+    "expectedHead",
+    "appliedHead",
+    "appliedMigrationIds",
+    "pendingMigrationIds",
+)
+
+
+def _failure(
+    blocker: str,
+    *,
+    phase: str | None = None,
+    migration_report: Mapping[str, Any] | None = None,
+    runtime_contract: Mapping[str, Any] | None = None,
+    maintenance_contract: Mapping[str, Any] | None = None,
+) -> int:
+    report = migration_report if isinstance(migration_report, Mapping) else {}
+    result: dict[str, Any] = {
         "status": "unsafe",
         "safeToApply": False,
-        "ledgerState": "unknown",
-        "expectedHead": None,
-        "appliedHead": None,
-        "appliedMigrationIds": None,
-        "pendingMigrationIds": [],
+        "ledgerState": None if report.get("ledgerState") == "unknown" else report.get("ledgerState"),
+        "expectedHead": report.get("expectedHead"),
+        "appliedHead": report.get("appliedHead"),
+        "appliedMigrationIds": report.get("appliedMigrationIds"),
+        "pendingMigrationIds": report.get("pendingMigrationIds"),
         "blockers": [blocker],
-    }, sort_keys=True))
+        "phase": phase,
+    }
+    for field in _MIGRATION_PROJECTION_FIELDS:
+        if field not in report:
+            result[field] = None
+    if phase == "post-apply":
+        result["runtimeContract"] = runtime_contract
+        result["maintenanceContract"] = maintenance_contract
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     return 2
+
+
+def _parse_phase(argv: Sequence[str] | None) -> str | None:
+    """Accept only the two-token operator grammar, without parser heuristics."""
+    tokens = tuple(sys.argv[1:] if argv is None else argv)
+    if tokens == ("--phase", "pre-apply"):
+        return "pre-apply"
+    if tokens == ("--phase", "post-apply"):
+        return "post-apply"
+    return None
 
 
 def _validate_pre_apply_report(
@@ -68,6 +102,7 @@ def _inspect_migration_ledger(
     migrations: Sequence[Migration],
     *,
     phase: str = "post-apply",
+    validate: bool = True,
 ) -> dict[str, Any]:
     """Inspect the migrator-owned ledger through an exact migrator session."""
     with webapp.postgres_storage_connection(
@@ -77,9 +112,10 @@ def _inspect_migration_ledger(
         connection.execute("set transaction read only")
         try:
             report = inspect_postgres_migrations(connection, migrations)
-            _validate_pre_apply_report(report, migrations)
-            if phase == "post-apply":
-                validate_migration_report(report)
+            if validate:
+                _validate_pre_apply_report(report, migrations)
+                if phase == "post-apply":
+                    validate_migration_report(report)
             return report
         finally:
             connection.rollback()
@@ -120,57 +156,75 @@ def _inspect(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", choices=("pre-apply", "post-apply"), required=True)
-    args = parser.parse_args(argv)
+    phase = _parse_phase(argv)
+    if phase is None:
+        return _failure("invalid_cli_grammar")
 
+    migration_report: dict[str, Any] | None = None
+    runtime_contract: dict[str, Any] | None = None
+    maintenance_contract: dict[str, Any] | None = None
     try:
-        manifest = validate_manifest()
-    except RuntimePrivilegeContractError:
-        return _failure("runtime_contract_static_invalid")
+        try:
+            manifest = validate_manifest()
+        except RuntimePrivilegeContractError:
+            return _failure("runtime_contract_static_invalid", phase=phase)
+        except Exception:
+            return _failure("runtime_contract_static_invalid", phase=phase)
 
-    migrator_url = webapp.configured_migrator_database_url()
-    if not migrator_url:
-        return _failure("migrator_database_url_absent")
-    if not webapp.postgres_database_url_is_supported(migrator_url):
-        return _failure("migrator_database_url_requires_postgres")
+        migrator_url = webapp.configured_migrator_database_url()
+        if not migrator_url:
+            return _failure("migrator_database_url_absent", phase=phase)
+        if not webapp.postgres_database_url_is_supported(migrator_url):
+            return _failure("migrator_database_url_requires_postgres", phase=phase)
 
-    database_url = ""
-    maintenance_url = ""
-    if args.phase == "post-apply":
-        database_url = webapp.configured_database_url()
-        maintenance_url = webapp.configured_maintenance_database_url()
-        if not database_url:
-            return _failure("database_url_absent")
-        if not webapp.postgres_database_url_is_supported(database_url):
-            return _failure("postgres_database_required")
-        if not maintenance_url:
-            return _failure("maintenance_database_url_absent")
-        if not webapp.postgres_database_url_is_supported(maintenance_url):
-            return _failure("maintenance_database_url_requires_postgres")
+        database_url = ""
+        maintenance_url = ""
+        if phase == "post-apply":
+            database_url = webapp.configured_database_url()
+            maintenance_url = webapp.configured_maintenance_database_url()
+            if not database_url:
+                return _failure("database_url_absent", phase=phase)
+            if not webapp.postgres_database_url_is_supported(database_url):
+                return _failure("postgres_database_required", phase=phase)
+            if not maintenance_url:
+                return _failure("maintenance_database_url_absent", phase=phase)
+            if not webapp.postgres_database_url_is_supported(maintenance_url):
+                return _failure("maintenance_database_url_requires_postgres", phase=phase)
 
-    try:
         migrations = migration_manifest(ROOT / "migrations")
         migration_report = _inspect_migration_ledger(
             migrator_url,
             migrations,
-            phase=args.phase,
+            phase=phase,
+            validate=False,
         )
-        result: dict[str, Any] = dict(migration_report)
-        if args.phase == "post-apply":
-            result["runtimeContract"] = _inspect_privilege_projection(
+        _validate_pre_apply_report(migration_report, migrations)
+        if phase == "post-apply":
+            validate_migration_report(migration_report)
+            runtime_contract = _inspect_privilege_projection(
                 database_url,
                 manifest,
                 webapp.SQAG_RUNTIME_DATABASE_ROLE,
             )
-            result["maintenanceContract"] = _inspect_privilege_projection(
+            maintenance_contract = _inspect_privilege_projection(
                 maintenance_url,
                 manifest,
                 webapp.SQAG_MAINTENANCE_DATABASE_ROLE,
             )
     except Exception:
-        return _failure("preflight_failed")
+        return _failure(
+            "preflight_failed",
+            phase=phase,
+            migration_report=migration_report,
+            runtime_contract=runtime_contract,
+            maintenance_contract=maintenance_contract,
+        )
 
+    result: dict[str, Any] = dict(migration_report)
+    result["phase"] = phase
+    if phase == "post-apply":
+        result["runtimeContract"] = runtime_contract
+        result["maintenanceContract"] = maintenance_contract
     print(json.dumps(result, sort_keys=True, default=str))
     return 0
 
