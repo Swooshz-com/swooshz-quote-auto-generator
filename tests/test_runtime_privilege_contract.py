@@ -2023,6 +2023,9 @@ order by object_kind, object_schema, object_name, object_type
             ("sqag_feedback_linkage_no_update", "sqag_feedback"),
             ("sqag_generation_evidence_guard_delete", "sqag_generation_evidence"),
             ("sqag_audit_events_guard_delete", "sqag_audit_events"),
+            ("sqag_telemetry_source_state_no_delete", "sqag_telemetry_source_state"),
+            ("sqag_telemetry_events_no_update", "sqag_telemetry_events"),
+            ("sqag_telemetry_events_guard_delete", "sqag_telemetry_events"),
         ):
             self._execute_admin(f"drop trigger if exists {trigger} on public.{table}")
         self._execute_admin("drop routine if exists public.sqag_reject_immutable_change()")
@@ -2038,6 +2041,22 @@ order by object_kind, object_schema, object_name, object_type
         self._execute_admin("create trigger sqag_feedback_linkage_no_update before update of run_id, session_id, publication_version_id, link_resolution_source, link_resolved_at on public.sqag_feedback for each row execute function public.sqag_reject_immutable_change()")
         self._execute_admin("create trigger sqag_generation_evidence_guard_delete before delete on public.sqag_generation_evidence for each row execute function public.sqag_require_retention_delete_authorization()")
         self._execute_admin("create trigger sqag_audit_events_guard_delete before delete on public.sqag_audit_events for each row execute function public.sqag_require_retention_delete_authorization()")
+        self._execute_admin("create trigger sqag_telemetry_source_state_no_delete before delete on public.sqag_telemetry_source_state for each row execute function public.sqag_reject_immutable_change()")
+        self._execute_admin(
+            "create trigger sqag_telemetry_events_no_update before update of "
+            "workspace_id, event_id, source_product, source_sequence, event_type, "
+            "event_status, actor_tracking_id, actor_key_version, action_reference, "
+            "run_reference, session_reference, support_reference, retry_lineage_id, "
+            "attempt_number, provider, model, reasoning_level, operation_route, "
+            "purpose, failure_class, duration_ms, usage_available, input_tokens, "
+            "output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, "
+            "cost_available, estimated_cost, actual_cost, currency, cost_version, "
+            "quota_decision, rate_limit_decision, abuse_decision, deployment_revision, "
+            "occurred_at, immutable_metadata_digest, retention_expires_at, "
+            "original_retention_expires_at on public.sqag_telemetry_events for each row "
+            "execute function public.sqag_reject_immutable_change()"
+        )
+        self._execute_admin("create trigger sqag_telemetry_events_guard_delete before delete on public.sqag_telemetry_events for each row execute function public.sqag_require_retention_delete_authorization()")
 
     def test_real_pg17_authenticated_and_active_identity_invariant(self):
         for expected_role in (
@@ -3259,6 +3278,18 @@ order by object_kind, object_schema, object_name, object_type
                     "drop trigger sqag_feedback_linkage_no_update on public.sqag_feedback"
                 ),
                 self._execute_admin(
+                    "drop trigger sqag_telemetry_source_state_no_delete "
+                    "on public.sqag_telemetry_source_state"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_telemetry_events_no_update "
+                    "on public.sqag_telemetry_events"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_telemetry_events_guard_delete "
+                    "on public.sqag_telemetry_events"
+                ),
+                self._execute_admin(
                     "drop function public.sqag_reject_immutable_change()"
                 ),
                 self._execute_admin(
@@ -3279,6 +3310,18 @@ order by object_kind, object_schema, object_name, object_type
                 ),
                 self._execute_admin(
                     "drop trigger sqag_feedback_linkage_no_update on public.sqag_feedback"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_telemetry_source_state_no_delete "
+                    "on public.sqag_telemetry_source_state"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_telemetry_events_no_update "
+                    "on public.sqag_telemetry_events"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_telemetry_events_guard_delete "
+                    "on public.sqag_telemetry_events"
                 ),
                 self._execute_admin(
                     "drop function public.sqag_reject_immutable_change()"
@@ -3615,10 +3658,22 @@ order by object_kind, object_schema, object_name, object_type
             self.assertEqual(report["status"], "unsafe")
             self.assertEqual(report["pendingMigrationIds"], [last.migration_id])
             self.assertEqual(
-                report["blockers"],
-                [
-                    "pending_suffix_present:routine:public.sqag_quote_session_deletion_hold_blocked(text, text)"
-                ],
+                set(report["blockers"]),
+                {
+                    *(
+                        f"pending_suffix_present:table:public.{table.name}"
+                        for table in migration_contract.MIGRATION_OBJECTS[-1].tables
+                    ),
+                    *(
+                        f"pending_suffix_present:index:public.{index.name}"
+                        for index in migration_contract.MIGRATION_OBJECTS[-1].indexes
+                    ),
+                    *(
+                        "pending_suffix_present:trigger:public."
+                        f"{trigger.table_name}.{trigger.name}"
+                        for trigger in migration_contract.MIGRATION_OBJECTS[-1].triggers
+                    ),
+                },
             )
         finally:
             self._execute_admin(
@@ -3807,9 +3862,9 @@ order by object_kind, object_schema, object_name, object_type
         )
         self.assertEqual(
             pre_apply["pendingMigrationIds"],
-            [self.migrations[-1].migration_id],
+            [migration.migration_id for migration in self.migrations[6:]],
         )
-        self.assertEqual(pre_apply["appliedHead"], self.migrations[-2].migration_id)
+        self.assertEqual(pre_apply["appliedHead"], self.migrations[5].migration_id)
         self.assertEqual(pre_apply["expectedHead"], self.migrations[-1].migration_id)
         self.assertNotIn("runtimeContract", pre_apply)
         self.assertNotIn("maintenanceContract", pre_apply)
@@ -3903,9 +3958,9 @@ order by object_kind, object_schema, object_name, object_type
         )
         self.assertEqual(
             clean_pre_apply["pendingMigrationIds"],
-            [self.migrations[-1].migration_id],
+            [migration.migration_id for migration in self.migrations[6:]],
         )
-        self.assertEqual(clean_pre_apply["appliedHead"], self.migrations[-2].migration_id)
+        self.assertEqual(clean_pre_apply["appliedHead"], self.migrations[5].migration_id)
         self.assertEqual(clean_pre_apply["expectedHead"], self.migrations[-1].migration_id)
         self.assertEqual(
             self._migration_mutation_snapshot(partial_database),
@@ -3932,6 +3987,7 @@ order by object_kind, object_schema, object_name, object_type
         self.assertNotIn(migrator_url, completed.stdout)
         self.assertNotIn(migrator_url, completed.stderr)
 
+        self._configure_acl_contract(partial_database)
         self._assert_causal_callable_catalog_contract(partial_database)
         runtime_url = safe_postgres_url("sqag_runtime", partial_database)
         maintenance_url = safe_postgres_url("sqag_maintenance", partial_database)
@@ -4029,7 +4085,7 @@ order by object_kind, object_schema, object_name, object_type
         )
         self.assertEqual(
             control["pendingMigrationIds"],
-            [self.migrations[-1].migration_id],
+            [migration.migration_id for migration in self.migrations[6:]],
         )
 
         expected_index = "applied_prefix_missing:index:public.sqag_feedback_publication_idx"

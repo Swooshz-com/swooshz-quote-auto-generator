@@ -230,7 +230,7 @@
     "sqag_retention_scan_cursors": {"privileges": ["SELECT", "INSERT", "UPDATE", "DELETE"]},
     "sqag_quote_publication_versions": {"privileges": ["SELECT", "DELETE"]},
     "sqag_quote_publication_artifacts": {"privileges": ["SELECT", "DELETE"]},
-    "sqag_telemetry_events": {"privileges": ["SELECT", "UPDATE", "DELETE"]},
+    "sqag_telemetry_events": {"privileges": ["SELECT", "INSERT", "UPDATE", "DELETE"]},
     "sqag_telemetry_source_state": {"privileges": ["SELECT", "UPDATE"]}
   },
   "runtime_forbidden_tables": {

@@ -97,8 +97,9 @@ Migration 009 adds the metadata-only SQAG telemetry producer relations. The
 runtime role may `SELECT` and `INSERT` `sqag_telemetry_events` and may
 `SELECT`, `INSERT`, and `UPDATE` `sqag_telemetry_source_state`; it cannot update
 or delete event rows and cannot delete source state. The maintenance role may
-read, update, and delete telemetry events and may read and update source state
-only through the existing controlled retention, hold, and reconciliation paths.
+read, insert, update, and delete telemetry events and may read and update source
+state only through the existing controlled retention, hold, and reconciliation
+paths.
 The source-state high-watermark and next-sequence values remain durable when
 retention removes event rows.
 

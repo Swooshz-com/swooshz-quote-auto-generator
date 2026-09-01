@@ -14402,8 +14402,7 @@ class DatabaseSqagStorage:
                     status=503,
                     reason="storage_postgres_session_delete_hold_unavailable",
                 )
-            if hold_blocked:
-                return True
+            return hold_blocked
         if any(bool(row["legal_hold"]) for row in versions):
             return True
         for row in versions:
