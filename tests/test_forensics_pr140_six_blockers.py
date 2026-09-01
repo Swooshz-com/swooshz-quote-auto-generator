@@ -17,6 +17,7 @@ from scripts import enforce_forensic_retention, enforce_log_retention
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = ROOT / "migrations" / "004_generation_forensics_feedback_retention.sql"
+TELEMETRY_MIGRATION = ROOT / "migrations" / "009_telemetry_events.sql"
 
 
 class Pr140SixBlockerRedTest(unittest.TestCase):
@@ -24,6 +25,7 @@ class Pr140SixBlockerRedTest(unittest.TestCase):
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript(MIGRATION.read_text(encoding="utf-8"))
+        self.connection.executescript(TELEMETRY_MIGRATION.read_text(encoding="utf-8"))
 
     def tearDown(self):
         self.connection.close()
@@ -187,6 +189,7 @@ class Pr140SixBlockerRedTest(unittest.TestCase):
                 reason="storage_forensics_database_not_migrated",
             )
         self.connection.executescript(MIGRATION.read_text(encoding="utf-8"))
+        self.connection.executescript(TELEMETRY_MIGRATION.read_text(encoding="utf-8"))
         self.connection.execute("drop trigger sqag_audit_events_guard_delete")
         with self.assertRaises(webapp.SqagStorageAccessError):
             storage._ensure_schema(
@@ -197,6 +200,7 @@ class Pr140SixBlockerRedTest(unittest.TestCase):
     def test_postgres_contract_contains_every_required_forensic_object(self):
         sql = (ROOT / "migrations" / "004_generation_forensics_feedback_retention_postgres.sql").read_text(encoding="utf-8").lower()
         sql += (ROOT / "migrations" / "005_forensic_postgres_delete_guards.sql").read_text(encoding="utf-8").lower()
+        sql += (ROOT / "migrations" / "009_telemetry_events_postgres.sql").read_text(encoding="utf-8").lower()
         for table, columns in webapp.SQAG_FORENSIC_REQUIRED_COLUMNS.items():
             self.assertIn(table.lower(), sql)
             for column in columns:

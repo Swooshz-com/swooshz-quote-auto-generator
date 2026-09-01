@@ -50,6 +50,11 @@ class DatabaseBackupRestoreVerifierTest(unittest.TestCase):
         self.assertTrue(report["backup_restore"]["row_counts_match"])
         self.assertTrue(report["backup_restore"]["artifact_checksums_match"])
         self.assertTrue(report["backup_restore"]["workspace_ownership_preserved"])
+        self.assertTrue(report["backup_restore"]["telemetry_source_state_match"])
+        self.assertTrue(report["backup_restore"]["telemetry_identity_order_preserved"])
+        self.assertTrue(report["backup_restore"]["restore_did_not_reemit"])
+        self.assertIn("sqag_telemetry_events", report["backup_restore"]["tables_verified"])
+        self.assertIn("sqag_telemetry_source_state", report["backup_restore"]["tables_verified"])
         self.assertTrue(report["rollback"]["restored_prior_known_good_state"])
         self.assertEqual(report["privacy"]["output"], "metadata-only")
         self.assertNotIn(str(work_dir), text)
@@ -123,6 +128,7 @@ class DatabaseBackupRestoreVerifierTest(unittest.TestCase):
                 "uploaded_references",
                 "profile_layout_assets",
                 "pricing_visual_assets",
+                "telemetry_events",
                 "logs",
                 "backups",
             },

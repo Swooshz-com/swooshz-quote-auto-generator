@@ -49,6 +49,17 @@ workspace-owned profile/pricing references, quote basis review, pricing review,
 quote-session persistence, generated quote artifacts, and SQAG-side runtime
 sessions after a valid Platform launch consume.
 
+SQAG also owns the metadata-only source telemetry producer through its existing
+`ForensicStore`: append, idempotency/digest checks, workspace source sequencing,
+feed reads, reconciliation, and retention/hold/deletion integration. Platform
+issue #114 remains the central dashboard/report owner and consumes the accepted
+SQAG feed contract; Platform does not read SQAG tables directly and no separate
+telemetry service or database coupling is introduced. The feed derives its
+workspace only from the authenticated SQAG session and validated Platform grant,
+supports one workspace per request, and uses the existing session-secret
+mechanism for an opaque HMAC-signed cursor. No new bearer or service credential
+architecture is added for telemetry.
+
 Koncept Images profile, pricing, and layout packs are tenant/workspace-imported
 SQAG data. They are not app defaults, bundled defaults, global seeds, or
 fallback packs. A new workspace starts without a real Koncept pack.
@@ -216,10 +227,12 @@ Platform credentials:
 | Local quote-session and artifact fallback blocked by Platform context | `test_platform_session_context_blocks_local_quote_session_runtime_storage_in_local_app_mode`, `test_platform_session_context_blocks_local_artifact_storage_in_local_app_mode` |
 | Synthetic/local hosted-contract negative launch/generate/session/download/delete smoke | `test_platform_uat_smoke_launch_generate_list_and_download_database_artifact` and compatibility command `scripts/verify_hosted_smoke.py`; this does not test a public URL and is not live Neon/R2 or Platform handoff evidence; readiness remains blocked until object storage evidence is live |
 
-This PR adds no duplicate runtime behavior tests because the existing tests
-already cover the SQAG-side fail-closed and isolation behavior. The new docs
-regression test keeps this audit document tied to the expected source evidence
-and privacy posture.
+The Run-356 producer tests cover feed/auth behavior, workspace isolation,
+replay/digest/sequence rules, privacy rejection, and unavailable readiness
+without connecting to live Platform or production data. The existing tests
+continue to cover the SQAG-side launch/session fail-closed and isolation
+behavior. The docs regression test keeps this audit document tied to the
+expected source evidence and privacy posture.
 
 ## Platform app-key migration complete
 

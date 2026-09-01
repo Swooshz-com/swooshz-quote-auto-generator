@@ -70,6 +70,8 @@ RUNTIME_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "sqag_object_artifacts": ("SELECT", "INSERT", "UPDATE"),
     "sqag_quote_publication_versions": ("SELECT", "INSERT", "UPDATE", "DELETE"),
     "sqag_quote_publication_artifacts": ("SELECT", "INSERT", "DELETE"),
+    "sqag_telemetry_events": ("SELECT", "INSERT"),
+    "sqag_telemetry_source_state": ("SELECT", "INSERT", "UPDATE"),
 }
 MAINTENANCE_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "sqag_quote_sessions": ("SELECT", "DELETE"),
@@ -85,6 +87,8 @@ MAINTENANCE_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "sqag_retention_scan_cursors": ("SELECT", "INSERT", "UPDATE", "DELETE"),
     "sqag_quote_publication_versions": ("SELECT", "DELETE"),
     "sqag_quote_publication_artifacts": ("SELECT", "DELETE"),
+    "sqag_telemetry_events": ("SELECT", "UPDATE", "DELETE"),
+    "sqag_telemetry_source_state": ("SELECT", "UPDATE"),
 }
 RUNTIME_FORBIDDEN_TABLES = frozenset({
     "sqag_legal_holds", "sqag_retention_delete_authorizations", "sqag_deletion_receipts",

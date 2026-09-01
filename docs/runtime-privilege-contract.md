@@ -22,9 +22,9 @@ The read-only admission path is
 
 The declared set is deliberately bounded to `public.sqag_*` application objects:
 
-- seven canonical PostgreSQL migrations and their canonical migration-ledger checksums;
-- the 15 application tables plus `sqag_schema_migrations`;
-- the 22 canonical indexes;
+- eight canonical PostgreSQL migrations and their canonical migration-ledger checksums;
+- the 17 application tables plus `sqag_schema_migrations`;
+- the 28 canonical indexes;
 - the two migrator-owned invoker trigger routines and one migrator-owned,
   runtime-callable security-definer hold-decision routine;
 - the fixed connection search path `public, pg_catalog`;
@@ -93,6 +93,15 @@ The local SQLite retention path is unchanged when an explicit SQLite URL or the
 local default is selected. `--use-configured-database` is PostgreSQL-only and
 requires the maintenance projection.
 
+Migration 009 adds the metadata-only SQAG telemetry producer relations. The
+runtime role may `SELECT` and `INSERT` `sqag_telemetry_events` and may
+`SELECT`, `INSERT`, and `UPDATE` `sqag_telemetry_source_state`; it cannot update
+or delete event rows and cannot delete source state. The maintenance role may
+read, update, and delete telemetry events and may read and update source state
+only through the existing controlled retention, hold, and reconciliation paths.
+The source-state high-watermark and next-sequence values remain durable when
+retention removes event rows.
+
 ## Provenance checks
 
 Effective `has_*_privilege` observations are necessary but not sufficient. The
@@ -143,6 +152,9 @@ registry. Runtime may call only
 `public.sqag_quote_session_deletion_hold_blocked(text, text)` for the hosted
 session-deletion decision; it remains denied direct access to
 `public.sqag_legal_holds`. Maintenance retains its direct forensic authority.
+The 009 telemetry relations are included in the same namespace, index, trigger,
+privilege, and source-binding proof; no separate telemetry service or database
+authority is introduced.
 
 The verifier performs a small source binding over the actual SQL relation names
 in the canonical application files. Supported PostgreSQL relations must be in
