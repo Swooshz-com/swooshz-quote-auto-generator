@@ -685,3 +685,13 @@ alter function public.sqag_quote_session_deletion_hold_blocked_v2(text, text) ow
 revoke all privileges on function public.sqag_quote_session_deletion_hold_blocked_v2(text, text) from public, sqag_runtime, sqag_maintenance
 -- SQAG_STATEMENT_BOUNDARY
 grant execute on function public.sqag_quote_session_deletion_hold_blocked_v2(text, text) to sqag_runtime
+-- SQAG_STATEMENT_BOUNDARY
+revoke all privileges on table public.sqag_telemetry_events, public.sqag_telemetry_source_state from public, sqag_runtime, sqag_maintenance
+-- SQAG_STATEMENT_BOUNDARY
+grant select, insert on table public.sqag_telemetry_events to sqag_runtime
+-- SQAG_STATEMENT_BOUNDARY
+grant select, insert, update on table public.sqag_telemetry_source_state to sqag_runtime
+-- SQAG_STATEMENT_BOUNDARY
+grant select, insert, update, delete on table public.sqag_telemetry_events to sqag_maintenance
+-- SQAG_STATEMENT_BOUNDARY
+grant select, update on table public.sqag_telemetry_source_state to sqag_maintenance
