@@ -62,6 +62,14 @@
       "rollback_note": "Restore feedback records together with their status history and linked run/session identifiers; do not duplicate canonical generation evidence."
     },
     {
+      "data_class": "telemetry_events",
+      "storage": "sqag_telemetry_events and sqag_telemetry_source_state",
+      "retention_calendar_years": 3,
+      "lifecycle_policy_version": "sqag.telemetry-retention.v1",
+      "lifecycle_note": "Telemetry events are workspace-scoped, append-only metadata records with immutable original retention expiry, digest, identity, retry lineage, and source sequence. Legal hold, deletion authorization, deletion receipts, graph hold rechecks, and controlled retention use the existing forensic authority. Event rows may be deleted after the three-calendar-year expiry when unheld; source-state identity, high-watermark, next sequence, and reconciliation state survive event deletion. Feed reads never create telemetry, and deletion or restore never re-emits events.",
+      "rollback_note": "Restore telemetry events and source state from the same workspace-scoped backup set; verify event identity/order, retry lineage, digests, high-watermark, next sequence, and reconciliation state before access is restored."
+    },
+    {
       "data_class": "logs",
       "storage": "_logs local-UAT only until hosted logging exists",
       "retention_days": 30,

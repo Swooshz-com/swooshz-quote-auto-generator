@@ -45,7 +45,50 @@ LEGAL_HOLD_TARGETS = {
     "sqag_audit_events": ("event_id", "audit_event"),
     "sqag_feedback": ("feedback_id", "feedback"),
     "sqag_feedback_status_history": ("history_id", "feedback_status_history"),
+    "sqag_telemetry_events": ("event_id", "telemetry_event"),
 }
+TELEMETRY_SOURCE_PRODUCT = "sqag"
+TELEMETRY_EVENT_TYPES = frozenset({
+    "generation", "validation", "ai_provider_attempt", "pricing_change",
+    "profile_change", "publication", "download", "feedback", "security",
+    "rate_limit", "abuse", "cancellation", "timeout", "abandonment",
+    "supersession", "storage_staging", "storage_finalization",
+    "storage_compensation", "configuration", "operator_action",
+    "reconciliation", "retention", "legal_hold", "deletion", "backup",
+    "restore",
+})
+TELEMETRY_EVENT_STATUSES = frozenset({
+    "started", "queued", "running", "success", "failed", "blocked", "denied",
+    "completed", "needs_confirmation", "needs_review",
+    "completed_with_review_required", "degraded", "cancelled", "timed_out",
+    "abandoned", "superseded", "available", "unavailable", "held", "deleted",
+    "reconciled", "staged", "finalized", "compensated", "requested", "updated",
+    "restored", "rate_limited",
+})
+TELEMETRY_FAILURE_CLASSES = frozenset({
+    "missing_api_key", "timeout", "rate_limited", "upstream_unavailable",
+    "http_error", "network_error", "invalid_json", "schema_validation_failed",
+    "model_output_invalid", "provider_error", "generator_error", "configuration",
+    "storage", "authorization", "unknown",
+})
+TELEMETRY_DECISIONS = frozenset({"allowed", "denied", "not_evaluated"})
+TELEMETRY_PROVIDERS = frozenset({"openai", "deepseek"})
+TELEMETRY_REASONING_LEVELS = frozenset({
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "standard",
+})
+TELEMETRY_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
+TELEMETRY_IMMUTABLE_FIELDS = (
+    "workspace_id", "event_id", "source_product", "source_sequence", "event_type",
+    "event_status", "actor_tracking_id", "actor_key_version", "action_reference",
+    "run_reference", "session_reference", "support_reference", "retry_lineage_id",
+    "attempt_number", "provider", "model", "reasoning_level", "operation_route",
+    "purpose", "failure_class", "duration_ms", "usage_available", "input_tokens",
+    "output_tokens", "total_tokens", "cache_read_tokens", "cache_write_tokens",
+    "cost_available", "estimated_cost", "actual_cost", "currency", "cost_version",
+    "quota_decision", "rate_limit_decision", "abuse_decision", "deployment_revision",
+    "occurred_at", "immutable_metadata_digest", "retention_expires_at",
+    "original_retention_expires_at",
+)
 FEEDBACK_TRANSITIONS = {
     "open": {"triaged", "in_progress", "resolved", "closed", "rejected", "duplicate"},
     "triaged": {"in_progress", "resolved", "closed", "rejected", "duplicate"},
@@ -159,6 +202,54 @@ def row_dict(row: Any) -> dict[str, Any]:
         return {}
 
 
+def safe_telemetry_label(value: Any, *, lowercase: bool = False) -> str:
+    text = safe_feedback_text(value, 128)
+    if lowercase:
+        text = text.lower()
+    return text if text and TELEMETRY_LABEL_RE.fullmatch(text) else ""
+
+
+def safe_telemetry_route(value: Any) -> str:
+    text = safe_feedback_text(value, 128)
+    if not text:
+        return ""
+    if text.startswith("/"):
+        return (
+            text
+            if re.fullmatch(r"/[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", text)
+            else ""
+        )
+    return safe_telemetry_label(text)
+
+
+def telemetry_integer(value: Any, *, field: str) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"Telemetry {field} is invalid.")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Telemetry {field} is invalid.") from exc
+    if parsed < 0:
+        raise ValueError(f"Telemetry {field} is invalid.")
+    return parsed
+
+
+def telemetry_number(value: Any, *, field: str) -> int | float | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"Telemetry {field} is invalid.")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Telemetry {field} is invalid.") from exc
+    if parsed < 0 or parsed != parsed or parsed in {float("inf"), float("-inf")}:
+        raise ValueError(f"Telemetry {field} is invalid.")
+    return parsed
+
+
 @dataclass(frozen=True)
 class RetentionResult:
     examined: int
@@ -177,6 +268,10 @@ class RetentionResult:
     receipt_deleted: int = 0
     receipt_failed: int = 0
     publication_retained: int = 0
+    telemetry_examined: int = 0
+    telemetry_deleted: int = 0
+    telemetry_held: int = 0
+    telemetry_failed: int = 0
 
 
 class RetentionGraphHeld(RuntimeError):
@@ -185,6 +280,14 @@ class RetentionGraphHeld(RuntimeError):
 
 class RetentionPublicationDependency(RetentionGraphHeld):
     """Signal that a current publication still requires its generation graph."""
+
+
+class TelemetryConflictError(ValueError):
+    """Raised when an event identity is replayed with different immutable data."""
+
+
+class TelemetryUnavailableError(RuntimeError):
+    """Raised when source state cannot prove a safe telemetry read/write."""
 
 
 class ForensicStore:
@@ -212,9 +315,467 @@ class ForensicStore:
     def new_support_reference() -> str:
         return f"SQAG-FB-{secrets.token_hex(5).upper()}"
 
+    @staticmethod
+    def telemetry_event_id(prefix: str, *parts: Any) -> str:
+        safe_prefix = safe_telemetry_label(prefix)[:32] or "telemetry"
+        raw = "-".join(
+            [safe_prefix]
+            + [safe_feedback_text(part, 256) for part in parts if part not in (None, "")]
+        )
+        if safe_reference(raw):
+            return raw
+        return f"{safe_prefix}-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:48]}"
+
     def _retention(self, now: dt.datetime | None = None) -> tuple[str, str]:
         expiry = iso_timestamp(add_calendar_years(now or utc_now()))
         return expiry, expiry
+
+    def _telemetry_retention(
+        self,
+        current: dt.datetime,
+        *,
+        run_reference: str = "",
+        support_reference: str = "",
+    ) -> tuple[str, str]:
+        expiry, original = self._retention(current)
+        linked_expiries: list[dt.datetime] = []
+        for table, identifier, column in (
+            ("sqag_generation_runs", run_reference, "run_id"),
+            ("sqag_feedback", support_reference, "feedback_id"),
+        ):
+            if not identifier:
+                continue
+            row = row_dict(
+                self.connection.execute(
+                    f"select retention_expires_at, original_retention_expires_at from {table} "
+                    f"where workspace_id = ? and {column} = ? limit 1",
+                    (self.workspace_id, identifier),
+                ).fetchone()
+            )
+            for field in ("retention_expires_at", "original_retention_expires_at"):
+                parsed = parse_timestamp(row.get(field))
+                if parsed is not None:
+                    linked_expiries.append(parsed)
+        if linked_expiries:
+            inherited = iso_timestamp(max(linked_expiries))
+            return inherited, inherited
+        return expiry, original
+
+    def _telemetry_source_state(self) -> dict[str, Any]:
+        state = row_dict(
+            self.connection.execute(
+                "select * from sqag_telemetry_source_state where workspace_id = ? "
+                "and source_product = ? limit 1",
+                (self.workspace_id, TELEMETRY_SOURCE_PRODUCT),
+            ).fetchone()
+        )
+        if not state:
+            raise TelemetryUnavailableError("telemetry_source_state_missing")
+        try:
+            next_sequence = int(state.get("next_source_sequence"))
+            high_watermark = int(state.get("high_watermark"))
+        except (TypeError, ValueError) as exc:
+            raise TelemetryUnavailableError("telemetry_source_state_invalid") from exc
+        if (
+            state.get("source_product") != TELEMETRY_SOURCE_PRODUCT
+            or next_sequence < 1
+            or high_watermark < 0
+            or next_sequence != high_watermark + 1
+            or safe_feedback_text(state.get("reconciliation_state"), 40) != "healthy"
+        ):
+            raise TelemetryUnavailableError("telemetry_source_state_inconsistent")
+        maximum = self.connection.execute(
+            "select max(source_sequence) as maximum_source_sequence "
+            "from sqag_telemetry_events where workspace_id = ? and source_product = ?",
+            (self.workspace_id, TELEMETRY_SOURCE_PRODUCT),
+        ).fetchone()
+        maximum_value = row_dict(maximum).get("maximum_source_sequence")
+        if maximum_value is not None:
+            try:
+                if int(maximum_value) > high_watermark:
+                    raise TelemetryUnavailableError("telemetry_high_watermark_behind")
+            except (TypeError, ValueError) as exc:
+                raise TelemetryUnavailableError("telemetry_source_sequence_invalid") from exc
+        state["next_source_sequence"] = next_sequence
+        state["high_watermark"] = high_watermark
+        return state
+
+    @staticmethod
+    def _telemetry_value_matches(actual: Any, expected: Any, field: str) -> bool:
+        if field in {"estimated_cost", "actual_cost"} and actual is not None and expected is not None:
+            try:
+                return float(actual) == float(expected)
+            except (TypeError, ValueError):
+                return False
+        if actual is None or expected is None:
+            return actual is None and expected is None
+        return str(actual) == str(expected)
+
+    def _telemetry_row_matches(
+        self, existing: dict[str, Any], expected: dict[str, Any]
+    ) -> bool:
+        return all(
+            self._telemetry_value_matches(existing.get(field), expected.get(field), field)
+            for field in TELEMETRY_IMMUTABLE_FIELDS
+            if field != "source_sequence"
+        )
+
+    def _public_telemetry_event(self, row: dict[str, Any]) -> dict[str, Any]:
+        fields = (
+            "workspace_id", "event_id", "source_product", "source_sequence",
+            "event_type", "event_status", "actor_tracking_id", "actor_key_version",
+            "action_reference", "run_reference", "session_reference", "support_reference",
+            "retry_lineage_id", "attempt_number", "provider", "model", "reasoning_level",
+            "operation_route", "purpose", "failure_class", "duration_ms", "usage_available",
+            "input_tokens", "output_tokens", "total_tokens", "cache_read_tokens",
+            "cache_write_tokens", "cost_available", "estimated_cost", "actual_cost",
+            "currency", "cost_version", "quota_decision", "rate_limit_decision",
+            "abuse_decision", "deployment_revision", "occurred_at",
+            "immutable_metadata_digest", "legal_hold", "deletion_state",
+        )
+        return {field: row.get(field) for field in fields}
+
+    def append_telemetry_event(
+        self,
+        event_type: str,
+        event_status: str,
+        *,
+        event_id: str = "",
+        action_reference: str = "",
+        run_reference: str = "",
+        session_reference: str = "",
+        support_reference: str = "",
+        retry_lineage_id: str = "",
+        attempt_number: int | None = None,
+        provider: str = "",
+        model: str = "",
+        reasoning_level: str = "",
+        operation_route: str = "",
+        purpose: str = "",
+        failure_class: str = "",
+        duration_ms: int | None = None,
+        usage_available: int | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        total_tokens: int | None = None,
+        cache_read_tokens: int | None = None,
+        cache_write_tokens: int | None = None,
+        cost_available: int | None = None,
+        estimated_cost: int | float | None = None,
+        actual_cost: int | float | None = None,
+        currency: str = "",
+        cost_version: str = "",
+        quota_decision: str = "",
+        rate_limit_decision: str = "",
+        abuse_decision: str = "",
+        deployment_revision: str = "",
+        occurred_at: dt.datetime | str | None = None,
+        immutable_metadata_digest: str = "",
+        now: dt.datetime | None = None,
+        commit: bool = True,
+    ) -> dict[str, Any]:
+        event_type = safe_feedback_text(event_type, 40).lower()
+        event_status = safe_feedback_text(event_status, 60).lower()
+        if event_type not in TELEMETRY_EVENT_TYPES or event_status not in TELEMETRY_EVENT_STATUSES:
+            raise ValueError("Telemetry event classification is invalid.")
+        if event_id:
+            safe_event_id = safe_reference(event_id)
+            if not safe_event_id:
+                raise ValueError("Telemetry event identity is invalid.")
+        else:
+            safe_event_id = self.new_id("telemetry")
+        def label(value: Any, field: str, *, lowercase: bool = False) -> str | None:
+            if value in (None, ""):
+                return None
+            result = safe_telemetry_label(value, lowercase=lowercase)
+            if not result:
+                raise ValueError(f"Telemetry {field} is invalid.")
+            return result
+
+        action = label(action_reference, "action_reference")
+        run_ref = safe_reference(run_reference, "run-") if run_reference else ""
+        if run_reference and not run_ref:
+            raise ValueError("Telemetry run reference is invalid.")
+        session_ref = label(session_reference, "session_reference")
+        support_ref = label(support_reference, "support_reference")
+        retry_ref = label(retry_lineage_id, "retry_lineage_id")
+        attempt = telemetry_integer(attempt_number, field="attempt_number")
+        if attempt is not None and attempt < 1:
+            raise ValueError("Telemetry attempt_number is invalid.")
+        provider_value = label(provider, "provider", lowercase=True)
+        if provider_value and provider_value not in TELEMETRY_PROVIDERS:
+            raise ValueError("Telemetry provider is invalid.")
+        model_value = label(model, "model")
+        reasoning_value = label(reasoning_level, "reasoning_level", lowercase=True)
+        if reasoning_value and reasoning_value not in TELEMETRY_REASONING_LEVELS:
+            raise ValueError("Telemetry reasoning level is invalid.")
+        route_value = (
+            safe_telemetry_route(operation_route)
+            if operation_route not in (None, "")
+            else None
+        )
+        if operation_route not in (None, "") and not route_value:
+            raise ValueError("Telemetry operation_route is invalid.")
+        purpose_value = label(purpose, "purpose")
+        failure_value = safe_feedback_text(failure_class, 40).lower() if failure_class else ""
+        if failure_value and failure_value not in TELEMETRY_FAILURE_CLASSES:
+            raise ValueError("Telemetry failure class is invalid.")
+        duration = telemetry_integer(duration_ms, field="duration_ms")
+        usage = telemetry_integer(usage_available, field="usage_available")
+        if usage is not None and usage not in (0, 1):
+            raise ValueError("Telemetry usage availability is invalid.")
+        token_values = {
+            "input_tokens": telemetry_integer(input_tokens, field="input_tokens"),
+            "output_tokens": telemetry_integer(output_tokens, field="output_tokens"),
+            "total_tokens": telemetry_integer(total_tokens, field="total_tokens"),
+            "cache_read_tokens": telemetry_integer(cache_read_tokens, field="cache_read_tokens"),
+            "cache_write_tokens": telemetry_integer(cache_write_tokens, field="cache_write_tokens"),
+        }
+        if any(value is not None for value in token_values.values()):
+            if usage == 0:
+                raise ValueError("Telemetry usage availability conflicts with usage values.")
+            usage = 1
+        cost_available_value = telemetry_integer(cost_available, field="cost_available")
+        if cost_available_value is not None and cost_available_value not in (0, 1):
+            raise ValueError("Telemetry cost availability is invalid.")
+        estimated = telemetry_number(estimated_cost, field="estimated_cost")
+        actual = telemetry_number(actual_cost, field="actual_cost")
+        if estimated is not None or actual is not None:
+            if cost_available_value == 0:
+                raise ValueError("Telemetry cost availability conflicts with cost values.")
+            cost_available_value = 1
+        currency_value = label(currency, "currency", lowercase=True)
+        cost_version_value = label(cost_version, "cost_version")
+        def decision(value: Any, field: str) -> str | None:
+            if value in (None, ""):
+                return None
+            result = safe_feedback_text(value, 20).lower()
+            if result not in TELEMETRY_DECISIONS:
+                raise ValueError(f"Telemetry {field} is invalid.")
+            return result
+        quota = decision(quota_decision, "quota_decision")
+        rate_limit = decision(rate_limit_decision, "rate_limit_decision")
+        abuse = decision(abuse_decision, "abuse_decision")
+        revision = label(deployment_revision, "deployment_revision")
+        current = now or utc_now()
+        if occurred_at is None:
+            occurred_text = iso_timestamp(current)
+        elif isinstance(occurred_at, dt.datetime):
+            occurred_text = iso_timestamp(occurred_at)
+        else:
+            parsed_occurred = parse_timestamp(occurred_at)
+            if parsed_occurred is None:
+                raise ValueError("Telemetry occurred_at is invalid.")
+            occurred_text = iso_timestamp(parsed_occurred)
+        expiry, original = self._telemetry_retention(
+            current,
+            run_reference=run_ref,
+            support_reference=support_ref,
+        )
+        values: dict[str, Any] = {
+            "workspace_id": self.workspace_id,
+            "event_id": safe_event_id,
+            "source_product": TELEMETRY_SOURCE_PRODUCT,
+            "event_type": event_type,
+            "event_status": event_status,
+            "actor_tracking_id": self.actor_tracking_id,
+            "actor_key_version": self.actor_key_version,
+            "action_reference": action,
+            "run_reference": run_ref or None,
+            "session_reference": session_ref,
+            "support_reference": support_ref,
+            "retry_lineage_id": retry_ref,
+            "attempt_number": attempt,
+            "provider": provider_value,
+            "model": model_value,
+            "reasoning_level": reasoning_value,
+            "operation_route": route_value,
+            "purpose": purpose_value,
+            "failure_class": failure_value or None,
+            "duration_ms": duration,
+            "usage_available": usage,
+            **token_values,
+            "cost_available": cost_available_value,
+            "estimated_cost": estimated,
+            "actual_cost": actual,
+            "currency": currency_value,
+            "cost_version": cost_version_value,
+            "quota_decision": quota,
+            "rate_limit_decision": rate_limit,
+            "abuse_decision": abuse,
+            "deployment_revision": revision,
+            "occurred_at": occurred_text,
+            "retention_expires_at": expiry,
+            "original_retention_expires_at": original,
+        }
+        digest_material = {
+            field: values.get(field)
+            for field in TELEMETRY_IMMUTABLE_FIELDS
+            if field not in {"source_sequence", "immutable_metadata_digest"}
+        }
+        calculated_digest = hashlib.sha256(canonical_json(digest_material).encode("utf-8")).hexdigest()
+        supplied_digest = safe_feedback_text(immutable_metadata_digest, 64).lower()
+        if supplied_digest and (not SHA256_RE.fullmatch(supplied_digest) or supplied_digest != calculated_digest):
+            raise TelemetryConflictError("Telemetry metadata digest does not match immutable fields.")
+        values["immutable_metadata_digest"] = calculated_digest
+        self._acquire_transaction_locks(("telemetry_source", self.workspace_id))
+        existing = row_dict(
+            self.connection.execute(
+                "select * from sqag_telemetry_events where workspace_id = ? and event_id = ? limit 1",
+                (self.workspace_id, safe_event_id),
+            ).fetchone()
+        )
+        if existing:
+            if not self._telemetry_row_matches(existing, values):
+                raise TelemetryConflictError("Telemetry event identity conflicts with immutable data.")
+            result = self._public_telemetry_event(existing)
+            result["idempotent_replay"] = True
+            if commit:
+                self.connection.commit()
+            return result
+        state = self._telemetry_source_state() if self.connection.execute(
+            "select 1 from sqag_telemetry_source_state where workspace_id = ? and source_product = ? limit 1",
+            (self.workspace_id, TELEMETRY_SOURCE_PRODUCT),
+        ).fetchone() else None
+        if state is None:
+            now_text = iso_timestamp(current)
+            self.connection.execute(
+                "insert into sqag_telemetry_source_state "
+                "(workspace_id, source_product, next_source_sequence, high_watermark, "
+                "reconciliation_state, created_at, updated_at) values (?, ?, 1, 0, 'healthy', ?, ?) "
+                "on conflict(workspace_id, source_product) do nothing",
+                (self.workspace_id, TELEMETRY_SOURCE_PRODUCT, now_text, now_text),
+            )
+            state = self._telemetry_source_state()
+        source_sequence = int(state["next_source_sequence"])
+        values["source_sequence"] = source_sequence
+        self.connection.execute(
+            "update sqag_telemetry_source_state set next_source_sequence = ?, "
+            "high_watermark = ?, updated_at = ? where workspace_id = ? and source_product = ?",
+            (source_sequence + 1, source_sequence, iso_timestamp(current), self.workspace_id, TELEMETRY_SOURCE_PRODUCT),
+        )
+        self.connection.execute(
+            "insert into sqag_telemetry_events (workspace_id, event_id, source_product, source_sequence, "
+            "event_type, event_status, actor_tracking_id, actor_key_version, action_reference, run_reference, "
+            "session_reference, support_reference, retry_lineage_id, attempt_number, provider, model, "
+            "reasoning_level, operation_route, purpose, failure_class, duration_ms, usage_available, "
+            "input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, cost_available, "
+            "estimated_cost, actual_cost, currency, cost_version, quota_decision, rate_limit_decision, "
+            "abuse_decision, deployment_revision, occurred_at, immutable_metadata_digest, retention_expires_at, "
+            "original_retention_expires_at, legal_hold, deletion_state) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'active')",
+            (
+                values["workspace_id"], values["event_id"], values["source_product"], values["source_sequence"],
+                values["event_type"], values["event_status"], values["actor_tracking_id"], values["actor_key_version"],
+                values["action_reference"], values["run_reference"], values["session_reference"], values["support_reference"],
+                values["retry_lineage_id"], values["attempt_number"], values["provider"], values["model"],
+                values["reasoning_level"], values["operation_route"], values["purpose"], values["failure_class"],
+                values["duration_ms"], values["usage_available"], values["input_tokens"], values["output_tokens"],
+                values["total_tokens"], values["cache_read_tokens"], values["cache_write_tokens"], values["cost_available"],
+                values["estimated_cost"], values["actual_cost"], values["currency"], values["cost_version"],
+                values["quota_decision"], values["rate_limit_decision"], values["abuse_decision"], values["deployment_revision"],
+                values["occurred_at"], values["immutable_metadata_digest"], values["retention_expires_at"],
+                values["original_retention_expires_at"],
+            ),
+        )
+        result = self._public_telemetry_event(values | {"legal_hold": 0, "deletion_state": "active"})
+        result["idempotent_replay"] = False
+        if commit:
+            self.connection.commit()
+        return result
+
+    def feed_telemetry_events(
+        self,
+        cursor: tuple[int, str] | None = None,
+        *,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 500:
+            raise ValueError("Telemetry feed limit is invalid.")
+        cursor_sequence: int | None = None
+        cursor_event_id = ""
+        if cursor is not None:
+            if (
+                not isinstance(cursor, tuple)
+                or len(cursor) != 2
+                or isinstance(cursor[0], bool)
+                or not isinstance(cursor[0], int)
+                or cursor[0] < 0
+                or not safe_reference(cursor[1])
+            ):
+                raise ValueError("Telemetry feed cursor is invalid.")
+            cursor_sequence = cursor[0]
+            cursor_event_id = safe_reference(cursor[1])
+        state = self._telemetry_source_state()
+        high_watermark = int(state["high_watermark"])
+        parameters: list[Any] = [self.workspace_id, TELEMETRY_SOURCE_PRODUCT, high_watermark]
+        continuation = ""
+        if cursor_sequence is not None:
+            continuation = "and (source_sequence > ? or (source_sequence = ? and event_id > ?)) "
+            parameters.extend((cursor_sequence, cursor_sequence, cursor_event_id))
+        parameters.append(limit)
+        rows = self.connection.execute(
+            "select * from sqag_telemetry_events where workspace_id = ? and source_product = ? "
+            "and source_sequence <= ? " + continuation +
+            "order by source_sequence, event_id limit ?",
+            tuple(parameters),
+        ).fetchall()
+        events = [self._public_telemetry_event(row_dict(row)) for row in rows]
+        next_cursor = None
+        if events:
+            next_cursor = (int(events[-1]["source_sequence"]), str(events[-1]["event_id"]))
+        return {
+            "events": events,
+            "high_watermark": high_watermark,
+            "next_cursor": next_cursor,
+        }
+
+    def reconcile_telemetry_source_state(
+        self, *, now: dt.datetime | None = None, reference: str = ""
+    ) -> dict[str, Any]:
+        current = now or utc_now()
+        self._acquire_transaction_locks(("telemetry_source", self.workspace_id))
+        state = row_dict(
+            self.connection.execute(
+                "select * from sqag_telemetry_source_state where workspace_id = ? and source_product = ?",
+                (self.workspace_id, TELEMETRY_SOURCE_PRODUCT),
+            ).fetchone()
+        )
+        if not state:
+            raise TelemetryUnavailableError("telemetry_source_state_missing")
+        maximum = self.connection.execute(
+            "select max(source_sequence) as maximum_source_sequence "
+            "from sqag_telemetry_events where workspace_id = ? and source_product = ?",
+            (self.workspace_id, TELEMETRY_SOURCE_PRODUCT),
+        ).fetchone()
+        maximum_value = row_dict(maximum).get("maximum_source_sequence")
+        try:
+            next_sequence = int(state.get("next_source_sequence"))
+            high_watermark = int(state.get("high_watermark"))
+            maximum_sequence = int(maximum_value or 0)
+        except (TypeError, ValueError) as exc:
+            next_sequence = high_watermark = maximum_sequence = -1
+            _ = exc
+        valid = (
+            state.get("source_product") == TELEMETRY_SOURCE_PRODUCT
+            and next_sequence == high_watermark + 1
+            and high_watermark >= 0
+            and maximum_sequence <= high_watermark
+        )
+        reconciliation_state = "healthy" if valid else "inconsistent"
+        safe_reference_value = safe_telemetry_label(reference, lowercase=False) if reference else None
+        self.connection.execute(
+            "update sqag_telemetry_source_state set reconciliation_state = ?, "
+            "last_reconciled_at = ?, reconciliation_reference = ?, updated_at = ? "
+            "where workspace_id = ? and source_product = ?",
+            (reconciliation_state, iso_timestamp(current), safe_reference_value, iso_timestamp(current), self.workspace_id, TELEMETRY_SOURCE_PRODUCT),
+        )
+        self.connection.commit()
+        return {
+            "reconciliation_state": reconciliation_state,
+            "next_source_sequence": next_sequence,
+            "high_watermark": high_watermark,
+            "maximum_source_sequence": maximum_sequence,
+        }
 
     def _owned_run(self, run_id: Any) -> dict[str, Any]:
         run_id = safe_reference(run_id, "run-")
@@ -296,6 +857,7 @@ class ForensicStore:
         request.setdefault("attempt_number", max(1, int(attempt_number or 1)))
         self.append_evidence(run_id, "request_manifest", request, now=now, commit=False)
         self.append_audit("generation_received", {"job_type": safe_feedback_text(job_type, 40) or "unknown", "job_id": safe_job_id}, run_id=run_id, now=now, commit=False)
+        self.append_telemetry_event("generation", "started", event_id=self.telemetry_event_id("telemetry-generation", run_id, "received"), action_reference=safe_job_id or run_id, run_reference=run_id, session_reference=safe_session_id, purpose=safe_feedback_text(job_type, 40), deployment_revision=app_revision, now=now, commit=False)
         self.connection.commit()
         return run_id
 
@@ -315,6 +877,15 @@ class ForensicStore:
             self.connection.rollback()
             return False
         self.append_audit(f"generation_{status}", {}, run_id=run_id, commit=False)
+        self.append_telemetry_event(
+            "generation",
+            "started" if status == "received" else status,
+            event_id=self.telemetry_event_id("telemetry-generation", safe_reference(run_id, "run-"), status),
+            action_reference=safe_reference(run_id, "run-"),
+            run_reference=safe_reference(run_id, "run-"),
+            now=utc_now(),
+            commit=False,
+        )
         self.connection.commit()
         return True
 
@@ -371,6 +942,23 @@ class ForensicStore:
             manifest["terminal_at"] = iso_timestamp(now)
             self.append_evidence(run_id, "generation_manifest", manifest, now=now, commit=False)
         self.append_audit(f"generation_{status}", {"error_category": safe_feedback_text(error_category, 80)}, run_id=run_id, now=now, commit=False)
+        event_type = {
+            "cancelled": "cancellation",
+            "timed_out": "timeout",
+            "abandoned": "abandonment",
+            "superseded": "supersession",
+        }.get(status, "generation")
+        self.append_telemetry_event(
+            event_type,
+            status,
+            event_id=self.telemetry_event_id("telemetry", event_type, safe_run_id, status),
+            action_reference=safe_run_id,
+            run_reference=safe_run_id,
+            session_reference=effective_session_id,
+            failure_class="timeout" if status == "timed_out" else "",
+            now=now,
+            commit=False,
+        )
         if commit:
             self.connection.commit()
         return True
@@ -617,6 +1205,7 @@ class ForensicStore:
         payload: dict[str, Any],
         *,
         publication_context_factory: Callable[[str], dict[str, str]] | None = None,
+        now: dt.datetime | None = None,
     ) -> dict[str, str]:
         category = safe_feedback_text(payload.get("category"), 40)
         if category not in FEEDBACK_CATEGORIES:
@@ -655,7 +1244,7 @@ class ForensicStore:
                 if validated:
                     resolved_type, resolved_id, manual_status = "quote_session", validated, "resolved"
                     session_id = session_id or validated
-        now = utc_now()
+        now = now or utc_now()
         publication_version_id = ""
         link_resolution_source = "none"
         if run_id:
@@ -700,6 +1289,18 @@ class ForensicStore:
             (self.new_id("feedback-history"), feedback_id, self.workspace_id, "", "open", self.actor_tracking_id, self.actor_key_version, None, iso_timestamp(now), expiry, original, 0),
         )
         self.append_audit("feedback_submitted", {"feedback_id": feedback_id, "support_reference": support_reference, "category": category, "linked_run": bool(run_id), "linked_session": bool(session_id), "manual_reference_status": manual_status, "link_resolution_source": link_resolution_source}, run_id=run_id, feedback_id=feedback_id, session_id=session_id, now=now, commit=False)
+        self.append_telemetry_event(
+            "feedback",
+            "completed",
+            event_id=self.telemetry_event_id("telemetry-feedback", feedback_id, "submitted"),
+            action_reference=feedback_id,
+            run_reference=run_id,
+            session_reference=session_id,
+            support_reference=feedback_id,
+            purpose=category,
+            now=now,
+            commit=False,
+        )
         self.connection.commit()
         return {"feedback_id": feedback_id, "feedback_report_id": feedback_id, "support_reference": support_reference, "manual_reference_status": manual_status, "status": "open"}
 
@@ -846,6 +1447,7 @@ class ForensicStore:
                 report["feedback_id"],
             ),
         )
+        history_id = self.new_id("feedback-history")
         self.connection.execute(
             "insert into sqag_feedback_status_history "
             "(history_id, feedback_id, workspace_id, from_status, to_status, "
@@ -853,7 +1455,7 @@ class ForensicStore:
             "retention_expires_at, original_retention_expires_at, legal_hold) "
             "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                self.new_id("feedback-history"),
+                history_id,
                 report["feedback_id"],
                 self.workspace_id,
                 current,
@@ -881,6 +1483,18 @@ class ForensicStore:
             run_id=safe_reference(report.get("run_id"), "run-"),
             feedback_id=report["feedback_id"],
             session_id=safe_reference(report.get("session_id")),
+            now=now,
+            commit=False,
+        )
+        self.append_telemetry_event(
+            "feedback",
+            "updated",
+            event_id=self.telemetry_event_id("telemetry-feedback", history_id),
+            action_reference=report["feedback_id"],
+            run_reference=safe_reference(report.get("run_id"), "run-"),
+            session_reference=safe_reference(report.get("session_id")),
+            support_reference=report["feedback_id"],
+            purpose=status,
             now=now,
             commit=False,
         )
@@ -951,6 +1565,8 @@ class ForensicStore:
             ).fetchone())
             feedback_id = safe_reference(row.get("feedback_id"))
             return ("feedback", feedback_id) if feedback_id else None
+        if table == "sqag_telemetry_events":
+            return ("telemetry_event", record_id) if self._target_exists(table, id_column, record_id) else None
         return None
 
     def set_legal_hold(self, table: str, record_id_column: str, record_id: str, enabled: bool, *, reason_code: str = "legal_process", case_reference: str = "", now: dt.datetime | None = None) -> bool:
@@ -982,14 +1598,38 @@ class ForensicStore:
         if not enabled and not active:
             self.connection.commit()
             return True
+        hold_id = ""
         if enabled:
-            self.connection.execute("insert into sqag_legal_holds (hold_id, workspace_id, target_type, target_id, enabled, reason_code, case_reference, actor_tracking_id, actor_key_version, created_at) values (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)", (self.new_id("hold"), self.workspace_id, target_type, safe_id, reason, case or None, self.actor_tracking_id, self.actor_key_version, iso_timestamp(now)))
+            hold_id = self.new_id("hold")
+            self.connection.execute("insert into sqag_legal_holds (hold_id, workspace_id, target_type, target_id, enabled, reason_code, case_reference, actor_tracking_id, actor_key_version, created_at) values (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)", (hold_id, self.workspace_id, target_type, safe_id, reason, case or None, self.actor_tracking_id, self.actor_key_version, iso_timestamp(now)))
             event = "legal_hold_applied"
         else:
             self.connection.execute("update sqag_legal_holds set enabled = 0, released_by_tracking_id = ?, released_by_key_version = ?, released_at = ? where hold_id = ? and enabled = 1", (self.actor_tracking_id, self.actor_key_version, iso_timestamp(now), active["hold_id"]))
             event = "legal_hold_released"
+        if table == "sqag_telemetry_events":
+            hold_cursor = self.connection.execute(
+                "update sqag_telemetry_events set legal_hold = ? "
+                "where workspace_id = ? and event_id = ?",
+                (1 if enabled else 0, self.workspace_id, safe_id),
+            )
+            if getattr(hold_cursor, "rowcount", 0) != 1:
+                self.connection.rollback()
+                return False
         self.append_audit(event, {"target_type": target_type, "target_id": safe_id, "reason_code": reason or active.get("reason_code"), "case_reference": case or active.get("case_reference") or ""}, now=now, commit=False)
         self.append_audit("legal_hold_changed", {"target_type": target_type, "target_id": safe_id, "enabled": enabled}, now=now, commit=False)
+        self.append_telemetry_event(
+            "legal_hold",
+            "held" if enabled else "updated",
+            event_id=self.telemetry_event_id(
+                "telemetry-legal-hold",
+                hold_id or safe_reference(active.get("hold_id")),
+                "applied" if enabled else "released",
+            ),
+            action_reference=safe_id,
+            purpose=target_type,
+            now=now,
+            commit=False,
+        )
         self.connection.commit()
         return True
 
@@ -1018,6 +1658,16 @@ class ForensicStore:
             ).fetchone()
             if row:
                 return True
+        telemetry = self.connection.execute(
+            "select 1 from sqag_telemetry_events child where child.workspace_id = ? "
+            "and child.run_reference = ? and (child.legal_hold = 1 or exists ("
+            "select 1 from sqag_legal_holds hold where hold.workspace_id = child.workspace_id "
+            "and hold.target_type = 'telemetry_event' and hold.target_id = child.event_id "
+            "and hold.enabled = 1)) limit 1",
+            (self.workspace_id, run_id),
+        ).fetchone()
+        if telemetry:
+            return True
         return False
 
     def _feedback_graph_held(self, feedback_id: str) -> bool:
@@ -1044,6 +1694,17 @@ class ForensicStore:
             (self.workspace_id, feedback_id),
         ).fetchone()
         if linked_audit_held:
+            return True
+        linked_telemetry_held = self.connection.execute(
+            "select 1 from sqag_telemetry_events child "
+            "where child.workspace_id = ? and child.support_reference = ? "
+            "and (child.legal_hold = 1 or exists (select 1 from sqag_legal_holds hold "
+            "where hold.workspace_id = child.workspace_id "
+            "and hold.target_type = 'telemetry_event' "
+            "and hold.target_id = child.event_id and hold.enabled = 1)) limit 1",
+            (self.workspace_id, feedback_id),
+        ).fetchone()
+        if linked_telemetry_held:
             return True
         report = row_dict(
             self.connection.execute(
@@ -1094,7 +1755,39 @@ class ForensicStore:
         for table in ("sqag_generation_evidence", "sqag_audit_events"):
             if self.connection.execute(f"select 1 from {table} where workspace_id = ? and run_id = ? and retention_expires_at > ? limit 1", (self.workspace_id, run_id, now_text)).fetchone():
                 return True
+        if self.connection.execute(
+            "select 1 from sqag_telemetry_events where workspace_id = ? "
+            "and run_reference = ? and retention_expires_at > ? limit 1",
+            (self.workspace_id, run_id, now_text),
+        ).fetchone():
+            return True
         return False
+
+    def _telemetry_event_graph_held(self, item: dict[str, Any]) -> bool:
+        run_id = safe_reference(item.get("run_reference"), "run-")
+        if run_id and self._run_graph_held(run_id):
+            return True
+        feedback_id = safe_reference(item.get("support_reference"), "feedback-")
+        return bool(feedback_id and self._feedback_graph_held(feedback_id))
+
+    def _record_retention_telemetry(
+        self,
+        event_type: str,
+        event_status: str,
+        record_id: str,
+        *,
+        purpose: str,
+        now_text: str,
+    ) -> None:
+        self.append_telemetry_event(
+            event_type,
+            event_status,
+            action_reference=record_id,
+            operation_route="retention_worker",
+            purpose=purpose,
+            now=parse_timestamp(now_text) or utc_now(),
+            commit=False,
+        )
 
     def _delete_retention_graph(
         self,
@@ -1168,6 +1861,19 @@ class ForensicStore:
                     self._authorize_delete(record_type, str(child[column]))
                     self.connection.execute(f"delete from {table} where workspace_id = ? and {column} = ?", (self.workspace_id, child[column]))
                     removed.append((record_type, str(child[column]), str(child["original_retention_expires_at"])))
+            telemetry_rows = self.connection.execute(
+                "select event_id, original_retention_expires_at from sqag_telemetry_events "
+                "where workspace_id = ? and run_reference = ?",
+                (self.workspace_id, record_id),
+            ).fetchall()
+            for row in telemetry_rows:
+                child = row_dict(row)
+                self._authorize_delete("sqag_telemetry_events", str(child["event_id"]))
+                self.connection.execute(
+                    "delete from sqag_telemetry_events where workspace_id = ? and event_id = ?",
+                    (self.workspace_id, child["event_id"]),
+                )
+                removed.append(("sqag_telemetry_events", str(child["event_id"]), str(child["original_retention_expires_at"])))
             cursor = self.connection.execute("delete from sqag_generation_runs where workspace_id = ? and run_id = ?", (self.workspace_id, record_id))
         else:
             audit_rows = self.connection.execute(
@@ -1189,6 +1895,19 @@ class ForensicStore:
                 child = row_dict(row)
                 self.connection.execute("delete from sqag_feedback_status_history where workspace_id = ? and history_id = ?", (self.workspace_id, child["history_id"]))
                 removed.append(("sqag_feedback_status_history", str(child["history_id"]), str(child["original_retention_expires_at"])))
+            telemetry_rows = self.connection.execute(
+                "select event_id, original_retention_expires_at from sqag_telemetry_events "
+                "where workspace_id = ? and support_reference = ?",
+                (self.workspace_id, record_id),
+            ).fetchall()
+            for row in telemetry_rows:
+                child = row_dict(row)
+                self._authorize_delete("sqag_telemetry_events", str(child["event_id"]))
+                self.connection.execute(
+                    "delete from sqag_telemetry_events where workspace_id = ? and event_id = ?",
+                    (self.workspace_id, child["event_id"]),
+                )
+                removed.append(("sqag_telemetry_events", str(child["event_id"]), str(child["original_retention_expires_at"])))
             cursor = self.connection.execute("delete from sqag_feedback where workspace_id = ? and feedback_id = ?", (self.workspace_id, record_id))
         if getattr(cursor, "rowcount", 0) != 1:
             raise RuntimeError("retention_parent_delete_incomplete")
@@ -1229,6 +1948,16 @@ class ForensicStore:
                 "where workspace_id = ? and retention_expires_at <= ? "
                 "order by case when deletion_claimed_at is null then 0 else 1 end, "
                 "deletion_claimed_at, retention_expires_at, feedback_id limit ?",
+                (self.workspace_id, now_text, query_limit),
+            ).fetchall()
+        ]
+        telemetry = [
+            dict(row_dict(row), _kind="telemetry_event")
+            for row in self.connection.execute(
+                "select * from sqag_telemetry_events "
+                "where workspace_id = ? and retention_expires_at <= ? "
+                "order by case when deletion_claimed_at is null then 0 else 1 end, "
+                "deletion_claimed_at, retention_expires_at, source_sequence, event_id limit ?",
                 (self.workspace_id, now_text, query_limit),
             ).fetchall()
         ]
@@ -1308,9 +2037,11 @@ class ForensicStore:
             for group in groups:
                 if offset < len(group):
                     merged.append(group[offset])
+        merged.extend(sorted(telemetry, key=candidate_key))
         has_more = bool(
             len(runs) > scan_limit
             or len(feedback) > scan_limit
+            or len(telemetry) > scan_limit
             or len(standalone_audits) > scan_limit
             or len(receipts) > scan_limit
             or len(merged) > scan_limit
@@ -1319,10 +2050,19 @@ class ForensicStore:
         examined = deleted = held = failed = review_required = parents = actions = 0
         standalone_examined = standalone_deleted = standalone_held = standalone_failed = 0
         receipt_examined = receipt_deleted = receipt_failed = 0
+        telemetry_examined = telemetry_deleted = telemetry_held = telemetry_failed = 0
         publication_retained = 0
 
         def mark_examined(kind: str, record_id: str, *, state: str = "") -> None:
             if not apply or kind in {"standalone_audit", "deletion_receipt"}:
+                return
+            if kind == "telemetry_event":
+                self.connection.execute(
+                    "update sqag_telemetry_events set deletion_claimed_at = ?, deletion_state = ? "
+                    "where workspace_id = ? and event_id = ?",
+                    (now_text, state or "active", self.workspace_id, record_id),
+                )
+                self.connection.commit()
                 return
             table = "sqag_generation_runs" if kind == "generation_run" else "sqag_feedback"
             id_column = "run_id" if kind == "generation_run" else "feedback_id"
@@ -1479,6 +2219,84 @@ class ForensicStore:
                     failed += 1
                     receipt_failed += 1
                 continue
+            if kind == "telemetry_event":
+                telemetry_examined += 1
+                if (
+                    bool(item.get("legal_hold"))
+                    or self._active_hold("telemetry_event", record_id)
+                    or self._telemetry_event_graph_held(item)
+                ):
+                    if apply:
+                        self._record_retention_telemetry(
+                            "retention",
+                            "held",
+                            record_id,
+                            purpose="candidate_held",
+                            now_text=now_text,
+                        )
+                    telemetry_held += 1
+                    mark_examined(kind, record_id, state="review_required")
+                    continue
+                if not apply:
+                    continue
+                try:
+                    self._acquire_transaction_locks(("telemetry_event", record_id))
+                    current = row_dict(
+                        self.connection.execute(
+                            "select * from sqag_telemetry_events where workspace_id = ? and event_id = ?",
+                            (self.workspace_id, record_id),
+                        ).fetchone()
+                    )
+                    current_expiry = parse_timestamp(current.get("retention_expires_at"))
+                    retention_now = parse_timestamp(now_text)
+                    if (
+                        not current
+                        or bool(current.get("legal_hold"))
+                        or self._active_hold("telemetry_event", record_id)
+                        or self._telemetry_event_graph_held(current)
+                        or current_expiry is None
+                        or retention_now is None
+                        or current_expiry > retention_now
+                    ):
+                        raise RetentionGraphHeld("telemetry_event_became_protected")
+                    self._record_retention_telemetry(
+                        "retention",
+                        "requested",
+                        record_id,
+                        purpose="candidate_delete",
+                        now_text=now_text,
+                    )
+                    self._authorize_delete("sqag_telemetry_events", record_id)
+                    delete_cursor = self.connection.execute(
+                        "delete from sqag_telemetry_events where workspace_id = ? and event_id = ?",
+                        (self.workspace_id, record_id),
+                    )
+                    if getattr(delete_cursor, "rowcount", 0) != 1:
+                        raise RuntimeError("telemetry_event_delete_incomplete")
+                    self._receipt(
+                        "sqag_telemetry_events",
+                        record_id,
+                        str(current["original_retention_expires_at"]),
+                        now_text,
+                    )
+                    self._record_retention_telemetry(
+                        "deletion",
+                        "deleted",
+                        record_id,
+                        purpose="expired_record_deleted",
+                        now_text=now_text,
+                    )
+                    self.connection.commit()
+                    telemetry_deleted += 1
+                except RetentionGraphHeld:
+                    self.connection.rollback()
+                    telemetry_held += 1
+                    mark_examined(kind, record_id, state="review_required")
+                except Exception:
+                    self.connection.rollback()
+                    telemetry_failed += 1
+                    mark_examined(kind, record_id, state="delete_failed")
+                continue
             if kind == "feedback" and item.get("status") not in FEEDBACK_CLOSED_STATES:
                 review_required += 1
                 mark_examined(kind, record_id, state="review_required")
@@ -1494,6 +2312,14 @@ class ForensicStore:
                 else False
             )
             if graph_held or retained_child:
+                if apply:
+                    self._record_retention_telemetry(
+                        "retention",
+                        "held",
+                        record_id,
+                        purpose="candidate_held",
+                        now_text=now_text,
+                    )
                 held += 1
                 mark_examined(kind, record_id)
                 continue
@@ -1502,8 +2328,20 @@ class ForensicStore:
             if not apply:
                 continue
             try:
+                self._record_retention_telemetry(
+                    "retention",
+                    "requested",
+                    record_id,
+                    purpose="candidate_delete",
+                    now_text=now_text,
+                )
                 removed: list[tuple[str, str, str]] = []
                 if kind == "generation_run" and artifact_delete is not None:
+                    # The existing artifact adapter owns a separate storage
+                    # transaction. Persist the retention request before
+                    # crossing that boundary so SQLite does not retain a
+                    # write lock while the adapter classifies the version.
+                    self.connection.commit()
 
                     def finalize_graph(
                         connection: Any,
@@ -1538,6 +2376,13 @@ class ForensicStore:
                     removed = self._delete_retention_graph(
                         kind, item, record_id, now_text
                     )
+                self._record_retention_telemetry(
+                    "deletion",
+                    "deleted",
+                    record_id,
+                    purpose="expired_record_deleted",
+                    now_text=now_text,
+                )
                 self.connection.commit()
                 deleted += len(removed)
             except RetentionPublicationDependency:
@@ -1585,6 +2430,10 @@ class ForensicStore:
             receipt_deleted,
             receipt_failed,
             publication_retained,
+            telemetry_examined,
+            telemetry_deleted,
+            telemetry_held,
+            telemetry_failed,
         )
 
     def reconcile_non_terminal_runs(
@@ -1714,6 +2563,27 @@ class ForensicStore:
                     "generation_abandoned",
                     {"reason": "interrupted_run_reconciliation"},
                     run_id=run_id,
+                    now=now,
+                    commit=False,
+                )
+                self.append_telemetry_event(
+                    "abandonment",
+                    "abandoned",
+                    event_id=self.telemetry_event_id("telemetry-abandonment", run_id),
+                    action_reference=run_id,
+                    run_reference=run_id,
+                    purpose="interrupted_run_reconciliation",
+                    failure_class="generator_error",
+                    now=now,
+                    commit=False,
+                )
+                self.append_telemetry_event(
+                    "reconciliation",
+                    "reconciled",
+                    event_id=self.telemetry_event_id("telemetry-reconciliation", run_id),
+                    action_reference=run_id,
+                    run_reference=run_id,
+                    purpose="startup_reconciliation",
                     now=now,
                     commit=False,
                 )

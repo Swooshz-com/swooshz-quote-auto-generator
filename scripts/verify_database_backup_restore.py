@@ -9,6 +9,7 @@ mode hosted/protected/deploy-ready or final production object-storage ready.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import json
 import sqlite3
@@ -23,6 +24,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from webapp import server as webapp
+from webapp.forensics import ForensicStore
 
 
 RETENTION_POLICY_PATH = ROOT / "docs" / "internal-alpha-retention-policy.json"
@@ -32,6 +34,8 @@ SQAG_TABLES = (
     "sqag_quote_sessions",
     "sqag_quote_artifacts",
     "sqag_file_artifacts",
+    "sqag_telemetry_source_state",
+    "sqag_telemetry_events",
 )
 REQUIRED_RETENTION_CLASSES = {
     "quote_sessions",
@@ -115,6 +119,35 @@ def snapshot_database(path: Path) -> dict[str, Any]:
                 "select metadata_json from sqag_quote_sessions order by workspace_id, session_id"
             ).fetchall()
         ]
+        source_state = [
+            {
+                "workspace_id": row["workspace_id"],
+                "source_product": row["source_product"],
+                "next_source_sequence": row["next_source_sequence"],
+                "high_watermark": row["high_watermark"],
+                "reconciliation_state": row["reconciliation_state"],
+            }
+            for row in connection.execute(
+                "select workspace_id, source_product, next_source_sequence, "
+                "high_watermark, reconciliation_state from sqag_telemetry_source_state "
+                "order by workspace_id, source_product"
+            ).fetchall()
+        ]
+        telemetry_events = [
+            {
+                "workspace_id": row["workspace_id"],
+                "event_id": row["event_id"],
+                "source_sequence": row["source_sequence"],
+                "retry_lineage_id": row["retry_lineage_id"],
+                "attempt_number": row["attempt_number"],
+                "immutable_metadata_digest": row["immutable_metadata_digest"],
+            }
+            for row in connection.execute(
+                "select workspace_id, event_id, source_sequence, retry_lineage_id, "
+                "attempt_number, immutable_metadata_digest from sqag_telemetry_events "
+                "order by workspace_id, source_sequence, event_id"
+            ).fetchall()
+        ]
     finally:
         connection.close()
     return {
@@ -123,6 +156,8 @@ def snapshot_database(path: Path) -> dict[str, Any]:
         "artifact_checksums": artifact_checksums,
         "workspace_count": len(workspaces),
         "owner_count": len([owner for owner in owners if owner]),
+        "telemetry_source_state": source_state,
+        "telemetry_events": telemetry_events,
     }
 
 
@@ -155,6 +190,7 @@ def seed_synthetic_database(database_path: Path) -> None:
     profile_payload = {"id": "profile-alpha", "label": "Synthetic profile", "defaults": {"project": "Private profile layout contents"}}
     pricing_payload = {"id": "pricing-alpha", "label": "Synthetic pricing", "items": [{"description": "Private pricing catalog contents"}]}
     connection = sqlite3.connect(database_path)
+    connection.row_factory = sqlite3.Row
     try:
         connection.execute(
             "insert into sqag_profiles (workspace_id, profile_id, payload_json, created_at, updated_at) values (?, ?, ?, ?, ?)",
@@ -175,6 +211,48 @@ def seed_synthetic_database(database_path: Path) -> None:
         connection.execute(
             "insert into sqag_file_artifacts (workspace_id, owner_type, owner_id, artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             ("workspace-alpha", "profile", "profile-alpha", "quotation_layout", "quotation-layout.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", len(file_blob), sqlite3.Binary(file_blob), now, now),
+        )
+        store = ForensicStore(connection, "workspace-alpha", "pid-backup-restore")
+        store.append_telemetry_event(
+            "ai_provider_attempt",
+            "success",
+            event_id="telemetry-backup-attempt-1",
+            retry_lineage_id="retry-backup-synthetic",
+            attempt_number=1,
+            provider="openai",
+            model="synthetic-model",
+            reasoning_level="standard",
+            operation_route="synthetic_backup_seed",
+            purpose="backup_restore_verification",
+            now=dt.datetime(2026, 7, 3, tzinfo=dt.timezone.utc),
+            commit=False,
+        )
+        store.append_telemetry_event(
+            "reconciliation",
+            "reconciled",
+            event_id="telemetry-backup-reconciliation-1",
+            operation_route="synthetic_backup_seed",
+            purpose="backup_restore_verification",
+            now=dt.datetime(2026, 7, 3, tzinfo=dt.timezone.utc),
+            commit=False,
+        )
+        store.append_telemetry_event(
+            "backup",
+            "available",
+            event_id="telemetry-backup-evidence-1",
+            operation_route="synthetic_backup_seed",
+            purpose="backup_restore_verification",
+            now=dt.datetime(2026, 7, 3, tzinfo=dt.timezone.utc),
+            commit=False,
+        )
+        store.append_telemetry_event(
+            "restore",
+            "restored",
+            event_id="telemetry-restore-evidence-1",
+            operation_route="synthetic_backup_seed",
+            purpose="backup_restore_verification",
+            now=dt.datetime(2026, 7, 3, tzinfo=dt.timezone.utc),
+            commit=False,
         )
         connection.execute(
             "insert into sqag_quote_sessions (workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at) values (?, ?, ?, ?, ?, ?)",
@@ -199,6 +277,11 @@ def mutate_database_after_known_good_backup(database_path: Path) -> None:
         connection.execute(
             "insert into sqag_profiles (workspace_id, profile_id, payload_json, created_at, updated_at) values (?, ?, ?, ?, ?)",
             ("workspace-alpha", "profile-mutated", json.dumps({"id": "profile-mutated"}, sort_keys=True), "2026-07-03T00:05:00Z", "2026-07-03T00:05:00Z"),
+        )
+        connection.execute(
+            "update sqag_telemetry_source_state set next_source_sequence = 1, "
+            "high_watermark = 0 where workspace_id = ? and source_product = ?",
+            ("workspace-alpha", "sqag"),
         )
         connection.commit()
     finally:
@@ -256,8 +339,14 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
     table_checksums_match = before["table_checksums"] == after["table_checksums"]
     artifact_checksums_match = before["artifact_checksums"] == after["artifact_checksums"]
     ownership_preserved = after["workspace_count"] == 2 and after["owner_count"] == 2
+    telemetry_source_state_match = before["telemetry_source_state"] == after["telemetry_source_state"]
+    telemetry_identity_order_preserved = before["telemetry_events"] == after["telemetry_events"]
+    restore_did_not_reemit = (
+        len(after["telemetry_events"]) == len(before["telemetry_events"])
+        and after["telemetry_source_state"] == before["telemetry_source_state"]
+    )
     rollback_ok = known_good["table_checksums"] == rolled_back["table_checksums"] and mutated["table_checksums"] != rolled_back["table_checksums"]
-    status = "passed" if all((row_counts_match, table_checksums_match, artifact_checksums_match, ownership_preserved, rollback_ok)) else "failed"
+    status = "passed" if all((row_counts_match, table_checksums_match, artifact_checksums_match, ownership_preserved, telemetry_source_state_match, telemetry_identity_order_preserved, restore_did_not_reemit, rollback_ok)) else "failed"
 
     return {
         "schema": "swooshz.sqag.database-backup-restore-verification.v1",
@@ -269,6 +358,9 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
             "table_checksums_match": table_checksums_match,
             "artifact_checksums_match": artifact_checksums_match,
             "workspace_ownership_preserved": ownership_preserved,
+            "telemetry_source_state_match": telemetry_source_state_match,
+            "telemetry_identity_order_preserved": telemetry_identity_order_preserved,
+            "restore_did_not_reemit": restore_did_not_reemit,
             "tables_verified": list(SQAG_TABLES),
         },
         "rollback": {

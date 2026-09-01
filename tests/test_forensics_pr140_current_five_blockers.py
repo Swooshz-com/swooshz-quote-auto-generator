@@ -154,7 +154,6 @@ class Pr140CurrentFiveBlockerTests(unittest.TestCase):
                         "where workspace_id = ? and run_id = ?",
                         (workspace_id, run_a),
                     ).fetchone()[0]
-
                 retention_output = io.StringIO()
                 with (
                     mock.patch.object(

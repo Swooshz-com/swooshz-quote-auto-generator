@@ -9,6 +9,7 @@ from webapp.forensics import ForensicStore, add_calendar_years, iso_timestamp
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = ROOT / "migrations" / "004_generation_forensics_feedback_retention.sql"
+TELEMETRY_MIGRATION = ROOT / "migrations" / "009_telemetry_events.sql"
 
 
 class ForensicsFeedbackRetentionTest(unittest.TestCase):
@@ -16,6 +17,7 @@ class ForensicsFeedbackRetentionTest(unittest.TestCase):
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript(MIGRATION.read_text(encoding="utf-8"))
+        self.connection.executescript(TELEMETRY_MIGRATION.read_text(encoding="utf-8"))
         self.store = ForensicStore(self.connection, "workspace-a", "pid-v1-user-a")
 
     def tearDown(self):
@@ -126,6 +128,15 @@ class ForensicsFeedbackRetentionTest(unittest.TestCase):
         past = iso_timestamp(dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc))
         now = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
         self.connection.execute("update sqag_generation_runs set retention_expires_at = ? where run_id = ?", (past, run_id))
+        telemetry_event_id = self.connection.execute(
+            "select event_id from sqag_telemetry_events where workspace_id = ? and run_reference = ?",
+            ("workspace-a", run_id),
+        ).fetchone()[0]
+        self.store._authorize_delete("sqag_telemetry_events", telemetry_event_id)
+        self.connection.execute(
+            "delete from sqag_telemetry_events where workspace_id = ? and event_id = ?",
+            ("workspace-a", telemetry_event_id),
+        )
         self.connection.commit()
 
         first = self.store.enforce_retention(now=now)

@@ -127,17 +127,43 @@ class RuntimePrivilegeContractStaticTest(unittest.TestCase):
         manifest = contract.validate_manifest()
         self.assertEqual(
             manifest["namespace"]["callable_routines"],
-            [contract.EXPECTED_CALLABLE_ROUTINE_DOCUMENT],
+            list(contract.EXPECTED_CALLABLE_ROUTINE_DOCUMENTS),
         )
         self.assertEqual(
-            manifest["source_binding"]["callable_routine_source"]["routine"],
-            "public.sqag_quote_session_deletion_hold_blocked(text, text)",
+            [
+                source["routine"]
+                for source in manifest["source_binding"]["callable_routine_sources"]
+            ],
+            [
+                "public.sqag_quote_session_deletion_hold_blocked(text, text)",
+                "public.sqag_quote_session_deletion_hold_blocked_v2(text, text)",
+            ],
         )
         self.assertEqual(contract.validate_source_bindings(manifest), [])
 
     def test_callable_session_hold_body_normalizes_formatting_but_not_semantics(self):
         canonical_body = contract._canonical_callable_routine_body()
         self.assertTrue(canonical_body)
+        canonical_body_v2 = contract._canonical_callable_routine_body(
+            routine_name=contract.CALLABLE_ROUTINE_V2_NAME,
+            migration_path=contract.CALLABLE_ROUTINE_V2_MIGRATION_PATH,
+            identity_arguments=contract.CALLABLE_ROUTINE_V2_IDENTITY_ARGUMENTS,
+        )
+        self.assertTrue(canonical_body_v2)
+        self.assertIn("from public.sqag_telemetry_events", canonical_body_v2)
+        self.assertIn("telemetry_state", canonical_body_v2)
+        self.assertNotIn(
+            "sqag_quote_session_deletion_hold_blocked(",
+            canonical_body_v2,
+        )
+        self.assertEqual(
+            {
+                match.group(1).lower()
+                for match in contract.SQL_RELATION_RE.finditer(canonical_body_v2)
+                if match.group(1).lower().startswith("sqag_")
+            },
+            set(contract.CALLABLE_ROUTINE_V2_REFERENCED_RELATIONS),
+        )
         formatting_only = canonical_body.replace("\n", " \t") + "\n-- formatting-only comment"
         self.assertEqual(
             contract._semantic_sql_tokens(canonical_body),
@@ -154,6 +180,33 @@ class RuntimePrivilegeContractStaticTest(unittest.TestCase):
         )
         verifier_source = (ROOT / "scripts" / "validate_runtime_privilege_contract.py").read_text(encoding="utf-8")
         self.assertIn("p.prosrc as function_body", verifier_source)
+
+    def test_runtime_session_delete_uses_v2_as_early_authority(self):
+        server_source = (ROOT / "webapp" / "server.py").read_text(encoding="utf-8")
+        method_start = server_source.index("    def _session_deletion_blocked_by_hold(")
+        method_end = server_source.index("\n    def ", method_start + 1)
+        method_source = server_source[method_start:method_end]
+        v2_call = "sqag_quote_session_deletion_hold_blocked_v2("
+        self.assertIn(v2_call, method_source)
+        self.assertNotIn("sqag_quote_session_deletion_hold_blocked(", method_source)
+        v2_index = method_source.index(v2_call)
+        self.assertLess(method_source.index("def load_graph"), v2_index)
+        self.assertLess(
+            method_source.index("_acquire_transaction_locks(*lock_identities)"),
+            v2_index,
+        )
+        self.assertLess(
+            method_source.rindex(
+                "versions, runs, feedback, standalone_audits, telemetry = load_graph()"
+            ),
+            v2_index,
+        )
+        self.assertLess(
+            v2_index,
+            method_source.index('if any(bool(row["legal_hold"]) for row in versions):'),
+        )
+        self.assertIn("type(hold_blocked) is not bool", method_source)
+        self.assertIn("storage_postgres_session_delete_hold_unavailable", method_source)
 
     def test_option_a_static_contract_drift_is_fail_closed(self):
         manifest = contract.validate_manifest()
@@ -2023,6 +2076,9 @@ order by object_kind, object_schema, object_name, object_type
             ("sqag_feedback_linkage_no_update", "sqag_feedback"),
             ("sqag_generation_evidence_guard_delete", "sqag_generation_evidence"),
             ("sqag_audit_events_guard_delete", "sqag_audit_events"),
+            ("sqag_telemetry_source_state_no_delete", "sqag_telemetry_source_state"),
+            ("sqag_telemetry_events_no_update", "sqag_telemetry_events"),
+            ("sqag_telemetry_events_guard_delete", "sqag_telemetry_events"),
         ):
             self._execute_admin(f"drop trigger if exists {trigger} on public.{table}")
         self._execute_admin("drop routine if exists public.sqag_reject_immutable_change()")
@@ -2038,6 +2094,22 @@ order by object_kind, object_schema, object_name, object_type
         self._execute_admin("create trigger sqag_feedback_linkage_no_update before update of run_id, session_id, publication_version_id, link_resolution_source, link_resolved_at on public.sqag_feedback for each row execute function public.sqag_reject_immutable_change()")
         self._execute_admin("create trigger sqag_generation_evidence_guard_delete before delete on public.sqag_generation_evidence for each row execute function public.sqag_require_retention_delete_authorization()")
         self._execute_admin("create trigger sqag_audit_events_guard_delete before delete on public.sqag_audit_events for each row execute function public.sqag_require_retention_delete_authorization()")
+        self._execute_admin("create trigger sqag_telemetry_source_state_no_delete before delete on public.sqag_telemetry_source_state for each row execute function public.sqag_reject_immutable_change()")
+        self._execute_admin(
+            "create trigger sqag_telemetry_events_no_update before update of "
+            "workspace_id, event_id, source_product, source_sequence, event_type, "
+            "event_status, actor_tracking_id, actor_key_version, action_reference, "
+            "run_reference, session_reference, support_reference, retry_lineage_id, "
+            "attempt_number, provider, model, reasoning_level, operation_route, "
+            "purpose, failure_class, duration_ms, usage_available, input_tokens, "
+            "output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, "
+            "cost_available, estimated_cost, actual_cost, currency, cost_version, "
+            "quota_decision, rate_limit_decision, abuse_decision, deployment_revision, "
+            "occurred_at, immutable_metadata_digest, retention_expires_at, "
+            "original_retention_expires_at on public.sqag_telemetry_events for each row "
+            "execute function public.sqag_reject_immutable_change()"
+        )
+        self._execute_admin("create trigger sqag_telemetry_events_guard_delete before delete on public.sqag_telemetry_events for each row execute function public.sqag_require_retention_delete_authorization()")
 
     def test_real_pg17_authenticated_and_active_identity_invariant(self):
         for expected_role in (
@@ -2129,6 +2201,81 @@ order by object_kind, object_schema, object_name, object_type
             effective = self._admin_row(
                 "select has_function_privilege(%s, %s, 'EXECUTE') as effective",
                 (role, "public.sqag_quote_session_deletion_hold_blocked(text, text)"),
+            )
+            self.assertEqual(effective["effective"], expected, role)
+        self.assertEqual(self._verify()["status"], "verified")
+
+    def test_real_pg17_callable_session_hold_authority_v2_metadata_acl_and_relations_are_exact(self):
+        spec = migration_contract.ROUTINE_SPECS[3]
+        row = self._admin_row(
+            "select n.nspname as schema_name, p.proname as name, "
+            "pg_get_function_identity_arguments(p.oid) as identity_arguments, "
+            "p.prokind, pg_get_function_result(p.oid) as result_type, "
+            "l.lanname as language, p.prosecdef, p.provolatile, "
+            "p.proparallel, p.proleakproof, p.proconfig, p.prosrc as function_body, "
+            "pg_get_functiondef(p.oid) as function_definition, owner.rolname as owner "
+            "from pg_catalog.pg_proc p "
+            "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+            "join pg_catalog.pg_language l on l.oid = p.prolang "
+            "join pg_catalog.pg_roles owner on owner.oid = p.proowner "
+            "where n.nspname = 'public' and p.proname = %s "
+            "and pg_get_function_identity_arguments(p.oid) = %s",
+            (spec.name, spec.identity_arguments),
+        )
+        self.assertEqual(row["schema_name"], "public")
+        self.assertEqual(row["name"], spec.name)
+        self.assertEqual(row["identity_arguments"], spec.identity_arguments)
+        self.assertEqual(row["prokind"], "f")
+        self.assertEqual(row["result_type"].lower(), "boolean")
+        self.assertEqual(row["language"], "sql")
+        self.assertTrue(row["prosecdef"])
+        self.assertEqual(row["provolatile"], "s")
+        self.assertEqual(row["proparallel"], "u")
+        self.assertFalse(row["proleakproof"])
+        self.assertEqual(row["proconfig"], ["search_path=pg_catalog, public"])
+        self.assertEqual(row["owner"], "sqag_migrator")
+        canonical_body = contract._canonical_callable_routine_body(
+            routine_name=contract.CALLABLE_ROUTINE_V2_NAME,
+            migration_path=contract.CALLABLE_ROUTINE_V2_MIGRATION_PATH,
+            identity_arguments=contract.CALLABLE_ROUTINE_V2_IDENTITY_ARGUMENTS,
+        )
+        self.assertEqual(
+            contract._semantic_sql_tokens(row["function_body"]),
+            contract._semantic_sql_tokens(canonical_body),
+        )
+        relation_inventory = {
+            match.group(1).lower()
+            for match in contract.SQL_RELATION_RE.finditer(row["function_definition"])
+            if match.group(1).lower().startswith("sqag_")
+        }
+        self.assertEqual(relation_inventory, set(spec.referenced_relations))
+        self.assertIsNone(contract.UNQUALIFIED_SQL_RELATION_RE.search(row["function_definition"]))
+        with self._admin_connection() as connection:
+            acl_rows = connection.execute(
+                "select case when acl.grantee = 0 then 'PUBLIC' "
+                "else coalesce(grantee_role.rolname, 'UNKNOWN') end as grantee, "
+                "acl.privilege_type, acl.is_grantable "
+                "from pg_catalog.pg_proc p "
+                "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+                "left join lateral pg_catalog.aclexplode(coalesce(p.proacl, pg_catalog.acldefault('f', p.proowner))) acl on true "
+                "left join pg_catalog.pg_roles grantee_role "
+                "on grantee_role.oid = acl.grantee and acl.grantee <> 0 "
+                "where n.nspname = 'public' and p.proname = %s "
+                "and pg_get_function_identity_arguments(p.oid) = %s "
+                "order by grantee, acl.privilege_type",
+                (spec.name, spec.identity_arguments),
+            ).fetchall()
+        self.assertEqual(
+            {
+                (item["grantee"], item["privilege_type"], item["is_grantable"])
+                for item in acl_rows
+            },
+            {("sqag_migrator", "EXECUTE", False), ("sqag_runtime", "EXECUTE", False)},
+        )
+        for role, expected in (("sqag_runtime", True), ("sqag_maintenance", False)):
+            effective = self._admin_row(
+                "select has_function_privilege(%s, %s, 'EXECUTE') as effective",
+                (role, "public.sqag_quote_session_deletion_hold_blocked_v2(text, text)"),
             )
             self.assertEqual(effective["effective"], expected, role)
         self.assertEqual(self._verify()["status"], "verified")
@@ -3259,6 +3406,18 @@ order by object_kind, object_schema, object_name, object_type
                     "drop trigger sqag_feedback_linkage_no_update on public.sqag_feedback"
                 ),
                 self._execute_admin(
+                    "drop trigger sqag_telemetry_source_state_no_delete "
+                    "on public.sqag_telemetry_source_state"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_telemetry_events_no_update "
+                    "on public.sqag_telemetry_events"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_telemetry_events_guard_delete "
+                    "on public.sqag_telemetry_events"
+                ),
+                self._execute_admin(
                     "drop function public.sqag_reject_immutable_change()"
                 ),
                 self._execute_admin(
@@ -3279,6 +3438,18 @@ order by object_kind, object_schema, object_name, object_type
                 ),
                 self._execute_admin(
                     "drop trigger sqag_feedback_linkage_no_update on public.sqag_feedback"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_telemetry_source_state_no_delete "
+                    "on public.sqag_telemetry_source_state"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_telemetry_events_no_update "
+                    "on public.sqag_telemetry_events"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_telemetry_events_guard_delete "
+                    "on public.sqag_telemetry_events"
                 ),
                 self._execute_admin(
                     "drop function public.sqag_reject_immutable_change()"
@@ -3615,10 +3786,27 @@ order by object_kind, object_schema, object_name, object_type
             self.assertEqual(report["status"], "unsafe")
             self.assertEqual(report["pendingMigrationIds"], [last.migration_id])
             self.assertEqual(
-                report["blockers"],
-                [
-                    "pending_suffix_present:routine:public.sqag_quote_session_deletion_hold_blocked(text, text)"
-                ],
+                set(report["blockers"]),
+                {
+                    *(
+                        f"pending_suffix_present:table:public.{table.name}"
+                        for table in migration_contract.MIGRATION_OBJECTS[-1].tables
+                    ),
+                    *(
+                        f"pending_suffix_present:index:public.{index.name}"
+                        for index in migration_contract.MIGRATION_OBJECTS[-1].indexes
+                    ),
+                    *(
+                        "pending_suffix_present:trigger:public."
+                        f"{trigger.table_name}.{trigger.name}"
+                        for trigger in migration_contract.MIGRATION_OBJECTS[-1].triggers
+                    ),
+                    *(
+                        "pending_suffix_present:routine:public."
+                        f"{routine.name}({routine.identity_arguments})"
+                        for routine in migration_contract.MIGRATION_OBJECTS[-1].routines
+                    ),
+                },
             )
         finally:
             self._execute_admin(
@@ -3682,6 +3870,84 @@ order by object_kind, object_schema, object_name, object_type
                     contract.verify_postgres_privilege_contract(adapter, self.manifest)
             finally:
                 adapter.close()
+
+    def test_telemetry_acl_antifalse_matrix_is_red_and_restored(self):
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "revoke select on table public.sqag_telemetry_events from sqag_runtime"
+            ),
+            lambda: self._execute_admin(
+                "grant select on table public.sqag_telemetry_events to sqag_runtime"
+            ),
+            "missing telemetry capability",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "grant update on table public.sqag_telemetry_events to sqag_runtime"
+            ),
+            lambda: self._execute_admin(
+                "revoke update on table public.sqag_telemetry_events from sqag_runtime"
+            ),
+            "runtime telemetry UPDATE",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "grant delete on table public.sqag_telemetry_source_state to sqag_runtime"
+            ),
+            lambda: self._execute_admin(
+                "revoke delete on table public.sqag_telemetry_source_state from sqag_runtime"
+            ),
+            "runtime telemetry DELETE",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "grant insert on table public.sqag_telemetry_source_state to sqag_maintenance"
+            ),
+            lambda: self._execute_admin(
+                "revoke insert on table public.sqag_telemetry_source_state from sqag_maintenance"
+            ),
+            "maintenance telemetry INSERT",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "grant delete on table public.sqag_telemetry_source_state to sqag_maintenance"
+            ),
+            lambda: self._execute_admin(
+                "revoke delete on table public.sqag_telemetry_source_state from sqag_maintenance"
+            ),
+            "maintenance telemetry DELETE",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "grant select on table public.sqag_telemetry_events to PUBLIC"
+            ),
+            lambda: self._execute_admin(
+                "revoke select on table public.sqag_telemetry_events from PUBLIC"
+            ),
+            "PUBLIC telemetry privilege",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "grant select on table public.sqag_telemetry_events "
+                "to sqag_runtime with grant option"
+            ),
+            lambda: self._execute_admin(
+                "revoke grant option for select on table "
+                "public.sqag_telemetry_events from sqag_runtime"
+            ),
+            "telemetry grant option",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "alter default privileges for role sqag_migrator in schema public "
+                "grant select on tables to sqag_runtime"
+            ),
+            lambda: self._execute_admin(
+                "alter default privileges for role sqag_migrator in schema public "
+                "revoke select on tables from sqag_runtime"
+            ),
+            "telemetry default ACL authority",
+        )
 
     def test_maintenance_projection_retention_and_cleanup_receipt(self):
         runtime_url = safe_postgres_url("sqag_runtime", self.database_name)
@@ -3779,15 +4045,14 @@ order by object_kind, object_schema, object_name, object_type
         self.assertFalse(maintenance_ledger["allowed"])
         self.assertTrue(migrator_ledger["allowed"])
 
-    def test_real_pg17_causal_001_007_cli_008_and_runtime_hold_denial(self):
+    def test_real_pg17_causal_001_008_cli_009_and_runtime_hold_denial(self):
         partial_database = self._create_isolated_database_fixture(
-            self.migrations[:6],
+            self.migrations[:7],
             configure_acl=False,
         )
         self._configure_acl_contract(
             partial_database,
-            migrations=self.migrations[:6],
-            include_callable=False,
+            migrations=self.migrations[:7],
         )
         migrator_url = safe_postgres_url("sqag_migrator", partial_database)
         before_pre_apply = self._migration_mutation_snapshot(partial_database)
@@ -3803,13 +4068,13 @@ order by object_kind, object_schema, object_name, object_type
         self.assertEqual(pre_apply["blockers"], [])
         self.assertEqual(
             pre_apply["appliedMigrationIds"],
-            [migration.migration_id for migration in self.migrations[:6]],
+            [migration.migration_id for migration in self.migrations[:7]],
         )
         self.assertEqual(
             pre_apply["pendingMigrationIds"],
-            [self.migrations[-1].migration_id],
+            [migration.migration_id for migration in self.migrations[7:]],
         )
-        self.assertEqual(pre_apply["appliedHead"], self.migrations[-2].migration_id)
+        self.assertEqual(pre_apply["appliedHead"], self.migrations[6].migration_id)
         self.assertEqual(pre_apply["expectedHead"], self.migrations[-1].migration_id)
         self.assertNotIn("runtimeContract", pre_apply)
         self.assertNotIn("maintenanceContract", pre_apply)
@@ -3899,18 +4164,23 @@ order by object_kind, object_schema, object_name, object_type
         self.assertEqual(clean_pre_apply["blockers"], [])
         self.assertEqual(
             clean_pre_apply["appliedMigrationIds"],
-            [migration.migration_id for migration in self.migrations[:6]],
+            [migration.migration_id for migration in self.migrations[:7]],
         )
         self.assertEqual(
             clean_pre_apply["pendingMigrationIds"],
-            [self.migrations[-1].migration_id],
+            [migration.migration_id for migration in self.migrations[7:]],
         )
-        self.assertEqual(clean_pre_apply["appliedHead"], self.migrations[-2].migration_id)
+        self.assertEqual(clean_pre_apply["appliedHead"], self.migrations[6].migration_id)
         self.assertEqual(clean_pre_apply["expectedHead"], self.migrations[-1].migration_id)
         self.assertEqual(
             self._migration_mutation_snapshot(partial_database),
             assumed_role_baseline,
         )
+        v1_before_009 = self._routine_catalog_snapshot(
+            partial_database,
+            migration_contract.ROUTINE_SPECS[2],
+        )
+        default_acl_before_009 = self._default_table_acl_snapshot(partial_database)
 
         environment = self._scrubbed_child_environment({
             webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME: migrator_url,
@@ -3929,9 +4199,55 @@ order by object_kind, object_schema, object_name, object_type
         )
         self.assertEqual(completed.returncode, 0, completed.stderr[-500:])
         self.assertIn(self.migrations[-1].migration_id, completed.stdout)
+        self.assertIn(
+            "Applied migration IDs: " + self.migrations[7].migration_id,
+            completed.stdout,
+        )
+        self.assertNotIn(
+            "Applied migration IDs: " + self.migrations[6].migration_id,
+            completed.stdout,
+        )
         self.assertNotIn(migrator_url, completed.stdout)
         self.assertNotIn(migrator_url, completed.stderr)
 
+        self.assertEqual(
+            v1_before_009,
+            self._routine_catalog_snapshot(
+                partial_database,
+                migration_contract.ROUTINE_SPECS[2],
+            ),
+        )
+        post_009 = self._inspect(partial_database)
+        self.assertEqual(post_009["status"], "ready")
+        self.assertIs(post_009["safeToApply"], True)
+        self.assertEqual(post_009["pendingMigrationIds"], [])
+        self.assertEqual(
+            post_009["appliedMigrationIds"],
+            [migration.migration_id for migration in self.migrations],
+        )
+        self.assertEqual(
+            post_009["appliedMigrationIds"][:-1],
+            clean_pre_apply["appliedMigrationIds"],
+        )
+        self.assertEqual(
+            set(post_009["appliedMigrationIds"])
+            - set(clean_pre_apply["appliedMigrationIds"]),
+            {self.migrations[7].migration_id},
+        )
+        ledger_row = self._admin_row(
+            "select sequence_no, migration_id, checksum_sha256, applied_at "
+            "from public.sqag_schema_migrations where sequence_no = %s",
+            (self.migrations[7].sequence_no,),
+            database_name=partial_database,
+        )
+        self.assertEqual(ledger_row["migration_id"], self.migrations[7].migration_id)
+        self.assertEqual(ledger_row["checksum_sha256"], self.migrations[7].checksum_sha256)
+        self.assertIsNotNone(ledger_row["applied_at"])
+        self.assertEqual(
+            self._default_table_acl_snapshot(partial_database),
+            default_acl_before_009,
+        )
+        self._assert_causal_telemetry_catalog_and_acl_contract(partial_database)
         self._assert_causal_callable_catalog_contract(partial_database)
         runtime_url = safe_postgres_url("sqag_runtime", partial_database)
         maintenance_url = safe_postgres_url("sqag_maintenance", partial_database)
@@ -3985,7 +4301,222 @@ order by object_kind, object_schema, object_name, object_type
         self.assertNotIn(migrator_url, completed.stderr)
         after_noop = self._migration_mutation_snapshot(partial_database)
         self.assertEqual(before_noop, after_noop)
-        print("RUN313_PG17_CAUSAL_TRANSITION_EXECUTED")
+        print("RUN367_PG17_CAUSAL_TRANSITION_EXECUTED")
+
+    def test_real_pg17_v2_telemetry_hold_graph_and_workspace_isolation(self):
+        runtime_url = safe_postgres_url("sqag_runtime", self.database_name)
+        workspace_id = "workspace-run367-telemetry"
+        wrong_workspace_id = "workspace-run367-wrong"
+        target_session_id = "quote-run367-target"
+        unrelated_session_id = "quote-run367-unrelated"
+        invalid_session_id = "quote-run367-invalid"
+        target_event_id = "telemetry-run367-target"
+        unrelated_event_id = "telemetry-run367-unrelated"
+        wrong_workspace_event_id = "telemetry-run367-wrong-workspace"
+        storage = webapp.DatabaseSqagStorage(
+            runtime_url,
+            workspace_id,
+            role="admin",
+            user_id="user-run367-telemetry",
+            expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+            },
+            clear=False,
+        ):
+            storage.create_or_update_quote_session(
+                {"session_id": target_session_id, "client": {"name": "synthetic"}},
+                result=None,
+            )
+            storage.create_or_update_quote_session(
+                {"session_id": unrelated_session_id, "client": {"name": "synthetic"}},
+                result=None,
+            )
+        with webapp.postgres_storage_connection(
+            runtime_url,
+            expected_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        ) as connection:
+            forensic = ForensicStore(
+                connection,
+                workspace_id,
+                "actor-run367-telemetry",
+                actor_key_version_value="test-v1",
+            )
+            forensic.append_telemetry_event(
+                "security",
+                "success",
+                event_id=target_event_id,
+                session_reference=target_session_id,
+            )
+            forensic.append_telemetry_event(
+                "security",
+                "success",
+                event_id=unrelated_event_id,
+                session_reference=unrelated_session_id,
+            )
+            wrong_workspace_forensic = ForensicStore(
+                connection,
+                wrong_workspace_id,
+                "actor-run367-wrong-workspace",
+                actor_key_version_value="test-v1",
+            )
+            wrong_workspace_forensic.append_telemetry_event(
+                "security",
+                "success",
+                event_id=wrong_workspace_event_id,
+                session_reference=target_session_id,
+            )
+
+        def runtime_hold_decision(session_id: str) -> bool:
+            with self.psycopg.connect(
+                runtime_url,
+                row_factory=self.dict_row,
+            ) as connection:
+                row = connection.execute(
+                    "select public.sqag_quote_session_deletion_hold_blocked_v2(%s, %s) "
+                    "as hold_blocked",
+                    (workspace_id, session_id),
+                ).fetchone()
+            self.assertIs(type(row["hold_blocked"]), bool)
+            return row["hold_blocked"]
+
+        self._execute_admin(
+            "update public.sqag_telemetry_events set legal_hold = 1 "
+            "where workspace_id = %s and event_id = %s",
+            (workspace_id, target_event_id),
+        )
+        self.assertTrue(runtime_hold_decision(target_session_id))
+        with mock.patch.dict(
+            os.environ,
+            {
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+            },
+            clear=False,
+        ):
+            self.assertFalse(storage.delete_quote_session(target_session_id))
+
+        self._execute_admin(
+            "update public.sqag_telemetry_events set legal_hold = 0 "
+            "where workspace_id = %s and event_id = %s",
+            (workspace_id, target_event_id),
+        )
+        self._execute_admin(
+            "insert into public.sqag_legal_holds "
+            "(hold_id, workspace_id, target_type, target_id, enabled, reason_code, "
+            "actor_tracking_id, actor_key_version, created_at) "
+            "values (%s, %s, 'telemetry_event', %s, 1, 'run367-test', "
+            "'actor-run367-telemetry', 'test-v1', '2026-09-01T00:00:00Z')",
+            ("hold-run367-telemetry-event", workspace_id, target_event_id),
+        )
+        self.assertTrue(runtime_hold_decision(target_session_id))
+        with mock.patch.dict(
+            os.environ,
+            {
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+            },
+            clear=False,
+        ):
+            self.assertFalse(storage.delete_quote_session(target_session_id))
+
+        self._execute_admin(
+            "delete from public.sqag_legal_holds "
+            "where workspace_id = %s and hold_id = %s",
+            (workspace_id, "hold-run367-telemetry-event"),
+        )
+        self._execute_admin(
+            "update public.sqag_telemetry_events set legal_hold = 1 "
+            "where workspace_id = %s and event_id = %s",
+            (workspace_id, unrelated_event_id),
+        )
+        self._execute_admin(
+            "update public.sqag_telemetry_events set legal_hold = 1 "
+            "where workspace_id = %s and event_id = %s",
+            (wrong_workspace_id, wrong_workspace_event_id),
+        )
+        self.assertFalse(runtime_hold_decision(target_session_id))
+        with mock.patch.dict(
+            os.environ,
+            {
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+            },
+            clear=False,
+        ):
+            self.assertTrue(storage.delete_quote_session(target_session_id))
+        self.assertIsNone(storage.get_quote_session(target_session_id))
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+            },
+            clear=False,
+        ):
+            storage.create_or_update_quote_session(
+                {"session_id": invalid_session_id, "client": {"name": "synthetic"}},
+                result=None,
+            )
+        with webapp.postgres_storage_connection(
+            runtime_url,
+            expected_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        ) as connection:
+            forensic = ForensicStore(
+                connection,
+                workspace_id,
+                "actor-run367-invalid",
+                actor_key_version_value="test-v1",
+            )
+            forensic.append_telemetry_event(
+                "security",
+                "success",
+                event_id="telemetry-run367-invalid-link",
+                session_reference=invalid_session_id,
+                run_reference="run-run367-missing",
+            )
+        self.assertTrue(runtime_hold_decision(invalid_session_id))
+
+        def insert_invalid_hold(hold_id: str, target_type: str, target_id: str, enabled: int):
+            self._execute_admin(
+                "insert into public.sqag_legal_holds "
+                "(hold_id, workspace_id, target_type, target_id, enabled, reason_code, "
+                "actor_tracking_id, actor_key_version, created_at) "
+                "values (%s, %s, %s, %s, %s, 'run367-test', "
+                "'actor-run367-invalid', 'test-v1', '2026-09-01T00:00:00Z')",
+                (hold_id, workspace_id, target_type, target_id, enabled),
+            )
+
+        invalid_holds = (
+            ("hold-run367-invalid-type", "unsupported_target", "target-run367", 1),
+            ("hold-run367-invalid-id", "telemetry_event", "bad target", 1),
+            ("hold-run367-missing-target", "telemetry_event", "telemetry-run367-missing-target", 1),
+            ("hold-run367-invalid-enabled", "telemetry_event", "target-run367", 2),
+        )
+        for hold_id, target_type, target_id, enabled in invalid_holds:
+            with self.subTest(invalid_hold=hold_id):
+                insert_invalid_hold(hold_id, target_type, target_id, enabled)
+                try:
+                    self.assertTrue(runtime_hold_decision(invalid_session_id))
+                finally:
+                    self._execute_admin(
+                        "delete from public.sqag_legal_holds "
+                        "where workspace_id = %s and hold_id = %s",
+                        (workspace_id, hold_id),
+                    )
+
+        with self.psycopg.connect(
+            runtime_url,
+            row_factory=self.dict_row,
+        ) as connection:
+            with self.assertRaises(Exception):
+                connection.execute("select 1 from public.sqag_legal_holds").fetchone()
+            connection.rollback()
 
     def test_real_pg17_mandatory_applied_prefix_and_missing_ledger_matrix(self):
         def assert_snapshot_stable(
@@ -4029,7 +4560,7 @@ order by object_kind, object_schema, object_name, object_type
         )
         self.assertEqual(
             control["pendingMigrationIds"],
-            [self.migrations[-1].migration_id],
+            [migration.migration_id for migration in self.migrations[6:]],
         )
 
         expected_index = "applied_prefix_missing:index:public.sqag_feedback_publication_idx"
@@ -4349,6 +4880,277 @@ order by object_kind, object_schema, object_name, object_type
                 raise AssertionError("fixture row missing")
             return row
 
+    def _routine_catalog_snapshot(self, database_name: str, spec) -> dict[str, object]:
+        row = self._admin_row(
+            "select n.nspname as schema_name, p.proname as name, "
+            "pg_get_function_identity_arguments(p.oid) as identity_arguments, "
+            "p.prokind, pg_get_function_result(p.oid) as result_type, "
+            "language_row.lanname as language, p.prosecdef as security_definer, "
+            "p.provolatile as volatility, p.proparallel as parallel, "
+            "p.proleakproof as leakproof, p.proconfig, p.prosrc as function_body, "
+            "pg_get_functiondef(p.oid) as function_definition, owner.rolname as owner "
+            "from pg_catalog.pg_proc p "
+            "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+            "join pg_catalog.pg_language language_row on language_row.oid = p.prolang "
+            "join pg_catalog.pg_roles owner on owner.oid = p.proowner "
+            "where n.nspname = 'public' and p.proname = %s "
+            "and pg_get_function_identity_arguments(p.oid) = %s",
+            (spec.name, spec.identity_arguments),
+            database_name=database_name,
+        )
+        acl_rows = self._admin_rows(
+            "select case when acl.grantee = 0 then 'PUBLIC' "
+            "else coalesce(grantee_role.rolname, 'UNKNOWN') end as grantee, "
+            "acl.privilege_type, acl.is_grantable "
+            "from pg_catalog.pg_proc p "
+            "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+            "left join lateral pg_catalog.aclexplode(coalesce(p.proacl, pg_catalog.acldefault('f', p.proowner))) acl on true "
+            "left join pg_catalog.pg_roles grantee_role "
+            "on grantee_role.oid = acl.grantee and acl.grantee <> 0 "
+            "where n.nspname = 'public' and p.proname = %s "
+            "and pg_get_function_identity_arguments(p.oid) = %s "
+            "order by grantee, acl.privilege_type",
+            (spec.name, spec.identity_arguments),
+            database_name=database_name,
+        )
+        return {
+            "catalog": (
+                row["schema_name"],
+                row["name"],
+                row["identity_arguments"],
+                row["prokind"],
+                row["result_type"],
+                row["language"],
+                row["security_definer"],
+                row["volatility"],
+                row["parallel"],
+                row["leakproof"],
+                tuple(row["proconfig"] or ()),
+                row["owner"],
+            ),
+            "function_body": row["function_body"],
+            "function_definition": row["function_definition"],
+            "acl": tuple(
+                (item["grantee"], item["privilege_type"], item["is_grantable"])
+                for item in acl_rows
+            ),
+        }
+
+    def _default_table_acl_snapshot(self, database_name: str) -> tuple[tuple[object, ...], ...]:
+        rows = self._admin_rows(
+            """
+select owner.rolname as owner,
+       coalesce(namespace.nspname, '<global>') as schema_name,
+       case when acl.grantee = 0 then 'PUBLIC'
+            else coalesce(grantee_role.rolname, 'UNKNOWN') end as grantee,
+       acl.privilege_type, acl.is_grantable
+from pg_catalog.pg_default_acl d
+join pg_catalog.pg_roles owner on owner.oid = d.defaclrole
+left join pg_catalog.pg_namespace namespace on namespace.oid = d.defaclnamespace
+left join lateral pg_catalog.aclexplode(d.defaclacl) acl on true
+left join pg_catalog.pg_roles grantee_role
+  on grantee_role.oid = acl.grantee and acl.grantee <> 0
+where d.defaclobjtype = 'r'
+  and owner.rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_maintenance')
+order by owner.rolname, schema_name, grantee, acl.privilege_type
+""",
+            database_name=database_name,
+        )
+        return tuple(
+            (
+                row["owner"],
+                row["schema_name"],
+                row["grantee"],
+                row["privilege_type"],
+                row["is_grantable"],
+            )
+            for row in rows
+        )
+
+    def _assert_causal_telemetry_catalog_and_acl_contract(self, database_name: str) -> None:
+        migration = migration_contract.MIGRATION_OBJECTS[-1]
+        telemetry_tables = {table.name for table in migration.tables}
+        with self._admin_connection(database_name) as raw_connection:
+            connection = webapp.PostgresConnectionAdapter(raw_connection)
+            relations = migration_contract._fetch_public_relations(connection)
+            tables = migration_contract._fetch_public_tables(connection, relations)
+            indexes = migration_contract._fetch_public_indexes(connection)
+            triggers = migration_contract._fetch_public_triggers(connection)
+
+        self.assertEqual(
+            {name for name in tables if name in telemetry_tables},
+            telemetry_tables,
+        )
+        for table in migration.tables:
+            self.assertTrue(
+                migration_contract._table_matches(tables[table.name], table),
+                table.name,
+            )
+
+        telemetry_indexes = {index.name for index in migration.indexes}
+        self.assertEqual(
+            {name for name in indexes if name in telemetry_indexes},
+            telemetry_indexes,
+        )
+        for index in migration.indexes:
+            self.assertTrue(
+                migration_contract._index_matches(indexes[index.name], index),
+                index.name,
+            )
+
+        trigger_by_key = {
+            (trigger["table_name"], trigger["name"]): trigger
+            for trigger in triggers
+        }
+        telemetry_triggers = {
+            (trigger.table_name, trigger.name)
+            for trigger in migration.triggers
+        }
+        self.assertEqual(
+            set(trigger_by_key) & telemetry_triggers,
+            telemetry_triggers,
+        )
+        for trigger in migration.triggers:
+            self.assertTrue(
+                migration_contract._trigger_matches(
+                    trigger_by_key[(trigger.table_name, trigger.name)],
+                    trigger,
+                ),
+                trigger.name,
+            )
+
+        placeholders = ", ".join("%s" for _ in sorted(telemetry_tables))
+        acl_rows = self._admin_rows(
+            f"""
+select c.relname as table_name, owner.rolname as owner,
+       case when acl.grantee = 0 then 'PUBLIC'
+            else coalesce(grantee_role.rolname, 'UNKNOWN') end as grantee,
+       grantor_role.rolname as grantor,
+       acl.privilege_type, acl.is_grantable
+from pg_catalog.pg_class c
+join pg_catalog.pg_namespace namespace on namespace.oid = c.relnamespace
+join pg_catalog.pg_roles owner on owner.oid = c.relowner
+left join lateral pg_catalog.aclexplode(c.relacl) acl on true
+left join pg_catalog.pg_roles grantee_role
+  on grantee_role.oid = acl.grantee and acl.grantee <> 0
+left join pg_catalog.pg_roles grantor_role on grantor_role.oid = acl.grantor
+where namespace.nspname = 'public'
+  and c.relkind = 'r'
+  and c.relname in ({placeholders})
+order by c.relname, grantee, acl.privilege_type
+""",
+            tuple(sorted(telemetry_tables)),
+            database_name=database_name,
+        )
+        direct_rows = [row for row in acl_rows if row["grantee"] is not None]
+        self.assertEqual(
+            {row["table_name"] for row in direct_rows},
+            telemetry_tables,
+        )
+        self.assertEqual(
+            {row["owner"] for row in direct_rows},
+            {"sqag_migrator"},
+        )
+        self.assertEqual(
+            {row["grantee"] for row in direct_rows},
+            {"sqag_migrator", "sqag_runtime", "sqag_maintenance"},
+        )
+        self.assertFalse(any(row["grantee"] == "PUBLIC" for row in direct_rows))
+
+        expected_direct = set()
+        for table_name in telemetry_tables:
+            for role, privilege_map in (
+                ("sqag_runtime", contract.RUNTIME_TABLE_PRIVILEGES),
+                ("sqag_maintenance", contract.MAINTENANCE_TABLE_PRIVILEGES),
+            ):
+                expected_direct.update(
+                    (
+                        table_name,
+                        role,
+                        "sqag_migrator",
+                        privilege,
+                        False,
+                    )
+                    for privilege in privilege_map[table_name]
+                )
+        observed_direct = {
+            (
+                row["table_name"],
+                row["grantee"],
+                row["grantor"],
+                row["privilege_type"],
+                row["is_grantable"],
+            )
+            for row in direct_rows
+            if row["grantee"] in {"sqag_runtime", "sqag_maintenance"}
+        }
+        self.assertEqual(observed_direct, expected_direct)
+        self.assertFalse(
+            any(
+                row["is_grantable"]
+                for row in direct_rows
+                if row["grantee"] in {"sqag_runtime", "sqag_maintenance"}
+            )
+        )
+
+        with self._admin_connection(database_name) as connection:
+            for role, privilege_map in (
+                ("sqag_runtime", contract.RUNTIME_TABLE_PRIVILEGES),
+                ("sqag_maintenance", contract.MAINTENANCE_TABLE_PRIVILEGES),
+            ):
+                for table_name in sorted(telemetry_tables):
+                    qualified = f"public.{table_name}"
+                    expected_privileges = set(privilege_map[table_name])
+                    for privilege in contract.TABLE_PRIVILEGES:
+                        result = connection.execute(
+                            "select has_table_privilege(%s, %s, %s) as effective, "
+                            "has_table_privilege(%s, %s, %s) as grantable",
+                            (
+                                role,
+                                qualified,
+                                privilege,
+                                role,
+                                qualified,
+                                f"{privilege} WITH GRANT OPTION",
+                            ),
+                        ).fetchone()
+                        self.assertEqual(
+                            bool(result["effective"]),
+                            privilege in expected_privileges,
+                            f"{role}:{table_name}:{privilege}",
+                        )
+                        self.assertFalse(
+                            bool(result["grantable"]),
+                            f"{role}:{table_name}:{privilege}:grantable",
+                        )
+
+        public_effective_rows = self._admin_rows(
+            f"""
+select c.relname as table_name, acl.privilege_type, acl.is_grantable
+from pg_catalog.pg_class c
+join pg_catalog.pg_namespace namespace on namespace.oid = c.relnamespace
+left join lateral pg_catalog.aclexplode(
+  coalesce(c.relacl, pg_catalog.acldefault('r', c.relowner))
+) acl on true
+where namespace.nspname = 'public'
+  and c.relkind = 'r'
+  and c.relname in ({placeholders})
+  and acl.grantee = 0
+order by c.relname, acl.privilege_type
+""",
+            tuple(sorted(telemetry_tables)),
+            database_name=database_name,
+        )
+        self.assertEqual(public_effective_rows, [])
+        default_acl_rows = self._default_table_acl_snapshot(database_name)
+        self.assertFalse(
+            any(
+                row[2] in {"PUBLIC", "sqag_runtime", "sqag_maintenance"}
+                for row in default_acl_rows
+            )
+        )
+        self.assertFalse(any(row[4] for row in default_acl_rows))
+
     def _assert_causal_callable_catalog_contract(self, database_name: str) -> None:
         routine = self._admin_row(
             "select n.nspname as schema_name, p.proname as name, "
@@ -4384,7 +5186,11 @@ order by object_kind, object_schema, object_name, object_type
         self.assertEqual(routine["proconfig"], ["search_path=pg_catalog, public"])
         self.assertEqual(routine["owner"], "sqag_migrator")
 
-        canonical_body = contract._canonical_callable_routine_body()
+        canonical_body = contract._canonical_callable_routine_body(
+            routine_name=contract.CALLABLE_ROUTINE_V2_NAME,
+            migration_path=contract.CALLABLE_ROUTINE_V2_MIGRATION_PATH,
+            identity_arguments=contract.CALLABLE_ROUTINE_V2_IDENTITY_ARGUMENTS,
+        )
         self.assertEqual(
             contract._semantic_sql_tokens(routine["function_body"]),
             contract._semantic_sql_tokens(canonical_body),

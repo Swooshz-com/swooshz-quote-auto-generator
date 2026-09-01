@@ -12,6 +12,7 @@ from webapp import server as webapp
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = ROOT / "migrations" / "004_generation_forensics_feedback_retention.sql"
+TELEMETRY_MIGRATION = ROOT / "migrations" / "009_telemetry_events.sql"
 
 
 class Pr140SevenBlockerRegressionTest(unittest.TestCase):
@@ -19,6 +20,7 @@ class Pr140SevenBlockerRegressionTest(unittest.TestCase):
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript(MIGRATION.read_text(encoding="utf-8"))
+        self.connection.executescript(TELEMETRY_MIGRATION.read_text(encoding="utf-8"))
 
     def tearDown(self):
         self.connection.close()

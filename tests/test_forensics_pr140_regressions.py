@@ -19,6 +19,7 @@ from scripts import enforce_forensic_retention
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = ROOT / "migrations" / "004_generation_forensics_feedback_retention.sql"
+TELEMETRY_MIGRATION = ROOT / "migrations" / "009_telemetry_events.sql"
 
 
 class Pr140RegressionTest(unittest.TestCase):
@@ -26,6 +27,7 @@ class Pr140RegressionTest(unittest.TestCase):
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript(MIGRATION.read_text(encoding="utf-8"))
+        self.connection.executescript(TELEMETRY_MIGRATION.read_text(encoding="utf-8"))
 
     def tearDown(self):
         self.connection.close()
@@ -145,6 +147,7 @@ class Pr140RegressionTest(unittest.TestCase):
             retention_connection = sqlite3.connect(path, timeout=5, check_same_thread=False)
             retention_connection.row_factory = sqlite3.Row
             retention_connection.executescript(MIGRATION.read_text(encoding="utf-8"))
+            retention_connection.executescript(TELEMETRY_MIGRATION.read_text(encoding="utf-8"))
             hold_connection = sqlite3.connect(path, timeout=5, check_same_thread=False)
             hold_connection.row_factory = sqlite3.Row
             try:
@@ -1326,10 +1329,18 @@ class Pr140RegressionTest(unittest.TestCase):
 
     def test_retention_worker_is_bounded(self):
         store = self.store()
-        past = iso_timestamp(dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc))
+        old_time = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+        past = iso_timestamp(old_time)
         for index in range(3):
-            run_id = store.record_run_started("generate", {"index": index})
-            store.finish_run(run_id, "failed", result_summary={"index": index})
+            run_id = store.record_run_started(
+                "generate", {"index": index}, now=old_time
+            )
+            store.finish_run(
+                run_id,
+                "failed",
+                result_summary={"index": index},
+                now=old_time,
+            )
         for table in ("sqag_generation_runs", "sqag_generation_evidence", "sqag_audit_events"):
             self.connection.execute(f"update {table} set retention_expires_at = ?", (past,))
         self.connection.commit()
@@ -1421,6 +1432,7 @@ class Pr140RegressionTest(unittest.TestCase):
                 "validate_generation_payload",
                 return_value=[webapp.MISSING_IMAGES_MESSAGE],
             ),
+            mock.patch.object(webapp, "append_runtime_telemetry"),
             mock.patch.object(
                 webapp, "begin_generation_forensics", return_value="run-direct123"
             ) as begin,
@@ -1454,6 +1466,7 @@ class Pr140RegressionTest(unittest.TestCase):
                     side_effect=lambda payload, **_kwargs: payload,
                 ),
                 mock.patch.object(webapp, "validate_generation_payload", return_value=errors),
+                mock.patch.object(webapp, "append_runtime_telemetry"),
                 mock.patch.object(
                     webapp,
                     "begin_generation_forensics",
@@ -1982,6 +1995,7 @@ class Pr140RegressionTest(unittest.TestCase):
                     side_effect=lambda value, **_kwargs: value,
                 ),
                 mock.patch.object(webapp, "validate_generation_payload", return_value=[]),
+                mock.patch.object(webapp, "append_runtime_telemetry"),
                 mock.patch.object(
                     webapp,
                     "payload_with_database_pricing_reference_detail",

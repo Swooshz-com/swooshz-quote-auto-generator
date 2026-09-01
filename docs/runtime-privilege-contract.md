@@ -22,11 +22,12 @@ The read-only admission path is
 
 The declared set is deliberately bounded to `public.sqag_*` application objects:
 
-- seven canonical PostgreSQL migrations and their canonical migration-ledger checksums;
-- the 15 application tables plus `sqag_schema_migrations`;
-- the 22 canonical indexes;
-- the two migrator-owned invoker trigger routines and one migrator-owned,
-  runtime-callable security-definer hold-decision routine;
+- eight canonical PostgreSQL migrations and their canonical migration-ledger checksums;
+- the 17 application tables plus `sqag_schema_migrations`;
+- the 28 canonical indexes;
+- the two migrator-owned invoker trigger routines and two migrator-owned,
+  runtime-callable security-definer hold-decision routines: historical v1 from
+  migration 008 and telemetry-aware v2 from migration 009;
 - the fixed connection search path `public, pg_catalog`;
 - the reviewed runtime and maintenance capability matrices.
 
@@ -93,6 +94,16 @@ The local SQLite retention path is unchanged when an explicit SQLite URL or the
 local default is selected. `--use-configured-database` is PostgreSQL-only and
 requires the maintenance projection.
 
+Migration 009 adds the metadata-only SQAG telemetry producer relations. The
+runtime role may `SELECT` and `INSERT` `sqag_telemetry_events` and may
+`SELECT`, `INSERT`, and `UPDATE` `sqag_telemetry_source_state`; it cannot update
+or delete event rows and cannot delete source state. The maintenance role may
+read, insert, update, and delete telemetry events and may read and update source
+state only through the existing controlled retention, hold, and reconciliation
+paths.
+The source-state high-watermark and next-sequence values remain durable when
+retention removes event rows.
+
 ## Provenance checks
 
 Effective `has_*_privilege` observations are necessary but not sufficient. The
@@ -110,13 +121,16 @@ verifier also observes, only for the declared namespace and roles:
 - relevant default ACL entries;
 - the absence of runtime/maintenance explicit column grants and public
   application grants.
-- the callable routine's exact SQL-language, STABLE, PARALLEL UNSAFE,
+- each callable routine's exact SQL-language, STABLE, PARALLEL UNSAFE,
   SECURITY DEFINER metadata, fixed `pg_catalog, public` function search path,
-  schema-qualified eight-relation body, and runtime-only EXECUTE ACL. Its
-  installed `pg_proc.prosrc` body is compared with the canonical body extracted
-  directly from the checksum-locked migration; only whitespace and SQL comments
-  are normalized, so token, operator, literal, control-flow, and result changes
-  fail closed;
+  schema-qualified relation body, and runtime-only EXECUTE ACL. Historical v1
+  remains the eight-relation migration-008 body. Telemetry-aware v2 is the
+  independent nine-relation migration-009 body and includes
+  `sqag_telemetry_events`, but not `sqag_telemetry_source_state`. Each installed
+  `pg_proc.prosrc` body is compared with its canonical body extracted directly
+  from its checksum-locked migration; only whitespace and SQL comments are
+  normalized, so token, operator, literal, control-flow, and result changes fail
+  closed;
 
 The information-schema column-grant view is effective authority, so table-level
 grants may appear there as per-column rows. It is not used as proof of explicit
@@ -136,13 +150,20 @@ validator output contain only safe statuses, counts, and fixed identifiers.
 canonical head with no checksum drift, missing table, unexpected pending table,
 missing index, missing trigger, ambiguous/wrong routine identity, wrong trigger
 linkage, callable-body relation or semantic-body drift, or callable ACL drift
-before the capability proof can pass. The verifier derives the expected callable
-body from the checksum-locked migration source and compares it with PostgreSQL
-`pg_proc.prosrc`; it does not maintain a second body hash or source-digest
-registry. Runtime may call only
-`public.sqag_quote_session_deletion_hold_blocked(text, text)` for the hosted
-session-deletion decision; it remains denied direct access to
-`public.sqag_legal_holds`. Maintenance retains its direct forensic authority.
+before the capability proof can pass. The verifier derives each expected
+callable body from its checksum-locked migration source and compares it with
+PostgreSQL `pg_proc.prosrc`; it does not maintain a second body hash or
+source-digest registry. Historical v1 remains bound to migration 008, while
+hosted runtime session deletion calls only
+`public.sqag_quote_session_deletion_hold_blocked_v2(text, text)` from migration
+009. The v2 authority retains the complete v1 quote-session graph and adds
+direct-session, run/publication, and feedback-linked telemetry, including
+linked `legal_hold=1` and enabled `telemetry_event` holds. Runtime remains
+denied direct access to `public.sqag_legal_holds`. Maintenance retains its
+direct forensic authority.
+The 009 telemetry relations are included in the same namespace, index, trigger,
+privilege, and source-binding proof; no separate telemetry service or database
+authority is introduced.
 
 The verifier performs a small source binding over the actual SQL relation names
 in the canonical application files. Supported PostgreSQL relations must be in
@@ -166,12 +187,18 @@ a generic blocker; it never prints a connection value.
 
 Repository CI must run the static validator and the real PostgreSQL 17 contract
 tests with actual canonical migrations and storage/forensic/retention paths.
-The disposable fixture uses separate migrator, runtime, and maintenance roles,
-two synthetic workspaces, positive operations, cross-workspace negatives, and
-anti-false privilege mutations. Its final receipt is emitted only after all
-connections are terminated, the database and roles are removed, and negative
-residual inspection proves that no fixture resource remains. Cleanup ambiguity
-is `CLEANUP_UNKNOWN`, never PASS, and the uncertain fixture is never reused.
+The causal fixture applies exactly 001-008, proves only 009 pending, applies
+only 009, and proves v1 catalog/source/ACL identity is unchanged while v2 has
+the exact catalog/source/ACL/relation contract. It exercises linked telemetry
+holds, enabled telemetry-event holds, valid unheld deletion, same-workspace
+unrelated telemetry, wrong-workspace telemetry, invalid hold/link fail-closed
+cases, and runtime denial of direct legal-hold reads. The disposable fixture
+uses separate migrator, runtime, and maintenance roles, two synthetic
+workspaces, positive operations, cross-workspace negatives, and anti-false
+privilege mutations. Its final receipt is emitted only after all connections
+are terminated, the database and roles are removed, and negative residual
+inspection proves that no fixture resource remains. Cleanup ambiguity is
+`CLEANUP_UNKNOWN`, never PASS, and the uncertain fixture is never reused.
 
 ## Review rule
 
