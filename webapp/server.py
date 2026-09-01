@@ -126,6 +126,7 @@ DEFAULT_COMPANY_ID = "default"
 DEFAULT_COMPANY_DISPLAY_NAME = "Quote Generator Workspace"
 DEFAULT_QUOTE_COMPANY_PROFILE_ID = "default"
 DEFAULT_QUOTE_COMPANY_FALLBACK_PRESET_ID = "synthetic-fixture-default"
+DELETED_PROFILE_MARKER_KEY = "_sqag_deleted"
 
 
 def discovered_default_resource_id(root: Path, marker_filename: str, fallback: str = "default") -> str:
@@ -10276,6 +10277,10 @@ class DatabaseSqagStorage:
                 payloads.append(payload)
         return payloads
 
+    @staticmethod
+    def _is_deleted_profile_payload(payload: Any) -> bool:
+        return isinstance(payload, Mapping) and payload.get(DELETED_PROFILE_MARKER_KEY) is True
+
     def _read_payload(self, table: str, id_column: str, item_id: str) -> dict[str, Any] | None:
         with self.connection() as connection:
             row = connection.execute(f"select payload_json from {table} where workspace_id = ? and {id_column} = ?", (self.workspace_id, item_id)).fetchone()
@@ -10531,7 +10536,11 @@ class DatabaseSqagStorage:
         return sorted(profiles, key=lambda item: (clean_text(item.get("label") or item.get("id")).casefold(), clean_text(item.get("id")).casefold()))
 
     def list_company_profiles(self) -> list[dict[str, Any]]:
-        return self._read_payloads("sqag_profiles", "profile_id")
+        return [
+            profile
+            for profile in self._read_payloads("sqag_profiles", "profile_id")
+            if not self._is_deleted_profile_payload(profile)
+        ]
 
     def profile_detail(self, profile_id: str, source: str = "") -> dict[str, Any] | None:
         safe_id = safe_resource_id(profile_id, "")
@@ -10541,7 +10550,7 @@ class DatabaseSqagStorage:
         if requested_source not in {"", "company"}:
             return None
         profile = self._read_payload("sqag_profiles", "profile_id", safe_id)
-        if profile is None:
+        if profile is None or self._is_deleted_profile_payload(profile):
             return None
         detail = copy.deepcopy(profile)
         detail["id"] = safe_id
@@ -10555,6 +10564,7 @@ class DatabaseSqagStorage:
         stored = {key: copy.deepcopy(value) for key, value in profile.items() if key not in {"_pack_assets", "pack", "profile_pack"}}
         stored["id"] = profile_id
         artifact_mode = configured_artifact_storage_mode()
+        materialize_default_layout = configured_storage_mode() == "database"
         if artifact_mode not in {"database", "object"}:
             self._upsert_payload("sqag_profiles", "profile_id", profile_id, stored)
             return stored
@@ -10562,16 +10572,27 @@ class DatabaseSqagStorage:
         item = self._prepare_profile_layout_artifact(profile)
         if artifact_mode == 'object':
             def prepare_object_profile(connection: Any):
+                profile_layout_item = item
+                if (
+                    profile_layout_item is None
+                    and materialize_default_layout
+                    and not self._profile_layout_artifact_exists(
+                        profile_id,
+                        artifact_mode=artifact_mode,
+                        connection=connection,
+                    )
+                ):
+                    profile_layout_item = self._prepare_default_profile_layout_artifact()
                 plan = (
                     self._prepare_object_artifact_batch(
                         'profile',
                         profile_id,
-                        [item],
+                        [profile_layout_item],
                         {'quotation_layout'},
                         {'quotation_layout'},
                         connection=connection,
                     )
-                    if item is not None
+                    if profile_layout_item is not None
                     else None
                 )
                 return plan, plan
@@ -10610,15 +10631,26 @@ class DatabaseSqagStorage:
             return stored
 
         def persist_profile(connection: Any) -> None:
-            if item is not None:
+            profile_layout_item = item
+            if (
+                profile_layout_item is None
+                and materialize_default_layout
+                and not self._profile_layout_artifact_exists(
+                    profile_id,
+                    artifact_mode=artifact_mode,
+                    connection=connection,
+                )
+            ):
+                profile_layout_item = self._prepare_default_profile_layout_artifact()
+            if profile_layout_item is not None:
                 self._execute_upsert_file_artifact(
                     connection,
                     "profile",
                     profile_id,
-                    item.artifact_kind,
-                    item.filename,
-                    item.content_type,
-                    item.content,
+                    profile_layout_item.artifact_kind,
+                    profile_layout_item.filename,
+                    profile_layout_item.content_type,
+                    profile_layout_item.content,
                 )
             self._execute_upsert_payload(
                 connection,
@@ -10661,14 +10693,36 @@ class DatabaseSqagStorage:
                 raise self._storage_unavailable_error(exc) from exc
 
         def delete_profile_owner(connection: Any) -> bool:
+            existing_row = connection.execute(
+                "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
+                (self.workspace_id, safe_id),
+            ).fetchone()
+            if existing_row:
+                try:
+                    existing_payload = json.loads(existing_row["payload_json"])
+                except (TypeError, json.JSONDecodeError):
+                    existing_payload = None
+                if self._is_deleted_profile_payload(existing_payload):
+                    return False
             if artifact_mode == "database":
                 connection.execute(
                     "delete from sqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ?",
                     (self.workspace_id, "profile", safe_id),
                 )
+            if not existing_row:
+                return False
             cursor = connection.execute(
-                "delete from sqag_profiles where workspace_id = ? and profile_id = ?",
-                (self.workspace_id, safe_id),
+                "update sqag_profiles set payload_json = ?, updated_at = ? where workspace_id = ? and profile_id = ?",
+                (
+                    json.dumps(
+                        {"id": safe_id, DELETED_PROFILE_MARKER_KEY: True},
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ),
+                    utc_timestamp(),
+                    self.workspace_id,
+                    safe_id,
+                ),
             )
             return cursor.rowcount > 0
 
@@ -10684,7 +10738,7 @@ class DatabaseSqagStorage:
         if not safe_id:
             return None
         profile = self._read_payload("sqag_profiles", "profile_id", safe_id)
-        if profile is None:
+        if profile is None or self._is_deleted_profile_payload(profile):
             return None
         return {"schema": COMPANY_PROFILE_EXPORT_SCHEMA, "exported_at": utc_timestamp(), "profile": {"id": safe_id, "label": clean_text(profile.get("label")) or safe_id, "description": clean_text(profile.get("description")), "defaults": copy.deepcopy(profile.get("defaults")) if isinstance(profile.get("defaults"), dict) else {}}}
 
@@ -10932,6 +10986,45 @@ class DatabaseSqagStorage:
             "size_bytes": size,
             "content": content,
         }
+
+    def _profile_layout_artifact_exists(
+        self,
+        profile_id: str,
+        *,
+        artifact_mode: str | None = None,
+        connection: Any | None = None,
+    ) -> bool:
+        safe_id = safe_resource_id(profile_id, "")
+        mode = artifact_mode or configured_artifact_storage_mode()
+        if not safe_id or mode not in {"database", "object"}:
+            return False
+        table = "sqag_file_artifacts" if mode == "database" else "sqag_object_artifacts"
+        query = (
+            f"select 1 from {table} where workspace_id = ? "
+            "and owner_type = ? and owner_id = ? and artifact_kind = ? limit 1"
+        )
+        params = (self.workspace_id, "profile", safe_id, "quotation_layout")
+        def artifact_or_deleted_profile_exists(active_connection: Any) -> bool:
+            if active_connection.execute(query, params).fetchone() is not None:
+                return True
+            if mode != "database":
+                return False
+            profile_row = active_connection.execute(
+                "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
+                (self.workspace_id, safe_id),
+            ).fetchone()
+            if not profile_row:
+                return False
+            try:
+                profile_payload = json.loads(profile_row["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                return False
+            return self._is_deleted_profile_payload(profile_payload)
+
+        if connection is not None:
+            return artifact_or_deleted_profile_exists(connection)
+        with self.connection() as read_connection:
+            return artifact_or_deleted_profile_exists(read_connection)
 
     def _active_object_artifact_rows(
         self,
@@ -11930,6 +12023,30 @@ class DatabaseSqagStorage:
             ),
             content_type=QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"],
             content=layout_bytes,
+        )
+
+    def _prepare_default_profile_layout_artifact(self) -> ArtifactBatchItem:
+        try:
+            layout_bytes = DEFAULT_QUOTE_LAYOUT_TEMPLATE_PATH.read_bytes()
+            validate_profile_layout_xlsx(layout_bytes)
+            if not embedded_layout_rules_from_xlsx_bytes(layout_bytes):
+                default_rules = default_layout_rules_payload()
+                if default_rules:
+                    layout_bytes = xlsx_bytes_with_embedded_layout_rules(
+                        layout_bytes,
+                        default_rules,
+                    )
+            validate_profile_layout_xlsx(layout_bytes)
+        except (OSError, ValueError) as exc:
+            raise ObjectStorageContractError(
+                "Default quotation layout is unavailable."
+            ) from exc
+        return ArtifactBatchItem(
+            artifact_kind="quotation_layout",
+            filename="quotation-layout.xlsx",
+            content_type=QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"],
+            content=layout_bytes,
+            source=DEFAULT_QUOTE_LAYOUT_TEMPLATE_PATH,
         )
 
     def _prepare_pricing_visual_artifacts(
