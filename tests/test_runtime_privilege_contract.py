@@ -189,7 +189,22 @@ class RuntimePrivilegeContractStaticTest(unittest.TestCase):
         v2_call = "sqag_quote_session_deletion_hold_blocked_v2("
         self.assertIn(v2_call, method_source)
         self.assertNotIn("sqag_quote_session_deletion_hold_blocked(", method_source)
-        self.assertLess(method_source.index(v2_call), method_source.index("def load_graph"))
+        v2_index = method_source.index(v2_call)
+        self.assertLess(method_source.index("def load_graph"), v2_index)
+        self.assertLess(
+            method_source.index("_acquire_transaction_locks(*lock_identities)"),
+            v2_index,
+        )
+        self.assertLess(
+            method_source.rindex(
+                "versions, runs, feedback, standalone_audits, telemetry = load_graph()"
+            ),
+            v2_index,
+        )
+        self.assertLess(
+            v2_index,
+            method_source.index('if any(bool(row["legal_hold"]) for row in versions):'),
+        )
         self.assertIn("type(hold_blocked) is not bool", method_source)
         self.assertIn("storage_postgres_session_delete_hold_unavailable", method_source)
 
@@ -3785,6 +3800,11 @@ order by object_kind, object_schema, object_name, object_type
                         "pending_suffix_present:trigger:public."
                         f"{trigger.table_name}.{trigger.name}"
                         for trigger in migration_contract.MIGRATION_OBJECTS[-1].triggers
+                    ),
+                    *(
+                        "pending_suffix_present:routine:public."
+                        f"{routine.name}({routine.identity_arguments})"
+                        for routine in migration_contract.MIGRATION_OBJECTS[-1].routines
                     ),
                 },
             )
