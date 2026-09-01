@@ -14274,6 +14274,30 @@ class DatabaseSqagStorage:
         if not safe_id:
             return True
 
+        if (
+            self.database_family == "postgres_compatible"
+            and self.expected_session_role == SQAG_RUNTIME_DATABASE_ROLE
+        ):
+            hold_row = connection.execute(
+                "select public.sqag_quote_session_deletion_hold_blocked_v2("
+                "cast(? as text), cast(? as text)) as hold_blocked",
+                (self.workspace_id, safe_id),
+            ).fetchone()
+            if isinstance(hold_row, Mapping):
+                hold_blocked = hold_row.get("hold_blocked")
+            else:
+                try:
+                    hold_blocked = hold_row[0]
+                except (IndexError, KeyError, TypeError):
+                    hold_blocked = None
+            if type(hold_blocked) is not bool:
+                raise SqagStorageAccessError(
+                    "Postgres session deletion hold authority is unavailable.",
+                    status=503,
+                    reason="storage_postgres_session_delete_hold_unavailable",
+                )
+            return hold_blocked
+
         def load_graph() -> tuple[list[Any], list[Any], list[Any], list[Any], list[Any]]:
             versions = list(
                 connection.execute(
@@ -14380,29 +14404,6 @@ class DatabaseSqagStorage:
         )
         forensic_store._acquire_transaction_locks(*lock_identities)
         versions, runs, feedback, standalone_audits, telemetry = load_graph()
-        if (
-            self.database_family == "postgres_compatible"
-            and self.expected_session_role == SQAG_RUNTIME_DATABASE_ROLE
-        ):
-            hold_row = connection.execute(
-                "select public.sqag_quote_session_deletion_hold_blocked("
-                "cast(? as text), cast(? as text)) as hold_blocked",
-                (self.workspace_id, safe_id),
-            ).fetchone()
-            if isinstance(hold_row, Mapping):
-                hold_blocked = hold_row.get("hold_blocked")
-            else:
-                try:
-                    hold_blocked = hold_row[0]
-                except (IndexError, KeyError, TypeError):
-                    hold_blocked = None
-            if type(hold_blocked) is not bool:
-                raise SqagStorageAccessError(
-                    "Postgres session deletion hold authority is unavailable.",
-                    status=503,
-                    reason="storage_postgres_session_delete_hold_unavailable",
-                )
-            return hold_blocked
         if any(bool(row["legal_hold"]) for row in versions):
             return True
         for row in versions:

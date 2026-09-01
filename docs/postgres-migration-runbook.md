@@ -33,8 +33,12 @@ Migration 009 creates `sqag_telemetry_source_state` and
 `sqag_telemetry_events`, their feed/retention/retry indexes, and the existing
 append-only/delete-authorization trigger bindings. It stores only bounded
 metadata, preserves workspace-scoped source ordering, and keeps source state
-after event retention or deletion. The migration is source- and checksum-
-locked like the earlier migrations; this run authorizes no live migration.
+after event retention or deletion. Its historical v1 quote-session hold
+authority remains bound to migration 008; the independent telemetry-aware v2
+authority is bound to migration 009 and its callable relation inventory does
+not include `sqag_telemetry_source_state`. The migration is source- and
+checksum-locked like the earlier migrations; this run authorizes no live
+migration.
 
 The runner accepts only an exact ordered prefix of the repository manifest.
 It fails closed for checksum drift, unknown or out-of-order rows, a complete
@@ -164,7 +168,8 @@ wrong runtime, maintenance, bootstrap, provider-like, and assumed-role
 authorities. The real PostgreSQL-17 applied-prefix matrix holds `001` through
 `008` applied with `009` pending and proves read-only RED behavior for a
 missing and drifted required telemetry index and trigger, while retaining the
-existing routine checks from migration 008. It also proves
+historical v1 routine checks from migration 008 and the exact telemetry-aware
+v2 routine checks from migration 009. It also proves
 lexically-before and lexically-after same-name trigger collisions, the
 canonical-missing plus wrong-table-extra case, missing-ledger known and unknown
 SQAG routines, an unrelated-provider-routine GREEN control, a managed-empty
@@ -216,9 +221,14 @@ row directly from the catalog, then take a pre-POST snapshot and execute the
 actual POST preflight child process with the dedicated migrator, runtime, and
 maintenance URLs. Require exact final heads, zero pending IDs and blockers,
 verified runtime and maintenance summaries, no URL/secret leakage, and an
-identical read-only BEFORE/AFTER snapshot. Prove the runtime role is denied
-direct legal-hold SELECT, and run the actual CLI a second time as an unchanged
-no-op with no ledger/object/ACL mutation. A second POST is not required.
+identical read-only BEFORE/AFTER snapshot. Prove the v1 catalog/source/ACL
+snapshot is unchanged and the v2 catalog/source/ACL/relation contract is
+exact. Prove the runtime role is denied direct legal-hold SELECT. The causal
+behavior must additionally prove linked held telemetry, enabled linked
+`telemetry_event` holds, invalid telemetry fail-closed behavior, valid
+unheld deletion, and same-workspace unrelated and wrong-workspace isolation.
+Run the actual CLI a second time as an unchanged no-op with no ledger/object/
+ACL mutation. A second POST is not required.
 
 Live retention/delete verification is not a migration action. Verification
 commands never grant themselves migration authority, create or populate the

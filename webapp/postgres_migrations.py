@@ -110,6 +110,7 @@ EXPECTED_ROUTINES = frozenset(
         "sqag_reject_immutable_change",
         "sqag_require_retention_delete_authorization",
         "sqag_quote_session_deletion_hold_blocked",
+        "sqag_quote_session_deletion_hold_blocked_v2",
     }
 )
 EXPECTED_TRIGGER_ROUTINE_KEYS = frozenset(
@@ -119,7 +120,10 @@ EXPECTED_TRIGGER_ROUTINE_KEYS = frozenset(
     }
 )
 EXPECTED_CALLABLE_ROUTINE_KEYS = frozenset(
-    {("sqag_quote_session_deletion_hold_blocked", "text, text")}
+    {
+        ("sqag_quote_session_deletion_hold_blocked", "text, text"),
+        ("sqag_quote_session_deletion_hold_blocked_v2", "text, text"),
+    }
 )
 EXPECTED_ROUTINE_KEYS = EXPECTED_TRIGGER_ROUTINE_KEYS | EXPECTED_CALLABLE_ROUTINE_KEYS
 EXPECTED_TRIGGER_ROUTINE_LINKS = {
@@ -697,6 +701,32 @@ ROUTINE_SPECS = (
         ),
         (("sqag_runtime", "EXECUTE", False),),
     ),
+    RoutineSpec(
+        "public",
+        "sqag_quote_session_deletion_hold_blocked_v2",
+        "text, text",
+        "boolean",
+        "sql",
+        "sqag_migrator",
+        True,
+        "s",
+        "u",
+        False,
+        ("search_path=pg_catalog, public",),
+        "009_telemetry_events_postgres.sql",
+        (
+            "sqag_audit_events",
+            "sqag_feedback",
+            "sqag_feedback_status_history",
+            "sqag_generation_evidence",
+            "sqag_generation_runs",
+            "sqag_legal_holds",
+            "sqag_quote_publication_versions",
+            "sqag_quote_sessions",
+            "sqag_telemetry_events",
+        ),
+        (("sqag_runtime", "EXECUTE", False),),
+    ),
 )
 ROUTINE_SPECS_BY_KEY = MappingProxyType({item.key: item for item in ROUTINE_SPECS})
 
@@ -742,6 +772,7 @@ MIGRATION_OBJECTS = (
         tables=tuple(TABLE_SPECS_BY_NAME[name] for name in ("sqag_telemetry_source_state", "sqag_telemetry_events")),
         indexes=tuple(INDEX_SPECS[22:28]),
         triggers=tuple(TRIGGER_SPECS[5:8]),
+        routines=(ROUTINE_SPECS[3],),
     ),
 )
 

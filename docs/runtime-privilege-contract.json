@@ -107,6 +107,40 @@
         "default_public_execute": false,
         "grant_options": false,
         "fail_closed": true
+      },
+      {
+        "name": "sqag_quote_session_deletion_hold_blocked_v2",
+        "identity_arguments": "text, text",
+        "argument_types": ["text", "text"],
+        "result_type": "boolean",
+        "language": "sql",
+        "owner": "sqag_migrator",
+        "security_mode": "definer",
+        "volatility": "stable",
+        "parallel": "unsafe",
+        "leakproof": false,
+        "direct_execute": true,
+        "trigger_only": false,
+        "function_search_path": ["pg_catalog", "public"],
+        "schema_qualified_relations": true,
+        "referenced_relations": [
+          "sqag_audit_events",
+          "sqag_feedback",
+          "sqag_feedback_status_history",
+          "sqag_generation_evidence",
+          "sqag_generation_runs",
+          "sqag_legal_holds",
+          "sqag_quote_publication_versions",
+          "sqag_quote_sessions",
+          "sqag_telemetry_events"
+        ],
+        "explicit_execute_roles": ["sqag_runtime"],
+        "owner_execute": true,
+        "public_execute": false,
+        "maintenance_execute": false,
+        "default_public_execute": false,
+        "grant_options": false,
+        "fail_closed": true
       }
     ],
     "sequences": [],
@@ -187,7 +221,7 @@
     {"path": "migrations/006_quote_publication_versions_postgres.sql", "sequence_no": 5, "sha256": "a66f620733c171571dfe44d078ef4bd37d2f8425bdc39d5278703af948d8e2f2", "tables": ["sqag_quote_publication_artifacts", "sqag_quote_publication_versions"]},
     {"path": "migrations/007_feedback_publication_binding_postgres.sql", "sequence_no": 6, "sha256": "886faa1a4cc76c942decbe02834662961fa336ca670d88f159ab3c5523cccc78", "tables": []},
     {"path": "migrations/008_quote_session_deletion_hold_authority_postgres.sql", "sequence_no": 7, "sha256": "709a822ff9b66405d97980d189d943b7346bc343ae7fd7ed3cb35ac7aafbb04c", "tables": []},
-    {"path": "migrations/009_telemetry_events_postgres.sql", "sequence_no": 8, "sha256": "847e528d8fc6aca999cff8e8de1fd6a5b3ba528e6b3436351a78e30c7b03f6e0", "tables": ["sqag_telemetry_events", "sqag_telemetry_source_state"]}
+    {"path": "migrations/009_telemetry_events_postgres.sql", "sequence_no": 8, "sha256": "019369ec31915b2f6ebe14e4a2925f3837ee49c0abd04ed211e895be7a06ebfe", "tables": ["sqag_telemetry_events", "sqag_telemetry_source_state"]}
   ],
   "database_privileges": {
     "public": {"connect": true, "create": false, "temporary": false},
@@ -245,20 +279,37 @@
     "allowed_sql_relations": ["sqag_audit_events", "sqag_deletion_receipts", "sqag_feedback", "sqag_feedback_status_history", "sqag_generation_evidence", "sqag_generation_runs", "sqag_legal_holds", "sqag_object_artifacts", "sqag_pricing_references", "sqag_profiles", "sqag_quote_publication_artifacts", "sqag_quote_publication_versions", "sqag_quote_sessions", "sqag_retention_delete_authorizations", "sqag_retention_scan_cursors", "sqag_telemetry_events", "sqag_telemetry_source_state"],
     "unsupported_sql_relations": ["sqag_file_artifacts", "sqag_quote_artifacts"],
     "dynamic_sql_variables": {"webapp/server.py": ["table"], "webapp/forensics.py": ["table"], "scripts/enforce_forensic_retention.py": []},
-    "callable_routine_source": {
-      "path": "migrations/008_quote_session_deletion_hold_authority_postgres.sql",
-      "routine": "public.sqag_quote_session_deletion_hold_blocked(text, text)",
-      "allowed_relations": [
-        "sqag_audit_events",
-        "sqag_feedback",
-        "sqag_feedback_status_history",
-        "sqag_generation_evidence",
-        "sqag_generation_runs",
-        "sqag_legal_holds",
-        "sqag_quote_publication_versions",
-        "sqag_quote_sessions"
-      ]
-    }
+    "callable_routine_sources": [
+      {
+        "path": "migrations/008_quote_session_deletion_hold_authority_postgres.sql",
+        "routine": "public.sqag_quote_session_deletion_hold_blocked(text, text)",
+        "allowed_relations": [
+          "sqag_audit_events",
+          "sqag_feedback",
+          "sqag_feedback_status_history",
+          "sqag_generation_evidence",
+          "sqag_generation_runs",
+          "sqag_legal_holds",
+          "sqag_quote_publication_versions",
+          "sqag_quote_sessions"
+        ]
+      },
+      {
+        "path": "migrations/009_telemetry_events_postgres.sql",
+        "routine": "public.sqag_quote_session_deletion_hold_blocked_v2(text, text)",
+        "allowed_relations": [
+          "sqag_audit_events",
+          "sqag_feedback",
+          "sqag_feedback_status_history",
+          "sqag_generation_evidence",
+          "sqag_generation_runs",
+          "sqag_legal_holds",
+          "sqag_quote_publication_versions",
+          "sqag_quote_sessions",
+          "sqag_telemetry_events"
+        ]
+      }
+    ]
   },
   "observation": {
     "allowed": ["server_major", "database_identity", "search_path", "migration_ledger", "named_namespace_metadata", "normalized_acl_provenance", "role_attributes", "bounded_memberships", "effective_privileges", "sanitized_counts"],
