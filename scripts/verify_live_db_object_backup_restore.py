@@ -22,7 +22,7 @@ import os
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, NamedTuple
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -122,6 +122,225 @@ OBJECT_ARTIFACT_ROW_FIELD_INDEX = {field: index for index, field in enumerate(OB
 StorageFactory = Callable[[str, str], Any]
 BackendFactory = Callable[[Mapping[str, str]], ObjectStorageBackend]
 MigrationApplier = Callable[[str], None]
+
+
+JOURNAL_NOT_REACHED = "not-reached"
+JOURNAL_ATTEMPTED = "attempted"
+JOURNAL_TOUCHED = "touched"
+JOURNAL_UNKNOWN = "unknown"
+JOURNAL_CLEANUP_PENDING = "cleanup-pending"
+JOURNAL_CLEANED = "cleaned"
+JOURNAL_ABSENCE_VERIFIED = "absence-verified"
+JOURNAL_CLEANUP_FAILED = "cleanup-failed"
+JOURNAL_STATES = (
+    JOURNAL_NOT_REACHED,
+    JOURNAL_ATTEMPTED,
+    JOURNAL_TOUCHED,
+    JOURNAL_UNKNOWN,
+    JOURNAL_CLEANUP_PENDING,
+    JOURNAL_CLEANED,
+    JOURNAL_ABSENCE_VERIFIED,
+    JOURNAL_CLEANUP_FAILED,
+)
+JOURNAL_TRANSITIONS = {
+    JOURNAL_NOT_REACHED: {
+        JOURNAL_ATTEMPTED,
+        JOURNAL_ABSENCE_VERIFIED,
+        JOURNAL_CLEANUP_FAILED,
+    },
+    JOURNAL_ATTEMPTED: {JOURNAL_TOUCHED, JOURNAL_UNKNOWN},
+    JOURNAL_UNKNOWN: {
+        JOURNAL_TOUCHED,
+        JOURNAL_ABSENCE_VERIFIED,
+        JOURNAL_CLEANUP_FAILED,
+    },
+    JOURNAL_TOUCHED: {JOURNAL_CLEANUP_PENDING, JOURNAL_CLEANUP_FAILED},
+    JOURNAL_CLEANUP_PENDING: {JOURNAL_CLEANED, JOURNAL_CLEANUP_FAILED},
+    JOURNAL_CLEANED: set(),
+    JOURNAL_ABSENCE_VERIFIED: set(),
+    JOURNAL_CLEANUP_FAILED: set(),
+}
+
+
+class ResourceSpec(NamedTuple):
+    key: str
+    operation: str
+    workspace_label: str
+    resource_kind: str
+    identifier: str
+
+
+class _JournalEntry:
+    def __init__(self, spec: ResourceSpec):
+        self.spec = spec
+        self._state = JOURNAL_NOT_REACHED
+        self.transitions: list[dict[str, str]] = []
+        self.touch_receipts: list[str] = []
+        self.attempted = False
+        self.unknowned = False
+        self.destructive_cleanup_attempted = False
+        self.destructive_cleanup_calls = 0
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+
+class ResourceJournal:
+    """Verifier-owned per-run resource state machine.
+
+    The entry state is intentionally private to this bounded API. Callers
+    record causal attempts, receipts, resolutions, and cleanup outcomes here;
+    cleanup eligibility is never inferred from storage construction.
+    """
+
+    def __init__(self, specs: tuple[ResourceSpec, ...]):
+        if len(specs) != 16 or len({spec.key for spec in specs}) != len(specs):
+            raise ValueError("The live backup/restore drill requires exactly 16 unique resources.")
+        self._order = tuple(spec.key for spec in specs)
+        self._entries = {spec.key: _JournalEntry(spec=spec) for spec in specs}
+
+    @property
+    def keys(self) -> tuple[str, ...]:
+        return self._order
+
+    def entry(self, key: str) -> _JournalEntry:
+        try:
+            return self._entries[key]
+        except KeyError as exc:
+            raise KeyError(f"Unknown verifier journal resource: {key}") from exc
+
+    def state(self, key: str) -> str:
+        return self.entry(key).state
+
+    def transition(self, key: str, target: str, reason: str) -> None:
+        if target not in JOURNAL_STATES:
+            raise ValueError(f"Unknown verifier journal state: {target}")
+        entry = self.entry(key)
+        current = entry.state
+        if target not in JOURNAL_TRANSITIONS[current]:
+            raise ValueError(f"Invalid verifier journal transition: {current} -> {target}")
+        entry._state = target
+        entry.transitions.append({"from": current, "to": target, "reason": reason})
+        if target == JOURNAL_ATTEMPTED:
+            entry.attempted = True
+        if target == JOURNAL_UNKNOWN:
+            entry.unknowned = True
+
+    def mark_attempted(self, key: str, reason: str) -> None:
+        self.transition(key, JOURNAL_ATTEMPTED, reason)
+
+    def mark_touched(self, key: str, reason: str) -> None:
+        self.transition(key, JOURNAL_TOUCHED, reason)
+
+    def mark_unknown(self, key: str, reason: str) -> None:
+        self.transition(key, JOURNAL_UNKNOWN, reason)
+
+    def mark_absence_verified(self, key: str, reason: str) -> None:
+        self.transition(key, JOURNAL_ABSENCE_VERIFIED, reason)
+
+    def mark_cleanup_pending(self, key: str, reason: str) -> None:
+        self.transition(key, JOURNAL_CLEANUP_PENDING, reason)
+
+    def mark_cleaned(self, key: str, reason: str) -> None:
+        self.transition(key, JOURNAL_CLEANED, reason)
+
+    def mark_cleanup_failed(self, key: str, reason: str) -> None:
+        self.transition(key, JOURNAL_CLEANUP_FAILED, reason)
+
+    def record_receipt(self, key: str, receipt: str) -> None:
+        entry = self.entry(key)
+        if receipt not in entry.touch_receipts:
+            entry.touch_receipts.append(receipt)
+
+    def mark_destructive_cleanup_attempt(self, key: str, operation: str) -> None:
+        entry = self.entry(key)
+        if entry.state != JOURNAL_CLEANUP_PENDING:
+            raise ValueError("Destructive cleanup requires cleanup-pending journal state.")
+        entry.destructive_cleanup_attempted = True
+        entry.destructive_cleanup_calls += 1
+        self.record_receipt(key, f"destructive-cleanup:{operation}")
+
+    def keys_in_state(self, state: str) -> tuple[str, ...]:
+        return tuple(key for key in self._order if self.state(key) == state)
+
+    def report(self) -> dict[str, object]:
+        entries: list[dict[str, object]] = []
+        state_counts = {state: 0 for state in JOURNAL_STATES}
+        attempted_and_resolved = 0
+        unknown_and_resolved = 0
+        destructive_cleanup_count = 0
+        not_written_by_this_run = 0
+        for key in self._order:
+            entry = self.entry(key)
+            state_counts[entry.state] += 1
+            if entry.attempted and entry.state != JOURNAL_ATTEMPTED:
+                attempted_and_resolved += 1
+            if entry.unknowned and entry.state != JOURNAL_UNKNOWN:
+                unknown_and_resolved += 1
+            if entry.destructive_cleanup_attempted:
+                destructive_cleanup_count += 1
+            not_written = not entry.attempted
+            if not_written:
+                not_written_by_this_run += 1
+            entries.append(
+                {
+                    "resource_key": entry.spec.key,
+                    "operation": entry.spec.operation,
+                    "workspace": entry.spec.workspace_label,
+                    "resource_kind": entry.spec.resource_kind,
+                    "state": entry.state,
+                    "transition_history": [dict(item) for item in entry.transitions],
+                    "touch_receipts": list(entry.touch_receipts),
+                    "destructive_cleanup_attempted": entry.destructive_cleanup_attempted,
+                    "destructive_cleanup_calls": entry.destructive_cleanup_calls,
+                    "not_written_by_this_run": not_written,
+                }
+            )
+        return {
+            "planned_resource_count": len(self._order),
+            "states": state_counts,
+            "attempted_and_resolved": attempted_and_resolved,
+            "unknown_and_resolved": unknown_and_resolved,
+            "destructive_cleanup_attempted": destructive_cleanup_count,
+            "not_written_by_this_run": not_written_by_this_run,
+            "entries": entries,
+        }
+
+
+class CleanupContext(NamedTuple):
+    """Immutable operation/workspace binding used by destructive cleanup."""
+
+    operation: str
+    workspace_identity: str
+    workspace_label: str
+    database_family: str
+    artifact_storage_mode: str
+    storage: object | None
+    maintenance_storage: object | None
+    backend: ObjectStorageBackend | None
+    backend_origin: str
+    backend_state: str
+    resource_keys: tuple[str, ...]
+    captured_artifacts: tuple[ObjectArtifactMetadata, ...]
+    capture_complete: bool
+    destructive_cleanup_eligible: bool
+
+    def report(self) -> dict[str, object]:
+        return {
+            "operation": self.operation,
+            "workspace": self.workspace_label,
+            "database_family": self.database_family,
+            "artifact_storage_mode": self.artifact_storage_mode,
+            "backend_origin": self.backend_origin,
+            "backend_state": self.backend_state,
+            "backend_bound": self.backend is not None,
+            "ambient_route_allowed": False,
+            "resource_keys": list(self.resource_keys),
+            "captured_artifact_count": len(self.captured_artifacts),
+            "capture_complete": self.capture_complete,
+            "destructive_cleanup_eligible": self.destructive_cleanup_eligible,
+        }
 
 
 def _clean(value: object) -> str:
@@ -250,6 +469,8 @@ def _report(
     missing_env_names: list[str],
     blockers: list[str],
     test_injected_backend: bool,
+    journal: ResourceJournal | None = None,
+    cleanup_contexts: Mapping[str, Mapping[str, object]] | None = None,
     active_db_rows: int = 0,
     active_object_count: int = 0,
     restore_db_rows: int = 0,
@@ -272,6 +493,23 @@ def _report(
         "privacy": _privacy_report(),
         "production_ready": False,
         "blockers": list(blockers),
+        "resource_journal": (
+            journal.report()
+            if journal is not None
+            else {
+                "planned_resource_count": 0,
+                "states": {state: 0 for state in JOURNAL_STATES},
+                "attempted_and_resolved": 0,
+                "unknown_and_resolved": 0,
+                "destructive_cleanup_attempted": 0,
+                "not_written_by_this_run": 0,
+                "entries": [],
+            }
+        ),
+        "cleanup_contexts": [
+            dict(value)
+            for value in (cleanup_contexts or {}).values()
+        ],
         "notes": [
             "This verifier uses synthetic namespaced rows and one tiny synthetic generated artifact payload only.",
             "It fails closed unless explicit live evidence, isolated restore targets, and operator decision markers are present.",
@@ -363,6 +601,163 @@ def _synthetic_probe_payload(ids: Mapping[str, str], purpose: str) -> bytes:
     return hashlib.sha256(seed).digest()[:16]
 
 
+def _planned_resource_specs(ids: Mapping[str, str]) -> tuple[ResourceSpec, ...]:
+    specs: list[ResourceSpec] = []
+    for operation in ("active", "restore"):
+        for workspace_label in ("workspace_a", "workspace_b"):
+            for resource_kind, id_key in (
+                ("profile", "profile_a" if workspace_label == "workspace_a" else "profile_b"),
+                ("pricing_reference", "pricing_a" if workspace_label == "workspace_a" else "pricing_b"),
+                ("quote_session", "session_a" if workspace_label == "workspace_a" else "session_b"),
+            ):
+                specs.append(
+                    ResourceSpec(
+                        key=f"{operation}/{workspace_label}/{resource_kind}",
+                        operation=operation,
+                        workspace_label=workspace_label,
+                        resource_kind=resource_kind,
+                        identifier=ids[id_key],
+                    )
+                )
+    specs.extend(
+        (
+            ResourceSpec(
+                key="active/workspace_a/generated_xlsx",
+                operation="active",
+                workspace_label="workspace_a",
+                resource_kind="generated_xlsx",
+                identifier=ids["session_a"],
+            ),
+            ResourceSpec(
+                key="restore/workspace_a/generated_xlsx",
+                operation="restore",
+                workspace_label="workspace_a",
+                resource_kind="generated_xlsx",
+                identifier=ids["session_a"],
+            ),
+            ResourceSpec(
+                key="active/workspace_a/isolation_probe",
+                operation="active",
+                workspace_label="workspace_a",
+                resource_kind="isolation_probe",
+                identifier=ids["active_probe_id"],
+            ),
+            ResourceSpec(
+                key="restore/workspace_a/isolation_probe",
+                operation="restore",
+                workspace_label="workspace_a",
+                resource_kind="isolation_probe",
+                identifier=ids["restore_probe_id"],
+            ),
+        )
+    )
+    return tuple(specs)
+
+
+def _verifier_artifact_storage_mode(env: Mapping[str, str]) -> str:
+    configured = _clean(env.get(webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME)).lower()
+    return configured if configured in {"database", "object"} else "object"
+
+
+def _expected_artifact_descriptor(
+    *,
+    workspace_id: str,
+    owner_type: str,
+    owner_id: str,
+    artifact_kind: str,
+    filename: str,
+    content_type: str,
+    content: bytes,
+) -> dict[str, object]:
+    checksum = artifact_checksum(content)
+    metadata = ObjectArtifactMetadata(
+        workspace_id=workspace_id,
+        owner_type=owner_type,
+        owner_id=owner_id,
+        artifact_kind=artifact_kind,
+        filename=filename,
+        content_type=content_type,
+        size_bytes=len(content),
+        checksum_sha256=checksum,
+        storage_key=webapp.object_artifact_key(
+            workspace_id=workspace_id,
+            owner_type=owner_type,
+            owner_id=owner_id,
+            artifact_kind=artifact_kind,
+            filename=filename,
+            checksum_sha256=checksum,
+        ),
+        created_at="1970-01-01T00:00:00Z",
+        updated_at="1970-01-01T00:00:00Z",
+    )
+    return {"metadata": metadata, "content": bytes(content)}
+
+
+def _expected_artifact_descriptors(
+    ids: Mapping[str, str],
+    active_payload: bytes,
+) -> dict[str, dict[str, object]]:
+    return {
+        "active/workspace_a/generated_xlsx": _expected_artifact_descriptor(
+            workspace_id=ids["workspace_a"],
+            owner_type="generated_quote",
+            owner_id=ids["session_a"],
+            artifact_kind="xlsx",
+            filename=SYNTHETIC_FILENAME,
+            content_type=SYNTHETIC_CONTENT_TYPE,
+            content=active_payload,
+        ),
+        "restore/workspace_a/generated_xlsx": _expected_artifact_descriptor(
+            workspace_id=ids["workspace_a"],
+            owner_type="generated_quote",
+            owner_id=ids["session_a"],
+            artifact_kind="xlsx",
+            filename=SYNTHETIC_FILENAME,
+            content_type=SYNTHETIC_CONTENT_TYPE,
+            content=active_payload,
+        ),
+        "active/workspace_a/isolation_probe": _expected_artifact_descriptor(
+            workspace_id=ids["workspace_a"],
+            owner_type=SYNTHETIC_PROBE_OWNER_TYPE,
+            owner_id=ids["active_probe_id"],
+            artifact_kind=SYNTHETIC_ACTIVE_PROBE_KIND,
+            filename=SYNTHETIC_PROBE_FILENAME,
+            content_type=SYNTHETIC_CONTENT_TYPE,
+            content=_synthetic_probe_payload(ids, "active"),
+        ),
+        "restore/workspace_a/isolation_probe": _expected_artifact_descriptor(
+            workspace_id=ids["workspace_a"],
+            owner_type=SYNTHETIC_PROBE_OWNER_TYPE,
+            owner_id=ids["restore_probe_id"],
+            artifact_kind=SYNTHETIC_RESTORE_PROBE_KIND,
+            filename=SYNTHETIC_PROBE_FILENAME,
+            content_type=SYNTHETIC_CONTENT_TYPE,
+            content=_synthetic_probe_payload(ids, "restore"),
+        ),
+    }
+
+
+def _artifact_receipt_matches(
+    receipt: object,
+    expected: ObjectArtifactMetadata,
+) -> bool:
+    if not isinstance(receipt, ObjectArtifactMetadata):
+        return False
+    return all(
+        (
+            receipt.workspace_id == expected.workspace_id,
+            receipt.owner_type == expected.owner_type,
+            receipt.owner_id == expected.owner_id,
+            receipt.artifact_kind == expected.artifact_kind,
+            receipt.filename == expected.filename,
+            receipt.content_type == expected.content_type,
+            receipt.size_bytes == expected.size_bytes,
+            receipt.checksum_sha256 == expected.checksum_sha256,
+            receipt.storage_key == expected.storage_key,
+        )
+    )
+
+
 def _backend_retrieval_proves_absence(
     backend: ObjectStorageBackend,
     metadata: ObjectArtifactMetadata,
@@ -413,39 +808,88 @@ def _object_artifact_row(storage: object, session_id: str, kind: str) -> object 
     return None
 
 
-def _write_metadata_rows(
-    *,
-    storage_a: object,
-    storage_b: object,
-    ids: Mapping[str, str],
-    artifact_metadata: ObjectArtifactMetadata | None,
-) -> int:
-    rows = 0
-    storage_a.save_profile({"id": ids["profile_a"], "label": "SQAG synthetic restore drill profile A"})
-    storage_b.save_profile({"id": ids["profile_b"], "label": "SQAG synthetic restore drill profile B"})
-    rows += 2
-    storage_a.save_pricing_reference({"id": ids["pricing_a"], "label": "SQAG synthetic restore drill pricing A", "items": []})
-    storage_b.save_pricing_reference({"id": ids["pricing_b"], "label": "SQAG synthetic restore drill pricing B", "items": []})
-    rows += 2
-    storage_a.create_or_update_quote_session(
-        {"session_id": ids["session_a"], "customer_summary": {"name": "Synthetic Restore Drill A"}},
-        session_id=ids["session_a"],
-    )
-    storage_b.create_or_update_quote_session(
-        {"session_id": ids["session_b"], "customer_summary": {"name": "Synthetic Restore Drill B"}},
-        session_id=ids["session_b"],
-    )
-    rows += 2
-    if artifact_metadata is not None:
-        storage_a._upsert_object_quote_artifact(
-            ids["session_a"],
-            "xlsx",
-            SYNTHETIC_FILENAME,
-            SYNTHETIC_CONTENT_TYPE,
-            artifact_metadata,
+def _owner_write_payload(
+    resource_kind: str,
+    identifier: str,
+    workspace_label: str,
+) -> tuple[str, dict[str, object], dict[str, object]]:
+    if resource_kind == "profile":
+        return (
+            "save_profile",
+            {"id": identifier, "label": f"SQAG synthetic restore drill profile {workspace_label[-1].upper()}"},
+            {"id": identifier},
         )
-        rows += 1
-    return rows
+    if resource_kind == "pricing_reference":
+        return (
+            "save_pricing_reference",
+            {"id": identifier, "label": f"SQAG synthetic restore drill pricing {workspace_label[-1].upper()}", "items": []},
+            {"id": identifier},
+        )
+    if resource_kind == "quote_session":
+        return (
+            "create_or_update_quote_session",
+            {"session_id": identifier, "customer_summary": {"name": f"Synthetic Restore Drill {workspace_label[-1].upper()}"}},
+            {"session_id": identifier},
+        )
+    raise ValueError(f"Unsupported verifier owner resource: {resource_kind}")
+
+
+def _owner_receipt_is_valid(
+    receipt: object,
+    expected: Mapping[str, object],
+) -> bool:
+    return isinstance(receipt, Mapping) and all(
+        _clean(receipt.get(key)) == _clean(value)
+        for key, value in expected.items()
+    )
+
+
+def _write_owner_resource(
+    *,
+    storage: object,
+    backend: ObjectStorageBackend | None,
+    journal: ResourceJournal,
+    resource_key: str,
+    resource_kind: str,
+    identifier: str,
+    workspace_label: str,
+    artifact_storage_mode: str = "object",
+) -> object:
+    method_name, payload, expected_receipt = _owner_write_payload(
+        resource_kind,
+        identifier,
+        workspace_label,
+    )
+    journal.mark_attempted(resource_key, f"dispatch:{method_name}")
+    try:
+        method = getattr(storage, method_name)
+        def invoke() -> object:
+            if resource_kind == "quote_session":
+                return method(payload, session_id=identifier)
+            return method(payload)
+
+        if backend is None:
+            if artifact_storage_mode == "object":
+                raise ObjectStorageConfigurationError(
+                    "Operation-specific object backend is required for this operation."
+                )
+            receipt = invoke()
+        elif resource_kind == "quote_session":
+            receipt = _with_configured_backend(
+                backend,
+                lambda: method(payload, session_id=identifier),
+            )
+        else:
+            receipt = _with_configured_backend(backend, lambda: method(payload))
+    except Exception:
+        journal.mark_unknown(resource_key, f"outcome-uncertain:{method_name}")
+        raise
+    if not _owner_receipt_is_valid(receipt, expected_receipt):
+        journal.mark_unknown(resource_key, f"receipt-invalid:{method_name}")
+        raise ObjectStorageContractError("Synthetic owner write receipt is invalid.")
+    journal.record_receipt(resource_key, f"validated:{method_name}")
+    journal.mark_touched(resource_key, f"receipt:{method_name}")
+    return receipt
 
 
 def _verify_db_rows(storage_a: object, storage_b: object, ids: Mapping[str, str]) -> bool:
@@ -711,7 +1155,18 @@ def _cleanup_storage(
     return not operation_failed and postconditions_ok
 
 
-def _with_configured_backend(backend: ObjectStorageBackend, callback: Callable[[], Any]) -> Any:
+def _with_configured_backend(
+    binding: CleanupContext | ObjectStorageBackend,
+    callback: Callable[[], Any],
+) -> Any:
+    context = binding if isinstance(binding, CleanupContext) else None
+    backend = context.backend if context is not None else binding
+    if backend is None and context is not None and context.artifact_storage_mode != "object":
+        return callback()
+    if backend is None:
+        raise ObjectStorageConfigurationError(
+            "Operation-specific object backend is required for this operation."
+        )
     missing = object()
     original_backend_factory = getattr(webapp, "configured_object_storage_backend", missing)
     try:
@@ -722,6 +1177,634 @@ def _with_configured_backend(backend: ObjectStorageBackend, callback: Callable[[
             delattr(webapp, "configured_object_storage_backend")
         else:
             webapp.configured_object_storage_backend = original_backend_factory  # type: ignore[assignment]
+
+
+def _store_object_resource(
+    *,
+    backend: ObjectStorageBackend | None,
+    journal: ResourceJournal,
+    resource_key: str,
+    descriptor: Mapping[str, object],
+) -> ObjectArtifactMetadata:
+    journal.mark_attempted(resource_key, "dispatch:object-store")
+    expected = descriptor.get("metadata")
+    content = descriptor.get("content")
+    if not isinstance(expected, ObjectArtifactMetadata) or not isinstance(content, bytes) or backend is None:
+        journal.mark_unknown(resource_key, "outcome-uncertain:object-backend-missing")
+        raise ObjectStorageConfigurationError("Operation-specific object backend is required for this operation.")
+    try:
+        receipt = backend.store_artifact(
+            workspace_id=expected.workspace_id,
+            owner_type=expected.owner_type,
+            owner_id=expected.owner_id,
+            artifact_kind=expected.artifact_kind,
+            filename=expected.filename,
+            content_type=expected.content_type,
+            content=content,
+        )
+    except Exception:
+        journal.mark_unknown(resource_key, "outcome-uncertain:object-store")
+        raise
+    if not _artifact_receipt_matches(receipt, expected):
+        journal.mark_unknown(resource_key, "receipt-invalid:object-store")
+        raise ObjectStorageContractError("Synthetic object store receipt is invalid.")
+    journal.record_receipt(resource_key, "validated:object-store")
+    journal.mark_touched(resource_key, "receipt:object-store")
+    return receipt
+
+
+def _context_resource_keys(
+    journal: ResourceJournal,
+    operation: str,
+    workspace_label: str,
+) -> tuple[str, ...]:
+    return tuple(
+        key
+        for key in journal.keys
+        if journal.entry(key).spec.operation == operation
+        and journal.entry(key).spec.workspace_label == workspace_label
+    )
+
+
+def _capture_context_artifacts(
+    storage: object | None,
+    *,
+    ids: Mapping[str, str],
+    workspace_label: str,
+    known_artifacts: tuple[ObjectArtifactMetadata, ...],
+) -> tuple[tuple[ObjectArtifactMetadata, ...], bool]:
+    if storage is None:
+        return (), False
+    captured: list[ObjectArtifactMetadata] = []
+    complete = True
+    suffix = "a" if workspace_label == "workspace_a" else "b"
+    for owner_type, owner_id in (
+        ("profile", ids[f"profile_{suffix}"]),
+        ("pricing_reference", ids[f"pricing_{suffix}"]),
+        ("generated_quote", ids[f"session_{suffix}"]),
+    ):
+        artifacts = _active_artifact_metadata(storage, owner_type, owner_id)
+        if artifacts is None:
+            complete = False
+            continue
+        captured.extend(artifacts)
+    for metadata in known_artifacts:
+        if not any(item.storage_key == metadata.storage_key for item in captured):
+            captured.append(metadata)
+    return tuple(captured), complete
+
+
+def _build_cleanup_contexts(
+    *,
+    active_storage_a: object | None,
+    active_storage_b: object | None,
+    restore_storage_a: object | None,
+    restore_storage_b: object | None,
+    active_maintenance_storage: object | None,
+    restore_maintenance_storage: object | None,
+    active_backend: ObjectStorageBackend | None,
+    restore_backend: ObjectStorageBackend | None,
+    active_backend_origin: str,
+    restore_backend_origin: str,
+    ids: Mapping[str, str],
+    journal: ResourceJournal,
+    expected_artifacts: Mapping[str, Mapping[str, object]],
+    artifact_metadata: Mapping[str, ObjectArtifactMetadata],
+    artifact_storage_mode: str,
+    evidence: dict[str, Mapping[str, object]],
+) -> tuple[CleanupContext, ...]:
+    bindings = (
+        (
+            "active",
+            "workspace_a",
+            ids["workspace_a"],
+            active_storage_a,
+            active_maintenance_storage,
+            active_backend,
+            active_backend_origin,
+        ),
+        (
+            "active",
+            "workspace_b",
+            ids["workspace_b"],
+            active_storage_b,
+            None,
+            active_backend,
+            active_backend_origin,
+        ),
+        (
+            "restore",
+            "workspace_a",
+            ids["workspace_a"],
+            restore_storage_a,
+            restore_maintenance_storage,
+            restore_backend,
+            restore_backend_origin,
+        ),
+        (
+            "restore",
+            "workspace_b",
+            ids["workspace_b"],
+            restore_storage_b,
+            None,
+            restore_backend,
+            restore_backend_origin,
+        ),
+    )
+    contexts: list[CleanupContext] = []
+    for (
+        operation,
+        workspace_label,
+        workspace_identity,
+        storage,
+        maintenance_storage,
+        backend,
+        backend_origin,
+    ) in bindings:
+        resource_keys = _context_resource_keys(journal, operation, workspace_label)
+        known: list[ObjectArtifactMetadata] = []
+        for key in resource_keys:
+            if journal.state(key) not in {JOURNAL_TOUCHED, JOURNAL_CLEANUP_PENDING}:
+                continue
+            metadata = artifact_metadata.get(key)
+            if metadata is None:
+                descriptor = expected_artifacts.get(key)
+                candidate = descriptor.get("metadata") if descriptor else None
+                if isinstance(candidate, ObjectArtifactMetadata):
+                    metadata = candidate
+            if metadata is not None:
+                known.append(metadata)
+        captured, capture_complete = _capture_context_artifacts(
+            storage,
+            ids=ids,
+            workspace_label=workspace_label,
+            known_artifacts=tuple(known),
+        )
+        touched = any(journal.state(key) == JOURNAL_TOUCHED for key in resource_keys)
+        eligible = bool(
+            touched
+            and storage is not None
+            and (
+                artifact_storage_mode != "object"
+                or (backend is not None and capture_complete)
+            )
+        )
+        context = CleanupContext(
+            operation=operation,
+            workspace_identity=workspace_identity,
+            workspace_label=workspace_label,
+            database_family=_clean(getattr(storage, "database_family", "")) or "unknown",
+            artifact_storage_mode=artifact_storage_mode,
+            storage=storage,
+            maintenance_storage=maintenance_storage,
+            backend=backend,
+            backend_origin=backend_origin,
+            backend_state="available" if backend is not None else "missing",
+            resource_keys=resource_keys,
+            captured_artifacts=captured,
+            capture_complete=capture_complete,
+            destructive_cleanup_eligible=eligible,
+        )
+        contexts.append(context)
+        evidence[f"{operation}/{workspace_label}"] = context.report()
+    return tuple(contexts)
+
+
+def _database_unknown_evidence(
+    storage: object | None,
+    *,
+    resource_kind: str,
+    identifier: str,
+    artifact_storage_mode: str,
+) -> str:
+    if storage is None:
+        return "failed"
+    detail_method_name = {
+        "profile": "profile_detail",
+        "pricing_reference": "pricing_reference_detail",
+        "quote_session": "get_quote_session",
+    }.get(resource_kind)
+    if detail_method_name is None:
+        return "failed"
+    try:
+        detail = getattr(storage, detail_method_name)(identifier)
+    except Exception:
+        return "failed"
+    if detail is not None:
+        return "present"
+    workspace_id = _clean(getattr(storage, "workspace_id", ""))
+    if resource_kind == "profile":
+        query = "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?"
+    elif resource_kind == "pricing_reference":
+        query = "select 1 from sqag_pricing_references where workspace_id = ? and reference_id = ?"
+    else:
+        query = "select 1 from sqag_quote_sessions where workspace_id = ? and session_id = ?"
+    rows = _database_rows(storage, query, (workspace_id, identifier))
+    if rows is None or rows is False:
+        return "failed"
+    if rows:
+        return "present"
+    if artifact_storage_mode == "object":
+        owner_type = {
+            "profile": "profile",
+            "pricing_reference": "pricing_reference",
+            "quote_session": "generated_quote",
+        }[resource_kind]
+        artifacts = _active_artifact_metadata(
+            storage,
+            owner_type,
+            identifier,
+        )
+        if artifacts is None:
+            return "failed"
+        if artifacts:
+            return "present"
+    return "absent"
+
+
+def _resolve_unknown_resource(
+    *,
+    key: str,
+    journal: ResourceJournal,
+    storage_by_context: Mapping[str, object | None],
+    backend_by_operation: Mapping[str, ObjectStorageBackend | None],
+    expected_artifacts: Mapping[str, Mapping[str, object]],
+    artifact_metadata: dict[str, ObjectArtifactMetadata],
+    artifact_storage_mode: str,
+) -> None:
+    entry = journal.entry(key)
+    spec = entry.spec
+    context_key = f"{spec.operation}/{spec.workspace_label}"
+    storage = storage_by_context.get(context_key)
+    if spec.resource_kind in {"profile", "pricing_reference", "quote_session"}:
+        evidence = _database_unknown_evidence(
+            storage,
+            resource_kind=spec.resource_kind,
+            identifier=spec.identifier,
+            artifact_storage_mode=artifact_storage_mode,
+        )
+        if evidence == "present":
+            journal.record_receipt(key, "unknown-resolution:database-present")
+            journal.mark_touched(key, "unknown-resolution:database-present")
+        elif evidence == "absent":
+            journal.record_receipt(key, "unknown-resolution:database-absent")
+            journal.mark_absence_verified(key, "unknown-resolution:database-absent")
+        else:
+            journal.mark_cleanup_failed(key, "unknown-resolution:database-read-failed")
+        return
+
+    descriptor = expected_artifacts.get(key)
+    expected = descriptor.get("metadata") if descriptor else None
+    backend = backend_by_operation.get(spec.operation)
+    if not isinstance(expected, ObjectArtifactMetadata) or backend is None:
+        journal.mark_cleanup_failed(key, "unknown-resolution:operation-backend-missing")
+        return
+    try:
+        backend.retrieve_artifact(expected, workspace_id=expected.workspace_id)
+    except (ObjectStorageNotFoundError, KeyError):
+        residue = _active_artifact_metadata(
+            storage,
+            expected.owner_type,
+            expected.owner_id,
+            artifact_kind=expected.artifact_kind,
+        )
+        if residue is None:
+            journal.mark_cleanup_failed(key, "unknown-resolution:metadata-read-failed")
+        elif residue:
+            artifact_metadata[key] = residue[0]
+            journal.record_receipt(key, "unknown-resolution:metadata-present")
+            journal.mark_touched(key, "unknown-resolution:metadata-present")
+        else:
+            journal.record_receipt(key, "unknown-resolution:object-and-metadata-absent")
+            journal.mark_absence_verified(key, "unknown-resolution:object-and-metadata-absent")
+    except Exception:
+        journal.mark_cleanup_failed(key, "unknown-resolution:object-read-failed")
+    else:
+        artifact_metadata.setdefault(key, expected)
+        journal.record_receipt(key, "unknown-resolution:object-present")
+        journal.mark_touched(key, "unknown-resolution:object-present")
+
+
+def _normalize_and_resolve_journal(
+    *,
+    journal: ResourceJournal,
+    storage_by_context: Mapping[str, object | None],
+    backend_by_operation: Mapping[str, ObjectStorageBackend | None],
+    expected_artifacts: Mapping[str, Mapping[str, object]],
+    artifact_metadata: dict[str, ObjectArtifactMetadata],
+    artifact_storage_mode: str,
+) -> None:
+    for key in journal.keys_in_state(JOURNAL_ATTEMPTED):
+        journal.mark_unknown(key, "cleanup-normalization:attempted-outcome-uncertain")
+    for key in journal.keys_in_state(JOURNAL_UNKNOWN):
+        _resolve_unknown_resource(
+            key=key,
+            journal=journal,
+            storage_by_context=storage_by_context,
+            backend_by_operation=backend_by_operation,
+            expected_artifacts=expected_artifacts,
+            artifact_metadata=artifact_metadata,
+            artifact_storage_mode=artifact_storage_mode,
+        )
+
+
+def _captured_for_resource(
+    context: CleanupContext,
+    *,
+    resource_kind: str,
+    identifier: str,
+) -> tuple[ObjectArtifactMetadata, ...]:
+    owner_type = {
+        "profile": "profile",
+        "pricing_reference": "pricing_reference",
+        "quote_session": "generated_quote",
+    }.get(resource_kind, "")
+    if not owner_type:
+        return ()
+    return tuple(
+        metadata
+        for metadata in context.captured_artifacts
+        if metadata.owner_type == owner_type and metadata.owner_id == identifier
+    )
+
+
+def _owner_postconditions(
+    context: CleanupContext,
+    *,
+    resource_kind: str,
+    identifier: str,
+) -> bool:
+    storage = context.storage
+    if storage is None:
+        return False
+    try:
+        detail_method = {
+            "profile": "profile_detail",
+            "pricing_reference": "pricing_reference_detail",
+            "quote_session": "get_quote_session",
+        }[resource_kind]
+        if getattr(storage, detail_method)(identifier) is not None:
+            return False
+        workspace_id = _clean(getattr(storage, "workspace_id", ""))
+        if resource_kind == "profile":
+            profile_rows = _database_rows(
+                storage,
+                "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
+                (workspace_id, identifier),
+            )
+            if profile_rows is None or profile_rows is False:
+                return False
+            if profile_rows:
+                if len(profile_rows) != 1:
+                    return False
+                try:
+                    payload = json.loads(_row_value(profile_rows[0], "payload_json"))
+                except (TypeError, json.JSONDecodeError):
+                    payload = None
+                if not isinstance(payload, Mapping) or payload.get(webapp.DELETED_PROFILE_MARKER_KEY) is not True:
+                    return False
+        else:
+            table, column = (
+                ("sqag_pricing_references", "reference_id")
+                if resource_kind == "pricing_reference"
+                else ("sqag_quote_sessions", "session_id")
+            )
+            rows = _database_rows(
+                storage,
+                f"select 1 from {table} where workspace_id = ? and {column} = ?",
+                (workspace_id, identifier),
+            )
+            if rows is None or rows is False or rows:
+                return False
+
+        if context.database_family != "postgres_compatible":
+            if resource_kind == "profile":
+                file_rows = _database_rows(
+                    storage,
+                    "select 1 from sqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+                    (workspace_id, "profile", identifier, "quotation_layout"),
+                )
+                if file_rows is None or file_rows is False or file_rows:
+                    return False
+            if resource_kind == "quote_session":
+                quote_rows = _database_rows(
+                    storage,
+                    "select 1 from sqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
+                    (workspace_id, identifier, "xlsx"),
+                )
+                if quote_rows is None or quote_rows is False or quote_rows:
+                    return False
+
+        object_rows = _database_rows(
+            storage,
+            "select * from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ?",
+            (workspace_id, {
+                "profile": "profile",
+                "pricing_reference": "pricing_reference",
+                "quote_session": "generated_quote",
+            }[resource_kind], identifier),
+        )
+        if object_rows is None or object_rows is False or not _object_rows_are_deleted(object_rows):
+            return False
+        for metadata in _captured_for_resource(
+            context,
+            resource_kind=resource_kind,
+            identifier=identifier,
+        ):
+            if context.backend is None or not _backend_artifact_absent(
+                context.backend,
+                metadata,
+                workspace_id=workspace_id,
+            ):
+                return False
+    except Exception:
+        return False
+    return True
+
+
+def _object_postconditions(
+    context: CleanupContext,
+    metadata: ObjectArtifactMetadata,
+) -> bool:
+    if context.backend is None or not _backend_artifact_absent(
+        context.backend,
+        metadata,
+        workspace_id=metadata.workspace_id,
+    ):
+        return False
+    if metadata.artifact_kind != "xlsx":
+        return True
+    storage = context.storage
+    if storage is None:
+        return False
+    rows = _database_rows(
+        storage,
+        "select * from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+        (
+            metadata.workspace_id,
+            metadata.owner_type,
+            metadata.owner_id,
+            metadata.artifact_kind,
+        ),
+    )
+    if rows is None or rows is False:
+        return False
+    for row in rows:
+        if not all(
+            (
+                _clean(_row_value(row, "workspace_id")) == metadata.workspace_id,
+                _clean(_row_value(row, "owner_type")) == metadata.owner_type,
+                _clean(_row_value(row, "owner_id")) == metadata.owner_id,
+                _clean(_row_value(row, "artifact_kind")) == metadata.artifact_kind,
+                _clean(_row_value(row, "filename")) == metadata.filename,
+                _clean(_row_value(row, "checksum_sha256")) == metadata.checksum_sha256,
+                _clean(_row_value(row, "object_key_ref")) == metadata.storage_key,
+            )
+        ):
+            return False
+    return _object_rows_are_deleted(rows)
+
+
+def _resource_cleanup_is_eligible(
+    context: CleanupContext,
+    resource_kind: str,
+) -> bool:
+    if context.storage is None:
+        return False
+    if resource_kind in {"generated_xlsx", "isolation_probe"}:
+        return context.backend is not None
+    if context.artifact_storage_mode == "object":
+        return context.backend is not None and context.capture_complete
+    return True
+
+
+def _cleanup_owner_resource(
+    *,
+    context: CleanupContext,
+    journal: ResourceJournal,
+    key: str,
+    resource_kind: str,
+    identifier: str,
+) -> bool:
+    if journal.state(key) != JOURNAL_TOUCHED:
+        return True
+    if not _resource_cleanup_is_eligible(context, resource_kind):
+        journal.mark_cleanup_failed(key, "destructive-cleanup:ineligible-context")
+        return False
+    journal.mark_cleanup_pending(key, "destructive-cleanup:owner-pending")
+    journal.mark_destructive_cleanup_attempt(key, f"delete-{resource_kind}")
+    method_name = {
+        "profile": "delete_profile",
+        "pricing_reference": "delete_pricing_reference",
+        "quote_session": "delete_quote_session",
+    }[resource_kind]
+    try:
+        result = _with_configured_backend(
+            context,
+            lambda: getattr(context.storage, method_name)(identifier),
+        )
+    except Exception:
+        journal.mark_cleanup_failed(key, f"destructive-cleanup:{resource_kind}-exception")
+        return False
+    if not _owner_postconditions(
+        context,
+        resource_kind=resource_kind,
+        identifier=identifier,
+    ):
+        journal.mark_cleanup_failed(key, f"destructive-cleanup:{resource_kind}-residue")
+        return False
+    journal.record_receipt(
+        key,
+        f"cleanup-receipt:{resource_kind}-deleted" if result else f"cleanup-receipt:{resource_kind}-already-absent",
+    )
+    journal.mark_cleaned(key, f"destructive-cleanup:{resource_kind}-postconditions-verified")
+    return True
+
+
+def _cleanup_object_resource(
+    *,
+    context: CleanupContext,
+    journal: ResourceJournal,
+    key: str,
+    metadata: ObjectArtifactMetadata | None,
+    maintenance: bool,
+) -> bool:
+    if journal.state(key) != JOURNAL_TOUCHED:
+        return True
+    if metadata is None or not _resource_cleanup_is_eligible(context, journal.entry(key).spec.resource_kind):
+        journal.mark_cleanup_failed(key, "destructive-cleanup:object-ineligible-context")
+        return False
+    journal.mark_cleanup_pending(key, "destructive-cleanup:object-pending")
+    ok = True
+    if maintenance and context.maintenance_storage is not None:
+        tombstone = getattr(context.maintenance_storage, "tombstone_object_quote_artifacts", None)
+        if callable(tombstone):
+            journal.mark_destructive_cleanup_attempt(key, "quote-maintenance-tombstone")
+            try:
+                _with_configured_backend(
+                    context,
+                    lambda: tombstone(metadata.owner_id),
+                )
+                journal.record_receipt(key, "cleanup-receipt:quote-maintenance-tombstone")
+            except Exception:
+                ok = False
+                journal.record_receipt(key, "cleanup-receipt:quote-maintenance-tombstone-failed")
+    journal.mark_destructive_cleanup_attempt(key, "object-delete")
+    try:
+        deleted = _delete_backend_artifact_and_verify(
+            context.backend,  # type: ignore[arg-type]
+            metadata,
+            workspace_id=metadata.workspace_id,
+        )
+    except Exception:
+        deleted = False
+    if not deleted or not _object_postconditions(context, metadata):
+        journal.mark_cleanup_failed(key, "destructive-cleanup:object-residue")
+        return False
+    if not ok:
+        journal.record_receipt(key, "cleanup-receipt:maintenance-failed")
+        journal.mark_cleanup_failed(key, "destructive-cleanup:maintenance-failed")
+        return False
+    journal.record_receipt(
+        key,
+        "cleanup-receipt:object-deleted",
+    )
+    journal.mark_cleaned(key, "destructive-cleanup:object-postconditions-verified")
+    return ok
+
+
+def _verify_final_context_postconditions(
+    *,
+    context: CleanupContext,
+    journal: ResourceJournal,
+    expected_artifacts: Mapping[str, Mapping[str, object]],
+    artifact_metadata: Mapping[str, ObjectArtifactMetadata],
+) -> bool:
+    ok = True
+    for key in context.resource_keys:
+        if journal.state(key) != JOURNAL_CLEANED:
+            continue
+        spec = journal.entry(key).spec
+        if spec.resource_kind in {"profile", "pricing_reference", "quote_session"}:
+            verified = _owner_postconditions(
+                context,
+                resource_kind=spec.resource_kind,
+                identifier=spec.identifier,
+            )
+        else:
+            metadata = artifact_metadata.get(key)
+            if metadata is None:
+                descriptor = expected_artifacts.get(key)
+                candidate = descriptor.get("metadata") if descriptor else None
+                metadata = candidate if isinstance(candidate, ObjectArtifactMetadata) else None
+            verified = metadata is not None and _object_postconditions(context, metadata)
+        if not verified:
+            journal.record_receipt(key, "postconditions:failed")
+            ok = False
+        else:
+            journal.record_receipt(key, "postconditions:verified")
+    return ok
+
 
 def _cleanup(
     *,
@@ -736,102 +1819,135 @@ def _cleanup(
     active_metadata: ObjectArtifactMetadata | None,
     restore_metadata: ObjectArtifactMetadata | None,
     ids: Mapping[str, str],
+    journal: ResourceJournal,
+    expected_artifacts: Mapping[str, Mapping[str, object]],
+    artifact_metadata: dict[str, ObjectArtifactMetadata],
+    artifact_storage_mode: str,
+    active_backend_origin: str,
+    restore_backend_origin: str,
+    context_evidence: dict[str, Mapping[str, object]],
     active_probe_metadata: ObjectArtifactMetadata | None = None,
     restore_probe_metadata: ObjectArtifactMetadata | None = None,
 ) -> bool:
+    if active_metadata is not None:
+        artifact_metadata["active/workspace_a/generated_xlsx"] = active_metadata
+    if restore_metadata is not None:
+        artifact_metadata["restore/workspace_a/generated_xlsx"] = restore_metadata
+    if active_probe_metadata is not None:
+        artifact_metadata["active/workspace_a/isolation_probe"] = active_probe_metadata
+    if restore_probe_metadata is not None:
+        artifact_metadata["restore/workspace_a/isolation_probe"] = restore_probe_metadata
+
+    storage_by_context = {
+        "active/workspace_a": active_storage_a,
+        "active/workspace_b": active_storage_b,
+        "restore/workspace_a": restore_storage_a,
+        "restore/workspace_b": restore_storage_b,
+    }
+    backend_by_operation = {
+        "active": active_backend,
+        "restore": restore_backend,
+    }
+    _normalize_and_resolve_journal(
+        journal=journal,
+        storage_by_context=storage_by_context,
+        backend_by_operation=backend_by_operation,
+        expected_artifacts=expected_artifacts,
+        artifact_metadata=artifact_metadata,
+        artifact_storage_mode=artifact_storage_mode,
+    )
+
+    contexts = _build_cleanup_contexts(
+        active_storage_a=active_storage_a,
+        active_storage_b=active_storage_b,
+        restore_storage_a=restore_storage_a,
+        restore_storage_b=restore_storage_b,
+        active_maintenance_storage=active_maintenance_storage,
+        restore_maintenance_storage=restore_maintenance_storage,
+        active_backend=active_backend,
+        restore_backend=restore_backend,
+        active_backend_origin=active_backend_origin,
+        restore_backend_origin=restore_backend_origin,
+        ids=ids,
+        journal=journal,
+        expected_artifacts=expected_artifacts,
+        artifact_metadata=artifact_metadata,
+        artifact_storage_mode=artifact_storage_mode,
+        evidence=context_evidence,
+    )
+
     ok = True
-    cleanup_entries: list[tuple[object, str, str, str, ObjectStorageBackend | None, tuple[ObjectArtifactMetadata, ...], bool]] = []
-    for storage, profile_key, pricing_key, session_key, backend in (
-        (active_storage_a, "profile_a", "pricing_a", "session_a", active_backend),
-        (active_storage_b, "profile_b", "pricing_b", "session_b", active_backend),
-        (restore_storage_a, "profile_a", "pricing_a", "session_a", restore_backend),
-        (restore_storage_b, "profile_b", "pricing_b", "session_b", restore_backend),
-    ):
-        if storage is None:
-            continue
-        captured: list[ObjectArtifactMetadata] = []
-        capture_failed = False
-        for owner_type, owner_id in (
-            ("profile", ids[profile_key]),
-            ("pricing_reference", ids[pricing_key]),
-            ("generated_quote", ids[session_key]),
-        ):
-            owner_artifacts = _active_artifact_metadata(storage, owner_type, owner_id)
-            if owner_artifacts is None:
-                capture_failed = True
-            else:
-                captured.extend(owner_artifacts)
-        cleanup_entries.append(
-            (
-                storage,
-                ids[profile_key],
-                ids[pricing_key],
-                ids[session_key],
-                backend,
-                tuple(captured),
-                capture_failed,
-            )
-        )
-    for maintenance_storage, backend, metadata, workspace_key in (
-        (active_maintenance_storage, active_backend, active_metadata, "workspace_a"),
-        (restore_maintenance_storage, restore_backend, restore_metadata, "workspace_a"),
-    ):
-        if (
-            maintenance_storage is None
-            or backend is None
-            or metadata is None
-            or not hasattr(maintenance_storage, "tombstone_object_quote_artifacts")
-        ):
-            continue
-        try:
-            _with_configured_backend(
-                backend,
-                lambda: maintenance_storage.tombstone_object_quote_artifacts(ids["session_a"]),
-            )
-        except Exception:
-            ok = False
-    for backend, metadata, workspace_key in (
-        (active_backend, active_metadata, "workspace_a"),
-        (restore_backend, restore_metadata, "workspace_a"),
-    ):
-        if backend is None or metadata is None:
-            continue
-        if not _delete_backend_artifact_and_verify(
-            backend,
-            metadata,
-            workspace_id=ids[workspace_key],
-        ):
-            ok = False
-
-    for backend, metadata in (
-        (active_backend, active_probe_metadata),
-        (restore_backend, restore_probe_metadata),
-    ):
-        if backend is None or metadata is None:
-            continue
-        if not _delete_backend_artifact_and_verify(
-            backend,
-            metadata,
-            workspace_id=ids["workspace_a"],
-        ):
-            ok = False
-
-    for storage, profile_id, pricing_id, session_id, backend, captured_artifacts, capture_failed in cleanup_entries:
-        if capture_failed:
-            ok = False
-        try:
-            cleaner = lambda: _cleanup_storage(
-                storage,
-                profile_id=profile_id,
-                pricing_id=pricing_id,
-                session_id=session_id,
-                backend=backend,
-                captured_artifacts=captured_artifacts,
-            )
-            cleaned = cleaner() if backend is None else _with_configured_backend(backend, cleaner)
-            if not cleaned:
+    for context in contexts:
+        for key in context.resource_keys:
+            if journal.state(key) != JOURNAL_TOUCHED:
+                continue
+            if not _resource_cleanup_is_eligible(
+                context,
+                journal.entry(key).spec.resource_kind,
+            ):
+                journal.mark_cleanup_failed(key, "destructive-cleanup:ineligible-context")
                 ok = False
-        except Exception:
+
+    for context in contexts:
+        probe_key = f"{context.operation}/{context.workspace_label}/isolation_probe"
+        if probe_key not in journal.keys:
+            continue
+        if journal.state(probe_key) == JOURNAL_TOUCHED:
+            metadata = artifact_metadata.get(probe_key)
+            if metadata is None:
+                descriptor = expected_artifacts.get(probe_key)
+                candidate = descriptor.get("metadata") if descriptor else None
+                metadata = candidate if isinstance(candidate, ObjectArtifactMetadata) else None
+            if not _cleanup_object_resource(
+                context=context,
+                journal=journal,
+                key=probe_key,
+                metadata=metadata,
+                maintenance=False,
+            ):
+                ok = False
+
+    for context in contexts:
+        object_key = f"{context.operation}/{context.workspace_label}/generated_xlsx"
+        if object_key not in journal.keys:
+            continue
+        if journal.state(object_key) == JOURNAL_TOUCHED:
+            metadata = artifact_metadata.get(object_key)
+            if metadata is None:
+                descriptor = expected_artifacts.get(object_key)
+                candidate = descriptor.get("metadata") if descriptor else None
+                metadata = candidate if isinstance(candidate, ObjectArtifactMetadata) else None
+            if not _cleanup_object_resource(
+                context=context,
+                journal=journal,
+                key=object_key,
+                metadata=metadata,
+                maintenance=context.workspace_label == "workspace_a",
+            ):
+                ok = False
+
+    for resource_kind in ("quote_session", "pricing_reference", "profile"):
+        for context in contexts:
+            for key in context.resource_keys:
+                spec = journal.entry(key).spec
+                if spec.resource_kind != resource_kind:
+                    continue
+                if not _cleanup_owner_resource(
+                    context=context,
+                    journal=journal,
+                    key=key,
+                    resource_kind=resource_kind,
+                    identifier=spec.identifier,
+                ):
+                    ok = False
+
+    for context in contexts:
+        if not _verify_final_context_postconditions(
+            context=context,
+            journal=journal,
+            expected_artifacts=expected_artifacts,
+            artifact_metadata=artifact_metadata,
+        ):
             ok = False
 
     for left, right, left_ids, right_ids in (
@@ -864,6 +1980,12 @@ def _cleanup(
                 ok = False
         except Exception:
             ok = False
+    if any(
+        journal.state(key)
+        in {JOURNAL_ATTEMPTED, JOURNAL_UNKNOWN, JOURNAL_CLEANUP_PENDING, JOURNAL_CLEANUP_FAILED}
+        for key in journal.keys
+    ):
+        ok = False
     return ok
 
 
@@ -879,8 +2001,24 @@ def _run_drill(
     active_backend_factory: BackendFactory,
     restore_backend_factory: BackendFactory,
     migration_applier: MigrationApplier,
-) -> tuple[dict[str, bool], list[str], int, int, int, int]:
+) -> tuple[
+    dict[str, bool],
+    list[str],
+    int,
+    int,
+    int,
+    int,
+    ResourceJournal,
+    dict[str, Mapping[str, object]],
+]:
     ids = _synthetic_ids()
+    active_payload = _synthetic_payload(ids)
+    expected_artifacts = _expected_artifact_descriptors(ids, active_payload)
+    journal = ResourceJournal(_planned_resource_specs(ids))
+    context_evidence: dict[str, Mapping[str, object]] = {}
+    artifact_metadata: dict[str, ObjectArtifactMetadata] = {}
+    artifact_storage_mode = _verifier_artifact_storage_mode(env)
+
     active_db_url = _clean(env.get(webapp.SQAG_DATABASE_URL_ENV_NAME))
     active_migrator_db_url = _clean(env.get(webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME))
     active_maintenance_db_url = _clean(env.get(webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME))
@@ -893,7 +2031,20 @@ def _run_drill(
     active_metadata = restore_metadata = None
     active_probe_metadata = restore_probe_metadata = None
     active_db_rows = active_object_count = restore_db_rows = restore_object_count = 0
-    active_payload = _synthetic_payload(ids)
+    active_backend_origin = "active-backend-factory"
+    restore_backend_origin = "restore-backend-factory"
+
+    def result():
+        return (
+            checks,
+            blockers,
+            active_db_rows,
+            active_object_count,
+            restore_db_rows,
+            restore_object_count,
+            journal,
+            context_evidence,
+        )
 
     try:
         checks["connection_attempted"] = True
@@ -913,7 +2064,7 @@ def _run_drill(
                 storage.ensure_object_artifact_ready()
         except Exception:
             blockers.append("database_connection_or_schema_failed")
-            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
+            return result()
 
         checks["write_attempted"] = True
         checks["read_attempted"] = True
@@ -921,58 +2072,73 @@ def _run_drill(
             active_backend = active_backend_factory(env)
         except Exception:
             blockers.append("active_object_write_failed")
-            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
+            return result()
 
         try:
-            active_probe_metadata = active_backend.store_artifact(
-                workspace_id=ids["workspace_a"],
-                owner_type=SYNTHETIC_PROBE_OWNER_TYPE,
-                owner_id=ids["active_probe_id"],
-                artifact_kind=SYNTHETIC_ACTIVE_PROBE_KIND,
-                filename=SYNTHETIC_PROBE_FILENAME,
-                content_type=SYNTHETIC_CONTENT_TYPE,
-                content=_synthetic_probe_payload(ids, "active"),
+            active_probe_metadata = _store_object_resource(
+                backend=active_backend,
+                journal=journal,
+                resource_key="active/workspace_a/isolation_probe",
+                descriptor=expected_artifacts["active/workspace_a/isolation_probe"],
             )
+            artifact_metadata["active/workspace_a/isolation_probe"] = active_probe_metadata
         except Exception:
             blockers.append("active_object_write_failed")
-            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
+            return result()
 
+        active_owner_writes = (
+            ("active/workspace_a/profile", active_storage_a, "profile", ids["profile_a"], "workspace_a"),
+            ("active/workspace_b/profile", active_storage_b, "profile", ids["profile_b"], "workspace_b"),
+            ("active/workspace_a/pricing_reference", active_storage_a, "pricing_reference", ids["pricing_a"], "workspace_a"),
+            ("active/workspace_b/pricing_reference", active_storage_b, "pricing_reference", ids["pricing_b"], "workspace_b"),
+            ("active/workspace_a/quote_session", active_storage_a, "quote_session", ids["session_a"], "workspace_a"),
+            ("active/workspace_b/quote_session", active_storage_b, "quote_session", ids["session_b"], "workspace_b"),
+        )
         try:
-            active_db_rows += _with_configured_backend(
-                active_backend,
-                lambda: _write_metadata_rows(
-                    storage_a=active_storage_a,
-                    storage_b=active_storage_b,
-                    ids=ids,
-                    artifact_metadata=None,
-                ),
-            )
+            for resource_key, storage, resource_kind, identifier, workspace_label in active_owner_writes:
+                _write_owner_resource(
+                    storage=storage,
+                    backend=active_backend,
+                    journal=journal,
+                    resource_key=resource_key,
+                    resource_kind=resource_kind,
+                    identifier=identifier,
+                    workspace_label=workspace_label,
+                    artifact_storage_mode=artifact_storage_mode,
+                )
+                active_db_rows += 1
             checks["active_db_write_read_verified"] = _verify_db_rows(active_storage_a, active_storage_b, ids)
             checks["workspace_isolation_preserved"] = checks["active_db_write_read_verified"]
         except Exception:
             blockers.append("active_db_write_failed")
-            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
+            return result()
 
         try:
-            active_metadata = active_backend.store_artifact(
-                workspace_id=ids["workspace_a"],
-                owner_type="generated_quote",
-                owner_id=ids["session_a"],
-                artifact_kind="xlsx",
-                filename=SYNTHETIC_FILENAME,
-                content_type=SYNTHETIC_CONTENT_TYPE,
-                content=active_payload,
+            active_metadata = _store_object_resource(
+                backend=active_backend,
+                journal=journal,
+                resource_key="active/workspace_a/generated_xlsx",
+                descriptor=expected_artifacts["active/workspace_a/generated_xlsx"],
             )
+            artifact_metadata["active/workspace_a/generated_xlsx"] = active_metadata
             active_object_count = 1
-            active_db_rows += _with_configured_backend(
+            _with_configured_backend(
                 active_backend,
-                lambda: _write_metadata_rows(
-                    storage_a=active_storage_a,
-                    storage_b=active_storage_b,
-                    ids=ids,
-                    artifact_metadata=active_metadata,
-                ) - 6,
+                lambda: active_storage_a._upsert_object_quote_artifact(
+                    ids["session_a"],
+                    "xlsx",
+                    SYNTHETIC_FILENAME,
+                    SYNTHETIC_CONTENT_TYPE,
+                    active_metadata,
+                ),
             )
+            if not _metadata_object_pairing_ok(active_storage_a, ids["session_a"], active_metadata):
+                journal.record_receipt("active/workspace_a/generated_xlsx", "metadata-upsert:invalid")
+                checks["metadata_object_pairing_verified"] = False
+                blockers.append("active_object_metadata_write_failed")
+                return result()
+            journal.record_receipt("active/workspace_a/generated_xlsx", "validated:metadata-upsert")
+            active_db_rows += 1
             active_content = active_backend.retrieve_artifact(active_metadata, workspace_id=ids["workspace_a"])
             checks["active_object_write_read_verified"] = (
                 active_content == active_payload
@@ -980,8 +2146,9 @@ def _run_drill(
                 and _metadata_object_pairing_ok(active_storage_a, ids["session_a"], active_metadata)
             )
         except Exception:
+            journal.record_receipt("active/workspace_a/generated_xlsx", "metadata-upsert:outcome-uncertain")
             blockers.append("active_object_write_failed")
-            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
+            return result()
 
         try:
             checks["restore_database_cannot_read_active_synthetic_rows"] = _restore_database_cannot_read_active_synthetic_rows(
@@ -992,47 +2159,36 @@ def _run_drill(
             )
         except Exception:
             blockers.append("isolated_restore_target_live_check_failed")
-            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
+            return result()
         if not checks["restore_database_cannot_read_active_synthetic_rows"]:
             blockers.append("restore_database_can_read_active_synthetic_rows")
-            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
+            return result()
 
         try:
             restore_backend = restore_backend_factory(env)
         except Exception:
             blockers.append("restore_object_write_failed")
-            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
-        try:
-            restore_probe_metadata = restore_backend.store_artifact(
-                workspace_id=ids["workspace_a"],
-                owner_type=SYNTHETIC_PROBE_OWNER_TYPE,
-                owner_id=ids["restore_probe_id"],
-                artifact_kind=SYNTHETIC_RESTORE_PROBE_KIND,
-                filename=SYNTHETIC_PROBE_FILENAME,
-                content_type=SYNTHETIC_CONTENT_TYPE,
-                content=_synthetic_probe_payload(ids, "restore"),
-            )
-        except Exception:
+            return result()
+        if restore_backend is None:
             blockers.append("restore_object_write_failed")
-            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
-
-        if not _backend_retrieval_proves_absence(
-            restore_backend,
-            active_probe_metadata,
-            workspace_id=ids["workspace_a"],
-        ):
-            blockers.append("restore_object_can_read_active_synthetic_object")
-            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
-        checks["restore_object_cannot_read_active_synthetic_object"] = True
+            return result()
 
         if not _backend_retrieval_proves_absence(
             active_backend,
-            restore_probe_metadata,
+            expected_artifacts["restore/workspace_a/isolation_probe"]["metadata"],
             workspace_id=ids["workspace_a"],
         ):
             blockers.append("active_object_can_read_restore_synthetic_object")
-            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
+            return result()
         checks["active_object_cannot_read_restore_synthetic_object"] = True
+        if not _backend_retrieval_proves_absence(
+            restore_backend,
+            expected_artifacts["active/workspace_a/isolation_probe"]["metadata"],
+            workspace_id=ids["workspace_a"],
+        ):
+            blockers.append("restore_object_can_read_active_synthetic_object")
+            return result()
+        checks["restore_object_cannot_read_active_synthetic_object"] = True
         checks["bidirectional_backend_isolation_verified"] = True
 
         if active_metadata is not None and not _backend_retrieval_proves_absence(
@@ -1041,47 +2197,77 @@ def _run_drill(
             workspace_id=ids["workspace_a"],
         ):
             blockers.append("restore_object_can_read_active_synthetic_object")
-            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
+            return result()
 
         checks["restore_attempted"] = True
         try:
-            restore_db_rows += _with_configured_backend(
-                restore_backend,
-                lambda: _write_metadata_rows(
-                    storage_a=restore_storage_a,
-                    storage_b=restore_storage_b,
-                    ids=ids,
-                    artifact_metadata=None,
-                ),
+            restore_probe_metadata = _store_object_resource(
+                backend=restore_backend,
+                journal=journal,
+                resource_key="restore/workspace_a/isolation_probe",
+                descriptor=expected_artifacts["restore/workspace_a/isolation_probe"],
             )
+            artifact_metadata["restore/workspace_a/isolation_probe"] = restore_probe_metadata
+        except Exception:
+            blockers.append("restore_object_write_failed")
+            return result()
+
+        restore_owner_writes = (
+            ("restore/workspace_a/profile", restore_storage_a, "profile", ids["profile_a"], "workspace_a"),
+            ("restore/workspace_b/profile", restore_storage_b, "profile", ids["profile_b"], "workspace_b"),
+            ("restore/workspace_a/pricing_reference", restore_storage_a, "pricing_reference", ids["pricing_a"], "workspace_a"),
+            ("restore/workspace_b/pricing_reference", restore_storage_b, "pricing_reference", ids["pricing_b"], "workspace_b"),
+            ("restore/workspace_a/quote_session", restore_storage_a, "quote_session", ids["session_a"], "workspace_a"),
+            ("restore/workspace_b/quote_session", restore_storage_b, "quote_session", ids["session_b"], "workspace_b"),
+        )
+        try:
+            for resource_key, storage, resource_kind, identifier, workspace_label in restore_owner_writes:
+                _write_owner_resource(
+                    storage=storage,
+                    backend=restore_backend,
+                    journal=journal,
+                    resource_key=resource_key,
+                    resource_kind=resource_kind,
+                    identifier=identifier,
+                    workspace_label=workspace_label,
+                    artifact_storage_mode=artifact_storage_mode,
+                )
+                restore_db_rows += 1
             checks["restore_db_write_read_verified"] = _verify_db_rows(restore_storage_a, restore_storage_b, ids)
             checks["workspace_isolation_preserved"] = (
                 checks["workspace_isolation_preserved"] and checks["restore_db_write_read_verified"]
             )
         except Exception:
             blockers.append("restore_db_write_failed")
-            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
+            return result()
 
         try:
-            restore_metadata = restore_backend.store_artifact(
-                workspace_id=ids["workspace_a"],
-                owner_type="generated_quote",
-                owner_id=ids["session_a"],
-                artifact_kind="xlsx",
-                filename=SYNTHETIC_FILENAME,
-                content_type=SYNTHETIC_CONTENT_TYPE,
-                content=active_payload,
+            restore_metadata = _store_object_resource(
+                backend=restore_backend,
+                journal=journal,
+                resource_key="restore/workspace_a/generated_xlsx",
+                descriptor=expected_artifacts["restore/workspace_a/generated_xlsx"],
             )
+            artifact_metadata["restore/workspace_a/generated_xlsx"] = restore_metadata
             restore_object_count = 1
-            restore_db_rows += _with_configured_backend(
+            _with_configured_backend(
                 restore_backend,
-                lambda: _write_metadata_rows(
-                    storage_a=restore_storage_a,
-                    storage_b=restore_storage_b,
-                    ids=ids,
-                    artifact_metadata=restore_metadata,
-                ) - 6,
+                lambda: restore_storage_a._upsert_object_quote_artifact(
+                    ids["session_a"],
+                    "xlsx",
+                    SYNTHETIC_FILENAME,
+                    SYNTHETIC_CONTENT_TYPE,
+                    restore_metadata,
+                ),
             )
+            if not _metadata_object_pairing_ok(restore_storage_a, ids["session_a"], restore_metadata):
+                journal.record_receipt("restore/workspace_a/generated_xlsx", "metadata-upsert:invalid")
+                checks["metadata_object_pairing_verified"] = False
+                blockers.append("metadata_object_pairing_mismatch")
+                blockers.append("restore_object_metadata_write_failed")
+                return result()
+            journal.record_receipt("restore/workspace_a/generated_xlsx", "validated:metadata-upsert")
+            restore_db_rows += 1
             restored_content = restore_backend.retrieve_artifact(restore_metadata, workspace_id=ids["workspace_a"])
             restored_checksum = hashlib.sha256(restored_content).hexdigest()
             checks["checksum_match"] = restored_checksum == active_metadata.checksum_sha256
@@ -1096,8 +2282,9 @@ def _run_drill(
                 and len(restored_content) == restore_metadata.size_bytes
             )
         except Exception:
+            journal.record_receipt("restore/workspace_a/generated_xlsx", "metadata-upsert:outcome-uncertain")
             blockers.append("restore_object_write_failed")
-            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
+            return result()
 
         if not checks["checksum_match"]:
             blockers.append("checksum_mismatch")
@@ -1113,23 +2300,33 @@ def _run_drill(
             blockers.append("restore_db_read_failed")
         if not checks["restore_object_write_read_verified"]:
             blockers.append("restore_object_read_failed")
-        return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
+        return result()
     finally:
-        cleanup_completed = _cleanup(
-            active_storage_a=active_storage_a,
-            active_storage_b=active_storage_b,
-            restore_storage_a=restore_storage_a,
-            restore_storage_b=restore_storage_b,
-            active_maintenance_storage=active_maintenance_storage,
-            restore_maintenance_storage=restore_maintenance_storage,
-            active_backend=active_backend,
-            restore_backend=restore_backend,
-            active_metadata=active_metadata,
-            restore_metadata=restore_metadata,
-            ids=ids,
-            active_probe_metadata=active_probe_metadata,
-            restore_probe_metadata=restore_probe_metadata,
-        )
+        try:
+            cleanup_completed = _cleanup(
+                active_storage_a=active_storage_a,
+                active_storage_b=active_storage_b,
+                restore_storage_a=restore_storage_a,
+                restore_storage_b=restore_storage_b,
+                active_maintenance_storage=active_maintenance_storage,
+                restore_maintenance_storage=restore_maintenance_storage,
+                active_backend=active_backend,
+                restore_backend=restore_backend,
+                active_metadata=active_metadata,
+                restore_metadata=restore_metadata,
+                ids=ids,
+                journal=journal,
+                expected_artifacts=expected_artifacts,
+                artifact_metadata=artifact_metadata,
+                artifact_storage_mode=artifact_storage_mode,
+                active_backend_origin=active_backend_origin,
+                restore_backend_origin=restore_backend_origin,
+                context_evidence=context_evidence,
+                active_probe_metadata=active_probe_metadata,
+                restore_probe_metadata=restore_probe_metadata,
+            )
+        except Exception:
+            cleanup_completed = False
         checks["cleanup_completed"] = cleanup_completed
         if not cleanup_completed and "cleanup_failed" not in blockers:
             blockers.append("cleanup_failed")
@@ -1187,7 +2384,16 @@ def run_verification(
             test_injected_backend=test_injected_backend,
         )
 
-    checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count = _run_drill(
+    (
+        checks,
+        blockers,
+        active_db_rows,
+        active_object_count,
+        restore_db_rows,
+        restore_object_count,
+        journal,
+        cleanup_contexts,
+    ) = _run_drill(
         env=effective_env,
         checks=checks,
         blockers=blockers,
@@ -1212,6 +2418,8 @@ def run_verification(
         missing_env_names=missing,
         blockers=blockers,
         test_injected_backend=test_injected_backend,
+        journal=journal,
+        cleanup_contexts=cleanup_contexts,
         active_db_rows=active_db_rows,
         active_object_count=active_object_count,
         restore_db_rows=restore_db_rows,

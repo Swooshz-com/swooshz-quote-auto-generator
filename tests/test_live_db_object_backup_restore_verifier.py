@@ -89,6 +89,7 @@ class FakeStorage:
         pairing_mismatch: bool = False,
         state: dict[str, dict[object, dict[str, object]]] | None = None,
         runtime_filename_gate: bool = False,
+        events: list[tuple[object, ...]] | None = None,
     ):
         self.label = label
         self.workspace_id = workspace_id
@@ -98,6 +99,8 @@ class FakeStorage:
         self.fail_on = fail_on
         self.pairing_mismatch = pairing_mismatch
         self.runtime_filename_gate = runtime_filename_gate
+        self.events = events if events is not None else []
+        self.delete_calls: list[tuple[str, str]] = []
         self._state = state or {
             "profiles": {},
             "pricing": {},
@@ -124,16 +127,19 @@ class FakeStorage:
         self._maybe_fail("ensure_object_artifact_ready")
 
     def save_profile(self, profile: dict[str, object]) -> dict[str, object]:
+        self.events.append(("storage-write", self.label, "profile", str(profile["id"])))
         self._maybe_fail("write")
         self.profiles[str(profile["id"])] = dict(profile)
         return dict(profile)
 
     def save_pricing_reference(self, reference: dict[str, object]) -> dict[str, object]:
+        self.events.append(("storage-write", self.label, "pricing_reference", str(reference["id"])))
         self._maybe_fail("write")
         self.pricing[str(reference["id"])] = dict(reference)
         return dict(reference)
 
     def create_or_update_quote_session(self, payload: dict[str, object], **_kwargs) -> dict[str, object]:
+        self.events.append(("storage-write", self.label, "quote_session", str(payload["session_id"])))
         self._maybe_fail("write")
         session_id = str(payload["session_id"])
         self.sessions[session_id] = dict(payload)
@@ -197,14 +203,20 @@ class FakeStorage:
         return row
 
     def delete_profile(self, profile_id: str) -> bool:
+        self.events.append(("storage-delete", self.label, "profile", profile_id))
+        self.delete_calls.append(("profile", profile_id))
         self._maybe_fail("cleanup")
         return self.profiles.pop(profile_id, None) is not None
 
     def delete_pricing_reference(self, reference_id: str, **_kwargs) -> bool:
+        self.events.append(("storage-delete", self.label, "pricing_reference", reference_id))
+        self.delete_calls.append(("pricing_reference", reference_id))
         self._maybe_fail("cleanup")
         return self.pricing.pop(reference_id, None) is not None
 
     def delete_quote_session(self, session_id: str) -> bool:
+        self.events.append(("storage-delete", self.label, "quote_session", session_id))
+        self.delete_calls.append(("quote_session", session_id))
         self._maybe_fail("cleanup")
         self.object_artifacts = {
             key: value for key, value in self.object_artifacts.items() if key[0] != session_id
@@ -221,6 +233,10 @@ class FakeBackend:
         fail_on: str = "",
         tamper_retrieve: bool = False,
         cleanup_fails: bool = False,
+        object_key_fn=None,
+        fail_artifact_kind: str = "",
+        raise_after_store_kind: str = "",
+        events: list[tuple[object, ...]] | None = None,
         state: dict[str, dict[str, object]] | None = None,
     ):
         self.metadata_cls = metadata_cls
@@ -228,6 +244,13 @@ class FakeBackend:
         self.fail_on = fail_on
         self.tamper_retrieve = tamper_retrieve
         self.cleanup_fails = cleanup_fails
+        self.fail_artifact_kind = fail_artifact_kind
+        self.raise_after_store_kind = raise_after_store_kind
+        self.events = events if events is not None else []
+        self.object_key_fn = object_key_fn or (
+            lambda *, workspace_id, owner_type, owner_id, artifact_kind, filename, checksum_sha256:
+            f"OPAQUE-STORAGE-REF-{self.label}-{workspace_id}-{owner_id}-{artifact_kind}"
+        )
         self._state = state or {"objects": {}, "metadata": {}}
         self.objects = self._state["objects"]
         self.metadata = self._state["metadata"]
@@ -237,9 +260,19 @@ class FakeBackend:
             raise RuntimeError(f"{self.label} private failure detail")
 
     def store_artifact(self, *, workspace_id, owner_type, owner_id, artifact_kind, filename, content_type, content):
+        self.events.append(("backend-store", self.label, artifact_kind, owner_id))
         self._maybe_fail("write")
-        key = f"OPAQUE-STORAGE-REF-{self.label}-{workspace_id}-{owner_id}-{artifact_kind}"
+        if self.fail_artifact_kind == artifact_kind:
+            raise RuntimeError(f"{self.label} artifact-kind failure detail")
         checksum = __import__("hashlib").sha256(bytes(content)).hexdigest()
+        key = self.object_key_fn(
+            workspace_id=workspace_id,
+            owner_type=owner_type,
+            owner_id=owner_id,
+            artifact_kind=artifact_kind,
+            filename=filename,
+            checksum_sha256=checksum,
+        )
         metadata = self.metadata_cls(
             workspace_id=workspace_id,
             owner_type=owner_type,
@@ -255,9 +288,12 @@ class FakeBackend:
         )
         self.objects[key] = bytes(content)
         self.metadata[key] = metadata
+        if self.raise_after_store_kind == artifact_kind:
+            raise RuntimeError(f"{self.label} write-after-store failure detail")
         return metadata
 
     def retrieve_artifact(self, metadata, *, workspace_id):
+        self.events.append(("backend-retrieve", self.label, metadata.artifact_kind, metadata.owner_id))
         self._maybe_fail("read")
         if metadata.workspace_id != workspace_id:
             raise RuntimeError("private workspace mismatch detail")
@@ -267,6 +303,7 @@ class FakeBackend:
         return content
 
     def delete_artifact(self, metadata, *, workspace_id):
+        self.events.append(("backend-delete", self.label, metadata.artifact_kind, metadata.owner_id))
         if self.cleanup_fails:
             raise RuntimeError("private cleanup detail")
         if metadata.workspace_id != workspace_id:
@@ -288,6 +325,11 @@ def run_injected_drill(
     shared_storage_state: bool = False,
     shared_backend_state: bool = False,
     runtime_filename_gate: bool = False,
+    fail_backend_kind: str = "",
+    raise_after_store_kind: str = "",
+    missing_backend: bool | str = False,
+    events: list[tuple[object, ...]] | None = None,
+    observations: dict[str, object] | None = None,
 ):
     storages: dict[tuple[str, str], FakeStorage] = {}
     backends: dict[str, FakeBackend] = {}
@@ -315,6 +357,7 @@ def run_injected_drill(
                 pairing_mismatch=pairing_mismatch and label == "restore",
                 state=state,
                 runtime_filename_gate=runtime_filename_gate,
+                events=events,
             )
             storages[(label, workspace_id)] = storage
             return storage
@@ -323,12 +366,21 @@ def run_injected_drill(
 
     def backend_factory(label: str):
         def factory(_env):
+            if observations is not None:
+                factory_calls = observations.setdefault("backend_factory_calls", {})
+                factory_calls[label] = int(factory_calls.get(label, 0)) + 1
+            if missing_backend is True or missing_backend == label:
+                return None
             backend = FakeBackend(
                 verifier.ObjectArtifactMetadata,
                 label=label,
                 fail_on=fail_backend,
                 tamper_retrieve=tamper_restore_retrieve and label == "restore",
                 cleanup_fails=cleanup_fails and label == "restore",
+                object_key_fn=verifier.webapp.object_artifact_key,
+                fail_artifact_kind=fail_backend_kind if label == "active" else "",
+                raise_after_store_kind=raise_after_store_kind if label == "active" else "",
+                events=events,
                 state=backend_state,
             )
             backends[label] = backend
@@ -501,6 +553,252 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
                 continue
             self.assertNotIn(value, text)
         self.assertNotIn("OPAQUE-STORAGE-REF", text)
+
+        journal = report["resource_journal"]
+        self.assertEqual(journal["planned_resource_count"], 16)
+        self.assertEqual(
+            journal["states"],
+            {
+                verifier.JOURNAL_NOT_REACHED: 0,
+                verifier.JOURNAL_ATTEMPTED: 0,
+                verifier.JOURNAL_TOUCHED: 0,
+                verifier.JOURNAL_UNKNOWN: 0,
+                verifier.JOURNAL_CLEANUP_PENDING: 0,
+                verifier.JOURNAL_CLEANED: 16,
+                verifier.JOURNAL_ABSENCE_VERIFIED: 0,
+                verifier.JOURNAL_CLEANUP_FAILED: 0,
+            },
+        )
+        self.assertEqual(journal["attempted_and_resolved"], 16)
+        self.assertEqual(journal["destructive_cleanup_attempted"], 16)
+        entries = {entry["resource_key"]: entry for entry in journal["entries"]}
+        self.assertEqual(len(entries), 16)
+        self.assertTrue(
+            all(
+                entry["state"] == verifier.JOURNAL_CLEANED
+                and entry["destructive_cleanup_attempted"]
+                and entry["not_written_by_this_run"] is False
+                for entry in entries.values()
+            )
+        )
+        self.assertEqual(len(report["cleanup_contexts"]), 4)
+        self.assertTrue(
+            all(
+                context["backend_bound"]
+                and context["ambient_route_allowed"] is False
+                and context["capture_complete"]
+                for context in report["cleanup_contexts"]
+            )
+        )
+
+    def test_successful_drill_has_exact_backend_counts_and_denial_order(self):
+        verifier = load_verifier()
+        events: list[tuple[object, ...]] = []
+        observations: dict[str, object] = {}
+        ambient_calls: list[str] = []
+        default_backend_calls: list[str] = []
+        original_ambient = verifier.webapp.configured_object_storage_backend
+        original_default_factory = verifier._build_s3_backend
+
+        def ambient_route():
+            ambient_calls.append("ambient")
+            raise AssertionError("ambient object backend route was invoked")
+
+        def default_factory(*_args, **_kwargs):
+            default_backend_calls.append("default")
+            raise AssertionError("default object backend factory was invoked")
+
+        verifier.webapp.configured_object_storage_backend = ambient_route
+        verifier._build_s3_backend = default_factory
+        try:
+            report, _storages, _backends = run_injected_drill(
+                verifier,
+                events=events,
+                observations=observations,
+            )
+        finally:
+            verifier.webapp.configured_object_storage_backend = original_ambient
+            verifier._build_s3_backend = original_default_factory
+
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(
+            observations["backend_factory_calls"],
+            {"active": 1, "restore": 1},
+        )
+        self.assertEqual(ambient_calls, [])
+        self.assertEqual(default_backend_calls, [])
+        active_denial = next(
+            index
+            for index, event in enumerate(events)
+            if event[0] == "backend-retrieve"
+            and event[1] == "active"
+            and event[2] == verifier.SYNTHETIC_RESTORE_PROBE_KIND
+        )
+        restore_denial = next(
+            index
+            for index, event in enumerate(events)
+            if event[0] == "backend-retrieve"
+            and event[1] == "restore"
+            and event[2] == verifier.SYNTHETIC_ACTIVE_PROBE_KIND
+        )
+        first_restore_db_write = next(
+            index
+            for index, event in enumerate(events)
+            if event[0] == "storage-write" and event[1] == "restore"
+        )
+        first_restore_generated_write = next(
+            index
+            for index, event in enumerate(events)
+            if event[0] == "backend-store"
+            and event[1] == "restore"
+            and event[2] == "xlsx"
+        )
+        self.assertLess(active_denial, first_restore_db_write)
+        self.assertLess(restore_denial, first_restore_db_write)
+        self.assertLess(active_denial, first_restore_generated_write)
+        self.assertLess(restore_denial, first_restore_generated_write)
+
+    def test_active_failure_before_restore_construction_is_not_false_cleanup(self):
+        verifier = load_verifier()
+        events: list[tuple[object, ...]] = []
+        observations: dict[str, object] = {}
+        ambient_calls: list[str] = []
+        default_backend_calls: list[str] = []
+        original_ambient = verifier.webapp.configured_object_storage_backend
+        original_default_factory = verifier._build_s3_backend
+
+        def ambient_route():
+            ambient_calls.append("ambient")
+            raise AssertionError("ambient object backend route was invoked")
+
+        def default_factory(*_args, **_kwargs):
+            default_backend_calls.append("default")
+            raise AssertionError("default object backend factory was invoked")
+
+        verifier.webapp.configured_object_storage_backend = ambient_route
+        verifier._build_s3_backend = default_factory
+        try:
+            report, storages, backends = run_injected_drill(
+                verifier,
+                fail_backend_kind="xlsx",
+                events=events,
+                observations=observations,
+            )
+        finally:
+            verifier.webapp.configured_object_storage_backend = original_ambient
+            verifier._build_s3_backend = original_default_factory
+
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("active_object_write_failed", report["blockers"])
+        self.assertTrue(report["checks"]["cleanup_completed"])
+        self.assertEqual(observations["backend_factory_calls"], {"active": 1})
+        self.assertNotIn("restore", backends)
+        self.assertEqual(ambient_calls, [])
+        self.assertEqual(default_backend_calls, [])
+        entries = {entry["resource_key"]: entry for entry in report["resource_journal"]["entries"]}
+        active_cleaned = {
+            key
+            for key, entry in entries.items()
+            if key.startswith("active/") and entry["state"] == verifier.JOURNAL_CLEANED
+        }
+        self.assertEqual(len(active_cleaned), 7)
+        self.assertEqual(
+            entries["active/workspace_a/generated_xlsx"]["state"],
+            verifier.JOURNAL_ABSENCE_VERIFIED,
+        )
+        restore_entries = [entry for key, entry in entries.items() if key.startswith("restore/")]
+        self.assertTrue(all(entry["state"] == verifier.JOURNAL_NOT_REACHED for entry in restore_entries))
+        self.assertTrue(all(not entry["destructive_cleanup_attempted"] for entry in restore_entries))
+        self.assertEqual(report["resource_journal"]["not_written_by_this_run"], 8)
+        self.assertTrue(all(entry["not_written_by_this_run"] for entry in restore_entries))
+        self.assertTrue(all(storage.delete_calls == [] for (label, _workspace), storage in storages.items() if label == "restore"))
+        self.assertEqual(backends["active"].objects, {})
+
+    def test_restore_failure_after_backend_construction_cleans_only_reached_resources(self):
+        verifier = load_verifier()
+        events: list[tuple[object, ...]] = []
+        observations: dict[str, object] = {}
+        report, storages, backends = run_injected_drill(
+            verifier,
+            fail_storage="restore_write",
+            events=events,
+            observations=observations,
+        )
+
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("restore_db_write_failed", report["blockers"])
+        self.assertTrue(report["checks"]["cleanup_completed"])
+        self.assertEqual(observations["backend_factory_calls"], {"active": 1, "restore": 1})
+        self.assertIn("restore", backends)
+        entries = {entry["resource_key"]: entry for entry in report["resource_journal"]["entries"]}
+        self.assertEqual(
+            entries["restore/workspace_a/profile"]["state"],
+            verifier.JOURNAL_ABSENCE_VERIFIED,
+        )
+        self.assertEqual(
+            entries["restore/workspace_a/isolation_probe"]["state"],
+            verifier.JOURNAL_CLEANED,
+        )
+        untouched = [
+            entry
+            for key, entry in entries.items()
+            if key.startswith("restore/")
+            and key not in {"restore/workspace_a/profile", "restore/workspace_a/isolation_probe"}
+        ]
+        self.assertTrue(all(entry["state"] == verifier.JOURNAL_NOT_REACHED for entry in untouched))
+        self.assertFalse(entries["restore/workspace_a/profile"]["destructive_cleanup_attempted"])
+        self.assertTrue(entries["restore/workspace_a/isolation_probe"]["destructive_cleanup_attempted"])
+        self.assertTrue(all(storage.delete_calls == [] for (label, _workspace), storage in storages.items() if label == "restore"))
+        self.assertEqual(backends["restore"].objects, {})
+        self.assertFalse(any(event[0] == "backend-store" and event[1] == "restore" and event[2] == "xlsx" for event in events))
+
+    def test_write_then_raise_object_mutation_is_resolved_present_then_cleaned(self):
+        verifier = load_verifier()
+        report, _storages, backends = run_injected_drill(
+            verifier,
+            raise_after_store_kind=verifier.SYNTHETIC_ACTIVE_PROBE_KIND,
+        )
+
+        self.assertEqual(report["status"], "failed")
+        self.assertTrue(report["checks"]["cleanup_completed"])
+        entry = next(
+            entry
+            for entry in report["resource_journal"]["entries"]
+            if entry["resource_key"] == "active/workspace_a/isolation_probe"
+        )
+        self.assertEqual(entry["state"], verifier.JOURNAL_CLEANED)
+        self.assertIn("unknown-resolution:object-present", entry["touch_receipts"])
+        self.assertEqual(
+            [(item["from"], item["to"]) for item in entry["transition_history"]],
+            [
+                (verifier.JOURNAL_NOT_REACHED, verifier.JOURNAL_ATTEMPTED),
+                (verifier.JOURNAL_ATTEMPTED, verifier.JOURNAL_UNKNOWN),
+                (verifier.JOURNAL_UNKNOWN, verifier.JOURNAL_TOUCHED),
+                (verifier.JOURNAL_TOUCHED, verifier.JOURNAL_CLEANUP_PENDING),
+                (verifier.JOURNAL_CLEANUP_PENDING, verifier.JOURNAL_CLEANED),
+            ],
+        )
+        self.assertEqual(backends["active"].objects, {})
+
+    def test_unreadable_uncertain_object_mutation_fails_closed(self):
+        verifier = load_verifier()
+        report, _storages, backends = run_injected_drill(
+            verifier,
+            fail_backend="read",
+            raise_after_store_kind=verifier.SYNTHETIC_ACTIVE_PROBE_KIND,
+        )
+
+        self.assertEqual(report["status"], "failed")
+        self.assertFalse(report["checks"]["cleanup_completed"])
+        entry = next(
+            entry
+            for entry in report["resource_journal"]["entries"]
+            if entry["resource_key"] == "active/workspace_a/isolation_probe"
+        )
+        self.assertEqual(entry["state"], verifier.JOURNAL_CLEANUP_FAILED)
+        self.assertFalse(entry["destructive_cleanup_attempted"])
+        self.assertIn("cleanup_failed", report["blockers"])
+        self.assertTrue(backends["active"].objects)
 
     def test_runtime_filename_gate_does_not_break_active_object_pairing(self):
         verifier = load_verifier()
@@ -963,6 +1261,312 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
             )
         )
 
+    def test_journal_false_delete_with_residue_is_cleanup_failure(self):
+        verifier = load_verifier()
+        ids = verifier._synthetic_ids()
+        resource_key = "active/workspace_a/generated_xlsx"
+        descriptor = verifier._expected_artifact_descriptors(
+            ids,
+            verifier._synthetic_payload(ids),
+        )[resource_key]
+        metadata = descriptor["metadata"]
+        journal = verifier.ResourceJournal(verifier._planned_resource_specs(ids))
+        journal.mark_attempted(resource_key, "test-dispatch")
+        journal.mark_touched(resource_key, "test-receipt")
+
+        class FalseDeleteBackend(FakeBackend):
+            def delete_artifact(self, metadata, *, workspace_id):
+                _ = metadata, workspace_id
+                return False
+
+        backend = FalseDeleteBackend(
+            verifier.ObjectArtifactMetadata,
+            label="active",
+            object_key_fn=verifier.webapp.object_artifact_key,
+        )
+        backend.objects[metadata.storage_key] = b"residual-bytes"
+        context = verifier.CleanupContext(
+            operation="active",
+            workspace_identity=ids["workspace_a"],
+            workspace_label="workspace_a",
+            database_family="sqlite",
+            artifact_storage_mode="object",
+            storage=FakeStorage(label="active", workspace_id=ids["workspace_a"]),
+            maintenance_storage=None,
+            backend=backend,
+            backend_origin="test-backend",
+            backend_state="available",
+            resource_keys=(resource_key,),
+            captured_artifacts=(),
+            capture_complete=True,
+            destructive_cleanup_eligible=True,
+        )
+
+        self.assertFalse(
+            verifier._cleanup_object_resource(
+                context=context,
+                journal=journal,
+                key=resource_key,
+                metadata=metadata,
+                maintenance=False,
+            )
+        )
+        self.assertEqual(journal.state(resource_key), verifier.JOURNAL_CLEANUP_FAILED)
+        self.assertTrue(journal.entry(resource_key).destructive_cleanup_attempted)
+        self.assertIn(metadata.storage_key, backend.objects)
+
+    def test_journal_false_delete_after_actual_absence_is_already_absent(self):
+        verifier = load_verifier()
+        ids = verifier._synthetic_ids()
+        resource_key = "active/workspace_a/generated_xlsx"
+        descriptor = verifier._expected_artifact_descriptors(
+            ids,
+            verifier._synthetic_payload(ids),
+        )[resource_key]
+        metadata = descriptor["metadata"]
+        journal = verifier.ResourceJournal(verifier._planned_resource_specs(ids))
+        journal.mark_attempted(resource_key, "test-dispatch")
+        journal.mark_touched(resource_key, "test-receipt")
+
+        class AlreadyAbsentBackend(FakeBackend):
+            def delete_artifact(self, metadata, *, workspace_id):
+                _ = metadata, workspace_id
+                return False
+
+        backend = AlreadyAbsentBackend(
+            verifier.ObjectArtifactMetadata,
+            label="active",
+            object_key_fn=verifier.webapp.object_artifact_key,
+        )
+        context = verifier.CleanupContext(
+            operation="active",
+            workspace_identity=ids["workspace_a"],
+            workspace_label="workspace_a",
+            database_family="sqlite",
+            artifact_storage_mode="object",
+            storage=FakeStorage(label="active", workspace_id=ids["workspace_a"]),
+            maintenance_storage=None,
+            backend=backend,
+            backend_origin="test-backend",
+            backend_state="available",
+            resource_keys=(resource_key,),
+            captured_artifacts=(),
+            capture_complete=True,
+            destructive_cleanup_eligible=True,
+        )
+
+        self.assertTrue(
+            verifier._cleanup_object_resource(
+                context=context,
+                journal=journal,
+                key=resource_key,
+                metadata=metadata,
+                maintenance=False,
+            )
+        )
+        self.assertEqual(journal.state(resource_key), verifier.JOURNAL_CLEANED)
+        self.assertTrue(journal.entry(resource_key).destructive_cleanup_attempted)
+
+    def test_journal_metadata_residue_fails_after_provider_delete(self):
+        verifier = load_verifier()
+        ids = verifier._synthetic_ids()
+        resource_key = "active/workspace_a/generated_xlsx"
+        descriptor = verifier._expected_artifact_descriptors(
+            ids,
+            verifier._synthetic_payload(ids),
+        )[resource_key]
+        metadata = descriptor["metadata"]
+        journal = verifier.ResourceJournal(verifier._planned_resource_specs(ids))
+        journal.mark_attempted(resource_key, "test-dispatch")
+        journal.mark_touched(resource_key, "test-receipt")
+        backend = FakeBackend(
+            verifier.ObjectArtifactMetadata,
+            label="active",
+            object_key_fn=verifier.webapp.object_artifact_key,
+        )
+        backend.objects[metadata.storage_key] = descriptor["content"]
+        storage = FakeStorage(
+            label="active",
+            workspace_id=ids["workspace_a"],
+            database_rows={
+                "sqag_object_artifacts": [
+                    {
+                        "workspace_id": metadata.workspace_id,
+                        "owner_type": metadata.owner_type,
+                        "owner_id": metadata.owner_id,
+                        "artifact_kind": metadata.artifact_kind,
+                        "filename": metadata.filename,
+                        "checksum_sha256": metadata.checksum_sha256,
+                        "object_key_ref": metadata.storage_key,
+                        "status": "active",
+                        "retention_status": "active",
+                        "deleted_at": None,
+                    }
+                ]
+            },
+        )
+        context = verifier.CleanupContext(
+            operation="active",
+            workspace_identity=ids["workspace_a"],
+            workspace_label="workspace_a",
+            database_family="postgres_compatible",
+            artifact_storage_mode="object",
+            storage=storage,
+            maintenance_storage=None,
+            backend=backend,
+            backend_origin="test-backend",
+            backend_state="available",
+            resource_keys=(resource_key,),
+            captured_artifacts=(),
+            capture_complete=True,
+            destructive_cleanup_eligible=True,
+        )
+
+        self.assertFalse(
+            verifier._cleanup_object_resource(
+                context=context,
+                journal=journal,
+                key=resource_key,
+                metadata=metadata,
+                maintenance=False,
+            )
+        )
+        self.assertEqual(journal.state(resource_key), verifier.JOURNAL_CLEANUP_FAILED)
+        self.assertTrue(journal.entry(resource_key).destructive_cleanup_attempted)
+        self.assertFalse(backend.objects)
+
+    def test_missing_object_backend_fails_before_ambient_route_resolution(self):
+        verifier = load_verifier()
+        ids = verifier._synthetic_ids()
+        resource_key = "active/workspace_a/isolation_probe"
+        descriptor = verifier._expected_artifact_descriptors(
+            ids,
+            verifier._synthetic_payload(ids),
+        )[resource_key]
+        journal = verifier.ResourceJournal(verifier._planned_resource_specs(ids))
+        journal.mark_attempted(resource_key, "test-dispatch")
+        journal.mark_touched(resource_key, "test-receipt")
+        context = verifier.CleanupContext(
+            operation="active",
+            workspace_identity=ids["workspace_a"],
+            workspace_label="workspace_a",
+            database_family="sqlite",
+            artifact_storage_mode="object",
+            storage=FakeStorage(label="active", workspace_id=ids["workspace_a"]),
+            maintenance_storage=None,
+            backend=None,
+            backend_origin="test-missing-backend",
+            backend_state="missing",
+            resource_keys=(resource_key,),
+            captured_artifacts=(),
+            capture_complete=True,
+            destructive_cleanup_eligible=False,
+        )
+        ambient_calls: list[str] = []
+        original_ambient = verifier.webapp.configured_object_storage_backend
+
+        def ambient_route():
+            ambient_calls.append("ambient")
+            raise AssertionError("ambient object backend route was invoked")
+
+        verifier.webapp.configured_object_storage_backend = ambient_route
+        try:
+            result = verifier._cleanup_object_resource(
+                context=context,
+                journal=journal,
+                key=resource_key,
+                metadata=descriptor["metadata"],
+                maintenance=False,
+            )
+        finally:
+            verifier.webapp.configured_object_storage_backend = original_ambient
+
+        self.assertFalse(result)
+        self.assertEqual(journal.state(resource_key), verifier.JOURNAL_CLEANUP_FAILED)
+        self.assertEqual(ambient_calls, [])
+
+    def test_missing_restore_backend_returns_fail_closed_report_without_global_route(self):
+        verifier = load_verifier()
+        events: list[tuple[object, ...]] = []
+        observations: dict[str, object] = {}
+        ambient_calls: list[str] = []
+        original_ambient = verifier.webapp.configured_object_storage_backend
+
+        def ambient_route():
+            ambient_calls.append("ambient")
+            raise AssertionError("ambient object backend route was invoked")
+
+        verifier.webapp.configured_object_storage_backend = ambient_route
+        try:
+            report, _storages, backends = run_injected_drill(
+                verifier,
+                missing_backend="restore",
+                events=events,
+                observations=observations,
+            )
+        finally:
+            verifier.webapp.configured_object_storage_backend = original_ambient
+
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("restore_object_write_failed", report["blockers"])
+        self.assertTrue(report["checks"]["cleanup_completed"])
+        self.assertEqual(observations["backend_factory_calls"], {"active": 1, "restore": 1})
+        self.assertIn("active", backends)
+        self.assertNotIn("restore", backends)
+        self.assertEqual(ambient_calls, [])
+        entries = {entry["resource_key"]: entry for entry in report["resource_journal"]["entries"]}
+        self.assertTrue(
+            all(
+                entry["state"] == verifier.JOURNAL_NOT_REACHED
+                for key, entry in entries.items()
+                if key.startswith("restore/")
+            )
+        )
+        self.assertTrue(
+            all(
+                entry["state"] == verifier.JOURNAL_CLEANED
+                for key, entry in entries.items()
+                if key.startswith("active/")
+            )
+        )
+
+    def test_database_mode_context_without_backend_uses_no_ambient_route(self):
+        verifier = load_verifier()
+        context = verifier.CleanupContext(
+            operation="active",
+            workspace_identity="workspace-a",
+            workspace_label="workspace_a",
+            database_family="sqlite",
+            artifact_storage_mode="database",
+            storage=FakeStorage(label="active", workspace_id="workspace-a"),
+            maintenance_storage=None,
+            backend=None,
+            backend_origin="database-mode",
+            backend_state="missing",
+            resource_keys=(),
+            captured_artifacts=(),
+            capture_complete=True,
+            destructive_cleanup_eligible=False,
+        )
+        ambient_calls: list[str] = []
+        original_ambient = verifier.webapp.configured_object_storage_backend
+
+        def ambient_route():
+            ambient_calls.append("ambient")
+            raise AssertionError("ambient object backend route was invoked")
+
+        verifier.webapp.configured_object_storage_backend = ambient_route
+        try:
+            result = verifier._with_configured_backend(
+                context,
+                lambda: "database-operation",
+            )
+        finally:
+            verifier.webapp.configured_object_storage_backend = original_ambient
+
+        self.assertEqual(result, "database-operation")
+        self.assertEqual(ambient_calls, [])
+
     def test_one_cleanup_failure_does_not_skip_other_targets(self):
         verifier = load_verifier()
 
@@ -974,6 +1578,8 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
         self.assertEqual(report["status"], "failed")
         self.assertFalse(report["checks"]["cleanup_completed"])
         self.assertIn("cleanup_failed", report["blockers"])
+        self.assertGreater(report["resource_journal"]["states"][verifier.JOURNAL_CLEANED], 0)
+        self.assertGreater(report["resource_journal"]["states"][verifier.JOURNAL_CLEANUP_FAILED], 0)
         restore_storages = [storage for (label, _workspace), storage in storages.items() if label == "restore"]
         self.assertTrue(restore_storages)
         for storage in restore_storages:
