@@ -37,9 +37,19 @@ def run_verification(work_dir: Path | None = None) -> dict[str, object]:
         connection = sqlite3.connect(database_path)
         connection.row_factory = sqlite3.Row
         connection.executescript((ROOT / "migrations" / "004_generation_forensics_feedback_retention.sql").read_text(encoding="utf-8"))
+        connection.executescript((ROOT / "migrations" / "009_telemetry_events.sql").read_text(encoding="utf-8"))
         store = ForensicStore(connection, "workspace-synthetic", "pid-v1-synthetic")
 
-        run_id = store.record_run_started("generate", {"image_count": 2, "payload_shape_sha256": "0" * 64})
+        historical_now = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+        store.append_telemetry_event(
+            "retention",
+            "requested",
+            event_id="telemetry-retention-standalone",
+            operation_route="synthetic_retention_verifier",
+            purpose="retention_evidence",
+            now=historical_now,
+        )
+        run_id = store.record_run_started("generate", {"image_count": 2, "payload_shape_sha256": "0" * 64}, now=historical_now)
         store.finish_run(
             run_id,
             "blocked",
@@ -47,12 +57,13 @@ def run_verification(work_dir: Path | None = None) -> dict[str, object]:
             quote_session_id="quote-synthetic",
             result_summary={"artifact_count": 0},
             canonical_manifest={"generator_executed": False, "artifacts": []},
+            now=historical_now,
         )
         run_row = dict(connection.execute("select * from sqag_generation_runs where run_id = ?", (run_id,)).fetchone())
         evidence_rows = [dict(row) for row in connection.execute("select * from sqag_generation_evidence where run_id = ?", (run_id,)).fetchall()]
         audit_types = [row[0] for row in connection.execute("select event_type from sqag_audit_events where run_id = ? order by created_at, event_id", (run_id,)).fetchall()]
 
-        feedback = store.submit_feedback({"category": "incorrect_output", "title": "Synthetic mismatch", "message": "Synthetic pricing mismatch", "run_id": run_id, "validated_session_id": "quote-synthetic", "include_link": True, "impact": "medium", "diagnostic_metadata": {"current_route": "/synthetic"}})
+        feedback = store.submit_feedback({"category": "incorrect_output", "title": "Synthetic mismatch", "message": "Synthetic pricing mismatch", "run_id": run_id, "validated_session_id": "quote-synthetic", "include_link": True, "impact": "medium", "diagnostic_metadata": {"current_route": "/synthetic"}}, now=historical_now)
         feedback_row = dict(connection.execute("select * from sqag_feedback where feedback_id = ?", (feedback["feedback_id"],)).fetchone())
         history_count = connection.execute("select count(*) from sqag_feedback_status_history where feedback_id = ?", (feedback["feedback_id"],)).fetchone()[0]
 
@@ -60,7 +71,7 @@ def run_verification(work_dir: Path | None = None) -> dict[str, object]:
         connection.execute("update sqag_generation_runs set retention_expires_at = ?, original_retention_expires_at = ? where run_id = ?", (past, past, run_id))
         connection.execute("update sqag_generation_evidence set retention_expires_at = ?, original_retention_expires_at = ? where run_id = ?", (past, past, run_id))
         connection.execute("update sqag_audit_events set retention_expires_at = ?, original_retention_expires_at = ? where run_id = ?", (past, past, run_id))
-        store.update_feedback_status(feedback["support_reference"], "resolved", resolution_note="Synthetic verifier closure")
+        store.update_feedback_status(feedback["support_reference"], "resolved", resolution_note="Synthetic verifier closure", now=historical_now)
         connection.execute("update sqag_audit_events set retention_expires_at = ?, original_retention_expires_at = ? where run_id = ?", (past, past, run_id))
         connection.execute("update sqag_feedback set retention_expires_at = ? where feedback_id = ?", (past, feedback["feedback_id"]))
         connection.execute("update sqag_feedback_status_history set retention_expires_at = ? where feedback_id = ?", (past, feedback["feedback_id"]))
@@ -114,6 +125,7 @@ def run_verification(work_dir: Path | None = None) -> dict[str, object]:
             for path in (
                 ROOT / "migrations" / "004_generation_forensics_feedback_retention_postgres.sql",
                 ROOT / "migrations" / "005_forensic_postgres_delete_guards.sql",
+                ROOT / "migrations" / "009_telemetry_events_postgres.sql",
             )
         )
         postgres_schema_contract_ready = all(
@@ -157,6 +169,15 @@ def run_verification(work_dir: Path | None = None) -> dict[str, object]:
             "complete_sqlite_forensic_schema_is_ready": sqlite_schema_ready,
             "complete_postgres_forensic_contract_is_declared": postgres_schema_contract_ready,
             "standalone_audit_retention_is_enforced": standalone_result.standalone_deleted == 1 and standalone_deleted,
+            "telemetry_source_state_is_consistent": connection.execute(
+                "select source_product, high_watermark, next_source_sequence, reconciliation_state "
+                "from sqag_telemetry_source_state where workspace_id = ? and source_product = ?",
+                ("workspace-synthetic", "sqag"),
+            ).fetchone() is not None,
+            "telemetry_retention_is_reported": (
+                held_result.telemetry_examined >= 1
+                and held_result.telemetry_deleted >= 1
+            ),
             "ownerless_sessions_fail_closed": not editor._quote_session_visible_to_current_user(ownerless) and not editor._quote_session_editable_by_current_user(ownerless),
             "tracking_identifier_is_keyed_and_versioned": tracking_identifier.startswith("pid-synthetic-v1-") and tracking_identifier != "user-editor",
             "xlsx_column_bound_is_enforced": False,

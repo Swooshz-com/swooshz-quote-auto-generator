@@ -28,6 +28,9 @@ This baseline covers:
 - Store usage records per authenticated user/account in production, including provider, model, mode, image count, token usage when available, estimated cost, status, and error reference.
 - Use AI usage records for abuse prevention, cost control, security review, support diagnostics, and billing/entitlement enforcement.
 - Usage records must be sufficient to identify and block abusive users or accounts, but must not store raw prompts, raw uploaded files, raw generated quotations, API keys, cookies, Authorization headers, or long customer text.
+- SQAG telemetry is a separate metadata-only forensic record. Its allowlist is limited to workspace and pseudonymous actor references, safe action/run/session/support references, bounded event/status/failure fields, deployment revision, duration, AI provider/model/reasoning/purpose/route, retry lineage, truthful usage/cost metadata, quota/rate-limit/abuse decisions, digests, and retention/lifecycle state.
+- Telemetry must not store raw prompts, quote contents, briefs, uploads/images/PDFs, customer/company details, pricing or profile payloads, provider requests/responses, model outputs, arbitrary free-form text or JSON, credentials, tokens, cookies, authorization headers, connection strings, or private filesystem/provider metadata.
+- Token and cost fields are nullable evidence: unavailable usage or cost remains unavailable and is never manufactured as zero. Existing logs remain transport-only and must not become a second telemetry store.
 - Support user-level and account-level AI rate limits, spend caps, temporary blocks, and audit records for block/unblock decisions.
 - Define and enforce retention periods for uploads, generated files, AI payloads, usage records, and logs before production launch.
 - Provide a user support path for access, correction, deletion, portability, restriction/objection, and consent withdrawal requests where applicable.

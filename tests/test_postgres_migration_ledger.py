@@ -642,7 +642,10 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
         self.assertEqual(routine_identities & EXPECTED_ROUTINE_KEYS, EXPECTED_ROUTINE_KEYS)
         self.assertEqual(
             EXPECTED_CALLABLE_ROUTINE_KEYS,
-            {("sqag_quote_session_deletion_hold_blocked", "text, text")},
+            {
+                ("sqag_quote_session_deletion_hold_blocked", "text, text"),
+                ("sqag_quote_session_deletion_hold_blocked_v2", "text, text"),
+            },
         )
         self.assertEqual(
             EXPECTED_TRIGGER_ROUTINE_KEYS,

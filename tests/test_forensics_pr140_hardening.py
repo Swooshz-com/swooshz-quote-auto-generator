@@ -14,6 +14,7 @@ from webapp.forensics import ForensicStore, trusted_workspace_id
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = ROOT / "migrations" / "004_generation_forensics_feedback_retention.sql"
+TELEMETRY_MIGRATION = ROOT / "migrations" / "009_telemetry_events.sql"
 
 
 class Pr140HardeningTest(unittest.TestCase):
@@ -22,6 +23,7 @@ class Pr140HardeningTest(unittest.TestCase):
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("pragma foreign_keys = on")
         self.connection.executescript(MIGRATION.read_text(encoding="utf-8"))
+        self.connection.executescript(TELEMETRY_MIGRATION.read_text(encoding="utf-8"))
         self.a = ForensicStore(self.connection, "tenant:acme", "pid-test-v1-" + "a" * 24)
         self.b = ForensicStore(self.connection, "org.example", "pid-test-v1-" + "b" * 24)
 

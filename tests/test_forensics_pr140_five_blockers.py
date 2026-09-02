@@ -21,6 +21,7 @@ from webapp.forensics import (
 
 ROOT = Path(__file__).resolve().parents[1]
 FORENSIC_MIGRATION = ROOT / "migrations" / "004_generation_forensics_feedback_retention.sql"
+TELEMETRY_MIGRATION = ROOT / "migrations" / "009_telemetry_events.sql"
 TEST_TMP_ROOT = Path("C:/tmp") if os.name == "nt" and Path("C:/tmp").is_dir() else None
 
 
@@ -269,6 +270,7 @@ class Pr140FiveBlockerRedTest(unittest.TestCase):
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
         connection.executescript(FORENSIC_MIGRATION.read_text(encoding="utf-8"))
+        connection.executescript(TELEMETRY_MIGRATION.read_text(encoding="utf-8"))
         try:
             store = ForensicStore(connection, "workspace-five", "pid-v1-five")
             opened = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
@@ -722,6 +724,7 @@ class Pr140FiveBlockerRedTest(unittest.TestCase):
                 mock.patch.object(webapp, "begin_generation_forensics", return_value="run-transient123"),
                 mock.patch.object(webapp, "generation_payload_with_profile_defaults", side_effect=lambda value, **_kwargs: value),
                 mock.patch.object(webapp, "validate_generation_payload", return_value=[]),
+                mock.patch.object(webapp, "append_runtime_telemetry"),
                 mock.patch.object(webapp, "payload_with_database_pricing_reference_detail", side_effect=lambda value, **_kwargs: value),
                 mock.patch.object(webapp, "ensure_quote_artifact_storage_available_for_auth_session"),
                 mock.patch.object(webapp, "configured_storage_mode", return_value="local"),

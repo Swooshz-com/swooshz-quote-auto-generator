@@ -22,6 +22,8 @@ RUNTIME_FORENSIC_TABLES = {
     "sqag_audit_events",
     "sqag_feedback",
     "sqag_feedback_status_history",
+    "sqag_telemetry_source_state",
+    "sqag_telemetry_events",
 }
 MAINTENANCE_ONLY_FORENSIC_TABLES = {
     "sqag_legal_holds",

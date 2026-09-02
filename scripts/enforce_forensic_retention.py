@@ -74,7 +74,14 @@ def session_has_retained_forensic_links(
         "select 1 from sqag_generation_runs where workspace_id = ? and quote_session_id = ? and run_id <> ? limit 1",
         (workspace_id, session_id, deleting_run_id),
     ).fetchone()
-    return bool(sibling)
+    if sibling:
+        return True
+    telemetry = connection.execute(
+        "select 1 from sqag_telemetry_events where workspace_id = ? "
+        "and session_reference = ? and (run_reference is null or run_reference <> ?) limit 1",
+        (workspace_id, session_id, deleting_run_id),
+    ).fetchone()
+    return bool(telemetry)
 
 
 def blocked(reason: str) -> dict[str, object]:
@@ -175,6 +182,7 @@ def _main() -> int:
         with webapp.sqlite_storage_connection(database_url) as connection:
             webapp.upgrade_legacy_local_forensic_schema(connection)
             connection.executescript((ROOT / "migrations" / "004_generation_forensics_feedback_retention.sql").read_text(encoding="utf-8"))
+            connection.executescript((ROOT / "migrations" / "009_telemetry_events.sql").read_text(encoding="utf-8"))
             connection.commit()
             result = ForensicStore(connection, args.workspace_id, "retention-worker", local_mode=webapp.configured_app_mode() == "local").enforce_retention(now=now, batch_size=batch_size, apply=args.apply)
 
@@ -197,6 +205,10 @@ def _main() -> int:
         "deletion_receipts_examined": result.receipt_examined,
         "deletion_receipts_deleted": result.receipt_deleted,
         "deletion_receipts_failed": result.receipt_failed,
+        "telemetry_events_examined": result.telemetry_examined,
+        "telemetry_events_deleted": result.telemetry_deleted,
+        "telemetry_events_held": result.telemetry_held,
+        "telemetry_events_failed": result.telemetry_failed,
         "scan_cursor_persisted": bool(args.apply),
         "scan_cursor_dry_run_unchanged": bool(args.dry_run),
         "review_required": result.review_required,

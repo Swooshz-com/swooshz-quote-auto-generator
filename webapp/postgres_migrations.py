@@ -25,6 +25,7 @@ MIGRATION_FILE_NAMES = (
     "006_quote_publication_versions_postgres.sql",
     "007_feedback_publication_binding_postgres.sql",
     "008_quote_session_deletion_hold_authority_postgres.sql",
+    "009_telemetry_events_postgres.sql",
 )
 
 EXPECTED_TABLES = frozenset(
@@ -44,6 +45,8 @@ EXPECTED_TABLES = frozenset(
         "sqag_retention_scan_cursors",
         "sqag_quote_publication_versions",
         "sqag_quote_publication_artifacts",
+        "sqag_telemetry_source_state",
+        "sqag_telemetry_events",
     }
 )
 EXPECTED_INDEXES = frozenset(
@@ -70,6 +73,12 @@ EXPECTED_INDEXES = frozenset(
         "sqag_quote_publication_versions_retention_idx",
         "sqag_quote_publication_artifacts_session_idx",
         "sqag_feedback_publication_idx",
+        "sqag_telemetry_source_state_workspace_idx",
+        "sqag_telemetry_events_feed_idx",
+        "sqag_telemetry_events_source_sequence_uidx",
+        "sqag_telemetry_events_retention_idx",
+        "sqag_telemetry_events_actor_idx",
+        "sqag_telemetry_events_retry_uidx",
     }
 )
 EXPECTED_TRIGGERS = frozenset(
@@ -79,6 +88,9 @@ EXPECTED_TRIGGERS = frozenset(
         "sqag_generation_evidence_guard_delete",
         "sqag_audit_events_guard_delete",
         "sqag_feedback_linkage_no_update",
+        "sqag_telemetry_source_state_no_delete",
+        "sqag_telemetry_events_no_update",
+        "sqag_telemetry_events_guard_delete",
     }
 )
 EXPECTED_TRIGGER_KEYS = frozenset(
@@ -88,6 +100,9 @@ EXPECTED_TRIGGER_KEYS = frozenset(
         ("public", "sqag_generation_evidence", "sqag_generation_evidence_guard_delete"),
         ("public", "sqag_audit_events", "sqag_audit_events_guard_delete"),
         ("public", "sqag_feedback", "sqag_feedback_linkage_no_update"),
+        ("public", "sqag_telemetry_source_state", "sqag_telemetry_source_state_no_delete"),
+        ("public", "sqag_telemetry_events", "sqag_telemetry_events_no_update"),
+        ("public", "sqag_telemetry_events", "sqag_telemetry_events_guard_delete"),
     }
 )
 EXPECTED_ROUTINES = frozenset(
@@ -95,6 +110,7 @@ EXPECTED_ROUTINES = frozenset(
         "sqag_reject_immutable_change",
         "sqag_require_retention_delete_authorization",
         "sqag_quote_session_deletion_hold_blocked",
+        "sqag_quote_session_deletion_hold_blocked_v2",
     }
 )
 EXPECTED_TRIGGER_ROUTINE_KEYS = frozenset(
@@ -104,7 +120,10 @@ EXPECTED_TRIGGER_ROUTINE_KEYS = frozenset(
     }
 )
 EXPECTED_CALLABLE_ROUTINE_KEYS = frozenset(
-    {("sqag_quote_session_deletion_hold_blocked", "text, text")}
+    {
+        ("sqag_quote_session_deletion_hold_blocked", "text, text"),
+        ("sqag_quote_session_deletion_hold_blocked_v2", "text, text"),
+    }
 )
 EXPECTED_ROUTINE_KEYS = EXPECTED_TRIGGER_ROUTINE_KEYS | EXPECTED_CALLABLE_ROUTINE_KEYS
 EXPECTED_TRIGGER_ROUTINE_LINKS = {
@@ -113,12 +132,15 @@ EXPECTED_TRIGGER_ROUTINE_LINKS = {
             ("sqag_generation_evidence_no_update", "sqag_generation_evidence"),
             ("sqag_audit_events_no_update", "sqag_audit_events"),
             ("sqag_feedback_linkage_no_update", "sqag_feedback"),
+            ("sqag_telemetry_source_state_no_delete", "sqag_telemetry_source_state"),
+            ("sqag_telemetry_events_no_update", "sqag_telemetry_events"),
         }
     ),
     "sqag_require_retention_delete_authorization": frozenset(
         {
             ("sqag_generation_evidence_guard_delete", "sqag_generation_evidence"),
             ("sqag_audit_events_guard_delete", "sqag_audit_events"),
+            ("sqag_telemetry_events_guard_delete", "sqag_telemetry_events"),
         }
     ),
 }
@@ -499,6 +521,70 @@ TABLE_SPECS = (
             _c("c", expression="length(checksum_sha256) = 64"),
         ),
     ),
+    TableSpec(
+        "sqag_telemetry_source_state",
+        _cols(
+            "workspace_id:text", "source_product:text", "next_source_sequence:integer=1",
+            "high_watermark:integer=0", "reconciliation_state:text='healthy'",
+            "last_reconciled_at:text?", "reconciliation_reference:text?",
+            "created_at:text", "updated_at:text",
+        ),
+        (
+            _c("p", "workspace_id,source_product"),
+            _c("c", expression="source_product = 'sqag'"),
+            _c("c", expression="next_source_sequence >= 1"),
+            _c("c", expression="(high_watermark >= 0) and (high_watermark < next_source_sequence)"),
+            _c("c", expression="reconciliation_state in ('healthy', 'reconciling', 'inconsistent')"),
+        ),
+    ),
+    TableSpec(
+        "sqag_telemetry_events",
+        _cols(
+            "workspace_id:text", "event_id:text", "source_product:text",
+            "source_sequence:integer", "event_type:text", "event_status:text",
+            "actor_tracking_id:text", "actor_key_version:text", "action_reference:text?",
+            "run_reference:text?", "session_reference:text?", "support_reference:text?",
+            "retry_lineage_id:text?", "attempt_number:integer?", "provider:text?",
+            "model:text?", "reasoning_level:text?", "operation_route:text?", "purpose:text?",
+            "failure_class:text?", "duration_ms:integer?", "usage_available:integer?",
+            "input_tokens:integer?", "output_tokens:integer?", "total_tokens:integer?",
+            "cache_read_tokens:integer?", "cache_write_tokens:integer?", "cost_available:integer?",
+            "estimated_cost:numeric?", "actual_cost:numeric?", "currency:text?", "cost_version:text?",
+            "quota_decision:text?", "rate_limit_decision:text?", "abuse_decision:text?",
+            "deployment_revision:text?", "occurred_at:text", "immutable_metadata_digest:text",
+            "retention_expires_at:text", "original_retention_expires_at:text",
+            "legal_hold:integer=0", "deletion_state:text='active'", "deletion_error_code:text?",
+            "deletion_claimed_at:text?",
+        ),
+        (
+            _c("p", "workspace_id,event_id"),
+            _c("f", "workspace_id,source_product", referenced_table="sqag_telemetry_source_state", referenced_columns="workspace_id,source_product"),
+            _c("c", expression="source_product = 'sqag'"),
+            _c("c", expression="source_sequence >= 1"),
+            _c("c", expression="event_type in ('generation', 'validation', 'ai_provider_attempt', 'pricing_change', 'profile_change', 'publication', 'download', 'feedback', 'security', 'rate_limit', 'abuse', 'cancellation', 'timeout', 'abandonment', 'supersession', 'storage_staging', 'storage_finalization', 'storage_compensation', 'configuration', 'operator_action', 'reconciliation', 'retention', 'legal_hold', 'deletion', 'backup', 'restore')"),
+            _c("c", expression="event_status in ('started', 'queued', 'running', 'success', 'failed', 'blocked', 'denied', 'completed', 'needs_confirmation', 'needs_review', 'completed_with_review_required', 'degraded', 'cancelled', 'timed_out', 'abandoned', 'superseded', 'available', 'unavailable', 'held', 'deleted', 'reconciled', 'staged', 'finalized', 'compensated', 'requested', 'updated', 'restored', 'rate_limited')"),
+            _c("c", expression="(attempt_number is null) or (attempt_number >= 1)"),
+            _c("c", expression="(failure_class is null) or (failure_class in ('missing_api_key', 'timeout', 'rate_limited', 'upstream_unavailable', 'http_error', 'network_error', 'invalid_json', 'schema_validation_failed', 'model_output_invalid', 'provider_error', 'generator_error', 'configuration', 'storage', 'authorization', 'unknown'))"),
+            _c("c", expression="(duration_ms is null) or (duration_ms >= 0)"),
+            _c("c", expression="(usage_available is null) or (usage_available in (0, 1))"),
+            _c("c", expression="(input_tokens is null) or (input_tokens >= 0)"),
+            _c("c", expression="(output_tokens is null) or (output_tokens >= 0)"),
+            _c("c", expression="(total_tokens is null) or (total_tokens >= 0)"),
+            _c("c", expression="(cache_read_tokens is null) or (cache_read_tokens >= 0)"),
+            _c("c", expression="(cache_write_tokens is null) or (cache_write_tokens >= 0)"),
+            _c("c", expression="(cost_available is null) or (cost_available in (0, 1))"),
+            _c("c", expression="(estimated_cost is null) or (estimated_cost >= (0)::numeric)"),
+            _c("c", expression="(actual_cost is null) or (actual_cost >= (0)::numeric)"),
+            _c("c", expression="(provider is null) or (provider in ('openai', 'deepseek'))"),
+            _c("c", expression="(reasoning_level is null) or (reasoning_level in ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'standard'))"),
+            _c("c", expression="(quota_decision is null) or (quota_decision in ('allowed', 'denied', 'not_evaluated'))"),
+            _c("c", expression="(rate_limit_decision is null) or (rate_limit_decision in ('allowed', 'denied', 'not_evaluated'))"),
+            _c("c", expression="(abuse_decision is null) or (abuse_decision in ('allowed', 'denied', 'not_evaluated'))"),
+            _c("c", expression="length(immutable_metadata_digest) = 64"),
+            _c("c", expression="legal_hold in (0, 1)"),
+            _c("c", expression="deletion_state in ('active', 'review_required', 'deleting', 'delete_failed')"),
+        ),
+    ),
 )
 TABLE_SPECS_BY_NAME = MappingProxyType({item.name: item for item in TABLE_SPECS})
 
@@ -536,6 +622,12 @@ INDEX_SPECS = (
     _index("sqag_quote_publication_versions_retention_idx", "sqag_quote_publication_versions", "workspace_id,deletion_state,retention_expires_at,run_id"),
     _index("sqag_quote_publication_artifacts_session_idx", "sqag_quote_publication_artifacts", "workspace_id,session_id,run_id,artifact_kind"),
     _index("sqag_feedback_publication_idx", "sqag_feedback", "workspace_id,publication_version_id,run_id"),
+    _index("sqag_telemetry_source_state_workspace_idx", "sqag_telemetry_source_state", "workspace_id,source_product,high_watermark"),
+    _index("sqag_telemetry_events_feed_idx", "sqag_telemetry_events", "workspace_id,source_sequence,event_id"),
+    _index("sqag_telemetry_events_source_sequence_uidx", "sqag_telemetry_events", "workspace_id,source_sequence", unique=True),
+    _index("sqag_telemetry_events_retention_idx", "sqag_telemetry_events", "workspace_id,deletion_state,retention_expires_at,event_id"),
+    _index("sqag_telemetry_events_actor_idx", "sqag_telemetry_events", "workspace_id,actor_tracking_id,occurred_at"),
+    _index("sqag_telemetry_events_retry_uidx", "sqag_telemetry_events", "workspace_id,retry_lineage_id,attempt_number", unique=True, predicate="(retry_lineage_id is not null) and (attempt_number is not null)"),
 )
 INDEX_SPECS_BY_NAME = MappingProxyType({item.name: item for item in INDEX_SPECS})
 
@@ -551,6 +643,31 @@ TRIGGER_SPECS = (
         columns=("run_id", "session_id", "publication_version_id", "link_resolution_source", "link_resolved_at"),
         routine_name="sqag_reject_immutable_change",
     ),
+    _trigger(
+        "sqag_telemetry_source_state_no_delete",
+        "sqag_telemetry_source_state",
+        ("delete",),
+        routine_name="sqag_reject_immutable_change",
+    ),
+    _trigger(
+        "sqag_telemetry_events_no_update",
+        "sqag_telemetry_events",
+        ("update",),
+        columns=(
+            "workspace_id", "event_id", "source_product", "source_sequence",
+            "event_type", "event_status", "actor_tracking_id", "actor_key_version",
+            "action_reference", "run_reference", "session_reference", "support_reference",
+            "retry_lineage_id", "attempt_number", "provider", "model", "reasoning_level",
+            "operation_route", "purpose", "failure_class", "duration_ms", "usage_available",
+            "input_tokens", "output_tokens", "total_tokens", "cache_read_tokens",
+            "cache_write_tokens", "cost_available", "estimated_cost", "actual_cost",
+            "currency", "cost_version", "quota_decision", "rate_limit_decision",
+            "abuse_decision", "deployment_revision", "occurred_at",
+            "immutable_metadata_digest", "retention_expires_at", "original_retention_expires_at",
+        ),
+        routine_name="sqag_reject_immutable_change",
+    ),
+    _trigger("sqag_telemetry_events_guard_delete", "sqag_telemetry_events", ("delete",), routine_name="sqag_require_retention_delete_authorization"),
 )
 TRIGGER_SPECS_BY_KEY = MappingProxyType(
     {("public", item.table_name, item.name): item for item in TRIGGER_SPECS}
@@ -581,6 +698,32 @@ ROUTINE_SPECS = (
             "sqag_legal_holds",
             "sqag_quote_publication_versions",
             "sqag_quote_sessions",
+        ),
+        (("sqag_runtime", "EXECUTE", False),),
+    ),
+    RoutineSpec(
+        "public",
+        "sqag_quote_session_deletion_hold_blocked_v2",
+        "text, text",
+        "boolean",
+        "sql",
+        "sqag_migrator",
+        True,
+        "s",
+        "u",
+        False,
+        ("search_path=pg_catalog, public",),
+        "009_telemetry_events_postgres.sql",
+        (
+            "sqag_audit_events",
+            "sqag_feedback",
+            "sqag_feedback_status_history",
+            "sqag_generation_evidence",
+            "sqag_generation_runs",
+            "sqag_legal_holds",
+            "sqag_quote_publication_versions",
+            "sqag_quote_sessions",
+            "sqag_telemetry_events",
         ),
         (("sqag_runtime", "EXECUTE", False),),
     ),
@@ -624,6 +767,13 @@ MIGRATION_OBJECTS = (
         table_mutations=(TableMutationSpec("sqag_feedback", ("publication_version_id", "link_resolution_source", "link_resolved_at")),),
     ),
     MigrationObjectSpec(MIGRATION_FILE_NAMES[6], routines=(ROUTINE_SPECS[2],)),
+    MigrationObjectSpec(
+        MIGRATION_FILE_NAMES[7],
+        tables=tuple(TABLE_SPECS_BY_NAME[name] for name in ("sqag_telemetry_source_state", "sqag_telemetry_events")),
+        indexes=tuple(INDEX_SPECS[22:28]),
+        triggers=tuple(TRIGGER_SPECS[5:8]),
+        routines=(ROUTINE_SPECS[3],),
+    ),
 )
 
 if tuple(item.migration_id for item in MIGRATION_OBJECTS) != MIGRATION_FILE_NAMES:
