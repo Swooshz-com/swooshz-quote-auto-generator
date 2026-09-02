@@ -663,18 +663,23 @@ def _cleanup_storage(
         if rows is False or rows:
             postconditions_ok = False
 
-    file_rows = _database_rows(
-        storage,
-        "select 1 from sqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
-        (workspace_id, "profile", profile_id, "quotation_layout"),
-    )
-    quote_rows = _database_rows(
-        storage,
-        "select 1 from sqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
-        (workspace_id, session_id, "xlsx"),
-    )
-    if file_rows is False or file_rows or quote_rows is False or quote_rows:
-        postconditions_ok = False
+    # DatabaseSqagStorage exposes the canonical family signal. Hosted
+    # PostgreSQL has no local DB-BLOB relations, while SQLite/local paths do.
+    # Keep this capability decision explicit rather than inferring it from a
+    # missing-table error after issuing an unsupported query.
+    if _clean(getattr(storage, "database_family", "")) != "postgres_compatible":
+        file_rows = _database_rows(
+            storage,
+            "select 1 from sqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+            (workspace_id, "profile", profile_id, "quotation_layout"),
+        )
+        quote_rows = _database_rows(
+            storage,
+            "select 1 from sqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
+            (workspace_id, session_id, "xlsx"),
+        )
+        if file_rows is False or file_rows or quote_rows is False or quote_rows:
+            postconditions_ok = False
 
     object_rows = _database_rows(
         storage,

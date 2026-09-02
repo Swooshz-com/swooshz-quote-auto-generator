@@ -50,12 +50,41 @@ def complete_env() -> dict[str, str]:
     }
 
 
+class FakeDatabaseResult:
+    def __init__(self, rows: list[object]):
+        self.rows = list(rows)
+
+    def fetchall(self):
+        return list(self.rows)
+
+
+class FakeDatabaseConnection:
+    def __init__(self, storage):
+        self.storage = storage
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        _ = exc_type, exc_value, traceback
+        return False
+
+    def execute(self, query, params=()):
+        self.storage.queries.append((query, tuple(params)))
+        for table, rows in self.storage.database_rows.items():
+            if table in query:
+                return FakeDatabaseResult(rows)
+        return FakeDatabaseResult([])
+
+
 class FakeStorage:
     def __init__(
         self,
         *,
         label: str,
         workspace_id: str,
+        database_family: str = "sqlite",
+        database_rows: dict[str, list[object]] | None = None,
         fail_on: str = "",
         pairing_mismatch: bool = False,
         state: dict[str, dict[object, dict[str, object]]] | None = None,
@@ -63,6 +92,9 @@ class FakeStorage:
     ):
         self.label = label
         self.workspace_id = workspace_id
+        self.database_family = database_family
+        self.database_rows = database_rows or {}
+        self.queries: list[tuple[str, tuple[object, ...]]] = []
         self.fail_on = fail_on
         self.pairing_mismatch = pairing_mismatch
         self.runtime_filename_gate = runtime_filename_gate
@@ -76,6 +108,10 @@ class FakeStorage:
         self.pricing = self._state["pricing"]
         self.sessions = self._state["sessions"]
         self.object_artifacts = self._state["object_artifacts"]
+
+    @contextlib.contextmanager
+    def connection(self):
+        yield FakeDatabaseConnection(self)
 
     def _maybe_fail(self, step: str) -> None:
         if self.fail_on == step or self.fail_on == f"{self.label}_{step}":
@@ -243,6 +279,7 @@ class FakeBackend:
 def run_injected_drill(
     verifier,
     *,
+    storage_database_family: str = "sqlite",
     fail_storage: str = "",
     fail_backend: str = "",
     tamper_restore_retrieve: bool = False,
@@ -273,6 +310,7 @@ def run_injected_drill(
             storage = FakeStorage(
                 label=label,
                 workspace_id=workspace_id,
+                database_family=storage_database_family,
                 fail_on=fail_storage,
                 pairing_mismatch=pairing_mismatch and label == "restore",
                 state=state,
@@ -472,6 +510,181 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
         self.assertEqual(report["status"], "passed")
         self.assertTrue(report["checks"]["active_object_write_read_verified"])
         self.assertTrue(report["checks"]["metadata_object_pairing_verified"])
+
+    def test_postgres_cleanup_never_queries_file_artifacts_relation(self):
+        verifier = load_verifier()
+
+        report, storages, _backends = run_injected_drill(
+            verifier,
+            storage_database_family="postgres_compatible",
+        )
+
+        self.assertEqual(report["status"], "passed")
+        queries = [
+            query.lower()
+            for storage in storages.values()
+            for query, _params in storage.queries
+        ]
+        self.assertFalse(any("sqag_file_artifacts" in query for query in queries))
+
+    def test_postgres_cleanup_never_queries_quote_artifacts_relation(self):
+        verifier = load_verifier()
+
+        report, storages, _backends = run_injected_drill(
+            verifier,
+            storage_database_family="postgres_compatible",
+        )
+
+        self.assertEqual(report["status"], "passed")
+        queries = [
+            query.lower()
+            for storage in storages.values()
+            for query, _params in storage.queries
+        ]
+        self.assertFalse(any("sqag_quote_artifacts" in query for query in queries))
+
+    def test_postgres_cleanup_keeps_canonical_postconditions(self):
+        verifier = load_verifier()
+
+        report, storages, backends = run_injected_drill(
+            verifier,
+            storage_database_family="postgres_compatible",
+        )
+
+        self.assertEqual(report["status"], "passed")
+        self.assertTrue(report["checks"]["cleanup_completed"])
+        queries = [
+            query.lower()
+            for storage in storages.values()
+            for query, _params in storage.queries
+        ]
+        for table in (
+            "sqag_profiles",
+            "sqag_pricing_references",
+            "sqag_quote_sessions",
+            "sqag_object_artifacts",
+        ):
+            self.assertTrue(any(table in query for query in queries), table)
+        self.assertEqual(backends["active"].objects, {})
+        self.assertEqual(backends["restore"].objects, {})
+
+    def test_postgres_remaining_object_metadata_fails_cleanup(self):
+        verifier = load_verifier()
+        storage = FakeStorage(
+            label="active",
+            workspace_id="workspace-a",
+            database_family="postgres_compatible",
+            database_rows={
+                "sqag_object_artifacts": [
+                    {
+                        "status": "active",
+                        "retention_status": "active",
+                        "deleted_at": None,
+                    }
+                ]
+            },
+        )
+
+        self.assertFalse(
+            verifier._cleanup_storage(
+                storage,
+                profile_id="profile-a",
+                pricing_id="pricing-a",
+                session_id="quote-a",
+                backend=None,
+            )
+        )
+
+    def test_postgres_remaining_object_bytes_fails_cleanup(self):
+        verifier = load_verifier()
+
+        class FalseDeleteBackend(FakeBackend):
+            def delete_artifact(self, metadata, *, workspace_id):
+                if metadata.workspace_id != workspace_id:
+                    raise RuntimeError("workspace mismatch")
+                return False
+
+        backend = FalseDeleteBackend(verifier.ObjectArtifactMetadata, label="active")
+        metadata = backend.store_artifact(
+            workspace_id="workspace-a",
+            owner_type="generated_quote",
+            owner_id="quote-a",
+            artifact_kind="xlsx",
+            filename="quotation.xlsx",
+            content_type=verifier.SYNTHETIC_CONTENT_TYPE,
+            content=b"residual-bytes",
+        )
+        storage = FakeStorage(
+            label="active",
+            workspace_id="workspace-a",
+            database_family="postgres_compatible",
+        )
+
+        self.assertFalse(
+            verifier._cleanup_storage(
+                storage,
+                profile_id="profile-a",
+                pricing_id="pricing-a",
+                session_id="quote-a",
+                backend=backend,
+                captured_artifacts=(metadata,),
+            )
+        )
+        self.assertIn(metadata.storage_key, backend.objects)
+
+    def test_sqlite_cleanup_checks_file_artifact_absence(self):
+        verifier = load_verifier()
+        storage = FakeStorage(label="active", workspace_id="workspace-a", database_family="sqlite")
+
+        self.assertTrue(
+            verifier._cleanup_storage(
+                storage,
+                profile_id="profile-a",
+                pricing_id="pricing-a",
+                session_id="quote-a",
+                backend=None,
+            )
+        )
+        queries = [query.lower() for query, _params in storage.queries]
+        self.assertTrue(any("sqag_file_artifacts" in query for query in queries))
+
+    def test_sqlite_cleanup_checks_quote_artifact_absence(self):
+        verifier = load_verifier()
+        storage = FakeStorage(label="active", workspace_id="workspace-a", database_family="sqlite")
+
+        self.assertTrue(
+            verifier._cleanup_storage(
+                storage,
+                profile_id="profile-a",
+                pricing_id="pricing-a",
+                session_id="quote-a",
+                backend=None,
+            )
+        )
+        queries = [query.lower() for query, _params in storage.queries]
+        self.assertTrue(any("sqag_quote_artifacts" in query for query in queries))
+
+    def test_sqlite_db_blob_residue_fails_cleanup(self):
+        verifier = load_verifier()
+
+        for table in ("sqag_file_artifacts", "sqag_quote_artifacts"):
+            with self.subTest(table=table):
+                storage = FakeStorage(
+                    label="active",
+                    workspace_id="workspace-a",
+                    database_family="sqlite",
+                    database_rows={table: [object()]},
+                )
+
+                self.assertFalse(
+                    verifier._cleanup_storage(
+                        storage,
+                        profile_id="profile-a",
+                        pricing_id="pricing-a",
+                        session_id="quote-a",
+                        backend=None,
+                    )
+                )
 
     def test_metadata_pairing_requires_runtime_owner_session_kind_and_workspace(self):
         verifier = load_verifier()
