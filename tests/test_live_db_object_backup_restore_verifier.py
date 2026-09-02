@@ -669,6 +669,132 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
         self.assertIn("cleanup_failed", report["blockers"])
         self.assertFalse(report["checks"]["cleanup_completed"])
 
+    def test_profile_delete_false_with_residue_fails_cleanup(self):
+        verifier = load_verifier()
+
+        class FalseProfileDeleteStorage(FakeStorage):
+            def delete_profile(self, _profile_id):
+                return False
+
+        storage = FalseProfileDeleteStorage(label="active", workspace_id="workspace-a")
+        storage.profiles["profile-a"] = {"id": "profile-a", "label": "residue"}
+
+        self.assertFalse(
+            verifier._cleanup_storage(
+                storage,
+                profile_id="profile-a",
+                pricing_id="pricing-a",
+                session_id="quote-a",
+                backend=None,
+            )
+        )
+        self.assertIsNotNone(storage.profile_detail("profile-a"))
+
+    def test_backend_delete_false_with_bytes_remaining_fails_cleanup(self):
+        verifier = load_verifier()
+
+        class FalseDeleteBackend(FakeBackend):
+            def delete_artifact(self, metadata, *, workspace_id):
+                if metadata.workspace_id != workspace_id:
+                    raise RuntimeError("workspace mismatch")
+                return False
+
+        backend = FalseDeleteBackend(verifier.ObjectArtifactMetadata, label="active")
+        metadata = backend.store_artifact(
+            workspace_id="workspace-a",
+            owner_type="generated_quote",
+            owner_id="quote-a",
+            artifact_kind="xlsx",
+            filename="quotation.xlsx",
+            content_type=verifier.SYNTHETIC_CONTENT_TYPE,
+            content=b"residual-bytes",
+        )
+
+        self.assertFalse(
+            verifier._delete_backend_artifact_and_verify(
+                backend,
+                metadata,
+                workspace_id="workspace-a",
+            )
+        )
+        self.assertIn(metadata.storage_key, backend.objects)
+
+    def test_false_delete_for_already_absent_backend_artifact_is_benign(self):
+        verifier = load_verifier()
+
+        class AlreadyAbsentBackend(FakeBackend):
+            def delete_artifact(self, _metadata, *, workspace_id):
+                _ = workspace_id
+                return False
+
+        backend = AlreadyAbsentBackend(verifier.ObjectArtifactMetadata, label="active")
+        metadata = verifier.ObjectArtifactMetadata(
+            workspace_id="workspace-a",
+            owner_type="generated_quote",
+            owner_id="quote-a",
+            artifact_kind="xlsx",
+            filename="quotation.xlsx",
+            content_type=verifier.SYNTHETIC_CONTENT_TYPE,
+            size_bytes=1,
+            checksum_sha256="a" * 64,
+            storage_key="already-absent",
+            created_at="2026-01-01T00:00:00Z",
+            updated_at="2026-01-01T00:00:00Z",
+        )
+
+        self.assertTrue(
+            verifier._delete_backend_artifact_and_verify(
+                backend,
+                metadata,
+                workspace_id="workspace-a",
+            )
+        )
+
+    def test_one_cleanup_failure_does_not_skip_other_targets(self):
+        verifier = load_verifier()
+
+        report, storages, _backends = run_injected_drill(
+            verifier,
+            fail_storage="active_cleanup",
+        )
+
+        self.assertEqual(report["status"], "failed")
+        self.assertFalse(report["checks"]["cleanup_completed"])
+        self.assertIn("cleanup_failed", report["blockers"])
+        restore_storages = [storage for (label, _workspace), storage in storages.items() if label == "restore"]
+        self.assertTrue(restore_storages)
+        for storage in restore_storages:
+            self.assertEqual(storage.profiles, {})
+            self.assertEqual(storage.pricing, {})
+            self.assertEqual(storage.sessions, {})
+
+    def test_partial_restore_write_still_runs_outer_cleanup(self):
+        verifier = load_verifier()
+
+        report, _storages, backends = run_injected_drill(
+            verifier,
+            fail_storage="restore_write",
+        )
+
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("restore_db_write_failed", report["blockers"])
+        self.assertTrue(report["checks"]["cleanup_completed"])
+        self.assertEqual(backends["active"].objects, {})
+        self.assertEqual(backends["restore"].objects, {})
+
+    def test_early_return_after_active_probe_failure_still_cleans_everything(self):
+        verifier = load_verifier()
+
+        report, _storages, backends = run_injected_drill(
+            verifier,
+            fail_backend="active_write",
+        )
+
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("active_object_write_failed", report["blockers"])
+        self.assertTrue(report["checks"]["cleanup_completed"])
+        self.assertEqual(backends["active"].objects, {})
+
     def test_sanitized_output_omits_private_live_values_and_payloads(self):
         verifier = load_verifier()
         env = complete_env()

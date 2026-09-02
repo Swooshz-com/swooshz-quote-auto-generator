@@ -40,6 +40,7 @@ from webapp.object_storage import (
     ObjectStorageBackend,
     ObjectStorageConfigurationError,
     ObjectStorageContractError,
+    ObjectStorageNotFoundError,
     S3CompatibleObjectStorageBackend,
     artifact_checksum,
     object_storage_provider_status,
@@ -91,6 +92,10 @@ REQUIRED_ENV_NAMES = [
 TRUE_VALUES = {"1", "true", "yes", "on", "run", "enabled"}
 SYNTHETIC_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 SYNTHETIC_FILENAME = webapp.QUOTE_SESSION_EXPORT_KINDS["xlsx"]
+SYNTHETIC_PROBE_OWNER_TYPE = "generated_quote"
+SYNTHETIC_ACTIVE_PROBE_KIND = "isolation_probe_active"
+SYNTHETIC_RESTORE_PROBE_KIND = "isolation_probe_restore"
+SYNTHETIC_PROBE_FILENAME = "sqag-isolation-probe.xlsx"
 OBJECT_ARTIFACT_ROW_FIELDS = (
     "artifact_id",
     "workspace_id",
@@ -209,6 +214,8 @@ def _default_checks(
         "restore_object_write_read_verified": False,
         "restore_database_cannot_read_active_synthetic_rows": False,
         "restore_object_cannot_read_active_synthetic_object": False,
+        "active_object_cannot_read_restore_synthetic_object": False,
+        "bidirectional_backend_isolation_verified": False,
         "checksum_match": False,
         "metadata_object_pairing_verified": False,
         "workspace_isolation_preserved": False,
@@ -341,12 +348,34 @@ def _synthetic_ids() -> dict[str, str]:
         "pricing_b": f"{prefix}-pricing-b",
         "session_a": f"quote-{token}a",
         "session_b": f"quote-{token}b",
+        "active_probe_id": f"{prefix}-active-probe",
+        "restore_probe_id": f"{prefix}-restore-probe",
     }
 
 
 def _synthetic_payload(ids: Mapping[str, str]) -> bytes:
     seed = f"sqag-db-object-restore:{ids['workspace_a']}:{ids['session_a']}".encode("ascii")
     return hashlib.sha256(seed).digest()[:24]
+
+
+def _synthetic_probe_payload(ids: Mapping[str, str], purpose: str) -> bytes:
+    seed = f"sqag-backend-isolation-probe:{purpose}:{ids['workspace_a']}".encode("ascii")
+    return hashlib.sha256(seed).digest()[:16]
+
+
+def _backend_retrieval_proves_absence(
+    backend: ObjectStorageBackend,
+    metadata: ObjectArtifactMetadata,
+    *,
+    workspace_id: str,
+) -> bool:
+    try:
+        backend.retrieve_artifact(metadata, workspace_id=workspace_id)
+    except (ObjectStorageNotFoundError, KeyError):
+        return True
+    except Exception:
+        return False
+    return False
 
 
 def _contains_id(items: list[dict[str, object]], item_id: str, id_key: str = "id") -> bool:
@@ -486,6 +515,90 @@ def _restore_database_cannot_read_active_synthetic_rows(
     return not visible
 
 
+def _active_artifact_metadata(
+    storage: object,
+    owner_type: str,
+    owner_id: str,
+    artifact_kind: str = "",
+) -> list[ObjectArtifactMetadata] | None:
+    reader = getattr(storage, "_active_object_artifact_rows", None)
+    converter = getattr(storage, "_object_metadata_from_row", None)
+    if not callable(reader) or not callable(converter):
+        return []
+    try:
+        rows = reader(owner_type, owner_id, artifact_kind=artifact_kind)
+    except Exception:
+        return None
+    metadata: list[ObjectArtifactMetadata] = []
+    for row in rows:
+        try:
+            metadata.append(converter(row))
+        except Exception:
+            return None
+    return metadata
+
+
+def _database_rows(
+    storage: object,
+    query: str,
+    params: tuple[object, ...],
+) -> list[object] | None | bool:
+    connection_factory = getattr(storage, "connection", None)
+    if not callable(connection_factory):
+        return None
+    try:
+        with connection_factory() as connection:
+            return list(connection.execute(query, params).fetchall())
+    except Exception:
+        return False
+
+
+def _backend_artifact_absent(
+    backend: ObjectStorageBackend,
+    metadata: ObjectArtifactMetadata,
+    *,
+    workspace_id: str,
+) -> bool:
+    try:
+        backend.retrieve_artifact(metadata, workspace_id=workspace_id)
+    except (ObjectStorageNotFoundError, KeyError):
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _delete_backend_artifact_and_verify(
+    backend: ObjectStorageBackend,
+    metadata: ObjectArtifactMetadata,
+    *,
+    workspace_id: str,
+) -> bool:
+    try:
+        delete_result = backend.delete_artifact(metadata, workspace_id=workspace_id)
+    except Exception:
+        return False
+    absent = _backend_artifact_absent(
+        backend,
+        metadata,
+        workspace_id=workspace_id,
+    )
+    if delete_result is False and not absent:
+        return False
+    return absent
+
+
+def _object_rows_are_deleted(rows: list[object]) -> bool:
+    for row in rows:
+        if not (
+            _clean(_row_value(row, "status")) == "deleted"
+            and _clean(_row_value(row, "retention_status")) == "deleted"
+            and _clean(_row_value(row, "deleted_at"))
+        ):
+            return False
+    return True
+
+
 def _cleanup_storage(
     storage: object,
     *,
@@ -493,34 +606,104 @@ def _cleanup_storage(
     pricing_id: str,
     session_id: str,
     backend: ObjectStorageBackend | None,
+    captured_artifacts: tuple[ObjectArtifactMetadata, ...] = (),
 ) -> bool:
-    if hasattr(storage, "connection"):
-        with storage.connection() as connection:
-            if getattr(storage, "database_family", "") != "postgres_compatible":
-                connection.execute(
-                    "delete from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
-                    (storage.workspace_id, "generated_quote", session_id, "xlsx"),
-                )
-            connection.execute(
-                "delete from sqag_quote_sessions where workspace_id = ? and session_id = ?",
-                (storage.workspace_id, session_id),
-            )
-            connection.execute(
-                "delete from sqag_pricing_references where workspace_id = ? and reference_id = ?",
-                (storage.workspace_id, pricing_id),
-            )
-            connection.commit()
-        if backend is None:
-            return storage.profile_detail(profile_id) is None
-        storage.delete_profile(profile_id)
-        return True
-    ok = True
-    ok = bool(storage.delete_quote_session(session_id)) or ok
-    ok = bool(storage.delete_pricing_reference(pricing_id)) or ok
-    if backend is None:
-        return storage.profile_detail(profile_id) is None and ok
-    ok = bool(storage.delete_profile(profile_id)) or ok
-    return ok
+    operation_results: dict[str, bool] = {}
+    operation_failed = False
+    for operation_name, operation in (
+        ("quote_session", lambda: storage.delete_quote_session(session_id)),
+        ("pricing_reference", lambda: storage.delete_pricing_reference(pricing_id)),
+        ("profile", lambda: storage.delete_profile(profile_id)),
+    ):
+        try:
+            operation_results[operation_name] = bool(operation())
+        except Exception:
+            operation_results[operation_name] = False
+            operation_failed = True
+
+    postconditions_ok = not operation_failed
+    try:
+        if storage.profile_detail(profile_id) is not None:
+            postconditions_ok = False
+        if storage.pricing_reference_detail(pricing_id) is not None:
+            postconditions_ok = False
+        if storage.get_quote_session(session_id) is not None:
+            postconditions_ok = False
+    except Exception:
+        postconditions_ok = False
+
+    workspace_id = _clean(getattr(storage, "workspace_id", ""))
+    profile_rows = _database_rows(
+        storage,
+        "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
+        (workspace_id, profile_id),
+    )
+    if profile_rows is False:
+        postconditions_ok = False
+    elif profile_rows:
+        if len(profile_rows) != 1:
+            postconditions_ok = False
+        else:
+            try:
+                payload = json.loads(_row_value(profile_rows[0], "payload_json"))
+            except (TypeError, json.JSONDecodeError):
+                payload = None
+            if not isinstance(payload, Mapping) or payload.get(webapp.DELETED_PROFILE_MARKER_KEY) is not True:
+                postconditions_ok = False
+
+    for table, id_column, item_id in (
+        ("sqag_pricing_references", "reference_id", pricing_id),
+        ("sqag_quote_sessions", "session_id", session_id),
+    ):
+        rows = _database_rows(
+            storage,
+            f"select 1 from {table} where workspace_id = ? and {id_column} = ?",
+            (workspace_id, item_id),
+        )
+        if rows is False or rows:
+            postconditions_ok = False
+
+    file_rows = _database_rows(
+        storage,
+        "select 1 from sqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+        (workspace_id, "profile", profile_id, "quotation_layout"),
+    )
+    quote_rows = _database_rows(
+        storage,
+        "select 1 from sqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
+        (workspace_id, session_id, "xlsx"),
+    )
+    if file_rows is False or file_rows or quote_rows is False or quote_rows:
+        postconditions_ok = False
+
+    object_rows = _database_rows(
+        storage,
+        "select * from sqag_object_artifacts where workspace_id = ? and ((owner_type = ? and owner_id = ?) or (owner_type = ? and owner_id = ?) or (owner_type = ? and owner_id = ?))",
+        (
+            workspace_id,
+            "profile",
+            profile_id,
+            "pricing_reference",
+            pricing_id,
+            "generated_quote",
+            session_id,
+        ),
+    )
+    if object_rows is False or (object_rows is not None and not _object_rows_are_deleted(object_rows)):
+        postconditions_ok = False
+
+    if backend is not None:
+        for metadata in captured_artifacts:
+            if not _backend_artifact_absent(
+                backend,
+                metadata,
+                workspace_id=workspace_id,
+            ):
+                postconditions_ok = False
+    false_returns = any(not result for result in operation_results.values())
+    if false_returns and not postconditions_ok:
+        return False
+    return not operation_failed and postconditions_ok
 
 
 def _with_configured_backend(backend: ObjectStorageBackend, callback: Callable[[], Any]) -> Any:
@@ -548,8 +731,42 @@ def _cleanup(
     active_metadata: ObjectArtifactMetadata | None,
     restore_metadata: ObjectArtifactMetadata | None,
     ids: Mapping[str, str],
+    active_probe_metadata: ObjectArtifactMetadata | None = None,
+    restore_probe_metadata: ObjectArtifactMetadata | None = None,
 ) -> bool:
     ok = True
+    cleanup_entries: list[tuple[object, str, str, str, ObjectStorageBackend | None, tuple[ObjectArtifactMetadata, ...], bool]] = []
+    for storage, profile_key, pricing_key, session_key, backend in (
+        (active_storage_a, "profile_a", "pricing_a", "session_a", active_backend),
+        (active_storage_b, "profile_b", "pricing_b", "session_b", active_backend),
+        (restore_storage_a, "profile_a", "pricing_a", "session_a", restore_backend),
+        (restore_storage_b, "profile_b", "pricing_b", "session_b", restore_backend),
+    ):
+        if storage is None:
+            continue
+        captured: list[ObjectArtifactMetadata] = []
+        capture_failed = False
+        for owner_type, owner_id in (
+            ("profile", ids[profile_key]),
+            ("pricing_reference", ids[pricing_key]),
+            ("generated_quote", ids[session_key]),
+        ):
+            owner_artifacts = _active_artifact_metadata(storage, owner_type, owner_id)
+            if owner_artifacts is None:
+                capture_failed = True
+            else:
+                captured.extend(owner_artifacts)
+        cleanup_entries.append(
+            (
+                storage,
+                ids[profile_key],
+                ids[pricing_key],
+                ids[session_key],
+                backend,
+                tuple(captured),
+                capture_failed,
+            )
+        )
     for maintenance_storage, backend, metadata, workspace_key in (
         (active_maintenance_storage, active_backend, active_metadata, "workspace_a"),
         (restore_maintenance_storage, restore_backend, restore_metadata, "workspace_a"),
@@ -562,15 +779,10 @@ def _cleanup(
         ):
             continue
         try:
-            tombstoned = int(
-                _with_configured_backend(
-                    backend,
-                    lambda: maintenance_storage.tombstone_object_quote_artifacts(ids["session_a"]),
-                )
-                or 0
+            _with_configured_backend(
+                backend,
+                lambda: maintenance_storage.tombstone_object_quote_artifacts(ids["session_a"]),
             )
-            if tombstoned == 0 and _object_artifact_row(maintenance_storage, ids["session_a"], "xlsx") is not None:
-                raise ObjectStorageContractError("Synthetic artifact tombstone was not applied.")
         except Exception:
             ok = False
     for backend, metadata, workspace_key in (
@@ -579,39 +791,71 @@ def _cleanup(
     ):
         if backend is None or metadata is None:
             continue
+        if not _delete_backend_artifact_and_verify(
+            backend,
+            metadata,
+            workspace_id=ids[workspace_key],
+        ):
+            ok = False
+
+    for backend, metadata in (
+        (active_backend, active_probe_metadata),
+        (restore_backend, restore_probe_metadata),
+    ):
+        if backend is None or metadata is None:
+            continue
+        if not _delete_backend_artifact_and_verify(
+            backend,
+            metadata,
+            workspace_id=ids["workspace_a"],
+        ):
+            ok = False
+
+    for storage, profile_id, pricing_id, session_id, backend, captured_artifacts, capture_failed in cleanup_entries:
+        if capture_failed:
+            ok = False
         try:
-            backend.delete_artifact(metadata, workspace_id=ids[workspace_key])
+            cleaner = lambda: _cleanup_storage(
+                storage,
+                profile_id=profile_id,
+                pricing_id=pricing_id,
+                session_id=session_id,
+                backend=backend,
+                captured_artifacts=captured_artifacts,
+            )
+            cleaned = cleaner() if backend is None else _with_configured_backend(backend, cleaner)
+            if not cleaned:
+                ok = False
         except Exception:
             ok = False
-    for storage, profile_key, pricing_key, session_key, backend in (
-        (active_storage_a, "profile_a", "pricing_a", "session_a", active_backend),
-        (active_storage_b, "profile_b", "pricing_b", "session_b", active_backend),
-        (restore_storage_a, "profile_a", "pricing_a", "session_a", restore_backend),
-        (restore_storage_b, "profile_b", "pricing_b", "session_b", restore_backend),
+
+    for left, right, left_ids, right_ids in (
+        (
+            active_storage_a,
+            active_storage_b,
+            ("profile_a", "pricing_a", "session_a"),
+            ("profile_b", "pricing_b", "session_b"),
+        ),
+        (
+            restore_storage_a,
+            restore_storage_b,
+            ("profile_a", "pricing_a", "session_a"),
+            ("profile_b", "pricing_b", "session_b"),
+        ),
     ):
-        if storage is None:
+        if left is None or right is None:
             continue
         try:
-            if backend is None:
-                cleaned = _cleanup_storage(
-                    storage,
-                    profile_id=ids[profile_key],
-                    pricing_id=ids[pricing_key],
-                    session_id=ids[session_key],
-                    backend=None,
+            if any(
+                (
+                    left.profile_detail(ids[right_ids[0]]) is not None,
+                    left.pricing_reference_detail(ids[right_ids[1]]) is not None,
+                    left.get_quote_session(ids[right_ids[2]]) is not None,
+                    right.profile_detail(ids[left_ids[0]]) is not None,
+                    right.pricing_reference_detail(ids[left_ids[1]]) is not None,
+                    right.get_quote_session(ids[left_ids[2]]) is not None,
                 )
-            else:
-                cleaned = _with_configured_backend(
-                    backend,
-                    lambda: _cleanup_storage(
-                        storage,
-                        profile_id=ids[profile_key],
-                        pricing_id=ids[pricing_key],
-                        session_id=ids[session_key],
-                        backend=backend,
-                    ),
-                )
-            if not cleaned:
+            ):
                 ok = False
         except Exception:
             ok = False
@@ -642,6 +886,7 @@ def _run_drill(
     active_maintenance_storage = restore_maintenance_storage = None
     active_backend = restore_backend = None
     active_metadata = restore_metadata = None
+    active_probe_metadata = restore_probe_metadata = None
     active_db_rows = active_object_count = restore_db_rows = restore_object_count = 0
     active_payload = _synthetic_payload(ids)
 
@@ -669,6 +914,20 @@ def _run_drill(
         checks["read_attempted"] = True
         try:
             active_backend = active_backend_factory(env)
+        except Exception:
+            blockers.append("active_object_write_failed")
+            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
+
+        try:
+            active_probe_metadata = active_backend.store_artifact(
+                workspace_id=ids["workspace_a"],
+                owner_type=SYNTHETIC_PROBE_OWNER_TYPE,
+                owner_id=ids["active_probe_id"],
+                artifact_kind=SYNTHETIC_ACTIVE_PROBE_KIND,
+                filename=SYNTHETIC_PROBE_FILENAME,
+                content_type=SYNTHETIC_CONTENT_TYPE,
+                content=_synthetic_probe_payload(ids, "active"),
+            )
         except Exception:
             blockers.append("active_object_write_failed")
             return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
@@ -739,10 +998,43 @@ def _run_drill(
             blockers.append("restore_object_write_failed")
             return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
         try:
-            restore_backend.retrieve_artifact(active_metadata, workspace_id=ids["workspace_a"])
+            restore_probe_metadata = restore_backend.store_artifact(
+                workspace_id=ids["workspace_a"],
+                owner_type=SYNTHETIC_PROBE_OWNER_TYPE,
+                owner_id=ids["restore_probe_id"],
+                artifact_kind=SYNTHETIC_RESTORE_PROBE_KIND,
+                filename=SYNTHETIC_PROBE_FILENAME,
+                content_type=SYNTHETIC_CONTENT_TYPE,
+                content=_synthetic_probe_payload(ids, "restore"),
+            )
         except Exception:
-            checks["restore_object_cannot_read_active_synthetic_object"] = True
-        else:
+            blockers.append("restore_object_write_failed")
+            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
+
+        if not _backend_retrieval_proves_absence(
+            restore_backend,
+            active_probe_metadata,
+            workspace_id=ids["workspace_a"],
+        ):
+            blockers.append("restore_object_can_read_active_synthetic_object")
+            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
+        checks["restore_object_cannot_read_active_synthetic_object"] = True
+
+        if not _backend_retrieval_proves_absence(
+            active_backend,
+            restore_probe_metadata,
+            workspace_id=ids["workspace_a"],
+        ):
+            blockers.append("active_object_can_read_restore_synthetic_object")
+            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
+        checks["active_object_cannot_read_restore_synthetic_object"] = True
+        checks["bidirectional_backend_isolation_verified"] = True
+
+        if active_metadata is not None and not _backend_retrieval_proves_absence(
+            restore_backend,
+            active_metadata,
+            workspace_id=ids["workspace_a"],
+        ):
             blockers.append("restore_object_can_read_active_synthetic_object")
             return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
 
@@ -830,6 +1122,8 @@ def _run_drill(
             active_metadata=active_metadata,
             restore_metadata=restore_metadata,
             ids=ids,
+            active_probe_metadata=active_probe_metadata,
+            restore_probe_metadata=restore_probe_metadata,
         )
         checks["cleanup_completed"] = cleanup_completed
         if not cleanup_completed and "cleanup_failed" not in blockers:

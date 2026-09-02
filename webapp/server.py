@@ -135,6 +135,7 @@ DEFAULT_COMPANY_DISPLAY_NAME = "Quote Generator Workspace"
 DEFAULT_QUOTE_COMPANY_PROFILE_ID = "default"
 DEFAULT_QUOTE_COMPANY_FALLBACK_PRESET_ID = "synthetic-fixture-default"
 DELETED_PROFILE_MARKER_KEY = "_sqag_deleted"
+DELETED_PROFILE_UPDATE_MESSAGE = "Deleted profiles cannot be updated. Create a new profile with a new id."
 
 
 def discovered_default_resource_id(root: Path, marker_filename: str, fallback: str = "default") -> str:
@@ -10174,6 +10175,7 @@ class ObjectArtifactBatchPlan:
     previous_backups: list[tuple[ObjectArtifactMetadata, bytes]] = field(default_factory=list)
     new_objects: list[ObjectArtifactMetadata] = field(default_factory=list)
     deleted_previous: list[tuple[ObjectArtifactMetadata, bytes]] = field(default_factory=list)
+    unchanged_kinds: set[str] = field(default_factory=set)
     state: str = "prepared"
 
 
@@ -10767,6 +10769,36 @@ class DatabaseSqagStorage:
         detail["source"] = "company"
         return detail
 
+    def _assert_profile_can_be_saved(
+        self,
+        profile_id: str,
+        *,
+        connection: Any | None = None,
+    ) -> None:
+        safe_id = safe_resource_id(profile_id, "")
+        if not safe_id:
+            return
+
+        def assert_on_connection(active_connection: Any) -> None:
+            row = active_connection.execute(
+                "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
+                (self.workspace_id, safe_id),
+            ).fetchone()
+            if not row:
+                return
+            try:
+                payload = json.loads(row["payload_json"])
+            except (KeyError, TypeError, json.JSONDecodeError):
+                return
+            if self._is_deleted_profile_payload(payload):
+                raise ValueError(DELETED_PROFILE_UPDATE_MESSAGE)
+
+        if connection is not None:
+            assert_on_connection(connection)
+            return
+        with self.connection() as read_connection:
+            assert_on_connection(read_connection)
+
     def save_profile(self, profile: dict[str, Any]) -> dict[str, Any]:
         profile_id = safe_resource_id(profile.get("id") or profile.get("label"), "")
         if not profile_id:
@@ -10776,12 +10808,23 @@ class DatabaseSqagStorage:
         artifact_mode = configured_artifact_storage_mode()
         materialize_default_layout = configured_storage_mode() == "database"
         if artifact_mode not in {"database", "object"}:
-            self._upsert_payload("sqag_profiles", "profile_id", profile_id, stored)
+            def persist_plain_profile(connection: Any) -> None:
+                self._assert_profile_can_be_saved(profile_id, connection=connection)
+                self._execute_upsert_payload(
+                    connection,
+                    "sqag_profiles",
+                    "profile_id",
+                    profile_id,
+                    stored,
+                )
+
+            self._run_storage_transaction(persist_plain_profile)
             return stored
 
-        item = self._prepare_profile_layout_artifact(profile)
         if artifact_mode == 'object':
             def prepare_object_profile(connection: Any):
+                self._assert_profile_can_be_saved(profile_id, connection=connection)
+                item = self._prepare_profile_layout_artifact(profile)
                 profile_layout_item = item
                 if (
                     profile_layout_item is None
@@ -10841,6 +10884,8 @@ class DatabaseSqagStorage:
             return stored
 
         def persist_profile(connection: Any) -> None:
+            self._assert_profile_can_be_saved(profile_id, connection=connection)
+            item = self._prepare_profile_layout_artifact(profile)
             profile_layout_item = item
             if (
                 profile_layout_item is None
@@ -10884,10 +10929,45 @@ class DatabaseSqagStorage:
             raise ValueError("Profile id is required and may only contain letters, numbers, dashes, or underscores.")
         artifact_mode = configured_artifact_storage_mode()
         if artifact_mode == "object":
-            def delete_object_profile_owner(connection: Any) -> bool:
-                cursor = connection.execute(
-                    "delete from sqag_profiles where workspace_id = ? and profile_id = ?",
+            def authorize_object_profile(connection: Any) -> bool:
+                existing_row = connection.execute(
+                    "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
                     (self.workspace_id, safe_id),
+                ).fetchone()
+                if not existing_row:
+                    return False
+                try:
+                    existing_payload = json.loads(existing_row["payload_json"])
+                except (KeyError, TypeError, json.JSONDecodeError):
+                    existing_payload = None
+                return not self._is_deleted_profile_payload(existing_payload)
+
+            def delete_object_profile_owner(connection: Any) -> bool:
+                existing_row = connection.execute(
+                    "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
+                    (self.workspace_id, safe_id),
+                )
+                existing_row = existing_row.fetchone()
+                if not existing_row:
+                    return False
+                try:
+                    existing_payload = json.loads(existing_row["payload_json"])
+                except (KeyError, TypeError, json.JSONDecodeError):
+                    existing_payload = None
+                if self._is_deleted_profile_payload(existing_payload):
+                    return False
+                cursor = connection.execute(
+                    "update sqag_profiles set payload_json = ?, updated_at = ? where workspace_id = ? and profile_id = ?",
+                    (
+                        json.dumps(
+                            {"id": safe_id, DELETED_PROFILE_MARKER_KEY: True},
+                            ensure_ascii=True,
+                            sort_keys=True,
+                        ),
+                        utc_timestamp(),
+                        self.workspace_id,
+                        safe_id,
+                    ),
                 )
                 return cursor.rowcount > 0
 
@@ -10896,6 +10976,7 @@ class DatabaseSqagStorage:
                     "profile",
                     safe_id,
                     delete_object_profile_owner,
+                    authorize=authorize_object_profile,
                 )
             except Exception as exc:
                 if not self._expected_storage_failure(exc):
@@ -10914,13 +10995,13 @@ class DatabaseSqagStorage:
                     existing_payload = None
                 if self._is_deleted_profile_payload(existing_payload):
                     return False
+            if not existing_row:
+                return False
             if artifact_mode == "database":
                 connection.execute(
                     "delete from sqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ?",
                     (self.workspace_id, "profile", safe_id),
                 )
-            if not existing_row:
-                return False
             cursor = connection.execute(
                 "update sqag_profiles set payload_json = ?, updated_at = ? where workspace_id = ? and profile_id = ?",
                 (
@@ -11153,11 +11234,25 @@ class DatabaseSqagStorage:
             return
         if len(content) > MAX_QUOTE_ARTIFACT_BYTES:
             raise ValueError("Artifact is larger than the database artifact limit.")
+        safe_content_type = clean_text(content_type) or "application/octet-stream"
+        content_bytes = bytes(content)
+        existing = connection.execute(
+            "select filename, content_type, size_bytes, content_blob from sqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+            (self.workspace_id, safe_owner_type, safe_owner_id, safe_kind),
+        ).fetchone()
+        if (
+            existing
+            and clean_text(existing["filename"]) == safe_filename
+            and clean_text(existing["content_type"]) == safe_content_type
+            and int(existing["size_bytes"] or 0) == len(content_bytes)
+            and bytes(existing["content_blob"] or b"") == content_bytes
+        ):
+            return
         now = utc_timestamp()
         connection.execute(
             "insert into sqag_file_artifacts (workspace_id, owner_type, owner_id, artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "on conflict(workspace_id, owner_type, owner_id, artifact_kind) do update set filename = excluded.filename, content_type = excluded.content_type, size_bytes = excluded.size_bytes, content_blob = excluded.content_blob, updated_at = excluded.updated_at",
-            (self.workspace_id, safe_owner_type, safe_owner_id, safe_kind, safe_filename, clean_text(content_type) or "application/octet-stream", len(content), sqlite3.Binary(content), now, now),
+            (self.workspace_id, safe_owner_type, safe_owner_id, safe_kind, safe_filename, safe_content_type, len(content_bytes), sqlite3.Binary(content_bytes), now, now),
         )
 
     def _upsert_file_artifact(self, owner_type: str, owner_id: str, artifact_kind: str, filename: str, content_type: str, content: bytes) -> None:
@@ -11211,14 +11306,15 @@ class DatabaseSqagStorage:
         table = "sqag_file_artifacts" if mode == "database" else "sqag_object_artifacts"
         query = (
             f"select 1 from {table} where workspace_id = ? "
-            "and owner_type = ? and owner_id = ? and artifact_kind = ? limit 1"
+            "and owner_type = ? and owner_id = ? and artifact_kind = ?"
         )
+        if mode == "object":
+            query += " and status = ? and retention_status = ? and deleted_at is null"
+        query += " limit 1"
         params = (self.workspace_id, "profile", safe_id, "quotation_layout")
+        if mode == "object":
+            params += ("active", "active")
         def artifact_or_deleted_profile_exists(active_connection: Any) -> bool:
-            if active_connection.execute(query, params).fetchone() is not None:
-                return True
-            if mode != "database":
-                return False
             profile_row = active_connection.execute(
                 "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
                 (self.workspace_id, safe_id),
@@ -11227,9 +11323,11 @@ class DatabaseSqagStorage:
                 return False
             try:
                 profile_payload = json.loads(profile_row["payload_json"])
-            except (TypeError, json.JSONDecodeError):
+            except (KeyError, TypeError, json.JSONDecodeError):
                 return False
-            return self._is_deleted_profile_payload(profile_payload)
+            if self._is_deleted_profile_payload(profile_payload):
+                return False
+            return active_connection.execute(query, params).fetchone() is not None
 
         if connection is not None:
             return artifact_or_deleted_profile_exists(connection)
@@ -11292,6 +11390,39 @@ class DatabaseSqagStorage:
             raise ObjectStorageContractError("Artifact metadata is incomplete.")
         artifact_id = f"obj-{secrets.token_hex(12)}"
         now = utc_timestamp()
+        safe_content_type = clean_text(content_type) or "application/octet-stream"
+        created_at = metadata.created_at or now
+        platform_user_id = self.user_id
+        session_id = ""
+        job_id = ""
+        existing = connection.execute(
+            "select artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at "
+            "from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+            (self.workspace_id, safe_owner_type, safe_owner_id, safe_kind),
+        ).fetchone()
+        reusable_existing = False
+        if existing:
+            try:
+                reusable_existing = (
+                    clean_text(existing["workspace_id"]) == self.workspace_id
+                    and clean_text(existing["owner_type"]) == safe_owner_type
+                    and clean_text(existing["owner_id"]) == safe_owner_id
+                    and clean_text(existing["artifact_kind"]) == safe_kind
+                    and clean_text(existing["object_key_ref"]) == metadata.storage_key
+                    and clean_text(existing["checksum_sha256"]) == metadata.checksum_sha256
+                    and int(existing["size_bytes"] or 0) == int(metadata.size_bytes)
+                    and clean_text(existing["status"]) == "active"
+                    and clean_text(existing["retention_status"]) == "active"
+                    and not clean_text(existing["deleted_at"])
+                )
+            except (KeyError, TypeError, ValueError):
+                reusable_existing = False
+        if reusable_existing:
+            artifact_id = clean_text(existing["artifact_id"]) or artifact_id
+            created_at = clean_text(existing["created_at"]) or created_at
+            platform_user_id = clean_text(existing["platform_user_id"])
+            session_id = clean_text(existing["session_id"])
+            job_id = clean_text(existing["job_id"])
         connection.execute(
             "insert into sqag_object_artifacts (artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at) "
             "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
@@ -11301,19 +11432,19 @@ class DatabaseSqagStorage:
                 self.workspace_id,
                 safe_owner_type,
                 safe_owner_id,
-                self.user_id,
-                "",
-                "",
+                platform_user_id,
+                session_id,
+                job_id,
                 safe_kind,
                 safe_filename,
-                clean_text(content_type) or "application/octet-stream",
+                safe_content_type,
                 metadata.size_bytes,
                 metadata.checksum_sha256,
                 "s3_compatible",
                 metadata.storage_key,
                 "active",
                 "active",
-                metadata.created_at or now,
+                created_at,
                 now,
                 None,
             ),
@@ -11643,14 +11774,38 @@ class DatabaseSqagStorage:
                         raise ObjectStorageContractError(
                             "Artifact content does not match metadata."
                         )
+                    safe_filename = safe_segment(
+                        item.filename,
+                        item.artifact_kind or "artifact",
+                    )
+                    safe_content_type = clean_text(item.content_type) or "application/octet-stream"
+                    same_authoritative_metadata = (
+                        clean_text(previous_row.get("artifact_id"))
+                        and clean_text(previous_row.get("workspace_id")) == self.workspace_id
+                        and clean_text(previous_row.get("owner_type")) == safe_owner_type
+                        and clean_text(previous_row.get("owner_id")) == safe_owner_id
+                        and clean_text(previous_row.get("artifact_kind")) == item.artifact_kind
+                        and clean_text(previous_row.get("filename")) == safe_filename
+                        and clean_text(previous_row.get("content_type")) == safe_content_type
+                        and int(previous_row.get("size_bytes") or 0) == len(item.content)
+                        and clean_text(previous_row.get("checksum_sha256")) == checksum
+                        and clean_text(previous_row.get("object_provider_type")) == "s3_compatible"
+                        and clean_text(previous_row.get("object_key_ref")) == desired_key
+                        and clean_text(previous_row.get("status")) == "active"
+                        and clean_text(previous_row.get("retention_status")) == "active"
+                        and not clean_text(previous_row.get("deleted_at"))
+                        and clean_text(previous_row.get("platform_user_id")) == self.user_id
+                        and clean_text(previous_row.get("session_id")) == ""
+                        and clean_text(previous_row.get("job_id")) == ""
+                    )
                     plan.desired_metadata[item.artifact_kind] = (
                         ObjectArtifactMetadata(
                             workspace_id=self.workspace_id,
                             owner_type=safe_owner_type,
                             owner_id=safe_owner_id,
                             artifact_kind=item.artifact_kind,
-                            filename=item.filename,
-                            content_type=item.content_type,
+                            filename=safe_filename,
+                            content_type=safe_content_type,
                             size_bytes=len(item.content),
                             checksum_sha256=checksum,
                             storage_key=desired_key,
@@ -11658,6 +11813,8 @@ class DatabaseSqagStorage:
                             updated_at=previous.updated_at,
                         )
                     )
+                    if same_authoritative_metadata:
+                        plan.unchanged_kinds.add(item.artifact_kind)
                     continue
 
                 stored = backend.store_artifact(
@@ -11734,6 +11891,8 @@ class DatabaseSqagStorage:
                 row,
             )
         for item in plan.items:
+            if item.artifact_kind in plan.unchanged_kinds:
+                continue
             metadata = plan.desired_metadata[item.artifact_kind]
             if quote_session:
                 self._execute_upsert_object_quote_artifact(
@@ -12217,6 +12376,9 @@ class DatabaseSqagStorage:
             return None
         safe_id = safe_resource_id(profile_id, "")
         if not safe_id:
+            return None
+        profile = self._read_payload("sqag_profiles", "profile_id", safe_id)
+        if profile is None or self._is_deleted_profile_payload(profile):
             return None
         artifact = (
             self._read_object_file_artifact("profile", safe_id, "quotation_layout")

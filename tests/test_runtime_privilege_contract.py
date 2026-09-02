@@ -3551,14 +3551,33 @@ order by object_kind, object_schema, object_name, object_type
             }
 
         class RecordingBackend(webapp.InMemoryObjectStorageBackend):
-            def __init__(self, label, *, fail_artifact_kind=""):
+            def __init__(self, label, *, fail_artifact_kind="", timeline=None):
                 super().__init__()
                 self.label = label
                 self.fail_artifact_kind = fail_artifact_kind
+                self.timeline = timeline if timeline is not None else []
                 self.events = []
                 self.store_calls = []
                 self.retrieve_calls = []
                 self.delete_calls = []
+
+            def _timeline_event(self, operation, metadata=None, **values):
+                event = {
+                    "index": len(self.timeline),
+                    "label": self.label,
+                    "operation": operation,
+                }
+                if metadata is not None:
+                    event.update(
+                        {
+                            "owner_type": metadata.owner_type,
+                            "owner_id": metadata.owner_id,
+                            "artifact_kind": metadata.artifact_kind,
+                        }
+                    )
+                event.update(values)
+                self.timeline.append(event)
+                return event
 
             def store_artifact(self, **kwargs):
                 event_index = len(self.events)
@@ -3570,6 +3589,13 @@ order by object_kind, object_schema, object_name, object_type
                         kwargs["artifact_kind"],
                     )
                 )
+                timeline_event = self._timeline_event(
+                    "store",
+                    owner_type=kwargs["owner_type"],
+                    owner_id=kwargs["owner_id"],
+                    artifact_kind=kwargs["artifact_kind"],
+                    succeeded=False,
+                )
                 record = dict(kwargs)
                 record["content"] = bytes(kwargs["content"])
                 record["event_index"] = event_index
@@ -3580,6 +3606,7 @@ order by object_kind, object_schema, object_name, object_type
                     )
                 metadata = super().store_artifact(**kwargs)
                 record["metadata"] = metadata
+                timeline_event["succeeded"] = True
                 return metadata
 
             def retrieve_artifact(self, metadata, *, workspace_id):
@@ -3592,6 +3619,12 @@ order by object_kind, object_schema, object_name, object_type
                         metadata.artifact_kind,
                     )
                 )
+                timeline_event = self._timeline_event(
+                    "retrieve",
+                    metadata,
+                    workspace_id=workspace_id,
+                    succeeded=False,
+                )
                 record = {
                     "metadata": metadata,
                     "workspace_id": workspace_id,
@@ -3599,12 +3632,16 @@ order by object_kind, object_schema, object_name, object_type
                     "succeeded": False,
                 }
                 self.retrieve_calls.append(record)
-                content = super().retrieve_artifact(
-                    metadata,
-                    workspace_id=workspace_id,
-                )
+                try:
+                    content = super().retrieve_artifact(
+                        metadata,
+                        workspace_id=workspace_id,
+                    )
+                except Exception:
+                    raise
                 record["succeeded"] = True
                 record["content"] = content
+                timeline_event["succeeded"] = True
                 return content
 
             def delete_artifact(self, metadata, *, workspace_id):
@@ -3624,13 +3661,60 @@ order by object_kind, object_schema, object_name, object_type
                         "event_index": event_index,
                     }
                 )
+                self._timeline_event(
+                    "delete",
+                    metadata,
+                    workspace_id=workspace_id,
+                    succeeded=True,
+                )
                 return super().delete_artifact(
                     metadata,
                     workspace_id=workspace_id,
                 )
 
+        class TimelineStorage:
+            def __init__(self, inner, label, timeline):
+                self.inner = inner
+                self.label = label
+                self.timeline = timeline
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+            def _record(self, operation):
+                self.timeline.append(
+                    {
+                        "index": len(self.timeline),
+                        "label": self.label,
+                        "operation": operation,
+                    }
+                )
+
+            def save_profile(self, profile):
+                if self.label == "restore":
+                    self._record("restore_database_profile_write")
+                return self.inner.save_profile(profile)
+
+            def save_pricing_reference(self, reference):
+                if self.label == "restore":
+                    self._record("restore_database_pricing_write")
+                return self.inner.save_pricing_reference(reference)
+
+            def create_or_update_quote_session(self, payload, **kwargs):
+                if self.label == "restore":
+                    self._record("restore_database_session_write")
+                return self.inner.create_or_update_quote_session(payload, **kwargs)
+
+            def _upsert_object_quote_artifact(self, *args, **kwargs):
+                if self.label == "restore":
+                    self._record("restore_product_metadata_write")
+                return self.inner._upsert_object_quote_artifact(*args, **kwargs)
+
         def run_case(restore_database_name, active_backend, restore_backend):
             factory_calls = {"active": 0, "restore": 0}
+            timeline = []
+            active_backend.timeline = timeline
+            restore_backend.timeline = timeline
 
             def active_factory(_env):
                 factory_calls["active"] += 1
@@ -3639,6 +3723,16 @@ order by object_kind, object_schema, object_name, object_type
             def restore_factory(_env):
                 factory_calls["restore"] += 1
                 return restore_backend
+
+            original_default_storage = verifier._build_default_storage
+
+            def timeline_storage_factory(database_url, workspace_id):
+                label = "restore" if restore_database_name in database_url else "active"
+                return TimelineStorage(
+                    original_default_storage(database_url, workspace_id),
+                    label,
+                    timeline,
+                )
 
             original_factory = webapp.configured_object_storage_backend
             with mock.patch.object(
@@ -3651,21 +3745,26 @@ order by object_kind, object_schema, object_name, object_type
                     "_build_s3_backend",
                     side_effect=AssertionError("default S3 backend was constructed"),
                 ) as default_s3_factory:
-                    env = verifier_env(restore_database_name)
-                    with mock.patch.dict(os.environ, env, clear=True):
-                        report = verifier.run_verification(
-                            env=env,
-                            active_backend_factory=active_factory,
-                            restore_backend_factory=restore_factory,
-                            test_injected_backend=True,
-                        )
-                        binding_restored = (
-                            webapp.configured_object_storage_backend is global_route
-                        )
+                    with mock.patch.object(
+                        verifier,
+                        "_build_default_storage",
+                        side_effect=timeline_storage_factory,
+                    ):
+                        env = verifier_env(restore_database_name)
+                        with mock.patch.dict(os.environ, env, clear=True):
+                            report = verifier.run_verification(
+                                env=env,
+                                active_backend_factory=active_factory,
+                                restore_backend_factory=restore_factory,
+                                test_injected_backend=True,
+                            )
+                            binding_restored = (
+                                webapp.configured_object_storage_backend is global_route
+                            )
             self.assertIs(webapp.configured_object_storage_backend, original_factory)
             self.assertEqual(global_route.call_count, 0)
             self.assertEqual(default_s3_factory.call_count, 0)
-            return report, factory_calls, binding_restored
+            return report, factory_calls, binding_restored, timeline
 
         def layout_calls(backend):
             return [
@@ -3781,7 +3880,7 @@ order by object_kind, object_schema, object_name, object_type
         restore_database_name = self._create_isolated_database_fixture()
         active_backend = RecordingBackend("active")
         restore_backend = RecordingBackend("restore")
-        report, factory_calls, binding_restored = run_case(
+        report, factory_calls, binding_restored, timeline = run_case(
             restore_database_name,
             active_backend,
             restore_backend,
@@ -3799,6 +3898,8 @@ order by object_kind, object_schema, object_name, object_type
         self.assertTrue(report["checks"]["workspace_isolation_preserved"])
         self.assertTrue(report["checks"]["restore_database_cannot_read_active_synthetic_rows"])
         self.assertTrue(report["checks"]["restore_object_cannot_read_active_synthetic_object"])
+        self.assertTrue(report["checks"]["active_object_cannot_read_restore_synthetic_object"])
+        self.assertTrue(report["checks"]["bidirectional_backend_isolation_verified"])
         self.assertTrue(report["checks"]["cleanup_completed"])
         self.assertEqual(report["active_db_synthetic_rows_written"], 7)
         self.assertEqual(report["restore_db_synthetic_rows_written"], 7)
@@ -3839,48 +3940,42 @@ order by object_kind, object_schema, object_name, object_type
                     successful_reads[call["metadata"].storage_key],
                     expected_layout,
                 )
-        wrong_way_reads = [
-            item
-            for item in restore_backend.retrieve_calls
-            if not item["succeeded"]
-            and item["metadata"].owner_type == "generated_quote"
-            and item["metadata"].artifact_kind == "xlsx"
+        active_probe_denial = [
+            event
+            for event in timeline
+            if event["label"] == "restore"
+            and event["operation"] == "retrieve"
+            and not event["succeeded"]
+            and event["owner_id"].endswith("-active-probe")
         ]
-        self.assertEqual(len(wrong_way_reads), 1)
-        self.assertLess(
-            wrong_way_reads[0]["event_index"],
-            min(call["event_index"] for call in restore_layout_calls),
+        restore_probe_denial = [
+            event
+            for event in timeline
+            if event["label"] == "active"
+            and event["operation"] == "retrieve"
+            and not event["succeeded"]
+            and event["owner_id"].endswith("-restore-probe")
+        ]
+        self.assertEqual(len(active_probe_denial), 1)
+        self.assertEqual(len(restore_probe_denial), 1)
+        first_restore_profile_write = next(
+            event
+            for event in timeline
+            if event["operation"] == "restore_database_profile_write"
         )
-
-        restore_only_metadata = restore_backend.store_artifact(
-            workspace_id="restore-only-workspace",
-            owner_type="profile",
-            owner_id="restore-only-profile",
-            artifact_kind="quotation_layout",
-            filename="quotation-layout.xlsx",
-            content_type=verifier.SYNTHETIC_CONTENT_TYPE,
-            content=expected_layout,
+        first_restore_product_write = next(
+            event
+            for event in timeline
+            if event["label"] == "restore"
+            and event["operation"] == "store"
+            and event["succeeded"]
+            and event["owner_type"] == "generated_quote"
+            and event["owner_id"].startswith("quote-")
+            and event["artifact_kind"] == "xlsx"
         )
-        try:
-            self.assertEqual(
-                restore_backend.retrieve_artifact(
-                    restore_only_metadata,
-                    workspace_id="restore-only-workspace",
-                ),
-                expected_layout,
-            )
-            with self.assertRaises(webapp.ObjectStorageContractError):
-                active_backend.retrieve_artifact(
-                    restore_only_metadata,
-                    workspace_id="restore-only-workspace",
-                )
-        finally:
-            self.assertTrue(
-                restore_backend.delete_artifact(
-                    restore_only_metadata,
-                    workspace_id="restore-only-workspace",
-                )
-            )
+        for denial in active_probe_denial + restore_probe_denial:
+            self.assertLess(denial["index"], first_restore_profile_write["index"])
+            self.assertLess(denial["index"], first_restore_product_write["index"])
         self.assertEqual(active_backend._objects, {})
         self.assertEqual(restore_backend._objects, {})
 
@@ -3890,7 +3985,7 @@ order by object_kind, object_schema, object_name, object_type
             fail_artifact_kind="xlsx",
         )
         failure_restore_backend = RecordingBackend("restore-failure")
-        failure_report, failure_factory_calls, failure_binding_restored = run_case(
+        failure_report, failure_factory_calls, failure_binding_restored, _failure_timeline = run_case(
             failure_restore_database_name,
             failure_active_backend,
             failure_restore_backend,
