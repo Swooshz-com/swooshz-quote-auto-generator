@@ -486,7 +486,14 @@ def _restore_database_cannot_read_active_synthetic_rows(
     return not visible
 
 
-def _cleanup_storage(storage: object, *, profile_id: str, pricing_id: str, session_id: str) -> bool:
+def _cleanup_storage(
+    storage: object,
+    *,
+    profile_id: str,
+    pricing_id: str,
+    session_id: str,
+    backend: ObjectStorageBackend | None,
+) -> bool:
     if hasattr(storage, "connection"):
         with storage.connection() as connection:
             if getattr(storage, "database_family", "") != "postgres_compatible":
@@ -502,26 +509,30 @@ def _cleanup_storage(storage: object, *, profile_id: str, pricing_id: str, sessi
                 "delete from sqag_pricing_references where workspace_id = ? and reference_id = ?",
                 (storage.workspace_id, pricing_id),
             )
-            connection.execute(
-                "delete from sqag_profiles where workspace_id = ? and profile_id = ?",
-                (storage.workspace_id, profile_id),
-            )
             connection.commit()
+        if backend is None:
+            return storage.profile_detail(profile_id) is None
+        storage.delete_profile(profile_id)
         return True
     ok = True
     ok = bool(storage.delete_quote_session(session_id)) or ok
     ok = bool(storage.delete_pricing_reference(pricing_id)) or ok
+    if backend is None:
+        return storage.profile_detail(profile_id) is None and ok
     ok = bool(storage.delete_profile(profile_id)) or ok
     return ok
 
 
 def _with_configured_backend(backend: ObjectStorageBackend, callback: Callable[[], Any]) -> Any:
-    original_backend_factory = getattr(webapp, "configured_object_storage_backend", None)
+    missing = object()
+    original_backend_factory = getattr(webapp, "configured_object_storage_backend", missing)
     try:
         webapp.configured_object_storage_backend = lambda: backend  # type: ignore[assignment]
         return callback()
     finally:
-        if original_backend_factory is not None:
+        if original_backend_factory is missing:
+            delattr(webapp, "configured_object_storage_backend")
+        else:
             webapp.configured_object_storage_backend = original_backend_factory  # type: ignore[assignment]
 
 def _cleanup(
@@ -572,21 +583,36 @@ def _cleanup(
             backend.delete_artifact(metadata, workspace_id=ids[workspace_key])
         except Exception:
             ok = False
-    for storage, profile_key, pricing_key, session_key in (
-        (active_storage_a, "profile_a", "pricing_a", "session_a"),
-        (active_storage_b, "profile_b", "pricing_b", "session_b"),
-        (restore_storage_a, "profile_a", "pricing_a", "session_a"),
-        (restore_storage_b, "profile_b", "pricing_b", "session_b"),
+    for storage, profile_key, pricing_key, session_key, backend in (
+        (active_storage_a, "profile_a", "pricing_a", "session_a", active_backend),
+        (active_storage_b, "profile_b", "pricing_b", "session_b", active_backend),
+        (restore_storage_a, "profile_a", "pricing_a", "session_a", restore_backend),
+        (restore_storage_b, "profile_b", "pricing_b", "session_b", restore_backend),
     ):
         if storage is None:
             continue
         try:
-            _cleanup_storage(
-                storage,
-                profile_id=ids[profile_key],
-                pricing_id=ids[pricing_key],
-                session_id=ids[session_key],
-            )
+            if backend is None:
+                cleaned = _cleanup_storage(
+                    storage,
+                    profile_id=ids[profile_key],
+                    pricing_id=ids[pricing_key],
+                    session_id=ids[session_key],
+                    backend=None,
+                )
+            else:
+                cleaned = _with_configured_backend(
+                    backend,
+                    lambda: _cleanup_storage(
+                        storage,
+                        profile_id=ids[profile_key],
+                        pricing_id=ids[pricing_key],
+                        session_id=ids[session_key],
+                        backend=backend,
+                    ),
+                )
+            if not cleaned:
+                ok = False
         except Exception:
             ok = False
     return ok
@@ -642,11 +668,20 @@ def _run_drill(
         checks["write_attempted"] = True
         checks["read_attempted"] = True
         try:
-            active_db_rows += _write_metadata_rows(
-                storage_a=active_storage_a,
-                storage_b=active_storage_b,
-                ids=ids,
-                artifact_metadata=None,
+            active_backend = active_backend_factory(env)
+        except Exception:
+            blockers.append("active_object_write_failed")
+            return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
+
+        try:
+            active_db_rows += _with_configured_backend(
+                active_backend,
+                lambda: _write_metadata_rows(
+                    storage_a=active_storage_a,
+                    storage_b=active_storage_b,
+                    ids=ids,
+                    artifact_metadata=None,
+                ),
             )
             checks["active_db_write_read_verified"] = _verify_db_rows(active_storage_a, active_storage_b, ids)
             checks["workspace_isolation_preserved"] = checks["active_db_write_read_verified"]
@@ -655,7 +690,6 @@ def _run_drill(
             return checks, blockers, active_db_rows, active_object_count, restore_db_rows, restore_object_count
 
         try:
-            active_backend = active_backend_factory(env)
             active_metadata = active_backend.store_artifact(
                 workspace_id=ids["workspace_a"],
                 owner_type="generated_quote",
@@ -666,12 +700,15 @@ def _run_drill(
                 content=active_payload,
             )
             active_object_count = 1
-            active_db_rows += _write_metadata_rows(
-                storage_a=active_storage_a,
-                storage_b=active_storage_b,
-                ids=ids,
-                artifact_metadata=active_metadata,
-            ) - 6
+            active_db_rows += _with_configured_backend(
+                active_backend,
+                lambda: _write_metadata_rows(
+                    storage_a=active_storage_a,
+                    storage_b=active_storage_b,
+                    ids=ids,
+                    artifact_metadata=active_metadata,
+                ) - 6,
+            )
             active_content = active_backend.retrieve_artifact(active_metadata, workspace_id=ids["workspace_a"])
             checks["active_object_write_read_verified"] = (
                 active_content == active_payload
@@ -711,11 +748,14 @@ def _run_drill(
 
         checks["restore_attempted"] = True
         try:
-            restore_db_rows += _write_metadata_rows(
-                storage_a=restore_storage_a,
-                storage_b=restore_storage_b,
-                ids=ids,
-                artifact_metadata=None,
+            restore_db_rows += _with_configured_backend(
+                restore_backend,
+                lambda: _write_metadata_rows(
+                    storage_a=restore_storage_a,
+                    storage_b=restore_storage_b,
+                    ids=ids,
+                    artifact_metadata=None,
+                ),
             )
             checks["restore_db_write_read_verified"] = _verify_db_rows(restore_storage_a, restore_storage_b, ids)
             checks["workspace_isolation_preserved"] = (
@@ -736,12 +776,15 @@ def _run_drill(
                 content=active_payload,
             )
             restore_object_count = 1
-            restore_db_rows += _write_metadata_rows(
-                storage_a=restore_storage_a,
-                storage_b=restore_storage_b,
-                ids=ids,
-                artifact_metadata=restore_metadata,
-            ) - 6
+            restore_db_rows += _with_configured_backend(
+                restore_backend,
+                lambda: _write_metadata_rows(
+                    storage_a=restore_storage_a,
+                    storage_b=restore_storage_b,
+                    ids=ids,
+                    artifact_metadata=restore_metadata,
+                ) - 6,
+            )
             restored_content = restore_backend.retrieve_artifact(restore_metadata, workspace_id=ids["workspace_a"])
             restored_checksum = hashlib.sha256(restored_content).hexdigest()
             checks["checksum_match"] = restored_checksum == active_metadata.checksum_sha256
