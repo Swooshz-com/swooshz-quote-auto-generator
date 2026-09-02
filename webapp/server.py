@@ -10844,6 +10844,7 @@ class DatabaseSqagStorage:
                         {'quotation_layout'},
                         {'quotation_layout'},
                         connection=connection,
+                        quote_session=False,
                     )
                     if profile_layout_item is not None
                     else None
@@ -11075,6 +11076,7 @@ class DatabaseSqagStorage:
                         managed_kinds,
                         retained_kinds,
                         connection=connection,
+                        quote_session=False,
                     )
                     if managed_kinds
                     else None
@@ -11653,6 +11655,7 @@ class DatabaseSqagStorage:
         retained_kinds: set[str] | None = None,
         *,
         connection: Any,
+        quote_session: bool,
     ) -> ObjectArtifactBatchPlan:
         safe_owner_type = safe_resource_id(owner_type, "")
         safe_owner_id = safe_resource_id(owner_id, "")
@@ -11794,9 +11797,14 @@ class DatabaseSqagStorage:
                         and clean_text(previous_row.get("status")) == "active"
                         and clean_text(previous_row.get("retention_status")) == "active"
                         and not clean_text(previous_row.get("deleted_at"))
-                        and clean_text(previous_row.get("platform_user_id")) == self.user_id
-                        and clean_text(previous_row.get("session_id")) == ""
-                        and clean_text(previous_row.get("job_id")) == ""
+                        and (
+                            not quote_session
+                            or (
+                                clean_text(previous_row.get("platform_user_id")) == self.user_id
+                                and clean_text(previous_row.get("session_id")) == ""
+                                and clean_text(previous_row.get("job_id")) == ""
+                            )
+                        )
                     )
                     plan.desired_metadata[item.artifact_kind] = (
                         ObjectArtifactMetadata(
@@ -12802,6 +12810,7 @@ class DatabaseSqagStorage:
                 set(QUOTE_SESSION_EXPORT_KINDS),
                 retained_kinds,
                 connection=connection,
+                quote_session=True,
             )
         return True, pending_artifacts, object_plan
 
@@ -13295,6 +13304,7 @@ class DatabaseSqagStorage:
                 retained_kinds | prior_kinds,
                 retained_kinds,
                 connection=connection,
+                quote_session=False,
             )
             return {
                 "changed": True,
@@ -13968,6 +13978,7 @@ class DatabaseSqagStorage:
                     draft_kinds | prior_draft_kinds,
                     draft_kinds,
                     connection=connection,
+                    quote_session=False,
                 )
             if object_plan is not None and draft_plan is not None:
                 raise ObjectStorageContractError(

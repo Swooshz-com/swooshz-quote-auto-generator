@@ -27143,6 +27143,245 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                         preserved = storage.profile_layout_artifact("idempotent-custom-profile")
                         self.assertEqual(preserved["content"], changed_layout)
 
+    def test_object_custom_profile_layout_cross_user_idempotency_preserves_attribution(self):
+        class CountingBackend(webapp.InMemoryObjectStorageBackend):
+            def __init__(self):
+                super().__init__()
+                self.store_calls = 0
+                self.delete_calls = 0
+
+            def store_artifact(self, **kwargs):
+                self.store_calls += 1
+                return super().store_artifact(**kwargs)
+
+            def delete_artifact(self, metadata, *, workspace_id):
+                self.delete_calls += 1
+                return super().delete_artifact(metadata, workspace_id=workspace_id)
+
+        raw_layout = KONCEPT_LAYOUT.read_bytes()
+        original_layout = webapp.normalize_profile_payload({
+            "id": "cross-user-custom-profile",
+            "pack": {
+                "quotation_layout": {
+                    "filename": "custom-layout.xlsx",
+                    "data_url": (
+                        "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,"
+                        + base64.b64encode(raw_layout).decode("ascii")
+                    ),
+                }
+            },
+        })["_pack_assets"]["quotation_layout"]["bytes"]
+        changed_buffer = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(original_layout)) as source:
+            with zipfile.ZipFile(changed_buffer, "w", compression=zipfile.ZIP_DEFLATED) as target:
+                for info in source.infolist():
+                    target.writestr(info, source.read(info.filename))
+                target.comment = b"sqag-run-384-custom-layout-change"
+        changed_layout = changed_buffer.getvalue()
+        webapp.validate_profile_layout_xlsx(changed_layout)
+
+        def profile(layout_bytes=None, label="Cross User Custom Layout"):
+            payload = {
+                "id": "cross-user-custom-profile",
+                "label": label,
+            }
+            if layout_bytes is not None:
+                payload["pack"] = {
+                    "quotation_layout": {
+                        "filename": "custom-layout.xlsx",
+                        "data_url": (
+                            "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,"
+                            + base64.b64encode(layout_bytes).decode("ascii")
+                        ),
+                    }
+                }
+            return webapp.normalize_profile_payload(payload)
+
+        object_artifact_columns = (
+            "artifact_id",
+            "workspace_id",
+            "owner_type",
+            "owner_id",
+            "platform_user_id",
+            "session_id",
+            "job_id",
+            "artifact_kind",
+            "filename",
+            "content_type",
+            "size_bytes",
+            "checksum_sha256",
+            "object_provider_type",
+            "object_key_ref",
+            "status",
+            "retention_status",
+            "created_at",
+            "updated_at",
+            "deleted_at",
+        )
+        self.assertEqual(len(object_artifact_columns), 19)
+        workspace_id = "workspace-cross-user-custom-layout"
+        profile_id = "cross-user-custom-profile"
+        tmp_path = test_temp_root() / f"profile-cross-user-idempotency-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+        backend = CountingBackend()
+        dml_counts = {"insert": 0, "update": 0}
+        original_connection_factory = webapp.sqlite_storage_connection
+
+        @contextlib.contextmanager
+        def traced_connection(url):
+            with original_connection_factory(url) as connection:
+                def trace(statement):
+                    normalized = statement.lstrip().lower()
+                    if normalized.startswith("insert into sqag_object_artifacts"):
+                        dml_counts["insert"] += 1
+                    elif normalized.startswith("update sqag_object_artifacts"):
+                        dml_counts["update"] += 1
+
+                connection.set_trace_callback(trace)
+                try:
+                    yield connection
+                finally:
+                    connection.set_trace_callback(None)
+
+        def object_row():
+            with sqlite3.connect(db_path) as connection:
+                connection.row_factory = sqlite3.Row
+                row = connection.execute(
+                    "select "
+                    + ", ".join(object_artifact_columns)
+                    + " from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+                    (workspace_id, "profile", profile_id, "quotation_layout"),
+                ).fetchone()
+            self.assertIsNotNone(row)
+            return {column: row[column] for column in object_artifact_columns}
+
+        def profile_layout_bytes(storage, row):
+            metadata = storage._object_metadata_from_row(row)
+            return backend.retrieve_artifact(metadata, workspace_id=workspace_id)
+
+        auth_a = self.platform_auth_session(workspace_id, user_id="cross-user-layout-user-a")
+        auth_b = self.platform_auth_session(workspace_id, user_id="cross-user-layout-user-b")
+        expected_user_a = webapp.platform_user_id_from_auth_session(auth_a)
+        expected_user_b = webapp.platform_user_id_from_auth_session(auth_b)
+        self.assertNotEqual(expected_user_a, expected_user_b)
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+            mock.patch.object(webapp, "sqlite_storage_connection", side_effect=traced_connection),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage_a = webapp.app_storage_for_auth_session(auth_a)
+            storage_b = webapp.app_storage_for_auth_session(auth_b)
+
+            storage_a.save_profile(profile(original_layout))
+            first_row = object_row()
+            first_objects = copy.deepcopy(backend._objects)
+            first_provider_counts = (backend.store_calls, backend.delete_calls)
+            first_dml_counts = dml_counts.copy()
+            first_layout_bytes = profile_layout_bytes(storage_a, first_row)
+
+            self.assertEqual(first_provider_counts, (1, 0))
+            self.assertEqual(first_dml_counts["insert"], 1)
+            self.assertEqual(first_dml_counts["update"], 0)
+            self.assertEqual(first_row["platform_user_id"], expected_user_a)
+            self.assertEqual(first_row["session_id"], "")
+            self.assertEqual(first_row["job_id"], "")
+            self.assertEqual(first_layout_bytes, original_layout)
+
+            with mock.patch.object(
+                storage_b,
+                "_execute_upsert_object_file_artifact",
+                wraps=storage_b._execute_upsert_object_file_artifact,
+            ) as identical_upsert:
+                storage_b.save_profile(profile(original_layout))
+            second_row = object_row()
+            second_objects = copy.deepcopy(backend._objects)
+            second_provider_counts = (backend.store_calls, backend.delete_calls)
+            second_dml_counts = dml_counts.copy()
+
+            self.assertEqual(identical_upsert.call_count, 0)
+            self.assertEqual(second_provider_counts[0] - first_provider_counts[0], 0)
+            self.assertEqual(second_provider_counts[1] - first_provider_counts[1], 0)
+            self.assertEqual(second_dml_counts["insert"] - first_dml_counts["insert"], 0)
+            self.assertEqual(second_dml_counts["update"] - first_dml_counts["update"], 0)
+            self.assertEqual(second_row, first_row)
+            self.assertEqual(second_row["artifact_id"], first_row["artifact_id"])
+            self.assertEqual(second_row["platform_user_id"], expected_user_a)
+            self.assertEqual(second_row["session_id"], first_row["session_id"])
+            self.assertEqual(second_row["job_id"], first_row["job_id"])
+            self.assertEqual(second_row["created_at"], first_row["created_at"])
+            self.assertEqual(second_row["updated_at"], first_row["updated_at"])
+            self.assertEqual(second_objects, first_objects)
+            self.assertEqual(profile_layout_bytes(storage_b, second_row), original_layout)
+
+            metadata_only = storage_b.save_profile(profile(label="Cross User Metadata Update"))
+            metadata_row = object_row()
+            self.assertEqual(metadata_only["label"], "Cross User Metadata Update")
+            self.assertEqual(
+                storage_b.profile_detail(profile_id, source="company")["label"],
+                "Cross User Metadata Update",
+            )
+            self.assertEqual(metadata_row, second_row)
+            self.assertEqual(backend._objects, second_objects)
+            self.assertEqual((backend.store_calls, backend.delete_calls), second_provider_counts)
+            self.assertEqual(dml_counts, second_dml_counts)
+
+            changed_provider_counts = (backend.store_calls, backend.delete_calls)
+            changed_dml_counts = dml_counts.copy()
+            with (
+                mock.patch.object(webapp, "utc_timestamp", return_value="2099-01-01T00:00:01Z"),
+                mock.patch.object(
+                    storage_b,
+                    "_execute_upsert_object_file_artifact",
+                    wraps=storage_b._execute_upsert_object_file_artifact,
+                ) as changed_upsert,
+            ):
+                storage_b.save_profile(profile(changed_layout, "Cross User Changed Layout"))
+            changed_row = object_row()
+            changed_metadata = storage_b._object_metadata_from_row(changed_row)
+            changed_checksum = webapp.artifact_checksum(changed_layout)
+            changed_key = webapp.object_artifact_key(
+                workspace_id=workspace_id,
+                owner_type="profile",
+                owner_id=profile_id,
+                artifact_kind="quotation_layout",
+                filename="custom-layout.xlsx",
+                checksum_sha256=changed_checksum,
+            )
+
+            self.assertEqual(changed_upsert.call_count, 1)
+            self.assertEqual(backend.store_calls - changed_provider_counts[0], 1)
+            self.assertEqual(backend.delete_calls - changed_provider_counts[1], 1)
+            self.assertEqual(dml_counts["insert"] - changed_dml_counts["insert"], 1)
+            self.assertEqual(dml_counts["update"] - changed_dml_counts["update"], 0)
+            self.assertNotEqual(changed_row["artifact_id"], second_row["artifact_id"])
+            self.assertEqual(changed_row["platform_user_id"], expected_user_b)
+            self.assertEqual(changed_row["checksum_sha256"], changed_checksum)
+            self.assertEqual(changed_row["object_key_ref"], changed_key)
+            self.assertNotEqual(changed_row["object_key_ref"], second_row["object_key_ref"])
+            self.assertNotEqual(changed_row["updated_at"], second_row["updated_at"])
+            self.assertEqual(changed_row["filename"], second_row["filename"])
+            self.assertEqual(changed_row["content_type"], second_row["content_type"])
+            self.assertEqual(changed_row["size_bytes"], len(changed_layout))
+            self.assertEqual(changed_row["status"], "active")
+            self.assertEqual(changed_row["retention_status"], "active")
+            self.assertIsNone(changed_row["deleted_at"])
+            self.assertNotIn(second_row["object_key_ref"], backend._objects)
+            self.assertEqual(len(backend._objects), 1)
+            self.assertEqual(profile_layout_bytes(storage_b, changed_row), changed_layout)
+            with self.assertRaises(webapp.ObjectStorageContractError):
+                backend.retrieve_artifact(
+                    storage_b._object_metadata_from_row(second_row),
+                    workspace_id=workspace_id,
+                )
+            self.assertEqual(
+                storage_b.profile_detail(profile_id, source="company")["label"],
+                "Cross User Changed Layout",
+            )
+
     def test_object_delete_restores_single_artifact_when_tombstone_execution_fails(self):
         backend = webapp.InMemoryObjectStorageBackend()
         layout_data_url = "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + base64.b64encode(KONCEPT_LAYOUT.read_bytes()).decode("ascii")
