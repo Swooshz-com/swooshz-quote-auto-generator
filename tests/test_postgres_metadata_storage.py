@@ -436,9 +436,14 @@ class PostgresMetadataStorageTest(unittest.TestCase):
 
     def test_postgres_storage_uses_workspace_scoped_metadata_queries(self):
         connection = FakePostgresConnection()
+        backend = webapp.InMemoryObjectStorageBackend()
         with mock.patch.dict(os.environ, self.postgres_env(), clear=True), mock.patch(
             "webapp.server.postgres_driver_connection_factory",
             return_value=lambda _database_url: connection,
+        ), mock.patch.object(
+            webapp,
+            "configured_object_storage_backend",
+            return_value=backend,
         ):
             storage = webapp.app_storage_for_auth_session(platform_session("workspace-alpha"))
             saved = storage.save_profile({"id": "profile-a", "label": "Profile A"})
