@@ -70,6 +70,8 @@ RUNTIME_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "sqag_object_artifacts": ("SELECT", "INSERT", "UPDATE"),
     "sqag_quote_publication_versions": ("SELECT", "INSERT", "UPDATE", "DELETE"),
     "sqag_quote_publication_artifacts": ("SELECT", "INSERT", "DELETE"),
+    "sqag_telemetry_events": ("SELECT", "INSERT"),
+    "sqag_telemetry_source_state": ("SELECT", "INSERT", "UPDATE"),
 }
 MAINTENANCE_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "sqag_quote_sessions": ("SELECT", "DELETE"),
@@ -85,6 +87,8 @@ MAINTENANCE_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "sqag_retention_scan_cursors": ("SELECT", "INSERT", "UPDATE", "DELETE"),
     "sqag_quote_publication_versions": ("SELECT", "DELETE"),
     "sqag_quote_publication_artifacts": ("SELECT", "DELETE"),
+    "sqag_telemetry_events": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+    "sqag_telemetry_source_state": ("SELECT", "UPDATE"),
 }
 RUNTIME_FORBIDDEN_TABLES = frozenset({
     "sqag_legal_holds", "sqag_retention_delete_authorizations", "sqag_deletion_receipts",
@@ -134,6 +138,9 @@ EXPECTED_ROUTINE_KEYS = EXPECTED_TRIGGER_ROUTINE_KEYS | EXPECTED_CALLABLE_ROUTIN
 CALLABLE_ROUTINE_NAME = "sqag_quote_session_deletion_hold_blocked"
 CALLABLE_ROUTINE_IDENTITY_ARGUMENTS = "text, text"
 CALLABLE_ROUTINE_MIGRATION_PATH = "migrations/008_quote_session_deletion_hold_authority_postgres.sql"
+CALLABLE_ROUTINE_V2_NAME = "sqag_quote_session_deletion_hold_blocked_v2"
+CALLABLE_ROUTINE_V2_IDENTITY_ARGUMENTS = "text, text"
+CALLABLE_ROUTINE_V2_MIGRATION_PATH = "migrations/009_telemetry_events_postgres.sql"
 CALLABLE_ROUTINE_HEADER_RE = re.compile(
     r"\bcreate\s+(?:or\s+replace\s+)?function\s+public\s*\.\s*"
     r"sqag_quote_session_deletion_hold_blocked\s*\(\s*text\s*,\s*text\s*\)"
@@ -153,6 +160,35 @@ CALLABLE_ROUTINE_REFERENCED_RELATIONS = (
     "sqag_quote_publication_versions",
     "sqag_quote_sessions",
 )
+CALLABLE_ROUTINE_V2_REFERENCED_RELATIONS = (
+    "sqag_audit_events",
+    "sqag_feedback",
+    "sqag_feedback_status_history",
+    "sqag_generation_evidence",
+    "sqag_generation_runs",
+    "sqag_legal_holds",
+    "sqag_quote_publication_versions",
+    "sqag_quote_sessions",
+    "sqag_telemetry_events",
+)
+CALLABLE_ROUTINE_DEFINITIONS = (
+    {
+        "name": CALLABLE_ROUTINE_NAME,
+        "identity_arguments": CALLABLE_ROUTINE_IDENTITY_ARGUMENTS,
+        "migration_path": CALLABLE_ROUTINE_MIGRATION_PATH,
+        "referenced_relations": CALLABLE_ROUTINE_REFERENCED_RELATIONS,
+    },
+    {
+        "name": CALLABLE_ROUTINE_V2_NAME,
+        "identity_arguments": CALLABLE_ROUTINE_V2_IDENTITY_ARGUMENTS,
+        "migration_path": CALLABLE_ROUTINE_V2_MIGRATION_PATH,
+        "referenced_relations": CALLABLE_ROUTINE_V2_REFERENCED_RELATIONS,
+    },
+)
+CALLABLE_ROUTINE_DEFINITIONS_BY_KEY = {
+    (item["name"], item["identity_arguments"]): item
+    for item in CALLABLE_ROUTINE_DEFINITIONS
+}
 EXPECTED_CALLABLE_ROUTINE_DOCUMENT = {
     "name": CALLABLE_ROUTINE_NAME,
     "identity_arguments": CALLABLE_ROUTINE_IDENTITY_ARGUMENTS,
@@ -177,6 +213,34 @@ EXPECTED_CALLABLE_ROUTINE_DOCUMENT = {
     "grant_options": False,
     "fail_closed": True,
 }
+EXPECTED_CALLABLE_ROUTINE_DOCUMENT_V2 = {
+    "name": CALLABLE_ROUTINE_V2_NAME,
+    "identity_arguments": CALLABLE_ROUTINE_V2_IDENTITY_ARGUMENTS,
+    "argument_types": ["text", "text"],
+    "result_type": "boolean",
+    "language": "sql",
+    "owner": "sqag_migrator",
+    "security_mode": "definer",
+    "volatility": "stable",
+    "parallel": "unsafe",
+    "leakproof": False,
+    "direct_execute": True,
+    "trigger_only": False,
+    "function_search_path": ["pg_catalog", "public"],
+    "schema_qualified_relations": True,
+    "referenced_relations": list(CALLABLE_ROUTINE_V2_REFERENCED_RELATIONS),
+    "explicit_execute_roles": ["sqag_runtime"],
+    "owner_execute": True,
+    "public_execute": False,
+    "maintenance_execute": False,
+    "default_public_execute": False,
+    "grant_options": False,
+    "fail_closed": True,
+}
+EXPECTED_CALLABLE_ROUTINE_DOCUMENTS = (
+    EXPECTED_CALLABLE_ROUTINE_DOCUMENT,
+    EXPECTED_CALLABLE_ROUTINE_DOCUMENT_V2,
+)
 PRODUCTION_POSTGRES_CALLER_SPECS = {
     "scripts/verify_production_database_provider.py": {
         "storage_roles": ("SQAG_RUNTIME_DATABASE_ROLE",),
@@ -369,8 +433,36 @@ def _semantic_sql_tokens(source: str) -> tuple[tuple[str, str], ...]:
     return tuple(tokens)
 
 
-def _extract_callable_routine_body(source: str) -> str:
-    matches = list(CALLABLE_ROUTINE_HEADER_RE.finditer(source))
+def _callable_routine_header_re(routine_name: str, identity_arguments: str) -> re.Pattern[str]:
+    argument_pattern = r"\s*,\s*".join(
+        re.escape(argument.strip())
+        for argument in identity_arguments.split(",")
+    )
+    return re.compile(
+        r"\bcreate\s+(?:or\s+replace\s+)?function\s+public\s*\.\s*"
+        + re.escape(routine_name)
+        + r"\s*\(\s*"
+        + argument_pattern
+        + r"\s*\).*?\bas\s+(?P<delimiter>\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$)",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+
+def _extract_callable_routine_body(
+    source: str,
+    *,
+    routine_name: str = CALLABLE_ROUTINE_NAME,
+    identity_arguments: str = CALLABLE_ROUTINE_IDENTITY_ARGUMENTS,
+) -> str:
+    header_re = (
+        CALLABLE_ROUTINE_HEADER_RE
+        if (
+            routine_name == CALLABLE_ROUTINE_NAME
+            and identity_arguments == CALLABLE_ROUTINE_IDENTITY_ARGUMENTS
+        )
+        else _callable_routine_header_re(routine_name, identity_arguments)
+    )
+    matches = list(header_re.finditer(source))
     if len(matches) != 1:
         raise RuntimePrivilegeContractError(
             "callable_routine_source_body:declaration_count"
@@ -390,11 +482,19 @@ def _extract_callable_routine_body(source: str) -> str:
     return body
 
 
-def _canonical_callable_routine_body() -> str:
-    path = ROOT / CALLABLE_ROUTINE_MIGRATION_PATH
+def _canonical_callable_routine_body(
+    routine_name: str = CALLABLE_ROUTINE_NAME,
+    migration_path: str = CALLABLE_ROUTINE_MIGRATION_PATH,
+    identity_arguments: str = CALLABLE_ROUTINE_IDENTITY_ARGUMENTS,
+) -> str:
+    path = ROOT / migration_path
     try:
         source = canonical_migration_payload(path).decode("utf-8")
-        return _extract_callable_routine_body(source)
+        return _extract_callable_routine_body(
+            source,
+            routine_name=routine_name,
+            identity_arguments=identity_arguments,
+        )
     except (MigrationSafetyError, UnicodeDecodeError, OSError) as exc:
         raise RuntimePrivilegeContractError(
             "callable_routine_source_body:unavailable"
@@ -587,57 +687,72 @@ def _validate_callable_routine_source(
     source_texts: Mapping[str, str] | None,
     errors: list[str],
 ) -> None:
-    source = binding.get("callable_routine_source")
-    _exact_keys(
-        source,
-        {"path", "routine", "allowed_relations"},
-        "source_binding.callable_routine_source",
-        errors,
-    )
-    if not isinstance(source, Mapping):
+    sources = binding.get("callable_routine_sources")
+    label = "source_binding.callable_routine_sources"
+    if not isinstance(sources, list):
+        errors.append(f"{label}:list_required")
         return
-    if source.get("path") != CALLABLE_ROUTINE_MIGRATION_PATH:
-        errors.append("source_binding.callable_routine_source.path:unexpected")
-    expected_routine = f"public.{CALLABLE_ROUTINE_NAME}({CALLABLE_ROUTINE_IDENTITY_ARGUMENTS})"
-    if source.get("routine") != expected_routine:
-        errors.append("source_binding.callable_routine_source.routine:unexpected")
-    declared_relations = set(_string_list(
-        source.get("allowed_relations"),
-        "source_binding.callable_routine_source.allowed_relations",
-        errors,
-    ))
-    if declared_relations != set(CALLABLE_ROUTINE_REFERENCED_RELATIONS):
-        errors.append("source_binding.callable_routine_source.allowed_relations:unexpected")
-    path = str(source.get("path") or "")
-    if not path:
-        return
+    if len(sources) != len(CALLABLE_ROUTINE_DEFINITIONS):
+        errors.append(f"{label}:unexpected")
     texts = dict(source_texts or {})
-    if path not in texts:
+    for index, definition in enumerate(CALLABLE_ROUTINE_DEFINITIONS):
+        item_label = f"{label}[{index}]"
+        source = sources[index] if index < len(sources) else None
+        _exact_keys(
+            source,
+            {"path", "routine", "allowed_relations"},
+            item_label,
+            errors,
+        )
+        if not isinstance(source, Mapping):
+            continue
+        expected_path = definition["migration_path"]
+        expected_routine = f"public.{definition['name']}({definition['identity_arguments']})"
+        if source.get("path") != expected_path:
+            errors.append(f"{item_label}.path:unexpected")
+        if source.get("routine") != expected_routine:
+            errors.append(f"{item_label}.routine:unexpected")
+        declared_relations = set(_string_list(
+            source.get("allowed_relations"),
+            f"{item_label}.allowed_relations",
+            errors,
+        ))
+        expected_relations = set(definition["referenced_relations"])
+        if declared_relations != expected_relations:
+            errors.append(f"{item_label}.allowed_relations:unexpected")
+        path = str(source.get("path") or "")
+        if not path:
+            continue
+        if path not in texts:
+            try:
+                texts[path] = canonical_migration_payload(ROOT / path).decode("utf-8")
+            except (MigrationSafetyError, UnicodeDecodeError, OSError):
+                errors.append(f"source_binding.file_missing:{path}")
+                continue
         try:
-            texts[path] = canonical_migration_payload(ROOT / path).decode("utf-8")
-        except (MigrationSafetyError, UnicodeDecodeError, OSError):
-            errors.append(f"source_binding.file_missing:{path}")
-            return
-    text = texts[path]
-    try:
-        _extract_callable_routine_body(text)
-    except RuntimePrivilegeContractError as exc:
-        errors.append(f"source_binding.callable_routine_source.body:{exc}")
-    literal = {
-        match.group(1).lower()
-        for match in SQL_RELATION_RE.finditer(text)
-        if match.group(1).lower().startswith("sqag_")
-    }
-    if literal != set(CALLABLE_ROUTINE_REFERENCED_RELATIONS):
-        errors.append("source_binding.callable_routine_source.relations:unexpected")
-    if UNQUALIFIED_SQL_RELATION_RE.search(text):
-        errors.append("source_binding.callable_routine_source.unqualified_relation")
+            body = _extract_callable_routine_body(
+                texts[path],
+                routine_name=definition["name"],
+                identity_arguments=definition["identity_arguments"],
+            )
+        except RuntimePrivilegeContractError as exc:
+            errors.append(f"{item_label}.body:{exc}")
+            continue
+        literal = {
+            match.group(1).lower()
+            for match in SQL_RELATION_RE.finditer(body)
+            if match.group(1).lower().startswith("sqag_")
+        }
+        if literal != expected_relations:
+            errors.append(f"{item_label}.relations:unexpected")
+        if UNQUALIFIED_SQL_RELATION_RE.search(body):
+            errors.append(f"{item_label}.unqualified_relation")
 
 
 def validate_source_bindings(manifest: Mapping[str, Any], *, source_texts: Mapping[str, str] | None = None) -> list[str]:
     errors: list[str] = []
     binding = manifest.get("source_binding")
-    _exact_keys(binding, {"files", "allowed_sql_relations", "unsupported_sql_relations", "dynamic_sql_variables", "callable_routine_source"}, "source_binding", errors)
+    _exact_keys(binding, {"files", "allowed_sql_relations", "unsupported_sql_relations", "dynamic_sql_variables", "callable_routine_sources"}, "source_binding", errors)
     if not isinstance(binding, Mapping):
         return errors
     if tuple(_string_list(binding.get("files"), "source_binding.files", errors)) != SOURCE_SQL_FILES:
@@ -713,17 +828,20 @@ def _validate_manifest_document(manifest: Mapping[str, Any]) -> None:
         if not isinstance(callable_routines, list):
             errors.append("namespace.callable_routines:list_required")
         else:
-            if len(callable_routines) != 1 or any(
+            if len(callable_routines) != len(EXPECTED_CALLABLE_ROUTINE_DOCUMENTS) or any(
                 not isinstance(item, Mapping)
-                or dict(item) != EXPECTED_CALLABLE_ROUTINE_DOCUMENT
-                for item in callable_routines
+                or dict(item) != EXPECTED_CALLABLE_ROUTINE_DOCUMENTS[index]
+                for index, item in enumerate(callable_routines)
+                if index < len(EXPECTED_CALLABLE_ROUTINE_DOCUMENTS)
             ):
-                for item in callable_routines:
+                for index, item in enumerate(callable_routines):
                     if isinstance(item, Mapping):
                         _exact_keys(
                             item,
-                            set(EXPECTED_CALLABLE_ROUTINE_DOCUMENT),
-                            "namespace.callable_routines.item",
+                            set(EXPECTED_CALLABLE_ROUTINE_DOCUMENTS[index])
+                            if index < len(EXPECTED_CALLABLE_ROUTINE_DOCUMENTS)
+                            else set(),
+                            f"namespace.callable_routines.item[{index}]",
                             errors,
                         )
                 errors.append("namespace.callable_routines:unexpected")
@@ -1189,24 +1307,32 @@ def _routine_proconfig(value: Any) -> list[str]:
     return [str(value)]
 
 
-def _check_callable_routine_definition(row: Any, errors: list[str]) -> None:
+def _check_callable_routine_definition(
+    row: Any,
+    errors: list[str],
+    definition: Mapping[str, Any],
+) -> None:
     try:
-        canonical_body = _canonical_callable_routine_body()
+        canonical_body = _canonical_callable_routine_body(
+            routine_name=definition["name"],
+            migration_path=definition["migration_path"],
+            identity_arguments=definition["identity_arguments"],
+        )
     except RuntimePrivilegeContractError:
         errors.append("callable_routine_source_body_unavailable")
     else:
         installed_body = _row_value(row, "function_body")
         if _semantic_sql_tokens(str(installed_body or "")) != _semantic_sql_tokens(canonical_body):
             errors.append("callable_routine_body_mismatch")
-    definition = _clean(_row_value(row, "function_definition"))
+    installed_definition = _clean(_row_value(row, "function_definition"))
     relations = {
         match.group(1).lower()
-        for match in SQL_RELATION_RE.finditer(definition)
+        for match in SQL_RELATION_RE.finditer(installed_definition)
         if match.group(1).lower().startswith("sqag_")
     }
-    if relations != set(CALLABLE_ROUTINE_REFERENCED_RELATIONS):
+    if relations != set(definition["referenced_relations"]):
         errors.append("callable_routine_relation_inventory_mismatch")
-    if UNQUALIFIED_SQL_RELATION_RE.search(definition):
+    if UNQUALIFIED_SQL_RELATION_RE.search(installed_definition):
         errors.append("callable_routine_unqualified_relation")
 
 
@@ -1261,10 +1387,11 @@ def _check_routines(connection: Any, errors: list[str]) -> None:
             errors.append(f"routine_identity_ambiguous:{key[0]}")
             continue
         row = candidates[0]
+        callable_definition = CALLABLE_ROUTINE_DEFINITIONS_BY_KEY[key]
         if (
             _clean(_row_value(row, "schema_name")) != "public"
             or _clean(_row_value(row, "prokind")) != "f"
-            or _clean(_row_value(row, "identity_arguments")) != CALLABLE_ROUTINE_IDENTITY_ARGUMENTS
+            or _clean(_row_value(row, "identity_arguments")) != callable_definition["identity_arguments"]
             or _clean(_row_value(row, "result_type")).lower() != "boolean"
             or _clean(_row_value(row, "language")) != "sql"
             or not bool(_row_value(row, "prosecdef"))
@@ -1275,7 +1402,7 @@ def _check_routines(connection: Any, errors: list[str]) -> None:
             or _routine_proconfig(_row_value(row, "proconfig")) != ["search_path=pg_catalog, public"]
         ):
             errors.append(f"callable_routine_properties_mismatch:{key[0]}")
-        _check_callable_routine_definition(row, errors)
+        _check_callable_routine_definition(row, errors, callable_definition)
         routine_oids[key] = _row_value(row, "function_oid")
 
     trigger_rows = _rows(

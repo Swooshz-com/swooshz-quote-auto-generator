@@ -127,17 +127,43 @@ class RuntimePrivilegeContractStaticTest(unittest.TestCase):
         manifest = contract.validate_manifest()
         self.assertEqual(
             manifest["namespace"]["callable_routines"],
-            [contract.EXPECTED_CALLABLE_ROUTINE_DOCUMENT],
+            list(contract.EXPECTED_CALLABLE_ROUTINE_DOCUMENTS),
         )
         self.assertEqual(
-            manifest["source_binding"]["callable_routine_source"]["routine"],
-            "public.sqag_quote_session_deletion_hold_blocked(text, text)",
+            [
+                source["routine"]
+                for source in manifest["source_binding"]["callable_routine_sources"]
+            ],
+            [
+                "public.sqag_quote_session_deletion_hold_blocked(text, text)",
+                "public.sqag_quote_session_deletion_hold_blocked_v2(text, text)",
+            ],
         )
         self.assertEqual(contract.validate_source_bindings(manifest), [])
 
     def test_callable_session_hold_body_normalizes_formatting_but_not_semantics(self):
         canonical_body = contract._canonical_callable_routine_body()
         self.assertTrue(canonical_body)
+        canonical_body_v2 = contract._canonical_callable_routine_body(
+            routine_name=contract.CALLABLE_ROUTINE_V2_NAME,
+            migration_path=contract.CALLABLE_ROUTINE_V2_MIGRATION_PATH,
+            identity_arguments=contract.CALLABLE_ROUTINE_V2_IDENTITY_ARGUMENTS,
+        )
+        self.assertTrue(canonical_body_v2)
+        self.assertIn("from public.sqag_telemetry_events", canonical_body_v2)
+        self.assertIn("telemetry_state", canonical_body_v2)
+        self.assertNotIn(
+            "sqag_quote_session_deletion_hold_blocked(",
+            canonical_body_v2,
+        )
+        self.assertEqual(
+            {
+                match.group(1).lower()
+                for match in contract.SQL_RELATION_RE.finditer(canonical_body_v2)
+                if match.group(1).lower().startswith("sqag_")
+            },
+            set(contract.CALLABLE_ROUTINE_V2_REFERENCED_RELATIONS),
+        )
         formatting_only = canonical_body.replace("\n", " \t") + "\n-- formatting-only comment"
         self.assertEqual(
             contract._semantic_sql_tokens(canonical_body),
@@ -154,6 +180,33 @@ class RuntimePrivilegeContractStaticTest(unittest.TestCase):
         )
         verifier_source = (ROOT / "scripts" / "validate_runtime_privilege_contract.py").read_text(encoding="utf-8")
         self.assertIn("p.prosrc as function_body", verifier_source)
+
+    def test_runtime_session_delete_uses_v2_as_early_authority(self):
+        server_source = (ROOT / "webapp" / "server.py").read_text(encoding="utf-8")
+        method_start = server_source.index("    def _session_deletion_blocked_by_hold(")
+        method_end = server_source.index("\n    def ", method_start + 1)
+        method_source = server_source[method_start:method_end]
+        v2_call = "sqag_quote_session_deletion_hold_blocked_v2("
+        self.assertIn(v2_call, method_source)
+        self.assertNotIn("sqag_quote_session_deletion_hold_blocked(", method_source)
+        v2_index = method_source.index(v2_call)
+        self.assertLess(method_source.index("def load_graph"), v2_index)
+        self.assertLess(
+            method_source.index("_acquire_transaction_locks(*lock_identities)"),
+            v2_index,
+        )
+        self.assertLess(
+            method_source.rindex(
+                "versions, runs, feedback, standalone_audits, telemetry = load_graph()"
+            ),
+            v2_index,
+        )
+        self.assertLess(
+            v2_index,
+            method_source.index('if any(bool(row["legal_hold"]) for row in versions):'),
+        )
+        self.assertIn("type(hold_blocked) is not bool", method_source)
+        self.assertIn("storage_postgres_session_delete_hold_unavailable", method_source)
 
     def test_option_a_static_contract_drift_is_fail_closed(self):
         manifest = contract.validate_manifest()
@@ -2023,6 +2076,9 @@ order by object_kind, object_schema, object_name, object_type
             ("sqag_feedback_linkage_no_update", "sqag_feedback"),
             ("sqag_generation_evidence_guard_delete", "sqag_generation_evidence"),
             ("sqag_audit_events_guard_delete", "sqag_audit_events"),
+            ("sqag_telemetry_source_state_no_delete", "sqag_telemetry_source_state"),
+            ("sqag_telemetry_events_no_update", "sqag_telemetry_events"),
+            ("sqag_telemetry_events_guard_delete", "sqag_telemetry_events"),
         ):
             self._execute_admin(f"drop trigger if exists {trigger} on public.{table}")
         self._execute_admin("drop routine if exists public.sqag_reject_immutable_change()")
@@ -2038,6 +2094,22 @@ order by object_kind, object_schema, object_name, object_type
         self._execute_admin("create trigger sqag_feedback_linkage_no_update before update of run_id, session_id, publication_version_id, link_resolution_source, link_resolved_at on public.sqag_feedback for each row execute function public.sqag_reject_immutable_change()")
         self._execute_admin("create trigger sqag_generation_evidence_guard_delete before delete on public.sqag_generation_evidence for each row execute function public.sqag_require_retention_delete_authorization()")
         self._execute_admin("create trigger sqag_audit_events_guard_delete before delete on public.sqag_audit_events for each row execute function public.sqag_require_retention_delete_authorization()")
+        self._execute_admin("create trigger sqag_telemetry_source_state_no_delete before delete on public.sqag_telemetry_source_state for each row execute function public.sqag_reject_immutable_change()")
+        self._execute_admin(
+            "create trigger sqag_telemetry_events_no_update before update of "
+            "workspace_id, event_id, source_product, source_sequence, event_type, "
+            "event_status, actor_tracking_id, actor_key_version, action_reference, "
+            "run_reference, session_reference, support_reference, retry_lineage_id, "
+            "attempt_number, provider, model, reasoning_level, operation_route, "
+            "purpose, failure_class, duration_ms, usage_available, input_tokens, "
+            "output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, "
+            "cost_available, estimated_cost, actual_cost, currency, cost_version, "
+            "quota_decision, rate_limit_decision, abuse_decision, deployment_revision, "
+            "occurred_at, immutable_metadata_digest, retention_expires_at, "
+            "original_retention_expires_at on public.sqag_telemetry_events for each row "
+            "execute function public.sqag_reject_immutable_change()"
+        )
+        self._execute_admin("create trigger sqag_telemetry_events_guard_delete before delete on public.sqag_telemetry_events for each row execute function public.sqag_require_retention_delete_authorization()")
 
     def test_real_pg17_authenticated_and_active_identity_invariant(self):
         for expected_role in (
@@ -2129,6 +2201,81 @@ order by object_kind, object_schema, object_name, object_type
             effective = self._admin_row(
                 "select has_function_privilege(%s, %s, 'EXECUTE') as effective",
                 (role, "public.sqag_quote_session_deletion_hold_blocked(text, text)"),
+            )
+            self.assertEqual(effective["effective"], expected, role)
+        self.assertEqual(self._verify()["status"], "verified")
+
+    def test_real_pg17_callable_session_hold_authority_v2_metadata_acl_and_relations_are_exact(self):
+        spec = migration_contract.ROUTINE_SPECS[3]
+        row = self._admin_row(
+            "select n.nspname as schema_name, p.proname as name, "
+            "pg_get_function_identity_arguments(p.oid) as identity_arguments, "
+            "p.prokind, pg_get_function_result(p.oid) as result_type, "
+            "l.lanname as language, p.prosecdef, p.provolatile, "
+            "p.proparallel, p.proleakproof, p.proconfig, p.prosrc as function_body, "
+            "pg_get_functiondef(p.oid) as function_definition, owner.rolname as owner "
+            "from pg_catalog.pg_proc p "
+            "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+            "join pg_catalog.pg_language l on l.oid = p.prolang "
+            "join pg_catalog.pg_roles owner on owner.oid = p.proowner "
+            "where n.nspname = 'public' and p.proname = %s "
+            "and pg_get_function_identity_arguments(p.oid) = %s",
+            (spec.name, spec.identity_arguments),
+        )
+        self.assertEqual(row["schema_name"], "public")
+        self.assertEqual(row["name"], spec.name)
+        self.assertEqual(row["identity_arguments"], spec.identity_arguments)
+        self.assertEqual(row["prokind"], "f")
+        self.assertEqual(row["result_type"].lower(), "boolean")
+        self.assertEqual(row["language"], "sql")
+        self.assertTrue(row["prosecdef"])
+        self.assertEqual(row["provolatile"], "s")
+        self.assertEqual(row["proparallel"], "u")
+        self.assertFalse(row["proleakproof"])
+        self.assertEqual(row["proconfig"], ["search_path=pg_catalog, public"])
+        self.assertEqual(row["owner"], "sqag_migrator")
+        canonical_body = contract._canonical_callable_routine_body(
+            routine_name=contract.CALLABLE_ROUTINE_V2_NAME,
+            migration_path=contract.CALLABLE_ROUTINE_V2_MIGRATION_PATH,
+            identity_arguments=contract.CALLABLE_ROUTINE_V2_IDENTITY_ARGUMENTS,
+        )
+        self.assertEqual(
+            contract._semantic_sql_tokens(row["function_body"]),
+            contract._semantic_sql_tokens(canonical_body),
+        )
+        relation_inventory = {
+            match.group(1).lower()
+            for match in contract.SQL_RELATION_RE.finditer(row["function_definition"])
+            if match.group(1).lower().startswith("sqag_")
+        }
+        self.assertEqual(relation_inventory, set(spec.referenced_relations))
+        self.assertIsNone(contract.UNQUALIFIED_SQL_RELATION_RE.search(row["function_definition"]))
+        with self._admin_connection() as connection:
+            acl_rows = connection.execute(
+                "select case when acl.grantee = 0 then 'PUBLIC' "
+                "else coalesce(grantee_role.rolname, 'UNKNOWN') end as grantee, "
+                "acl.privilege_type, acl.is_grantable "
+                "from pg_catalog.pg_proc p "
+                "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+                "left join lateral pg_catalog.aclexplode(coalesce(p.proacl, pg_catalog.acldefault('f', p.proowner))) acl on true "
+                "left join pg_catalog.pg_roles grantee_role "
+                "on grantee_role.oid = acl.grantee and acl.grantee <> 0 "
+                "where n.nspname = 'public' and p.proname = %s "
+                "and pg_get_function_identity_arguments(p.oid) = %s "
+                "order by grantee, acl.privilege_type",
+                (spec.name, spec.identity_arguments),
+            ).fetchall()
+        self.assertEqual(
+            {
+                (item["grantee"], item["privilege_type"], item["is_grantable"])
+                for item in acl_rows
+            },
+            {("sqag_migrator", "EXECUTE", False), ("sqag_runtime", "EXECUTE", False)},
+        )
+        for role, expected in (("sqag_runtime", True), ("sqag_maintenance", False)):
+            effective = self._admin_row(
+                "select has_function_privilege(%s, %s, 'EXECUTE') as effective",
+                (role, "public.sqag_quote_session_deletion_hold_blocked_v2(text, text)"),
             )
             self.assertEqual(effective["effective"], expected, role)
         self.assertEqual(self._verify()["status"], "verified")
@@ -3259,6 +3406,18 @@ order by object_kind, object_schema, object_name, object_type
                     "drop trigger sqag_feedback_linkage_no_update on public.sqag_feedback"
                 ),
                 self._execute_admin(
+                    "drop trigger sqag_telemetry_source_state_no_delete "
+                    "on public.sqag_telemetry_source_state"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_telemetry_events_no_update "
+                    "on public.sqag_telemetry_events"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_telemetry_events_guard_delete "
+                    "on public.sqag_telemetry_events"
+                ),
+                self._execute_admin(
                     "drop function public.sqag_reject_immutable_change()"
                 ),
                 self._execute_admin(
@@ -3279,6 +3438,18 @@ order by object_kind, object_schema, object_name, object_type
                 ),
                 self._execute_admin(
                     "drop trigger sqag_feedback_linkage_no_update on public.sqag_feedback"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_telemetry_source_state_no_delete "
+                    "on public.sqag_telemetry_source_state"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_telemetry_events_no_update "
+                    "on public.sqag_telemetry_events"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_telemetry_events_guard_delete "
+                    "on public.sqag_telemetry_events"
                 ),
                 self._execute_admin(
                     "drop function public.sqag_reject_immutable_change()"
@@ -3332,56 +3503,618 @@ order by object_kind, object_schema, object_name, object_type
             "verify_live_db_object_backup_restore.py",
             "run146_verify_live_db_object_backup_restore",
         )
-        restore_database_name = self._create_isolated_database_fixture()
-        env = {
-            verifier.LIVE_DB_OBJECT_BACKUP_RESTORE_ENV_NAME: "1",
-            webapp.SQAG_DATABASE_URL_ENV_NAME: safe_postgres_url("sqag_runtime", self.database_name),
-            webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME: safe_postgres_url(
-                "sqag_migrator", self.database_name
-            ),
-            webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME: safe_postgres_url(
-                "sqag_maintenance", self.database_name
-            ),
-            verifier.RESTORE_DATABASE_URL_ENV_NAME: safe_postgres_url(
-                "sqag_runtime", restore_database_name
-            ),
-            verifier.RESTORE_MIGRATOR_DATABASE_URL_ENV_NAME: safe_postgres_url(
-                "sqag_migrator", restore_database_name
-            ),
-            verifier.RESTORE_MAINTENANCE_DATABASE_URL_ENV_NAME: safe_postgres_url(
-                "sqag_maintenance", restore_database_name
-            ),
-            webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
-            webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "object",
-            webapp.OBJECT_STORAGE_PROVIDER_ENV_NAME: "s3_compatible",
-            webapp.OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME: "https://synthetic-active.example",
-            webapp.OBJECT_STORAGE_BUCKET_ENV_NAME: "synthetic-active-bucket",
-            webapp.OBJECT_STORAGE_REGION_ENV_NAME: "ap-southeast-1",
-            webapp.OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME: "REDACTED",
-            webapp.OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME: "REDACTED",
-            verifier.RESTORE_OBJECT_STORAGE_PROVIDER_ENV_NAME: "s3_compatible",
-            verifier.RESTORE_OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME: "https://synthetic-restore.example",
-            verifier.RESTORE_OBJECT_STORAGE_BUCKET_ENV_NAME: "synthetic-restore-bucket",
-            verifier.RESTORE_OBJECT_STORAGE_REGION_ENV_NAME: "ap-southeast-1",
-            verifier.RESTORE_OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME: "REDACTED",
-            verifier.RESTORE_OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME: "REDACTED",
-            verifier.BACKUP_RESTORE_DECISION_ID_ENV_NAME: "synthetic-decision",
-            verifier.BACKUP_RESTORE_WINDOW_ID_ENV_NAME: "synthetic-window",
-        }
-        active_backend = webapp.InMemoryObjectStorageBackend()
-        restore_backend = webapp.InMemoryObjectStorageBackend()
-        with mock.patch.dict(os.environ, env, clear=True):
-            report = verifier.run_verification(
-                env=env,
-                active_backend_factory=lambda _env: active_backend,
-                restore_backend_factory=lambda _env: restore_backend,
-                test_injected_backend=True,
+        expected_layout = webapp.DEFAULT_QUOTE_LAYOUT_TEMPLATE_PATH.read_bytes()
+        if not webapp.embedded_layout_rules_from_xlsx_bytes(expected_layout):
+            default_rules = webapp.default_layout_rules_payload()
+            if default_rules:
+                expected_layout = webapp.xlsx_bytes_with_embedded_layout_rules(
+                    expected_layout,
+                    default_rules,
+                )
+        webapp.validate_profile_layout_xlsx(expected_layout)
+
+        def verifier_env(restore_database_name):
+            return {
+                verifier.LIVE_DB_OBJECT_BACKUP_RESTORE_ENV_NAME: "1",
+                webapp.SQAG_DATABASE_URL_ENV_NAME: safe_postgres_url("sqag_runtime", self.database_name),
+                webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME: safe_postgres_url(
+                    "sqag_migrator", self.database_name
+                ),
+                webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME: safe_postgres_url(
+                    "sqag_maintenance", self.database_name
+                ),
+                verifier.RESTORE_DATABASE_URL_ENV_NAME: safe_postgres_url(
+                    "sqag_runtime", restore_database_name
+                ),
+                verifier.RESTORE_MIGRATOR_DATABASE_URL_ENV_NAME: safe_postgres_url(
+                    "sqag_migrator", restore_database_name
+                ),
+                verifier.RESTORE_MAINTENANCE_DATABASE_URL_ENV_NAME: safe_postgres_url(
+                    "sqag_maintenance", restore_database_name
+                ),
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "object",
+                webapp.OBJECT_STORAGE_PROVIDER_ENV_NAME: "s3_compatible",
+                webapp.OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME: "https://synthetic-active.example",
+                webapp.OBJECT_STORAGE_BUCKET_ENV_NAME: "synthetic-active-bucket",
+                webapp.OBJECT_STORAGE_REGION_ENV_NAME: "ap-southeast-1",
+                webapp.OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME: "REDACTED",
+                webapp.OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME: "REDACTED",
+                verifier.RESTORE_OBJECT_STORAGE_PROVIDER_ENV_NAME: "s3_compatible",
+                verifier.RESTORE_OBJECT_STORAGE_ENDPOINT_URL_ENV_NAME: "https://synthetic-restore.example",
+                verifier.RESTORE_OBJECT_STORAGE_BUCKET_ENV_NAME: "synthetic-restore-bucket",
+                verifier.RESTORE_OBJECT_STORAGE_REGION_ENV_NAME: "ap-southeast-1",
+                verifier.RESTORE_OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME: "REDACTED",
+                verifier.RESTORE_OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME: "REDACTED",
+                verifier.BACKUP_RESTORE_DECISION_ID_ENV_NAME: "synthetic-decision",
+                verifier.BACKUP_RESTORE_WINDOW_ID_ENV_NAME: "synthetic-window",
+            }
+
+        class RecordingBackend(webapp.InMemoryObjectStorageBackend):
+            def __init__(self, label, *, fail_artifact_kind="", timeline=None):
+                super().__init__()
+                self.label = label
+                self.fail_artifact_kind = fail_artifact_kind
+                self.timeline = timeline if timeline is not None else []
+                self.events = []
+                self.store_calls = []
+                self.retrieve_calls = []
+                self.delete_calls = []
+
+            def _timeline_event(self, operation, metadata=None, **values):
+                event = {
+                    "index": len(self.timeline),
+                    "label": self.label,
+                    "operation": operation,
+                }
+                if metadata is not None:
+                    event.update(
+                        {
+                            "owner_type": metadata.owner_type,
+                            "owner_id": metadata.owner_id,
+                            "artifact_kind": metadata.artifact_kind,
+                        }
+                    )
+                event.update(values)
+                self.timeline.append(event)
+                return event
+
+            def _name_first_event(self, event, name):
+                if not any(item.get("event") == name for item in self.timeline):
+                    event["event"] = name
+
+            def store_artifact(self, **kwargs):
+                event_index = len(self.events)
+                self.events.append(
+                    (
+                        "store",
+                        kwargs["owner_type"],
+                        kwargs["owner_id"],
+                        kwargs["artifact_kind"],
+                    )
+                )
+                timeline_event = self._timeline_event(
+                    "store",
+                    owner_type=kwargs["owner_type"],
+                    owner_id=kwargs["owner_id"],
+                    artifact_kind=kwargs["artifact_kind"],
+                    succeeded=False,
+                )
+                record = dict(kwargs)
+                record["content"] = bytes(kwargs["content"])
+                record["event_index"] = event_index
+                self.store_calls.append(record)
+                if self.fail_artifact_kind == kwargs["artifact_kind"]:
+                    raise webapp.ObjectStorageContractError(
+                        "synthetic object store failure"
+                    )
+                metadata = super().store_artifact(**kwargs)
+                record["metadata"] = metadata
+                timeline_event["succeeded"] = True
+                if self.label == "active" and kwargs["artifact_kind"] == verifier.SYNTHETIC_ACTIVE_PROBE_KIND:
+                    self._name_first_event(timeline_event, "active_probe_store_success")
+                if self.label == "restore" and kwargs["artifact_kind"] == verifier.SYNTHETIC_RESTORE_PROBE_KIND:
+                    self._name_first_event(timeline_event, "restore_probe_store_success")
+                if self.label == "restore" and kwargs["artifact_kind"] == "xlsx":
+                    self._name_first_event(
+                        timeline_event,
+                        "first_restore_generated_or_product_object_destination_write",
+                    )
+                return metadata
+
+            def retrieve_artifact(self, metadata, *, workspace_id):
+                event_index = len(self.events)
+                self.events.append(
+                    (
+                        "retrieve",
+                        metadata.owner_type,
+                        metadata.owner_id,
+                        metadata.artifact_kind,
+                    )
+                )
+                timeline_event = self._timeline_event(
+                    "retrieve",
+                    metadata,
+                    workspace_id=workspace_id,
+                    succeeded=False,
+                )
+                record = {
+                    "metadata": metadata,
+                    "workspace_id": workspace_id,
+                    "event_index": event_index,
+                    "succeeded": False,
+                }
+                self.retrieve_calls.append(record)
+                try:
+                    content = super().retrieve_artifact(
+                        metadata,
+                        workspace_id=workspace_id,
+                    )
+                except Exception:
+                    if self.label == "restore" and metadata.owner_id.endswith("-active-probe"):
+                        timeline_event["event"] = "restore_denied_exact_returned_active_metadata"
+                    if self.label == "active" and metadata.owner_id.endswith("-restore-probe"):
+                        timeline_event["event"] = "active_denied_exact_returned_restore_metadata"
+                    raise
+                record["succeeded"] = True
+                record["content"] = content
+                timeline_event["succeeded"] = True
+                if self.label == "active" and metadata.owner_id.endswith("-active-probe"):
+                    self._name_first_event(timeline_event, "active_probe_self_read_success")
+                if self.label == "restore" and metadata.owner_id.endswith("-restore-probe"):
+                    self._name_first_event(timeline_event, "restore_probe_self_read_success")
+                return content
+
+            def delete_artifact(self, metadata, *, workspace_id):
+                event_index = len(self.events)
+                self.events.append(
+                    (
+                        "delete",
+                        metadata.owner_type,
+                        metadata.owner_id,
+                        metadata.artifact_kind,
+                    )
+                )
+                self.delete_calls.append(
+                    {
+                        "metadata": metadata,
+                        "workspace_id": workspace_id,
+                        "event_index": event_index,
+                    }
+                )
+                self._timeline_event(
+                    "delete",
+                    metadata,
+                    workspace_id=workspace_id,
+                    succeeded=True,
+                )
+                return super().delete_artifact(
+                    metadata,
+                    workspace_id=workspace_id,
+                )
+
+        class TimelineStorage:
+            def __init__(self, inner, label, timeline):
+                self.inner = inner
+                self.label = label
+                self.timeline = timeline
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+            def _record(self, operation):
+                event = {
+                    "index": len(self.timeline),
+                    "label": self.label,
+                    "operation": operation,
+                }
+                if (
+                    self.label == "restore"
+                    and operation in {
+                        "restore_database_profile_write",
+                        "restore_database_pricing_write",
+                        "restore_database_session_write",
+                    }
+                    and not any(
+                        item.get("event") == "first_restore_database_or_owner_destination_write"
+                        for item in self.timeline
+                    )
+                ):
+                    event["event"] = "first_restore_database_or_owner_destination_write"
+                self.timeline.append(event)
+
+            def save_profile(self, profile):
+                if self.label == "restore":
+                    self._record("restore_database_profile_write")
+                return self.inner.save_profile(profile)
+
+            def save_pricing_reference(self, reference):
+                if self.label == "restore":
+                    self._record("restore_database_pricing_write")
+                return self.inner.save_pricing_reference(reference)
+
+            def create_or_update_quote_session(self, payload, **kwargs):
+                if self.label == "restore":
+                    self._record("restore_database_session_write")
+                return self.inner.create_or_update_quote_session(payload, **kwargs)
+
+            def _upsert_object_quote_artifact(self, *args, **kwargs):
+                if self.label == "restore":
+                    self._record("restore_product_metadata_write")
+                return self.inner._upsert_object_quote_artifact(*args, **kwargs)
+
+        def run_case(restore_database_name, active_backend, restore_backend):
+            factory_calls = {"active": 0, "restore": 0}
+            timeline = []
+            active_backend.timeline = timeline
+            restore_backend.timeline = timeline
+
+            def active_factory(_env):
+                factory_calls["active"] += 1
+                return active_backend
+
+            def restore_factory(_env):
+                factory_calls["restore"] += 1
+                return restore_backend
+
+            original_default_storage = verifier._build_default_storage
+
+            def timeline_storage_factory(database_url, workspace_id):
+                label = "restore" if restore_database_name in database_url else "active"
+                return TimelineStorage(
+                    original_default_storage(database_url, workspace_id),
+                    label,
+                    timeline,
+                )
+
+            original_factory = webapp.configured_object_storage_backend
+            with mock.patch.object(
+                webapp,
+                "configured_object_storage_backend",
+                side_effect=AssertionError("global S3 route was called"),
+            ) as global_route:
+                with mock.patch.object(
+                    verifier,
+                    "_build_s3_backend",
+                    side_effect=AssertionError("default S3 backend was constructed"),
+                ) as default_s3_factory:
+                    with mock.patch.object(
+                        verifier,
+                        "_build_default_storage",
+                        side_effect=timeline_storage_factory,
+                    ):
+                        env = verifier_env(restore_database_name)
+                        with mock.patch.dict(os.environ, env, clear=True):
+                            report = verifier.run_verification(
+                                env=env,
+                                active_backend_factory=active_factory,
+                                restore_backend_factory=restore_factory,
+                                test_injected_backend=True,
+                            )
+                            binding_restored = (
+                                webapp.configured_object_storage_backend is global_route
+                            )
+            self.assertIs(webapp.configured_object_storage_backend, original_factory)
+            self.assertEqual(global_route.call_count, 0)
+            self.assertEqual(default_s3_factory.call_count, 0)
+            return report, factory_calls, binding_restored, timeline
+
+        def layout_calls(backend):
+            return [
+                call
+                for call in backend.store_calls
+                if call.get("metadata") is not None
+                and call["owner_type"] == "profile"
+                and call["artifact_kind"] == "quotation_layout"
+            ]
+
+        def assert_layout_calls(backend):
+            calls = layout_calls(backend)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual({call["owner_type"] for call in calls}, {"profile"})
+            self.assertEqual(
+                {call["artifact_kind"] for call in calls},
+                {"quotation_layout"},
             )
+            self.assertEqual(
+                {call["workspace_id"] for call in calls},
+                {call["metadata"].workspace_id for call in calls},
+            )
+            self.assertEqual(
+                {call["owner_id"] for call in calls},
+                {call["metadata"].owner_id for call in calls},
+            )
+            self.assertEqual(
+                {
+                    tuple(call["owner_id"].rsplit("-", 2)[-2:])
+                    for call in calls
+                },
+                {("profile", "a"), ("profile", "b")},
+            )
+            for call in calls:
+                metadata = call["metadata"]
+                self.assertEqual(call["content"], expected_layout)
+                webapp.validate_profile_layout_xlsx(call["content"])
+                self.assertEqual(metadata.workspace_id, call["workspace_id"])
+                self.assertEqual(metadata.owner_type, "profile")
+                self.assertEqual(metadata.owner_id, call["owner_id"])
+                self.assertEqual(metadata.artifact_kind, "quotation_layout")
+                self.assertEqual(metadata.filename, "quotation-layout.xlsx")
+                self.assertEqual(
+                    metadata.content_type,
+                    verifier.SYNTHETIC_CONTENT_TYPE,
+                )
+                self.assertEqual(metadata.size_bytes, len(expected_layout))
+                self.assertEqual(
+                    metadata.checksum_sha256,
+                    webapp.artifact_checksum(expected_layout),
+                )
+                self.assertEqual(
+                    metadata.storage_key,
+                    webapp.object_artifact_key(
+                        workspace_id=metadata.workspace_id,
+                        owner_type=metadata.owner_type,
+                        owner_id=metadata.owner_id,
+                        artifact_kind=metadata.artifact_kind,
+                        filename=metadata.filename,
+                        checksum_sha256=metadata.checksum_sha256,
+                    ),
+                )
+            return calls
+
+        def assert_tombstoned_layouts(database_name, backend, calls):
+            for call in calls:
+                metadata = call["metadata"]
+                row = self._admin_row(
+                    "select workspace_id, owner_type, owner_id, artifact_kind, "
+                    "filename, content_type, size_bytes, checksum_sha256, "
+                    "object_key_ref, status, retention_status, deleted_at "
+                    "from public.sqag_object_artifacts "
+                    "where workspace_id = %s and owner_type = %s "
+                    "and owner_id = %s and artifact_kind = %s",
+                    (
+                        metadata.workspace_id,
+                        metadata.owner_type,
+                        metadata.owner_id,
+                        metadata.artifact_kind,
+                    ),
+                    database_name=database_name,
+                )
+                self.assertEqual(row["workspace_id"], metadata.workspace_id)
+                self.assertEqual(row["owner_type"], "profile")
+                self.assertEqual(row["owner_id"], metadata.owner_id)
+                self.assertEqual(row["artifact_kind"], "quotation_layout")
+                self.assertEqual(row["filename"], metadata.filename)
+                self.assertEqual(row["content_type"], metadata.content_type)
+                self.assertEqual(int(row["size_bytes"]), metadata.size_bytes)
+                self.assertEqual(row["checksum_sha256"], metadata.checksum_sha256)
+                self.assertEqual(row["object_key_ref"], metadata.storage_key)
+                self.assertEqual(row["status"], "deleted")
+                self.assertEqual(row["retention_status"], "deleted")
+                self.assertIsNotNone(row["deleted_at"])
+                self.assertEqual(
+                    self._admin_rows(
+                        "select artifact_id from public.sqag_object_artifacts "
+                        "where workspace_id = %s and owner_type = %s "
+                        "and owner_id = %s and artifact_kind = %s "
+                        "and status = 'active'",
+                        (
+                            metadata.workspace_id,
+                            metadata.owner_type,
+                            metadata.owner_id,
+                            metadata.artifact_kind,
+                        ),
+                        database_name=database_name,
+                    ),
+                    [],
+                )
+                self.assertNotIn(metadata.storage_key, backend._objects)
+
+        restore_database_name = self._create_isolated_database_fixture()
+        active_backend = RecordingBackend("active")
+        restore_backend = RecordingBackend("restore")
+        report, factory_calls, binding_restored, timeline = run_case(
+            restore_database_name,
+            active_backend,
+            restore_backend,
+        )
         self.assertEqual(report["status"], "passed")
         self.assertEqual(report["blockers"], [])
+        self.assertTrue(binding_restored)
+        self.assertEqual(factory_calls, {"active": 1, "restore": 1})
         self.assertTrue(report["checks"]["active_db_write_read_verified"])
+        self.assertTrue(report["checks"]["active_object_write_read_verified"])
         self.assertTrue(report["checks"]["restore_db_write_read_verified"])
         self.assertTrue(report["checks"]["restore_object_write_read_verified"])
+        self.assertTrue(report["checks"]["checksum_match"])
+        self.assertTrue(report["checks"]["metadata_object_pairing_verified"])
+        self.assertTrue(report["checks"]["workspace_isolation_preserved"])
+        self.assertTrue(report["checks"]["restore_database_cannot_read_active_synthetic_rows"])
+        self.assertTrue(report["checks"]["restore_object_cannot_read_active_synthetic_object"])
+        self.assertTrue(report["checks"]["active_object_cannot_read_restore_synthetic_object"])
+        self.assertTrue(report["checks"]["bidirectional_backend_isolation_verified"])
+        self.assertTrue(report["checks"]["cleanup_completed"])
+        self.assertEqual(report["active_db_synthetic_rows_written"], 7)
+        self.assertEqual(report["restore_db_synthetic_rows_written"], 7)
+        self.assertEqual(report["active_object_synthetic_objects_written"], 1)
+        self.assertEqual(report["restore_object_synthetic_objects_written"], 1)
+
+        active_layout_calls = assert_layout_calls(active_backend)
+        restore_layout_calls = assert_layout_calls(restore_backend)
+        self.assertEqual(
+            {call["owner_id"] for call in active_layout_calls},
+            {call["owner_id"] for call in restore_layout_calls},
+        )
+        self.assertEqual(
+            {call["workspace_id"] for call in active_layout_calls},
+            {call["workspace_id"] for call in restore_layout_calls},
+        )
+        assert_tombstoned_layouts(
+            self.database_name,
+            active_backend,
+            active_layout_calls,
+        )
+        assert_tombstoned_layouts(
+            restore_database_name,
+            restore_backend,
+            restore_layout_calls,
+        )
+        for backend, calls in (
+            (active_backend, active_layout_calls),
+            (restore_backend, restore_layout_calls),
+        ):
+            successful_reads = {
+                item["metadata"].storage_key: item["content"]
+                for item in backend.retrieve_calls
+                if item["succeeded"]
+            }
+            for call in calls:
+                self.assertEqual(
+                    successful_reads[call["metadata"].storage_key],
+                    expected_layout,
+                )
+        active_probe_denial = [
+            event
+            for event in timeline
+            if event["label"] == "restore"
+            and event["operation"] == "retrieve"
+            and not event["succeeded"]
+            and event["owner_id"].endswith("-active-probe")
+        ]
+        restore_probe_denial = [
+            event
+            for event in timeline
+            if event["label"] == "active"
+            and event["operation"] == "retrieve"
+            and not event["succeeded"]
+            and event["owner_id"].endswith("-restore-probe")
+        ]
+        self.assertEqual(len(active_probe_denial), 1)
+        self.assertEqual(len(restore_probe_denial), 1)
+        first_restore_profile_write = next(
+            event
+            for event in timeline
+            if event["operation"] == "restore_database_profile_write"
+        )
+        first_restore_product_write = next(
+            event
+            for event in timeline
+            if event["label"] == "restore"
+            and event["operation"] == "store"
+            and event["succeeded"]
+            and event["owner_type"] == "generated_quote"
+            and event["owner_id"].startswith("quote-")
+            and event["artifact_kind"] == "xlsx"
+        )
+        for denial in active_probe_denial + restore_probe_denial:
+            self.assertLess(denial["index"], first_restore_profile_write["index"])
+            self.assertLess(denial["index"], first_restore_product_write["index"])
+
+        def named_event(name):
+            matches = [event for event in timeline if event.get("event") == name]
+            self.assertEqual(len(matches), 1, name)
+            return matches[0]
+
+        active_probe_store_success = named_event("active_probe_store_success")
+        active_probe_self_read_success = named_event("active_probe_self_read_success")
+        restore_probe_store_success = named_event("restore_probe_store_success")
+        restore_probe_self_read_success = named_event("restore_probe_self_read_success")
+        restore_denied_exact = named_event(
+            "restore_denied_exact_returned_active_metadata"
+        )
+        active_denied_exact = named_event(
+            "active_denied_exact_returned_restore_metadata"
+        )
+        first_restore_database_write = named_event(
+            "first_restore_database_or_owner_destination_write"
+        )
+        first_restore_generated_write = named_event(
+            "first_restore_generated_or_product_object_destination_write"
+        )
+        self.assertLess(active_probe_store_success["index"], active_probe_self_read_success["index"])
+        self.assertLess(active_probe_self_read_success["index"], restore_probe_store_success["index"])
+        self.assertLess(restore_probe_store_success["index"], restore_probe_self_read_success["index"])
+        for store in (active_probe_store_success, restore_probe_store_success):
+            for denial in (restore_denied_exact, active_denied_exact):
+                self.assertLess(store["index"], denial["index"])
+        for self_read in (active_probe_self_read_success, restore_probe_self_read_success):
+            for denial in (restore_denied_exact, active_denied_exact):
+                self.assertLess(self_read["index"], denial["index"])
+        for denial in (restore_denied_exact, active_denied_exact):
+            self.assertLess(denial["index"], first_restore_database_write["index"])
+            self.assertLess(denial["index"], first_restore_generated_write["index"])
+
+        active_probe_store_call = next(
+            call
+            for call in active_backend.store_calls
+            if call["artifact_kind"] == verifier.SYNTHETIC_ACTIVE_PROBE_KIND
+        )
+        restore_probe_store_call = next(
+            call
+            for call in restore_backend.store_calls
+            if call["artifact_kind"] == verifier.SYNTHETIC_RESTORE_PROBE_KIND
+        )
+        restore_cross_call = next(
+            call
+            for call in restore_backend.retrieve_calls
+            if call["metadata"].owner_id.endswith("-active-probe")
+        )
+        active_cross_call = next(
+            call
+            for call in active_backend.retrieve_calls
+            if call["metadata"].owner_id.endswith("-restore-probe")
+        )
+        self.assertIs(
+            restore_cross_call["metadata"],
+            active_probe_store_call["metadata"],
+        )
+        self.assertIs(
+            active_cross_call["metadata"],
+            restore_probe_store_call["metadata"],
+        )
+        self.assertEqual(
+            verifier._immutable_artifact_metadata_tuple(restore_cross_call["metadata"]),
+            verifier._immutable_artifact_metadata_tuple(active_probe_store_call["metadata"]),
+        )
+        self.assertEqual(
+            verifier._immutable_artifact_metadata_tuple(active_cross_call["metadata"]),
+            verifier._immutable_artifact_metadata_tuple(restore_probe_store_call["metadata"]),
+        )
+        self.assertEqual(
+            restore_cross_call["metadata"].storage_key,
+            active_probe_store_call["metadata"].storage_key,
+        )
+        self.assertEqual(
+            active_cross_call["metadata"].storage_key,
+            restore_probe_store_call["metadata"].storage_key,
+        )
+        self.assertEqual(active_backend._objects, {})
+        self.assertEqual(restore_backend._objects, {})
+
+        failure_restore_database_name = self._create_isolated_database_fixture()
+        failure_active_backend = RecordingBackend(
+            "active-failure",
+            fail_artifact_kind="xlsx",
+        )
+        failure_restore_backend = RecordingBackend("restore-failure")
+        failure_report, failure_factory_calls, failure_binding_restored, _failure_timeline = run_case(
+            failure_restore_database_name,
+            failure_active_backend,
+            failure_restore_backend,
+        )
+        self.assertEqual(failure_report["status"], "failed")
+        self.assertIn("active_object_write_failed", failure_report["blockers"])
+        self.assertTrue(failure_report["checks"]["cleanup_completed"])
+        self.assertTrue(failure_binding_restored)
+        self.assertEqual(failure_factory_calls, {"active": 1, "restore": 0})
+        failure_layout_calls = assert_layout_calls(failure_active_backend)
+        self.assertEqual(failure_restore_backend.store_calls, [])
+        assert_tombstoned_layouts(
+            self.database_name,
+            failure_active_backend,
+            failure_layout_calls,
+        )
+        self.assertEqual(failure_active_backend._objects, {})
 
     def test_real_pg17_migrations_capabilities_provenance_and_workspace_isolation(self):
         evidence = self._verify()
@@ -3615,10 +4348,27 @@ order by object_kind, object_schema, object_name, object_type
             self.assertEqual(report["status"], "unsafe")
             self.assertEqual(report["pendingMigrationIds"], [last.migration_id])
             self.assertEqual(
-                report["blockers"],
-                [
-                    "pending_suffix_present:routine:public.sqag_quote_session_deletion_hold_blocked(text, text)"
-                ],
+                set(report["blockers"]),
+                {
+                    *(
+                        f"pending_suffix_present:table:public.{table.name}"
+                        for table in migration_contract.MIGRATION_OBJECTS[-1].tables
+                    ),
+                    *(
+                        f"pending_suffix_present:index:public.{index.name}"
+                        for index in migration_contract.MIGRATION_OBJECTS[-1].indexes
+                    ),
+                    *(
+                        "pending_suffix_present:trigger:public."
+                        f"{trigger.table_name}.{trigger.name}"
+                        for trigger in migration_contract.MIGRATION_OBJECTS[-1].triggers
+                    ),
+                    *(
+                        "pending_suffix_present:routine:public."
+                        f"{routine.name}({routine.identity_arguments})"
+                        for routine in migration_contract.MIGRATION_OBJECTS[-1].routines
+                    ),
+                },
             )
         finally:
             self._execute_admin(
@@ -3682,6 +4432,84 @@ order by object_kind, object_schema, object_name, object_type
                     contract.verify_postgres_privilege_contract(adapter, self.manifest)
             finally:
                 adapter.close()
+
+    def test_telemetry_acl_antifalse_matrix_is_red_and_restored(self):
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "revoke select on table public.sqag_telemetry_events from sqag_runtime"
+            ),
+            lambda: self._execute_admin(
+                "grant select on table public.sqag_telemetry_events to sqag_runtime"
+            ),
+            "missing telemetry capability",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "grant update on table public.sqag_telemetry_events to sqag_runtime"
+            ),
+            lambda: self._execute_admin(
+                "revoke update on table public.sqag_telemetry_events from sqag_runtime"
+            ),
+            "runtime telemetry UPDATE",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "grant delete on table public.sqag_telemetry_source_state to sqag_runtime"
+            ),
+            lambda: self._execute_admin(
+                "revoke delete on table public.sqag_telemetry_source_state from sqag_runtime"
+            ),
+            "runtime telemetry DELETE",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "grant insert on table public.sqag_telemetry_source_state to sqag_maintenance"
+            ),
+            lambda: self._execute_admin(
+                "revoke insert on table public.sqag_telemetry_source_state from sqag_maintenance"
+            ),
+            "maintenance telemetry INSERT",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "grant delete on table public.sqag_telemetry_source_state to sqag_maintenance"
+            ),
+            lambda: self._execute_admin(
+                "revoke delete on table public.sqag_telemetry_source_state from sqag_maintenance"
+            ),
+            "maintenance telemetry DELETE",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "grant select on table public.sqag_telemetry_events to PUBLIC"
+            ),
+            lambda: self._execute_admin(
+                "revoke select on table public.sqag_telemetry_events from PUBLIC"
+            ),
+            "PUBLIC telemetry privilege",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "grant select on table public.sqag_telemetry_events "
+                "to sqag_runtime with grant option"
+            ),
+            lambda: self._execute_admin(
+                "revoke grant option for select on table "
+                "public.sqag_telemetry_events from sqag_runtime"
+            ),
+            "telemetry grant option",
+        )
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "alter default privileges for role sqag_migrator in schema public "
+                "grant select on tables to sqag_runtime"
+            ),
+            lambda: self._execute_admin(
+                "alter default privileges for role sqag_migrator in schema public "
+                "revoke select on tables from sqag_runtime"
+            ),
+            "telemetry default ACL authority",
+        )
 
     def test_maintenance_projection_retention_and_cleanup_receipt(self):
         runtime_url = safe_postgres_url("sqag_runtime", self.database_name)
@@ -3779,15 +4607,14 @@ order by object_kind, object_schema, object_name, object_type
         self.assertFalse(maintenance_ledger["allowed"])
         self.assertTrue(migrator_ledger["allowed"])
 
-    def test_real_pg17_causal_001_007_cli_008_and_runtime_hold_denial(self):
+    def test_real_pg17_causal_001_008_cli_009_and_runtime_hold_denial(self):
         partial_database = self._create_isolated_database_fixture(
-            self.migrations[:6],
+            self.migrations[:7],
             configure_acl=False,
         )
         self._configure_acl_contract(
             partial_database,
-            migrations=self.migrations[:6],
-            include_callable=False,
+            migrations=self.migrations[:7],
         )
         migrator_url = safe_postgres_url("sqag_migrator", partial_database)
         before_pre_apply = self._migration_mutation_snapshot(partial_database)
@@ -3803,13 +4630,13 @@ order by object_kind, object_schema, object_name, object_type
         self.assertEqual(pre_apply["blockers"], [])
         self.assertEqual(
             pre_apply["appliedMigrationIds"],
-            [migration.migration_id for migration in self.migrations[:6]],
+            [migration.migration_id for migration in self.migrations[:7]],
         )
         self.assertEqual(
             pre_apply["pendingMigrationIds"],
-            [self.migrations[-1].migration_id],
+            [migration.migration_id for migration in self.migrations[7:]],
         )
-        self.assertEqual(pre_apply["appliedHead"], self.migrations[-2].migration_id)
+        self.assertEqual(pre_apply["appliedHead"], self.migrations[6].migration_id)
         self.assertEqual(pre_apply["expectedHead"], self.migrations[-1].migration_id)
         self.assertNotIn("runtimeContract", pre_apply)
         self.assertNotIn("maintenanceContract", pre_apply)
@@ -3899,18 +4726,23 @@ order by object_kind, object_schema, object_name, object_type
         self.assertEqual(clean_pre_apply["blockers"], [])
         self.assertEqual(
             clean_pre_apply["appliedMigrationIds"],
-            [migration.migration_id for migration in self.migrations[:6]],
+            [migration.migration_id for migration in self.migrations[:7]],
         )
         self.assertEqual(
             clean_pre_apply["pendingMigrationIds"],
-            [self.migrations[-1].migration_id],
+            [migration.migration_id for migration in self.migrations[7:]],
         )
-        self.assertEqual(clean_pre_apply["appliedHead"], self.migrations[-2].migration_id)
+        self.assertEqual(clean_pre_apply["appliedHead"], self.migrations[6].migration_id)
         self.assertEqual(clean_pre_apply["expectedHead"], self.migrations[-1].migration_id)
         self.assertEqual(
             self._migration_mutation_snapshot(partial_database),
             assumed_role_baseline,
         )
+        v1_before_009 = self._routine_catalog_snapshot(
+            partial_database,
+            migration_contract.ROUTINE_SPECS[2],
+        )
+        default_acl_before_009 = self._default_table_acl_snapshot(partial_database)
 
         environment = self._scrubbed_child_environment({
             webapp.SQAG_MIGRATOR_DATABASE_URL_ENV_NAME: migrator_url,
@@ -3929,9 +4761,55 @@ order by object_kind, object_schema, object_name, object_type
         )
         self.assertEqual(completed.returncode, 0, completed.stderr[-500:])
         self.assertIn(self.migrations[-1].migration_id, completed.stdout)
+        self.assertIn(
+            "Applied migration IDs: " + self.migrations[7].migration_id,
+            completed.stdout,
+        )
+        self.assertNotIn(
+            "Applied migration IDs: " + self.migrations[6].migration_id,
+            completed.stdout,
+        )
         self.assertNotIn(migrator_url, completed.stdout)
         self.assertNotIn(migrator_url, completed.stderr)
 
+        self.assertEqual(
+            v1_before_009,
+            self._routine_catalog_snapshot(
+                partial_database,
+                migration_contract.ROUTINE_SPECS[2],
+            ),
+        )
+        post_009 = self._inspect(partial_database)
+        self.assertEqual(post_009["status"], "ready")
+        self.assertIs(post_009["safeToApply"], True)
+        self.assertEqual(post_009["pendingMigrationIds"], [])
+        self.assertEqual(
+            post_009["appliedMigrationIds"],
+            [migration.migration_id for migration in self.migrations],
+        )
+        self.assertEqual(
+            post_009["appliedMigrationIds"][:-1],
+            clean_pre_apply["appliedMigrationIds"],
+        )
+        self.assertEqual(
+            set(post_009["appliedMigrationIds"])
+            - set(clean_pre_apply["appliedMigrationIds"]),
+            {self.migrations[7].migration_id},
+        )
+        ledger_row = self._admin_row(
+            "select sequence_no, migration_id, checksum_sha256, applied_at "
+            "from public.sqag_schema_migrations where sequence_no = %s",
+            (self.migrations[7].sequence_no,),
+            database_name=partial_database,
+        )
+        self.assertEqual(ledger_row["migration_id"], self.migrations[7].migration_id)
+        self.assertEqual(ledger_row["checksum_sha256"], self.migrations[7].checksum_sha256)
+        self.assertIsNotNone(ledger_row["applied_at"])
+        self.assertEqual(
+            self._default_table_acl_snapshot(partial_database),
+            default_acl_before_009,
+        )
+        self._assert_causal_telemetry_catalog_and_acl_contract(partial_database)
         self._assert_causal_callable_catalog_contract(partial_database)
         runtime_url = safe_postgres_url("sqag_runtime", partial_database)
         maintenance_url = safe_postgres_url("sqag_maintenance", partial_database)
@@ -3985,7 +4863,222 @@ order by object_kind, object_schema, object_name, object_type
         self.assertNotIn(migrator_url, completed.stderr)
         after_noop = self._migration_mutation_snapshot(partial_database)
         self.assertEqual(before_noop, after_noop)
-        print("RUN313_PG17_CAUSAL_TRANSITION_EXECUTED")
+        print("RUN367_PG17_CAUSAL_TRANSITION_EXECUTED")
+
+    def test_real_pg17_v2_telemetry_hold_graph_and_workspace_isolation(self):
+        runtime_url = safe_postgres_url("sqag_runtime", self.database_name)
+        workspace_id = "workspace-run367-telemetry"
+        wrong_workspace_id = "workspace-run367-wrong"
+        target_session_id = "quote-run367-target"
+        unrelated_session_id = "quote-run367-unrelated"
+        invalid_session_id = "quote-run367-invalid"
+        target_event_id = "telemetry-run367-target"
+        unrelated_event_id = "telemetry-run367-unrelated"
+        wrong_workspace_event_id = "telemetry-run367-wrong-workspace"
+        storage = webapp.DatabaseSqagStorage(
+            runtime_url,
+            workspace_id,
+            role="admin",
+            user_id="user-run367-telemetry",
+            expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+            },
+            clear=False,
+        ):
+            storage.create_or_update_quote_session(
+                {"session_id": target_session_id, "client": {"name": "synthetic"}},
+                result=None,
+            )
+            storage.create_or_update_quote_session(
+                {"session_id": unrelated_session_id, "client": {"name": "synthetic"}},
+                result=None,
+            )
+        with webapp.postgres_storage_connection(
+            runtime_url,
+            expected_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        ) as connection:
+            forensic = ForensicStore(
+                connection,
+                workspace_id,
+                "actor-run367-telemetry",
+                actor_key_version_value="test-v1",
+            )
+            forensic.append_telemetry_event(
+                "security",
+                "success",
+                event_id=target_event_id,
+                session_reference=target_session_id,
+            )
+            forensic.append_telemetry_event(
+                "security",
+                "success",
+                event_id=unrelated_event_id,
+                session_reference=unrelated_session_id,
+            )
+            wrong_workspace_forensic = ForensicStore(
+                connection,
+                wrong_workspace_id,
+                "actor-run367-wrong-workspace",
+                actor_key_version_value="test-v1",
+            )
+            wrong_workspace_forensic.append_telemetry_event(
+                "security",
+                "success",
+                event_id=wrong_workspace_event_id,
+                session_reference=target_session_id,
+            )
+
+        def runtime_hold_decision(session_id: str) -> bool:
+            with self.psycopg.connect(
+                runtime_url,
+                row_factory=self.dict_row,
+            ) as connection:
+                row = connection.execute(
+                    "select public.sqag_quote_session_deletion_hold_blocked_v2(%s, %s) "
+                    "as hold_blocked",
+                    (workspace_id, session_id),
+                ).fetchone()
+            self.assertIs(type(row["hold_blocked"]), bool)
+            return row["hold_blocked"]
+
+        self._execute_admin(
+            "update public.sqag_telemetry_events set legal_hold = 1 "
+            "where workspace_id = %s and event_id = %s",
+            (workspace_id, target_event_id),
+        )
+        self.assertTrue(runtime_hold_decision(target_session_id))
+        with mock.patch.dict(
+            os.environ,
+            {
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+            },
+            clear=False,
+        ):
+            self.assertFalse(storage.delete_quote_session(target_session_id))
+
+        self._execute_admin(
+            "update public.sqag_telemetry_events set legal_hold = 0 "
+            "where workspace_id = %s and event_id = %s",
+            (workspace_id, target_event_id),
+        )
+        self._execute_admin(
+            "insert into public.sqag_legal_holds "
+            "(hold_id, workspace_id, target_type, target_id, enabled, reason_code, "
+            "actor_tracking_id, actor_key_version, created_at) "
+            "values (%s, %s, 'telemetry_event', %s, 1, 'run367-test', "
+            "'actor-run367-telemetry', 'test-v1', '2026-09-01T00:00:00Z')",
+            ("hold-run367-telemetry-event", workspace_id, target_event_id),
+        )
+        self.assertTrue(runtime_hold_decision(target_session_id))
+        with mock.patch.dict(
+            os.environ,
+            {
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+            },
+            clear=False,
+        ):
+            self.assertFalse(storage.delete_quote_session(target_session_id))
+
+        self._execute_admin(
+            "delete from public.sqag_legal_holds "
+            "where workspace_id = %s and hold_id = %s",
+            (workspace_id, "hold-run367-telemetry-event"),
+        )
+        self._execute_admin(
+            "update public.sqag_telemetry_events set legal_hold = 1 "
+            "where workspace_id = %s and event_id = %s",
+            (workspace_id, unrelated_event_id),
+        )
+        self._execute_admin(
+            "update public.sqag_telemetry_events set legal_hold = 1 "
+            "where workspace_id = %s and event_id = %s",
+            (wrong_workspace_id, wrong_workspace_event_id),
+        )
+        self.assertFalse(runtime_hold_decision(target_session_id))
+        with mock.patch.dict(
+            os.environ,
+            {
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+            },
+            clear=False,
+        ):
+            self.assertTrue(storage.delete_quote_session(target_session_id))
+        self.assertIsNone(storage.get_quote_session(target_session_id))
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+            },
+            clear=False,
+        ):
+            storage.create_or_update_quote_session(
+                {"session_id": invalid_session_id, "client": {"name": "synthetic"}},
+                result=None,
+            )
+        with webapp.postgres_storage_connection(
+            runtime_url,
+            expected_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        ) as connection:
+            forensic = ForensicStore(
+                connection,
+                workspace_id,
+                "actor-run367-invalid",
+                actor_key_version_value="test-v1",
+            )
+            forensic.append_telemetry_event(
+                "security",
+                "success",
+                event_id="telemetry-run367-invalid-link",
+                session_reference=invalid_session_id,
+                run_reference="run-run367-missing",
+            )
+        self.assertTrue(runtime_hold_decision(invalid_session_id))
+
+        def insert_invalid_hold(hold_id: str, target_type: str, target_id: str, enabled: int):
+            self._execute_admin(
+                "insert into public.sqag_legal_holds "
+                "(hold_id, workspace_id, target_type, target_id, enabled, reason_code, "
+                "actor_tracking_id, actor_key_version, created_at) "
+                "values (%s, %s, %s, %s, %s, 'run367-test', "
+                "'actor-run367-invalid', 'test-v1', '2026-09-01T00:00:00Z')",
+                (hold_id, workspace_id, target_type, target_id, enabled),
+            )
+
+        invalid_holds = (
+            ("hold-run367-invalid-type", "unsupported_target", "target-run367", 1),
+            ("hold-run367-invalid-id", "telemetry_event", "bad target", 1),
+            ("hold-run367-missing-target", "telemetry_event", "telemetry-run367-missing-target", 1),
+            ("hold-run367-invalid-enabled", "telemetry_event", "target-run367", 2),
+        )
+        for hold_id, target_type, target_id, enabled in invalid_holds:
+            with self.subTest(invalid_hold=hold_id):
+                insert_invalid_hold(hold_id, target_type, target_id, enabled)
+                try:
+                    self.assertTrue(runtime_hold_decision(invalid_session_id))
+                finally:
+                    self._execute_admin(
+                        "delete from public.sqag_legal_holds "
+                        "where workspace_id = %s and hold_id = %s",
+                        (workspace_id, hold_id),
+                    )
+
+        with self.psycopg.connect(
+            runtime_url,
+            row_factory=self.dict_row,
+        ) as connection:
+            with self.assertRaises(Exception):
+                connection.execute("select 1 from public.sqag_legal_holds").fetchone()
+            connection.rollback()
 
     def test_real_pg17_mandatory_applied_prefix_and_missing_ledger_matrix(self):
         def assert_snapshot_stable(
@@ -4029,7 +5122,7 @@ order by object_kind, object_schema, object_name, object_type
         )
         self.assertEqual(
             control["pendingMigrationIds"],
-            [self.migrations[-1].migration_id],
+            [migration.migration_id for migration in self.migrations[6:]],
         )
 
         expected_index = "applied_prefix_missing:index:public.sqag_feedback_publication_idx"
@@ -4349,6 +5442,277 @@ order by object_kind, object_schema, object_name, object_type
                 raise AssertionError("fixture row missing")
             return row
 
+    def _routine_catalog_snapshot(self, database_name: str, spec) -> dict[str, object]:
+        row = self._admin_row(
+            "select n.nspname as schema_name, p.proname as name, "
+            "pg_get_function_identity_arguments(p.oid) as identity_arguments, "
+            "p.prokind, pg_get_function_result(p.oid) as result_type, "
+            "language_row.lanname as language, p.prosecdef as security_definer, "
+            "p.provolatile as volatility, p.proparallel as parallel, "
+            "p.proleakproof as leakproof, p.proconfig, p.prosrc as function_body, "
+            "pg_get_functiondef(p.oid) as function_definition, owner.rolname as owner "
+            "from pg_catalog.pg_proc p "
+            "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+            "join pg_catalog.pg_language language_row on language_row.oid = p.prolang "
+            "join pg_catalog.pg_roles owner on owner.oid = p.proowner "
+            "where n.nspname = 'public' and p.proname = %s "
+            "and pg_get_function_identity_arguments(p.oid) = %s",
+            (spec.name, spec.identity_arguments),
+            database_name=database_name,
+        )
+        acl_rows = self._admin_rows(
+            "select case when acl.grantee = 0 then 'PUBLIC' "
+            "else coalesce(grantee_role.rolname, 'UNKNOWN') end as grantee, "
+            "acl.privilege_type, acl.is_grantable "
+            "from pg_catalog.pg_proc p "
+            "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
+            "left join lateral pg_catalog.aclexplode(coalesce(p.proacl, pg_catalog.acldefault('f', p.proowner))) acl on true "
+            "left join pg_catalog.pg_roles grantee_role "
+            "on grantee_role.oid = acl.grantee and acl.grantee <> 0 "
+            "where n.nspname = 'public' and p.proname = %s "
+            "and pg_get_function_identity_arguments(p.oid) = %s "
+            "order by grantee, acl.privilege_type",
+            (spec.name, spec.identity_arguments),
+            database_name=database_name,
+        )
+        return {
+            "catalog": (
+                row["schema_name"],
+                row["name"],
+                row["identity_arguments"],
+                row["prokind"],
+                row["result_type"],
+                row["language"],
+                row["security_definer"],
+                row["volatility"],
+                row["parallel"],
+                row["leakproof"],
+                tuple(row["proconfig"] or ()),
+                row["owner"],
+            ),
+            "function_body": row["function_body"],
+            "function_definition": row["function_definition"],
+            "acl": tuple(
+                (item["grantee"], item["privilege_type"], item["is_grantable"])
+                for item in acl_rows
+            ),
+        }
+
+    def _default_table_acl_snapshot(self, database_name: str) -> tuple[tuple[object, ...], ...]:
+        rows = self._admin_rows(
+            """
+select owner.rolname as owner,
+       coalesce(namespace.nspname, '<global>') as schema_name,
+       case when acl.grantee = 0 then 'PUBLIC'
+            else coalesce(grantee_role.rolname, 'UNKNOWN') end as grantee,
+       acl.privilege_type, acl.is_grantable
+from pg_catalog.pg_default_acl d
+join pg_catalog.pg_roles owner on owner.oid = d.defaclrole
+left join pg_catalog.pg_namespace namespace on namespace.oid = d.defaclnamespace
+left join lateral pg_catalog.aclexplode(d.defaclacl) acl on true
+left join pg_catalog.pg_roles grantee_role
+  on grantee_role.oid = acl.grantee and acl.grantee <> 0
+where d.defaclobjtype = 'r'
+  and owner.rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_maintenance')
+order by owner.rolname, schema_name, grantee, acl.privilege_type
+""",
+            database_name=database_name,
+        )
+        return tuple(
+            (
+                row["owner"],
+                row["schema_name"],
+                row["grantee"],
+                row["privilege_type"],
+                row["is_grantable"],
+            )
+            for row in rows
+        )
+
+    def _assert_causal_telemetry_catalog_and_acl_contract(self, database_name: str) -> None:
+        migration = migration_contract.MIGRATION_OBJECTS[-1]
+        telemetry_tables = {table.name for table in migration.tables}
+        with self._admin_connection(database_name) as raw_connection:
+            connection = webapp.PostgresConnectionAdapter(raw_connection)
+            relations = migration_contract._fetch_public_relations(connection)
+            tables = migration_contract._fetch_public_tables(connection, relations)
+            indexes = migration_contract._fetch_public_indexes(connection)
+            triggers = migration_contract._fetch_public_triggers(connection)
+
+        self.assertEqual(
+            {name for name in tables if name in telemetry_tables},
+            telemetry_tables,
+        )
+        for table in migration.tables:
+            self.assertTrue(
+                migration_contract._table_matches(tables[table.name], table),
+                table.name,
+            )
+
+        telemetry_indexes = {index.name for index in migration.indexes}
+        self.assertEqual(
+            {name for name in indexes if name in telemetry_indexes},
+            telemetry_indexes,
+        )
+        for index in migration.indexes:
+            self.assertTrue(
+                migration_contract._index_matches(indexes[index.name], index),
+                index.name,
+            )
+
+        trigger_by_key = {
+            (trigger["table_name"], trigger["name"]): trigger
+            for trigger in triggers
+        }
+        telemetry_triggers = {
+            (trigger.table_name, trigger.name)
+            for trigger in migration.triggers
+        }
+        self.assertEqual(
+            set(trigger_by_key) & telemetry_triggers,
+            telemetry_triggers,
+        )
+        for trigger in migration.triggers:
+            self.assertTrue(
+                migration_contract._trigger_matches(
+                    trigger_by_key[(trigger.table_name, trigger.name)],
+                    trigger,
+                ),
+                trigger.name,
+            )
+
+        placeholders = ", ".join("%s" for _ in sorted(telemetry_tables))
+        acl_rows = self._admin_rows(
+            f"""
+select c.relname as table_name, owner.rolname as owner,
+       case when acl.grantee = 0 then 'PUBLIC'
+            else coalesce(grantee_role.rolname, 'UNKNOWN') end as grantee,
+       grantor_role.rolname as grantor,
+       acl.privilege_type, acl.is_grantable
+from pg_catalog.pg_class c
+join pg_catalog.pg_namespace namespace on namespace.oid = c.relnamespace
+join pg_catalog.pg_roles owner on owner.oid = c.relowner
+left join lateral pg_catalog.aclexplode(c.relacl) acl on true
+left join pg_catalog.pg_roles grantee_role
+  on grantee_role.oid = acl.grantee and acl.grantee <> 0
+left join pg_catalog.pg_roles grantor_role on grantor_role.oid = acl.grantor
+where namespace.nspname = 'public'
+  and c.relkind = 'r'
+  and c.relname in ({placeholders})
+order by c.relname, grantee, acl.privilege_type
+""",
+            tuple(sorted(telemetry_tables)),
+            database_name=database_name,
+        )
+        direct_rows = [row for row in acl_rows if row["grantee"] is not None]
+        self.assertEqual(
+            {row["table_name"] for row in direct_rows},
+            telemetry_tables,
+        )
+        self.assertEqual(
+            {row["owner"] for row in direct_rows},
+            {"sqag_migrator"},
+        )
+        self.assertEqual(
+            {row["grantee"] for row in direct_rows},
+            {"sqag_migrator", "sqag_runtime", "sqag_maintenance"},
+        )
+        self.assertFalse(any(row["grantee"] == "PUBLIC" for row in direct_rows))
+
+        expected_direct = set()
+        for table_name in telemetry_tables:
+            for role, privilege_map in (
+                ("sqag_runtime", contract.RUNTIME_TABLE_PRIVILEGES),
+                ("sqag_maintenance", contract.MAINTENANCE_TABLE_PRIVILEGES),
+            ):
+                expected_direct.update(
+                    (
+                        table_name,
+                        role,
+                        "sqag_migrator",
+                        privilege,
+                        False,
+                    )
+                    for privilege in privilege_map[table_name]
+                )
+        observed_direct = {
+            (
+                row["table_name"],
+                row["grantee"],
+                row["grantor"],
+                row["privilege_type"],
+                row["is_grantable"],
+            )
+            for row in direct_rows
+            if row["grantee"] in {"sqag_runtime", "sqag_maintenance"}
+        }
+        self.assertEqual(observed_direct, expected_direct)
+        self.assertFalse(
+            any(
+                row["is_grantable"]
+                for row in direct_rows
+                if row["grantee"] in {"sqag_runtime", "sqag_maintenance"}
+            )
+        )
+
+        with self._admin_connection(database_name) as connection:
+            for role, privilege_map in (
+                ("sqag_runtime", contract.RUNTIME_TABLE_PRIVILEGES),
+                ("sqag_maintenance", contract.MAINTENANCE_TABLE_PRIVILEGES),
+            ):
+                for table_name in sorted(telemetry_tables):
+                    qualified = f"public.{table_name}"
+                    expected_privileges = set(privilege_map[table_name])
+                    for privilege in contract.TABLE_PRIVILEGES:
+                        result = connection.execute(
+                            "select has_table_privilege(%s, %s, %s) as effective, "
+                            "has_table_privilege(%s, %s, %s) as grantable",
+                            (
+                                role,
+                                qualified,
+                                privilege,
+                                role,
+                                qualified,
+                                f"{privilege} WITH GRANT OPTION",
+                            ),
+                        ).fetchone()
+                        self.assertEqual(
+                            bool(result["effective"]),
+                            privilege in expected_privileges,
+                            f"{role}:{table_name}:{privilege}",
+                        )
+                        self.assertFalse(
+                            bool(result["grantable"]),
+                            f"{role}:{table_name}:{privilege}:grantable",
+                        )
+
+        public_effective_rows = self._admin_rows(
+            f"""
+select c.relname as table_name, acl.privilege_type, acl.is_grantable
+from pg_catalog.pg_class c
+join pg_catalog.pg_namespace namespace on namespace.oid = c.relnamespace
+left join lateral pg_catalog.aclexplode(
+  coalesce(c.relacl, pg_catalog.acldefault('r', c.relowner))
+) acl on true
+where namespace.nspname = 'public'
+  and c.relkind = 'r'
+  and c.relname in ({placeholders})
+  and acl.grantee = 0
+order by c.relname, acl.privilege_type
+""",
+            tuple(sorted(telemetry_tables)),
+            database_name=database_name,
+        )
+        self.assertEqual(public_effective_rows, [])
+        default_acl_rows = self._default_table_acl_snapshot(database_name)
+        self.assertFalse(
+            any(
+                row[2] in {"PUBLIC", "sqag_runtime", "sqag_maintenance"}
+                for row in default_acl_rows
+            )
+        )
+        self.assertFalse(any(row[4] for row in default_acl_rows))
+
     def _assert_causal_callable_catalog_contract(self, database_name: str) -> None:
         routine = self._admin_row(
             "select n.nspname as schema_name, p.proname as name, "
@@ -4384,7 +5748,11 @@ order by object_kind, object_schema, object_name, object_type
         self.assertEqual(routine["proconfig"], ["search_path=pg_catalog, public"])
         self.assertEqual(routine["owner"], "sqag_migrator")
 
-        canonical_body = contract._canonical_callable_routine_body()
+        canonical_body = contract._canonical_callable_routine_body(
+            routine_name=contract.CALLABLE_ROUTINE_V2_NAME,
+            migration_path=contract.CALLABLE_ROUTINE_V2_MIGRATION_PATH,
+            identity_arguments=contract.CALLABLE_ROUTINE_V2_IDENTITY_ARGUMENTS,
+        )
         self.assertEqual(
             contract._semantic_sql_tokens(routine["function_body"]),
             contract._semantic_sql_tokens(canonical_body),

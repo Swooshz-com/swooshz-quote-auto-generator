@@ -61,8 +61,16 @@ import pricing_reference_enrichment
 from webapp.forensics import (
     MAX_GENERATION_MANIFEST_BYTES,
     ForensicStore,
+    RetentionGraphHeld,
+    TELEMETRY_FAILURE_CLASSES,
+    TelemetryConflictError,
+    TelemetryUnavailableError,
+    iso_timestamp,
+    safe_telemetry_label,
+    safe_telemetry_route,
     safe_reference,
     trusted_workspace_id,
+    utc_now,
 )
 from webapp.object_storage import (
     ALLOWED_OWNER_TYPES,
@@ -126,6 +134,8 @@ DEFAULT_COMPANY_ID = "default"
 DEFAULT_COMPANY_DISPLAY_NAME = "Quote Generator Workspace"
 DEFAULT_QUOTE_COMPANY_PROFILE_ID = "default"
 DEFAULT_QUOTE_COMPANY_FALLBACK_PRESET_ID = "synthetic-fixture-default"
+DELETED_PROFILE_MARKER_KEY = "_sqag_deleted"
+DELETED_PROFILE_UPDATE_MESSAGE = "Deleted profiles cannot be updated. Create a new profile with a new id."
 
 
 def discovered_default_resource_id(root: Path, marker_filename: str, fallback: str = "default") -> str:
@@ -375,6 +385,7 @@ OIDC_CALLBACK_MAX_QUERY_BYTES = 8192
 OIDC_CALLBACK_MAX_FIELDS = 12
 PLATFORM_LAUNCH_ENDPOINT = "/api/platform/launch"
 PLATFORM_FINALIZATION_ENDPOINT = "/api/auth/platform/finalize"
+TELEMETRY_FEED_ENDPOINT = "/api/platform/telemetry/feed"
 PLATFORM_APP_KEY = "sqag"
 PLATFORM_LAUNCH_TOKEN_HEADER = "X-App-Launch-Token"
 PLATFORM_FINALIZATION_HANDLE_HEADER = "X-SQAG-Finalization-Handle"
@@ -410,6 +421,7 @@ MAX_RATE_LIMIT_BUCKETS = 4096
 POST_RATE_LIMITS = {
     PLATFORM_LAUNCH_ENDPOINT: 20,
     PLATFORM_FINALIZATION_ENDPOINT: 30,
+    TELEMETRY_FEED_ENDPOINT: 60,
     "/api/jobs": 30,
     "/api/draft": 15,
     "/api/generate": 15,
@@ -1023,9 +1035,19 @@ def current_ai_log_tracking_metadata() -> dict[str, Any]:
 
 
 @contextlib.contextmanager
-def ai_log_tracking_scope(metadata: dict[str, Any] | None):
+def ai_log_tracking_scope(
+    metadata: dict[str, Any] | None,
+    *,
+    auth_session: dict[str, Any] | None = None,
+):
     previous = getattr(AI_LOG_TRACKING_CONTEXT, "metadata", None)
+    previous_session = getattr(AI_LOG_TRACKING_CONTEXT, "auth_session", None)
     AI_LOG_TRACKING_CONTEXT.metadata = normalized_ai_log_tracking_metadata(metadata)
+    AI_LOG_TRACKING_CONTEXT.auth_session = (
+        safe_auth_session_for_async(auth_session)
+        if isinstance(auth_session, dict)
+        else None
+    )
     try:
         yield
     finally:
@@ -1036,6 +1058,13 @@ def ai_log_tracking_scope(metadata: dict[str, Any] | None):
                 pass
         else:
             AI_LOG_TRACKING_CONTEXT.metadata = previous
+        if previous_session is None:
+            try:
+                delattr(AI_LOG_TRACKING_CONTEXT, "auth_session")
+            except AttributeError:
+                pass
+        else:
+            AI_LOG_TRACKING_CONTEXT.auth_session = previous_session
 
 
 def log_ai_call_attempt(
@@ -1094,7 +1123,11 @@ def log_ai_call_attempt(
         if safe_details:
             record["details"] = safe_details
     record.update(current_ai_log_tracking_metadata())
-    return write_local_log("ai_call_attempt", record, log_root=log_root)
+    local_result = write_local_log("ai_call_attempt", record, log_root=log_root)
+    auth_session = getattr(AI_LOG_TRACKING_CONTEXT, "auth_session", None)
+    if isinstance(auth_session, dict):
+        append_ai_attempt_telemetry(auth_session, record)
+    return local_result
 
 
 def sanitize_log_value(value: Any) -> Any:
@@ -1997,6 +2030,141 @@ def b64url_decode(value: str) -> bytes:
 
 def session_secret() -> str:
     return clean_text(read_dotenv_value(SESSION_SECRET_ENV_NAME))
+
+
+TELEMETRY_CURSOR_VERSION = 1
+TELEMETRY_CURSOR_PREFIX = b"sqag-telemetry-cursor-v1\0"
+TELEMETRY_CURSOR_MAX_CHARS = 4096
+
+
+def telemetry_cursor_signing_key() -> bytes:
+    secret = session_secret()
+    if not secret and configured_app_mode() == "deploy":
+        raise TelemetryUnavailableError("telemetry_cursor_signing_secret_missing")
+    return (secret or PROCESS_CSRF_TOKEN).encode("utf-8")
+
+
+def encode_telemetry_cursor(
+    workspace_id: str,
+    source_sequence: int,
+    event_id: str,
+) -> str:
+    safe_workspace = trusted_workspace_id(
+        workspace_id,
+        allow_local=configured_app_mode() == "local",
+    )
+    if isinstance(source_sequence, bool) or not isinstance(source_sequence, int) or source_sequence < 0:
+        raise ValueError("Telemetry feed cursor is invalid.")
+    safe_event_id = safe_reference(event_id)
+    if not safe_event_id:
+        raise ValueError("Telemetry feed cursor is invalid.")
+    body = json.dumps(
+        {
+            "event_id": safe_event_id,
+            "source_sequence": source_sequence,
+            "v": TELEMETRY_CURSOR_VERSION,
+            "workspace_id": safe_workspace,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    signature = hmac.new(
+        telemetry_cursor_signing_key(),
+        TELEMETRY_CURSOR_PREFIX + body,
+        hashlib.sha256,
+    ).digest()
+    return f"{b64url_encode(body)}.{b64url_encode(signature)}"
+
+
+def decode_telemetry_cursor(value: str, workspace_id: str) -> tuple[int, str]:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > TELEMETRY_CURSOR_MAX_CHARS
+        or not re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", value)
+    ):
+        raise ValueError("Telemetry feed cursor is invalid.")
+    encoded_body, encoded_signature = value.split(".", 1)
+    try:
+        body = b64url_decode(encoded_body)
+        signature = b64url_decode(encoded_signature)
+    except (ValueError, binascii.Error):
+        raise ValueError("Telemetry feed cursor is invalid.") from None
+    if (
+        not body
+        or len(signature) != hashlib.sha256().digest_size
+        or b64url_encode(body) != encoded_body
+        or b64url_encode(signature) != encoded_signature
+    ):
+        raise ValueError("Telemetry feed cursor is invalid.")
+    expected_signature = hmac.new(
+        telemetry_cursor_signing_key(),
+        TELEMETRY_CURSOR_PREFIX + body,
+        hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(signature, expected_signature):
+        raise ValueError("Telemetry feed cursor is invalid.")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("Telemetry feed cursor is invalid.") from None
+    if not isinstance(payload, dict):
+        raise ValueError("Telemetry feed cursor is invalid.")
+    canonical_body = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if canonical_body != body:
+        raise ValueError("Telemetry feed cursor is invalid.")
+    safe_workspace = trusted_workspace_id(
+        workspace_id,
+        allow_local=configured_app_mode() == "local",
+    )
+    if payload.get("v") != TELEMETRY_CURSOR_VERSION or payload.get("workspace_id") != safe_workspace:
+        raise ValueError("Telemetry feed cursor is invalid.")
+    source_sequence = payload.get("source_sequence")
+    event_id = safe_reference(payload.get("event_id"))
+    if (
+        isinstance(source_sequence, bool)
+        or not isinstance(source_sequence, int)
+        or source_sequence < 0
+        or not event_id
+    ):
+        raise ValueError("Telemetry feed cursor is invalid.")
+    return source_sequence, event_id
+
+
+def parse_telemetry_feed_query(raw_query: str) -> tuple[str, int]:
+    try:
+        pairs = parse_qsl(
+            raw_query or "",
+            keep_blank_values=True,
+            strict_parsing=False,
+            max_num_fields=4,
+        )
+    except ValueError:
+        raise ValueError("Telemetry feed parameters are invalid.") from None
+    allowed = {"cursor", "limit"}
+    if any(key not in allowed for key, _value in pairs):
+        raise ValueError("Telemetry feed parameters are invalid.")
+    values: dict[str, list[str]] = {}
+    for key, value in pairs:
+        values.setdefault(key, []).append(value)
+    if any(len(items) != 1 for items in values.values()):
+        raise ValueError("Telemetry feed parameters are invalid.")
+    cursor = values.get("cursor", [""])[0]
+    if "cursor" in values and not cursor:
+        raise ValueError("Telemetry feed parameters are invalid.")
+    raw_limit = values.get("limit", ["100"])[0]
+    if not re.fullmatch(r"[0-9]+", raw_limit):
+        raise ValueError("Telemetry feed parameters are invalid.")
+    limit = int(raw_limit)
+    if not 1 <= limit <= 500:
+        raise ValueError("Telemetry feed parameters are invalid.")
+    return cursor, limit
 
 
 def deploy_session_secret_ready() -> bool:
@@ -9121,6 +9289,7 @@ SQAG_STORAGE_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "004_generation_forensics_feedback_retention.sql",
     PROJECT_ROOT / "migrations" / "006_quote_publication_versions.sql",
     PROJECT_ROOT / "migrations" / "007_feedback_publication_binding.sql",
+    PROJECT_ROOT / "migrations" / "009_telemetry_events.sql",
 ]
 SQAG_POSTGRES_METADATA_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "001_platform_scoped_storage.sql",
@@ -9130,6 +9299,7 @@ SQAG_POSTGRES_METADATA_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "006_quote_publication_versions_postgres.sql",
     PROJECT_ROOT / "migrations" / "007_feedback_publication_binding_postgres.sql",
     PROJECT_ROOT / "migrations" / "008_quote_session_deletion_hold_authority_postgres.sql",
+    PROJECT_ROOT / "migrations" / "009_telemetry_events_postgres.sql",
 ]
 SQAG_PUBLICATION_VERSION_REQUIRED_COLUMNS = {
     "workspace_id", "session_id", "run_id", "job_id", "state",
@@ -9201,6 +9371,26 @@ SQAG_FORENSIC_REQUIRED_COLUMNS = {
         "workspace_id", "candidate_type", "last_retention_expires_at",
         "last_record_id", "updated_at",
     },
+    "sqag_telemetry_source_state": {
+        "workspace_id", "source_product", "next_source_sequence",
+        "high_watermark", "reconciliation_state", "last_reconciled_at",
+        "reconciliation_reference", "created_at", "updated_at",
+    },
+    "sqag_telemetry_events": {
+        "workspace_id", "event_id", "source_product", "source_sequence",
+        "event_type", "event_status", "actor_tracking_id", "actor_key_version",
+        "action_reference", "run_reference", "session_reference",
+        "support_reference", "retry_lineage_id", "attempt_number", "provider",
+        "model", "reasoning_level", "operation_route", "purpose", "failure_class",
+        "duration_ms", "usage_available", "input_tokens", "output_tokens",
+        "total_tokens", "cache_read_tokens", "cache_write_tokens",
+        "cost_available", "estimated_cost", "actual_cost", "currency",
+        "cost_version", "quota_decision", "rate_limit_decision",
+        "abuse_decision", "deployment_revision", "occurred_at",
+        "immutable_metadata_digest", "retention_expires_at",
+        "original_retention_expires_at", "legal_hold", "deletion_state",
+        "deletion_error_code", "deletion_claimed_at",
+    },
 }
 
 SQAG_RUNTIME_FORENSIC_REQUIRED_COLUMNS = {
@@ -9211,6 +9401,8 @@ SQAG_RUNTIME_FORENSIC_REQUIRED_COLUMNS = {
         "sqag_audit_events",
         "sqag_feedback",
         "sqag_feedback_status_history",
+        "sqag_telemetry_source_state",
+        "sqag_telemetry_events",
     )
 }
 
@@ -9233,21 +9425,32 @@ SQAG_FORENSIC_REQUIRED_INDEXES = {
     "sqag_legal_holds_active_target_uidx",
     "sqag_legal_holds_state_idx",
     "sqag_deletion_receipts_retention_idx",
+    "sqag_telemetry_source_state_workspace_idx",
+    "sqag_telemetry_events_feed_idx",
+    "sqag_telemetry_events_source_sequence_uidx",
+    "sqag_telemetry_events_retention_idx",
+    "sqag_telemetry_events_actor_idx",
+    "sqag_telemetry_events_retry_uidx",
 }
 SQAG_FORENSIC_REQUIRED_UNIQUE_INDEXES = {
     "sqag_generation_runs_workspace_job_uidx",
     "sqag_generation_runs_workspace_idempotency_uidx",
     "sqag_legal_holds_active_target_uidx",
+    "sqag_telemetry_events_retry_uidx",
 }
 SQAG_FORENSIC_REQUIRED_TRIGGERS = {
     "sqag_generation_evidence_no_update",
     "sqag_audit_events_no_update",
     "sqag_generation_evidence_guard_delete",
     "sqag_audit_events_guard_delete",
+    "sqag_telemetry_source_state_no_delete",
+    "sqag_telemetry_events_no_update",
+    "sqag_telemetry_events_guard_delete",
 }
 SQAG_FORENSIC_SQLITE_REQUIRED_TRIGGERS = SQAG_FORENSIC_REQUIRED_TRIGGERS | {
     "sqag_generation_evidence_cleanup_delete_auth",
     "sqag_audit_events_cleanup_delete_auth",
+    "sqag_telemetry_events_cleanup_delete_auth",
 }
 SQAG_FORENSIC_POSTGRES_REQUIRED_ROUTINES = {
     "sqag_reject_immutable_change",
@@ -9972,6 +10175,7 @@ class ObjectArtifactBatchPlan:
     previous_backups: list[tuple[ObjectArtifactMetadata, bytes]] = field(default_factory=list)
     new_objects: list[ObjectArtifactMetadata] = field(default_factory=list)
     deleted_previous: list[tuple[ObjectArtifactMetadata, bytes]] = field(default_factory=list)
+    unchanged_kinds: set[str] = field(default_factory=set)
     state: str = "prepared"
 
 
@@ -10079,11 +10283,17 @@ class DatabaseSqagStorage:
             with self.connection() as connection:
                 if self.database_family == "postgres_compatible":
                     rows = self._postgres_schema_columns(connection, set(required))
-                    if reason == "storage_forensics_database_not_migrated":
+                    if reason in {
+                        "storage_forensics_database_not_migrated",
+                        "storage_runtime_forensics_not_migrated",
+                    }:
                         objects = self._postgres_forensic_schema_objects(connection)
                 else:
                     rows = self._sqlite_schema_columns(connection, set(required))
-                    if reason == "storage_forensics_database_not_migrated":
+                    if reason in {
+                        "storage_forensics_database_not_migrated",
+                        "storage_runtime_forensics_not_migrated",
+                    }:
                         objects = self._sqlite_forensic_schema_objects(connection)
         except SqagStorageAccessError:
             raise
@@ -10106,7 +10316,10 @@ class DatabaseSqagStorage:
         }
         missing_tables = {table for table in required if table not in present}
         missing_objects = False
-        if reason == "storage_forensics_database_not_migrated":
+        if reason in {
+            "storage_forensics_database_not_migrated",
+            "storage_runtime_forensics_not_migrated",
+        }:
             required_triggers = (
                 SQAG_FORENSIC_REQUIRED_TRIGGERS
                 if self.database_family == "postgres_compatible"
@@ -10275,6 +10488,10 @@ class DatabaseSqagStorage:
             if isinstance(payload, dict):
                 payloads.append(payload)
         return payloads
+
+    @staticmethod
+    def _is_deleted_profile_payload(payload: Any) -> bool:
+        return isinstance(payload, Mapping) and payload.get(DELETED_PROFILE_MARKER_KEY) is True
 
     def _read_payload(self, table: str, id_column: str, item_id: str) -> dict[str, Any] | None:
         with self.connection() as connection:
@@ -10531,7 +10748,11 @@ class DatabaseSqagStorage:
         return sorted(profiles, key=lambda item: (clean_text(item.get("label") or item.get("id")).casefold(), clean_text(item.get("id")).casefold()))
 
     def list_company_profiles(self) -> list[dict[str, Any]]:
-        return self._read_payloads("sqag_profiles", "profile_id")
+        return [
+            profile
+            for profile in self._read_payloads("sqag_profiles", "profile_id")
+            if not self._is_deleted_profile_payload(profile)
+        ]
 
     def profile_detail(self, profile_id: str, source: str = "") -> dict[str, Any] | None:
         safe_id = safe_resource_id(profile_id, "")
@@ -10541,12 +10762,42 @@ class DatabaseSqagStorage:
         if requested_source not in {"", "company"}:
             return None
         profile = self._read_payload("sqag_profiles", "profile_id", safe_id)
-        if profile is None:
+        if profile is None or self._is_deleted_profile_payload(profile):
             return None
         detail = copy.deepcopy(profile)
         detail["id"] = safe_id
         detail["source"] = "company"
         return detail
+
+    def _assert_profile_can_be_saved(
+        self,
+        profile_id: str,
+        *,
+        connection: Any | None = None,
+    ) -> None:
+        safe_id = safe_resource_id(profile_id, "")
+        if not safe_id:
+            return
+
+        def assert_on_connection(active_connection: Any) -> None:
+            row = active_connection.execute(
+                "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
+                (self.workspace_id, safe_id),
+            ).fetchone()
+            if not row:
+                return
+            try:
+                payload = json.loads(row["payload_json"])
+            except (KeyError, TypeError, json.JSONDecodeError):
+                return
+            if self._is_deleted_profile_payload(payload):
+                raise ValueError(DELETED_PROFILE_UPDATE_MESSAGE)
+
+        if connection is not None:
+            assert_on_connection(connection)
+            return
+        with self.connection() as read_connection:
+            assert_on_connection(read_connection)
 
     def save_profile(self, profile: dict[str, Any]) -> dict[str, Any]:
         profile_id = safe_resource_id(profile.get("id") or profile.get("label"), "")
@@ -10555,23 +10806,47 @@ class DatabaseSqagStorage:
         stored = {key: copy.deepcopy(value) for key, value in profile.items() if key not in {"_pack_assets", "pack", "profile_pack"}}
         stored["id"] = profile_id
         artifact_mode = configured_artifact_storage_mode()
+        materialize_default_layout = configured_storage_mode() == "database"
         if artifact_mode not in {"database", "object"}:
-            self._upsert_payload("sqag_profiles", "profile_id", profile_id, stored)
+            def persist_plain_profile(connection: Any) -> None:
+                self._assert_profile_can_be_saved(profile_id, connection=connection)
+                self._execute_upsert_payload(
+                    connection,
+                    "sqag_profiles",
+                    "profile_id",
+                    profile_id,
+                    stored,
+                )
+
+            self._run_storage_transaction(persist_plain_profile)
             return stored
 
-        item = self._prepare_profile_layout_artifact(profile)
         if artifact_mode == 'object':
             def prepare_object_profile(connection: Any):
+                self._assert_profile_can_be_saved(profile_id, connection=connection)
+                item = self._prepare_profile_layout_artifact(profile)
+                profile_layout_item = item
+                if (
+                    profile_layout_item is None
+                    and materialize_default_layout
+                    and not self._profile_layout_artifact_exists(
+                        profile_id,
+                        artifact_mode=artifact_mode,
+                        connection=connection,
+                    )
+                ):
+                    profile_layout_item = self._prepare_default_profile_layout_artifact()
                 plan = (
                     self._prepare_object_artifact_batch(
                         'profile',
                         profile_id,
-                        [item],
+                        [profile_layout_item],
                         {'quotation_layout'},
                         {'quotation_layout'},
                         connection=connection,
+                        quote_session=False,
                     )
-                    if item is not None
+                    if profile_layout_item is not None
                     else None
                 )
                 return plan, plan
@@ -10610,15 +10885,28 @@ class DatabaseSqagStorage:
             return stored
 
         def persist_profile(connection: Any) -> None:
-            if item is not None:
+            self._assert_profile_can_be_saved(profile_id, connection=connection)
+            item = self._prepare_profile_layout_artifact(profile)
+            profile_layout_item = item
+            if (
+                profile_layout_item is None
+                and materialize_default_layout
+                and not self._profile_layout_artifact_exists(
+                    profile_id,
+                    artifact_mode=artifact_mode,
+                    connection=connection,
+                )
+            ):
+                profile_layout_item = self._prepare_default_profile_layout_artifact()
+            if profile_layout_item is not None:
                 self._execute_upsert_file_artifact(
                     connection,
                     "profile",
                     profile_id,
-                    item.artifact_kind,
-                    item.filename,
-                    item.content_type,
-                    item.content,
+                    profile_layout_item.artifact_kind,
+                    profile_layout_item.filename,
+                    profile_layout_item.content_type,
+                    profile_layout_item.content,
                 )
             self._execute_upsert_payload(
                 connection,
@@ -10642,10 +10930,45 @@ class DatabaseSqagStorage:
             raise ValueError("Profile id is required and may only contain letters, numbers, dashes, or underscores.")
         artifact_mode = configured_artifact_storage_mode()
         if artifact_mode == "object":
-            def delete_object_profile_owner(connection: Any) -> bool:
-                cursor = connection.execute(
-                    "delete from sqag_profiles where workspace_id = ? and profile_id = ?",
+            def authorize_object_profile(connection: Any) -> bool:
+                existing_row = connection.execute(
+                    "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
                     (self.workspace_id, safe_id),
+                ).fetchone()
+                if not existing_row:
+                    return False
+                try:
+                    existing_payload = json.loads(existing_row["payload_json"])
+                except (KeyError, TypeError, json.JSONDecodeError):
+                    existing_payload = None
+                return not self._is_deleted_profile_payload(existing_payload)
+
+            def delete_object_profile_owner(connection: Any) -> bool:
+                existing_row = connection.execute(
+                    "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
+                    (self.workspace_id, safe_id),
+                )
+                existing_row = existing_row.fetchone()
+                if not existing_row:
+                    return False
+                try:
+                    existing_payload = json.loads(existing_row["payload_json"])
+                except (KeyError, TypeError, json.JSONDecodeError):
+                    existing_payload = None
+                if self._is_deleted_profile_payload(existing_payload):
+                    return False
+                cursor = connection.execute(
+                    "update sqag_profiles set payload_json = ?, updated_at = ? where workspace_id = ? and profile_id = ?",
+                    (
+                        json.dumps(
+                            {"id": safe_id, DELETED_PROFILE_MARKER_KEY: True},
+                            ensure_ascii=True,
+                            sort_keys=True,
+                        ),
+                        utc_timestamp(),
+                        self.workspace_id,
+                        safe_id,
+                    ),
                 )
                 return cursor.rowcount > 0
 
@@ -10654,6 +10977,7 @@ class DatabaseSqagStorage:
                     "profile",
                     safe_id,
                     delete_object_profile_owner,
+                    authorize=authorize_object_profile,
                 )
             except Exception as exc:
                 if not self._expected_storage_failure(exc):
@@ -10661,14 +10985,36 @@ class DatabaseSqagStorage:
                 raise self._storage_unavailable_error(exc) from exc
 
         def delete_profile_owner(connection: Any) -> bool:
+            existing_row = connection.execute(
+                "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
+                (self.workspace_id, safe_id),
+            ).fetchone()
+            if existing_row:
+                try:
+                    existing_payload = json.loads(existing_row["payload_json"])
+                except (TypeError, json.JSONDecodeError):
+                    existing_payload = None
+                if self._is_deleted_profile_payload(existing_payload):
+                    return False
+            if not existing_row:
+                return False
             if artifact_mode == "database":
                 connection.execute(
                     "delete from sqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ?",
                     (self.workspace_id, "profile", safe_id),
                 )
             cursor = connection.execute(
-                "delete from sqag_profiles where workspace_id = ? and profile_id = ?",
-                (self.workspace_id, safe_id),
+                "update sqag_profiles set payload_json = ?, updated_at = ? where workspace_id = ? and profile_id = ?",
+                (
+                    json.dumps(
+                        {"id": safe_id, DELETED_PROFILE_MARKER_KEY: True},
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ),
+                    utc_timestamp(),
+                    self.workspace_id,
+                    safe_id,
+                ),
             )
             return cursor.rowcount > 0
 
@@ -10684,7 +11030,7 @@ class DatabaseSqagStorage:
         if not safe_id:
             return None
         profile = self._read_payload("sqag_profiles", "profile_id", safe_id)
-        if profile is None:
+        if profile is None or self._is_deleted_profile_payload(profile):
             return None
         return {"schema": COMPANY_PROFILE_EXPORT_SCHEMA, "exported_at": utc_timestamp(), "profile": {"id": safe_id, "label": clean_text(profile.get("label")) or safe_id, "description": clean_text(profile.get("description")), "defaults": copy.deepcopy(profile.get("defaults")) if isinstance(profile.get("defaults"), dict) else {}}}
 
@@ -10730,6 +11076,7 @@ class DatabaseSqagStorage:
                         managed_kinds,
                         retained_kinds,
                         connection=connection,
+                        quote_session=False,
                     )
                     if managed_kinds
                     else None
@@ -10889,11 +11236,25 @@ class DatabaseSqagStorage:
             return
         if len(content) > MAX_QUOTE_ARTIFACT_BYTES:
             raise ValueError("Artifact is larger than the database artifact limit.")
+        safe_content_type = clean_text(content_type) or "application/octet-stream"
+        content_bytes = bytes(content)
+        existing = connection.execute(
+            "select filename, content_type, size_bytes, content_blob from sqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+            (self.workspace_id, safe_owner_type, safe_owner_id, safe_kind),
+        ).fetchone()
+        if (
+            existing
+            and clean_text(existing["filename"]) == safe_filename
+            and clean_text(existing["content_type"]) == safe_content_type
+            and int(existing["size_bytes"] or 0) == len(content_bytes)
+            and bytes(existing["content_blob"] or b"") == content_bytes
+        ):
+            return
         now = utc_timestamp()
         connection.execute(
             "insert into sqag_file_artifacts (workspace_id, owner_type, owner_id, artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "on conflict(workspace_id, owner_type, owner_id, artifact_kind) do update set filename = excluded.filename, content_type = excluded.content_type, size_bytes = excluded.size_bytes, content_blob = excluded.content_blob, updated_at = excluded.updated_at",
-            (self.workspace_id, safe_owner_type, safe_owner_id, safe_kind, safe_filename, clean_text(content_type) or "application/octet-stream", len(content), sqlite3.Binary(content), now, now),
+            (self.workspace_id, safe_owner_type, safe_owner_id, safe_kind, safe_filename, safe_content_type, len(content_bytes), sqlite3.Binary(content_bytes), now, now),
         )
 
     def _upsert_file_artifact(self, owner_type: str, owner_id: str, artifact_kind: str, filename: str, content_type: str, content: bytes) -> None:
@@ -10932,6 +11293,48 @@ class DatabaseSqagStorage:
             "size_bytes": size,
             "content": content,
         }
+
+    def _profile_layout_artifact_exists(
+        self,
+        profile_id: str,
+        *,
+        artifact_mode: str | None = None,
+        connection: Any | None = None,
+    ) -> bool:
+        safe_id = safe_resource_id(profile_id, "")
+        mode = artifact_mode or configured_artifact_storage_mode()
+        if not safe_id or mode not in {"database", "object"}:
+            return False
+        table = "sqag_file_artifacts" if mode == "database" else "sqag_object_artifacts"
+        query = (
+            f"select 1 from {table} where workspace_id = ? "
+            "and owner_type = ? and owner_id = ? and artifact_kind = ?"
+        )
+        if mode == "object":
+            query += " and status = ? and retention_status = ? and deleted_at is null"
+        query += " limit 1"
+        params = (self.workspace_id, "profile", safe_id, "quotation_layout")
+        if mode == "object":
+            params += ("active", "active")
+        def artifact_or_deleted_profile_exists(active_connection: Any) -> bool:
+            profile_row = active_connection.execute(
+                "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
+                (self.workspace_id, safe_id),
+            ).fetchone()
+            if not profile_row:
+                return False
+            try:
+                profile_payload = json.loads(profile_row["payload_json"])
+            except (KeyError, TypeError, json.JSONDecodeError):
+                return False
+            if self._is_deleted_profile_payload(profile_payload):
+                return False
+            return active_connection.execute(query, params).fetchone() is not None
+
+        if connection is not None:
+            return artifact_or_deleted_profile_exists(connection)
+        with self.connection() as read_connection:
+            return artifact_or_deleted_profile_exists(read_connection)
 
     def _active_object_artifact_rows(
         self,
@@ -10989,6 +11392,39 @@ class DatabaseSqagStorage:
             raise ObjectStorageContractError("Artifact metadata is incomplete.")
         artifact_id = f"obj-{secrets.token_hex(12)}"
         now = utc_timestamp()
+        safe_content_type = clean_text(content_type) or "application/octet-stream"
+        created_at = metadata.created_at or now
+        platform_user_id = self.user_id
+        session_id = ""
+        job_id = ""
+        existing = connection.execute(
+            "select artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at "
+            "from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+            (self.workspace_id, safe_owner_type, safe_owner_id, safe_kind),
+        ).fetchone()
+        reusable_existing = False
+        if existing:
+            try:
+                reusable_existing = (
+                    clean_text(existing["workspace_id"]) == self.workspace_id
+                    and clean_text(existing["owner_type"]) == safe_owner_type
+                    and clean_text(existing["owner_id"]) == safe_owner_id
+                    and clean_text(existing["artifact_kind"]) == safe_kind
+                    and clean_text(existing["object_key_ref"]) == metadata.storage_key
+                    and clean_text(existing["checksum_sha256"]) == metadata.checksum_sha256
+                    and int(existing["size_bytes"] or 0) == int(metadata.size_bytes)
+                    and clean_text(existing["status"]) == "active"
+                    and clean_text(existing["retention_status"]) == "active"
+                    and not clean_text(existing["deleted_at"])
+                )
+            except (KeyError, TypeError, ValueError):
+                reusable_existing = False
+        if reusable_existing:
+            artifact_id = clean_text(existing["artifact_id"]) or artifact_id
+            created_at = clean_text(existing["created_at"]) or created_at
+            platform_user_id = clean_text(existing["platform_user_id"])
+            session_id = clean_text(existing["session_id"])
+            job_id = clean_text(existing["job_id"])
         connection.execute(
             "insert into sqag_object_artifacts (artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at) "
             "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
@@ -10998,19 +11434,19 @@ class DatabaseSqagStorage:
                 self.workspace_id,
                 safe_owner_type,
                 safe_owner_id,
-                self.user_id,
-                "",
-                "",
+                platform_user_id,
+                session_id,
+                job_id,
                 safe_kind,
                 safe_filename,
-                clean_text(content_type) or "application/octet-stream",
+                safe_content_type,
                 metadata.size_bytes,
                 metadata.checksum_sha256,
                 "s3_compatible",
                 metadata.storage_key,
                 "active",
                 "active",
-                metadata.created_at or now,
+                created_at,
                 now,
                 None,
             ),
@@ -11186,6 +11622,29 @@ class DatabaseSqagStorage:
                 "Artifact batch recovery failed."
             ) from recovery_errors[0]
         plan.state = "compensated"
+        ForensicStore(
+            connection,
+            self.workspace_id,
+            self.user_id or "storage-lifecycle",
+            actor_key_version_value="storage-v1",
+        ).append_telemetry_event(
+            "storage_compensation",
+            "compensated",
+            action_reference=plan.owner_id,
+            run_reference=(
+                plan.owner_id
+                if plan.owner_type == "generated_quote_version"
+                else ""
+            ),
+            session_reference=(
+                plan.owner_id
+                if plan.owner_type in {"generated_quote", "uploaded_reference"}
+                else ""
+            ),
+            operation_route="object_storage",
+            purpose="artifact_compensation",
+            commit=False,
+        )
 
     def _prepare_object_artifact_batch(
         self,
@@ -11196,6 +11655,7 @@ class DatabaseSqagStorage:
         retained_kinds: set[str] | None = None,
         *,
         connection: Any,
+        quote_session: bool,
     ) -> ObjectArtifactBatchPlan:
         safe_owner_type = safe_resource_id(owner_type, "")
         safe_owner_id = safe_resource_id(owner_id, "")
@@ -11317,14 +11777,43 @@ class DatabaseSqagStorage:
                         raise ObjectStorageContractError(
                             "Artifact content does not match metadata."
                         )
+                    safe_filename = safe_segment(
+                        item.filename,
+                        item.artifact_kind or "artifact",
+                    )
+                    safe_content_type = clean_text(item.content_type) or "application/octet-stream"
+                    same_authoritative_metadata = (
+                        clean_text(previous_row.get("artifact_id"))
+                        and clean_text(previous_row.get("workspace_id")) == self.workspace_id
+                        and clean_text(previous_row.get("owner_type")) == safe_owner_type
+                        and clean_text(previous_row.get("owner_id")) == safe_owner_id
+                        and clean_text(previous_row.get("artifact_kind")) == item.artifact_kind
+                        and clean_text(previous_row.get("filename")) == safe_filename
+                        and clean_text(previous_row.get("content_type")) == safe_content_type
+                        and int(previous_row.get("size_bytes") or 0) == len(item.content)
+                        and clean_text(previous_row.get("checksum_sha256")) == checksum
+                        and clean_text(previous_row.get("object_provider_type")) == "s3_compatible"
+                        and clean_text(previous_row.get("object_key_ref")) == desired_key
+                        and clean_text(previous_row.get("status")) == "active"
+                        and clean_text(previous_row.get("retention_status")) == "active"
+                        and not clean_text(previous_row.get("deleted_at"))
+                        and (
+                            not quote_session
+                            or (
+                                clean_text(previous_row.get("platform_user_id")) == self.user_id
+                                and clean_text(previous_row.get("session_id")) == ""
+                                and clean_text(previous_row.get("job_id")) == ""
+                            )
+                        )
+                    )
                     plan.desired_metadata[item.artifact_kind] = (
                         ObjectArtifactMetadata(
                             workspace_id=self.workspace_id,
                             owner_type=safe_owner_type,
                             owner_id=safe_owner_id,
                             artifact_kind=item.artifact_kind,
-                            filename=item.filename,
-                            content_type=item.content_type,
+                            filename=safe_filename,
+                            content_type=safe_content_type,
                             size_bytes=len(item.content),
                             checksum_sha256=checksum,
                             storage_key=desired_key,
@@ -11332,6 +11821,8 @@ class DatabaseSqagStorage:
                             updated_at=previous.updated_at,
                         )
                     )
+                    if same_authoritative_metadata:
+                        plan.unchanged_kinds.add(item.artifact_kind)
                     continue
 
                 stored = backend.store_artifact(
@@ -11408,6 +11899,8 @@ class DatabaseSqagStorage:
                 row,
             )
         for item in plan.items:
+            if item.artifact_kind in plan.unchanged_kinds:
+                continue
             metadata = plan.desired_metadata[item.artifact_kind]
             if quote_session:
                 self._execute_upsert_object_quote_artifact(
@@ -11892,6 +12385,9 @@ class DatabaseSqagStorage:
         safe_id = safe_resource_id(profile_id, "")
         if not safe_id:
             return None
+        profile = self._read_payload("sqag_profiles", "profile_id", safe_id)
+        if profile is None or self._is_deleted_profile_payload(profile):
+            return None
         artifact = (
             self._read_object_file_artifact("profile", safe_id, "quotation_layout")
             if artifact_mode == "object"
@@ -11930,6 +12426,30 @@ class DatabaseSqagStorage:
             ),
             content_type=QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"],
             content=layout_bytes,
+        )
+
+    def _prepare_default_profile_layout_artifact(self) -> ArtifactBatchItem:
+        try:
+            layout_bytes = DEFAULT_QUOTE_LAYOUT_TEMPLATE_PATH.read_bytes()
+            validate_profile_layout_xlsx(layout_bytes)
+            if not embedded_layout_rules_from_xlsx_bytes(layout_bytes):
+                default_rules = default_layout_rules_payload()
+                if default_rules:
+                    layout_bytes = xlsx_bytes_with_embedded_layout_rules(
+                        layout_bytes,
+                        default_rules,
+                    )
+            validate_profile_layout_xlsx(layout_bytes)
+        except (OSError, ValueError) as exc:
+            raise ObjectStorageContractError(
+                "Default quotation layout is unavailable."
+            ) from exc
+        return ArtifactBatchItem(
+            artifact_kind="quotation_layout",
+            filename="quotation-layout.xlsx",
+            content_type=QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"],
+            content=layout_bytes,
+            source=DEFAULT_QUOTE_LAYOUT_TEMPLATE_PATH,
         )
 
     def _prepare_pricing_visual_artifacts(
@@ -12290,6 +12810,7 @@ class DatabaseSqagStorage:
                 set(QUOTE_SESSION_EXPORT_KINDS),
                 retained_kinds,
                 connection=connection,
+                quote_session=True,
             )
         return True, pending_artifacts, object_plan
 
@@ -12783,6 +13304,7 @@ class DatabaseSqagStorage:
                 retained_kinds | prior_kinds,
                 retained_kinds,
                 connection=connection,
+                quote_session=False,
             )
             return {
                 "changed": True,
@@ -13211,6 +13733,25 @@ class DatabaseSqagStorage:
                 normalized_visible.get("created_at") or now, now,
             ),
         )
+        ForensicStore(
+            connection,
+            self.workspace_id,
+            self.user_id or "storage-lifecycle",
+            actor_key_version_value="storage-v1",
+        ).append_telemetry_event(
+            "storage_staging",
+            "staged",
+            event_id=ForensicStore.telemetry_event_id(
+                "telemetry-storage-staging", run_id, now
+            ),
+            action_reference=job_id,
+            run_reference=run_id,
+            session_reference=session_id,
+            operation_route="quote_publication",
+            purpose="quote_publication_staging",
+            occurred_at=now,
+            commit=False,
+        )
 
     def _stage_versioned_quote_publication(
         self,
@@ -13306,6 +13847,23 @@ class DatabaseSqagStorage:
             for item in state["pending_artifacts"]:
                 if item.source is not None:
                     self._cleanup_object_staging_file(item.source, output_dir)
+        self._run_storage_transaction(
+            lambda connection: ForensicStore(
+                connection,
+                self.workspace_id,
+                self.user_id or "storage-lifecycle",
+                actor_key_version_value="storage-v1",
+            ).append_telemetry_event(
+                "storage_finalization",
+                "finalized",
+                action_reference=job_id,
+                run_reference=run_id,
+                session_reference=session_id,
+                operation_route="quote_publication",
+                purpose="quote_publication_finalization",
+                commit=False,
+            )
+        )
         if publish:
             files = self.quote_session_evidence_files(session_id, run_id)
             self._run_storage_transaction(
@@ -13420,6 +13978,7 @@ class DatabaseSqagStorage:
                     draft_kinds | prior_draft_kinds,
                     draft_kinds,
                     connection=connection,
+                    quote_session=False,
                 )
             if object_plan is not None and draft_plan is not None:
                 raise ObjectStorageContractError(
@@ -13747,12 +14306,13 @@ class DatabaseSqagStorage:
         safe_run_id = safe_reference(run_id, "run-")
         if not safe_id or not safe_run_id:
             raise ValueError("Quote publication identity is invalid.")
-        ForensicStore(
+        forensic_store = ForensicStore(
             connection,
             self.workspace_id,
             "publication-lifecycle",
             actor_key_version_value="storage-v1",
-        )._acquire_transaction_locks(
+        )
+        forensic_store._acquire_transaction_locks(
             ("quote_session", safe_id), ("generation_run", safe_run_id)
         )
         session_row = connection.execute(
@@ -13901,6 +14461,16 @@ class DatabaseSqagStorage:
         )
         if getattr(cursor, "rowcount", 0) != 1:
             raise ValueError("Quote publication state changed concurrently.")
+        forensic_store.append_telemetry_event(
+            "publication",
+            "completed",
+            action_reference=safe_run_id,
+            run_reference=safe_run_id,
+            session_reference=safe_id,
+            operation_route="quote_publication",
+            purpose="quote_publication",
+            commit=False,
+        )
 
     def mark_quote_session_publication_failed(self, session_id: str, run_id: str, error_code: str) -> bool:
         safe_id = safe_quote_session_id(session_id, "")
@@ -13994,7 +14564,7 @@ class DatabaseSqagStorage:
         if not safe_id:
             return True
 
-        def load_graph() -> tuple[list[Any], list[Any], list[Any], list[Any]]:
+        def load_graph() -> tuple[list[Any], list[Any], list[Any], list[Any], list[Any]]:
             versions = list(
                 connection.execute(
                     "select run_id, legal_hold from sqag_quote_publication_versions "
@@ -14034,9 +14604,43 @@ class DatabaseSqagStorage:
                     (self.workspace_id, safe_id),
                 ).fetchall()
             )
-            return versions, runs, feedback, standalone_audits
+            telemetry = list(
+                connection.execute(
+                    "select distinct event_id, legal_hold from sqag_telemetry_events "
+                    "where workspace_id = ? and (session_reference = ? or "
+                    "run_reference in (select run_id from sqag_generation_runs "
+                    "where workspace_id = ? and quote_session_id = ?) or "
+                    "run_reference in (select run_id from sqag_quote_publication_versions "
+                    "where workspace_id = ? and session_id = ?) or "
+                    "support_reference in (select feedback_id from sqag_feedback "
+                    "where workspace_id = ? and (session_id = ? or run_id in ("
+                    "select run_id from sqag_generation_runs where workspace_id = ? "
+                    "and (quote_session_id = ? or run_id in (select run_id from "
+                    "sqag_quote_publication_versions where workspace_id = ? and "
+                    "session_id = ?))) or publication_version_id in (select run_id "
+                    "from sqag_quote_publication_versions where workspace_id = ? and "
+                    "session_id = ?)))) order by event_id",
+                    (
+                        self.workspace_id,
+                        safe_id,
+                        self.workspace_id,
+                        safe_id,
+                        self.workspace_id,
+                        safe_id,
+                        self.workspace_id,
+                        safe_id,
+                        self.workspace_id,
+                        safe_id,
+                        self.workspace_id,
+                        safe_id,
+                        self.workspace_id,
+                        safe_id,
+                    ),
+                ).fetchall()
+            )
+            return versions, runs, feedback, standalone_audits, telemetry
 
-        versions, runs, feedback, standalone_audits = load_graph()
+        versions, runs, feedback, standalone_audits, telemetry = load_graph()
         forensic_store = ForensicStore(
             connection,
             self.workspace_id,
@@ -14059,14 +14663,19 @@ class DatabaseSqagStorage:
             for row in standalone_audits
             if (event_id := safe_reference(row["event_id"], "audit-"))
         )
+        lock_identities.extend(
+            ("telemetry_event", event_id)
+            for row in telemetry
+            if (event_id := safe_reference(row["event_id"]))
+        )
         forensic_store._acquire_transaction_locks(*lock_identities)
-        versions, runs, feedback, standalone_audits = load_graph()
+        versions, runs, feedback, standalone_audits, telemetry = load_graph()
         if (
             self.database_family == "postgres_compatible"
             and self.expected_session_role == SQAG_RUNTIME_DATABASE_ROLE
         ):
             hold_row = connection.execute(
-                "select public.sqag_quote_session_deletion_hold_blocked("
+                "select public.sqag_quote_session_deletion_hold_blocked_v2("
                 "cast(? as text), cast(? as text)) as hold_blocked",
                 (self.workspace_id, safe_id),
             ).fetchone()
@@ -14106,6 +14715,12 @@ class DatabaseSqagStorage:
             event_id = safe_reference(row["event_id"], "audit-")
             if bool(row["legal_hold"]) or (
                 event_id and forensic_store._active_hold("audit_event", event_id)
+            ):
+                return True
+        for row in telemetry:
+            event_id = safe_reference(row["event_id"])
+            if bool(row["legal_hold"]) or (
+                event_id and forensic_store._active_hold("telemetry_event", event_id)
             ):
                 return True
         return False
@@ -14181,6 +14796,39 @@ class DatabaseSqagStorage:
                     connection,
                     require_session_exclusive=True,
                 )
+                forensic_store = ForensicStore(
+                    connection,
+                    self.workspace_id,
+                    self.user_id or "storage-lifecycle",
+                    actor_key_version_value="storage-v1",
+                )
+                telemetry_rows = connection.execute(
+                    "select event_id, legal_hold, original_retention_expires_at "
+                    "from sqag_telemetry_events where workspace_id = ? "
+                    "and session_reference = ? order by event_id",
+                    (self.workspace_id, session_id),
+                ).fetchall()
+                for row in telemetry_rows:
+                    event_id = safe_reference(row["event_id"])
+                    if (
+                        not event_id
+                        or bool(row["legal_hold"])
+                        or forensic_store._active_hold("telemetry_event", event_id)
+                    ):
+                        raise RetentionGraphHeld("retention_session_telemetry_became_protected")
+                    forensic_store._authorize_delete("sqag_telemetry_events", event_id)
+                    cursor = connection.execute(
+                        "delete from sqag_telemetry_events where workspace_id = ? and event_id = ?",
+                        (self.workspace_id, event_id),
+                    )
+                    if getattr(cursor, "rowcount", 0) != 1:
+                        raise RetentionGraphHeld("retention_session_telemetry_delete_incomplete")
+                    forensic_store._receipt(
+                        "sqag_telemetry_events",
+                        event_id,
+                        str(row["original_retention_expires_at"]),
+                        iso_timestamp(utc_now()),
+                    )
             connection.execute(
                 "delete from sqag_quote_publication_artifacts "
                 "where workspace_id = ? and session_id = ?",
@@ -20913,7 +21561,11 @@ def finish_generate_pdf_job(job_id: str, payload: dict[str, Any], auth_session: 
         set_job_state(job_id, status="failed", result={"status": "failed", "errors": errors, "error_reference": error_reference}, errors=errors, error_reference=error_reference)
 
 
-def finish_basis_chat_job(job_id: str, payload: dict[str, Any]) -> None:
+def finish_basis_chat_job(
+    job_id: str,
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> None:
     try:
         result = answer_basis_chat(payload)
         set_job_state(job_id, status="completed", result=result, errors=result.get("warnings") or [])
@@ -20936,8 +21588,16 @@ def run_job_worker(
     ai_tracking_context: dict[str, Any] | None = None,
     auth_session: dict[str, Any] | None = None,
 ) -> None:
-    with ai_log_tracking_scope(ai_tracking_context):
-        if worker in {finish_generate_job, finish_generate_pdf_job, finish_draft_job}:
+    with ai_log_tracking_scope(
+        ai_tracking_context,
+        auth_session=auth_session,
+    ):
+        if worker in {
+            finish_generate_job,
+            finish_generate_pdf_job,
+            finish_draft_job,
+            finish_basis_chat_job,
+        }:
             worker(job_id, payload, auth_session=auth_session)
         else:
             worker(job_id, payload)
@@ -20974,10 +21634,188 @@ def forensic_store_for_auth_session(auth_session: dict[str, Any] | None = None):
     database_url = f"sqlite:///{database_path.as_posix()}"
     with sqlite_storage_connection(database_url) as connection:
         migration_path = PROJECT_ROOT / "migrations" / "004_generation_forensics_feedback_retention.sql"
+        telemetry_migration_path = PROJECT_ROOT / "migrations" / "009_telemetry_events.sql"
         upgrade_legacy_local_forensic_schema(connection)
         connection.executescript(migration_path.read_text(encoding="utf-8"))
+        connection.executescript(telemetry_migration_path.read_text(encoding="utf-8"))
         connection.commit()
         yield ForensicStore(connection, workspace_id, actor_tracking_id, local_mode=True, actor_key_version_value="local-v1")
+
+
+def telemetry_feed_for_auth_session(
+    auth_session: dict[str, Any] | None,
+    raw_query: str,
+) -> dict[str, Any]:
+    if not platform_auth_session_complete(auth_session):
+        raise PermissionError("Platform telemetry capability is required.")
+    permissions = permissions_for_auth_session(auth_session)
+    if not permissions.get("canSupportForensics"):
+        raise PermissionError("Platform telemetry capability is required.")
+    cursor_text, limit = parse_telemetry_feed_query(raw_query)
+    workspace_id = platform_workspace_id_from_auth_session(auth_session)
+    cursor = decode_telemetry_cursor(cursor_text, workspace_id) if cursor_text else None
+    with forensic_store_for_auth_session(auth_session) as store:
+        result = store.feed_telemetry_events(cursor, limit=limit)
+    next_cursor = result.get("next_cursor")
+    result["next_cursor"] = (
+        encode_telemetry_cursor(workspace_id, next_cursor[0], next_cursor[1])
+        if isinstance(next_cursor, tuple) and len(next_cursor) == 2
+        else None
+    )
+    return result
+
+
+def append_runtime_telemetry(
+    auth_session: dict[str, Any] | None,
+    event_type: str,
+    event_status: str,
+    **fields: Any,
+) -> dict[str, Any]:
+    try:
+        with forensic_store_for_auth_session(auth_session) as store:
+            return store.append_telemetry_event(
+                event_type,
+                event_status,
+                **fields,
+            )
+    except SqagStorageAccessError:
+        raise
+    except (TelemetryConflictError, TelemetryUnavailableError) as exc:
+        raise SqagStorageAccessError(
+            "SQAG telemetry storage is unavailable.",
+            status=503,
+            reason="telemetry_persistence_unavailable",
+        ) from exc
+    except Exception as exc:
+        raise SqagStorageAccessError(
+            "SQAG telemetry storage is unavailable.",
+            status=503,
+            reason="telemetry_persistence_failed",
+        ) from exc
+
+
+def append_ai_attempt_telemetry(
+    auth_session: dict[str, Any],
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    raw_status = log_event_name(record.get("status"))
+    status = (
+        "success"
+        if raw_status in {"success", "completed", "ok"}
+        else "running"
+        if raw_status in {"running", "queued"}
+        else "failed"
+    )
+    provider = clean_text(record.get("provider")).lower()
+    provider = provider if provider in {"openai", "deepseek"} else ""
+    model = safe_telemetry_label(record.get("model")) or ""
+    reasoning = clean_text(
+        record.get("reasoning_level") or record.get("analysis_mode")
+    ).lower()
+    if reasoning == "high_quality":
+        reasoning = "high"
+    if reasoning not in {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "standard"}:
+        reasoning = ""
+    feature = log_event_name(record.get("feature"))
+    operation_route = safe_telemetry_route(
+        record.get("operation_route") or record.get("route") or feature
+    ) or ""
+    purpose = safe_telemetry_label(record.get("purpose") or feature) or ""
+    failure_class = clean_text(record.get("failure_kind")).lower()
+    if failure_class not in TELEMETRY_FAILURE_CLASSES:
+        failure_class = ""
+    lineage = safe_telemetry_label(
+        record.get("retry_lineage_id") or record.get("ai_run_id")
+    ) or ""
+
+    def safe_int(value: Any) -> int | None:
+        if value in (None, "") or isinstance(value, bool):
+            return None
+        try:
+            result = int(value)
+        except (TypeError, ValueError):
+            return None
+        return result if result >= 0 else None
+
+    attempt_index = safe_int(record.get("attempt_index"))
+    batch_index = safe_int(record.get("batch_index"))
+    usage_available = safe_int(record.get("usage_available"))
+    if usage_available not in {0, 1}:
+        usage_available = None
+    attempt_number = attempt_index
+    if attempt_number is not None and batch_index is not None:
+        attempt_number = attempt_number * 1000 + batch_index
+    event_id = ""
+    if lineage and attempt_number is not None:
+        event_seed = "|".join(
+            (
+                lineage,
+                provider,
+                model,
+                str(attempt_number),
+                feature,
+            )
+        )
+        event_id = f"telemetry-ai-{hashlib.sha256(event_seed.encode('utf-8')).hexdigest()[:24]}"
+
+    def safe_cost(value: Any) -> float | None:
+        if value in (None, "") or isinstance(value, bool):
+            return None
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        return result if math.isfinite(result) and result >= 0 else None
+
+    estimated_cost = safe_cost(record.get("estimated_cost_usd"))
+    actual_cost = safe_cost(record.get("actual_cost_usd"))
+    revision = clean_text(
+        record.get("deployment_revision")
+        or os.getenv("GIT_REVISION")
+        or os.getenv("COMMIT_SHA")
+    )
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", revision):
+        revision = ""
+
+    def decision_value(value: Any) -> str:
+        value = clean_text(value).lower()
+        return value if value in {"allowed", "denied", "not_evaluated"} else ""
+
+    run_reference = safe_reference(record.get("run_id"), "run-")
+    session_reference = safe_telemetry_label(record.get("session_id")) or ""
+    action_reference = safe_telemetry_label(record.get("error_reference")) or ""
+    with forensic_store_for_auth_session(auth_session) as store:
+        return store.append_telemetry_event(
+            "ai_provider_attempt",
+            status,
+            event_id=event_id,
+            action_reference=action_reference,
+            run_reference=run_reference,
+            session_reference=session_reference,
+            retry_lineage_id=lineage,
+            attempt_number=attempt_number,
+            provider=provider,
+            model=model,
+            reasoning_level=reasoning,
+            operation_route=operation_route,
+            purpose=purpose,
+            failure_class=failure_class,
+            duration_ms=safe_int(record.get("duration_ms")),
+            usage_available=usage_available,
+            input_tokens=safe_int(record.get("input_tokens")),
+            output_tokens=safe_int(record.get("output_tokens")),
+            total_tokens=safe_int(record.get("total_tokens")),
+            cache_read_tokens=safe_int(record.get("cache_read_tokens")),
+            cache_write_tokens=safe_int(record.get("cache_write_tokens")),
+            estimated_cost=estimated_cost,
+            actual_cost=actual_cost,
+            currency="USD" if estimated_cost is not None or actual_cost is not None else "",
+            cost_version=record.get("cost_version", ""),
+            quota_decision=decision_value(record.get("quota_decision")),
+            rate_limit_decision=decision_value(record.get("rate_limit_decision")),
+            abuse_decision=decision_value(record.get("abuse_decision")),
+            deployment_revision=revision,
+        )
 
 
 FORENSIC_MANIFEST_ENVELOPE_RESERVE_BYTES = 4096
@@ -22071,6 +22909,23 @@ def _run_quote_job(
 
     payload = generation_payload_with_profile_defaults(payload, auth_session=auth_session)
     errors = validate_generation_payload(payload, auth_session=auth_session)
+    try:
+        append_runtime_telemetry(
+            auth_session,
+            "validation",
+            "failed" if errors else "success",
+            event_id=ForensicStore.telemetry_event_id(
+                "telemetry-validation", generation_run_id or job_id
+            ),
+            action_reference=job_id,
+            run_reference=generation_run_id,
+            session_reference=validated_session_id,
+            operation_route="generation",
+            purpose="generation_input",
+            failure_class="schema_validation_failed" if errors else "",
+        )
+    except SqagStorageAccessError as exc:
+        return storage_block(exc)
     if errors:
         if PRICING_REFERENCE_SELECTION_ERROR_MESSAGE in errors:
             log_database_pricing_reference_resolution_block(payload)
@@ -22554,6 +23409,11 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             return
         if self.block_unauthenticated_request(path):
             return
+        if path == TELEMETRY_FEED_ENDPOINT:
+            if self.block_telemetry_feed_rate_limit():
+                return
+            self.handle_telemetry_feed(parsed.query)
+            return
         if path == "/":
             self.send_index_file()
             return
@@ -22857,6 +23717,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         except RequestBodyError as exc:
             self.send_json({"status": "blocked", "errors": safe_error_messages([str(exc)])}, status=exc.status)
             return
+        auth_session = self.current_auth_session()
         request_ai_tracking = self.current_ai_log_tracking()
 
         if parsed.path == "/api/pricing-reference/validate":
@@ -22868,7 +23729,10 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             if not allowed:
                 self.send_json(error, status=403)
                 return
-            with ai_log_tracking_scope(request_ai_tracking):
+            with ai_log_tracking_scope(
+                request_ai_tracking,
+                auth_session=auth_session,
+            ):
                 self.send_json(pricing_reference_import_preview(payload))
             return
 
@@ -22905,9 +23769,28 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                     except SqagStorageAccessError as exc:
                         self.send_json(storage_access_error_payload(exc), status=exc.status)
                         return
-                with ai_log_tracking_scope(request_ai_tracking):
+                with ai_log_tracking_scope(
+                    request_ai_tracking,
+                    auth_session=auth_session,
+                ):
                     reference, metadata_enrichment_status = pricing_reference_with_ai_metadata_before_save(reference)
                 saved = storage.save_pricing_reference(reference)
+                append_runtime_telemetry(
+                    auth_session,
+                    "pricing_change",
+                    "completed",
+                    action_reference=safe_resource_id(saved.get("id"), ""),
+                    operation_route=parsed.path,
+                    purpose="pricing_reference_saved",
+                )
+                append_runtime_telemetry(
+                    auth_session,
+                    "operator_action",
+                    "completed",
+                    action_reference=safe_resource_id(saved.get("id"), ""),
+                    operation_route=parsed.path,
+                    purpose="settings_update",
+                )
             except SqagStorageAccessError as exc:
                 self.send_json(storage_access_error_payload(exc), status=exc.status)
                 return
@@ -22939,6 +23822,22 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                     return
                 workspace = storage.workspace()
                 saved = storage.save_profile(profile)
+                append_runtime_telemetry(
+                    auth_session,
+                    "profile_change",
+                    "completed",
+                    action_reference=safe_resource_id(saved.get("id"), ""),
+                    operation_route=parsed.path,
+                    purpose="profile_saved",
+                )
+                append_runtime_telemetry(
+                    auth_session,
+                    "operator_action",
+                    "completed",
+                    action_reference=safe_resource_id(saved.get("id"), ""),
+                    operation_route=parsed.path,
+                    purpose="settings_update",
+                )
             except SqagStorageAccessError as exc:
                 self.send_json(storage_access_error_payload(exc), status=exc.status)
                 return
@@ -23028,6 +23927,15 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 if storage is None:
                     return
                 session = storage.create_or_update_quote_session(payload)
+                append_runtime_telemetry(
+                    auth_session,
+                    "configuration",
+                    "completed",
+                    action_reference=safe_quote_session_id(session.get("session_id"), ""),
+                    session_reference=safe_quote_session_id(session.get("session_id"), ""),
+                    operation_route=parsed.path,
+                    purpose="quote_session_saved",
+                )
             except SqagStorageAccessError as exc:
                 self.send_json(storage_access_error_payload(exc), status=exc.status)
                 return
@@ -23042,7 +23950,10 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             if not allowed:
                 self.send_json(error, status=403)
                 return
-            with ai_log_tracking_scope(request_ai_tracking):
+            with ai_log_tracking_scope(
+                request_ai_tracking,
+                auth_session=auth_session,
+            ):
                 if not image_entries(payload):
                     errors = safe_error_messages([MISSING_IMAGES_MESSAGE])
                     write_local_log("draft_blocked", {"errors": errors})
@@ -23076,7 +23987,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                     return
                 payload = resolved_payload
                 try:
-                    result = draft_quote_basis(payload, auth_session=self.current_auth_session())
+                    result = draft_quote_basis(payload, auth_session=auth_session)
                     if result.get("status") == "blocked":
                         self.send_json(result, status=503)
                         return
@@ -23271,6 +24182,170 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
 
     def current_ai_log_tracking(self) -> dict[str, Any]:
         return ai_log_tracking_metadata(self.current_auth_session())
+
+    def record_boundary_telemetry(
+        self,
+        event_type: str,
+        event_status: str,
+        **fields: Any,
+    ) -> None:
+        try:
+            append_runtime_telemetry(
+                self.current_auth_session(),
+                event_type,
+                event_status,
+                **fields,
+            )
+        except SqagStorageAccessError:
+            write_local_log(
+                "forensic_persistence_failed",
+                {
+                    "error_reference": new_error_reference(),
+                    "reason": "telemetry_boundary_persistence_failed",
+                    "event_type": log_event_name(event_type),
+                },
+            )
+
+    def block_telemetry_feed_rate_limit(self) -> bool:
+        client_id = self.client_address[0] if self.client_address else "unknown"
+        if not is_rate_limited(
+            effective_rate_limit_client_id(
+                client_id,
+                single_forwarded_for_header_value(self.headers),
+            ),
+            TELEMETRY_FEED_ENDPOINT,
+        ):
+            return False
+        error_reference = new_error_reference()
+        self.record_boundary_telemetry(
+            "rate_limit",
+            "rate_limited",
+            action_reference=error_reference,
+            operation_route=TELEMETRY_FEED_ENDPOINT,
+            purpose="telemetry_feed",
+            rate_limit_decision="denied",
+        )
+        write_local_log(
+            "abuse_signal",
+            {
+                "error_reference": error_reference,
+                "reason": "rate_limit",
+                "path": TELEMETRY_FEED_ENDPOINT,
+                "status": 429,
+            },
+        )
+        self.send_json(
+            {
+                "status": "denied",
+                "errors": ["Telemetry feed is rate limited."],
+                "error_reference": error_reference,
+            },
+            status=429,
+        )
+        return True
+
+    def handle_telemetry_feed(self, raw_query: str) -> None:
+        try:
+            result = telemetry_feed_for_auth_session(
+                self.current_auth_session(),
+                raw_query,
+            )
+        except ValueError:
+            error_reference = new_error_reference()
+            self.record_boundary_telemetry(
+                "abuse",
+                "denied",
+                action_reference=error_reference,
+                operation_route=TELEMETRY_FEED_ENDPOINT,
+                purpose="telemetry_feed_parameters",
+                abuse_decision="denied",
+            )
+            write_local_log(
+                "server_error",
+                {
+                    "error_reference": error_reference,
+                    "reason": "telemetry_feed_parameters_invalid",
+                    "status": 400,
+                },
+            )
+            self.send_json(
+                {
+                    "status": "failed",
+                    "errors": ["Telemetry feed parameters are invalid."],
+                    "error_reference": error_reference,
+                },
+                status=400,
+            )
+            return
+        except PermissionError:
+            error_reference = new_error_reference()
+            self.record_boundary_telemetry(
+                "security",
+                "denied",
+                action_reference=error_reference,
+                operation_route=TELEMETRY_FEED_ENDPOINT,
+                purpose="telemetry_feed_capability",
+            )
+            write_local_log(
+                "security_event",
+                {
+                    "error_reference": error_reference,
+                    "reason": "telemetry_feed_capability_denied",
+                    "status": 403,
+                },
+            )
+            self.send_json(
+                {
+                    "status": "denied",
+                    "errors": ["Telemetry feed is not available."],
+                    "error_reference": error_reference,
+                },
+                status=403,
+            )
+            return
+        except (SqagStorageAccessError, TelemetryUnavailableError):
+            error_reference = new_error_reference()
+            write_local_log(
+                "server_error",
+                {
+                    "error_reference": error_reference,
+                    "reason": "telemetry_feed_unavailable",
+                    "status": 503,
+                },
+            )
+            self.send_json(
+                {
+                    "status": "unavailable",
+                    "errors": ["Telemetry feed is unavailable."],
+                    "error_reference": error_reference,
+                },
+                status=503,
+            )
+            return
+        except Exception as exc:  # pragma: no cover - defensive HTTP boundary
+            error_reference = new_error_reference()
+            write_local_log(
+                "server_error",
+                {
+                    "error_reference": error_reference,
+                    "reason": "telemetry_feed_failed",
+                    "status": 500,
+                },
+            )
+            self.send_json(
+                failed_result_payload(error_reference),
+                status=500,
+            )
+            return
+        self.send_json(
+            {
+                "status": "healthy",
+                "events": result.get("events", []),
+                "high_watermark": result.get("high_watermark", 0),
+                "next_cursor": result.get("next_cursor"),
+            },
+            status=200,
+        )
 
     def block_platform_launch_rate_limit(self) -> bool:
         return self.block_platform_boundary_rate_limit(
@@ -24067,6 +25142,18 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             return
         content_type = mimetypes.guess_type(str(resolved))[0] or "application/octet-stream"
         body = resolved.read_bytes()
+        try:
+            append_runtime_telemetry(
+                auth_session,
+                "download",
+                "completed",
+                action_reference=job_id,
+                operation_route="/api/jobs/files",
+                purpose=filename,
+            )
+        except SqagStorageAccessError as exc:
+            self.send_json(storage_access_error_payload(exc), status=exc.status)
+            return
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         disposition = "inline" if filename == "quotation.pdf" else "attachment"
@@ -24098,6 +25185,19 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             safe_filename = safe_segment(file_path.name, expected_filename)
         if not body:
             self.send_json({"error": "Not found"}, status=404)
+            return
+        try:
+            append_runtime_telemetry(
+                self.current_auth_session(),
+                "download",
+                "completed",
+                action_reference=safe_id,
+                session_reference=safe_id,
+                operation_route="/api/quote-sessions/download",
+                purpose=normalized_kind,
+            )
+        except SqagStorageAccessError as exc:
+            self.send_json(storage_access_error_payload(exc), status=exc.status)
             return
         self.send_response(200)
         self.send_header("Content-Type", content_type)

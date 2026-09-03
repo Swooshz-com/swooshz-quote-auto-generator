@@ -19,6 +19,7 @@ chat, logs, screenshots, and command history.
 5. `006_quote_publication_versions_postgres.sql`
 6. `007_feedback_publication_binding_postgres.sql`
 7. `008_quote_session_deletion_hold_authority_postgres.sql`
+8. `009_telemetry_events_postgres.sql`
 
 Successful applications are recorded in `public.sqag_schema_migrations` with
 the sequence number, migration ID, SHA-256 source checksum, and database
@@ -27,6 +28,17 @@ bare CR line endings are normalized to LF. The same canonical bytes are
 decoded and executed. A transaction-scoped PostgreSQL advisory lock
 serializes migration processes, and the ledger row and its migration SQL
 commit in the same transaction.
+
+Migration 009 creates `sqag_telemetry_source_state` and
+`sqag_telemetry_events`, their feed/retention/retry indexes, and the existing
+append-only/delete-authorization trigger bindings. It stores only bounded
+metadata, preserves workspace-scoped source ordering, and keeps source state
+after event retention or deletion. Its historical v1 quote-session hold
+authority remains bound to migration 008; the independent telemetry-aware v2
+authority is bound to migration 009 and its callable relation inventory does
+not include `sqag_telemetry_source_state`. The migration is source- and
+checksum-locked like the earlier migrations; this run authorizes no live
+migration.
 
 The runner accepts only an exact ordered prefix of the repository manifest.
 It fails closed for checksum drift, unknown or out-of-order rows, a complete
@@ -68,7 +80,7 @@ reads the catalog and ledger, rolls the transaction back, and prints
 privacy-safe metadata. A ready pre-apply report may have a missing or present
 ledger and may have pending IDs, but applied IDs must be the exact manifest
 prefix and pending IDs the exact manifest suffix. A target with no reserved
-public `sqag_` objects reports all seven IDs pending and is safe for a
+public `sqag_` objects reports all eight IDs pending and is safe for a
 separately approved first application, even when unrelated provider/public
 tables, indexes, routines, or triggers are present. Known premature SQAG
 objects and unknown `sqag_` objects remain fail-closed blockers; existing
@@ -154,13 +166,15 @@ out-of-order/checksum rows, rollback, advisory-lock serialization,
 applied-prefix drift, post-apply and no-op behavior, and the actual CLI under
 wrong runtime, maintenance, bootstrap, provider-like, and assumed-role
 authorities. The real PostgreSQL-17 applied-prefix matrix holds `001` through
-`007` applied with `008` pending and proves read-only RED behavior for a
-missing and drifted required index, trigger, and routine. It also proves
+`008` applied with `009` pending and proves read-only RED behavior for a
+missing and drifted required telemetry index and trigger, while retaining the
+historical v1 routine checks from migration 008 and the exact telemetry-aware
+v2 routine checks from migration 009. It also proves
 lexically-before and lexically-after same-name trigger collisions, the
 canonical-missing plus wrong-table-extra case, missing-ledger known and unknown
 SQAG routines, an unrelated-provider-routine GREEN control, a managed-empty
-GREEN control, and a valid present empty ledger with the premature `008`
-callable. Every applicable inspection has an identical mutation-relevant
+GREEN control, and a valid present empty ledger with premature `009` telemetry
+objects. Every applicable inspection has an identical mutation-relevant
 BEFORE/AFTER snapshot.
 
 The assumed-role case creates one generated LOGIN role with no superuser,
@@ -186,34 +200,35 @@ After the assumed-role refusal, all generated-role sessions are closed, the
 database-local role setting is reset, membership and `CONNECT` are revoked,
 and the role is dropped. The test proves no role, membership, database ACL,
 `pg_db_role_setting`, shared dependency, or owned-object residue before
-rechecking the clean `001`-`007` / pending-`008` preflight.
+rechecking the clean `001`-`008` / pending-`009` preflight.
 
-The causal transition is one disposable target and has no post-`008` helper
-repair: complete the ACL/default-ACL fixture first, apply `001` through `007`,
+The causal transition is one disposable target and has no post-`009` helper
+repair: complete the ACL/default-ACL fixture first, apply `001` through `008`,
 take a mutation-relevant BEFORE snapshot, and execute the production preflight
 script in a bounded child interpreter with a scrubbed minimal environment.
-Require the actual PRE JSON to show exactly `001` through `007` applied and
-only `008` pending, with an identical BEFORE/AFTER snapshot. Exercise every
+Require the actual PRE JSON to show exactly `001` through `008` applied and
+only `009` pending, with an identical BEFORE/AFTER snapshot. Exercise every
 wrong-authority actual-CLI negative, including the assumed-role
 `session_user != current_user` case, with immutable snapshots; tear down that
 role narrowly and prove no role, membership, database ACL, database-local
 setting, owned-object, or related residue. Execute the actual PRE child process
-again on the same clean target and require the same `001`-`007` / pending-`008`
-report before applying `008`.
+again on the same clean target and require the same `001`-`008` / pending-`009`
+report before applying `009`.
 
-Apply `008` with the actual CLI through the dedicated migrator URL, immediately
-prove the migration-created callable directly from the catalog
-(schema/name/identity, boolean result, SQL/STABLE/PARALLEL
-UNSAFE/non-leakproof properties, owner, security-definer flag, exact search
-path, body/definition and relation inventory, and exact ACL), then take a
-pre-POST snapshot and execute the actual POST preflight child process with the
-dedicated migrator, runtime, and maintenance URLs. Require exact final heads,
-zero pending IDs and blockers, verified runtime and maintenance summaries, no
-URL/secret leakage, and an identical read-only BEFORE/AFTER snapshot. Prove
-the runtime role is denied direct legal-hold SELECT, and run the actual CLI a
-second time as an unchanged no-op with no ledger/object/ACL mutation. A second
-POST is not required. Emit
-`RUN313_PG17_CAUSAL_TRANSITION_EXECUTED` only as the final causal action.
+Apply `009` with the actual CLI through the dedicated migrator URL, immediately
+prove the telemetry tables, indexes, trigger bindings, and migration-ledger
+row directly from the catalog, then take a pre-POST snapshot and execute the
+actual POST preflight child process with the dedicated migrator, runtime, and
+maintenance URLs. Require exact final heads, zero pending IDs and blockers,
+verified runtime and maintenance summaries, no URL/secret leakage, and an
+identical read-only BEFORE/AFTER snapshot. Prove the v1 catalog/source/ACL
+snapshot is unchanged and the v2 catalog/source/ACL/relation contract is
+exact. Prove the runtime role is denied direct legal-hold SELECT. The causal
+behavior must additionally prove linked held telemetry, enabled linked
+`telemetry_event` holds, invalid telemetry fail-closed behavior, valid
+unheld deletion, and same-workspace unrelated and wrong-workspace isolation.
+Run the actual CLI a second time as an unchanged no-op with no ledger/object/
+ACL mutation. A second POST is not required.
 
 Live retention/delete verification is not a migration action. Verification
 commands never grant themselves migration authority, create or populate the
