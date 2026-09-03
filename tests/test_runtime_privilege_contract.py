@@ -3579,6 +3579,10 @@ order by object_kind, object_schema, object_name, object_type
                 self.timeline.append(event)
                 return event
 
+            def _name_first_event(self, event, name):
+                if not any(item.get("event") == name for item in self.timeline):
+                    event["event"] = name
+
             def store_artifact(self, **kwargs):
                 event_index = len(self.events)
                 self.events.append(
@@ -3607,6 +3611,15 @@ order by object_kind, object_schema, object_name, object_type
                 metadata = super().store_artifact(**kwargs)
                 record["metadata"] = metadata
                 timeline_event["succeeded"] = True
+                if self.label == "active" and kwargs["artifact_kind"] == verifier.SYNTHETIC_ACTIVE_PROBE_KIND:
+                    self._name_first_event(timeline_event, "active_probe_store_success")
+                if self.label == "restore" and kwargs["artifact_kind"] == verifier.SYNTHETIC_RESTORE_PROBE_KIND:
+                    self._name_first_event(timeline_event, "restore_probe_store_success")
+                if self.label == "restore" and kwargs["artifact_kind"] == "xlsx":
+                    self._name_first_event(
+                        timeline_event,
+                        "first_restore_generated_or_product_object_destination_write",
+                    )
                 return metadata
 
             def retrieve_artifact(self, metadata, *, workspace_id):
@@ -3638,10 +3651,18 @@ order by object_kind, object_schema, object_name, object_type
                         workspace_id=workspace_id,
                     )
                 except Exception:
+                    if self.label == "restore" and metadata.owner_id.endswith("-active-probe"):
+                        timeline_event["event"] = "restore_denied_exact_returned_active_metadata"
+                    if self.label == "active" and metadata.owner_id.endswith("-restore-probe"):
+                        timeline_event["event"] = "active_denied_exact_returned_restore_metadata"
                     raise
                 record["succeeded"] = True
                 record["content"] = content
                 timeline_event["succeeded"] = True
+                if self.label == "active" and metadata.owner_id.endswith("-active-probe"):
+                    self._name_first_event(timeline_event, "active_probe_self_read_success")
+                if self.label == "restore" and metadata.owner_id.endswith("-restore-probe"):
+                    self._name_first_event(timeline_event, "restore_probe_self_read_success")
                 return content
 
             def delete_artifact(self, metadata, *, workspace_id):
@@ -3682,13 +3703,25 @@ order by object_kind, object_schema, object_name, object_type
                 return getattr(self.inner, name)
 
             def _record(self, operation):
-                self.timeline.append(
-                    {
-                        "index": len(self.timeline),
-                        "label": self.label,
-                        "operation": operation,
+                event = {
+                    "index": len(self.timeline),
+                    "label": self.label,
+                    "operation": operation,
+                }
+                if (
+                    self.label == "restore"
+                    and operation in {
+                        "restore_database_profile_write",
+                        "restore_database_pricing_write",
+                        "restore_database_session_write",
                     }
-                )
+                    and not any(
+                        item.get("event") == "first_restore_database_or_owner_destination_write"
+                        for item in self.timeline
+                    )
+                ):
+                    event["event"] = "first_restore_database_or_owner_destination_write"
+                self.timeline.append(event)
 
             def save_profile(self, profile):
                 if self.label == "restore":
@@ -3976,6 +4009,85 @@ order by object_kind, object_schema, object_name, object_type
         for denial in active_probe_denial + restore_probe_denial:
             self.assertLess(denial["index"], first_restore_profile_write["index"])
             self.assertLess(denial["index"], first_restore_product_write["index"])
+
+        def named_event(name):
+            matches = [event for event in timeline if event.get("event") == name]
+            self.assertEqual(len(matches), 1, name)
+            return matches[0]
+
+        active_probe_store_success = named_event("active_probe_store_success")
+        active_probe_self_read_success = named_event("active_probe_self_read_success")
+        restore_probe_store_success = named_event("restore_probe_store_success")
+        restore_probe_self_read_success = named_event("restore_probe_self_read_success")
+        restore_denied_exact = named_event(
+            "restore_denied_exact_returned_active_metadata"
+        )
+        active_denied_exact = named_event(
+            "active_denied_exact_returned_restore_metadata"
+        )
+        first_restore_database_write = named_event(
+            "first_restore_database_or_owner_destination_write"
+        )
+        first_restore_generated_write = named_event(
+            "first_restore_generated_or_product_object_destination_write"
+        )
+        self.assertLess(active_probe_store_success["index"], active_probe_self_read_success["index"])
+        self.assertLess(active_probe_self_read_success["index"], restore_probe_store_success["index"])
+        self.assertLess(restore_probe_store_success["index"], restore_probe_self_read_success["index"])
+        for store in (active_probe_store_success, restore_probe_store_success):
+            for denial in (restore_denied_exact, active_denied_exact):
+                self.assertLess(store["index"], denial["index"])
+        for self_read in (active_probe_self_read_success, restore_probe_self_read_success):
+            for denial in (restore_denied_exact, active_denied_exact):
+                self.assertLess(self_read["index"], denial["index"])
+        for denial in (restore_denied_exact, active_denied_exact):
+            self.assertLess(denial["index"], first_restore_database_write["index"])
+            self.assertLess(denial["index"], first_restore_generated_write["index"])
+
+        active_probe_store_call = next(
+            call
+            for call in active_backend.store_calls
+            if call["artifact_kind"] == verifier.SYNTHETIC_ACTIVE_PROBE_KIND
+        )
+        restore_probe_store_call = next(
+            call
+            for call in restore_backend.store_calls
+            if call["artifact_kind"] == verifier.SYNTHETIC_RESTORE_PROBE_KIND
+        )
+        restore_cross_call = next(
+            call
+            for call in restore_backend.retrieve_calls
+            if call["metadata"].owner_id.endswith("-active-probe")
+        )
+        active_cross_call = next(
+            call
+            for call in active_backend.retrieve_calls
+            if call["metadata"].owner_id.endswith("-restore-probe")
+        )
+        self.assertIs(
+            restore_cross_call["metadata"],
+            active_probe_store_call["metadata"],
+        )
+        self.assertIs(
+            active_cross_call["metadata"],
+            restore_probe_store_call["metadata"],
+        )
+        self.assertEqual(
+            verifier._immutable_artifact_metadata_tuple(restore_cross_call["metadata"]),
+            verifier._immutable_artifact_metadata_tuple(active_probe_store_call["metadata"]),
+        )
+        self.assertEqual(
+            verifier._immutable_artifact_metadata_tuple(active_cross_call["metadata"]),
+            verifier._immutable_artifact_metadata_tuple(restore_probe_store_call["metadata"]),
+        )
+        self.assertEqual(
+            restore_cross_call["metadata"].storage_key,
+            active_probe_store_call["metadata"].storage_key,
+        )
+        self.assertEqual(
+            active_cross_call["metadata"].storage_key,
+            restore_probe_store_call["metadata"].storage_key,
+        )
         self.assertEqual(active_backend._objects, {})
         self.assertEqual(restore_backend._objects, {})
 

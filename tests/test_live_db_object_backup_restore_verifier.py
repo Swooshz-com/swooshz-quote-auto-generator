@@ -1,14 +1,17 @@
 import contextlib
+from dataclasses import replace
 import importlib.util
 import io
 import json
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT / "scripts" / "verify_live_db_object_backup_restore.py"
+GLOBAL_AMBIENT_ROUTE_CALLS = 0
 
 
 def load_verifier():
@@ -153,6 +156,7 @@ class FakeStorage:
         content_type: str,
         metadata,
     ) -> None:
+        self.events.append(("storage-write", self.label, "product_object_metadata", session_id))
         self._maybe_fail("write")
         checksum = metadata.checksum_sha256
         if self.pairing_mismatch:
@@ -225,6 +229,8 @@ class FakeStorage:
 
 
 class FakeBackend:
+    _is_in_memory_test_adapter = True
+
     def __init__(
         self,
         metadata_cls,
@@ -236,6 +242,10 @@ class FakeBackend:
         object_key_fn=None,
         fail_artifact_kind: str = "",
         raise_after_store_kind: str = "",
+        cross_denial_failure: str = "",
+        cross_denial_mode: str = "",
+        tamper_store_metadata: bool = False,
+        tamper_probe_retrieve: bool = False,
         events: list[tuple[object, ...]] | None = None,
         state: dict[str, dict[str, object]] | None = None,
     ):
@@ -246,7 +256,13 @@ class FakeBackend:
         self.cleanup_fails = cleanup_fails
         self.fail_artifact_kind = fail_artifact_kind
         self.raise_after_store_kind = raise_after_store_kind
+        self.cross_denial_failure = cross_denial_failure
+        self.cross_denial_mode = cross_denial_mode
+        self.tamper_store_metadata = tamper_store_metadata
+        self.tamper_probe_retrieve = tamper_probe_retrieve
         self.events = events if events is not None else []
+        self.store_metadata_objects: list[object] = []
+        self.retrieve_metadata_objects: list[object] = []
         self.object_key_fn = object_key_fn or (
             lambda *, workspace_id, owner_type, owner_id, artifact_kind, filename, checksum_sha256:
             f"OPAQUE-STORAGE-REF-{self.label}-{workspace_id}-{owner_id}-{artifact_kind}"
@@ -286,19 +302,41 @@ class FakeBackend:
             created_at="2026-07-07T00:00:00Z",
             updated_at="2026-07-07T00:00:00Z",
         )
+        self.store_metadata_objects.append(metadata)
         self.objects[key] = bytes(content)
         self.metadata[key] = metadata
         if self.raise_after_store_kind == artifact_kind:
             raise RuntimeError(f"{self.label} write-after-store failure detail")
+        if self.tamper_store_metadata:
+            metadata = replace(metadata, owner_id=f"{metadata.owner_id}-tampered")
         return metadata
 
     def retrieve_artifact(self, metadata, *, workspace_id):
         self.events.append(("backend-retrieve", self.label, metadata.artifact_kind, metadata.owner_id))
+        self.retrieve_metadata_objects.append(metadata)
         self._maybe_fail("read")
         if metadata.workspace_id != workspace_id:
             raise RuntimeError("private workspace mismatch detail")
+        is_cross_denial = (
+            (self.label == "restore" and metadata.owner_id.endswith("-active-probe"))
+            or (self.label == "active" and metadata.owner_id.endswith("-restore-probe"))
+        )
+        if is_cross_denial and self.cross_denial_failure == self.label:
+            raise RuntimeError(f"{self.label} cross-denial provider failure detail")
+        if is_cross_denial and self.cross_denial_mode == "provider_error":
+            raise RuntimeError(f"{self.label} cross-denial provider failure detail")
+        if is_cross_denial and self.cross_denial_mode == "empty":
+            return b""
+        if is_cross_denial and self.cross_denial_mode == "key_error":
+            raise KeyError(metadata.storage_key)
         content = self.objects[metadata.storage_key]
-        if self.tamper_retrieve:
+        is_self_probe = (
+            (self.label == "active" and metadata.owner_id.endswith("-active-probe"))
+            or (self.label == "restore" and metadata.owner_id.endswith("-restore-probe"))
+        )
+        if is_self_probe and self.tamper_probe_retrieve:
+            return content[:-1] + bytes([(content[-1] + 1) % 256])
+        if self.tamper_retrieve and metadata.artifact_kind == "xlsx":
             return content[:-1] + bytes([(content[-1] + 1) % 256])
         return content
 
@@ -327,6 +365,12 @@ def run_injected_drill(
     runtime_filename_gate: bool = False,
     fail_backend_kind: str = "",
     raise_after_store_kind: str = "",
+    cross_denial_failure: str = "",
+    cross_denial_mode: str = "",
+    tamper_store_metadata: str = "",
+    tamper_probe_retrieve: str = "",
+    backend_factory_error: str = "",
+    generic_key_error: bool = False,
     missing_backend: bool | str = False,
     events: list[tuple[object, ...]] | None = None,
     observations: dict[str, object] | None = None,
@@ -369,6 +413,8 @@ def run_injected_drill(
             if observations is not None:
                 factory_calls = observations.setdefault("backend_factory_calls", {})
                 factory_calls[label] = int(factory_calls.get(label, 0)) + 1
+            if backend_factory_error == label:
+                raise RuntimeError(f"{label} backend construction failure detail")
             if missing_backend is True or missing_backend == label:
                 return None
             backend = FakeBackend(
@@ -379,10 +425,15 @@ def run_injected_drill(
                 cleanup_fails=cleanup_fails and label == "restore",
                 object_key_fn=verifier.webapp.object_artifact_key,
                 fail_artifact_kind=fail_backend_kind if label == "active" else "",
-                raise_after_store_kind=raise_after_store_kind if label == "active" else "",
+                raise_after_store_kind=raise_after_store_kind,
+                cross_denial_failure=cross_denial_failure,
+                cross_denial_mode=cross_denial_mode,
+                tamper_store_metadata=tamper_store_metadata == label,
+                tamper_probe_retrieve=tamper_probe_retrieve == label,
                 events=events,
                 state=backend_state,
             )
+            backend._is_in_memory_test_adapter = not generic_key_error
             backends[label] = backend
             return backend
 
@@ -657,6 +708,316 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
         self.assertLess(restore_denial, first_restore_db_write)
         self.assertLess(active_denial, first_restore_generated_write)
         self.assertLess(restore_denial, first_restore_generated_write)
+
+    def test_dual_existing_probe_barrier_reports_actual_metadata_and_exact_timeline(self):
+        global GLOBAL_AMBIENT_ROUTE_CALLS
+        GLOBAL_AMBIENT_ROUTE_CALLS = 0
+        verifier = load_verifier()
+        events: list[tuple[object, ...]] = []
+        observations: dict[str, object] = {}
+        original_ambient = verifier.webapp.configured_object_storage_backend
+
+        def ambient_route():
+            global GLOBAL_AMBIENT_ROUTE_CALLS
+            GLOBAL_AMBIENT_ROUTE_CALLS += 1
+            raise AssertionError("ambient object backend route was invoked")
+
+        verifier.webapp.configured_object_storage_backend = ambient_route
+        try:
+            report, _storages, backends = run_injected_drill(
+                verifier,
+                events=events,
+                observations=observations,
+            )
+        finally:
+            verifier.webapp.configured_object_storage_backend = original_ambient
+
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(observations["backend_factory_calls"], {"active": 1, "restore": 1})
+        self.assertEqual(GLOBAL_AMBIENT_ROUTE_CALLS, 0)
+        barrier = report["barrier"]
+        self.assertEqual(barrier["state"], verifier.BARRIER_CROSS_DENIALS_VERIFIED)
+        self.assertEqual(
+            [(item["from"], item["to"]) for item in barrier["transitions"]],
+            [
+                (verifier.BARRIER_NOT_STARTED, verifier.BARRIER_PROBES_ESTABLISHED),
+                (verifier.BARRIER_PROBES_ESTABLISHED, verifier.BARRIER_CROSS_DENIALS_VERIFIED),
+            ],
+        )
+        for side in ("active", "restore"):
+            self.assertEqual(
+                barrier["probe_receipts"][side],
+                {
+                    "store_validated": True,
+                    "self_read_validated": True,
+                    "self_read_metadata_identity_verified": True,
+                },
+            )
+        for direction in ("restore_denied_active_probe", "active_denied_restore_probe"):
+            receipt = barrier["cross_denial_receipts"][direction]
+            self.assertTrue(receipt["attempted"])
+            self.assertTrue(receipt["validated"])
+            self.assertTrue(receipt["metadata_argument_is_returned"])
+            self.assertTrue(receipt["metadata_immutable_tuple_equal"])
+            self.assertTrue(receipt["metadata_key_equal"])
+            self.assertIn(receipt["classifier"], {
+                "ObjectStorageNotFoundError",
+                "KeyError:in-memory-test-adapter-not-found",
+            })
+        self.assertTrue(report["checks"]["bidirectional_backend_isolation_verified"])
+
+        active_backend = backends["active"]
+        restore_backend = backends["restore"]
+        active_returned = active_backend.store_metadata_objects[0]
+        restore_returned = restore_backend.store_metadata_objects[0]
+        active_self_read = next(
+            metadata
+            for metadata in active_backend.retrieve_metadata_objects
+            if metadata.owner_id.endswith("-active-probe")
+        )
+        restore_self_read = next(
+            metadata
+            for metadata in restore_backend.retrieve_metadata_objects
+            if metadata.owner_id.endswith("-restore-probe")
+        )
+        restore_cross_read = next(
+            metadata
+            for metadata in restore_backend.retrieve_metadata_objects
+            if metadata.owner_id.endswith("-active-probe")
+        )
+        active_cross_read = next(
+            metadata
+            for metadata in active_backend.retrieve_metadata_objects
+            if metadata.owner_id.endswith("-restore-probe")
+        )
+        self.assertIs(active_self_read, active_returned)
+        self.assertIs(restore_self_read, restore_returned)
+        self.assertIs(restore_cross_read, active_returned)
+        self.assertIs(active_cross_read, restore_returned)
+        self.assertEqual(
+            verifier._immutable_artifact_metadata_tuple(restore_cross_read),
+            verifier._immutable_artifact_metadata_tuple(active_returned),
+        )
+        self.assertEqual(
+            verifier._immutable_artifact_metadata_tuple(active_cross_read),
+            verifier._immutable_artifact_metadata_tuple(restore_returned),
+        )
+        self.assertEqual(restore_cross_read.storage_key, active_returned.storage_key)
+        self.assertEqual(active_cross_read.storage_key, restore_returned.storage_key)
+
+        def event_index(predicate):
+            return next(index for index, event in enumerate(events) if predicate(event))
+
+        active_store = event_index(
+            lambda event: event[:3] == (
+                "backend-store", "active", verifier.SYNTHETIC_ACTIVE_PROBE_KIND
+            )
+        )
+        active_self = event_index(
+            lambda event: event[:3] == (
+                "backend-retrieve", "active", verifier.SYNTHETIC_ACTIVE_PROBE_KIND
+            )
+        )
+        restore_store = event_index(
+            lambda event: event[:3] == (
+                "backend-store", "restore", verifier.SYNTHETIC_RESTORE_PROBE_KIND
+            )
+        )
+        restore_self = event_index(
+            lambda event: event[:3] == (
+                "backend-retrieve", "restore", verifier.SYNTHETIC_RESTORE_PROBE_KIND
+            )
+        )
+        restore_denial = event_index(
+            lambda event: event[:3] == (
+                "backend-retrieve", "restore", verifier.SYNTHETIC_ACTIVE_PROBE_KIND
+            )
+        )
+        active_denial = event_index(
+            lambda event: event[:3] == (
+                "backend-retrieve", "active", verifier.SYNTHETIC_RESTORE_PROBE_KIND
+            )
+        )
+        first_restore_owner_write = event_index(
+            lambda event: event[0] == "storage-write"
+            and event[1] == "restore"
+            and event[2] in {"profile", "pricing_reference", "quote_session"}
+        )
+        first_restore_product_metadata_write = event_index(
+            lambda event: event[:3] == (
+                "storage-write", "restore", "product_object_metadata"
+            )
+        )
+        first_restore_generated_write = event_index(
+            lambda event: event[:3] == ("backend-store", "restore", "xlsx")
+        )
+        self.assertLess(active_store, active_self)
+        self.assertLess(active_self, restore_store)
+        self.assertLess(restore_store, restore_self)
+        for store in (active_store, restore_store):
+            for denial in (restore_denial, active_denial):
+                self.assertLess(store, denial)
+        for self_read in (active_self, restore_self):
+            for denial in (restore_denial, active_denial):
+                self.assertLess(self_read, denial)
+        for denial in (restore_denial, active_denial):
+            self.assertLess(denial, first_restore_owner_write)
+            self.assertLess(denial, first_restore_product_metadata_write)
+            self.assertLess(denial, first_restore_generated_write)
+
+        entries = {
+            entry["resource_key"]: entry
+            for entry in report["resource_journal"]["entries"]
+        }
+        for resource_key in (
+            "active/workspace_a/isolation_probe",
+            "restore/workspace_a/isolation_probe",
+        ):
+            self.assertEqual(entries[resource_key]["state"], verifier.JOURNAL_CLEANED)
+            self.assertTrue({
+                "store_validated",
+                "self_read_validated",
+                "opposite_backend_denial_validated",
+            }.issubset(set(entries[resource_key]["touch_receipts"])))
+        self.assertEqual(barrier["destination_gate"]["required_state"], verifier.BARRIER_CROSS_DENIALS_VERIFIED)
+        self.assertGreaterEqual(barrier["destination_gate"]["calls"], 8)
+
+    def test_dual_existing_probe_failure_matrix_is_fail_closed_and_cleanup_truthful(self):
+        verifier = load_verifier()
+        cases = (
+            ("active-store", {"fail_backend": "active_write"}, "active_object_write_failed"),
+            ("active-self-read", {"fail_backend": "active_read"}, "active_object_write_failed"),
+            ("restore-backend-construction", {"backend_factory_error": "restore"}, "restore_object_write_failed"),
+            ("restore-store", {"fail_backend": "restore_write"}, "restore_object_write_failed"),
+            (
+                "restore-write-then-raise",
+                {"raise_after_store_kind": verifier.SYNTHETIC_RESTORE_PROBE_KIND},
+                "restore_object_write_failed",
+            ),
+            ("restore-self-read", {"fail_backend": "restore_read"}, "restore_object_write_failed"),
+            ("first-cross-denial", {"cross_denial_failure": "restore"}, "restore_object_can_read_active_synthetic_object"),
+            ("second-cross-denial", {"cross_denial_failure": "active"}, "active_object_can_read_restore_synthetic_object"),
+            ("metadata-validation", {"tamper_store_metadata": "active"}, "active_object_write_failed"),
+            ("probe-byte-validation", {"tamper_probe_retrieve": "restore"}, "restore_object_write_failed"),
+            ("generic-provider-error", {"cross_denial_mode": "provider_error"}, "restore_object_can_read_active_synthetic_object"),
+            (
+                "successful-cross-retrieval",
+                {"cross_denial_mode": "success", "shared_backend_state": True},
+                "restore_object_can_read_active_synthetic_object",
+            ),
+            ("empty-cross-retrieval", {"cross_denial_mode": "empty"}, "restore_object_can_read_active_synthetic_object"),
+            (
+                "generic-key-error",
+                {"cross_denial_mode": "key_error", "generic_key_error": True},
+                "restore_object_can_read_active_synthetic_object",
+            ),
+        )
+
+        for name, options, expected_blocker in cases:
+            with self.subTest(name=name):
+                events: list[tuple[object, ...]] = []
+                report, _storages, _backends = run_injected_drill(
+                    verifier,
+                    events=events,
+                    **options,
+                )
+                self.assertEqual(report["status"], "failed")
+                self.assertIn(expected_blocker, report["blockers"])
+                self.assertEqual(report["barrier"]["state"], verifier.BARRIER_FAILED)
+                self.assertFalse(report["checks"]["bidirectional_backend_isolation_verified"])
+                destination_events = [
+                    event
+                    for event in events
+                    if (
+                        event[0] == "storage-write"
+                        and event[1] == "restore"
+                        and event[2] in {"profile", "pricing_reference", "quote_session", "product_object_metadata"}
+                    )
+                    or (
+                        event[0] == "backend-store"
+                        and event[1] == "restore"
+                        and event[2] == "xlsx"
+                    )
+                ]
+                self.assertEqual(destination_events, [])
+                entries = {
+                    entry["resource_key"]: entry
+                    for entry in report["resource_journal"]["entries"]
+                }
+                self.assertTrue(
+                    all(
+                        entry["state"] == verifier.JOURNAL_NOT_REACHED
+                        for key, entry in entries.items()
+                        if key.startswith("restore/")
+                        and entry["resource_kind"] != "isolation_probe"
+                    )
+                )
+                probe_entry = entries["restore/workspace_a/isolation_probe"]
+                self.assertIn(
+                    probe_entry["state"],
+                    {
+                        verifier.JOURNAL_NOT_REACHED,
+                        verifier.JOURNAL_ABSENCE_VERIFIED,
+                        verifier.JOURNAL_CLEANED,
+                        verifier.JOURNAL_CLEANUP_FAILED,
+                    },
+                )
+                if probe_entry["state"] == verifier.JOURNAL_CLEANUP_FAILED:
+                    self.assertFalse(report["checks"]["cleanup_completed"])
+
+    def test_restore_destination_guard_fails_closed_before_callbacks(self):
+        verifier = load_verifier()
+        events: list[tuple[object, ...]] = []
+
+        def leave_barrier_unverified(self, **_kwargs):
+            _ = self
+            return None
+
+        with mock.patch.object(
+            verifier.DualExistingProbeBarrier,
+            "verify_cross_denials",
+            leave_barrier_unverified,
+        ):
+            report, _storages, _backends = run_injected_drill(verifier, events=events)
+
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("restore_db_write_failed", report["blockers"])
+        self.assertEqual(report["barrier"]["state"], verifier.BARRIER_FAILED)
+        self.assertIn(
+            {"from": verifier.BARRIER_PROBES_ESTABLISHED,
+             "to": verifier.BARRIER_FAILED,
+             "reason": "restore_destination_gate_violation"},
+            report["barrier"]["transitions"],
+        )
+        self.assertEqual(
+            [
+                event
+                for event in events
+                if event[0] == "storage-write" and event[1] == "restore"
+            ],
+            [],
+        )
+        self.assertEqual(
+            [
+                event
+                for event in events
+                if event[0] == "backend-store" and event[1] == "restore" and event[2] == "xlsx"
+            ],
+            [],
+        )
+        entries = {
+            entry["resource_key"]: entry
+            for entry in report["resource_journal"]["entries"]
+        }
+        self.assertTrue(
+            all(
+                entry["state"] == verifier.JOURNAL_NOT_REACHED
+                for key, entry in entries.items()
+                if key.startswith("restore/")
+                and entry["resource_kind"] != "isolation_probe"
+            )
+        )
+
 
     def test_active_failure_before_restore_construction_is_not_false_cleanup(self):
         verifier = load_verifier()

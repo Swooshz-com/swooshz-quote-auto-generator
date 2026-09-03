@@ -162,6 +162,30 @@ JOURNAL_TRANSITIONS = {
 }
 
 
+BARRIER_NOT_STARTED = "not-started"
+BARRIER_PROBES_ESTABLISHED = "probes-established"
+BARRIER_CROSS_DENIALS_VERIFIED = "cross-denials-verified"
+BARRIER_FAILED = "failed"
+BARRIER_STATES = (
+    BARRIER_NOT_STARTED,
+    BARRIER_PROBES_ESTABLISHED,
+    BARRIER_CROSS_DENIALS_VERIFIED,
+    BARRIER_FAILED,
+)
+BARRIER_TRANSITIONS = {
+    BARRIER_NOT_STARTED: {
+        BARRIER_PROBES_ESTABLISHED,
+        BARRIER_FAILED,
+    },
+    BARRIER_PROBES_ESTABLISHED: {
+        BARRIER_CROSS_DENIALS_VERIFIED,
+        BARRIER_FAILED,
+    },
+    BARRIER_CROSS_DENIALS_VERIFIED: set(),
+    BARRIER_FAILED: set(),
+}
+
+
 class ResourceSpec(NamedTuple):
     key: str
     operation: str
@@ -434,6 +458,16 @@ def _default_checks(
         "restore_database_cannot_read_active_synthetic_rows": False,
         "restore_object_cannot_read_active_synthetic_object": False,
         "active_object_cannot_read_restore_synthetic_object": False,
+        "active_probe_store_validated": False,
+        "active_probe_self_read_validated": False,
+        "restore_probe_store_validated": False,
+        "restore_probe_self_read_validated": False,
+        "restore_cross_denial_metadata_identity_verified": False,
+        "active_cross_denial_metadata_identity_verified": False,
+        "restore_cross_denial_metadata_tuple_verified": False,
+        "active_cross_denial_metadata_tuple_verified": False,
+        "restore_cross_denial_key_verified": False,
+        "active_cross_denial_key_verified": False,
         "bidirectional_backend_isolation_verified": False,
         "checksum_match": False,
         "metadata_object_pairing_verified": False,
@@ -475,6 +509,7 @@ def _report(
     active_object_count: int = 0,
     restore_db_rows: int = 0,
     restore_object_count: int = 0,
+    barrier: object | None = None,
 ) -> dict[str, object]:
     supported = status == "passed" and not test_injected_backend
     return {
@@ -485,6 +520,41 @@ def _report(
         "required_env_names": list(REQUIRED_ENV_NAMES),
         "missing_env_names": list(missing_env_names),
         "checks": dict(checks),
+        "barrier": (
+            barrier.report()
+            if barrier is not None
+            else {
+                "state": BARRIER_NOT_STARTED,
+                "transitions": [],
+                "failure_reason": "",
+                "probe_receipts": {
+                    "active": {
+                        "store_validated": False,
+                        "self_read_validated": False,
+                        "self_read_metadata_identity_verified": False,
+                    },
+                    "restore": {
+                        "store_validated": False,
+                        "self_read_validated": False,
+                        "self_read_metadata_identity_verified": False,
+                    },
+                },
+                "cross_denial_receipts": {
+                    "restore_denied_active_probe": {
+                        "attempted": False,
+                        "validated": False,
+                    },
+                    "active_denied_restore_probe": {
+                        "attempted": False,
+                        "validated": False,
+                    },
+                },
+                "destination_gate": {
+                    "required_state": BARRIER_CROSS_DENIALS_VERIFIED,
+                    "calls": 0,
+                },
+            }
+        ),
         "active_db_synthetic_rows_written": int(active_db_rows),
         "active_object_synthetic_objects_written": int(active_object_count),
         "restore_db_synthetic_rows_written": int(restore_db_rows),
@@ -741,21 +811,413 @@ def _artifact_receipt_matches(
     receipt: object,
     expected: ObjectArtifactMetadata,
 ) -> bool:
-    if not isinstance(receipt, ObjectArtifactMetadata):
-        return False
-    return all(
-        (
-            receipt.workspace_id == expected.workspace_id,
-            receipt.owner_type == expected.owner_type,
-            receipt.owner_id == expected.owner_id,
-            receipt.artifact_kind == expected.artifact_kind,
-            receipt.filename == expected.filename,
-            receipt.content_type == expected.content_type,
-            receipt.size_bytes == expected.size_bytes,
-            receipt.checksum_sha256 == expected.checksum_sha256,
-            receipt.storage_key == expected.storage_key,
-        )
+    return _immutable_artifact_metadata_tuple(receipt) == _immutable_artifact_metadata_tuple(expected)
+
+
+def _immutable_artifact_metadata_tuple(
+    metadata: object,
+) -> tuple[object, ...]:
+    if not isinstance(metadata, ObjectArtifactMetadata):
+        return ()
+    return (
+        metadata.workspace_id,
+        metadata.owner_type,
+        metadata.owner_id,
+        metadata.artifact_kind,
+        metadata.filename,
+        metadata.content_type,
+        metadata.size_bytes,
+        metadata.checksum_sha256,
+        metadata.storage_key,
     )
+
+
+class BarrierFailure(ObjectStorageContractError):
+    """Raised when the bounded dual-existing-probe barrier cannot complete."""
+
+
+def _is_in_memory_test_adapter(backend: ObjectStorageBackend) -> bool:
+    in_memory_type = getattr(webapp, "InMemoryObjectStorageBackend", None)
+    if isinstance(in_memory_type, type) and isinstance(backend, in_memory_type):
+        return True
+    return bool(
+        getattr(backend, "_is_in_memory_test_adapter", False)
+        or getattr(backend, "backend_name", "") == "synthetic-in-memory"
+    )
+
+
+class DualExistingProbeBarrier:
+    """Bounded per-run proof that active and restore backends are isolated."""
+
+    def __init__(self, journal: ResourceJournal):
+        self._journal = journal
+        self.state = BARRIER_NOT_STARTED
+        self.transitions: list[dict[str, str]] = []
+        self.failure_reason = ""
+        self.active_probe_metadata: ObjectArtifactMetadata | None = None
+        self.restore_probe_metadata: ObjectArtifactMetadata | None = None
+        self.probe_receipts: dict[str, dict[str, object]] = {
+            "active": {
+                "store_validated": False,
+                "self_read_validated": False,
+                "self_read_metadata_identity_verified": False,
+            },
+            "restore": {
+                "store_validated": False,
+                "self_read_validated": False,
+                "self_read_metadata_identity_verified": False,
+            },
+        }
+        self.cross_denial_receipts: dict[str, dict[str, object]] = {
+            "restore_denied_active_probe": {
+                "attempted": False,
+                "validated": False,
+            },
+            "active_denied_restore_probe": {
+                "attempted": False,
+                "validated": False,
+            },
+        }
+        self.destination_gate_calls = 0
+
+    def _transition(self, target: str, reason: str) -> None:
+        if target not in BARRIER_STATES:
+            raise ValueError(f"Unknown verifier barrier state: {target}")
+        if target not in BARRIER_TRANSITIONS[self.state]:
+            raise ValueError(f"Invalid verifier barrier transition: {self.state} -> {target}")
+        self.transitions.append({"from": self.state, "to": target, "reason": reason})
+        self.state = target
+
+    def fail(self, reason: str) -> None:
+        if not self.failure_reason:
+            self.failure_reason = reason
+        if self.state in {BARRIER_NOT_STARTED, BARRIER_PROBES_ESTABLISHED}:
+            self._transition(BARRIER_FAILED, reason)
+
+    def _abort(self, reason: str) -> None:
+        self.fail(reason)
+        raise BarrierFailure(reason)
+
+    def _set_probe_metadata(self, side: str, metadata: ObjectArtifactMetadata) -> None:
+        if side == "active":
+            self.active_probe_metadata = metadata
+        else:
+            self.restore_probe_metadata = metadata
+
+    def _store_probe(
+        self,
+        *,
+        side: str,
+        backend: ObjectStorageBackend | None,
+        journal: ResourceJournal,
+        resource_key: str,
+        descriptor: Mapping[str, object],
+    ) -> ObjectArtifactMetadata:
+        journal.mark_attempted(resource_key, "dispatch:object-store")
+        expected = descriptor.get("metadata")
+        content = descriptor.get("content")
+        if (
+            not isinstance(expected, ObjectArtifactMetadata)
+            or not isinstance(content, bytes)
+            or backend is None
+        ):
+            journal.mark_unknown(resource_key, "outcome-uncertain:object-backend-missing")
+            self._abort(f"{side}_probe_store_contract_failed")
+        try:
+            receipt = backend.store_artifact(
+                workspace_id=expected.workspace_id,
+                owner_type=expected.owner_type,
+                owner_id=expected.owner_id,
+                artifact_kind=expected.artifact_kind,
+                filename=expected.filename,
+                content_type=expected.content_type,
+                content=content,
+            )
+        except Exception:
+            journal.mark_unknown(resource_key, "outcome-uncertain:object-store")
+            self._abort(f"{side}_probe_store_failed")
+        if isinstance(receipt, ObjectArtifactMetadata):
+            self._set_probe_metadata(side, receipt)
+        if not _artifact_receipt_matches(receipt, expected):
+            journal.mark_unknown(resource_key, "receipt-invalid:object-store")
+            self._abort(f"{side}_probe_metadata_validation_failed")
+        journal.record_receipt(resource_key, "validated:object-store")
+        journal.record_receipt(resource_key, "store_validated")
+        journal.mark_touched(resource_key, "receipt:object-store")
+        self.probe_receipts[side]["store_validated"] = True
+        return receipt
+
+    def _self_read_probe(
+        self,
+        *,
+        side: str,
+        backend: ObjectStorageBackend | None,
+        journal: ResourceJournal,
+        resource_key: str,
+        descriptor: Mapping[str, object],
+        metadata: ObjectArtifactMetadata,
+    ) -> bytes:
+        expected_metadata = descriptor.get("metadata")
+        expected_content = descriptor.get("content")
+        if (
+            not self.probe_receipts[side]["store_validated"]
+            or backend is None
+            or not isinstance(expected_metadata, ObjectArtifactMetadata)
+            or not isinstance(expected_content, bytes)
+        ):
+            journal.record_receipt(resource_key, "self_read_failed")
+            self._abort(f"{side}_probe_self_read_contract_failed")
+        try:
+            content = backend.retrieve_artifact(
+                metadata,
+                workspace_id=metadata.workspace_id,
+            )
+        except Exception:
+            journal.record_receipt(resource_key, "self_read_failed")
+            self._abort(f"{side}_probe_self_read_failed")
+        exact = (
+            isinstance(content, bytes)
+            and bool(content)
+            and content == expected_content
+            and len(content) == len(expected_content)
+            and artifact_checksum(content) == expected_metadata.checksum_sha256
+            and _artifact_receipt_matches(metadata, expected_metadata)
+            and metadata is getattr(self, f"{side}_probe_metadata")
+        )
+        if not exact:
+            journal.record_receipt(resource_key, "self_read_failed")
+            self._abort(f"{side}_probe_self_read_validation_failed")
+        journal.record_receipt(resource_key, "self_read_validated")
+        self.probe_receipts[side]["self_read_validated"] = True
+        self.probe_receipts[side]["self_read_metadata_identity_verified"] = (
+            metadata is getattr(self, f"{side}_probe_metadata")
+        )
+        return content
+
+    def establish_active_probe(
+        self,
+        *,
+        backend: ObjectStorageBackend | None,
+        journal: ResourceJournal,
+        resource_key: str,
+        descriptor: Mapping[str, object],
+    ) -> ObjectArtifactMetadata:
+        if self.state != BARRIER_NOT_STARTED:
+            self._abort("active_probe_established_in_invalid_barrier_state")
+        metadata = self._store_probe(
+            side="active",
+            backend=backend,
+            journal=journal,
+            resource_key=resource_key,
+            descriptor=descriptor,
+        )
+        self._self_read_probe(
+            side="active",
+            backend=backend,
+            journal=journal,
+            resource_key=resource_key,
+            descriptor=descriptor,
+            metadata=metadata,
+        )
+        return metadata
+
+    def establish_restore_probe(
+        self,
+        *,
+        backend: ObjectStorageBackend | None,
+        journal: ResourceJournal,
+        resource_key: str,
+        descriptor: Mapping[str, object],
+    ) -> ObjectArtifactMetadata:
+        if self.state != BARRIER_NOT_STARTED:
+            self._abort("restore_probe_established_in_invalid_barrier_state")
+        if not all(
+            (
+                self.active_probe_metadata is not None,
+                self.probe_receipts["active"]["store_validated"],
+                self.probe_receipts["active"]["self_read_validated"],
+            )
+        ):
+            self._abort("active_probe_not_established")
+        metadata = self._store_probe(
+            side="restore",
+            backend=backend,
+            journal=journal,
+            resource_key=resource_key,
+            descriptor=descriptor,
+        )
+        self._self_read_probe(
+            side="restore",
+            backend=backend,
+            journal=journal,
+            resource_key=resource_key,
+            descriptor=descriptor,
+            metadata=metadata,
+        )
+        self._transition(
+            BARRIER_PROBES_ESTABLISHED,
+            "active and restore probes stored and self-read successfully",
+        )
+        return metadata
+
+    def _verify_cross_denial(
+        self,
+        *,
+        direction: str,
+        backend: ObjectStorageBackend | None,
+        returned_metadata: ObjectArtifactMetadata,
+        resource_key: str,
+    ) -> None:
+        receipt = self.cross_denial_receipts[direction]
+        receipt.update(
+            {
+                "attempted": True,
+                "metadata_argument_is_returned": returned_metadata is (
+                    self.active_probe_metadata
+                    if direction == "restore_denied_active_probe"
+                    else self.restore_probe_metadata
+                ),
+                "metadata_immutable_tuple_equal": _immutable_artifact_metadata_tuple(
+                    returned_metadata
+                )
+                == _immutable_artifact_metadata_tuple(
+                    self.active_probe_metadata
+                    if direction == "restore_denied_active_probe"
+                    else self.restore_probe_metadata
+                ),
+                "metadata_key_equal": returned_metadata.storage_key
+                == (
+                    self.active_probe_metadata.storage_key
+                    if direction == "restore_denied_active_probe"
+                    else self.restore_probe_metadata.storage_key
+                ),
+            }
+        )
+        if not all(
+            (
+                receipt["metadata_argument_is_returned"],
+                receipt["metadata_immutable_tuple_equal"],
+                receipt["metadata_key_equal"],
+            )
+        ):
+            receipt["classifier"] = "metadata-identity-or-tuple-mismatch"
+            self._abort(f"{direction}_metadata_validation_failed")
+        if backend is None:
+            receipt["classifier"] = "backend-missing"
+            self._abort(f"{direction}_backend_missing")
+        try:
+            content = backend.retrieve_artifact(
+                returned_metadata,
+                workspace_id=returned_metadata.workspace_id,
+            )
+        except ObjectStorageNotFoundError:
+            classifier = "ObjectStorageNotFoundError"
+        except KeyError:
+            if not _is_in_memory_test_adapter(backend):
+                receipt["classifier"] = "KeyError-not-accepted"
+                self._abort(f"{direction}_classifier_failed")
+            classifier = "KeyError:in-memory-test-adapter-not-found"
+        except Exception:
+            receipt["classifier"] = "provider-exception-not-accepted"
+            self._abort(f"{direction}_classifier_failed")
+        else:
+            receipt["classifier"] = (
+                "empty-success-not-accepted"
+                if isinstance(content, bytes) and not content
+                else "successful-retrieval-not-accepted"
+            )
+            self._abort(f"{direction}_retrieval_succeeded")
+        receipt["classifier"] = classifier
+        receipt["validated"] = True
+        self._journal.record_receipt(resource_key, "opposite_backend_denial_validated")
+
+    def verify_cross_denials(
+        self,
+        *,
+        active_backend: ObjectStorageBackend | None,
+        restore_backend: ObjectStorageBackend | None,
+        journal: ResourceJournal,
+    ) -> None:
+        if self.state != BARRIER_PROBES_ESTABLISHED:
+            self._abort("cross_denials_started_in_invalid_barrier_state")
+        if self.active_probe_metadata is None or self.restore_probe_metadata is None:
+            self._abort("both_returned_probe_metadata_required")
+        self._verify_cross_denial(
+            direction="restore_denied_active_probe",
+            backend=restore_backend,
+            returned_metadata=self.active_probe_metadata,
+            resource_key="active/workspace_a/isolation_probe",
+        )
+        self._verify_cross_denial(
+            direction="active_denied_restore_probe",
+            backend=active_backend,
+            returned_metadata=self.restore_probe_metadata,
+            resource_key="restore/workspace_a/isolation_probe",
+        )
+        self._transition(
+            BARRIER_CROSS_DENIALS_VERIFIED,
+            "both opposite-backend denials validated",
+        )
+
+    def require_restore_destination_ready(self, _resource_key: str = "") -> None:
+        self.destination_gate_calls += 1
+        if self.state != BARRIER_CROSS_DENIALS_VERIFIED:
+            self._abort("restore_destination_gate_violation")
+
+    def apply_checks(self, checks: dict[str, bool]) -> None:
+        checks["active_probe_store_validated"] = bool(
+            self.probe_receipts["active"]["store_validated"]
+        )
+        checks["active_probe_self_read_validated"] = bool(
+            self.probe_receipts["active"]["self_read_validated"]
+        )
+        checks["restore_probe_store_validated"] = bool(
+            self.probe_receipts["restore"]["store_validated"]
+        )
+        checks["restore_probe_self_read_validated"] = bool(
+            self.probe_receipts["restore"]["self_read_validated"]
+        )
+        for direction, prefix in (
+            ("restore_denied_active_probe", "restore"),
+            ("active_denied_restore_probe", "active"),
+        ):
+            receipt = self.cross_denial_receipts[direction]
+            checks[
+                "restore_object_cannot_read_active_synthetic_object"
+                if direction == "restore_denied_active_probe"
+                else "active_object_cannot_read_restore_synthetic_object"
+            ] = bool(receipt.get("validated"))
+            checks[f"{prefix}_cross_denial_metadata_identity_verified"] = bool(
+                receipt.get("metadata_argument_is_returned")
+            )
+            checks[f"{prefix}_cross_denial_metadata_tuple_verified"] = bool(
+                receipt.get("metadata_immutable_tuple_equal")
+            )
+            checks[f"{prefix}_cross_denial_key_verified"] = bool(
+                receipt.get("metadata_key_equal")
+            )
+        checks["bidirectional_backend_isolation_verified"] = (
+            self.state == BARRIER_CROSS_DENIALS_VERIFIED
+        )
+
+    def report(self) -> dict[str, object]:
+        return {
+            "state": self.state,
+            "transitions": [dict(item) for item in self.transitions],
+            "failure_reason": self.failure_reason,
+            "probe_receipts": {
+                side: dict(receipts)
+                for side, receipts in self.probe_receipts.items()
+            },
+            "cross_denial_receipts": {
+                direction: dict(receipt)
+                for direction, receipt in self.cross_denial_receipts.items()
+            },
+            "destination_gate": {
+                "required_state": BARRIER_CROSS_DENIALS_VERIFIED,
+                "calls": self.destination_gate_calls,
+            },
+        }
 
 
 def _backend_retrieval_proves_absence(
@@ -854,7 +1316,10 @@ def _write_owner_resource(
     identifier: str,
     workspace_label: str,
     artifact_storage_mode: str = "object",
+    destination_guard: Callable[[str], None] | None = None,
 ) -> object:
+    if destination_guard is not None:
+        destination_guard(resource_key)
     method_name, payload, expected_receipt = _owner_write_payload(
         resource_kind,
         identifier,
@@ -1454,7 +1919,9 @@ def _resolve_unknown_resource(
         return
 
     descriptor = expected_artifacts.get(key)
-    expected = descriptor.get("metadata") if descriptor else None
+    expected = artifact_metadata.get(key)
+    if expected is None:
+        expected = descriptor.get("metadata") if descriptor else None
     backend = backend_by_operation.get(spec.operation)
     if not isinstance(expected, ObjectArtifactMetadata) or backend is None:
         journal.mark_cleanup_failed(key, "unknown-resolution:operation-backend-missing")
@@ -2010,11 +2477,13 @@ def _run_drill(
     int,
     ResourceJournal,
     dict[str, Mapping[str, object]],
+    DualExistingProbeBarrier,
 ]:
     ids = _synthetic_ids()
     active_payload = _synthetic_payload(ids)
     expected_artifacts = _expected_artifact_descriptors(ids, active_payload)
     journal = ResourceJournal(_planned_resource_specs(ids))
+    barrier = DualExistingProbeBarrier(journal)
     context_evidence: dict[str, Mapping[str, object]] = {}
     artifact_metadata: dict[str, ObjectArtifactMetadata] = {}
     artifact_storage_mode = _verifier_artifact_storage_mode(env)
@@ -2035,6 +2504,7 @@ def _run_drill(
     restore_backend_origin = "restore-backend-factory"
 
     def result():
+        barrier.apply_checks(checks)
         return (
             checks,
             blockers,
@@ -2044,6 +2514,7 @@ def _run_drill(
             restore_object_count,
             journal,
             context_evidence,
+            barrier,
         )
 
     try:
@@ -2063,6 +2534,7 @@ def _run_drill(
             for storage in (active_maintenance_storage, restore_maintenance_storage):
                 storage.ensure_object_artifact_ready()
         except Exception:
+            barrier.fail("database_connection_or_schema_failed")
             blockers.append("database_connection_or_schema_failed")
             return result()
 
@@ -2071,11 +2543,12 @@ def _run_drill(
         try:
             active_backend = active_backend_factory(env)
         except Exception:
+            barrier.fail("active_backend_construction_failed")
             blockers.append("active_object_write_failed")
             return result()
 
         try:
-            active_probe_metadata = _store_object_resource(
+            active_probe_metadata = barrier.establish_active_probe(
                 backend=active_backend,
                 journal=journal,
                 resource_key="active/workspace_a/isolation_probe",
@@ -2083,6 +2556,9 @@ def _run_drill(
             )
             artifact_metadata["active/workspace_a/isolation_probe"] = active_probe_metadata
         except Exception:
+            if active_probe_metadata is None:
+                active_probe_metadata = barrier.active_probe_metadata
+            barrier.fail("active_probe_establishment_failed")
             blockers.append("active_object_write_failed")
             return result()
 
@@ -2110,6 +2586,7 @@ def _run_drill(
             checks["active_db_write_read_verified"] = _verify_db_rows(active_storage_a, active_storage_b, ids)
             checks["workspace_isolation_preserved"] = checks["active_db_write_read_verified"]
         except Exception:
+            barrier.fail("active_database_destination_failed")
             blockers.append("active_db_write_failed")
             return result()
 
@@ -2135,6 +2612,7 @@ def _run_drill(
             if not _metadata_object_pairing_ok(active_storage_a, ids["session_a"], active_metadata):
                 journal.record_receipt("active/workspace_a/generated_xlsx", "metadata-upsert:invalid")
                 checks["metadata_object_pairing_verified"] = False
+                barrier.fail("active_generated_destination_failed")
                 blockers.append("active_object_metadata_write_failed")
                 return result()
             journal.record_receipt("active/workspace_a/generated_xlsx", "validated:metadata-upsert")
@@ -2147,6 +2625,7 @@ def _run_drill(
             )
         except Exception:
             journal.record_receipt("active/workspace_a/generated_xlsx", "metadata-upsert:outcome-uncertain")
+            barrier.fail("active_generated_destination_failed")
             blockers.append("active_object_write_failed")
             return result()
 
@@ -2158,50 +2637,28 @@ def _run_drill(
                 active_metadata=active_metadata,
             )
         except Exception:
+            barrier.fail("isolated_restore_target_live_check_failed")
             blockers.append("isolated_restore_target_live_check_failed")
             return result()
         if not checks["restore_database_cannot_read_active_synthetic_rows"]:
+            barrier.fail("restore_database_can_read_active_synthetic_rows")
             blockers.append("restore_database_can_read_active_synthetic_rows")
             return result()
 
         try:
             restore_backend = restore_backend_factory(env)
         except Exception:
+            barrier.fail("restore_backend_construction_failed")
             blockers.append("restore_object_write_failed")
             return result()
         if restore_backend is None:
+            barrier.fail("restore_backend_construction_failed")
             blockers.append("restore_object_write_failed")
-            return result()
-
-        if not _backend_retrieval_proves_absence(
-            active_backend,
-            expected_artifacts["restore/workspace_a/isolation_probe"]["metadata"],
-            workspace_id=ids["workspace_a"],
-        ):
-            blockers.append("active_object_can_read_restore_synthetic_object")
-            return result()
-        checks["active_object_cannot_read_restore_synthetic_object"] = True
-        if not _backend_retrieval_proves_absence(
-            restore_backend,
-            expected_artifacts["active/workspace_a/isolation_probe"]["metadata"],
-            workspace_id=ids["workspace_a"],
-        ):
-            blockers.append("restore_object_can_read_active_synthetic_object")
-            return result()
-        checks["restore_object_cannot_read_active_synthetic_object"] = True
-        checks["bidirectional_backend_isolation_verified"] = True
-
-        if active_metadata is not None and not _backend_retrieval_proves_absence(
-            restore_backend,
-            active_metadata,
-            workspace_id=ids["workspace_a"],
-        ):
-            blockers.append("restore_object_can_read_active_synthetic_object")
             return result()
 
         checks["restore_attempted"] = True
         try:
-            restore_probe_metadata = _store_object_resource(
+            restore_probe_metadata = barrier.establish_restore_probe(
                 backend=restore_backend,
                 journal=journal,
                 resource_key="restore/workspace_a/isolation_probe",
@@ -2209,8 +2666,30 @@ def _run_drill(
             )
             artifact_metadata["restore/workspace_a/isolation_probe"] = restore_probe_metadata
         except Exception:
+            if restore_probe_metadata is None:
+                restore_probe_metadata = barrier.restore_probe_metadata
+            barrier.fail("restore_probe_establishment_failed")
             blockers.append("restore_object_write_failed")
             return result()
+
+        try:
+            barrier.verify_cross_denials(
+                active_backend=active_backend,
+                restore_backend=restore_backend,
+                journal=journal,
+            )
+        except Exception:
+            if barrier.state in {BARRIER_NOT_STARTED, BARRIER_PROBES_ESTABLISHED}:
+                barrier.fail("cross_denial_unexpected_failure")
+            barrier.apply_checks(checks)
+            if "restore_denied_active_probe" in barrier.failure_reason:
+                blockers.append("restore_object_can_read_active_synthetic_object")
+            elif "active_denied_restore_probe" in barrier.failure_reason:
+                blockers.append("active_object_can_read_restore_synthetic_object")
+            else:
+                blockers.append("bidirectional_backend_isolation_failed")
+            return result()
+        barrier.apply_checks(checks)
 
         restore_owner_writes = (
             ("restore/workspace_a/profile", restore_storage_a, "profile", ids["profile_a"], "workspace_a"),
@@ -2231,6 +2710,7 @@ def _run_drill(
                     identifier=identifier,
                     workspace_label=workspace_label,
                     artifact_storage_mode=artifact_storage_mode,
+                    destination_guard=barrier.require_restore_destination_ready,
                 )
                 restore_db_rows += 1
             checks["restore_db_write_read_verified"] = _verify_db_rows(restore_storage_a, restore_storage_b, ids)
@@ -2242,6 +2722,9 @@ def _run_drill(
             return result()
 
         try:
+            barrier.require_restore_destination_ready(
+                "restore/workspace_a/generated_xlsx"
+            )
             restore_metadata = _store_object_resource(
                 backend=restore_backend,
                 journal=journal,
@@ -2250,6 +2733,9 @@ def _run_drill(
             )
             artifact_metadata["restore/workspace_a/generated_xlsx"] = restore_metadata
             restore_object_count = 1
+            barrier.require_restore_destination_ready(
+                "restore/workspace_a/generated_xlsx"
+            )
             _with_configured_backend(
                 restore_backend,
                 lambda: restore_storage_a._upsert_object_quote_artifact(
@@ -2302,6 +2788,14 @@ def _run_drill(
             blockers.append("restore_object_read_failed")
         return result()
     finally:
+        if active_probe_metadata is None:
+            active_probe_metadata = barrier.active_probe_metadata
+        if restore_probe_metadata is None:
+            restore_probe_metadata = barrier.restore_probe_metadata
+        if active_probe_metadata is not None:
+            artifact_metadata["active/workspace_a/isolation_probe"] = active_probe_metadata
+        if restore_probe_metadata is not None:
+            artifact_metadata["restore/workspace_a/isolation_probe"] = restore_probe_metadata
         try:
             cleanup_completed = _cleanup(
                 active_storage_a=active_storage_a,
@@ -2393,6 +2887,7 @@ def run_verification(
         restore_object_count,
         journal,
         cleanup_contexts,
+        barrier,
     ) = _run_drill(
         env=effective_env,
         checks=checks,
@@ -2424,6 +2919,7 @@ def run_verification(
         active_object_count=active_object_count,
         restore_db_rows=restore_db_rows,
         restore_object_count=restore_object_count,
+        barrier=barrier,
     )
 
 
