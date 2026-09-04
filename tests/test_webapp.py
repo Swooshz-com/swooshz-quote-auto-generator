@@ -2631,6 +2631,169 @@ class WebappServerTest(unittest.TestCase):
                 self.assertNotIn("model_output_json", serialized)
                 self.assertNotIn("application_normalization", serialized)
 
+    def _run_run410_protected_draft_fixture(self, response_data, label):
+        payload = valid_payload()
+        log_root = ROOT / "_logs" / "tests" / f"run-410-{label}-{time.time_ns()}"
+        log_root.parent.mkdir(parents=True, exist_ok=True)
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(response_data).encode("utf-8")
+        with (
+            mock.patch.dict(
+                os.environ,
+                isolated_env(
+                    APP_MODE="deploy",
+                    OPENAI_API_KEY="sk-test-observability",
+                    QUOTE_LOG_ROOT=str(log_root),
+                ),
+                clear=True,
+            ),
+            mock.patch.object(webapp, "read_dotenv_value", side_effect=env_only_dotenv_value),
+            mock.patch.object(webapp.urllib.request, "urlopen", return_value=response),
+        ):
+            result = webapp.draft_quote_basis(payload)
+
+        records = [
+            json.loads(line)
+            for line in next((log_root / "ai").glob("*.jsonl")).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        return payload, result, records
+
+    def _assert_run410_protected_shape_failure(self, payload, result, records, private_markers=()):
+        attempt = next(record for record in records if record["event"] == "ai_call_attempt")
+        blocked = next(record for record in records if record["event"] == "ai_draft_protected_mode_blocked")
+        attempt_details = attempt["details"]
+        diagnostics = attempt_details["details"]
+        error_reference = result["error_reference"]
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+        self.assertRegex(error_reference, r"^ERR-[0-9A-F]{8}$")
+        self.assertEqual(diagnostics["failure_kind"], "provider_error")
+        self.assertEqual(diagnostics["failure_boundary"], "provider_response_shape")
+        self.assertEqual(diagnostics["attempt_number"], 1)
+        self.assertEqual(attempt_details["error_reference"], error_reference)
+        self.assertEqual(diagnostics["error_reference"], error_reference)
+        self.assertEqual(blocked["details"]["error_reference"], error_reference)
+        self.assertEqual(blocked["details"]["failure_boundary"], "provider_response_shape")
+        serialized = json.dumps([result, records], sort_keys=True)
+        for private_value in (
+            *private_markers,
+            "sk-test-observability",
+            payload["client"]["name"],
+            payload["images"][0]["data_url"],
+        ):
+            self.assertNotIn(private_value, serialized)
+        self.assertNotIn("model_output_json", serialized)
+        self.assertNotIn("application_normalization", serialized)
+
+    def test_run410_non_string_top_level_output_text_is_shape_failure(self):
+        """Locks the output_text type guard before response_output_text extraction."""
+        private_marker = "PRIVATE_NON_STRING_OUTPUT_TEXT"
+        payload, result, records = self._run_run410_protected_draft_fixture(
+            {"output_text": {"sentinel": private_marker}},
+            "non-string-output-text",
+        )
+
+        self._assert_run410_protected_shape_failure(payload, result, records, (private_marker,))
+
+    def test_run410_decoded_non_object_top_level_responses_are_shape_failures(self):
+        """Locks the successfully decoded non-dict guard in request_openai_quote_basis."""
+        cases = (
+            ("null", None, ()),
+            ("scalar", "PRIVATE_TOP_LEVEL_SCALAR", ("PRIVATE_TOP_LEVEL_SCALAR",)),
+            ("list", ["PRIVATE_TOP_LEVEL_LIST"], ("PRIVATE_TOP_LEVEL_LIST",)),
+        )
+
+        for label, response_data, private_markers in cases:
+            with self.subTest(label=label):
+                payload, result, records = self._run_run410_protected_draft_fixture(
+                    response_data,
+                    f"decoded-top-level-{label}",
+                )
+
+                self._assert_run410_protected_shape_failure(payload, result, records, private_markers)
+
+    def test_run410_non_object_output_content_member_is_shape_failure(self):
+        """Locks the content-list member guard before diagnostics traversal and extraction."""
+        private_marker = "PRIVATE_NON_OBJECT_CONTENT_MEMBER"
+        payload, result, records = self._run_run410_protected_draft_fixture(
+            {
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "PRIVATE_CONTENT_TEXT"},
+                        private_marker,
+                    ],
+                }],
+                "untrusted": "PRIVATE_NESTED_RESPONSE_MARKER",
+            },
+            "non-object-content-member",
+        )
+
+        self._assert_run410_protected_shape_failure(
+            payload,
+            result,
+            records,
+            (private_marker, "PRIVATE_CONTENT_TEXT", "PRIVATE_NESTED_RESPONSE_MARKER"),
+        )
+
+    def test_run410_completed_nested_raw_responses_payload_remains_supported(self):
+        """Locks completed-status diagnostics plus nested response_output_text and normalization."""
+        ai_draft = {
+            "quote_basis_sections": [{
+                "id": "surfaces",
+                "title": "Synthetic Nested Surfaces",
+                "lines": [{
+                    "tag": "Confirm",
+                    "text": "Synthetic nested raw response line",
+                    "confidence_pct": 95,
+                }],
+            }],
+            "line_items": [],
+        }
+        response_data = {
+            "id": "resp_synthetic_nested_success",
+            "status": "completed",
+            "output": [{
+                "id": "msg_synthetic_nested_success",
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": json.dumps(ai_draft),
+                }],
+            }],
+        }
+        payload, result, records = self._run_run410_protected_draft_fixture(
+            response_data,
+            "nested-raw-responses-success",
+        )
+        diagnostics = webapp.openai_response_failure_diagnostics(response_data)
+
+        self.assertEqual(diagnostics["responses_status"], "completed")
+        self.assertEqual(diagnostics["output_item_present"], True)
+        self.assertEqual(diagnostics["output_item_count"], 1)
+        self.assertEqual(diagnostics["output_text_present"], True)
+        self.assertEqual(diagnostics["output_text_count"], 1)
+        self.assertEqual(diagnostics["refusal_present"], False)
+        self.assertNotIn("failure_boundary", diagnostics)
+        self.assertEqual(result["status"], "drafted")
+        self.assertEqual(result["source"], "openai")
+        self.assertEqual(result["quote_basis"]["surfaces"], "Confirm: Synthetic nested raw response line")
+        normalized_lines = [
+            line["text"]
+            for section in result["quote_basis_sections"]
+            for line in section["lines"]
+        ]
+        self.assertIn("Synthetic nested raw response line", normalized_lines)
+        self.assertNotIn("error_reference", result)
+        attempt = next(record for record in records if record["event"] == "ai_call_attempt")
+        self.assertEqual(attempt["details"]["status"], "success")
+        self.assertNotIn("ai_draft_protected_mode_blocked", json.dumps(records, sort_keys=True))
+        self.assertNotIn("failure_boundary", json.dumps(records, sort_keys=True))
+
     def test_protected_draft_provider_transport_terminal_failure_is_safe(self):
         payload = valid_payload()
         log_root = test_temp_root() / f"draft-protected-transport-failure-{time.time_ns()}"
