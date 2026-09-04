@@ -2564,6 +2564,265 @@ class WebappServerTest(unittest.TestCase):
                 self.assertNotIn("PRIVATE_MODEL_OUTPUT_NOT_JSON", json.dumps(metadata))
                 self.assertNotIn("Synthetic line without confidence", json.dumps(metadata))
 
+    def test_protected_draft_malformed_nested_response_content_is_shape_failure(self):
+        payload = valid_payload()
+        cases = (
+            ("numeric", [{"type": "message", "content": 7}], "PRIVATE_NUMERIC_PROVIDER_CONTENT"),
+            (
+                "mapping",
+                [{"type": "message", "content": {"sentinel": "PRIVATE_MAPPING_PROVIDER_CONTENT"}}],
+                "PRIVATE_MAPPING_PROVIDER_CONTENT",
+            ),
+            ("string", [{"type": "message", "content": "PRIVATE_STRING_PROVIDER_CONTENT"}], "PRIVATE_STRING_PROVIDER_CONTENT"),
+            ("malformed_output_item", ["PRIVATE_MALFORMED_OUTPUT_ITEM"], "PRIVATE_MALFORMED_OUTPUT_ITEM"),
+        )
+
+        for label, output_value, private_marker in cases:
+            with self.subTest(label=label):
+                log_root = test_temp_root() / f"draft-protected-nested-shape-{label}-{time.time_ns()}"
+                response = mock.MagicMock()
+                response.__enter__.return_value.read.return_value = json.dumps({
+                    "output": output_value,
+                    "untrusted": private_marker,
+                }).encode("utf-8")
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        isolated_env(
+                            APP_MODE="deploy",
+                            OPENAI_API_KEY="sk-test-observability",
+                            QUOTE_LOG_ROOT=str(log_root),
+                        ),
+                        clear=True,
+                    ),
+                    mock.patch.object(webapp, "read_dotenv_value", side_effect=env_only_dotenv_value),
+                    mock.patch.object(webapp.urllib.request, "urlopen", return_value=response),
+                ):
+                    result = webapp.draft_quote_basis(payload)
+
+                records = [
+                    json.loads(line)
+                    for line in next((log_root / "ai").glob("*.jsonl")).read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                attempt = next(record for record in records if record["event"] == "ai_call_attempt")
+                blocked = next(record for record in records if record["event"] == "ai_draft_protected_mode_blocked")
+                attempt_details = attempt["details"]
+                diagnostics = attempt_details["details"]
+                error_reference = result["error_reference"]
+
+                self.assertEqual(result["status"], "blocked")
+                self.assertEqual(result["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+                self.assertEqual(diagnostics["failure_kind"], "provider_error")
+                self.assertEqual(diagnostics["failure_boundary"], "provider_response_shape")
+                self.assertEqual(diagnostics["attempt_number"], 1)
+                self.assertEqual(attempt_details["error_reference"], error_reference)
+                self.assertEqual(diagnostics["error_reference"], error_reference)
+                self.assertEqual(blocked["details"]["error_reference"], error_reference)
+                self.assertEqual(blocked["details"]["failure_boundary"], "provider_response_shape")
+                serialized = json.dumps(records, sort_keys=True)
+                for private_value in (
+                    private_marker,
+                    "sk-test-observability",
+                    payload["client"]["name"],
+                    payload["images"][0]["data_url"],
+                ):
+                    self.assertNotIn(private_value, serialized)
+                self.assertNotIn("model_output_json", serialized)
+                self.assertNotIn("application_normalization", serialized)
+
+    def test_protected_draft_provider_transport_terminal_failure_is_safe(self):
+        payload = valid_payload()
+        log_root = test_temp_root() / f"draft-protected-transport-failure-{time.time_ns()}"
+        transport_error = webapp.urllib.error.URLError("PRIVATE_TRANSPORT_REASON")
+        with (
+            mock.patch.dict(
+                os.environ,
+                isolated_env(
+                    APP_MODE="deploy",
+                    OPENAI_API_KEY="sk-test-observability",
+                    QUOTE_LOG_ROOT=str(log_root),
+                ),
+                clear=True,
+            ),
+            mock.patch.object(webapp, "read_dotenv_value", side_effect=env_only_dotenv_value),
+            mock.patch.object(webapp, "OPENAI_RETRY_DELAYS_SECONDS", ()),
+            mock.patch.object(webapp.urllib.request, "urlopen", side_effect=transport_error),
+        ):
+            result = webapp.draft_quote_basis(payload)
+
+        records = [
+            json.loads(line)
+            for line in next((log_root / "ai").glob("*.jsonl")).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        attempt = next(record for record in records if record["event"] == "ai_call_attempt")
+        blocked = next(record for record in records if record["event"] == "ai_draft_protected_mode_blocked")
+        attempt_details = attempt["details"]
+        diagnostics = attempt_details["details"]
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+        self.assertEqual(diagnostics["failure_kind"], "network_error")
+        self.assertEqual(diagnostics["failure_boundary"], "provider_transport")
+        self.assertEqual(diagnostics["attempt_number"], 1)
+        self.assertEqual(attempt_details["error_reference"], result["error_reference"])
+        self.assertEqual(diagnostics["error_reference"], result["error_reference"])
+        self.assertEqual(blocked["details"]["error_reference"], result["error_reference"])
+        self.assertEqual(blocked["details"]["failure_boundary"], "provider_transport")
+        serialized = json.dumps(records, sort_keys=True)
+        for private_value in (
+            "PRIVATE_TRANSPORT_REASON",
+            "sk-test-observability",
+            payload["client"]["name"],
+            payload["images"][0]["data_url"],
+        ):
+            self.assertNotIn(private_value, serialized)
+
+    def test_protected_draft_provider_contract_and_top_level_shape_are_safe(self):
+        payload = valid_payload()
+        cases = (
+            (
+                "responses_failed",
+                {
+                    "status": "failed",
+                    "error": {
+                        "type": "server_error",
+                        "code": "provider_failed",
+                        "message": "PRIVATE_FAILED_PROVIDER_BODY",
+                    },
+                },
+                "provider_response_contract",
+            ),
+            (
+                "top_level_shape",
+                {"output": "PRIVATE_TOP_LEVEL_OUTPUT"},
+                "provider_response_shape",
+            ),
+        )
+
+        for label, response_data, expected_boundary in cases:
+            with self.subTest(label=label):
+                log_root = test_temp_root() / f"draft-protected-contract-shape-{label}-{time.time_ns()}"
+                response = mock.MagicMock()
+                response.__enter__.return_value.read.return_value = json.dumps(response_data).encode("utf-8")
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        isolated_env(
+                            APP_MODE="deploy",
+                            OPENAI_API_KEY="sk-test-observability",
+                            QUOTE_LOG_ROOT=str(log_root),
+                        ),
+                        clear=True,
+                    ),
+                    mock.patch.object(webapp, "read_dotenv_value", side_effect=env_only_dotenv_value),
+                    mock.patch.object(webapp.urllib.request, "urlopen", return_value=response),
+                ):
+                    result = webapp.draft_quote_basis(payload)
+
+                records = [
+                    json.loads(line)
+                    for line in next((log_root / "ai").glob("*.jsonl")).read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                attempt = next(record for record in records if record["event"] == "ai_call_attempt")
+                blocked = next(record for record in records if record["event"] == "ai_draft_protected_mode_blocked")
+                attempt_details = attempt["details"]
+                diagnostics = attempt_details["details"]
+
+                self.assertEqual(result["status"], "blocked")
+                self.assertEqual(result["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+                self.assertEqual(diagnostics["failure_kind"], "provider_error")
+                self.assertEqual(diagnostics["failure_boundary"], expected_boundary)
+                self.assertEqual(diagnostics["attempt_number"], 1)
+                self.assertEqual(attempt_details["error_reference"], result["error_reference"])
+                self.assertEqual(diagnostics["error_reference"], result["error_reference"])
+                self.assertEqual(blocked["details"]["error_reference"], result["error_reference"])
+                self.assertEqual(blocked["details"]["failure_boundary"], expected_boundary)
+                serialized = json.dumps(records, sort_keys=True)
+                for private_value in (
+                    "PRIVATE_FAILED_PROVIDER_BODY",
+                    "PRIVATE_TOP_LEVEL_OUTPUT",
+                    "sk-test-observability",
+                    payload["client"]["name"],
+                    payload["images"][0]["data_url"],
+                ):
+                    self.assertNotIn(private_value, serialized)
+
+    def test_protected_draft_terminal_retry_uses_terminal_attempt_and_shared_reference(self):
+        payload = valid_payload()
+        log_root = test_temp_root() / f"draft-protected-terminal-retry-{time.time_ns()}"
+        first_error = webapp.urllib.error.HTTPError(
+            url=webapp.OPENAI_RESPONSES_URL,
+            code=500,
+            msg="Upstream retryable error",
+            hdrs={},
+            fp=io.BytesIO(b"retryable"),
+        )
+        second_error = webapp.urllib.error.HTTPError(
+            url=webapp.OPENAI_RESPONSES_URL,
+            code=400,
+            msg="Bad Request",
+            hdrs={},
+            fp=io.BytesIO(json.dumps({
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "invalid_parameter",
+                    "message": "PRIVATE_TERMINAL_PROVIDER_BODY",
+                }
+            }).encode("utf-8")),
+        )
+        try:
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    isolated_env(
+                        APP_MODE="deploy",
+                        OPENAI_API_KEY="sk-test-observability",
+                        QUOTE_LOG_ROOT=str(log_root),
+                    ),
+                    clear=True,
+                ),
+                mock.patch.object(webapp, "read_dotenv_value", side_effect=env_only_dotenv_value),
+                mock.patch.object(webapp, "OPENAI_RETRY_DELAYS_SECONDS", (0.0,)),
+                mock.patch.object(webapp.time, "sleep"),
+                mock.patch.object(webapp.urllib.request, "urlopen", side_effect=[first_error, second_error]),
+            ):
+                result = webapp.draft_quote_basis(payload)
+        finally:
+            first_error.close()
+            second_error.close()
+
+        records = [
+            json.loads(line)
+            for line in next((log_root / "ai").glob("*.jsonl")).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        attempt = next(record for record in records if record["event"] == "ai_call_attempt")
+        blocked = next(record for record in records if record["event"] == "ai_draft_protected_mode_blocked")
+        attempt_details = attempt["details"]
+        diagnostics = attempt_details["details"]
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+        self.assertEqual(diagnostics["failure_kind"], "http_error")
+        self.assertEqual(diagnostics["failure_boundary"], "provider_http")
+        self.assertEqual(diagnostics["http_status"], 400)
+        self.assertEqual(diagnostics["attempt_number"], 2)
+        self.assertEqual(attempt_details["error_reference"], result["error_reference"])
+        self.assertEqual(diagnostics["error_reference"], result["error_reference"])
+        self.assertEqual(blocked["details"]["error_reference"], result["error_reference"])
+        self.assertEqual(blocked["details"]["failure_boundary"], "provider_http")
+        serialized = json.dumps(records, sort_keys=True)
+        for private_value in (
+            "PRIVATE_TERMINAL_PROVIDER_BODY",
+            "sk-test-observability",
+            payload["client"]["name"],
+            payload["images"][0]["data_url"],
+        ):
+            self.assertNotIn(private_value, serialized)
+
     def test_normalize_ai_draft_appends_missing_catalog_backed_basis_lines(self):
         parsed = {
             "quote_basis_sections": [

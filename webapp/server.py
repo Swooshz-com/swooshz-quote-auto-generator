@@ -17411,8 +17411,20 @@ def openai_response_failure_diagnostics(data: Any) -> dict[str, Any]:
         return {"failure_boundary": "provider_response_shape"}
 
     output = data.get("output")
+    if output is not None and not isinstance(output, list):
+        return {"failure_boundary": "provider_response_shape"}
     output_items = output if isinstance(output, list) else []
     top_level_text = data.get("output_text")
+    if top_level_text is not None and not isinstance(top_level_text, str):
+        return {"failure_boundary": "provider_response_shape"}
+    for item in output_items:
+        if not isinstance(item, dict):
+            return {"failure_boundary": "provider_response_shape"}
+        content_items = item.get("content")
+        if content_items is not None and not isinstance(content_items, list):
+            return {"failure_boundary": "provider_response_shape"}
+        if any(not isinstance(content, dict) for content in content_items or []):
+            return {"failure_boundary": "provider_response_shape"}
     if isinstance(top_level_text, str):
         output_text_count = 1 if top_level_text.strip() else 0
     else:
@@ -19772,7 +19784,10 @@ def request_openai_quote_basis(payload: dict[str, Any], api_key: str) -> dict[st
 
     response_diagnostics = openai_response_failure_diagnostics(data)
     response_diagnostics["attempt_number"] = attempt + 1
-    if not isinstance(data, dict):
+    if (
+        not isinstance(data, dict)
+        or response_diagnostics.get("failure_boundary") == "provider_response_shape"
+    ):
         raise OpenAIAnalysisError(
             "OpenAI analysis response shape was invalid.",
             diagnostics={**response_diagnostics, "failure_boundary": "provider_response_shape"},
