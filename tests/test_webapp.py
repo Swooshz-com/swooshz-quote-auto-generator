@@ -2362,6 +2362,208 @@ class WebappServerTest(unittest.TestCase):
         self.assertNotIn('"quote_basis"', log_text)
         self.assertNotIn('"line_items"', log_text)
 
+    def test_protected_draft_http_failure_logs_allowlisted_metadata_with_shared_reference(self):
+        payload = valid_payload()
+        private_provider_message = "PRIVATE_PROVIDER_BODY prompt text and generated draft text"
+        http_error = webapp.urllib.error.HTTPError(
+            url=webapp.OPENAI_RESPONSES_URL,
+            code=400,
+            msg="Bad Request",
+            hdrs={},
+            fp=io.BytesIO(json.dumps({
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "invalid_parameter",
+                    "message": private_provider_message,
+                }
+            }).encode("utf-8")),
+        )
+        log_root = test_temp_root() / f"draft-protected-http-log-{time.time_ns()}"
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                isolated_env(
+                    APP_MODE="deploy",
+                    OPENAI_API_KEY="sk-test-observability",
+                    QUOTE_LOG_ROOT=str(log_root),
+                ),
+                clear=True,
+            ),
+            mock.patch.object(webapp, "read_dotenv_value", side_effect=env_only_dotenv_value),
+            mock.patch.object(webapp.urllib.request, "urlopen", side_effect=http_error),
+        ):
+            result = webapp.draft_quote_basis(payload)
+
+        http_error.close()
+        records = [
+            json.loads(line)
+            for line in next((log_root / "ai").glob("*.jsonl")).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        attempt = next(record for record in records if record["event"] == "ai_call_attempt")
+        blocked = next(record for record in records if record["event"] == "ai_draft_protected_mode_blocked")
+        attempt_details = attempt["details"]
+        diagnostics = attempt_details["details"]
+        error_reference = result["error_reference"]
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+        self.assertRegex(error_reference, r"^ERR-[0-9A-F]{8}$")
+        self.assertEqual(attempt_details["error_reference"], error_reference)
+        self.assertEqual(diagnostics["error_reference"], error_reference)
+        self.assertEqual(diagnostics["failure_kind"], "http_error")
+        self.assertEqual(diagnostics["failure_boundary"], "provider_http")
+        self.assertEqual(diagnostics["http_status"], 400)
+        self.assertEqual(diagnostics["http_status_class"], "4xx")
+        self.assertEqual(diagnostics["provider_error_class"], "invalid_request_error")
+        self.assertEqual(diagnostics["provider_error_code"], "invalid_parameter")
+        self.assertEqual(diagnostics["attempt_number"], 1)
+        self.assertEqual(blocked["details"]["error_reference"], error_reference)
+        self.assertEqual(blocked["details"]["failure_boundary"], "provider_http")
+        self.assertTrue(set(diagnostics).issubset({
+            "failure_kind",
+            "error_type",
+            "safe_error_summary",
+            "timeout_seconds",
+            "error_reference",
+            "failure_boundary",
+            "http_status",
+            "http_status_class",
+            "provider_error_class",
+            "provider_error_code",
+            "responses_status",
+            "incomplete_reason",
+            "refusal_present",
+            "output_item_present",
+            "output_item_count",
+            "output_text_present",
+            "output_text_count",
+            "attempt_number",
+        }))
+        serialized = json.dumps(records, sort_keys=True)
+        for private_value in (
+            private_provider_message,
+            "sk-test-observability",
+            payload["client"]["name"],
+            payload["quote_basis"]["platform"],
+            payload["images"][0]["data_url"],
+        ):
+            self.assertNotIn(private_value, serialized)
+
+    def test_protected_draft_incomplete_and_refusal_responses_are_classified_without_body_leakage(self):
+        cases = (
+            (
+                "incomplete",
+                {
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "output": [{
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "PRIVATE_INCOMPLETE_OUTPUT"}],
+                    }],
+                },
+                {"responses_status": "incomplete", "incomplete_reason": "max_output_tokens", "refusal_present": False},
+            ),
+            (
+                "refusal",
+                {
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "content": [{"type": "refusal", "refusal": "PRIVATE_REFUSAL_BODY"}],
+                    }],
+                },
+                {"responses_status": "completed", "refusal_present": True},
+            ),
+        )
+
+        for label, response_data, expected in cases:
+            with self.subTest(label=label):
+                log_root = test_temp_root() / f"draft-protected-contract-{label}-{time.time_ns()}"
+                response = mock.MagicMock()
+                response.__enter__.return_value.read.return_value = json.dumps(response_data).encode("utf-8")
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        isolated_env(
+                            APP_MODE="deploy",
+                            OPENAI_API_KEY="sk-test-observability",
+                            QUOTE_LOG_ROOT=str(log_root),
+                        ),
+                        clear=True,
+                    ),
+                    mock.patch.object(webapp, "read_dotenv_value", side_effect=env_only_dotenv_value),
+                    mock.patch.object(webapp.urllib.request, "urlopen", return_value=response),
+                ):
+                    result = webapp.draft_quote_basis(valid_payload())
+
+                records = [
+                    json.loads(line)
+                    for line in next((log_root / "ai").glob("*.jsonl")).read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                attempt = next(record for record in records if record["event"] == "ai_call_attempt")
+                diagnostics = attempt["details"]["details"]
+                self.assertEqual(result["status"], "blocked")
+                self.assertEqual(diagnostics["failure_kind"], "model_output_invalid")
+                self.assertEqual(diagnostics["failure_boundary"], "provider_response_contract")
+                self.assertEqual(diagnostics["output_item_present"], True)
+                self.assertEqual(diagnostics["output_item_count"], 1)
+                for key, value in expected.items():
+                    self.assertEqual(diagnostics[key], value)
+                serialized = json.dumps(records, sort_keys=True)
+                self.assertNotIn("PRIVATE_INCOMPLETE_OUTPUT", serialized)
+                self.assertNotIn("PRIVATE_REFUSAL_BODY", serialized)
+
+    def test_openai_draft_failure_boundaries_distinguish_provider_json_model_output_and_normalization(self):
+        cases = (
+            (
+                "provider_response_json",
+                b"PRIVATE_PROVIDER_NON_JSON_BODY",
+                "invalid_json",
+            ),
+            (
+                "model_output_json",
+                {"output_text": "PRIVATE_MODEL_OUTPUT_NOT_JSON"},
+                "model_output_invalid",
+            ),
+            (
+                "application_normalization",
+                {"output_text": json.dumps({
+                    "quote_basis_sections": [{
+                        "title": "Synthetic section",
+                        "lines": [{"tag": "Confirm", "text": "Synthetic line without confidence"}],
+                    }],
+                    "line_items": [],
+                })},
+                "schema_validation_failed",
+            ),
+        )
+
+        for boundary, response_value, expected_kind in cases:
+            with self.subTest(boundary=boundary):
+                response = mock.MagicMock()
+                response.__enter__.return_value.read.return_value = (
+                    response_value
+                    if isinstance(response_value, bytes)
+                    else json.dumps(response_value).encode("utf-8")
+                )
+                with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response):
+                    with self.assertRaises(webapp.OpenAIAnalysisError) as error:
+                        webapp.request_openai_quote_basis(valid_payload(), "sk-test-observability")
+
+                metadata = webapp.ai_failure_metadata(
+                    error.exception,
+                    provider=webapp.AI_PROVIDER_OPENAI,
+                    error_reference="ERR-ABCDEF12",
+                )
+                self.assertEqual(metadata["failure_boundary"], boundary)
+                self.assertEqual(metadata["failure_kind"], expected_kind)
+                self.assertNotIn("PRIVATE_PROVIDER_NON_JSON_BODY", json.dumps(metadata))
+                self.assertNotIn("PRIVATE_MODEL_OUTPUT_NOT_JSON", json.dumps(metadata))
+                self.assertNotIn("Synthetic line without confidence", json.dumps(metadata))
+
     def test_normalize_ai_draft_appends_missing_catalog_backed_basis_lines(self):
         parsed = {
             "quote_basis_sections": [

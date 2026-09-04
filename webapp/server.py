@@ -898,6 +898,10 @@ def ai_failure_metadata(
     url_error = first_exception_of_type(exception, urllib.error.URLError)
     json_error = first_exception_of_type(exception, json.JSONDecodeError)
     http_status = getattr(http_error, "code", None) if http_error else None
+    diagnostics: dict[str, Any] = {}
+    for item in reversed(chain):
+        diagnostics.update(safe_ai_output_diagnostics(getattr(item, "diagnostics", {})))
+        diagnostics.update(provider_error_diagnostics(getattr(item, "_sqag_provider_error_diagnostics", {})))
 
     if "missing:" in combined_text:
         failure_kind = "missing_api_key"
@@ -913,7 +917,11 @@ def ai_failure_metadata(
         failure_kind = "network_error"
     elif json_error or "invalid json" in combined_text:
         failure_kind = "invalid_json"
-    elif "omitted pricing rows" in combined_text or "failed validation" in combined_text:
+    elif (
+        "omitted pricing rows" in combined_text
+        or "failed validation" in combined_text
+        or "mandatory confidence" in combined_text
+    ):
         failure_kind = "schema_validation_failed"
     elif "returned no usable" in combined_text:
         failure_kind = "model_output_invalid"
@@ -940,11 +948,21 @@ def ai_failure_metadata(
         "error_type": type(chain[-1]).__name__ if chain else type(exception).__name__,
         "safe_error_summary": summaries[failure_kind],
     }
-    diagnostics = safe_ai_output_diagnostics(getattr(exception, "diagnostics", {}))
     if diagnostics:
         metadata.update(diagnostics)
+    if "failure_boundary" not in metadata:
+        if http_error:
+            metadata["failure_boundary"] = "provider_http"
+        elif json_error:
+            metadata["failure_boundary"] = "provider_response_json"
+        elif isinstance(exception, AIModelOutputError):
+            metadata["failure_boundary"] = "model_output"
+        else:
+            metadata["failure_boundary"] = "provider"
     if http_status:
         metadata["http_status"] = int(http_status)
+        if 100 <= int(http_status) <= 599:
+            metadata["http_status_class"] = f"{int(http_status) // 100}xx"
     if timeout_seconds is not None:
         metadata["timeout_seconds"] = int(timeout_seconds)
     if clean_text(error_reference):
@@ -1117,6 +1135,7 @@ def log_ai_call_attempt(
                 clean_text(error_values[0]) if error_values else "",
                 provider=record["provider"],
                 timeout_seconds=record.get("timeout_seconds") if isinstance(record.get("timeout_seconds"), int) else None,
+                error_reference=record.get("error_reference", ""),
             ).items():
                 record.setdefault(key, value)
             record["error_count"] = len(error_values)
@@ -17216,7 +17235,9 @@ def default_line_items(payload: dict[str, Any], auth_session: dict[str, Any] | N
 
 
 class OpenAIAnalysisError(RuntimeError):
-    pass
+    def __init__(self, message: str, diagnostics: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics or {}
 
 
 class AIModelOutputError(OpenAIAnalysisError):
@@ -17225,8 +17246,28 @@ class AIModelOutputError(OpenAIAnalysisError):
         self.diagnostics = diagnostics or {}
 
 
+def safe_ai_diagnostic_enum(value: Any) -> str:
+    text = clean_text(value).lower()
+    return text if re.fullmatch(r"[a-z0-9][a-z0-9_.:/-]{0,63}", text) else ""
+
+
+def provider_error_diagnostics(value: Any) -> dict[str, str]:
+    source = value.get("error") if isinstance(value, dict) and isinstance(value.get("error"), dict) else value
+    if not isinstance(source, dict):
+        return {}
+    diagnostics: dict[str, str] = {}
+    error_class = safe_ai_diagnostic_enum(source.get("type") or source.get("class") or source.get("error_type"))
+    error_code = safe_ai_diagnostic_enum(source.get("code") or source.get("error_code"))
+    if error_class:
+        diagnostics["provider_error_class"] = error_class
+    if error_code:
+        diagnostics["provider_error_code"] = error_code
+    return diagnostics
+
+
 def provider_http_error_message(provider: str, exc: urllib.error.HTTPError) -> str:
     message = ""
+    data: Any = None
     try:
         raw = exc.read().decode("utf-8", errors="replace")
     except OSError:
@@ -17242,6 +17283,9 @@ def provider_http_error_message(provider: str, exc: urllib.error.HTTPError) -> s
                 message = clean_text(error.get("message"))
             elif isinstance(data, dict):
                 message = clean_text(data.get("message"))
+    provider_diagnostics = provider_error_diagnostics(data)
+    if provider_diagnostics:
+        setattr(exc, "_sqag_provider_error_diagnostics", provider_diagnostics)
     if message:
         result = f"{provider} analysis failed with HTTP {exc.code}: {scrub_sensitive_text(message)[:500]}"
     else:
@@ -17328,11 +17372,28 @@ SAFE_AI_OUTPUT_DIAGNOSTIC_KEYS = {
 }
 
 
+SAFE_AI_FAILURE_DIAGNOSTIC_KEYS = {
+    "failure_boundary",
+    "http_status",
+    "http_status_class",
+    "provider_error_class",
+    "provider_error_code",
+    "responses_status",
+    "incomplete_reason",
+    "refusal_present",
+    "output_item_present",
+    "output_item_count",
+    "output_text_present",
+    "output_text_count",
+    "attempt_number",
+}
+
+
 def safe_ai_output_diagnostics(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     diagnostics: dict[str, Any] = {}
-    for key in SAFE_AI_OUTPUT_DIAGNOSTIC_KEYS:
+    for key in SAFE_AI_OUTPUT_DIAGNOSTIC_KEYS | SAFE_AI_FAILURE_DIAGNOSTIC_KEYS:
         item = value.get(key)
         if isinstance(item, bool):
             diagnostics[key] = item
@@ -17343,6 +17404,53 @@ def safe_ai_output_diagnostics(value: Any) -> dict[str, Any]:
             if re.fullmatch(r"[a-z0-9_-]{1,64}", text):
                 diagnostics[key] = text
     return diagnostics
+
+
+def openai_response_failure_diagnostics(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {"failure_boundary": "provider_response_shape"}
+
+    output = data.get("output")
+    output_items = output if isinstance(output, list) else []
+    top_level_text = data.get("output_text")
+    if isinstance(top_level_text, str):
+        output_text_count = 1 if top_level_text.strip() else 0
+    else:
+        output_text_count = sum(
+            1
+            for item in output_items
+            if isinstance(item, dict)
+            for content in (item.get("content") or [])
+            if isinstance(content, dict) and isinstance(content.get("text"), str) and content.get("text", "").strip()
+        )
+    refusal_present = "refusal" in data and data.get("refusal") is not None
+    for item in output_items:
+        if not isinstance(item, dict):
+            continue
+        if safe_ai_diagnostic_enum(item.get("type")) == "refusal":
+            refusal_present = True
+        for content in item.get("content") or []:
+            if not isinstance(content, dict):
+                continue
+            if safe_ai_diagnostic_enum(content.get("type")) == "refusal" or "refusal" in content:
+                refusal_present = True
+
+    diagnostics: dict[str, Any] = {
+        "output_item_present": bool(output_items),
+        "output_item_count": len(output_items),
+        "output_text_present": output_text_count > 0,
+        "output_text_count": output_text_count,
+        "refusal_present": refusal_present,
+    }
+    responses_status = safe_ai_diagnostic_enum(data.get("status"))
+    incomplete_details = data.get("incomplete_details") if isinstance(data.get("incomplete_details"), dict) else {}
+    incomplete_reason = safe_ai_diagnostic_enum(incomplete_details.get("reason") or data.get("incomplete_reason"))
+    if responses_status:
+        diagnostics["responses_status"] = responses_status
+    if incomplete_reason:
+        diagnostics["incomplete_reason"] = incomplete_reason
+    diagnostics.update(provider_error_diagnostics(data.get("error")))
+    return safe_ai_output_diagnostics(diagnostics)
 
 
 def token_usage_diagnostics(data: dict[str, Any]) -> dict[str, int]:
@@ -19630,16 +19738,89 @@ def request_openai_quote_basis(payload: dict[str, Any], api_key: str) -> dict[st
             if attempt < len(retry_delays) and is_transient_openai_error(exc):
                 time.sleep(retry_delays[attempt])
                 continue
-            raise OpenAIAnalysisError(openai_http_error_message(exc)) from exc
+            message = openai_http_error_message(exc)
+            diagnostics: dict[str, Any] = {
+                "failure_boundary": "provider_http",
+                "attempt_number": attempt + 1,
+            }
+            if isinstance(exc.code, int) and 100 <= exc.code <= 599:
+                diagnostics.update({
+                    "http_status": exc.code,
+                    "http_status_class": f"{exc.code // 100}xx",
+                })
+            diagnostics.update(getattr(exc, "_sqag_provider_error_diagnostics", {}))
+            raise OpenAIAnalysisError(message, diagnostics=diagnostics) from exc
         except PROVIDER_CONNECTION_EXCEPTIONS as exc:
             if attempt < len(retry_delays) and is_transient_openai_error(exc):
                 time.sleep(retry_delays[attempt])
                 continue
-            raise OpenAIAnalysisError(provider_connection_error_message("OpenAI", exc)) from exc
-        except json.JSONDecodeError as exc:
-            raise OpenAIAnalysisError("OpenAI analysis returned invalid JSON.") from exc
+            raise OpenAIAnalysisError(
+                provider_connection_error_message("OpenAI", exc),
+                diagnostics={
+                    "failure_boundary": "provider_transport",
+                    "attempt_number": attempt + 1,
+                },
+            ) from exc
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise OpenAIAnalysisError(
+                "OpenAI analysis returned invalid JSON.",
+                diagnostics={
+                    "failure_boundary": "provider_response_json",
+                    "attempt_number": attempt + 1,
+                },
+            ) from exc
 
-    return normalize_ai_draft(parse_json_object(response_output_text(data)), payload, require_confidence=True)
+    response_diagnostics = openai_response_failure_diagnostics(data)
+    response_diagnostics["attempt_number"] = attempt + 1
+    if not isinstance(data, dict):
+        raise OpenAIAnalysisError(
+            "OpenAI analysis response shape was invalid.",
+            diagnostics={**response_diagnostics, "failure_boundary": "provider_response_shape"},
+        )
+    if (
+        ("output" in data and data.get("output") is not None and not isinstance(data.get("output"), list))
+        or ("output_text" in data and data.get("output_text") is not None and not isinstance(data.get("output_text"), str))
+    ):
+        raise OpenAIAnalysisError(
+            "OpenAI analysis response shape was invalid.",
+            diagnostics={**response_diagnostics, "failure_boundary": "provider_response_shape"},
+        )
+    if response_diagnostics.get("responses_status") == "failed":
+        raise OpenAIAnalysisError(
+            "OpenAI analysis response failed.",
+            diagnostics={**response_diagnostics, "failure_boundary": "provider_response_contract"},
+        )
+    if response_diagnostics.get("responses_status") == "incomplete" or response_diagnostics.get("refusal_present"):
+        raise AIModelOutputError(
+            "OpenAI analysis response was incomplete or refused.",
+            diagnostics={**response_diagnostics, "failure_boundary": "provider_response_contract"},
+        )
+    try:
+        output_text = response_output_text(data)
+    except (AttributeError, TypeError) as exc:
+        raise OpenAIAnalysisError(
+            "OpenAI analysis response shape was invalid.",
+            diagnostics={**response_diagnostics, "failure_boundary": "provider_response_shape"},
+        ) from exc
+    try:
+        parsed = parse_json_object(output_text)
+    except OpenAIAnalysisError as exc:
+        raise AIModelOutputError(
+            str(exc),
+            diagnostics={**response_diagnostics, "failure_boundary": "model_output_json"},
+        ) from exc
+    try:
+        return normalize_ai_draft(parsed, payload, require_confidence=True)
+    except OpenAIAnalysisError as exc:
+        raise OpenAIAnalysisError(
+            str(exc),
+            diagnostics={**response_diagnostics, "failure_boundary": "application_normalization"},
+        ) from exc
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
+        raise OpenAIAnalysisError(
+            "OpenAI analysis response could not be normalized.",
+            diagnostics={**response_diagnostics, "failure_boundary": "application_normalization"},
+        ) from exc
 
 
 def request_openai_basis_chat_with_model(payload: dict[str, Any], api_key: str, model: str) -> dict[str, Any]:
@@ -20007,6 +20188,7 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
     provider_label = "OpenAI"
     missing_env = OPENAI_API_KEY_ENV_NAME
     remote_errors: list[str] = []
+    error_reference = ""
 
     if configured_storage_mode() == "database" or protected_job_routes_enabled(auth_session):
         try:
@@ -20052,21 +20234,35 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
                 log_database_profile_resolution_block(payload)
                 return profile_defaults_blocked_result()
             fallback_project = booth_dimensions_from_payload(payload)
-            result = finalized_remote_draft_result(
-                payload,
-                ai_basis,
-                "openai",
-                "OpenAI",
-                fallback_project,
-                fallback_line_items,
-                {
-                    "provider": AI_PROVIDER_OPENAI,
-                    "model": draft_model,
-                    "analysis_mode": analysis_mode,
-                    "image_count": image_count,
-                    "pdf_count": pdf_count,
-                },
-            )
+            try:
+                result = finalized_remote_draft_result(
+                    payload,
+                    ai_basis,
+                    "openai",
+                    "OpenAI",
+                    fallback_project,
+                    fallback_line_items,
+                    {
+                        "provider": AI_PROVIDER_OPENAI,
+                        "model": draft_model,
+                        "analysis_mode": analysis_mode,
+                        "image_count": image_count,
+                        "pdf_count": pdf_count,
+                    },
+                )
+            except OpenAIAnalysisError as exc:
+                raise OpenAIAnalysisError(
+                    str(exc),
+                    diagnostics={
+                        **safe_ai_output_diagnostics(getattr(exc, "diagnostics", {})),
+                        "failure_boundary": "application_normalization",
+                    },
+                ) from exc
+            except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
+                raise OpenAIAnalysisError(
+                    "OpenAI analysis response could not be normalized.",
+                    diagnostics={"failure_boundary": "application_normalization"},
+                ) from exc
             log_ai_call_attempt(
                 feature="draft_quote_basis",
                 provider=AI_PROVIDER_OPENAI,
@@ -20084,14 +20280,12 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
         except OpenAIAnalysisError as exc:
             openai_error = str(exc)
             remote_errors.append(openai_error)
-            provider_failure_details = (
-                ai_failure_metadata(
-                    exc,
-                    provider=AI_PROVIDER_OPENAI,
-                    timeout_seconds=ai_provider_timeout_seconds(AI_PROVIDER_OPENAI, "draft_quote_basis"),
-                )
-                if protected_mode
-                else {"errors": safe_error_messages([openai_error])}
+            error_reference = new_error_reference()
+            provider_failure_details = ai_failure_metadata(
+                exc,
+                provider=AI_PROVIDER_OPENAI,
+                timeout_seconds=ai_provider_timeout_seconds(AI_PROVIDER_OPENAI, "draft_quote_basis"),
+                error_reference=error_reference,
             )
             log_ai_call_attempt(
                 feature="draft_quote_basis",
@@ -20102,10 +20296,10 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
                 analysis_mode=analysis_mode,
                 image_count=image_count,
                 pdf_count=pdf_count,
+                error_reference=error_reference,
                 details=provider_failure_details,
             )
             if protected_mode:
-                error_reference = new_error_reference()
                 log_protected_ai_draft_block(
                     error_reference=error_reference,
                     reason="remote_ai_failed",
@@ -20114,7 +20308,13 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
                     exc=exc,
                 )
                 return protected_ai_draft_blocked_result(error_reference)
-            write_local_log("openai_draft_failed", {"errors": safe_error_messages([openai_error])})
+            write_local_log(
+                "openai_draft_failed",
+                {
+                    "error_reference": error_reference,
+                    **provider_failure_details,
+                },
+            )
 
     if remote_errors:
         try:
@@ -20124,7 +20324,6 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
             log_database_profile_resolution_block(payload)
             return profile_defaults_blocked_result()
         fallback_project = booth_dimensions_from_payload(payload)
-        error_reference = new_error_reference()
         warning_messages = [
             "Remote AI analysis was unavailable, so I used a local starter draft from the current quote details. Review it carefully or regenerate later.",
             *remote_errors,
@@ -20137,7 +20336,7 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
                 "error_reference": error_reference,
                 "selected_provider": provider,
                 "provider_error_count": len(remote_errors),
-                "warnings": warnings,
+                "failure_kind": provider_failure_details.get("failure_kind"),
                 "line_item_count": len(fallback_line_items),
             },
         )
