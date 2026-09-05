@@ -65,6 +65,8 @@ WORKBOOK_PDF_PACKAGE_ALIASES = frozenset(
         "soffice",
     }
 )
+NIX_PACKAGE_FIELD_NAMES = frozenset({"nixpkgs", "nixpackages"})
+APT_PACKAGE_FIELD_NAMES = frozenset({"aptpkgs", "aptpackages"})
 
 # Immutable NixOS/nixpkgs commit providing python312 == 3.12.13 on x86_64-linux.
 # Commit message: "python312: 3.12.12 -> 3.12.13"
@@ -146,7 +148,7 @@ def _contract_values(document: dict[str, object]) -> tuple[object, object, objec
 def _dependency_bindings(
     document: dict[str, object],
 ) -> list[tuple[tuple[str, ...], str, object]]:
-    """Find case variants of supported Nix/Apt package fields and their paths."""
+    """Find supported Nix/Apt package fields, including alternate spellings."""
     bindings: list[tuple[tuple[str, ...], str, object]] = []
 
     def walk(value: object, path: tuple[str, ...]) -> None:
@@ -155,7 +157,7 @@ def _dependency_bindings(
         for key, nested in value.items():
             if not isinstance(key, str):
                 continue
-            if key.casefold() in {"nixpkgs", "aptpkgs", "aptpackages"}:
+            if key.casefold() in NIX_PACKAGE_FIELD_NAMES | APT_PACKAGE_FIELD_NAMES:
                 bindings.append((path + (key,), key, nested))
             walk(nested, path + (key,))
 
@@ -168,61 +170,70 @@ def _validate_workbook_pdf_dependency(document: dict[str, object]) -> list[str]:
     issues: list[str] = []
     expected_path = ("phases", "setup", "nixPkgs")
     bindings = _dependency_bindings(document)
-    setup_bindings = [
-        binding for binding in bindings if binding[0] == expected_path
+    nix_bindings = [
+        binding
+        for binding in bindings
+        if binding[1].casefold() in NIX_PACKAGE_FIELD_NAMES
+    ]
+    canonical_bindings = [
+        binding
+        for binding in nix_bindings
+        if binding[0] == expected_path and binding[1] == "nixPkgs"
     ]
 
-    if not setup_bindings:
+    for path, _key, value in bindings:
+        dotted_path = ".".join(path)
+        if not isinstance(value, list):
+            issues.append(
+                f"nixpacks.toml: {dotted_path} must be an array of package names"
+            )
+        elif any(not isinstance(package, str) for package in value):
+            issues.append(
+                f"nixpacks.toml: {dotted_path} must contain only strings"
+            )
+
+    if len(nix_bindings) > 1:
+        issues.append(
+            "nixpacks.toml: duplicate Nix package bindings are not allowed; "
+            "only [phases.setup].nixPkgs may be declared"
+        )
+
+    if not canonical_bindings:
         issues.append(
             "nixpacks.toml: [phases.setup].nixPkgs must bind the required "
             f"workbook PDF package {REQUIRED_WORKBOOK_PDF_NIXPKG!r}"
         )
-    elif len(setup_bindings) != 1:
+    elif len(canonical_bindings) != 1:
         issues.append(
             "nixpacks.toml: [phases.setup].nixPkgs has an ambiguous duplicate binding"
         )
     else:
-        packages = setup_bindings[0][2]
-        if not isinstance(packages, list):
-            issues.append(
-                "nixpacks.toml: [phases.setup].nixPkgs must be an array of package names"
-            )
-        elif any(not isinstance(package, str) for package in packages):
-            issues.append(
-                "nixpacks.toml: [phases.setup].nixPkgs must contain only strings"
-            )
-        else:
-            converter_count = packages.count(REQUIRED_WORKBOOK_PDF_NIXPKG)
-            hole_count = packages.count(NIXPACKS_SETUP_PACKAGE_HOLE)
-            unexpected = [
-                package
-                for package in packages
-                if package not in EXPECTED_SETUP_NIXPKGS
-            ]
-            if converter_count != 1:
+        packages = canonical_bindings[0][2]
+        if isinstance(packages, list) and all(
+            isinstance(package, str) for package in packages
+        ):
+            expected_packages = list(EXPECTED_SETUP_NIXPKGS)
+            if packages != expected_packages:
                 issues.append(
-                    "nixpacks.toml: [phases.setup].nixPkgs must contain exactly "
-                    f"one {REQUIRED_WORKBOOK_PDF_NIXPKG!r} package"
-                )
-            if hole_count != 1:
-                issues.append(
-                    "nixpacks.toml: [phases.setup].nixPkgs must contain exactly "
-                    f"one {NIXPACKS_SETUP_PACKAGE_HOLE!r} provider-package hole"
-                )
-            if unexpected:
-                issues.append(
-                    "nixpacks.toml: [phases.setup].nixPkgs contains unsupported or "
-                    f"ambiguous package names: {unexpected}"
+                    "nixpacks.toml: [phases.setup].nixPkgs must equal exactly "
+                    f"{expected_packages!r}, got {packages!r}"
                 )
 
     for path, key, value in bindings:
-        if path != expected_path and key.casefold() == "nixpkgs":
+        field_name = key.casefold()
+        dotted_path = ".".join(path)
+        if field_name == "nixpackages":
+            issues.append(
+                "nixpacks.toml: alternate Nix package field "
+                f"{dotted_path} is not accepted; use only [phases.setup].nixPkgs"
+            )
+        elif field_name == "nixpkgs" and path != expected_path:
             dotted_path = ".".join(path)
             issues.append(
                 "nixpacks.toml: workbook PDF nixPkgs must be declared only at "
                 f"[phases.setup].nixPkgs, not {dotted_path}"
             )
-        if key.casefold() in {"aptpkgs", "aptpackages"} and isinstance(value, list):
+        if field_name in APT_PACKAGE_FIELD_NAMES and isinstance(value, list):
             alternate = [
                 item
                 for item in value
@@ -291,16 +302,15 @@ def validate() -> int:
     else:
         if not isinstance(providers, list):
             issues.append("nixpacks.toml: providers must be an array")
-        elif len(providers) != 1:
-            issues.append(
-                f"nixpacks.toml: expected exactly 1 provider, got {len(providers)}: {providers}"
-            )
-        elif not isinstance(providers[0], str):
+        elif any(not isinstance(provider, str) for provider in providers):
             issues.append("nixpacks.toml: provider names must be strings")
-        elif providers[0].lower() != "python":
-            issues.append(f"nixpacks.toml: provider must be python, got {providers[0]}")
+        elif providers != list(LOCKED_PROVIDERS):
+            issues.append(
+                "nixpacks.toml: providers must equal exactly "
+                f"{list(LOCKED_PROVIDERS)!r}, got {providers!r}"
+            )
         if isinstance(providers, list) and any(
-            isinstance(provider, str) and provider.lower() == "node"
+            isinstance(provider, str) and provider.casefold() == "node"
             for provider in providers
         ):
             issues.append("nixpacks.toml: Node provider present (forbidden)")
