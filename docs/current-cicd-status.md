@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-08-02
+Last updated: 2026-09-05
 
 Source of truth: `.github/workflows/ci.yml`
 
@@ -41,6 +41,11 @@ Source of truth: `.github/workflows/ci.yml`
   not the original RED chronology or original development sequence.
 - `Secret scan`: checks the repository with Gitleaks before validation work proceeds.
 - `Dependency audit`: installs Node dependencies with `npm ci` and runs `npm audit --audit-level=high`.
+- `Nixpacks Python-only contract`: runs `python scripts/validate_nixpacks_python_contract.py`
+  and `python -m unittest tests.test_nixpacks_python_contract`. It requires
+  the locked Python-only provider/archive/start contract and exact
+  `[phases.setup].nixPkgs = ["...", "libreoffice"]`; missing, wrong, malformed,
+  duplicate, misplaced, or alternate converter bindings fail closed.
 - `Validate app`: runs after retrospective fixture integrity/result and security gates pass.
 
 ## Validate App Checks
@@ -63,6 +68,9 @@ Source of truth: `.github/workflows/ci.yml`
 - Checks JavaScript syntax for `webapp/static/app.js`, `scripts/playwright-smoke.mjs`, and `scripts/playwright-ai-basis-chat-stress.mjs`.
 - Checks Python syntax for `webapp/server.py`, quote/pricing scripts, and validation guard scripts.
 - Runs `python scripts/validate_local_pdf_dependency_usage.py` to keep `pypdfium2` and `Pillow` usage on the local PDF rendering path only.
+- The local PDF dependency guard is separate from hosted workbook conversion: it
+  does not prove live PDF success; the Nixpacks contract job verifies the locked
+  `libreoffice` binding only.
 - Runs `python scripts/validate_dynamic_pricing_reference_rules.py` to keep pricing-reference matching data-driven and block source-code semantic family/synonym packs.
 - Runs `python scripts/scan_sensitive_fixtures.py --fail-on-review` so review-level sensitive fixture findings fail CI.
 - Runtime privilege-contract static validation runs `python scripts/validate_runtime_privilege_contract.py`; the canonical manifest, complete unfiltered protected-role membership evaluation across parent/member/grantor positions, closed runtime-as-member/provider-control schema, exact six-column membership tuple, fourteen-key bounded verification-query set, independent executable-token contracts, exact publication-artifact column authority, the legacy `sqag_quote_artifacts` view read, the Boundary B owner-authority model, complete `r`/`S`/`f`/`n`/`T` default-ACL object-class binding, and repository requirement binding fail closed.
@@ -175,6 +183,11 @@ Source of truth: `.github/workflows/ci.yml`
   unauthenticated health probes.
 - CI exercises these boundaries with synthetic/mocked dependencies only and
   requires no database, object-storage, Platform, OIDC, or deployment secrets.
+- Internal-alpha requires a second PDF export path: an explicit PDF request
+  regenerates a fresh `quotation.xlsx` from the current reviewed state, converts it
+  through the installed workbook-mode `libreoffice`/`soffice` dependency, then
+  persists and session-associates the PDF for authorized download. XLSX remains the
+  master/default export; CI validates the contract but not live PDF success.
 
 ## Not Configured
 
