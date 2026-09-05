@@ -117,6 +117,7 @@ class NixpacksPythonContractREDTests(unittest.TestCase):
             "nixpacks.toml",
             'providers = ["python"]\n'
             '[phases.setup]\n'
+            'nixPkgs = ["...", "libreoffice"]\n'
             'nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
             '[start]\n'
             'cmd = "python webapp/server.py"\n',
@@ -125,10 +126,86 @@ class NixpacksPythonContractREDTests(unittest.TestCase):
         self._write("requirements.txt", "pyjwt==2.13.0\n")
         self._write("package.json", '{"name":"test"}\n')
 
+    def _replace_setup_package_binding(self, replacement: str) -> None:
+        path = self.tmp_root / "nixpacks.toml"
+        content = path.read_text(encoding="utf-8")
+        self._write(
+            "nixpacks.toml",
+            content.replace('nixPkgs = ["...", "libreoffice"]\n', replacement),
+        )
+
     def test_pass_when_all_correct(self):
         self._write_valid_files()
         self._redirect_root()
         self.assertEqual(validator.validate(), 0)
+
+    # -- Workbook-PDF converter fail-closed coverage -----------------------------
+
+    def test_pass_when_workbook_pdf_converter_is_bound_in_setup(self):
+        self._write_valid_files()
+        self._redirect_root()
+        self.assertEqual(validator.validate(), 0)
+
+    def test_fail_missing_workbook_pdf_converter(self):
+        self._write_valid_files()
+        self._replace_setup_package_binding("")
+        self._redirect_root()
+        self.assertNotEqual(validator.validate(), 0)
+
+    def test_fail_wrong_workbook_pdf_package(self):
+        self._write_valid_files()
+        self._replace_setup_package_binding('nixPkgs = ["...", "libreoffice-fresh"]\n')
+        self._redirect_root()
+        self.assertNotEqual(validator.validate(), 0)
+
+    def test_fail_malformed_workbook_pdf_package_binding(self):
+        self._write_valid_files()
+        self._replace_setup_package_binding('nixPkgs = "libreoffice"\n')
+        self._redirect_root()
+        self.assertNotEqual(validator.validate(), 0)
+
+    def test_fail_non_string_workbook_pdf_package(self):
+        self._write_valid_files()
+        self._replace_setup_package_binding('nixPkgs = ["...", 42]\n')
+        self._redirect_root()
+        self.assertNotEqual(validator.validate(), 0)
+
+    def test_fail_duplicate_workbook_pdf_package(self):
+        self._write_valid_files()
+        self._replace_setup_package_binding(
+            'nixPkgs = ["...", "libreoffice", "libreoffice"]\n'
+        )
+        self._redirect_root()
+        self.assertNotEqual(validator.validate(), 0)
+
+    def test_fail_ambiguous_duplicate_workbook_pdf_binding(self):
+        self._write_valid_files()
+        self._replace_setup_package_binding(
+            'nixPkgs = ["...", "libreoffice"]\n'
+            'nixPkgs = ["...", "libreoffice"]\n'
+        )
+        self._redirect_root()
+        self.assertNotEqual(validator.validate(), 0)
+
+    def test_fail_misplaced_workbook_pdf_package(self):
+        self._write_valid_files()
+        self._write(
+            "nixpacks.toml",
+            (self.tmp_root / "nixpacks.toml").read_text(encoding="utf-8")
+            + "[phases.build]\n"
+            + 'nixPkgs = ["...", "libreoffice"]\n',
+        )
+        self._redirect_root()
+        self.assertNotEqual(validator.validate(), 0)
+
+    def test_fail_alternate_apt_workbook_pdf_package(self):
+        self._write_valid_files()
+        self._replace_setup_package_binding(
+            'nixPkgs = ["...", "libreoffice"]\n'
+            'aptPkgs = ["libreoffice"]\n'
+        )
+        self._redirect_root()
+        self.assertNotEqual(validator.validate(), 0)
 
     def test_fail_missing_nixpacks_toml(self):
         self._write_valid_files()
@@ -339,6 +416,16 @@ class NixpacksArchiveProofTests(unittest.TestCase):
         self.assertEqual(
             validator.LOCKED_NIXPKGS_ARCHIVE,
             "5c994fe2b1e540ff83aa59ba370918ad5aae4776",
+        )
+
+    def test_locked_workbook_pdf_package_identity(self):
+        self.assertEqual(
+            validator.REQUIRED_WORKBOOK_PDF_NIXPKG,
+            "libreoffice",
+        )
+        self.assertEqual(
+            validator.EXPECTED_SETUP_NIXPKGS,
+            ("...", "libreoffice"),
         )
 
 

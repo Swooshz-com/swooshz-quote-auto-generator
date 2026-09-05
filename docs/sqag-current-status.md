@@ -1,6 +1,6 @@
 # SQAG Current Status And RC Audit
 
-Last updated: 2026-06-21 Singapore local time
+Last updated: 2026-09-05 Singapore local time
 
 ## Namespace Cleanup Update
 
@@ -33,8 +33,10 @@ Minor follow-ups before wider internal rollout:
 - Run the private real-data smoke checklist with files outside the repo.
 - Confirm the exported `quotation.xlsx` visually in Excel with the real private
   profile and pricing reference.
-- Confirm optional workbook PDF viewing only if the current local machine has a
-  supported Excel export path.
+- Confirm the required internal-alpha workbook-PDF second export path during the
+  owner-run private smoke with a machine/host that has the locked LibreOffice
+  converter; keep `quotation.xlsx` as the master/default export. Repository
+  tests do not prove live PDF success.
 
 ## Current Product Scope
 
@@ -45,7 +47,9 @@ SQAG owns the quote-generator module only:
 - pricing-reference import, review, save, edit, list, selection, and export
 - quote basis review and pricing review
 - `quotation.xlsx` generation as the customer-ready master output
-- optional view-PDF behavior when explicitly requested and supported locally
+- required internal-alpha second export path: explicit workbook-PDF request and
+  authorized PDF download, with `quotation.xlsx` remaining the master/default
+  export
 - local Settings/runtime configuration for the quote workflow
 
 ## Current Non-Goals
@@ -68,10 +72,11 @@ Important module surfaces inspected for this audit:
 - `webapp/server.py`: local HTTP API, runtime storage, import/export endpoints,
   job orchestration, pricing-reference resolution, and privacy-safe errors.
 - `webapp/static/app.js`: browser workflow state, pricing selection, output row
-  review, export controls, and optional PDF view trigger.
+  review, export controls, and the internal-alpha workbook-PDF request/download
+  trigger.
 - `webapp/static/index.html` and `webapp/static/styles.css`: existing final UI
   shell. This audit made no UI changes.
-- `scripts/generate_quote.py`: XLSX master generation and optional workbook PDF
+- `scripts/generate_quote.py`: XLSX master generation and required internal-alpha workbook PDF
   export mode.
 - `scripts/scan_sensitive_fixtures.py`: committed fixture and private-data scan.
 - `scripts/validate_dynamic_pricing_reference_rules.py`: guard that pricing
@@ -144,7 +149,10 @@ Owner-run private smoke flow:
     images.
 11. Generate and review the output table.
 12. Export `quotation.xlsx`.
-13. Use View PDF only if currently supported on the local machine.
+13. Click View PDF after the current reviewed quote state is confirmed. The
+    server must regenerate a fresh `quotation.xlsx`, convert it with the installed
+    LibreOffice/soffice dependency, persist and session-associate the PDF, then
+    allow the authorized PDF download.
 14. Confirm `git status --short` shows no committed or untracked private
     runtime/export files.
 
@@ -165,8 +173,8 @@ Confirmed pass items:
   pack.
 - Output table rows are the reviewed export source: the browser converts
   reviewed output rows back into final line items before generation.
-- XLSX export remains the default master output; PDF generation is not the
-  default and uses explicit workbook PDF mode only.
+- XLSX export remains the default master output; PDF is a required second export
+  path for internal-alpha and uses explicit workbook PDF mode only.
 - Stale output/PDF behavior is guarded: output edits clear stale download files,
   reset restores the reviewed snapshot, and default generation removes stale PDF
   output.
@@ -181,8 +189,9 @@ Risks and known limitations:
 
 - Real private profile/pricing files were not available to this task runner, so
   the private smoke test remains owner-run.
-- Optional PDF viewing depends on the local workbook export path. Excel-only
-  output remains the default and should be treated as the RC master output.
+- Internal-alpha PDF is a required second export path, but repository tests do
+  not prove hosted PDF success; the path depends on the locked workbook
+  converter. XLSX remains the default and should be treated as the RC master output.
 - Existing local auth/deploy scaffolding is outside the internal RC path and was
   not expanded. Hosting should wait for a separate platform/security decision.
 - Test-only seeded fixtures remain available for automated coverage, but team

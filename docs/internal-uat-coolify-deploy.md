@@ -56,6 +56,16 @@ The `nixpacks.toml` file enforces an exact Python-only production build contract
   `[phases.setup].nixpkgsArchive` to the immutable Nixpkgs commit
   `5c994fe2b1e540ff83aa59ba370918ad5aae4776` (python312: 3.12.12 -> 3.12.13).
 - Dependencies: `requirements.txt`.
+- Workbook-PDF converter: `[phases.setup].nixPkgs = ["...", "libreoffice"]`.
+  `libreoffice` is the verified package attribute in the locked archive and
+  provides the `soffice` binary used by the existing workbook-mode export; the
+  `...` entry preserves the Nixpacks Python provider packages.
+- Internal-alpha PDF is a required second export path. An explicit PDF request
+  regenerates a fresh XLSX from the current reviewed quote state, converts that
+  workbook with the installed LibreOffice/soffice path, persists and
+  session-associates the PDF, then permits the authorized PDF download. XLSX
+  remains the customer-ready master/default export; repository checks do not
+  prove live hosted PDF success.
 - The root `package.json` is preserved for local Playwright scripts, CI
   smokes and `npm audit`; it must not cause Nixpacks to select Node.
 
@@ -213,6 +223,12 @@ bytes, host IPs, or private paths into issue/PR output.
 - Quote generation persists metadata through database quote sessions.
 - XLSX/PDF artifacts require object storage before hosted/protected/deploy or
   production readiness can be claimed.
+- Internal-alpha hosted PDF validation must exercise the explicit PDF request
+  flow: regenerate the current reviewed quote state to a fresh
+  `quotation.xlsx`, convert that workbook with the installed
+  `libreoffice`/`soffice` dependency, persist and session-associate the PDF, and
+  verify authorized PDF download. XLSX remains the master/default export;
+  repository CI does not establish live PDF success.
 - Delete makes the session and artifacts inaccessible.
 - Concurrent save/delete probes for the same profile, pricing reference, and
   quote session resolve to a consistent save-wins, delete-wins, or generic-503
