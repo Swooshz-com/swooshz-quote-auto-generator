@@ -236,6 +236,17 @@ async function installMockJobs(page) {
   const jobs = new Map();
   let counter = 0;
 
+  await page.route("**/api/settings/pricing-references/synthetic-playwright-pricing?source=local", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ pricing_reference: {
+        id: "synthetic-playwright-pricing", label: "Synthetic Playwright Pricing", source: "local",
+        currency: "SGD", tax: { label: "GST", rate: 0.09 }, item_count: 1,
+      } }),
+    });
+  });
+
   await page.route("**/api/profiles", async (route) => {
     await route.fulfill({
       status: 200,

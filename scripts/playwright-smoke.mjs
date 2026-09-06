@@ -79,9 +79,10 @@ function startServer() {
 
 async function stopServer(serverInfo) {
   if (!serverInfo || options.keepServer) return;
-  if (serverInfo.server.killed) return;
+  if (serverInfo.server.killed || serverInfo.server.exitCode !== null) return;
+  const exited = new Promise((resolve) => serverInfo.server.once("exit", resolve));
   serverInfo.server.kill();
-  await new Promise((resolve) => serverInfo.server.once("exit", resolve));
+  await exited;
 }
 
 async function screenshot(page, name) {
@@ -510,6 +511,115 @@ async function prepareRefreshRecoveryQuote(page) {
     syncControlStates();
     await persistSessionFiles(sessionFileRecordsFromDraft());
   });
+}
+
+async function verifySavedSelectionAuthorityRecovery(page) {
+  await prepareRefreshRecoveryQuote(page);
+  const sessionId = "quote-authority-synthetic";
+  const companyDefaults = await page.evaluate(() => collectQuoteCompanyProfileDetails());
+  let mode = "valid", price = 73, writes = 0, normalizations = 0;
+  const jobs = new Map();
+  const payloads = [];
+  const reply = (route, data) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(data) });
+  const priorFiles = ["xlsx", "pdf"].map((kind) => ({ name: `quotation.${kind}`, url: `/api/quote-sessions/${sessionId}/files/quotation.${kind}` }));
+  const exports = Object.fromEntries(priorFiles.map((file) => [file.name.endsWith("pdf") ? "pdf" : "xlsx", { ...file, exists: true }]));
+  let saved = { session_id: sessionId, exports, has_draft_state: true, status: { quote_generated: true }, customer_summary: {customer_name: "Authority Synthetic Client", project_name: "Authority Synthetic Quote"} };
+  const patterns = ["**/api/settings/profiles", "**/api/settings/pricing-references/authority-shared-id*", "**/api/quote-sessions", `**/api/quote-sessions/${sessionId}`, "**/api/jobs", "**/api/jobs/job-authority-*", "**/api/line-items/normalize"];
+  await page.route(patterns[0], async (route) => {
+    if (mode === "transport") return route.abort("failed");
+    return reply(route, {company_profiles: mode === "empty" ? [] : [{id: "authority-profile", label: "Authority Synthetic Profile", defaults: companyDefaults}]});
+  });
+  await page.route(patterns[1], route => reply(route, {pricing_reference: {id: "authority-shared-id", source: mode === "wrong-source" ? "bundled" : "company", label: "Authority Synthetic Pricing", currency: "SGD", tax: {label: "GST", rate: 0.09}, amount: price}}));
+  await page.route(patterns[2], async (route) => {
+    if (route.request().method() === "POST") {
+      writes++;
+      saved = {...saved, ...route.request().postDataJSON(), exports};
+      return reply(route, {quote_session: saved});
+    }
+    return reply(route, {quote_sessions: [saved]});
+  });
+  await page.route(patterns[3], route => reply(route, {quote_session: saved}));
+  await page.route(patterns[4], async (route) => {
+    const request = route.request().postDataJSON();
+    payloads.push(request.payload);
+    if (request.payload.profile_id !== "authority-profile" || request.payload.pricing_reference.id !== "authority-shared-id" || request.payload.pricing_reference.source !== "company") throw new Error("Generation crossed selected authority namespaces.");
+    const id = `job-authority-${payloads.length}`;
+    jobs.set(id, request.type);
+    return reply(route, {job_id: id, status: "running", type: request.type});
+  });
+  await page.route(patterns[5], route => {
+    const id = new URL(route.request().url()).pathname.split("/").pop();
+    return reply(route, {job_id: id, status: "completed", result: {status: "completed", files: jobs.get(id) === "generate_pdf" ? priorFiles : [priorFiles[0]], quote_session: {session_id: sessionId}}});
+  });
+  await page.route(patterns[6], route => {
+    normalizations++;
+    const payload = route.request().postDataJSON();
+    return reply(route, {status: "ok", line_items: payload.line_items, quote_basis: payload.quote_basis, quote_basis_sections: payload.quote_basis_sections});
+  });
+  const snapshot = () => page.evaluate(() => JSON.stringify({
+    selected: state.selectedPresetValue, template: state.profileId, pricing: [state.pricingReferenceSource, state.pricingReferenceId],
+    session: state.quoteSessionId, basis: state.quoteBasisSections, lines: state.lineItems, rows: state.outputRows,
+    xlsx: state.downloadFile, pdf: state.pdfFile, revisions: [state.outputRevision, state.downloadFileRevision, state.pdfFileRevision],
+  }));
+  try {
+    saved.draft_state = await page.evaluate(({sessionId, priorFiles}) => {
+      state.selectedPresetValue = "company:authority-profile";
+      state.profileId = "synthetic-template-fallback";
+      state.companyProfiles = [];
+      state.pricingReferenceId = "authority-shared-id";
+      state.pricingReferenceSource = "company";
+      state.pricingReferences = [{id: "authority-shared-id", source: "bundled", label: "Wrong namespace"}];
+      state.quoteSessionId = sessionId;
+      state.quoteBasisSections = normalizeQuoteBasisSections(state.quoteBasisSections);
+      state.basisConfirmed = true;
+      refreshOutputRowsFromLineItems();
+      state.originalOutputRows = snapshotOutputRows(state.outputRows);
+      setDownloadFiles(priorFiles);
+      setWorkflowStage("completed");
+      setSidePanel("output", {force: true});
+      saveSessionState();
+      return buildSessionSnapshot();
+    }, {sessionId, priorFiles});
+    const before = await snapshot();
+    await page.reload({waitUntil: "domcontentloaded"});
+    await page.waitForFunction(() => currentPricingReference()?.amount === 73 && !appIsBusy());
+    if (await snapshot() !== before) throw new Error("Boot recovery changed quote identity/content/exports.");
+    for (mode of ["empty", "transport", "wrong-source"]) {
+      const priorWrites = writes, priorJobs = payloads.length, priorNormalizations = normalizations;
+      const retained = await snapshot();
+      await page.evaluate(async () => {
+        await handleGenerate(); await handleGenerate({viewPdf: true}); await confirmBasis();
+        await goToNextSidePanel();
+        state.activeJob = normalizeActiveJob({phase: "starting", type: "generate", id: newClientJobId(), startedAt: new Date().toISOString()});
+        const retainedJob = JSON.stringify(state.activeJob);
+        await resumeSavedJob();
+        if (JSON.stringify(state.activeJob) !== retainedJob) throw new Error("Blocked resume changed the saved job.");
+        state.activeJob = null;
+      });
+      if (await snapshot() !== retained || writes !== priorWrites || payloads.length !== priorJobs || normalizations !== priorNormalizations) throw new Error(`Blocked ${mode} attempt mutated quote or crossed a write boundary.`);
+      await page.evaluate(async (id) => { await modifyDashboardQuote(id); }, sessionId);
+      if (await snapshot() !== before || writes !== priorWrites) throw new Error(`Modify under ${mode} lost saved state.`);
+      const links = await page.evaluate(session => [dashboardSelectedExportAction(session, "xlsx"), dashboardSelectedExportAction(session, "pdf")].every(html => html.includes('href="')), saved);
+      if (!links) throw new Error("Blocked refresh removed persisted Dashboard exports.");
+    }
+    mode = "valid"; price = 81;
+    await page.evaluate(async () => {
+      setSidePanel("customer", {force: true});
+      await goToNextSidePanel();
+      if (currentPricingReference()?.amount !== 81) throw new Error("Next did not refresh selected pricing.");
+      setSidePanel("basis", {force: true});
+      await confirmBasis();
+      if (!state.basisConfirmed || state.activeSidePanel !== "output") throw new Error("Prepare output failed: " + JSON.stringify({panel: state.activeSidePanel, missing: missingDetailFields(), reason: basisConfirmBlockReason(), status: elements.resultStatus.textContent}));
+      if (!await handleGenerate()) throw new Error("Exact-authority XLSX generation failed.");
+      if (!await handleGenerate({viewPdf: true})) throw new Error("Exact-authority PDF generation failed.");
+    });
+    if (payloads.length !== 2 || !normalizations || !saved.draft_state.downloadFile || !saved.draft_state.pdfFile) throw new Error("Successful exports were not persisted by the synthetic session adapter.");
+    await page.evaluate(async (id) => { await modifyDashboardQuote(id); showDashboard({load: false}); state.dashboardActiveSessionId = id; renderQuoteDashboard(); }, sessionId);
+    if (await page.locator('.dashboard-export-link[aria-label="Download XLSX"]').count() !== 1 || await page.locator('.dashboard-export-link[aria-label="Download PDF"]').count() !== 1) throw new Error("Reopened exports are unavailable on Dashboard.");
+    console.log(JSON.stringify({savedSelectionAuthority: "passed", blockedModes: ["empty", "transport", "wrong-source"], exactGenerationJobs: payloads.length, persistence: "synthetic session endpoint adapter"}));
+  } finally {
+    for (const pattern of patterns) await page.unroute(pattern);
+  }
 }
 
 async function verifyConfirmBasisSurvivesImmediateRefresh(page) {
@@ -1109,6 +1219,12 @@ async function verifyExpiredQuoteJobsDoNotResume(page) {
 
 async function verifyPricingReferenceSelectionCommitsOnCustomerNext(page) {
   const pendingValue = "local::pending-refresh-reference";
+  await page.route("**/api/settings/pricing-references/pending-refresh-reference?source=local", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ pricing_reference: {
+      id: "pending-refresh-reference", source: "local", label: "Pending Refresh Reference",
+      currency: "USD", tax: { label: "VAT", rate: 0.2 },
+    } }) });
+  });
   const applied = await page.evaluate(async () => {
     const current = currentPricingReference();
     if (!current) throw new Error("Pricing-reference regression needs an applied reference.");
@@ -1940,6 +2056,13 @@ async function main() {
 
   try {
     await installMockProfiles(page);
+    if (args.includes("--authority-only")) {
+      await page.goto(baseUrl, {waitUntil: "domcontentloaded"});
+      await page.locator("#dashboardLoadingModal").waitFor({state: "hidden"});
+      await verifySavedSelectionAuthorityRecovery(page);
+      console.log(JSON.stringify({status: "ok", mode: "authority-only", consoleProblems, networkProblems}));
+      return;
+    }
     if (args.includes("--recovery-only")) {
       await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
       await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
@@ -1949,6 +2072,7 @@ async function main() {
       await verifyGenerationTerminalRecoveryAfterRefresh(page);
       await verifyExpiredQuoteJobsDoNotResume(page);
       await verifyPricingReferenceSelectionCommitsOnCustomerNext(page);
+      await verifySavedSelectionAuthorityRecovery(page);
       console.log(JSON.stringify({
         status: "ok",
         mode: "recovery-only",
@@ -2745,6 +2869,7 @@ async function main() {
     await verifyConfirmBasisSurvivesImmediateRefresh(page);
     await verifyGenerationLoadingModalSurvivesRefresh(page);
     await verifyGenerationTerminalRecoveryAfterRefresh(page);
+    await verifySavedSelectionAuthorityRecovery(page);
 
     console.log(JSON.stringify({
       status: "ok",

@@ -14306,6 +14306,7 @@ function updateSidePanelNav() {}
 function setSidePanel(panelName) { routedPanel = panelName; state.activeSidePanel = panelName; return true; }
 async function saveQuoteSessionDraftState() { saveCalls += 1; }
 async function goToNextSidePanel() { nextCalls += 1; }
+async function refreshSelectedQuoteAuthority() { return true; }
 
 eval(extractAsyncFunction("confirmQuoteDependencyChange"));
 
@@ -14441,7 +14442,7 @@ eval(extractAsyncFunction("confirmQuoteDependencyChange"));
 
         self.assertIn('class="pricing-reference-source-badge">Repo catalog</span>', html)
         self.assertIn('id="selectedPricingReferenceSummary">Managed in Settings.</p>', html)
-        self.assertIn('source: state.pricingReferenceSource || "bundled"', js)
+        self.assertIn('source: state.pricingReferenceSource || ""', js)
         self.assertIn("pricingReferenceSourceLabel(reference)", js)
         self.assertNotIn("canManageSettings()", js)
         self.assertIn("Saved from the Quote Company panel.", js)
@@ -14709,8 +14710,9 @@ const DEFAULT_PROFILE_ID = "synthetic-exhibition-fixture-template";
 const state = {
   profileId: "synthetic-exhibition-fixture-template",
   pricingReferenceId: "synthetic-exhibition-fixture-pricing",
+  pricingReferenceSource: "local",
   profiles: [{ id: "synthetic-exhibition-fixture-template", label: "Synthetic" }],
-  pricingReferences: [{ id: "synthetic-exhibition-fixture-pricing", label: "Synthetic", profile_id: "synthetic-exhibition-fixture-template" }],
+  pricingReferences: [{ id: "synthetic-exhibition-fixture-pricing", source: "local", label: "Synthetic", profile_id: "synthetic-exhibition-fixture-template" }],
   images: [],
   lineItems: [],
   quoteBasis: {},
@@ -14987,7 +14989,9 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertIn("await handleGenerate();", js)
         self.assertIn("downloadCurrentExcelFile();", js)
         self.assertIn("await waitForUiPaint();", download_handler)
-        self.assertIn("commitActiveOutputEditor();", download_handler)
+        self.assertNotIn("commitActiveOutputEditor();", download_handler)
+        generate_body = js.split("async function handleGenerate(options = {})", 1)[1].split("async function ensureSavedServerJobStarted", 1)[0]
+        self.assertLess(generate_body.index("refreshSelectedQuoteAuthority"), generate_body.index("commitActiveOutputEditor();"))
         self.assertIn("showExcelGeneratingModal(generationLoadingModalOptions(false));", download_handler)
         self.assertIn('title: "Regenerating Excel"', loading_options_body)
         self.assertIn("await handleGenerate();", download_handler)
@@ -16797,6 +16801,135 @@ assert.strictEqual(elements.headerDetails.value, "Analysis header");
             check=False,
         )
 
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_static_saved_selection_authority_is_exact_atomic_and_fail_safe(self):
+        node = require_node(self)
+        script = r"""
+const fs = require('fs');
+const vm = require('vm');
+const assert = require('assert');
+const source = fs.readFileSync('webapp/static/app.js', 'utf8');
+function extract(name) {
+  const match = new RegExp(`(?:async )?function ${name}\\(`).exec(source);
+  assert(match, name);
+  const end = source.indexOf('\n}', match.index) + 2;
+  return source.slice(match.index, end);
+}
+const state = {
+  selectedPresetValue: 'company:saved-profile', profileId: 'synthetic-template-fallback',
+  pricingReferenceId: 'same-id', pricingReferenceSource: 'company', quoteSessionId: 'session-synthetic',
+  companyProfiles: [], pricingReferences: [{id: 'same-id', source: 'bundled', amount: 999}],
+  lineItems: [{description: 'retained draft'}], quoteBasis: {scope: ['retained basis']},
+  outputRows: [{description: 'retained output', amount: 50}], basisConfirmed: true,
+  downloadFile: {url: '/synthetic/quotation.xlsx'}, pdfFile: {url: '/synthetic/quotation.pdf'},
+  outputRevision: 4, downloadFileRevision: 4, pdfFileRevision: 4,
+  activeSidePanel: 'output', activeJob: {type: 'generate', phase: 'starting', id: 'job-synthetic'},
+};
+let mode = 'empty', reads = 0, applied = 0;
+const c = {
+  state, COMPANY_PROFILE_PRESET_PREFIX: 'company:', QUOTE_COMPANY_RICH_TEXT_IDS: ['company'],
+  elements: {profileSelect: {value: 'company::same-id'}},
+  appIsBusy: () => false, normalizeActiveJob: job => job, renderMessages() {}, setResultStatus() {},
+  renderPresetOptions() {}, renderProfileOptions() {}, applyQuoteDetails() { applied++; },
+  selectedPreset: () => null, resolvedProfileIdForPayload: () => state.profileId,
+  pricingReferenceSelectionFromValue(value) { const [source, pricingReferenceId] = value.split('::'); return {source, pricingReferenceId}; },
+  getJson: async (url) => {
+    reads++;
+    if (mode === 'transport') return {ok: false, data: {}};
+    if (url === '/api/settings/profiles') return {ok: true, data: {company_profiles: mode === 'empty' ? [] : [{id: 'saved-profile', defaults: {company: {name: 'Fresh synthetic company'}}}]}};
+    return {ok: true, data: {pricing_reference: {id: mode === 'wrong-id' ? 'other-id' : 'same-id', source: mode === 'wrong-source' ? 'bundled' : 'company', amount: 73}}};
+  },
+};
+for (const name of ['commitActiveOutputEditor', 'ensureQuoteSession', 'startJob', 'refreshLineItemsFromServer', 'saveQuoteSessionDraftState', 'setDownloadFiles', 'clearActiveJob']) {
+  c[name] = () => { throw new Error(`Mutation before authority: ${name}`); };
+}
+vm.createContext(c);
+vm.runInContext(['currentPricingReference', 'generationProfileIdForPayload', 'syncSelectedPricingReference', 'refreshSelectedQuoteAuthority', 'handleGenerate', 'confirmBasis', 'goToNextSidePanel', 'confirmQuoteDependencyChange', 'ensureSavedServerJobStarted', 'resumeSavedJob'].map(extract).join('\n'), c);
+const snapshot = () => JSON.stringify({...state, authorityRefreshSequence: 0});
+(async () => {
+  for (mode of ['empty', 'transport', 'wrong-source', 'wrong-id']) {
+    const before = snapshot();
+    assert.strictEqual(c.generationProfileIdForPayload(), 'saved-profile');
+    c.syncSelectedPricingReference();
+    assert.strictEqual(c.currentPricingReference(), null);
+    assert.strictEqual(await c.refreshSelectedQuoteAuthority(), false);
+    await c.handleGenerate();
+    await c.handleGenerate({viewPdf: true});
+    await c.confirmBasis();
+    await c.goToNextSidePanel();
+    await c.confirmQuoteDependencyChange();
+    await c.resumeSavedJob();
+    assert.strictEqual(snapshot(), before, mode);
+    assert.strictEqual(applied, 0);
+  }
+  mode = 'valid';
+  assert.strictEqual(await c.refreshSelectedQuoteAuthority(), true);
+  assert.strictEqual(c.currentPricingReference().amount, 73);
+  assert.strictEqual(state.pricingReferences.find(r => r.source === 'bundled').amount, 999);
+  assert.strictEqual(state.selectedPresetValue, 'company:saved-profile');
+  assert.strictEqual(state.profileId, 'synthetic-template-fallback');
+  assert.strictEqual(applied, 1);
+  const originalGet = c.getJson;
+  for (const field of ['pricingReferenceId', 'pricingReferenceSource']) {
+    let releasePricing, pricingStarted;
+    const started = new Promise(resolve => { pricingStarted = resolve; });
+    c.getJson = url => url === '/api/settings/profiles' ? originalGet(url)
+      : new Promise(resolve => { releasePricing = resolve; pricingStarted(); });
+    const latePricing = c.refreshSelectedQuoteAuthority();
+    await started;
+    const previous = state[field]; state[field] = 'other-selection';
+    const retained = snapshot();
+    releasePricing({ok: true, data: {pricing_reference: {id: 'same-id', source: 'company', amount: 1}}});
+    assert.strictEqual(await latePricing, false);
+    assert.strictEqual(snapshot(), retained);
+    state[field] = previous;
+  }
+
+  let release;
+  c.getJson = () => new Promise(resolve => { release = resolve; });
+  const old = c.refreshSelectedQuoteAuthority();
+  state.selectedPresetValue = 'company:new-selection';
+  const beforeLate = snapshot();
+  release({ok: true, data: {company_profiles: [{id: 'saved-profile'}]}});
+  assert.strictEqual(await old, false);
+  assert.strictEqual(snapshot(), beforeLate);
+  state.selectedPresetValue = 'company:saved-profile';
+  const olderSameId = c.refreshSelectedQuoteAuthority();
+  c.getJson = originalGet;
+  assert.strictEqual(await c.refreshSelectedQuoteAuthority(), true);
+  const newest = snapshot();
+  release({ok: true, data: {company_profiles: [{id: 'saved-profile', defaults: {company: {name: 'stale'}}}]}});
+  assert.strictEqual(await olderSameId, false);
+  assert.strictEqual(snapshot(), newest);
+  // Real inventory rendering must not erase unresolved logical identities.
+  Object.assign(c, {
+    selectableTemplateProfilePresets: () => [], companyProfilePresets: () => [], availablePresetValues: () => new Set(),
+    lastSelectedPresetValue: () => '', updatePresetButtons() {},
+    sortedPricingReferencesForDisplay: value => value, pricingReferenceSelectValue: r => `${r.source}::${r.id}`,
+    lastSelectedPricingReference: () => state.pricingReferences[0], defaultPricingReference: () => state.pricingReferences[0],
+    renderSelectedPricingReferenceSummary() {}, renderPricingReferenceDeleteOptions() {}, escapeHtml: x => x,
+    MISSING_PRICING_REFERENCES_MESSAGE: 'Missing',
+  });
+  c.elements.presetSelect = {value: '', setAttribute() {}};
+  c.elements.profileSelect.setAttribute = () => {};
+  state.companyProfiles = [];
+  state.pricingReferences = [{id: 'same-id', source: 'bundled'}];
+  vm.runInContext(extract('renderPresetOptions') + '\n' + extract('renderProfileOptions'), c);
+  c.renderPresetOptions(); c.renderProfileOptions();
+  assert.strictEqual(state.selectedPresetValue, 'company:saved-profile');
+  assert.strictEqual(state.pricingReferenceId, 'same-id');
+  assert.strictEqual(state.pricingReferenceSource, 'company');
+  assert.strictEqual(c.generationProfileIdForPayload(), 'saved-profile');
+  for (const name of ['applyQuoteSessionSnapshot', 'confirmBasis', 'handleGenerate', 'goToNextSidePanel', 'resumeSavedJob']) {
+    assert(extract(name).includes('refreshSelectedQuoteAuthority'), name);
+  }
+  assert(extract('handleGenerate').indexOf('refreshSelectedQuoteAuthority') < extract('handleGenerate').indexOf('commitActiveOutputEditor'));
+  assert(!extract('handleGenerate').split('const synchronizedSessionId')[0].includes('setDownloadFiles([])'));
+  console.log('authority: exact identity, atomic failures, stale responses and action preflight passed');
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+        completed = subprocess.run([node, "-e", script], cwd=str(ROOT), text=True, capture_output=True, check=False)
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
 
     def test_static_generation_profile_id_uses_selected_current_profile_pack(self):
@@ -19236,8 +19369,9 @@ assert.strictEqual(sanitizeRichTextHtml("<blink>Plain <em>x</em></blink>"), "Pla
         self.assertNotIn('value="manual"', html)
         self.assertIn('value="pricing_reference" selected', html)
         self.assertIn("source_basis_line_id", js)
-        self.assertIn('source: "bundled"', js)
-        self.assertIn('source: state.pricingReferenceSource || "bundled"', js)
+        normalize_body = js.split('function buildLineItemNormalizePayload()', 1)[1].split('function setResultStatus', 1)[0]
+        self.assertNotIn('source: "bundled"', normalize_body)
+        self.assertIn('source: state.pricingReferenceSource || ""', js)
         self.assertIn("Download Excel", js)
         self.assertIn('elements.sideDownloadButton.href = enabled && freshFile?.url ? freshFile.url : "#";', js)
         generate_body = js.split("async function handleGenerate(options = {})", 1)[1].split("async function resumeSavedJob", 1)[0]
