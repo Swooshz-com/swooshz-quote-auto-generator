@@ -1732,6 +1732,84 @@ class WebappServerTest(unittest.TestCase):
 
         self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, errors)
 
+    def test_recovered_quote_catalog_price_cannot_complete_missing_historical_row_price(self):
+        payload = valid_payload()
+        reference_source = "local"
+        details = {
+            "quote_date": "2026-06-06",
+            "project_number": "KI-LEGACY-451",
+            "client": valid_payload()["client"],
+            "project": valid_payload()["project"],
+            "company": valid_payload()["company"],
+            "currency": "USD",
+            "exchange_rate": 1.37,
+            "tax": {"label": "GST", "rate": 0.09},
+            "quote_text": valid_payload()["quote_text"],
+            "signature": valid_payload()["signature"],
+        }
+        details["commercial_snapshot"] = {
+            "schema": webapp.QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+            "version": webapp.QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+            "owner": "quote",
+            "lifecycle": "RECOVERED",
+            "origin": "session_recovery",
+            "presence": {key: "captured" for key in webapp.QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS},
+            "pricing_basis": {
+                "currency": "SGD",
+                "source": reference_source,
+                "id": "saved-reference",
+                "digest": "sha256:" + "c" * 64,
+            },
+        }
+        payload["pricing_reference_id"] = "saved-reference"
+        payload["pricing_reference_source"] = reference_source
+        payload["pricing_reference"] = {
+            "id": "saved-reference",
+            "source": reference_source,
+            "currency": "SGD",
+            "tax": {"label": "GST", "rate": 0.09},
+        }
+        payload["quote_session"] = {
+            "session_id": "quote-missing-historical-price",
+            "draft_state": {
+                "quoteDetails": details,
+                "outputRows": [{
+                    "section": "Saved Floors",
+                    "description": "Recovered row without captured price",
+                    "quantity": 1,
+                    "unit": "sqm",
+                    "price_mode": "Priced",
+                    "catalog_unit_price": 999,
+                }],
+            },
+        }
+
+        with mock.patch.object(
+            webapp,
+            "pricing_catalog_runtime_lookup_for_payload",
+            side_effect=AssertionError("recovered row validation must not consult the current catalog"),
+        ):
+            errors_at_999 = webapp.quote_commercial_state_errors(payload)
+            canonical_at_999 = webapp.quote_commercial_payload(payload)
+            session_at_999 = webapp.quote_session_commercials(payload, {"commercials": {}})
+            validation_at_999 = webapp.validate_generation_payload(payload)
+            with self.assertRaises(webapp.QuoteCommercialStateError):
+                webapp.payload_to_brief(payload)
+
+        row_at_999 = canonical_at_999["line_items"][0]
+        self.assertEqual(row_at_999["catalog_unit_price"], 999)
+        self.assertNotIn("effective_unit_price", row_at_999)
+        self.assertNotIn("unit_price_override", row_at_999)
+        self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, errors_at_999)
+        self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, validation_at_999)
+        self.assertIsNone(session_at_999["subtotal"])
+        self.assertIsNone(session_at_999["tax_amount"])
+        self.assertIsNone(session_at_999["grand_total"])
+
+        payload["quote_session"]["draft_state"]["outputRows"][0]["catalog_unit_price"] = 1
+        self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.quote_commercial_state_errors(payload))
+        self.assertIsNone(webapp.quote_session_commercials(payload, {"commercials": {}})["subtotal"])
+
     def test_static_recovered_browser_collectors_and_output_projection_keep_saved_commercials(self):
         node = require_node(self)
 
@@ -1843,8 +1921,8 @@ eval([
   "collectRichTextDetails", "collectQuoteDetails", "setInputValue", "collectTaxDetails", "collectQuoteCurrency",
   "collectQuoteExchangeRate", "syncQuoteExchangeRateField", "quoteCommercialTaxText", "quoteExchangeRateText",
   "quoteFxMultiplier", "quoteAmountValue", "formatAmount", "unitPriceEditKind", "numberOrNull", "orderNumber",
-  "effectiveOutputUnitPrice", "recalculateOutputRow", "normalizeOutputRow", "outputCellDisplayValue",
-  "rowNeedsManualInput", "matchSummaryStats", "outputRowsToLineItems", "dashboardCommercialsFromState",
+  "quoteCommercialStateIsOwned", "effectiveOutputUnitPrice", "recalculateOutputRow", "normalizeOutputRow", "outputCellDisplayValue",
+  "rowNeedsManualInput", "matchSummaryStats", "outputRowsToLineItems", "outputRowsValid", "dashboardCommercialsFromState",
   "applyQuoteDetails", "applyPricingReferenceCommercialDefaults",
 ].map(extractFunction).join("\n"));
 
@@ -1852,6 +1930,15 @@ state.outputRows = [
   normalizeOutputRow({ section: "Saved Floors", description: "Captured carpet", quantity: 2, unit: "sqm", price_mode: "Priced", effective_unit_price: 100, catalog_unit_price: 999, pricing_keyword: "captured-row", amount: 200 }),
   normalizeOutputRow({ section: "Saved Services", description: "Included coordination", quantity: 1, unit: "lot", price_mode: "Included", display_price: "Included", amount: 0 }),
 ];
+const missingHistoricalPrice = normalizeOutputRow({ section: "Saved Review", description: "Missing captured price", quantity: 1, unit: "sqm", price_mode: "Priced", catalog_unit_price: 999 });
+assert.strictEqual(effectiveOutputUnitPrice(missingHistoricalPrice), null);
+assert.strictEqual(missingHistoricalPrice.amount, "");
+assert.strictEqual(outputCellDisplayValue(missingHistoricalPrice, "unit_price_override"), "???");
+assert.deepStrictEqual(outputRowsValid([missingHistoricalPrice]), { valid: false, errors: ["Row 1: Unit price is required."] });
+const missingHistoricalLine = outputRowsToLineItems([missingHistoricalPrice])[0];
+assert.strictEqual(missingHistoricalLine.catalog_unit_price, 999);
+assert.strictEqual(missingHistoricalLine.effective_unit_price, undefined);
+assert.strictEqual(missingHistoricalLine.unit_price_override, undefined);
 const saved = collectQuoteDetails();
 assert.deepStrictEqual(collectTaxDetails(), { label: "GST", rate: 0.09 });
 assert.strictEqual(collectQuoteCurrency(), "USD");

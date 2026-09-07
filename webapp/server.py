@@ -3973,6 +3973,24 @@ def quote_commercial_state(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def quote_commercial_historical_effective_unit_price(
+    row: dict[str, Any],
+    *,
+    quantity: float | None = None,
+) -> float | None:
+    effective = parse_float_or_none(row.get("effective_unit_price"))
+    if effective is not None:
+        return effective
+    override = parse_float_or_none(row.get("unit_price_override"))
+    if override is not None:
+        return override
+    basis_amount = parse_float_or_none(row.get("pricing_basis_amount"))
+    resolved_quantity = quantity if quantity is not None else parse_float_or_none(row.get("quantity"))
+    if basis_amount is not None and resolved_quantity is not None and resolved_quantity > 0:
+        return round(basis_amount / resolved_quantity, 6)
+    return None
+
+
 def quote_commercial_row_from_output_row(row: dict[str, Any]) -> dict[str, Any]:
     price_mode = "Included" if (
         clean_text(row.get("price_mode")).lower() == "included"
@@ -3987,15 +4005,7 @@ def quote_commercial_row_from_output_row(row: dict[str, Any]) -> dict[str, Any]:
         return next_row
     quantity = parse_float_or_none(row.get("quantity"))
     basis_amount = parse_float_or_none(row.get("pricing_basis_amount"))
-    if basis_amount is None:
-        basis_amount = parse_float_or_none(row.get("amount"))
-    effective = parse_float_or_none(row.get("effective_unit_price"))
-    if effective is None:
-        effective = parse_float_or_none(row.get("unit_price_override"))
-    if effective is None and basis_amount is not None and quantity is not None and quantity > 0:
-        effective = round(basis_amount / quantity, 6)
-    if effective is None:
-        effective = parse_float_or_none(row.get("catalog_unit_price"))
+    effective = quote_commercial_historical_effective_unit_price(row, quantity=quantity)
     if effective is not None:
         next_row["effective_unit_price"] = effective
         next_row["unit_price_override"] = effective
@@ -4176,11 +4186,7 @@ def quote_commercial_state_errors(
             continue
         if clean_text(row.get("price_mode")).lower() == "included" or clean_text(row.get("display_price")).lower() == "included":
             continue
-        effective = parse_float_or_none(row.get("effective_unit_price"))
-        if effective is None:
-            effective = parse_float_or_none(row.get("unit_price_override"))
-        if effective is None:
-            effective = parse_float_or_none(row.get("catalog_unit_price"))
+        effective = quote_commercial_historical_effective_unit_price(row)
         if effective is None or effective < 0:
             errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
             break
@@ -17285,17 +17291,9 @@ def normalize_owned_line_item(raw: dict[str, Any]) -> dict[str, Any] | None:
         value = clean_text(raw.get(key))
         if value:
             item[key] = value
-    effective = parse_float_or_none(raw.get("effective_unit_price"))
-    if effective is None:
-        effective = parse_float_or_none(raw.get("unit_price_override"))
     basis_amount = parse_float_or_none(raw.get("pricing_basis_amount"))
-    if basis_amount is None:
-        basis_amount = parse_float_or_none(raw.get("amount"))
     quantity = parse_float_or_none(quantity_parts["quantity"])
-    if effective is None and basis_amount is not None and quantity is not None and quantity > 0:
-        effective = round(basis_amount / quantity, 6)
-    if effective is None:
-        effective = parse_float_or_none(raw.get("catalog_unit_price"))
+    effective = quote_commercial_historical_effective_unit_price(raw, quantity=quantity)
     if price_mode == "Included":
         item["approved_quote_amount"] = 0
         item["display_price"] = "Included"
@@ -17303,7 +17301,8 @@ def normalize_owned_line_item(raw: dict[str, Any]) -> dict[str, Any] | None:
         item["effective_unit_price"] = effective
         item["unit_price_override"] = effective
         catalog_unit_price = parse_float_or_none(raw.get("catalog_unit_price"))
-        item["catalog_unit_price"] = catalog_unit_price if catalog_unit_price is not None else effective
+        if catalog_unit_price is not None:
+            item["catalog_unit_price"] = catalog_unit_price
     else:
         item["unit_price_override"] = None
     for key in ("pricing_basis_amount", "approved_quote_amount"):
@@ -21280,11 +21279,7 @@ def quote_session_commercials(payload: dict[str, Any], patch: dict[str, Any]) ->
             if clean_text(row.get("price_mode")).lower() == "included" or clean_text(row.get("display_price")).lower() == "included":
                 continue
             quantity = parse_float_or_none(row.get("quantity"))
-            effective = parse_float_or_none(row.get("effective_unit_price"))
-            if effective is None:
-                effective = parse_float_or_none(row.get("unit_price_override"))
-            if effective is None:
-                effective = parse_float_or_none(row.get("catalog_unit_price"))
+            effective = quote_commercial_historical_effective_unit_price(row)
             if quantity is None or effective is None or quantity < 0 or effective < 0:
                 has_invalid_row = True
                 continue

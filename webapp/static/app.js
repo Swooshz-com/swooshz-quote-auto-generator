@@ -5971,6 +5971,7 @@ function normalizeOutputRow(row = {}) {
     price_mode: priceMode,
     unit_price_override: rawUnitPriceOverride !== "" ? rawUnitPriceOverride : (capturedUnitPrice !== null ? capturedUnitPrice : ""),
     catalog_unit_price: row.catalog_unit_price ?? row.unit_price ?? row.sale_unit_price ?? "",
+    pricing_basis_amount: row.pricing_basis_amount ?? "",
     catalog_description: cleanCustomerQuoteLineText(row.catalog_description || ""),
     pricing_reference_description: pricingReferenceLineText(row.pricing_reference_description || row.reference_description || ""),
     pricing_keyword: row.pricing_keyword || row.keyword || "",
@@ -7809,6 +7810,13 @@ function effectiveOutputUnitPrice(row = {}) {
   if (overrideText && overrideText.toLowerCase() !== "included") return null;
   const captured = numberOrNull(row.effective_unit_price);
   if (captured !== null) return captured;
+  const basisAmount = numberOrNull(row.pricing_basis_amount);
+  const quantity = numberOrNull(row.quantity);
+  if (basisAmount !== null && quantity !== null && quantity > 0) {
+    return Math.round((basisAmount / quantity) * 1000000) / 1000000;
+  }
+  const ownedCommercial = typeof quoteCommercialStateIsOwned === "function" && quoteCommercialStateIsOwned();
+  if (ownedCommercial) return null;
   return numberOrNull(row.catalog_unit_price);
 }
 
@@ -8258,6 +8266,11 @@ function outputCellDisplayValue(row = {}, field = "") {
   if (field === "unit_price_override") {
     if (row.price_mode === "Included") return "Included";
     if (unitPriceEditKind(row.unit_price_override) === "invalid") return "???";
+    const ownedCommercial = typeof quoteCommercialStateIsOwned === "function" && quoteCommercialStateIsOwned();
+    if (ownedCommercial) {
+      const effective = effectiveOutputUnitPrice(row);
+      return effective === null ? "???" : formatAmount(quoteAmountValue(effective));
+    }
     if (numberOrNull(row.unit_price_override) !== null) return formatAmount(quoteAmountValue(row.unit_price_override));
     if (numberOrNull(row.catalog_unit_price) !== null) return formatAmount(quoteAmountValue(row.catalog_unit_price));
     return "???";
@@ -8285,10 +8298,14 @@ function outputEditorPlaceholder(field = "") {
 }
 
 function outputEditorHtml(row = {}, index = 0, field = "") {
+  const ownedCommercial = typeof quoteCommercialStateIsOwned === "function" && quoteCommercialStateIsOwned();
+  const unitPriceValue = ownedCommercial
+    ? effectiveOutputUnitPrice(row)
+    : (row.unit_price_override || row.catalog_unit_price || "");
   const value = field === "unit_price_override"
     ? row.price_mode === "Included"
       ? "Included"
-      : String(row.unit_price_override || row.catalog_unit_price || "")
+      : String(unitPriceValue ?? "")
     : String(row[field] ?? "");
   if (field === "description") {
     return `<textarea class="output-cell-input output-description-input is-editing" data-output-editor-field="${field}" data-output-row="${index}" rows="3" placeholder="${escapeHtml(outputEditorPlaceholder(field))}">${escapeHtml(value)}</textarea>`;
@@ -8396,7 +8413,7 @@ function outputRowsToLineItems(rows = state.outputRows) {
     ["pricing_basis_currency", "pricing_reference_source", "pricing_reference_id", "pricing_basis_digest"].forEach((key) => {
       if (Object.prototype.hasOwnProperty.call(row, key) && String(row[key] || "").trim()) next[key] = String(row[key]).trim();
     });
-    if (ownedCommercial) {
+    if (ownedCommercial && next.price_mode !== "Included") {
       const basis = state.quoteCommercialSnapshot?.pricing_basis && typeof state.quoteCommercialSnapshot.pricing_basis === "object"
         ? state.quoteCommercialSnapshot.pricing_basis
         : {};
@@ -8404,9 +8421,14 @@ function outputRowsToLineItems(rows = state.outputRows) {
       if (!next.pricing_reference_source && String(basis.source || "").trim()) next.pricing_reference_source = String(basis.source).trim();
       if (!next.pricing_reference_id && String(basis.id || "").trim()) next.pricing_reference_id = String(basis.id).trim();
       if (!next.pricing_basis_digest && String(basis.digest || "").trim()) next.pricing_basis_digest = String(basis.digest).trim();
-      const basisAmount = numberOrNull(row.amount);
-      if (next.pricing_basis_amount == null && basisAmount !== null) next.pricing_basis_amount = basisAmount;
-      if (next.approved_quote_amount == null && basisAmount !== null) next.approved_quote_amount = quoteAmountValue(basisAmount);
+      const historicalEffectivePrice = effectiveOutputUnitPrice(row);
+      const quantity = numberOrNull(row.quantity);
+      if (next.pricing_basis_amount == null && historicalEffectivePrice !== null && quantity !== null && quantity > 0) {
+        next.pricing_basis_amount = Math.round(quantity * historicalEffectivePrice * 100) / 100;
+      }
+      if (next.approved_quote_amount == null && next.pricing_basis_amount != null) {
+        next.approved_quote_amount = quoteAmountValue(next.pricing_basis_amount);
+      }
     }
     if (next.price_mode === "Included") {
       next.display_price = "Included";
@@ -8425,6 +8447,7 @@ function outputRowsToLineItems(rows = state.outputRows) {
 }
 
 function outputRowsValid(rows = state.outputRows) {
+  const ownedCommercial = typeof quoteCommercialStateIsOwned === "function" && quoteCommercialStateIsOwned();
   const errors = [];
   rows.forEach((row, index) => {
     const label = `Row ${index + 1}`;
@@ -8435,8 +8458,8 @@ function outputRowsValid(rows = state.outputRows) {
       errors.push(`${label}: Quantity must be greater than 0.`);
     }
     if (row.price_mode !== "Included") {
-      const unitPrice = numberOrNull(row.unit_price_override);
-      const catalogUnitPrice = numberOrNull(row.catalog_unit_price);
+      const unitPrice = ownedCommercial ? effectiveOutputUnitPrice(row) : numberOrNull(row.unit_price_override);
+      const catalogUnitPrice = ownedCommercial ? null : numberOrNull(row.catalog_unit_price);
       const unitPriceKind = unitPriceEditKind(row.unit_price_override);
       if (unitPriceKind === "invalid") {
         errors.push(`${label}: Unit price must be a number or Included.`);
