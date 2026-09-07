@@ -1519,6 +1519,53 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertAlmostEqual(float(cell_value(sheet, "E28")), 960.0)
         self.assertAlmostEqual(float(cell_value(sheet, "E29")), 5760.0)
 
+    def test_recovered_quote_commercial_values_reach_xlsx_and_pdf_cell_map(self):
+        brief = {
+            "company_identity": "Saved Quotation Co",
+            "quote_date": "2026-06-06",
+            "project_number": "SQAG-451-001",
+            "client": {"name": "Saved Client", "attention": "Saved Contact", "title": "Director", "address": ["1 Saved Road"]},
+            "project": {"title": "Recovered Booth"},
+            "currency": "USD",
+            "exchange_rate": 1.37,
+            "tax": {"label": "GST", "rate": 0.09},
+            "company": {"name": "Saved Quotation Co", "header_lines": ["Saved Quotation Co", "1 Saved Road"], "logo_data_url": logo_data_url()},
+            "acceptance": {"company_name": "Saved Quotation Co", "text": "Saved acceptance", "person_label": "Saved person", "stamp_label": "Saved stamp", "date_label": "Saved date"},
+            "signature": {"company_signatory": "Saved Signatory", "company_title": "Saved Title", "company_date_label": "Saved date"},
+            "terms_heading": "Saved Terms",
+            "payment_terms": ["Saved payment term"],
+            "notes_heading": "Saved Notes",
+            "standard_notes": ["Saved note"],
+            "line_items": [],
+        }
+        priced = quote.PriceRow(1, "Graphics", "Saved captured graphics", "sqm", 100, 1.09, 1, "", pricing_id="saved-graphics")
+        lines = [
+            quote.QuoteLine("Graphics", 2, "sqm", "Saved captured graphics", "saved-graphics", "", priced, 200, "matched", [], unit_price_override=100),
+            quote.QuoteLine("Graphics", 1, "lot", "Saved included item", "", "Included", None, None, "included", [], price_mode="Included"),
+        ]
+        pdf_cells = quote.build_pdf_cell_map(brief, lines)
+        self.assertEqual(pdf_cells[(21, 5)], "USD")
+        self.assertAlmostEqual(pdf_cells[(92, 5)], 274.0)
+        self.assertAlmostEqual(pdf_cells[(93, 5)], 24.66)
+        self.assertAlmostEqual(pdf_cells[(94, 5)], 298.66)
+        self.assertEqual(pdf_cells[(93, 4)], "GST 9%")
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "quotation.xlsx"
+        quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, path, brief, lines)
+        with zipfile.ZipFile(path) as zf:
+            sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+        total_row = quote.parse_cell_ref(find_cell_ref(sheet, "Total"))[0]
+        tax_row = quote.parse_cell_ref(find_cell_ref(sheet, "GST 9%"))[0]
+        grand_row = quote.parse_cell_ref(find_cell_ref(sheet, "Total including GST"))[0]
+        self.assertEqual(cell_value(sheet, f"F{total_row}"), "USD")
+        self.assertAlmostEqual(float(cell_value(sheet, f"E{total_row}")), 274.0)
+        self.assertAlmostEqual(float(cell_value(sheet, f"E{tax_row}")), 24.66)
+        self.assertAlmostEqual(float(cell_value(sheet, f"E{grand_row}")), 298.66)
+        included_row = quote.parse_cell_ref(find_cell_ref(sheet, "Saved included item"))[0]
+        self.assertAlmostEqual(float(cell_value(sheet, f"E{included_row}")), 0.0)
+
     def test_layout_totals_show_zero_tax_row_from_quote_config(self):
         tmp, path = generate_layout_workbook({"currency": "IDR", "exchange_rate": 1, "tax": {"label": "VAT", "rate": 0}})
         self.addCleanup(tmp.cleanup)

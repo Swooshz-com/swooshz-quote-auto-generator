@@ -294,6 +294,31 @@ PRICING_REFERENCE_TEMPLATE_EXAMPLE_ROWS = [
 ]
 DOWNLOADABLE_FILES = {"quotation.pdf", "quotation.xlsx"}
 QUOTE_SESSION_SCHEMA_VERSION = 1
+QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA = "swooshz.quote-commercial-snapshot.v1"
+QUOTE_COMMERCIAL_SNAPSHOT_VERSION = 1
+QUOTE_COMMERCIAL_LIFECYCLES = {"NEW_UNINITIALISED", "EXISTING", "RECOVERED"}
+QUOTE_COMMERCIAL_PRESENCE_VALUES = {"captured", "intentional_empty", "legacy_unknown"}
+QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS = (
+    "currency",
+    "exchange_rate",
+    "tax",
+    "company_name",
+    "header_details",
+    "logo",
+    "terms_heading",
+    "payment_terms",
+    "notes_heading",
+    "standard_notes",
+    "acceptance_text",
+    "person_label",
+    "stamp_label",
+    "date_label",
+    "company_signatory",
+    "company_title",
+    "company_date_label",
+    "rich_text",
+)
+QUOTE_COMMERCIAL_REVIEW_MESSAGE = "Saved quote commercial state requires pricing review before generation."
 QUOTE_SESSION_ID_RE = re.compile(r"^quote-[A-Za-z0-9_-]{3,64}$")
 QUOTE_SESSION_DIR_NAME = "quote-sessions"
 QUOTE_SESSION_METADATA_FILENAME = "quote-session.json"
@@ -3862,6 +3887,317 @@ def parse_float_or_none(value: Any) -> float | None:
         return None
 
 
+def quote_session_draft_state_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    patch = payload.get("quote_session") if isinstance(payload.get("quote_session"), dict) else payload
+    draft_state = patch.get("draft_state") if isinstance(patch, dict) else None
+    if not isinstance(draft_state, dict):
+        draft_state = payload.get("draft_state") if isinstance(payload.get("draft_state"), dict) else {}
+    return draft_state
+
+
+def quote_commercial_saved_details(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    draft_state = quote_session_draft_state_from_payload(payload)
+    details = draft_state.get("quoteDetails") if isinstance(draft_state.get("quoteDetails"), dict) else None
+    if details is None:
+        details = draft_state.get("quote_details") if isinstance(draft_state.get("quote_details"), dict) else {}
+    snapshot = details.get("commercial_snapshot") if isinstance(details.get("commercial_snapshot"), dict) else {}
+    return details, snapshot, draft_state
+
+
+def normalized_quote_commercial_snapshot(
+    value: Any,
+    *,
+    lifecycle_override: str = "",
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    if (
+        value.get("schema") != QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA
+        or value.get("version") != QUOTE_COMMERCIAL_SNAPSHOT_VERSION
+        or value.get("owner") != "quote"
+    ):
+        return None
+    lifecycle = clean_text(lifecycle_override or value.get("lifecycle"))
+    if lifecycle not in QUOTE_COMMERCIAL_LIFECYCLES:
+        return None
+    raw_presence = value.get("presence") if isinstance(value.get("presence"), dict) else {}
+    presence: dict[str, str] = {}
+    for key in QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS:
+        item = clean_text(raw_presence.get(key))
+        if item not in QUOTE_COMMERCIAL_PRESENCE_VALUES:
+            return None
+        presence[key] = item
+    raw_basis = value.get("pricing_basis") if isinstance(value.get("pricing_basis"), dict) else {}
+    basis = {
+        "currency": clean_text(raw_basis.get("currency")).upper(),
+        "source": clean_text(raw_basis.get("source")),
+        "id": clean_text(raw_basis.get("id")),
+        "digest": clean_text(raw_basis.get("digest")),
+    }
+    basis = {key: item for key, item in basis.items() if item}
+    return {
+        "schema": QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+        "version": QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+        "owner": "quote",
+        "lifecycle": lifecycle,
+        "origin": dashboard_safe_text(value.get("origin"), 80) or "captured",
+        "presence": presence,
+        "pricing_basis": basis,
+    }
+
+
+def quote_commercial_state(payload: dict[str, Any]) -> dict[str, Any]:
+    details, raw_snapshot, draft_state = quote_commercial_saved_details(payload)
+    snapshot = normalized_quote_commercial_snapshot(raw_snapshot)
+    has_saved_state = bool(
+        details
+        or draft_state.get("outputRows")
+        or "quoteDetails" in draft_state
+        or "quote_details" in draft_state
+        or "quoteCommercialLifecycle" in draft_state
+    )
+    if snapshot:
+        return {
+            "owned": snapshot["lifecycle"] in {"EXISTING", "RECOVERED"},
+            "legacy": False,
+            "details": details,
+            "snapshot": snapshot,
+            "draft_state": draft_state,
+        }
+    return {
+        "owned": has_saved_state,
+        "legacy": has_saved_state,
+        "details": details,
+        "snapshot": None,
+        "draft_state": draft_state,
+    }
+
+
+def quote_commercial_row_from_output_row(row: dict[str, Any]) -> dict[str, Any]:
+    price_mode = "Included" if (
+        clean_text(row.get("price_mode")).lower() == "included"
+        or clean_text(row.get("display_price")).lower() == "included"
+    ) else "Priced"
+    next_row = copy.deepcopy(row)
+    next_row["price_mode"] = price_mode
+    if price_mode == "Included":
+        next_row["display_price"] = "Included"
+        next_row["approved_quote_amount"] = 0
+        next_row["unit_price_override"] = None
+        return next_row
+    quantity = parse_float_or_none(row.get("quantity"))
+    basis_amount = parse_float_or_none(row.get("pricing_basis_amount"))
+    if basis_amount is None:
+        basis_amount = parse_float_or_none(row.get("amount"))
+    effective = parse_float_or_none(row.get("effective_unit_price"))
+    if effective is None:
+        effective = parse_float_or_none(row.get("unit_price_override"))
+    if effective is None and basis_amount is not None and quantity is not None and quantity > 0:
+        effective = round(basis_amount / quantity, 6)
+    if effective is None:
+        effective = parse_float_or_none(row.get("catalog_unit_price"))
+    if effective is not None:
+        next_row["effective_unit_price"] = effective
+        next_row["unit_price_override"] = effective
+    if basis_amount is not None:
+        next_row["pricing_basis_amount"] = basis_amount
+    approved_amount = parse_float_or_none(row.get("approved_quote_amount"))
+    if approved_amount is not None:
+        next_row["approved_quote_amount"] = approved_amount
+    return next_row
+
+
+def quote_commercial_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    state = quote_commercial_state(payload)
+    if not state["owned"]:
+        return copy.deepcopy(payload)
+    resolved = copy.deepcopy(payload)
+    details = state["details"] if isinstance(state["details"], dict) else {}
+    for key in ("client", "project", "company", "quote_text", "signature", "rich_text"):
+        if isinstance(details.get(key), dict):
+            resolved[key] = copy.deepcopy(details[key])
+    for key in ("quote_date", "project_number"):
+        if key in details:
+            resolved[key] = details[key]
+    if "currency" in details:
+        resolved["quote_currency"] = details.get("currency")
+    if "exchange_rate" in details:
+        resolved["quote_exchange_rate"] = details.get("exchange_rate")
+    if "tax" in details:
+        resolved["quote_tax"] = copy.deepcopy(details.get("tax"))
+        resolved["tax"] = copy.deepcopy(details.get("tax"))
+
+    company = resolved.get("company") if isinstance(resolved.get("company"), dict) else {}
+    saved_company = details.get("company") if isinstance(details.get("company"), dict) else {}
+    presence = state.get("snapshot", {}).get("presence", {}) if isinstance(state.get("snapshot"), dict) else {}
+    if presence.get("logo") == "intentional_empty":
+        for key in ("logo_data_url", "logo", "header_logo", "logo_session_file_key"):
+            company.pop(key, None)
+        company["logo_data_url"] = ""
+    elif presence.get("logo") == "captured":
+        saved_fingerprint = clean_text(saved_company.get("logo_content_fingerprint"))
+        saved_file_key = clean_text(saved_company.get("logo_session_file_key"))
+        incoming_fingerprint = clean_text(payload.get("company", {}).get("logo_content_fingerprint")) if isinstance(payload.get("company"), dict) else ""
+        incoming_file_key = clean_text(payload.get("company", {}).get("logo_session_file_key")) if isinstance(payload.get("company"), dict) else ""
+        if saved_company.get("logo_data_url"):
+            company["logo_data_url"] = saved_company.get("logo_data_url")
+        elif saved_fingerprint and incoming_fingerprint == saved_fingerprint:
+            company["logo_data_url"] = payload.get("company", {}).get("logo_data_url", "")
+        elif saved_file_key and incoming_file_key == saved_file_key:
+            company["logo_data_url"] = payload.get("company", {}).get("logo_data_url", "")
+        elif not saved_fingerprint and not saved_file_key:
+            company["logo_data_url"] = payload.get("company", {}).get("logo_data_url", "")
+        else:
+            company["logo_data_url"] = ""
+    resolved["company"] = company
+    pricing_basis = state.get("snapshot", {}).get("pricing_basis", {}) if isinstance(state.get("snapshot"), dict) else {}
+    if isinstance(pricing_basis, dict):
+        reference = copy.deepcopy(resolved.get("pricing_reference")) if isinstance(resolved.get("pricing_reference"), dict) else {}
+        basis_id = clean_text(pricing_basis.get("id"))
+        basis_source = clean_text(pricing_basis.get("source"))
+        if basis_id and not clean_text(resolved.get("pricing_reference_id")):
+            resolved["pricing_reference_id"] = basis_id
+        if basis_id and not clean_text(reference.get("id")):
+            reference["id"] = basis_id
+        if basis_source and not clean_text(reference.get("source")):
+            reference["source"] = basis_source
+        if reference:
+            resolved["pricing_reference"] = reference
+    saved_profile_id = safe_resource_id(
+        state.get("draft_state", {}).get("profileId")
+        or state.get("draft_state", {}).get("profile_id"),
+        "",
+    )
+    if saved_profile_id and not clean_text(resolved.get("profile_id")):
+        resolved["profile_id"] = saved_profile_id
+
+    output_rows = state["draft_state"].get("outputRows")
+    if isinstance(output_rows, list):
+        resolved["line_items"] = [
+            quote_commercial_row_from_output_row(row)
+            for row in output_rows
+            if isinstance(row, dict)
+        ]
+    else:
+        resolved["line_items"] = [
+            quote_commercial_row_from_output_row(row)
+            for row in (resolved.get("line_items") if isinstance(resolved.get("line_items"), list) else [])
+            if isinstance(row, dict)
+        ]
+    if isinstance(pricing_basis, dict):
+        for row in resolved["line_items"]:
+            if not isinstance(row, dict):
+                continue
+            for key, basis_key in (
+                ("pricing_basis_currency", "currency"),
+                ("pricing_reference_source", "source"),
+                ("pricing_reference_id", "id"),
+                ("pricing_basis_digest", "digest"),
+            ):
+                if not clean_text(row.get(key)) and clean_text(pricing_basis.get(basis_key)):
+                    row[key] = clean_text(pricing_basis.get(basis_key))
+    return resolved
+
+
+def quote_commercial_state_errors(
+    payload: dict[str, Any],
+    state: dict[str, Any] | None = None,
+) -> list[str]:
+    commercial_state = state or quote_commercial_state(payload)
+    if not commercial_state.get("owned"):
+        return []
+    errors: list[str] = []
+    snapshot = commercial_state.get("snapshot")
+    if commercial_state.get("legacy") or not snapshot:
+        errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+        return errors
+    presence = snapshot.get("presence") if isinstance(snapshot.get("presence"), dict) else {}
+    required_presence = {
+        "currency",
+        "exchange_rate",
+        "tax",
+        "company_name",
+        "header_details",
+        "logo",
+        "acceptance_text",
+        "person_label",
+        "stamp_label",
+        "date_label",
+        "company_signatory",
+        "company_title",
+        "company_date_label",
+    }
+    if any(presence.get(key) == "legacy_unknown" for key in required_presence):
+        errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+    details = commercial_state.get("details") if isinstance(commercial_state.get("details"), dict) else {}
+    currency = clean_text(details.get("currency")).upper()
+    if not re.fullmatch(r"[A-Z]{3}", currency):
+        errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+    exchange_rate = parse_float_or_none(details.get("exchange_rate"))
+    if exchange_rate is None or exchange_rate <= 0:
+        errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+    tax = details.get("tax") if isinstance(details.get("tax"), dict) else {}
+    tax_label = clean_text(tax.get("label")).upper()
+    tax_rate = parse_float_or_none(tax.get("rate"))
+    if tax_rate is not None and tax_rate > 1:
+        tax_rate /= 100
+    if tax_label not in {"GST", "VAT"} or tax_rate is None or not 0 <= tax_rate <= 1:
+        errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+    basis = snapshot.get("pricing_basis") if isinstance(snapshot.get("pricing_basis"), dict) else {}
+    basis_currency = clean_text(basis.get("currency")).upper()
+    basis_source = clean_text(basis.get("source"))
+    basis_id = clean_text(basis.get("id"))
+    if not re.fullmatch(r"[A-Z]{3}", basis_currency) or not basis_source or not basis_id:
+        errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+    current_reference = payload.get("pricing_reference") if isinstance(payload.get("pricing_reference"), dict) else {}
+    current_id = clean_text(payload.get("pricing_reference_id") or current_reference.get("id"))
+    current_source = clean_text(
+        payload.get("pricing_reference_source")
+        or (payload.get("pricing_reference", {}).get("source") if isinstance(payload.get("pricing_reference"), dict) else "")
+    )
+    if current_id and current_id != basis_id:
+        errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+    if current_source and current_source != basis_source:
+        errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+    saved_profile_id = safe_resource_id(
+        commercial_state.get("draft_state", {}).get("profileId")
+        or commercial_state.get("draft_state", {}).get("profile_id"),
+        "",
+    )
+    current_profile = payload.get("quote_company_profile") if isinstance(payload.get("quote_company_profile"), dict) else {}
+    current_profile_id = safe_resource_id(payload.get("profile_id") or current_profile.get("id"), "")
+    if saved_profile_id and current_profile_id and saved_profile_id != current_profile_id:
+        errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+
+    canonical = quote_commercial_payload(payload)
+    rows = canonical.get("line_items") if isinstance(canonical.get("line_items"), list) else []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if clean_text(row.get("price_mode")).lower() == "included" or clean_text(row.get("display_price")).lower() == "included":
+            continue
+        effective = parse_float_or_none(row.get("effective_unit_price"))
+        if effective is None:
+            effective = parse_float_or_none(row.get("unit_price_override"))
+        if effective is None:
+            effective = parse_float_or_none(row.get("catalog_unit_price"))
+        if effective is None or effective < 0:
+            errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+            break
+        quantity = parse_float_or_none(row.get("quantity"))
+        approved_amount = parse_float_or_none(row.get("approved_quote_amount"))
+        if approved_amount is not None and quantity is not None and exchange_rate > 0:
+            expected_amount = round(round(quantity * effective, 2) * exchange_rate, 2)
+            if abs(approved_amount - expected_amount) > 0.005:
+                errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+                break
+    return list(dict.fromkeys(errors))
+
+
+class QuoteCommercialStateError(ValueError):
+    """Raised when a saved quote commercial snapshot cannot be resolved safely."""
+
+
 def normalize_tax_label(value: Any) -> str:
     label = clean_text(value).upper()
     return label if label in {"GST", "VAT"} else DEFAULT_TAX_LABEL
@@ -3877,6 +4213,15 @@ def normalize_tax_rate(value: Any, fallback: float = DEFAULT_TAX_RATE) -> float:
 
 
 def quote_tax_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    commercial_state = quote_commercial_state(payload)
+    if commercial_state.get("owned"):
+        details = commercial_state.get("details") if isinstance(commercial_state.get("details"), dict) else {}
+        tax = details.get("tax") if isinstance(details.get("tax"), dict) else {}
+        label = clean_text(tax.get("label")).upper()
+        rate = parse_float_or_none(tax.get("rate"))
+        if rate is not None and rate > 1:
+            rate /= 100
+        return {"label": label if label in {"GST", "VAT"} else "", "rate": rate}
     explicit_tax = payload.get("quote_tax") if isinstance(payload.get("quote_tax"), dict) else {}
     if explicit_tax:
         return {"label": normalize_tax_label(explicit_tax.get("label")), "rate": normalize_tax_rate(explicit_tax.get("rate"))}
@@ -3895,6 +4240,11 @@ def quote_tax_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def quote_currency_from_payload(payload: dict[str, Any]) -> str:
+    commercial_state = quote_commercial_state(payload)
+    if commercial_state.get("owned"):
+        details = commercial_state.get("details") if isinstance(commercial_state.get("details"), dict) else {}
+        currency = clean_text(details.get("currency")).upper()
+        return currency if re.fullmatch(r"[A-Z]{3}", currency) else ""
     explicit_currency = clean_text(payload.get("quote_currency"))
     if explicit_currency:
         return normalize_currency_label(explicit_currency)
@@ -3915,6 +4265,16 @@ def quote_currency_from_payload(payload: dict[str, Any]) -> str:
         if pack_currency:
             return normalize_currency_label(pack_currency)
     return DEFAULT_CURRENCY_LABEL
+
+
+def quote_exchange_rate_from_payload(payload: dict[str, Any]) -> float | None:
+    commercial_state = quote_commercial_state(payload)
+    if commercial_state.get("owned"):
+        details = commercial_state.get("details") if isinstance(commercial_state.get("details"), dict) else {}
+        value = parse_float_or_none(details.get("exchange_rate"))
+        return value if value is not None and value > 0 else None
+    value = parse_float_or_none(payload.get("quote_exchange_rate"))
+    return value if value is not None and value > 0 else None
 
 
 def normalize_currency_label(value: Any) -> str:
@@ -15293,6 +15653,9 @@ def payload_with_database_profile_defaults(payload: dict[str, Any], auth_session
 
 
 def generation_payload_with_profile_defaults(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any]:
+    commercial_state = quote_commercial_state(payload)
+    if commercial_state.get("owned"):
+        return quote_commercial_payload(payload)
     if configured_storage_mode() == "database":
         return payload_with_database_profile_defaults(payload, auth_session=auth_session)
     return payload_with_workspace_quote_profile_defaults(payload)
@@ -16881,10 +17244,92 @@ def resolve_tied_catalog_attribute_item(query_text: str, items: list[dict[str, A
     return None
 
 
+def normalize_owned_line_item(raw: dict[str, Any]) -> dict[str, Any] | None:
+    display_price = clean_text(raw.get("display_price"))
+    price_mode = clean_text(raw.get("price_mode")).title()
+    if clean_text(raw.get("unit_price_override")).lower() == "included" or display_price.lower() == "included":
+        price_mode = "Included"
+        display_price = "Included"
+    if price_mode not in {"Priced", "Included"}:
+        price_mode = "Included" if display_price.lower() == "included" else "Priced"
+    raw_unit = normalize_pricing_unit(raw.get("unit"))
+    quantity_parts = normalized_line_text_quantity_parts(raw.get("description"), raw.get("quantity"), raw_unit)
+    description = clean_customer_quote_line_text(quantity_parts["text"])
+    if not description and not display_price and not clean_text(raw.get("pricing_keyword")):
+        return None
+    item: dict[str, Any] = {
+        "section": normalize_catalog_section(raw.get("section")),
+        "quantity": parse_float_or_none(quantity_parts["quantity"]),
+        "unit": quantity_parts["unit"] if quantity_parts.get("from_text_prefix") else raw_unit,
+        "description": description,
+        "pricing_keyword": clean_text(raw.get("pricing_keyword")),
+        "price_mode": price_mode,
+        "source_basis_line_id": safe_resource_id(raw.get("source_basis_line_id"), ""),
+    }
+    for order_key in ("category_order", "item_order", "basis_order"):
+        order_value = pricing_reference_order_number(raw.get(order_key))
+        if order_value is not None:
+            item[order_key] = order_value
+    for key in ("reference_section", "status"):
+        value = clean_text(raw.get(key))
+        if value:
+            item[key] = clean_basis_section_title(value) if key == "reference_section" else value
+    for key in ("catalog_description", "pricing_reference_description"):
+        value = clean_customer_quote_line_text(raw.get(key))
+        if value:
+            item[key] = value
+    basis_currency = clean_text(raw.get("pricing_basis_currency")).upper()
+    if basis_currency:
+        item["pricing_basis_currency"] = basis_currency
+    for key in ("pricing_reference_source", "pricing_reference_id", "pricing_basis_digest"):
+        value = clean_text(raw.get(key))
+        if value:
+            item[key] = value
+    effective = parse_float_or_none(raw.get("effective_unit_price"))
+    if effective is None:
+        effective = parse_float_or_none(raw.get("unit_price_override"))
+    basis_amount = parse_float_or_none(raw.get("pricing_basis_amount"))
+    if basis_amount is None:
+        basis_amount = parse_float_or_none(raw.get("amount"))
+    quantity = parse_float_or_none(quantity_parts["quantity"])
+    if effective is None and basis_amount is not None and quantity is not None and quantity > 0:
+        effective = round(basis_amount / quantity, 6)
+    if effective is None:
+        effective = parse_float_or_none(raw.get("catalog_unit_price"))
+    if price_mode == "Included":
+        item["approved_quote_amount"] = 0
+        item["display_price"] = "Included"
+    elif effective is not None and effective >= 0:
+        item["effective_unit_price"] = effective
+        item["unit_price_override"] = effective
+        catalog_unit_price = parse_float_or_none(raw.get("catalog_unit_price"))
+        item["catalog_unit_price"] = catalog_unit_price if catalog_unit_price is not None else effective
+    else:
+        item["unit_price_override"] = None
+    for key in ("pricing_basis_amount", "approved_quote_amount"):
+        value = parse_float_or_none(raw.get(key))
+        if key == "pricing_basis_amount" and value is None:
+            value = basis_amount
+        if value is not None:
+            item[key] = 0 if price_mode == "Included" and key == "approved_quote_amount" else value
+    if not item["source_basis_line_id"]:
+        item.pop("source_basis_line_id", None)
+    return item
+
+
 def normalize_line_items(payload: dict[str, Any], use_catalog: bool = True) -> list[dict[str, Any]]:
     raw_items = payload.get("line_items")
     if not isinstance(raw_items, list):
         return []
+
+    if quote_commercial_state(payload).get("owned"):
+        return [
+            item
+            for raw in raw_items
+            if isinstance(raw, dict)
+            for item in [normalize_owned_line_item(raw)]
+            if item
+        ]
 
     catalog_lookup = pricing_catalog_runtime_lookup_for_payload(payload, profile_id_from_payload(payload)) if use_catalog else {}
     items: list[dict[str, Any]] = []
@@ -17020,6 +17465,9 @@ def quote_detail_missing_fields(payload: dict[str, Any]) -> list[str]:
 
 def validate_generation_payload(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> list[str]:
     errors: list[str] = []
+    commercial_state = quote_commercial_state(payload)
+    errors.extend(quote_commercial_state_errors(payload, commercial_state))
+    payload = quote_commercial_payload(payload)
     if not image_entries(payload):
         errors.append(MISSING_IMAGES_MESSAGE)
     image_error = image_limit_error(payload)
@@ -17093,6 +17541,11 @@ def quote_detail_rich_text(payload: dict[str, Any]) -> dict[str, str]:
 
 
 def payload_to_brief(payload: dict[str, Any]) -> dict[str, Any]:
+    commercial_state = quote_commercial_state(payload)
+    commercial_errors = quote_commercial_state_errors(payload, commercial_state)
+    if commercial_errors:
+        raise QuoteCommercialStateError(" ".join(commercial_errors))
+    payload = quote_commercial_payload(payload)
     client_address = nested_value(payload, "client", "address", "client_address")
     project = payload.get("project") if isinstance(payload.get("project"), dict) else {}
     company = payload.get("company") if isinstance(payload.get("company"), dict) else {}
@@ -17134,7 +17587,7 @@ def payload_to_brief(payload: dict[str, Any]) -> dict[str, Any]:
             "logo_data_url": header_logo,
         },
         "currency": quote_currency_from_payload(payload),
-        "exchange_rate": parse_float_or_none(payload.get("quote_exchange_rate")),
+        "exchange_rate": quote_exchange_rate_from_payload(payload),
         "tax": quote_tax_from_payload(payload),
         "line_items": normalize_line_items_for_final_brief(payload),
         "payment_terms": multiline_list(quote_text.get("payment_terms") or payload.get("payment_terms")),
@@ -19408,6 +19861,8 @@ def line_items_aligned_to_quote_basis(
 
 def normalize_line_items_for_quote_basis_review(payload: dict[str, Any]) -> list[dict[str, Any]]:
     line_items = normalize_line_items(payload)
+    if quote_commercial_state(payload).get("owned"):
+        return sort_line_items_by_pricing_reference_order(payload, line_items)
     sections = normalize_quote_basis_sections(payload, pricing_reference_section_names_for_payload(payload))
     if not sections:
         return sort_line_items_by_pricing_reference_order(payload, line_items)
@@ -19432,6 +19887,8 @@ def normalize_line_items_for_final_brief(payload: dict[str, Any]) -> list[dict[s
     line_items = normalize_line_items(payload)
     if not line_items:
         return []
+    if quote_commercial_state(payload).get("owned"):
+        return sort_line_items_by_pricing_reference_order(payload, line_items)
 
     sections = normalize_quote_basis_sections(payload, pricing_reference_section_names_for_payload(payload))
     if sections:
@@ -20709,9 +21166,10 @@ def quote_session_generation_snapshot(
     profile_detail: dict[str, Any] | None = None,
     pricing_reference_detail: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    profile = quote_session_snapshot_resource(quote_session_profile_summary(payload, patch), profile_detail)
+    resolved_payload = quote_commercial_payload(payload)
+    profile = quote_session_snapshot_resource(quote_session_profile_summary(resolved_payload, patch), profile_detail)
     pricing_reference = quote_session_snapshot_resource(
-        quote_session_pricing_reference_summary(payload, patch),
+        quote_session_pricing_reference_summary(resolved_payload, patch),
         pricing_reference_detail,
     )
     storage = {
@@ -20719,6 +21177,8 @@ def quote_session_generation_snapshot(
         "storage_mode": configured_storage_mode(),
         "artifact_storage_mode": configured_artifact_storage_mode(),
     }
+    commercial_state = quote_commercial_state(payload)
+    commercial_snapshot = commercial_state.get("snapshot") if isinstance(commercial_state.get("snapshot"), dict) else None
     snapshot: dict[str, Any] = {
         "schema": "swooshz.sqag.quote-generation-snapshot.v1",
         "created_at": dashboard_safe_text(created_at),
@@ -20730,12 +21190,15 @@ def quote_session_generation_snapshot(
         },
         "storage": storage,
     }
+    if commercial_snapshot:
+        snapshot["commercial_snapshot"] = copy.deepcopy(commercial_snapshot)
     snapshot["digest_sha256"] = quote_session_safe_digest({
         "created_at": snapshot["created_at"],
         "profile": profile,
         "pricing_reference": pricing_reference,
         "workspace": snapshot["workspace"],
         "storage": storage,
+        **({"commercial_snapshot": snapshot["commercial_snapshot"]} if "commercial_snapshot" in snapshot else {}),
     })
     return snapshot
 
@@ -20762,6 +21225,9 @@ def normalized_quote_session_generation_snapshot(value: Any) -> dict[str, Any]:
     storage = value.get("storage") if isinstance(value.get("storage"), dict) else {}
     for key in ("app_mode", "storage_mode", "artifact_storage_mode"):
         snapshot["storage"][key] = safe_resource_id(storage.get(key), "")
+    commercial_snapshot = normalized_quote_commercial_snapshot(value.get("commercial_snapshot"))
+    if commercial_snapshot:
+        snapshot["commercial_snapshot"] = commercial_snapshot
     digest = clean_text(value.get("digest_sha256"))
     snapshot["digest_sha256"] = digest if re.fullmatch(r"[a-f0-9]{64}", digest) else quote_session_safe_digest({
         "created_at": snapshot["created_at"],
@@ -20769,12 +21235,87 @@ def normalized_quote_session_generation_snapshot(value: Any) -> dict[str, Any]:
         "pricing_reference": snapshot["pricing_reference"],
         "workspace": snapshot["workspace"],
         "storage": snapshot["storage"],
+        **({"commercial_snapshot": snapshot["commercial_snapshot"]} if "commercial_snapshot" in snapshot else {}),
     })
     return snapshot
 
 
 def quote_session_commercials(payload: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     supplied = patch.get("commercials") if isinstance(patch.get("commercials"), dict) else {}
+    commercial_state = quote_commercial_state(payload)
+    if commercial_state.get("owned"):
+        if commercial_state.get("legacy"):
+            details = commercial_state.get("details") if isinstance(commercial_state.get("details"), dict) else {}
+            saved_tax = details.get("tax") if isinstance(details.get("tax"), dict) else {}
+            supplied_tax_rate = supplied.get("tax_rate") if supplied.get("tax_rate") not in (None, "") else saved_tax.get("rate")
+            tax_rate = parse_float_or_none(supplied_tax_rate)
+            if tax_rate is not None and tax_rate > 1:
+                tax_rate /= 100
+            supplied_currency = clean_text(supplied.get("currency") or details.get("currency")).upper()
+            supplied_exchange = supplied.get("exchange_rate") if supplied.get("exchange_rate") not in (None, "") else details.get("exchange_rate")
+            return {
+                "currency": supplied_currency,
+                "tax_label": clean_text(supplied.get("tax_label") or saved_tax.get("label")).upper(),
+                "tax_rate": tax_rate,
+                "exchange_rate": dashboard_safe_exchange_rate(supplied_exchange),
+                "subtotal": dashboard_safe_number(supplied.get("subtotal")),
+                "tax_amount": dashboard_safe_number(supplied.get("tax_amount")),
+                "grand_total": dashboard_safe_number(supplied.get("grand_total")),
+            }
+        canonical = quote_commercial_payload(payload)
+        details = commercial_state.get("details") if isinstance(commercial_state.get("details"), dict) else {}
+        tax = details.get("tax") if isinstance(details.get("tax"), dict) else {}
+        currency = clean_text(details.get("currency")).upper()
+        exchange_rate = dashboard_safe_exchange_rate(details.get("exchange_rate"))
+        tax_rate = parse_float_or_none(tax.get("rate"))
+        if tax_rate is not None and tax_rate > 1:
+            tax_rate /= 100
+        tax_label = clean_text(tax.get("label")).upper()
+        rows = canonical.get("line_items") if isinstance(canonical.get("line_items"), list) else []
+        subtotal = 0.0
+        has_invalid_row = not rows
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if clean_text(row.get("price_mode")).lower() == "included" or clean_text(row.get("display_price")).lower() == "included":
+                continue
+            quantity = parse_float_or_none(row.get("quantity"))
+            effective = parse_float_or_none(row.get("effective_unit_price"))
+            if effective is None:
+                effective = parse_float_or_none(row.get("unit_price_override"))
+            if effective is None:
+                effective = parse_float_or_none(row.get("catalog_unit_price"))
+            if quantity is None or effective is None or quantity < 0 or effective < 0:
+                has_invalid_row = True
+                continue
+            base_amount = round(quantity * effective, 2)
+            quote_amount = round(base_amount * exchange_rate, 2) if exchange_rate is not None else None
+            if quote_amount is None:
+                has_invalid_row = True
+            else:
+                subtotal += quote_amount
+        if not re.fullmatch(r"[A-Z]{3}", currency) or exchange_rate is None or not rows or has_invalid_row:
+            subtotal_value = None
+        else:
+            subtotal_value = round(subtotal, 2)
+        if tax_label not in {"GST", "VAT"} or tax_rate is None or not 0 <= tax_rate <= 1:
+            tax_amount = None
+            grand_total = None
+        elif subtotal_value is None:
+            tax_amount = None
+            grand_total = None
+        else:
+            tax_amount = round(subtotal_value * tax_rate, 2)
+            grand_total = round(subtotal_value + tax_amount, 2)
+        return {
+            "currency": currency,
+            "tax_label": tax_label if tax_label in {"GST", "VAT"} else "",
+            "tax_rate": tax_rate if tax_rate is not None and 0 <= tax_rate <= 1 else None,
+            "exchange_rate": exchange_rate,
+            "subtotal": subtotal_value,
+            "tax_amount": tax_amount,
+            "grand_total": grand_total,
+        }
     tax = quote_tax_from_payload(payload)
     subtotal = dashboard_safe_number(supplied.get("subtotal"))
     tax_amount = dashboard_safe_number(supplied.get("tax_amount"))

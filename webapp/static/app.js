@@ -24,6 +24,29 @@ const QUOTE_SESSION_FILE_DB_NAME = "swooshz_quote_session_files_v1";
 const QUOTE_SESSION_FILE_STORE_NAME = "reference_files";
 const QUOTE_SESSION_FILE_DB_VERSION = 1;
 const QUOTE_SESSION_STATE_VERSION = 5;
+const QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA = "swooshz.quote-commercial-snapshot.v1";
+const QUOTE_COMMERCIAL_SNAPSHOT_VERSION = 1;
+const QUOTE_COMMERCIAL_LIFECYCLES = new Set(["NEW_UNINITIALISED", "EXISTING", "RECOVERED"]);
+const QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS = [
+  "currency",
+  "exchange_rate",
+  "tax",
+  "company_name",
+  "header_details",
+  "logo",
+  "terms_heading",
+  "payment_terms",
+  "notes_heading",
+  "standard_notes",
+  "acceptance_text",
+  "person_label",
+  "stamp_label",
+  "date_label",
+  "company_signatory",
+  "company_title",
+  "company_date_label",
+  "rich_text",
+];
 const OUTPUT_SORT_MODES = ["pricing_reference", "category", "name", "category_name"];
 const ANALYSIS_MODE_STANDARD = "standard";
 const ANALYSIS_MODE_HIGH_QUALITY = "high_quality";
@@ -192,6 +215,10 @@ const state = {
   quoteSessionDraftSaveStarted: false,
   quoteSessionRestoredSessionId: "",
   quoteSessionRestoredDraftKey: "",
+  quoteCommercialLifecycle: "NEW_UNINITIALISED",
+  quoteCommercialSnapshot: null,
+  quoteCommercialRecoveryError: "",
+  quoteCommercialPreservedQuoteText: {},
   dashboardStatusFilter: "all",
   dashboardDateFilter: "all",
   dashboardCustomDateStart: "",
@@ -1231,6 +1258,12 @@ function generationProfileIdForPayload() {
 }
 
 function syncSelectedPricingReference() {
+  const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+  const savedBasis = state.quoteCommercialSnapshot?.pricing_basis;
+  if (ownedCommercial && (
+    state.quoteCommercialLifecycle === "RECOVERED"
+    || (savedBasis && typeof savedBasis === "object" && String(savedBasis.id || "").trim())
+  )) return;
   const selectedReference = currentPricingReference();
   if (selectedReference) {
     state.pricingReferenceId = selectedReference.id || "";
@@ -2081,6 +2114,9 @@ function quoteCurrencyControlValue() {
       ? normalizedCustomCurrencyInput(elements.quoteCurrencyCustom)
       : "";
   }
+  if (["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || "")) && !String(selected || "").trim()) {
+    return "";
+  }
   return normalizeCurrencyLabel(selected || selectedPricingReferenceCurrency());
 }
 
@@ -2115,6 +2151,126 @@ function syncPricingReferenceCurrencyCustomInput() {
 }
 
 const QUOTE_COMMERCIAL_FIELD_KEYS = ["quoteCurrency", "quoteExchangeRate", "quoteTaxLabel", "quoteTaxRate"];
+
+function quoteCommercialSnapshotPresence(value, previous = "") {
+  const prior = String(previous || "").trim();
+  if (prior === "legacy_unknown") return prior;
+  return hasMeaningfulQuoteDetailValue(value) ? "captured" : "intentional_empty";
+}
+
+function quoteCommercialSnapshotFromLegacyRecovery() {
+  return {
+    schema: QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+    version: QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+    owner: "quote",
+    lifecycle: "RECOVERED",
+    origin: "legacy_recovery",
+    presence: QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS.reduce((presence, key) => {
+      presence[key] = "legacy_unknown";
+      return presence;
+    }, {}),
+    pricing_basis: {},
+  };
+}
+
+function normalizeQuoteCommercialSnapshot(snapshot = {}, lifecycleOverride = "") {
+  if (!snapshot || typeof snapshot !== "object") return null;
+  if (
+    snapshot.schema !== QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA
+    || Number(snapshot.version) !== QUOTE_COMMERCIAL_SNAPSHOT_VERSION
+    || snapshot.owner !== "quote"
+  ) return null;
+  const lifecycle = String(lifecycleOverride || snapshot.lifecycle || "").trim();
+  if (!QUOTE_COMMERCIAL_LIFECYCLES.has(lifecycle)) return null;
+  const rawPresence = snapshot.presence && typeof snapshot.presence === "object" ? snapshot.presence : {};
+  const presence = QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS.reduce((normalized, key) => {
+    const value = String(rawPresence[key] || "").trim();
+    normalized[key] = ["captured", "intentional_empty", "legacy_unknown"].includes(value)
+      ? value
+      : "legacy_unknown";
+    return normalized;
+  }, {});
+  const rawBasis = snapshot.pricing_basis && typeof snapshot.pricing_basis === "object" ? snapshot.pricing_basis : {};
+  const pricingBasis = {};
+  ["currency", "source", "id", "digest"].forEach((key) => {
+    const value = String(rawBasis[key] || "").trim();
+    if (value) pricingBasis[key] = value;
+  });
+  return {
+    schema: QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+    version: QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+    owner: "quote",
+    lifecycle,
+    origin: String(snapshot.origin || "").trim() || "captured",
+    presence,
+    pricing_basis: pricingBasis,
+  };
+}
+
+function quoteCommercialSnapshotForDetails(details = {}, options = {}) {
+  const previous = state.quoteCommercialSnapshot && typeof state.quoteCommercialSnapshot === "object"
+    ? state.quoteCommercialSnapshot
+    : {};
+  const lifecycle = QUOTE_COMMERCIAL_LIFECYCLES.has(String(options.lifecycle || state.quoteCommercialLifecycle || previous.lifecycle || "NEW_UNINITIALISED"))
+    ? String(options.lifecycle || state.quoteCommercialLifecycle || previous.lifecycle || "NEW_UNINITIALISED")
+    : "NEW_UNINITIALISED";
+  const owned = ["EXISTING", "RECOVERED"].includes(lifecycle);
+  const reference = options.reference
+    || (typeof currentPricingReference === "function" ? currentPricingReference() : null)
+    || {};
+  const previousBasis = previous.pricing_basis && typeof previous.pricing_basis === "object"
+    ? previous.pricing_basis
+    : {};
+  const pricingBasis = owned && Object.keys(previousBasis).length
+    ? { ...previousBasis }
+    : {
+      currency: normalizeCurrencyLabel(reference.currency || ""),
+      source: String(reference.source || state.pricingReferenceSource || "").trim(),
+      id: String(reference.id || state.pricingReferenceId || "").trim(),
+      digest: String(reference.digest_sha256 || reference.reference_digest || reference.content_fingerprint || "").trim(),
+    };
+  const company = details.company && typeof details.company === "object" ? details.company : {};
+  const quoteText = details.quote_text && typeof details.quote_text === "object" ? details.quote_text : {};
+  const signature = details.signature && typeof details.signature === "object" ? details.signature : {};
+  const richText = details.rich_text && typeof details.rich_text === "object" ? details.rich_text : {};
+  const values = {
+    currency: details.currency,
+    exchange_rate: details.exchange_rate,
+    tax: details.tax && typeof details.tax === "object" ? details.tax : {},
+    company_name: company.name,
+    header_details: company.header_details,
+    logo: company.logo_data_url || company.logo_session_file_key || company.logo_content_fingerprint,
+    terms_heading: quoteText.terms_heading,
+    payment_terms: quoteText.payment_terms,
+    notes_heading: quoteText.notes_heading,
+    standard_notes: quoteText.standard_notes,
+    acceptance_text: quoteText.acceptance_text,
+    person_label: quoteText.person_label,
+    stamp_label: quoteText.stamp_label,
+    date_label: quoteText.date_label,
+    company_signatory: signature.company_signatory,
+    company_title: signature.company_title,
+    company_date_label: signature.company_date_label,
+    rich_text: richText,
+  };
+  const previousPresence = previous.presence && typeof previous.presence === "object" ? previous.presence : {};
+  return {
+    schema: QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+    version: QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+    owner: "quote",
+    lifecycle,
+    origin: String(options.origin || previous.origin || (owned ? "captured" : "new_quote")).trim(),
+    presence: QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS.reduce((presence, key) => {
+      presence[key] = quoteCommercialSnapshotPresence(values[key], previousPresence[key]);
+      return presence;
+    }, {}),
+    pricing_basis: Object.fromEntries(Object.entries(pricingBasis).filter(([, value]) => String(value || "").trim())),
+  };
+}
+
+function quoteCommercialStateIsOwned() {
+  return ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+}
 
 function emptyQuoteCommercialTouched() {
   return QUOTE_COMMERCIAL_FIELD_KEYS.reduce((touched, key) => {
@@ -2225,6 +2381,16 @@ function restoreQuoteCommercialOverrideSnapshot(snapshot = {}, options = {}) {
 }
 
 function collectTaxDetails() {
+  const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+  if (ownedCommercial) {
+    const labelSource = elements.quoteTaxLabel?.value ?? elements.taxLabel?.value ?? "";
+    const rateSource = elements.quoteTaxRate?.value ?? elements.taxRate?.value ?? "";
+    const rawRate = Number(String(rateSource || "").replace("%", "").trim());
+    return {
+      label: String(labelSource || "").trim() ? normalizeTaxLabel(labelSource) : "",
+      rate: Number.isFinite(rawRate) ? Math.min(1, Math.max(0, rawRate / 100)) : null,
+    };
+  }
   const referenceTax = selectedPricingReferenceTax();
   const label = elements.quoteTaxLabel?.value || elements.taxLabel?.value || referenceTax.label;
   const rateSource = elements.quoteTaxRate?.value || elements.taxRate?.value;
@@ -2237,17 +2403,25 @@ function collectTaxDetails() {
 }
 
 function collectQuoteCurrency() {
-  return normalizeCurrencyLabel(quoteCurrencyControlValue() || selectedPricingReferenceCurrency());
+  const value = quoteCurrencyControlValue();
+  if (["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""))) {
+    return value ? normalizeCurrencyLabel(value) : "";
+  }
+  return normalizeCurrencyLabel(value || selectedPricingReferenceCurrency());
 }
 
 function collectQuoteExchangeRate() {
   const value = Number(String(elements.quoteExchangeRate?.value || "").trim());
+  if (["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""))) {
+    return Number.isFinite(value) && value > 0 ? value : null;
+  }
   if (collectQuoteCurrency() === selectedPricingReferenceCurrency() && !quoteCommercialFieldIsTouched("quoteExchangeRate")) return 1;
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
 function syncQuoteExchangeRateField() {
   if (elements.quoteExchangeRateField) elements.quoteExchangeRateField.hidden = false;
+  if (["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""))) return;
   if (
     elements.quoteExchangeRate
     && collectQuoteCurrency() === selectedPricingReferenceCurrency()
@@ -2258,7 +2432,14 @@ function syncQuoteExchangeRateField() {
 }
 
 function quoteCommercialTaxText(tax = collectTaxDetails()) {
-  return `${tax.label || DEFAULT_TAX_LABEL} ${taxRatePercentText(tax.rate ?? DEFAULT_TAX_RATE)}%`;
+  const ownedCommercial = typeof state !== "undefined"
+    && ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+  const label = String(tax?.label || "").trim();
+  const rate = Number(tax?.rate);
+  if (ownedCommercial && (!label || !Number.isFinite(rate) || rate < 0 || rate > 1)) {
+    return "Review required";
+  }
+  return `${label || DEFAULT_TAX_LABEL} ${taxRatePercentText(Number.isFinite(rate) ? rate : DEFAULT_TAX_RATE)}%`;
 }
 
 function quoteExchangeRateText(value = collectQuoteExchangeRate()) {
@@ -2269,7 +2450,10 @@ function quoteExchangeRateText(value = collectQuoteExchangeRate()) {
 
 function quoteFxMultiplier(value = collectQuoteExchangeRate()) {
   const number = Number(value);
-  return Number.isFinite(number) && number > 0 ? number : 1;
+  if (Number.isFinite(number) && number > 0) return number;
+  const ownedCommercial = typeof state !== "undefined"
+    && ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+  return ownedCommercial ? Number.NaN : 1;
 }
 
 function syncQuoteCommercialContextPills() {
@@ -2289,6 +2473,7 @@ function syncQuoteCommercialContextPills() {
 }
 
 function applyPricingReferenceCommercialDefaults() {
+  if (["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""))) return;
   const tax = selectedPricingReferenceTax();
   const currency = selectedPricingReferenceCurrency();
   const selectedQuoteCurrency = String(elements.quoteCurrency?.value || "").trim();
@@ -2310,6 +2495,7 @@ function applyPricingReferenceCommercialDefaults() {
 function resetQuoteCommercialFieldsToSelectedPricingReference() {
   const tax = selectedPricingReferenceTax();
   const currency = selectedPricingReferenceCurrency();
+  const reference = currentPricingReference();
   resetQuoteCommercialTouched();
   if (elements.taxLabel) elements.taxLabel.value = normalizeTaxLabel(tax.label || DEFAULT_TAX_LABEL);
   setInputValue(elements.taxRate, taxRatePercentText(tax.rate ?? DEFAULT_TAX_RATE));
@@ -2317,12 +2503,38 @@ function resetQuoteCommercialFieldsToSelectedPricingReference() {
   setInputValue(elements.quoteExchangeRate, "1");
   setInputValue(elements.quoteTaxLabel, normalizeTaxLabel(tax.label || DEFAULT_TAX_LABEL));
   setInputValue(elements.quoteTaxRate, taxRatePercentText(tax.rate ?? DEFAULT_TAX_RATE));
+  state.quoteCommercialLifecycle = "EXISTING";
+  state.quoteCommercialPreservedQuoteText = {};
+  state.quoteCommercialSnapshot = {
+    schema: "swooshz.quote-commercial-snapshot.v1",
+    version: 1,
+    owner: "quote",
+    lifecycle: "EXISTING",
+    origin: "explicit_initialization",
+    presence: [
+      "currency", "exchange_rate", "tax", "company_name", "header_details", "logo",
+      "terms_heading", "payment_terms", "notes_heading", "standard_notes", "acceptance_text",
+      "person_label", "stamp_label", "date_label", "company_signatory", "company_title",
+      "company_date_label", "rich_text",
+    ].reduce((presence, key) => {
+      presence[key] = "captured";
+      return presence;
+    }, {}),
+    pricing_basis: {
+      currency,
+      source: String(reference?.source || state.pricingReferenceSource || "").trim(),
+      id: String(reference?.id || state.pricingReferenceId || "").trim(),
+      digest: String(reference?.digest_sha256 || reference?.reference_digest || reference?.content_fingerprint || "").trim(),
+    },
+  };
+  state.quoteCommercialRecoveryError = "";
   syncQuoteExchangeRateField();
   syncQuoteCommercialContextPills();
   updateOutputHeader();
 }
 
 function renderSelectedPricingReferenceSummary() {
+  const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
   const reference = currentPricingReference();
   const tax = selectedPricingReferenceTax();
   const currency = selectedPricingReferenceCurrency();
@@ -2341,8 +2553,10 @@ function renderSelectedPricingReferenceSummary() {
   if (elements.selectedPricingReferenceTax) elements.selectedPricingReferenceTax.textContent = taxText;
   syncPricingReferenceContextPills(currency, taxText);
   applyPricingReferenceCommercialDefaults();
-  if (elements.taxLabel) elements.taxLabel.value = tax.label;
-  if (elements.taxRate) elements.taxRate.value = taxRatePercentText(tax.rate);
+  if (!ownedCommercial) {
+    if (elements.taxLabel) elements.taxLabel.value = tax.label;
+    if (elements.taxRate) elements.taxRate.value = taxRatePercentText(tax.rate);
+  }
   updatePricingReferenceDeleteButton();
   updateOutputHeader();
 }
@@ -2451,6 +2665,13 @@ function normalizeLineItem(item = {}) {
     item_order: orderNumber(item.item_order) ?? "",
     basis_order: orderNumber(item.basis_order) ?? "",
     status: item.status || "",
+    ...(Object.prototype.hasOwnProperty.call(item, "effective_unit_price") ? { effective_unit_price: item.effective_unit_price } : {}),
+    ...(Object.prototype.hasOwnProperty.call(item, "pricing_basis_amount") ? { pricing_basis_amount: item.pricing_basis_amount } : {}),
+    ...(Object.prototype.hasOwnProperty.call(item, "approved_quote_amount") ? { approved_quote_amount: item.approved_quote_amount } : {}),
+    ...(Object.prototype.hasOwnProperty.call(item, "pricing_basis_currency") ? { pricing_basis_currency: item.pricing_basis_currency } : {}),
+    ...(Object.prototype.hasOwnProperty.call(item, "pricing_reference_source") ? { pricing_reference_source: item.pricing_reference_source } : {}),
+    ...(Object.prototype.hasOwnProperty.call(item, "pricing_reference_id") ? { pricing_reference_id: item.pricing_reference_id } : {}),
+    ...(Object.prototype.hasOwnProperty.call(item, "pricing_basis_digest") ? { pricing_basis_digest: item.pricing_basis_digest } : {}),
   };
 }
 
@@ -2480,7 +2701,14 @@ function hasMeaningfulQuoteDetailValue(value) {
   return String(value ?? "").trim().length > 0;
 }
 
-function quoteDetailsWithFallbackDefaults(defaults = {}, details = {}) {
+function quoteDetailsWithFallbackDefaults(defaults = {}, details = {}, options = {}) {
+  const savedSnapshot = details?.commercial_snapshot;
+  if (
+    options.preserveSavedState === true
+    || ["EXISTING", "RECOVERED"].includes(String(savedSnapshot?.lifecycle || ""))
+  ) {
+    return details && typeof details === "object" ? { ...details } : {};
+  }
   const merge = (base = {}, override = {}) => {
     const merged = { ...(base && typeof base === "object" ? base : {}) };
     Object.entries(override && typeof override === "object" ? override : {}).forEach(([key, value]) => {
@@ -2672,7 +2900,7 @@ function normalizeBoothDimensions(project = {}) {
 
 function collectQuoteDetails() {
   syncRichTextSources();
-  return {
+  const details = {
     quote_date: elements.quoteDate.value,
     project_number: elements.projectNumber.value.trim(),
     client: {
@@ -2705,6 +2933,9 @@ function collectQuoteDetails() {
       person_label: elements.personLabel.value.trim(),
       stamp_label: elements.stampLabel.value.trim(),
       date_label: elements.dateLabel.value.trim(),
+      ...(Object.prototype.hasOwnProperty.call(state.quoteCommercialPreservedQuoteText || {}, "cheque_payee")
+        ? { cheque_payee: state.quoteCommercialPreservedQuoteText.cheque_payee }
+        : {}),
     },
     signature: {
       company_signatory: elements.companySignatory.value.trim(),
@@ -2713,6 +2944,9 @@ function collectQuoteDetails() {
     },
     rich_text: collectRichTextDetails(),
   };
+  state.quoteCommercialSnapshot = quoteCommercialSnapshotForDetails(details);
+  details.commercial_snapshot = state.quoteCommercialSnapshot;
+  return details;
 }
 
 function collectQuoteCompanyProfileDetails() {
@@ -2730,6 +2964,7 @@ function collectQuoteCompanyProfileDetails() {
 }
 
 function applyQuoteDetails(details = {}, options = {}) {
+  const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
   const client = details.client || {};
   const project = details.project || {};
   const company = details.company || {};
@@ -2754,30 +2989,53 @@ function applyQuoteDetails(details = {}, options = {}) {
   if (shouldApply(company, "name", partial)) setInputValue(elements.quoteCompanyName, company.name);
   if (shouldApply(company, "header_details", partial)) setInputValue(elements.headerDetails, company.header_details);
   if (!partial || hasQuoteTaxLabel) {
-    if (elements.taxLabel) elements.taxLabel.value = normalizeTaxLabel(tax.label || quoteText.tax_label || DEFAULT_TAX_LABEL);
+    const taxLabelValue = tax.label ?? quoteText.tax_label;
+    if (elements.taxLabel) elements.taxLabel.value = ownedCommercial
+      ? String(taxLabelValue ?? "").trim()
+      : normalizeTaxLabel(taxLabelValue || DEFAULT_TAX_LABEL);
     if (
       elements.quoteTaxLabel
       && shouldApplyQuoteCommercialField("quoteTaxLabel", hasQuoteTaxLabel, partial, options)
     ) {
-      elements.quoteTaxLabel.value = normalizeTaxLabel(tax.label || quoteText.tax_label || DEFAULT_TAX_LABEL);
+      elements.quoteTaxLabel.value = ownedCommercial
+        ? String(taxLabelValue ?? "").trim()
+        : normalizeTaxLabel(taxLabelValue || DEFAULT_TAX_LABEL);
     }
   }
   if (!partial || hasQuoteTaxRate) {
-    setInputValue(elements.taxRate, taxRatePercentText(tax.rate ?? quoteText.tax_rate ?? DEFAULT_TAX_RATE));
+    const taxRateValue = tax.rate ?? quoteText.tax_rate;
+    setInputValue(elements.taxRate, ownedCommercial && taxRateValue == null ? "" : taxRatePercentText(
+      ownedCommercial ? taxRateValue : (taxRateValue ?? DEFAULT_TAX_RATE)
+    ));
     if (
       elements.quoteTaxRate
       && shouldApplyQuoteCommercialField("quoteTaxRate", hasQuoteTaxRate, partial, options)
     ) {
-      setInputValue(elements.quoteTaxRate, taxRatePercentText(tax.rate ?? quoteText.tax_rate ?? DEFAULT_TAX_RATE));
+      setInputValue(elements.quoteTaxRate, ownedCommercial && taxRateValue == null ? "" : taxRatePercentText(
+        ownedCommercial ? taxRateValue : (taxRateValue ?? DEFAULT_TAX_RATE)
+      ));
     }
   }
   if (shouldApplyQuoteCommercialField("quoteCurrency", hasOwnValue(details, "currency"), partial, options)) {
-    setQuoteCurrencyControls(normalizeCurrencyLabel(details.currency || selectedPricingReferenceCurrency()));
+    const savedCurrency = String(details.currency ?? "").trim();
+    if (ownedCommercial && !savedCurrency) {
+      if (elements.quoteCurrency) elements.quoteCurrency.value = "";
+      if (elements.quoteCurrencyCustom) {
+        elements.quoteCurrencyCustom.value = "";
+        elements.quoteCurrencyCustom.hidden = true;
+        elements.quoteCurrencyCustom.required = false;
+      }
+    } else {
+      setQuoteCurrencyControls(ownedCommercial ? savedCurrency : normalizeCurrencyLabel(savedCurrency || selectedPricingReferenceCurrency()));
+    }
   }
   if (shouldApplyQuoteCommercialField("quoteExchangeRate", hasOwnValue(details, "exchange_rate"), partial, options)) {
-    setInputValue(elements.quoteExchangeRate, quoteExchangeRateText(details.exchange_rate ?? 1));
+    const savedExchangeRate = Number(details.exchange_rate);
+    setInputValue(elements.quoteExchangeRate, ownedCommercial
+      ? (Number.isFinite(savedExchangeRate) && savedExchangeRate > 0 ? quoteExchangeRateText(savedExchangeRate) : "")
+      : quoteExchangeRateText(details.exchange_rate ?? 1));
   }
-  syncQuoteExchangeRateField();
+  if (!ownedCommercial) syncQuoteExchangeRateField();
   syncQuoteCommercialContextPills();
   if (shouldApply(quoteText, "terms_heading", partial)) setInputValue(elements.termsHeading, quoteText.terms_heading);
   if (shouldApply(quoteText, "payment_terms", partial)) setInputValue(elements.paymentTerms, linesValue(quoteText.payment_terms));
@@ -2806,7 +3064,7 @@ function applyQuoteDetails(details = {}, options = {}) {
   if (hasRichText || !partial) {
     restoreRichTextDetails(hasRichText ? details.rich_text : {}, { partial: partial && hasRichText });
   }
-  applyDefaultQuoteDate();
+  if (!ownedCommercial) applyDefaultQuoteDate();
   renderHeaderLogoPreview();
   renderPresetStatus();
 }
@@ -3103,6 +3361,7 @@ function buildSessionSnapshot() {
     quoteSessionDraftSaveStarted: state.quoteSessionDraftSaveStarted,
     quoteSessionRestoredSessionId: state.quoteSessionRestoredSessionId,
     quoteSessionRestoredDraftKey: state.quoteSessionRestoredDraftKey,
+    quoteCommercialLifecycle: state.quoteCommercialLifecycle,
     quoteCommercialTouched: normalizeQuoteCommercialTouched(state.quoteCommercialTouched || {}),
     images: state.images.slice(0, MAX_REFERENCE_IMAGES).map(sessionImageMetadata),
     quoteDetails: quoteDetailsWithSessionLogoMetadata(collectQuoteDetails()),
@@ -3241,7 +3500,7 @@ async function hydrateProfileLogoFingerprints() {
   })));
 }
 
-async function restoreQuoteDetailsLogo(details = {}) {
+async function restoreQuoteDetailsLogo(details = {}, options = {}) {
   const company = details.company && typeof details.company === "object" ? details.company : {};
   const directDataUrl = String(company.logo_data_url || "").trim();
   if (directDataUrl) {
@@ -3253,7 +3512,7 @@ async function restoreQuoteDetailsLogo(details = {}) {
     const fileMap = await loadSessionFileMap([sessionFileKey]).catch(() => new Map());
     restoredLogo = fileMap.get(sessionFileKey) || null;
   }
-  const presetLogo = restoredLogo ? null : selectedPresetCompanyLogo();
+  const presetLogo = restoredLogo ? null : (options.preserveMissingLogo ? null : selectedPresetCompanyLogo());
   const source = restoredLogo || presetLogo;
   if (!source?.data_url && !source?.logo_data_url) return details;
   const restoredDataUrl = source.data_url || source.logo_data_url;
@@ -3358,6 +3617,23 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
     ? normalizePricingReferenceSettingsMode(saved.pricingReferenceSettingsMode)
     : PRICING_REFERENCE_SETTINGS_MODE_MANAGE;
   state.selectedPresetValue = saved.selectedPresetValue || presetValueFromQuoteDetails(saved.quoteDetails || {}) || lastSelectedPresetValue();
+  const savedCommercialSnapshot = saved.quoteDetails?.commercial_snapshot;
+  const normalizedCommercialSnapshot = normalizeQuoteCommercialSnapshot(savedCommercialSnapshot, "RECOVERED");
+  state.quoteCommercialLifecycle = "RECOVERED";
+  state.quoteCommercialSnapshot = normalizedCommercialSnapshot || quoteCommercialSnapshotFromLegacyRecovery();
+  const savedPricingBasis = normalizedCommercialSnapshot?.pricing_basis;
+  if (savedPricingBasis && typeof savedPricingBasis === "object" && String(savedPricingBasis.id || "").trim()) {
+    state.pricingReferenceId = String(savedPricingBasis.id).trim();
+    state.pricingReferenceSource = String(savedPricingBasis.source || "").trim();
+  }
+  state.quoteCommercialRecoveryError = normalizedCommercialSnapshot
+    ? ""
+    : "Saved quote commercial state requires pricing review before generation.";
+  const savedQuoteText = saved.quoteDetails?.quote_text;
+  state.quoteCommercialPreservedQuoteText = savedQuoteText
+    && Object.prototype.hasOwnProperty.call(savedQuoteText, "cheque_payee")
+    ? { cheque_payee: savedQuoteText.cheque_payee }
+    : {};
   state.quoteCommercialTouched = normalizeQuoteCommercialTouched(
     saved.quoteCommercialTouched || quoteDetailsCommercialTouched(saved.quoteDetails || {})
   );
@@ -3366,7 +3642,8 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   renderPresetOptions();
   state.pendingFeedback = String(saved.pendingFeedback || "");
   const restoredQuoteDetails = await restoreQuoteDetailsLogo(
-    quoteDetailsWithFallbackDefaults(selectedPreset()?.details || {}, saved.quoteDetails || {})
+    quoteDetailsWithFallbackDefaults(selectedPreset()?.details || {}, saved.quoteDetails || {}, { preserveSavedState: true }),
+    { preserveMissingLogo: true }
   );
   applyQuoteDetails(restoredQuoteDetails, { includeLogo: true, clearLogo: true });
   state.images = await restoreSessionImages(saved.images);
@@ -4211,7 +4488,13 @@ function loadSelectedPreset(options = {}) {
   state.selectedPresetValue = elements.presetSelect.value || presetOptionValue(preset);
   persistLastProfilePresetSelection(state.selectedPresetValue);
   clearPendingProfilePack();
-  const shouldPreserveExistingQuoteState = options.silent === true && (quoteDraftHasAiAnalysis() || quoteDraftHasOutputState());
+  const shouldPreserveExistingQuoteState = options.silent === true && (
+    state.quoteCommercialLifecycle === "EXISTING"
+    ||
+    state.quoteCommercialLifecycle === "RECOVERED"
+    || quoteDraftHasAiAnalysis()
+    || quoteDraftHasOutputState()
+  );
   const details = preset.details || {};
   const emptyDefaultProfilePreset = preset.source === "profile"
     && preset.id === "default"
@@ -4219,6 +4502,12 @@ function loadSelectedPreset(options = {}) {
     && typeof details === "object"
     && !Object.keys(details).length;
   if (!shouldPreserveExistingQuoteState) {
+    if (options.silent !== true) {
+      state.quoteCommercialLifecycle = "EXISTING";
+      state.quoteCommercialSnapshot = null;
+      state.quoteCommercialRecoveryError = "";
+      state.quoteCommercialPreservedQuoteText = {};
+    }
     const clearsLogo = Boolean(details.company && typeof details.company === "object");
     applyQuoteDetails(details, { includeLogo: true, clearLogo: clearsLogo, partial: true });
     if (emptyDefaultProfilePreset) {
@@ -4349,6 +4638,10 @@ function resetCurrentQuoteDraftState() {
   transitionGenerationContext("", "");
   state.quoteSessionDraftSaveStarted = false;
   clearRestoredQuoteSessionBaseline();
+  state.quoteCommercialLifecycle = "NEW_UNINITIALISED";
+  state.quoteCommercialSnapshot = null;
+  state.quoteCommercialRecoveryError = "";
+  state.quoteCommercialPreservedQuoteText = {};
   resetQuoteCommercialTouched();
   state.profileId = "";
   state.pricingReferenceId = "";
@@ -4693,6 +4986,12 @@ function requestPresetImport(event) {
 
 function renderProfileOptions() {
   if (!elements.profileSelect) return;
+  const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+  const savedBasis = state.quoteCommercialSnapshot?.pricing_basis;
+  const preserveOwnedReference = ownedCommercial && (
+    state.quoteCommercialLifecycle === "RECOVERED"
+    || (savedBasis && typeof savedBasis === "object" && String(savedBasis.id || "").trim())
+  );
   const references = sortedPricingReferencesForDisplay(state.pricingReferences);
   const selectedValue = currentPricingReference() ? pricingReferenceSelectValue(currentPricingReference()) : "";
   const referenceOption = (reference) => {
@@ -4702,16 +5001,20 @@ function renderProfileOptions() {
   elements.profileSelect.innerHTML = references.length
     ? references.map(referenceOption).join("")
     : `<option value="">${escapeHtml(MISSING_PRICING_REFERENCES_MESSAGE)}</option>`;
-  const preferredReference = currentPricingReference() || lastSelectedPricingReference() || defaultPricingReference() || references[0] || null;
+  const preferredReference = preserveOwnedReference
+    ? currentPricingReference()
+    : currentPricingReference() || lastSelectedPricingReference() || defaultPricingReference() || references[0] || null;
   if (preferredReference) {
     state.pricingReferenceId = preferredReference.id || "";
     state.pricingReferenceSource = pricingReferenceSelectionFromValue(pricingReferenceSelectValue(preferredReference)).source;
-  } else {
+  } else if (!preserveOwnedReference) {
     state.pricingReferenceId = "";
     state.pricingReferenceSource = "";
   }
   const selectedReference = currentPricingReference();
-  elements.profileSelect.value = selectedReference ? pricingReferenceSelectValue(selectedReference) : selectedValue;
+  elements.profileSelect.value = selectedReference
+    ? pricingReferenceSelectValue(selectedReference)
+    : preserveOwnedReference ? "" : selectedValue;
   elements.profileSelect.disabled = references.length === 0;
   elements.profileSelect.title = references.length ? "" : MISSING_PRICING_REFERENCES_MESSAGE;
   elements.profileSelect.setAttribute("aria-disabled", String(elements.profileSelect.disabled));
@@ -5651,13 +5954,15 @@ function normalizeOutputRow(row = {}) {
         ? catalogDescription
         : currentDescription
     );
-  return recalculateOutputRow({
+  const capturedUnitPrice = numberOrNull(row.effective_unit_price);
+  const rawUnitPriceOverride = row.unit_price_override ?? "";
+  const normalized = recalculateOutputRow({
     section: normalizeCategoryTitle(row.section || ""),
     description,
     quantity: row.quantity ?? "",
     unit: normalizeUnit(row.unit || ""),
     price_mode: priceMode,
-    unit_price_override: row.unit_price_override ?? "",
+    unit_price_override: rawUnitPriceOverride !== "" ? rawUnitPriceOverride : (capturedUnitPrice !== null ? capturedUnitPrice : ""),
     catalog_unit_price: row.catalog_unit_price ?? row.unit_price ?? row.sale_unit_price ?? "",
     catalog_description: cleanCustomerQuoteLineText(row.catalog_description || ""),
     pricing_reference_description: pricingReferenceLineText(row.pricing_reference_description || row.reference_description || ""),
@@ -5668,6 +5973,19 @@ function normalizeOutputRow(row = {}) {
     basis_order: orderNumber(row.basis_order) ?? "",
     status: row.status || "",
   });
+  const numericFields = ["effective_unit_price", "pricing_basis_amount", "approved_quote_amount"];
+  numericFields.forEach((key) => {
+    if (Object.prototype.hasOwnProperty.call(row, key)) normalized[key] = numberOrNull(row[key]);
+  });
+  ["pricing_basis_currency", "pricing_reference_source", "pricing_reference_id", "pricing_basis_digest"].forEach((key) => {
+    if (Object.prototype.hasOwnProperty.call(row, key) && String(row[key] || "").trim()) normalized[key] = String(row[key]).trim();
+  });
+  if (normalized.price_mode !== "Included" && normalized.effective_unit_price == null) {
+    const capturedPrice = effectiveOutputUnitPrice(normalized);
+    if (capturedPrice !== null) normalized.effective_unit_price = capturedPrice;
+  }
+  if (normalized.price_mode === "Included") normalized.approved_quote_amount = 0;
+  return normalized;
 }
 
 function pricingReferenceValidationResult(items, headers, skipped, sourceName = "") {
@@ -6800,9 +7118,12 @@ async function deleteRepoPricingReference(referenceId, source = "local") {
     }
     state.pricingReferences = mergePricingReferences(Array.isArray(data.pricing_references) ? data.pricing_references : state.pricingReferences);
     if (state.pricingReferenceId === reference.id) {
-      const fallback = defaultPricingReference() || state.pricingReferences[0] || null;
-      state.pricingReferenceId = fallback?.id || "";
-      state.pricingReferenceSource = fallback ? pricingReferenceSelectionFromValue(pricingReferenceSelectValue(fallback)).source : "";
+      const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+      if (!ownedCommercial) {
+        const fallback = defaultPricingReference() || state.pricingReferences[0] || null;
+        state.pricingReferenceId = fallback?.id || "";
+        state.pricingReferenceSource = fallback ? pricingReferenceSelectionFromValue(pricingReferenceSelectValue(fallback)).source : "";
+      }
     }
     hidePricingReferenceDeleteConfirm();
     clearPricingReferenceDraft({ clearFile: true, resetMetadata: true });
@@ -7115,8 +7436,11 @@ function buildPayload(options = {}) {
       logo_data_url: state.headerLogo ? state.headerLogo.data_url : "",
       logo_name: state.headerLogo ? state.headerLogo.name : "",
       logo_type: state.headerLogo ? state.headerLogo.type : "",
+      logo_size: state.headerLogo ? state.headerLogo.size : 0,
+      logo_content_fingerprint: state.headerLogo ? state.headerLogo.content_fingerprint : "",
+      logo_session_file_key: state.headerLogo ? state.headerLogo.session_file_key : "",
     },
-    tax: selectedPricingReferenceTax(),
+    tax: quoteCommercialStateIsOwned() ? collectTaxDetails() : selectedPricingReferenceTax(),
     quote_tax: collectTaxDetails(),
     quote_currency: collectQuoteCurrency(),
     quote_exchange_rate: collectQuoteExchangeRate(),
@@ -7476,6 +7800,8 @@ function effectiveOutputUnitPrice(row = {}) {
   const manual = numberOrNull(overrideText);
   if (manual !== null) return manual;
   if (overrideText && overrideText.toLowerCase() !== "included") return null;
+  const captured = numberOrNull(row.effective_unit_price);
+  if (captured !== null) return captured;
   return numberOrNull(row.catalog_unit_price);
 }
 
@@ -7802,6 +8128,13 @@ function outputRowFromLineItem(item = {}) {
     item_order: normalized.item_order,
     basis_order: normalized.basis_order,
     status: normalized.status || "",
+    ...(Object.prototype.hasOwnProperty.call(normalized, "effective_unit_price") ? { effective_unit_price: normalized.effective_unit_price } : {}),
+    ...(Object.prototype.hasOwnProperty.call(normalized, "pricing_basis_amount") ? { pricing_basis_amount: normalized.pricing_basis_amount } : {}),
+    ...(Object.prototype.hasOwnProperty.call(normalized, "approved_quote_amount") ? { approved_quote_amount: normalized.approved_quote_amount } : {}),
+    ...(Object.prototype.hasOwnProperty.call(normalized, "pricing_basis_currency") ? { pricing_basis_currency: normalized.pricing_basis_currency } : {}),
+    ...(Object.prototype.hasOwnProperty.call(normalized, "pricing_reference_source") ? { pricing_reference_source: normalized.pricing_reference_source } : {}),
+    ...(Object.prototype.hasOwnProperty.call(normalized, "pricing_reference_id") ? { pricing_reference_id: normalized.pricing_reference_id } : {}),
+    ...(Object.prototype.hasOwnProperty.call(normalized, "pricing_basis_digest") ? { pricing_basis_digest: normalized.pricing_basis_digest } : {}),
   });
 }
 
@@ -8020,6 +8353,7 @@ function snapshotOutputRows(rows = state.outputRows) {
 }
 
 function outputRowsToLineItems(rows = state.outputRows) {
+  const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
   return rows.map((row) => {
     const next = {
       section: String(row.section || "").trim(),
@@ -8046,11 +8380,38 @@ function outputRowsToLineItems(rows = state.outputRows) {
     if (basisOrder !== null) next.basis_order = basisOrder;
     const status = String(row.status || "").trim();
     if (status) next.status = status;
+    ["effective_unit_price", "pricing_basis_amount", "approved_quote_amount"].forEach((key) => {
+      if (Object.prototype.hasOwnProperty.call(row, key)) {
+        const value = numberOrNull(row[key]);
+        if (value !== null || key === "approved_quote_amount") next[key] = value;
+      }
+    });
+    ["pricing_basis_currency", "pricing_reference_source", "pricing_reference_id", "pricing_basis_digest"].forEach((key) => {
+      if (Object.prototype.hasOwnProperty.call(row, key) && String(row[key] || "").trim()) next[key] = String(row[key]).trim();
+    });
+    if (ownedCommercial) {
+      const basis = state.quoteCommercialSnapshot?.pricing_basis && typeof state.quoteCommercialSnapshot.pricing_basis === "object"
+        ? state.quoteCommercialSnapshot.pricing_basis
+        : {};
+      if (!next.pricing_basis_currency && String(basis.currency || "").trim()) next.pricing_basis_currency = String(basis.currency).trim();
+      if (!next.pricing_reference_source && String(basis.source || "").trim()) next.pricing_reference_source = String(basis.source).trim();
+      if (!next.pricing_reference_id && String(basis.id || "").trim()) next.pricing_reference_id = String(basis.id).trim();
+      if (!next.pricing_basis_digest && String(basis.digest || "").trim()) next.pricing_basis_digest = String(basis.digest).trim();
+      const basisAmount = numberOrNull(row.amount);
+      if (next.pricing_basis_amount == null && basisAmount !== null) next.pricing_basis_amount = basisAmount;
+      if (next.approved_quote_amount == null && basisAmount !== null) next.approved_quote_amount = quoteAmountValue(basisAmount);
+    }
     if (next.price_mode === "Included") {
       next.display_price = "Included";
+      if (ownedCommercial) next.approved_quote_amount = 0;
     } else {
       const unitPrice = numberOrNull(row.unit_price_override);
+      const effectivePrice = ownedCommercial ? effectiveOutputUnitPrice(row) : null;
       if (unitPrice !== null) next.unit_price_override = unitPrice;
+      else if (effectivePrice !== null) next.unit_price_override = effectivePrice;
+      if (ownedCommercial && next.effective_unit_price == null && effectivePrice !== null) {
+        next.effective_unit_price = effectivePrice;
+      }
     }
     return next;
   });
@@ -8171,12 +8532,21 @@ function matchSummaryStats(rows = []) {
   const sections = new Set(safeRows.map((row) => String(row.section || "").trim()).filter(Boolean)).size;
   const needsManualInput = safeRows.filter(rowNeedsManualInput).length;
   const pricedRows = safeRows.filter((row) => row.price_mode === "Included" || !rowNeedsManualInput(row)).length;
-  const totalPending = needsManualInput > 0;
+  const ownedCommercial = typeof state !== "undefined"
+    && ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+  const tax = typeof collectTaxDetails === "function" ? collectTaxDetails() : {};
+  const commercialIncomplete = ownedCommercial && (
+    !String(typeof collectQuoteCurrency === "function" ? collectQuoteCurrency() : "").trim()
+    || !(Number(typeof collectQuoteExchangeRate === "function" ? collectQuoteExchangeRate() : NaN) > 0)
+    || !(Number(tax?.rate) >= 0 && Number(tax?.rate) <= 1)
+    || !String(tax?.label || "").trim()
+  );
+  const totalPending = needsManualInput > 0 || commercialIncomplete;
   const total = safeRows.reduce((sum, row) => {
     const amount = quoteAmountValue(row.amount);
     return Number.isFinite(amount) ? sum + amount : sum;
   }, 0);
-  return { sections, pricedRows, needsManualInput, total, totalPending };
+  return { sections, pricedRows, needsManualInput, total: Math.round(total * 100) / 100, totalPending };
 }
 
 function formatSubtotalValue(stats = {}) {
@@ -8188,9 +8558,16 @@ function formatSubtotalValue(stats = {}) {
 function formatOutputTotalValue(stats = {}) {
   const subtotal = Number(stats.total || 0);
   const tax = collectTaxDetails();
-  const taxRate = Number(tax.rate ?? DEFAULT_TAX_RATE);
-  const grandTotal = Number.isFinite(taxRate) ? subtotal + (subtotal * taxRate) : subtotal;
-  const totalText = `${collectQuoteCurrency()} ${grandTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const ownedCommercial = typeof state !== "undefined"
+    && ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+  const taxRate = Number(tax.rate);
+  const resolvedTaxRate = Number.isFinite(taxRate) ? taxRate : (ownedCommercial ? Number.NaN : DEFAULT_TAX_RATE);
+  const grandTotal = Number.isFinite(resolvedTaxRate)
+    ? Math.round((subtotal + (subtotal * resolvedTaxRate)) * 100) / 100
+    : null;
+  const totalText = grandTotal === null
+    ? `${collectQuoteCurrency()} -`
+    : `${collectQuoteCurrency()} ${grandTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
   return stats.totalPending ? `${totalText} + ???` : totalText;
 }
 
@@ -10193,8 +10570,8 @@ function formatDashboardDateTime(value = "") {
 function formatDashboardMoney(session = {}) {
   const commercials = session.commercials || {};
   const total = dashboardNumberOrNull(commercials.grand_total);
-  if (total === null) return "-";
-  const currency = String(commercials.currency || DEFAULT_CURRENCY_LABEL).trim() || DEFAULT_CURRENCY_LABEL;
+  const currency = String(commercials.currency || "").trim();
+  if (total === null || !currency) return "-";
   return `${currency} ${total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
@@ -10208,7 +10585,7 @@ function dashboardGrandTotalValue(session = {}) {
 }
 
 function dashboardSessionCurrency(session = {}) {
-  return String(session.commercials?.currency || DEFAULT_CURRENCY_LABEL).trim() || DEFAULT_CURRENCY_LABEL;
+  return String(session.commercials?.currency || "").trim() || "Review required";
 }
 
 function formatDashboardMoneyValue(total, currency = DEFAULT_CURRENCY_LABEL) {
@@ -10218,20 +10595,25 @@ function formatDashboardMoneyValue(total, currency = DEFAULT_CURRENCY_LABEL) {
 }
 
 function dashboardCommercialsFromState() {
+  const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
   const tax = collectTaxDetails();
   const stats = matchSummaryStats(state.outputRows);
   const hasConfirmedTotal = state.outputRows.length > 0 && !stats.totalPending;
-  const subtotal = hasConfirmedTotal ? stats.total : null;
-  const taxRate = Number(tax.rate ?? DEFAULT_TAX_RATE);
-  const taxAmount = subtotal === null || !Number.isFinite(taxRate) ? null : subtotal * taxRate;
+  const subtotal = hasConfirmedTotal ? Math.round(Number(stats.total) * 100) / 100 : null;
+  const taxRate = ownedCommercial && tax.rate == null
+    ? Number.NaN
+    : Number(ownedCommercial ? tax.rate : (tax.rate ?? DEFAULT_TAX_RATE));
+  const taxAmount = subtotal === null || !Number.isFinite(taxRate)
+    ? null
+    : Math.round(subtotal * taxRate * 100) / 100;
   return {
     currency: collectQuoteCurrency(),
-    tax_label: tax.label || DEFAULT_TAX_LABEL,
-    tax_rate: Number.isFinite(taxRate) ? taxRate : DEFAULT_TAX_RATE,
+    tax_label: ownedCommercial ? tax.label : (tax.label || DEFAULT_TAX_LABEL),
+    tax_rate: Number.isFinite(taxRate) ? taxRate : (ownedCommercial ? null : DEFAULT_TAX_RATE),
     exchange_rate: collectQuoteExchangeRate(),
     subtotal,
     tax_amount: taxAmount,
-    grand_total: subtotal === null || taxAmount === null ? null : subtotal + taxAmount,
+    grand_total: subtotal === null || taxAmount === null ? null : Math.round((subtotal + taxAmount) * 100) / 100,
   };
 }
 
@@ -10301,6 +10683,7 @@ function currentQuoteSessionDraftState() {
     pricingReferenceId: snapshot.pricingReferenceId,
     pricingReferenceSource: snapshot.pricingReferenceSource,
     selectedPresetValue: snapshot.selectedPresetValue,
+    quoteCommercialLifecycle: snapshot.quoteCommercialLifecycle,
     quoteCommercialTouched: snapshot.quoteCommercialTouched,
     images: snapshot.images,
     quoteDetails: snapshot.quoteDetails,
@@ -11053,14 +11436,15 @@ function dashboardModifiedText(session = {}) {
 
 function dashboardTaxText(session = {}) {
   const commercials = session.commercials || {};
-  const label = String(commercials.tax_label || DEFAULT_TAX_LABEL).trim() || DEFAULT_TAX_LABEL;
-  return label;
+  return String(commercials.tax_label || "").trim() || "Review required";
 }
 
 function dashboardTaxRateText(session = {}) {
   const commercials = session.commercials || {};
-  const rate = Number(commercials.tax_rate ?? DEFAULT_TAX_RATE);
-  return Number.isFinite(rate) ? `${(rate * 100).toLocaleString(undefined, { maximumFractionDigits: 2 })}%` : "-";
+  const rate = Number(commercials.tax_rate);
+  return Number.isFinite(rate) && rate >= 0 && rate <= 1
+    ? `${(rate * 100).toLocaleString(undefined, { maximumFractionDigits: 2 })}%`
+    : "Review required";
 }
 
 const QUOTE_SESSION_DELETE_SINGLE_MESSAGE = "This removes the local dashboard record and any saved local exports for this quote session. This cannot be undone.";
@@ -11725,7 +12109,7 @@ function renderDashboardSinglePanel(activeSession = {}) {
       <dl class="dashboard-selected-summary-grid">
         <div><dt>Grand Total</dt><dd><span class="dashboard-money">${escapeHtml(formatDashboardMoney(activeSession))}</span></dd></div>
         <div><dt>Subtotal</dt><dd>${escapeHtml(formatDashboardSubtotal(activeSession))}</dd></div>
-        <div><dt>Currency / FX</dt><dd>${escapeHtml(`${dashboardSessionCurrency(activeSession)} / FX ${quoteExchangeRateText(activeSession.commercials?.exchange_rate ?? 1)}`)}</dd></div>
+        <div><dt>Currency / FX</dt><dd>${escapeHtml(`${dashboardSessionCurrency(activeSession)} / FX ${quoteExchangeRateText(activeSession.commercials?.exchange_rate)}`)}</dd></div>
         <div><dt>Pricing Reference</dt><dd>${escapeHtml(pricing)}</dd></div>
         <div><dt>Tax / Rate</dt><dd>${escapeHtml(`${dashboardTaxText(activeSession)} / ${dashboardTaxRateText(activeSession)}`)}</dd></div>
         <div><dt>Show Name</dt><dd>${showName ? escapeHtml(showName) : "-"}</dd></div>
@@ -13015,6 +13399,7 @@ function setSidePanel(panelName, options = {}) {
   state.activeSidePanel = nextPanel;
   if (
     state.activeSidePanel === "customer"
+    && !["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""))
     && !QUOTE_COMMERCIAL_FIELD_KEYS.some((field) => quoteCommercialFieldIsTouched(field))
   ) {
     resetQuoteCommercialFieldsToSelectedPricingReference();
@@ -13299,6 +13684,15 @@ function wireEvents() {
       };
     } else {
       state.headerLogo = null;
+    }
+    if (quoteCommercialStateIsOwned() && state.quoteCommercialSnapshot) {
+      state.quoteCommercialSnapshot = {
+        ...state.quoteCommercialSnapshot,
+        presence: {
+          ...(state.quoteCommercialSnapshot.presence || {}),
+          logo: state.headerLogo ? "captured" : "intentional_empty",
+        },
+      };
     }
     renderHeaderLogoPreview();
     renderPresetStatus();

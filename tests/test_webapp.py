@@ -1522,6 +1522,390 @@ class WebappServerTest(unittest.TestCase):
 
         self.assertEqual(brief["tax"], {"label": "GST", "rate": 0.09})
 
+    def test_recovered_quote_commercial_snapshot_owns_brief_session_and_prices(self):
+        payload = valid_payload()
+        reference_source = "local"
+        saved_details = {
+            "quote_date": "2026-06-06",
+            "project_number": "KI-SAVED-001",
+            "client": {
+                "name": "Saved Client Pte Ltd",
+                "attention": "Saved Contact",
+                "title": "Saved Manager",
+                "address": "Saved Address",
+            },
+            "project": {
+                "title": "Saved Booth",
+                "show_name": "Saved Show",
+                "booth_width": "6",
+                "booth_depth": "6",
+            },
+            "company": {
+                "name": "Saved Quotation Co Pte Ltd",
+                "header_details": "Saved header line 1\nSaved header line 2",
+                "logo_data_url": "data:image/png;base64,c2F2ZWQ=",
+                "logo_name": "saved-logo.png",
+                "logo_type": "image/png",
+                "logo_content_fingerprint": "sha256:" + "a" * 64,
+                "logo_session_file_key": "saved-logo-key",
+            },
+            "currency": "USD",
+            "exchange_rate": 1.37,
+            "tax": {"label": "GST", "rate": 0.09},
+            "quote_text": {
+                "terms_heading": "Saved Terms",
+                "payment_terms": ["Saved payment term"],
+                "notes_heading": "Saved Notes",
+                "standard_notes": ["Saved note"],
+                "acceptance_text": "Saved acceptance",
+                "person_label": "Saved person",
+                "stamp_label": "Saved stamp",
+                "date_label": "Saved date:",
+                "cheque_payee": "Saved Quotation Co Pte Ltd",
+            },
+            "signature": {
+                "company_signatory": "Saved Signatory",
+                "company_title": "Saved Director",
+                "company_date_label": "Saved signed date:",
+            },
+            "rich_text": {
+                "headerDetails": "<div><strong>Saved header line 1</strong></div>",
+                "paymentTerms": "<div><em>Saved payment term</em></div>",
+                "standardNotes": "<div>Saved note</div>",
+            },
+        }
+        saved_details["commercial_snapshot"] = {
+            "schema": webapp.QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+            "version": webapp.QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+            "owner": "quote",
+            "lifecycle": "RECOVERED",
+            "origin": "session_recovery",
+            "presence": {key: "captured" for key in webapp.QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS},
+            "pricing_basis": {
+                "currency": "SGD",
+                "source": reference_source,
+                "id": payload["pricing_reference_id"],
+                "digest": "sha256:" + "b" * 64,
+            },
+        }
+        saved_rows = [
+            {
+                "section": "Saved Floors",
+                "description": "Captured carpet",
+                "quantity": 2,
+                "unit": "sqm",
+                "price_mode": "Priced",
+                "effective_unit_price": 100,
+                "catalog_unit_price": 999,
+                "pricing_basis_amount": 200,
+                "approved_quote_amount": 274,
+                "amount": 200,
+            },
+            {
+                "section": "Saved Services",
+                "description": "Included coordination",
+                "quantity": 1,
+                "unit": "lot",
+                "price_mode": "Included",
+                "display_price": "Included",
+                "approved_quote_amount": 0,
+                "amount": 0,
+            },
+        ]
+        payload["quote_currency"] = "SGD"
+        payload["quote_exchange_rate"] = 9
+        payload["quote_tax"] = {"label": "VAT", "rate": 0.07}
+        payload["company"] = {"name": "Current Profile Co", "header_details": "Current header"}
+        payload["quote_text"] = {"terms_heading": "Current Terms", "acceptance_text": "Current acceptance"}
+        payload["signature"] = {"company_signatory": "Current Signatory"}
+        payload["rich_text"] = {"headerDetails": "<div>Current header</div>"}
+        payload["pricing_reference"] = {
+            "id": payload["pricing_reference_id"],
+            "source": reference_source,
+            "currency": "USD",
+            "tax": {"label": "VAT", "rate": 0.07},
+        }
+        payload["quote_session"] = {
+            "session_id": "quote-commercial-snapshot",
+            "commercials": {
+                "currency": "SGD",
+                "tax_label": "GST",
+                "tax_rate": 0.09,
+                "exchange_rate": 1.37,
+                "subtotal": 274,
+                "tax_amount": 24.66,
+                "grand_total": 298.66,
+            },
+            "draft_state": {
+                "quoteDetails": saved_details,
+                "outputRows": saved_rows,
+            },
+        }
+
+        with mock.patch.object(
+            webapp,
+            "pricing_catalog_runtime_lookup_for_payload",
+            side_effect=AssertionError("recovered quote must not consult the current catalog"),
+        ):
+            brief = webapp.payload_to_brief(payload)
+            commercials = webapp.quote_session_commercials(payload, payload["quote_session"])
+
+        self.assertEqual(brief["currency"], "USD")
+        self.assertEqual(brief["exchange_rate"], 1.37)
+        self.assertEqual(brief["tax"], {"label": "GST", "rate": 0.09})
+        self.assertEqual(brief["company"]["name"], "Saved Quotation Co Pte Ltd")
+        self.assertEqual(brief["company"]["header_lines"], ["Saved header line 1", "Saved header line 2"])
+        self.assertEqual(brief["terms_heading"], "Saved Terms")
+        self.assertEqual(brief["payment_terms"], ["Saved payment term"])
+        self.assertEqual(brief["notes_heading"], "Saved Notes")
+        self.assertEqual(brief["standard_notes"], ["Saved note"])
+        self.assertEqual(brief["cheque_payee"], "Saved Quotation Co Pte Ltd")
+        self.assertEqual(brief["rich_text"]["headerDetails"], "<div><strong>Saved header line 1</strong></div>")
+        self.assertEqual(brief["acceptance"]["text"], "Saved acceptance")
+        self.assertEqual(brief["signature"]["company_title"], "Saved Director")
+        self.assertEqual(brief["line_items"][0]["unit_price_override"], 100)
+        self.assertEqual(brief["line_items"][0]["catalog_unit_price"], 999)
+        self.assertEqual(brief["line_items"][1]["pricing_basis_currency"], "SGD")
+        self.assertEqual(brief["line_items"][1]["price_mode"], "Included")
+        self.assertEqual(commercials, {
+            "currency": "USD",
+            "tax_label": "GST",
+            "tax_rate": 0.09,
+            "exchange_rate": 1.37,
+            "subtotal": 274.0,
+            "tax_amount": 24.66,
+            "grand_total": 298.66,
+        })
+        self.assertEqual(webapp.validate_generation_payload(payload), [])
+
+    def test_recovered_quote_missing_snapshot_fails_closed_without_current_defaults(self):
+        payload = valid_payload()
+        payload["quote_session"] = {
+            "session_id": "quote-legacy-commercial",
+            "draft_state": {
+                "quoteDetails": {
+                    "currency": "",
+                    "exchange_rate": None,
+                    "tax": {},
+                    "company": {},
+                },
+                "outputRows": [{
+                    "description": "Legacy row without price",
+                    "quantity": 1,
+                    "unit": "lot",
+                    "price_mode": "Priced",
+                }],
+            },
+        }
+
+        resolved = webapp.generation_payload_with_profile_defaults(payload)
+
+        self.assertEqual(webapp.quote_currency_from_payload(resolved), "")
+        self.assertIsNone(webapp.quote_exchange_rate_from_payload(resolved))
+        self.assertTrue(any(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE in error for error in webapp.validate_generation_payload(payload)))
+        with self.assertRaises(webapp.QuoteCommercialStateError):
+            webapp.payload_to_brief(payload)
+
+    def test_recovered_quote_rejects_changed_exact_pricing_identity(self):
+        payload = valid_payload()
+        details = {
+            "currency": "USD",
+            "exchange_rate": 1.37,
+            "tax": {"label": "GST", "rate": 0.09},
+            "company": valid_payload()["company"],
+            "quote_text": valid_payload()["quote_text"],
+            "signature": valid_payload()["signature"],
+        }
+        details["commercial_snapshot"] = {
+            "schema": webapp.QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+            "version": webapp.QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+            "owner": "quote",
+            "lifecycle": "RECOVERED",
+            "presence": {key: "captured" for key in webapp.QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS},
+            "pricing_basis": {"currency": "SGD", "source": "bundled", "id": "saved-reference"},
+        }
+        payload["quote_session"] = {"draft_state": {"quoteDetails": details}}
+        payload["pricing_reference_id"] = "different-reference"
+        payload["pricing_reference"] = {"id": "different-reference", "source": "bundled"}
+
+        errors = webapp.quote_commercial_state_errors(payload)
+
+        self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, errors)
+
+    def test_static_recovered_browser_collectors_and_output_projection_keep_saved_commercials(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const marker = `function ${name}(`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const DEFAULT_TAX_LABEL = "GST";
+const DEFAULT_TAX_RATE = 0.09;
+const DEFAULT_CURRENCY_LABEL = "SGD";
+const CUSTOM_CURRENCY_VALUE = "__CUSTOM__";
+const CURRENCY_OPTIONS = [["SGD"], ["AUD"], ["CNY"], ["EUR"], ["GBP"], ["IDR"], ["MYR"], ["THB"], ["USD"]];
+const QUOTE_COMMERCIAL_FIELD_KEYS = ["quoteCurrency", "quoteExchangeRate", "quoteTaxLabel", "quoteTaxRate"];
+const QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA = "swooshz.quote-commercial-snapshot.v1";
+const QUOTE_COMMERCIAL_SNAPSHOT_VERSION = 1;
+const QUOTE_COMMERCIAL_LIFECYCLES = new Set(["NEW_UNINITIALISED", "EXISTING", "RECOVERED"]);
+const QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS = [
+  "currency", "exchange_rate", "tax", "company_name", "header_details", "logo",
+  "terms_heading", "payment_terms", "notes_heading", "standard_notes", "acceptance_text",
+  "person_label", "stamp_label", "date_label", "company_signatory", "company_title",
+  "company_date_label", "rich_text",
+];
+const RICH_TEXT_SOURCE_IDS = ["headerDetails"];
+
+const input = (value = "") => ({ value: String(value), hidden: false, required: false });
+const elements = {
+  quoteCurrency: input("USD"), quoteCurrencyCustom: input(""), quoteExchangeRate: input("1.37"), quoteExchangeRateField: { hidden: false },
+  quoteTaxLabel: input("GST"), quoteTaxRate: input("9"), taxLabel: input("GST"), taxRate: input("9"),
+  quoteDate: input("2026-06-06"), projectNumber: input("KI-SAVED-001"),
+  clientName: input("Saved Client"), clientAttention: input("Saved Contact"), clientTitle: input("Saved Manager"), clientAddress: input("Saved Address"),
+  projectTitle: input("Saved Booth"), showName: input("Saved Show"),
+  quoteCompanyName: input("Saved Quotation Co"), headerDetails: input("Saved header"),
+  termsHeading: input("Saved Terms"), paymentTerms: input("Saved payment"), notesHeading: input("Saved Notes"),
+  standardNotes: input("Saved note"), acceptanceText: input("Saved acceptance"), personLabel: input("Saved person"),
+  stampLabel: input("Saved stamp"), dateLabel: input("Saved date:"), companySignatory: input("Saved Signatory"),
+  companyTitle: input("Saved Director"), companyDateLabel: input("Saved signed date:"),
+  richTextEditors: [{ dataset: { richTextSource: "headerDetails" }, innerHTML: "<div><strong>Saved header</strong></div>" }],
+};
+const state = {
+  quoteCommercialLifecycle: "RECOVERED",
+  quoteCommercialTouched: { quoteCurrency: false, quoteExchangeRate: false, quoteTaxLabel: false, quoteTaxRate: false },
+  quoteCommercialSnapshot: {
+    schema: QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+    version: QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+    owner: "quote",
+    lifecycle: "RECOVERED",
+    origin: "session_recovery",
+    presence: QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS.reduce((out, key) => { out[key] = "captured"; return out; }, {}),
+    pricing_basis: { currency: "SGD", source: "local", id: "saved-reference", digest: "sha256:" + "b".repeat(64) },
+  },
+  quoteCommercialPreservedQuoteText: { cheque_payee: "Saved Quotation Co" },
+  pricingReferenceId: "saved-reference",
+  pricingReferenceSource: "local",
+  pricingReferences: [{ id: "saved-reference", source: "local", currency: "SGD", tax: { label: "VAT", rate: 0.07 } }],
+  headerLogo: { name: "saved-logo.png", type: "image/png", size: 6, content_fingerprint: "sha256:" + "a".repeat(64), data_url: "data:image/png;base64,c2F2ZWQ=" },
+  quoteDateFormat: { bold: false, italic: false, underline: false },
+  outputRows: [],
+};
+const document = { activeElement: null, querySelectorAll() { return []; } };
+function currentPricingReference() { return state.pricingReferences.find((item) => item.id === state.pricingReferenceId && item.source === state.pricingReferenceSource) || null; }
+function selectedPricingReferenceTax() { const ref = currentPricingReference(); return { label: normalizeTaxLabel(ref?.tax?.label), rate: normalizeTaxRate(ref?.tax?.rate, DEFAULT_TAX_RATE) }; }
+function selectedPricingReferenceCurrency() { return normalizeCurrencyLabel(currentPricingReference()?.currency); }
+function sanitizeRichTextHtml(value) { return String(value || ""); }
+function normalizedContentFingerprint(value) { return String(value || ""); }
+function quoteDateRichTextHtml() { return ""; }
+function syncRichTextSources() {}
+function syncRichTextEditor() {}
+function restoreRichTextDetails() {}
+function applyDefaultQuoteDate() {}
+function applyQuoteDateFormatFromHtml() {}
+function normalizeBoothDimensions(project = {}) { return project; }
+function splitLines(value) { return String(value || "").split(/\r?\n/).filter(Boolean); }
+function linesValue(value) { return Array.isArray(value) ? value.join("\n") : String(value || ""); }
+function normalizeCategoryTitle(value) { return String(value || "").trim(); }
+function cleanCustomerQuoteLineText(value) { return String(value || "").trim(); }
+function pricingReferenceLineText(value) { return String(value || "").trim(); }
+function bracketedCatalogReferenceParts() { return null; }
+function outputCatalogDescription() { return ""; }
+function normalizeUnit(value) { return String(value || "").trim(); }
+function renderHeaderLogoPreview() {}
+function renderPresetStatus() {}
+function syncQuoteCommercialContextPills() {}
+
+eval([
+  "hasOwnValue", "hasMeaningfulQuoteDetailValue", "normalizeTaxLabel", "normalizeTaxRate", "taxRatePercentText",
+  "normalizeCurrencyLabel", "isStandardCurrencyCode", "normalizedCustomCurrencyInput", "customCurrencyInputIsValid",
+  "setQuoteCurrencyControls", "syncQuoteCurrencyCustomInput", "quoteCurrencyControlValue", "emptyQuoteCommercialTouched",
+  "normalizeQuoteCommercialTouched", "resetQuoteCommercialTouched", "quoteCommercialFieldKeyForElement",
+  "quoteCommercialFieldIsTouched", "quoteCommercialFieldHasValue", "shouldApplyQuoteCommercialField", "shouldApply",
+  "quoteCommercialSnapshotPresence", "quoteCommercialSnapshotForDetails", "quoteDetailsWithFallbackDefaults",
+  "collectRichTextDetails", "collectQuoteDetails", "setInputValue", "collectTaxDetails", "collectQuoteCurrency",
+  "collectQuoteExchangeRate", "syncQuoteExchangeRateField", "quoteCommercialTaxText", "quoteExchangeRateText",
+  "quoteFxMultiplier", "quoteAmountValue", "formatAmount", "unitPriceEditKind", "numberOrNull", "orderNumber",
+  "effectiveOutputUnitPrice", "recalculateOutputRow", "normalizeOutputRow", "outputCellDisplayValue",
+  "rowNeedsManualInput", "matchSummaryStats", "outputRowsToLineItems", "dashboardCommercialsFromState",
+  "applyQuoteDetails", "applyPricingReferenceCommercialDefaults",
+].map(extractFunction).join("\n"));
+
+state.outputRows = [
+  normalizeOutputRow({ section: "Saved Floors", description: "Captured carpet", quantity: 2, unit: "sqm", price_mode: "Priced", effective_unit_price: 100, catalog_unit_price: 999, pricing_keyword: "captured-row", amount: 200 }),
+  normalizeOutputRow({ section: "Saved Services", description: "Included coordination", quantity: 1, unit: "lot", price_mode: "Included", display_price: "Included", amount: 0 }),
+];
+const saved = collectQuoteDetails();
+assert.deepStrictEqual(collectTaxDetails(), { label: "GST", rate: 0.09 });
+assert.strictEqual(collectQuoteCurrency(), "USD");
+assert.strictEqual(collectQuoteExchangeRate(), 1.37);
+assert.strictEqual(saved.commercial_snapshot.lifecycle, "RECOVERED");
+assert.strictEqual(saved.commercial_snapshot.pricing_basis.currency, "SGD");
+assert.strictEqual(outputRowsToLineItems()[0].unit_price_override, 100);
+assert.strictEqual(outputRowsToLineItems()[0].pricing_basis_currency, "SGD");
+assert.strictEqual(outputRowsToLineItems()[1].approved_quote_amount, 0);
+assert.deepStrictEqual(dashboardCommercialsFromState(), {
+  currency: "USD", tax_label: "GST", tax_rate: 0.09, exchange_rate: 1.37,
+  subtotal: 274, tax_amount: 24.66, grand_total: 298.66,
+});
+
+state.pricingReferences[0].currency = "USD";
+state.pricingReferences[0].tax = { label: "VAT", rate: 0.07 };
+assert.strictEqual(collectQuoteExchangeRate(), 1.37);
+assert.deepStrictEqual(collectTaxDetails(), { label: "GST", rate: 0.09 });
+state.quoteCommercialTouched.quoteExchangeRate = true;
+assert.strictEqual(collectQuoteExchangeRate(), 1.37);
+elements.quoteCurrency.value = "EUR";
+elements.quoteExchangeRate.value = "9";
+elements.quoteTaxLabel.value = "VAT";
+elements.quoteTaxRate.value = "7";
+applyPricingReferenceCommercialDefaults();
+assert.strictEqual(elements.quoteCurrency.value, "EUR");
+assert.strictEqual(elements.quoteExchangeRate.value, "9");
+assert.strictEqual(elements.quoteTaxLabel.value, "VAT");
+assert.strictEqual(elements.quoteTaxRate.value, "7");
+
+elements.quoteCurrency.value = "EUR";
+elements.quoteExchangeRate.value = "9";
+elements.quoteTaxLabel.value = "VAT";
+elements.quoteTaxRate.value = "7";
+applyQuoteDetails(saved, { includeLogo: true, clearLogo: true });
+assert.strictEqual(elements.quoteCurrency.value, "USD");
+assert.strictEqual(elements.quoteExchangeRate.value, "1.37");
+assert.strictEqual(elements.quoteTaxLabel.value, "GST");
+assert.strictEqual(elements.quoteTaxRate.value, "9");
+assert.strictEqual(saved.quote_text.cheque_payee, "Saved Quotation Co");
+assert.strictEqual(saved.rich_text.headerDetails, "<div><strong>Saved header</strong></div>");
+assert.strictEqual(state.headerLogo.content_fingerprint, "sha256:" + "a".repeat(64));
+assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, { preserveSavedState: true }).currency, "USD");
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
     def test_payload_to_brief_ignores_title_dimensions_without_manual_fields(self):
         payload = valid_payload()
         payload["project"].pop("booth_width", None)
@@ -13018,7 +13402,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertIn("dashboardSessionProjectNumberText(session)", search_body)
         self.assertIn("<dt>Currency / FX</dt>", js)
         self.assertIn("<dt>Tax / Rate</dt>", js)
-        self.assertIn("FX ${quoteExchangeRateText(activeSession.commercials?.exchange_rate ?? 1)}", js)
+        self.assertIn("FX ${quoteExchangeRateText(activeSession.commercials?.exchange_rate)}", js)
         selected_grid = js.split('<dl class="dashboard-selected-summary-grid">', 1)[1].split("</dl>", 1)[0]
         self.assertLess(selected_grid.index("<dt>Subtotal</dt>"), selected_grid.index("<dt>Currency / FX</dt>"))
         self.assertLess(selected_grid.index("<dt>Currency / FX</dt>"), selected_grid.index("<dt>Pricing Reference</dt>"))
