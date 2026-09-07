@@ -14223,6 +14223,7 @@ const document = {
   },
 };
 const DEFAULT_TAX_RATE = 0.09;
+const RECOVERED_QUOTE_AUTHORITATIVE_SELECTION = "recovered_quote_authoritative_selection";
 let navUpdates = 0;
 function normalizeTaxLabel(value) { return String(value || "GST").trim().toUpperCase(); }
 function normalizeTaxRate(value, fallback) { return Number.isFinite(Number(value)) ? Number(value) : fallback; }
@@ -14706,6 +14707,7 @@ function syncRichTextSources() {
 }
 
 const DEFAULT_PROFILE_ID = "synthetic-exhibition-fixture-template";
+const RECOVERED_QUOTE_AUTHORITATIVE_SELECTION = "recovered_quote_authoritative_selection";
 const state = {
   profileId: "synthetic-exhibition-fixture-template",
   pricingReferenceId: "synthetic-exhibition-fixture-pricing",
@@ -14982,12 +14984,13 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         pdf_handler = js.split('elements.sideViewPdfButton.addEventListener("click", async (event) => {', 1)[1].split('  document.addEventListener("keydown"', 1)[0]
         loading_options_body = js.split("function generationLoadingModalOptions", 1)[1].split("function generationFinalizingModalOptions", 1)[0]
         finalizing_options_body = js.split("function generationFinalizingModalOptions", 1)[1].split("function clearActiveJob", 1)[0]
+        handle_generate_body = js.split("async function handleGenerate", 1)[1].split("async function ensureSavedServerJobStarted", 1)[0]
         resumed_generation_body = js.split('if (activeJob.type === "generate" || activeJob.type === "generate_pdf") {', 1)[1].split("async function checkHealth", 1)[0]
         self.assertIn("event.preventDefault();", download_handler)
         self.assertIn("await handleGenerate();", js)
         self.assertIn("downloadCurrentExcelFile();", js)
         self.assertIn("await waitForUiPaint();", download_handler)
-        self.assertIn("commitActiveOutputEditor();", download_handler)
+        self.assertIn("commitActiveOutputEditor();", handle_generate_body)
         self.assertIn("showExcelGeneratingModal(generationLoadingModalOptions(false));", download_handler)
         self.assertIn('title: "Regenerating Excel"', loading_options_body)
         self.assertIn("await handleGenerate();", download_handler)
@@ -15599,6 +15602,7 @@ function extractFunction(name) {
 
 const DEFAULT_PROFILE_ID = "synthetic-exhibition-fixture-template";
 const DEFAULT_PRICING_REFERENCE_ID = "synthetic-exhibition-fixture-pricing";
+const RECOVERED_QUOTE_AUTHORITATIVE_SELECTION = "recovered_quote_authoritative_selection";
 const rawPricingReferences = [
     { id: "shared", label: "Shared A", source: "bundled" },
     { id: "unique", label: "Unique", source: "bundled" },
@@ -17439,6 +17443,882 @@ eval([
 
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
 
+    def test_static_authority_refresh_validates_without_reapplying_quote_defaults(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const asyncMarker = `async function ${name}`;
+  const functionMarker = `function ${name}`;
+  const asyncStart = source.indexOf(asyncMarker);
+  const functionStart = source.indexOf(functionMarker);
+  const start = asyncStart >= 0 ? asyncStart : functionStart;
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  if (bodyStart < 2) throw new Error(`Missing body for function ${name}`);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const state = {
+  authorityRefreshSequence: 0,
+  browserRecoveryScope: "scope-a",
+  quoteSessionId: "quote-authority123",
+  selectedPresetValue: "company:saved-company",
+  pricingReferenceId: "saved-pricing",
+  pricingReferenceSource: "local",
+  pricingReferences: [{ id: "saved-pricing", label: "Saved pricing", source: "local", tax: { label: "GST", rate: 0.09 }, currency: "SGD" }],
+  companyProfiles: [{ id: "saved-company", label: "Saved company", defaults: { quote_text: { payment_terms: ["50% standard deposit"] } } }],
+};
+const COMPANY_PROFILE_PRESET_PREFIX = "company:";
+const field = () => ({ value: "" });
+const elements = {
+  clientName: field(), clientAttention: field(), clientTitle: field(), clientAddress: field(),
+  projectTitle: field(), showName: field(), quoteDate: field(), projectNumber: field(),
+  quoteCompanyName: field(), headerDetails: field(), taxLabel: field(), quoteTaxLabel: field(),
+  taxRate: field(), quoteTaxRate: field(), quoteCurrency: field(), quoteCurrencyCustom: field(),
+  quoteExchangeRate: field(), termsHeading: field(), paymentTerms: field(), notesHeading: field(),
+  standardNotes: field(), acceptanceText: field(), companySignatory: field(), companyTitle: field(),
+  companyDateLabel: field(), personLabel: field(), stampLabel: field(), dateLabel: field(),
+  richTextEditors: [],
+};
+
+function hasOwnValue(object, key) { return Object.prototype.hasOwnProperty.call(object || {}, key); }
+function shouldApply(object, key, partial) { return !partial || hasOwnValue(object, key); }
+const DEFAULT_TAX_LABEL = "GST";
+const DEFAULT_TAX_RATE = 0.09;
+const DEFAULT_CURRENCY_LABEL = "SGD";
+function setInputValue(input, value) { if (input) input.value = value ?? ""; }
+function normalizeBoothDimensions(project = {}) { return project; }
+function normalizeTaxLabel(value) { return String(value || "GST"); }
+function taxRatePercentText(value) { return String(value ?? "9"); }
+function normalizeCurrencyLabel(value) { return String(value || "SGD"); }
+function selectedPricingReferenceCurrency() { return "SGD"; }
+function normalizeTaxRate(value) { return Number(value) || 0; }
+function shouldApplyQuoteCommercialField(_key, hasValue, partial) { return !partial || hasValue; }
+function syncQuoteExchangeRateField() {}
+function syncQuoteCommercialContextPills() {}
+function setQuoteCurrencyControls() {}
+function quoteExchangeRateText(value) { return String(value ?? "1"); }
+function restoreRichTextDetails() {}
+function applyDefaultQuoteDate() {}
+function renderHeaderLogoPreview() {}
+function renderPresetStatus() {}
+function normalizedContentFingerprint(value) { return String(value || ""); }
+function linesValue(value) { return Array.isArray(value) ? value.join("\n") : String(value || ""); }
+function currentBrowserRecoveryScope() { return state.browserRecoveryScope; }
+function safeQuoteSessionId(value) { return String(value || ""); }
+function selectedPresetId() { return state.selectedPresetValue; }
+function pendingPricingReferenceSelection() {
+  return { pricingReferenceId: state.pricingReferenceId, source: state.pricingReferenceSource };
+}
+function genericFailureMessage() { return ""; }
+function currentPricingReference() {
+  return state.pricingReferences.find((item) => item.id === state.pricingReferenceId && item.source === state.pricingReferenceSource) || null;
+}
+function pricingReferenceSelectValue(reference = {}) {
+  const source = String(reference.source || "").trim();
+  const id = String(reference.id || "").trim();
+  return source && id ? `${source}::${id}` : "";
+}
+function pricingReferenceSourceIsValid(value = "") {
+  return ["bundled", "company", "local"].includes(String(value || "").trim());
+}
+function pricingReferenceSelectionFromValue(value) {
+  const [source, ...rest] = String(value || "").split("::");
+  return { source: rest.length ? source : "", pricingReferenceId: rest.length ? rest.join("::") : source };
+}
+function companyProfileOptionValue(id) { return `company:${id}`; }
+function mergePricingReferences(values) { return values; }
+function normalizeCompanyProfile(profile = {}) { return profile; }
+function renderProfileOptions() {}
+function renderPresetOptions() {}
+function showBlockedAction(message) { throw new Error(message); }
+function getJson(url) {
+  assert.ok(url.includes("/api/quote-authority?"));
+  assert.ok(!url.includes("workspace"));
+  return Promise.resolve({ ok: true, data: {
+    status: "ok",
+    authority: {
+      company_profile: { id: "saved-company", label: "Saved company", defaults: { quote_text: { payment_terms: ["50% standard deposit"] } } },
+      pricing_reference: { id: "saved-pricing", label: "Saved pricing", source: "local", tax: { label: "GST", rate: 0.09 }, currency: "SGD" },
+    },
+  } });
+}
+
+eval([
+  "applyQuoteDetails",
+  "quoteAuthoritySelectionSnapshot",
+  "quoteAuthoritySelectionIsCurrent",
+  "quoteAuthorityErrorMessage",
+  "quoteAuthorityProfileResponseId",
+  "quoteAuthorityPricingResponseKey",
+  "replacePricingReferenceState",
+  "replaceCompanyProfileState",
+  "refreshSelectedQuoteAuthority",
+].map(extractFunction).join("\n"));
+
+(async () => {
+  const quoteSpecific = {
+    company: { name: "Quote-specific Company", header_details: "Negotiated header" },
+    quote_text: {
+      terms_heading: "Negotiated Terms",
+      payment_terms: ["100% on completion - quote-specific agreement"],
+      standard_notes: ["Quote-specific note"],
+      acceptance_text: "Quote-specific acceptance",
+    },
+    signature: { company_signatory: "Quote-specific signer" },
+  };
+  applyQuoteDetails(quoteSpecific);
+  const before = {
+    paymentTerms: elements.paymentTerms.value,
+    termsHeading: elements.termsHeading.value,
+    notes: elements.standardNotes.value,
+    acceptance: elements.acceptanceText.value,
+    company: elements.quoteCompanyName.value,
+  };
+
+  assert.strictEqual(await refreshSelectedQuoteAuthority(), true);
+  assert.deepStrictEqual({
+    paymentTerms: elements.paymentTerms.value,
+    termsHeading: elements.termsHeading.value,
+    notes: elements.standardNotes.value,
+    acceptance: elements.acceptanceText.value,
+    company: elements.quoteCompanyName.value,
+  }, before);
+  assert.strictEqual(state.pricingReferenceId, "saved-pricing");
+  assert.strictEqual(state.pricingReferenceSource, "local");
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_static_recovery_keeps_missing_pricing_authority_fail_closed(self):
+        static_dir = ROOT / "webapp" / "static"
+        js = (static_dir / "app.js").read_text(encoding="utf-8")
+        snapshot_body = js.split("async function applyQuoteSessionSnapshot", 1)[1].split("function restoreSessionState", 1)[0]
+
+        self.assertNotIn('saved.pricingReferenceId || saved.profileId || ""', snapshot_body)
+        self.assertIn("renderProfileOptions({ preserveSelection: true })", snapshot_body)
+        self.assertIn("await refreshSelectedQuoteAuthority({ recovery: true })", snapshot_body)
+        self.assertIn("if (!pricingReferenceId || !pricingReferenceSource)", js)
+        self.assertIn("NEW_QUOTE_DEFAULT_SELECTION", js)
+        self.assertIn("RECOVERED_QUOTE_AUTHORITATIVE_SELECTION", js)
+
+    def test_static_missing_recovered_pricing_identity_blocks_without_default_or_output_mutation(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const asyncMarker = `async function ${name}`;
+  const functionMarker = `function ${name}`;
+  const asyncStart = source.indexOf(asyncMarker);
+  const functionStart = source.indexOf(functionMarker);
+  const start = asyncStart >= 0 ? asyncStart : functionStart;
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  if (bodyStart < 2) throw new Error(`Missing body for function ${name}`);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const NEW_QUOTE_DEFAULT_SELECTION = "new_quote_default_selection";
+const RECOVERED_QUOTE_AUTHORITATIVE_SELECTION = "recovered_quote_authoritative_selection";
+const COMPANY_PROFILE_PRESET_PREFIX = "company:";
+const QUOTE_AUTHORITY_BLOCKED_MESSAGE = "Saved quote generation authority is unavailable. No quote or output data was changed.";
+const state = {
+  authorityRefreshSequence: 0,
+  pricingSelectionMode: RECOVERED_QUOTE_AUTHORITATIVE_SELECTION,
+  browserRecoveryScope: "scope-a",
+  quoteSessionId: "quote-recovered123",
+  profileId: "saved-company",
+  selectedPresetValue: "company:saved-company",
+  pricingReferenceId: "",
+  pricingReferenceSource: "company",
+  defaultPricingReferenceId: "default-pricing",
+  pricingReferences: [{ id: "default-pricing", source: "company", label: "Workspace default" }],
+  companyProfiles: [{ id: "saved-company", label: "Saved company" }],
+  downloadFile: { url: "/api/quote-sessions/quote-recovered123/download/quotation.xlsx", name: "quotation.xlsx" },
+  pdfFile: { url: "/api/quote-sessions/quote-recovered123/download/quotation.pdf", name: "quotation.pdf" },
+  outputRevision: 4,
+  downloadFileRevision: 4,
+  pdfFileRevision: 4,
+};
+const elements = { profileSelect: { value: "" } };
+let blockedMessages = [];
+let authorityReads = 0;
+let defaultSyncs = 0;
+function selectedPresetId() { return state.selectedPresetValue; }
+function safeQuoteSessionId(value) { return String(value || ""); }
+function pendingPricingReferenceSelection() { return { pricingReferenceId: "", source: "" }; }
+function pricingReferenceSourceIsValid(value) { return ["bundled", "company", "local"].includes(String(value || "")); }
+function pricingReferenceSelectValue(reference = {}) {
+  return `${reference.source || ""}::${reference.id || ""}`;
+}
+function currentPricingReference() {
+  return state.pricingReferences.find((item) => item.id === state.pricingReferenceId && item.source === state.pricingReferenceSource) || null;
+}
+function defaultPricingReference() {
+  return state.pricingReferences.find((item) => item.id === state.defaultPricingReferenceId) || null;
+}
+function pricingReferenceSelectionFromValue(value) {
+  const [source, ...rest] = String(value || "").split("::");
+  return { source: rest.length ? source : "", pricingReferenceId: rest.length ? rest.join("::") : source };
+}
+function showBlockedAction(message) { blockedMessages.push(String(message)); }
+function genericFailureMessage() { return ""; }
+function normalizeCompanyProfile(profile) { return profile; }
+function mergePricingReferences(values) { return values; }
+function renderProfileOptions() {}
+function renderPresetOptions() {}
+function getJson() {
+  authorityReads += 1;
+  return Promise.resolve({ ok: true, data: {} });
+}
+
+eval([
+  "syncSelectedPricingReference",
+  "quoteAuthoritySelectionSnapshot",
+  "quoteAuthoritySelectionIsCurrent",
+  "quoteAuthorityErrorMessage",
+  "quoteAuthorityProfileResponseId",
+  "quoteAuthorityPricingResponseKey",
+  "replacePricingReferenceState",
+  "replaceCompanyProfileState",
+  "refreshSelectedQuoteAuthority",
+].map(extractFunction).join("\n"));
+
+(async () => {
+  const before = {
+    pricingReferenceId: state.pricingReferenceId,
+    pricingReferenceSource: state.pricingReferenceSource,
+    downloadFile: structuredClone(state.downloadFile),
+    pdfFile: structuredClone(state.pdfFile),
+    outputRevision: state.outputRevision,
+    downloadFileRevision: state.downloadFileRevision,
+    pdfFileRevision: state.pdfFileRevision,
+  };
+  assert.strictEqual(await refreshSelectedQuoteAuthority({ recovery: true }), false);
+  assert.strictEqual(authorityReads, 0, "missing recovered identity must not start an authority read");
+  assert.deepStrictEqual({
+    pricingReferenceId: state.pricingReferenceId,
+    pricingReferenceSource: state.pricingReferenceSource,
+    downloadFile: state.downloadFile,
+    pdfFile: state.pdfFile,
+    outputRevision: state.outputRevision,
+    downloadFileRevision: state.downloadFileRevision,
+    pdfFileRevision: state.pdfFileRevision,
+  }, before);
+  assert.strictEqual(state.pricingReferences[0].id, "default-pricing");
+  assert.ok(blockedMessages.length >= 1);
+
+  state.pricingSelectionMode = NEW_QUOTE_DEFAULT_SELECTION;
+  state.pricingReferenceId = "";
+  state.pricingReferenceSource = "";
+  syncSelectedPricingReference();
+  defaultSyncs += 1;
+  assert.strictEqual(defaultSyncs, 1);
+  assert.strictEqual(state.pricingReferenceId, "default-pricing");
+  assert.strictEqual(state.pricingReferenceSource, "company");
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_static_recovered_pricing_source_requires_exact_match(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const marker = `function ${name}`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const RECOVERED_QUOTE_AUTHORITATIVE_SELECTION = "recovered_quote_authoritative_selection";
+const state = {
+  pricingSelectionMode: RECOVERED_QUOTE_AUTHORITATIVE_SELECTION,
+  pricingReferenceId: "same-id",
+  pricingReferenceSource: "",
+  pricingReferences: [
+    { id: "same-id", source: "company", label: "Company copy" },
+    { id: "same-id", source: "bundled", label: "Bundled copy" },
+  ],
+};
+function pricingReferenceSourceIsValid(value = "") {
+  return ["bundled", "company", "local"].includes(String(value || "").trim());
+}
+function pricingReferenceSelectValue(reference = {}) {
+  const source = reference.source === "company" ? "company" : reference.source === "local" ? "local" : "bundled";
+  return `${source}::${String(reference.id || "").trim()}`;
+}
+
+eval(extractFunction("currentPricingReference"));
+assert.strictEqual(currentPricingReference(), null, "missing recovered source must not resolve by id alone");
+state.pricingReferenceSource = "company";
+assert.strictEqual(currentPricingReference().label, "Company copy");
+state.pricingReferenceSource = "bundled";
+assert.strictEqual(currentPricingReference().label, "Bundled copy");
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_static_authority_late_response_cannot_mutate_changed_quote_selection_or_session(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const asyncMarker = `async function ${name}`;
+  const functionMarker = `function ${name}`;
+  const asyncStart = source.indexOf(asyncMarker);
+  const functionStart = source.indexOf(functionMarker);
+  const start = asyncStart >= 0 ? asyncStart : functionStart;
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const COMPANY_PROFILE_PRESET_PREFIX = "company:";
+const state = {
+  authorityRefreshSequence: 0,
+  pricingSelectionMode: "recovered_quote_authoritative_selection",
+  browserRecoveryScope: "scope-a",
+  quoteSessionId: "quote-late123",
+  profileId: "saved-company",
+  selectedPresetValue: "company:saved-company",
+  pricingReferenceId: "saved-pricing",
+  pricingReferenceSource: "company",
+  pricingReferences: [{ id: "saved-pricing", source: "company", label: "Saved pricing" }],
+  companyProfiles: [{ id: "saved-company", label: "Saved company" }],
+};
+const elements = { profileSelect: { value: "company::saved-pricing" } };
+let resolveAuthority;
+let renderCalls = 0;
+function selectedPresetId() { return state.selectedPresetValue; }
+function safeQuoteSessionId(value) { return String(value || ""); }
+function pendingPricingReferenceSelection() { return { pricingReferenceId: "", source: "" }; }
+function pricingReferenceSourceIsValid(value) { return ["bundled", "company", "local"].includes(String(value || "")); }
+function pricingReferenceSelectValue(reference = {}) { return `${reference.source || ""}::${reference.id || ""}`; }
+function normalizeCompanyProfile(profile) { return profile; }
+function mergePricingReferences(values) { return values; }
+function renderProfileOptions() { renderCalls += 1; }
+function renderPresetOptions() { renderCalls += 1; }
+function showBlockedAction() { throw new Error("unexpected blocked response"); }
+function genericFailureMessage() { return ""; }
+function getJson() {
+  return new Promise((resolve) => { resolveAuthority = resolve; });
+}
+
+eval([
+  "quoteAuthoritySelectionSnapshot",
+  "quoteAuthoritySelectionIsCurrent",
+  "quoteAuthorityErrorMessage",
+  "quoteAuthorityProfileResponseId",
+  "quoteAuthorityPricingResponseKey",
+  "replacePricingReferenceState",
+  "replaceCompanyProfileState",
+  "refreshSelectedQuoteAuthority",
+].map(extractFunction).join("\n"));
+
+(async () => {
+  const pending = refreshSelectedQuoteAuthority();
+  state.pricingReferenceId = "changed-pricing";
+  state.pricingReferenceSource = "company";
+  state.quoteSessionId = "quote-new123";
+  const originalReferences = structuredClone(state.pricingReferences);
+  resolveAuthority({ ok: true, data: { authority: {
+    company_profile: { id: "saved-company", label: "Saved company" },
+    pricing_reference: { id: "saved-pricing", source: "company", label: "Saved pricing" },
+  } } });
+  assert.strictEqual(await pending, false);
+  assert.strictEqual(state.pricingReferenceId, "changed-pricing");
+  assert.deepStrictEqual(state.pricingReferences, originalReferences);
+  assert.strictEqual(renderCalls, 0);
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_static_pending_pricing_authority_read_preserves_pending_selection_until_apply(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const asyncMarker = `async function ${name}`;
+  const functionMarker = `function ${name}`;
+  const asyncStart = source.indexOf(asyncMarker);
+  const functionStart = source.indexOf(functionMarker);
+  const start = asyncStart >= 0 ? asyncStart : functionStart;
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const COMPANY_PROFILE_PRESET_PREFIX = "company:";
+const state = {
+  authorityRefreshSequence: 0,
+  pricingSelectionMode: "recovered_quote_authoritative_selection",
+  browserRecoveryScope: "scope-a",
+  quoteSessionId: "quote-pending123",
+  profileId: "saved-company",
+  selectedPresetValue: "company:saved-company",
+  pricingReferenceId: "old-pricing",
+  pricingReferenceSource: "company",
+  pricingReferences: [{ id: "old-pricing", source: "company", label: "Old pricing" }],
+  companyProfiles: [{ id: "saved-company", label: "Saved company" }],
+};
+const elements = { profileSelect: { value: "company::new-pricing" } };
+let renderedCurrentValue = "";
+function selectedPresetId() { return state.selectedPresetValue; }
+function safeQuoteSessionId(value) { return String(value || ""); }
+function pendingPricingReferenceSelection() {
+  const [source, id] = elements.profileSelect.value.split("::");
+  return { source, pricingReferenceId: id };
+}
+function pricingReferenceSourceIsValid(value) { return ["bundled", "company", "local"].includes(String(value || "")); }
+function pricingReferenceSelectValue(reference = {}) { return `${reference.source || ""}::${reference.id || ""}`; }
+function normalizeCompanyProfile(profile) { return profile; }
+function mergePricingReferences(values) { return values; }
+function renderProfileOptions() {
+  renderedCurrentValue = pricingReferenceSelectValue({
+    id: state.pricingReferenceId,
+    source: state.pricingReferenceSource,
+  });
+  elements.profileSelect.value = renderedCurrentValue;
+}
+function renderPresetOptions() {}
+function showBlockedAction(message) { throw new Error(String(message)); }
+function genericFailureMessage() { return ""; }
+function getJson(url) {
+  assert.ok(url.includes("pricing_reference_id=new-pricing"));
+  return Promise.resolve({ ok: true, data: { authority: {
+    company_profile: { id: "saved-company", label: "Saved company" },
+    pricing_reference: { id: "new-pricing", source: "company", label: "New pricing" },
+  } } });
+}
+
+eval([
+  "quoteAuthoritySelectionSnapshot",
+  "quoteAuthoritySelectionIsCurrent",
+  "quoteAuthorityErrorMessage",
+  "quoteAuthorityProfileResponseId",
+  "quoteAuthorityPricingResponseKey",
+  "replacePricingReferenceState",
+  "replaceCompanyProfileState",
+  "refreshSelectedQuoteAuthority",
+].map(extractFunction).join("\n"));
+
+(async () => {
+  assert.strictEqual(await refreshSelectedQuoteAuthority({ pendingPricing: true }), true);
+  assert.strictEqual(state.pricingReferenceId, "old-pricing", "authority validation must not apply a pending selection");
+  assert.strictEqual(elements.profileSelect.value, "company::new-pricing");
+  assert.strictEqual(renderedCurrentValue, "company::old-pricing");
+  assert.ok(state.pricingReferences.some((item) => item.id === "new-pricing" && item.source === "company"));
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_static_authority_transport_failure_preserves_quote_and_output(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const asyncMarker = `async function ${name}`;
+  const functionMarker = `function ${name}`;
+  const asyncStart = source.indexOf(asyncMarker);
+  const functionStart = source.indexOf(functionMarker);
+  const start = asyncStart >= 0 ? asyncStart : functionStart;
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  if (bodyStart < 2) throw new Error(`Missing body for function ${name}`);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const state = {
+  authorityRefreshSequence: 0,
+  pricingSelectionMode: "recovered_quote_authoritative_selection",
+  browserRecoveryScope: "scope-a",
+  isPageUnloading: false,
+  quoteSessionId: "quote-transport123",
+  profileId: "saved-company",
+  selectedPresetValue: "company:saved-company",
+  pricingReferenceId: "saved-pricing",
+  pricingReferenceSource: "company",
+  pricingReferences: [{ id: "saved-pricing", source: "company", label: "Saved pricing" }],
+  companyProfiles: [{ id: "saved-company", label: "Saved company" }],
+  downloadFile: { url: "/api/quote-sessions/quote-transport123/download/quotation.xlsx", name: "quotation.xlsx" },
+  pdfFile: { url: "/api/quote-sessions/quote-transport123/download/quotation.pdf", name: "quotation.pdf" },
+  outputRevision: 7,
+  downloadFileRevision: 7,
+  pdfFileRevision: 7,
+};
+const elements = { profileSelect: { value: "company::saved-pricing" } };
+const COMPANY_PROFILE_PRESET_PREFIX = "company:";
+const QUOTE_AUTHORITY_BLOCKED_MESSAGE = "Saved quote generation authority is unavailable. No quote or output data was changed.";
+let blockedMessages = [];
+const logged = [];
+function selectedPresetId() { return state.selectedPresetValue; }
+function safeQuoteSessionId(value) { return String(value || ""); }
+function pendingPricingReferenceSelection() { return { pricingReferenceId: state.pricingReferenceId, source: state.pricingReferenceSource }; }
+function pricingReferenceSourceIsValid(value) { return ["bundled", "company", "local"].includes(String(value || "")); }
+function pricingReferenceSelectValue(reference = {}) { return `${reference.source || ""}::${reference.id || ""}`; }
+function genericFailureMessage() { return ""; }
+function genericFailureMessages() { return ["Authority transport failed safely."]; }
+function newClientErrorReference() { return "ERR-445TRANSPORT"; }
+function fetchFailureLogDetails(_url, details) { return details; }
+function logClientEvent(...args) { logged.push(args); }
+function showBlockedAction(message) { blockedMessages.push(String(message)); }
+
+global.fetch = () => Promise.reject(new Error("PRIVATE_TRANSPORT_REASON"));
+eval([
+  "getJson",
+  "quoteAuthoritySelectionSnapshot",
+  "quoteAuthoritySelectionIsCurrent",
+  "quoteAuthorityErrorMessage",
+  "refreshSelectedQuoteAuthority",
+].map(extractFunction).join("\n"));
+
+(async () => {
+  const before = {
+    pricingReferenceId: state.pricingReferenceId,
+    pricingReferenceSource: state.pricingReferenceSource,
+    downloadFile: structuredClone(state.downloadFile),
+    pdfFile: structuredClone(state.pdfFile),
+    outputRevision: state.outputRevision,
+    downloadFileRevision: state.downloadFileRevision,
+    pdfFileRevision: state.pdfFileRevision,
+  };
+  assert.strictEqual(await refreshSelectedQuoteAuthority(), false);
+  assert.deepStrictEqual({
+    pricingReferenceId: state.pricingReferenceId,
+    pricingReferenceSource: state.pricingReferenceSource,
+    downloadFile: state.downloadFile,
+    pdfFile: state.pdfFile,
+    outputRevision: state.outputRevision,
+    downloadFileRevision: state.downloadFileRevision,
+    pdfFileRevision: state.pdfFileRevision,
+  }, before);
+  assert.deepStrictEqual(blockedMessages, ["Authority transport failed safely."]);
+  assert.ok(logged.length >= 1);
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_quote_authority_http_is_generation_scoped_exact_and_read_only(self):
+        root = Path(tempfile.mkdtemp(prefix="sqag-quote-authority-", dir=str(ROOT / "_tmp" / "tests")))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        database_url = f"sqlite:///{(root / 'sqag.sqlite3').as_posix()}"
+        env = self.platform_launch_env(
+            SQAG_STORAGE_MODE="database",
+            SQAG_ARTIFACT_STORAGE_MODE="local",
+            SQAG_DATABASE_URL=database_url,
+            QUOTE_DATA_ROOT=str(root / "data"),
+            QUOTE_LOG_ROOT=str(root / "logs"),
+        )
+        admin_session = self.platform_auth_session(
+            "workspace-authority-a", membership_role="owner", user_id="authority-admin"
+        )
+        operator_session = self.platform_auth_session(
+            "workspace-authority-a", membership_role="operator", user_id="authority-operator"
+        )
+        viewer_session = self.platform_auth_session(
+            "workspace-authority-a", membership_role="viewer", user_id="authority-viewer"
+        )
+        other_workspace_session = self.platform_auth_session(
+            "workspace-authority-b", membership_role="operator", user_id="authority-other"
+        )
+
+        def cookie(session):
+            return f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(session)}"
+
+        with mock.patch.dict(os.environ, env, clear=True):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(admin_session)
+            storage.save_profile(webapp.normalize_profile_payload({
+                "id": "saved-company",
+                "label": "Saved Company",
+                "description": "Synthetic saved authority profile.",
+                "defaults": {
+                    "company": {"name": "Saved Company"},
+                    "quote_text": {"payment_terms": ["50% standard deposit"]},
+                },
+            }))
+            storage.save_pricing_reference(workspace_pricing_reference("saved-pricing"))
+            storage.save_profile(webapp.normalize_profile_payload({
+                "id": "deleted-company",
+                "label": "Deleted Company",
+                "defaults": {},
+            }))
+            storage.save_pricing_reference(workspace_pricing_reference("deleted-pricing"))
+            self.assertTrue(storage.delete_profile("deleted-company"))
+            self.assertTrue(storage.delete_pricing_reference("deleted-pricing", source="company"))
+
+            def db_snapshot():
+                with sqlite3.connect(root / "sqag.sqlite3") as connection:
+                    return {
+                        "profiles": connection.execute(
+                            "select workspace_id, profile_id, payload_json, created_at, updated_at from sqag_profiles order by workspace_id, profile_id"
+                        ).fetchall(),
+                        "pricing": connection.execute(
+                            "select workspace_id, reference_id, payload_json, created_at, updated_at from sqag_pricing_references order by workspace_id, reference_id"
+                        ).fetchall(),
+                    }
+
+            before_reads = db_snapshot()
+            authority_path = "/api/quote-authority?company_profile_id=saved-company&pricing_reference_id=saved-pricing&source=company"
+            admin_cookie = cookie(admin_session)
+            operator_cookie = cookie(operator_session)
+            viewer_cookie = cookie(viewer_session)
+            other_cookie = cookie(other_workspace_session)
+            with (
+                mock.patch.object(webapp, "validated_platform_auth_session", side_effect=lambda session: session),
+                LocalRunnerServer() as runner,
+            ):
+                admin = self.http_json(runner, "GET", authority_path, cookie=admin_cookie)
+                operator = self.http_json(runner, "GET", authority_path, cookie=operator_cookie)
+                settings = self.http_json(runner, "GET", "/api/settings/profiles", cookie=operator_cookie)
+                viewer = self.http_json(runner, "GET", authority_path, cookie=viewer_cookie)
+                other_workspace = self.http_json(runner, "GET", authority_path, cookie=other_cookie)
+                wrong_source = self.http_json(
+                    runner,
+                    "GET",
+                    authority_path.replace("source=company", "source=local"),
+                    cookie=operator_cookie,
+                )
+                wrong_id = self.http_json(
+                    runner,
+                    "GET",
+                    authority_path.replace("saved-pricing", "missing-pricing"),
+                    cookie=operator_cookie,
+                )
+                wrong_company = self.http_json(
+                    runner,
+                    "GET",
+                    authority_path.replace("saved-company", "missing-company"),
+                    cookie=operator_cookie,
+                )
+                deleted = self.http_json(
+                    runner,
+                    "GET",
+                    authority_path.replace("saved-pricing", "deleted-pricing"),
+                    cookie=operator_cookie,
+                )
+                caller_workspace = self.http_json(
+                    runner,
+                    "GET",
+                    authority_path + "&workspace_id=workspace-authority-b",
+                    cookie=operator_cookie,
+                )
+                with mock.patch.object(
+                    webapp.DatabaseSqagStorage,
+                    "pricing_reference_detail",
+                    side_effect=webapp.SqagStorageAccessError(
+                        "synthetic storage failure", status=503, reason="storage_unavailable"
+                    ),
+                ):
+                    storage_failure = self.http_json(runner, "GET", authority_path, cookie=operator_cookie)
+            after_reads = db_snapshot()
+
+        self.assertEqual(admin["status"], 200, admin)
+        self.assertEqual(operator["status"], 200, operator)
+        authority = operator["body"]["authority"]
+        self.assertEqual(authority["company_profile"]["id"], "saved-company")
+        self.assertEqual(authority["pricing_reference"]["id"], "saved-pricing")
+        self.assertEqual(authority["pricing_reference"]["source"], "company")
+        self.assertNotIn("items", authority["pricing_reference"])
+        self.assertNotIn("internal_cost", json.dumps(authority["pricing_reference"]))
+        self.assertNotIn("markup_multiplier", json.dumps(authority["pricing_reference"]))
+        self.assertEqual(settings["status"], 403)
+        self.assertEqual(viewer["status"], 403)
+        self.assertEqual(other_workspace["status"], 404)
+        self.assertEqual(wrong_source["status"], 404)
+        self.assertEqual(wrong_id["status"], 404)
+        self.assertEqual(wrong_company["status"], 404)
+        self.assertEqual(deleted["status"], 404)
+        self.assertEqual(caller_workspace["status"], 400)
+        self.assertEqual(storage_failure["status"], 503)
+        self.assertEqual(storage_failure["body"]["status"], "failed")
+        self.assertNotIn("reason", storage_failure["body"])
+        self.assertEqual(before_reads, after_reads)
+
+    def test_quote_generation_authority_rejects_ambiguous_or_mismatched_records(self):
+        storage = mock.Mock()
+        storage.list_company_profiles.return_value = [
+            {"id": "saved-company", "label": "Saved Company"},
+            {"id": "saved-company", "label": "Duplicate Saved Company"},
+        ]
+        self.assertIsNone(
+            webapp.quote_generation_authority(
+                storage,
+                company_profile_id="saved-company",
+                pricing_reference_id="saved-pricing",
+                pricing_reference_source="company",
+            )
+        )
+        storage.pricing_reference_detail.assert_not_called()
+
+        storage.list_company_profiles.return_value = [{"id": "saved-company", "label": "Saved Company"}]
+        storage.pricing_reference_detail.return_value = {
+            "id": "saved-pricing",
+            "source": "bundled",
+            "label": "Wrong source",
+            "items": [],
+        }
+        self.assertIsNone(
+            webapp.quote_generation_authority(
+                storage,
+                company_profile_id="saved-company",
+                pricing_reference_id="saved-pricing",
+                pricing_reference_source="company",
+            )
+        )
+
+        company_store = mock.Mock()
+        company_store.list_pricing_references.return_value = [
+            {"id": "ambiguous-pricing", "label": "First"},
+            {"id": "ambiguous-pricing", "label": "Second"},
+        ]
+        with mock.patch.object(webapp, "company_config_store", return_value=company_store):
+            self.assertIsNone(
+                webapp.company_config_pricing_reference_detail(
+                    "ambiguous-pricing",
+                    "default",
+                )
+            )
+
     def test_static_pricing_reference_empty_state_disables_selection_and_next_button(self):
         node = require_node(self)
 
@@ -17466,6 +18346,7 @@ function extractFunction(name) {
 }
 
 const DEFAULT_PROFILE_ID = "";
+const RECOVERED_QUOTE_AUTHORITATIVE_SELECTION = "recovered_quote_authoritative_selection";
 const DEFAULT_PRICING_REFERENCE_ID = "";
 const DEFAULT_TAX_LABEL = "GST";
 const DEFAULT_TAX_RATE = 0.09;
@@ -18433,6 +19314,7 @@ function extractFunction(name) {
 const DEFAULT_PROFILE_ID = "synthetic-exhibition-fixture-template";
 const DEFAULT_PRICING_REFERENCE_ID = "default-ref";
 const PRICING_REFERENCE_SETTINGS_MODE_MANAGE = "manage";
+const RECOVERED_QUOTE_AUTHORITATIVE_SELECTION = "recovered_quote_authoritative_selection";
 const state = {
   profileId: DEFAULT_PROFILE_ID,
   pricingReferenceId: "new-ref",

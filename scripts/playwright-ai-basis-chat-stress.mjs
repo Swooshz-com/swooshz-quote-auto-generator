@@ -287,6 +287,44 @@ async function installMockJobs(page) {
       }),
     });
   });
+  await page.route("**/api/quote-authority*", async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.fallback();
+      return;
+    }
+    const requestUrl = new URL(route.request().url());
+    const pricingReferenceId = requestUrl.searchParams.get("pricing_reference_id") || "";
+    const pricingReferenceSource = requestUrl.searchParams.get("source") || "";
+    const companyProfileId = requestUrl.searchParams.get("company_profile_id") || "";
+    if (!pricingReferenceId || !pricingReferenceSource) {
+      await route.fulfill({
+        status: 400,
+        contentType: "application/json",
+        body: JSON.stringify({ status: "blocked", errors: ["Selected quote generation authority is unavailable."] }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "ok",
+        authority: {
+          company_profile: companyProfileId
+            ? { id: companyProfileId, label: "Synthetic saved company", defaults: {} }
+            : null,
+          pricing_reference: {
+            id: pricingReferenceId,
+            label: "Synthetic authority pricing",
+            source: pricingReferenceSource,
+            currency: "SGD",
+            tax: { label: "GST", rate: 0.09 },
+            item_count: 1,
+          },
+        },
+      }),
+    });
+  });
 
   await page.route("**/api/jobs", async (route) => {
     if (route.request().method() !== "POST") {

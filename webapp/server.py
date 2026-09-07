@@ -10137,6 +10137,8 @@ class LocalSqagStorage:
         return delete_pricing_reference_pack(reference_id, source=source)
 
     def pricing_reference_detail(self, reference_id: str, source: str = "") -> dict[str, Any] | None:
+        if clean_text(source).lower() == "company":
+            return company_config_pricing_reference_detail(reference_id, self.company_id())
         return pricing_reference_pack_detail(reference_id, source=source)
 
     def pricing_reference_export_xlsx(self, reference_id: str, source: str = "") -> tuple[str, bytes] | None:
@@ -15827,6 +15829,115 @@ def public_company_pricing_reference(reference: dict[str, Any]) -> dict[str, Any
         "currency": normalize_currency_label(reference.get("currency")),
         "item_count": len(items),
         "source": "company",
+    }
+
+
+def company_config_pricing_reference_detail(
+    reference_id: str,
+    company_id: str = DEFAULT_COMPANY_ID,
+) -> dict[str, Any] | None:
+    safe_id = safe_resource_id(reference_id, "")
+    if not safe_id:
+        raise ValueError("Pricing reference id is required and may only contain letters, numbers, dashes, or underscores.")
+    safe_company = safe_company_id(company_id, DEFAULT_COMPANY_ID)
+    matches = [
+        copy.deepcopy(item)
+        for item in company_config_store().list_pricing_references(safe_company)
+        if safe_resource_id(item.get("id"), "") == safe_id
+    ]
+    if len(matches) != 1:
+        return None
+    reference = matches[0]
+    detail = public_company_pricing_reference(reference)
+    items = [
+        dict(item)
+        for item in (reference.get("items") if isinstance(reference.get("items"), list) else [])
+        if isinstance(item, dict)
+    ]
+    ensure_pricing_reference_order_fields(items)
+    detail.update({
+        "schema_version": int(parse_pricing_number(reference.get("schema_version")) or 1),
+        "items": sorted_pricing_reference_items(items),
+        "item_count": len(items),
+    })
+    return detail
+
+
+QUOTE_AUTHORITY_SOURCE_VALUES = frozenset({"bundled", "company", "local"})
+QUOTE_AUTHORITY_UNAVAILABLE_MESSAGE = "Selected quote generation authority is unavailable."
+
+
+def exact_authority_resource_id(value: Any) -> str:
+    text = clean_text(value)
+    return text if text and PROFILE_ID_RE.fullmatch(text) else ""
+
+
+def quote_authority_profile_projection(profile: dict[str, Any]) -> dict[str, Any]:
+    profile_id = exact_authority_resource_id(profile.get("id"))
+    return {
+        "id": profile_id,
+        "label": clean_text(profile.get("label")) or profile_id or "Company Profile",
+        "description": clean_text(profile.get("description")),
+        "defaults": copy.deepcopy(profile.get("defaults")) if isinstance(profile.get("defaults"), dict) else {},
+        "source": "company",
+    }
+
+
+def quote_authority_pricing_projection(reference: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": exact_authority_resource_id(reference.get("id")),
+        "label": clean_text(reference.get("label")) or exact_authority_resource_id(reference.get("id")),
+        "description": clean_text(reference.get("description")),
+        "tax": normalized_tax_config(reference.get("tax")),
+        "currency": normalize_currency_label(reference.get("currency")),
+        "item_count": int(parse_pricing_number(reference.get("item_count")) or 0),
+        "source": clean_text(reference.get("source")).lower(),
+    }
+
+
+def quote_generation_authority(
+    storage: LocalSqagStorage | DatabaseSqagStorage,
+    company_profile_id: str = "",
+    pricing_reference_id: str = "",
+    pricing_reference_source: str = "",
+) -> dict[str, Any] | None:
+    safe_company_profile_id = exact_authority_resource_id(company_profile_id) if clean_text(company_profile_id) else ""
+    safe_pricing_reference_id = exact_authority_resource_id(pricing_reference_id)
+    source = clean_text(pricing_reference_source).lower()
+    if (
+        (clean_text(company_profile_id) and not safe_company_profile_id)
+        or not safe_pricing_reference_id
+        or source not in QUOTE_AUTHORITY_SOURCE_VALUES
+    ):
+        return None
+
+    company_profile = None
+    if safe_company_profile_id:
+        profiles = storage.list_company_profiles()
+        matches = [
+            profile
+            for profile in profiles
+            if isinstance(profile, dict) and exact_authority_resource_id(profile.get("id")) == safe_company_profile_id
+        ]
+        if len(matches) != 1:
+            return None
+        company_profile = quote_authority_profile_projection(matches[0])
+
+    pricing_reference = storage.pricing_reference_detail(
+        safe_pricing_reference_id,
+        source=source,
+    )
+    if not isinstance(pricing_reference, dict):
+        return None
+    if (
+        exact_authority_resource_id(pricing_reference.get("id")) != safe_pricing_reference_id
+        or clean_text(pricing_reference.get("source")).lower() != source
+    ):
+        return None
+
+    return {
+        "company_profile": company_profile,
+        "pricing_reference": quote_authority_pricing_projection(pricing_reference),
     }
 
 
@@ -23764,6 +23875,71 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 "company_id": workspace["company"]["id"],
                 "workspace": workspace,
             })
+            return
+        if path == "/api/quote-authority":
+            allowed, error = self.require_permission("canGenerateQuote")
+            if not allowed:
+                self.send_json(error, status=403)
+                return
+            allowed_query_keys = {"company_profile_id", "pricing_reference_id", "source"}
+            if set(query) - allowed_query_keys:
+                self.send_json(
+                    {"status": "blocked", "errors": [QUOTE_AUTHORITY_UNAVAILABLE_MESSAGE]},
+                    status=400,
+                )
+                return
+
+            def query_value(name: str, *, required: bool = False) -> str | None:
+                values = query.get(name)
+                if values is None:
+                    return None if required else ""
+                if len(values) != 1:
+                    return None
+                return clean_text(values[0])
+
+            company_profile_id = query_value("company_profile_id")
+            pricing_reference_id = query_value("pricing_reference_id", required=True)
+            pricing_reference_source = query_value("source", required=True)
+            if (
+                company_profile_id is None
+                or pricing_reference_id is None
+                or pricing_reference_source is None
+                or pricing_reference_source.lower() not in QUOTE_AUTHORITY_SOURCE_VALUES
+                or not pricing_reference_id
+            ):
+                self.send_json(
+                    {"status": "blocked", "errors": [QUOTE_AUTHORITY_UNAVAILABLE_MESSAGE]},
+                    status=400,
+                )
+                return
+            storage = self.current_app_storage()
+            if storage is None:
+                return
+            try:
+                authority = quote_generation_authority(
+                    storage,
+                    company_profile_id=company_profile_id,
+                    pricing_reference_id=pricing_reference_id,
+                    pricing_reference_source=pricing_reference_source.lower(),
+                )
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
+            except Exception as exc:  # pragma: no cover - defensive HTTP boundary
+                error_reference = new_error_reference()
+                write_local_log(
+                    "quote_authority_read_failed",
+                    unexpected_error_log_details(error_reference, exc),
+                )
+                self.send_json(failed_result_payload(error_reference), status=500)
+                return
+            if authority is None:
+                self.send_json(
+                    {"status": "blocked", "errors": [QUOTE_AUTHORITY_UNAVAILABLE_MESSAGE]},
+                    status=404,
+                )
+                return
+            self.send_json({"status": "ok", "authority": authority})
             return
         if path == "/api/settings":
             allowed, error = self.require_permission("canManageSettings")

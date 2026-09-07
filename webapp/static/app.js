@@ -24,6 +24,8 @@ const QUOTE_SESSION_FILE_DB_NAME = "swooshz_quote_session_files_v1";
 const QUOTE_SESSION_FILE_STORE_NAME = "reference_files";
 const QUOTE_SESSION_FILE_DB_VERSION = 1;
 const QUOTE_SESSION_STATE_VERSION = 5;
+const NEW_QUOTE_DEFAULT_SELECTION = "new_quote_default_selection";
+const RECOVERED_QUOTE_AUTHORITATIVE_SELECTION = "recovered_quote_authoritative_selection";
 const OUTPUT_SORT_MODES = ["pricing_reference", "category", "name", "category_name"];
 const ANALYSIS_MODE_STANDARD = "standard";
 const ANALYSIS_MODE_HIGH_QUALITY = "high_quality";
@@ -164,6 +166,7 @@ const BASIS_TAGS = [
 ];
 
 const state = {
+  pricingSelectionMode: NEW_QUOTE_DEFAULT_SELECTION,
   profileId: "",
   pricingReferenceId: "",
   pricingReferenceSource: "",
@@ -189,6 +192,7 @@ const state = {
   quoteSessionDashboardBusy: false,
   quoteSessionRestoreError: "",
   quoteSessionRestoreBusy: false,
+  authorityRefreshSequence: 0,
   quoteSessionDraftSaveStarted: false,
   quoteSessionRestoredSessionId: "",
   quoteSessionRestoredDraftKey: "",
@@ -639,6 +643,10 @@ function pricingReferenceSelectionFromValue(value = "") {
     source: text.slice(0, delimiterIndex) || "bundled",
     pricingReferenceId: text.slice(delimiterIndex + 2),
   };
+}
+
+function pricingReferenceSourceIsValid(value = "") {
+  return ["bundled", "company", "local"].includes(String(value || "").trim());
 }
 
 function mergePricingReferences(bundled = []) {
@@ -1146,6 +1154,11 @@ function currentPricingReference() {
   const pricingReferenceId = String(state.pricingReferenceId || "").trim();
   const source = String(state.pricingReferenceSource || "").trim();
   if (!pricingReferenceId) return null;
+  if (state.pricingSelectionMode === RECOVERED_QUOTE_AUTHORITATIVE_SELECTION) {
+    if (!pricingReferenceSourceIsValid(source)) return null;
+    const exactValue = `${source}::${pricingReferenceId}`;
+    return state.pricingReferences.find((reference) => pricingReferenceSelectValue(reference) === exactValue) || null;
+  }
   return state.pricingReferences.find((reference) => reference.id === pricingReferenceId && (!source || pricingReferenceSelectValue(reference).startsWith(`${source}::`)))
     || state.pricingReferences.find((reference) => reference.id === pricingReferenceId && !source)
     || null;
@@ -1230,13 +1243,16 @@ function generationProfileIdForPayload() {
   return presetProfileId || resolvedProfileIdForPayload();
 }
 
-function syncSelectedPricingReference() {
+function syncSelectedPricingReference(options = {}) {
+  const allowDefault = options.allowDefault !== false
+    && state.pricingSelectionMode !== RECOVERED_QUOTE_AUTHORITATIVE_SELECTION;
   const selectedReference = currentPricingReference();
   if (selectedReference) {
     state.pricingReferenceId = selectedReference.id || "";
     state.pricingReferenceSource = pricingReferenceSelectionFromValue(pricingReferenceSelectValue(selectedReference)).source;
     return;
   }
+  if (!allowDefault) return;
   const fallbackReference = defaultPricingReference();
   if (fallbackReference) {
     state.pricingReferenceId = fallbackReference.id || "";
@@ -3340,9 +3356,10 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
     return false;
   }
   let rejectedRestoredActiveJob = false;
+  state.pricingSelectionMode = RECOVERED_QUOTE_AUTHORITATIVE_SELECTION;
   state.profileId = saved.profileId || "";
-  state.pricingReferenceId = saved.pricingReferenceId || saved.profileId || "";
-  state.pricingReferenceSource = saved.pricingReferenceSource || "";
+  state.pricingReferenceId = String(saved.pricingReferenceId || "").trim();
+  state.pricingReferenceSource = String(saved.pricingReferenceSource || "").trim();
   const targetSessionId = safeQuoteSessionId(options.sessionId || saved.quoteSessionId || "");
   const savedGenerationContext = saved.generationContext && typeof saved.generationContext === "object"
     ? saved.generationContext : {};
@@ -3357,13 +3374,14 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.pricingReferenceSettingsMode = state.restorableOverlay
     ? normalizePricingReferenceSettingsMode(saved.pricingReferenceSettingsMode)
     : PRICING_REFERENCE_SETTINGS_MODE_MANAGE;
-  state.selectedPresetValue = saved.selectedPresetValue || presetValueFromQuoteDetails(saved.quoteDetails || {}) || lastSelectedPresetValue();
+  state.selectedPresetValue = state.pricingSelectionMode === RECOVERED_QUOTE_AUTHORITATIVE_SELECTION
+    ? String(saved.selectedPresetValue || "").trim()
+    : saved.selectedPresetValue || presetValueFromQuoteDetails(saved.quoteDetails || {}) || lastSelectedPresetValue();
   state.quoteCommercialTouched = normalizeQuoteCommercialTouched(
     saved.quoteCommercialTouched || quoteDetailsCommercialTouched(saved.quoteDetails || {})
   );
-  syncSelectedPricingReference();
-  renderProfileOptions();
-  renderPresetOptions();
+  renderProfileOptions({ preserveSelection: true });
+  renderPresetOptions({ preserveSelection: true });
   state.pendingFeedback = String(saved.pendingFeedback || "");
   const restoredQuoteDetails = await restoreQuoteDetailsLogo(
     quoteDetailsWithFallbackDefaults(selectedPreset()?.details || {}, saved.quoteDetails || {})
@@ -3436,6 +3454,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   }
   const restoredPanel = restoredQuoteSessionSidePanel(saved, options);
   setSidePanel(restoredPanel, { force: true });
+  await refreshSelectedQuoteAuthority({ recovery: true });
   try {
     window.localStorage.setItem(QUOTE_SESSION_STORAGE_KEY, JSON.stringify(buildSessionSnapshot()));
     persistSessionFiles(sessionFileRecordsFromDraft()).catch(() => {});
@@ -3745,15 +3764,19 @@ function renderHeaderLogoPreview() {
   elements.headerLogoPreview.innerHTML = "<span>No logo loaded</span>";
 }
 
-function renderPresetOptions() {
+function renderPresetOptions(options = {}) {
+  const preserveSelection = options.preserveSelection === true;
   const builtInPresets = selectableTemplateProfilePresets();
   const savedPresets = companyProfilePresets();
   const availableValues = availablePresetValues();
-  const selectedValue = [
-    state.selectedPresetValue,
-    elements.presetSelect.value,
-    lastSelectedPresetValue(),
-  ].find((value) => value && availableValues.has(value)) || "";
+  const requestedValue = String(state.selectedPresetValue || "").trim();
+  const selectedValue = preserveSelection
+    ? requestedValue
+    : [
+      requestedValue,
+      elements.presetSelect.value,
+      lastSelectedPresetValue(),
+    ].find((value) => value && availableValues.has(value)) || "";
   const builtInOptions = builtInPresets
     .map((preset) => `<option value="${escapeHtml(profilePresetOptionValue(preset.id))}">${escapeHtml(preset.name)}</option>`)
     .join("");
@@ -4347,6 +4370,8 @@ async function startNewQuote() {
 function resetCurrentQuoteDraftState() {
   clearQuoteSessionDraftSaveTimer();
   transitionGenerationContext("", "");
+  state.pricingSelectionMode = NEW_QUOTE_DEFAULT_SELECTION;
+  state.authorityRefreshSequence += 1;
   state.quoteSessionDraftSaveStarted = false;
   clearRestoredQuoteSessionBaseline();
   resetQuoteCommercialTouched();
@@ -4692,9 +4717,19 @@ function requestPresetImport(event) {
 }
 
 function renderProfileOptions() {
+  const options = arguments[0] || {};
+  const preserveSelection = options.preserveSelection === true
+    || state.pricingSelectionMode === "recovered_quote_authoritative_selection";
   if (!elements.profileSelect) return;
   const references = sortedPricingReferencesForDisplay(state.pricingReferences);
-  const selectedValue = currentPricingReference() ? pricingReferenceSelectValue(currentPricingReference()) : "";
+  const currentReference = currentPricingReference();
+  const preservedReferenceId = String(state.pricingReferenceId || "").trim();
+  const preservedReferenceSource = String(state.pricingReferenceSource || "").trim();
+  const selectedValue = currentReference
+    ? pricingReferenceSelectValue(currentReference)
+    : preserveSelection && preservedReferenceId && pricingReferenceSourceIsValid(preservedReferenceSource)
+      ? `${preservedReferenceSource}::${preservedReferenceId}`
+      : "";
   const referenceOption = (reference) => {
     const referenceId = String(reference.id || "").trim();
     return `<option value="${escapeHtml(pricingReferenceSelectValue(reference))}">${escapeHtml(reference.label || referenceId)}</option>`;
@@ -4702,11 +4737,13 @@ function renderProfileOptions() {
   elements.profileSelect.innerHTML = references.length
     ? references.map(referenceOption).join("")
     : `<option value="">${escapeHtml(MISSING_PRICING_REFERENCES_MESSAGE)}</option>`;
-  const preferredReference = currentPricingReference() || lastSelectedPricingReference() || defaultPricingReference() || references[0] || null;
+  const preferredReference = preserveSelection
+    ? currentReference
+    : currentReference || lastSelectedPricingReference() || defaultPricingReference() || references[0] || null;
   if (preferredReference) {
     state.pricingReferenceId = preferredReference.id || "";
     state.pricingReferenceSource = pricingReferenceSelectionFromValue(pricingReferenceSelectValue(preferredReference)).source;
-  } else {
+  } else if (!preserveSelection) {
     state.pricingReferenceId = "";
     state.pricingReferenceSource = "";
   }
@@ -10167,6 +10204,156 @@ async function getJson(url, options = {}) {
   return { ok: response.ok, data };
 }
 
+const QUOTE_AUTHORITY_BLOCKED_MESSAGE = "Saved quote generation authority is unavailable. No quote or output data was changed.";
+
+function quoteAuthoritySelectionSnapshot(options = {}) {
+  const pendingPricing = options.pendingPricing === true;
+  const pendingSelection = pendingPricing ? pendingPricingReferenceSelection() : null;
+  const selectedPresetValue = String(selectedPresetId() || "").trim();
+  const companyProfileId = selectedPresetValue.startsWith(COMPANY_PROFILE_PRESET_PREFIX)
+    ? selectedPresetValue.slice(COMPANY_PROFILE_PRESET_PREFIX.length).trim()
+    : "";
+  const currentPricingReferenceId = String(state.pricingReferenceId || "").trim();
+  const currentPricingReferenceSource = String(state.pricingReferenceSource || "").trim();
+  const profileSelectValue = String(elements.profileSelect?.value || "");
+  return {
+    sequence: (Number(state.authorityRefreshSequence) || 0) + 1,
+    selectionMode: String(state.pricingSelectionMode || "").trim(),
+    sessionId: safeQuoteSessionId(state.quoteSessionId || ""),
+    profileId: String(state.profileId || "").trim(),
+    selectedPresetValue,
+    companyProfileId,
+    pricingReferenceId: String(
+      pendingPricing ? pendingSelection?.pricingReferenceId : state.pricingReferenceId,
+    ).trim(),
+    pricingReferenceSource: String(
+      pendingPricing ? pendingSelection?.source : state.pricingReferenceSource,
+    ).trim(),
+    currentPricingReferenceId,
+    currentPricingReferenceSource,
+    pendingPricing,
+    profileSelectValue,
+  };
+}
+
+function quoteAuthoritySelectionIsCurrent(selection = {}) {
+  const profileSelectValue = String(elements.profileSelect?.value || "");
+  const currentPricingReferenceId = String(state.pricingReferenceId || "").trim();
+  const currentPricingReferenceSource = String(state.pricingReferenceSource || "").trim();
+  return Number(state.authorityRefreshSequence) === Number(selection.sequence)
+    && safeQuoteSessionId(state.quoteSessionId || "") === selection.sessionId
+    && String(state.profileId || "").trim() === selection.profileId
+    && String(state.pricingSelectionMode || "").trim() === selection.selectionMode
+    && String(selectedPresetId() || "").trim() === selection.selectedPresetValue
+    && currentPricingReferenceId === String(
+      selection.currentPricingReferenceId ?? selection.pricingReferenceId,
+    ).trim()
+    && currentPricingReferenceSource === String(
+      selection.currentPricingReferenceSource ?? selection.pricingReferenceSource,
+    ).trim()
+    && profileSelectValue === String(
+      selection.profileSelectValue ?? (selection.pendingPricing ? selection.pendingSelectionValue : ""),
+    );
+}
+
+function quoteAuthorityErrorMessage(data = {}) {
+  const errors = Array.isArray(data?.errors) ? data.errors.map((value) => String(value || "").trim()).filter(Boolean) : [];
+  return errors[0] || genericFailureMessage(data) || QUOTE_AUTHORITY_BLOCKED_MESSAGE;
+}
+
+function quoteAuthorityProfileResponseId(profile = {}) {
+  return String(profile?.id || "").trim();
+}
+
+function quoteAuthorityPricingResponseKey(reference = {}) {
+  const id = String(reference?.id || "").trim();
+  const source = String(reference?.source || "").trim();
+  return id && pricingReferenceSourceIsValid(source) ? `${source}::${id}` : "";
+}
+
+function replacePricingReferenceState(reference = {}) {
+  const key = quoteAuthorityPricingResponseKey(reference);
+  if (!key) return;
+  const existing = state.pricingReferences.find((item) => pricingReferenceSelectValue(item) === key);
+  state.pricingReferences = mergePricingReferences([
+    ...state.pricingReferences.filter((item) => pricingReferenceSelectValue(item) !== key),
+    existing ? { ...existing, ...reference } : reference,
+  ]);
+}
+
+function replaceCompanyProfileState(profile = {}) {
+  const profileId = quoteAuthorityProfileResponseId(profile);
+  if (!profileId) return;
+  const normalized = normalizeCompanyProfile(profile);
+  state.companyProfiles = [
+    ...state.companyProfiles.filter((item) => String(item?.id || "").trim() !== profileId),
+    normalized,
+  ].sort((left, right) => String(left.label || left.id || "").localeCompare(String(right.label || right.id || ""), undefined, { sensitivity: "base" }));
+}
+
+async function refreshSelectedQuoteAuthority(options = {}) {
+  const selection = quoteAuthoritySelectionSnapshot(options);
+  state.authorityRefreshSequence = selection.sequence;
+  const pricingReferenceId = selection.pricingReferenceId;
+  const pricingReferenceSource = selection.pricingReferenceSource;
+  if (!pricingReferenceId || !pricingReferenceSource) {
+    showBlockedAction(QUOTE_AUTHORITY_BLOCKED_MESSAGE, { details: false });
+    return false;
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(pricingReferenceId) || !pricingReferenceSourceIsValid(pricingReferenceSource)) {
+    showBlockedAction(QUOTE_AUTHORITY_BLOCKED_MESSAGE, { details: false });
+    return false;
+  }
+  if (selection.selectedPresetValue.startsWith(COMPANY_PROFILE_PRESET_PREFIX) && !selection.companyProfileId) {
+    showBlockedAction(QUOTE_AUTHORITY_BLOCKED_MESSAGE, { details: false });
+    return false;
+  }
+  if (selection.companyProfileId && !/^[A-Za-z0-9_-]+$/.test(selection.companyProfileId)) {
+    showBlockedAction(QUOTE_AUTHORITY_BLOCKED_MESSAGE, { details: false });
+    return false;
+  }
+
+  const query = new URLSearchParams({
+    company_profile_id: selection.companyProfileId,
+    pricing_reference_id: pricingReferenceId,
+    source: pricingReferenceSource,
+  });
+  const { ok, data } = await getJson(`/api/quote-authority?${query.toString()}`);
+  if (!quoteAuthoritySelectionIsCurrent(selection)) return false;
+  if (!ok) {
+    showBlockedAction(quoteAuthorityErrorMessage(data), { details: false });
+    return false;
+  }
+
+  const authority = data?.authority && typeof data.authority === "object" ? data.authority : null;
+  const companyProfile = authority?.company_profile && typeof authority.company_profile === "object"
+    ? authority.company_profile
+    : null;
+  const pricingReference = authority?.pricing_reference && typeof authority.pricing_reference === "object"
+    ? authority.pricing_reference
+    : null;
+  if (
+    !authority
+    || !pricingReference
+    || String(pricingReference.id || "").trim() !== pricingReferenceId
+    || String(pricingReference.source || "").trim() !== pricingReferenceSource
+    || (selection.companyProfileId && quoteAuthorityProfileResponseId(companyProfile) !== selection.companyProfileId)
+    || (!selection.companyProfileId && companyProfile)
+  ) {
+    showBlockedAction(QUOTE_AUTHORITY_BLOCKED_MESSAGE, { details: false });
+    return false;
+  }
+
+  if (selection.companyProfileId) replaceCompanyProfileState(companyProfile);
+  replacePricingReferenceState(pricingReference);
+  renderProfileOptions({ preserveSelection: true });
+  if (selection.pendingPricing && elements.profileSelect) {
+    elements.profileSelect.value = selection.profileSelectValue;
+  }
+  renderPresetOptions({ preserveSelection: true });
+  return true;
+}
+
 function dashboardNumberOrNull(value) {
   if (value === null || value === undefined || value === "") return null;
   const number = Number(String(value).replaceAll(",", "").trim());
@@ -12444,6 +12631,7 @@ async function confirmBasis(options = {}) {
     if (options.resume === true) clearActiveJob();
     return;
   }
+  if (!await refreshSelectedQuoteAuthority()) return;
   const restoredOperation = options.resume === true ? normalizeActiveJob(options.operation || state.activeJob || {}, { restoring: true }) : null;
   const operation = restoredOperation?.type === "confirm_basis" ? restoredOperation : normalizeActiveJob({
     id: newClientOperationId(),
@@ -12526,6 +12714,8 @@ async function confirmBasis(options = {}) {
 
 async function handleGenerate(options = {}) {
   if (state.isGenerating) return;
+  if (!await refreshSelectedQuoteAuthority()) return false;
+  commitActiveOutputEditor();
   const viewPdf = options.viewPdf === true;
   if (state.activeSidePanel === "output") {
     const validation = outputRowsValid();
@@ -12674,10 +12864,17 @@ async function handleGenerate(options = {}) {
   return viewPdf ? Boolean(state.pdfFile) : Boolean(state.downloadFile);
 }
 
-async function ensureSavedServerJobStarted(activeJob) {
+async function ensureSavedServerJobStarted(activeJob, options = {}) {
   if (activeJob.phase !== "starting") return { ok: true, data: { job_id: activeJob.id } };
   const isDraft = activeJob.type === "draft";
   const viewPdf = activeJob.type === "generate_pdf" || activeJob.viewPdf === true;
+  if (!isDraft && options.authorityValidated !== true && !await refreshSelectedQuoteAuthority()) {
+    return {
+      ok: false,
+      authorityBlocked: true,
+      data: { status: "blocked", errors: [QUOTE_AUTHORITY_BLOCKED_MESSAGE] },
+    };
+  }
   const synchronizedSessionId = await ensureQuoteSession({
     quoteGenerated: !isDraft,
     synchronizeDraft: true,
@@ -12818,6 +13015,7 @@ async function resumeSavedJob() {
 
   if (activeJob.type === "generate" || activeJob.type === "generate_pdf") {
     const viewPdf = activeJob.viewPdf === true || activeJob.type === "generate_pdf";
+    if (!await refreshSelectedQuoteAuthority()) return;
     state.isGenerating = true;
     state.isAnalysisRunning = false;
     setWorkflowStage("generating");
@@ -12825,10 +13023,18 @@ async function resumeSavedJob() {
     setSidePanel("output", { force: true });
     showExcelGeneratingModal(generationLoadingModalOptions(viewPdf));
     syncControlStates();
-    const restarted = await ensureSavedServerJobStarted(activeJob);
+    const restarted = await ensureSavedServerJobStarted(activeJob, { authorityValidated: true });
     if (!restarted.ok) {
       if (restarted.data?.page_unloading) return;
       state.isGenerating = false;
+      if (restarted.authorityBlocked) {
+        hideExcelGeneratingModal();
+        setWorkflowStage("completed");
+        setResultStatus("Generation blocked", "is-bad");
+        renderMessages(restarted.data.errors || [QUOTE_AUTHORITY_BLOCKED_MESSAGE], "error");
+        syncControlStates();
+        return;
+      }
       clearActiveJob();
       hideExcelGeneratingModal();
       setWorkflowStage("completed");
@@ -13156,7 +13362,10 @@ async function goToNextSidePanel(options = {}) {
     return;
   }
   if (state.activeSidePanel === "output") return;
-  if (state.activeSidePanel === "customer") applyPendingPricingReferenceSelection();
+  if (state.activeSidePanel === "customer") {
+    if (!await refreshSelectedQuoteAuthority({ pendingPricing: true })) return;
+    applyPendingPricingReferenceSelection();
+  }
   const nextPanel = SIDE_PANEL_SEQUENCE[index + 1];
   const moved = setSidePanel(nextPanel, { notify: true });
   if (moved && nextPanel === "customer") {
@@ -13362,7 +13571,6 @@ function wireEvents() {
       if (!validation.valid) renderOutputValidationMessages(validation.errors);
       return;
     }
-    commitActiveOutputEditor();
     showExcelGeneratingModal(generationLoadingModalOptions(false));
     await waitForUiPaint();
     try {
@@ -13379,7 +13587,6 @@ function wireEvents() {
       if (!validation.valid) renderOutputValidationMessages(validation.errors);
       return;
     }
-    commitActiveOutputEditor();
     showExcelGeneratingModal(generationLoadingModalOptions(true));
     await waitForUiPaint();
     try {
