@@ -18274,6 +18274,91 @@ eval([
         self.assertNotIn("reason", storage_failure["body"])
         self.assertEqual(before_reads, after_reads)
 
+    def test_quote_generation_http_export_matrix_preserves_role_and_exact_payload(self):
+        root = Path(tempfile.mkdtemp(prefix="sqag-quote-export-matrix-", dir=str(ROOT / "_tmp" / "tests")))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        database_url = f"sqlite:///{(root / 'sqag.sqlite3').as_posix()}"
+        env = self.platform_launch_env(
+            SQAG_STORAGE_MODE="database",
+            SQAG_ARTIFACT_STORAGE_MODE="local",
+            SQAG_DATABASE_URL=database_url,
+            QUOTE_DATA_ROOT=str(root / "data"),
+            QUOTE_LOG_ROOT=str(root / "logs"),
+        )
+        admin_session = self.platform_auth_session(
+            "workspace-export-matrix", membership_role="admin", user_id="matrix-admin"
+        )
+        operator_session = self.platform_auth_session(
+            "workspace-export-matrix", membership_role="operator", user_id="matrix-operator"
+        )
+
+        def cookie(session):
+            return f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(session)}"
+
+        matrix = [
+            ("admin-company-xlsx", admin_session, "saved-company", "generate", False),
+            ("admin-company-pdf", admin_session, "saved-company", "generate_pdf", True),
+            ("operator-company-xlsx", operator_session, "saved-company", "generate", False),
+            ("operator-company-pdf", operator_session, "saved-company", "generate_pdf", True),
+            ("operator-template-xlsx", operator_session, "synthetic-template", "generate", False),
+            ("operator-template-pdf", operator_session, "synthetic-template", "generate_pdf", True),
+        ]
+        captured: list[dict[str, Any]] = []
+
+        def fake_create_job(job_type, payload, **kwargs):
+            captured.append({
+                "type": job_type,
+                "payload": payload,
+                "auth_session": kwargs.get("auth_session"),
+            })
+            return {"job_id": f"matrix-job-{len(captured)}", "status": "queued", "type": job_type}
+
+        with mock.patch.dict(os.environ, env, clear=True):
+            webapp.apply_sqag_storage_migrations(database_url)
+            with (
+                mock.patch.object(webapp, "validated_platform_auth_session", side_effect=lambda session: session),
+                mock.patch.object(webapp, "create_job", side_effect=fake_create_job),
+                LocalRunnerServer() as runner,
+            ):
+                session_bodies = {}
+                for session_name, session, _profile_id, _job_type, _view_pdf in matrix:
+                    if session_name.split("-", 1)[0] not in session_bodies:
+                        response = self.http_json(runner, "GET", "/api/session", cookie=cookie(session))
+                        self.assertEqual(response["status"], 200, response)
+                        session_bodies[session_name.split("-", 1)[0]] = response["body"]
+                for session_name, session, profile_id, job_type, view_pdf in matrix:
+                    role = session_name.split("-", 1)[0]
+                    session_body = session_bodies[role]
+                    payload = {
+                        "profile_id": profile_id,
+                        "pricing_reference_id": "saved-pricing",
+                        "pricing_reference": {"id": "saved-pricing", "source": "company"},
+                        "quote_session": {"session_id": f"quote-{role}-matrix"},
+                        "view_pdf": view_pdf,
+                    }
+                    response = self.http_json(
+                        runner,
+                        "POST",
+                        "/api/jobs",
+                        cookie=cookie(session),
+                        body={"type": job_type, "payload": payload},
+                        headers={session_body["csrf_header"]: session_body["csrf_token"]},
+                    )
+                    self.assertEqual(response["status"], 202, (session_name, response))
+                    self.assertEqual(response["body"]["status"], "queued")
+                    request = captured[-1]
+                    self.assertEqual(request["type"], job_type)
+                    self.assertEqual(request["payload"]["profile_id"], profile_id)
+                    self.assertEqual(request["payload"]["pricing_reference_id"], "saved-pricing")
+                    self.assertEqual(request["payload"]["pricing_reference"]["source"], "company")
+                    self.assertIs(request["payload"]["view_pdf"], view_pdf)
+                    self.assertEqual(
+                        webapp.permissions_for_auth_session(request["auth_session"])["role"],
+                        "admin" if role == "admin" else "operator",
+                    )
+
+        self.assertEqual(len(captured), len(matrix))
+
     def test_quote_generation_authority_rejects_ambiguous_or_mismatched_records(self):
         storage = mock.Mock()
         storage.list_company_profiles.return_value = [
