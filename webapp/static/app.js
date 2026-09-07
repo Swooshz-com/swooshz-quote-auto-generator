@@ -2492,7 +2492,7 @@ function applyPricingReferenceCommercialDefaults() {
   syncQuoteExchangeRateField();
 }
 
-function resetQuoteCommercialFieldsToSelectedPricingReference() {
+function resetQuoteCommercialFieldsToSelectedPricingReference(options = {}) {
   const tax = selectedPricingReferenceTax();
   const currency = selectedPricingReferenceCurrency();
   const reference = currentPricingReference();
@@ -2503,31 +2503,38 @@ function resetQuoteCommercialFieldsToSelectedPricingReference() {
   setInputValue(elements.quoteExchangeRate, "1");
   setInputValue(elements.quoteTaxLabel, normalizeTaxLabel(tax.label || DEFAULT_TAX_LABEL));
   setInputValue(elements.quoteTaxRate, taxRatePercentText(tax.rate ?? DEFAULT_TAX_RATE));
-  state.quoteCommercialLifecycle = "EXISTING";
-  state.quoteCommercialPreservedQuoteText = {};
-  state.quoteCommercialSnapshot = {
-    schema: "swooshz.quote-commercial-snapshot.v1",
-    version: 1,
-    owner: "quote",
-    lifecycle: "EXISTING",
-    origin: "explicit_initialization",
-    presence: [
-      "currency", "exchange_rate", "tax", "company_name", "header_details", "logo",
-      "terms_heading", "payment_terms", "notes_heading", "standard_notes", "acceptance_text",
-      "person_label", "stamp_label", "date_label", "company_signatory", "company_title",
-      "company_date_label", "rich_text",
-    ].reduce((presence, key) => {
-      presence[key] = "captured";
-      return presence;
-    }, {}),
-    pricing_basis: {
-      currency,
-      source: String(reference?.source || state.pricingReferenceSource || "").trim(),
-      id: String(reference?.id || state.pricingReferenceId || "").trim(),
-      digest: String(reference?.digest_sha256 || reference?.reference_digest || reference?.content_fingerprint || "").trim(),
-    },
-  };
-  state.quoteCommercialRecoveryError = "";
+  const markOwned = options.markOwned === true
+    || ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+  if (!markOwned) {
+    state.quoteCommercialSnapshot = null;
+    state.quoteCommercialRecoveryError = "";
+  } else {
+    state.quoteCommercialLifecycle = "EXISTING";
+    state.quoteCommercialPreservedQuoteText = {};
+    state.quoteCommercialSnapshot = {
+      schema: "swooshz.quote-commercial-snapshot.v1",
+      version: 1,
+      owner: "quote",
+      lifecycle: "EXISTING",
+      origin: "explicit_initialization",
+      presence: [
+        "currency", "exchange_rate", "tax", "company_name", "header_details", "logo",
+        "terms_heading", "payment_terms", "notes_heading", "standard_notes", "acceptance_text",
+        "person_label", "stamp_label", "date_label", "company_signatory", "company_title",
+        "company_date_label", "rich_text",
+      ].reduce((presence, key) => {
+        presence[key] = "captured";
+        return presence;
+      }, {}),
+      pricing_basis: {
+        currency,
+        source: String(reference?.source || state.pricingReferenceSource || "").trim(),
+        id: String(reference?.id || state.pricingReferenceId || "").trim(),
+        digest: String(reference?.digest_sha256 || reference?.reference_digest || reference?.content_fingerprint || "").trim(),
+      },
+    };
+    state.quoteCommercialRecoveryError = "";
+  }
   syncQuoteExchangeRateField();
   syncQuoteCommercialContextPills();
   updateOutputHeader();
@@ -4488,7 +4495,7 @@ function loadSelectedPreset(options = {}) {
   state.selectedPresetValue = elements.presetSelect.value || presetOptionValue(preset);
   persistLastProfilePresetSelection(state.selectedPresetValue);
   clearPendingProfilePack();
-  const shouldPreserveExistingQuoteState = options.silent === true && (
+  const shouldPreserveExistingQuoteState = options.silent === true && options.allowOwnedInitialization !== true && (
     state.quoteCommercialLifecycle === "EXISTING"
     ||
     state.quoteCommercialLifecycle === "RECOVERED"
@@ -4575,7 +4582,7 @@ function clearCustomerDetails() {
   setInputValue(elements.quoteDate, todayDateInputValue());
   applyQuoteDateFormatFromHtml("");
   setInputValue(elements.projectNumber, "");
-  resetQuoteCommercialFieldsToSelectedPricingReference();
+  resetQuoteCommercialFieldsToSelectedPricingReference({ markOwned: true });
   clearGeneratedQuoteState();
   renderProfileOptions();
   setWorkflowStage(state.images.length ? "ready_to_analyze" : "needs_images");
@@ -4605,7 +4612,7 @@ function clearQuoteCompanyDetails() {
   hideProfileNameModal({ force: true });
   updatePresetButtons();
   renderHeaderLogoPreview();
-  loadDefaultProfilePreset({ silent: true, preferLastSelection: false });
+  loadDefaultProfilePreset({ silent: true, preferLastSelection: false, allowOwnedInitialization: true });
   invalidateGeneratedExportsIfPresentationChanged(presentationBeforeClear);
   syncControlStates();
   if (quoteSessionDraftStateCanSave()) {
@@ -13402,7 +13409,7 @@ function setSidePanel(panelName, options = {}) {
     && !["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""))
     && !QUOTE_COMMERCIAL_FIELD_KEYS.some((field) => quoteCommercialFieldIsTouched(field))
   ) {
-    resetQuoteCommercialFieldsToSelectedPricingReference();
+    resetQuoteCommercialFieldsToSelectedPricingReference({ markOwned: true });
   }
   document.body.dataset.sidePanel = state.activeSidePanel;
   elements.sideDrawerTitle.textContent = title;

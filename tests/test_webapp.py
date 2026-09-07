@@ -13975,7 +13975,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertNotIn(".quote-details-clear-button", css)
         self.assertIn("loadDefaultProfilePreset", js)
         self.assertIn("loadDefaultProfilePreset({ silent: true })", js)
-        self.assertIn("loadDefaultProfilePreset({ silent: true, preferLastSelection: false })", js)
+        self.assertIn("loadDefaultProfilePreset({ silent: true, preferLastSelection: false, allowOwnedInitialization: true })", js)
         self.assertIn("function resetImagesDraft", js)
         self.assertIn("state.images = [];", js)
         self.assertIn('id="savePresetButton"', html)
