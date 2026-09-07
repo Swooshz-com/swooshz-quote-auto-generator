@@ -520,16 +520,21 @@ async function verifySavedSelectionAuthorityRecovery(page) {
   let mode = "valid", price = 73, writes = 0, normalizations = 0;
   const jobs = new Map();
   const payloads = [];
+  let expectedProfileId = "authority-profile";
   const reply = (route, data) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(data) });
   const priorFiles = ["xlsx", "pdf"].map((kind) => ({ name: `quotation.${kind}`, url: `/api/quote-sessions/${sessionId}/files/quotation.${kind}` }));
   const exports = Object.fromEntries(priorFiles.map((file) => [file.name.endsWith("pdf") ? "pdf" : "xlsx", { ...file, exists: true }]));
   let saved = { session_id: sessionId, exports, has_draft_state: true, status: { quote_generated: true }, customer_summary: {customer_name: "Authority Synthetic Client", project_name: "Authority Synthetic Quote"} };
-  const patterns = ["**/api/settings/profiles", "**/api/settings/pricing-references/authority-shared-id*", "**/api/quote-sessions", `**/api/quote-sessions/${sessionId}`, "**/api/jobs", "**/api/jobs/job-authority-*", "**/api/line-items/normalize"];
-  await page.route(patterns[0], async (route) => {
+  const patterns = ["**/api/settings/profiles", "**/api/quote-authority?company_profile_id=*&pricing_reference_id=authority-shared-id&source=*", "**/api/quote-sessions", `**/api/quote-sessions/${sessionId}`, "**/api/jobs", "**/api/jobs/job-authority-*", "**/api/line-items/normalize"];
+  await page.route(patterns[0], route => reply(route, {company_profiles: []}));
+  await page.route(patterns[1], async (route) => {
     if (mode === "transport") return route.abort("failed");
-    return reply(route, {company_profiles: mode === "empty" ? [] : [{id: "authority-profile", label: "Authority Synthetic Profile", defaults: companyDefaults}]});
+    const companyId = new URL(route.request().url()).searchParams.get("company_profile_id");
+    return reply(route, {
+      company_profile: companyId && mode !== "empty" ? {id: mode === "wrong-company" ? "other-profile" : companyId, label: "Authority Synthetic Profile", defaults: companyDefaults} : null,
+      pricing_reference: mode === "missing-pricing" ? null : {id: "authority-shared-id", source: mode === "wrong-source" ? "bundled" : "company", label: "Authority Synthetic Pricing", currency: "SGD", tax: {label: "GST", rate: 0.09}, amount: price},
+    });
   });
-  await page.route(patterns[1], route => reply(route, {pricing_reference: {id: "authority-shared-id", source: mode === "wrong-source" ? "bundled" : "company", label: "Authority Synthetic Pricing", currency: "SGD", tax: {label: "GST", rate: 0.09}, amount: price}}));
   await page.route(patterns[2], async (route) => {
     if (route.request().method() === "POST") {
       writes++;
@@ -542,7 +547,7 @@ async function verifySavedSelectionAuthorityRecovery(page) {
   await page.route(patterns[4], async (route) => {
     const request = route.request().postDataJSON();
     payloads.push(request.payload);
-    if (request.payload.profile_id !== "authority-profile" || request.payload.pricing_reference.id !== "authority-shared-id" || request.payload.pricing_reference.source !== "company") throw new Error("Generation crossed selected authority namespaces.");
+    if (request.payload.profile_id !== expectedProfileId || request.payload.pricing_reference.id !== "authority-shared-id" || request.payload.pricing_reference.source !== "company") throw new Error("Generation crossed selected authority namespaces: " + JSON.stringify({expectedProfileId, profile: request.payload.profile_id, pricingId: request.payload.pricing_reference.id, pricingSource: request.payload.pricing_reference.source, count: payloads.length}));
     const id = `job-authority-${payloads.length}`;
     jobs.set(id, request.type);
     return reply(route, {job_id: id, status: "running", type: request.type});
@@ -584,7 +589,7 @@ async function verifySavedSelectionAuthorityRecovery(page) {
     await page.reload({waitUntil: "domcontentloaded"});
     await page.waitForFunction(() => currentPricingReference()?.amount === 73 && !appIsBusy());
     if (await snapshot() !== before) throw new Error("Boot recovery changed quote identity/content/exports.");
-    for (mode of ["empty", "transport", "wrong-source"]) {
+    for (mode of ["empty", "transport", "wrong-source", "wrong-company", "missing-pricing"]) {
       const priorWrites = writes, priorJobs = payloads.length, priorNormalizations = normalizations;
       const retained = await snapshot();
       await page.evaluate(async () => {
@@ -614,9 +619,26 @@ async function verifySavedSelectionAuthorityRecovery(page) {
       if (!await handleGenerate({viewPdf: true})) throw new Error("Exact-authority PDF generation failed.");
     });
     if (payloads.length !== 2 || !normalizations || !saved.draft_state.downloadFile || !saved.draft_state.pdfFile) throw new Error("Successful exports were not persisted by the synthetic session adapter.");
+    const adminPermissions = await page.evaluate(() => ({...state.permissions}));
+    await page.evaluate(async () => {
+      state.permissions = {...state.permissions, role: "operator", canGenerateQuote: true, canManageSettings: false, canManageProfiles: false, canManagePricingReferences: false, canImportPricingReferences: false};
+      if (!await handleGenerate() || !await handleGenerate({viewPdf: true})) throw new Error("Operator saved-profile exports failed.");
+      if (canManageProfiles() || canManagePricingReferences()) throw new Error("Export granted management permissions.");
+    });
+    expectedProfileId = "synthetic-exhibition-fixture-template";
+    await page.evaluate(async () => {
+      const profile = state.profiles.find(item => item.id === "synthetic-exhibition-fixture-template");
+      profile.quote_detail_presets = [{id: "operator-template", name: "Synthetic operator template", details: collectQuoteCompanyProfileDetails()}];
+      state.selectedPresetValue = profilePresetOptionValue("operator-template");
+      state.profileId = profile.id;
+      renderPresetOptions();
+      if (!await handleGenerate() || !await handleGenerate({viewPdf: true})) throw new Error("Operator template exports failed.");
+    });
+    if (payloads.length !== 6) throw new Error("Admin/operator company and operator template export matrix incomplete.");
+    await page.evaluate(permissions => { state.permissions = permissions; }, adminPermissions);
     await page.evaluate(async (id) => { await modifyDashboardQuote(id); showDashboard({load: false}); state.dashboardActiveSessionId = id; renderQuoteDashboard(); }, sessionId);
     if (await page.locator('.dashboard-export-link[aria-label="Download XLSX"]').count() !== 1 || await page.locator('.dashboard-export-link[aria-label="Download PDF"]').count() !== 1) throw new Error("Reopened exports are unavailable on Dashboard.");
-    console.log(JSON.stringify({savedSelectionAuthority: "passed", blockedModes: ["empty", "transport", "wrong-source"], exactGenerationJobs: payloads.length, persistence: "synthetic session endpoint adapter"}));
+    console.log(JSON.stringify({savedSelectionAuthority: "passed", blockedModes: ["empty", "transport", "wrong-source", "wrong-company", "missing-pricing"], roleMatrix: ["admin/company", "operator/company", "operator/template"], exactGenerationJobs: payloads.length, persistence: "synthetic session endpoint adapter"}));
   } finally {
     for (const pattern of patterns) await page.unroute(pattern);
   }
@@ -1219,7 +1241,7 @@ async function verifyExpiredQuoteJobsDoNotResume(page) {
 
 async function verifyPricingReferenceSelectionCommitsOnCustomerNext(page) {
   const pendingValue = "local::pending-refresh-reference";
-  await page.route("**/api/settings/pricing-references/pending-refresh-reference?source=local", async (route) => {
+  await page.route("**/api/quote-authority?company_profile_id=*&pricing_reference_id=pending-refresh-reference&source=local", async (route) => {
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ pricing_reference: {
       id: "pending-refresh-reference", source: "local", label: "Pending Refresh Reference",
       currency: "USD", tax: { label: "VAT", rate: 0.2 },
@@ -1420,7 +1442,7 @@ async function verifyPricingReferenceSelectionCommitsOnCustomerNext(page) {
   }
 }
 async function installMockProfiles(page) {
-  await page.route("**/api/settings/pricing-references/synthetic-exhibition-fixture-pricing**", async (route) => {
+  const pricingDetail = async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -1446,7 +1468,9 @@ async function installMockProfiles(page) {
         },
       }),
     });
-  });
+  };
+  await page.route("**/api/settings/pricing-references/synthetic-exhibition-fixture-pricing**", pricingDetail);
+  await page.route("**/api/quote-authority?company_profile_id=*&pricing_reference_id=synthetic-exhibition-fixture-pricing&source=*", pricingDetail);
   await page.route("**/api/profiles", async (route) => {
     await route.fulfill({
       status: 200,

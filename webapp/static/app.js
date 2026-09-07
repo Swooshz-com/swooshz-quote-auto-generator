@@ -6901,22 +6901,17 @@ async function refreshSelectedQuoteAuthority(options = {}) {
     }
     return false;
   };
-  // Stage both reads before applying anything to the working quote.
-  let company = null;
-  if (token.startsWith(COMPANY_PROFILE_PRESET_PREFIX)) {
-    const id = token.slice(COMPANY_PROFILE_PRESET_PREFIX.length);
-    const result = await getJson("/api/settings/profiles", { logFetchFailure: false });
-    if (!isCurrent()) return false;
-    company = result.ok && Array.isArray(result.data?.company_profiles)
-      ? result.data.company_profiles.find((profile) => profile.id === id) : null;
-    if (!id || !company) return blocked();
-  }
+  // Resolve both exact selections before applying anything to the working quote.
+  const companyId = token.startsWith(COMPANY_PROFILE_PRESET_PREFIX)
+    ? token.slice(COMPANY_PROFILE_PRESET_PREFIX.length) : "";
   const { pricingReferenceId: id, source } = selection;
-  if (!id || !source) return blocked();
-  const result = await getJson(`/api/settings/pricing-references/${encodeURIComponent(id)}?source=${encodeURIComponent(source)}`, { logFetchFailure: false });
+  if (!id || !source || (token.startsWith(COMPANY_PROFILE_PRESET_PREFIX) && !companyId)) return blocked();
+  const result = await getJson(`/api/quote-authority?company_profile_id=${encodeURIComponent(companyId)}&pricing_reference_id=${encodeURIComponent(id)}&source=${encodeURIComponent(source)}`, { logFetchFailure: false });
   if (!isCurrent()) return false;
+  const company = result.data?.company_profile;
   const pricing = result.data?.pricing_reference;
-  if (!result.ok || pricing?.id !== id || pricing?.source !== source) return blocked();
+  if (!result.ok || (companyId ? company?.id !== companyId : company != null)
+    || pricing?.id !== id || pricing?.source !== source) return blocked();
   if (company) {
     state.companyProfiles = [...state.companyProfiles.filter((profile) => profile.id !== company.id), company];
     const defaults = company.defaults || {};

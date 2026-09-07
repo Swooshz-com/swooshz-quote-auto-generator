@@ -23765,6 +23765,42 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 "workspace": workspace,
             })
             return
+        if path == "/api/quote-authority":
+            allowed, error = self.require_permission("canGenerateQuote")
+            if not allowed:
+                self.send_json(error, status=403)
+                return
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            fields = {"company_profile_id", "pricing_reference_id", "source"}
+            if set(query) != fields or any(len(values) != 1 for values in query.values()):
+                self.send_json({"error": "Invalid selection"}, status=400)
+                return
+            company_id, pricing_id, source = (query[field][0] for field in ("company_profile_id", "pricing_reference_id", "source"))
+            if (company_id and not re.fullmatch(r"[A-Za-z0-9_-]+", company_id)) or not re.fullmatch(r"[A-Za-z0-9_-]+", pricing_id) or source not in {"company", "local", "bundled"}:
+                self.send_json({"error": "Invalid selection"}, status=400)
+                return
+            storage = self.current_app_storage()
+            if storage is None:
+                return
+            try:
+                company = next((profile for profile in storage.list_company_profiles() if profile.get("id") == company_id), None) if company_id else None
+                pricing = storage.pricing_reference_detail(pricing_id, source=source)
+                if (company_id and company is None) or not pricing or pricing.get("id") != pricing_id or pricing.get("source") != source:
+                    self.send_json({"error": "Not found"}, status=404)
+                    return
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
+            except Exception as exc:
+                error_reference = new_error_reference()
+                write_local_log("quote_authority_read_failed", unexpected_error_log_details(error_reference, exc))
+                self.send_json(failed_result_payload(error_reference), status=500)
+                return
+            self.send_json({
+                "company_profile": {key: company[key] for key in ("id", "label", "defaults") if key in company} if company else None,
+                "pricing_reference": pricing,
+            })
+            return
         if path == "/api/settings":
             allowed, error = self.require_permission("canManageSettings")
             if not allowed:

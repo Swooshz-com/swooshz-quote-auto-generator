@@ -236,7 +236,7 @@ async function installMockJobs(page) {
   const jobs = new Map();
   let counter = 0;
 
-  await page.route("**/api/settings/pricing-references/synthetic-playwright-pricing?source=local", async (route) => {
+  await page.route("**/api/quote-authority?company_profile_id=*&pricing_reference_id=synthetic-playwright-pricing&source=local", async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/json",

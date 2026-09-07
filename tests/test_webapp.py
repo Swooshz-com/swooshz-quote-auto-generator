@@ -16837,8 +16837,8 @@ const c = {
   getJson: async (url) => {
     reads++;
     if (mode === 'transport') return {ok: false, data: {}};
-    if (url === '/api/settings/profiles') return {ok: true, data: {company_profiles: mode === 'empty' ? [] : [{id: 'saved-profile', defaults: {company: {name: 'Fresh synthetic company'}}}]}};
-    return {ok: true, data: {pricing_reference: {id: mode === 'wrong-id' ? 'other-id' : 'same-id', source: mode === 'wrong-source' ? 'bundled' : 'company', amount: 73}}};
+    assert.strictEqual(url, '/api/quote-authority?company_profile_id=saved-profile&pricing_reference_id=same-id&source=company');
+    return {ok: true, data: {company_profile: mode === 'empty' ? null : {id: mode === 'wrong-company' ? 'other-profile' : 'saved-profile', defaults: {company: {name: 'Fresh synthetic company'}}}, pricing_reference: mode === 'missing-pricing' ? null : {id: mode === 'wrong-id' ? 'other-id' : 'same-id', source: mode === 'wrong-source' ? 'bundled' : 'company', amount: 73}}};
   },
 };
 for (const name of ['commitActiveOutputEditor', 'ensureQuoteSession', 'startJob', 'refreshLineItemsFromServer', 'saveQuoteSessionDraftState', 'setDownloadFiles', 'clearActiveJob']) {
@@ -16848,7 +16848,7 @@ vm.createContext(c);
 vm.runInContext(['currentPricingReference', 'generationProfileIdForPayload', 'syncSelectedPricingReference', 'refreshSelectedQuoteAuthority', 'handleGenerate', 'confirmBasis', 'goToNextSidePanel', 'confirmQuoteDependencyChange', 'ensureSavedServerJobStarted', 'resumeSavedJob'].map(extract).join('\n'), c);
 const snapshot = () => JSON.stringify({...state, authorityRefreshSequence: 0});
 (async () => {
-  for (mode of ['empty', 'transport', 'wrong-source', 'wrong-id']) {
+  for (mode of ['empty', 'transport', 'wrong-source', 'wrong-id', 'wrong-company', 'missing-pricing']) {
     const before = snapshot();
     assert.strictEqual(c.generationProfileIdForPayload(), 'saved-profile');
     c.syncSelectedPricingReference();
@@ -16874,8 +16874,7 @@ const snapshot = () => JSON.stringify({...state, authorityRefreshSequence: 0});
   for (const field of ['pricingReferenceId', 'pricingReferenceSource']) {
     let releasePricing, pricingStarted;
     const started = new Promise(resolve => { pricingStarted = resolve; });
-    c.getJson = url => url === '/api/settings/profiles' ? originalGet(url)
-      : new Promise(resolve => { releasePricing = resolve; pricingStarted(); });
+    c.getJson = () => new Promise(resolve => { releasePricing = resolve; pricingStarted(); });
     const latePricing = c.refreshSelectedQuoteAuthority();
     await started;
     const previous = state[field]; state[field] = 'other-selection';
@@ -16891,7 +16890,7 @@ const snapshot = () => JSON.stringify({...state, authorityRefreshSequence: 0});
   const old = c.refreshSelectedQuoteAuthority();
   state.selectedPresetValue = 'company:new-selection';
   const beforeLate = snapshot();
-  release({ok: true, data: {company_profiles: [{id: 'saved-profile'}]}});
+  release({ok: true, data: {company_profile: {id: 'saved-profile'}}});
   assert.strictEqual(await old, false);
   assert.strictEqual(snapshot(), beforeLate);
   state.selectedPresetValue = 'company:saved-profile';
@@ -16899,7 +16898,7 @@ const snapshot = () => JSON.stringify({...state, authorityRefreshSequence: 0});
   c.getJson = originalGet;
   assert.strictEqual(await c.refreshSelectedQuoteAuthority(), true);
   const newest = snapshot();
-  release({ok: true, data: {company_profiles: [{id: 'saved-profile', defaults: {company: {name: 'stale'}}}]}});
+  release({ok: true, data: {company_profile: {id: 'saved-profile', defaults: {company: {name: 'stale'}}}}});
   assert.strictEqual(await olderSameId, false);
   assert.strictEqual(snapshot(), newest);
   // Real inventory rendering must not erase unresolved logical identities.
@@ -31187,6 +31186,106 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             workspace["runtime_dependencies"]["pricing_reference"]["source"],
             "selected-runtime-reference",
         )
+
+    def test_quote_authority_internal_roles_read_exact_records_and_start_exports(self):
+        from tests.test_internal_google_auth_webapp import InternalGoogleAuthWebappTest, _VerifiedClaimsAdapter
+
+        auth = InternalGoogleAuthWebappTest()
+        webapp.INTERNAL_AUTH_STATE.reset()
+        self.addCleanup(webapp.INTERNAL_AUTH_STATE.reset)
+        with tempfile.TemporaryDirectory() as tmp:
+            database_url = f"sqlite:///{(Path(tmp) / 'authority.sqlite3').as_posix()}"
+            env = auth.internal_env(SQAG_STORAGE_MODE="database", SQAG_DATABASE_URL=database_url)
+            with mock.patch.dict(os.environ, env, clear=True):
+                webapp.apply_sqag_storage_migrations(database_url)
+                storage = webapp.DatabaseSqagStorage(database_url, "workspace-internal-alpha", role="admin")
+                storage.save_profile({"id": "selected-profile", "label": "Synthetic Profile", "defaults": {"company": {"name": "Synthetic Authority"}}})
+                storage.save_pricing_reference({"id": "selected-pricing", "label": "Synthetic Pricing", "items": [{"id": "row", "internal_cost": 12}]})
+                with LocalRunnerServer() as runner, mock.patch.object(webapp, "create_job", return_value={"job_id": "job-synthetic", "status": "running"}) as create_job:
+                    path = "/api/quote-authority?company_profile_id=selected-profile&pricing_reference_id=selected-pricing&source=company"
+                    self.assertEqual(self.http_json(runner, "GET", path)["status"], 401)
+                    for role, subject in (("admin", "stable-google-subject"), ("operator", "stable-google-operator-subject")):
+                        with self.subTest(role=role):
+                            location, transaction = auth.start_login(runner)
+                            cookie_value, _ = auth.finish_login(runner, location, transaction, _VerifiedClaimsAdapter({"sub": subject, "email": f"{role}@example.test", "email_verified": True}))
+                            cookie = f"{webapp.SESSION_COOKIE_NAME}={cookie_value}"
+                            session = self.http_json(runner, "GET", "/api/session", cookie=cookie)["body"]
+                            self.assertTrue(session["permissions"]["canGenerateQuote"])
+                            create_job.reset_mock()
+                            result = self.http_json(runner, "GET", path, cookie=cookie)
+                            self.assertEqual(result["status"], 200)
+                            self.assertEqual(result["body"]["company_profile"]["id"], "selected-profile")
+                            self.assertEqual(result["body"]["company_profile"]["defaults"]["company"]["name"], "Synthetic Authority")
+                            self.assertEqual(result["body"]["pricing_reference"]["items"][0]["internal_cost"], 12)
+                            create_job.assert_not_called()
+                            for kind in ("generate", "generate_pdf"):
+                                payload = {"profile_id": "selected-profile", "pricing_reference": {"id": "selected-pricing", "source": "company"}}
+                                response = self.http_json(runner, "POST", "/api/jobs", cookie=cookie, body={"type": kind, "payload": payload}, headers={session["csrf_header"]: session["csrf_token"], "Origin": runner.base_url})
+                                self.assertEqual(response["status"], 202, response["body"])
+                                self.assertEqual(create_job.call_args.args, (kind, payload))
+                            if role == "operator":
+                                for permission in ("canManageSettings", "canManageProfiles", "canManagePricingReferences", "canImportPricingReferences"):
+                                    self.assertFalse(session["permissions"][permission])
+                                for method, management_path in (
+                                    ("GET", "/api/settings"), ("GET", "/api/settings/profiles"),
+                                    ("GET", "/api/settings/profiles/selected-profile/export.json"),
+                                    ("GET", "/api/settings/pricing-references"),
+                                    ("GET", "/api/settings/pricing-references/selected-pricing?source=company"),
+                                    ("GET", "/api/settings/pricing-references/selected-pricing/export.xlsx?source=company"),
+                                    ("POST", "/api/settings/profiles"), ("DELETE", "/api/settings/profiles/selected-profile"),
+                                    ("POST", "/api/settings/pricing-references"), ("DELETE", "/api/settings/pricing-references/selected-pricing?source=company"),
+                                    ("POST", "/api/settings/pricing-references/import-preview"),
+                                ):
+                                    denied = self.http_json(runner, method, management_path, cookie=cookie, body={} if method != "GET" else None, headers={session["csrf_header"]: session["csrf_token"], "Origin": runner.base_url})
+                                    self.assertEqual(denied["status"], 403, (method, management_path))
+
+    def test_quote_authority_is_workspace_scoped_fail_closed_and_read_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database_url = f"sqlite:///{(Path(tmp) / 'authority.sqlite3').as_posix()}"
+            env = {"APP_MODE": "local", "SQAG_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
+            with mock.patch.dict(os.environ, env, clear=True):
+                webapp.apply_sqag_storage_migrations(database_url)
+                workspace_a = webapp.DatabaseSqagStorage(database_url, "authority-a", role="operator")
+                workspace_b = webapp.DatabaseSqagStorage(database_url, "authority-b", role="operator")
+                workspace_a.save_profile({"id": "same-id", "defaults": {"company": {"name": "Synthetic A"}}})
+                workspace_a.save_pricing_reference({"id": "same-id", "items": []})
+                workspace_b.save_pricing_reference({"id": "same-id", "items": []})
+                path = "/api/quote-authority?company_profile_id=same-id&pricing_reference_id=same-id&source=company"
+                with LocalRunnerServer() as runner, mock.patch.object(webapp.QuoteRunnerHandler, "current_auth_session") as session:
+                    session.return_value = self.platform_auth_session("authority-a", membership_role="operator")
+                    with workspace_a.connection() as connection:
+                        before = list(connection.iterdump())
+                    self.assertEqual(self.http_json(runner, "GET", path)["status"], 200)
+                    for invalid in (path.replace("company_profile_id=same-id", "company_profile_id=missing"), path.replace("pricing_reference_id=same-id", "pricing_reference_id=missing"), path.replace("source=company", "source=local")):
+                        self.assertEqual(self.http_json(runner, "GET", invalid)["status"], 404)
+                    for invalid in (path.replace("source=company", "source="), path + "&source=company", path + "&workspace_id=authority-b", path.replace("company_profile_id=same-id", "company_profile_id=../same-id")):
+                        self.assertEqual(self.http_json(runner, "GET", invalid)["status"], 400)
+                    session.return_value = self.platform_auth_session("authority-b", membership_role="operator")
+                    self.assertEqual(self.http_json(runner, "GET", path)["status"], 404)
+                    session.return_value = self.platform_auth_session("authority-a", membership_role="viewer")
+                    self.assertEqual(self.http_json(runner, "GET", path)["status"], 403)
+                    session.return_value = self.platform_auth_session("authority-a", membership_role="operator")
+                    with mock.patch.object(webapp.DatabaseSqagStorage, "pricing_reference_detail", side_effect=RuntimeError("synthetic private storage failure")), mock.patch.object(webapp, "write_local_log") as log:
+                        failed = self.http_json(runner, "GET", path)
+                        self.assertEqual(failed["status"], 500)
+                        self.assertNotIn("private storage", json.dumps(failed["body"]))
+                        self.assertEqual(failed["body"]["error_reference"], log.call_args.args[1]["error_reference"])
+                    with workspace_a.connection() as connection:
+                        self.assertEqual(list(connection.iterdump()), before)
+
+    def test_quote_authority_operator_profile_pack_pricing_and_source_identity(self):
+        env = {"APP_MODE": "local", "USER_TYPE": "operator", "SQAG_STORAGE_MODE": "local"}
+        with mock.patch.dict(os.environ, env, clear=True), LocalRunnerServer() as runner:
+            path = f"/api/quote-authority?company_profile_id=&pricing_reference_id={webapp.DEFAULT_PRICING_REFERENCE_ID}&source=local"
+            result = self.http_json(runner, "GET", path)
+            self.assertEqual(result["status"], 200)
+            self.assertIsNone(result["body"]["company_profile"])
+            self.assertEqual(result["body"]["pricing_reference"]["id"], webapp.DEFAULT_PRICING_REFERENCE_ID)
+            self.assertEqual(result["body"]["pricing_reference"]["source"], "local")
+            with mock.patch.object(webapp.LocalSqagStorage, "pricing_reference_detail", return_value={"id": webapp.DEFAULT_PRICING_REFERENCE_ID, "source": "bundled"}):
+                self.assertEqual(self.http_json(runner, "GET", path)["status"], 404)
+            with mock.patch.object(webapp.LocalSqagStorage, "pricing_reference_detail", return_value={"id": "other-id", "source": "local"}):
+                self.assertEqual(self.http_json(runner, "GET", path)["status"], 404)
 
     def test_settings_read_endpoints_require_management_permission(self):
         paths = [
