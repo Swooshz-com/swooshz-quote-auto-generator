@@ -2339,6 +2339,7 @@ function resetQuoteCommercialFieldsToSelectedPricingReference() {
 }
 
 function renderSelectedPricingReferenceSummary() {
+  const options = arguments[0] || {};
   const reference = currentPricingReference();
   const tax = selectedPricingReferenceTax();
   const currency = selectedPricingReferenceCurrency();
@@ -2356,9 +2357,11 @@ function renderSelectedPricingReferenceSummary() {
   if (elements.selectedPricingReferenceCurrency) elements.selectedPricingReferenceCurrency.textContent = currency;
   if (elements.selectedPricingReferenceTax) elements.selectedPricingReferenceTax.textContent = taxText;
   syncPricingReferenceContextPills(currency, taxText);
-  applyPricingReferenceCommercialDefaults();
-  if (elements.taxLabel) elements.taxLabel.value = tax.label;
-  if (elements.taxRate) elements.taxRate.value = taxRatePercentText(tax.rate);
+  if (options.applyCommercialDefaults !== false) {
+    applyPricingReferenceCommercialDefaults();
+    if (elements.taxLabel) elements.taxLabel.value = tax.label;
+    if (elements.taxRate) elements.taxRate.value = taxRatePercentText(tax.rate);
+  }
   updatePricingReferenceDeleteButton();
   updateOutputHeader();
 }
@@ -4752,7 +4755,7 @@ function renderProfileOptions() {
   elements.profileSelect.disabled = references.length === 0;
   elements.profileSelect.title = references.length ? "" : MISSING_PRICING_REFERENCES_MESSAGE;
   elements.profileSelect.setAttribute("aria-disabled", String(elements.profileSelect.disabled));
-  renderSelectedPricingReferenceSummary();
+  renderSelectedPricingReferenceSummary(options);
   renderPricingReferenceDeleteOptions();
 }
 
@@ -10218,6 +10221,7 @@ function quoteAuthoritySelectionSnapshot(options = {}) {
   const profileSelectValue = String(elements.profileSelect?.value || "");
   return {
     sequence: (Number(state.authorityRefreshSequence) || 0) + 1,
+    browserRecoveryScope: currentBrowserRecoveryScope(),
     selectionMode: String(state.pricingSelectionMode || "").trim(),
     sessionId: safeQuoteSessionId(state.quoteSessionId || ""),
     profileId: String(state.profileId || "").trim(),
@@ -10241,6 +10245,7 @@ function quoteAuthoritySelectionIsCurrent(selection = {}) {
   const currentPricingReferenceId = String(state.pricingReferenceId || "").trim();
   const currentPricingReferenceSource = String(state.pricingReferenceSource || "").trim();
   return Number(state.authorityRefreshSequence) === Number(selection.sequence)
+    && currentBrowserRecoveryScope() === String(selection.browserRecoveryScope || "").trim()
     && safeQuoteSessionId(state.quoteSessionId || "") === selection.sessionId
     && String(state.profileId || "").trim() === selection.profileId
     && String(state.pricingSelectionMode || "").trim() === selection.selectionMode
@@ -10346,7 +10351,7 @@ async function refreshSelectedQuoteAuthority(options = {}) {
 
   if (selection.companyProfileId) replaceCompanyProfileState(companyProfile);
   replacePricingReferenceState(pricingReference);
-  renderProfileOptions({ preserveSelection: true });
+  renderProfileOptions({ preserveSelection: true, applyCommercialDefaults: false });
   if (selection.pendingPricing && elements.profileSelect) {
     elements.profileSelect.value = selection.profileSelectValue;
   }

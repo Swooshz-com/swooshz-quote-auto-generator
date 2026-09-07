@@ -17615,6 +17615,298 @@ eval([
 
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
 
+    def test_static_authority_refresh_real_renderer_preserves_recovered_commercial_fields(self):
+        node = require_node(self)
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const asyncMarker = `async function ${name}`;
+  const functionMarker = `function ${name}`;
+  const asyncStart = source.indexOf(asyncMarker);
+  const functionStart = source.indexOf(functionMarker);
+  const start = asyncStart >= 0 && (functionStart < 0 || asyncStart < functionStart)
+    ? asyncStart
+    : functionStart;
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  if (bodyStart < 2) throw new Error(`Missing body for function ${name}`);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const DEFAULT_TAX_LABEL = "GST";
+const DEFAULT_TAX_RATE = 0.09;
+const DEFAULT_CURRENCY_LABEL = "SGD";
+const CUSTOM_CURRENCY_VALUE = "__CUSTOM__";
+const CURRENCY_OPTIONS = [["SGD"], ["AUD"], ["CNY"], ["EUR"], ["GBP"], ["IDR"], ["MYR"], ["THB"], ["USD"]];
+const QUOTE_COMMERCIAL_FIELD_KEYS = ["quoteCurrency", "quoteExchangeRate", "quoteTaxLabel", "quoteTaxRate"];
+const MISSING_PRICING_REFERENCES_MESSAGE = "No pricing references are available.";
+const COMPANY_PROFILE_PRESET_PREFIX = "company:";
+const RECOVERED_QUOTE_AUTHORITATIVE_SELECTION = "recovered_quote_authoritative_selection";
+const QUOTE_AUTHORITY_BLOCKED_MESSAGE = "Saved quote generation authority is unavailable. No quote or output data was changed.";
+const field = (value = "") => ({ value });
+const elements = {
+  profileSelect: { innerHTML: "", value: "company::saved-pricing", disabled: false, title: "", setAttribute() {} },
+  pricingReferenceSourceBadge: { textContent: "" },
+  selectedPricingReferenceSummary: { textContent: "" },
+  selectedPricingReferenceCurrency: { textContent: "" },
+  selectedPricingReferenceTax: { textContent: "" },
+  quoteCurrency: field("SGD"),
+  quoteCurrencyCustom: { value: "", hidden: true, required: false },
+  quoteExchangeRate: field("1.37"),
+  quoteExchangeRateField: { hidden: false },
+  quoteTaxLabel: field("GST"),
+  quoteTaxRate: field("9"),
+  taxLabel: field("GST"),
+  taxRate: field("9"),
+  quoteCompanyName: field("Recovered company"),
+  headerDetails: field("Recovered header"),
+  termsHeading: field("Recovered terms"),
+  paymentTerms: field("50% upfront\n50% on completion"),
+  notesHeading: field("Recovered notes heading"),
+  standardNotes: field("Recovered note"),
+  acceptanceText: field("Recovered acceptance"),
+  companySignatory: field("Recovered signer"),
+  companyTitle: field("Director"),
+  companyDateLabel: field("Date:"),
+  personLabel: field("Person in charge"),
+  stampLabel: field("Recovered company"),
+  dateLabel: field("Date:"),
+};
+const state = {
+  authorityRefreshSequence: 0,
+  browserRecoveryScope: "scope-a",
+  pricingSelectionMode: "recovered_quote_authoritative_selection",
+  quoteSessionId: "quote-authority123",
+  profileId: "saved-company",
+  selectedPresetValue: "company:saved-company",
+  pricingReferenceId: "saved-pricing",
+  pricingReferenceSource: "company",
+  pricingReferences: [{
+    id: "saved-pricing",
+    source: "company",
+    label: "Cached pricing",
+    currency: "SGD",
+    tax: { label: "GST", rate: 0.09 },
+  }],
+  companyProfiles: [{
+    id: "saved-company",
+    label: "Cached company",
+    defaults: { quote_text: { payment_terms: ["Cached terms"] } },
+  }],
+  quoteCommercialTouched: {
+    quoteCurrency: false,
+    quoteExchangeRate: false,
+    quoteTaxLabel: false,
+    quoteTaxRate: false,
+  },
+  outputRows: [{ description: "Approved row", amount: 100 }],
+  downloadFile: { name: "quotation.xlsx", url: "/api/quote-sessions/q/download/xlsx" },
+  pdfFile: { name: "quotation.pdf", url: "/api/quote-sessions/q/download/pdf" },
+  outputRevision: 4,
+  downloadFileRevision: 4,
+  pdfFileRevision: 4,
+};
+const document = { querySelectorAll() { return []; } };
+let authorityReads = 0;
+let startedJobs = 0;
+
+function selectedPresetId() { return state.selectedPresetValue; }
+function currentBrowserRecoveryScope() { return state.browserRecoveryScope; }
+function safeQuoteSessionId(value) { return String(value || ""); }
+function pendingPricingReferenceSelection() { return { pricingReferenceId: state.pricingReferenceId, source: state.pricingReferenceSource }; }
+function pricingReferenceSourceIsValid(value = "") { return ["bundled", "company", "local"].includes(String(value || "").trim()); }
+function pricingReferenceSelectValue(reference = {}) { return `${reference.source || ""}::${reference.id || ""}`; }
+function pricingReferenceSelectionFromValue(value = "") {
+  const [source, ...rest] = String(value || "").split("::");
+  return { source: rest.length ? source : "", pricingReferenceId: rest.length ? rest.join("::") : source };
+}
+function isStandardCurrencyCode(value = "") { return CURRENCY_OPTIONS.some(([code]) => code === String(value || "").trim().toUpperCase()); }
+function normalizedCustomCurrencyInput(input = {}) { return String(input.value || "").trim().toUpperCase(); }
+function customCurrencyInputIsValid(input = {}) { return /^[A-Z]{3}$/.test(normalizedCustomCurrencyInput(input)); }
+function sortedPricingReferencesForDisplay(references = []) { return references.slice(); }
+function pricingReferenceSourceLabel(reference = {}) { return reference.source || ""; }
+function defaultPricingReference() { return null; }
+function lastSelectedPricingReference() { return null; }
+function escapeHtml(value) { return String(value || ""); }
+function mergePricingReferences(values) { return values; }
+function normalizeCompanyProfile(profile) { return { ...profile }; }
+function renderPricingReferenceDeleteOptions() {}
+function renderPresetOptions() {}
+function syncPricingReferenceContextPills() {}
+function updatePricingReferenceDeleteButton() {}
+function updateOutputHeader() {}
+function showBlockedAction(message) { throw new Error(message); }
+function genericFailureMessage() { return ""; }
+function ensureQuoteSession() { return Promise.resolve(state.quoteSessionId); }
+function buildPayload() { return { quote_currency: collectQuoteCurrency() }; }
+function startJob(type, payload) {
+  startedJobs += 1;
+  assert.strictEqual(type, "generate");
+  assert.strictEqual(payload.quote_currency, "SGD");
+  return Promise.resolve({ ok: true, data: { job_id: "job-authority123" } });
+}
+function saveSessionState() {}
+function getJson(url) {
+  authorityReads += 1;
+  assert.ok(url.includes("/api/quote-authority?"));
+  assert.ok(!url.includes("workspace"));
+  return Promise.resolve({ ok: true, data: {
+    status: "ok",
+    authority: {
+      company_profile: {
+        id: "saved-company",
+        label: "Refreshed company",
+        defaults: { quote_text: { payment_terms: ["Authority terms"] } },
+      },
+      pricing_reference: {
+        id: "saved-pricing",
+        source: "company",
+        label: "Refreshed pricing",
+        currency: "USD",
+        tax: { label: "VAT", rate: 0.07 },
+      },
+    },
+  } });
+}
+
+eval([
+  "normalizeTaxLabel",
+  "normalizeTaxRate",
+  "taxRatePercentText",
+  "normalizeCurrencyLabel",
+  "setQuoteCurrencyControls",
+  "syncQuoteCurrencyCustomInput",
+  "quoteCurrencyControlValue",
+  "emptyQuoteCommercialTouched",
+  "normalizeQuoteCommercialTouched",
+  "quoteCommercialFieldIsTouched",
+  "selectedPricingReferenceTax",
+  "selectedPricingReferenceCurrency",
+  "selectedPricingReferenceTaxText",
+  "collectTaxDetails",
+  "collectQuoteCurrency",
+  "collectQuoteExchangeRate",
+  "syncQuoteExchangeRateField",
+  "quoteCommercialTaxText",
+  "quoteExchangeRateText",
+  "syncQuoteCommercialContextPills",
+  "applyPricingReferenceCommercialDefaults",
+  "currentPricingReference",
+  "renderSelectedPricingReferenceSummary",
+  "renderProfileOptions",
+  "quoteAuthoritySelectionSnapshot",
+  "quoteAuthoritySelectionIsCurrent",
+  "quoteAuthorityErrorMessage",
+  "quoteAuthorityProfileResponseId",
+  "quoteAuthorityPricingResponseKey",
+  "replacePricingReferenceState",
+  "replaceCompanyProfileState",
+  "refreshSelectedQuoteAuthority",
+  "ensureSavedServerJobStarted",
+].map(extractFunction).join("\n"));
+
+(async () => {
+  const before = {
+    currency: elements.quoteCurrency.value,
+    taxLabel: elements.quoteTaxLabel.value,
+    taxRate: elements.quoteTaxRate.value,
+    legacyTaxLabel: elements.taxLabel.value,
+    legacyTaxRate: elements.taxRate.value,
+    exchangeRate: elements.quoteExchangeRate.value,
+    termsHeading: elements.termsHeading.value,
+    paymentTerms: elements.paymentTerms.value,
+    notesHeading: elements.notesHeading.value,
+    notes: elements.standardNotes.value,
+    acceptance: elements.acceptanceText.value,
+    company: elements.quoteCompanyName.value,
+    signer: elements.companySignatory.value,
+    companyTitle: elements.companyTitle.value,
+  };
+  const outputBefore = structuredClone({
+    outputRows: state.outputRows,
+    downloadFile: state.downloadFile,
+    pdfFile: state.pdfFile,
+    outputRevision: state.outputRevision,
+    downloadFileRevision: state.downloadFileRevision,
+    pdfFileRevision: state.pdfFileRevision,
+  });
+
+  assert.strictEqual(await refreshSelectedQuoteAuthority(), true);
+  assert.strictEqual(authorityReads, 1);
+  assert.deepStrictEqual({
+    currency: elements.quoteCurrency.value,
+    taxLabel: elements.quoteTaxLabel.value,
+    taxRate: elements.quoteTaxRate.value,
+    legacyTaxLabel: elements.taxLabel.value,
+    legacyTaxRate: elements.taxRate.value,
+    exchangeRate: elements.quoteExchangeRate.value,
+    termsHeading: elements.termsHeading.value,
+    paymentTerms: elements.paymentTerms.value,
+    notesHeading: elements.notesHeading.value,
+    notes: elements.standardNotes.value,
+    acceptance: elements.acceptanceText.value,
+    company: elements.quoteCompanyName.value,
+    signer: elements.companySignatory.value,
+    companyTitle: elements.companyTitle.value,
+  }, before);
+  assert.strictEqual(state.pricingReferenceId, "saved-pricing");
+  assert.strictEqual(state.pricingReferenceSource, "company");
+  assert.strictEqual(elements.profileSelect.value, "company::saved-pricing");
+  assert.strictEqual(state.pricingReferences[0].currency, "USD");
+  assert.deepStrictEqual(state.pricingReferences[0].tax, { label: "VAT", rate: 0.07 });
+  assert.strictEqual(state.companyProfiles[0].label, "Refreshed company");
+  assert.deepStrictEqual({
+    outputRows: state.outputRows,
+    downloadFile: state.downloadFile,
+    pdfFile: state.pdfFile,
+    outputRevision: state.outputRevision,
+    downloadFileRevision: state.downloadFileRevision,
+    pdfFileRevision: state.pdfFileRevision,
+  }, outputBefore);
+
+  const preflight = await ensureSavedServerJobStarted(
+    { id: "job-authority123", type: "generate", phase: "starting" },
+    { authorityValidated: true },
+  );
+  assert.strictEqual(preflight.ok, true);
+  assert.strictEqual(preflight.authorityBlocked, undefined);
+  assert.strictEqual(startedJobs, 1);
+
+  elements.quoteCurrency.value = "USD";
+  elements.quoteTaxLabel.value = "GST";
+  elements.quoteTaxRate.value = "9";
+  elements.quoteExchangeRate.value = "1.37";
+  state.quoteCommercialTouched = emptyQuoteCommercialTouched();
+  assert.strictEqual(await refreshSelectedQuoteAuthority(), true);
+  assert.strictEqual(elements.quoteExchangeRate.value, "1.37");
+  assert.strictEqual(elements.quoteTaxLabel.value, "GST");
+  assert.strictEqual(elements.quoteTaxRate.value, "9");
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
     def test_static_recovery_keeps_missing_pricing_authority_fail_closed(self):
         static_dir = ROOT / "webapp" / "static"
         js = (static_dir / "app.js").read_text(encoding="utf-8")
@@ -17683,6 +17975,7 @@ let blockedMessages = [];
 let authorityReads = 0;
 let defaultSyncs = 0;
 function selectedPresetId() { return state.selectedPresetValue; }
+function currentBrowserRecoveryScope() { return state.browserRecoveryScope; }
 function safeQuoteSessionId(value) { return String(value || ""); }
 function pendingPricingReferenceSelection() { return { pricingReferenceId: "", source: "" }; }
 function pricingReferenceSourceIsValid(value) { return ["bundled", "company", "local"].includes(String(value || "")); }
@@ -17872,6 +18165,7 @@ const elements = { profileSelect: { value: "company::saved-pricing" } };
 let resolveAuthority;
 let renderCalls = 0;
 function selectedPresetId() { return state.selectedPresetValue; }
+function currentBrowserRecoveryScope() { return state.browserRecoveryScope; }
 function safeQuoteSessionId(value) { return String(value || ""); }
 function pendingPricingReferenceSelection() { return { pricingReferenceId: "", source: "" }; }
 function pricingReferenceSourceIsValid(value) { return ["bundled", "company", "local"].includes(String(value || "")); }
@@ -17911,6 +18205,104 @@ eval([
   assert.strictEqual(state.pricingReferenceId, "changed-pricing");
   assert.deepStrictEqual(state.pricingReferences, originalReferences);
   assert.strictEqual(renderCalls, 0);
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_static_authority_late_response_ignores_recovery_scope_change(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const asyncMarker = `async function ${name}`;
+  const functionMarker = `function ${name}`;
+  const asyncStart = source.indexOf(asyncMarker);
+  const functionStart = source.indexOf(functionMarker);
+  const start = asyncStart >= 0 && (functionStart < 0 || asyncStart < functionStart)
+    ? asyncStart
+    : functionStart;
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const state = {
+  authorityRefreshSequence: 0,
+  browserRecoveryScope: "scope-a",
+  pricingSelectionMode: "recovered_quote_authoritative_selection",
+  quoteSessionId: "quote-scope123",
+  profileId: "saved-company",
+  selectedPresetValue: "company:saved-company",
+  pricingReferenceId: "saved-pricing",
+  pricingReferenceSource: "company",
+  pricingReferences: [{ id: "saved-pricing", source: "company", label: "Cached pricing" }],
+  companyProfiles: [{ id: "saved-company", label: "Cached company" }],
+};
+const elements = { profileSelect: { value: "company::saved-pricing" } };
+const COMPANY_PROFILE_PRESET_PREFIX = "company:";
+const QUOTE_AUTHORITY_BLOCKED_MESSAGE = "Saved quote generation authority is unavailable. No quote or output data was changed.";
+let resolveAuthority;
+let renderCalls = 0;
+function selectedPresetId() { return state.selectedPresetValue; }
+function currentBrowserRecoveryScope() { return state.browserRecoveryScope; }
+function safeQuoteSessionId(value) { return String(value || ""); }
+function pendingPricingReferenceSelection() { return { pricingReferenceId: "", source: "" }; }
+function pricingReferenceSourceIsValid(value) { return ["bundled", "company", "local"].includes(String(value || "")); }
+function pricingReferenceSelectValue(reference = {}) { return `${reference.source || ""}::${reference.id || ""}`; }
+function normalizeCompanyProfile(profile) { return profile; }
+function mergePricingReferences(values) { return values; }
+function renderProfileOptions() { renderCalls += 1; }
+function renderPresetOptions() { renderCalls += 1; }
+function showBlockedAction() { throw new Error("unexpected blocked response"); }
+function genericFailureMessage() { return ""; }
+function getJson() { return new Promise((resolve) => { resolveAuthority = resolve; }); }
+
+eval([
+  "quoteAuthoritySelectionSnapshot",
+  "quoteAuthoritySelectionIsCurrent",
+  "quoteAuthorityErrorMessage",
+  "quoteAuthorityProfileResponseId",
+  "quoteAuthorityPricingResponseKey",
+  "replacePricingReferenceState",
+  "replaceCompanyProfileState",
+  "refreshSelectedQuoteAuthority",
+].map(extractFunction).join("\n"));
+
+(async () => {
+  const originalReferences = structuredClone(state.pricingReferences);
+  const pending = refreshSelectedQuoteAuthority();
+  state.browserRecoveryScope = "scope-b";
+  resolveAuthority({ ok: true, data: { authority: {
+    company_profile: { id: "saved-company", label: "Late company" },
+    pricing_reference: { id: "saved-pricing", source: "company", label: "Late pricing" },
+  } } });
+  assert.strictEqual(await pending, false);
+  assert.deepStrictEqual(state.pricingReferences, originalReferences);
+  assert.strictEqual(renderCalls, 0);
+  assert.strictEqual(state.companyProfiles[0].label, "Cached company");
 })().catch((error) => {
   console.error(error);
   process.exit(1);
@@ -17969,6 +18361,7 @@ const state = {
 const elements = { profileSelect: { value: "company::new-pricing" } };
 let renderedCurrentValue = "";
 function selectedPresetId() { return state.selectedPresetValue; }
+function currentBrowserRecoveryScope() { return state.browserRecoveryScope; }
 function safeQuoteSessionId(value) { return String(value || ""); }
 function pendingPricingReferenceSelection() {
   const [source, id] = elements.profileSelect.value.split("::");
@@ -18080,6 +18473,7 @@ const QUOTE_AUTHORITY_BLOCKED_MESSAGE = "Saved quote generation authority is una
 let blockedMessages = [];
 const logged = [];
 function selectedPresetId() { return state.selectedPresetValue; }
+function currentBrowserRecoveryScope() { return state.browserRecoveryScope; }
 function safeQuoteSessionId(value) { return String(value || ""); }
 function pendingPricingReferenceSelection() { return { pricingReferenceId: state.pricingReferenceId, source: state.pricingReferenceSource }; }
 function pricingReferenceSourceIsValid(value) { return ["bundled", "company", "local"].includes(String(value || "")); }
