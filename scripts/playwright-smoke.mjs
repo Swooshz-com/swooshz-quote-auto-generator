@@ -2034,7 +2034,7 @@ async function main() {
     await page.locator('.rail-button[data-side-panel="quote_company"]').click();
     await page.locator("#quoteCompanyPanel").waitFor({ state: "visible" });
     const seededPresetValue = await page.locator("#presetSelect").inputValue();
-    if (seededPresetValue !== "profile:synthetic-fixture-default") {
+    if (seededPresetValue !== "profile:synthetic-exhibition-fixture-template:synthetic-fixture-default") {
       throw new Error(`Expected seeded setup to select the synthetic fixture preset, found ${seededPresetValue}.`);
     }
     await page.reload({ waitUntil: "domcontentloaded" });
@@ -2136,7 +2136,7 @@ async function main() {
     await page.locator('.rail-button[data-side-panel="quote_company"]').click();
     await page.locator("#quoteCompanyPanel").waitFor({ state: "visible", timeout: 15000 });
     const restoredPresetValue = await page.locator("#presetSelect").inputValue();
-    if (restoredPresetValue !== "profile:synthetic-fixture-default") {
+    if (restoredPresetValue !== "profile:synthetic-exhibition-fixture-template:synthetic-fixture-default") {
       throw new Error(`Expected refresh to preserve company preset, found ${restoredPresetValue}.`);
     }
     const presetSelectBox = await page.locator("#presetSelect").boundingBox();
