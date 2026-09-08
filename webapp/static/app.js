@@ -859,8 +859,19 @@ function safeProfileLabel(value = "", fallback = "Company Profile") {
   return neutralizeFormulaText(label || fallback);
 }
 
-function profilePresetOptionValue(presetId) {
-  return `${PROFILE_PRESET_PREFIX}${presetId}`;
+function profilePresetOptionValue(profileId, presetId) {
+  const ownerId = String(profileId || "").trim();
+  const childId = String(presetId || "").trim();
+  if (!/^[A-Za-z0-9_-]+$/.test(ownerId) || !/^[A-Za-z0-9_-]+$/.test(childId)) return "";
+  return `${PROFILE_PRESET_PREFIX}${ownerId}:${childId}`;
+}
+
+function profilePresetOptionParts(value = "") {
+  const text = String(value || "").trim();
+  if (!text.startsWith(PROFILE_PRESET_PREFIX)) return null;
+  const parts = text.slice(PROFILE_PRESET_PREFIX.length).split(":");
+  if (parts.length !== 2 || !/^[A-Za-z0-9_-]+$/.test(parts[0]) || !/^[A-Za-z0-9_-]+$/.test(parts[1])) return null;
+  return { profileId: parts[0], presetId: parts[1] };
 }
 
 function companyProfileOptionValue(profileId) {
@@ -1315,17 +1326,32 @@ function resolvedProfileIdForPayload() {
 }
 
 function generationProfileIdForPayload() {
-  const preset = selectedPreset();
-  if (preset?.source === "company") {
-    return `${COMPANY_PROFILE_PRESET_PREFIX}${safeProfileId(preset.id, "")}`;
-  }
   const selectedValue = String(state.selectedPresetValue || elements.presetSelect?.value || "").trim();
   if (selectedValue.startsWith(COMPANY_PROFILE_PRESET_PREFIX)) {
     const savedCompanyId = safeProfileId(selectedValue.slice(COMPANY_PROFILE_PRESET_PREFIX.length), "");
-    if (savedCompanyId) return `${COMPANY_PROFILE_PRESET_PREFIX}${savedCompanyId}`;
+    const preset = selectedPreset();
+    return savedCompanyId && preset?.source === "company" && preset.id === savedCompanyId
+      ? `${COMPANY_PROFILE_PRESET_PREFIX}${savedCompanyId}`
+      : "";
+  }
+  if (selectedValue.startsWith(PROFILE_PRESET_PREFIX)) {
+    const qualified = profilePresetOptionParts(selectedValue);
+    const preset = selectedPreset();
+    return qualified && preset?.source === "profile" && preset.profile_id === qualified.profileId
+      ? `${PROFILE_PRESET_PREFIX}${qualified.profileId}`
+      : "";
+  }
+  if (selectedValue) return "";
+  const preset = selectedPreset();
+  if (preset?.source === "company") {
+    const companyId = safeProfileId(preset.id, "");
+    return companyId ? `${COMPANY_PROFILE_PRESET_PREFIX}${companyId}` : "";
   }
   const presetProfileId = String(preset?.profile_id || "").trim();
-  return presetProfileId || resolvedProfileIdForPayload();
+  const resolvedProfileId = presetProfileId || resolvedProfileIdForPayload();
+  return /^[A-Za-z0-9_-]+$/.test(resolvedProfileId)
+    ? `${PROFILE_PRESET_PREFIX}${resolvedProfileId}`
+    : "";
 }
 
 function syncSelectedPricingReference() {
@@ -3848,18 +3874,19 @@ function selectedPresetId() {
 
 function templateProfilePresets() {
   return state.profiles.flatMap((profile) => {
+    if (profile.source === "company") return [];
     const presets = Array.isArray(profile.quote_detail_presets) ? profile.quote_detail_presets : [];
     return presets.map((preset) => ({
       ...preset,
       profile_id: preset.profile_id || profile.id,
       profile_label: profile.label || profile.id,
-      source: profile.source === "company" ? "company" : "profile",
+      source: "profile",
     }));
   });
 }
 
 function selectableTemplateProfilePresets() {
-  return templateProfilePresets().filter((preset) => preset.id !== "default");
+  return templateProfilePresets().filter((preset) => preset.source === "profile" && preset.profile_id && preset.id !== "default");
 }
 
 function normalizeCompanyProfile(profile = {}) {
@@ -3894,7 +3921,8 @@ function profilePresets() {
 function defaultProfilePresetId() {
   const profile = currentProfile();
   const configured = profile.default_quote_detail_preset || "default";
-  const presets = templateProfilePresets();
+  const ownerId = String(profile.id || "").trim();
+  const presets = templateProfilePresets().filter((preset) => preset.source === "profile" && preset.profile_id === ownerId);
   if (presets.some((preset) => preset.id === "default")) return "default";
   if (configured && presets.some((preset) => preset.id === configured)) return configured;
   return presets[0]?.id || "";
@@ -3903,33 +3931,39 @@ function defaultProfilePresetId() {
 function presetOptionValue(preset = {}) {
   const presetId = String(preset.id || "").trim();
   if (!presetId) return "";
-  return preset.source === "company" ? companyProfileOptionValue(presetId) : profilePresetOptionValue(presetId);
+  return preset.source === "company"
+    ? companyProfileOptionValue(presetId)
+    : profilePresetOptionValue(preset.profile_id, presetId);
 }
 
 function defaultPresetOptionValue() {
   const profileDefault = defaultProfilePresetId();
-  if (profileDefault) return profilePresetOptionValue(profileDefault);
+  if (profileDefault) return profilePresetOptionValue(currentProfile()?.id, profileDefault);
   return "";
 }
 
 function configuredProfilePresetId() {
   const profile = currentProfile();
   const configured = profile.default_quote_detail_preset || "";
-  const presets = templateProfilePresets();
+  const presets = templateProfilePresets().filter((preset) => preset.source === "profile" && preset.profile_id === String(profile.id || "").trim());
   return configured && presets.some((preset) => preset.id === configured) ? configured : "";
 }
 
 function selectedPreset() {
   const value = selectedPresetId();
   if (value.startsWith(PROFILE_PRESET_PREFIX)) {
-    const presetId = value.slice(PROFILE_PRESET_PREFIX.length);
-    const preset = templateProfilePresets().find((item) => item.id === presetId);
+    const qualified = profilePresetOptionParts(value);
+    if (!qualified) return null;
+    const preset = templateProfilePresets().find((item) => (
+      item.source === "profile"
+      && item.profile_id === qualified.profileId
+      && item.id === qualified.presetId
+    ));
     return preset ? { ...preset, source: "profile" } : null;
   }
   if (value.startsWith(COMPANY_PROFILE_PRESET_PREFIX)) {
     const presetId = value.slice(COMPANY_PROFILE_PRESET_PREFIX.length);
-    const preset = companyProfilePresets().find((item) => item.id === presetId)
-      || templateProfilePresets().find((item) => item.source === "company" && item.id === presetId);
+    const preset = companyProfilePresets().find((item) => item.id === presetId);
     return preset ? { ...preset, source: "company" } : null;
   }
   return null;
@@ -3957,10 +3991,10 @@ function quoteDetailsMatchPreset(savedDetails = {}, presetDetails = {}) {
 
 function presetValueFromQuoteDetails(savedDetails = {}) {
   const matchesDetails = (preset) => quoteDetailsMatchPreset(savedDetails, preset.details || {});
-  const companyPreset = companyProfilePresets().find(matchesDetails);
-  if (companyPreset) return companyProfileOptionValue(companyPreset.id);
-  const profilePreset = templateProfilePresets().find(matchesDetails);
-  if (profilePreset) return profilePresetOptionValue(profilePreset.id);
+  const companyMatches = companyProfilePresets().filter(matchesDetails);
+  if (companyMatches.length === 1) return companyProfileOptionValue(companyMatches[0].id);
+  const profileMatches = templateProfilePresets().filter((preset) => preset.source === "profile" && matchesDetails(preset));
+  if (profileMatches.length === 1) return profilePresetOptionValue(profileMatches[0].profile_id, profileMatches[0].id);
   return "";
 }
 
@@ -4666,7 +4700,7 @@ function loadConfiguredProfilePreset(options = {}) {
     loadDefaultProfilePreset(options);
     return;
   }
-  state.selectedPresetValue = profilePresetOptionValue(configuredPreset);
+  state.selectedPresetValue = profilePresetOptionValue(currentProfile()?.id, configuredPreset);
   elements.presetSelect.value = availablePresetValues().has(state.selectedPresetValue) ? state.selectedPresetValue : "";
   loadSelectedPreset(options);
   if (!availablePresetValues().has(state.selectedPresetValue)) {
@@ -7642,6 +7676,11 @@ function buildLineItemNormalizePayload() {
       tax: selectedPricingReferenceTax(),
       currency: selectedPricingReferenceCurrency(),
     },
+    quote_session: currentQuoteSessionPayload({
+      quoteGenerated: Boolean(state.basisConfirmed || state.outputRows.length),
+      includeDraftState: true,
+      includeDraftFiles: false,
+    }),
     project: {
       booth_width: state.boothDimensions.booth_width,
       booth_depth: state.boothDimensions.booth_depth,
@@ -11456,7 +11495,10 @@ function quoteSessionHasMissingExport(session = {}) {
 }
 
 function quoteSessionHasAvailableExport(session = {}) {
-  return ["xlsx", "pdf"].some((kind) => Boolean(quoteSessionExport(session, kind).exists));
+  return ["xlsx", "pdf"].some((kind) => {
+    const exportInfo = quoteSessionExport(session, kind);
+    return Boolean(exportInfo.exists && exportInfo.stale !== true);
+  });
 }
 
 function quoteSessionHasStaleExport(session = {}) {
@@ -12087,7 +12129,7 @@ async function duplicateDashboardQuote(sessionId, options = {}) {
 function dashboardExportAvailabilityItem(session = {}, kind = "xlsx", label = "XLSX") {
   const exportInfo = quoteSessionExport(session, kind);
   const generatedStatus = quoteSessionStatus(session).key === "generated";
-  if (exportInfo.exists && exportInfo.url) {
+  if (exportInfo.exists && exportInfo.stale !== true && exportInfo.url) {
     return { kind, label, exportInfo, available: true, statusText: `${label} ready`, className: "is-available" };
   }
   if (exportInfo.stale) {

@@ -1884,12 +1884,14 @@ class WebappServerTest(unittest.TestCase):
                 }],
             },
         }
+        payload["line_items"] = copy.deepcopy(payload["quote_session"]["draft_state"]["outputRows"])
 
         with mock.patch.object(
             webapp,
             "pricing_catalog_runtime_lookup_for_payload",
             side_effect=AssertionError("recovered row validation must not consult the current catalog"),
         ):
+            normalized_for_review = webapp.normalize_line_items_for_quote_basis_review(payload)
             errors_at_999 = webapp.quote_commercial_state_errors(payload)
             canonical_at_999 = webapp.quote_commercial_payload(payload)
             session_at_999 = webapp.quote_session_commercials(payload, {"commercials": {}})
@@ -1898,9 +1900,13 @@ class WebappServerTest(unittest.TestCase):
                 webapp.payload_to_brief(payload)
 
         row_at_999 = canonical_at_999["line_items"][0]
+        normalized_row = normalized_for_review[0]
         self.assertEqual(row_at_999["catalog_unit_price"], 999)
         self.assertNotIn("effective_unit_price", row_at_999)
         self.assertNotIn("unit_price_override", row_at_999)
+        self.assertIsNone(normalized_row.get("effective_unit_price"))
+        self.assertIsNone(normalized_row.get("unit_price_override"))
+        self.assertIsNone(normalized_row.get("catalog_unit_price"))
         self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, errors_at_999)
         self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, validation_at_999)
         self.assertIsNone(session_at_999["subtotal"])
@@ -1913,6 +1919,7 @@ class WebappServerTest(unittest.TestCase):
 
     def test_recovered_explicit_price_edit_replaces_stale_captured_price_everywhere(self):
         payload = recovered_convergence_payload(unit_price_override=120)
+        payload["line_items"] = copy.deepcopy(payload["quote_session"]["draft_state"]["outputRows"])
 
         with mock.patch.object(
             webapp,
@@ -1920,14 +1927,20 @@ class WebappServerTest(unittest.TestCase):
             side_effect=AssertionError("recovered explicit edits must not consult the current catalog"),
         ):
             canonical = webapp.quote_commercial_payload(payload)
+            normalized = webapp.normalize_line_items_for_quote_basis_review(payload)
             session = webapp.quote_session_commercials(payload, payload["quote_session"])
             brief = webapp.payload_to_brief(payload)
 
         row = canonical["line_items"][0]
+        normalized_row = normalized[0]
         self.assertEqual(row["effective_unit_price"], 120)
         self.assertEqual(row["unit_price_override"], 120)
         self.assertEqual(row["pricing_basis_amount"], 240)
         self.assertEqual(row["approved_quote_amount"], 328.8)
+        self.assertEqual(normalized_row["effective_unit_price"], 120)
+        self.assertEqual(normalized_row["unit_price_override"], 120)
+        self.assertEqual(normalized_row["pricing_basis_amount"], 240)
+        self.assertEqual(normalized_row["approved_quote_amount"], 328.8)
         self.assertEqual(session, {
             "currency": "USD",
             "tax_label": "GST",
@@ -2006,9 +2019,11 @@ class WebappServerTest(unittest.TestCase):
             "session_id": "quote-new-quote-453",
             "draft_state": {"quoteCommercialLifecycle": "NEW_UNINITIALISED"},
         }
+        payload["quote_basis_sections"] = []
 
         self.assertFalse(webapp.quote_commercial_state(payload)["owned"])
         [item] = webapp.normalize_line_items(payload)
+        [review_item] = webapp.normalize_line_items_for_quote_basis_review(payload)
         self.assertEqual(item["catalog_unit_price"], 77)
         self.assertEqual(item["quantity"], 2)
         self.assertEqual(item["status"], "matched")
@@ -2020,6 +2035,9 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(item["pricing_reference_source"], "local")
         self.assertEqual(item["pricing_reference_id"], "new-quote-pricing")
         self.assertEqual(item["price_mode"], "Priced")
+        self.assertEqual(review_item["effective_unit_price"], 77)
+        self.assertEqual(review_item["pricing_basis_amount"], 154)
+        self.assertEqual(review_item["approved_quote_amount"], 154)
 
         fx_payload = {**payload, "quote_exchange_rate": 1.37}
         [fx_item] = webapp.normalize_line_items(fx_payload)
@@ -2129,6 +2147,90 @@ class WebappServerTest(unittest.TestCase):
                 ):
                     with self.assertRaises(webapp.SqagStorageAccessError):
                         webapp.profile_defaults_source_for_payload(missing_payload)
+
+    def test_profile_and_company_preset_identity_resolves_only_exact_owner_pack(self):
+        with tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+            root = Path(tmp)
+            template_root = root / "profiles"
+            template_a = write_test_profile_pack(template_root, "template-a", "template-pricing-a")
+            template_b = write_test_profile_pack(template_root, "template-b", "template-pricing-b")
+            template_default = write_test_profile_pack(template_root, "default", "template-pricing-default")
+            (template_root / "broken").mkdir(parents=True)
+            company_store = webapp.CompanyConfigStore(root / "company-data")
+            company_store.save_profile(webapp.DEFAULT_COMPANY_ID, workspace_profile_with_layout("default"))
+            missing_company_store = webapp.CompanyConfigStore(root / "missing-company-data")
+
+            template_payload = valid_payload()
+            template_payload["profile_id"] = "profile:template-a"
+            template_payload["profile_source"] = "profile"
+            template_payload["pricing_reference_id"] = ""
+            template_payload["quote_company_profile"] = {"id": "profile:template-a", "source": "profile"}
+            template_b_payload = copy.deepcopy(template_payload)
+            template_b_payload["profile_id"] = "profile:template-b"
+            template_b_payload["quote_company_profile"] = {"id": "profile:template-b", "source": "profile"}
+            company_payload = copy.deepcopy(template_payload)
+            company_payload["profile_id"] = "company:default"
+            company_payload["profile_source"] = "company"
+            company_payload["quote_company_profile"] = {"id": "company:default", "source": "company"}
+
+            with (
+                mock.patch.object(webapp, "profiles_root", return_value=template_root),
+                mock.patch.object(webapp, "company_config_store", return_value=company_store),
+                mock.patch.object(webapp, "workspace_pricing_reference_id", return_value=""),
+            ):
+                resolved_a = webapp.load_template_profile_pack("template-a")
+                resolved_b = webapp.load_template_profile_pack("template-b")
+                self.assertEqual(resolved_a.id, "template-a")
+                self.assertEqual(resolved_b.id, "template-b")
+                self.assertNotEqual(resolved_a.quotation_layout_path, resolved_b.quotation_layout_path)
+                listed_profiles = webapp.list_profiles()
+                self.assertNotIn("broken", {profile["id"] for profile in listed_profiles})
+                self.assertEqual(webapp.profile_selection_error(template_payload), "")
+                self.assertEqual(webapp.profile_selection_error(template_b_payload), "")
+                self.assertEqual(
+                    webapp.profile_defaults_source_for_payload(template_payload).quotation_layout_path,
+                    template_a / "quotation-layout.xlsx",
+                )
+                self.assertEqual(
+                    webapp.profile_defaults_source_for_payload(template_b_payload).quotation_layout_path,
+                    template_b / "quotation-layout.xlsx",
+                )
+                self.assertEqual(webapp.pricing_reference_id_from_payload(template_payload), "template-pricing-a")
+                self.assertEqual(webapp.pricing_reference_id_from_payload(template_b_payload), "template-pricing-b")
+                resolved_company = webapp.profile_defaults_source_for_payload(company_payload)
+                self.assertEqual(resolved_company.id, "default")
+                self.assertEqual(
+                    resolved_company.asset_path("quotation_layout", "quotation-layout.xlsx"),
+                    company_store.profile_pack_dir(webapp.DEFAULT_COMPANY_ID, "default") / "quotation-layout.xlsx",
+                )
+                self.assertEqual(webapp.profile_selection_error(company_payload), "")
+
+            missing_company_payload = copy.deepcopy(company_payload)
+            with (
+                mock.patch.object(webapp, "profiles_root", return_value=template_root),
+                mock.patch.object(webapp, "company_config_store", return_value=missing_company_store),
+            ):
+                self.assertEqual(
+                    webapp.profile_selection_error(missing_company_payload),
+                    webapp.PROFILE_SELECTION_ERROR_MESSAGE,
+                )
+                with self.assertRaises(webapp.SqagStorageAccessError):
+                    webapp.profile_defaults_source_for_payload(missing_company_payload)
+                self.assertEqual(webapp.profile_selection_error(template_payload), "")
+                self.assertEqual(webapp.load_template_profile_pack("default").id, "default")
+                self.assertEqual(
+                    webapp.load_template_profile_pack("default").quotation_layout_path,
+                    template_default / "quotation-layout.xlsx",
+                )
+                missing_template_payload = copy.deepcopy(template_payload)
+                missing_template_payload["profile_id"] = "profile:missing-template"
+                missing_template_payload["quote_company_profile"] = {"id": "profile:missing-template", "source": "profile"}
+                self.assertEqual(
+                    webapp.profile_selection_error(missing_template_payload),
+                    webapp.PROFILE_SELECTION_ERROR_MESSAGE,
+                )
+                with self.assertRaises(webapp.SqagStorageAccessError):
+                    webapp.profile_defaults_source_for_payload(missing_template_payload)
 
     def test_operator_profiles_read_exact_company_authority_but_settings_stays_management_only(self):
         with tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
@@ -13478,6 +13580,15 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 generated = webapp.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
                 stale = webapp.create_or_update_quote_session(stale_payload)
                 persisted_stale = webapp.get_quote_session("quote-stale", include_draft_state=True)
+                blocked = webapp.create_or_update_quote_session(
+                    stale_payload,
+                    result={"status": "needs_confirmation", "errors": ["Price review required."], "files": []},
+                )
+                failed = webapp.create_or_update_quote_session(
+                    stale_payload,
+                    result={"status": "failed", "errors": ["Synthetic generation failure."], "files": []},
+                )
+                stale_download_path = webapp.LocalSqagStorage().quote_session_export_file_path("quote-stale", "xlsx")
                 regenerated = webapp.create_or_update_quote_session(stale_payload, result=result, output_dir=output_dir)
                 post_generate_payload = valid_payload()
                 post_generate_payload["quote_session"] = {
@@ -13511,11 +13622,21 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
             self.assertFalse(stale["status"]["quote_generated"])
             self.assertTrue(stale["status"]["draft_modified"])
             self.assertEqual(stale["exports"]["xlsx"]["filename"], "quotation.xlsx")
-            self.assertFalse(stale["exports"]["xlsx"]["exists"])
+            self.assertTrue(stale["exports"]["xlsx"]["exists"])
             self.assertTrue(stale["exports"]["xlsx"]["stale"])
-            self.assertIsNone(stale["exports"]["xlsx"]["url"])
-            self.assertFalse(stale["exports"]["pdf"]["exists"])
+            self.assertEqual(stale["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-stale/download/xlsx")
+            self.assertTrue(stale["exports"]["pdf"]["exists"])
             self.assertTrue(stale["exports"]["pdf"]["stale"])
+            self.assertEqual(stale["exports"]["pdf"]["url"], "/api/quote-sessions/quote-stale/download/pdf")
+            for attempted in (stale, blocked, failed):
+                self.assertTrue(attempted["exports"]["xlsx"]["exists"])
+                self.assertTrue(attempted["exports"]["xlsx"]["stale"])
+                self.assertEqual(attempted["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-stale/download/xlsx")
+                self.assertTrue(attempted["exports"]["pdf"]["exists"])
+                self.assertTrue(attempted["exports"]["pdf"]["stale"])
+                self.assertEqual(attempted["exports"]["pdf"]["url"], "/api/quote-sessions/quote-stale/download/pdf")
+                self.assertEqual(webapp.quote_session_result_files(attempted), [])
+            self.assertIsNone(stale_download_path)
             self.assertNotIn(str(tmp_path), json.dumps(stale))
             self.assertIsNotNone(persisted_stale)
             self.assertEqual(
@@ -14473,7 +14594,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertNotIn('id="taxRate"', html)
         self.assertIn("if (elements.taxLabel) elements.taxLabel.value", js)
         self.assertIn("selectableTemplateProfilePresets", js)
-        self.assertIn('.filter((preset) => preset.id !== "default")', js)
+        self.assertIn('.filter((preset) => preset.source === "profile" && preset.profile_id && preset.id !== "default")', js)
         self.assertNotIn("defaultOption", js)
         self.assertIn('`<optgroup label="Saved Profiles">', js)
         self.assertNotIn("Profile Pricing References", js)
@@ -16822,6 +16943,7 @@ eval([
   "safeProfileId",
   "safeProfileLabel",
   "profilePresetOptionValue",
+  "profilePresetOptionParts",
   "companyProfileOptionValue",
   "currentProfile",
   "templateProfilePresets",
@@ -16864,12 +16986,12 @@ renderPresetOptions();
 assert.strictEqual(state.selectedPresetValue, "company:missing-profile");
 assert.strictEqual(elements.presetSelect.value, "");
 
-savedSelection = JSON.stringify({ browserRecoveryScope: "scope-a", presetValue: "profile:trade-show" });
+savedSelection = JSON.stringify({ browserRecoveryScope: "scope-a", presetValue: "profile:quote-layout:trade-show" });
 state.selectedPresetValue = "";
 elements.presetSelect.value = "";
 renderPresetOptions();
-assert.strictEqual(state.selectedPresetValue, "profile:trade-show");
-assert.strictEqual(elements.presetSelect.value, "profile:trade-show");
+assert.strictEqual(state.selectedPresetValue, "profile:quote-layout:trade-show");
+assert.strictEqual(elements.presetSelect.value, "profile:quote-layout:trade-show");
 """
         completed = subprocess.run(
             [node, "-e", script],
@@ -17270,9 +17392,14 @@ assert.strictEqual(dashboardExportAvailabilityItem(mixed, "pdf", "PDF").statusTe
 
 const stale = {
   status: { quote_generated: false, draft_modified: true },
-  exports: { xlsx: { stale: true, filename: "quotation.xlsx" }, pdf: { stale: true, filename: "quotation.pdf" } },
+  exports: {
+    xlsx: { exists: true, stale: true, url: "/old-quote.xlsx", filename: "quotation.xlsx" },
+    pdf: { exists: true, stale: true, url: "/old-quote.pdf", filename: "quotation.pdf" },
+  },
 };
 assert.strictEqual(dashboardExportAvailabilityItem(stale, "xlsx", "XLSX").statusText, "XLSX needs regeneration");
+assert.strictEqual(quoteSessionHasAvailableExport(stale), false);
+assert.strictEqual(dashboardExportAvailabilityItem(stale, "xlsx", "XLSX").available, false);
 assert.deepStrictEqual(quoteSessionStatus(stale), { key: "draft-modified", label: "Draft Modified", className: "is-draft-modified" });
 
 const partialFresh = {
@@ -17795,7 +17922,7 @@ function extractFunction(name) {
 const PROFILE_PRESET_PREFIX = "profile:";
 const COMPANY_PROFILE_PRESET_PREFIX = "company:";
 const state = {
-  selectedPresetValue: "profile:default",
+  selectedPresetValue: "profile:default:default",
   profiles: [{
     id: "default",
     label: "Default",
@@ -17809,7 +17936,7 @@ const state = {
   outputRows: [],
 };
 const elements = {
-  presetSelect: { value: "profile:default" },
+  presetSelect: { value: "profile:default:default" },
   headerDetails: { value: "Custom header" },
   paymentTerms: { value: "Custom payment" },
   standardNotes: { value: "Custom notes" },
@@ -17851,6 +17978,7 @@ eval([
   "safeProfileId",
   "safeProfileLabel",
   "profilePresetOptionValue",
+  "profilePresetOptionParts",
   "companyProfileOptionValue",
   "selectedPresetId",
   "templateProfilePresets",
@@ -17863,7 +17991,7 @@ eval([
 
 loadSelectedPreset();
 
-assert.strictEqual(state.selectedPresetValue, "profile:default");
+assert.strictEqual(state.selectedPresetValue, "profile:default:default");
 assert.strictEqual(clearedPendingPack, true);
 assert.deepStrictEqual(appliedDetails, {});
 assert.deepStrictEqual(appliedOptions, { includeLogo: true, clearLogo: false, partial: true });
@@ -17943,8 +18071,12 @@ const state = {
     label: "Repo Layout",
     quote_detail_presets: [
       { id: "default", name: "Default", profile_id: "repo-layout", details: {} },
-      { id: "alt", name: "Alt", profile_id: "alt-layout", details: {} },
+      { id: "alt", name: "Alt", details: {} },
     ],
+  }, {
+    id: "alt-layout",
+    label: "Alternate Layout",
+    quote_detail_presets: [{ id: "alt", name: "Alternate Alt", details: {} }],
   }],
   companyProfiles: [{ id: "custom-layout", label: "Custom Layout", defaults: { company: { name: "Custom" } } }],
 };
@@ -17956,6 +18088,7 @@ eval([
   "safeProfileId",
   "safeProfileLabel",
   "profilePresetOptionValue",
+  "profilePresetOptionParts",
   "companyProfileOptionValue",
   "currentProfile",
   "selectedPresetId",
@@ -17970,14 +18103,33 @@ eval([
 assert.strictEqual(generationProfileIdForPayload(), "company:custom-layout");
 
 state.selectedPresetValue = "company:missing-layout";
-assert.strictEqual(generationProfileIdForPayload(), "company:missing-layout");
+assert.strictEqual(generationProfileIdForPayload(), "");
 
-state.selectedPresetValue = "profile:alt";
-assert.strictEqual(generationProfileIdForPayload(), "alt-layout");
+state.selectedPresetValue = "profile:repo-layout:alt";
+assert.deepStrictEqual(profilePresetOptionParts(state.selectedPresetValue), { profileId: "repo-layout", presetId: "alt" });
+assert.strictEqual(generationProfileIdForPayload(), "profile:repo-layout");
+assert.strictEqual(selectedPreset().name, "Alt");
+
+state.selectedPresetValue = "profile:alt-layout:alt";
+assert.strictEqual(generationProfileIdForPayload(), "profile:alt-layout");
+assert.strictEqual(selectedPreset().name, "Alternate Alt");
+
+state.selectedPresetValue = "profile:repo-layout";
+assert.strictEqual(profilePresetOptionParts(state.selectedPresetValue), null);
+assert.strictEqual(selectedPreset(), null);
+assert.strictEqual(generationProfileIdForPayload(), "");
+
+state.companyProfiles = [];
+state.selectedPresetValue = "company:default";
+assert.strictEqual(selectedPreset(), null);
+assert.strictEqual(generationProfileIdForPayload(), "");
+state.companyProfiles = [{ id: "default", label: "Own Company Default", defaults: { company: { name: "Own" } } }];
+assert.strictEqual(selectedPreset().name, "Own Company Default");
+assert.strictEqual(generationProfileIdForPayload(), "company:default");
 
 state.selectedPresetValue = "";
 elements.presetSelect.value = "";
-assert.strictEqual(generationProfileIdForPayload(), "repo-layout");
+assert.strictEqual(generationProfileIdForPayload(), "profile:repo-layout");
 """
         completed = subprocess.run(
             [node, "-e", script],
@@ -18018,7 +18170,7 @@ function extractFunction(name) {
 const PROFILE_PRESET_PREFIX = "profile:";
 const COMPANY_PROFILE_PRESET_PREFIX = "company:";
 const state = {
-  selectedPresetValue: "profile:default",
+  selectedPresetValue: "profile:default:default",
   profileDeleteConfirmId: "",
   profileDeleteReadOnlyName: "",
   profileDeleteError: "",
@@ -18033,7 +18185,7 @@ const state = {
   companyProfiles: [{ id: "saved-profile", label: "Saved Profile", defaults: { company: { name: "Saved" } } }],
 };
 const elements = {
-  presetSelect: { value: "profile:default" },
+  presetSelect: { value: "profile:default:default" },
   presetSourceBadge: { textContent: "" },
   loadPresetButton: { disabled: false, title: "", setAttribute(name, value) { this[name] = value; }, querySelector() { return { textContent: "" }; } },
   deletePresetButton: { dataset: {}, disabled: false, title: "", setAttribute(name, value) { this[name] = value; }, querySelector() { return { textContent: "" }; } },
@@ -18085,6 +18237,7 @@ eval([
   "safeProfileId",
   "safeProfileLabel",
   "profilePresetOptionValue",
+  "profilePresetOptionParts",
   "companyProfileOptionValue",
   "selectedPresetId",
   "templateProfilePresets",
@@ -25378,6 +25531,8 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertNotIn("rich_text:", normalize_body)
         self.assertNotIn("logo_data_url", normalize_body)
         self.assertIn("quote_exchange_rate: collectQuoteExchangeRate()", normalize_body)
+        self.assertIn("quote_session: currentQuoteSessionPayload({", normalize_body)
+        self.assertIn("includeDraftState: true", normalize_body)
         self.assertLess(
             confirm_body.index("const refreshed = await refreshLineItemsFromServer();"),
             confirm_body.index("refreshOutputRowsFromLineItems();"),
@@ -26730,7 +26885,9 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertEqual(generated["generation_snapshot"]["profile"]["display_name"], "Generated Stale Profile")
         self.assertEqual(edited["generation_snapshot"]["pricing_reference"]["display_name"], "Generated Stale Pricing")
         self.assertTrue(fetched["exports"]["xlsx"]["stale"])
-        self.assertIsNone(fetched["exports"]["xlsx"]["url"])
+        self.assertTrue(fetched["exports"]["xlsx"]["exists"])
+        self.assertEqual(fetched["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-db-stale/download/xlsx")
+        self.assertEqual(webapp.quote_session_result_files(fetched), [])
         self.assertEqual(fetched["generation_snapshot"]["profile"]["display_name"], "Generated Stale Profile")
         self.assertEqual(fetched["generation_snapshot"]["pricing_reference"]["display_name"], "Generated Stale Pricing")
         self.assertIsNone(artifact)
@@ -30121,9 +30278,10 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertEqual(active_kinds, ["xlsx"])
         self.assertEqual(len(backend._objects), 1)
         self.assertFalse(session["status"]["quote_generated"])
-        self.assertFalse(session["exports"]["xlsx"]["exists"])
+        self.assertTrue(session["exports"]["xlsx"]["exists"])
         self.assertTrue(session["exports"]["xlsx"]["stale"])
-        self.assertIsNone(session["exports"]["xlsx"]["url"])
+        self.assertEqual(session["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-object-confirmation/download/xlsx")
+        self.assertEqual(webapp.quote_session_result_files(session), [])
         self.assertEqual(
             backend.retrieve_artifact(
                 prior_metadata,
@@ -31634,6 +31792,8 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         }
         payload = valid_payload()
         payload["profile_id"] = company_id
+        payload["profile_source"] = "company"
+        payload["quote_company_profile"] = {"id": f"company:{company_id}", "source": "company"}
         payload["pricing_reference_id"] = pricing_reference["id"]
         payload["line_items"] = [{
             "section": "Graphics",

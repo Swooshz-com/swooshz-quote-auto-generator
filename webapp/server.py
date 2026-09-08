@@ -8017,8 +8017,8 @@ def company_profile_export_payload(profile_id: str, company_id: str = DEFAULT_CO
         "exported_at": utc_timestamp(),
         "profile": exported_profile,
     }
-    profile_pack = load_company_profile_pack(safe_id, company_id) or load_profile_pack(safe_id)
-    pack = profile_pack_asset_export_payload(profile_pack)
+    profile_pack = load_company_profile_pack(safe_id, company_id)
+    pack = profile_pack_asset_export_payload(profile_pack) if profile_pack is not None else {}
     if pack:
         payload["pack"] = pack
     return payload
@@ -13613,9 +13613,9 @@ class DatabaseSqagStorage:
             artifact = self._quote_artifact_metadata(public["session_id"], kind) if published and configured_artifact_storage_mode() in {"database", "object"} and safe_recorded else None
             artifact_exists = bool(artifact)
             stale = bool(artifact_exists and quote_session_export_is_stale(metadata, raw_export))
-            exists = bool(artifact_exists and not stale)
+            exists = artifact_exists
             has_stale_export = has_stale_export or stale
-            has_available_export = has_available_export or exists
+            has_available_export = has_available_export or (exists and not stale)
             export["filename"] = safe_recorded or None
             export["exists"] = exists
             export["missing"] = bool(safe_recorded and not artifact_exists)
@@ -15659,8 +15659,13 @@ def pricing_reference_id_from_payload(payload: dict[str, Any]) -> str:
     workspace_reference_id = workspace_pricing_reference_id()
     if workspace_reference_id:
         return workspace_reference_id
-    profile = load_profile_pack(profile_id_from_payload(payload))
-    return profile.default_pricing_reference_id() or DEFAULT_PRICING_REFERENCE_ID
+    source, profile_id = profile_authority_from_payload(payload)
+    profile = (
+        load_company_profile_pack(profile_id, DEFAULT_COMPANY_ID)
+        if source == "company"
+        else load_template_profile_pack(profile_id or workspace_profile_pack_id())
+    )
+    return profile.default_pricing_reference_id() if profile is not None else ""
 
 
 def pricing_reference_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -15764,6 +15769,10 @@ def profile_selection_error(payload: dict[str, Any], auth_session: dict[str, Any
     elif source == "company":
         profile = load_company_profile_pack(profile_id, DEFAULT_COMPANY_ID)
         if profile is None or not profile.asset_path("quotation_layout", "quotation-layout.xlsx").is_file():
+            return PROFILE_SELECTION_ERROR_MESSAGE
+    else:
+        profile = load_template_profile_pack(profile_id or workspace_profile_pack_id())
+        if profile is None:
             return PROFILE_SELECTION_ERROR_MESSAGE
     return ""
 
@@ -16069,6 +16078,21 @@ class ProfilePack:
         return config
 
 
+def load_template_profile_pack(profile_id: str | None = None) -> ProfilePack | None:
+    """Resolve only the requested bundled template pack; never fall back by id."""
+    resolved_id = safe_resource_id(profile_id, "")
+    if not resolved_id:
+        return None
+    profile = ProfilePack.resolve(resolved_id)
+    if profile.id != resolved_id or not profile.config:
+        return None
+    if resolved_id != DEFAULT_PROFILE_ID and not profile.asset_path("quotation_layout", "quotation-layout.xlsx").is_file():
+        return None
+    if not profile.quotation_layout_path.is_file():
+        return None
+    return profile
+
+
 @dataclass(frozen=True)
 class PricingReferencePack:
     """Resolved pricing catalog package independent from quotation profiles."""
@@ -16249,8 +16273,8 @@ def list_profiles() -> list[dict[str, Any]]:
         for path in sorted(root.iterdir()):
             if not path.is_dir() or not PROFILE_ID_RE.fullmatch(path.name):
                 continue
-            profile = load_profile_pack(path.name)
-            if profile.config and profile.id not in seen_ids:
+            profile = load_template_profile_pack(path.name)
+            if profile is not None and profile.config and profile.id not in seen_ids:
                 profiles.append(profile_public_summary(profile))
                 seen_ids.add(profile.id)
     return profiles
@@ -17367,7 +17391,7 @@ def resolve_tied_catalog_attribute_item(query_text: str, items: list[dict[str, A
     return None
 
 
-def normalize_owned_line_item(raw: dict[str, Any]) -> dict[str, Any] | None:
+def normalize_owned_line_item(raw: dict[str, Any], *, exchange_rate: float | None = None) -> dict[str, Any] | None:
     display_price = clean_text(raw.get("display_price"))
     price_mode = clean_text(raw.get("price_mode")).title()
     if clean_text(raw.get("unit_price_override")).lower() == "included" or display_price.lower() == "included":
@@ -17430,6 +17454,15 @@ def normalize_owned_line_item(raw: dict[str, Any]) -> dict[str, Any] | None:
             item[key] = 0 if price_mode == "Included" and key == "approved_quote_amount" else value
     if not item["source_basis_line_id"]:
         item.pop("source_basis_line_id", None)
+    normalized_exchange_rate = parse_float_or_none(exchange_rate)
+    if normalized_exchange_rate is not None and normalized_exchange_rate <= 0:
+        normalized_exchange_rate = None
+    if effective is not None and effective >= 0 and quantity is not None and quantity > 0:
+        item["pricing_basis_amount"] = round_commercial_cents(quantity * effective)
+        if normalized_exchange_rate is not None:
+            item["approved_quote_amount"] = round_commercial_cents(
+                item["pricing_basis_amount"] * normalized_exchange_rate
+            )
     return item
 
 
@@ -17439,11 +17472,12 @@ def normalize_line_items(payload: dict[str, Any], use_catalog: bool = True) -> l
         return []
 
     if quote_commercial_state(payload).get("owned"):
+        exchange_rate = quote_exchange_rate_from_payload(payload)
         return [
             item
             for raw in raw_items
             if isinstance(raw, dict)
-            for item in [normalize_owned_line_item(raw)]
+            for item in [normalize_owned_line_item(raw, exchange_rate=exchange_rate)]
             if item
         ]
 
@@ -17800,7 +17834,14 @@ def profile_defaults_source_for_payload(payload: dict[str, Any], auth_session: d
                 reason="workspace_profile_missing_or_unavailable",
             )
         return profile
-    return load_profile_pack(profile_id_from_payload(payload))
+    profile = load_template_profile_pack(profile_id or workspace_profile_pack_id())
+    if profile is None:
+        raise SqagStorageAccessError(
+            PROFILE_SELECTION_ERROR_MESSAGE,
+            status=400,
+            reason="workspace_profile_missing_or_unavailable",
+        )
+    return profile
 
 
 def profile_defaults_blocked_result() -> dict[str, Any]:
@@ -18430,7 +18471,21 @@ def pricing_catalog_runtime_lookup_for_payload(payload: dict[str, Any], profile_
 def build_quote_draft_prompt(payload: dict[str, Any]) -> str:
     project = payload.get("project") if isinstance(payload.get("project"), dict) else {}
     client = payload.get("client") if isinstance(payload.get("client"), dict) else {}
-    profile = load_profile_pack(profile_id_from_payload(payload))
+    if configured_storage_mode() == "database":
+        profile = load_profile_pack(profile_id_from_payload(payload))
+    else:
+        source, profile_id = profile_authority_from_payload(payload)
+        profile = (
+            load_company_profile_pack(profile_id, DEFAULT_COMPANY_ID)
+            if source == "company"
+            else load_template_profile_pack(profile_id or workspace_profile_pack_id())
+        )
+        if profile is None:
+            raise SqagStorageAccessError(
+                PROFILE_SELECTION_ERROR_MESSAGE,
+                status=400,
+                reason="workspace_profile_missing_or_unavailable",
+            )
     generator_label = clean_text(payload.get("generator_label")) or clean_text(profile.config.get("label")) or "Quotation"
     user_feedback = clean_multiline(payload.get("user_feedback"))
     include_current_draft = bool(user_feedback)
@@ -21140,7 +21195,7 @@ def quote_session_result_files(session: dict[str, Any] | None) -> list[dict[str,
     for kind, filename in sorted(QUOTE_SESSION_EXPORT_KINDS.items(), key=lambda item: item[1]):
         export = exports.get(kind) if isinstance(exports.get(kind), dict) else {}
         url = clean_text(export.get("url"))
-        if export.get("exists") is True and url.startswith("/api/quote-sessions/"):
+        if export.get("exists") is True and export.get("stale") is not True and url.startswith("/api/quote-sessions/"):
             item = {"name": filename, "url": url}
             size = int(export.get("size_bytes") or 0)
             if size > 0:
@@ -21282,7 +21337,7 @@ def quote_session_profile_summary(payload: dict[str, Any], patch: dict[str, Any]
     if not display_name and profile_id and configured_storage_mode() != "database":
         with contextlib.suppress(Exception):
             _source, raw_profile_id = profile_identity_parts(profile_id)
-            profile = load_company_profile_pack(raw_profile_id, DEFAULT_COMPANY_ID) if _source == "company" else load_profile_pack(raw_profile_id)
+            profile = load_company_profile_pack(raw_profile_id, DEFAULT_COMPANY_ID) if _source == "company" else load_template_profile_pack(raw_profile_id)
             if profile is not None:
                 display_name = profile_prompt_summary(profile).get("label", "")
     return {
@@ -22072,9 +22127,9 @@ def public_quote_session(metadata: dict[str, Any], *, include_draft_state: bool 
         export_path = quote_session_export_path(session_id, kind) if safe_recorded else None
         file_exists = bool(published and export_path and export_path.exists() and export_path.is_file())
         stale = bool(file_exists and quote_session_export_is_stale(normalized, raw_export))
-        exists = bool(file_exists and not stale)
+        exists = file_exists
         has_stale_export = has_stale_export or stale
-        has_available_export = has_available_export or exists
+        has_available_export = has_available_export or (exists and not stale)
         raw_export["filename"] = safe_recorded or None
         raw_export["exists"] = exists
         raw_export["missing"] = bool(safe_recorded and not file_exists)
