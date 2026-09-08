@@ -777,6 +777,24 @@ def local_http_get_json(runner: LocalRunnerServer, path: str) -> tuple[int, dict
         connection.close()
 
 
+def local_http_get_bytes(
+    runner: LocalRunnerServer,
+    path: str,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, bytes]:
+    connection = http.client.HTTPConnection(
+        runner.server.server_address[0],
+        runner.server.server_address[1],
+        timeout=3,
+    )
+    try:
+        connection.request("GET", path, headers=headers or {})
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
+
+
 class JsonResponseMock:
     def __init__(self, payload: dict[str, object], status: int = 200):
         self.payload = payload
@@ -1832,6 +1850,40 @@ class WebappServerTest(unittest.TestCase):
         errors = webapp.quote_commercial_state_errors(payload)
 
         self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, errors)
+
+    def test_recovered_qualified_template_authority_cannot_switch_owner(self):
+        payload = recovered_convergence_payload()
+        payload["quote_session"]["draft_state"]["selectedPresetValue"] = "profile:owner-a:shared"
+        payload["profile_id"] = "profile:owner-b"
+        payload["quote_company_profile"] = {"id": "profile:owner-b", "source": "profile"}
+
+        self.assertEqual(
+            webapp.profile_authority_identity_from_selection("profile:owner-a:shared"),
+            "profile:owner-a",
+        )
+        errors = webapp.quote_commercial_state_errors(payload)
+        self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, errors)
+        self.assertEqual(webapp.quote_commercial_payload(payload)["profile_id"], "profile:owner-b")
+
+        valid_owner_payload = copy.deepcopy(payload)
+        valid_owner_payload["profile_id"] = "profile:owner-a"
+        valid_owner_payload["quote_company_profile"] = {"id": "profile:owner-a", "source": "profile"}
+        self.assertNotIn(
+            webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE,
+            webapp.quote_commercial_state_errors(valid_owner_payload),
+        )
+
+        missing_current_owner = copy.deepcopy(payload)
+        missing_current_owner.pop("profile_id")
+        missing_current_owner["quote_company_profile"] = {}
+        self.assertIn(
+            webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE,
+            webapp.quote_commercial_state_errors(missing_current_owner),
+        )
+        self.assertEqual(
+            webapp.quote_commercial_payload(missing_current_owner)["profile_id"],
+            "profile:owner-a",
+        )
 
     def test_recovered_quote_catalog_price_cannot_complete_missing_historical_row_price(self):
         payload = valid_payload()
@@ -13576,20 +13628,48 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 },
             }
 
-            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
                 generated = webapp.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
                 stale = webapp.create_or_update_quote_session(stale_payload)
+                stale_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-stale/download/{kind}",
+                    )
+                    for kind in ("xlsx", "pdf")
+                }
                 persisted_stale = webapp.get_quote_session("quote-stale", include_draft_state=True)
                 blocked = webapp.create_or_update_quote_session(
                     stale_payload,
                     result={"status": "needs_confirmation", "errors": ["Price review required."], "files": []},
                 )
+                blocked_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-stale/download/{kind}",
+                    )
+                    for kind in ("xlsx", "pdf")
+                }
                 failed = webapp.create_or_update_quote_session(
                     stale_payload,
                     result={"status": "failed", "errors": ["Synthetic generation failure."], "files": []},
                 )
+                failed_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-stale/download/{kind}",
+                    )
+                    for kind in ("xlsx", "pdf")
+                }
                 stale_download_path = webapp.LocalSqagStorage().quote_session_export_file_path("quote-stale", "xlsx")
                 regenerated = webapp.create_or_update_quote_session(stale_payload, result=result, output_dir=output_dir)
+                fresh_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-stale/download/{kind}",
+                    )
+                    for kind in ("xlsx", "pdf")
+                }
                 post_generate_payload = valid_payload()
                 post_generate_payload["quote_session"] = {
                     **stale_payload["quote_session"],
@@ -13636,7 +13716,11 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 self.assertTrue(attempted["exports"]["pdf"]["stale"])
                 self.assertEqual(attempted["exports"]["pdf"]["url"], "/api/quote-sessions/quote-stale/download/pdf")
                 self.assertEqual(webapp.quote_session_result_files(attempted), [])
-            self.assertIsNone(stale_download_path)
+            self.assertTrue(stale_download_path.is_file())
+            self.assertEqual(stale_download_path.read_bytes(), b"xlsx")
+            for downloads in (stale_downloads, blocked_downloads, failed_downloads):
+                self.assertEqual(downloads["xlsx"], (200, b"xlsx"))
+                self.assertEqual(downloads["pdf"], (200, b"pdf"))
             self.assertNotIn(str(tmp_path), json.dumps(stale))
             self.assertIsNotNone(persisted_stale)
             self.assertEqual(
@@ -13650,6 +13734,8 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
             self.assertTrue(regenerated["status"]["quote_generated"])
             self.assertTrue(regenerated["exports"]["xlsx"]["exists"])
             self.assertFalse(regenerated["exports"]["xlsx"]["stale"])
+            self.assertEqual(fresh_downloads["xlsx"], (200, b"xlsx"))
+            self.assertEqual(fresh_downloads["pdf"], (200, b"pdf"))
             self.assertTrue(saved_after_generate["status"]["quote_generated"])
             self.assertFalse(saved_after_generate["status"].get("draft_modified", False))
             self.assertTrue(saved_after_generate["exports"]["xlsx"]["exists"])
@@ -13714,9 +13800,12 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                     metadata["updated_at"] = "2026-01-03T00:00:00Z"
                     metadata["exports"]["xlsx"]["created_at"] = "2026-01-02T00:00:00Z"
                     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-                    with self.assertRaises(urllib.error.HTTPError) as error:
-                        urllib.request.urlopen(f"{runner.base_url}/api/quote-sessions/quote-api/download/xlsx", timeout=3)
-                    self.assertEqual(error.exception.code, 404)
+                    with urllib.request.urlopen(
+                        f"{runner.base_url}/api/quote-sessions/quote-api/download/xlsx",
+                        timeout=3,
+                    ) as response:
+                        self.assertEqual(response.status, 200)
+                        self.assertEqual(response.read(), b"xlsx")
 
                     for path in (
                         "/api/quote-sessions/quote-api/download/docx",
@@ -16957,6 +17046,7 @@ eval([
   "presetOptionValue",
   "availablePresetValues",
   "lastSelectedPresetValue",
+  "preservedOwnedPresetValue",
   "renderPresetOptions",
   "loadDefaultProfilePreset",
 ].map(extractFunction).join("\n"));
@@ -16986,6 +17076,32 @@ renderPresetOptions();
 assert.strictEqual(state.selectedPresetValue, "company:missing-profile");
 assert.strictEqual(elements.presetSelect.value, "");
 
+state.profiles = [{
+  id: "owner-b",
+  label: "Owner B",
+  quote_detail_presets: [{ id: "shared", name: "Owner B Shared", details: {} }],
+}];
+state.companyProfiles = [];
+state.selectedPresetValue = "profile:owner-a:shared";
+elements.presetSelect.value = "profile:owner-b:shared";
+savedSelection = JSON.stringify({ browserRecoveryScope: "scope-a", presetValue: "profile:owner-b:shared" });
+state.quoteCommercialLifecycle = "RECOVERED";
+renderPresetOptions();
+assert.strictEqual(state.selectedPresetValue, "profile:owner-a:shared");
+assert.strictEqual(elements.presetSelect.value, "");
+loadDefaultProfilePreset();
+assert.strictEqual(state.selectedPresetValue, "profile:owner-a:shared");
+assert.strictEqual(elements.presetSelect.value, "");
+
+state.profiles = [{
+  id: "quote-layout",
+  label: "Quote Layout",
+  quote_detail_presets: [
+    { id: "default", name: "Default Profile", details: {} },
+    { id: "trade-show", name: "Trade Show", details: {} },
+  ],
+}];
+state.companyProfiles = [{ id: "saved-profile", label: "Saved Profile", defaults: { company: { name: "Saved" } } }];
 savedSelection = JSON.stringify({ browserRecoveryScope: "scope-a", presetValue: "profile:quote-layout:trade-show" });
 state.selectedPresetValue = "";
 elements.presetSelect.value = "";
@@ -17397,9 +17513,14 @@ const stale = {
     pdf: { exists: true, stale: true, url: "/old-quote.pdf", filename: "quotation.pdf" },
   },
 };
-assert.strictEqual(dashboardExportAvailabilityItem(stale, "xlsx", "XLSX").statusText, "XLSX needs regeneration");
+assert.strictEqual(dashboardExportAvailabilityItem(stale, "xlsx", "XLSX").statusText, "XLSX stale - needs regeneration");
 assert.strictEqual(quoteSessionHasAvailableExport(stale), false);
-assert.strictEqual(dashboardExportAvailabilityItem(stale, "xlsx", "XLSX").available, false);
+assert.strictEqual(dashboardExportAvailabilityItem(stale, "xlsx", "XLSX").available, true);
+const staleAction = dashboardSelectedExportAction(stale, "xlsx", "XLSX");
+assert.strictEqual(visibleText(staleAction), "Download XLSX (stale)");
+assert.ok(staleAction.includes('title="XLSX stale - needs regeneration"'));
+assert.ok(staleAction.includes('aria-label="Download XLSX (stale; needs regeneration)"'));
+assert.ok(staleAction.includes("is-stale"));
 assert.deepStrictEqual(quoteSessionStatus(stale), { key: "draft-modified", label: "Draft Modified", className: "is-draft-modified" });
 
 const partialFresh = {
@@ -17860,6 +17981,7 @@ function extractFunction(name) {
   throw new Error(`Unclosed function ${name}`);
 }
 
+const COMPANY_PROFILE_PRESET_PREFIX = "company:";
 const state = { selectedPresetValue: "" };
 const elements = { presetSelect: { value: "" } };
 const loaded = [];
@@ -17868,8 +17990,9 @@ function defaultPresetOptionValue() { return "profile:default"; }
 function availablePresetValues() { return new Set(["company:saved-profile"]); }
 function updatePresetButtons() {}
 function loadSelectedPreset(options = {}) { loaded.push({ value: state.selectedPresetValue, options }); }
+function profilePresetOptionParts() { return null; }
 
-eval(extractFunction("loadDefaultProfilePreset"));
+eval([extractFunction("preservedOwnedPresetValue"), extractFunction("loadDefaultProfilePreset")].join("\n"));
 
 loadDefaultProfilePreset({ silent: true });
 assert.strictEqual(state.selectedPresetValue, "company:saved-profile");
@@ -18113,6 +18236,17 @@ assert.strictEqual(selectedPreset().name, "Alt");
 state.selectedPresetValue = "profile:alt-layout:alt";
 assert.strictEqual(generationProfileIdForPayload(), "profile:alt-layout");
 assert.strictEqual(selectedPreset().name, "Alternate Alt");
+
+state.profiles = [{
+  id: "owner-b",
+  label: "Owner B",
+  quote_detail_presets: [{ id: "shared", name: "Owner B Shared", details: {} }],
+}];
+state.selectedPresetValue = "profile:owner-a:shared";
+state.quoteCommercialLifecycle = "RECOVERED";
+elements.presetSelect.value = "profile:owner-b:shared";
+assert.strictEqual(selectedPreset(), null);
+assert.strictEqual(generationProfileIdForPayload(), "");
 
 state.selectedPresetValue = "profile:repo-layout";
 assert.strictEqual(profilePresetOptionParts(state.selectedPresetValue), null);
@@ -26830,13 +26964,14 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertEqual(delete_response["status"], "deleted")
         self.assertIsNone(artifact_after_delete)
 
-    def test_database_artifact_stale_export_does_not_download_and_snapshot_is_preserved(self):
+    def test_database_artifact_stale_export_remains_downloadable_and_snapshot_is_preserved(self):
         tmp_path = test_temp_root() / f"db-artifact-stale-{time.time_ns()}"
         tmp_path.mkdir(parents=True)
         database_url = f"sqlite:///{(tmp_path / 'sqag-storage.sqlite3').as_posix()}"
         output_dir = tmp_path / "out" / "job-db-stale"
         output_dir.mkdir(parents=True)
         (output_dir / "quotation.xlsx").write_bytes(b"xlsx-db-stale")
+        (output_dir / "quotation.pdf").write_bytes(b"pdf-db-stale")
         env = {**self.platform_launch_env(), "SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
         with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
             webapp, "validated_platform_auth_session", side_effect=lambda session: session
@@ -26851,7 +26986,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             payload["quote_session"] = {"session_id": "quote-db-stale"}
             generated = storage.create_or_update_quote_session(
                 payload,
-                result={"status": "completed", "files": [{"name": "quotation.xlsx"}]},
+                result={"status": "completed", "files": [{"name": "quotation.xlsx"}, {"name": "quotation.pdf"}]},
                 output_dir=output_dir,
             )
 
@@ -26867,31 +27002,53 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             storage.delete_pricing_reference("stale-pricing")
             fetched = storage.get_quote_session("quote-db-stale", include_draft_state=True)
             artifact = storage.quote_session_export_artifact("quote-db-stale", "xlsx")
+            pdf_artifact = storage.quote_session_export_artifact("quote-db-stale", "pdf")
             cookie = webapp.signed_cookie_value(self.platform_auth_session("workspace-db-stale"))
+            other_cookie = webapp.signed_cookie_value(self.platform_auth_session("workspace-db-stale-other"))
             with LocalRunnerServer() as runner:
-                parsed = urllib.parse.urlparse(runner.base_url)
-                connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
-                try:
-                    connection.request(
-                        "GET",
-                        "/api/quote-sessions/quote-db-stale/download/xlsx",
+                stale_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-db-stale/download/{kind}",
                         headers={"Cookie": f"{webapp.SESSION_COOKIE_NAME}={cookie}"},
                     )
-                    stale_response = connection.getresponse()
-                    stale_response.read()
-                finally:
-                    connection.close()
+                    for kind in ("xlsx", "pdf")
+                }
+                cross_workspace_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-db-stale/download/{kind}",
+                        headers={"Cookie": f"{webapp.SESSION_COOKIE_NAME}={other_cookie}"},
+                    )
+                    for kind in ("xlsx", "pdf")
+                }
+                unauthorised_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-db-stale/download/{kind}",
+                    )
+                    for kind in ("xlsx", "pdf")
+                }
 
         self.assertEqual(generated["generation_snapshot"]["profile"]["display_name"], "Generated Stale Profile")
         self.assertEqual(edited["generation_snapshot"]["pricing_reference"]["display_name"], "Generated Stale Pricing")
         self.assertTrue(fetched["exports"]["xlsx"]["stale"])
         self.assertTrue(fetched["exports"]["xlsx"]["exists"])
         self.assertEqual(fetched["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-db-stale/download/xlsx")
+        self.assertTrue(fetched["exports"]["pdf"]["stale"])
+        self.assertTrue(fetched["exports"]["pdf"]["exists"])
+        self.assertEqual(fetched["exports"]["pdf"]["url"], "/api/quote-sessions/quote-db-stale/download/pdf")
         self.assertEqual(webapp.quote_session_result_files(fetched), [])
         self.assertEqual(fetched["generation_snapshot"]["profile"]["display_name"], "Generated Stale Profile")
         self.assertEqual(fetched["generation_snapshot"]["pricing_reference"]["display_name"], "Generated Stale Pricing")
-        self.assertIsNone(artifact)
-        self.assertEqual(stale_response.status, 404)
+        self.assertEqual(artifact["content"], b"xlsx-db-stale")
+        self.assertEqual(pdf_artifact["content"], b"pdf-db-stale")
+        self.assertEqual(stale_downloads["xlsx"], (200, b"xlsx-db-stale"))
+        self.assertEqual(stale_downloads["pdf"], (200, b"pdf-db-stale"))
+        self.assertEqual(cross_workspace_downloads["xlsx"][0], 404)
+        self.assertEqual(cross_workspace_downloads["pdf"][0], 404)
+        self.assertIn(unauthorised_downloads["xlsx"][0], {401, 403})
+        self.assertIn(unauthorised_downloads["pdf"][0], {401, 403})
 
     def test_object_artifact_storage_saves_db_metadata_and_downloads_through_authorized_route(self):
         backend = webapp.InMemoryObjectStorageBackend()
@@ -26901,10 +27058,15 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         output_dir = tmp_path / "out" / "job-object-artifact"
         output_dir.mkdir(parents=True)
         xlsx_bytes = b"xlsx-object-artifact"
+        pdf_bytes = b"pdf-object-artifact"
         (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
+        (output_dir / "quotation.pdf").write_bytes(pdf_bytes)
         payload = valid_payload()
         payload["quote_session"] = {"session_id": "quote-object-artifact"}
-        result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-object-artifact/files/quotation.xlsx"}]}
+        result = {"status": "completed", "files": [
+            {"name": "quotation.xlsx", "url": "/api/jobs/job-object-artifact/files/quotation.xlsx"},
+            {"name": "quotation.pdf", "url": "/api/jobs/job-object-artifact/files/quotation.pdf"},
+        ]}
         env = {
             **self.platform_launch_env(),
             "SQAG_STORAGE_MODE": "database",
@@ -26931,23 +27093,75 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             payload["pricing_reference_id"] = "object-snapshot-pricing"
             session = workspace_a.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
             artifact = workspace_a.quote_session_export_artifact("quote-object-artifact", "xlsx")
+            pdf_artifact = workspace_a.quote_session_export_artifact("quote-object-artifact", "pdf")
             blocked_artifact = workspace_b.quote_session_export_artifact("quote-object-artifact", "xlsx")
             cookie = webapp.signed_cookie_value(self.platform_auth_session("workspace-object-a"))
+            other_cookie = webapp.signed_cookie_value(self.platform_auth_session("workspace-object-b"))
             session_cookie = f"{webapp.SESSION_COOKIE_NAME}={cookie}"
+            other_session_cookie = f"{webapp.SESSION_COOKIE_NAME}={other_cookie}"
             with LocalRunnerServer() as runner:
-                parsed = urllib.parse.urlparse(runner.base_url)
-                connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
-                try:
-                    connection.request(
-                        "GET",
-                        "/api/quote-sessions/quote-object-artifact/download/xlsx",
+                fresh_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-object-artifact/download/{kind}",
                         headers={"Cookie": session_cookie},
                     )
-                    response = connection.getresponse()
-                    downloaded = response.read()
-                    status = response.status
-                finally:
-                    connection.close()
+                    for kind in ("xlsx", "pdf")
+                }
+                edit_payload = valid_payload()
+                edit_payload["quote_session"] = {
+                    "session_id": "quote-object-artifact",
+                    "draft_state": {"activeSidePanel": "pricing_review", "outputRevision": 2},
+                }
+                stale_session = workspace_a.create_or_update_quote_session(edit_payload)
+                stale_artifacts = {
+                    kind: workspace_a.quote_session_export_artifact("quote-object-artifact", kind)
+                    for kind in ("xlsx", "pdf")
+                }
+                stale_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-object-artifact/download/{kind}",
+                        headers={"Cookie": session_cookie},
+                    )
+                    for kind in ("xlsx", "pdf")
+                }
+                cross_workspace_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-object-artifact/download/{kind}",
+                        headers={"Cookie": other_session_cookie},
+                    )
+                    for kind in ("xlsx", "pdf")
+                }
+                unauthorised_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-object-artifact/download/{kind}",
+                    )
+                    for kind in ("xlsx", "pdf")
+                }
+                replacement_output_dir = tmp_path / "out" / "job-object-artifact-replacement"
+                replacement_output_dir.mkdir(parents=True)
+                (replacement_output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
+                (replacement_output_dir / "quotation.pdf").write_bytes(pdf_bytes)
+                replaced_session = workspace_a.create_or_update_quote_session(
+                    payload,
+                    result=result,
+                    output_dir=replacement_output_dir,
+                )
+                replacement_artifacts = {
+                    kind: workspace_a.quote_session_export_artifact("quote-object-artifact", kind)
+                    for kind in ("xlsx", "pdf")
+                }
+                replacement_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-object-artifact/download/{kind}",
+                        headers={"Cookie": session_cookie},
+                    )
+                    for kind in ("xlsx", "pdf")
+                }
 
         with sqlite3.connect(db_path) as connection:
             row = connection.execute(
@@ -26958,16 +27172,39 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
 
         self.assertTrue(session["exports"]["xlsx"]["exists"])
         self.assertEqual(session["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-object-artifact/download/xlsx")
+        self.assertTrue(session["exports"]["pdf"]["exists"])
+        self.assertEqual(session["exports"]["pdf"]["url"], "/api/quote-sessions/quote-object-artifact/download/pdf")
         self.assertEqual(session["generation_snapshot"]["profile"]["display_name"], "Object Snapshot Profile")
         self.assertEqual(session["generation_snapshot"]["pricing_reference"]["display_name"], "Object Snapshot Pricing")
         result_files = webapp.quote_session_result_files(session)
-        self.assertEqual(result_files[0]["url"], "/api/quote-sessions/quote-object-artifact/download/xlsx")
+        self.assertEqual(
+            {item["url"] for item in result_files},
+            {
+                "/api/quote-sessions/quote-object-artifact/download/xlsx",
+                "/api/quote-sessions/quote-object-artifact/download/pdf",
+            },
+        )
         self.assertNotIn("/api/jobs/", json.dumps(result_files))
         self.assertIsNotNone(artifact)
         self.assertEqual(artifact["content"], xlsx_bytes)
+        self.assertIsNotNone(pdf_artifact)
+        self.assertEqual(pdf_artifact["content"], pdf_bytes)
         self.assertIsNone(blocked_artifact)
-        self.assertEqual(status, 200)
-        self.assertEqual(downloaded, xlsx_bytes)
+        self.assertEqual(fresh_downloads["xlsx"], (200, xlsx_bytes))
+        self.assertEqual(fresh_downloads["pdf"], (200, pdf_bytes))
+        for kind, expected in (("xlsx", xlsx_bytes), ("pdf", pdf_bytes)):
+            self.assertTrue(stale_session["exports"][kind]["exists"])
+            self.assertTrue(stale_session["exports"][kind]["stale"])
+            self.assertEqual(stale_artifacts[kind]["content"], expected)
+            self.assertEqual(stale_downloads[kind], (200, expected))
+            self.assertEqual(replacement_artifacts[kind]["content"], expected)
+            self.assertFalse(replaced_session["exports"][kind]["stale"])
+            self.assertEqual(replacement_downloads[kind], (200, expected))
+        self.assertEqual(webapp.quote_session_result_files(stale_session), [])
+        self.assertEqual(cross_workspace_downloads["xlsx"][0], 404)
+        self.assertEqual(cross_workspace_downloads["pdf"][0], 404)
+        self.assertIn(unauthorised_downloads["xlsx"][0], {401, 403})
+        self.assertIn(unauthorised_downloads["pdf"][0], {401, 403})
         self.assertEqual(blob_rows, 0)
         self.assertEqual(row[1], "workspace-object-a")
         self.assertEqual(row[2], "quote-object-artifact")

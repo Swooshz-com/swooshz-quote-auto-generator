@@ -4103,7 +4103,7 @@ def quote_commercial_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if reference:
             resolved["pricing_reference"] = reference
     saved_draft_state = state.get("draft_state") if isinstance(state.get("draft_state"), dict) else {}
-    saved_profile_id = profile_identity_value(
+    saved_profile_id = profile_authority_identity_from_selection(
         saved_draft_state.get("selectedPresetValue")
         or saved_draft_state.get("selected_preset_value")
         or saved_draft_state.get("profileId")
@@ -4221,7 +4221,7 @@ def quote_commercial_state_errors(
     if current_source and current_source != basis_source:
         errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
     saved_draft_state = commercial_state.get("draft_state") if isinstance(commercial_state.get("draft_state"), dict) else {}
-    saved_profile_id = profile_identity_value(
+    saved_profile_id = profile_authority_identity_from_selection(
         saved_draft_state.get("selectedPresetValue")
         or saved_draft_state.get("selected_preset_value")
         or saved_draft_state.get("profileId")
@@ -9364,6 +9364,18 @@ def profile_identity_value(value: Any, default_source: str = "") -> str:
     return f"{source}:{raw_id}" if source else raw_id
 
 
+def profile_authority_identity_from_selection(value: Any, default_source: str = "") -> str:
+    """Resolve a saved qualified template selection to its existing owner identity."""
+    text = clean_text(value)
+    parts = text.split(":")
+    if len(parts) == 3 and parts[0].lower() == "profile":
+        owner_id = safe_resource_id(parts[1], "")
+        preset_id = safe_resource_id(parts[2], "")
+        if owner_id and preset_id:
+            return f"profile:{owner_id}"
+    return profile_identity_value(value, default_source)
+
+
 def profile_identity_from_payload(payload: dict[str, Any]) -> str:
     profile = payload.get("quote_company_profile") if isinstance(payload.get("quote_company_profile"), dict) else {}
     value = payload.get("profile_id") or profile.get("id")
@@ -10641,7 +10653,7 @@ class LocalSqagStorage:
         metadata = read_quote_session_metadata(safe_id)
         export = metadata.get("exports", {}).get(clean_text(kind).lower()) if metadata else None
         filename = clean_text(export.get("filename")) if isinstance(export, dict) else ""
-        if filename != expected_filename or quote_session_export_is_stale(metadata, export if isinstance(export, dict) else None):
+        if filename != expected_filename:
             return None
         path = quote_session_export_dir(safe_id) / filename
         return path if path.exists() and path.is_file() else None
@@ -13537,8 +13549,6 @@ class DatabaseSqagStorage:
             return None
         export = metadata.get("exports", {}).get(safe_kind) if metadata else None
         if not isinstance(export, dict) or clean_text(export.get("filename")) != expected_filename:
-            return None
-        if quote_session_export_is_stale(metadata, export):
             return None
         publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
         current_run_id = safe_reference(publication.get("run_id"), "run-")

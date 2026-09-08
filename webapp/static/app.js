@@ -4022,6 +4022,13 @@ function lastSelectedPresetValue() {
   return value && availablePresetValues().has(value) ? value : "";
 }
 
+function preservedOwnedPresetValue() {
+  if (!["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""))) return "";
+  const value = String(state.selectedPresetValue || "").trim();
+  if (value.startsWith(COMPANY_PROFILE_PRESET_PREFIX)) return value;
+  return profilePresetOptionParts(value) ? value : "";
+}
+
 function persistLastProfilePresetSelection(value = state.selectedPresetValue) {
   const presetValue = String(value || "").trim();
   if (!presetValue || !availablePresetValues().has(presetValue)) return;
@@ -4159,10 +4166,7 @@ function renderPresetOptions() {
   const builtInPresets = selectableTemplateProfilePresets();
   const savedPresets = companyProfilePresets();
   const availableValues = availablePresetValues();
-  const savedOwnedPresetValue = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""))
-    && String(state.selectedPresetValue || "").startsWith(COMPANY_PROFILE_PRESET_PREFIX)
-    ? String(state.selectedPresetValue)
-    : "";
+  const savedOwnedPresetValue = preservedOwnedPresetValue();
   const selectedValue = savedOwnedPresetValue || [
     state.selectedPresetValue,
     elements.presetSelect.value,
@@ -4671,12 +4675,8 @@ function loadSelectedPreset(options = {}) {
 }
 
 function loadDefaultProfilePreset(options = {}) {
-  const ownedPresetValue = String(state.selectedPresetValue || "").trim();
-  if (
-    options.allowOwnedInitialization !== true
-    && ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""))
-    && ownedPresetValue.startsWith(COMPANY_PROFILE_PRESET_PREFIX)
-  ) {
+  const ownedPresetValue = preservedOwnedPresetValue();
+  if (options.allowOwnedInitialization !== true && ownedPresetValue) {
     elements.presetSelect.value = availablePresetValues().has(ownedPresetValue) ? ownedPresetValue : "";
     return;
   }
@@ -4695,6 +4695,11 @@ function loadDefaultProfilePreset(options = {}) {
 }
 
 function loadConfiguredProfilePreset(options = {}) {
+  const ownedPresetValue = preservedOwnedPresetValue();
+  if (options.allowOwnedInitialization !== true && ownedPresetValue) {
+    elements.presetSelect.value = availablePresetValues().has(ownedPresetValue) ? ownedPresetValue : "";
+    return;
+  }
   const configuredPreset = configuredProfilePresetId();
   if (!configuredPreset) {
     loadDefaultProfilePreset(options);
@@ -12129,7 +12134,10 @@ async function duplicateDashboardQuote(sessionId, options = {}) {
 function dashboardExportAvailabilityItem(session = {}, kind = "xlsx", label = "XLSX") {
   const exportInfo = quoteSessionExport(session, kind);
   const generatedStatus = quoteSessionStatus(session).key === "generated";
-  if (exportInfo.exists && exportInfo.stale !== true && exportInfo.url) {
+  if (exportInfo.exists && exportInfo.url) {
+    if (exportInfo.stale) {
+      return { kind, label, exportInfo, available: true, statusText: `${label} stale - needs regeneration`, className: "is-stale" };
+    }
     return { kind, label, exportInfo, available: true, statusText: `${label} ready`, className: "is-available" };
   }
   if (exportInfo.stale) {
@@ -12313,7 +12321,9 @@ function continueDashboardDraft(sessionId) {
 function dashboardSelectedExportAction(session = {}, kind = "xlsx", label = "XLSX") {
   const item = dashboardExportAvailabilityItem(session, kind, label);
   if (item.available) {
-    return `<a class="dashboard-selected-action dashboard-export-link ${escapeHtml(item.className)}" href="${escapeHtml(item.exportInfo.url)}" download title="${escapeHtml(item.statusText)}" aria-label="Download ${escapeHtml(label)}"><span class="dashboard-selected-action-kicker">Download</span><span class="dashboard-selected-action-label">${escapeHtml(label)}</span></a>`;
+    const actionLabel = item.exportInfo.stale ? `${label} (stale)` : label;
+    const ariaLabel = item.exportInfo.stale ? `Download ${label} (stale; needs regeneration)` : `Download ${label}`;
+    return `<a class="dashboard-selected-action dashboard-export-link ${escapeHtml(item.className)}" href="${escapeHtml(item.exportInfo.url)}" download title="${escapeHtml(item.statusText)}" aria-label="${escapeHtml(ariaLabel)}"><span class="dashboard-selected-action-kicker">Download</span><span class="dashboard-selected-action-label">${escapeHtml(actionLabel)}</span></a>`;
   }
   return `<span class="dashboard-selected-action dashboard-export-missing ${escapeHtml(item.className)}" aria-disabled="true" title="${escapeHtml(item.statusText)}" aria-label="${escapeHtml(item.statusText)}"><span class="dashboard-selected-action-label">${escapeHtml(label)}</span></span>`;
 }
