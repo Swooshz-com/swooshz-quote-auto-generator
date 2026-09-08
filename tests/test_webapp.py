@@ -240,6 +240,92 @@ def valid_payload():
     }
 
 
+def recovered_convergence_payload(
+    *,
+    effective_unit_price: float | None = 100,
+    unit_price_override: float | None = None,
+    pricing_basis_amount: float | None = 200,
+    approved_quote_amount: float | None = 274,
+    tax: dict[str, object] | None = None,
+    exchange_rate: float | None = 1.37,
+    include_included_row: bool = True,
+) -> dict:
+    payload = valid_payload()
+    saved = valid_payload()
+    details = {
+        "quote_date": "2026-06-06",
+        "project_number": "KI-SAVED-453",
+        "client": copy.deepcopy(saved["client"]),
+        "project": copy.deepcopy(saved["project"]),
+        "company": copy.deepcopy(saved["company"]),
+        "currency": "USD",
+        "exchange_rate": exchange_rate,
+        "tax": copy.deepcopy(tax if tax is not None else {"label": "GST", "rate": 0.09}),
+        "quote_text": copy.deepcopy(saved["quote_text"]),
+        "signature": copy.deepcopy(saved["signature"]),
+    }
+    details["commercial_snapshot"] = {
+        "schema": webapp.QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+        "version": webapp.QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+        "owner": "quote",
+        "lifecycle": "RECOVERED",
+        "origin": "session_recovery",
+        "presence": {key: "captured" for key in webapp.QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS},
+        "pricing_basis": {
+            "currency": "SGD",
+            "source": "local",
+            "id": payload["pricing_reference_id"],
+            "digest": "sha256:" + "d" * 64,
+        },
+    }
+    row = {
+        "section": "Saved Floors",
+        "description": "Captured carpet",
+        "quantity": 2,
+        "unit": "sqm",
+        "price_mode": "Priced",
+        "catalog_unit_price": 999,
+        "amount": pricing_basis_amount if pricing_basis_amount is not None else "",
+    }
+    if effective_unit_price is not None:
+        row["effective_unit_price"] = effective_unit_price
+    if unit_price_override is not None:
+        row["unit_price_override"] = unit_price_override
+    if pricing_basis_amount is not None:
+        row["pricing_basis_amount"] = pricing_basis_amount
+    if approved_quote_amount is not None:
+        row["approved_quote_amount"] = approved_quote_amount
+    rows = [row]
+    if include_included_row:
+        rows.append({
+            "section": "Saved Services",
+            "description": "Included coordination",
+            "quantity": 1,
+            "unit": "lot",
+            "price_mode": "Included",
+            "display_price": "Included",
+            "amount": 0,
+            "approved_quote_amount": 0,
+        })
+    payload["pricing_reference"] = {
+        "id": payload["pricing_reference_id"],
+        "source": "local",
+        "currency": "SGD",
+        "tax": {"label": "GST", "rate": 0.09},
+    }
+    payload["quote_session"] = {
+        "session_id": "quote-convergence-453",
+        "commercials": {},
+        "draft_state": {
+            "quoteCommercialLifecycle": "RECOVERED",
+            "selectedPresetValue": payload["profile_id"],
+            "quoteDetails": details,
+            "outputRows": rows,
+        },
+    }
+    return payload
+
+
 def wait_for_job(job_id: str, timeout: float = 2.0, auth_session: dict | None = None) -> dict:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -674,6 +760,21 @@ class LocalRunnerServer:
             self.origin_patcher.stop()
         if self.host_patcher is not None:
             self.host_patcher.stop()
+
+
+def local_http_get_json(runner: LocalRunnerServer, path: str) -> tuple[int, dict]:
+    connection = http.client.HTTPConnection(
+        runner.server.server_address[0],
+        runner.server.server_address[1],
+        timeout=3,
+    )
+    try:
+        connection.request("GET", path)
+        response = connection.getresponse()
+        body = response.read().decode("utf-8")
+        return response.status, json.loads(body or "{}")
+    finally:
+        connection.close()
 
 
 class JsonResponseMock:
@@ -1810,6 +1911,349 @@ class WebappServerTest(unittest.TestCase):
         self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.quote_commercial_state_errors(payload))
         self.assertIsNone(webapp.quote_session_commercials(payload, {"commercials": {}})["subtotal"])
 
+    def test_recovered_explicit_price_edit_replaces_stale_captured_price_everywhere(self):
+        payload = recovered_convergence_payload(unit_price_override=120)
+
+        with mock.patch.object(
+            webapp,
+            "pricing_catalog_runtime_lookup_for_payload",
+            side_effect=AssertionError("recovered explicit edits must not consult the current catalog"),
+        ):
+            canonical = webapp.quote_commercial_payload(payload)
+            session = webapp.quote_session_commercials(payload, payload["quote_session"])
+            brief = webapp.payload_to_brief(payload)
+
+        row = canonical["line_items"][0]
+        self.assertEqual(row["effective_unit_price"], 120)
+        self.assertEqual(row["unit_price_override"], 120)
+        self.assertEqual(row["pricing_basis_amount"], 240)
+        self.assertEqual(row["approved_quote_amount"], 328.8)
+        self.assertEqual(session, {
+            "currency": "USD",
+            "tax_label": "GST",
+            "tax_rate": 0.09,
+            "exchange_rate": 1.37,
+            "subtotal": 328.8,
+            "tax_amount": 29.59,
+            "grand_total": 358.39,
+        })
+        self.assertEqual(brief["line_items"][0]["effective_unit_price"], 120)
+        self.assertEqual(brief["line_items"][0]["unit_price_override"], 120)
+        self.assertEqual(brief["line_items"][0]["pricing_basis_amount"], 240)
+        self.assertEqual(brief["line_items"][0]["approved_quote_amount"], 328.8)
+        self.assertEqual(webapp.validate_generation_payload(payload), [])
+
+    def test_recovered_invalid_price_override_fails_closed(self):
+        payload = recovered_convergence_payload(unit_price_override="not-a-price")
+
+        canonical = webapp.quote_commercial_payload(payload)
+        errors = webapp.quote_commercial_state_errors(payload)
+        commercials = webapp.quote_session_commercials(payload, payload["quote_session"])
+
+        self.assertTrue(canonical["line_items"][0]["_commercial_invalid_unit_price_override"])
+        self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, errors)
+        self.assertIsNone(commercials["subtotal"])
+        self.assertIsNone(commercials["tax_amount"])
+        self.assertIsNone(commercials["grand_total"])
+        with self.assertRaises(webapp.QuoteCommercialStateError):
+            webapp.payload_to_brief(payload)
+
+    def test_recovered_missing_tax_rate_stays_review_required(self):
+        payload = recovered_convergence_payload(
+            unit_price_override=120,
+            tax={"label": "GST"},
+        )
+
+        self.assertEqual(webapp.quote_tax_from_payload(payload), {"label": "GST", "rate": None})
+        errors = webapp.quote_commercial_state_errors(payload)
+        self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, errors)
+        commercials = webapp.quote_session_commercials(payload, payload["quote_session"])
+        self.assertEqual(commercials["subtotal"], 328.8)
+        self.assertIsNone(commercials["tax_rate"])
+        self.assertIsNone(commercials["tax_amount"])
+        self.assertIsNone(commercials["grand_total"])
+        self.assertNotIn(0, [commercials["tax_rate"], commercials["tax_amount"], commercials["grand_total"]])
+        with self.assertRaises(webapp.QuoteCommercialStateError):
+            webapp.payload_to_brief(payload)
+
+    def test_new_quote_catalog_match_remains_current_priced_state(self):
+        payload = valid_payload()
+        payload["pricing_reference_id"] = "new-quote-pricing"
+        payload["pricing_reference"] = {
+            "id": "new-quote-pricing",
+            "source": "local",
+            "currency": "SGD",
+            "tax": {"label": "GST", "rate": 0.09},
+            "items": [with_required_pricing_metadata({
+                "id": "new-quote-printed-graphics",
+                "section": "Graphics",
+                "description": "Printed graphics",
+                "unit_hint": "sqm",
+                "sale_unit_price": 77,
+                "match_terms": ["printed graphics"],
+                "object_families": ["graphics"],
+            })],
+        }
+        payload["line_items"] = [{
+            "section": "Graphics",
+            "quantity": 2,
+            "unit": "sqm",
+            "description": "Printed graphics",
+            "pricing_keyword": "new-quote-printed-graphics",
+        }]
+        payload["quote_session"] = {
+            "session_id": "quote-new-quote-453",
+            "draft_state": {"quoteCommercialLifecycle": "NEW_UNINITIALISED"},
+        }
+
+        self.assertFalse(webapp.quote_commercial_state(payload)["owned"])
+        [item] = webapp.normalize_line_items(payload)
+        self.assertEqual(item["catalog_unit_price"], 77)
+        self.assertEqual(item["quantity"], 2)
+        self.assertNotIn("effective_unit_price", item)
+        self.assertNotIn("pricing_basis_amount", item)
+        self.assertEqual(item["price_mode"], "Priced")
+
+    def test_server_and_browser_generation_paths_use_explicit_half_up_cents(self):
+        payload = recovered_convergence_payload(
+            effective_unit_price=10.625,
+            unit_price_override=10.625,
+            pricing_basis_amount=10.625,
+            approved_quote_amount=10.625,
+            exchange_rate=1,
+            include_included_row=False,
+        )
+        row = payload["quote_session"]["draft_state"]["outputRows"][0]
+        row["quantity"] = 1
+
+        canonical = webapp.quote_commercial_payload(payload)
+        session = webapp.quote_session_commercials(payload, payload["quote_session"])
+
+        self.assertEqual(canonical["line_items"][0]["pricing_basis_amount"], 10.63)
+        self.assertEqual(canonical["line_items"][0]["approved_quote_amount"], 10.63)
+        self.assertEqual(session, {
+            "currency": "USD",
+            "tax_label": "GST",
+            "tax_rate": 0.09,
+            "exchange_rate": 1,
+            "subtotal": 10.63,
+            "tax_amount": 0.96,
+            "grand_total": 11.59,
+        })
+        self.assertEqual(webapp.round_commercial_cents(10.625), 10.63)
+        self.assertEqual(webapp.round_commercial_cents(1.005), 1.01)
+        self.assertEqual(webapp.round_commercial_cents(2.674), 2.67)
+
+    def test_local_exact_company_authority_fails_closed_without_template_substitution(self):
+        with tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+            store = webapp.CompanyConfigStore(Path(tmp) / "data")
+            store.save_profile(webapp.DEFAULT_COMPANY_ID, workspace_profile_with_layout("saved-company"))
+            saved_payload = valid_payload()
+            saved_payload["profile_id"] = "company:saved-company"
+            saved_payload["quote_company_profile"] = {"id": "company:saved-company", "source": "company"}
+            saved_payload["quote_session"] = {
+                "quote_company_profile": copy.deepcopy(saved_payload["quote_company_profile"]),
+            }
+
+            missing_payload = copy.deepcopy(saved_payload)
+            missing_payload["profile_id"] = "company:missing-company"
+            missing_payload["quote_company_profile"] = {"id": "company:missing-company", "source": "company"}
+
+            with mock.patch.object(webapp, "company_config_store", return_value=store):
+                self.assertEqual(webapp.profile_selection_error(saved_payload), "")
+                resolved = webapp.profile_defaults_source_for_payload(saved_payload)
+                self.assertIsInstance(resolved, webapp.ProfilePack)
+                self.assertEqual(resolved.id, "saved-company")
+                self.assertEqual(
+                    resolved.asset_path("quotation_layout", "quotation-layout.xlsx"),
+                    store.profile_pack_dir(webapp.DEFAULT_COMPANY_ID, "saved-company") / "quotation-layout.xlsx",
+                )
+                self.assertEqual(
+                    webapp.quote_session_profile_summary(
+                        saved_payload,
+                        saved_payload["quote_session"],
+                    )["id"],
+                    "company:saved-company",
+                )
+                self.assertEqual(
+                    webapp.quote_session_generation_snapshot(
+                        saved_payload,
+                        saved_payload["quote_session"],
+                        created_at="2026-09-08T00:00:00Z",
+                    )["profile"]["id"],
+                    "company:saved-company",
+                )
+                self.assertEqual(
+                    webapp.profile_selection_error(missing_payload),
+                    webapp.PROFILE_SELECTION_ERROR_MESSAGE,
+                )
+                with mock.patch.object(
+                    webapp,
+                    "load_profile_pack",
+                    side_effect=AssertionError("missing company authority must not fall through to a template"),
+                ):
+                    with self.assertRaises(webapp.SqagStorageAccessError):
+                        webapp.profile_defaults_source_for_payload(missing_payload)
+
+    def test_operator_profiles_read_exact_company_authority_but_settings_stays_management_only(self):
+        with tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+            store = webapp.CompanyConfigStore(Path(tmp) / "data")
+            store.save_profile(webapp.DEFAULT_COMPANY_ID, workspace_profile_with_layout("operator-company"))
+            with mock.patch.object(webapp, "company_config_store", return_value=store):
+                with mock.patch.dict(os.environ, {"APP_MODE": "local", "USER_TYPE": "operator"}, clear=True):
+                    with LocalRunnerServer() as runner:
+                        profiles_status, profiles = local_http_get_json(runner, "/api/profiles")
+                        settings_status, _settings = local_http_get_json(runner, "/api/settings")
+                        self.assertEqual(profiles_status, 200)
+                        self.assertEqual(settings_status, 403)
+                with mock.patch.dict(os.environ, {"APP_MODE": "local", "USER_TYPE": "viewer"}, clear=True):
+                    with LocalRunnerServer() as runner:
+                        viewer_status, viewer_profiles = local_http_get_json(runner, "/api/profiles")
+                        self.assertEqual(viewer_status, 200)
+
+        self.assertEqual([profile["id"] for profile in profiles["company_profiles"]], ["operator-company"])
+        self.assertEqual(
+            profiles["company_profiles"][0]["defaults"]["company"]["name"],
+            "Sample Quotation Co Pte Ltd",
+        )
+        self.assertEqual(viewer_profiles["company_profiles"], [])
+
+    def test_static_generation_failure_keeps_previous_export_references(self):
+        js = (ROOT / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
+        generate_body = js.split("async function handleGenerate(options = {})", 1)[1].split("async function resumeSavedJob", 1)[0]
+        failure_body = generate_body.split("if (!polled.ok", 1)[1].split("const needsPricingReview", 1)[0]
+
+        self.assertIn("const hadSuccessfulExports = quoteSessionHasFreshOutputExports();", generate_body)
+        self.assertNotIn("setDownloadFiles([])", failure_body)
+        self.assertNotIn("renderMatchSummary({});", failure_body)
+        self.assertIn("if (!hadSuccessfulExports && data.pricing_matches?.length)", failure_body)
+        self.assertIn("renderMatchSummary(hadSuccessfulExports ? { pricing_matches: state.outputRows } : data);", failure_body)
+
+    def test_static_authority_profile_race_discards_late_request_completely(self):
+        node = require_node(self)
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name, prefix = "function") {
+  const marker = `${prefix} ${name}(`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const COMPANY_PROFILE_PRESET_PREFIX = "company:";
+const DEFAULT_PROFILE_ID = "default";
+const DEFAULT_PRICING_REFERENCE_ID = "default-pricing";
+let authorityProfileRequestSequence = 0;
+let activeAuthorityProfileRequestContext = null;
+const elements = { presetSelect: { value: "company:company-a" } };
+const state = {
+  browserRecoveryScope: "recovery-a",
+  quoteSessionId: "session-a",
+  workspace: { id: "workspace-a", company: { id: "company-a" }, workspace: { id: "workspace-a" } },
+  selectedPresetValue: "company:company-a",
+  profileId: "profile-a",
+  pricingReferenceId: "pricing-a",
+  pricingReferenceSource: "local",
+  quoteCommercialLifecycle: "RECOVERED",
+  permissions: { canGenerateQuote: true },
+  profiles: [{ id: "old-profile" }],
+  companyProfiles: [{ id: "old-company" }],
+  pricingReferences: [{ id: "old-pricing" }],
+  defaultProfileId: "old-profile",
+  defaultPricingReferenceId: "old-pricing",
+};
+function safeQuoteSessionId(value) { return String(value || "").trim(); }
+function normalizeCompanyProfile(value) { return value; }
+function mergePricingReferences(value) { return value; }
+function syncSelectedPricingReference() {}
+function renderProfileOptions() {}
+function renderPresetOptions() {}
+async function hydrateProfileLogoFingerprints(options) {
+  return { profiles: options.profiles, companyProfiles: options.companyProfiles };
+}
+const pending = [];
+function getJson() {
+  return new Promise((resolve) => pending.push(resolve));
+}
+
+eval([
+  "currentBrowserRecoveryScope",
+  "authorityProfileHydrationContext",
+  "beginAuthorityProfileRequest",
+  "refreshAuthorityProfileRequestContext",
+  "authorityProfileRequestIsFresh",
+  "loadProfiles",
+].map((name) => extractFunction(name, name === "loadProfiles" ? "async function" : "function")).join("\n"));
+
+function response(suffix) {
+  return {
+    ok: true,
+    data: {
+      profiles: [{ id: `profile-${suffix}` }],
+      company_profiles: [{ id: `company-${suffix}` }],
+      pricing_references: [{ id: `pricing-${suffix}`, source: "local" }],
+      workspace: { id: `workspace-${suffix}`, company: { id: `company-${suffix}` }, workspace: { id: `workspace-${suffix}` } },
+      default_profile_id: `profile-${suffix}`,
+      default_pricing_reference_id: `pricing-${suffix}`,
+    },
+  };
+}
+
+(async () => {
+  const requestA = loadProfiles();
+  await Promise.resolve();
+  assert.strictEqual(pending.length, 1);
+
+  state.browserRecoveryScope = "recovery-b";
+  state.quoteSessionId = "session-b";
+  state.workspace = { id: "workspace-b", company: { id: "company-b" }, workspace: { id: "workspace-b" } };
+  state.selectedPresetValue = "company:company-b";
+  elements.presetSelect.value = "company:company-b";
+  state.profileId = "profile-b";
+  state.pricingReferenceId = "pricing-b";
+  const requestB = loadProfiles();
+  await Promise.resolve();
+  assert.strictEqual(pending.length, 2);
+
+  pending[1](response("b"));
+  assert.strictEqual(await requestB, true);
+  assert.strictEqual(state.workspace.id, "workspace-b");
+  assert.strictEqual(state.profiles[0].id, "profile-b");
+  assert.strictEqual(state.companyProfiles[0].id, "company-b");
+  assert.strictEqual(state.pricingReferences[0].id, "pricing-b");
+
+  pending[0](response("a"));
+  assert.strictEqual(await requestA, false);
+  assert.strictEqual(state.workspace.id, "workspace-b");
+  assert.strictEqual(state.profiles[0].id, "profile-b");
+  assert.strictEqual(state.companyProfiles[0].id, "company-b");
+  assert.strictEqual(state.pricingReferences[0].id, "pricing-b");
+  assert.strictEqual(state.defaultProfileId, "profile-b");
+  assert.strictEqual(state.defaultPricingReferenceId, "pricing-b");
+})();
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
     def test_static_recovered_browser_collectors_and_output_projection_keep_saved_commercials(self):
         node = require_node(self)
 
@@ -1920,8 +2364,8 @@ eval([
   "quoteCommercialSnapshotPresence", "quoteCommercialSnapshotForDetails", "quoteDetailsWithFallbackDefaults",
   "collectRichTextDetails", "collectQuoteDetails", "setInputValue", "collectTaxDetails", "collectQuoteCurrency",
   "collectQuoteExchangeRate", "syncQuoteExchangeRateField", "quoteCommercialTaxText", "quoteExchangeRateText",
-  "quoteFxMultiplier", "quoteAmountValue", "formatAmount", "unitPriceEditKind", "numberOrNull", "orderNumber",
-  "quoteCommercialStateIsOwned", "effectiveOutputUnitPrice", "recalculateOutputRow", "normalizeOutputRow", "outputCellDisplayValue",
+  "quoteFxMultiplier", "quoteAmountValue", "roundCommercialCents", "formatAmount", "unitPriceEditKind", "numberOrNull", "orderNumber",
+  "quoteCommercialStateIsOwned", "effectiveOutputUnitPrice", "synchronizeOwnedOutputRowPrice", "recalculateOutputRow", "normalizeOutputRow", "outputCellDisplayValue",
   "rowNeedsManualInput", "matchSummaryStats", "outputRowsToLineItems", "outputRowsValid", "dashboardCommercialsFromState",
   "applyQuoteDetails", "applyPricingReferenceCommercialDefaults",
 ].map(extractFunction).join("\n"));
@@ -1952,6 +2396,40 @@ assert.deepStrictEqual(dashboardCommercialsFromState(), {
   currency: "USD", tax_label: "GST", tax_rate: 0.09, exchange_rate: 1.37,
   subtotal: 274, tax_amount: 24.66, grand_total: 298.66,
 });
+
+const edited = normalizeOutputRow({ ...state.outputRows[0], unit_price_override: 120 });
+assert.strictEqual(edited.effective_unit_price, 120);
+assert.strictEqual(edited.unit_price_override, 120);
+assert.strictEqual(edited.pricing_basis_amount, 240);
+assert.strictEqual(edited.approved_quote_amount, 328.8);
+assert.strictEqual(edited.amount, 240);
+const editedLine = outputRowsToLineItems([edited])[0];
+assert.strictEqual(editedLine.effective_unit_price, 120);
+assert.strictEqual(editedLine.unit_price_override, 120);
+assert.strictEqual(editedLine.pricing_basis_amount, 240);
+assert.strictEqual(editedLine.approved_quote_amount, 328.8);
+state.outputRows = [edited, state.outputRows[1]];
+assert.deepStrictEqual(dashboardCommercialsFromState(), {
+  currency: "USD", tax_label: "GST", tax_rate: 0.09, exchange_rate: 1.37,
+  subtotal: 328.8, tax_amount: 29.59, grand_total: 358.39,
+});
+
+elements.quoteExchangeRate.value = "1";
+const halfCent = normalizeOutputRow({
+  section: "Boundary", description: "Half-cent boundary", quantity: 1, unit: "lot",
+  price_mode: "Priced", unit_price_override: 10.625,
+});
+assert.strictEqual(halfCent.amount, 10.63);
+assert.strictEqual(halfCent.pricing_basis_amount, 10.63);
+assert.strictEqual(halfCent.approved_quote_amount, 10.63);
+state.outputRows = [halfCent];
+assert.deepStrictEqual(dashboardCommercialsFromState(), {
+  currency: "USD", tax_label: "GST", tax_rate: 0.09, exchange_rate: 1,
+  subtotal: 10.63, tax_amount: 0.96, grand_total: 11.59,
+});
+assert.strictEqual(roundCommercialCents(1.005), 1.01);
+assert.strictEqual(roundCommercialCents(2.674), 2.67);
+elements.quoteExchangeRate.value = "1.37";
 
 state.pricingReferences[0].currency = "USD";
 state.pricingReferences[0].tax = { label: "VAT", rate: 0.07 };
@@ -15751,10 +16229,13 @@ function outputCellDisplayValue(row, field) {
   if (field === "amount") return row.amount === "" || row.amount === undefined || row.amount === null ? "???" : String(row.amount);
   return String(row[field] || "");
 }
+const state = { quoteCommercialLifecycle: "NEW_UNINITIALISED" };
 eval(extractFunction("effectiveOutputUnitPrice"));
+eval(extractFunction("roundCommercialCents"));
 eval(extractFunction("recalculateOutputRow"));
 eval(extractFunction("normalizeOutputRow"));
 eval(extractFunction("unitPriceEditKind"));
+eval(extractFunction("synchronizeOwnedOutputRowPrice"));
 eval(extractFunction("outputRowsValid"));
 eval(extractFunction("outputQuantityPartsFromPricingMatch"));
 eval(extractFunction("outputRowFromPricingMatch"));
@@ -16212,6 +16693,7 @@ eval([
   "defaultPresetOptionValue",
   "safeLastSelectionJson",
   "currentBrowserRecoveryScope",
+  "presetOptionValue",
   "availablePresetValues",
   "lastSelectedPresetValue",
   "renderPresetOptions",
@@ -16223,10 +16705,11 @@ assert.strictEqual(elements.presetSelect.value, "company:saved-profile");
 assert.ok(!elements.presetSelect.innerHTML.includes("Default Profile"));
 
 savedSelection = JSON.stringify({ browserRecoveryScope: "scope-a", presetValue: "company:missing-profile" });
-state.selectedPresetValue = "";
+state.selectedPresetValue = "company:missing-profile";
 elements.presetSelect.value = "";
+state.quoteCommercialLifecycle = "RECOVERED";
 renderPresetOptions();
-assert.strictEqual(state.selectedPresetValue, "");
+assert.strictEqual(state.selectedPresetValue, "company:missing-profile");
 assert.strictEqual(elements.presetSelect.value, "");
 
 savedSelection = JSON.stringify({ browserRecoveryScope: "scope-a", presetValue: "profile:trade-show" });
@@ -17332,7 +17815,10 @@ eval([
   "generationProfileIdForPayload",
 ].map(extractFunction).join("\n"));
 
-assert.strictEqual(generationProfileIdForPayload(), "custom-layout");
+assert.strictEqual(generationProfileIdForPayload(), "company:custom-layout");
+
+state.selectedPresetValue = "company:missing-layout";
+assert.strictEqual(generationProfileIdForPayload(), "company:missing-layout");
 
 state.selectedPresetValue = "profile:alt";
 assert.strictEqual(generationProfileIdForPayload(), "alt-layout");
@@ -20157,6 +20643,8 @@ eval([
   "numberOrNull",
   "orderNumber",
   "effectiveOutputUnitPrice",
+  "roundCommercialCents",
+  "synchronizeOwnedOutputRowPrice",
   "recalculateOutputRow",
   "normalizeLineItem",
   "normalizeOutputRow",
@@ -20627,8 +21115,11 @@ eval([
   "numberOrNull",
   "unitPriceEditKind",
   "effectiveOutputUnitPrice",
+  "roundCommercialCents",
+  "synchronizeOwnedOutputRowPrice",
   "formatAmount",
   "quoteFxMultiplier",
+  "roundCommercialCents",
   "quoteAmountValue",
   "recalculateOutputRow",
   "outputCellDisplayValue",
@@ -20794,6 +21285,8 @@ eval([
   "numberOrNull",
   "unitPriceEditKind",
   "effectiveOutputUnitPrice",
+  "roundCommercialCents",
+  "synchronizeOwnedOutputRowPrice",
   "formatAmount",
   "recalculateOutputRow",
   "normalizeUnit",
@@ -24294,7 +24787,9 @@ eval([
   "effectiveOutputUnitPrice",
   "formatAmount",
   "quoteFxMultiplier",
+  "roundCommercialCents",
   "quoteAmountValue",
+  "synchronizeOwnedOutputRowPrice",
   "recalculateOutputRow",
   "normalizeOutputRow",
   "categoryOrderValue",
@@ -24500,7 +24995,9 @@ eval([
   "effectiveOutputUnitPrice",
   "formatAmount",
   "quoteFxMultiplier",
+  "roundCommercialCents",
   "quoteAmountValue",
+  "synchronizeOwnedOutputRowPrice",
   "recalculateOutputRow",
   "normalizeOutputRow",
   "bracketedCatalogReferenceParts",

@@ -348,6 +348,8 @@ let quoteSessionDraftSavePromise = null;
 let quoteSessionConfirmedDraftSessionId = "";
 let quoteSessionConfirmedDraftKey = "";
 let quoteSessionConfirmedDraftFileKey = "";
+let authorityProfileRequestSequence = 0;
+let activeAuthorityProfileRequestContext = null;
 
 const elements = {
   healthText: qs("#healthText"),
@@ -1182,6 +1184,70 @@ function currentBrowserRecoveryScope() {
   return String(state.browserRecoveryScope || "").trim();
 }
 
+function authorityProfileHydrationContext(sequence = authorityProfileRequestSequence) {
+  const workspace = state.workspace && typeof state.workspace === "object" ? state.workspace : {};
+  const workspaceDetails = workspace.workspace && typeof workspace.workspace === "object" ? workspace.workspace : {};
+  const company = workspace.company && typeof workspace.company === "object" ? workspace.company : {};
+  const pendingSelection = String(
+    state.selectedPresetValue
+      || elements.presetSelect?.value
+      || ""
+  ).trim();
+  const savedCompanyIdentity = pendingSelection.startsWith(COMPANY_PROFILE_PRESET_PREFIX)
+    ? pendingSelection
+    : "";
+  return {
+    sequence,
+    browserRecoveryScope: currentBrowserRecoveryScope(),
+    quoteSessionId: safeQuoteSessionId(state.quoteSessionId || ""),
+    workspaceId: String(workspaceDetails.id || workspace.id || "").trim(),
+    companyId: String(company.id || "").trim(),
+    savedCompanyIdentity,
+    profileId: String(state.profileId || "").trim(),
+    pricingReferenceId: String(state.pricingReferenceId || "").trim(),
+    pricingReferenceSource: String(state.pricingReferenceSource || "").trim(),
+    pendingSelection,
+    quoteCommercialLifecycle: String(state.quoteCommercialLifecycle || "").trim(),
+  };
+}
+
+function beginAuthorityProfileRequest() {
+  authorityProfileRequestSequence += 1;
+  activeAuthorityProfileRequestContext = authorityProfileHydrationContext(authorityProfileRequestSequence);
+  return activeAuthorityProfileRequestContext;
+}
+
+function refreshAuthorityProfileRequestContext(context = null) {
+  if (!context || context.sequence !== authorityProfileRequestSequence) return null;
+  activeAuthorityProfileRequestContext = authorityProfileHydrationContext(context.sequence);
+  return activeAuthorityProfileRequestContext;
+}
+
+function invalidateAuthorityProfileRequests() {
+  authorityProfileRequestSequence += 1;
+  activeAuthorityProfileRequestContext = null;
+}
+
+function authorityProfileRequestIsFresh(context = null) {
+  if (!context || !activeAuthorityProfileRequestContext) return false;
+  if (context.sequence !== authorityProfileRequestSequence || context.sequence !== activeAuthorityProfileRequestContext.sequence) {
+    return false;
+  }
+  const current = authorityProfileHydrationContext(context.sequence);
+  return [
+    "browserRecoveryScope",
+    "quoteSessionId",
+    "workspaceId",
+    "companyId",
+    "savedCompanyIdentity",
+    "profileId",
+    "pricingReferenceId",
+    "pricingReferenceSource",
+    "pendingSelection",
+    "quoteCommercialLifecycle",
+  ].every((key) => current[key] === activeAuthorityProfileRequestContext[key]);
+}
+
 function safeLastSelectionJson() {
   const currentScope = currentBrowserRecoveryScope();
   if (!currentScope) return {};
@@ -1251,7 +1317,12 @@ function resolvedProfileIdForPayload() {
 function generationProfileIdForPayload() {
   const preset = selectedPreset();
   if (preset?.source === "company") {
-    return safeProfileId(preset.id, resolvedProfileIdForPayload());
+    return `${COMPANY_PROFILE_PRESET_PREFIX}${safeProfileId(preset.id, "")}`;
+  }
+  const selectedValue = String(state.selectedPresetValue || elements.presetSelect?.value || "").trim();
+  if (selectedValue.startsWith(COMPANY_PROFILE_PRESET_PREFIX)) {
+    const savedCompanyId = safeProfileId(selectedValue.slice(COMPANY_PROFILE_PRESET_PREFIX.length), "");
+    if (savedCompanyId) return `${COMPANY_PROFILE_PRESET_PREFIX}${savedCompanyId}`;
   }
   const presetProfileId = String(preset?.profile_id || "").trim();
   return presetProfileId || resolvedProfileIdForPayload();
@@ -2385,7 +2456,8 @@ function collectTaxDetails() {
   if (ownedCommercial) {
     const labelSource = elements.quoteTaxLabel?.value ?? elements.taxLabel?.value ?? "";
     const rateSource = elements.quoteTaxRate?.value ?? elements.taxRate?.value ?? "";
-    const rawRate = Number(String(rateSource || "").replace("%", "").trim());
+    const rateText = String(rateSource ?? "").replace("%", "").trim();
+    const rawRate = rateText ? Number(rateText) : Number.NaN;
     return {
       label: String(labelSource || "").trim() ? normalizeTaxLabel(labelSource) : "",
       rate: Number.isFinite(rawRate) ? Math.min(1, Math.max(0, rawRate / 100)) : null,
@@ -3493,18 +3565,27 @@ async function quoteDetailsWithStrongLogoFingerprint(details = {}) {
   };
 }
 
-async function hydrateProfileLogoFingerprints() {
-  state.profiles = await Promise.all(state.profiles.map(async (profile) => ({
+async function hydrateProfileLogoFingerprints(options = {}) {
+  const context = options.context || beginAuthorityProfileRequest();
+  const sourceProfiles = Array.isArray(options.profiles) ? options.profiles : state.profiles;
+  const sourceCompanyProfiles = Array.isArray(options.companyProfiles) ? options.companyProfiles : state.companyProfiles;
+  const profiles = await Promise.all(sourceProfiles.map(async (profile) => ({
     ...profile,
     quote_detail_presets: await Promise.all(
       (Array.isArray(profile.quote_detail_presets) ? profile.quote_detail_presets : [])
         .map(async (preset) => ({ ...preset, details: await quoteDetailsWithStrongLogoFingerprint(preset.details || {}) }))
     ),
   })));
-  state.companyProfiles = await Promise.all(state.companyProfiles.map(async (profile) => ({
+  const companyProfiles = await Promise.all(sourceCompanyProfiles.map(async (profile) => ({
     ...profile,
     defaults: await quoteDetailsWithStrongLogoFingerprint(profile.defaults || {}),
   })));
+  if (!authorityProfileRequestIsFresh(context)) return null;
+  if (options.commit !== false) {
+    state.profiles = profiles;
+    state.companyProfiles = companyProfiles;
+  }
+  return { profiles, companyProfiles };
 }
 
 async function restoreQuoteDetailsLogo(details = {}, options = {}) {
@@ -3605,6 +3686,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   if (!saved || typeof saved !== "object" || saved.version !== QUOTE_SESSION_STATE_VERSION) {
     return false;
   }
+  invalidateAuthorityProfileRequests();
   let rejectedRestoredActiveJob = false;
   state.profileId = saved.profileId || "";
   state.pricingReferenceId = saved.pricingReferenceId || saved.profileId || "";
@@ -3762,7 +3844,7 @@ function templateProfilePresets() {
       ...preset,
       profile_id: preset.profile_id || profile.id,
       profile_label: profile.label || profile.id,
-      source: "profile",
+      source: profile.source === "company" ? "company" : "profile",
     }));
   });
 }
@@ -3837,7 +3919,8 @@ function selectedPreset() {
   }
   if (value.startsWith(COMPANY_PROFILE_PRESET_PREFIX)) {
     const presetId = value.slice(COMPANY_PROFILE_PRESET_PREFIX.length);
-    const preset = companyProfilePresets().find((item) => item.id === presetId);
+    const preset = companyProfilePresets().find((item) => item.id === presetId)
+      || templateProfilePresets().find((item) => item.source === "company" && item.id === presetId);
     return preset ? { ...preset, source: "company" } : null;
   }
   return null;
@@ -3874,8 +3957,8 @@ function presetValueFromQuoteDetails(savedDetails = {}) {
 
 function availablePresetValues() {
   return new Set([
-    ...selectableTemplateProfilePresets().map((preset) => profilePresetOptionValue(preset.id)),
-    ...companyProfilePresets().map((preset) => companyProfileOptionValue(preset.id)),
+    ...selectableTemplateProfilePresets().map((preset) => presetOptionValue(preset)),
+    ...companyProfilePresets().map((preset) => presetOptionValue(preset)),
   ]);
 }
 
@@ -4033,13 +4116,17 @@ function renderPresetOptions() {
   const builtInPresets = selectableTemplateProfilePresets();
   const savedPresets = companyProfilePresets();
   const availableValues = availablePresetValues();
+  const savedOwnedPresetValue = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""))
+    && String(state.selectedPresetValue || "").startsWith(COMPANY_PROFILE_PRESET_PREFIX)
+    ? String(state.selectedPresetValue)
+    : "";
   const selectedValue = [
     state.selectedPresetValue,
     elements.presetSelect.value,
     lastSelectedPresetValue(),
-  ].find((value) => value && availableValues.has(value)) || "";
+  ].find((value) => value && availableValues.has(value)) || savedOwnedPresetValue;
   const builtInOptions = builtInPresets
-    .map((preset) => `<option value="${escapeHtml(profilePresetOptionValue(preset.id))}">${escapeHtml(preset.name)}</option>`)
+    .map((preset) => `<option value="${escapeHtml(presetOptionValue(preset))}">${escapeHtml(preset.name)}</option>`)
     .join("");
   const savedOptions = savedPresets
     .map((preset) => `<option value="${escapeHtml(companyProfileOptionValue(preset.id))}">${escapeHtml(preset.name)}</option>`)
@@ -4050,7 +4137,7 @@ function renderPresetOptions() {
   ].join("");
   elements.presetSelect.innerHTML = optionGroups || '<option value="">No saved profiles yet</option>';
   state.selectedPresetValue = selectedValue;
-  elements.presetSelect.value = state.selectedPresetValue;
+  elements.presetSelect.value = availableValues.has(state.selectedPresetValue) ? state.selectedPresetValue : "";
   elements.presetSelect.disabled = !availableValues.size;
   elements.presetSelect.title = availableValues.size ? "" : "Save or import a profile to load it here.";
   elements.presetSelect.setAttribute("aria-disabled", String(elements.presetSelect.disabled));
@@ -4641,6 +4728,7 @@ async function startNewQuote() {
 }
 
 function resetCurrentQuoteDraftState() {
+  invalidateAuthorityProfileRequests();
   clearQuoteSessionDraftSaveTimer();
   transitionGenerationContext("", "");
   state.quoteSessionDraftSaveStarted = false;
@@ -5993,7 +6081,7 @@ function normalizeOutputRow(row = {}) {
     if (capturedPrice !== null) normalized.effective_unit_price = capturedPrice;
   }
   if (normalized.price_mode === "Included") normalized.approved_quote_amount = 0;
-  return normalized;
+  return recalculateOutputRow(synchronizeOwnedOutputRowPrice(normalized, normalized.unit_price_override));
 }
 
 function pricingReferenceValidationResult(items, headers, skipped, sourceName = "") {
@@ -7173,37 +7261,76 @@ async function deleteSelectedPricingReference() {
 }
 
 async function loadProfiles() {
+  const context = beginAuthorityProfileRequest();
   const { ok, data } = await getJson("/api/profiles");
+  if (!authorityProfileRequestIsFresh(context)) return false;
+  let profiles = state.profiles;
+  let workspace = state.workspace;
+  let defaultProfileId = state.defaultProfileId;
+  let defaultPricingReferenceId = state.defaultPricingReferenceId;
+  let pricingReferences = state.pricingReferences;
+  let companyProfiles = state.companyProfiles;
   if (ok && Array.isArray(data.profiles)) {
-    state.profiles = data.profiles;
-    state.workspace = data.workspace && typeof data.workspace === "object" ? data.workspace : null;
-    state.defaultProfileId = data.default_profile_id || DEFAULT_PROFILE_ID;
-    state.defaultPricingReferenceId = data.default_pricing_reference_id || DEFAULT_PRICING_REFERENCE_ID;
-    state.pricingReferences = mergePricingReferences(Array.isArray(data.pricing_references) ? data.pricing_references : []);
-    if (state.pricingReferenceId) {
-      syncSelectedPricingReference();
-    }
+    profiles = data.profiles;
+    workspace = data.workspace && typeof data.workspace === "object" ? data.workspace : null;
+    defaultProfileId = data.default_profile_id || DEFAULT_PROFILE_ID;
+    defaultPricingReferenceId = data.default_pricing_reference_id || DEFAULT_PRICING_REFERENCE_ID;
+    pricingReferences = mergePricingReferences(Array.isArray(data.pricing_references) ? data.pricing_references : []);
+    const canReadCompanyProfiles = state.permissions?.canGenerateQuote !== false;
+    companyProfiles = canReadCompanyProfiles && Array.isArray(data.company_profiles)
+      ? data.company_profiles
+        .map(normalizeCompanyProfile)
+        .sort((left, right) => String(left.label || left.id || "").localeCompare(String(right.label || right.id || ""), undefined, { sensitivity: "base" }))
+      : [];
   }
-  await loadCompanyProfiles();
-  await hydrateProfileLogoFingerprints();
+  const refreshedContext = refreshAuthorityProfileRequestContext(context);
+  const hydrated = refreshedContext
+    ? await hydrateProfileLogoFingerprints({
+      context: refreshedContext,
+      profiles,
+      companyProfiles,
+      commit: false,
+    })
+    : null;
+  if (!hydrated || !authorityProfileRequestIsFresh(refreshedContext)) return false;
+  state.profiles = hydrated.profiles;
+  state.companyProfiles = hydrated.companyProfiles;
+  state.workspace = workspace;
+  state.defaultProfileId = defaultProfileId;
+  state.defaultPricingReferenceId = defaultPricingReferenceId;
+  state.pricingReferences = pricingReferences;
+  if (state.pricingReferenceId) syncSelectedPricingReference();
+  if (!authorityProfileRequestIsFresh(refreshedContext)) return false;
   renderProfileOptions();
   renderPresetOptions();
+  return true;
 }
 
 async function loadCompanyProfiles() {
   if (!canManageProfiles()) {
-    state.companyProfiles = [];
-    return;
+    return false;
   }
+  const context = beginAuthorityProfileRequest();
   const { ok, data } = await getJson("/api/settings/profiles", { logFetchFailure: false });
-  if (!ok) {
-    state.companyProfiles = [];
-    return;
-  }
-  state.companyProfiles = (Array.isArray(data.company_profiles) ? data.company_profiles : [])
+  if (!ok || !authorityProfileRequestIsFresh(context)) return false;
+  const companyProfiles = (Array.isArray(data.company_profiles) ? data.company_profiles : [])
     .map(normalizeCompanyProfile)
     .sort((left, right) => String(left.label || left.id || "").localeCompare(String(right.label || right.id || ""), undefined, { sensitivity: "base" }));
+  const refreshedContext = refreshAuthorityProfileRequestContext(context);
+  const hydrated = refreshedContext
+    ? await hydrateProfileLogoFingerprints({
+      context: refreshedContext,
+      profiles: state.profiles,
+      companyProfiles,
+      commit: false,
+    })
+    : null;
+  if (!hydrated || !authorityProfileRequestIsFresh(refreshedContext)) return false;
+  state.profiles = hydrated.profiles;
+  state.companyProfiles = hydrated.companyProfiles;
+  if (!authorityProfileRequestIsFresh(refreshedContext)) return false;
   renderPresetOptions();
+  return true;
 }
 
 function quoteHasDerivedResults() {
@@ -7827,11 +7954,40 @@ function formatAmount(value) {
   return numeric.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+// Commercial amounts use explicit decimal half-up rounding, matching Python's
+// round_commercial_cents. BigInt avoids binary floating-point tie surprises such
+// as 1.005 becoming 1.00 in some runtimes.
+function roundCommercialCents(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  const text = numeric.toString().toLowerCase();
+  const negative = text.startsWith("-");
+  const unsigned = text.replace(/^[+-]/, "");
+  const parts = unsigned.split("e");
+  const coefficient = parts[0] || "0";
+  const exponent = parts.length > 1 ? Number(parts[1]) : 0;
+  if (!Number.isInteger(exponent) || !/^\d*(?:\.\d*)?$/.test(coefficient)) return null;
+  const digits = coefficient.replace(".", "") || "0";
+  const decimalPlaces = coefficient.includes(".") ? coefficient.length - coefficient.indexOf(".") - 1 : 0;
+  let cents = BigInt(digits);
+  const centShift = exponent + 2 - decimalPlaces;
+  if (centShift >= 0) {
+    cents *= 10n ** BigInt(centShift);
+  } else {
+    const divisor = 10n ** BigInt(-centShift);
+    const quotient = cents / divisor;
+    const remainder = cents % divisor;
+    cents = quotient + (remainder * 2n >= divisor ? 1n : 0n);
+  }
+  if (cents === 0n) return 0;
+  return (negative ? -1 : 1) * Number(cents) / 100;
+}
+
 function quoteAmountValue(value, multiplier = quoteFxMultiplier()) {
   const numeric = numberOrNull(value);
   if (numeric === null) return null;
   const fx = quoteFxMultiplier(multiplier);
-  return Math.round(numeric * fx * 100) / 100;
+  return roundCommercialCents(numeric * fx);
 }
 
 function recalculateOutputRow(row = {}) {
@@ -7842,8 +7998,29 @@ function recalculateOutputRow(row = {}) {
   return {
     ...row,
     price_mode: priceMode,
-    amount: priceMode === "Included" ? 0 : (quantity !== null && hasUsablePrice ? Math.round(quantity * unitPrice * 100) / 100 : ""),
+    amount: priceMode === "Included" ? 0 : (quantity !== null && hasUsablePrice ? roundCommercialCents(quantity * unitPrice) : ""),
   };
+}
+
+function synchronizeOwnedOutputRowPrice(row = {}, value = row.unit_price_override) {
+  const ownedCommercial = typeof quoteCommercialStateIsOwned === "function" && quoteCommercialStateIsOwned();
+  if (!ownedCommercial || unitPriceEditKind(value) !== "number") return row;
+  const unitPrice = numberOrNull(value);
+  if (unitPrice === null) return row;
+  const quantity = numberOrNull(row.quantity);
+  const next = {
+    ...row,
+    unit_price_override: unitPrice,
+    effective_unit_price: unitPrice,
+  };
+  if (quantity !== null && quantity > 0) {
+    next.pricing_basis_amount = roundCommercialCents(quantity * unitPrice);
+    next.approved_quote_amount = quoteAmountValue(next.pricing_basis_amount);
+  } else {
+    next.pricing_basis_amount = null;
+    next.approved_quote_amount = null;
+  }
+  return next;
 }
 
 function outputComparableText(value = "") {
@@ -8174,9 +8351,15 @@ function outputRowFromPricingMatch(row = {}) {
   const manualDisplayAmount = status === "manual-display" ? numberOrNull(amount) : null;
   const quantity = numberOrNull(quantityParts.quantity);
   const manualDisplayUnitPrice = manualDisplayAmount !== null
-    ? (quantity !== null && quantity > 0 ? Math.round((manualDisplayAmount / quantity) * 100) / 100 : manualDisplayAmount)
+    ? (quantity !== null && quantity > 0 ? roundCommercialCents(manualDisplayAmount / quantity) : manualDisplayAmount)
     : "";
   const unitPrice = manualDisplayAmount !== null ? manualDisplayUnitPrice : row.unit_price || row.unit_price_override || "";
+  const recoveredCommercial = String(state.quoteCommercialLifecycle || "") === "RECOVERED"
+    || String(state.quoteCommercialSnapshot?.lifecycle || "") === "RECOVERED";
+  const canCaptureCurrentCatalogPrice = !recoveredCommercial
+    && ["matched", "matched-from-ambiguous"].includes(status)
+    && numberOrNull(unitPrice) !== null;
+  const capturedUnitPrice = canCaptureCurrentCatalogPrice ? numberOrNull(unitPrice) : null;
   const referenceDescription = pricingReferenceLineText(row.pricing_reference_description || row.catalog_description || "");
   return normalizeOutputRow({
     section: row.section,
@@ -8193,6 +8376,11 @@ function outputRowFromPricingMatch(row = {}) {
     category_order: row.category_order ?? "",
     item_order: row.item_order ?? "",
     status: row.status,
+    ...(capturedUnitPrice !== null ? {
+      effective_unit_price: capturedUnitPrice,
+      pricing_basis_amount: quantity !== null && quantity > 0 ? roundCommercialCents(quantity * capturedUnitPrice) : null,
+      approved_quote_amount: quantity !== null && quantity > 0 ? quoteAmountValue(roundCommercialCents(quantity * capturedUnitPrice)) : null,
+    } : {}),
   });
 }
 
@@ -8378,7 +8566,10 @@ function snapshotOutputRows(rows = state.outputRows) {
 
 function outputRowsToLineItems(rows = state.outputRows) {
   const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
-  return rows.map((row) => {
+  return rows.map((inputRow) => {
+    const row = ownedCommercial
+      ? synchronizeOwnedOutputRowPrice(inputRow, inputRow.unit_price_override)
+      : inputRow;
     const next = {
       section: String(row.section || "").trim(),
       description: String(row.description || "").trim(),
@@ -8424,7 +8615,7 @@ function outputRowsToLineItems(rows = state.outputRows) {
       const historicalEffectivePrice = effectiveOutputUnitPrice(row);
       const quantity = numberOrNull(row.quantity);
       if (next.pricing_basis_amount == null && historicalEffectivePrice !== null && quantity !== null && quantity > 0) {
-        next.pricing_basis_amount = Math.round(quantity * historicalEffectivePrice * 100) / 100;
+        next.pricing_basis_amount = roundCommercialCents(quantity * historicalEffectivePrice);
       }
       if (next.approved_quote_amount == null && next.pricing_basis_amount != null) {
         next.approved_quote_amount = quoteAmountValue(next.pricing_basis_amount);
@@ -8576,7 +8767,7 @@ function matchSummaryStats(rows = []) {
     const amount = quoteAmountValue(row.amount);
     return Number.isFinite(amount) ? sum + amount : sum;
   }, 0);
-  return { sections, pricedRows, needsManualInput, total: Math.round(total * 100) / 100, totalPending };
+  return { sections, pricedRows, needsManualInput, total: roundCommercialCents(total), totalPending };
 }
 
 function formatSubtotalValue(stats = {}) {
@@ -8593,7 +8784,7 @@ function formatOutputTotalValue(stats = {}) {
   const taxRate = Number(tax.rate);
   const resolvedTaxRate = Number.isFinite(taxRate) ? taxRate : (ownedCommercial ? Number.NaN : DEFAULT_TAX_RATE);
   const grandTotal = Number.isFinite(resolvedTaxRate)
-    ? Math.round((subtotal + (subtotal * resolvedTaxRate)) * 100) / 100
+    ? roundCommercialCents(subtotal + roundCommercialCents(subtotal * resolvedTaxRate))
     : null;
   const totalText = grandTotal === null
     ? `${collectQuoteCurrency()} -`
@@ -8721,10 +8912,12 @@ function handleOutputRowEdit(event) {
   const index = Number(input.dataset.outputRow);
   const field = input.dataset.outputField;
   if (!Number.isInteger(index) || index < 0 || !state.outputRows[index] || !field) return;
-  state.outputRows[index] = recalculateOutputRow({
+  let nextRow = {
     ...state.outputRows[index],
     [field]: input.value,
-  });
+  };
+  if (field === "unit_price_override") nextRow = synchronizeOwnedOutputRowPrice(nextRow, input.value);
+  state.outputRows[index] = recalculateOutputRow(nextRow);
   state.lineItems = outputRowsToLineItems();
   markOutputRowsDirty();
   const validation = outputRowsValid();
@@ -8748,6 +8941,7 @@ function commitOutputEditor(editor) {
       nextRow = { ...currentRow, price_mode: "Included", unit_price_override: "", display_price: "Included" };
     } else {
       nextRow = { ...currentRow, price_mode: "Priced", display_price: "", unit_price_override: value };
+      nextRow = synchronizeOwnedOutputRowPrice(nextRow, value);
     }
   }
   state.outputRows[index] = recalculateOutputRow(nextRow);
@@ -10629,13 +10823,13 @@ function dashboardCommercialsFromState() {
   const tax = collectTaxDetails();
   const stats = matchSummaryStats(state.outputRows);
   const hasConfirmedTotal = state.outputRows.length > 0 && !stats.totalPending;
-  const subtotal = hasConfirmedTotal ? Math.round(Number(stats.total) * 100) / 100 : null;
+  const subtotal = hasConfirmedTotal ? roundCommercialCents(Number(stats.total)) : null;
   const taxRate = ownedCommercial && tax.rate == null
     ? Number.NaN
     : Number(ownedCommercial ? tax.rate : (tax.rate ?? DEFAULT_TAX_RATE));
   const taxAmount = subtotal === null || !Number.isFinite(taxRate)
     ? null
-    : Math.round(subtotal * taxRate * 100) / 100;
+    : roundCommercialCents(subtotal * taxRate);
   return {
     currency: collectQuoteCurrency(),
     tax_label: ownedCommercial ? tax.label : (tax.label || DEFAULT_TAX_LABEL),
@@ -10643,7 +10837,7 @@ function dashboardCommercialsFromState() {
     exchange_rate: collectQuoteExchangeRate(),
     subtotal,
     tax_amount: taxAmount,
-    grand_total: subtotal === null || taxAmount === null ? null : Math.round((subtotal + taxAmount) * 100) / 100,
+    grand_total: subtotal === null || taxAmount === null ? null : roundCommercialCents(subtotal + taxAmount),
   };
 }
 
@@ -10843,7 +11037,7 @@ function currentQuoteSessionPayload(options = {}) {
       event_or_project_date: details.quote_date || "",
     },
     quote_company_profile: {
-      id: safeProfileId(generationProfileIdForPayload(), ""),
+      id: generationProfileIdForPayload(),
       display_name: selectedProfile?.name || profile?.label || details.company?.name || "",
     },
     pricing_reference: {
@@ -12977,6 +13171,7 @@ async function handleGenerate(options = {}) {
     setWorkflowStage("basis_review");
     return;
   }
+  const hadSuccessfulExports = quoteSessionHasFreshOutputExports();
 
   const jobType = viewPdf ? "generate_pdf" : "generate";
   const operation = normalizeActiveJob({
@@ -12992,8 +13187,6 @@ async function handleGenerate(options = {}) {
   setWorkflowStage("generating");
   setResultStatus(viewPdf ? "Generating PDF" : "Generating Excel", "is-warn");
   renderMessages([]);
-  setDownloadFiles([]);
-  renderMatchSummary({});
   clearPricingReviewMessages();
   syncControlStates();
   const synchronizedSessionId = await ensureQuoteSession({
@@ -13047,8 +13240,10 @@ async function handleGenerate(options = {}) {
     setResultStatus(data.status || "Failed", "is-bad");
     const blocked = polled.data.status === "blocked" || data.status === "blocked";
     renderMessages(blocked ? (data.errors || ["Generation blocked."]) : genericFailureMessages(data || polled.data), "error");
-    if (data.pricing_matches?.length) renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
-    renderMatchSummary(data);
+    if (!hadSuccessfulExports && data.pricing_matches?.length) {
+      renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
+    }
+    renderMatchSummary(hadSuccessfulExports ? { pricing_matches: state.outputRows } : data);
     syncControlStates();
     return;
   }
@@ -13061,9 +13256,10 @@ async function handleGenerate(options = {}) {
     renderMessages([]);
     clearPricingReviewMessages();
     setSidePanel("output", { force: true });
-    setDownloadFiles([]);
-    if (data.pricing_matches?.length) renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
-    renderMatchSummary(data);
+    if (!hadSuccessfulExports && data.pricing_matches?.length) {
+      renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
+    }
+    renderMatchSummary(hadSuccessfulExports ? { pricing_matches: state.outputRows } : data);
   } else {
     setWorkflowStage("completed");
     clearPricingReviewMessages();

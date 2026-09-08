@@ -14,6 +14,7 @@ import contextlib
 import copy
 import csv
 import datetime as dt
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import html
 import hashlib
 import hmac
@@ -3882,9 +3883,22 @@ def parse_float_or_none(value: Any) -> float | None:
     if value in (None, ""):
         return None
     try:
-        return float(str(value).replace(",", "").replace("%", "").strip())
-    except ValueError:
+        number = float(str(value).replace(",", "").replace("%", "").strip())
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError):
         return None
+
+
+def round_commercial_cents(value: Any) -> float | None:
+    """Round commercial values to cents with explicit decimal half-up semantics."""
+    number = parse_float_or_none(value)
+    if number is None or not math.isfinite(number):
+        return None
+    try:
+        rounded = Decimal(str(number)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError):
+        return None
+    return float(rounded) if rounded else 0.0
 
 
 def quote_session_draft_state_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -3949,6 +3963,10 @@ def normalized_quote_commercial_snapshot(
 def quote_commercial_state(payload: dict[str, Any]) -> dict[str, Any]:
     details, raw_snapshot, draft_state = quote_commercial_saved_details(payload)
     snapshot = normalized_quote_commercial_snapshot(raw_snapshot)
+    lifecycle = clean_text(
+        draft_state.get("quoteCommercialLifecycle")
+        or draft_state.get("quote_commercial_lifecycle")
+    ).upper()
     has_saved_state = bool(
         details
         or draft_state.get("outputRows")
@@ -3965,8 +3983,8 @@ def quote_commercial_state(payload: dict[str, Any]) -> dict[str, Any]:
             "draft_state": draft_state,
         }
     return {
-        "owned": has_saved_state,
-        "legacy": has_saved_state,
+        "owned": has_saved_state and lifecycle != "NEW_UNINITIALISED",
+        "legacy": has_saved_state and lifecycle != "NEW_UNINITIALISED",
         "details": details,
         "snapshot": None,
         "draft_state": draft_state,
@@ -3978,17 +3996,23 @@ def quote_commercial_historical_effective_unit_price(
     *,
     quantity: float | None = None,
 ) -> float | None:
-    effective = parse_float_or_none(row.get("effective_unit_price"))
-    if effective is not None:
-        return effective
     override = parse_float_or_none(row.get("unit_price_override"))
     if override is not None:
         return override
+    effective = parse_float_or_none(row.get("effective_unit_price"))
+    if effective is not None:
+        return effective
     basis_amount = parse_float_or_none(row.get("pricing_basis_amount"))
     resolved_quantity = quantity if quantity is not None else parse_float_or_none(row.get("quantity"))
     if basis_amount is not None and resolved_quantity is not None and resolved_quantity > 0:
         return round(basis_amount / resolved_quantity, 6)
     return None
+
+
+def quote_commercial_invalid_unit_price_override(row: dict[str, Any]) -> bool:
+    """Identify a non-empty persisted override that cannot be commercial state."""
+    raw_override = row.get("unit_price_override")
+    return raw_override not in (None, "") and parse_float_or_none(raw_override) is None
 
 
 def quote_commercial_row_from_output_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -4003,13 +4027,18 @@ def quote_commercial_row_from_output_row(row: dict[str, Any]) -> dict[str, Any]:
         next_row["approved_quote_amount"] = 0
         next_row["unit_price_override"] = None
         return next_row
+    if quote_commercial_invalid_unit_price_override(row):
+        next_row["_commercial_invalid_unit_price_override"] = True
     quantity = parse_float_or_none(row.get("quantity"))
     basis_amount = parse_float_or_none(row.get("pricing_basis_amount"))
+    explicit_override = parse_float_or_none(row.get("unit_price_override"))
     effective = quote_commercial_historical_effective_unit_price(row, quantity=quantity)
     if effective is not None:
         next_row["effective_unit_price"] = effective
         next_row["unit_price_override"] = effective
-    if basis_amount is not None:
+    if explicit_override is not None and quantity is not None and quantity > 0:
+        next_row["pricing_basis_amount"] = round_commercial_cents(quantity * effective) if effective is not None else None
+    elif basis_amount is not None:
         next_row["pricing_basis_amount"] = basis_amount
     approved_amount = parse_float_or_none(row.get("approved_quote_amount"))
     if approved_amount is not None:
@@ -4073,27 +4102,49 @@ def quote_commercial_payload(payload: dict[str, Any]) -> dict[str, Any]:
             reference["source"] = basis_source
         if reference:
             resolved["pricing_reference"] = reference
-    saved_profile_id = safe_resource_id(
-        state.get("draft_state", {}).get("profileId")
-        or state.get("draft_state", {}).get("profile_id"),
+    saved_draft_state = state.get("draft_state") if isinstance(state.get("draft_state"), dict) else {}
+    saved_profile_id = profile_identity_value(
+        saved_draft_state.get("selectedPresetValue")
+        or saved_draft_state.get("selected_preset_value")
+        or saved_draft_state.get("profileId")
+        or saved_draft_state.get("profile_id"),
         "",
     )
     if saved_profile_id and not clean_text(resolved.get("profile_id")):
         resolved["profile_id"] = saved_profile_id
 
     output_rows = state["draft_state"].get("outputRows")
-    if isinstance(output_rows, list):
-        resolved["line_items"] = [
-            quote_commercial_row_from_output_row(row)
-            for row in output_rows
-            if isinstance(row, dict)
-        ]
-    else:
-        resolved["line_items"] = [
-            quote_commercial_row_from_output_row(row)
-            for row in (resolved.get("line_items") if isinstance(resolved.get("line_items"), list) else [])
-            if isinstance(row, dict)
-        ]
+    raw_line_items = output_rows if isinstance(output_rows, list) else (
+        resolved.get("line_items") if isinstance(resolved.get("line_items"), list) else []
+    )
+    resolved["line_items"] = []
+    saved_exchange_rate = parse_float_or_none(details.get("exchange_rate"))
+    if saved_exchange_rate is not None and saved_exchange_rate <= 0:
+        saved_exchange_rate = None
+    for raw_row in raw_line_items:
+        if not isinstance(raw_row, dict):
+            continue
+        row = quote_commercial_row_from_output_row(raw_row)
+        if clean_text(row.get("price_mode")).lower() in {"included"} or clean_text(row.get("display_price")).lower() == "included":
+            resolved["line_items"].append(row)
+            continue
+        effective = quote_commercial_historical_effective_unit_price(row)
+        quantity = parse_float_or_none(row.get("quantity"))
+        raw_override = parse_float_or_none(raw_row.get("unit_price_override"))
+        basis_amount = parse_float_or_none(row.get("pricing_basis_amount"))
+        if effective is not None and quantity is not None and quantity > 0:
+            if raw_override is not None or basis_amount is None:
+                basis_amount = round_commercial_cents(quantity * effective)
+                row["pricing_basis_amount"] = basis_amount
+            if parse_float_or_none(row.get("approved_quote_amount")) is None and saved_exchange_rate is not None and basis_amount is not None:
+                row["approved_quote_amount"] = round_commercial_cents(basis_amount * saved_exchange_rate)
+            elif raw_override is not None:
+                row["approved_quote_amount"] = (
+                    round_commercial_cents(basis_amount * saved_exchange_rate)
+                    if saved_exchange_rate is not None and basis_amount is not None
+                    else None
+                )
+        resolved["line_items"].append(row)
     if isinstance(pricing_basis, dict):
         for row in resolved["line_items"]:
             if not isinstance(row, dict):
@@ -4169,14 +4220,17 @@ def quote_commercial_state_errors(
         errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
     if current_source and current_source != basis_source:
         errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
-    saved_profile_id = safe_resource_id(
-        commercial_state.get("draft_state", {}).get("profileId")
-        or commercial_state.get("draft_state", {}).get("profile_id"),
+    saved_draft_state = commercial_state.get("draft_state") if isinstance(commercial_state.get("draft_state"), dict) else {}
+    saved_profile_id = profile_identity_value(
+        saved_draft_state.get("selectedPresetValue")
+        or saved_draft_state.get("selected_preset_value")
+        or saved_draft_state.get("profileId")
+        or saved_draft_state.get("profile_id"),
         "",
     )
     current_profile = payload.get("quote_company_profile") if isinstance(payload.get("quote_company_profile"), dict) else {}
-    current_profile_id = safe_resource_id(payload.get("profile_id") or current_profile.get("id"), "")
-    if saved_profile_id and current_profile_id and saved_profile_id != current_profile_id:
+    current_profile_id = profile_identity_from_payload(payload)
+    if saved_profile_id and saved_profile_id != current_profile_id:
         errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
 
     canonical = quote_commercial_payload(payload)
@@ -4186,15 +4240,31 @@ def quote_commercial_state_errors(
             continue
         if clean_text(row.get("price_mode")).lower() == "included" or clean_text(row.get("display_price")).lower() == "included":
             continue
+        if row.get("_commercial_invalid_unit_price_override") is True:
+            errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+            break
         effective = quote_commercial_historical_effective_unit_price(row)
         if effective is None or effective < 0:
             errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
             break
         quantity = parse_float_or_none(row.get("quantity"))
+        basis_amount = parse_float_or_none(row.get("pricing_basis_amount"))
+        expected_basis = (
+            round_commercial_cents(quantity * effective)
+            if quantity is not None and quantity > 0
+            else None
+        )
+        if (
+            basis_amount is not None
+            and expected_basis is not None
+            and round_commercial_cents(basis_amount) != expected_basis
+        ):
+            errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+            break
         approved_amount = parse_float_or_none(row.get("approved_quote_amount"))
-        if approved_amount is not None and quantity is not None and exchange_rate > 0:
-            expected_amount = round(round(quantity * effective, 2) * exchange_rate, 2)
-            if abs(approved_amount - expected_amount) > 0.005:
+        if approved_amount is not None and expected_basis is not None and exchange_rate is not None and exchange_rate > 0:
+            expected_amount = round_commercial_cents(expected_basis * exchange_rate)
+            if round_commercial_cents(approved_amount) != expected_amount:
                 errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
                 break
     return list(dict.fromkeys(errors))
@@ -5612,12 +5682,12 @@ def persist_pricing_reference_visuals(reference: dict[str, Any], company_id: str
 def pricing_reference_sale_unit_price(item: dict[str, Any]) -> float | None:
     explicit = parse_pricing_number(item.get("sale_unit_price"))
     if explicit is not None and explicit >= 0:
-        return round(explicit, 2)
+        return round_commercial_cents(explicit)
     cost = parse_pricing_number(item.get("internal_cost") or item.get("cost"))
     markup = parse_pricing_number(item.get("markup_multiplier") or item.get("markup"))
     if cost is None or cost <= 0 or markup is None or markup <= 0:
         return None
-    return round(cost * markup, 2)
+    return round_commercial_cents(cost * markup)
 
 
 def sanitize_pricing_reference_item(
@@ -5680,7 +5750,7 @@ def sanitize_pricing_reference_item(
         "unit_hint": unit_hint,
         "internal_cost": internal_cost,
         "markup_multiplier": markup,
-        "sale_unit_price": round(internal_cost * markup, 2),
+        "sale_unit_price": round_commercial_cents(internal_cost * markup),
         "remarks": remarks,
         "aliases": aliases,
     }
@@ -9270,6 +9340,44 @@ def safe_resource_id(value: Any, fallback: str = DEFAULT_PROFILE_ID) -> str:
     return resource_id
 
 
+def profile_identity_parts(value: Any, default_source: str = "") -> tuple[str, str]:
+    """Return a qualified profile source and raw id without collapsing identity."""
+    text = clean_text(value)
+    source = ""
+    raw_id = text
+    if ":" in text:
+        prefix, candidate = text.split(":", 1)
+        if prefix.lower() in {"company", "profile"}:
+            source = prefix.lower()
+            raw_id = candidate
+    if not source:
+        candidate_source = clean_text(default_source).lower()
+        if candidate_source in {"company", "profile"}:
+            source = candidate_source
+    return source, safe_resource_id(raw_id, "")
+
+
+def profile_identity_value(value: Any, default_source: str = "") -> str:
+    source, raw_id = profile_identity_parts(value, default_source)
+    if not raw_id:
+        return ""
+    return f"{source}:{raw_id}" if source else raw_id
+
+
+def profile_identity_from_payload(payload: dict[str, Any]) -> str:
+    profile = payload.get("quote_company_profile") if isinstance(payload.get("quote_company_profile"), dict) else {}
+    value = payload.get("profile_id") or profile.get("id")
+    declared_source = clean_text(payload.get("profile_source") or profile.get("source")).lower()
+    if declared_source not in {"company", "profile"}:
+        declared_source = ""
+    return profile_identity_value(value, declared_source)
+
+
+def profile_authority_from_payload(payload: dict[str, Any]) -> tuple[str, str]:
+    identity = profile_identity_from_payload(payload)
+    return profile_identity_parts(identity)
+
+
 def profiles_root() -> Path:
     return PROJECT_ROOT / "profiles"
 
@@ -9452,6 +9560,7 @@ def public_database_profile_summary(profile: dict[str, Any]) -> dict[str, Any]:
         "id": profile_id,
         "label": label,
         "description": clean_text(profile.get("description")),
+        "defaults": defaults,
         "default_pricing_reference": safe_resource_id(profile.get("default_pricing_reference"), ""),
         "default_quote_detail_preset": "default" if defaults else "",
         "quote_detail_presets": [],
@@ -13999,7 +14108,7 @@ class DatabaseSqagStorage:
         metadata["status"]["quote_generated"] = False
         for kind in QUOTE_SESSION_EXPORT_KINDS:
             metadata["status"][f"{kind}_exported"] = False
-        profile_id = safe_resource_id(payload.get("profile_id"), "")
+        profile_id = explicit_profile_id_from_payload(payload)
         pricing_reference_id = (
             pricing_reference_id_from_payload(payload)
             or safe_resource_id(payload.get("pricing_reference_id"), "")
@@ -14401,7 +14510,7 @@ class DatabaseSqagStorage:
             object_plan = state["object_plan"]
             if stored_generated_quote:
                 metadata["status"]["quote_generated"] = bool(publish)
-                profile_id = safe_resource_id(payload.get("profile_id"), "")
+                profile_id = explicit_profile_id_from_payload(payload)
                 pricing_reference_id = (
                     pricing_reference_id_from_payload(payload)
                     or safe_resource_id(payload.get("pricing_reference_id"), "")
@@ -14594,7 +14703,7 @@ class DatabaseSqagStorage:
         try:
             if stored_generated_quote:
                 metadata["status"]["quote_generated"] = bool(publish)
-                profile_id = safe_resource_id(payload.get("profile_id"), "")
+                profile_id = explicit_profile_id_from_payload(payload)
                 pricing_reference_id = pricing_reference_id_from_payload(payload) or safe_resource_id(payload.get("pricing_reference_id"), "")
                 metadata["generation_snapshot"] = quote_session_generation_snapshot(
                     payload,
@@ -15532,15 +15641,15 @@ def company_config_store() -> CompanyConfigStore:
 
 
 def profile_id_from_payload(payload: dict[str, Any]) -> str:
-    explicit_profile_id = safe_resource_id(payload.get("profile_id"), "")
+    _source, explicit_profile_id = profile_authority_from_payload(payload)
     if explicit_profile_id:
         return explicit_profile_id
     return workspace_profile_pack_id()
 
 
 def explicit_profile_id_from_payload(payload: dict[str, Any]) -> str:
-    profile = payload.get("quote_company_profile") if isinstance(payload.get("quote_company_profile"), dict) else {}
-    return safe_resource_id(payload.get("profile_id") or profile.get("id"), "")
+    _source, profile_id = profile_authority_from_payload(payload)
+    return profile_id
 
 
 def pricing_reference_id_from_payload(payload: dict[str, Any]) -> str:
@@ -15642,12 +15751,20 @@ def log_database_profile_resolution_block(payload: dict[str, Any], reason: str =
 
 
 def profile_selection_error(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> str:
-    if configured_storage_mode() != "database":
-        return ""
-    if database_profile_detail_for_payload(payload, auth_session=auth_session) is None:
-        return PROFILE_SELECTION_ERROR_MESSAGE
-    if database_profile_layout_artifact_for_payload(payload, auth_session=auth_session) is None:
-        return PROFILE_SELECTION_ERROR_MESSAGE
+    source, profile_id = profile_authority_from_payload(payload)
+    if not profile_id:
+        return PROFILE_SELECTION_ERROR_MESSAGE if configured_storage_mode() == "database" else ""
+    if configured_storage_mode() == "database":
+        if source not in {"", "company"}:
+            return PROFILE_SELECTION_ERROR_MESSAGE
+        if database_profile_detail_for_payload(payload, auth_session=auth_session) is None:
+            return PROFILE_SELECTION_ERROR_MESSAGE
+        if database_profile_layout_artifact_for_payload(payload, auth_session=auth_session) is None:
+            return PROFILE_SELECTION_ERROR_MESSAGE
+    elif source == "company":
+        profile = load_company_profile_pack(profile_id, DEFAULT_COMPANY_ID)
+        if profile is None or not profile.asset_path("quotation_layout", "quotation-layout.xlsx").is_file():
+            return PROFILE_SELECTION_ERROR_MESSAGE
     return ""
 
 
@@ -17615,6 +17732,16 @@ def profile_defaults_source_for_payload(payload: dict[str, Any], auth_session: d
     if configured_storage_mode() == "database":
         profile = database_profile_detail_for_payload(payload, auth_session=auth_session)
         if not profile:
+            raise SqagStorageAccessError(
+                PROFILE_SELECTION_ERROR_MESSAGE,
+                status=400,
+                reason="workspace_profile_missing_or_unavailable",
+            )
+        return profile
+    source, profile_id = profile_authority_from_payload(payload)
+    if source == "company":
+        profile = load_company_profile_pack(profile_id, DEFAULT_COMPANY_ID)
+        if profile is None or not profile.asset_path("quotation_layout", "quotation-layout.xlsx").is_file():
             raise SqagStorageAccessError(
                 PROFILE_SELECTION_ERROR_MESSAGE,
                 status=400,
@@ -21049,7 +21176,7 @@ def dashboard_safe_number(value: Any) -> float | None:
     number = parse_float_or_none(value)
     if number is None or not math.isfinite(number):
         return None
-    return round(number, 2)
+    return round_commercial_cents(number)
 
 
 def dashboard_safe_exchange_rate(value: Any) -> float | None:
@@ -21090,15 +21217,22 @@ def safe_display_pair(value: Any) -> tuple[str, str]:
 
 def quote_session_profile_summary(payload: dict[str, Any], patch: dict[str, Any]) -> dict[str, str]:
     supplied = patch.get("quote_company_profile") if isinstance(patch.get("quote_company_profile"), dict) else {}
-    supplied_id, supplied_name = safe_display_pair(supplied)
-    profile_id = supplied_id or safe_resource_id(payload.get("profile_id"), "")
+    supplied_source = clean_text(supplied.get("source")).lower()
+    if supplied_source not in {"company", "profile"}:
+        supplied_source = profile_identity_parts(profile_identity_from_payload(payload))[0]
+    supplied_id = profile_identity_value(supplied.get("id"), supplied_source)
+    supplied_name = dashboard_safe_text(supplied.get("display_name") or supplied.get("label") or supplied.get("name"))
+    profile_id = supplied_id or profile_identity_from_payload(payload)
     display_name = supplied_name
     company = payload.get("company") if isinstance(payload.get("company"), dict) else {}
     if not display_name:
         display_name = dashboard_safe_text(company.get("name"))
     if not display_name and profile_id and configured_storage_mode() != "database":
         with contextlib.suppress(Exception):
-            display_name = profile_prompt_summary(load_profile_pack(profile_id)).get("label", "")
+            _source, raw_profile_id = profile_identity_parts(profile_id)
+            profile = load_company_profile_pack(raw_profile_id, DEFAULT_COMPANY_ID) if _source == "company" else load_profile_pack(raw_profile_id)
+            if profile is not None:
+                display_name = profile_prompt_summary(profile).get("label", "")
     return {
         "id": profile_id,
         "display_name": dashboard_safe_text(display_name) or "Quote Company Profile",
@@ -21129,9 +21263,21 @@ def quote_session_safe_digest(value: dict[str, Any]) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def quote_session_snapshot_resource(summary: dict[str, Any], detail: dict[str, Any] | None = None) -> dict[str, str]:
+def quote_session_snapshot_resource(
+    summary: dict[str, Any],
+    detail: dict[str, Any] | None = None,
+    *,
+    preserve_profile_identity: bool = False,
+) -> dict[str, str]:
     detail = detail if isinstance(detail, dict) else {}
-    resource_id = safe_resource_id(detail.get("id") or summary.get("id"), "")
+    raw_resource_id = detail.get("id") or summary.get("id")
+    if preserve_profile_identity:
+        # The detail source describes the resolved authority, but must not
+        # qualify a legacy/raw id that was not explicitly selected that way.
+        default_source = profile_identity_parts(summary.get("id"))[0]
+        resource_id = profile_identity_value(raw_resource_id, default_source)
+    else:
+        resource_id = safe_resource_id(raw_resource_id, "")
     display_name = dashboard_safe_text(
         detail.get("display_name")
         or detail.get("label")
@@ -21166,7 +21312,11 @@ def quote_session_generation_snapshot(
     pricing_reference_detail: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     resolved_payload = quote_commercial_payload(payload)
-    profile = quote_session_snapshot_resource(quote_session_profile_summary(resolved_payload, patch), profile_detail)
+    profile = quote_session_snapshot_resource(
+        quote_session_profile_summary(resolved_payload, patch),
+        profile_detail,
+        preserve_profile_identity=True,
+    )
     pricing_reference = quote_session_snapshot_resource(
         quote_session_pricing_reference_summary(resolved_payload, patch),
         pricing_reference_detail,
@@ -21211,7 +21361,10 @@ def normalized_quote_session_generation_snapshot(value: Any) -> dict[str, Any]:
     snapshot = {
         "schema": schema,
         "created_at": dashboard_safe_text(value.get("created_at")),
-        "profile": quote_session_snapshot_resource(value.get("profile") if isinstance(value.get("profile"), dict) else {}),
+        "profile": quote_session_snapshot_resource(
+            value.get("profile") if isinstance(value.get("profile"), dict) else {},
+            preserve_profile_identity=True,
+        ),
         "pricing_reference": quote_session_snapshot_resource(
             value.get("pricing_reference") if isinstance(value.get("pricing_reference"), dict) else {}
         ),
@@ -21278,13 +21431,16 @@ def quote_session_commercials(payload: dict[str, Any], patch: dict[str, Any]) ->
                 continue
             if clean_text(row.get("price_mode")).lower() == "included" or clean_text(row.get("display_price")).lower() == "included":
                 continue
+            if row.get("_commercial_invalid_unit_price_override") is True:
+                has_invalid_row = True
+                continue
             quantity = parse_float_or_none(row.get("quantity"))
             effective = quote_commercial_historical_effective_unit_price(row)
             if quantity is None or effective is None or quantity < 0 or effective < 0:
                 has_invalid_row = True
                 continue
-            base_amount = round(quantity * effective, 2)
-            quote_amount = round(base_amount * exchange_rate, 2) if exchange_rate is not None else None
+            base_amount = round_commercial_cents(quantity * effective)
+            quote_amount = round_commercial_cents(base_amount * exchange_rate) if exchange_rate is not None and base_amount is not None else None
             if quote_amount is None:
                 has_invalid_row = True
             else:
@@ -21292,7 +21448,7 @@ def quote_session_commercials(payload: dict[str, Any], patch: dict[str, Any]) ->
         if not re.fullmatch(r"[A-Z]{3}", currency) or exchange_rate is None or not rows or has_invalid_row:
             subtotal_value = None
         else:
-            subtotal_value = round(subtotal, 2)
+            subtotal_value = round_commercial_cents(subtotal)
         if tax_label not in {"GST", "VAT"} or tax_rate is None or not 0 <= tax_rate <= 1:
             tax_amount = None
             grand_total = None
@@ -21300,8 +21456,8 @@ def quote_session_commercials(payload: dict[str, Any], patch: dict[str, Any]) ->
             tax_amount = None
             grand_total = None
         else:
-            tax_amount = round(subtotal_value * tax_rate, 2)
-            grand_total = round(subtotal_value + tax_amount, 2)
+            tax_amount = round_commercial_cents(subtotal_value * tax_rate)
+            grand_total = round_commercial_cents(subtotal_value + tax_amount)
         return {
             "currency": currency,
             "tax_label": tax_label if tax_label in {"GST", "VAT"} else "",
@@ -23743,7 +23899,12 @@ def _run_quote_job(
             log_database_profile_resolution_block(payload, "workspace_profile_layout_missing_or_unavailable")
             return blocked([PROFILE_SELECTION_ERROR_MESSAGE], "profile_layout_unavailable")
     else:
-        profile = load_profile_pack(profile_id_from_payload(payload))
+        try:
+            profile = profile_defaults_source_for_payload(payload, auth_session=auth_session)
+        except SqagStorageAccessError as exc:
+            return storage_block(exc)
+        if profile is None:
+            return blocked([PROFILE_SELECTION_ERROR_MESSAGE], "profile_layout_unavailable")
         layout_template_path = profile.quotation_layout_path
     pricing_catalog_path = pricing_catalog_path_for_payload(payload, job_tmp, auth_session=auth_session)
     uploaded_images = save_uploaded_images(image_entries(payload), job_tmp)
@@ -24292,8 +24453,23 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             if storage is None:
                 return
             workspace = storage.workspace()
+            company_profiles = []
+            if self.current_permissions().get("canGenerateQuote"):
+                company_profiles = [
+                    public_database_profile_summary(profile)
+                    for profile in storage.list_company_profiles()
+                    if isinstance(profile, dict)
+                    and safe_resource_id(profile.get("id") or profile.get("label"), "")
+                ]
+                company_profiles.sort(
+                    key=lambda item: (
+                        clean_text(item.get("label") or item.get("id")).casefold(),
+                        clean_text(item.get("id")).casefold(),
+                    )
+                )
             self.send_json({
                 "profiles": storage.list_profiles(),
+                "company_profiles": company_profiles,
                 "pricing_references": storage.list_pricing_references(),
                 "default_profile_id": workspace_profile_pack_id(workspace),
                 "default_pricing_reference_id": workspace_pricing_reference_id(workspace),
