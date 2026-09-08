@@ -1994,6 +1994,14 @@ function taxRateFromPercentInput(value, fallback = DEFAULT_TAX_RATE) {
   return Math.min(1, Math.max(0, number / 100));
 }
 
+function commercialTaxRateOrNull(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "number" && typeof value !== "string") return null;
+  if (typeof value === "string" && value.trim() === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 && number <= 1 ? number : null;
+}
+
 function normalizeCurrencyLabel(value = DEFAULT_CURRENCY_LABEL) {
   const normalized = String(value || "")
     .trim()
@@ -2507,11 +2515,11 @@ function quoteCommercialTaxText(tax = collectTaxDetails()) {
   const ownedCommercial = typeof state !== "undefined"
     && ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
   const label = String(tax?.label || "").trim();
-  const rate = Number(tax?.rate);
-  if (ownedCommercial && (!label || !Number.isFinite(rate) || rate < 0 || rate > 1)) {
+  const rate = commercialTaxRateOrNull(tax?.rate);
+  if (ownedCommercial && (!label || rate === null)) {
     return "Review required";
   }
-  return `${label || DEFAULT_TAX_LABEL} ${taxRatePercentText(Number.isFinite(rate) ? rate : DEFAULT_TAX_RATE)}%`;
+  return `${label || DEFAULT_TAX_LABEL} ${taxRatePercentText(rate ?? DEFAULT_TAX_RATE)}%`;
 }
 
 function quoteExchangeRateText(value = collectQuoteExchangeRate()) {
@@ -3082,16 +3090,17 @@ function applyQuoteDetails(details = {}, options = {}) {
     }
   }
   if (!partial || hasQuoteTaxRate) {
-    const taxRateValue = tax.rate ?? quoteText.tax_rate;
-    setInputValue(elements.taxRate, ownedCommercial && taxRateValue == null ? "" : taxRatePercentText(
-      ownedCommercial ? taxRateValue : (taxRateValue ?? DEFAULT_TAX_RATE)
+    const taxRateValue = Object.prototype.hasOwnProperty.call(tax, "rate") ? tax.rate : quoteText.tax_rate;
+    const capturedTaxRate = commercialTaxRateOrNull(taxRateValue);
+    setInputValue(elements.taxRate, ownedCommercial && capturedTaxRate === null ? "" : taxRatePercentText(
+      ownedCommercial ? capturedTaxRate : (capturedTaxRate ?? DEFAULT_TAX_RATE)
     ));
     if (
       elements.quoteTaxRate
       && shouldApplyQuoteCommercialField("quoteTaxRate", hasQuoteTaxRate, partial, options)
     ) {
-      setInputValue(elements.quoteTaxRate, ownedCommercial && taxRateValue == null ? "" : taxRatePercentText(
-        ownedCommercial ? taxRateValue : (taxRateValue ?? DEFAULT_TAX_RATE)
+      setInputValue(elements.quoteTaxRate, ownedCommercial && capturedTaxRate === null ? "" : taxRatePercentText(
+        ownedCommercial ? capturedTaxRate : (capturedTaxRate ?? DEFAULT_TAX_RATE)
       ));
     }
   }
@@ -3705,7 +3714,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.pricingReferenceSettingsMode = state.restorableOverlay
     ? normalizePricingReferenceSettingsMode(saved.pricingReferenceSettingsMode)
     : PRICING_REFERENCE_SETTINGS_MODE_MANAGE;
-  state.selectedPresetValue = saved.selectedPresetValue || presetValueFromQuoteDetails(saved.quoteDetails || {}) || lastSelectedPresetValue();
+  state.selectedPresetValue = saved.selectedPresetValue || presetValueFromQuoteDetails(saved.quoteDetails || {}) || "";
   const savedCommercialSnapshot = saved.quoteDetails?.commercial_snapshot;
   const normalizedCommercialSnapshot = normalizeQuoteCommercialSnapshot(savedCommercialSnapshot, "RECOVERED");
   state.quoteCommercialLifecycle = "RECOVERED";
@@ -4120,11 +4129,11 @@ function renderPresetOptions() {
     && String(state.selectedPresetValue || "").startsWith(COMPANY_PROFILE_PRESET_PREFIX)
     ? String(state.selectedPresetValue)
     : "";
-  const selectedValue = [
+  const selectedValue = savedOwnedPresetValue || [
     state.selectedPresetValue,
     elements.presetSelect.value,
     lastSelectedPresetValue(),
-  ].find((value) => value && availableValues.has(value)) || savedOwnedPresetValue;
+  ].find((value) => value && availableValues.has(value)) || "";
   const builtInOptions = builtInPresets
     .map((preset) => `<option value="${escapeHtml(presetOptionValue(preset))}">${escapeHtml(preset.name)}</option>`)
     .join("");
@@ -4628,6 +4637,15 @@ function loadSelectedPreset(options = {}) {
 }
 
 function loadDefaultProfilePreset(options = {}) {
+  const ownedPresetValue = String(state.selectedPresetValue || "").trim();
+  if (
+    options.allowOwnedInitialization !== true
+    && ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""))
+    && ownedPresetValue.startsWith(COMPANY_PROFILE_PRESET_PREFIX)
+  ) {
+    elements.presetSelect.value = availablePresetValues().has(ownedPresetValue) ? ownedPresetValue : "";
+    return;
+  }
   const defaultPreset = options.preferLastSelection === false
     ? defaultPresetOptionValue()
     : lastSelectedPresetValue() || defaultPresetOptionValue();
@@ -7610,6 +7628,7 @@ function buildLineItemNormalizePayload() {
   const profileId = generationProfileIdForPayload();
   return {
     profile_id: profileId,
+    quote_exchange_rate: collectQuoteExchangeRate(),
     pricing_reference_id: pricingReference?.id || state.pricingReferenceId || "",
     pricing_reference: pricingReference ? {
       id: pricingReference.id || state.pricingReferenceId || "",
@@ -7665,7 +7684,7 @@ function revisionNumber(value, fallback = 0) {
 
 function markOutputRowsDirty() {
   state.outputRevision = revisionNumber(state.outputRevision, 0) + 1;
-  setDownloadFiles([]);
+  updateDownloadButton();
 }
 
 function downloadFileIsFresh(file = state.downloadFile) {
@@ -8304,6 +8323,26 @@ function includedBasisOutputRows(existingRows = []) {
 function outputRowFromLineItem(item = {}) {
   const normalized = normalizeLineItem(item);
   const description = normalized.pricing_keyword ? outputCatalogDescription(normalized) : normalized.description;
+  const lifecycle = String(state.quoteCommercialLifecycle || "");
+  const snapshotLifecycle = String(state.quoteCommercialSnapshot?.lifecycle || "");
+  const recoveredCommercial = ["EXISTING", "RECOVERED"].includes(lifecycle)
+    || ["EXISTING", "RECOVERED"].includes(snapshotLifecycle);
+  const matchStatus = String(normalized.status || "").trim().toLowerCase();
+  const catalogUnitPrice = numberOrNull(normalized.catalog_unit_price);
+  const manualUnitPrice = numberOrNull(normalized.unit_price_override);
+  const capturedUnitPrice = !recoveredCommercial
+    && normalized.price_mode !== "Included"
+    && ["matched", "matched-from-ambiguous"].includes(matchStatus)
+    && catalogUnitPrice !== null
+    ? (manualUnitPrice !== null ? manualUnitPrice : catalogUnitPrice)
+    : null;
+  const quantity = numberOrNull(normalized.quantity);
+  const capturedBasisAmount = capturedUnitPrice !== null && quantity !== null && quantity > 0
+    ? roundCommercialCents(quantity * capturedUnitPrice)
+    : null;
+  const capturedApprovedAmount = capturedBasisAmount !== null
+    ? (typeof quoteAmountValue === "function" ? quoteAmountValue(capturedBasisAmount) : capturedBasisAmount)
+    : null;
   return normalizeOutputRow({
     section: normalized.section,
     description,
@@ -8320,6 +8359,11 @@ function outputRowFromLineItem(item = {}) {
     item_order: normalized.item_order,
     basis_order: normalized.basis_order,
     status: normalized.status || "",
+    ...(capturedUnitPrice !== null ? {
+      effective_unit_price: capturedUnitPrice,
+      pricing_basis_amount: capturedBasisAmount,
+      approved_quote_amount: capturedApprovedAmount,
+    } : {}),
     ...(Object.prototype.hasOwnProperty.call(normalized, "effective_unit_price") ? { effective_unit_price: normalized.effective_unit_price } : {}),
     ...(Object.prototype.hasOwnProperty.call(normalized, "pricing_basis_amount") ? { pricing_basis_amount: normalized.pricing_basis_amount } : {}),
     ...(Object.prototype.hasOwnProperty.call(normalized, "approved_quote_amount") ? { approved_quote_amount: normalized.approved_quote_amount } : {}),
@@ -8759,7 +8803,7 @@ function matchSummaryStats(rows = []) {
   const commercialIncomplete = ownedCommercial && (
     !String(typeof collectQuoteCurrency === "function" ? collectQuoteCurrency() : "").trim()
     || !(Number(typeof collectQuoteExchangeRate === "function" ? collectQuoteExchangeRate() : NaN) > 0)
-    || !(Number(tax?.rate) >= 0 && Number(tax?.rate) <= 1)
+    || commercialTaxRateOrNull(tax?.rate) === null
     || !String(tax?.label || "").trim()
   );
   const totalPending = needsManualInput > 0 || commercialIncomplete;
@@ -8781,15 +8825,16 @@ function formatOutputTotalValue(stats = {}) {
   const tax = collectTaxDetails();
   const ownedCommercial = typeof state !== "undefined"
     && ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
-  const taxRate = Number(tax.rate);
-  const resolvedTaxRate = Number.isFinite(taxRate) ? taxRate : (ownedCommercial ? Number.NaN : DEFAULT_TAX_RATE);
+  const taxRate = commercialTaxRateOrNull(tax?.rate);
+  const taxIncomplete = ownedCommercial && (!String(tax?.label || "").trim() || taxRate === null);
+  const resolvedTaxRate = taxRate ?? (ownedCommercial ? Number.NaN : DEFAULT_TAX_RATE);
   const grandTotal = Number.isFinite(resolvedTaxRate)
     ? roundCommercialCents(subtotal + roundCommercialCents(subtotal * resolvedTaxRate))
     : null;
   const totalText = grandTotal === null
     ? `${collectQuoteCurrency()} -`
     : `${collectQuoteCurrency()} ${grandTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-  return stats.totalPending ? `${totalText} + ???` : totalText;
+  return stats.totalPending || taxIncomplete ? `${totalText} + ???` : totalText;
 }
 
 function outputPricingSourceLabel() {
@@ -8802,7 +8847,7 @@ function outputHeaderStatus(rows = state.outputRows) {
   const safeRows = Array.isArray(rows) ? rows : [];
   if (!safeRows.length) return { label: "Draft", className: "is-empty" };
   const stats = matchSummaryStats(safeRows);
-  return stats.needsManualInput > 0
+  return stats.totalPending
     ? { label: "Needs pricing", className: "is-warn" }
     : { label: "Ready", className: "is-ok" };
 }
@@ -10824,9 +10869,8 @@ function dashboardCommercialsFromState() {
   const stats = matchSummaryStats(state.outputRows);
   const hasConfirmedTotal = state.outputRows.length > 0 && !stats.totalPending;
   const subtotal = hasConfirmedTotal ? roundCommercialCents(Number(stats.total)) : null;
-  const taxRate = ownedCommercial && tax.rate == null
-    ? Number.NaN
-    : Number(ownedCommercial ? tax.rate : (tax.rate ?? DEFAULT_TAX_RATE));
+  const capturedTaxRate = commercialTaxRateOrNull(tax?.rate);
+  const taxRate = capturedTaxRate ?? (ownedCommercial ? Number.NaN : DEFAULT_TAX_RATE);
   const taxAmount = subtotal === null || !Number.isFinite(taxRate)
     ? null
     : roundCommercialCents(subtotal * taxRate);
@@ -11665,8 +11709,8 @@ function dashboardTaxText(session = {}) {
 
 function dashboardTaxRateText(session = {}) {
   const commercials = session.commercials || {};
-  const rate = Number(commercials.tax_rate);
-  return Number.isFinite(rate) && rate >= 0 && rate <= 1
+  const rate = commercialTaxRateOrNull(commercials.tax_rate);
+  return rate !== null
     ? `${(rate * 100).toLocaleString(undefined, { maximumFractionDigits: 2 })}%`
     : "Review required";
 }
@@ -13486,7 +13530,6 @@ async function resumeSavedJob() {
       renderMessages([]);
       clearPricingReviewMessages();
       setSidePanel("output", { force: true });
-      setDownloadFiles([]);
     } else {
       setWorkflowStage("completed");
       setResultStatus(viewPdf ? "PDF ready" : "Completed", "is-ok");

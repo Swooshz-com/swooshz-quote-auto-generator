@@ -17540,6 +17540,58 @@ def normalize_line_items(payload: dict[str, Any], use_catalog: bool = True) -> l
         if needs_quantity_review and (not pricing_keyword_was_explicit or piece_dimension_quantity_review):
             item["status"] = "quantity-review"
             item.pop("catalog_unit_price", None)
+        raw_match_status = clean_text(raw.get("status")).lower()
+        if (
+            price_mode != "Included"
+            and catalog_item
+            and catalog_unit_price is not None
+            and not needs_quantity_review
+            and raw_match_status in {"", "matched", "matched-from-ambiguous"}
+        ):
+            match_status = raw_match_status if raw_match_status in {"matched", "matched-from-ambiguous"} else (
+                "matched" if pricing_keyword_was_explicit else "matched-from-ambiguous"
+            )
+            item["status"] = match_status
+            raw_override_text = clean_text(raw.get("unit_price_override"))
+            raw_override = parse_float_or_none(raw.get("unit_price_override"))
+            effective = None if raw_override_text and raw_override is None else (raw_override if raw_override is not None else catalog_unit_price)
+            if effective is not None and effective >= 0:
+                item["effective_unit_price"] = effective
+                item["unit_price_override"] = effective
+                if quantity is not None and quantity > 0:
+                    basis_amount = round_commercial_cents(quantity * effective)
+                    item["pricing_basis_amount"] = basis_amount
+                    exchange_rate = quote_exchange_rate_from_payload(payload) or 1
+                    item["approved_quote_amount"] = round_commercial_cents(basis_amount * exchange_rate) if basis_amount is not None else None
+                reference = pricing_reference_payload(payload)
+                basis_currency = clean_text(raw.get("pricing_basis_currency") or reference.get("currency")).upper()
+                basis_source = clean_text(
+                    raw.get("pricing_reference_source")
+                    or payload.get("pricing_reference_source")
+                    or reference.get("source")
+                ).lower()
+                basis_id = safe_resource_id(
+                    raw.get("pricing_reference_id")
+                    or payload.get("pricing_reference_id")
+                    or reference.get("id"),
+                    "",
+                )
+                if not basis_id:
+                    basis_id = safe_resource_id(pricing_reference_id_from_payload(payload), "")
+                basis_digest = clean_text(
+                    raw.get("pricing_basis_digest")
+                    or reference.get("digest_sha256")
+                    or reference.get("reference_digest")
+                    or reference.get("content_fingerprint")
+                )
+                if basis_currency:
+                    item["pricing_basis_currency"] = basis_currency
+                if basis_source:
+                    item["pricing_reference_source"] = basis_source
+                if basis_id:
+                    item["pricing_reference_id"] = basis_id
+                if basis_digest:
+                    item["pricing_basis_digest"] = basis_digest
         if not item["source_basis_line_id"]:
             item.pop("source_basis_line_id", None)
         if display_price:
