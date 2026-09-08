@@ -13552,6 +13552,328 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
             self.assertEqual(refreshed["exports"]["pdf"]["missing"], True)
             self.assertNotIn(str(tmp_path), json.dumps(refreshed))
 
+    def _local_publication_case(
+        self,
+        root: Path,
+        session_id: str,
+        xlsx_bytes: bytes,
+        pdf_bytes: bytes,
+        variant: str = "current",
+    ) -> tuple[dict, dict, Path]:
+        output_dir = root / "output" / f"{session_id}-{variant}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
+        (output_dir / "quotation.pdf").write_bytes(pdf_bytes)
+        payload = valid_payload()
+        payload["quote_session"] = {"session_id": session_id}
+        result = {
+            "status": "completed",
+            "files": [
+                {"name": "quotation.xlsx", "url": f"/api/jobs/{session_id}/files/quotation.xlsx"},
+                {"name": "quotation.pdf", "url": f"/api/jobs/{session_id}/files/quotation.pdf"},
+            ],
+        }
+        return payload, result, output_dir
+
+    def _assert_local_pair_downloads(
+        self,
+        runner: LocalRunnerServer,
+        session_id: str,
+        xlsx_bytes: bytes,
+        pdf_bytes: bytes,
+    ) -> None:
+        self.assertEqual(
+            local_http_get_bytes(runner, f"/api/quote-sessions/{session_id}/download/xlsx"),
+            (200, xlsx_bytes),
+        )
+        self.assertEqual(
+            local_http_get_bytes(runner, f"/api/quote-sessions/{session_id}/download/pdf"),
+            (200, pdf_bytes),
+        )
+
+    def test_local_publication_f1_xlsx_staging_failure_keeps_old_pair(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            old_xlsx = b"old-xlsx-f1"
+            old_pdf = b"old-pdf-f1"
+            new_payload, new_result, new_output = self._local_publication_case(
+                root, "quote-f1a", b"new-xlsx-f1", b"new-pdf-f1", variant="new"
+            )
+            old_payload, old_result, old_output = self._local_publication_case(
+                root, "quote-f1a", old_xlsx, old_pdf, variant="old"
+            )
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+                webapp.create_or_update_quote_session(old_payload, result=old_result, output_dir=old_output)
+                old_metadata = webapp.read_quote_session_metadata("quote-f1a")
+
+                def fail_xlsx(_source, destination):
+                    Path(destination).write_bytes(b"partial-xlsx-f1")
+                    raise OSError("synthetic XLSX staging failure")
+
+                with self.assertRaises(OSError):
+                    with mock.patch.object(webapp.shutil, "copy2", side_effect=fail_xlsx):
+                        webapp.create_or_update_quote_session(
+                            new_payload,
+                            result=new_result,
+                            output_dir=new_output,
+                        )
+
+                current = webapp.read_quote_session_metadata("quote-f1a")
+                self.assertEqual(
+                    current["publication"]["active_publication_id"],
+                    old_metadata["publication"]["active_publication_id"],
+                )
+                self.assertEqual(webapp.quote_session_export_path("quote-f1a", "xlsx").read_bytes(), old_xlsx)
+                self.assertEqual(webapp.quote_session_export_path("quote-f1a", "pdf").read_bytes(), old_pdf)
+                self._assert_local_pair_downloads(runner, "quote-f1a", old_xlsx, old_pdf)
+
+    def test_local_publication_f2_pdf_staging_failure_keeps_old_pair(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            old_xlsx = b"old-xlsx-f2"
+            old_pdf = b"old-pdf-f2"
+            new_payload, new_result, new_output = self._local_publication_case(
+                root, "quote-f2a", b"new-xlsx-f2", b"new-pdf-f2", variant="new"
+            )
+            old_payload, old_result, old_output = self._local_publication_case(
+                root, "quote-f2a", old_xlsx, old_pdf, variant="old"
+            )
+            original_copy2 = webapp.shutil.copy2
+
+            def fail_pdf(source, destination):
+                if Path(source).name == "quotation.pdf":
+                    Path(destination).write_bytes(b"partial-pdf-f2")
+                    raise OSError("synthetic PDF staging failure")
+                return original_copy2(source, destination)
+
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+                webapp.create_or_update_quote_session(old_payload, result=old_result, output_dir=old_output)
+                old_metadata = webapp.read_quote_session_metadata("quote-f2a")
+                with self.assertRaises(OSError):
+                    with mock.patch.object(webapp.shutil, "copy2", side_effect=fail_pdf):
+                        webapp.create_or_update_quote_session(
+                            new_payload,
+                            result=new_result,
+                            output_dir=new_output,
+                        )
+                current = webapp.read_quote_session_metadata("quote-f2a")
+                self.assertEqual(
+                    current["publication"]["active_publication_id"],
+                    old_metadata["publication"]["active_publication_id"],
+                )
+                self.assertEqual(webapp.quote_session_export_path("quote-f2a", "xlsx").read_bytes(), old_xlsx)
+                self.assertEqual(webapp.quote_session_export_path("quote-f2a", "pdf").read_bytes(), old_pdf)
+                self._assert_local_pair_downloads(runner, "quote-f2a", old_xlsx, old_pdf)
+
+    def test_local_publication_f3_precommit_failure_keeps_old_pair(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            old_xlsx = b"old-xlsx-f3"
+            old_pdf = b"old-pdf-f3"
+            new_payload, new_result, new_output = self._local_publication_case(
+                root, "quote-f3a", b"new-xlsx-f3", b"new-pdf-f3", variant="new"
+            )
+            old_payload, old_result, old_output = self._local_publication_case(
+                root, "quote-f3a", old_xlsx, old_pdf, variant="old"
+            )
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+                webapp.create_or_update_quote_session(old_payload, result=old_result, output_dir=old_output)
+                old_metadata = webapp.read_quote_session_metadata("quote-f3a")
+                with self.assertRaises(RuntimeError):
+                    with mock.patch.object(
+                        webapp,
+                        "commit_local_quote_publication",
+                        side_effect=RuntimeError("synthetic pre-commit failure"),
+                    ):
+                        webapp.create_or_update_quote_session(
+                            new_payload,
+                            result=new_result,
+                            output_dir=new_output,
+                        )
+                current = webapp.read_quote_session_metadata("quote-f3a")
+                self.assertEqual(
+                    current["publication"]["active_publication_id"],
+                    old_metadata["publication"]["active_publication_id"],
+                )
+                self.assertEqual(webapp.quote_session_export_path("quote-f3a", "xlsx").read_bytes(), old_xlsx)
+                self.assertEqual(webapp.quote_session_export_path("quote-f3a", "pdf").read_bytes(), old_pdf)
+                self._assert_local_pair_downloads(runner, "quote-f3a", old_xlsx, old_pdf)
+
+    def test_local_publication_f4_metadata_pointer_failure_keeps_parseable_old_state(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            old_xlsx = b"old-xlsx-f4"
+            old_pdf = b"old-pdf-f4"
+            new_payload, new_result, new_output = self._local_publication_case(
+                root, "quote-f4a", b"new-xlsx-f4", b"new-pdf-f4", variant="new"
+            )
+            old_payload, old_result, old_output = self._local_publication_case(
+                root, "quote-f4a", old_xlsx, old_pdf, variant="old"
+            )
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+                webapp.create_or_update_quote_session(old_payload, result=old_result, output_dir=old_output)
+                metadata_path = webapp.quote_session_metadata_path("quote-f4a").resolve()
+                old_metadata_bytes = metadata_path.read_bytes()
+                original_replace = webapp.os.replace
+
+                def fail_metadata_pointer(source, destination):
+                    if Path(destination).resolve() == metadata_path:
+                        raise OSError("synthetic metadata pointer commit failure")
+                    return original_replace(source, destination)
+
+                with self.assertRaises(OSError):
+                    with mock.patch.object(webapp.os, "replace", side_effect=fail_metadata_pointer):
+                        webapp.create_or_update_quote_session(
+                            new_payload,
+                            result=new_result,
+                            output_dir=new_output,
+                        )
+                self.assertEqual(metadata_path.read_bytes(), old_metadata_bytes)
+                current = webapp.read_quote_session_metadata("quote-f4a")
+                self.assertEqual(current["session_id"], "quote-f4a")
+                self.assertEqual(webapp.quote_session_export_path("quote-f4a", "xlsx").read_bytes(), old_xlsx)
+                self.assertEqual(webapp.quote_session_export_path("quote-f4a", "pdf").read_bytes(), old_pdf)
+                self._assert_local_pair_downloads(runner, "quote-f4a", old_xlsx, old_pdf)
+
+    def test_local_publication_f5_partial_set_never_exposes_mixed_pair(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            old_xlsx = b"old-xlsx-f5"
+            old_pdf = b"old-pdf-f5"
+            new_payload, new_result, new_output = self._local_publication_case(
+                root, "quote-f5a", b"new-xlsx-f5", b"new-pdf-f5", variant="new"
+            )
+            old_payload, old_result, old_output = self._local_publication_case(
+                root, "quote-f5a", old_xlsx, old_pdf, variant="old"
+            )
+            original_copy2 = webapp.shutil.copy2
+
+            def interrupt_after_staged_xlsx(source, destination):
+                result = original_copy2(source, destination)
+                if Path(source).name == "quotation.xlsx":
+                    raise RuntimeError("synthetic interruption after staged XLSX")
+                return result
+
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+                webapp.create_or_update_quote_session(old_payload, result=old_result, output_dir=old_output)
+                old_metadata = webapp.read_quote_session_metadata("quote-f5a")
+                with self.assertRaises(RuntimeError):
+                    with mock.patch.object(webapp.shutil, "copy2", side_effect=interrupt_after_staged_xlsx):
+                        webapp.create_or_update_quote_session(
+                            new_payload,
+                            result=new_result,
+                            output_dir=new_output,
+                        )
+                current = webapp.read_quote_session_metadata("quote-f5a")
+                self.assertEqual(
+                    current["publication"]["active_publication_id"],
+                    old_metadata["publication"]["active_publication_id"],
+                )
+                self.assertNotEqual(webapp.quote_session_export_path("quote-f5a", "xlsx").read_bytes(), b"new-xlsx-f5")
+                self.assertNotEqual(webapp.quote_session_export_path("quote-f5a", "pdf").read_bytes(), b"new-pdf-f5")
+                self._assert_local_pair_downloads(runner, "quote-f5a", old_xlsx, old_pdf)
+
+    def test_local_publication_f6_success_commits_complete_pair_as_one_generation(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            old_xlsx = b"old-xlsx-f6"
+            old_pdf = b"old-pdf-f6"
+            new_xlsx = b"new-xlsx-f6"
+            new_pdf = b"new-pdf-f6"
+            new_payload, new_result, new_output = self._local_publication_case(
+                root, "quote-f6a", new_xlsx, new_pdf, variant="new"
+            )
+            old_payload, old_result, old_output = self._local_publication_case(
+                root, "quote-f6a", old_xlsx, old_pdf, variant="old"
+            )
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+                webapp.create_or_update_quote_session(old_payload, result=old_result, output_dir=old_output)
+                old_metadata = webapp.read_quote_session_metadata("quote-f6a")
+                new_session = webapp.create_or_update_quote_session(
+                    new_payload, result=new_result, output_dir=new_output
+                )
+                current = webapp.read_quote_session_metadata("quote-f6a")
+                publication_id = current["publication"]["active_publication_id"]
+                self.assertNotEqual(publication_id, old_metadata["publication"]["active_publication_id"])
+                self.assertEqual(current["exports"]["xlsx"]["publication_id"], publication_id)
+                self.assertEqual(current["exports"]["pdf"]["publication_id"], publication_id)
+                for kind, expected in (("xlsx", new_xlsx), ("pdf", new_pdf)):
+                    export = current["exports"][kind]
+                    self.assertEqual(export["size_bytes"], len(expected))
+                    self.assertEqual(export["sha256"], hashlib.sha256(expected).hexdigest())
+                    self.assertFalse(export["stale"])
+                self.assertTrue(new_session["status"]["quote_generated"])
+                self.assertEqual(
+                    {item["name"] for item in webapp.quote_session_result_files(new_session)},
+                    {"quotation.xlsx", "quotation.pdf"},
+                )
+                self._assert_local_pair_downloads(runner, "quote-f6a", new_xlsx, new_pdf)
+
+    def test_local_legacy_publication_stays_downloadable_and_migrates_safely(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            session_id = "quote-legacy-publication"
+            legacy_xlsx = b"legacy-stale-xlsx"
+            legacy_pdf = b"legacy-stale-pdf"
+            new_xlsx = b"migrated-xlsx"
+            new_pdf = b"migrated-pdf"
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+                legacy_dir = webapp.quote_session_export_dir(session_id)
+                legacy_dir.mkdir(parents=True, exist_ok=True)
+                (legacy_dir / "quotation.xlsx").write_bytes(legacy_xlsx)
+                (legacy_dir / "quotation.pdf").write_bytes(legacy_pdf)
+                legacy_metadata = webapp.blank_quote_session_metadata(session_id, "2026-01-01T00:00:00Z")
+                for kind, content in (("xlsx", legacy_xlsx), ("pdf", legacy_pdf)):
+                    legacy_metadata["exports"][kind] = {
+                        "filename": webapp.QUOTE_SESSION_EXPORT_KINDS[kind],
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                        "size_bytes": len(content),
+                        "stale": True,
+                    }
+                    legacy_metadata["status"][f"{kind}_exported"] = True
+                webapp.write_quote_session_metadata(legacy_metadata)
+                stale = webapp.get_quote_session(session_id)
+                self.assertTrue(stale["exports"]["xlsx"]["stale"])
+                self.assertTrue(stale["exports"]["pdf"]["stale"])
+                self.assertEqual(webapp.quote_session_result_files(stale), [])
+                self._assert_local_pair_downloads(runner, session_id, legacy_xlsx, legacy_pdf)
+
+                new_payload, new_result, new_output = self._local_publication_case(
+                    root, session_id, new_xlsx, new_pdf, variant="new"
+                )
+                original_copy2 = webapp.shutil.copy2
+
+                def fail_legacy_migration(source, destination):
+                    if Path(source).name == "quotation.xlsx":
+                        Path(destination).write_bytes(b"partial-legacy-migration")
+                        raise OSError("synthetic legacy migration failure")
+                    return original_copy2(source, destination)
+
+                with self.assertRaises(OSError):
+                    with mock.patch.object(webapp.shutil, "copy2", side_effect=fail_legacy_migration):
+                        webapp.create_or_update_quote_session(
+                            new_payload, result=new_result, output_dir=new_output
+                        )
+                self._assert_local_pair_downloads(runner, session_id, legacy_xlsx, legacy_pdf)
+                migrated = webapp.create_or_update_quote_session(
+                    new_payload, result=new_result, output_dir=new_output
+                )
+                self.assertFalse(migrated["exports"]["xlsx"]["stale"])
+                self.assertFalse(migrated["exports"]["pdf"]["stale"])
+                self.assertEqual(
+                    migrated["exports"]["xlsx"]["publication_id"],
+                    migrated["exports"]["pdf"]["publication_id"],
+                )
+                self._assert_local_pair_downloads(runner, session_id, new_xlsx, new_pdf)
+
     def test_quote_session_draft_update_marks_existing_exports_stale(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

@@ -35,6 +35,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -325,6 +326,8 @@ QUOTE_SESSION_DIR_NAME = "quote-sessions"
 QUOTE_SESSION_METADATA_FILENAME = "quote-session.json"
 QUOTE_SESSION_DRAFT_FILES_FILENAME = "draft-files.json"
 QUOTE_SESSION_EXPORT_DIR_NAME = "exports"
+QUOTE_SESSION_PUBLICATIONS_DIR_NAME = "publications"
+QUOTE_SESSION_PUBLICATION_ID_RE = re.compile(r"^pub-[0-9a-f]{32}$")
 QUOTE_SESSION_EXPORT_KINDS = {
     "xlsx": "quotation.xlsx",
     "pdf": "quotation.pdf",
@@ -10655,7 +10658,7 @@ class LocalSqagStorage:
         filename = clean_text(export.get("filename")) if isinstance(export, dict) else ""
         if filename != expected_filename:
             return None
-        path = quote_session_export_dir(safe_id) / filename
+        path = quote_session_recorded_export_path(safe_id, clean_text(kind).lower(), metadata)
         return path if path.exists() and path.is_file() else None
 
 
@@ -21226,6 +21229,10 @@ def new_quote_session_id() -> str:
     return f"quote-{secrets.token_hex(12)}"
 
 
+def new_quote_publication_id() -> str:
+    return f"pub-{secrets.token_hex(16)}"
+
+
 def quote_sessions_root() -> Path:
     return configured_data_root() / QUOTE_SESSION_DIR_NAME
 
@@ -21257,12 +21264,65 @@ def quote_session_export_dir(session_id: str) -> Path:
     return quote_session_dir(session_id) / QUOTE_SESSION_EXPORT_DIR_NAME
 
 
-def quote_session_export_path(session_id: str, kind: str) -> Path:
+def quote_session_publications_dir(session_id: str) -> Path:
+    return quote_session_dir(session_id) / QUOTE_SESSION_PUBLICATIONS_DIR_NAME
+
+
+def safe_quote_publication_id(value: Any, fallback: str = "") -> str:
+    publication_id = clean_text(value)
+    return publication_id if QUOTE_SESSION_PUBLICATION_ID_RE.fullmatch(publication_id) else fallback
+
+
+def quote_session_publication_dir(session_id: str, publication_id: str) -> Path:
+    safe_id = safe_quote_session_id(session_id, "")
+    safe_publication_id = safe_quote_publication_id(publication_id, "")
+    if not safe_id or not safe_publication_id:
+        raise ValueError("Quote publication identity is not safe.")
+    root = quote_session_publications_dir(safe_id)
+    path = root / safe_publication_id
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError as exc:
+        raise ValueError("Quote publication path is not safe.") from exc
+    return path.resolve()
+
+
+def quote_session_legacy_export_path(session_id: str, kind: str) -> Path:
     normalized_kind = clean_text(kind).lower()
     filename = QUOTE_SESSION_EXPORT_KINDS.get(normalized_kind)
     if not filename:
         raise ValueError("Quote session export type is not supported.")
     return quote_session_export_dir(session_id) / filename
+
+
+def quote_session_recorded_export_path(
+    session_id: str,
+    kind: str,
+    metadata: dict[str, Any] | None = None,
+) -> Path:
+    normalized_kind = clean_text(kind).lower()
+    expected_filename = QUOTE_SESSION_EXPORT_KINDS.get(normalized_kind)
+    if not expected_filename:
+        raise ValueError("Quote session export type is not supported.")
+    export = {}
+    if isinstance(metadata, dict):
+        exports = metadata.get("exports") if isinstance(metadata.get("exports"), dict) else {}
+        candidate = exports.get(normalized_kind)
+        if isinstance(candidate, dict):
+            export = candidate
+    publication_id = safe_quote_publication_id(export.get("publication_id"), "")
+    if publication_id:
+        return quote_session_publication_dir(session_id, publication_id) / expected_filename
+    return quote_session_legacy_export_path(session_id, normalized_kind)
+
+
+def quote_session_export_path(session_id: str, kind: str) -> Path:
+    safe_id = safe_quote_session_id(session_id, "")
+    if safe_id:
+        metadata = read_quote_session_metadata(safe_id)
+        if metadata:
+            return quote_session_recorded_export_path(safe_id, kind, metadata)
+    return quote_session_legacy_export_path(session_id, kind)
 
 
 def read_quote_session_metadata(session_id: str) -> dict[str, Any]:
@@ -21751,7 +21811,10 @@ def write_quote_session_draft_files(session_id: str, records: list[dict[str, Any
             path.unlink()
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(records, indent=2, sort_keys=True), encoding="utf-8")
+    atomic_write_text(
+        path,
+        json.dumps(records, indent=2, sort_keys=True),
+    )
 
 
 def read_quote_session_draft_files(session_id: str) -> list[dict[str, Any]]:
@@ -21828,6 +21891,7 @@ def blank_quote_session_metadata(session_id: str, created_at: str) -> dict[str, 
         "generation_snapshot": {},
         "publication": {
             "state": "",
+            "active_publication_id": "",
             "run_id": "",
             "job_id": "",
             "error_code": "",
@@ -21845,6 +21909,29 @@ def normalized_quote_session_metadata(metadata: dict[str, Any]) -> dict[str, Any
     for key in ("customer_summary", "quote_company_profile", "pricing_reference", "commercials", "status", "exports", "owner", "draft_state", "publication"):
         if isinstance(metadata.get(key), dict):
             normalized[key].update(copy.deepcopy(metadata[key]))
+    publication = normalized["publication"]
+    active_publication_id = safe_quote_publication_id(
+        publication.get("active_publication_id"),
+        "",
+    )
+    if active_publication_id:
+        publication["active_publication_id"] = active_publication_id
+    else:
+        publication.pop("active_publication_id", None)
+    for kind, expected_filename in QUOTE_SESSION_EXPORT_KINDS.items():
+        export = normalized["exports"].get(kind)
+        if not isinstance(export, dict):
+            export = {}
+            normalized["exports"][kind] = export
+        if clean_text(export.get("filename")) != expected_filename:
+            export["filename"] = None
+            export.pop("publication_id", None)
+        else:
+            publication_id = safe_quote_publication_id(export.get("publication_id"), "")
+            if publication_id:
+                export["publication_id"] = publication_id
+            else:
+                export.pop("publication_id", None)
     snapshot = normalized_quote_session_generation_snapshot(metadata.get("generation_snapshot"))
     if snapshot:
         normalized["generation_snapshot"] = snapshot
@@ -21887,8 +21974,30 @@ def write_quote_session_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Quote session metadata is not valid.")
     path = quote_session_metadata_path(normalized["session_id"])
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(normalized, indent=2, sort_keys=True), encoding="utf-8")
+    atomic_write_text(
+        path,
+        json.dumps(normalized, indent=2, sort_keys=True),
+    )
     return normalized
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
 
 
 def result_has_generated_quote(result: dict[str, Any] | None) -> bool:
@@ -21985,31 +22094,152 @@ def mark_quote_session_exports_stale(metadata: dict[str, Any], preserve_kinds: s
         metadata["status"]["draft_modified"] = True
 
 
-def copy_quote_session_exports(session_id: str, metadata: dict[str, Any], result: dict[str, Any] | None, output_dir: Path | None) -> bool:
+def local_quote_publication_sources(
+    result: dict[str, Any] | None,
+    output_dir: Path | None,
+) -> list[tuple[str, str, Path]]:
     if not result_has_generated_quote(result) or output_dir is None:
-        return False
-    pending_sources = [
-        (kind, filename, output_dir / filename)
-        for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items()
-        if (output_dir / filename).exists() and (output_dir / filename).is_file()
-    ]
-    if not any(kind == "xlsx" for kind, _filename, _source in pending_sources):
-        return False
-    export_dir = quote_session_export_dir(session_id)
-    export_dir.mkdir(parents=True, exist_ok=True)
-    for kind, filename, source in pending_sources:
-        target = quote_session_export_path(session_id, kind)
-        shutil.copy2(source, target)
-        stat = target.stat()
-        metadata["exports"][kind] = {
-            "filename": filename,
-            "created_at": utc_timestamp(),
-            "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
-            "size_bytes": stat.st_size,
-            "stale": False,
-        }
-        metadata["status"][f"{kind}_exported"] = True
-    return True
+        return []
+    declared_names = {
+        clean_text(item.get("name"))
+        for item in (result.get("files") if isinstance(result, dict) else [])
+        if isinstance(item, dict)
+    }
+    sources: list[tuple[str, str, Path]] = []
+    for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
+        source = output_dir / filename
+        if filename in declared_names and not source.is_file():
+            raise ValueError(f"Generated quote publication is missing {filename}.")
+        if source.exists() and not source.is_file():
+            raise ValueError(f"Generated quote publication source is not a regular file: {filename}.")
+        if source.is_file():
+            sources.append((kind, filename, source))
+    return sources
+
+
+def stage_local_quote_publication(
+    session_id: str,
+    result: dict[str, Any] | None,
+    output_dir: Path | None,
+) -> dict[str, Any] | None:
+    sources = local_quote_publication_sources(result, output_dir)
+    if not any(kind == "xlsx" for kind, _filename, _source in sources):
+        return None
+    publication_id = new_quote_publication_id()
+    publications_dir = quote_session_publications_dir(session_id)
+    publications_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir = publications_dir / f".{publication_id}.staging"
+    final_dir = quote_session_publication_dir(session_id, publication_id)
+    staging_dir.mkdir(parents=True, exist_ok=False)
+    staged_at = utc_timestamp()
+    staged_exports: dict[str, dict[str, Any]] = {}
+    try:
+        for kind, filename, source in sources:
+            source_bytes = source.read_bytes()
+            if not source_bytes:
+                raise ValueError(f"Generated quote publication source is empty: {filename}.")
+            source_digest = hashlib.sha256(source_bytes).hexdigest()
+            target = staging_dir / filename
+            shutil.copy2(source, target)
+            if not target.is_file():
+                raise ValueError(f"Staged quote publication file is missing: {filename}.")
+            staged_bytes = target.read_bytes()
+            staged_digest = hashlib.sha256(staged_bytes).hexdigest()
+            if (
+                not staged_bytes
+                or len(staged_bytes) != len(source_bytes)
+                or staged_digest != source_digest
+            ):
+                raise ValueError(f"Staged quote publication validation failed: {filename}.")
+            staged_exports[kind] = {
+                "filename": filename,
+                "publication_id": publication_id,
+                "created_at": staged_at,
+                "sha256": staged_digest,
+                "size_bytes": len(staged_bytes),
+                "stale": False,
+            }
+        os.replace(staging_dir, final_dir)
+    except Exception:
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
+        raise
+    return {
+        "publication_id": publication_id,
+        "final_dir": final_dir,
+        "created_at": staged_at,
+        "exports": staged_exports,
+    }
+
+
+def commit_local_quote_publication(
+    metadata: dict[str, Any],
+    staged_publication: dict[str, Any],
+) -> dict[str, Any]:
+    publication_id = safe_quote_publication_id(
+        staged_publication.get("publication_id"),
+        "",
+    )
+    staged_exports = staged_publication.get("exports")
+    if not publication_id or not isinstance(staged_exports, dict):
+        raise ValueError("Staged quote publication identity is not valid.")
+    exports = metadata.get("exports") if isinstance(metadata.get("exports"), dict) else {}
+    for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
+        staged_export = staged_exports.get(kind)
+        if isinstance(staged_export, dict):
+            if clean_text(staged_export.get("filename")) != filename:
+                raise ValueError("Staged quote publication filename is not valid.")
+            if safe_quote_publication_id(staged_export.get("publication_id"), "") != publication_id:
+                raise ValueError("Staged quote publication generation is mixed.")
+            exports[kind] = copy.deepcopy(staged_export)
+            metadata["status"][f"{kind}_exported"] = True
+            continue
+        existing = exports.get(kind)
+        if isinstance(existing, dict) and clean_text(existing.get("filename")) == filename:
+            existing["stale"] = True
+        metadata["status"][f"{kind}_exported"] = False
+    metadata["exports"] = exports
+    metadata["status"]["quote_generated"] = True
+    metadata["publication"] = {
+        "state": "published",
+        "active_publication_id": publication_id,
+        "committed_at": utc_timestamp(),
+        "run_id": "",
+        "job_id": "",
+        "error_code": "",
+    }
+    committed = write_quote_session_metadata(metadata)
+    metadata.clear()
+    metadata.update(committed)
+    return committed
+
+
+def cleanup_uncommitted_local_quote_publication(
+    session_id: str,
+    staged_publication: dict[str, Any] | None,
+) -> None:
+    if not isinstance(staged_publication, dict):
+        return
+    publication_id = safe_quote_publication_id(
+        staged_publication.get("publication_id"),
+        "",
+    )
+    if not publication_id:
+        return
+    current = read_quote_session_metadata(session_id)
+    current_publication = current.get("publication") if isinstance(current.get("publication"), dict) else {}
+    if safe_quote_publication_id(current_publication.get("active_publication_id"), "") == publication_id:
+        return
+    final_dir = staged_publication.get("final_dir")
+    if not isinstance(final_dir, Path):
+        return
+    publications_dir = quote_session_publications_dir(session_id).resolve()
+    try:
+        final_dir.resolve().relative_to(publications_dir)
+    except ValueError:
+        return
+    if final_dir.exists() and final_dir.is_dir():
+        shutil.rmtree(final_dir)
 
 
 def create_or_update_quote_session(
@@ -22036,25 +22266,39 @@ def create_or_update_quote_session(
     status_patch = patch.get("status") if isinstance(patch.get("status"), dict) else {}
     if isinstance(status_patch.get("quote_generated"), bool):
         metadata["status"]["quote_generated"] = status_patch["quote_generated"]
+    draft_file_records: list[dict[str, Any]] | None = None
     if isinstance(patch.get("draft_state"), dict):
         metadata["draft_state"] = quote_session_draft_state(patch)
-        write_quote_session_draft_files(resolved_session_id, quote_session_draft_files(patch))
-    stored_generated_quote = copy_quote_session_exports(
-        resolved_session_id,
-        metadata,
-        result,
-        output_dir,
-    )
-    if stored_generated_quote:
-        metadata["status"]["quote_generated"] = True
-        metadata["generation_snapshot"] = quote_session_generation_snapshot(
-            payload,
-            patch,
-            created_at=now,
+        draft_file_records = quote_session_draft_files(patch)
+    staged_publication: dict[str, Any] | None = None
+    try:
+        staged_publication = stage_local_quote_publication(
+            resolved_session_id,
+            result,
+            output_dir,
         )
-    else:
-        mark_quote_session_exports_stale(metadata, quote_session_current_draft_export_kinds(patch))
-    write_quote_session_metadata(metadata)
+        if staged_publication is not None:
+            metadata["generation_snapshot"] = quote_session_generation_snapshot(
+                payload,
+                patch,
+                created_at=now,
+            )
+            commit_local_quote_publication(metadata, staged_publication)
+            if draft_file_records is not None:
+                write_quote_session_draft_files(resolved_session_id, draft_file_records)
+        else:
+            if draft_file_records is not None:
+                write_quote_session_draft_files(resolved_session_id, draft_file_records)
+            mark_quote_session_exports_stale(metadata, quote_session_current_draft_export_kinds(patch))
+            committed = write_quote_session_metadata(metadata)
+            metadata.clear()
+            metadata.update(committed)
+    except Exception:
+        cleanup_uncommitted_local_quote_publication(
+            resolved_session_id,
+            staged_publication,
+        )
+        raise
     return public_quote_session(metadata)
 
 
@@ -22134,7 +22378,11 @@ def public_quote_session(metadata: dict[str, Any], *, include_draft_state: bool 
         raw_export = public["exports"].get(kind) if isinstance(public["exports"].get(kind), dict) else {}
         recorded_filename = clean_text(raw_export.get("filename"))
         safe_recorded = recorded_filename if recorded_filename == filename else ""
-        export_path = quote_session_export_path(session_id, kind) if safe_recorded else None
+        export_path = (
+            quote_session_recorded_export_path(session_id, kind, normalized)
+            if safe_recorded
+            else None
+        )
         file_exists = bool(published and export_path and export_path.exists() and export_path.is_file())
         stale = bool(file_exists and quote_session_export_is_stale(normalized, raw_export))
         exists = file_exists
