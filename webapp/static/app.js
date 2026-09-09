@@ -7710,6 +7710,19 @@ function renderMessages(messages = [], tone = "") {
     .join("");
 }
 
+function postCommitProjectionWarningFrom(data = {}) {
+  const warning = data?.post_commit_projection;
+  return warning
+    && warning.code === "post_commit_projection_failed"
+    && warning.retryable === true
+    ? warning
+    : null;
+}
+
+function postCommitProjectionWarningMessage(warning = {}) {
+  return String(warning.message || "Generation completed, but the session view could not be refreshed. Refresh to retry.").trim();
+}
+
 function setDownloadFiles(files = []) {
   const excelFile = files.find((file) => /\.xlsx$/i.test(file.name || "")) || null;
   const pdfFile = files.find((file) => /\.pdf$/i.test(file.name || "")) || null;
@@ -13326,6 +13339,7 @@ async function handleGenerate(options = {}) {
   clearActiveJob();
 
   const data = polled.data.result || polled.data || {};
+  const postCommitProjectionWarning = postCommitProjectionWarningFrom(data);
   const previousContext = currentGenerationContext();
   const resultSessionId = safeQuoteSessionId(data.quote_session?.session_id || previousContext.session_id);
   const resultRunId = data.generation_run_id || polled.data.generation_run_id
@@ -13360,10 +13374,17 @@ async function handleGenerate(options = {}) {
     setWorkflowStage("completed");
     clearPricingReviewMessages();
     setSidePanel("output", { force: true });
-    setDownloadFiles(data.files || []);
+    setDownloadFiles(
+      postCommitProjectionWarning
+        ? (data.committed_files || [])
+        : (data.files || []),
+    );
     renderPricingMatches(state.outputRows);
     renderMatchSummary({ pricing_matches: state.outputRows });
-    if (viewPdf && !state.pdfFile) {
+    if (postCommitProjectionWarning) {
+      setResultStatus("Completed - refresh needed", "is-warn");
+      renderMessages([postCommitProjectionWarningMessage(postCommitProjectionWarning)], "warn");
+    } else if (viewPdf && !state.pdfFile) {
       setResultStatus("PDF unavailable", "is-bad");
       const pdfStatus = data.export_status?.pdf_status || data.export_status?.pdf_readiness || "";
       const reason = pdfStatus === "workbook_export_unavailable"
@@ -13375,9 +13396,15 @@ async function handleGenerate(options = {}) {
       renderMessages([]);
     }
   }
-  await saveQuoteSessionDraftState({ quoteGenerated: true });
+  if (postCommitProjectionWarning) {
+    saveSessionState();
+  } else {
+    await saveQuoteSessionDraftState({ quoteGenerated: true });
+  }
   syncControlStates();
-  return viewPdf ? Boolean(state.pdfFile) : Boolean(state.downloadFile);
+  return postCommitProjectionWarning
+    ? false
+    : viewPdf ? Boolean(state.pdfFile) : Boolean(state.downloadFile);
 }
 
 async function ensureSavedServerJobStarted(activeJob) {
@@ -13554,6 +13581,7 @@ async function resumeSavedJob() {
     }
 
     const data = polled.data.result || polled.data || {};
+    const postCommitProjectionWarning = postCommitProjectionWarningFrom(data);
     const previousContext = currentGenerationContext();
     const resultSessionId = safeQuoteSessionId(data.quote_session?.session_id || previousContext.session_id);
     const resultRunId = data.generation_run_id || polled.data.generation_run_id
@@ -13584,19 +13612,32 @@ async function resumeSavedJob() {
       setSidePanel("output", { force: true });
     } else {
       setWorkflowStage("completed");
-      setResultStatus(viewPdf ? "PDF ready" : "Completed", "is-ok");
-      renderMessages([]);
+      if (postCommitProjectionWarning) {
+        setResultStatus("Completed - refresh needed", "is-warn");
+        renderMessages([postCommitProjectionWarningMessage(postCommitProjectionWarning)], "warn");
+      } else {
+        setResultStatus(viewPdf ? "PDF ready" : "Completed", "is-ok");
+        renderMessages([]);
+      }
       clearPricingReviewMessages();
       setSidePanel("output");
-      setDownloadFiles(data.files || []);
+      setDownloadFiles(
+        postCommitProjectionWarning
+          ? (data.committed_files || [])
+          : (data.files || []),
+      );
     }
     if (data.pricing_matches?.length) renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
     renderMatchSummary(data);
-    await saveQuoteSessionDraftState({ quoteGenerated: true });
+    if (postCommitProjectionWarning) {
+      saveSessionState();
+    } else {
+      await saveQuoteSessionDraftState({ quoteGenerated: true });
+    }
     state.isGenerating = false;
     clearActiveJob();
     syncControlStates();
-    if (!needsPricingReview && showGeneratedExportReadyModal(viewPdf)) return;
+    if (!needsPricingReview && !postCommitProjectionWarning && showGeneratedExportReadyModal(viewPdf)) return;
     hideExcelGeneratingModal();
     return;
   }

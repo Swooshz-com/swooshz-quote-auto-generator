@@ -14295,6 +14295,324 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                         expected,
                     )
 
+    def test_run472_post_commit_projection_failure_preserves_commit_and_recovers(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            output_root = root / "output"
+            tmp_root = root / "tmp"
+            log_root = root / "_logs" / "app"
+            outputs = {
+                "job-472-old": (b"run472-old-xlsx", b"run472-old-pdf"),
+                "job-472-red": (b"run472-red-xlsx", b"run472-red-pdf"),
+                "job-472-persistent": (b"run472-persistent-xlsx", b"run472-persistent-pdf"),
+            }
+            env = isolated_env(
+                QUOTE_DATA_ROOT=str(data_root),
+                QUOTE_OUTPUT_ROOT=str(output_root),
+                QUOTE_LOG_ROOT=str(log_root),
+            )
+
+            def generation_payload(row_description: str, file_key: str) -> dict:
+                payload = self._run466_payload(
+                    "quote-run472",
+                    row_description,
+                    1,
+                    workflow_stage="generating",
+                )
+                payload["quote_session"]["draft_files"] = [{
+                    "session_file_key": file_key,
+                    "name": "run472-reference.pdf",
+                    "type": "application/pdf",
+                    "size": 3,
+                    "data_url": "data:application/pdf;base64,UERG",
+                }]
+                return payload
+
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(webapp, "configured_data_root", return_value=data_root),
+                mock.patch.object(webapp, "configured_output_root", return_value=output_root),
+                mock.patch.object(webapp, "configured_log_root", return_value=log_root),
+                mock.patch.object(
+                    webapp.subprocess,
+                    "run",
+                    side_effect=self._run466_fake_generator(outputs),
+                ),
+                LocalRunnerServer() as runner,
+            ):
+                old_result = webapp.run_quote_job(
+                    generation_payload("Run-472 old row", "run472-old-reference"),
+                    output_root=output_root,
+                    tmp_root=tmp_root,
+                    job_id="job-472-old",
+                )
+                self.assertEqual(old_result["status"], "completed", old_result)
+                old_metadata = webapp.read_quote_session_metadata("quote-run472")
+                old_publication_id = old_metadata["publication"]["active_publication_id"]
+
+                commit_observed = {"value": False}
+                projection_fault_active = {"value": True}
+                original_commit = webapp.commit_local_quote_publication
+                original_projection = webapp.public_quote_session
+
+                def mark_commit(*args, **kwargs):
+                    committed = original_commit(*args, **kwargs)
+                    commit_observed["value"] = True
+                    return committed
+
+                def fail_projection(metadata, *args, **kwargs):
+                    if projection_fault_active["value"] and commit_observed["value"]:
+                        raise OSError("synthetic Run-472 post-commit projection read failure")
+                    return original_projection(metadata, *args, **kwargs)
+
+                with (
+                    mock.patch.object(
+                        webapp,
+                        "commit_local_quote_publication",
+                        side_effect=mark_commit,
+                    ),
+                    mock.patch.object(
+                        webapp,
+                        "public_quote_session",
+                        side_effect=fail_projection,
+                    ),
+                ):
+                    red = webapp.run_quote_job(
+                        generation_payload("Run-472 red row", "run472-red-reference"),
+                        output_root=output_root,
+                        tmp_root=tmp_root,
+                        job_id="job-472-red",
+                    )
+                    self.assertEqual(red["status"], "completed", red)
+                    self.assertEqual(red["generation_outcome"], "committed")
+                    self.assertEqual(red["publication_outcome"], "committed")
+                    self.assertEqual(red["durable_commit"], "success")
+                    self.assertNotIn("files", red)
+                    self.assertEqual(
+                        {item["name"] for item in red["committed_files"]},
+                        {"quotation.xlsx", "quotation.pdf"},
+                    )
+                    warning = red["post_commit_projection"]
+                    self.assertEqual(warning["code"], "post_commit_projection_failed")
+                    self.assertTrue(warning["retryable"])
+                    self.assertEqual(red["quote_session"]["status"]["quote_generated"], True)
+                    self.assertEqual(red["quote_session"]["projection_status"], "unavailable")
+                    for kind in ("xlsx", "pdf"):
+                        self.assertIsNone(red["quote_session"]["exports"][kind]["exists"])
+                        self.assertIsNone(red["quote_session"]["exports"][kind]["url"])
+
+                    red_metadata = webapp.read_quote_session_metadata("quote-run472")
+                    red_publication_id = red_metadata["publication"]["active_publication_id"]
+                    self.assertNotEqual(red_publication_id, old_publication_id)
+                    self.assertEqual(
+                        red_metadata["publication"]["draft_files_publication_id"],
+                        red_publication_id,
+                    )
+                    red_draft_files = webapp.read_quote_session_draft_files(
+                        "quote-run472",
+                        red_metadata,
+                    )
+                    self.assertEqual(
+                        red_draft_files[0]["session_file_key"],
+                        "run472-red-reference",
+                    )
+                    self.assertEqual(
+                        webapp.quote_session_recorded_export_path(
+                            "quote-run472", "xlsx", red_metadata
+                        ).read_bytes(),
+                        b"run472-red-xlsx",
+                    )
+                    self.assertEqual(
+                        webapp.quote_session_recorded_export_path(
+                            "quote-run472", "pdf", red_metadata
+                        ).read_bytes(),
+                        b"run472-red-pdf",
+                    )
+                    self._assert_local_pair_downloads(
+                        runner,
+                        "quote-run472",
+                        b"run472-red-xlsx",
+                        b"run472-red-pdf",
+                    )
+
+                    connection = sqlite3.connect(data_root / "forensics.sqlite3")
+                    try:
+                        run_row = connection.execute(
+                            "select status from sqag_generation_runs where run_id = ?",
+                            (red["generation_run_id"],),
+                        ).fetchone()
+                        evidence = connection.execute(
+                            "select evidence_type, evidence_json from sqag_generation_evidence where run_id = ?",
+                            (red["generation_run_id"],),
+                        ).fetchall()
+                        events = connection.execute(
+                            "select event_type, event_status, purpose, failure_class from sqag_telemetry_events where run_reference = ?",
+                            (red["generation_run_id"],),
+                        ).fetchall()
+                        audits = connection.execute(
+                            "select event_type, event_json from sqag_audit_events where run_id = ?",
+                            (red["generation_run_id"],),
+                        ).fetchall()
+                    finally:
+                        connection.close()
+                    summaries = [
+                        json.loads(body)
+                        for evidence_type, body in evidence
+                        if evidence_type == "result_summary"
+                    ]
+                    manifests = [
+                        json.loads(body)
+                        for evidence_type, body in evidence
+                        if evidence_type == "generation_manifest"
+                    ]
+                    self.assertEqual(run_row[0], "completed")
+                    self.assertTrue(
+                        any(
+                            event_type == "generation"
+                            and event_status == "completed"
+                            for event_type, event_status, _purpose, _failure_class in events
+                        )
+                    )
+                    self.assertIn(
+                        ("publication", "completed", "publication_committed", None),
+                        events,
+                    )
+                    self.assertIn(
+                        (
+                            "publication",
+                            "failed",
+                            "post_commit_projection_failed",
+                            "storage",
+                        ),
+                        events,
+                    )
+                    self.assertFalse(
+                        any(
+                            event_type == "generation" and event_status == "failed"
+                            for event_type, event_status, _purpose, _failure_class in events
+                        )
+                    )
+                    self.assertTrue(summaries)
+                    self.assertTrue(manifests)
+                    summary = summaries[-1]
+                    manifest = manifests[-1]
+                    self.assertEqual(summary["status"], "completed")
+                    self.assertEqual(summary["publication_outcome"], "committed")
+                    self.assertEqual(summary["post_commit_projection"]["code"], warning["code"])
+                    self.assertTrue(summary["artifacts_durable"])
+                    self.assertEqual(manifest["terminal_state"], "completed")
+                    self.assertTrue(manifest["artifacts_durable"])
+                    self.assertEqual(manifest["publication_outcome"]["status"], "committed")
+                    self.assertEqual(
+                        manifest["post_commit_projection"]["code"],
+                        warning["code"],
+                    )
+                    self.assertEqual(manifest["transient_outputs"]["output_count"], 0)
+                    self.assertIn(
+                        "publication_committed",
+                        {event_type for event_type, _body in audits},
+                    )
+                    self.assertIn(
+                        "post_commit_projection_failed",
+                        {event_type for event_type, _body in audits},
+                    )
+                    projection_audit = next(
+                        json.loads(body)
+                        for event_type, body in audits
+                        if event_type == "post_commit_projection_failed"
+                    )
+                    self.assertEqual(
+                        projection_audit["publication_outcome"],
+                        "PUBLICATION_COMMITTED",
+                    )
+                    self.assertEqual(
+                        projection_audit["projection_outcome"],
+                        "POST_COMMIT_PROJECTION_FAILED",
+                    )
+
+                    projection_fault_active["value"] = False
+                    recovered = webapp.get_quote_session(
+                        "quote-run472",
+                        include_draft_state=True,
+                    )
+                    self.assertEqual(
+                        recovered["publication"]["active_publication_id"]
+                        if "publication" in recovered
+                        else red_publication_id,
+                        red_publication_id,
+                    )
+                    self.assertEqual(
+                        recovered["draft_files"][0]["session_file_key"],
+                        "run472-red-reference",
+                    )
+                    self.assertEqual(
+                        {item["name"] for item in webapp.quote_session_result_files(recovered)},
+                        {"quotation.xlsx", "quotation.pdf"},
+                    )
+                    endpoint_status, endpoint_body = local_http_get_json(
+                        runner,
+                        "/api/quote-sessions/quote-run472",
+                    )
+                    self.assertEqual(endpoint_status, 200, endpoint_body)
+                    self.assertEqual(
+                        {item["name"] for item in webapp.quote_session_result_files(endpoint_body["quote_session"])},
+                        {"quotation.xlsx", "quotation.pdf"},
+                    )
+
+                    projection_fault_active["value"] = True
+                    persistent = webapp.run_quote_job(
+                        generation_payload(
+                            "Run-472 persistent projection row",
+                            "run472-persistent-reference",
+                        ),
+                        output_root=output_root,
+                        tmp_root=tmp_root,
+                        job_id="job-472-persistent",
+                    )
+                    self.assertEqual(persistent["status"], "completed", persistent)
+                    self.assertEqual(
+                        persistent["post_commit_projection"]["code"],
+                        "post_commit_projection_failed",
+                    )
+                    persistent_status, persistent_body = local_http_get_json(
+                        runner,
+                        "/api/quote-sessions/quote-run472",
+                    )
+                    self.assertEqual(persistent_status, 503, persistent_body)
+                    self.assertEqual(
+                        persistent_body["error_code"],
+                        "post_commit_projection_failed",
+                    )
+                    persistent_metadata = webapp.read_quote_session_metadata("quote-run472")
+                    persistent_publication_id = persistent_metadata["publication"]["active_publication_id"]
+                    self.assertNotEqual(persistent_publication_id, red_publication_id)
+                    self.assertEqual(
+                        webapp.quote_session_recorded_export_path(
+                            "quote-run472", "xlsx", persistent_metadata
+                        ).read_bytes(),
+                        b"run472-persistent-xlsx",
+                    )
+
+                final_session = webapp.get_quote_session(
+                    "quote-run472",
+                    include_draft_state=True,
+                )
+                self.assertEqual(
+                    final_session["draft_files"][0]["session_file_key"],
+                    "run472-persistent-reference",
+                )
+                self.assertEqual(
+                    {item["name"] for item in webapp.quote_session_result_files(final_session)},
+                    {"quotation.xlsx", "quotation.pdf"},
+                )
+                self._assert_local_pair_downloads(
+                    runner,
+                    "quote-run472",
+                    b"run472-persistent-xlsx",
+                    b"run472-persistent-pdf",
+                )
+
     def test_local_publication_f1_xlsx_staging_failure_keeps_old_pair(self):
         with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
             root = Path(tmp)
@@ -17285,8 +17603,10 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertLess(save_index, terminal_clear_index)
         self.assertLess(terminal_clear_index, ready_index)
         self.assertIn("showGeneratedExportReadyModal(viewPdf)", resumed_generation_body)
+        self.assertIn("data.committed_files || []", resumed_generation_body)
+        self.assertIn("data.files || []", resumed_generation_body)
         self.assertLess(
-            resumed_generation_body.index("setDownloadFiles(data.files || [])"),
+            resumed_generation_body.index("data.files || []"),
             resumed_generation_body.index("showGeneratedExportReadyModal(viewPdf)"),
         )
         self.assertIn("hideExcelGeneratingModal();", resumed_generation_body)

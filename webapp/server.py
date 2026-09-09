@@ -511,6 +511,7 @@ ALLOWED_LOG_EVENTS = {
     "profile_export_not_found",
     "quote_artifact_storage_blocked",
     "quote_publication_compensation_failed",
+    "quote_session_projection_failed",
     "quote_session_update_failed",
     "quote_session_runtime_storage_blocked",
     "security_event",
@@ -693,6 +694,14 @@ class SqagStorageAccessError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.reason = reason
+
+
+class PostCommitQuoteSessionProjectionError(RuntimeError):
+    """A committed publication could not be rendered into the public session view."""
+
+    def __init__(self, committed_metadata: dict[str, Any]) -> None:
+        super().__init__("Quote session projection failed after publication commit.")
+        self.committed_metadata = copy.deepcopy(committed_metadata)
 
 
 class GenerationRunReplay(RuntimeError):
@@ -14374,6 +14383,7 @@ class DatabaseSqagStorage:
                 commit=False,
             )
         )
+        committed_metadata: dict[str, Any] | None = None
         if publish:
             files = self.quote_session_evidence_files(session_id, run_id)
             self._run_storage_transaction(
@@ -14381,7 +14391,34 @@ class DatabaseSqagStorage:
                     connection, session_id, run_id, files,
                 )
             )
-        current = self.get_quote_session(session_id)
+            try:
+                committed_metadata, _draft_files = self._read_quote_session_metadata_for_workspace(session_id)
+            except Exception:
+                committed_metadata = None
+            if not committed_metadata:
+                committed_metadata = copy.deepcopy(state["metadata"])
+                committed_metadata["publication"] = {
+                    **(
+                        committed_metadata.get("publication")
+                        if isinstance(committed_metadata.get("publication"), dict)
+                        else {}
+                    ),
+                    "state": "published",
+                }
+                committed_metadata["publication"].pop("pending_run_id", None)
+                committed_metadata["publication"].pop("pending_job_id", None)
+                committed_metadata.setdefault("status", {})["quote_generated"] = True
+                for kind in QUOTE_SESSION_EXPORT_KINDS:
+                    committed_metadata["status"][f"{kind}_exported"] = bool(
+                        committed_metadata.get("exports", {}).get(kind, {}).get("filename")
+                    )
+                committed_metadata = normalized_quote_session_metadata(committed_metadata)
+        try:
+            current = self.get_quote_session(session_id)
+        except Exception as exc:
+            if committed_metadata is None:
+                raise
+            raise PostCommitQuoteSessionProjectionError(committed_metadata) from exc
         return current or {"session_id": session_id}
 
     def _create_or_update_object_quote_session(
@@ -14625,7 +14662,17 @@ class DatabaseSqagStorage:
             for item in state["pending_artifacts"]:
                 if item.source is not None:
                     self._cleanup_object_staging_file(item.source, output_dir)
-        return self._public_quote_session(state["normalized"])
+        committed_metadata = (
+            copy.deepcopy(state.get("normalized"))
+            if publish and state.get("stored_generated_quote")
+            else None
+        )
+        try:
+            return self._public_quote_session(state["normalized"])
+        except Exception as exc:
+            if committed_metadata is None:
+                raise
+            raise PostCommitQuoteSessionProjectionError(committed_metadata) from exc
 
     def create_or_update_quote_session(self, payload: dict[str, Any], result: dict[str, Any] | None = None, output_dir: Path | None = None, session_id: str | None = None, *, publish: bool = True, generation_run_id: str = "", generation_job_id: str = "") -> dict[str, Any]:
         patch = copy.deepcopy(quote_session_patch_payload(payload))
@@ -14780,7 +14827,13 @@ class DatabaseSqagStorage:
             if stored_generated_quote and self._expected_storage_failure(exc):
                 raise self._storage_unavailable_error(exc) from exc
             raise
-        return self._public_quote_session(normalized)
+        committed_metadata = copy.deepcopy(normalized) if publish and stored_generated_quote else None
+        try:
+            return self._public_quote_session(normalized)
+        except Exception as exc:
+            if committed_metadata is None:
+                raise
+            raise PostCommitQuoteSessionProjectionError(committed_metadata) from exc
 
     def quote_session_evidence_files(self, session_id: str, run_id: str = "") -> list[dict[str, Any]]:
         safe_id = safe_quote_session_id(session_id, "")
@@ -22518,6 +22571,7 @@ def create_or_update_quote_session(
             existing,
         )
     staged_publication: dict[str, Any] | None = None
+    committed_publication: dict[str, Any] | None = None
     try:
         staged_publication = stage_local_quote_publication(
             resolved_session_id,
@@ -22531,7 +22585,7 @@ def create_or_update_quote_session(
                 patch,
                 created_at=now,
             )
-            commit_local_quote_publication(
+            committed_publication = commit_local_quote_publication(
                 metadata,
                 staged_publication,
                 freshness_proof=quote_session_publication_freshness_proof(patch),
@@ -22559,7 +22613,12 @@ def create_or_update_quote_session(
             previous_metadata_snapshot=previous_metadata_snapshot,
         )
         raise
-    return public_quote_session(metadata)
+    try:
+        return public_quote_session(metadata)
+    except Exception as exc:
+        if committed_publication is None:
+            raise
+        raise PostCommitQuoteSessionProjectionError(committed_publication) from exc
 
 
 QUOTE_SESSION_DRAFT_PROGRESS_LABELS = {
@@ -22667,6 +22726,117 @@ def public_quote_session(metadata: dict[str, Any], *, include_draft_state: bool 
     return public
 
 
+def committed_quote_session_artifacts(metadata: dict[str, Any]) -> list[dict[str, str]]:
+    """Return only server-owned artifact evidence from a published session."""
+    normalized = normalized_quote_session_metadata(metadata)
+    if not normalized or not quote_session_is_published(normalized):
+        return []
+    publication = normalized.get("publication") if isinstance(normalized.get("publication"), dict) else {}
+    active_publication_id = safe_quote_publication_id(
+        publication.get("active_publication_id"),
+        "",
+    )
+    if clean_text(publication.get("state")).lower() != "published":
+        return []
+    artifacts: list[dict[str, str]] = []
+    exports = normalized.get("exports") if isinstance(normalized.get("exports"), dict) else {}
+    for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
+        export = exports.get(kind) if isinstance(exports.get(kind), dict) else {}
+        if (
+            clean_text(export.get("filename")) != filename
+            or (
+                active_publication_id
+                and safe_quote_publication_id(export.get("publication_id"), "") != active_publication_id
+            )
+            or (
+                not active_publication_id
+                and safe_quote_publication_id(export.get("publication_id"), "")
+            )
+            or quote_session_export_is_stale(normalized, export)
+        ):
+            continue
+        digest = clean_text(export.get("sha256")).lower()
+        try:
+            size_bytes = int(export.get("size_bytes") or 0)
+        except (TypeError, ValueError):
+            size_bytes = 0
+        if size_bytes <= 0 or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            continue
+        artifacts.append({
+            "name": filename,
+            "bytes": str(size_bytes),
+            "sha256": digest,
+        })
+    return artifacts
+
+
+def committed_quote_session_projection(
+    metadata: dict[str, Any],
+    warning: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a safe committed-session receipt without retrying fallible reads."""
+    normalized = normalized_quote_session_metadata(metadata)
+    if not normalized:
+        return {}
+    public = copy.deepcopy(normalized)
+    public.pop("publication", None)
+    public.pop("owner", None)
+    draft_state = normalized.get("draft_state") if isinstance(normalized.get("draft_state"), dict) else {}
+    public["has_draft_state"] = bool(draft_state)
+    draft_progress = quote_session_draft_progress(draft_state)
+    if draft_progress:
+        public["draft_progress"] = draft_progress
+    public.pop("draft_state", None)
+    public.pop("draft_files", None)
+    exports = public.get("exports") if isinstance(public.get("exports"), dict) else {}
+    for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
+        export = exports.get(kind) if isinstance(exports.get(kind), dict) else {}
+        recorded_filename = clean_text(export.get("filename"))
+        has_recorded_export = recorded_filename == filename
+        export["filename"] = filename if has_recorded_export else None
+        export["exists"] = None if has_recorded_export else False
+        export["missing"] = None if has_recorded_export else False
+        export["stale"] = None if has_recorded_export else False
+        export["url"] = None
+        exports[kind] = export
+    public["exports"] = exports
+    public.setdefault("status", {})["quote_generated"] = True
+    public["status"]["draft_modified"] = False
+    public["projection_status"] = "unavailable"
+    public["post_commit_projection"] = copy.deepcopy(warning)
+    return public
+
+
+def committed_quote_session_downloads(
+    metadata: dict[str, Any],
+    artifacts: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    session_id = safe_quote_session_id(metadata.get("session_id"), "")
+    if not session_id:
+        return []
+    by_name = {
+        clean_text(item.get("name")): item
+        for item in artifacts
+        if isinstance(item, dict)
+    }
+    downloads: list[dict[str, str]] = []
+    for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
+        artifact = by_name.get(filename)
+        if not artifact:
+            continue
+        item = {
+            "name": filename,
+            "url": f"/api/quote-sessions/{session_id}/download/{kind}",
+        }
+        if clean_text(artifact.get("bytes")):
+            item["bytes"] = clean_text(artifact.get("bytes"))
+        digest = clean_text(artifact.get("sha256")).lower()
+        if re.fullmatch(r"[0-9a-f]{64}", digest):
+            item["sha256"] = digest
+        downloads.append(item)
+    return downloads
+
+
 def get_quote_session(session_id: str, *, include_draft_state: bool = False) -> dict[str, Any] | None:
     metadata = read_quote_session_metadata(session_id)
     if not metadata:
@@ -22732,6 +22902,10 @@ def new_error_reference() -> str:
 
 
 GENERIC_REFERENCED_FAILURE_MESSAGE = "Failed. Please try again. Contact support if this keeps happening."
+POST_COMMIT_PROJECTION_FAILURE_CODE = "post_commit_projection_failed"
+POST_COMMIT_PROJECTION_FAILURE_MESSAGE = (
+    "Generation completed, but the session view could not be refreshed. Refresh to retry."
+)
 
 
 def generic_referenced_errors(error_reference: str = "") -> list[str]:
@@ -22746,6 +22920,16 @@ def failed_result_payload(error_reference: str) -> dict[str, Any]:
         "status": "failed",
         "errors": generic_referenced_errors(error_reference),
         "error_reference": clean_text(error_reference),
+    }
+
+
+def post_commit_projection_warning(error_reference: str) -> dict[str, Any]:
+    return {
+        "code": POST_COMMIT_PROJECTION_FAILURE_CODE,
+        "status": "failed",
+        "retryable": True,
+        "error_reference": clean_text(error_reference),
+        "message": POST_COMMIT_PROJECTION_FAILURE_MESSAGE,
     }
 
 
@@ -23558,20 +23742,27 @@ def forensic_request_summary(payload: dict[str, Any]) -> dict[str, Any]:
 
 def forensic_result_summary(result: dict[str, Any]) -> dict[str, Any]:
     files: list[dict[str, Any]] = []
+    committed_files = result.get("_committed_publication_artifacts")
     evidence_files = (
-        result.get("_forensic_transient_files")
+        committed_files
+        if isinstance(committed_files, list)
+        else result.get("_forensic_transient_files")
         if isinstance(result.get("_forensic_transient_files"), list)
         else result.get("files")
     )
     for item in evidence_files if isinstance(evidence_files, list) else []:
         if not isinstance(item, dict):
             continue
+        try:
+            size_bytes = int(item.get("size_bytes") or item.get("bytes") or 0)
+        except (TypeError, ValueError):
+            size_bytes = 0
         files.append({
             "name": clean_text(item.get("name"))[:128],
-            "size_bytes": int(item.get("bytes") or 0),
+            "size_bytes": size_bytes,
             "sha256": clean_text(item.get("sha256")),
         })
-    return {
+    summary = {
         "schema": "swooshz.sqag.generation-result-evidence.v1",
         "status": clean_text(result.get("status")),
         "return_code": int(result.get("return_code") or 0),
@@ -23580,6 +23771,17 @@ def forensic_result_summary(result: dict[str, Any]) -> dict[str, Any]:
         "pricing_match_count": len(result.get("pricing_matches")) if isinstance(result.get("pricing_matches"), list) else 0,
         "export_status_sha256": hashlib.sha256(clean_text(result.get("export_status")).encode("utf-8")).hexdigest(),
     }
+    projection_failure = result.get("_post_commit_projection_failure")
+    if isinstance(committed_files, list):
+        summary.update({
+            "generation_outcome": "committed",
+            "publication_outcome": "committed",
+            "artifacts_durable": True,
+            "committed_artifacts": copy.deepcopy(files),
+        })
+    if isinstance(projection_failure, dict):
+        summary["post_commit_projection"] = copy.deepcopy(projection_failure)
+    return summary
 
 
 def pre_generator_terminal_manifest(
@@ -23772,18 +23974,83 @@ def finish_generation_forensics(
         and publication_storage is not None
         and safe_quote_session_id(publication_session_id, "")
     )
+    post_commit_projection_failure = (
+        result.get("_post_commit_projection_failure")
+        if isinstance(result.get("_post_commit_projection_failure"), dict)
+        else None
+    )
+    has_post_commit_projection_failure = post_commit_projection_failure is not None
     try:
         with forensic_store_for_auth_session(auth_session) as store:
             try:
-                store.finish_run(
+                finished = store.finish_run(
                     run_id,
                     clean_text(enriched.get("status")) or "failed",
                     error_category=error_category,
                     quote_session_id=effective_session,
                     result_summary=forensic_result_summary(enriched),
                     canonical_manifest=canonical_manifest,
-                    commit=not atomic_publication,
+                    commit=not atomic_publication and not has_post_commit_projection_failure,
                 )
+                if has_post_commit_projection_failure and finished:
+                    committed_artifacts = result.get("_committed_publication_artifacts")
+                    committed_artifact_count = (
+                        len(committed_artifacts)
+                        if isinstance(committed_artifacts, list)
+                        else 0
+                    )
+                    projection_details = {
+                        "publication_outcome": "PUBLICATION_COMMITTED",
+                        "projection_outcome": "POST_COMMIT_PROJECTION_FAILED",
+                        "error_reference": clean_text(
+                            post_commit_projection_failure.get("error_reference")
+                        ),
+                        "artifact_count": committed_artifact_count,
+                    }
+                    store.append_audit(
+                        "publication_committed",
+                        {
+                            "outcome": "PUBLICATION_COMMITTED",
+                            "artifact_count": committed_artifact_count,
+                        },
+                        run_id=run_id,
+                        session_id=effective_session,
+                        commit=False,
+                    )
+                    store.append_audit(
+                        POST_COMMIT_PROJECTION_FAILURE_CODE,
+                        projection_details,
+                        run_id=run_id,
+                        session_id=effective_session,
+                        commit=False,
+                    )
+                    store.append_telemetry_event(
+                        "publication",
+                        "completed",
+                        event_id=ForensicStore.telemetry_event_id(
+                            "telemetry-publication-committed", run_id
+                        ),
+                        action_reference=run_id,
+                        run_reference=run_id,
+                        session_reference=effective_session,
+                        operation_route="quote_publication",
+                        purpose="publication_committed",
+                        commit=False,
+                    )
+                    store.append_telemetry_event(
+                        "publication",
+                        "failed",
+                        event_id=ForensicStore.telemetry_event_id(
+                            "telemetry-post-commit-projection", run_id
+                        ),
+                        action_reference=run_id,
+                        run_reference=run_id,
+                        session_reference=effective_session,
+                        operation_route="quote_publication",
+                        purpose=POST_COMMIT_PROJECTION_FAILURE_CODE,
+                        failure_class="storage",
+                        commit=False,
+                    )
                 if atomic_publication and publication_storage is not None:
                     publication_storage.publish_quote_session_forensic_transaction(
                         store.connection,
@@ -23791,6 +24058,8 @@ def finish_generation_forensics(
                         run_id,
                         publication_files or [],
                     )
+                    store.connection.commit()
+                elif has_post_commit_projection_failure:
                     store.connection.commit()
             except Exception:
                 store.connection.rollback()
@@ -24657,6 +24926,44 @@ def _run_quote_job(
                 result["files"] = publication_files
             elif artifact_mode in {"database", "object"}:
                 result["files"] = quote_session_result_files(result.get("quote_session"))
+        except PostCommitQuoteSessionProjectionError as exc:
+            projection_reference = new_error_reference()
+            committed_metadata = exc.committed_metadata
+            committed_artifacts = committed_quote_session_artifacts(committed_metadata)
+            warning = post_commit_projection_warning(projection_reference)
+            committed_session_id = safe_quote_session_id(
+                committed_metadata.get("session_id"),
+            )
+            result["status"] = "completed"
+            result["return_code"] = 0
+            result["errors"] = []
+            result["warnings"] = [warning["message"]]
+            result["generation_outcome"] = "committed"
+            result["publication_outcome"] = "committed"
+            result["durable_commit"] = "success"
+            result["post_commit_projection"] = warning
+            result["quote_session"] = committed_quote_session_projection(
+                committed_metadata,
+                warning,
+            )
+            result["committed_files"] = committed_quote_session_downloads(
+                committed_metadata,
+                committed_artifacts,
+            )
+            result["_committed_publication_artifacts"] = committed_artifacts
+            result["_post_commit_projection_failure"] = warning
+            result["_forensic_transient_files"] = []
+            result.pop("files", None)
+            write_local_log(
+                "quote_session_projection_failed",
+                {
+                    "error_reference": projection_reference,
+                    "job_id": job_id,
+                    "session_id": committed_session_id,
+                    "failure_kind": POST_COMMIT_PROJECTION_FAILURE_CODE,
+                    "durable_outcome": "publication_committed",
+                },
+            )
         except SqagStorageAccessError as exc:
             storage_error = storage_access_error_payload(exc)
             result["_forensic_transient_files"] = copy.deepcopy(
@@ -24699,12 +25006,19 @@ def _run_quote_job(
     normalized_brief["_webapp"] = brief_webapp
 
     result_evidence_summary = forensic_result_summary(result)
+    committed_artifacts = result.get("_committed_publication_artifacts")
     durable_artifacts = (
         copy.deepcopy(publication_files)
         if publication_storage is not None and publication_session_id
+        else copy.deepcopy(committed_artifacts)
+        if isinstance(committed_artifacts, list)
         else []
     )
-    transient_outputs = result_evidence_summary.get("artifacts", [])
+    transient_outputs = (
+        []
+        if durable_artifacts
+        else result_evidence_summary.get("artifacts", [])
+    )
     transient_output_types = sorted({
         clean_text(item.get("name")).rsplit(".", 1)[-1].lower()
         for item in transient_outputs
@@ -24730,6 +25044,16 @@ def _run_quote_job(
             "retained_as_canonical_artifacts": False,
         },
     }
+    post_commit_projection_failure = result.get("_post_commit_projection_failure")
+    if isinstance(post_commit_projection_failure, dict):
+        canonical_manifest.update({
+            "generation_outcome": "committed",
+            "publication_outcome": {
+                "status": "committed",
+                "artifact_count": len(durable_artifacts),
+            },
+            "post_commit_projection": copy.deepcopy(post_commit_projection_failure),
+        })
     canonical_manifest = compact_generation_canonical_manifest(canonical_manifest)
     compaction = canonical_manifest.get("evidence_compaction")
     if isinstance(compaction, dict) and compaction.get("compacted") is True:
@@ -24810,6 +25134,8 @@ def _run_quote_job(
     ):
         finalized["_durable_publication_committed"] = True
     finalized.pop("_forensic_transient_files", None)
+    finalized.pop("_committed_publication_artifacts", None)
+    finalized.pop("_post_commit_projection_failure", None)
     return finalized
 
 
@@ -25081,6 +25407,47 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 session = storage.get_quote_session(quote_session_detail_match.group(1), include_draft_state=True)
             except SqagStorageAccessError as exc:
                 self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
+            except PostCommitQuoteSessionProjectionError as exc:
+                committed_metadata = exc.committed_metadata
+            except Exception:
+                try:
+                    if isinstance(storage, DatabaseSqagStorage):
+                        committed_metadata, _draft_files = storage._read_quote_session_metadata_for_workspace(
+                            quote_session_detail_match.group(1),
+                        )
+                    else:
+                        committed_metadata = read_quote_session_metadata(
+                            quote_session_detail_match.group(1),
+                        )
+                except Exception:
+                    committed_metadata = {}
+                if not (
+                    isinstance(committed_metadata, dict)
+                    and quote_session_is_published(committed_metadata)
+                    and committed_quote_session_artifacts(committed_metadata)
+                ):
+                    raise
+                error_reference = new_error_reference()
+                write_local_log(
+                    "quote_session_projection_failed",
+                    {
+                        "error_reference": error_reference,
+                        "session_id": safe_quote_session_id(
+                            quote_session_detail_match.group(1),
+                        ),
+                        "failure_kind": POST_COMMIT_PROJECTION_FAILURE_CODE,
+                    },
+                )
+                self.send_json(
+                    {
+                        "status": "failed",
+                        "error_code": POST_COMMIT_PROJECTION_FAILURE_CODE,
+                        "errors": [POST_COMMIT_PROJECTION_FAILURE_MESSAGE],
+                        "error_reference": error_reference,
+                    },
+                    status=503,
+                )
                 return
             if not session:
                 self.send_json({"error": "Not found"}, status=404)
