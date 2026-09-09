@@ -13958,6 +13958,343 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                     {"quotation.xlsx"},
                 )
 
+    def test_run469_local_generation_outcome_is_one_publication_transaction(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            output_root = root / "output"
+            tmp_root = root / "tmp"
+            log_root = root / "_logs" / "app"
+            outputs = {
+                "job-469-old": (b"run469-old-xlsx", b"run469-old-pdf"),
+                "job-469-staging-fail": (b"run469-staging-fail-xlsx", b"run469-staging-fail-pdf"),
+                "job-469-draft-fail": (b"run469-draft-fail-xlsx", b"run469-draft-fail-pdf"),
+                "job-469-commit-fail": (b"run469-commit-fail-xlsx", b"run469-commit-fail-pdf"),
+                "job-469-success": (b"run469-success-xlsx", b"run469-success-pdf"),
+            }
+            env = isolated_env(
+                QUOTE_DATA_ROOT=str(data_root),
+                QUOTE_OUTPUT_ROOT=str(output_root),
+                QUOTE_LOG_ROOT=str(log_root),
+            )
+
+            def generation_payload(
+                row_description: str,
+                output_revision: int,
+                *,
+                workflow_stage: str = "generating",
+                file_urls: tuple[str, str] | None = None,
+                file_key: str | None = None,
+            ) -> dict:
+                payload = self._run466_payload(
+                    "quote-run469",
+                    row_description,
+                    output_revision,
+                    workflow_stage=workflow_stage,
+                    file_urls=file_urls,
+                )
+                payload["quote_session"]["draft_files"] = [{
+                    "session_file_key": file_key or f"run469-reference-{output_revision}",
+                    "name": "run469-reference.pdf",
+                    "type": "application/pdf",
+                    "size": 3,
+                    "data_url": "data:application/pdf;base64,UERG",
+                }]
+                return payload
+
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(webapp, "configured_data_root", return_value=data_root),
+                mock.patch.object(webapp, "configured_output_root", return_value=output_root),
+                mock.patch.object(webapp, "configured_log_root", return_value=log_root),
+                mock.patch.object(
+                    webapp.subprocess,
+                    "run",
+                    side_effect=self._run466_fake_generator(outputs),
+                ),
+                LocalRunnerServer() as runner,
+            ):
+                old_result = webapp.run_quote_job(
+                    generation_payload("Run-469 old row", 0, file_key="run469-old-reference"),
+                    output_root=output_root,
+                    tmp_root=tmp_root,
+                    job_id="job-469-old",
+                )
+                self.assertEqual(old_result["status"], "completed", old_result)
+                metadata_path = webapp.quote_session_metadata_path("quote-run469")
+                old_metadata_bytes = metadata_path.read_bytes()
+                old_metadata = webapp.read_quote_session_metadata("quote-run469")
+                old_publication_id = old_metadata["publication"]["active_publication_id"]
+                self.assertEqual(
+                    old_metadata["publication"]["draft_files_publication_id"],
+                    old_publication_id,
+                )
+                old_draft_path = webapp.quote_session_publication_draft_files_path(
+                    "quote-run469",
+                    old_publication_id,
+                )
+                old_draft_bytes = old_draft_path.read_bytes()
+                old_draft_files = webapp.read_quote_session_draft_files(
+                    "quote-run469",
+                    old_metadata,
+                )
+                old_publication_dirs = {
+                    path.name
+                    for path in webapp.quote_session_publications_dir("quote-run469").iterdir()
+                    if path.is_dir() and not path.name.startswith(".")
+                }
+
+                def assert_prior_authority() -> None:
+                    self.assertEqual(metadata_path.read_bytes(), old_metadata_bytes)
+                    current = webapp.read_quote_session_metadata("quote-run469")
+                    self.assertEqual(
+                        current["publication"]["active_publication_id"],
+                        old_publication_id,
+                    )
+                    self.assertEqual(
+                        current["publication"]["draft_files_publication_id"],
+                        old_publication_id,
+                    )
+                    self.assertEqual(
+                        webapp.quote_session_publication_draft_files_path(
+                            "quote-run469",
+                            old_publication_id,
+                        ).read_bytes(),
+                        old_draft_bytes,
+                    )
+                    session = webapp.get_quote_session(
+                        "quote-run469",
+                        include_draft_state=True,
+                    )
+                    self.assertEqual(session["draft_files"], old_draft_files)
+                    self.assertFalse(session["exports"]["xlsx"]["stale"])
+                    self.assertFalse(session["exports"]["pdf"]["stale"])
+                    self._assert_local_pair_downloads(
+                        runner,
+                        "quote-run469",
+                        b"run469-old-xlsx",
+                        b"run469-old-pdf",
+                    )
+                    current_publication_dirs = {
+                        path.name
+                        for path in webapp.quote_session_publications_dir("quote-run469").iterdir()
+                        if path.is_dir() and not path.name.startswith(".")
+                    }
+                    self.assertEqual(current_publication_dirs, old_publication_dirs)
+                    self.assertFalse(
+                        any(
+                            path.name.endswith(".staging")
+                            for path in webapp.quote_session_publications_dir("quote-run469").iterdir()
+                        )
+                    )
+
+                def assert_failed_forensics(result: dict) -> None:
+                    self.assertEqual(result["status"], "failed", result)
+                    self.assertNotIn("files", result)
+                    self.assertNotIn("quote_session", result)
+                    self.assertNotIn("_durable_publication_committed", result)
+                    run_id = result.get("generation_run_id")
+                    self.assertTrue(run_id)
+                    connection = sqlite3.connect(data_root / "forensics.sqlite3")
+                    try:
+                        run_row = connection.execute(
+                            "select status from sqag_generation_runs where run_id = ?",
+                            (run_id,),
+                        ).fetchone()
+                        events = connection.execute(
+                            "select event_type, event_status from sqag_telemetry_events where run_reference = ?",
+                            (run_id,),
+                        ).fetchall()
+                        evidence = connection.execute(
+                            "select evidence_type, evidence_json from sqag_generation_evidence where run_id = ?",
+                            (run_id,),
+                        ).fetchall()
+                    finally:
+                        connection.close()
+                    self.assertEqual(run_row[0], "failed")
+                    self.assertFalse(
+                        any(
+                            event_type in {"generation", "publication", "storage_finalization"}
+                            and event_status in {"success", "completed"}
+                            for event_type, event_status in events
+                        )
+                    )
+                    result_summaries = [
+                        json.loads(body)
+                        for evidence_type, body in evidence
+                        if evidence_type == "result_summary"
+                    ]
+                    manifests = [
+                        json.loads(body)
+                        for evidence_type, body in evidence
+                        if evidence_type == "generation_manifest"
+                    ]
+                    self.assertTrue(result_summaries)
+                    self.assertTrue(manifests)
+                    self.assertEqual(result_summaries[-1]["status"], "failed")
+                    self.assertEqual(manifests[-1]["terminal_state"], "failed")
+                    self.assertFalse(manifests[-1]["artifacts_durable"])
+                    self.assertFalse(
+                        manifests[-1]["transient_outputs"]["retained_as_canonical_artifacts"]
+                    )
+
+                original_copy2 = webapp.shutil.copy2
+
+                def fail_publication_staging(source, destination):
+                    if Path(source).name == "quotation.xlsx":
+                        raise OSError("synthetic Run-469 publication staging failure")
+                    return original_copy2(source, destination)
+
+                with mock.patch.object(webapp.shutil, "copy2", side_effect=fail_publication_staging):
+                    failed_staging = webapp.run_quote_job(
+                        generation_payload("Run-469 staging failure", 1),
+                        output_root=output_root,
+                        tmp_root=tmp_root,
+                        job_id="job-469-staging-fail",
+                    )
+                assert_failed_forensics(failed_staging)
+                assert_prior_authority()
+
+                with mock.patch.object(
+                    webapp,
+                    "write_quote_session_draft_files",
+                    side_effect=OSError("synthetic Run-469 draft persistence failure"),
+                ):
+                    failed_draft = webapp.run_quote_job(
+                        generation_payload("Run-469 draft persistence failure", 2),
+                        output_root=output_root,
+                        tmp_root=tmp_root,
+                        job_id="job-469-draft-fail",
+                    )
+                assert_failed_forensics(failed_draft)
+                assert_prior_authority()
+
+                original_metadata_writer = webapp.write_quote_session_metadata
+
+                def fail_final_metadata_commit(metadata):
+                    committed = original_metadata_writer(metadata)
+                    raise OSError("synthetic Run-469 final metadata commit failure")
+
+                with mock.patch.object(
+                    webapp,
+                    "write_quote_session_metadata",
+                    side_effect=fail_final_metadata_commit,
+                ):
+                    failed_commit = webapp.run_quote_job(
+                        generation_payload("Run-469 final commit failure", 3),
+                        output_root=output_root,
+                        tmp_root=tmp_root,
+                        job_id="job-469-commit-fail",
+                    )
+                assert_failed_forensics(failed_commit)
+                assert_prior_authority()
+
+                failed_followup_urls = (
+                    "/api/jobs/job-469-draft-fail/files/quotation.xlsx",
+                    "/api/jobs/job-469-draft-fail/files/quotation.pdf",
+                )
+                followup_response = self._post_local_quote_session(
+                    runner,
+                    generation_payload(
+                        "Run-469 failed follow-up draft",
+                        2,
+                        workflow_stage="completed",
+                        file_urls=failed_followup_urls,
+                        file_key="run469-follow-up-reference",
+                    ),
+                )
+                self.assertEqual(followup_response["status"], 200, followup_response)
+                followup_session = followup_response["body"]["quote_session"]
+                self.assertTrue(followup_session["exports"]["xlsx"]["stale"])
+                self.assertTrue(followup_session["exports"]["pdf"]["stale"])
+                self.assertEqual(webapp.quote_session_result_files(followup_session), [])
+                refreshed = webapp.get_quote_session("quote-run469", include_draft_state=True)
+                self.assertEqual(
+                    refreshed["draft_files"][0]["session_file_key"],
+                    "run469-follow-up-reference",
+                )
+                self._assert_local_pair_downloads(
+                    runner,
+                    "quote-run469",
+                    b"run469-old-xlsx",
+                    b"run469-old-pdf",
+                )
+                self.assertFalse(
+                    any(
+                        path.name.startswith("pub-")
+                        and path.name != old_publication_id
+                        for path in webapp.quote_session_publications_dir("quote-run469").iterdir()
+                        if path.is_dir()
+                    )
+                )
+
+                successful = webapp.run_quote_job(
+                    generation_payload("Run-469 successful row", 2, file_key="run469-success-reference"),
+                    output_root=output_root,
+                    tmp_root=tmp_root,
+                    job_id="job-469-success",
+                )
+                self.assertEqual(successful["status"], "completed", successful)
+                current_metadata = webapp.read_quote_session_metadata("quote-run469")
+                new_publication_id = current_metadata["publication"]["active_publication_id"]
+                self.assertNotEqual(new_publication_id, old_publication_id)
+                self.assertEqual(
+                    current_metadata["publication"]["draft_files_publication_id"],
+                    new_publication_id,
+                )
+                new_draft_path = webapp.quote_session_publication_draft_files_path(
+                    "quote-run469",
+                    new_publication_id,
+                )
+                self.assertTrue(new_draft_path.is_file())
+                self.assertEqual(
+                    webapp.read_quote_session_draft_files(
+                        "quote-run469",
+                        current_metadata,
+                    )[0]["session_file_key"],
+                    "run469-success-reference",
+                )
+                successful_session = webapp.get_quote_session(
+                    "quote-run469",
+                    include_draft_state=True,
+                )
+                endpoint_status, endpoint_body = local_http_get_json(
+                    runner,
+                    "/api/quote-sessions/quote-run469",
+                )
+                self.assertEqual(endpoint_status, 200, endpoint_body)
+                endpoint_session = endpoint_body["quote_session"]
+                self.assertEqual(endpoint_session["draft_files"], successful_session["draft_files"])
+                self.assertEqual(
+                    {item["name"] for item in webapp.quote_session_result_files(successful_session)},
+                    {"quotation.xlsx", "quotation.pdf"},
+                )
+                self.assertEqual(
+                    {
+                        (item["name"], item["bytes"], item["sha256"])
+                        for item in successful["files"]
+                    },
+                    {
+                        (item["name"], item["bytes"], item["sha256"])
+                        for item in webapp.quote_session_result_files(successful_session)
+                    },
+                )
+                for kind, expected in (
+                    ("xlsx", b"run469-success-xlsx"),
+                    ("pdf", b"run469-success-pdf"),
+                ):
+                    export = current_metadata["exports"][kind]
+                    self.assertEqual(export["publication_id"], new_publication_id)
+                    self.assertFalse(export["stale"])
+                    self.assertEqual(
+                        webapp.quote_session_recorded_export_path(
+                            "quote-run469",
+                            kind,
+                            current_metadata,
+                        ).read_bytes(),
+                        expected,
+                    )
+
     def test_local_publication_f1_xlsx_staging_failure_keeps_old_pair(self):
         with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
             root = Path(tmp)

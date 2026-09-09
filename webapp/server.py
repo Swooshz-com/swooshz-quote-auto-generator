@@ -21307,6 +21307,13 @@ def quote_session_publication_dir(session_id: str, publication_id: str) -> Path:
     return path.resolve()
 
 
+def quote_session_publication_draft_files_path(
+    session_id: str,
+    publication_id: str,
+) -> Path:
+    return quote_session_publication_dir(session_id, publication_id) / QUOTE_SESSION_DRAFT_FILES_FILENAME
+
+
 def quote_session_legacy_export_path(session_id: str, kind: str) -> Path:
     normalized_kind = clean_text(kind).lower()
     filename = QUOTE_SESSION_EXPORT_KINDS.get(normalized_kind)
@@ -21888,9 +21895,14 @@ def quote_session_draft_object_artifacts(
     return metadata_records, items, managed_kinds
 
 
-def write_quote_session_draft_files(session_id: str, records: list[dict[str, Any]]) -> None:
-    path = quote_session_draft_files_path(session_id)
-    if not records:
+def write_quote_session_draft_files(
+    session_id: str,
+    records: list[dict[str, Any]],
+    *,
+    destination: Path | None = None,
+) -> None:
+    path = destination or quote_session_draft_files_path(session_id)
+    if destination is None and not records:
         if path.exists():
             path.unlink()
         return
@@ -21901,12 +21913,37 @@ def write_quote_session_draft_files(session_id: str, records: list[dict[str, Any
     )
 
 
-def read_quote_session_draft_files(session_id: str) -> list[dict[str, Any]]:
+def read_quote_session_draft_files_path(
+    session_id: str,
+    metadata: dict[str, Any] | None = None,
+) -> Path:
+    safe_id = safe_quote_session_id(session_id, "")
+    if not safe_id:
+        return quote_session_draft_files_path(session_id)
+    source = metadata if isinstance(metadata, dict) else read_quote_session_metadata(safe_id)
+    publication = source.get("publication") if isinstance(source.get("publication"), dict) else {}
+    publication_id = safe_quote_publication_id(
+        publication.get("draft_files_publication_id"),
+        "",
+    )
+    if publication_id:
+        return quote_session_publication_draft_files_path(safe_id, publication_id)
+    return quote_session_draft_files_path(safe_id)
+
+
+def read_quote_session_draft_files(
+    session_id: str,
+    metadata: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     safe_id = safe_quote_session_id(session_id, "")
     if not safe_id:
         return []
     try:
-        data = json.loads(quote_session_draft_files_path(safe_id).read_text(encoding="utf-8-sig"))
+        data = json.loads(
+            read_quote_session_draft_files_path(safe_id, metadata).read_text(
+                encoding="utf-8-sig"
+            )
+        )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return []
     if not isinstance(data, list):
@@ -22002,6 +22039,14 @@ def normalized_quote_session_metadata(metadata: dict[str, Any]) -> dict[str, Any
         publication["active_publication_id"] = active_publication_id
     else:
         publication.pop("active_publication_id", None)
+    draft_files_publication_id = safe_quote_publication_id(
+        publication.get("draft_files_publication_id"),
+        "",
+    )
+    if draft_files_publication_id:
+        publication["draft_files_publication_id"] = draft_files_publication_id
+    else:
+        publication.pop("draft_files_publication_id", None)
     for kind, expected_filename in QUOTE_SESSION_EXPORT_KINDS.items():
         export = normalized["exports"].get(kind)
         if not isinstance(export, dict):
@@ -22245,6 +22290,8 @@ def stage_local_quote_publication(
     session_id: str,
     result: dict[str, Any] | None,
     output_dir: Path | None,
+    *,
+    draft_file_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     sources = local_quote_publication_sources(result, output_dir)
     if not any(kind == "xlsx" for kind, _filename, _source in sources):
@@ -22283,16 +22330,35 @@ def stage_local_quote_publication(
                 "size_bytes": len(staged_bytes),
                 "stale": False,
             }
+        if draft_file_records is not None:
+            staged_draft_files_path = staging_dir / QUOTE_SESSION_DRAFT_FILES_FILENAME
+            write_quote_session_draft_files(
+                session_id,
+                draft_file_records,
+                destination=staged_draft_files_path,
+            )
+            if not staged_draft_files_path.is_file():
+                raise ValueError("Staged quote session draft files are missing.")
+            try:
+                staged_draft_files = json.loads(
+                    staged_draft_files_path.read_text(encoding="utf-8-sig")
+                )
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("Staged quote session draft files are invalid.") from exc
+            if staged_draft_files != draft_file_records:
+                raise ValueError("Staged quote session draft files validation failed.")
         os.replace(staging_dir, final_dir)
     except Exception:
-        if staging_dir.exists():
-            shutil.rmtree(staging_dir)
+        for uncommitted_dir in (staging_dir, final_dir):
+            if uncommitted_dir.exists() and uncommitted_dir.is_dir():
+                shutil.rmtree(uncommitted_dir)
         raise
     return {
         "publication_id": publication_id,
         "final_dir": final_dir,
         "created_at": staged_at,
         "exports": staged_exports,
+        "draft_files_bound": draft_file_records is not None,
     }
 
 
@@ -22334,6 +22400,8 @@ def commit_local_quote_publication(
         "job_id": "",
         "error_code": "",
     }
+    if staged_publication.get("draft_files_bound") is True:
+        metadata["publication"]["draft_files_publication_id"] = publication_id
     if isinstance(freshness_proof, dict):
         metadata["publication"].update({
             "committed_draft_state_digest": clean_text(
@@ -22352,6 +22420,9 @@ def commit_local_quote_publication(
 def cleanup_uncommitted_local_quote_publication(
     session_id: str,
     staged_publication: dict[str, Any] | None,
+    *,
+    previous_metadata: dict[str, Any] | None = None,
+    previous_metadata_snapshot: str | None = None,
 ) -> None:
     if not isinstance(staged_publication, dict):
         return
@@ -22364,7 +22435,32 @@ def cleanup_uncommitted_local_quote_publication(
     current = read_quote_session_metadata(session_id)
     current_publication = current.get("publication") if isinstance(current.get("publication"), dict) else {}
     if safe_quote_publication_id(current_publication.get("active_publication_id"), "") == publication_id:
-        return
+        if previous_metadata is None:
+            return
+        metadata_path = quote_session_metadata_path(session_id)
+        if previous_metadata_snapshot is not None:
+            atomic_write_text(metadata_path, previous_metadata_snapshot)
+        elif previous_metadata:
+            restored = normalized_quote_session_metadata(previous_metadata)
+            if not restored:
+                raise ValueError("Previous quote session metadata is not restorable.")
+            atomic_write_text(
+                metadata_path,
+                json.dumps(restored, indent=2, sort_keys=True),
+            )
+        elif metadata_path.exists():
+            metadata_path.unlink()
+        restored_metadata = read_quote_session_metadata(session_id)
+        restored_publication = (
+            restored_metadata.get("publication")
+            if isinstance(restored_metadata.get("publication"), dict)
+            else {}
+        )
+        if safe_quote_publication_id(
+            restored_publication.get("active_publication_id"),
+            "",
+        ) == publication_id:
+            raise RuntimeError("Failed to restore the prior quote publication authority.")
     final_dir = staged_publication.get("final_dir")
     if not isinstance(final_dir, Path):
         return
@@ -22393,6 +22489,13 @@ def create_or_update_quote_session(
         "",
     ) or new_quote_session_id()
     existing = read_quote_session_metadata(resolved_session_id)
+    previous_metadata_snapshot: str | None = None
+    try:
+        metadata_path = quote_session_metadata_path(resolved_session_id)
+        if metadata_path.is_file():
+            previous_metadata_snapshot = metadata_path.read_text(encoding="utf-8")
+    except OSError:
+        previous_metadata_snapshot = None
     storage = storage or LocalSqagStorage()
     now = utc_timestamp()
     metadata = normalized_quote_session_metadata(existing) if existing else blank_quote_session_metadata(resolved_session_id, now)
@@ -22404,16 +22507,23 @@ def create_or_update_quote_session(
     status_patch = patch.get("status") if isinstance(patch.get("status"), dict) else {}
     if isinstance(status_patch.get("quote_generated"), bool):
         metadata["status"]["quote_generated"] = status_patch["quote_generated"]
+    draft_state_supplied = isinstance(patch.get("draft_state"), dict)
     draft_file_records: list[dict[str, Any]] | None = None
-    if isinstance(patch.get("draft_state"), dict):
+    if draft_state_supplied:
         metadata["draft_state"] = quote_session_draft_state(patch)
         draft_file_records = quote_session_draft_files(patch)
+    elif result_has_generated_quote(result):
+        draft_file_records = read_quote_session_draft_files(
+            resolved_session_id,
+            existing,
+        )
     staged_publication: dict[str, Any] | None = None
     try:
         staged_publication = stage_local_quote_publication(
             resolved_session_id,
             result,
             output_dir,
+            draft_file_records=draft_file_records,
         )
         if staged_publication is not None:
             metadata["generation_snapshot"] = quote_session_generation_snapshot(
@@ -22426,11 +22536,10 @@ def create_or_update_quote_session(
                 staged_publication,
                 freshness_proof=quote_session_publication_freshness_proof(patch),
             )
-            if draft_file_records is not None:
-                write_quote_session_draft_files(resolved_session_id, draft_file_records)
         else:
-            if draft_file_records is not None:
+            if draft_state_supplied and draft_file_records is not None:
                 write_quote_session_draft_files(resolved_session_id, draft_file_records)
+                metadata["publication"].pop("draft_files_publication_id", None)
             mark_quote_session_exports_stale(
                 metadata,
                 quote_session_authoritative_current_export_kinds(
@@ -22446,6 +22555,8 @@ def create_or_update_quote_session(
         cleanup_uncommitted_local_quote_publication(
             resolved_session_id,
             staged_publication,
+            previous_metadata=existing,
+            previous_metadata_snapshot=previous_metadata_snapshot,
         )
         raise
     return public_quote_session(metadata)
@@ -22520,7 +22631,7 @@ def public_quote_session(metadata: dict[str, Any], *, include_draft_state: bool 
         public.pop("draft_state", None)
         public.pop("draft_files", None)
     else:
-        public["draft_files"] = read_quote_session_draft_files(session_id)
+        public["draft_files"] = read_quote_session_draft_files(session_id, normalized)
     has_stale_export = False
     has_available_export = False
     for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
