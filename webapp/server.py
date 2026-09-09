@@ -1898,8 +1898,35 @@ def configured_sqag_public_base_url() -> str:
         or not url_uses_https_or_loopback_http(base_url)
     ):
         return ""
-    if configured_app_mode() == "deploy" and base_url != PRODUCTION_SQAG_ORIGIN:
-        return ""
+    if configured_app_mode() == "deploy":
+        auth_mode = configured_auth_mode()
+        launch_mode = configured_platform_launch_mode()
+        launch_mode_value = clean_text(
+            read_dotenv_value(PLATFORM_LAUNCH_MODE_ENV_NAME)
+        ).lower()
+        if auth_mode == "platform":
+            if launch_mode != "platform" or base_url != PRODUCTION_SQAG_ORIGIN:
+                return ""
+        elif auth_mode == INTERNAL_AUTH_MODE:
+            # Internal Google owns one host-configured alpha origin. It must
+            # remain separate from the production SQAG origin and cannot use
+            # loopback HTTP or an explicit public port in deploy mode.
+            try:
+                has_explicit_port = parsed.port is not None
+            except ValueError:
+                return ""
+            if (
+                launch_mode != "disabled"
+                or launch_mode_value != "disabled"
+                or parsed.scheme != "https"
+                or has_explicit_port
+                or base_url == PRODUCTION_SQAG_ORIGIN
+                or clean_text(read_dotenv_value(PLATFORM_BASE_URL_ENV_NAME))
+                or clean_text(read_dotenv_value(PLATFORM_SERVICE_SECRET_ENV_NAME))
+            ):
+                return ""
+        else:
+            return ""
     return base_url
 
 
