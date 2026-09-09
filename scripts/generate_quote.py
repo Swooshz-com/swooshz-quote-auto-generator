@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import textwrap
 import zipfile
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
@@ -35,6 +36,20 @@ from xml.etree import ElementTree as ET
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RESOURCE_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def round_commercial_cents(value: Any) -> float | None:
+    """Round commercial amounts with explicit decimal half-up semantics."""
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    try:
+        number = Decimal(str(value).replace(",", "").strip())
+        if not number.is_finite():
+            return None
+        rounded = number.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError):
+        return None
+    return float(rounded) if rounded else 0.0
 
 
 def discovered_default_resource_dir(root: Path, marker_filename: str, fallback: str = "default") -> Path:
@@ -184,7 +199,8 @@ class PriceRow:
 
     @property
     def sale_unit_price(self) -> float:
-        return round(self.cost * self.markup, 2)
+        rounded = round_commercial_cents(self.cost * self.markup)
+        return rounded if rounded is not None else 0.0
 
 
 @dataclass
@@ -625,7 +641,7 @@ def prepare_lines(brief: dict[str, Any], price_rows: list[PriceRow], allow_ambig
             match = None
         elif unit_price_override_num is not None:
             status = "manual-price"
-            amount = round((quantity_num or 0.0) * unit_price_override_num, 2)
+            amount = round_commercial_cents((quantity_num or 0.0) * unit_price_override_num)
             match = None
         elif display_price:
             status = "manual-display"
@@ -638,7 +654,7 @@ def prepare_lines(brief: dict[str, Any], price_rows: list[PriceRow], allow_ambig
             match = None
             amount = None
         elif status == "matched" or (status == "ambiguous" and allow_ambiguous):
-            amount = round((quantity_num or 0.0) * (match.sale_unit_price if match else 0.0), 2)
+            amount = round_commercial_cents((quantity_num or 0.0) * (match.sale_unit_price if match else 0.0))
             if status == "ambiguous" and allow_ambiguous:
                 status = "matched-from-ambiguous"
         prepared.append(
@@ -987,7 +1003,7 @@ def quote_amount(value: Any, exchange_rate: float = 1.0) -> float | None:
     amount = quote_amount_number(value)
     if amount is None:
         return None
-    return round(amount * exchange_rate, 2)
+    return round_commercial_cents(amount * exchange_rate)
 
 
 def quote_subtotal(entries: list[dict[str, Any]]) -> float:
@@ -996,7 +1012,8 @@ def quote_subtotal(entries: list[dict[str, Any]]) -> float:
         amount = entry.get("amount")
         if isinstance(amount, (int, float)) and not isinstance(amount, bool):
             total += float(amount)
-    return total
+    rounded = round_commercial_cents(total)
+    return rounded if rounded is not None else 0.0
 
 
 def quantity_text(line: QuoteLine) -> str:
@@ -1036,11 +1053,11 @@ def build_quote_rows(brief: dict[str, Any], lines: list[QuoteLine]) -> list[list
                 rows.append(["", "", "", entry["coverage"]])
             continue
         rows.append([entry["number"], entry["quantity"], " ".join(entry["description_lines"]), money(entry.get("amount"))])
-    discount = as_float(brief.get("discount"), 0.0)
-    subtotal = max(quote_subtotal(entries) - discount, 0.0)
+    discount = round_commercial_cents(as_float(brief.get("discount"), 0.0)) or 0.0
+    subtotal = round_commercial_cents(max(quote_subtotal(entries) - discount, 0.0)) or 0.0
     tax_rate = quote_tax_rate(brief)
-    tax_amount = round(subtotal * tax_rate, 2)
-    final_total = subtotal + tax_amount
+    tax_amount = round_commercial_cents(subtotal * tax_rate) or 0.0
+    final_total = round_commercial_cents(subtotal + tax_amount) or 0.0
     rows.extend([[], ["", "", "Total", money(subtotal), currency]])
     if discount:
         rows.insert(-1, ["", "", "Less goodwill discount", money(discount), currency])
@@ -2443,7 +2460,9 @@ def render_quote_entries(lines: list[QuoteLine], brief: dict[str, Any] | None = 
         detail_number += 1
         detail_amount = amount_value(line, exchange_rate)
         if active_section_entry and active_section_entry.get("section_grouped"):
-            active_section_entry["amount"] = round(float(active_section_entry["amount"] or 0.0) + float(line_amount_value(line, exchange_rate) or 0.0), 2)
+            active_section_entry["amount"] = round_commercial_cents(
+                float(active_section_entry["amount"] or 0.0) + float(line_amount_value(line, exchange_rate) or 0.0)
+            ) or 0.0
             detail_amount = None
         entries.append({
             "kind": "item",
@@ -2647,9 +2666,9 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
     gst_row = total_row + 1
     grand_row = total_row + 2
     tax_rate = quote_tax_rate(brief)
-    cached_total = sum(formula_cache_amount(entry.get("amount")) for entry in entries)
-    cached_tax = round(cached_total * tax_rate, 2)
-    cached_grand = cached_total + cached_tax
+    cached_total = round_commercial_cents(sum(formula_cache_amount(entry.get("amount")) for entry in entries)) or 0.0
+    cached_tax = round_commercial_cents(cached_total * tax_rate) or 0.0
+    cached_grand = round_commercial_cents(cached_total + cached_tax) or 0.0
     set_ooxml_cell(root, total_row, 4, "Total", layout_styles["total_label"])
     set_ooxml_formula(
         root,
@@ -2957,11 +2976,11 @@ def build_pdf_cell_map(brief: dict[str, Any], lines: list[QuoteLine]) -> dict[tu
 
     subtotal = quote_subtotal(entries)
     tax_rate = quote_tax_rate(brief)
-    tax_amount = round(subtotal * tax_rate, 2)
+    tax_amount = round_commercial_cents(subtotal * tax_rate) or 0.0
     cells[(92, 5)] = subtotal
     cells[(93, 5)] = tax_amount
     cells[(93, 6)] = currency
-    cells[(94, 5)] = subtotal + tax_amount
+    cells[(94, 5)] = round_commercial_cents(subtotal + tax_amount) or 0.0
     text_row = 99
     terms_heading = clean_text(brief.get("terms_heading"))
     payment_terms = brief.get("payment_terms") or []

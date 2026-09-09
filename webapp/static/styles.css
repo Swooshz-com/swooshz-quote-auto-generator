@@ -1103,6 +1103,16 @@ h3 {
   color: var(--green-dark);
 }
 
+.dashboard-selected-action.is-stale {
+  border-color: rgba(180, 83, 9, 0.34);
+  background: #fff7ed;
+  color: #92400e;
+}
+
+.dashboard-selected-action.is-stale .dashboard-selected-action-kicker {
+  color: #92400e;
+}
+
 .dashboard-selected-action.is-unavailable {
   border-color: rgba(100, 116, 139, 0.24);
   background: #f8fafc;

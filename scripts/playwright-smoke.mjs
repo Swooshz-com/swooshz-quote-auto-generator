@@ -1384,6 +1384,122 @@ async function installMockProfiles(page) {
   });
 }
 
+async function verifyRecoveredTemplateOwnerFailsClosed(page) {
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
+  await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+  const result = await page.evaluate(() => {
+    const original = {
+      profiles: structuredClone(state.profiles),
+      companyProfiles: structuredClone(state.companyProfiles),
+      profileId: state.profileId,
+      defaultProfileId: state.defaultProfileId,
+      quoteCommercialLifecycle: state.quoteCommercialLifecycle,
+      selectedPresetValue: state.selectedPresetValue,
+      presetSelectValue: elements.presetSelect.value,
+      lastSelection: window.localStorage.getItem(LAST_SELECTION_STORAGE_KEY),
+    };
+    const ownerBProfiles = [{
+      id: "owner-b",
+      label: "Owner B",
+      default_quote_detail_preset: "shared",
+      quote_detail_presets: [{ id: "shared", name: "Owner B Shared", details: {} }],
+    }];
+    try {
+      state.profiles = ownerBProfiles;
+      state.companyProfiles = [];
+      state.profileId = "owner-a";
+      state.defaultProfileId = "owner-a";
+      state.quoteCommercialLifecycle = "RECOVERED";
+      state.selectedPresetValue = "profile:owner-a:shared";
+      elements.presetSelect.value = "profile:owner-b:shared";
+      window.localStorage.setItem(LAST_SELECTION_STORAGE_KEY, JSON.stringify({
+        browserRecoveryScope: currentBrowserRecoveryScope(),
+        presetValue: "profile:owner-b:shared",
+      }));
+
+      renderPresetOptions();
+      const afterRender = {
+        selected: state.selectedPresetValue,
+        domValue: elements.presetSelect.value,
+      };
+      loadDefaultProfilePreset();
+      const afterDefault = {
+        selected: state.selectedPresetValue,
+        domValue: elements.presetSelect.value,
+      };
+      loadConfiguredProfilePreset();
+      const afterConfigured = {
+        selected: state.selectedPresetValue,
+        domValue: elements.presetSelect.value,
+      };
+      let generationPayload = null;
+      let generationPayloadError = "";
+      try {
+        generationPayload = buildPayload({ includeDraftContext: false });
+      } catch (error) {
+        generationPayloadError = String(error?.message || error);
+      }
+      const recoveredGenerationProfileId = generationProfileIdForPayload();
+      const recoveredSessionProfileId = currentQuoteSessionPayload().quote_company_profile?.id || "";
+      const recoveredSnapshot = buildSessionSnapshot();
+
+      window.localStorage.removeItem(LAST_SELECTION_STORAGE_KEY);
+      state.quoteCommercialLifecycle = "NEW_UNINITIALISED";
+      state.selectedPresetValue = "";
+      elements.presetSelect.value = "";
+      state.profileId = "owner-b";
+      state.defaultProfileId = "owner-b";
+      renderPresetOptions();
+      loadDefaultProfilePreset({ preferLastSelection: false });
+      const normalNewQuote = {
+        selected: state.selectedPresetValue,
+        domValue: elements.presetSelect.value,
+        generationProfileId: generationProfileIdForPayload(),
+      };
+      return {
+        afterRender,
+        afterDefault,
+        afterConfigured,
+        generationProfileId: recoveredGenerationProfileId,
+        generationPayloadId: generationPayload?.profile_id || "",
+        recoveredSessionProfileId,
+        generationPayloadError,
+        recoveredSnapshotSelected: recoveredSnapshot.selectedPresetValue,
+        normalNewQuote,
+      };
+    } finally {
+      state.profiles = original.profiles;
+      state.companyProfiles = original.companyProfiles;
+      state.profileId = original.profileId;
+      state.defaultProfileId = original.defaultProfileId;
+      state.quoteCommercialLifecycle = original.quoteCommercialLifecycle;
+      state.selectedPresetValue = original.selectedPresetValue;
+      elements.presetSelect.value = original.presetSelectValue;
+      if (original.lastSelection === null) window.localStorage.removeItem(LAST_SELECTION_STORAGE_KEY);
+      else window.localStorage.setItem(LAST_SELECTION_STORAGE_KEY, original.lastSelection);
+    }
+  });
+  for (const phase of ["afterRender", "afterDefault", "afterConfigured"]) {
+    if (result[phase].selected !== "profile:owner-a:shared" || result[phase].domValue !== "") {
+      throw new Error(`Recovered template owner changed during ${phase}: ${JSON.stringify(result)}.`);
+    }
+  }
+  if (result.generationProfileId || result.generationPayloadId || result.recoveredSessionProfileId || result.generationPayloadError) {
+    throw new Error(`Recovered missing template owner was not fail-closed for generation: ${JSON.stringify(result)}.`);
+  }
+  if (result.recoveredSnapshotSelected !== "profile:owner-a:shared") {
+    throw new Error(`Recovered template owner identity was not preserved in the session snapshot: ${JSON.stringify(result)}.`);
+  }
+  if (
+    result.normalNewQuote.selected !== "profile:owner-b:shared"
+    || result.normalNewQuote.domValue !== "profile:owner-b:shared"
+    || result.normalNewQuote.generationProfileId !== "profile:owner-b"
+  ) {
+    throw new Error(`Normal new-quote profile selection did not remain functional: ${JSON.stringify(result)}.`);
+  }
+}
+
 async function currentQuoteSessionId(page) {
   return page.evaluate(() => {
     try {
@@ -1940,6 +2056,7 @@ async function main() {
 
   try {
     await installMockProfiles(page);
+    await verifyRecoveredTemplateOwnerFailsClosed(page);
     if (args.includes("--recovery-only")) {
       await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
       await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
@@ -2034,7 +2151,7 @@ async function main() {
     await page.locator('.rail-button[data-side-panel="quote_company"]').click();
     await page.locator("#quoteCompanyPanel").waitFor({ state: "visible" });
     const seededPresetValue = await page.locator("#presetSelect").inputValue();
-    if (seededPresetValue !== "profile:synthetic-fixture-default") {
+    if (seededPresetValue !== "profile:synthetic-exhibition-fixture-template:synthetic-fixture-default") {
       throw new Error(`Expected seeded setup to select the synthetic fixture preset, found ${seededPresetValue}.`);
     }
     await page.reload({ waitUntil: "domcontentloaded" });
@@ -2136,7 +2253,7 @@ async function main() {
     await page.locator('.rail-button[data-side-panel="quote_company"]').click();
     await page.locator("#quoteCompanyPanel").waitFor({ state: "visible", timeout: 15000 });
     const restoredPresetValue = await page.locator("#presetSelect").inputValue();
-    if (restoredPresetValue !== "profile:synthetic-fixture-default") {
+    if (restoredPresetValue !== "profile:synthetic-exhibition-fixture-template:synthetic-fixture-default") {
       throw new Error(`Expected refresh to preserve company preset, found ${restoredPresetValue}.`);
     }
     const presetSelectBox = await page.locator("#presetSelect").boundingBox();

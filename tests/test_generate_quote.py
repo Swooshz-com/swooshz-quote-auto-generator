@@ -476,6 +476,49 @@ def logo_data_url():
     return SANITIZED_LOGO_DATA_URL
 
 
+def commercial_test_brief(updates=None):
+    brief = {
+        "company_identity": "Saved Quotation Co",
+        "quote_date": "2026-06-06",
+        "project_number": "SQAG-453-001",
+        "client": {
+            "name": "Saved Client",
+            "attention": "Saved Contact",
+            "title": "Director",
+            "address": ["1 Saved Road"],
+        },
+        "project": {"title": "Convergence Booth"},
+        "currency": "USD",
+        "exchange_rate": 1.37,
+        "tax": {"label": "GST", "rate": 0.09},
+        "company": {
+            "name": "Saved Quotation Co",
+            "header_lines": ["Saved Quotation Co", "1 Saved Road"],
+            "logo_data_url": logo_data_url(),
+        },
+        "acceptance": {
+            "company_name": "Saved Quotation Co",
+            "text": "Saved acceptance",
+            "person_label": "Saved person",
+            "stamp_label": "Saved stamp",
+            "date_label": "Saved date",
+        },
+        "signature": {
+            "company_signatory": "Saved Signatory",
+            "company_title": "Saved Title",
+            "company_date_label": "Saved date",
+        },
+        "terms_heading": "Saved Terms",
+        "payment_terms": ["Saved payment term"],
+        "notes_heading": "Saved Notes",
+        "standard_notes": ["Saved note"],
+        "line_items": [],
+    }
+    if updates:
+        brief.update(updates)
+    return brief
+
+
 def generate_layout_workbook(brief_updates=None, layout_template=KONCEPT_LAYOUT):
     brief = {
         "company_identity": "Koncept Image",
@@ -1518,6 +1561,147 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertEqual(worksheet_formulas(sheet), ["SUM(E22:E26)", "ROUND(E27*0.200000,2)", "SUM(E27:E28)"])
         self.assertAlmostEqual(float(cell_value(sheet, "E28")), 960.0)
         self.assertAlmostEqual(float(cell_value(sheet, "E29")), 5760.0)
+
+    def test_recovered_quote_commercial_values_reach_xlsx_and_pdf_cell_map(self):
+        brief = {
+            "company_identity": "Saved Quotation Co",
+            "quote_date": "2026-06-06",
+            "project_number": "SQAG-451-001",
+            "client": {"name": "Saved Client", "attention": "Saved Contact", "title": "Director", "address": ["1 Saved Road"]},
+            "project": {"title": "Recovered Booth"},
+            "currency": "USD",
+            "exchange_rate": 1.37,
+            "tax": {"label": "GST", "rate": 0.09},
+            "company": {"name": "Saved Quotation Co", "header_lines": ["Saved Quotation Co", "1 Saved Road"], "logo_data_url": logo_data_url()},
+            "acceptance": {"company_name": "Saved Quotation Co", "text": "Saved acceptance", "person_label": "Saved person", "stamp_label": "Saved stamp", "date_label": "Saved date"},
+            "signature": {"company_signatory": "Saved Signatory", "company_title": "Saved Title", "company_date_label": "Saved date"},
+            "terms_heading": "Saved Terms",
+            "payment_terms": ["Saved payment term"],
+            "notes_heading": "Saved Notes",
+            "standard_notes": ["Saved note"],
+            "line_items": [],
+        }
+        priced = quote.PriceRow(1, "Graphics", "Saved captured graphics", "sqm", 100, 1.09, 1, "", pricing_id="saved-graphics")
+        lines = [
+            quote.QuoteLine("Graphics", 2, "sqm", "Saved captured graphics", "saved-graphics", "", priced, 200, "matched", [], unit_price_override=100),
+            quote.QuoteLine("Graphics", 1, "lot", "Saved included item", "", "Included", None, None, "included", [], price_mode="Included"),
+        ]
+        pdf_cells = quote.build_pdf_cell_map(brief, lines)
+        self.assertEqual(pdf_cells[(21, 5)], "USD")
+        self.assertAlmostEqual(pdf_cells[(92, 5)], 274.0)
+        self.assertAlmostEqual(pdf_cells[(93, 5)], 24.66)
+        self.assertAlmostEqual(pdf_cells[(94, 5)], 298.66)
+        self.assertEqual(pdf_cells[(93, 4)], "GST 9%")
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "quotation.xlsx"
+        quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, path, brief, lines)
+        with zipfile.ZipFile(path) as zf:
+            sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+        total_row = quote.parse_cell_ref(find_cell_ref(sheet, "Total"))[0]
+        tax_row = quote.parse_cell_ref(find_cell_ref(sheet, "GST 9%"))[0]
+        grand_row = quote.parse_cell_ref(find_cell_ref(sheet, "Total including GST"))[0]
+        self.assertEqual(cell_value(sheet, f"F{total_row}"), "USD")
+        self.assertAlmostEqual(float(cell_value(sheet, f"E{total_row}")), 274.0)
+        self.assertAlmostEqual(float(cell_value(sheet, f"E{tax_row}")), 24.66)
+        self.assertAlmostEqual(float(cell_value(sheet, f"E{grand_row}")), 298.66)
+        included_row = quote.parse_cell_ref(find_cell_ref(sheet, "Saved included item"))[0]
+        self.assertAlmostEqual(float(cell_value(sheet, f"E{included_row}")), 0.0)
+
+    def test_recovered_explicit_price_edit_reaches_xlsx_and_pdf_everywhere(self):
+        brief = commercial_test_brief({
+            "line_items": [{
+                "section": "Graphics",
+                "quantity": 2,
+                "unit": "sqm",
+                "description": "Captured graphics",
+                "pricing_keyword": "",
+                "unit_price_override": 120,
+                "price_mode": "Priced",
+            }],
+        })
+
+        [line] = quote.prepare_lines(brief, [], allow_ambiguous=True)
+        self.assertEqual(line.unit_price_override, 120)
+        self.assertEqual(line.amount, 240)
+        pdf_cells = quote.build_pdf_cell_map(brief, [line])
+        self.assertAlmostEqual(pdf_cells[(92, 5)], 328.8)
+        self.assertAlmostEqual(pdf_cells[(93, 5)], 29.59)
+        self.assertAlmostEqual(pdf_cells[(94, 5)], 358.39)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "quotation.xlsx"
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, path, brief, [line])
+            with zipfile.ZipFile(path) as zf:
+                sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+        total_row = quote.parse_cell_ref(find_cell_ref(sheet, "Total"))[0]
+        tax_row = quote.parse_cell_ref(find_cell_ref(sheet, "GST 9%"))[0]
+        grand_row = quote.parse_cell_ref(find_cell_ref(sheet, "Total including GST"))[0]
+        self.assertAlmostEqual(float(cell_value(sheet, f"E{total_row}")), 328.8)
+        self.assertAlmostEqual(float(cell_value(sheet, f"E{tax_row}")), 29.59)
+        self.assertAlmostEqual(float(cell_value(sheet, f"E{grand_row}")), 358.39)
+
+    def test_new_catalog_match_and_half_cent_rounding_use_explicit_commercial_rule(self):
+        self.assertEqual(quote.round_commercial_cents(10.625), 10.63)
+        self.assertEqual(quote.round_commercial_cents(1.005), 1.01)
+        self.assertEqual(quote.round_commercial_cents(2.674), 2.67)
+
+        catalog_row = quote.PriceRow(
+            row_number=1,
+            section="Graphics",
+            description="Printed graphics",
+            unit_hint="sqm",
+            cost=77,
+            gst_multiplier=1,
+            markup=1,
+            remark="",
+            pricing_id="new-quote-printed-graphics",
+        )
+        new_brief = commercial_test_brief({
+            "line_items": [{
+                "section": "Graphics",
+                "quantity": 2,
+                "unit": "sqm",
+                "description": "Printed graphics",
+                "pricing_keyword": "new-quote-printed-graphics",
+            }],
+        })
+        [new_line] = quote.prepare_lines(new_brief, [catalog_row], allow_ambiguous=True)
+        self.assertEqual(new_line.match_status, "matched")
+        self.assertEqual(new_line.matched_price.sale_unit_price, 77)
+        self.assertEqual(new_line.amount, 154)
+
+        half_cent_brief = commercial_test_brief({
+            "exchange_rate": 1,
+            "line_items": [{
+                "section": "Graphics",
+                "quantity": 1,
+                "unit": "lot",
+                "description": "Half-cent boundary",
+                "pricing_keyword": "",
+                "unit_price_override": 10.625,
+                "price_mode": "Priced",
+            }],
+        })
+        [half_cent_line] = quote.prepare_lines(half_cent_brief, [], allow_ambiguous=True)
+        self.assertEqual(half_cent_line.amount, 10.63)
+        pdf_cells = quote.build_pdf_cell_map(half_cent_brief, [half_cent_line])
+        self.assertEqual((pdf_cells[(92, 5)], pdf_cells[(93, 5)], pdf_cells[(94, 5)]), (10.63, 0.96, 11.59))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "quotation.xlsx"
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, path, half_cent_brief, [half_cent_line])
+            with zipfile.ZipFile(path) as zf:
+                sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+        total_row = quote.parse_cell_ref(find_cell_ref(sheet, "Total"))[0]
+        tax_row = quote.parse_cell_ref(find_cell_ref(sheet, "GST 9%"))[0]
+        grand_row = quote.parse_cell_ref(find_cell_ref(sheet, "Total including GST"))[0]
+        self.assertEqual((
+            float(cell_value(sheet, f"E{total_row}")),
+            float(cell_value(sheet, f"E{tax_row}")),
+            float(cell_value(sheet, f"E{grand_row}")),
+        ), (10.63, 0.96, 11.59))
 
     def test_layout_totals_show_zero_tax_row_from_quote_config(self):
         tmp, path = generate_layout_workbook({"currency": "IDR", "exchange_rate": 1, "tax": {"label": "VAT", "rate": 0}})

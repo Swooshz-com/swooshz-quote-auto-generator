@@ -240,6 +240,92 @@ def valid_payload():
     }
 
 
+def recovered_convergence_payload(
+    *,
+    effective_unit_price: float | None = 100,
+    unit_price_override: float | None = None,
+    pricing_basis_amount: float | None = 200,
+    approved_quote_amount: float | None = 274,
+    tax: dict[str, object] | None = None,
+    exchange_rate: float | None = 1.37,
+    include_included_row: bool = True,
+) -> dict:
+    payload = valid_payload()
+    saved = valid_payload()
+    details = {
+        "quote_date": "2026-06-06",
+        "project_number": "KI-SAVED-453",
+        "client": copy.deepcopy(saved["client"]),
+        "project": copy.deepcopy(saved["project"]),
+        "company": copy.deepcopy(saved["company"]),
+        "currency": "USD",
+        "exchange_rate": exchange_rate,
+        "tax": copy.deepcopy(tax if tax is not None else {"label": "GST", "rate": 0.09}),
+        "quote_text": copy.deepcopy(saved["quote_text"]),
+        "signature": copy.deepcopy(saved["signature"]),
+    }
+    details["commercial_snapshot"] = {
+        "schema": webapp.QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+        "version": webapp.QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+        "owner": "quote",
+        "lifecycle": "RECOVERED",
+        "origin": "session_recovery",
+        "presence": {key: "captured" for key in webapp.QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS},
+        "pricing_basis": {
+            "currency": "SGD",
+            "source": "local",
+            "id": payload["pricing_reference_id"],
+            "digest": "sha256:" + "d" * 64,
+        },
+    }
+    row = {
+        "section": "Saved Floors",
+        "description": "Captured carpet",
+        "quantity": 2,
+        "unit": "sqm",
+        "price_mode": "Priced",
+        "catalog_unit_price": 999,
+        "amount": pricing_basis_amount if pricing_basis_amount is not None else "",
+    }
+    if effective_unit_price is not None:
+        row["effective_unit_price"] = effective_unit_price
+    if unit_price_override is not None:
+        row["unit_price_override"] = unit_price_override
+    if pricing_basis_amount is not None:
+        row["pricing_basis_amount"] = pricing_basis_amount
+    if approved_quote_amount is not None:
+        row["approved_quote_amount"] = approved_quote_amount
+    rows = [row]
+    if include_included_row:
+        rows.append({
+            "section": "Saved Services",
+            "description": "Included coordination",
+            "quantity": 1,
+            "unit": "lot",
+            "price_mode": "Included",
+            "display_price": "Included",
+            "amount": 0,
+            "approved_quote_amount": 0,
+        })
+    payload["pricing_reference"] = {
+        "id": payload["pricing_reference_id"],
+        "source": "local",
+        "currency": "SGD",
+        "tax": {"label": "GST", "rate": 0.09},
+    }
+    payload["quote_session"] = {
+        "session_id": "quote-convergence-453",
+        "commercials": {},
+        "draft_state": {
+            "quoteCommercialLifecycle": "RECOVERED",
+            "selectedPresetValue": payload["profile_id"],
+            "quoteDetails": details,
+            "outputRows": rows,
+        },
+    }
+    return payload
+
+
 def wait_for_job(job_id: str, timeout: float = 2.0, auth_session: dict | None = None) -> dict:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -674,6 +760,39 @@ class LocalRunnerServer:
             self.origin_patcher.stop()
         if self.host_patcher is not None:
             self.host_patcher.stop()
+
+
+def local_http_get_json(runner: LocalRunnerServer, path: str) -> tuple[int, dict]:
+    connection = http.client.HTTPConnection(
+        runner.server.server_address[0],
+        runner.server.server_address[1],
+        timeout=3,
+    )
+    try:
+        connection.request("GET", path)
+        response = connection.getresponse()
+        body = response.read().decode("utf-8")
+        return response.status, json.loads(body or "{}")
+    finally:
+        connection.close()
+
+
+def local_http_get_bytes(
+    runner: LocalRunnerServer,
+    path: str,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, bytes]:
+    connection = http.client.HTTPConnection(
+        runner.server.server_address[0],
+        runner.server.server_address[1],
+        timeout=3,
+    )
+    try:
+        connection.request("GET", path, headers=headers or {})
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
 
 
 class JsonResponseMock:
@@ -1522,6 +1641,1053 @@ class WebappServerTest(unittest.TestCase):
 
         self.assertEqual(brief["tax"], {"label": "GST", "rate": 0.09})
 
+    def test_recovered_quote_commercial_snapshot_owns_brief_session_and_prices(self):
+        payload = valid_payload()
+        reference_source = "local"
+        saved_details = {
+            "quote_date": "2026-06-06",
+            "project_number": "KI-SAVED-001",
+            "client": {
+                "name": "Saved Client Pte Ltd",
+                "attention": "Saved Contact",
+                "title": "Saved Manager",
+                "address": "Saved Address",
+            },
+            "project": {
+                "title": "Saved Booth",
+                "show_name": "Saved Show",
+                "booth_width": "6",
+                "booth_depth": "6",
+            },
+            "company": {
+                "name": "Saved Quotation Co Pte Ltd",
+                "header_details": "Saved header line 1\nSaved header line 2",
+                "logo_data_url": "data:image/png;base64,c2F2ZWQ=",
+                "logo_name": "saved-logo.png",
+                "logo_type": "image/png",
+                "logo_content_fingerprint": "sha256:" + "a" * 64,
+                "logo_session_file_key": "saved-logo-key",
+            },
+            "currency": "USD",
+            "exchange_rate": 1.37,
+            "tax": {"label": "GST", "rate": 0.09},
+            "quote_text": {
+                "terms_heading": "Saved Terms",
+                "payment_terms": ["Saved payment term"],
+                "notes_heading": "Saved Notes",
+                "standard_notes": ["Saved note"],
+                "acceptance_text": "Saved acceptance",
+                "person_label": "Saved person",
+                "stamp_label": "Saved stamp",
+                "date_label": "Saved date:",
+                "cheque_payee": "Saved Quotation Co Pte Ltd",
+            },
+            "signature": {
+                "company_signatory": "Saved Signatory",
+                "company_title": "Saved Director",
+                "company_date_label": "Saved signed date:",
+            },
+            "rich_text": {
+                "headerDetails": "<div><strong>Saved header line 1</strong></div>",
+                "paymentTerms": "<div><em>Saved payment term</em></div>",
+                "standardNotes": "<div>Saved note</div>",
+            },
+        }
+        saved_details["commercial_snapshot"] = {
+            "schema": webapp.QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+            "version": webapp.QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+            "owner": "quote",
+            "lifecycle": "RECOVERED",
+            "origin": "session_recovery",
+            "presence": {key: "captured" for key in webapp.QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS},
+            "pricing_basis": {
+                "currency": "SGD",
+                "source": reference_source,
+                "id": payload["pricing_reference_id"],
+                "digest": "sha256:" + "b" * 64,
+            },
+        }
+        saved_rows = [
+            {
+                "section": "Saved Floors",
+                "description": "Captured carpet",
+                "quantity": 2,
+                "unit": "sqm",
+                "price_mode": "Priced",
+                "effective_unit_price": 100,
+                "catalog_unit_price": 999,
+                "pricing_basis_amount": 200,
+                "approved_quote_amount": 274,
+                "amount": 200,
+            },
+            {
+                "section": "Saved Services",
+                "description": "Included coordination",
+                "quantity": 1,
+                "unit": "lot",
+                "price_mode": "Included",
+                "display_price": "Included",
+                "approved_quote_amount": 0,
+                "amount": 0,
+            },
+        ]
+        payload["quote_currency"] = "SGD"
+        payload["quote_exchange_rate"] = 9
+        payload["quote_tax"] = {"label": "VAT", "rate": 0.07}
+        payload["company"] = {"name": "Current Profile Co", "header_details": "Current header"}
+        payload["quote_text"] = {"terms_heading": "Current Terms", "acceptance_text": "Current acceptance"}
+        payload["signature"] = {"company_signatory": "Current Signatory"}
+        payload["rich_text"] = {"headerDetails": "<div>Current header</div>"}
+        payload["pricing_reference"] = {
+            "id": payload["pricing_reference_id"],
+            "source": reference_source,
+            "currency": "USD",
+            "tax": {"label": "VAT", "rate": 0.07},
+        }
+        payload["quote_session"] = {
+            "session_id": "quote-commercial-snapshot",
+            "commercials": {
+                "currency": "SGD",
+                "tax_label": "GST",
+                "tax_rate": 0.09,
+                "exchange_rate": 1.37,
+                "subtotal": 274,
+                "tax_amount": 24.66,
+                "grand_total": 298.66,
+            },
+            "draft_state": {
+                "quoteDetails": saved_details,
+                "outputRows": saved_rows,
+            },
+        }
+
+        with mock.patch.object(
+            webapp,
+            "pricing_catalog_runtime_lookup_for_payload",
+            side_effect=AssertionError("recovered quote must not consult the current catalog"),
+        ):
+            brief = webapp.payload_to_brief(payload)
+            commercials = webapp.quote_session_commercials(payload, payload["quote_session"])
+
+        self.assertEqual(brief["currency"], "USD")
+        self.assertEqual(brief["exchange_rate"], 1.37)
+        self.assertEqual(brief["tax"], {"label": "GST", "rate": 0.09})
+        self.assertEqual(brief["company"]["name"], "Saved Quotation Co Pte Ltd")
+        self.assertEqual(brief["company"]["header_lines"], ["Saved header line 1", "Saved header line 2"])
+        self.assertEqual(brief["terms_heading"], "Saved Terms")
+        self.assertEqual(brief["payment_terms"], ["Saved payment term"])
+        self.assertEqual(brief["notes_heading"], "Saved Notes")
+        self.assertEqual(brief["standard_notes"], ["Saved note"])
+        self.assertEqual(brief["cheque_payee"], "Saved Quotation Co Pte Ltd")
+        self.assertEqual(brief["rich_text"]["headerDetails"], "<div><strong>Saved header line 1</strong></div>")
+        self.assertEqual(brief["acceptance"]["text"], "Saved acceptance")
+        self.assertEqual(brief["signature"]["company_title"], "Saved Director")
+        self.assertEqual(brief["line_items"][0]["unit_price_override"], 100)
+        self.assertEqual(brief["line_items"][0]["catalog_unit_price"], 999)
+        self.assertEqual(brief["line_items"][1]["pricing_basis_currency"], "SGD")
+        self.assertEqual(brief["line_items"][1]["price_mode"], "Included")
+        self.assertEqual(commercials, {
+            "currency": "USD",
+            "tax_label": "GST",
+            "tax_rate": 0.09,
+            "exchange_rate": 1.37,
+            "subtotal": 274.0,
+            "tax_amount": 24.66,
+            "grand_total": 298.66,
+        })
+        self.assertEqual(webapp.validate_generation_payload(payload), [])
+
+    def test_recovered_quote_missing_snapshot_fails_closed_without_current_defaults(self):
+        payload = valid_payload()
+        payload["quote_session"] = {
+            "session_id": "quote-legacy-commercial",
+            "draft_state": {
+                "quoteDetails": {
+                    "currency": "",
+                    "exchange_rate": None,
+                    "tax": {},
+                    "company": {},
+                },
+                "outputRows": [{
+                    "description": "Legacy row without price",
+                    "quantity": 1,
+                    "unit": "lot",
+                    "price_mode": "Priced",
+                }],
+            },
+        }
+
+        resolved = webapp.generation_payload_with_profile_defaults(payload)
+
+        self.assertEqual(webapp.quote_currency_from_payload(resolved), "")
+        self.assertIsNone(webapp.quote_exchange_rate_from_payload(resolved))
+        self.assertTrue(any(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE in error for error in webapp.validate_generation_payload(payload)))
+        with self.assertRaises(webapp.QuoteCommercialStateError):
+            webapp.payload_to_brief(payload)
+
+    def test_recovered_quote_rejects_changed_exact_pricing_identity(self):
+        payload = valid_payload()
+        details = {
+            "currency": "USD",
+            "exchange_rate": 1.37,
+            "tax": {"label": "GST", "rate": 0.09},
+            "company": valid_payload()["company"],
+            "quote_text": valid_payload()["quote_text"],
+            "signature": valid_payload()["signature"],
+        }
+        details["commercial_snapshot"] = {
+            "schema": webapp.QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+            "version": webapp.QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+            "owner": "quote",
+            "lifecycle": "RECOVERED",
+            "presence": {key: "captured" for key in webapp.QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS},
+            "pricing_basis": {"currency": "SGD", "source": "bundled", "id": "saved-reference"},
+        }
+        payload["quote_session"] = {"draft_state": {"quoteDetails": details}}
+        payload["pricing_reference_id"] = "different-reference"
+        payload["pricing_reference"] = {"id": "different-reference", "source": "bundled"}
+
+        errors = webapp.quote_commercial_state_errors(payload)
+
+        self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, errors)
+
+    def test_recovered_qualified_template_authority_cannot_switch_owner(self):
+        payload = recovered_convergence_payload()
+        payload["quote_session"]["draft_state"]["selectedPresetValue"] = "profile:owner-a:shared"
+        payload["profile_id"] = "profile:owner-b"
+        payload["quote_company_profile"] = {"id": "profile:owner-b", "source": "profile"}
+
+        self.assertEqual(
+            webapp.profile_authority_identity_from_selection("profile:owner-a:shared"),
+            "profile:owner-a",
+        )
+        errors = webapp.quote_commercial_state_errors(payload)
+        self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, errors)
+        self.assertEqual(webapp.quote_commercial_payload(payload)["profile_id"], "profile:owner-b")
+
+        valid_owner_payload = copy.deepcopy(payload)
+        valid_owner_payload["profile_id"] = "profile:owner-a"
+        valid_owner_payload["quote_company_profile"] = {"id": "profile:owner-a", "source": "profile"}
+        self.assertNotIn(
+            webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE,
+            webapp.quote_commercial_state_errors(valid_owner_payload),
+        )
+
+        missing_current_owner = copy.deepcopy(payload)
+        missing_current_owner.pop("profile_id")
+        missing_current_owner["quote_company_profile"] = {}
+        self.assertIn(
+            webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE,
+            webapp.quote_commercial_state_errors(missing_current_owner),
+        )
+        self.assertEqual(
+            webapp.quote_commercial_payload(missing_current_owner)["profile_id"],
+            "profile:owner-a",
+        )
+
+    def test_recovered_quote_catalog_price_cannot_complete_missing_historical_row_price(self):
+        payload = valid_payload()
+        reference_source = "local"
+        details = {
+            "quote_date": "2026-06-06",
+            "project_number": "KI-LEGACY-451",
+            "client": valid_payload()["client"],
+            "project": valid_payload()["project"],
+            "company": valid_payload()["company"],
+            "currency": "USD",
+            "exchange_rate": 1.37,
+            "tax": {"label": "GST", "rate": 0.09},
+            "quote_text": valid_payload()["quote_text"],
+            "signature": valid_payload()["signature"],
+        }
+        details["commercial_snapshot"] = {
+            "schema": webapp.QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+            "version": webapp.QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+            "owner": "quote",
+            "lifecycle": "RECOVERED",
+            "origin": "session_recovery",
+            "presence": {key: "captured" for key in webapp.QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS},
+            "pricing_basis": {
+                "currency": "SGD",
+                "source": reference_source,
+                "id": "saved-reference",
+                "digest": "sha256:" + "c" * 64,
+            },
+        }
+        payload["pricing_reference_id"] = "saved-reference"
+        payload["pricing_reference_source"] = reference_source
+        payload["pricing_reference"] = {
+            "id": "saved-reference",
+            "source": reference_source,
+            "currency": "SGD",
+            "tax": {"label": "GST", "rate": 0.09},
+        }
+        payload["quote_session"] = {
+            "session_id": "quote-missing-historical-price",
+            "draft_state": {
+                "quoteDetails": details,
+                "outputRows": [{
+                    "section": "Saved Floors",
+                    "description": "Recovered row without captured price",
+                    "quantity": 1,
+                    "unit": "sqm",
+                    "price_mode": "Priced",
+                    "catalog_unit_price": 999,
+                }],
+            },
+        }
+        payload["line_items"] = copy.deepcopy(payload["quote_session"]["draft_state"]["outputRows"])
+
+        with mock.patch.object(
+            webapp,
+            "pricing_catalog_runtime_lookup_for_payload",
+            side_effect=AssertionError("recovered row validation must not consult the current catalog"),
+        ):
+            normalized_for_review = webapp.normalize_line_items_for_quote_basis_review(payload)
+            errors_at_999 = webapp.quote_commercial_state_errors(payload)
+            canonical_at_999 = webapp.quote_commercial_payload(payload)
+            session_at_999 = webapp.quote_session_commercials(payload, {"commercials": {}})
+            validation_at_999 = webapp.validate_generation_payload(payload)
+            with self.assertRaises(webapp.QuoteCommercialStateError):
+                webapp.payload_to_brief(payload)
+
+        row_at_999 = canonical_at_999["line_items"][0]
+        normalized_row = normalized_for_review[0]
+        self.assertEqual(row_at_999["catalog_unit_price"], 999)
+        self.assertNotIn("effective_unit_price", row_at_999)
+        self.assertNotIn("unit_price_override", row_at_999)
+        self.assertIsNone(normalized_row.get("effective_unit_price"))
+        self.assertIsNone(normalized_row.get("unit_price_override"))
+        self.assertIsNone(normalized_row.get("catalog_unit_price"))
+        self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, errors_at_999)
+        self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, validation_at_999)
+        self.assertIsNone(session_at_999["subtotal"])
+        self.assertIsNone(session_at_999["tax_amount"])
+        self.assertIsNone(session_at_999["grand_total"])
+
+        payload["quote_session"]["draft_state"]["outputRows"][0]["catalog_unit_price"] = 1
+        self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.quote_commercial_state_errors(payload))
+        self.assertIsNone(webapp.quote_session_commercials(payload, {"commercials": {}})["subtotal"])
+
+    def test_recovered_explicit_price_edit_replaces_stale_captured_price_everywhere(self):
+        payload = recovered_convergence_payload(unit_price_override=120)
+        payload["line_items"] = copy.deepcopy(payload["quote_session"]["draft_state"]["outputRows"])
+
+        with mock.patch.object(
+            webapp,
+            "pricing_catalog_runtime_lookup_for_payload",
+            side_effect=AssertionError("recovered explicit edits must not consult the current catalog"),
+        ):
+            canonical = webapp.quote_commercial_payload(payload)
+            normalized = webapp.normalize_line_items_for_quote_basis_review(payload)
+            session = webapp.quote_session_commercials(payload, payload["quote_session"])
+            brief = webapp.payload_to_brief(payload)
+
+        row = canonical["line_items"][0]
+        normalized_row = normalized[0]
+        self.assertEqual(row["effective_unit_price"], 120)
+        self.assertEqual(row["unit_price_override"], 120)
+        self.assertEqual(row["pricing_basis_amount"], 240)
+        self.assertEqual(row["approved_quote_amount"], 328.8)
+        self.assertEqual(normalized_row["effective_unit_price"], 120)
+        self.assertEqual(normalized_row["unit_price_override"], 120)
+        self.assertEqual(normalized_row["pricing_basis_amount"], 240)
+        self.assertEqual(normalized_row["approved_quote_amount"], 328.8)
+        self.assertEqual(session, {
+            "currency": "USD",
+            "tax_label": "GST",
+            "tax_rate": 0.09,
+            "exchange_rate": 1.37,
+            "subtotal": 328.8,
+            "tax_amount": 29.59,
+            "grand_total": 358.39,
+        })
+        self.assertEqual(brief["line_items"][0]["effective_unit_price"], 120)
+        self.assertEqual(brief["line_items"][0]["unit_price_override"], 120)
+        self.assertEqual(brief["line_items"][0]["pricing_basis_amount"], 240)
+        self.assertEqual(brief["line_items"][0]["approved_quote_amount"], 328.8)
+        self.assertEqual(webapp.validate_generation_payload(payload), [])
+
+    def test_recovered_invalid_price_override_fails_closed(self):
+        payload = recovered_convergence_payload(unit_price_override="not-a-price")
+
+        canonical = webapp.quote_commercial_payload(payload)
+        errors = webapp.quote_commercial_state_errors(payload)
+        commercials = webapp.quote_session_commercials(payload, payload["quote_session"])
+
+        self.assertTrue(canonical["line_items"][0]["_commercial_invalid_unit_price_override"])
+        self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, errors)
+        self.assertIsNone(commercials["subtotal"])
+        self.assertIsNone(commercials["tax_amount"])
+        self.assertIsNone(commercials["grand_total"])
+        with self.assertRaises(webapp.QuoteCommercialStateError):
+            webapp.payload_to_brief(payload)
+
+    def test_recovered_missing_tax_rate_stays_review_required(self):
+        payload = recovered_convergence_payload(
+            unit_price_override=120,
+            tax={"label": "GST"},
+        )
+
+        self.assertEqual(webapp.quote_tax_from_payload(payload), {"label": "GST", "rate": None})
+        errors = webapp.quote_commercial_state_errors(payload)
+        self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, errors)
+        commercials = webapp.quote_session_commercials(payload, payload["quote_session"])
+        self.assertEqual(commercials["subtotal"], 328.8)
+        self.assertIsNone(commercials["tax_rate"])
+        self.assertIsNone(commercials["tax_amount"])
+        self.assertIsNone(commercials["grand_total"])
+        self.assertNotIn(0, [commercials["tax_rate"], commercials["tax_amount"], commercials["grand_total"]])
+        self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.validate_generation_payload(payload))
+        with self.assertRaises(webapp.QuoteCommercialStateError):
+            webapp.payload_to_brief(payload)
+
+    def test_new_quote_catalog_match_remains_current_priced_state(self):
+        payload = valid_payload()
+        payload["pricing_reference_id"] = "new-quote-pricing"
+        payload["pricing_reference"] = {
+            "id": "new-quote-pricing",
+            "source": "local",
+            "currency": "SGD",
+            "tax": {"label": "GST", "rate": 0.09},
+            "items": [with_required_pricing_metadata({
+                "id": "new-quote-printed-graphics",
+                "section": "Graphics",
+                "description": "Printed graphics",
+                "unit_hint": "sqm",
+                "sale_unit_price": 77,
+                "match_terms": ["printed graphics"],
+                "object_families": ["graphics"],
+            })],
+        }
+        payload["line_items"] = [{
+            "section": "Graphics",
+            "quantity": 2,
+            "unit": "sqm",
+            "description": "Printed graphics",
+            "pricing_keyword": "new-quote-printed-graphics",
+        }]
+        payload["quote_session"] = {
+            "session_id": "quote-new-quote-453",
+            "draft_state": {"quoteCommercialLifecycle": "NEW_UNINITIALISED"},
+        }
+        payload["quote_basis_sections"] = []
+
+        self.assertFalse(webapp.quote_commercial_state(payload)["owned"])
+        [item] = webapp.normalize_line_items(payload)
+        [review_item] = webapp.normalize_line_items_for_quote_basis_review(payload)
+        self.assertEqual(item["catalog_unit_price"], 77)
+        self.assertEqual(item["quantity"], 2)
+        self.assertEqual(item["status"], "matched")
+        self.assertEqual(item["effective_unit_price"], 77)
+        self.assertEqual(item["unit_price_override"], 77)
+        self.assertEqual(item["pricing_basis_amount"], 154)
+        self.assertEqual(item["approved_quote_amount"], 154)
+        self.assertEqual(item["pricing_basis_currency"], "SGD")
+        self.assertEqual(item["pricing_reference_source"], "local")
+        self.assertEqual(item["pricing_reference_id"], "new-quote-pricing")
+        self.assertEqual(item["price_mode"], "Priced")
+        self.assertEqual(review_item["effective_unit_price"], 77)
+        self.assertEqual(review_item["pricing_basis_amount"], 154)
+        self.assertEqual(review_item["approved_quote_amount"], 154)
+
+        fx_payload = {**payload, "quote_exchange_rate": 1.37}
+        [fx_item] = webapp.normalize_line_items(fx_payload)
+        self.assertEqual(fx_item["approved_quote_amount"], 210.98)
+
+        normalized_payload = {**payload, "line_items": webapp.normalize_line_items(payload)}
+        self.assertEqual(normalized_payload["line_items"][0]["effective_unit_price"], 77)
+        self.assertEqual(normalized_payload["line_items"][0]["pricing_basis_amount"], 154)
+        self.assertEqual(normalized_payload["line_items"][0]["approved_quote_amount"], 154)
+        session_patch = {
+            **payload["quote_session"],
+            "commercials": {
+                "currency": "SGD",
+                "tax_label": "GST",
+                "tax_rate": 0.09,
+                "exchange_rate": 1,
+                "subtotal": 154,
+                "tax_amount": 13.86,
+                "grand_total": 167.86,
+            },
+        }
+        session = webapp.quote_session_commercials(payload, session_patch)
+        self.assertEqual(session["subtotal"], 154)
+        self.assertEqual(session["tax_rate"], 0.09)
+        self.assertEqual(session["grand_total"], 167.86)
+        brief = webapp.payload_to_brief(payload)
+        self.assertEqual(brief["line_items"][0]["effective_unit_price"], 77)
+        self.assertEqual(brief["line_items"][0]["pricing_basis_amount"], 154)
+
+    def test_server_and_browser_generation_paths_use_explicit_half_up_cents(self):
+        payload = recovered_convergence_payload(
+            effective_unit_price=10.625,
+            unit_price_override=10.625,
+            pricing_basis_amount=10.625,
+            approved_quote_amount=10.625,
+            exchange_rate=1,
+            include_included_row=False,
+        )
+        row = payload["quote_session"]["draft_state"]["outputRows"][0]
+        row["quantity"] = 1
+
+        canonical = webapp.quote_commercial_payload(payload)
+        session = webapp.quote_session_commercials(payload, payload["quote_session"])
+
+        self.assertEqual(canonical["line_items"][0]["pricing_basis_amount"], 10.63)
+        self.assertEqual(canonical["line_items"][0]["approved_quote_amount"], 10.63)
+        self.assertEqual(session, {
+            "currency": "USD",
+            "tax_label": "GST",
+            "tax_rate": 0.09,
+            "exchange_rate": 1,
+            "subtotal": 10.63,
+            "tax_amount": 0.96,
+            "grand_total": 11.59,
+        })
+        self.assertEqual(webapp.round_commercial_cents(10.625), 10.63)
+        self.assertEqual(webapp.round_commercial_cents(1.005), 1.01)
+        self.assertEqual(webapp.round_commercial_cents(2.674), 2.67)
+
+    def test_local_exact_company_authority_fails_closed_without_template_substitution(self):
+        with tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+            store = webapp.CompanyConfigStore(Path(tmp) / "data")
+            store.save_profile(webapp.DEFAULT_COMPANY_ID, workspace_profile_with_layout("saved-company"))
+            saved_payload = valid_payload()
+            saved_payload["profile_id"] = "company:saved-company"
+            saved_payload["quote_company_profile"] = {"id": "company:saved-company", "source": "company"}
+            saved_payload["quote_session"] = {
+                "quote_company_profile": copy.deepcopy(saved_payload["quote_company_profile"]),
+            }
+
+            missing_payload = copy.deepcopy(saved_payload)
+            missing_payload["profile_id"] = "company:missing-company"
+            missing_payload["quote_company_profile"] = {"id": "company:missing-company", "source": "company"}
+
+            with mock.patch.object(webapp, "company_config_store", return_value=store):
+                self.assertEqual(webapp.profile_selection_error(saved_payload), "")
+                resolved = webapp.profile_defaults_source_for_payload(saved_payload)
+                self.assertIsInstance(resolved, webapp.ProfilePack)
+                self.assertEqual(resolved.id, "saved-company")
+                self.assertEqual(
+                    resolved.asset_path("quotation_layout", "quotation-layout.xlsx"),
+                    store.profile_pack_dir(webapp.DEFAULT_COMPANY_ID, "saved-company") / "quotation-layout.xlsx",
+                )
+                self.assertEqual(
+                    webapp.quote_session_profile_summary(
+                        saved_payload,
+                        saved_payload["quote_session"],
+                    )["id"],
+                    "company:saved-company",
+                )
+                self.assertEqual(
+                    webapp.quote_session_generation_snapshot(
+                        saved_payload,
+                        saved_payload["quote_session"],
+                        created_at="2026-09-08T00:00:00Z",
+                    )["profile"]["id"],
+                    "company:saved-company",
+                )
+                self.assertEqual(
+                    webapp.profile_selection_error(missing_payload),
+                    webapp.PROFILE_SELECTION_ERROR_MESSAGE,
+                )
+                with mock.patch.object(
+                    webapp,
+                    "load_profile_pack",
+                    side_effect=AssertionError("missing company authority must not fall through to a template"),
+                ):
+                    with self.assertRaises(webapp.SqagStorageAccessError):
+                        webapp.profile_defaults_source_for_payload(missing_payload)
+
+    def test_profile_and_company_preset_identity_resolves_only_exact_owner_pack(self):
+        with tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+            root = Path(tmp)
+            template_root = root / "profiles"
+            template_a = write_test_profile_pack(template_root, "template-a", "template-pricing-a")
+            template_b = write_test_profile_pack(template_root, "template-b", "template-pricing-b")
+            template_default = write_test_profile_pack(template_root, "default", "template-pricing-default")
+            (template_root / "broken").mkdir(parents=True)
+            company_store = webapp.CompanyConfigStore(root / "company-data")
+            company_store.save_profile(webapp.DEFAULT_COMPANY_ID, workspace_profile_with_layout("default"))
+            missing_company_store = webapp.CompanyConfigStore(root / "missing-company-data")
+
+            template_payload = valid_payload()
+            template_payload["profile_id"] = "profile:template-a"
+            template_payload["profile_source"] = "profile"
+            template_payload["pricing_reference_id"] = ""
+            template_payload["quote_company_profile"] = {"id": "profile:template-a", "source": "profile"}
+            template_b_payload = copy.deepcopy(template_payload)
+            template_b_payload["profile_id"] = "profile:template-b"
+            template_b_payload["quote_company_profile"] = {"id": "profile:template-b", "source": "profile"}
+            company_payload = copy.deepcopy(template_payload)
+            company_payload["profile_id"] = "company:default"
+            company_payload["profile_source"] = "company"
+            company_payload["quote_company_profile"] = {"id": "company:default", "source": "company"}
+
+            with (
+                mock.patch.object(webapp, "profiles_root", return_value=template_root),
+                mock.patch.object(webapp, "company_config_store", return_value=company_store),
+                mock.patch.object(webapp, "workspace_pricing_reference_id", return_value=""),
+            ):
+                resolved_a = webapp.load_template_profile_pack("template-a")
+                resolved_b = webapp.load_template_profile_pack("template-b")
+                self.assertEqual(resolved_a.id, "template-a")
+                self.assertEqual(resolved_b.id, "template-b")
+                self.assertNotEqual(resolved_a.quotation_layout_path, resolved_b.quotation_layout_path)
+                listed_profiles = webapp.list_profiles()
+                self.assertNotIn("broken", {profile["id"] for profile in listed_profiles})
+                self.assertEqual(webapp.profile_selection_error(template_payload), "")
+                self.assertEqual(webapp.profile_selection_error(template_b_payload), "")
+                self.assertEqual(
+                    webapp.profile_defaults_source_for_payload(template_payload).quotation_layout_path,
+                    template_a / "quotation-layout.xlsx",
+                )
+                self.assertEqual(
+                    webapp.profile_defaults_source_for_payload(template_b_payload).quotation_layout_path,
+                    template_b / "quotation-layout.xlsx",
+                )
+                self.assertEqual(webapp.pricing_reference_id_from_payload(template_payload), "template-pricing-a")
+                self.assertEqual(webapp.pricing_reference_id_from_payload(template_b_payload), "template-pricing-b")
+                resolved_company = webapp.profile_defaults_source_for_payload(company_payload)
+                self.assertEqual(resolved_company.id, "default")
+                self.assertEqual(
+                    resolved_company.asset_path("quotation_layout", "quotation-layout.xlsx"),
+                    company_store.profile_pack_dir(webapp.DEFAULT_COMPANY_ID, "default") / "quotation-layout.xlsx",
+                )
+                self.assertEqual(webapp.profile_selection_error(company_payload), "")
+
+            missing_company_payload = copy.deepcopy(company_payload)
+            with (
+                mock.patch.object(webapp, "profiles_root", return_value=template_root),
+                mock.patch.object(webapp, "company_config_store", return_value=missing_company_store),
+            ):
+                self.assertEqual(
+                    webapp.profile_selection_error(missing_company_payload),
+                    webapp.PROFILE_SELECTION_ERROR_MESSAGE,
+                )
+                with self.assertRaises(webapp.SqagStorageAccessError):
+                    webapp.profile_defaults_source_for_payload(missing_company_payload)
+                self.assertEqual(webapp.profile_selection_error(template_payload), "")
+                self.assertEqual(webapp.load_template_profile_pack("default").id, "default")
+                self.assertEqual(
+                    webapp.load_template_profile_pack("default").quotation_layout_path,
+                    template_default / "quotation-layout.xlsx",
+                )
+                missing_template_payload = copy.deepcopy(template_payload)
+                missing_template_payload["profile_id"] = "profile:missing-template"
+                missing_template_payload["quote_company_profile"] = {"id": "profile:missing-template", "source": "profile"}
+                self.assertEqual(
+                    webapp.profile_selection_error(missing_template_payload),
+                    webapp.PROFILE_SELECTION_ERROR_MESSAGE,
+                )
+                with self.assertRaises(webapp.SqagStorageAccessError):
+                    webapp.profile_defaults_source_for_payload(missing_template_payload)
+
+    def test_operator_profiles_read_exact_company_authority_but_settings_stays_management_only(self):
+        with tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+            store = webapp.CompanyConfigStore(Path(tmp) / "data")
+            store.save_profile(webapp.DEFAULT_COMPANY_ID, workspace_profile_with_layout("operator-company"))
+            with mock.patch.object(webapp, "company_config_store", return_value=store):
+                with mock.patch.dict(os.environ, {"APP_MODE": "local", "USER_TYPE": "operator"}, clear=True):
+                    with LocalRunnerServer() as runner:
+                        profiles_status, profiles = local_http_get_json(runner, "/api/profiles")
+                        settings_status, _settings = local_http_get_json(runner, "/api/settings")
+                        self.assertEqual(profiles_status, 200)
+                        self.assertEqual(settings_status, 403)
+                with mock.patch.dict(os.environ, {"APP_MODE": "local", "USER_TYPE": "viewer"}, clear=True):
+                    with LocalRunnerServer() as runner:
+                        viewer_status, viewer_profiles = local_http_get_json(runner, "/api/profiles")
+                        self.assertEqual(viewer_status, 200)
+
+        self.assertEqual([profile["id"] for profile in profiles["company_profiles"]], ["operator-company"])
+        self.assertEqual(
+            profiles["company_profiles"][0]["defaults"]["company"]["name"],
+            "Sample Quotation Co Pte Ltd",
+        )
+        self.assertEqual(viewer_profiles["company_profiles"], [])
+
+    def test_static_generation_failure_keeps_previous_export_references(self):
+        js = (ROOT / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
+        generate_body = js.split("async function handleGenerate(options = {})", 1)[1].split("async function resumeSavedJob", 1)[0]
+        failure_body = generate_body.split("if (!polled.ok", 1)[1].split("const needsPricingReview", 1)[0]
+        resume_body = js.split("async function resumeSavedJob", 1)[1].split("async function checkHealth", 1)[0]
+        resume_review_body = resume_body.split("if (needsPricingReview)", 1)[1].split("} else", 1)[0]
+
+        self.assertIn("const hadSuccessfulExports = quoteSessionHasFreshOutputExports();", generate_body)
+        self.assertNotIn("setDownloadFiles([])", failure_body)
+        self.assertNotIn("setDownloadFiles([])", resume_review_body)
+        self.assertNotIn("renderMatchSummary({});", failure_body)
+        self.assertIn("if (!hadSuccessfulExports && data.pricing_matches?.length)", failure_body)
+        self.assertIn("renderMatchSummary(hadSuccessfulExports ? { pricing_matches: state.outputRows } : data);", failure_body)
+
+    def test_static_authority_profile_race_discards_late_request_completely(self):
+        node = require_node(self)
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name, prefix = "function") {
+  const marker = `${prefix} ${name}(`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const COMPANY_PROFILE_PRESET_PREFIX = "company:";
+const DEFAULT_PROFILE_ID = "default";
+const DEFAULT_PRICING_REFERENCE_ID = "default-pricing";
+let authorityProfileRequestSequence = 0;
+let activeAuthorityProfileRequestContext = null;
+const elements = { presetSelect: { value: "company:company-a" } };
+const state = {
+  browserRecoveryScope: "recovery-a",
+  quoteSessionId: "session-a",
+  workspace: { id: "workspace-a", company: { id: "company-a" }, workspace: { id: "workspace-a" } },
+  selectedPresetValue: "company:company-a",
+  profileId: "profile-a",
+  pricingReferenceId: "pricing-a",
+  pricingReferenceSource: "local",
+  quoteCommercialLifecycle: "RECOVERED",
+  permissions: { canGenerateQuote: true },
+  profiles: [{ id: "old-profile" }],
+  companyProfiles: [{ id: "old-company" }],
+  pricingReferences: [{ id: "old-pricing" }],
+  defaultProfileId: "old-profile",
+  defaultPricingReferenceId: "old-pricing",
+};
+function safeQuoteSessionId(value) { return String(value || "").trim(); }
+function normalizeCompanyProfile(value) { return value; }
+function mergePricingReferences(value) { return value; }
+function syncSelectedPricingReference() {}
+function renderProfileOptions() {}
+function renderPresetOptions() {}
+async function hydrateProfileLogoFingerprints(options) {
+  return { profiles: options.profiles, companyProfiles: options.companyProfiles };
+}
+const pending = [];
+function getJson() {
+  return new Promise((resolve) => pending.push(resolve));
+}
+
+eval([
+  "currentBrowserRecoveryScope",
+  "authorityProfileHydrationContext",
+  "beginAuthorityProfileRequest",
+  "refreshAuthorityProfileRequestContext",
+  "authorityProfileRequestIsFresh",
+  "loadProfiles",
+].map((name) => extractFunction(name, name === "loadProfiles" ? "async function" : "function")).join("\n"));
+
+function response(suffix) {
+  return {
+    ok: true,
+    data: {
+      profiles: [{ id: `profile-${suffix}` }],
+      company_profiles: [{ id: `company-${suffix}` }],
+      pricing_references: [{ id: `pricing-${suffix}`, source: "local" }],
+      workspace: { id: `workspace-${suffix}`, company: { id: `company-${suffix}` }, workspace: { id: `workspace-${suffix}` } },
+      default_profile_id: `profile-${suffix}`,
+      default_pricing_reference_id: `pricing-${suffix}`,
+    },
+  };
+}
+
+(async () => {
+  const requestA = loadProfiles();
+  await Promise.resolve();
+  assert.strictEqual(pending.length, 1);
+
+  state.browserRecoveryScope = "recovery-b";
+  state.quoteSessionId = "session-b";
+  state.workspace = { id: "workspace-b", company: { id: "company-b" }, workspace: { id: "workspace-b" } };
+  state.selectedPresetValue = "company:company-b";
+  elements.presetSelect.value = "company:company-b";
+  state.profileId = "profile-b";
+  state.pricingReferenceId = "pricing-b";
+  const requestB = loadProfiles();
+  await Promise.resolve();
+  assert.strictEqual(pending.length, 2);
+
+  pending[1](response("b"));
+  assert.strictEqual(await requestB, true);
+  assert.strictEqual(state.workspace.id, "workspace-b");
+  assert.strictEqual(state.profiles[0].id, "profile-b");
+  assert.strictEqual(state.companyProfiles[0].id, "company-b");
+  assert.strictEqual(state.pricingReferences[0].id, "pricing-b");
+
+  pending[0](response("a"));
+  assert.strictEqual(await requestA, false);
+  assert.strictEqual(state.workspace.id, "workspace-b");
+  assert.strictEqual(state.profiles[0].id, "profile-b");
+  assert.strictEqual(state.companyProfiles[0].id, "company-b");
+  assert.strictEqual(state.pricingReferences[0].id, "pricing-b");
+  assert.strictEqual(state.defaultProfileId, "profile-b");
+  assert.strictEqual(state.defaultPricingReferenceId, "pricing-b");
+})();
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_static_recovered_browser_collectors_and_output_projection_keep_saved_commercials(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+function extractFunction(name) {
+  const marker = `function ${name}(`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const DEFAULT_TAX_LABEL = "GST";
+const DEFAULT_TAX_RATE = 0.09;
+const DEFAULT_CURRENCY_LABEL = "SGD";
+const CUSTOM_CURRENCY_VALUE = "__CUSTOM__";
+const CURRENCY_OPTIONS = [["SGD"], ["AUD"], ["CNY"], ["EUR"], ["GBP"], ["IDR"], ["MYR"], ["THB"], ["USD"]];
+const QUOTE_COMMERCIAL_FIELD_KEYS = ["quoteCurrency", "quoteExchangeRate", "quoteTaxLabel", "quoteTaxRate"];
+const QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA = "swooshz.quote-commercial-snapshot.v1";
+const QUOTE_COMMERCIAL_SNAPSHOT_VERSION = 1;
+const QUOTE_COMMERCIAL_LIFECYCLES = new Set(["NEW_UNINITIALISED", "EXISTING", "RECOVERED"]);
+const QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS = [
+  "currency", "exchange_rate", "tax", "company_name", "header_details", "logo",
+  "terms_heading", "payment_terms", "notes_heading", "standard_notes", "acceptance_text",
+  "person_label", "stamp_label", "date_label", "company_signatory", "company_title",
+  "company_date_label", "rich_text",
+];
+const RICH_TEXT_SOURCE_IDS = ["headerDetails"];
+
+const input = (value = "") => ({ value: String(value), hidden: false, required: false });
+const elements = {
+  quoteCurrency: input("USD"), quoteCurrencyCustom: input(""), quoteExchangeRate: input("1.37"), quoteExchangeRateField: { hidden: false },
+  quoteTaxLabel: input("GST"), quoteTaxRate: input("9"), taxLabel: input("GST"), taxRate: input("9"),
+  quoteDate: input("2026-06-06"), projectNumber: input("KI-SAVED-001"),
+  clientName: input("Saved Client"), clientAttention: input("Saved Contact"), clientTitle: input("Saved Manager"), clientAddress: input("Saved Address"),
+  projectTitle: input("Saved Booth"), showName: input("Saved Show"),
+  quoteCompanyName: input("Saved Quotation Co"), headerDetails: input("Saved header"),
+  termsHeading: input("Saved Terms"), paymentTerms: input("Saved payment"), notesHeading: input("Saved Notes"),
+  standardNotes: input("Saved note"), acceptanceText: input("Saved acceptance"), personLabel: input("Saved person"),
+  stampLabel: input("Saved stamp"), dateLabel: input("Saved date:"), companySignatory: input("Saved Signatory"),
+  companyTitle: input("Saved Director"), companyDateLabel: input("Saved signed date:"),
+  richTextEditors: [{ dataset: { richTextSource: "headerDetails" }, innerHTML: "<div><strong>Saved header</strong></div>" }],
+};
+const state = {
+  quoteCommercialLifecycle: "RECOVERED",
+  quoteCommercialTouched: { quoteCurrency: false, quoteExchangeRate: false, quoteTaxLabel: false, quoteTaxRate: false },
+  quoteCommercialSnapshot: {
+    schema: QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+    version: QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+    owner: "quote",
+    lifecycle: "RECOVERED",
+    origin: "session_recovery",
+    presence: QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS.reduce((out, key) => { out[key] = "captured"; return out; }, {}),
+    pricing_basis: { currency: "SGD", source: "local", id: "saved-reference", digest: "sha256:" + "b".repeat(64) },
+  },
+  quoteCommercialPreservedQuoteText: { cheque_payee: "Saved Quotation Co" },
+  pricingReferenceId: "saved-reference",
+  pricingReferenceSource: "local",
+  pricingReferences: [{ id: "saved-reference", source: "local", currency: "SGD", tax: { label: "VAT", rate: 0.07 } }],
+  headerLogo: { name: "saved-logo.png", type: "image/png", size: 6, content_fingerprint: "sha256:" + "a".repeat(64), data_url: "data:image/png;base64,c2F2ZWQ=" },
+  quoteDateFormat: { bold: false, italic: false, underline: false },
+  outputRows: [],
+};
+const document = { activeElement: null, querySelectorAll() { return []; } };
+function currentPricingReference() { return state.pricingReferences.find((item) => item.id === state.pricingReferenceId && item.source === state.pricingReferenceSource) || null; }
+function selectedPricingReferenceTax() { const ref = currentPricingReference(); return { label: normalizeTaxLabel(ref?.tax?.label), rate: normalizeTaxRate(ref?.tax?.rate, DEFAULT_TAX_RATE) }; }
+function selectedPricingReferenceCurrency() { return normalizeCurrencyLabel(currentPricingReference()?.currency); }
+function sanitizeRichTextHtml(value) { return String(value || ""); }
+function normalizedContentFingerprint(value) { return String(value || ""); }
+function quoteDateRichTextHtml() { return ""; }
+function syncRichTextSources() {}
+function syncRichTextEditor() {}
+function restoreRichTextDetails() {}
+function applyDefaultQuoteDate() {}
+function applyQuoteDateFormatFromHtml() {}
+function normalizeBoothDimensions(project = {}) { return project; }
+function splitLines(value) { return String(value || "").split(/\r?\n/).filter(Boolean); }
+function linesValue(value) { return Array.isArray(value) ? value.join("\n") : String(value || ""); }
+function normalizeCategoryTitle(value) { return String(value || "").trim(); }
+function cleanCustomerQuoteLineText(value) { return String(value || "").trim(); }
+function pricingReferenceLineText(value) { return String(value || "").trim(); }
+function bracketedCatalogReferenceParts() { return null; }
+function outputCatalogDescription() { return ""; }
+function normalizeUnit(value) { return String(value || "").trim(); }
+function renderHeaderLogoPreview() {}
+function renderPresetStatus() {}
+function syncQuoteCommercialContextPills() {}
+
+eval([
+  "hasOwnValue", "hasMeaningfulQuoteDetailValue", "normalizeTaxLabel", "normalizeTaxRate", "taxRatePercentText", "commercialTaxRateOrNull",
+  "normalizeCurrencyLabel", "isStandardCurrencyCode", "normalizedCustomCurrencyInput", "customCurrencyInputIsValid",
+  "setQuoteCurrencyControls", "syncQuoteCurrencyCustomInput", "quoteCurrencyControlValue", "emptyQuoteCommercialTouched",
+  "normalizeQuoteCommercialTouched", "resetQuoteCommercialTouched", "quoteCommercialFieldKeyForElement",
+  "quoteCommercialFieldIsTouched", "quoteCommercialFieldHasValue", "shouldApplyQuoteCommercialField", "shouldApply",
+  "quoteCommercialSnapshotPresence", "quoteCommercialSnapshotForDetails", "quoteDetailsWithFallbackDefaults",
+  "collectRichTextDetails", "collectQuoteDetails", "setInputValue", "collectTaxDetails", "collectQuoteCurrency",
+  "collectQuoteExchangeRate", "syncQuoteExchangeRateField", "quoteCommercialTaxText", "quoteExchangeRateText",
+  "quoteFxMultiplier", "quoteAmountValue", "roundCommercialCents", "formatAmount", "unitPriceEditKind", "numberOrNull", "orderNumber",
+  "quoteCommercialStateIsOwned", "effectiveOutputUnitPrice", "synchronizeOwnedOutputRowPrice", "recalculateOutputRow", "normalizeOutputRow", "outputCellDisplayValue",
+  "rowNeedsManualInput", "matchSummaryStats", "outputRowsToLineItems", "outputRowsValid", "dashboardCommercialsFromState",
+  "applyQuoteDetails", "applyPricingReferenceCommercialDefaults",
+].map(extractFunction).join("\n"));
+
+state.outputRows = [
+  normalizeOutputRow({ section: "Saved Floors", description: "Captured carpet", quantity: 2, unit: "sqm", price_mode: "Priced", effective_unit_price: 100, catalog_unit_price: 999, pricing_keyword: "captured-row", amount: 200 }),
+  normalizeOutputRow({ section: "Saved Services", description: "Included coordination", quantity: 1, unit: "lot", price_mode: "Included", display_price: "Included", amount: 0 }),
+];
+const missingHistoricalPrice = normalizeOutputRow({ section: "Saved Review", description: "Missing captured price", quantity: 1, unit: "sqm", price_mode: "Priced", catalog_unit_price: 999 });
+assert.strictEqual(effectiveOutputUnitPrice(missingHistoricalPrice), null);
+assert.strictEqual(missingHistoricalPrice.amount, "");
+assert.strictEqual(outputCellDisplayValue(missingHistoricalPrice, "unit_price_override"), "???");
+assert.deepStrictEqual(outputRowsValid([missingHistoricalPrice]), { valid: false, errors: ["Row 1: Unit price is required."] });
+const missingHistoricalLine = outputRowsToLineItems([missingHistoricalPrice])[0];
+assert.strictEqual(missingHistoricalLine.catalog_unit_price, 999);
+assert.strictEqual(missingHistoricalLine.effective_unit_price, undefined);
+assert.strictEqual(missingHistoricalLine.unit_price_override, undefined);
+const saved = collectQuoteDetails();
+assert.deepStrictEqual(collectTaxDetails(), { label: "GST", rate: 0.09 });
+assert.strictEqual(collectQuoteCurrency(), "USD");
+assert.strictEqual(collectQuoteExchangeRate(), 1.37);
+assert.strictEqual(saved.commercial_snapshot.lifecycle, "RECOVERED");
+assert.strictEqual(saved.commercial_snapshot.pricing_basis.currency, "SGD");
+assert.strictEqual(outputRowsToLineItems()[0].unit_price_override, 100);
+assert.strictEqual(outputRowsToLineItems()[0].pricing_basis_currency, "SGD");
+assert.strictEqual(outputRowsToLineItems()[1].approved_quote_amount, 0);
+assert.deepStrictEqual(dashboardCommercialsFromState(), {
+  currency: "USD", tax_label: "GST", tax_rate: 0.09, exchange_rate: 1.37,
+  subtotal: 274, tax_amount: 24.66, grand_total: 298.66,
+});
+
+for (const missingRate of [null, ""]) {
+  applyQuoteDetails({
+    ...saved,
+    tax: { label: "GST", rate: missingRate },
+    quote_text: { ...saved.quote_text, tax_rate: missingRate },
+  }, { includeLogo: true, clearLogo: true });
+  assert.strictEqual(elements.taxRate.value, "");
+  assert.strictEqual(elements.quoteTaxRate.value, "");
+  assert.deepStrictEqual(collectTaxDetails(), { label: "GST", rate: null });
+  assert.strictEqual(quoteCommercialTaxText(), "Review required");
+}
+const missingTaxRateProperty = {
+  ...saved,
+  tax: { label: "GST" },
+  quote_text: { ...saved.quote_text },
+};
+delete missingTaxRateProperty.quote_text.tax_rate;
+applyQuoteDetails(missingTaxRateProperty, { includeLogo: true, clearLogo: true });
+assert.strictEqual(elements.taxRate.value, "");
+assert.strictEqual(elements.quoteTaxRate.value, "");
+assert.deepStrictEqual(collectTaxDetails(), { label: "GST", rate: null });
+assert.strictEqual(quoteCommercialTaxText(), "Review required");
+applyQuoteDetails(saved, { includeLogo: true, clearLogo: true });
+assert.strictEqual(elements.taxRate.value, "9");
+assert.strictEqual(elements.quoteTaxRate.value, "9");
+
+const edited = normalizeOutputRow({ ...state.outputRows[0], unit_price_override: 120 });
+assert.strictEqual(edited.effective_unit_price, 120);
+assert.strictEqual(edited.unit_price_override, 120);
+assert.strictEqual(edited.pricing_basis_amount, 240);
+assert.strictEqual(edited.approved_quote_amount, 328.8);
+assert.strictEqual(edited.amount, 240);
+const editedLine = outputRowsToLineItems([edited])[0];
+assert.strictEqual(editedLine.effective_unit_price, 120);
+assert.strictEqual(editedLine.unit_price_override, 120);
+assert.strictEqual(editedLine.pricing_basis_amount, 240);
+assert.strictEqual(editedLine.approved_quote_amount, 328.8);
+state.outputRows = [edited, state.outputRows[1]];
+assert.deepStrictEqual(dashboardCommercialsFromState(), {
+  currency: "USD", tax_label: "GST", tax_rate: 0.09, exchange_rate: 1.37,
+  subtotal: 328.8, tax_amount: 29.59, grand_total: 358.39,
+});
+
+elements.quoteExchangeRate.value = "1";
+const halfCent = normalizeOutputRow({
+  section: "Boundary", description: "Half-cent boundary", quantity: 1, unit: "lot",
+  price_mode: "Priced", unit_price_override: 10.625,
+});
+assert.strictEqual(halfCent.amount, 10.63);
+assert.strictEqual(halfCent.pricing_basis_amount, 10.63);
+assert.strictEqual(halfCent.approved_quote_amount, 10.63);
+state.outputRows = [halfCent];
+assert.deepStrictEqual(dashboardCommercialsFromState(), {
+  currency: "USD", tax_label: "GST", tax_rate: 0.09, exchange_rate: 1,
+  subtotal: 10.63, tax_amount: 0.96, grand_total: 11.59,
+});
+assert.strictEqual(roundCommercialCents(1.005), 1.01);
+assert.strictEqual(roundCommercialCents(2.674), 2.67);
+elements.quoteExchangeRate.value = "1.37";
+
+state.pricingReferences[0].currency = "USD";
+state.pricingReferences[0].tax = { label: "VAT", rate: 0.07 };
+assert.strictEqual(collectQuoteExchangeRate(), 1.37);
+assert.deepStrictEqual(collectTaxDetails(), { label: "GST", rate: 0.09 });
+state.quoteCommercialTouched.quoteExchangeRate = true;
+assert.strictEqual(collectQuoteExchangeRate(), 1.37);
+elements.quoteCurrency.value = "EUR";
+elements.quoteExchangeRate.value = "9";
+elements.quoteTaxLabel.value = "VAT";
+elements.quoteTaxRate.value = "7";
+applyPricingReferenceCommercialDefaults();
+assert.strictEqual(elements.quoteCurrency.value, "EUR");
+assert.strictEqual(elements.quoteExchangeRate.value, "9");
+assert.strictEqual(elements.quoteTaxLabel.value, "VAT");
+assert.strictEqual(elements.quoteTaxRate.value, "7");
+
+elements.quoteCurrency.value = "EUR";
+elements.quoteExchangeRate.value = "9";
+elements.quoteTaxLabel.value = "VAT";
+elements.quoteTaxRate.value = "7";
+applyQuoteDetails(saved, { includeLogo: true, clearLogo: true });
+assert.strictEqual(elements.quoteCurrency.value, "USD");
+assert.strictEqual(elements.quoteExchangeRate.value, "1.37");
+assert.strictEqual(elements.quoteTaxLabel.value, "GST");
+assert.strictEqual(elements.quoteTaxRate.value, "9");
+assert.strictEqual(saved.quote_text.cheque_payee, "Saved Quotation Co");
+assert.strictEqual(saved.rich_text.headerDetails, "<div><strong>Saved header</strong></div>");
+assert.strictEqual(state.headerLogo.content_fingerprint, "sha256:" + "a".repeat(64));
+assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, { preserveSavedState: true }).currency, "USD");
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
     def test_payload_to_brief_ignores_title_dimensions_without_manual_fields(self):
         payload = valid_payload()
         payload["project"].pop("booth_width", None)
@@ -1697,7 +2863,12 @@ class WebappServerTest(unittest.TestCase):
             items[0]["catalog_unit_price"],
             koncept_catalog_sale_unit_price("synthetic-floors-synthetic-carpet-tile"),
         )
-        self.assertNotIn("unit_price_override", items[0])
+        expected_price = koncept_catalog_sale_unit_price("synthetic-floors-synthetic-carpet-tile")
+        self.assertEqual(items[0]["status"], "matched")
+        self.assertEqual(items[0]["effective_unit_price"], expected_price)
+        self.assertEqual(items[0]["unit_price_override"], expected_price)
+        self.assertEqual(items[0]["pricing_basis_amount"], 518.4)
+        self.assertEqual(items[0]["approved_quote_amount"], 518.4)
 
     def test_normalize_line_items_preserves_output_table_unit_when_locked(self):
         items = webapp.normalize_line_items({
@@ -12381,6 +13552,1350 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
             self.assertEqual(refreshed["exports"]["pdf"]["missing"], True)
             self.assertNotIn(str(tmp_path), json.dumps(refreshed))
 
+    def _local_publication_case(
+        self,
+        root: Path,
+        session_id: str,
+        xlsx_bytes: bytes,
+        pdf_bytes: bytes,
+        variant: str = "current",
+    ) -> tuple[dict, dict, Path]:
+        output_dir = root / "output" / f"{session_id}-{variant}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
+        (output_dir / "quotation.pdf").write_bytes(pdf_bytes)
+        payload = valid_payload()
+        payload["quote_session"] = {"session_id": session_id}
+        result = {
+            "status": "completed",
+            "files": [
+                {"name": "quotation.xlsx", "url": f"/api/jobs/{session_id}/files/quotation.xlsx"},
+                {"name": "quotation.pdf", "url": f"/api/jobs/{session_id}/files/quotation.pdf"},
+            ],
+        }
+        return payload, result, output_dir
+
+    def _assert_local_pair_downloads(
+        self,
+        runner: LocalRunnerServer,
+        session_id: str,
+        xlsx_bytes: bytes,
+        pdf_bytes: bytes,
+    ) -> None:
+        self.assertEqual(
+            local_http_get_bytes(runner, f"/api/quote-sessions/{session_id}/download/xlsx"),
+            (200, xlsx_bytes),
+        )
+        self.assertEqual(
+            local_http_get_bytes(runner, f"/api/quote-sessions/{session_id}/download/pdf"),
+            (200, pdf_bytes),
+        )
+
+    def _run466_payload(
+        self,
+        session_id: str,
+        row_description: str,
+        output_revision: int,
+        *,
+        quote_generated: bool = True,
+        workflow_stage: str = "generating",
+        file_urls: tuple[str, str] | None = None,
+    ) -> dict:
+        payload = valid_payload()
+        draft_state = {
+            "version": 1,
+            "savedAt": "2026-09-09T00:00:00Z",
+            "activeAppView": "quote",
+            "activeSidePanel": "output",
+            "workflowStage": workflow_stage,
+            "quoteCommercialLifecycle": "NEW_UNINITIALISED",
+            "quoteDetails": {
+                "quote_date": payload["quote_date"],
+                "project_number": payload["project_number"],
+                "client": copy.deepcopy(payload["client"]),
+                "project": copy.deepcopy(payload["project"]),
+                "company": copy.deepcopy(payload["company"]),
+                "quote_text": copy.deepcopy(payload["quote_text"]),
+                "signature": copy.deepcopy(payload["signature"]),
+            },
+            "outputRows": [{
+                "section": "Floor Design",
+                "description": row_description,
+                "quantity": 1,
+                "unit": "sqm",
+                "amount": 100,
+            }],
+            "outputRevision": output_revision,
+        }
+        if file_urls is not None:
+            draft_state.update({
+                "downloadFile": {
+                    "name": "quotation.xlsx",
+                    "url": file_urls[0],
+                    "output_revision": output_revision,
+                },
+                "pdfFile": {
+                    "name": "quotation.pdf",
+                    "url": file_urls[1],
+                    "output_revision": output_revision,
+                },
+                "downloadFileRevision": output_revision,
+                "pdfFileRevision": output_revision,
+            })
+        payload["quote_session"] = {
+            "session_id": session_id,
+            "commercials": {
+                "currency": "SGD",
+                "tax_label": "GST",
+                "tax_rate": 0.09,
+                "subtotal": 100,
+                "tax_amount": 9,
+                "grand_total": 109,
+            },
+            "status": {"quote_generated": quote_generated},
+            "draft_state": draft_state,
+        }
+        return payload
+
+    def _post_local_quote_session(self, runner: LocalRunnerServer, payload: dict) -> dict:
+        session = self.http_json(runner, "GET", "/api/session")
+        self.assertEqual(session["status"], 200, session)
+        body = session["body"]
+        return self.http_json(
+            runner,
+            "POST",
+            "/api/quote-sessions",
+            body=payload,
+            headers={
+                "Origin": runner.base_url,
+                body["csrf_header"]: body["csrf_token"],
+            },
+        )
+
+    @staticmethod
+    def _run466_fake_generator(outputs: dict[str, tuple[bytes, bytes | None]]):
+        def fake_generator(command, **_kwargs):
+            output_dir = Path(command[command.index("--out") + 1])
+            xlsx_bytes, pdf_bytes = outputs[output_dir.name]
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
+            if pdf_bytes is not None:
+                (output_dir / "quotation.pdf").write_bytes(pdf_bytes)
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        return fake_generator
+
+    def test_run466_local_publication_truthfulness_end_to_end(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            output_root = root / "output"
+            tmp_root = root / "tmp"
+            log_root = root / "_logs" / "app"
+            outputs = {
+                "job-466-old": (b"run466-old-xlsx", b"run466-old-pdf"),
+                "job-466-pdf-fail": (b"run466-uncommitted-xlsx", b"run466-uncommitted-pdf"),
+                "job-466-metadata-fail": (b"run466-metadata-xlsx", b"run466-metadata-pdf"),
+                "job-466-final": (b"run466-final-xlsx", b"run466-final-pdf"),
+                "job-466-partial-old": (b"run466-partial-old-xlsx", b"run466-partial-old-pdf"),
+                "job-466-partial-new": (b"run466-partial-new-xlsx", None),
+            }
+            env = isolated_env(
+                QUOTE_DATA_ROOT=str(data_root),
+                QUOTE_OUTPUT_ROOT=str(output_root),
+                QUOTE_LOG_ROOT=str(log_root),
+            )
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(webapp, "configured_data_root", return_value=data_root),
+                mock.patch.object(webapp, "configured_output_root", return_value=output_root),
+                mock.patch.object(webapp, "configured_log_root", return_value=log_root),
+                mock.patch.object(
+                    webapp.subprocess,
+                    "run",
+                    side_effect=self._run466_fake_generator(outputs),
+                ),
+                LocalRunnerServer() as runner,
+            ):
+                old_payload = self._run466_payload("quote-run466", "Run-466 old row", 0)
+                old_result = webapp.run_quote_job(
+                    old_payload,
+                    output_root=output_root,
+                    tmp_root=tmp_root,
+                    job_id="job-466-old",
+                )
+                self.assertEqual(old_result["status"], "completed", old_result)
+                old_metadata = webapp.read_quote_session_metadata("quote-run466")
+                old_publication_id = old_metadata["publication"]["active_publication_id"]
+
+                unchanged_payload = self._run466_payload(
+                    "quote-run466",
+                    "Run-466 old row",
+                    0,
+                    workflow_stage="completed",
+                    file_urls=(
+                        "/api/quote-sessions/quote-run466/download/xlsx",
+                        "/api/quote-sessions/quote-run466/download/pdf",
+                    ),
+                )
+                unchanged_response = self._post_local_quote_session(runner, unchanged_payload)
+                self.assertEqual(unchanged_response["status"], 200, unchanged_response)
+                unchanged = unchanged_response["body"]["quote_session"]
+                self.assertFalse(unchanged["exports"]["xlsx"]["stale"])
+                self.assertFalse(unchanged["exports"]["pdf"]["stale"])
+
+                changed_payload = self._run466_payload(
+                    "quote-run466", "Run-466 changed row", 1, workflow_stage="generating"
+                )
+                original_copy2 = webapp.shutil.copy2
+
+                def fail_pdf_staging(source, destination):
+                    if Path(source).name == "quotation.pdf":
+                        raise OSError("synthetic Run-466 PDF staging failure")
+                    return original_copy2(source, destination)
+
+                with mock.patch.object(webapp.shutil, "copy2", side_effect=fail_pdf_staging):
+                    failed_pdf = webapp.run_quote_job(
+                        changed_payload,
+                        output_root=output_root,
+                        tmp_root=tmp_root,
+                        job_id="job-466-pdf-fail",
+                    )
+                self.assertEqual(failed_pdf["status"], "failed", failed_pdf)
+                self.assertNotIn("files", failed_pdf)
+                self.assertNotIn("quote_session", failed_pdf)
+                self.assertNotIn("output_dir", failed_pdf)
+                self.assertNotIn("brief_path", failed_pdf)
+                self.assertEqual(
+                    webapp.read_quote_session_metadata("quote-run466")["publication"]["active_publication_id"],
+                    old_publication_id,
+                )
+                after_pdf_failure = webapp.get_quote_session("quote-run466")
+                self.assertFalse(after_pdf_failure["exports"]["xlsx"]["stale"])
+                self.assertFalse(after_pdf_failure["exports"]["pdf"]["stale"])
+                self._assert_local_pair_downloads(
+                    runner, "quote-run466", b"run466-old-xlsx", b"run466-old-pdf"
+                )
+                self.assertEqual(
+                    local_http_get_bytes(
+                        runner,
+                        "/api/jobs/job-466-pdf-fail/files/quotation.pdf",
+                    ),
+                    (200, b"run466-uncommitted-pdf"),
+                )
+
+                with mock.patch.object(
+                    webapp,
+                    "write_quote_session_metadata",
+                    side_effect=RuntimeError("synthetic Run-466 metadata commit failure"),
+                ):
+                    failed_metadata = webapp.run_quote_job(
+                        changed_payload,
+                        output_root=output_root,
+                        tmp_root=tmp_root,
+                        job_id="job-466-metadata-fail",
+                    )
+                self.assertEqual(failed_metadata["status"], "failed", failed_metadata)
+                self.assertNotIn("files", failed_metadata)
+                self.assertNotIn("quote_session", failed_metadata)
+                self.assertEqual(
+                    webapp.read_quote_session_metadata("quote-run466")["publication"]["active_publication_id"],
+                    old_publication_id,
+                )
+
+                failed_urls = (
+                    "/api/jobs/job-466-pdf-fail/files/quotation.xlsx",
+                    "/api/jobs/job-466-pdf-fail/files/quotation.pdf",
+                )
+                failed_followup_response = self._post_local_quote_session(
+                    runner,
+                    self._run466_payload(
+                        "quote-run466",
+                        "Run-466 changed row",
+                        1,
+                        workflow_stage="completed",
+                        file_urls=failed_urls,
+                    ),
+                )
+                self.assertEqual(failed_followup_response["status"], 200, failed_followup_response)
+                failed_followup = failed_followup_response["body"]["quote_session"]
+                for kind in ("xlsx", "pdf"):
+                    self.assertTrue(failed_followup["exports"][kind]["stale"])
+                self.assertEqual(webapp.quote_session_result_files(failed_followup), [])
+                self._assert_local_pair_downloads(
+                    runner, "quote-run466", b"run466-old-xlsx", b"run466-old-pdf"
+                )
+
+                malicious_response = self._post_local_quote_session(
+                    runner,
+                    self._run466_payload(
+                        "quote-run466",
+                        "Run-466 old row",
+                        0,
+                        workflow_stage="completed",
+                        file_urls=failed_urls,
+                    ),
+                )
+                self.assertEqual(malicious_response["status"], 200, malicious_response)
+                malicious = malicious_response["body"]["quote_session"]
+                self.assertTrue(malicious["exports"]["xlsx"]["stale"])
+                self.assertTrue(malicious["exports"]["pdf"]["stale"])
+                self.assertEqual(webapp.quote_session_result_files(malicious), [])
+
+                edit_response = self._post_local_quote_session(
+                    runner,
+                    self._run466_payload(
+                        "quote-run466",
+                        "Run-466 late edit",
+                        2,
+                        quote_generated=False,
+                        workflow_stage="pricing_review",
+                    ),
+                )
+                self.assertEqual(edit_response["status"], 200, edit_response)
+                edited = edit_response["body"]["quote_session"]
+                self.assertTrue(edited["exports"]["xlsx"]["stale"])
+                self.assertTrue(edited["exports"]["pdf"]["stale"])
+
+                final_payload = self._run466_payload(
+                    "quote-run466", "Run-466 final row", 2
+                )
+                final_result = webapp.run_quote_job(
+                    final_payload,
+                    output_root=output_root,
+                    tmp_root=tmp_root,
+                    job_id="job-466-final",
+                )
+                self.assertEqual(final_result["status"], "completed", final_result)
+                final_session = final_result["quote_session"]
+                self.assertEqual(
+                    {item["name"] for item in webapp.quote_session_result_files(final_session)},
+                    {"quotation.xlsx", "quotation.pdf"},
+                )
+                self.assertFalse(final_session["exports"]["xlsx"]["stale"])
+                self.assertFalse(final_session["exports"]["pdf"]["stale"])
+                self._assert_local_pair_downloads(
+                    runner, "quote-run466", b"run466-final-xlsx", b"run466-final-pdf"
+                )
+                final_followup_response = self._post_local_quote_session(
+                    runner,
+                    self._run466_payload(
+                        "quote-run466",
+                        "Run-466 final row",
+                        2,
+                        workflow_stage="completed",
+                        file_urls=(
+                            "/api/quote-sessions/quote-run466/download/xlsx",
+                            "/api/quote-sessions/quote-run466/download/pdf",
+                        ),
+                    ),
+                )
+                self.assertEqual(final_followup_response["status"], 200, final_followup_response)
+                final_followup = final_followup_response["body"]["quote_session"]
+                self.assertFalse(final_followup["exports"]["xlsx"]["stale"])
+                self.assertFalse(final_followup["exports"]["pdf"]["stale"])
+
+                partial_old = webapp.run_quote_job(
+                    self._run466_payload("quote-run466-partial", "Partial row", 0),
+                    output_root=output_root,
+                    tmp_root=tmp_root,
+                    job_id="job-466-partial-old",
+                )
+                self.assertEqual(partial_old["status"], "completed", partial_old)
+                partial_new = webapp.run_quote_job(
+                    self._run466_payload("quote-run466-partial", "Partial row", 0),
+                    output_root=output_root,
+                    tmp_root=tmp_root,
+                    job_id="job-466-partial-new",
+                )
+                self.assertEqual(partial_new["status"], "completed", partial_new)
+                self.assertEqual(
+                    {item["name"] for item in partial_new["files"]},
+                    {"quotation.xlsx"},
+                )
+                partial_session = partial_new["quote_session"]
+                self.assertTrue(partial_session["status"]["quote_generated"])
+                self.assertFalse(partial_session["exports"]["xlsx"]["stale"])
+                self.assertTrue(partial_session["exports"]["pdf"]["exists"])
+                self.assertTrue(partial_session["exports"]["pdf"]["stale"])
+                self.assertEqual(
+                    {item["name"] for item in webapp.quote_session_result_files(partial_session)},
+                    {"quotation.xlsx"},
+                )
+                self.assertEqual(
+                    local_http_get_bytes(
+                        runner,
+                        "/api/quote-sessions/quote-run466-partial/download/xlsx",
+                    ),
+                    (200, b"run466-partial-new-xlsx"),
+                )
+                self.assertEqual(
+                    local_http_get_bytes(
+                        runner,
+                        "/api/quote-sessions/quote-run466-partial/download/pdf",
+                    ),
+                    (200, b"run466-partial-old-pdf"),
+                )
+                partial_followup_response = self._post_local_quote_session(
+                    runner,
+                    self._run466_payload(
+                        "quote-run466-partial",
+                        "Partial row",
+                        0,
+                        workflow_stage="completed",
+                        file_urls=(
+                            "/api/quote-sessions/quote-run466-partial/download/xlsx",
+                            "/api/jobs/job-466-partial-old/files/quotation.pdf",
+                        ),
+                    ),
+                )
+                self.assertEqual(partial_followup_response["status"], 200, partial_followup_response)
+                partial_followup = partial_followup_response["body"]["quote_session"]
+                self.assertFalse(partial_followup["exports"]["xlsx"]["stale"])
+                self.assertTrue(partial_followup["exports"]["pdf"]["stale"])
+                self.assertEqual(
+                    {item["name"] for item in webapp.quote_session_result_files(partial_followup)},
+                    {"quotation.xlsx"},
+                )
+
+    def test_run469_local_generation_outcome_is_one_publication_transaction(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            output_root = root / "output"
+            tmp_root = root / "tmp"
+            log_root = root / "_logs" / "app"
+            outputs = {
+                "job-469-old": (b"run469-old-xlsx", b"run469-old-pdf"),
+                "job-469-staging-fail": (b"run469-staging-fail-xlsx", b"run469-staging-fail-pdf"),
+                "job-469-draft-fail": (b"run469-draft-fail-xlsx", b"run469-draft-fail-pdf"),
+                "job-469-commit-fail": (b"run469-commit-fail-xlsx", b"run469-commit-fail-pdf"),
+                "job-469-success": (b"run469-success-xlsx", b"run469-success-pdf"),
+            }
+            env = isolated_env(
+                QUOTE_DATA_ROOT=str(data_root),
+                QUOTE_OUTPUT_ROOT=str(output_root),
+                QUOTE_LOG_ROOT=str(log_root),
+            )
+
+            def generation_payload(
+                row_description: str,
+                output_revision: int,
+                *,
+                workflow_stage: str = "generating",
+                file_urls: tuple[str, str] | None = None,
+                file_key: str | None = None,
+            ) -> dict:
+                payload = self._run466_payload(
+                    "quote-run469",
+                    row_description,
+                    output_revision,
+                    workflow_stage=workflow_stage,
+                    file_urls=file_urls,
+                )
+                payload["quote_session"]["draft_files"] = [{
+                    "session_file_key": file_key or f"run469-reference-{output_revision}",
+                    "name": "run469-reference.pdf",
+                    "type": "application/pdf",
+                    "size": 3,
+                    "data_url": "data:application/pdf;base64,UERG",
+                }]
+                return payload
+
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(webapp, "configured_data_root", return_value=data_root),
+                mock.patch.object(webapp, "configured_output_root", return_value=output_root),
+                mock.patch.object(webapp, "configured_log_root", return_value=log_root),
+                mock.patch.object(
+                    webapp.subprocess,
+                    "run",
+                    side_effect=self._run466_fake_generator(outputs),
+                ),
+                LocalRunnerServer() as runner,
+            ):
+                old_result = webapp.run_quote_job(
+                    generation_payload("Run-469 old row", 0, file_key="run469-old-reference"),
+                    output_root=output_root,
+                    tmp_root=tmp_root,
+                    job_id="job-469-old",
+                )
+                self.assertEqual(old_result["status"], "completed", old_result)
+                metadata_path = webapp.quote_session_metadata_path("quote-run469")
+                old_metadata_bytes = metadata_path.read_bytes()
+                old_metadata = webapp.read_quote_session_metadata("quote-run469")
+                old_publication_id = old_metadata["publication"]["active_publication_id"]
+                self.assertEqual(
+                    old_metadata["publication"]["draft_files_publication_id"],
+                    old_publication_id,
+                )
+                old_draft_path = webapp.quote_session_publication_draft_files_path(
+                    "quote-run469",
+                    old_publication_id,
+                )
+                old_draft_bytes = old_draft_path.read_bytes()
+                old_draft_files = webapp.read_quote_session_draft_files(
+                    "quote-run469",
+                    old_metadata,
+                )
+                old_publication_dirs = {
+                    path.name
+                    for path in webapp.quote_session_publications_dir("quote-run469").iterdir()
+                    if path.is_dir() and not path.name.startswith(".")
+                }
+
+                def assert_prior_authority() -> None:
+                    self.assertEqual(metadata_path.read_bytes(), old_metadata_bytes)
+                    current = webapp.read_quote_session_metadata("quote-run469")
+                    self.assertEqual(
+                        current["publication"]["active_publication_id"],
+                        old_publication_id,
+                    )
+                    self.assertEqual(
+                        current["publication"]["draft_files_publication_id"],
+                        old_publication_id,
+                    )
+                    self.assertEqual(
+                        webapp.quote_session_publication_draft_files_path(
+                            "quote-run469",
+                            old_publication_id,
+                        ).read_bytes(),
+                        old_draft_bytes,
+                    )
+                    session = webapp.get_quote_session(
+                        "quote-run469",
+                        include_draft_state=True,
+                    )
+                    self.assertEqual(session["draft_files"], old_draft_files)
+                    self.assertFalse(session["exports"]["xlsx"]["stale"])
+                    self.assertFalse(session["exports"]["pdf"]["stale"])
+                    self._assert_local_pair_downloads(
+                        runner,
+                        "quote-run469",
+                        b"run469-old-xlsx",
+                        b"run469-old-pdf",
+                    )
+                    current_publication_dirs = {
+                        path.name
+                        for path in webapp.quote_session_publications_dir("quote-run469").iterdir()
+                        if path.is_dir() and not path.name.startswith(".")
+                    }
+                    self.assertEqual(current_publication_dirs, old_publication_dirs)
+                    self.assertFalse(
+                        any(
+                            path.name.endswith(".staging")
+                            for path in webapp.quote_session_publications_dir("quote-run469").iterdir()
+                        )
+                    )
+
+                def assert_failed_forensics(result: dict) -> None:
+                    self.assertEqual(result["status"], "failed", result)
+                    self.assertNotIn("files", result)
+                    self.assertNotIn("quote_session", result)
+                    self.assertNotIn("_durable_publication_committed", result)
+                    run_id = result.get("generation_run_id")
+                    self.assertTrue(run_id)
+                    connection = sqlite3.connect(data_root / "forensics.sqlite3")
+                    try:
+                        run_row = connection.execute(
+                            "select status from sqag_generation_runs where run_id = ?",
+                            (run_id,),
+                        ).fetchone()
+                        events = connection.execute(
+                            "select event_type, event_status from sqag_telemetry_events where run_reference = ?",
+                            (run_id,),
+                        ).fetchall()
+                        evidence = connection.execute(
+                            "select evidence_type, evidence_json from sqag_generation_evidence where run_id = ?",
+                            (run_id,),
+                        ).fetchall()
+                    finally:
+                        connection.close()
+                    self.assertEqual(run_row[0], "failed")
+                    self.assertFalse(
+                        any(
+                            event_type in {"generation", "publication", "storage_finalization"}
+                            and event_status in {"success", "completed"}
+                            for event_type, event_status in events
+                        )
+                    )
+                    result_summaries = [
+                        json.loads(body)
+                        for evidence_type, body in evidence
+                        if evidence_type == "result_summary"
+                    ]
+                    manifests = [
+                        json.loads(body)
+                        for evidence_type, body in evidence
+                        if evidence_type == "generation_manifest"
+                    ]
+                    self.assertTrue(result_summaries)
+                    self.assertTrue(manifests)
+                    self.assertEqual(result_summaries[-1]["status"], "failed")
+                    self.assertEqual(manifests[-1]["terminal_state"], "failed")
+                    self.assertFalse(manifests[-1]["artifacts_durable"])
+                    self.assertFalse(
+                        manifests[-1]["transient_outputs"]["retained_as_canonical_artifacts"]
+                    )
+
+                original_copy2 = webapp.shutil.copy2
+
+                def fail_publication_staging(source, destination):
+                    if Path(source).name == "quotation.xlsx":
+                        raise OSError("synthetic Run-469 publication staging failure")
+                    return original_copy2(source, destination)
+
+                with mock.patch.object(webapp.shutil, "copy2", side_effect=fail_publication_staging):
+                    failed_staging = webapp.run_quote_job(
+                        generation_payload("Run-469 staging failure", 1),
+                        output_root=output_root,
+                        tmp_root=tmp_root,
+                        job_id="job-469-staging-fail",
+                    )
+                assert_failed_forensics(failed_staging)
+                assert_prior_authority()
+
+                with mock.patch.object(
+                    webapp,
+                    "write_quote_session_draft_files",
+                    side_effect=OSError("synthetic Run-469 draft persistence failure"),
+                ):
+                    failed_draft = webapp.run_quote_job(
+                        generation_payload("Run-469 draft persistence failure", 2),
+                        output_root=output_root,
+                        tmp_root=tmp_root,
+                        job_id="job-469-draft-fail",
+                    )
+                assert_failed_forensics(failed_draft)
+                assert_prior_authority()
+
+                original_metadata_writer = webapp.write_quote_session_metadata
+
+                def fail_final_metadata_commit(metadata):
+                    committed = original_metadata_writer(metadata)
+                    raise OSError("synthetic Run-469 final metadata commit failure")
+
+                with mock.patch.object(
+                    webapp,
+                    "write_quote_session_metadata",
+                    side_effect=fail_final_metadata_commit,
+                ):
+                    failed_commit = webapp.run_quote_job(
+                        generation_payload("Run-469 final commit failure", 3),
+                        output_root=output_root,
+                        tmp_root=tmp_root,
+                        job_id="job-469-commit-fail",
+                    )
+                assert_failed_forensics(failed_commit)
+                assert_prior_authority()
+
+                failed_followup_urls = (
+                    "/api/jobs/job-469-draft-fail/files/quotation.xlsx",
+                    "/api/jobs/job-469-draft-fail/files/quotation.pdf",
+                )
+                followup_response = self._post_local_quote_session(
+                    runner,
+                    generation_payload(
+                        "Run-469 failed follow-up draft",
+                        2,
+                        workflow_stage="completed",
+                        file_urls=failed_followup_urls,
+                        file_key="run469-follow-up-reference",
+                    ),
+                )
+                self.assertEqual(followup_response["status"], 200, followup_response)
+                followup_session = followup_response["body"]["quote_session"]
+                self.assertTrue(followup_session["exports"]["xlsx"]["stale"])
+                self.assertTrue(followup_session["exports"]["pdf"]["stale"])
+                self.assertEqual(webapp.quote_session_result_files(followup_session), [])
+                refreshed = webapp.get_quote_session("quote-run469", include_draft_state=True)
+                self.assertEqual(
+                    refreshed["draft_files"][0]["session_file_key"],
+                    "run469-follow-up-reference",
+                )
+                self._assert_local_pair_downloads(
+                    runner,
+                    "quote-run469",
+                    b"run469-old-xlsx",
+                    b"run469-old-pdf",
+                )
+                self.assertFalse(
+                    any(
+                        path.name.startswith("pub-")
+                        and path.name != old_publication_id
+                        for path in webapp.quote_session_publications_dir("quote-run469").iterdir()
+                        if path.is_dir()
+                    )
+                )
+
+                successful = webapp.run_quote_job(
+                    generation_payload("Run-469 successful row", 2, file_key="run469-success-reference"),
+                    output_root=output_root,
+                    tmp_root=tmp_root,
+                    job_id="job-469-success",
+                )
+                self.assertEqual(successful["status"], "completed", successful)
+                current_metadata = webapp.read_quote_session_metadata("quote-run469")
+                new_publication_id = current_metadata["publication"]["active_publication_id"]
+                self.assertNotEqual(new_publication_id, old_publication_id)
+                self.assertEqual(
+                    current_metadata["publication"]["draft_files_publication_id"],
+                    new_publication_id,
+                )
+                new_draft_path = webapp.quote_session_publication_draft_files_path(
+                    "quote-run469",
+                    new_publication_id,
+                )
+                self.assertTrue(new_draft_path.is_file())
+                self.assertEqual(
+                    webapp.read_quote_session_draft_files(
+                        "quote-run469",
+                        current_metadata,
+                    )[0]["session_file_key"],
+                    "run469-success-reference",
+                )
+                successful_session = webapp.get_quote_session(
+                    "quote-run469",
+                    include_draft_state=True,
+                )
+                endpoint_status, endpoint_body = local_http_get_json(
+                    runner,
+                    "/api/quote-sessions/quote-run469",
+                )
+                self.assertEqual(endpoint_status, 200, endpoint_body)
+                endpoint_session = endpoint_body["quote_session"]
+                self.assertEqual(endpoint_session["draft_files"], successful_session["draft_files"])
+                self.assertEqual(
+                    {item["name"] for item in webapp.quote_session_result_files(successful_session)},
+                    {"quotation.xlsx", "quotation.pdf"},
+                )
+                self.assertEqual(
+                    {
+                        (item["name"], item["bytes"], item["sha256"])
+                        for item in successful["files"]
+                    },
+                    {
+                        (item["name"], item["bytes"], item["sha256"])
+                        for item in webapp.quote_session_result_files(successful_session)
+                    },
+                )
+                for kind, expected in (
+                    ("xlsx", b"run469-success-xlsx"),
+                    ("pdf", b"run469-success-pdf"),
+                ):
+                    export = current_metadata["exports"][kind]
+                    self.assertEqual(export["publication_id"], new_publication_id)
+                    self.assertFalse(export["stale"])
+                    self.assertEqual(
+                        webapp.quote_session_recorded_export_path(
+                            "quote-run469",
+                            kind,
+                            current_metadata,
+                        ).read_bytes(),
+                        expected,
+                    )
+
+    def test_run472_post_commit_projection_failure_preserves_commit_and_recovers(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            output_root = root / "output"
+            tmp_root = root / "tmp"
+            log_root = root / "_logs" / "app"
+            outputs = {
+                "job-472-old": (b"run472-old-xlsx", b"run472-old-pdf"),
+                "job-472-red": (b"run472-red-xlsx", b"run472-red-pdf"),
+                "job-472-persistent": (b"run472-persistent-xlsx", b"run472-persistent-pdf"),
+            }
+            env = isolated_env(
+                QUOTE_DATA_ROOT=str(data_root),
+                QUOTE_OUTPUT_ROOT=str(output_root),
+                QUOTE_LOG_ROOT=str(log_root),
+            )
+
+            def generation_payload(row_description: str, file_key: str) -> dict:
+                payload = self._run466_payload(
+                    "quote-run472",
+                    row_description,
+                    1,
+                    workflow_stage="generating",
+                )
+                payload["quote_session"]["draft_files"] = [{
+                    "session_file_key": file_key,
+                    "name": "run472-reference.pdf",
+                    "type": "application/pdf",
+                    "size": 3,
+                    "data_url": "data:application/pdf;base64,UERG",
+                }]
+                return payload
+
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(webapp, "configured_data_root", return_value=data_root),
+                mock.patch.object(webapp, "configured_output_root", return_value=output_root),
+                mock.patch.object(webapp, "configured_log_root", return_value=log_root),
+                mock.patch.object(
+                    webapp.subprocess,
+                    "run",
+                    side_effect=self._run466_fake_generator(outputs),
+                ),
+                LocalRunnerServer() as runner,
+            ):
+                old_result = webapp.run_quote_job(
+                    generation_payload("Run-472 old row", "run472-old-reference"),
+                    output_root=output_root,
+                    tmp_root=tmp_root,
+                    job_id="job-472-old",
+                )
+                self.assertEqual(old_result["status"], "completed", old_result)
+                old_metadata = webapp.read_quote_session_metadata("quote-run472")
+                old_publication_id = old_metadata["publication"]["active_publication_id"]
+
+                commit_observed = {"value": False}
+                projection_fault_active = {"value": True}
+                original_commit = webapp.commit_local_quote_publication
+                original_projection = webapp.public_quote_session
+
+                def mark_commit(*args, **kwargs):
+                    committed = original_commit(*args, **kwargs)
+                    commit_observed["value"] = True
+                    return committed
+
+                def fail_projection(metadata, *args, **kwargs):
+                    if projection_fault_active["value"] and commit_observed["value"]:
+                        raise OSError("synthetic Run-472 post-commit projection read failure")
+                    return original_projection(metadata, *args, **kwargs)
+
+                with (
+                    mock.patch.object(
+                        webapp,
+                        "commit_local_quote_publication",
+                        side_effect=mark_commit,
+                    ),
+                    mock.patch.object(
+                        webapp,
+                        "public_quote_session",
+                        side_effect=fail_projection,
+                    ),
+                ):
+                    red = webapp.run_quote_job(
+                        generation_payload("Run-472 red row", "run472-red-reference"),
+                        output_root=output_root,
+                        tmp_root=tmp_root,
+                        job_id="job-472-red",
+                    )
+                    self.assertEqual(red["status"], "completed", red)
+                    self.assertEqual(red["generation_outcome"], "committed")
+                    self.assertEqual(red["publication_outcome"], "committed")
+                    self.assertEqual(red["durable_commit"], "success")
+                    self.assertNotIn("files", red)
+                    self.assertEqual(
+                        {item["name"] for item in red["committed_files"]},
+                        {"quotation.xlsx", "quotation.pdf"},
+                    )
+                    warning = red["post_commit_projection"]
+                    self.assertEqual(warning["code"], "post_commit_projection_failed")
+                    self.assertTrue(warning["retryable"])
+                    self.assertEqual(red["quote_session"]["status"]["quote_generated"], True)
+                    self.assertEqual(red["quote_session"]["projection_status"], "unavailable")
+                    for kind in ("xlsx", "pdf"):
+                        self.assertIsNone(red["quote_session"]["exports"][kind]["exists"])
+                        self.assertIsNone(red["quote_session"]["exports"][kind]["url"])
+
+                    red_metadata = webapp.read_quote_session_metadata("quote-run472")
+                    red_publication_id = red_metadata["publication"]["active_publication_id"]
+                    self.assertNotEqual(red_publication_id, old_publication_id)
+                    self.assertEqual(
+                        red_metadata["publication"]["draft_files_publication_id"],
+                        red_publication_id,
+                    )
+                    red_draft_files = webapp.read_quote_session_draft_files(
+                        "quote-run472",
+                        red_metadata,
+                    )
+                    self.assertEqual(
+                        red_draft_files[0]["session_file_key"],
+                        "run472-red-reference",
+                    )
+                    self.assertEqual(
+                        webapp.quote_session_recorded_export_path(
+                            "quote-run472", "xlsx", red_metadata
+                        ).read_bytes(),
+                        b"run472-red-xlsx",
+                    )
+                    self.assertEqual(
+                        webapp.quote_session_recorded_export_path(
+                            "quote-run472", "pdf", red_metadata
+                        ).read_bytes(),
+                        b"run472-red-pdf",
+                    )
+                    self._assert_local_pair_downloads(
+                        runner,
+                        "quote-run472",
+                        b"run472-red-xlsx",
+                        b"run472-red-pdf",
+                    )
+
+                    connection = sqlite3.connect(data_root / "forensics.sqlite3")
+                    try:
+                        run_row = connection.execute(
+                            "select status from sqag_generation_runs where run_id = ?",
+                            (red["generation_run_id"],),
+                        ).fetchone()
+                        evidence = connection.execute(
+                            "select evidence_type, evidence_json from sqag_generation_evidence where run_id = ?",
+                            (red["generation_run_id"],),
+                        ).fetchall()
+                        events = connection.execute(
+                            "select event_type, event_status, purpose, failure_class from sqag_telemetry_events where run_reference = ?",
+                            (red["generation_run_id"],),
+                        ).fetchall()
+                        audits = connection.execute(
+                            "select event_type, event_json from sqag_audit_events where run_id = ?",
+                            (red["generation_run_id"],),
+                        ).fetchall()
+                    finally:
+                        connection.close()
+                    summaries = [
+                        json.loads(body)
+                        for evidence_type, body in evidence
+                        if evidence_type == "result_summary"
+                    ]
+                    manifests = [
+                        json.loads(body)
+                        for evidence_type, body in evidence
+                        if evidence_type == "generation_manifest"
+                    ]
+                    self.assertEqual(run_row[0], "completed")
+                    self.assertTrue(
+                        any(
+                            event_type == "generation"
+                            and event_status == "completed"
+                            for event_type, event_status, _purpose, _failure_class in events
+                        )
+                    )
+                    self.assertIn(
+                        ("publication", "completed", "publication_committed", None),
+                        events,
+                    )
+                    self.assertIn(
+                        (
+                            "publication",
+                            "failed",
+                            "post_commit_projection_failed",
+                            "storage",
+                        ),
+                        events,
+                    )
+                    self.assertFalse(
+                        any(
+                            event_type == "generation" and event_status == "failed"
+                            for event_type, event_status, _purpose, _failure_class in events
+                        )
+                    )
+                    self.assertTrue(summaries)
+                    self.assertTrue(manifests)
+                    summary = summaries[-1]
+                    manifest = manifests[-1]
+                    self.assertEqual(summary["status"], "completed")
+                    self.assertEqual(summary["publication_outcome"], "committed")
+                    self.assertEqual(summary["post_commit_projection"]["code"], warning["code"])
+                    self.assertTrue(summary["artifacts_durable"])
+                    self.assertEqual(manifest["terminal_state"], "completed")
+                    self.assertTrue(manifest["artifacts_durable"])
+                    self.assertEqual(manifest["publication_outcome"]["status"], "committed")
+                    self.assertEqual(
+                        manifest["post_commit_projection"]["code"],
+                        warning["code"],
+                    )
+                    self.assertEqual(manifest["transient_outputs"]["output_count"], 0)
+                    self.assertIn(
+                        "publication_committed",
+                        {event_type for event_type, _body in audits},
+                    )
+                    self.assertIn(
+                        "post_commit_projection_failed",
+                        {event_type for event_type, _body in audits},
+                    )
+                    projection_audit = next(
+                        json.loads(body)
+                        for event_type, body in audits
+                        if event_type == "post_commit_projection_failed"
+                    )
+                    self.assertEqual(
+                        projection_audit["publication_outcome"],
+                        "PUBLICATION_COMMITTED",
+                    )
+                    self.assertEqual(
+                        projection_audit["projection_outcome"],
+                        "POST_COMMIT_PROJECTION_FAILED",
+                    )
+
+                    projection_fault_active["value"] = False
+                    recovered = webapp.get_quote_session(
+                        "quote-run472",
+                        include_draft_state=True,
+                    )
+                    self.assertEqual(
+                        recovered["publication"]["active_publication_id"]
+                        if "publication" in recovered
+                        else red_publication_id,
+                        red_publication_id,
+                    )
+                    self.assertEqual(
+                        recovered["draft_files"][0]["session_file_key"],
+                        "run472-red-reference",
+                    )
+                    self.assertEqual(
+                        {item["name"] for item in webapp.quote_session_result_files(recovered)},
+                        {"quotation.xlsx", "quotation.pdf"},
+                    )
+                    endpoint_status, endpoint_body = local_http_get_json(
+                        runner,
+                        "/api/quote-sessions/quote-run472",
+                    )
+                    self.assertEqual(endpoint_status, 200, endpoint_body)
+                    self.assertEqual(
+                        {item["name"] for item in webapp.quote_session_result_files(endpoint_body["quote_session"])},
+                        {"quotation.xlsx", "quotation.pdf"},
+                    )
+
+                    projection_fault_active["value"] = True
+                    persistent = webapp.run_quote_job(
+                        generation_payload(
+                            "Run-472 persistent projection row",
+                            "run472-persistent-reference",
+                        ),
+                        output_root=output_root,
+                        tmp_root=tmp_root,
+                        job_id="job-472-persistent",
+                    )
+                    self.assertEqual(persistent["status"], "completed", persistent)
+                    self.assertEqual(
+                        persistent["post_commit_projection"]["code"],
+                        "post_commit_projection_failed",
+                    )
+                    persistent_status, persistent_body = local_http_get_json(
+                        runner,
+                        "/api/quote-sessions/quote-run472",
+                    )
+                    self.assertEqual(persistent_status, 503, persistent_body)
+                    self.assertEqual(
+                        persistent_body["error_code"],
+                        "post_commit_projection_failed",
+                    )
+                    persistent_metadata = webapp.read_quote_session_metadata("quote-run472")
+                    persistent_publication_id = persistent_metadata["publication"]["active_publication_id"]
+                    self.assertNotEqual(persistent_publication_id, red_publication_id)
+                    self.assertEqual(
+                        webapp.quote_session_recorded_export_path(
+                            "quote-run472", "xlsx", persistent_metadata
+                        ).read_bytes(),
+                        b"run472-persistent-xlsx",
+                    )
+
+                final_session = webapp.get_quote_session(
+                    "quote-run472",
+                    include_draft_state=True,
+                )
+                self.assertEqual(
+                    final_session["draft_files"][0]["session_file_key"],
+                    "run472-persistent-reference",
+                )
+                self.assertEqual(
+                    {item["name"] for item in webapp.quote_session_result_files(final_session)},
+                    {"quotation.xlsx", "quotation.pdf"},
+                )
+                self._assert_local_pair_downloads(
+                    runner,
+                    "quote-run472",
+                    b"run472-persistent-xlsx",
+                    b"run472-persistent-pdf",
+                )
+
+    def test_local_publication_f1_xlsx_staging_failure_keeps_old_pair(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            old_xlsx = b"old-xlsx-f1"
+            old_pdf = b"old-pdf-f1"
+            new_payload, new_result, new_output = self._local_publication_case(
+                root, "quote-f1a", b"new-xlsx-f1", b"new-pdf-f1", variant="new"
+            )
+            old_payload, old_result, old_output = self._local_publication_case(
+                root, "quote-f1a", old_xlsx, old_pdf, variant="old"
+            )
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+                webapp.create_or_update_quote_session(old_payload, result=old_result, output_dir=old_output)
+                old_metadata = webapp.read_quote_session_metadata("quote-f1a")
+
+                def fail_xlsx(_source, destination):
+                    Path(destination).write_bytes(b"partial-xlsx-f1")
+                    raise OSError("synthetic XLSX staging failure")
+
+                with self.assertRaises(OSError):
+                    with mock.patch.object(webapp.shutil, "copy2", side_effect=fail_xlsx):
+                        webapp.create_or_update_quote_session(
+                            new_payload,
+                            result=new_result,
+                            output_dir=new_output,
+                        )
+
+                current = webapp.read_quote_session_metadata("quote-f1a")
+                self.assertEqual(
+                    current["publication"]["active_publication_id"],
+                    old_metadata["publication"]["active_publication_id"],
+                )
+                self.assertEqual(webapp.quote_session_export_path("quote-f1a", "xlsx").read_bytes(), old_xlsx)
+                self.assertEqual(webapp.quote_session_export_path("quote-f1a", "pdf").read_bytes(), old_pdf)
+                self._assert_local_pair_downloads(runner, "quote-f1a", old_xlsx, old_pdf)
+
+    def test_local_publication_f2_pdf_staging_failure_keeps_old_pair(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            old_xlsx = b"old-xlsx-f2"
+            old_pdf = b"old-pdf-f2"
+            new_payload, new_result, new_output = self._local_publication_case(
+                root, "quote-f2a", b"new-xlsx-f2", b"new-pdf-f2", variant="new"
+            )
+            old_payload, old_result, old_output = self._local_publication_case(
+                root, "quote-f2a", old_xlsx, old_pdf, variant="old"
+            )
+            original_copy2 = webapp.shutil.copy2
+
+            def fail_pdf(source, destination):
+                if Path(source).name == "quotation.pdf":
+                    Path(destination).write_bytes(b"partial-pdf-f2")
+                    raise OSError("synthetic PDF staging failure")
+                return original_copy2(source, destination)
+
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+                webapp.create_or_update_quote_session(old_payload, result=old_result, output_dir=old_output)
+                old_metadata = webapp.read_quote_session_metadata("quote-f2a")
+                with self.assertRaises(OSError):
+                    with mock.patch.object(webapp.shutil, "copy2", side_effect=fail_pdf):
+                        webapp.create_or_update_quote_session(
+                            new_payload,
+                            result=new_result,
+                            output_dir=new_output,
+                        )
+                current = webapp.read_quote_session_metadata("quote-f2a")
+                self.assertEqual(
+                    current["publication"]["active_publication_id"],
+                    old_metadata["publication"]["active_publication_id"],
+                )
+                self.assertEqual(webapp.quote_session_export_path("quote-f2a", "xlsx").read_bytes(), old_xlsx)
+                self.assertEqual(webapp.quote_session_export_path("quote-f2a", "pdf").read_bytes(), old_pdf)
+                self._assert_local_pair_downloads(runner, "quote-f2a", old_xlsx, old_pdf)
+
+    def test_local_publication_f3_precommit_failure_keeps_old_pair(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            old_xlsx = b"old-xlsx-f3"
+            old_pdf = b"old-pdf-f3"
+            new_payload, new_result, new_output = self._local_publication_case(
+                root, "quote-f3a", b"new-xlsx-f3", b"new-pdf-f3", variant="new"
+            )
+            old_payload, old_result, old_output = self._local_publication_case(
+                root, "quote-f3a", old_xlsx, old_pdf, variant="old"
+            )
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+                webapp.create_or_update_quote_session(old_payload, result=old_result, output_dir=old_output)
+                old_metadata = webapp.read_quote_session_metadata("quote-f3a")
+                with self.assertRaises(RuntimeError):
+                    with mock.patch.object(
+                        webapp,
+                        "commit_local_quote_publication",
+                        side_effect=RuntimeError("synthetic pre-commit failure"),
+                    ):
+                        webapp.create_or_update_quote_session(
+                            new_payload,
+                            result=new_result,
+                            output_dir=new_output,
+                        )
+                current = webapp.read_quote_session_metadata("quote-f3a")
+                self.assertEqual(
+                    current["publication"]["active_publication_id"],
+                    old_metadata["publication"]["active_publication_id"],
+                )
+                self.assertEqual(webapp.quote_session_export_path("quote-f3a", "xlsx").read_bytes(), old_xlsx)
+                self.assertEqual(webapp.quote_session_export_path("quote-f3a", "pdf").read_bytes(), old_pdf)
+                self._assert_local_pair_downloads(runner, "quote-f3a", old_xlsx, old_pdf)
+
+    def test_local_publication_f4_metadata_pointer_failure_keeps_parseable_old_state(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            old_xlsx = b"old-xlsx-f4"
+            old_pdf = b"old-pdf-f4"
+            new_payload, new_result, new_output = self._local_publication_case(
+                root, "quote-f4a", b"new-xlsx-f4", b"new-pdf-f4", variant="new"
+            )
+            old_payload, old_result, old_output = self._local_publication_case(
+                root, "quote-f4a", old_xlsx, old_pdf, variant="old"
+            )
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+                webapp.create_or_update_quote_session(old_payload, result=old_result, output_dir=old_output)
+                metadata_path = webapp.quote_session_metadata_path("quote-f4a").resolve()
+                old_metadata_bytes = metadata_path.read_bytes()
+                original_replace = webapp.os.replace
+
+                def fail_metadata_pointer(source, destination):
+                    if Path(destination).resolve() == metadata_path:
+                        raise OSError("synthetic metadata pointer commit failure")
+                    return original_replace(source, destination)
+
+                with self.assertRaises(OSError):
+                    with mock.patch.object(webapp.os, "replace", side_effect=fail_metadata_pointer):
+                        webapp.create_or_update_quote_session(
+                            new_payload,
+                            result=new_result,
+                            output_dir=new_output,
+                        )
+                self.assertEqual(metadata_path.read_bytes(), old_metadata_bytes)
+                current = webapp.read_quote_session_metadata("quote-f4a")
+                self.assertEqual(current["session_id"], "quote-f4a")
+                self.assertEqual(webapp.quote_session_export_path("quote-f4a", "xlsx").read_bytes(), old_xlsx)
+                self.assertEqual(webapp.quote_session_export_path("quote-f4a", "pdf").read_bytes(), old_pdf)
+                self._assert_local_pair_downloads(runner, "quote-f4a", old_xlsx, old_pdf)
+
+    def test_local_publication_f5_partial_set_never_exposes_mixed_pair(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            old_xlsx = b"old-xlsx-f5"
+            old_pdf = b"old-pdf-f5"
+            new_payload, new_result, new_output = self._local_publication_case(
+                root, "quote-f5a", b"new-xlsx-f5", b"new-pdf-f5", variant="new"
+            )
+            old_payload, old_result, old_output = self._local_publication_case(
+                root, "quote-f5a", old_xlsx, old_pdf, variant="old"
+            )
+            original_copy2 = webapp.shutil.copy2
+
+            def interrupt_after_staged_xlsx(source, destination):
+                result = original_copy2(source, destination)
+                if Path(source).name == "quotation.xlsx":
+                    raise RuntimeError("synthetic interruption after staged XLSX")
+                return result
+
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+                webapp.create_or_update_quote_session(old_payload, result=old_result, output_dir=old_output)
+                old_metadata = webapp.read_quote_session_metadata("quote-f5a")
+                with self.assertRaises(RuntimeError):
+                    with mock.patch.object(webapp.shutil, "copy2", side_effect=interrupt_after_staged_xlsx):
+                        webapp.create_or_update_quote_session(
+                            new_payload,
+                            result=new_result,
+                            output_dir=new_output,
+                        )
+                current = webapp.read_quote_session_metadata("quote-f5a")
+                self.assertEqual(
+                    current["publication"]["active_publication_id"],
+                    old_metadata["publication"]["active_publication_id"],
+                )
+                self.assertNotEqual(webapp.quote_session_export_path("quote-f5a", "xlsx").read_bytes(), b"new-xlsx-f5")
+                self.assertNotEqual(webapp.quote_session_export_path("quote-f5a", "pdf").read_bytes(), b"new-pdf-f5")
+                self._assert_local_pair_downloads(runner, "quote-f5a", old_xlsx, old_pdf)
+
+    def test_local_publication_f6_success_commits_complete_pair_as_one_generation(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            old_xlsx = b"old-xlsx-f6"
+            old_pdf = b"old-pdf-f6"
+            new_xlsx = b"new-xlsx-f6"
+            new_pdf = b"new-pdf-f6"
+            new_payload, new_result, new_output = self._local_publication_case(
+                root, "quote-f6a", new_xlsx, new_pdf, variant="new"
+            )
+            old_payload, old_result, old_output = self._local_publication_case(
+                root, "quote-f6a", old_xlsx, old_pdf, variant="old"
+            )
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+                webapp.create_or_update_quote_session(old_payload, result=old_result, output_dir=old_output)
+                old_metadata = webapp.read_quote_session_metadata("quote-f6a")
+                new_session = webapp.create_or_update_quote_session(
+                    new_payload, result=new_result, output_dir=new_output
+                )
+                current = webapp.read_quote_session_metadata("quote-f6a")
+                publication_id = current["publication"]["active_publication_id"]
+                self.assertNotEqual(publication_id, old_metadata["publication"]["active_publication_id"])
+                self.assertEqual(current["exports"]["xlsx"]["publication_id"], publication_id)
+                self.assertEqual(current["exports"]["pdf"]["publication_id"], publication_id)
+                for kind, expected in (("xlsx", new_xlsx), ("pdf", new_pdf)):
+                    export = current["exports"][kind]
+                    self.assertEqual(export["size_bytes"], len(expected))
+                    self.assertEqual(export["sha256"], hashlib.sha256(expected).hexdigest())
+                    self.assertFalse(export["stale"])
+                self.assertTrue(new_session["status"]["quote_generated"])
+                self.assertEqual(
+                    {item["name"] for item in webapp.quote_session_result_files(new_session)},
+                    {"quotation.xlsx", "quotation.pdf"},
+                )
+                self._assert_local_pair_downloads(runner, "quote-f6a", new_xlsx, new_pdf)
+
+    def test_local_legacy_publication_stays_downloadable_and_migrates_safely(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            session_id = "quote-legacy-publication"
+            legacy_xlsx = b"legacy-stale-xlsx"
+            legacy_pdf = b"legacy-stale-pdf"
+            new_xlsx = b"migrated-xlsx"
+            new_pdf = b"migrated-pdf"
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+                legacy_dir = webapp.quote_session_export_dir(session_id)
+                legacy_dir.mkdir(parents=True, exist_ok=True)
+                (legacy_dir / "quotation.xlsx").write_bytes(legacy_xlsx)
+                (legacy_dir / "quotation.pdf").write_bytes(legacy_pdf)
+                legacy_metadata = webapp.blank_quote_session_metadata(session_id, "2026-01-01T00:00:00Z")
+                for kind, content in (("xlsx", legacy_xlsx), ("pdf", legacy_pdf)):
+                    legacy_metadata["exports"][kind] = {
+                        "filename": webapp.QUOTE_SESSION_EXPORT_KINDS[kind],
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                        "size_bytes": len(content),
+                        "stale": True,
+                    }
+                    legacy_metadata["status"][f"{kind}_exported"] = True
+                webapp.write_quote_session_metadata(legacy_metadata)
+                stale = webapp.get_quote_session(session_id)
+                self.assertTrue(stale["exports"]["xlsx"]["stale"])
+                self.assertTrue(stale["exports"]["pdf"]["stale"])
+                self.assertEqual(webapp.quote_session_result_files(stale), [])
+                self._assert_local_pair_downloads(runner, session_id, legacy_xlsx, legacy_pdf)
+
+                new_payload, new_result, new_output = self._local_publication_case(
+                    root, session_id, new_xlsx, new_pdf, variant="new"
+                )
+                original_copy2 = webapp.shutil.copy2
+
+                def fail_legacy_migration(source, destination):
+                    if Path(source).name == "quotation.xlsx":
+                        Path(destination).write_bytes(b"partial-legacy-migration")
+                        raise OSError("synthetic legacy migration failure")
+                    return original_copy2(source, destination)
+
+                with self.assertRaises(OSError):
+                    with mock.patch.object(webapp.shutil, "copy2", side_effect=fail_legacy_migration):
+                        webapp.create_or_update_quote_session(
+                            new_payload, result=new_result, output_dir=new_output
+                        )
+                self._assert_local_pair_downloads(runner, session_id, legacy_xlsx, legacy_pdf)
+                migrated = webapp.create_or_update_quote_session(
+                    new_payload, result=new_result, output_dir=new_output
+                )
+                self.assertFalse(migrated["exports"]["xlsx"]["stale"])
+                self.assertFalse(migrated["exports"]["pdf"]["stale"])
+                self.assertEqual(
+                    migrated["exports"]["xlsx"]["publication_id"],
+                    migrated["exports"]["pdf"]["publication_id"],
+                )
+                self._assert_local_pair_downloads(runner, session_id, new_xlsx, new_pdf)
+
     def test_quote_session_draft_update_marks_existing_exports_stale(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -12431,6 +14946,18 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                     "activeSidePanel": "output",
                     "outputRows": [{"description": "Modified row", "amount": 200}],
                     "outputRevision": 1,
+                    "downloadFile": {
+                        "name": "quotation.xlsx",
+                        "url": "/api/jobs/job-stale/files/quotation.xlsx",
+                        "output_revision": 0,
+                    },
+                    "pdfFile": {
+                        "name": "quotation.pdf",
+                        "url": "/api/jobs/job-stale/files/quotation.pdf",
+                        "output_revision": 0,
+                    },
+                    "downloadFileRevision": 0,
+                    "pdfFileRevision": 0,
                 },
             }
             no_export_payload = valid_payload()
@@ -12445,10 +14972,48 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 },
             }
 
-            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
                 generated = webapp.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
                 stale = webapp.create_or_update_quote_session(stale_payload)
+                stale_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-stale/download/{kind}",
+                    )
+                    for kind in ("xlsx", "pdf")
+                }
+                persisted_stale = webapp.get_quote_session("quote-stale", include_draft_state=True)
+                blocked = webapp.create_or_update_quote_session(
+                    stale_payload,
+                    result={"status": "needs_confirmation", "errors": ["Price review required."], "files": []},
+                )
+                blocked_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-stale/download/{kind}",
+                    )
+                    for kind in ("xlsx", "pdf")
+                }
+                failed = webapp.create_or_update_quote_session(
+                    stale_payload,
+                    result={"status": "failed", "errors": ["Synthetic generation failure."], "files": []},
+                )
+                failed_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-stale/download/{kind}",
+                    )
+                    for kind in ("xlsx", "pdf")
+                }
+                stale_download_path = webapp.LocalSqagStorage().quote_session_export_file_path("quote-stale", "xlsx")
                 regenerated = webapp.create_or_update_quote_session(stale_payload, result=result, output_dir=output_dir)
+                fresh_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-stale/download/{kind}",
+                    )
+                    for kind in ("xlsx", "pdf")
+                }
                 post_generate_payload = valid_payload()
                 post_generate_payload["quote_session"] = {
                     **stale_payload["quote_session"],
@@ -12481,15 +15046,40 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
             self.assertFalse(stale["status"]["quote_generated"])
             self.assertTrue(stale["status"]["draft_modified"])
             self.assertEqual(stale["exports"]["xlsx"]["filename"], "quotation.xlsx")
-            self.assertFalse(stale["exports"]["xlsx"]["exists"])
+            self.assertTrue(stale["exports"]["xlsx"]["exists"])
             self.assertTrue(stale["exports"]["xlsx"]["stale"])
-            self.assertIsNone(stale["exports"]["xlsx"]["url"])
-            self.assertFalse(stale["exports"]["pdf"]["exists"])
+            self.assertEqual(stale["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-stale/download/xlsx")
+            self.assertTrue(stale["exports"]["pdf"]["exists"])
             self.assertTrue(stale["exports"]["pdf"]["stale"])
+            self.assertEqual(stale["exports"]["pdf"]["url"], "/api/quote-sessions/quote-stale/download/pdf")
+            for attempted in (stale, blocked, failed):
+                self.assertTrue(attempted["exports"]["xlsx"]["exists"])
+                self.assertTrue(attempted["exports"]["xlsx"]["stale"])
+                self.assertEqual(attempted["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-stale/download/xlsx")
+                self.assertTrue(attempted["exports"]["pdf"]["exists"])
+                self.assertTrue(attempted["exports"]["pdf"]["stale"])
+                self.assertEqual(attempted["exports"]["pdf"]["url"], "/api/quote-sessions/quote-stale/download/pdf")
+                self.assertEqual(webapp.quote_session_result_files(attempted), [])
+            self.assertTrue(stale_download_path.is_file())
+            self.assertEqual(stale_download_path.read_bytes(), b"xlsx")
+            for downloads in (stale_downloads, blocked_downloads, failed_downloads):
+                self.assertEqual(downloads["xlsx"], (200, b"xlsx"))
+                self.assertEqual(downloads["pdf"], (200, b"pdf"))
             self.assertNotIn(str(tmp_path), json.dumps(stale))
+            self.assertIsNotNone(persisted_stale)
+            self.assertEqual(
+                persisted_stale["draft_state"]["downloadFile"]["url"],
+                "/api/jobs/job-stale/files/quotation.xlsx",
+            )
+            self.assertEqual(
+                persisted_stale["draft_state"]["pdfFile"]["url"],
+                "/api/jobs/job-stale/files/quotation.pdf",
+            )
             self.assertTrue(regenerated["status"]["quote_generated"])
             self.assertTrue(regenerated["exports"]["xlsx"]["exists"])
             self.assertFalse(regenerated["exports"]["xlsx"]["stale"])
+            self.assertEqual(fresh_downloads["xlsx"], (200, b"xlsx"))
+            self.assertEqual(fresh_downloads["pdf"], (200, b"pdf"))
             self.assertTrue(saved_after_generate["status"]["quote_generated"])
             self.assertFalse(saved_after_generate["status"].get("draft_modified", False))
             self.assertTrue(saved_after_generate["exports"]["xlsx"]["exists"])
@@ -12554,9 +15144,12 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                     metadata["updated_at"] = "2026-01-03T00:00:00Z"
                     metadata["exports"]["xlsx"]["created_at"] = "2026-01-02T00:00:00Z"
                     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-                    with self.assertRaises(urllib.error.HTTPError) as error:
-                        urllib.request.urlopen(f"{runner.base_url}/api/quote-sessions/quote-api/download/xlsx", timeout=3)
-                    self.assertEqual(error.exception.code, 404)
+                    with urllib.request.urlopen(
+                        f"{runner.base_url}/api/quote-sessions/quote-api/download/xlsx",
+                        timeout=3,
+                    ) as response:
+                        self.assertEqual(response.status, 200)
+                        self.assertEqual(response.read(), b"xlsx")
 
                     for path in (
                         "/api/quote-sessions/quote-api/download/docx",
@@ -13018,7 +15611,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertIn("dashboardSessionProjectNumberText(session)", search_body)
         self.assertIn("<dt>Currency / FX</dt>", js)
         self.assertIn("<dt>Tax / Rate</dt>", js)
-        self.assertIn("FX ${quoteExchangeRateText(activeSession.commercials?.exchange_rate ?? 1)}", js)
+        self.assertIn("FX ${quoteExchangeRateText(activeSession.commercials?.exchange_rate)}", js)
         selected_grid = js.split('<dl class="dashboard-selected-summary-grid">', 1)[1].split("</dl>", 1)[0]
         self.assertLess(selected_grid.index("<dt>Subtotal</dt>"), selected_grid.index("<dt>Currency / FX</dt>"))
         self.assertLess(selected_grid.index("<dt>Currency / FX</dt>"), selected_grid.index("<dt>Pricing Reference</dt>"))
@@ -13434,7 +16027,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertNotIn('id="taxRate"', html)
         self.assertIn("if (elements.taxLabel) elements.taxLabel.value", js)
         self.assertIn("selectableTemplateProfilePresets", js)
-        self.assertIn('.filter((preset) => preset.id !== "default")', js)
+        self.assertIn('.filter((preset) => preset.source === "profile" && preset.profile_id && preset.id !== "default")', js)
         self.assertNotIn("defaultOption", js)
         self.assertIn('`<optgroup label="Saved Profiles">', js)
         self.assertNotIn("Profile Pricing References", js)
@@ -13591,7 +16184,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertNotIn(".quote-details-clear-button", css)
         self.assertIn("loadDefaultProfilePreset", js)
         self.assertIn("loadDefaultProfilePreset({ silent: true })", js)
-        self.assertIn("loadDefaultProfilePreset({ silent: true, preferLastSelection: false })", js)
+        self.assertIn("loadDefaultProfilePreset({ silent: true, preferLastSelection: false, allowOwnedInitialization: true })", js)
         self.assertIn("function resetImagesDraft", js)
         self.assertIn("state.images = [];", js)
         self.assertIn('id="savePresetButton"', html)
@@ -15010,8 +17603,10 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertLess(save_index, terminal_clear_index)
         self.assertLess(terminal_clear_index, ready_index)
         self.assertIn("showGeneratedExportReadyModal(viewPdf)", resumed_generation_body)
+        self.assertIn("data.committed_files || []", resumed_generation_body)
+        self.assertIn("data.files || []", resumed_generation_body)
         self.assertLess(
-            resumed_generation_body.index("setDownloadFiles(data.files || [])"),
+            resumed_generation_body.index("data.files || []"),
             resumed_generation_body.index("showGeneratedExportReadyModal(viewPdf)"),
         )
         self.assertIn("hideExcelGeneratingModal();", resumed_generation_body)
@@ -15264,10 +17859,15 @@ function extractFunction(name) {
   throw new Error(`Unclosed function ${name}`);
 }
 
+const DEFAULT_TAX_LABEL = "GST";
+const DEFAULT_TAX_RATE = 0.09;
+const DEFAULT_CURRENCY_LABEL = "SGD";
 eval(extractFunction("pricingMatchStatus"));
 eval(extractFunction("pricingStatusLabel"));
 eval(extractFunction("numberOrNull"));
 eval(extractFunction("orderNumber"));
+eval(extractFunction("normalizeTaxRate"));
+eval(extractFunction("taxRatePercentText"));
 function normalizeCategoryTitle(value = "") {
   return String(value || "").trim();
 }
@@ -15280,10 +17880,14 @@ function outputCellDisplayValue(row, field) {
   if (field === "amount") return row.amount === "" || row.amount === undefined || row.amount === null ? "???" : String(row.amount);
   return String(row[field] || "");
 }
+const state = { quoteCommercialLifecycle: "NEW_UNINITIALISED", outputRows: [] };
+eval(extractFunction("commercialTaxRateOrNull"));
 eval(extractFunction("effectiveOutputUnitPrice"));
+eval(extractFunction("roundCommercialCents"));
 eval(extractFunction("recalculateOutputRow"));
 eval(extractFunction("normalizeOutputRow"));
 eval(extractFunction("unitPriceEditKind"));
+eval(extractFunction("synchronizeOwnedOutputRowPrice"));
 eval(extractFunction("outputRowsValid"));
 eval(extractFunction("outputQuantityPartsFromPricingMatch"));
 eval(extractFunction("outputRowFromPricingMatch"));
@@ -15303,9 +17907,12 @@ function collectQuoteExchangeRate() {
 eval(extractFunction("quoteFxMultiplier"));
 eval(extractFunction("quoteAmountValue"));
 eval(extractFunction("formatSubtotalValue"));
-function collectTaxDetails() {
-  return { label: "GST", rate: 0.09 };
-}
+let taxLabel = "GST";
+let taxRate = 0.09;
+function collectTaxDetails() { return { label: taxLabel, rate: taxRate }; }
+eval(extractFunction("quoteCommercialTaxText"));
+eval(extractFunction("dashboardCommercialsFromState"));
+eval(extractFunction("dashboardTaxRateText"));
 eval(extractFunction("formatOutputTotalValue"));
 
 const rows = [
@@ -15347,6 +17954,46 @@ assert.strictEqual(rowNeedsManualInput(zeroManualRow), false);
 assert.deepStrictEqual(outputRowsValid([zeroManualRow]), { valid: true, errors: [] });
 assert.strictEqual(formatSubtotalValue({ total: 6480, totalPending: false }), "SGD 6,480.00");
 assert.strictEqual(formatOutputTotalValue({ total: 6480, totalPending: false }), "SGD 7,063.20");
+
+const recoveredRow = {
+  section: "Saved Floors",
+  description: "Captured carpet",
+  quantity: 2,
+  unit: "sqm",
+  price_mode: "Priced",
+  pricing_keyword: "saved-carpet",
+  effective_unit_price: 100,
+  unit_price_override: 100,
+  amount: 200,
+};
+state.quoteCommercialLifecycle = "RECOVERED";
+quoteCurrency = "USD";
+fxRate = 1.37;
+taxRate = null;
+assert.strictEqual(commercialTaxRateOrNull(null), null);
+assert.strictEqual(commercialTaxRateOrNull(""), null);
+assert.strictEqual(commercialTaxRateOrNull(0), 0);
+state.outputRows = [recoveredRow];
+const missingTaxStats = matchSummaryStats(state.outputRows);
+assert.strictEqual(missingTaxStats.totalPending, true);
+assert.strictEqual(formatOutputTotalValue(missingTaxStats), "USD - + ???");
+assert.strictEqual(formatOutputTotalValue({ total: 274, totalPending: false }), "USD - + ???");
+assert.strictEqual(quoteCommercialTaxText(), "Review required");
+const missingTaxDashboard = dashboardCommercialsFromState();
+assert.strictEqual(missingTaxDashboard.tax_rate, null);
+assert.strictEqual(dashboardTaxRateText({ commercials: missingTaxDashboard }), "Review required");
+assert.strictEqual(dashboardTaxRateText({ commercials: { tax_rate: "" } }), "Review required");
+taxRate = 0;
+const zeroTaxStats = matchSummaryStats(state.outputRows);
+assert.strictEqual(zeroTaxStats.totalPending, false);
+assert.strictEqual(quoteCommercialTaxText(), "GST 0%");
+assert.strictEqual(dashboardTaxRateText({ commercials: { tax_rate: 0 } }), "0%");
+state.quoteCommercialLifecycle = "NEW_UNINITIALISED";
+state.outputRows = [];
+quoteCurrency = "SGD";
+fxRate = 1;
+taxRate = 0.09;
+
 quoteCurrency = "AUD";
 fxRate = 2;
 const fxStats = matchSummaryStats([{ price_mode: "Priced", description: "FX row", quantity: 1, pricing_keyword: "fx", catalog_unit_price: 100, amount: 100 }]);
@@ -15731,6 +18378,7 @@ eval([
   "safeProfileId",
   "safeProfileLabel",
   "profilePresetOptionValue",
+  "profilePresetOptionParts",
   "companyProfileOptionValue",
   "currentProfile",
   "templateProfilePresets",
@@ -15741,9 +18389,12 @@ eval([
   "defaultPresetOptionValue",
   "safeLastSelectionJson",
   "currentBrowserRecoveryScope",
+  "presetOptionValue",
   "availablePresetValues",
   "lastSelectedPresetValue",
+  "preservedOwnedPresetValue",
   "renderPresetOptions",
+  "loadDefaultProfilePreset",
 ].map(extractFunction).join("\n"));
 
 renderPresetOptions();
@@ -15751,19 +18402,58 @@ assert.strictEqual(state.selectedPresetValue, "company:saved-profile");
 assert.strictEqual(elements.presetSelect.value, "company:saved-profile");
 assert.ok(!elements.presetSelect.innerHTML.includes("Default Profile"));
 
-savedSelection = JSON.stringify({ browserRecoveryScope: "scope-a", presetValue: "company:missing-profile" });
-state.selectedPresetValue = "";
-elements.presetSelect.value = "";
+state.companyProfiles = [{ id: "other-company", label: "Other Company", defaults: { company: { name: "Other" } } }];
+state.selectedPresetValue = "company:saved-company";
+elements.presetSelect.value = "company:other-company";
+savedSelection = JSON.stringify({ browserRecoveryScope: "scope-a", presetValue: "company:other-company" });
+state.quoteCommercialLifecycle = "RECOVERED";
 renderPresetOptions();
-assert.strictEqual(state.selectedPresetValue, "");
+assert.strictEqual(state.selectedPresetValue, "company:saved-company");
+assert.strictEqual(elements.presetSelect.value, "");
+loadDefaultProfilePreset();
+assert.strictEqual(state.selectedPresetValue, "company:saved-company");
 assert.strictEqual(elements.presetSelect.value, "");
 
-savedSelection = JSON.stringify({ browserRecoveryScope: "scope-a", presetValue: "profile:trade-show" });
+savedSelection = JSON.stringify({ browserRecoveryScope: "scope-a", presetValue: "company:missing-profile" });
+state.selectedPresetValue = "company:missing-profile";
+elements.presetSelect.value = "";
+state.quoteCommercialLifecycle = "RECOVERED";
+renderPresetOptions();
+assert.strictEqual(state.selectedPresetValue, "company:missing-profile");
+assert.strictEqual(elements.presetSelect.value, "");
+
+state.profiles = [{
+  id: "owner-b",
+  label: "Owner B",
+  quote_detail_presets: [{ id: "shared", name: "Owner B Shared", details: {} }],
+}];
+state.companyProfiles = [];
+state.selectedPresetValue = "profile:owner-a:shared";
+elements.presetSelect.value = "profile:owner-b:shared";
+savedSelection = JSON.stringify({ browserRecoveryScope: "scope-a", presetValue: "profile:owner-b:shared" });
+state.quoteCommercialLifecycle = "RECOVERED";
+renderPresetOptions();
+assert.strictEqual(state.selectedPresetValue, "profile:owner-a:shared");
+assert.strictEqual(elements.presetSelect.value, "");
+loadDefaultProfilePreset();
+assert.strictEqual(state.selectedPresetValue, "profile:owner-a:shared");
+assert.strictEqual(elements.presetSelect.value, "");
+
+state.profiles = [{
+  id: "quote-layout",
+  label: "Quote Layout",
+  quote_detail_presets: [
+    { id: "default", name: "Default Profile", details: {} },
+    { id: "trade-show", name: "Trade Show", details: {} },
+  ],
+}];
+state.companyProfiles = [{ id: "saved-profile", label: "Saved Profile", defaults: { company: { name: "Saved" } } }];
+savedSelection = JSON.stringify({ browserRecoveryScope: "scope-a", presetValue: "profile:quote-layout:trade-show" });
 state.selectedPresetValue = "";
 elements.presetSelect.value = "";
 renderPresetOptions();
-assert.strictEqual(state.selectedPresetValue, "profile:trade-show");
-assert.strictEqual(elements.presetSelect.value, "profile:trade-show");
+assert.strictEqual(state.selectedPresetValue, "profile:quote-layout:trade-show");
+assert.strictEqual(elements.presetSelect.value, "profile:quote-layout:trade-show");
 """
         completed = subprocess.run(
             [node, "-e", script],
@@ -16164,9 +18854,19 @@ assert.strictEqual(dashboardExportAvailabilityItem(mixed, "pdf", "PDF").statusTe
 
 const stale = {
   status: { quote_generated: false, draft_modified: true },
-  exports: { xlsx: { stale: true, filename: "quotation.xlsx" }, pdf: { stale: true, filename: "quotation.pdf" } },
+  exports: {
+    xlsx: { exists: true, stale: true, url: "/old-quote.xlsx", filename: "quotation.xlsx" },
+    pdf: { exists: true, stale: true, url: "/old-quote.pdf", filename: "quotation.pdf" },
+  },
 };
-assert.strictEqual(dashboardExportAvailabilityItem(stale, "xlsx", "XLSX").statusText, "XLSX needs regeneration");
+assert.strictEqual(dashboardExportAvailabilityItem(stale, "xlsx", "XLSX").statusText, "XLSX stale - needs regeneration");
+assert.strictEqual(quoteSessionHasAvailableExport(stale), false);
+assert.strictEqual(dashboardExportAvailabilityItem(stale, "xlsx", "XLSX").available, true);
+const staleAction = dashboardSelectedExportAction(stale, "xlsx", "XLSX");
+assert.strictEqual(visibleText(staleAction), "Download XLSX (stale)");
+assert.ok(staleAction.includes('title="XLSX stale - needs regeneration"'));
+assert.ok(staleAction.includes('aria-label="Download XLSX (stale; needs regeneration)"'));
+assert.ok(staleAction.includes("is-stale"));
 assert.deepStrictEqual(quoteSessionStatus(stale), { key: "draft-modified", label: "Draft Modified", className: "is-draft-modified" });
 
 const partialFresh = {
@@ -16627,6 +19327,7 @@ function extractFunction(name) {
   throw new Error(`Unclosed function ${name}`);
 }
 
+const COMPANY_PROFILE_PRESET_PREFIX = "company:";
 const state = { selectedPresetValue: "" };
 const elements = { presetSelect: { value: "" } };
 const loaded = [];
@@ -16635,8 +19336,9 @@ function defaultPresetOptionValue() { return "profile:default"; }
 function availablePresetValues() { return new Set(["company:saved-profile"]); }
 function updatePresetButtons() {}
 function loadSelectedPreset(options = {}) { loaded.push({ value: state.selectedPresetValue, options }); }
+function profilePresetOptionParts() { return null; }
 
-eval(extractFunction("loadDefaultProfilePreset"));
+eval([extractFunction("preservedOwnedPresetValue"), extractFunction("loadDefaultProfilePreset")].join("\n"));
 
 loadDefaultProfilePreset({ silent: true });
 assert.strictEqual(state.selectedPresetValue, "company:saved-profile");
@@ -16689,7 +19391,7 @@ function extractFunction(name) {
 const PROFILE_PRESET_PREFIX = "profile:";
 const COMPANY_PROFILE_PRESET_PREFIX = "company:";
 const state = {
-  selectedPresetValue: "profile:default",
+  selectedPresetValue: "profile:default:default",
   profiles: [{
     id: "default",
     label: "Default",
@@ -16703,7 +19405,7 @@ const state = {
   outputRows: [],
 };
 const elements = {
-  presetSelect: { value: "profile:default" },
+  presetSelect: { value: "profile:default:default" },
   headerDetails: { value: "Custom header" },
   paymentTerms: { value: "Custom payment" },
   standardNotes: { value: "Custom notes" },
@@ -16745,6 +19447,7 @@ eval([
   "safeProfileId",
   "safeProfileLabel",
   "profilePresetOptionValue",
+  "profilePresetOptionParts",
   "companyProfileOptionValue",
   "selectedPresetId",
   "templateProfilePresets",
@@ -16757,7 +19460,7 @@ eval([
 
 loadSelectedPreset();
 
-assert.strictEqual(state.selectedPresetValue, "profile:default");
+assert.strictEqual(state.selectedPresetValue, "profile:default:default");
 assert.strictEqual(clearedPendingPack, true);
 assert.deepStrictEqual(appliedDetails, {});
 assert.deepStrictEqual(appliedOptions, { includeLogo: true, clearLogo: false, partial: true });
@@ -16837,8 +19540,12 @@ const state = {
     label: "Repo Layout",
     quote_detail_presets: [
       { id: "default", name: "Default", profile_id: "repo-layout", details: {} },
-      { id: "alt", name: "Alt", profile_id: "alt-layout", details: {} },
+      { id: "alt", name: "Alt", details: {} },
     ],
+  }, {
+    id: "alt-layout",
+    label: "Alternate Layout",
+    quote_detail_presets: [{ id: "alt", name: "Alternate Alt", details: {} }],
   }],
   companyProfiles: [{ id: "custom-layout", label: "Custom Layout", defaults: { company: { name: "Custom" } } }],
 };
@@ -16850,6 +19557,7 @@ eval([
   "safeProfileId",
   "safeProfileLabel",
   "profilePresetOptionValue",
+  "profilePresetOptionParts",
   "companyProfileOptionValue",
   "currentProfile",
   "selectedPresetId",
@@ -16861,14 +19569,47 @@ eval([
   "generationProfileIdForPayload",
 ].map(extractFunction).join("\n"));
 
-assert.strictEqual(generationProfileIdForPayload(), "custom-layout");
+assert.strictEqual(generationProfileIdForPayload(), "company:custom-layout");
 
-state.selectedPresetValue = "profile:alt";
-assert.strictEqual(generationProfileIdForPayload(), "alt-layout");
+state.selectedPresetValue = "company:missing-layout";
+assert.strictEqual(generationProfileIdForPayload(), "");
+
+state.selectedPresetValue = "profile:repo-layout:alt";
+assert.deepStrictEqual(profilePresetOptionParts(state.selectedPresetValue), { profileId: "repo-layout", presetId: "alt" });
+assert.strictEqual(generationProfileIdForPayload(), "profile:repo-layout");
+assert.strictEqual(selectedPreset().name, "Alt");
+
+state.selectedPresetValue = "profile:alt-layout:alt";
+assert.strictEqual(generationProfileIdForPayload(), "profile:alt-layout");
+assert.strictEqual(selectedPreset().name, "Alternate Alt");
+
+state.profiles = [{
+  id: "owner-b",
+  label: "Owner B",
+  quote_detail_presets: [{ id: "shared", name: "Owner B Shared", details: {} }],
+}];
+state.selectedPresetValue = "profile:owner-a:shared";
+state.quoteCommercialLifecycle = "RECOVERED";
+elements.presetSelect.value = "profile:owner-b:shared";
+assert.strictEqual(selectedPreset(), null);
+assert.strictEqual(generationProfileIdForPayload(), "");
+
+state.selectedPresetValue = "profile:repo-layout";
+assert.strictEqual(profilePresetOptionParts(state.selectedPresetValue), null);
+assert.strictEqual(selectedPreset(), null);
+assert.strictEqual(generationProfileIdForPayload(), "");
+
+state.companyProfiles = [];
+state.selectedPresetValue = "company:default";
+assert.strictEqual(selectedPreset(), null);
+assert.strictEqual(generationProfileIdForPayload(), "");
+state.companyProfiles = [{ id: "default", label: "Own Company Default", defaults: { company: { name: "Own" } } }];
+assert.strictEqual(selectedPreset().name, "Own Company Default");
+assert.strictEqual(generationProfileIdForPayload(), "company:default");
 
 state.selectedPresetValue = "";
 elements.presetSelect.value = "";
-assert.strictEqual(generationProfileIdForPayload(), "repo-layout");
+assert.strictEqual(generationProfileIdForPayload(), "profile:repo-layout");
 """
         completed = subprocess.run(
             [node, "-e", script],
@@ -16909,7 +19650,7 @@ function extractFunction(name) {
 const PROFILE_PRESET_PREFIX = "profile:";
 const COMPANY_PROFILE_PRESET_PREFIX = "company:";
 const state = {
-  selectedPresetValue: "profile:default",
+  selectedPresetValue: "profile:default:default",
   profileDeleteConfirmId: "",
   profileDeleteReadOnlyName: "",
   profileDeleteError: "",
@@ -16924,7 +19665,7 @@ const state = {
   companyProfiles: [{ id: "saved-profile", label: "Saved Profile", defaults: { company: { name: "Saved" } } }],
 };
 const elements = {
-  presetSelect: { value: "profile:default" },
+  presetSelect: { value: "profile:default:default" },
   presetSourceBadge: { textContent: "" },
   loadPresetButton: { disabled: false, title: "", setAttribute(name, value) { this[name] = value; }, querySelector() { return { textContent: "" }; } },
   deletePresetButton: { dataset: {}, disabled: false, title: "", setAttribute(name, value) { this[name] = value; }, querySelector() { return { textContent: "" }; } },
@@ -16976,6 +19717,7 @@ eval([
   "safeProfileId",
   "safeProfileLabel",
   "profilePresetOptionValue",
+  "profilePresetOptionParts",
   "companyProfileOptionValue",
   "selectedPresetId",
   "templateProfilePresets",
@@ -17613,6 +20355,23 @@ renderProfileOptions();
 assert.strictEqual(state.pricingReferenceId, "default-ref");
 assert.strictEqual(state.pricingReferenceSource, "bundled");
 assert.strictEqual(currentPricingReference().label, "Default Ref");
+
+state.quoteCommercialLifecycle = "RECOVERED";
+state.quoteCommercialSnapshot = {
+  lifecycle: "RECOVERED",
+  pricing_basis: { id: "saved-ref", source: "company" },
+};
+state.pricingReferenceId = "saved-ref";
+state.pricingReferenceSource = "company";
+state.pricingReferences = [
+  { id: "saved-ref", label: "Bundled Same ID", source: "bundled", tax: { label: "GST", rate: 0.09 }, currency: "SGD" },
+  { id: "other-ref", label: "Other Ref", source: "local", tax: { label: "GST", rate: 0.09 }, currency: "SGD" },
+];
+optionSelect.value = "local::other-ref";
+renderProfileOptions();
+assert.strictEqual(state.pricingReferenceId, "saved-ref");
+assert.strictEqual(state.pricingReferenceSource, "company");
+assert.strictEqual(optionSelect.value, "");
 """
         completed = subprocess.run(
             [node, "-e", script],
@@ -18806,7 +21565,19 @@ const state = {
   draftSource: "openai",
   lastAnalysisMode: "standard",
   activeSidePanel: "customer",
-  downloadFile: null,
+  downloadFile: {
+    name: "quotation.xlsx",
+    url: "/api/jobs/old/files/quotation.xlsx",
+    output_revision: 0,
+  },
+  pdfFile: {
+    name: "quotation.pdf",
+    url: "/api/jobs/old/files/quotation.pdf",
+    output_revision: 0,
+  },
+  outputRevision: 0,
+  downloadFileRevision: 0,
+  pdfFileRevision: 0,
   pricingMatches: [],
   pricingIssues: [],
   activeJob: null,
@@ -18881,6 +21652,10 @@ assert.strictEqual(saved.images[0].name, "huge-reference.pdf");
 assert.strictEqual(saved.images[0].data_url, undefined);
 assert.strictEqual(saved.images[0].content_fingerprint, `sha256:${"d".repeat(64)}`);
 assert.ok(saved.images[0].session_file_key);
+assert.strictEqual(saved.downloadFile.url, "/api/jobs/old/files/quotation.xlsx");
+assert.strictEqual(saved.pdfFile.url, "/api/jobs/old/files/quotation.pdf");
+assert.strictEqual(saved.downloadFileRevision, 0);
+assert.strictEqual(saved.pdfFileRevision, 0);
 assert.strictEqual(persistedRecords.length, 2);
 assert.strictEqual(persistedRecords[0].data_url.startsWith("data:application/pdf;base64,"), true);
 assert.strictEqual(persistedRecords[0].file_role, "reference");
@@ -19600,6 +22375,14 @@ function extractFunction(name) {
   throw new Error(`Unclosed function ${name}`);
 }
 
+const BASIS_FIELDS = [
+  ["surfaces", "Surfaces / Structures"],
+  ["counters", "Cabinets / Counters"],
+  ["platform", "Platform / Flooring"],
+  ["graphics", "Graphics / Signage"],
+  ["furniture", "Furniture / Plants / AV"],
+  ["electrical", "Electrical"],
+];
 const state = {
   pricingReferenceId: "synthetic-exhibition-fixture-pricing",
   pricingReferenceSource: "",
@@ -19685,7 +22468,10 @@ eval([
   "outputCatalogDescription",
   "numberOrNull",
   "orderNumber",
+  "unitPriceEditKind",
   "effectiveOutputUnitPrice",
+  "roundCommercialCents",
+  "synchronizeOwnedOutputRowPrice",
   "recalculateOutputRow",
   "normalizeLineItem",
   "normalizeOutputRow",
@@ -19720,6 +22506,7 @@ eval([
   "refreshOutputRowsFromLineItems",
   "ensureOutputRowsFromLineItems",
   "outputRowsToLineItems",
+  "outputRowsValid",
 ].map(extractFunction).join("\n"));
 
 const plainCounter = {
@@ -20024,6 +22811,47 @@ assert.deepStrictEqual(
 assert.strictEqual(state.outputRows[0].quantity, 2);
 assert.strictEqual(state.outputRows[0].unit, "sqm");
 assert.strictEqual(state.outputRows[0].price_mode, "Priced");
+state.quoteCommercialLifecycle = "NEW_UNINITIALISED";
+state.quoteCommercialSnapshot = null;
+state.quoteBasisSections = [{
+  id: "graphics",
+  title: "Graphics",
+  lines: [{
+    id: "new-quote-line",
+    tag: "Include",
+    text: "Printed graphics",
+    quantity: 2,
+    unit: "sqm",
+    pricing_keyword: "new-quote-printed-graphics",
+  }],
+}];
+state.lineItems = [{
+  section: "Graphics",
+  description: "Printed graphics",
+  quantity: 2,
+  unit: "sqm",
+  pricing_keyword: "new-quote-printed-graphics",
+  catalog_unit_price: 77,
+  status: "matched",
+  pricing_basis_currency: "SGD",
+  pricing_reference_source: "local",
+  pricing_reference_id: "new-quote-pricing",
+}];
+state.outputRows = [];
+refreshOutputRowsFromLineItems();
+assert.strictEqual(state.outputRows.length, 1);
+assert.strictEqual(state.outputRows[0].effective_unit_price, 77);
+assert.strictEqual(state.outputRows[0].unit_price_override, 77);
+assert.strictEqual(state.outputRows[0].pricing_basis_amount, 154);
+assert.strictEqual(state.outputRows[0].approved_quote_amount, 154);
+assert.strictEqual(state.outputRows[0].amount, 154);
+assert.deepStrictEqual(outputRowsValid(state.outputRows), { valid: true, errors: [] });
+const confirmedNewLineItem = outputRowsToLineItems()[0];
+assert.strictEqual(confirmedNewLineItem.effective_unit_price, 77);
+assert.strictEqual(confirmedNewLineItem.pricing_basis_amount, 154);
+assert.strictEqual(confirmedNewLineItem.approved_quote_amount, 154);
+assert.strictEqual(confirmedNewLineItem.pricing_reference_source, "local");
+assert.strictEqual(confirmedNewLineItem.pricing_reference_id, "new-quote-pricing");
 assert.ok(source.includes("refreshOutputRowsFromLineItems();"));
 """
         completed = subprocess.run(
@@ -20156,8 +22984,11 @@ eval([
   "numberOrNull",
   "unitPriceEditKind",
   "effectiveOutputUnitPrice",
+  "roundCommercialCents",
+  "synchronizeOwnedOutputRowPrice",
   "formatAmount",
   "quoteFxMultiplier",
+  "roundCommercialCents",
   "quoteAmountValue",
   "recalculateOutputRow",
   "outputCellDisplayValue",
@@ -20323,6 +23154,8 @@ eval([
   "numberOrNull",
   "unitPriceEditKind",
   "effectiveOutputUnitPrice",
+  "roundCommercialCents",
+  "synchronizeOwnedOutputRowPrice",
   "formatAmount",
   "recalculateOutputRow",
   "normalizeUnit",
@@ -20335,6 +23168,7 @@ eval([
   "revisionNumber",
   "markOutputRowsDirty",
   "downloadFileIsFresh",
+  "pdfFileIsFresh",
   "updateDownloadButton",
   "commitOutputEditor",
   "hideOutputDeleteModal",
@@ -20362,11 +23196,13 @@ const state = {
   ],
   lineItems: [],
   downloadFile: null,
+  pdfFile: null,
   outputDeleteRowIndex: 1,
   isGenerating: false,
   isPreparingOutput: false,
   outputRevision: 0,
   downloadFileRevision: -1,
+  pdfFileRevision: -1,
 };
 function renderOutputValidationMessages() {}
 function renderPricingMatches() {}
@@ -20374,28 +23210,42 @@ function renderMatchSummary() {}
 function syncControlStates() {}
 function appIsBusy() { return false; }
 
-setDownloadFiles([{ url: "/api/jobs/old/files/quotation.xlsx", name: "quotation.xlsx" }]);
+setDownloadFiles([
+  { url: "/api/jobs/old/files/quotation.xlsx", name: "quotation.xlsx" },
+  { url: "/api/jobs/old/files/quotation.pdf", name: "quotation.pdf" },
+]);
 assert.strictEqual(downloadFileIsFresh(), true);
+assert.strictEqual(pdfFileIsFresh(), true);
 assert.strictEqual(elements.sideDownloadButton.href, "/api/jobs/old/files/quotation.xlsx");
 
 commitOutputEditor({
-  dataset: { outputEditorField: "quantity", outputRow: "0" },
-  value: "3",
+  dataset: { outputEditorField: "unit_price_override", outputRow: "0" },
+  value: "not-a-price",
   isConnected: true,
 });
 assert.strictEqual(state.outputRevision, 1);
-assert.strictEqual(state.downloadFile, null);
+assert.strictEqual(state.downloadFile.url, "/api/jobs/old/files/quotation.xlsx");
+assert.strictEqual(state.pdfFile.url, "/api/jobs/old/files/quotation.pdf");
+assert.strictEqual(state.outputRows[0].unit_price_override, "not-a-price");
+assert.strictEqual(outputRowsValid().valid, false);
 assert.strictEqual(downloadFileIsFresh(), false);
+assert.strictEqual(pdfFileIsFresh(), false);
 assert.strictEqual(elements.sideDownloadButton.href, "#");
 assert.strictEqual(elements.sideDownloadButton.download, "");
 
-setDownloadFiles([{ url: "/api/jobs/new/files/quotation.xlsx", name: "quotation.xlsx" }]);
+setDownloadFiles([
+  { url: "/api/jobs/new/files/quotation.xlsx", name: "quotation.xlsx" },
+  { url: "/api/jobs/new/files/quotation.pdf", name: "quotation.pdf" },
+]);
 assert.strictEqual(downloadFileIsFresh(), true);
+assert.strictEqual(pdfFileIsFresh(), true);
 confirmOutputRowDelete();
 assert.strictEqual(state.outputRevision, 2);
 assert.strictEqual(state.outputRows.length, 1);
-assert.strictEqual(state.downloadFile, null);
+assert.strictEqual(state.downloadFile.url, "/api/jobs/new/files/quotation.xlsx");
+assert.strictEqual(state.pdfFile.url, "/api/jobs/new/files/quotation.pdf");
 assert.strictEqual(downloadFileIsFresh(), false);
+assert.strictEqual(pdfFileIsFresh(), false);
 assert.strictEqual(elements.sideDownloadButton.href, "#");
 """
         completed = subprocess.run(
@@ -20454,17 +23304,17 @@ const state = {
   outputRows: [{ description: "Generated row", amount: 100 }],
   outputRevision: 0,
   downloadFile: { url: "/api/jobs/old/files/quotation.xlsx", name: "quotation.xlsx" },
-  pdfFile: null,
+  pdfFile: { url: "/api/jobs/old/files/quotation.pdf", name: "quotation.pdf" },
+  downloadFileRevision: 0,
+  pdfFileRevision: 0,
 };
 let saved = false;
-function setDownloadFiles(files = []) {
-  assert.deepStrictEqual(files, []);
-  state.downloadFile = null;
-  state.pdfFile = null;
-}
+let setDownloadFilesCalls = 0;
+function setDownloadFiles() { setDownloadFilesCalls += 1; }
 function syncQuoteExchangeRateField() {}
 function invalidateGeneratedExportsForPresentationChange() {}
 function updateOutputHeader() {}
+function updateDownloadButton() {}
 function syncControlStates() {}
 function quoteSessionDraftStateCanSave() { return false; }
 function queueQuoteSessionDraftStateSave() { saved = true; }
@@ -20491,7 +23341,11 @@ assert.ok(state.downloadFile);
 
 handleQuoteDetailFieldChange({ target: quoteCurrency });
 assert.strictEqual(state.outputRevision, 1);
-assert.strictEqual(state.downloadFile, null);
+assert.strictEqual(state.downloadFile.url, "/api/jobs/old/files/quotation.xlsx");
+assert.strictEqual(state.pdfFile.url, "/api/jobs/old/files/quotation.pdf");
+assert.strictEqual(state.downloadFileRevision, 0);
+assert.strictEqual(state.pdfFileRevision, 0);
+assert.strictEqual(setDownloadFilesCalls, 0);
 assert.strictEqual(saved, false);
 """
         completed = subprocess.run(
@@ -20586,6 +23440,7 @@ eval([
   "normalizeTaxRate",
   "taxRatePercentText",
   "taxRateFromPercentInput",
+  "commercialTaxRateOrNull",
   "normalizeCurrencyLabel",
   "isStandardCurrencyCode",
   "normalizedCustomCurrencyInput",
@@ -20799,6 +23654,7 @@ eval([
   "normalizeTaxRate",
   "taxRatePercentText",
   "taxRateFromPercentInput",
+  "commercialTaxRateOrNull",
   "normalizeCurrencyLabel",
   "isStandardCurrencyCode",
   "normalizedCustomCurrencyInput",
@@ -20953,6 +23809,7 @@ eval([
   "normalizeTaxRate",
   "taxRatePercentText",
   "taxRateFromPercentInput",
+  "commercialTaxRateOrNull",
   "normalizeCurrencyLabel",
   "isStandardCurrencyCode",
   "normalizedCustomCurrencyInput",
@@ -21114,6 +23971,7 @@ eval([
   "normalizeTaxRate",
   "taxRatePercentText",
   "taxRateFromPercentInput",
+  "commercialTaxRateOrNull",
   "normalizeCurrencyLabel",
   "isStandardCurrencyCode",
   "normalizedCustomCurrencyInput",
@@ -23823,7 +26681,9 @@ eval([
   "effectiveOutputUnitPrice",
   "formatAmount",
   "quoteFxMultiplier",
+  "roundCommercialCents",
   "quoteAmountValue",
+  "synchronizeOwnedOutputRowPrice",
   "recalculateOutputRow",
   "normalizeOutputRow",
   "categoryOrderValue",
@@ -24014,6 +26874,7 @@ eval([
   "cleanCustomerQuoteLineText",
   "pricingReferenceLineText",
   "numberOrNull",
+  "commercialTaxRateOrNull",
   "orderNumber",
   "leadingNumber",
   "formatQuantityNumber",
@@ -24029,7 +26890,9 @@ eval([
   "effectiveOutputUnitPrice",
   "formatAmount",
   "quoteFxMultiplier",
+  "roundCommercialCents",
   "quoteAmountValue",
+  "synchronizeOwnedOutputRowPrice",
   "recalculateOutputRow",
   "normalizeOutputRow",
   "bracketedCatalogReferenceParts",
@@ -24147,6 +27010,9 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertNotIn("images:", normalize_body)
         self.assertNotIn("rich_text:", normalize_body)
         self.assertNotIn("logo_data_url", normalize_body)
+        self.assertIn("quote_exchange_rate: collectQuoteExchangeRate()", normalize_body)
+        self.assertIn("quote_session: currentQuoteSessionPayload({", normalize_body)
+        self.assertIn("includeDraftState: true", normalize_body)
         self.assertLess(
             confirm_body.index("const refreshed = await refreshLineItemsFromServer();"),
             confirm_body.index("refreshOutputRowsFromLineItems();"),
@@ -25444,13 +28310,14 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertEqual(delete_response["status"], "deleted")
         self.assertIsNone(artifact_after_delete)
 
-    def test_database_artifact_stale_export_does_not_download_and_snapshot_is_preserved(self):
+    def test_database_artifact_stale_export_remains_downloadable_and_snapshot_is_preserved(self):
         tmp_path = test_temp_root() / f"db-artifact-stale-{time.time_ns()}"
         tmp_path.mkdir(parents=True)
         database_url = f"sqlite:///{(tmp_path / 'sqag-storage.sqlite3').as_posix()}"
         output_dir = tmp_path / "out" / "job-db-stale"
         output_dir.mkdir(parents=True)
         (output_dir / "quotation.xlsx").write_bytes(b"xlsx-db-stale")
+        (output_dir / "quotation.pdf").write_bytes(b"pdf-db-stale")
         env = {**self.platform_launch_env(), "SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
         with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
             webapp, "validated_platform_auth_session", side_effect=lambda session: session
@@ -25465,7 +28332,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             payload["quote_session"] = {"session_id": "quote-db-stale"}
             generated = storage.create_or_update_quote_session(
                 payload,
-                result={"status": "completed", "files": [{"name": "quotation.xlsx"}]},
+                result={"status": "completed", "files": [{"name": "quotation.xlsx"}, {"name": "quotation.pdf"}]},
                 output_dir=output_dir,
             )
 
@@ -25481,29 +28348,53 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             storage.delete_pricing_reference("stale-pricing")
             fetched = storage.get_quote_session("quote-db-stale", include_draft_state=True)
             artifact = storage.quote_session_export_artifact("quote-db-stale", "xlsx")
+            pdf_artifact = storage.quote_session_export_artifact("quote-db-stale", "pdf")
             cookie = webapp.signed_cookie_value(self.platform_auth_session("workspace-db-stale"))
+            other_cookie = webapp.signed_cookie_value(self.platform_auth_session("workspace-db-stale-other"))
             with LocalRunnerServer() as runner:
-                parsed = urllib.parse.urlparse(runner.base_url)
-                connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
-                try:
-                    connection.request(
-                        "GET",
-                        "/api/quote-sessions/quote-db-stale/download/xlsx",
+                stale_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-db-stale/download/{kind}",
                         headers={"Cookie": f"{webapp.SESSION_COOKIE_NAME}={cookie}"},
                     )
-                    stale_response = connection.getresponse()
-                    stale_response.read()
-                finally:
-                    connection.close()
+                    for kind in ("xlsx", "pdf")
+                }
+                cross_workspace_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-db-stale/download/{kind}",
+                        headers={"Cookie": f"{webapp.SESSION_COOKIE_NAME}={other_cookie}"},
+                    )
+                    for kind in ("xlsx", "pdf")
+                }
+                unauthorised_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-db-stale/download/{kind}",
+                    )
+                    for kind in ("xlsx", "pdf")
+                }
 
         self.assertEqual(generated["generation_snapshot"]["profile"]["display_name"], "Generated Stale Profile")
         self.assertEqual(edited["generation_snapshot"]["pricing_reference"]["display_name"], "Generated Stale Pricing")
         self.assertTrue(fetched["exports"]["xlsx"]["stale"])
-        self.assertIsNone(fetched["exports"]["xlsx"]["url"])
+        self.assertTrue(fetched["exports"]["xlsx"]["exists"])
+        self.assertEqual(fetched["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-db-stale/download/xlsx")
+        self.assertTrue(fetched["exports"]["pdf"]["stale"])
+        self.assertTrue(fetched["exports"]["pdf"]["exists"])
+        self.assertEqual(fetched["exports"]["pdf"]["url"], "/api/quote-sessions/quote-db-stale/download/pdf")
+        self.assertEqual(webapp.quote_session_result_files(fetched), [])
         self.assertEqual(fetched["generation_snapshot"]["profile"]["display_name"], "Generated Stale Profile")
         self.assertEqual(fetched["generation_snapshot"]["pricing_reference"]["display_name"], "Generated Stale Pricing")
-        self.assertIsNone(artifact)
-        self.assertEqual(stale_response.status, 404)
+        self.assertEqual(artifact["content"], b"xlsx-db-stale")
+        self.assertEqual(pdf_artifact["content"], b"pdf-db-stale")
+        self.assertEqual(stale_downloads["xlsx"], (200, b"xlsx-db-stale"))
+        self.assertEqual(stale_downloads["pdf"], (200, b"pdf-db-stale"))
+        self.assertEqual(cross_workspace_downloads["xlsx"][0], 404)
+        self.assertEqual(cross_workspace_downloads["pdf"][0], 404)
+        self.assertIn(unauthorised_downloads["xlsx"][0], {401, 403})
+        self.assertIn(unauthorised_downloads["pdf"][0], {401, 403})
 
     def test_object_artifact_storage_saves_db_metadata_and_downloads_through_authorized_route(self):
         backend = webapp.InMemoryObjectStorageBackend()
@@ -25513,10 +28404,15 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         output_dir = tmp_path / "out" / "job-object-artifact"
         output_dir.mkdir(parents=True)
         xlsx_bytes = b"xlsx-object-artifact"
+        pdf_bytes = b"pdf-object-artifact"
         (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
+        (output_dir / "quotation.pdf").write_bytes(pdf_bytes)
         payload = valid_payload()
         payload["quote_session"] = {"session_id": "quote-object-artifact"}
-        result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-object-artifact/files/quotation.xlsx"}]}
+        result = {"status": "completed", "files": [
+            {"name": "quotation.xlsx", "url": "/api/jobs/job-object-artifact/files/quotation.xlsx"},
+            {"name": "quotation.pdf", "url": "/api/jobs/job-object-artifact/files/quotation.pdf"},
+        ]}
         env = {
             **self.platform_launch_env(),
             "SQAG_STORAGE_MODE": "database",
@@ -25543,23 +28439,75 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             payload["pricing_reference_id"] = "object-snapshot-pricing"
             session = workspace_a.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
             artifact = workspace_a.quote_session_export_artifact("quote-object-artifact", "xlsx")
+            pdf_artifact = workspace_a.quote_session_export_artifact("quote-object-artifact", "pdf")
             blocked_artifact = workspace_b.quote_session_export_artifact("quote-object-artifact", "xlsx")
             cookie = webapp.signed_cookie_value(self.platform_auth_session("workspace-object-a"))
+            other_cookie = webapp.signed_cookie_value(self.platform_auth_session("workspace-object-b"))
             session_cookie = f"{webapp.SESSION_COOKIE_NAME}={cookie}"
+            other_session_cookie = f"{webapp.SESSION_COOKIE_NAME}={other_cookie}"
             with LocalRunnerServer() as runner:
-                parsed = urllib.parse.urlparse(runner.base_url)
-                connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
-                try:
-                    connection.request(
-                        "GET",
-                        "/api/quote-sessions/quote-object-artifact/download/xlsx",
+                fresh_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-object-artifact/download/{kind}",
                         headers={"Cookie": session_cookie},
                     )
-                    response = connection.getresponse()
-                    downloaded = response.read()
-                    status = response.status
-                finally:
-                    connection.close()
+                    for kind in ("xlsx", "pdf")
+                }
+                edit_payload = valid_payload()
+                edit_payload["quote_session"] = {
+                    "session_id": "quote-object-artifact",
+                    "draft_state": {"activeSidePanel": "pricing_review", "outputRevision": 2},
+                }
+                stale_session = workspace_a.create_or_update_quote_session(edit_payload)
+                stale_artifacts = {
+                    kind: workspace_a.quote_session_export_artifact("quote-object-artifact", kind)
+                    for kind in ("xlsx", "pdf")
+                }
+                stale_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-object-artifact/download/{kind}",
+                        headers={"Cookie": session_cookie},
+                    )
+                    for kind in ("xlsx", "pdf")
+                }
+                cross_workspace_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-object-artifact/download/{kind}",
+                        headers={"Cookie": other_session_cookie},
+                    )
+                    for kind in ("xlsx", "pdf")
+                }
+                unauthorised_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-object-artifact/download/{kind}",
+                    )
+                    for kind in ("xlsx", "pdf")
+                }
+                replacement_output_dir = tmp_path / "out" / "job-object-artifact-replacement"
+                replacement_output_dir.mkdir(parents=True)
+                (replacement_output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
+                (replacement_output_dir / "quotation.pdf").write_bytes(pdf_bytes)
+                replaced_session = workspace_a.create_or_update_quote_session(
+                    payload,
+                    result=result,
+                    output_dir=replacement_output_dir,
+                )
+                replacement_artifacts = {
+                    kind: workspace_a.quote_session_export_artifact("quote-object-artifact", kind)
+                    for kind in ("xlsx", "pdf")
+                }
+                replacement_downloads = {
+                    kind: local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/quote-object-artifact/download/{kind}",
+                        headers={"Cookie": session_cookie},
+                    )
+                    for kind in ("xlsx", "pdf")
+                }
 
         with sqlite3.connect(db_path) as connection:
             row = connection.execute(
@@ -25570,16 +28518,39 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
 
         self.assertTrue(session["exports"]["xlsx"]["exists"])
         self.assertEqual(session["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-object-artifact/download/xlsx")
+        self.assertTrue(session["exports"]["pdf"]["exists"])
+        self.assertEqual(session["exports"]["pdf"]["url"], "/api/quote-sessions/quote-object-artifact/download/pdf")
         self.assertEqual(session["generation_snapshot"]["profile"]["display_name"], "Object Snapshot Profile")
         self.assertEqual(session["generation_snapshot"]["pricing_reference"]["display_name"], "Object Snapshot Pricing")
         result_files = webapp.quote_session_result_files(session)
-        self.assertEqual(result_files[0]["url"], "/api/quote-sessions/quote-object-artifact/download/xlsx")
+        self.assertEqual(
+            {item["url"] for item in result_files},
+            {
+                "/api/quote-sessions/quote-object-artifact/download/xlsx",
+                "/api/quote-sessions/quote-object-artifact/download/pdf",
+            },
+        )
         self.assertNotIn("/api/jobs/", json.dumps(result_files))
         self.assertIsNotNone(artifact)
         self.assertEqual(artifact["content"], xlsx_bytes)
+        self.assertIsNotNone(pdf_artifact)
+        self.assertEqual(pdf_artifact["content"], pdf_bytes)
         self.assertIsNone(blocked_artifact)
-        self.assertEqual(status, 200)
-        self.assertEqual(downloaded, xlsx_bytes)
+        self.assertEqual(fresh_downloads["xlsx"], (200, xlsx_bytes))
+        self.assertEqual(fresh_downloads["pdf"], (200, pdf_bytes))
+        for kind, expected in (("xlsx", xlsx_bytes), ("pdf", pdf_bytes)):
+            self.assertTrue(stale_session["exports"][kind]["exists"])
+            self.assertTrue(stale_session["exports"][kind]["stale"])
+            self.assertEqual(stale_artifacts[kind]["content"], expected)
+            self.assertEqual(stale_downloads[kind], (200, expected))
+            self.assertEqual(replacement_artifacts[kind]["content"], expected)
+            self.assertFalse(replaced_session["exports"][kind]["stale"])
+            self.assertEqual(replacement_downloads[kind], (200, expected))
+        self.assertEqual(webapp.quote_session_result_files(stale_session), [])
+        self.assertEqual(cross_workspace_downloads["xlsx"][0], 404)
+        self.assertEqual(cross_workspace_downloads["pdf"][0], 404)
+        self.assertIn(unauthorised_downloads["xlsx"][0], {401, 403})
+        self.assertIn(unauthorised_downloads["pdf"][0], {401, 403})
         self.assertEqual(blob_rows, 0)
         self.assertEqual(row[1], "workspace-object-a")
         self.assertEqual(row[2], "quote-object-artifact")
@@ -28890,9 +31861,10 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertEqual(active_kinds, ["xlsx"])
         self.assertEqual(len(backend._objects), 1)
         self.assertFalse(session["status"]["quote_generated"])
-        self.assertFalse(session["exports"]["xlsx"]["exists"])
+        self.assertTrue(session["exports"]["xlsx"]["exists"])
         self.assertTrue(session["exports"]["xlsx"]["stale"])
-        self.assertIsNone(session["exports"]["xlsx"]["url"])
+        self.assertEqual(session["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-object-confirmation/download/xlsx")
+        self.assertEqual(webapp.quote_session_result_files(session), [])
         self.assertEqual(
             backend.retrieve_artifact(
                 prior_metadata,
@@ -30403,6 +33375,8 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         }
         payload = valid_payload()
         payload["profile_id"] = company_id
+        payload["profile_source"] = "company"
+        payload["quote_company_profile"] = {"id": f"company:{company_id}", "source": "company"}
         payload["pricing_reference_id"] = pricing_reference["id"]
         payload["line_items"] = [{
             "section": "Graphics",

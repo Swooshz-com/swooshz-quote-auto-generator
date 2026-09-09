@@ -24,6 +24,29 @@ const QUOTE_SESSION_FILE_DB_NAME = "swooshz_quote_session_files_v1";
 const QUOTE_SESSION_FILE_STORE_NAME = "reference_files";
 const QUOTE_SESSION_FILE_DB_VERSION = 1;
 const QUOTE_SESSION_STATE_VERSION = 5;
+const QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA = "swooshz.quote-commercial-snapshot.v1";
+const QUOTE_COMMERCIAL_SNAPSHOT_VERSION = 1;
+const QUOTE_COMMERCIAL_LIFECYCLES = new Set(["NEW_UNINITIALISED", "EXISTING", "RECOVERED"]);
+const QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS = [
+  "currency",
+  "exchange_rate",
+  "tax",
+  "company_name",
+  "header_details",
+  "logo",
+  "terms_heading",
+  "payment_terms",
+  "notes_heading",
+  "standard_notes",
+  "acceptance_text",
+  "person_label",
+  "stamp_label",
+  "date_label",
+  "company_signatory",
+  "company_title",
+  "company_date_label",
+  "rich_text",
+];
 const OUTPUT_SORT_MODES = ["pricing_reference", "category", "name", "category_name"];
 const ANALYSIS_MODE_STANDARD = "standard";
 const ANALYSIS_MODE_HIGH_QUALITY = "high_quality";
@@ -192,6 +215,10 @@ const state = {
   quoteSessionDraftSaveStarted: false,
   quoteSessionRestoredSessionId: "",
   quoteSessionRestoredDraftKey: "",
+  quoteCommercialLifecycle: "NEW_UNINITIALISED",
+  quoteCommercialSnapshot: null,
+  quoteCommercialRecoveryError: "",
+  quoteCommercialPreservedQuoteText: {},
   dashboardStatusFilter: "all",
   dashboardDateFilter: "all",
   dashboardCustomDateStart: "",
@@ -321,6 +348,8 @@ let quoteSessionDraftSavePromise = null;
 let quoteSessionConfirmedDraftSessionId = "";
 let quoteSessionConfirmedDraftKey = "";
 let quoteSessionConfirmedDraftFileKey = "";
+let authorityProfileRequestSequence = 0;
+let activeAuthorityProfileRequestContext = null;
 
 const elements = {
   healthText: qs("#healthText"),
@@ -830,8 +859,19 @@ function safeProfileLabel(value = "", fallback = "Company Profile") {
   return neutralizeFormulaText(label || fallback);
 }
 
-function profilePresetOptionValue(presetId) {
-  return `${PROFILE_PRESET_PREFIX}${presetId}`;
+function profilePresetOptionValue(profileId, presetId) {
+  const ownerId = String(profileId || "").trim();
+  const childId = String(presetId || "").trim();
+  if (!/^[A-Za-z0-9_-]+$/.test(ownerId) || !/^[A-Za-z0-9_-]+$/.test(childId)) return "";
+  return `${PROFILE_PRESET_PREFIX}${ownerId}:${childId}`;
+}
+
+function profilePresetOptionParts(value = "") {
+  const text = String(value || "").trim();
+  if (!text.startsWith(PROFILE_PRESET_PREFIX)) return null;
+  const parts = text.slice(PROFILE_PRESET_PREFIX.length).split(":");
+  if (parts.length !== 2 || !/^[A-Za-z0-9_-]+$/.test(parts[0]) || !/^[A-Za-z0-9_-]+$/.test(parts[1])) return null;
+  return { profileId: parts[0], presetId: parts[1] };
 }
 
 function companyProfileOptionValue(profileId) {
@@ -1155,6 +1195,70 @@ function currentBrowserRecoveryScope() {
   return String(state.browserRecoveryScope || "").trim();
 }
 
+function authorityProfileHydrationContext(sequence = authorityProfileRequestSequence) {
+  const workspace = state.workspace && typeof state.workspace === "object" ? state.workspace : {};
+  const workspaceDetails = workspace.workspace && typeof workspace.workspace === "object" ? workspace.workspace : {};
+  const company = workspace.company && typeof workspace.company === "object" ? workspace.company : {};
+  const pendingSelection = String(
+    state.selectedPresetValue
+      || elements.presetSelect?.value
+      || ""
+  ).trim();
+  const savedCompanyIdentity = pendingSelection.startsWith(COMPANY_PROFILE_PRESET_PREFIX)
+    ? pendingSelection
+    : "";
+  return {
+    sequence,
+    browserRecoveryScope: currentBrowserRecoveryScope(),
+    quoteSessionId: safeQuoteSessionId(state.quoteSessionId || ""),
+    workspaceId: String(workspaceDetails.id || workspace.id || "").trim(),
+    companyId: String(company.id || "").trim(),
+    savedCompanyIdentity,
+    profileId: String(state.profileId || "").trim(),
+    pricingReferenceId: String(state.pricingReferenceId || "").trim(),
+    pricingReferenceSource: String(state.pricingReferenceSource || "").trim(),
+    pendingSelection,
+    quoteCommercialLifecycle: String(state.quoteCommercialLifecycle || "").trim(),
+  };
+}
+
+function beginAuthorityProfileRequest() {
+  authorityProfileRequestSequence += 1;
+  activeAuthorityProfileRequestContext = authorityProfileHydrationContext(authorityProfileRequestSequence);
+  return activeAuthorityProfileRequestContext;
+}
+
+function refreshAuthorityProfileRequestContext(context = null) {
+  if (!context || context.sequence !== authorityProfileRequestSequence) return null;
+  activeAuthorityProfileRequestContext = authorityProfileHydrationContext(context.sequence);
+  return activeAuthorityProfileRequestContext;
+}
+
+function invalidateAuthorityProfileRequests() {
+  authorityProfileRequestSequence += 1;
+  activeAuthorityProfileRequestContext = null;
+}
+
+function authorityProfileRequestIsFresh(context = null) {
+  if (!context || !activeAuthorityProfileRequestContext) return false;
+  if (context.sequence !== authorityProfileRequestSequence || context.sequence !== activeAuthorityProfileRequestContext.sequence) {
+    return false;
+  }
+  const current = authorityProfileHydrationContext(context.sequence);
+  return [
+    "browserRecoveryScope",
+    "quoteSessionId",
+    "workspaceId",
+    "companyId",
+    "savedCompanyIdentity",
+    "profileId",
+    "pricingReferenceId",
+    "pricingReferenceSource",
+    "pendingSelection",
+    "quoteCommercialLifecycle",
+  ].every((key) => current[key] === activeAuthorityProfileRequestContext[key]);
+}
+
 function safeLastSelectionJson() {
   const currentScope = currentBrowserRecoveryScope();
   if (!currentScope) return {};
@@ -1222,15 +1326,41 @@ function resolvedProfileIdForPayload() {
 }
 
 function generationProfileIdForPayload() {
+  const selectedValue = String(state.selectedPresetValue || elements.presetSelect?.value || "").trim();
+  if (selectedValue.startsWith(COMPANY_PROFILE_PRESET_PREFIX)) {
+    const savedCompanyId = safeProfileId(selectedValue.slice(COMPANY_PROFILE_PRESET_PREFIX.length), "");
+    const preset = selectedPreset();
+    return savedCompanyId && preset?.source === "company" && preset.id === savedCompanyId
+      ? `${COMPANY_PROFILE_PRESET_PREFIX}${savedCompanyId}`
+      : "";
+  }
+  if (selectedValue.startsWith(PROFILE_PRESET_PREFIX)) {
+    const qualified = profilePresetOptionParts(selectedValue);
+    const preset = selectedPreset();
+    return qualified && preset?.source === "profile" && preset.profile_id === qualified.profileId
+      ? `${PROFILE_PRESET_PREFIX}${qualified.profileId}`
+      : "";
+  }
+  if (selectedValue) return "";
   const preset = selectedPreset();
   if (preset?.source === "company") {
-    return safeProfileId(preset.id, resolvedProfileIdForPayload());
+    const companyId = safeProfileId(preset.id, "");
+    return companyId ? `${COMPANY_PROFILE_PRESET_PREFIX}${companyId}` : "";
   }
   const presetProfileId = String(preset?.profile_id || "").trim();
-  return presetProfileId || resolvedProfileIdForPayload();
+  const resolvedProfileId = presetProfileId || resolvedProfileIdForPayload();
+  return /^[A-Za-z0-9_-]+$/.test(resolvedProfileId)
+    ? `${PROFILE_PRESET_PREFIX}${resolvedProfileId}`
+    : "";
 }
 
 function syncSelectedPricingReference() {
+  const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+  const savedBasis = state.quoteCommercialSnapshot?.pricing_basis;
+  if (ownedCommercial && (
+    state.quoteCommercialLifecycle === "RECOVERED"
+    || (savedBasis && typeof savedBasis === "object" && String(savedBasis.id || "").trim())
+  )) return;
   const selectedReference = currentPricingReference();
   if (selectedReference) {
     state.pricingReferenceId = selectedReference.id || "";
@@ -1890,6 +2020,14 @@ function taxRateFromPercentInput(value, fallback = DEFAULT_TAX_RATE) {
   return Math.min(1, Math.max(0, number / 100));
 }
 
+function commercialTaxRateOrNull(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "number" && typeof value !== "string") return null;
+  if (typeof value === "string" && value.trim() === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 && number <= 1 ? number : null;
+}
+
 function normalizeCurrencyLabel(value = DEFAULT_CURRENCY_LABEL) {
   const normalized = String(value || "")
     .trim()
@@ -2081,6 +2219,9 @@ function quoteCurrencyControlValue() {
       ? normalizedCustomCurrencyInput(elements.quoteCurrencyCustom)
       : "";
   }
+  if (["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || "")) && !String(selected || "").trim()) {
+    return "";
+  }
   return normalizeCurrencyLabel(selected || selectedPricingReferenceCurrency());
 }
 
@@ -2115,6 +2256,126 @@ function syncPricingReferenceCurrencyCustomInput() {
 }
 
 const QUOTE_COMMERCIAL_FIELD_KEYS = ["quoteCurrency", "quoteExchangeRate", "quoteTaxLabel", "quoteTaxRate"];
+
+function quoteCommercialSnapshotPresence(value, previous = "") {
+  const prior = String(previous || "").trim();
+  if (prior === "legacy_unknown") return prior;
+  return hasMeaningfulQuoteDetailValue(value) ? "captured" : "intentional_empty";
+}
+
+function quoteCommercialSnapshotFromLegacyRecovery() {
+  return {
+    schema: QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+    version: QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+    owner: "quote",
+    lifecycle: "RECOVERED",
+    origin: "legacy_recovery",
+    presence: QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS.reduce((presence, key) => {
+      presence[key] = "legacy_unknown";
+      return presence;
+    }, {}),
+    pricing_basis: {},
+  };
+}
+
+function normalizeQuoteCommercialSnapshot(snapshot = {}, lifecycleOverride = "") {
+  if (!snapshot || typeof snapshot !== "object") return null;
+  if (
+    snapshot.schema !== QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA
+    || Number(snapshot.version) !== QUOTE_COMMERCIAL_SNAPSHOT_VERSION
+    || snapshot.owner !== "quote"
+  ) return null;
+  const lifecycle = String(lifecycleOverride || snapshot.lifecycle || "").trim();
+  if (!QUOTE_COMMERCIAL_LIFECYCLES.has(lifecycle)) return null;
+  const rawPresence = snapshot.presence && typeof snapshot.presence === "object" ? snapshot.presence : {};
+  const presence = QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS.reduce((normalized, key) => {
+    const value = String(rawPresence[key] || "").trim();
+    normalized[key] = ["captured", "intentional_empty", "legacy_unknown"].includes(value)
+      ? value
+      : "legacy_unknown";
+    return normalized;
+  }, {});
+  const rawBasis = snapshot.pricing_basis && typeof snapshot.pricing_basis === "object" ? snapshot.pricing_basis : {};
+  const pricingBasis = {};
+  ["currency", "source", "id", "digest"].forEach((key) => {
+    const value = String(rawBasis[key] || "").trim();
+    if (value) pricingBasis[key] = value;
+  });
+  return {
+    schema: QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+    version: QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+    owner: "quote",
+    lifecycle,
+    origin: String(snapshot.origin || "").trim() || "captured",
+    presence,
+    pricing_basis: pricingBasis,
+  };
+}
+
+function quoteCommercialSnapshotForDetails(details = {}, options = {}) {
+  const previous = state.quoteCommercialSnapshot && typeof state.quoteCommercialSnapshot === "object"
+    ? state.quoteCommercialSnapshot
+    : {};
+  const lifecycle = QUOTE_COMMERCIAL_LIFECYCLES.has(String(options.lifecycle || state.quoteCommercialLifecycle || previous.lifecycle || "NEW_UNINITIALISED"))
+    ? String(options.lifecycle || state.quoteCommercialLifecycle || previous.lifecycle || "NEW_UNINITIALISED")
+    : "NEW_UNINITIALISED";
+  const owned = ["EXISTING", "RECOVERED"].includes(lifecycle);
+  const reference = options.reference
+    || (typeof currentPricingReference === "function" ? currentPricingReference() : null)
+    || {};
+  const previousBasis = previous.pricing_basis && typeof previous.pricing_basis === "object"
+    ? previous.pricing_basis
+    : {};
+  const pricingBasis = owned && Object.keys(previousBasis).length
+    ? { ...previousBasis }
+    : {
+      currency: normalizeCurrencyLabel(reference.currency || ""),
+      source: String(reference.source || state.pricingReferenceSource || "").trim(),
+      id: String(reference.id || state.pricingReferenceId || "").trim(),
+      digest: String(reference.digest_sha256 || reference.reference_digest || reference.content_fingerprint || "").trim(),
+    };
+  const company = details.company && typeof details.company === "object" ? details.company : {};
+  const quoteText = details.quote_text && typeof details.quote_text === "object" ? details.quote_text : {};
+  const signature = details.signature && typeof details.signature === "object" ? details.signature : {};
+  const richText = details.rich_text && typeof details.rich_text === "object" ? details.rich_text : {};
+  const values = {
+    currency: details.currency,
+    exchange_rate: details.exchange_rate,
+    tax: details.tax && typeof details.tax === "object" ? details.tax : {},
+    company_name: company.name,
+    header_details: company.header_details,
+    logo: company.logo_data_url || company.logo_session_file_key || company.logo_content_fingerprint,
+    terms_heading: quoteText.terms_heading,
+    payment_terms: quoteText.payment_terms,
+    notes_heading: quoteText.notes_heading,
+    standard_notes: quoteText.standard_notes,
+    acceptance_text: quoteText.acceptance_text,
+    person_label: quoteText.person_label,
+    stamp_label: quoteText.stamp_label,
+    date_label: quoteText.date_label,
+    company_signatory: signature.company_signatory,
+    company_title: signature.company_title,
+    company_date_label: signature.company_date_label,
+    rich_text: richText,
+  };
+  const previousPresence = previous.presence && typeof previous.presence === "object" ? previous.presence : {};
+  return {
+    schema: QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+    version: QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+    owner: "quote",
+    lifecycle,
+    origin: String(options.origin || previous.origin || (owned ? "captured" : "new_quote")).trim(),
+    presence: QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS.reduce((presence, key) => {
+      presence[key] = quoteCommercialSnapshotPresence(values[key], previousPresence[key]);
+      return presence;
+    }, {}),
+    pricing_basis: Object.fromEntries(Object.entries(pricingBasis).filter(([, value]) => String(value || "").trim())),
+  };
+}
+
+function quoteCommercialStateIsOwned() {
+  return ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+}
 
 function emptyQuoteCommercialTouched() {
   return QUOTE_COMMERCIAL_FIELD_KEYS.reduce((touched, key) => {
@@ -2225,6 +2486,17 @@ function restoreQuoteCommercialOverrideSnapshot(snapshot = {}, options = {}) {
 }
 
 function collectTaxDetails() {
+  const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+  if (ownedCommercial) {
+    const labelSource = elements.quoteTaxLabel?.value ?? elements.taxLabel?.value ?? "";
+    const rateSource = elements.quoteTaxRate?.value ?? elements.taxRate?.value ?? "";
+    const rateText = String(rateSource ?? "").replace("%", "").trim();
+    const rawRate = rateText ? Number(rateText) : Number.NaN;
+    return {
+      label: String(labelSource || "").trim() ? normalizeTaxLabel(labelSource) : "",
+      rate: Number.isFinite(rawRate) ? Math.min(1, Math.max(0, rawRate / 100)) : null,
+    };
+  }
   const referenceTax = selectedPricingReferenceTax();
   const label = elements.quoteTaxLabel?.value || elements.taxLabel?.value || referenceTax.label;
   const rateSource = elements.quoteTaxRate?.value || elements.taxRate?.value;
@@ -2237,17 +2509,25 @@ function collectTaxDetails() {
 }
 
 function collectQuoteCurrency() {
-  return normalizeCurrencyLabel(quoteCurrencyControlValue() || selectedPricingReferenceCurrency());
+  const value = quoteCurrencyControlValue();
+  if (["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""))) {
+    return value ? normalizeCurrencyLabel(value) : "";
+  }
+  return normalizeCurrencyLabel(value || selectedPricingReferenceCurrency());
 }
 
 function collectQuoteExchangeRate() {
   const value = Number(String(elements.quoteExchangeRate?.value || "").trim());
+  if (["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""))) {
+    return Number.isFinite(value) && value > 0 ? value : null;
+  }
   if (collectQuoteCurrency() === selectedPricingReferenceCurrency() && !quoteCommercialFieldIsTouched("quoteExchangeRate")) return 1;
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
 function syncQuoteExchangeRateField() {
   if (elements.quoteExchangeRateField) elements.quoteExchangeRateField.hidden = false;
+  if (["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""))) return;
   if (
     elements.quoteExchangeRate
     && collectQuoteCurrency() === selectedPricingReferenceCurrency()
@@ -2258,7 +2538,14 @@ function syncQuoteExchangeRateField() {
 }
 
 function quoteCommercialTaxText(tax = collectTaxDetails()) {
-  return `${tax.label || DEFAULT_TAX_LABEL} ${taxRatePercentText(tax.rate ?? DEFAULT_TAX_RATE)}%`;
+  const ownedCommercial = typeof state !== "undefined"
+    && ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+  const label = String(tax?.label || "").trim();
+  const rate = commercialTaxRateOrNull(tax?.rate);
+  if (ownedCommercial && (!label || rate === null)) {
+    return "Review required";
+  }
+  return `${label || DEFAULT_TAX_LABEL} ${taxRatePercentText(rate ?? DEFAULT_TAX_RATE)}%`;
 }
 
 function quoteExchangeRateText(value = collectQuoteExchangeRate()) {
@@ -2269,7 +2556,10 @@ function quoteExchangeRateText(value = collectQuoteExchangeRate()) {
 
 function quoteFxMultiplier(value = collectQuoteExchangeRate()) {
   const number = Number(value);
-  return Number.isFinite(number) && number > 0 ? number : 1;
+  if (Number.isFinite(number) && number > 0) return number;
+  const ownedCommercial = typeof state !== "undefined"
+    && ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+  return ownedCommercial ? Number.NaN : 1;
 }
 
 function syncQuoteCommercialContextPills() {
@@ -2289,6 +2579,7 @@ function syncQuoteCommercialContextPills() {
 }
 
 function applyPricingReferenceCommercialDefaults() {
+  if (["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""))) return;
   const tax = selectedPricingReferenceTax();
   const currency = selectedPricingReferenceCurrency();
   const selectedQuoteCurrency = String(elements.quoteCurrency?.value || "").trim();
@@ -2307,9 +2598,10 @@ function applyPricingReferenceCommercialDefaults() {
   syncQuoteExchangeRateField();
 }
 
-function resetQuoteCommercialFieldsToSelectedPricingReference() {
+function resetQuoteCommercialFieldsToSelectedPricingReference(options = {}) {
   const tax = selectedPricingReferenceTax();
   const currency = selectedPricingReferenceCurrency();
+  const reference = currentPricingReference();
   resetQuoteCommercialTouched();
   if (elements.taxLabel) elements.taxLabel.value = normalizeTaxLabel(tax.label || DEFAULT_TAX_LABEL);
   setInputValue(elements.taxRate, taxRatePercentText(tax.rate ?? DEFAULT_TAX_RATE));
@@ -2317,12 +2609,45 @@ function resetQuoteCommercialFieldsToSelectedPricingReference() {
   setInputValue(elements.quoteExchangeRate, "1");
   setInputValue(elements.quoteTaxLabel, normalizeTaxLabel(tax.label || DEFAULT_TAX_LABEL));
   setInputValue(elements.quoteTaxRate, taxRatePercentText(tax.rate ?? DEFAULT_TAX_RATE));
+  const markOwned = options.markOwned === true
+    || ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+  if (!markOwned) {
+    state.quoteCommercialSnapshot = null;
+    state.quoteCommercialRecoveryError = "";
+  } else {
+    state.quoteCommercialLifecycle = "EXISTING";
+    state.quoteCommercialPreservedQuoteText = {};
+    state.quoteCommercialSnapshot = {
+      schema: "swooshz.quote-commercial-snapshot.v1",
+      version: 1,
+      owner: "quote",
+      lifecycle: "EXISTING",
+      origin: "explicit_initialization",
+      presence: [
+        "currency", "exchange_rate", "tax", "company_name", "header_details", "logo",
+        "terms_heading", "payment_terms", "notes_heading", "standard_notes", "acceptance_text",
+        "person_label", "stamp_label", "date_label", "company_signatory", "company_title",
+        "company_date_label", "rich_text",
+      ].reduce((presence, key) => {
+        presence[key] = "captured";
+        return presence;
+      }, {}),
+      pricing_basis: {
+        currency,
+        source: String(reference?.source || state.pricingReferenceSource || "").trim(),
+        id: String(reference?.id || state.pricingReferenceId || "").trim(),
+        digest: String(reference?.digest_sha256 || reference?.reference_digest || reference?.content_fingerprint || "").trim(),
+      },
+    };
+    state.quoteCommercialRecoveryError = "";
+  }
   syncQuoteExchangeRateField();
   syncQuoteCommercialContextPills();
   updateOutputHeader();
 }
 
 function renderSelectedPricingReferenceSummary() {
+  const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
   const reference = currentPricingReference();
   const tax = selectedPricingReferenceTax();
   const currency = selectedPricingReferenceCurrency();
@@ -2341,8 +2666,10 @@ function renderSelectedPricingReferenceSummary() {
   if (elements.selectedPricingReferenceTax) elements.selectedPricingReferenceTax.textContent = taxText;
   syncPricingReferenceContextPills(currency, taxText);
   applyPricingReferenceCommercialDefaults();
-  if (elements.taxLabel) elements.taxLabel.value = tax.label;
-  if (elements.taxRate) elements.taxRate.value = taxRatePercentText(tax.rate);
+  if (!ownedCommercial) {
+    if (elements.taxLabel) elements.taxLabel.value = tax.label;
+    if (elements.taxRate) elements.taxRate.value = taxRatePercentText(tax.rate);
+  }
   updatePricingReferenceDeleteButton();
   updateOutputHeader();
 }
@@ -2451,6 +2778,13 @@ function normalizeLineItem(item = {}) {
     item_order: orderNumber(item.item_order) ?? "",
     basis_order: orderNumber(item.basis_order) ?? "",
     status: item.status || "",
+    ...(Object.prototype.hasOwnProperty.call(item, "effective_unit_price") ? { effective_unit_price: item.effective_unit_price } : {}),
+    ...(Object.prototype.hasOwnProperty.call(item, "pricing_basis_amount") ? { pricing_basis_amount: item.pricing_basis_amount } : {}),
+    ...(Object.prototype.hasOwnProperty.call(item, "approved_quote_amount") ? { approved_quote_amount: item.approved_quote_amount } : {}),
+    ...(Object.prototype.hasOwnProperty.call(item, "pricing_basis_currency") ? { pricing_basis_currency: item.pricing_basis_currency } : {}),
+    ...(Object.prototype.hasOwnProperty.call(item, "pricing_reference_source") ? { pricing_reference_source: item.pricing_reference_source } : {}),
+    ...(Object.prototype.hasOwnProperty.call(item, "pricing_reference_id") ? { pricing_reference_id: item.pricing_reference_id } : {}),
+    ...(Object.prototype.hasOwnProperty.call(item, "pricing_basis_digest") ? { pricing_basis_digest: item.pricing_basis_digest } : {}),
   };
 }
 
@@ -2480,7 +2814,14 @@ function hasMeaningfulQuoteDetailValue(value) {
   return String(value ?? "").trim().length > 0;
 }
 
-function quoteDetailsWithFallbackDefaults(defaults = {}, details = {}) {
+function quoteDetailsWithFallbackDefaults(defaults = {}, details = {}, options = {}) {
+  const savedSnapshot = details?.commercial_snapshot;
+  if (
+    options.preserveSavedState === true
+    || ["EXISTING", "RECOVERED"].includes(String(savedSnapshot?.lifecycle || ""))
+  ) {
+    return details && typeof details === "object" ? { ...details } : {};
+  }
   const merge = (base = {}, override = {}) => {
     const merged = { ...(base && typeof base === "object" ? base : {}) };
     Object.entries(override && typeof override === "object" ? override : {}).forEach(([key, value]) => {
@@ -2672,7 +3013,7 @@ function normalizeBoothDimensions(project = {}) {
 
 function collectQuoteDetails() {
   syncRichTextSources();
-  return {
+  const details = {
     quote_date: elements.quoteDate.value,
     project_number: elements.projectNumber.value.trim(),
     client: {
@@ -2705,6 +3046,9 @@ function collectQuoteDetails() {
       person_label: elements.personLabel.value.trim(),
       stamp_label: elements.stampLabel.value.trim(),
       date_label: elements.dateLabel.value.trim(),
+      ...(Object.prototype.hasOwnProperty.call(state.quoteCommercialPreservedQuoteText || {}, "cheque_payee")
+        ? { cheque_payee: state.quoteCommercialPreservedQuoteText.cheque_payee }
+        : {}),
     },
     signature: {
       company_signatory: elements.companySignatory.value.trim(),
@@ -2713,6 +3057,9 @@ function collectQuoteDetails() {
     },
     rich_text: collectRichTextDetails(),
   };
+  state.quoteCommercialSnapshot = quoteCommercialSnapshotForDetails(details);
+  details.commercial_snapshot = state.quoteCommercialSnapshot;
+  return details;
 }
 
 function collectQuoteCompanyProfileDetails() {
@@ -2730,6 +3077,7 @@ function collectQuoteCompanyProfileDetails() {
 }
 
 function applyQuoteDetails(details = {}, options = {}) {
+  const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
   const client = details.client || {};
   const project = details.project || {};
   const company = details.company || {};
@@ -2754,30 +3102,54 @@ function applyQuoteDetails(details = {}, options = {}) {
   if (shouldApply(company, "name", partial)) setInputValue(elements.quoteCompanyName, company.name);
   if (shouldApply(company, "header_details", partial)) setInputValue(elements.headerDetails, company.header_details);
   if (!partial || hasQuoteTaxLabel) {
-    if (elements.taxLabel) elements.taxLabel.value = normalizeTaxLabel(tax.label || quoteText.tax_label || DEFAULT_TAX_LABEL);
+    const taxLabelValue = tax.label ?? quoteText.tax_label;
+    if (elements.taxLabel) elements.taxLabel.value = ownedCommercial
+      ? String(taxLabelValue ?? "").trim()
+      : normalizeTaxLabel(taxLabelValue || DEFAULT_TAX_LABEL);
     if (
       elements.quoteTaxLabel
       && shouldApplyQuoteCommercialField("quoteTaxLabel", hasQuoteTaxLabel, partial, options)
     ) {
-      elements.quoteTaxLabel.value = normalizeTaxLabel(tax.label || quoteText.tax_label || DEFAULT_TAX_LABEL);
+      elements.quoteTaxLabel.value = ownedCommercial
+        ? String(taxLabelValue ?? "").trim()
+        : normalizeTaxLabel(taxLabelValue || DEFAULT_TAX_LABEL);
     }
   }
   if (!partial || hasQuoteTaxRate) {
-    setInputValue(elements.taxRate, taxRatePercentText(tax.rate ?? quoteText.tax_rate ?? DEFAULT_TAX_RATE));
+    const taxRateValue = Object.prototype.hasOwnProperty.call(tax, "rate") ? tax.rate : quoteText.tax_rate;
+    const capturedTaxRate = commercialTaxRateOrNull(taxRateValue);
+    setInputValue(elements.taxRate, ownedCommercial && capturedTaxRate === null ? "" : taxRatePercentText(
+      ownedCommercial ? capturedTaxRate : (capturedTaxRate ?? DEFAULT_TAX_RATE)
+    ));
     if (
       elements.quoteTaxRate
       && shouldApplyQuoteCommercialField("quoteTaxRate", hasQuoteTaxRate, partial, options)
     ) {
-      setInputValue(elements.quoteTaxRate, taxRatePercentText(tax.rate ?? quoteText.tax_rate ?? DEFAULT_TAX_RATE));
+      setInputValue(elements.quoteTaxRate, ownedCommercial && capturedTaxRate === null ? "" : taxRatePercentText(
+        ownedCommercial ? capturedTaxRate : (capturedTaxRate ?? DEFAULT_TAX_RATE)
+      ));
     }
   }
   if (shouldApplyQuoteCommercialField("quoteCurrency", hasOwnValue(details, "currency"), partial, options)) {
-    setQuoteCurrencyControls(normalizeCurrencyLabel(details.currency || selectedPricingReferenceCurrency()));
+    const savedCurrency = String(details.currency ?? "").trim();
+    if (ownedCommercial && !savedCurrency) {
+      if (elements.quoteCurrency) elements.quoteCurrency.value = "";
+      if (elements.quoteCurrencyCustom) {
+        elements.quoteCurrencyCustom.value = "";
+        elements.quoteCurrencyCustom.hidden = true;
+        elements.quoteCurrencyCustom.required = false;
+      }
+    } else {
+      setQuoteCurrencyControls(ownedCommercial ? savedCurrency : normalizeCurrencyLabel(savedCurrency || selectedPricingReferenceCurrency()));
+    }
   }
   if (shouldApplyQuoteCommercialField("quoteExchangeRate", hasOwnValue(details, "exchange_rate"), partial, options)) {
-    setInputValue(elements.quoteExchangeRate, quoteExchangeRateText(details.exchange_rate ?? 1));
+    const savedExchangeRate = Number(details.exchange_rate);
+    setInputValue(elements.quoteExchangeRate, ownedCommercial
+      ? (Number.isFinite(savedExchangeRate) && savedExchangeRate > 0 ? quoteExchangeRateText(savedExchangeRate) : "")
+      : quoteExchangeRateText(details.exchange_rate ?? 1));
   }
-  syncQuoteExchangeRateField();
+  if (!ownedCommercial) syncQuoteExchangeRateField();
   syncQuoteCommercialContextPills();
   if (shouldApply(quoteText, "terms_heading", partial)) setInputValue(elements.termsHeading, quoteText.terms_heading);
   if (shouldApply(quoteText, "payment_terms", partial)) setInputValue(elements.paymentTerms, linesValue(quoteText.payment_terms));
@@ -2806,7 +3178,7 @@ function applyQuoteDetails(details = {}, options = {}) {
   if (hasRichText || !partial) {
     restoreRichTextDetails(hasRichText ? details.rich_text : {}, { partial: partial && hasRichText });
   }
-  applyDefaultQuoteDate();
+  if (!ownedCommercial) applyDefaultQuoteDate();
   renderHeaderLogoPreview();
   renderPresetStatus();
 }
@@ -3103,6 +3475,7 @@ function buildSessionSnapshot() {
     quoteSessionDraftSaveStarted: state.quoteSessionDraftSaveStarted,
     quoteSessionRestoredSessionId: state.quoteSessionRestoredSessionId,
     quoteSessionRestoredDraftKey: state.quoteSessionRestoredDraftKey,
+    quoteCommercialLifecycle: state.quoteCommercialLifecycle,
     quoteCommercialTouched: normalizeQuoteCommercialTouched(state.quoteCommercialTouched || {}),
     images: state.images.slice(0, MAX_REFERENCE_IMAGES).map(sessionImageMetadata),
     quoteDetails: quoteDetailsWithSessionLogoMetadata(collectQuoteDetails()),
@@ -3227,21 +3600,30 @@ async function quoteDetailsWithStrongLogoFingerprint(details = {}) {
   };
 }
 
-async function hydrateProfileLogoFingerprints() {
-  state.profiles = await Promise.all(state.profiles.map(async (profile) => ({
+async function hydrateProfileLogoFingerprints(options = {}) {
+  const context = options.context || beginAuthorityProfileRequest();
+  const sourceProfiles = Array.isArray(options.profiles) ? options.profiles : state.profiles;
+  const sourceCompanyProfiles = Array.isArray(options.companyProfiles) ? options.companyProfiles : state.companyProfiles;
+  const profiles = await Promise.all(sourceProfiles.map(async (profile) => ({
     ...profile,
     quote_detail_presets: await Promise.all(
       (Array.isArray(profile.quote_detail_presets) ? profile.quote_detail_presets : [])
         .map(async (preset) => ({ ...preset, details: await quoteDetailsWithStrongLogoFingerprint(preset.details || {}) }))
     ),
   })));
-  state.companyProfiles = await Promise.all(state.companyProfiles.map(async (profile) => ({
+  const companyProfiles = await Promise.all(sourceCompanyProfiles.map(async (profile) => ({
     ...profile,
     defaults: await quoteDetailsWithStrongLogoFingerprint(profile.defaults || {}),
   })));
+  if (!authorityProfileRequestIsFresh(context)) return null;
+  if (options.commit !== false) {
+    state.profiles = profiles;
+    state.companyProfiles = companyProfiles;
+  }
+  return { profiles, companyProfiles };
 }
 
-async function restoreQuoteDetailsLogo(details = {}) {
+async function restoreQuoteDetailsLogo(details = {}, options = {}) {
   const company = details.company && typeof details.company === "object" ? details.company : {};
   const directDataUrl = String(company.logo_data_url || "").trim();
   if (directDataUrl) {
@@ -3253,7 +3635,7 @@ async function restoreQuoteDetailsLogo(details = {}) {
     const fileMap = await loadSessionFileMap([sessionFileKey]).catch(() => new Map());
     restoredLogo = fileMap.get(sessionFileKey) || null;
   }
-  const presetLogo = restoredLogo ? null : selectedPresetCompanyLogo();
+  const presetLogo = restoredLogo ? null : (options.preserveMissingLogo ? null : selectedPresetCompanyLogo());
   const source = restoredLogo || presetLogo;
   if (!source?.data_url && !source?.logo_data_url) return details;
   const restoredDataUrl = source.data_url || source.logo_data_url;
@@ -3339,6 +3721,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   if (!saved || typeof saved !== "object" || saved.version !== QUOTE_SESSION_STATE_VERSION) {
     return false;
   }
+  invalidateAuthorityProfileRequests();
   let rejectedRestoredActiveJob = false;
   state.profileId = saved.profileId || "";
   state.pricingReferenceId = saved.pricingReferenceId || saved.profileId || "";
@@ -3357,7 +3740,24 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.pricingReferenceSettingsMode = state.restorableOverlay
     ? normalizePricingReferenceSettingsMode(saved.pricingReferenceSettingsMode)
     : PRICING_REFERENCE_SETTINGS_MODE_MANAGE;
-  state.selectedPresetValue = saved.selectedPresetValue || presetValueFromQuoteDetails(saved.quoteDetails || {}) || lastSelectedPresetValue();
+  state.selectedPresetValue = saved.selectedPresetValue || presetValueFromQuoteDetails(saved.quoteDetails || {}) || "";
+  const savedCommercialSnapshot = saved.quoteDetails?.commercial_snapshot;
+  const normalizedCommercialSnapshot = normalizeQuoteCommercialSnapshot(savedCommercialSnapshot, "RECOVERED");
+  state.quoteCommercialLifecycle = "RECOVERED";
+  state.quoteCommercialSnapshot = normalizedCommercialSnapshot || quoteCommercialSnapshotFromLegacyRecovery();
+  const savedPricingBasis = normalizedCommercialSnapshot?.pricing_basis;
+  if (savedPricingBasis && typeof savedPricingBasis === "object" && String(savedPricingBasis.id || "").trim()) {
+    state.pricingReferenceId = String(savedPricingBasis.id).trim();
+    state.pricingReferenceSource = String(savedPricingBasis.source || "").trim();
+  }
+  state.quoteCommercialRecoveryError = normalizedCommercialSnapshot
+    ? ""
+    : "Saved quote commercial state requires pricing review before generation.";
+  const savedQuoteText = saved.quoteDetails?.quote_text;
+  state.quoteCommercialPreservedQuoteText = savedQuoteText
+    && Object.prototype.hasOwnProperty.call(savedQuoteText, "cheque_payee")
+    ? { cheque_payee: savedQuoteText.cheque_payee }
+    : {};
   state.quoteCommercialTouched = normalizeQuoteCommercialTouched(
     saved.quoteCommercialTouched || quoteDetailsCommercialTouched(saved.quoteDetails || {})
   );
@@ -3366,7 +3766,8 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   renderPresetOptions();
   state.pendingFeedback = String(saved.pendingFeedback || "");
   const restoredQuoteDetails = await restoreQuoteDetailsLogo(
-    quoteDetailsWithFallbackDefaults(selectedPreset()?.details || {}, saved.quoteDetails || {})
+    quoteDetailsWithFallbackDefaults(selectedPreset()?.details || {}, saved.quoteDetails || {}, { preserveSavedState: true }),
+    { preserveMissingLogo: true }
   );
   applyQuoteDetails(restoredQuoteDetails, { includeLogo: true, clearLogo: true });
   state.images = await restoreSessionImages(saved.images);
@@ -3473,6 +3874,7 @@ function selectedPresetId() {
 
 function templateProfilePresets() {
   return state.profiles.flatMap((profile) => {
+    if (profile.source === "company") return [];
     const presets = Array.isArray(profile.quote_detail_presets) ? profile.quote_detail_presets : [];
     return presets.map((preset) => ({
       ...preset,
@@ -3484,7 +3886,7 @@ function templateProfilePresets() {
 }
 
 function selectableTemplateProfilePresets() {
-  return templateProfilePresets().filter((preset) => preset.id !== "default");
+  return templateProfilePresets().filter((preset) => preset.source === "profile" && preset.profile_id && preset.id !== "default");
 }
 
 function normalizeCompanyProfile(profile = {}) {
@@ -3519,7 +3921,8 @@ function profilePresets() {
 function defaultProfilePresetId() {
   const profile = currentProfile();
   const configured = profile.default_quote_detail_preset || "default";
-  const presets = templateProfilePresets();
+  const ownerId = String(profile.id || "").trim();
+  const presets = templateProfilePresets().filter((preset) => preset.source === "profile" && preset.profile_id === ownerId);
   if (presets.some((preset) => preset.id === "default")) return "default";
   if (configured && presets.some((preset) => preset.id === configured)) return configured;
   return presets[0]?.id || "";
@@ -3528,27 +3931,34 @@ function defaultProfilePresetId() {
 function presetOptionValue(preset = {}) {
   const presetId = String(preset.id || "").trim();
   if (!presetId) return "";
-  return preset.source === "company" ? companyProfileOptionValue(presetId) : profilePresetOptionValue(presetId);
+  return preset.source === "company"
+    ? companyProfileOptionValue(presetId)
+    : profilePresetOptionValue(preset.profile_id, presetId);
 }
 
 function defaultPresetOptionValue() {
   const profileDefault = defaultProfilePresetId();
-  if (profileDefault) return profilePresetOptionValue(profileDefault);
+  if (profileDefault) return profilePresetOptionValue(currentProfile()?.id, profileDefault);
   return "";
 }
 
 function configuredProfilePresetId() {
   const profile = currentProfile();
   const configured = profile.default_quote_detail_preset || "";
-  const presets = templateProfilePresets();
+  const presets = templateProfilePresets().filter((preset) => preset.source === "profile" && preset.profile_id === String(profile.id || "").trim());
   return configured && presets.some((preset) => preset.id === configured) ? configured : "";
 }
 
 function selectedPreset() {
   const value = selectedPresetId();
   if (value.startsWith(PROFILE_PRESET_PREFIX)) {
-    const presetId = value.slice(PROFILE_PRESET_PREFIX.length);
-    const preset = templateProfilePresets().find((item) => item.id === presetId);
+    const qualified = profilePresetOptionParts(value);
+    if (!qualified) return null;
+    const preset = templateProfilePresets().find((item) => (
+      item.source === "profile"
+      && item.profile_id === qualified.profileId
+      && item.id === qualified.presetId
+    ));
     return preset ? { ...preset, source: "profile" } : null;
   }
   if (value.startsWith(COMPANY_PROFILE_PRESET_PREFIX)) {
@@ -3581,17 +3991,17 @@ function quoteDetailsMatchPreset(savedDetails = {}, presetDetails = {}) {
 
 function presetValueFromQuoteDetails(savedDetails = {}) {
   const matchesDetails = (preset) => quoteDetailsMatchPreset(savedDetails, preset.details || {});
-  const companyPreset = companyProfilePresets().find(matchesDetails);
-  if (companyPreset) return companyProfileOptionValue(companyPreset.id);
-  const profilePreset = templateProfilePresets().find(matchesDetails);
-  if (profilePreset) return profilePresetOptionValue(profilePreset.id);
+  const companyMatches = companyProfilePresets().filter(matchesDetails);
+  if (companyMatches.length === 1) return companyProfileOptionValue(companyMatches[0].id);
+  const profileMatches = templateProfilePresets().filter((preset) => preset.source === "profile" && matchesDetails(preset));
+  if (profileMatches.length === 1) return profilePresetOptionValue(profileMatches[0].profile_id, profileMatches[0].id);
   return "";
 }
 
 function availablePresetValues() {
   return new Set([
-    ...selectableTemplateProfilePresets().map((preset) => profilePresetOptionValue(preset.id)),
-    ...companyProfilePresets().map((preset) => companyProfileOptionValue(preset.id)),
+    ...selectableTemplateProfilePresets().map((preset) => presetOptionValue(preset)),
+    ...companyProfilePresets().map((preset) => presetOptionValue(preset)),
   ]);
 }
 
@@ -3610,6 +4020,13 @@ function selectPresetValue(value = "") {
 function lastSelectedPresetValue() {
   const value = String(safeLastSelectionJson().presetValue || "").trim();
   return value && availablePresetValues().has(value) ? value : "";
+}
+
+function preservedOwnedPresetValue() {
+  if (!["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""))) return "";
+  const value = String(state.selectedPresetValue || "").trim();
+  if (value.startsWith(COMPANY_PROFILE_PRESET_PREFIX)) return value;
+  return profilePresetOptionParts(value) ? value : "";
 }
 
 function persistLastProfilePresetSelection(value = state.selectedPresetValue) {
@@ -3749,13 +4166,14 @@ function renderPresetOptions() {
   const builtInPresets = selectableTemplateProfilePresets();
   const savedPresets = companyProfilePresets();
   const availableValues = availablePresetValues();
-  const selectedValue = [
+  const savedOwnedPresetValue = preservedOwnedPresetValue();
+  const selectedValue = savedOwnedPresetValue || [
     state.selectedPresetValue,
     elements.presetSelect.value,
     lastSelectedPresetValue(),
   ].find((value) => value && availableValues.has(value)) || "";
   const builtInOptions = builtInPresets
-    .map((preset) => `<option value="${escapeHtml(profilePresetOptionValue(preset.id))}">${escapeHtml(preset.name)}</option>`)
+    .map((preset) => `<option value="${escapeHtml(presetOptionValue(preset))}">${escapeHtml(preset.name)}</option>`)
     .join("");
   const savedOptions = savedPresets
     .map((preset) => `<option value="${escapeHtml(companyProfileOptionValue(preset.id))}">${escapeHtml(preset.name)}</option>`)
@@ -3766,7 +4184,7 @@ function renderPresetOptions() {
   ].join("");
   elements.presetSelect.innerHTML = optionGroups || '<option value="">No saved profiles yet</option>';
   state.selectedPresetValue = selectedValue;
-  elements.presetSelect.value = state.selectedPresetValue;
+  elements.presetSelect.value = availableValues.has(state.selectedPresetValue) ? state.selectedPresetValue : "";
   elements.presetSelect.disabled = !availableValues.size;
   elements.presetSelect.title = availableValues.size ? "" : "Save or import a profile to load it here.";
   elements.presetSelect.setAttribute("aria-disabled", String(elements.presetSelect.disabled));
@@ -4211,7 +4629,13 @@ function loadSelectedPreset(options = {}) {
   state.selectedPresetValue = elements.presetSelect.value || presetOptionValue(preset);
   persistLastProfilePresetSelection(state.selectedPresetValue);
   clearPendingProfilePack();
-  const shouldPreserveExistingQuoteState = options.silent === true && (quoteDraftHasAiAnalysis() || quoteDraftHasOutputState());
+  const shouldPreserveExistingQuoteState = options.silent === true && options.allowOwnedInitialization !== true && (
+    state.quoteCommercialLifecycle === "EXISTING"
+    ||
+    state.quoteCommercialLifecycle === "RECOVERED"
+    || quoteDraftHasAiAnalysis()
+    || quoteDraftHasOutputState()
+  );
   const details = preset.details || {};
   const emptyDefaultProfilePreset = preset.source === "profile"
     && preset.id === "default"
@@ -4219,6 +4643,12 @@ function loadSelectedPreset(options = {}) {
     && typeof details === "object"
     && !Object.keys(details).length;
   if (!shouldPreserveExistingQuoteState) {
+    if (options.silent !== true) {
+      state.quoteCommercialLifecycle = "EXISTING";
+      state.quoteCommercialSnapshot = null;
+      state.quoteCommercialRecoveryError = "";
+      state.quoteCommercialPreservedQuoteText = {};
+    }
     const clearsLogo = Boolean(details.company && typeof details.company === "object");
     applyQuoteDetails(details, { includeLogo: true, clearLogo: clearsLogo, partial: true });
     if (emptyDefaultProfilePreset) {
@@ -4245,6 +4675,11 @@ function loadSelectedPreset(options = {}) {
 }
 
 function loadDefaultProfilePreset(options = {}) {
+  const ownedPresetValue = preservedOwnedPresetValue();
+  if (options.allowOwnedInitialization !== true && ownedPresetValue) {
+    elements.presetSelect.value = availablePresetValues().has(ownedPresetValue) ? ownedPresetValue : "";
+    return;
+  }
   const defaultPreset = options.preferLastSelection === false
     ? defaultPresetOptionValue()
     : lastSelectedPresetValue() || defaultPresetOptionValue();
@@ -4260,12 +4695,17 @@ function loadDefaultProfilePreset(options = {}) {
 }
 
 function loadConfiguredProfilePreset(options = {}) {
+  const ownedPresetValue = preservedOwnedPresetValue();
+  if (options.allowOwnedInitialization !== true && ownedPresetValue) {
+    elements.presetSelect.value = availablePresetValues().has(ownedPresetValue) ? ownedPresetValue : "";
+    return;
+  }
   const configuredPreset = configuredProfilePresetId();
   if (!configuredPreset) {
     loadDefaultProfilePreset(options);
     return;
   }
-  state.selectedPresetValue = profilePresetOptionValue(configuredPreset);
+  state.selectedPresetValue = profilePresetOptionValue(currentProfile()?.id, configuredPreset);
   elements.presetSelect.value = availablePresetValues().has(state.selectedPresetValue) ? state.selectedPresetValue : "";
   loadSelectedPreset(options);
   if (!availablePresetValues().has(state.selectedPresetValue)) {
@@ -4286,7 +4726,7 @@ function clearCustomerDetails() {
   setInputValue(elements.quoteDate, todayDateInputValue());
   applyQuoteDateFormatFromHtml("");
   setInputValue(elements.projectNumber, "");
-  resetQuoteCommercialFieldsToSelectedPricingReference();
+  resetQuoteCommercialFieldsToSelectedPricingReference({ markOwned: true });
   clearGeneratedQuoteState();
   renderProfileOptions();
   setWorkflowStage(state.images.length ? "ready_to_analyze" : "needs_images");
@@ -4316,7 +4756,7 @@ function clearQuoteCompanyDetails() {
   hideProfileNameModal({ force: true });
   updatePresetButtons();
   renderHeaderLogoPreview();
-  loadDefaultProfilePreset({ silent: true, preferLastSelection: false });
+  loadDefaultProfilePreset({ silent: true, preferLastSelection: false, allowOwnedInitialization: true });
   invalidateGeneratedExportsIfPresentationChanged(presentationBeforeClear);
   syncControlStates();
   if (quoteSessionDraftStateCanSave()) {
@@ -4345,10 +4785,15 @@ async function startNewQuote() {
 }
 
 function resetCurrentQuoteDraftState() {
+  invalidateAuthorityProfileRequests();
   clearQuoteSessionDraftSaveTimer();
   transitionGenerationContext("", "");
   state.quoteSessionDraftSaveStarted = false;
   clearRestoredQuoteSessionBaseline();
+  state.quoteCommercialLifecycle = "NEW_UNINITIALISED";
+  state.quoteCommercialSnapshot = null;
+  state.quoteCommercialRecoveryError = "";
+  state.quoteCommercialPreservedQuoteText = {};
   resetQuoteCommercialTouched();
   state.profileId = "";
   state.pricingReferenceId = "";
@@ -4693,6 +5138,12 @@ function requestPresetImport(event) {
 
 function renderProfileOptions() {
   if (!elements.profileSelect) return;
+  const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+  const savedBasis = state.quoteCommercialSnapshot?.pricing_basis;
+  const preserveOwnedReference = ownedCommercial && (
+    state.quoteCommercialLifecycle === "RECOVERED"
+    || (savedBasis && typeof savedBasis === "object" && String(savedBasis.id || "").trim())
+  );
   const references = sortedPricingReferencesForDisplay(state.pricingReferences);
   const selectedValue = currentPricingReference() ? pricingReferenceSelectValue(currentPricingReference()) : "";
   const referenceOption = (reference) => {
@@ -4702,16 +5153,20 @@ function renderProfileOptions() {
   elements.profileSelect.innerHTML = references.length
     ? references.map(referenceOption).join("")
     : `<option value="">${escapeHtml(MISSING_PRICING_REFERENCES_MESSAGE)}</option>`;
-  const preferredReference = currentPricingReference() || lastSelectedPricingReference() || defaultPricingReference() || references[0] || null;
+  const preferredReference = preserveOwnedReference
+    ? currentPricingReference()
+    : currentPricingReference() || lastSelectedPricingReference() || defaultPricingReference() || references[0] || null;
   if (preferredReference) {
     state.pricingReferenceId = preferredReference.id || "";
     state.pricingReferenceSource = pricingReferenceSelectionFromValue(pricingReferenceSelectValue(preferredReference)).source;
-  } else {
+  } else if (!preserveOwnedReference) {
     state.pricingReferenceId = "";
     state.pricingReferenceSource = "";
   }
   const selectedReference = currentPricingReference();
-  elements.profileSelect.value = selectedReference ? pricingReferenceSelectValue(selectedReference) : selectedValue;
+  elements.profileSelect.value = selectedReference
+    ? pricingReferenceSelectValue(selectedReference)
+    : preserveOwnedReference ? "" : selectedValue;
   elements.profileSelect.disabled = references.length === 0;
   elements.profileSelect.title = references.length ? "" : MISSING_PRICING_REFERENCES_MESSAGE;
   elements.profileSelect.setAttribute("aria-disabled", String(elements.profileSelect.disabled));
@@ -5651,14 +6106,17 @@ function normalizeOutputRow(row = {}) {
         ? catalogDescription
         : currentDescription
     );
-  return recalculateOutputRow({
+  const capturedUnitPrice = numberOrNull(row.effective_unit_price);
+  const rawUnitPriceOverride = row.unit_price_override ?? "";
+  const normalized = recalculateOutputRow({
     section: normalizeCategoryTitle(row.section || ""),
     description,
     quantity: row.quantity ?? "",
     unit: normalizeUnit(row.unit || ""),
     price_mode: priceMode,
-    unit_price_override: row.unit_price_override ?? "",
+    unit_price_override: rawUnitPriceOverride !== "" ? rawUnitPriceOverride : (capturedUnitPrice !== null ? capturedUnitPrice : ""),
     catalog_unit_price: row.catalog_unit_price ?? row.unit_price ?? row.sale_unit_price ?? "",
+    pricing_basis_amount: row.pricing_basis_amount ?? "",
     catalog_description: cleanCustomerQuoteLineText(row.catalog_description || ""),
     pricing_reference_description: pricingReferenceLineText(row.pricing_reference_description || row.reference_description || ""),
     pricing_keyword: row.pricing_keyword || row.keyword || "",
@@ -5668,6 +6126,19 @@ function normalizeOutputRow(row = {}) {
     basis_order: orderNumber(row.basis_order) ?? "",
     status: row.status || "",
   });
+  const numericFields = ["effective_unit_price", "pricing_basis_amount", "approved_quote_amount"];
+  numericFields.forEach((key) => {
+    if (Object.prototype.hasOwnProperty.call(row, key)) normalized[key] = numberOrNull(row[key]);
+  });
+  ["pricing_basis_currency", "pricing_reference_source", "pricing_reference_id", "pricing_basis_digest"].forEach((key) => {
+    if (Object.prototype.hasOwnProperty.call(row, key) && String(row[key] || "").trim()) normalized[key] = String(row[key]).trim();
+  });
+  if (normalized.price_mode !== "Included" && normalized.effective_unit_price == null) {
+    const capturedPrice = effectiveOutputUnitPrice(normalized);
+    if (capturedPrice !== null) normalized.effective_unit_price = capturedPrice;
+  }
+  if (normalized.price_mode === "Included") normalized.approved_quote_amount = 0;
+  return recalculateOutputRow(synchronizeOwnedOutputRowPrice(normalized, normalized.unit_price_override));
 }
 
 function pricingReferenceValidationResult(items, headers, skipped, sourceName = "") {
@@ -6800,9 +7271,12 @@ async function deleteRepoPricingReference(referenceId, source = "local") {
     }
     state.pricingReferences = mergePricingReferences(Array.isArray(data.pricing_references) ? data.pricing_references : state.pricingReferences);
     if (state.pricingReferenceId === reference.id) {
-      const fallback = defaultPricingReference() || state.pricingReferences[0] || null;
-      state.pricingReferenceId = fallback?.id || "";
-      state.pricingReferenceSource = fallback ? pricingReferenceSelectionFromValue(pricingReferenceSelectValue(fallback)).source : "";
+      const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+      if (!ownedCommercial) {
+        const fallback = defaultPricingReference() || state.pricingReferences[0] || null;
+        state.pricingReferenceId = fallback?.id || "";
+        state.pricingReferenceSource = fallback ? pricingReferenceSelectionFromValue(pricingReferenceSelectValue(fallback)).source : "";
+      }
     }
     hidePricingReferenceDeleteConfirm();
     clearPricingReferenceDraft({ clearFile: true, resetMetadata: true });
@@ -6844,37 +7318,76 @@ async function deleteSelectedPricingReference() {
 }
 
 async function loadProfiles() {
+  const context = beginAuthorityProfileRequest();
   const { ok, data } = await getJson("/api/profiles");
+  if (!authorityProfileRequestIsFresh(context)) return false;
+  let profiles = state.profiles;
+  let workspace = state.workspace;
+  let defaultProfileId = state.defaultProfileId;
+  let defaultPricingReferenceId = state.defaultPricingReferenceId;
+  let pricingReferences = state.pricingReferences;
+  let companyProfiles = state.companyProfiles;
   if (ok && Array.isArray(data.profiles)) {
-    state.profiles = data.profiles;
-    state.workspace = data.workspace && typeof data.workspace === "object" ? data.workspace : null;
-    state.defaultProfileId = data.default_profile_id || DEFAULT_PROFILE_ID;
-    state.defaultPricingReferenceId = data.default_pricing_reference_id || DEFAULT_PRICING_REFERENCE_ID;
-    state.pricingReferences = mergePricingReferences(Array.isArray(data.pricing_references) ? data.pricing_references : []);
-    if (state.pricingReferenceId) {
-      syncSelectedPricingReference();
-    }
+    profiles = data.profiles;
+    workspace = data.workspace && typeof data.workspace === "object" ? data.workspace : null;
+    defaultProfileId = data.default_profile_id || DEFAULT_PROFILE_ID;
+    defaultPricingReferenceId = data.default_pricing_reference_id || DEFAULT_PRICING_REFERENCE_ID;
+    pricingReferences = mergePricingReferences(Array.isArray(data.pricing_references) ? data.pricing_references : []);
+    const canReadCompanyProfiles = state.permissions?.canGenerateQuote !== false;
+    companyProfiles = canReadCompanyProfiles && Array.isArray(data.company_profiles)
+      ? data.company_profiles
+        .map(normalizeCompanyProfile)
+        .sort((left, right) => String(left.label || left.id || "").localeCompare(String(right.label || right.id || ""), undefined, { sensitivity: "base" }))
+      : [];
   }
-  await loadCompanyProfiles();
-  await hydrateProfileLogoFingerprints();
+  const refreshedContext = refreshAuthorityProfileRequestContext(context);
+  const hydrated = refreshedContext
+    ? await hydrateProfileLogoFingerprints({
+      context: refreshedContext,
+      profiles,
+      companyProfiles,
+      commit: false,
+    })
+    : null;
+  if (!hydrated || !authorityProfileRequestIsFresh(refreshedContext)) return false;
+  state.profiles = hydrated.profiles;
+  state.companyProfiles = hydrated.companyProfiles;
+  state.workspace = workspace;
+  state.defaultProfileId = defaultProfileId;
+  state.defaultPricingReferenceId = defaultPricingReferenceId;
+  state.pricingReferences = pricingReferences;
+  if (state.pricingReferenceId) syncSelectedPricingReference();
+  if (!authorityProfileRequestIsFresh(refreshedContext)) return false;
   renderProfileOptions();
   renderPresetOptions();
+  return true;
 }
 
 async function loadCompanyProfiles() {
   if (!canManageProfiles()) {
-    state.companyProfiles = [];
-    return;
+    return false;
   }
+  const context = beginAuthorityProfileRequest();
   const { ok, data } = await getJson("/api/settings/profiles", { logFetchFailure: false });
-  if (!ok) {
-    state.companyProfiles = [];
-    return;
-  }
-  state.companyProfiles = (Array.isArray(data.company_profiles) ? data.company_profiles : [])
+  if (!ok || !authorityProfileRequestIsFresh(context)) return false;
+  const companyProfiles = (Array.isArray(data.company_profiles) ? data.company_profiles : [])
     .map(normalizeCompanyProfile)
     .sort((left, right) => String(left.label || left.id || "").localeCompare(String(right.label || right.id || ""), undefined, { sensitivity: "base" }));
+  const refreshedContext = refreshAuthorityProfileRequestContext(context);
+  const hydrated = refreshedContext
+    ? await hydrateProfileLogoFingerprints({
+      context: refreshedContext,
+      profiles: state.profiles,
+      companyProfiles,
+      commit: false,
+    })
+    : null;
+  if (!hydrated || !authorityProfileRequestIsFresh(refreshedContext)) return false;
+  state.profiles = hydrated.profiles;
+  state.companyProfiles = hydrated.companyProfiles;
+  if (!authorityProfileRequestIsFresh(refreshedContext)) return false;
   renderPresetOptions();
+  return true;
 }
 
 function quoteHasDerivedResults() {
@@ -7115,8 +7628,11 @@ function buildPayload(options = {}) {
       logo_data_url: state.headerLogo ? state.headerLogo.data_url : "",
       logo_name: state.headerLogo ? state.headerLogo.name : "",
       logo_type: state.headerLogo ? state.headerLogo.type : "",
+      logo_size: state.headerLogo ? state.headerLogo.size : 0,
+      logo_content_fingerprint: state.headerLogo ? state.headerLogo.content_fingerprint : "",
+      logo_session_file_key: state.headerLogo ? state.headerLogo.session_file_key : "",
     },
-    tax: selectedPricingReferenceTax(),
+    tax: quoteCommercialStateIsOwned() ? collectTaxDetails() : selectedPricingReferenceTax(),
     quote_tax: collectTaxDetails(),
     quote_currency: collectQuoteCurrency(),
     quote_exchange_rate: collectQuoteExchangeRate(),
@@ -7151,6 +7667,7 @@ function buildLineItemNormalizePayload() {
   const profileId = generationProfileIdForPayload();
   return {
     profile_id: profileId,
+    quote_exchange_rate: collectQuoteExchangeRate(),
     pricing_reference_id: pricingReference?.id || state.pricingReferenceId || "",
     pricing_reference: pricingReference ? {
       id: pricingReference.id || state.pricingReferenceId || "",
@@ -7164,6 +7681,11 @@ function buildLineItemNormalizePayload() {
       tax: selectedPricingReferenceTax(),
       currency: selectedPricingReferenceCurrency(),
     },
+    quote_session: currentQuoteSessionPayload({
+      quoteGenerated: Boolean(state.basisConfirmed || state.outputRows.length),
+      includeDraftState: true,
+      includeDraftFiles: false,
+    }),
     project: {
       booth_width: state.boothDimensions.booth_width,
       booth_depth: state.boothDimensions.booth_depth,
@@ -7188,6 +7710,19 @@ function renderMessages(messages = [], tone = "") {
     .join("");
 }
 
+function postCommitProjectionWarningFrom(data = {}) {
+  const warning = data?.post_commit_projection;
+  return warning
+    && warning.code === "post_commit_projection_failed"
+    && warning.retryable === true
+    ? warning
+    : null;
+}
+
+function postCommitProjectionWarningMessage(warning = {}) {
+  return String(warning.message || "Generation completed, but the session view could not be refreshed. Refresh to retry.").trim();
+}
+
 function setDownloadFiles(files = []) {
   const excelFile = files.find((file) => /\.xlsx$/i.test(file.name || "")) || null;
   const pdfFile = files.find((file) => /\.pdf$/i.test(file.name || "")) || null;
@@ -7206,7 +7741,7 @@ function revisionNumber(value, fallback = 0) {
 
 function markOutputRowsDirty() {
   state.outputRevision = revisionNumber(state.outputRevision, 0) + 1;
-  setDownloadFiles([]);
+  updateDownloadButton();
 }
 
 function downloadFileIsFresh(file = state.downloadFile) {
@@ -7476,6 +8011,15 @@ function effectiveOutputUnitPrice(row = {}) {
   const manual = numberOrNull(overrideText);
   if (manual !== null) return manual;
   if (overrideText && overrideText.toLowerCase() !== "included") return null;
+  const captured = numberOrNull(row.effective_unit_price);
+  if (captured !== null) return captured;
+  const basisAmount = numberOrNull(row.pricing_basis_amount);
+  const quantity = numberOrNull(row.quantity);
+  if (basisAmount !== null && quantity !== null && quantity > 0) {
+    return Math.round((basisAmount / quantity) * 1000000) / 1000000;
+  }
+  const ownedCommercial = typeof quoteCommercialStateIsOwned === "function" && quoteCommercialStateIsOwned();
+  if (ownedCommercial) return null;
   return numberOrNull(row.catalog_unit_price);
 }
 
@@ -7486,11 +8030,40 @@ function formatAmount(value) {
   return numeric.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+// Commercial amounts use explicit decimal half-up rounding, matching Python's
+// round_commercial_cents. BigInt avoids binary floating-point tie surprises such
+// as 1.005 becoming 1.00 in some runtimes.
+function roundCommercialCents(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  const text = numeric.toString().toLowerCase();
+  const negative = text.startsWith("-");
+  const unsigned = text.replace(/^[+-]/, "");
+  const parts = unsigned.split("e");
+  const coefficient = parts[0] || "0";
+  const exponent = parts.length > 1 ? Number(parts[1]) : 0;
+  if (!Number.isInteger(exponent) || !/^\d*(?:\.\d*)?$/.test(coefficient)) return null;
+  const digits = coefficient.replace(".", "") || "0";
+  const decimalPlaces = coefficient.includes(".") ? coefficient.length - coefficient.indexOf(".") - 1 : 0;
+  let cents = BigInt(digits);
+  const centShift = exponent + 2 - decimalPlaces;
+  if (centShift >= 0) {
+    cents *= 10n ** BigInt(centShift);
+  } else {
+    const divisor = 10n ** BigInt(-centShift);
+    const quotient = cents / divisor;
+    const remainder = cents % divisor;
+    cents = quotient + (remainder * 2n >= divisor ? 1n : 0n);
+  }
+  if (cents === 0n) return 0;
+  return (negative ? -1 : 1) * Number(cents) / 100;
+}
+
 function quoteAmountValue(value, multiplier = quoteFxMultiplier()) {
   const numeric = numberOrNull(value);
   if (numeric === null) return null;
   const fx = quoteFxMultiplier(multiplier);
-  return Math.round(numeric * fx * 100) / 100;
+  return roundCommercialCents(numeric * fx);
 }
 
 function recalculateOutputRow(row = {}) {
@@ -7501,8 +8074,29 @@ function recalculateOutputRow(row = {}) {
   return {
     ...row,
     price_mode: priceMode,
-    amount: priceMode === "Included" ? 0 : (quantity !== null && hasUsablePrice ? Math.round(quantity * unitPrice * 100) / 100 : ""),
+    amount: priceMode === "Included" ? 0 : (quantity !== null && hasUsablePrice ? roundCommercialCents(quantity * unitPrice) : ""),
   };
+}
+
+function synchronizeOwnedOutputRowPrice(row = {}, value = row.unit_price_override) {
+  const ownedCommercial = typeof quoteCommercialStateIsOwned === "function" && quoteCommercialStateIsOwned();
+  if (!ownedCommercial || unitPriceEditKind(value) !== "number") return row;
+  const unitPrice = numberOrNull(value);
+  if (unitPrice === null) return row;
+  const quantity = numberOrNull(row.quantity);
+  const next = {
+    ...row,
+    unit_price_override: unitPrice,
+    effective_unit_price: unitPrice,
+  };
+  if (quantity !== null && quantity > 0) {
+    next.pricing_basis_amount = roundCommercialCents(quantity * unitPrice);
+    next.approved_quote_amount = quoteAmountValue(next.pricing_basis_amount);
+  } else {
+    next.pricing_basis_amount = null;
+    next.approved_quote_amount = null;
+  }
+  return next;
 }
 
 function outputComparableText(value = "") {
@@ -7786,6 +8380,26 @@ function includedBasisOutputRows(existingRows = []) {
 function outputRowFromLineItem(item = {}) {
   const normalized = normalizeLineItem(item);
   const description = normalized.pricing_keyword ? outputCatalogDescription(normalized) : normalized.description;
+  const lifecycle = String(state.quoteCommercialLifecycle || "");
+  const snapshotLifecycle = String(state.quoteCommercialSnapshot?.lifecycle || "");
+  const recoveredCommercial = ["EXISTING", "RECOVERED"].includes(lifecycle)
+    || ["EXISTING", "RECOVERED"].includes(snapshotLifecycle);
+  const matchStatus = String(normalized.status || "").trim().toLowerCase();
+  const catalogUnitPrice = numberOrNull(normalized.catalog_unit_price);
+  const manualUnitPrice = numberOrNull(normalized.unit_price_override);
+  const capturedUnitPrice = !recoveredCommercial
+    && normalized.price_mode !== "Included"
+    && ["matched", "matched-from-ambiguous"].includes(matchStatus)
+    && catalogUnitPrice !== null
+    ? (manualUnitPrice !== null ? manualUnitPrice : catalogUnitPrice)
+    : null;
+  const quantity = numberOrNull(normalized.quantity);
+  const capturedBasisAmount = capturedUnitPrice !== null && quantity !== null && quantity > 0
+    ? roundCommercialCents(quantity * capturedUnitPrice)
+    : null;
+  const capturedApprovedAmount = capturedBasisAmount !== null
+    ? (typeof quoteAmountValue === "function" ? quoteAmountValue(capturedBasisAmount) : capturedBasisAmount)
+    : null;
   return normalizeOutputRow({
     section: normalized.section,
     description,
@@ -7802,6 +8416,18 @@ function outputRowFromLineItem(item = {}) {
     item_order: normalized.item_order,
     basis_order: normalized.basis_order,
     status: normalized.status || "",
+    ...(capturedUnitPrice !== null ? {
+      effective_unit_price: capturedUnitPrice,
+      pricing_basis_amount: capturedBasisAmount,
+      approved_quote_amount: capturedApprovedAmount,
+    } : {}),
+    ...(Object.prototype.hasOwnProperty.call(normalized, "effective_unit_price") ? { effective_unit_price: normalized.effective_unit_price } : {}),
+    ...(Object.prototype.hasOwnProperty.call(normalized, "pricing_basis_amount") ? { pricing_basis_amount: normalized.pricing_basis_amount } : {}),
+    ...(Object.prototype.hasOwnProperty.call(normalized, "approved_quote_amount") ? { approved_quote_amount: normalized.approved_quote_amount } : {}),
+    ...(Object.prototype.hasOwnProperty.call(normalized, "pricing_basis_currency") ? { pricing_basis_currency: normalized.pricing_basis_currency } : {}),
+    ...(Object.prototype.hasOwnProperty.call(normalized, "pricing_reference_source") ? { pricing_reference_source: normalized.pricing_reference_source } : {}),
+    ...(Object.prototype.hasOwnProperty.call(normalized, "pricing_reference_id") ? { pricing_reference_id: normalized.pricing_reference_id } : {}),
+    ...(Object.prototype.hasOwnProperty.call(normalized, "pricing_basis_digest") ? { pricing_basis_digest: normalized.pricing_basis_digest } : {}),
   });
 }
 
@@ -7826,9 +8452,15 @@ function outputRowFromPricingMatch(row = {}) {
   const manualDisplayAmount = status === "manual-display" ? numberOrNull(amount) : null;
   const quantity = numberOrNull(quantityParts.quantity);
   const manualDisplayUnitPrice = manualDisplayAmount !== null
-    ? (quantity !== null && quantity > 0 ? Math.round((manualDisplayAmount / quantity) * 100) / 100 : manualDisplayAmount)
+    ? (quantity !== null && quantity > 0 ? roundCommercialCents(manualDisplayAmount / quantity) : manualDisplayAmount)
     : "";
   const unitPrice = manualDisplayAmount !== null ? manualDisplayUnitPrice : row.unit_price || row.unit_price_override || "";
+  const recoveredCommercial = String(state.quoteCommercialLifecycle || "") === "RECOVERED"
+    || String(state.quoteCommercialSnapshot?.lifecycle || "") === "RECOVERED";
+  const canCaptureCurrentCatalogPrice = !recoveredCommercial
+    && ["matched", "matched-from-ambiguous"].includes(status)
+    && numberOrNull(unitPrice) !== null;
+  const capturedUnitPrice = canCaptureCurrentCatalogPrice ? numberOrNull(unitPrice) : null;
   const referenceDescription = pricingReferenceLineText(row.pricing_reference_description || row.catalog_description || "");
   return normalizeOutputRow({
     section: row.section,
@@ -7845,6 +8477,11 @@ function outputRowFromPricingMatch(row = {}) {
     category_order: row.category_order ?? "",
     item_order: row.item_order ?? "",
     status: row.status,
+    ...(capturedUnitPrice !== null ? {
+      effective_unit_price: capturedUnitPrice,
+      pricing_basis_amount: quantity !== null && quantity > 0 ? roundCommercialCents(quantity * capturedUnitPrice) : null,
+      approved_quote_amount: quantity !== null && quantity > 0 ? quoteAmountValue(roundCommercialCents(quantity * capturedUnitPrice)) : null,
+    } : {}),
   });
 }
 
@@ -7918,6 +8555,11 @@ function outputCellDisplayValue(row = {}, field = "") {
   if (field === "unit_price_override") {
     if (row.price_mode === "Included") return "Included";
     if (unitPriceEditKind(row.unit_price_override) === "invalid") return "???";
+    const ownedCommercial = typeof quoteCommercialStateIsOwned === "function" && quoteCommercialStateIsOwned();
+    if (ownedCommercial) {
+      const effective = effectiveOutputUnitPrice(row);
+      return effective === null ? "???" : formatAmount(quoteAmountValue(effective));
+    }
     if (numberOrNull(row.unit_price_override) !== null) return formatAmount(quoteAmountValue(row.unit_price_override));
     if (numberOrNull(row.catalog_unit_price) !== null) return formatAmount(quoteAmountValue(row.catalog_unit_price));
     return "???";
@@ -7945,10 +8587,14 @@ function outputEditorPlaceholder(field = "") {
 }
 
 function outputEditorHtml(row = {}, index = 0, field = "") {
+  const ownedCommercial = typeof quoteCommercialStateIsOwned === "function" && quoteCommercialStateIsOwned();
+  const unitPriceValue = ownedCommercial
+    ? effectiveOutputUnitPrice(row)
+    : (row.unit_price_override || row.catalog_unit_price || "");
   const value = field === "unit_price_override"
     ? row.price_mode === "Included"
       ? "Included"
-      : String(row.unit_price_override || row.catalog_unit_price || "")
+      : String(unitPriceValue ?? "")
     : String(row[field] ?? "");
   if (field === "description") {
     return `<textarea class="output-cell-input output-description-input is-editing" data-output-editor-field="${field}" data-output-row="${index}" rows="3" placeholder="${escapeHtml(outputEditorPlaceholder(field))}">${escapeHtml(value)}</textarea>`;
@@ -8020,7 +8666,11 @@ function snapshotOutputRows(rows = state.outputRows) {
 }
 
 function outputRowsToLineItems(rows = state.outputRows) {
-  return rows.map((row) => {
+  const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+  return rows.map((inputRow) => {
+    const row = ownedCommercial
+      ? synchronizeOwnedOutputRowPrice(inputRow, inputRow.unit_price_override)
+      : inputRow;
     const next = {
       section: String(row.section || "").trim(),
       description: String(row.description || "").trim(),
@@ -8046,17 +8696,50 @@ function outputRowsToLineItems(rows = state.outputRows) {
     if (basisOrder !== null) next.basis_order = basisOrder;
     const status = String(row.status || "").trim();
     if (status) next.status = status;
+    ["effective_unit_price", "pricing_basis_amount", "approved_quote_amount"].forEach((key) => {
+      if (Object.prototype.hasOwnProperty.call(row, key)) {
+        const value = numberOrNull(row[key]);
+        if (value !== null || key === "approved_quote_amount") next[key] = value;
+      }
+    });
+    ["pricing_basis_currency", "pricing_reference_source", "pricing_reference_id", "pricing_basis_digest"].forEach((key) => {
+      if (Object.prototype.hasOwnProperty.call(row, key) && String(row[key] || "").trim()) next[key] = String(row[key]).trim();
+    });
+    if (ownedCommercial && next.price_mode !== "Included") {
+      const basis = state.quoteCommercialSnapshot?.pricing_basis && typeof state.quoteCommercialSnapshot.pricing_basis === "object"
+        ? state.quoteCommercialSnapshot.pricing_basis
+        : {};
+      if (!next.pricing_basis_currency && String(basis.currency || "").trim()) next.pricing_basis_currency = String(basis.currency).trim();
+      if (!next.pricing_reference_source && String(basis.source || "").trim()) next.pricing_reference_source = String(basis.source).trim();
+      if (!next.pricing_reference_id && String(basis.id || "").trim()) next.pricing_reference_id = String(basis.id).trim();
+      if (!next.pricing_basis_digest && String(basis.digest || "").trim()) next.pricing_basis_digest = String(basis.digest).trim();
+      const historicalEffectivePrice = effectiveOutputUnitPrice(row);
+      const quantity = numberOrNull(row.quantity);
+      if (next.pricing_basis_amount == null && historicalEffectivePrice !== null && quantity !== null && quantity > 0) {
+        next.pricing_basis_amount = roundCommercialCents(quantity * historicalEffectivePrice);
+      }
+      if (next.approved_quote_amount == null && next.pricing_basis_amount != null) {
+        next.approved_quote_amount = quoteAmountValue(next.pricing_basis_amount);
+      }
+    }
     if (next.price_mode === "Included") {
       next.display_price = "Included";
+      if (ownedCommercial) next.approved_quote_amount = 0;
     } else {
       const unitPrice = numberOrNull(row.unit_price_override);
+      const effectivePrice = ownedCommercial ? effectiveOutputUnitPrice(row) : null;
       if (unitPrice !== null) next.unit_price_override = unitPrice;
+      else if (effectivePrice !== null) next.unit_price_override = effectivePrice;
+      if (ownedCommercial && next.effective_unit_price == null && effectivePrice !== null) {
+        next.effective_unit_price = effectivePrice;
+      }
     }
     return next;
   });
 }
 
 function outputRowsValid(rows = state.outputRows) {
+  const ownedCommercial = typeof quoteCommercialStateIsOwned === "function" && quoteCommercialStateIsOwned();
   const errors = [];
   rows.forEach((row, index) => {
     const label = `Row ${index + 1}`;
@@ -8067,8 +8750,8 @@ function outputRowsValid(rows = state.outputRows) {
       errors.push(`${label}: Quantity must be greater than 0.`);
     }
     if (row.price_mode !== "Included") {
-      const unitPrice = numberOrNull(row.unit_price_override);
-      const catalogUnitPrice = numberOrNull(row.catalog_unit_price);
+      const unitPrice = ownedCommercial ? effectiveOutputUnitPrice(row) : numberOrNull(row.unit_price_override);
+      const catalogUnitPrice = ownedCommercial ? null : numberOrNull(row.catalog_unit_price);
       const unitPriceKind = unitPriceEditKind(row.unit_price_override);
       if (unitPriceKind === "invalid") {
         errors.push(`${label}: Unit price must be a number or Included.`);
@@ -8171,12 +8854,21 @@ function matchSummaryStats(rows = []) {
   const sections = new Set(safeRows.map((row) => String(row.section || "").trim()).filter(Boolean)).size;
   const needsManualInput = safeRows.filter(rowNeedsManualInput).length;
   const pricedRows = safeRows.filter((row) => row.price_mode === "Included" || !rowNeedsManualInput(row)).length;
-  const totalPending = needsManualInput > 0;
+  const ownedCommercial = typeof state !== "undefined"
+    && ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+  const tax = typeof collectTaxDetails === "function" ? collectTaxDetails() : {};
+  const commercialIncomplete = ownedCommercial && (
+    !String(typeof collectQuoteCurrency === "function" ? collectQuoteCurrency() : "").trim()
+    || !(Number(typeof collectQuoteExchangeRate === "function" ? collectQuoteExchangeRate() : NaN) > 0)
+    || commercialTaxRateOrNull(tax?.rate) === null
+    || !String(tax?.label || "").trim()
+  );
+  const totalPending = needsManualInput > 0 || commercialIncomplete;
   const total = safeRows.reduce((sum, row) => {
     const amount = quoteAmountValue(row.amount);
     return Number.isFinite(amount) ? sum + amount : sum;
   }, 0);
-  return { sections, pricedRows, needsManualInput, total, totalPending };
+  return { sections, pricedRows, needsManualInput, total: roundCommercialCents(total), totalPending };
 }
 
 function formatSubtotalValue(stats = {}) {
@@ -8188,10 +8880,18 @@ function formatSubtotalValue(stats = {}) {
 function formatOutputTotalValue(stats = {}) {
   const subtotal = Number(stats.total || 0);
   const tax = collectTaxDetails();
-  const taxRate = Number(tax.rate ?? DEFAULT_TAX_RATE);
-  const grandTotal = Number.isFinite(taxRate) ? subtotal + (subtotal * taxRate) : subtotal;
-  const totalText = `${collectQuoteCurrency()} ${grandTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-  return stats.totalPending ? `${totalText} + ???` : totalText;
+  const ownedCommercial = typeof state !== "undefined"
+    && ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+  const taxRate = commercialTaxRateOrNull(tax?.rate);
+  const taxIncomplete = ownedCommercial && (!String(tax?.label || "").trim() || taxRate === null);
+  const resolvedTaxRate = taxRate ?? (ownedCommercial ? Number.NaN : DEFAULT_TAX_RATE);
+  const grandTotal = Number.isFinite(resolvedTaxRate)
+    ? roundCommercialCents(subtotal + roundCommercialCents(subtotal * resolvedTaxRate))
+    : null;
+  const totalText = grandTotal === null
+    ? `${collectQuoteCurrency()} -`
+    : `${collectQuoteCurrency()} ${grandTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  return stats.totalPending || taxIncomplete ? `${totalText} + ???` : totalText;
 }
 
 function outputPricingSourceLabel() {
@@ -8204,7 +8904,7 @@ function outputHeaderStatus(rows = state.outputRows) {
   const safeRows = Array.isArray(rows) ? rows : [];
   if (!safeRows.length) return { label: "Draft", className: "is-empty" };
   const stats = matchSummaryStats(safeRows);
-  return stats.needsManualInput > 0
+  return stats.totalPending
     ? { label: "Needs pricing", className: "is-warn" }
     : { label: "Ready", className: "is-ok" };
 }
@@ -8314,10 +9014,12 @@ function handleOutputRowEdit(event) {
   const index = Number(input.dataset.outputRow);
   const field = input.dataset.outputField;
   if (!Number.isInteger(index) || index < 0 || !state.outputRows[index] || !field) return;
-  state.outputRows[index] = recalculateOutputRow({
+  let nextRow = {
     ...state.outputRows[index],
     [field]: input.value,
-  });
+  };
+  if (field === "unit_price_override") nextRow = synchronizeOwnedOutputRowPrice(nextRow, input.value);
+  state.outputRows[index] = recalculateOutputRow(nextRow);
   state.lineItems = outputRowsToLineItems();
   markOutputRowsDirty();
   const validation = outputRowsValid();
@@ -8341,6 +9043,7 @@ function commitOutputEditor(editor) {
       nextRow = { ...currentRow, price_mode: "Included", unit_price_override: "", display_price: "Included" };
     } else {
       nextRow = { ...currentRow, price_mode: "Priced", display_price: "", unit_price_override: value };
+      nextRow = synchronizeOwnedOutputRowPrice(nextRow, value);
     }
   }
   state.outputRows[index] = recalculateOutputRow(nextRow);
@@ -10193,8 +10896,8 @@ function formatDashboardDateTime(value = "") {
 function formatDashboardMoney(session = {}) {
   const commercials = session.commercials || {};
   const total = dashboardNumberOrNull(commercials.grand_total);
-  if (total === null) return "-";
-  const currency = String(commercials.currency || DEFAULT_CURRENCY_LABEL).trim() || DEFAULT_CURRENCY_LABEL;
+  const currency = String(commercials.currency || "").trim();
+  if (total === null || !currency) return "-";
   return `${currency} ${total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
@@ -10208,7 +10911,7 @@ function dashboardGrandTotalValue(session = {}) {
 }
 
 function dashboardSessionCurrency(session = {}) {
-  return String(session.commercials?.currency || DEFAULT_CURRENCY_LABEL).trim() || DEFAULT_CURRENCY_LABEL;
+  return String(session.commercials?.currency || "").trim() || "Review required";
 }
 
 function formatDashboardMoneyValue(total, currency = DEFAULT_CURRENCY_LABEL) {
@@ -10218,20 +10921,24 @@ function formatDashboardMoneyValue(total, currency = DEFAULT_CURRENCY_LABEL) {
 }
 
 function dashboardCommercialsFromState() {
+  const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
   const tax = collectTaxDetails();
   const stats = matchSummaryStats(state.outputRows);
   const hasConfirmedTotal = state.outputRows.length > 0 && !stats.totalPending;
-  const subtotal = hasConfirmedTotal ? stats.total : null;
-  const taxRate = Number(tax.rate ?? DEFAULT_TAX_RATE);
-  const taxAmount = subtotal === null || !Number.isFinite(taxRate) ? null : subtotal * taxRate;
+  const subtotal = hasConfirmedTotal ? roundCommercialCents(Number(stats.total)) : null;
+  const capturedTaxRate = commercialTaxRateOrNull(tax?.rate);
+  const taxRate = capturedTaxRate ?? (ownedCommercial ? Number.NaN : DEFAULT_TAX_RATE);
+  const taxAmount = subtotal === null || !Number.isFinite(taxRate)
+    ? null
+    : roundCommercialCents(subtotal * taxRate);
   return {
     currency: collectQuoteCurrency(),
-    tax_label: tax.label || DEFAULT_TAX_LABEL,
-    tax_rate: Number.isFinite(taxRate) ? taxRate : DEFAULT_TAX_RATE,
+    tax_label: ownedCommercial ? tax.label : (tax.label || DEFAULT_TAX_LABEL),
+    tax_rate: Number.isFinite(taxRate) ? taxRate : (ownedCommercial ? null : DEFAULT_TAX_RATE),
     exchange_rate: collectQuoteExchangeRate(),
     subtotal,
     tax_amount: taxAmount,
-    grand_total: subtotal === null || taxAmount === null ? null : subtotal + taxAmount,
+    grand_total: subtotal === null || taxAmount === null ? null : roundCommercialCents(subtotal + taxAmount),
   };
 }
 
@@ -10301,6 +11008,7 @@ function currentQuoteSessionDraftState() {
     pricingReferenceId: snapshot.pricingReferenceId,
     pricingReferenceSource: snapshot.pricingReferenceSource,
     selectedPresetValue: snapshot.selectedPresetValue,
+    quoteCommercialLifecycle: snapshot.quoteCommercialLifecycle,
     quoteCommercialTouched: snapshot.quoteCommercialTouched,
     images: snapshot.images,
     quoteDetails: snapshot.quoteDetails,
@@ -10430,7 +11138,7 @@ function currentQuoteSessionPayload(options = {}) {
       event_or_project_date: details.quote_date || "",
     },
     quote_company_profile: {
-      id: safeProfileId(generationProfileIdForPayload(), ""),
+      id: generationProfileIdForPayload(),
       display_name: selectedProfile?.name || profile?.label || details.company?.name || "",
     },
     pricing_reference: {
@@ -10805,7 +11513,10 @@ function quoteSessionHasMissingExport(session = {}) {
 }
 
 function quoteSessionHasAvailableExport(session = {}) {
-  return ["xlsx", "pdf"].some((kind) => Boolean(quoteSessionExport(session, kind).exists));
+  return ["xlsx", "pdf"].some((kind) => {
+    const exportInfo = quoteSessionExport(session, kind);
+    return Boolean(exportInfo.exists && exportInfo.stale !== true);
+  });
 }
 
 function quoteSessionHasStaleExport(session = {}) {
@@ -11053,14 +11764,15 @@ function dashboardModifiedText(session = {}) {
 
 function dashboardTaxText(session = {}) {
   const commercials = session.commercials || {};
-  const label = String(commercials.tax_label || DEFAULT_TAX_LABEL).trim() || DEFAULT_TAX_LABEL;
-  return label;
+  return String(commercials.tax_label || "").trim() || "Review required";
 }
 
 function dashboardTaxRateText(session = {}) {
   const commercials = session.commercials || {};
-  const rate = Number(commercials.tax_rate ?? DEFAULT_TAX_RATE);
-  return Number.isFinite(rate) ? `${(rate * 100).toLocaleString(undefined, { maximumFractionDigits: 2 })}%` : "-";
+  const rate = commercialTaxRateOrNull(commercials.tax_rate);
+  return rate !== null
+    ? `${(rate * 100).toLocaleString(undefined, { maximumFractionDigits: 2 })}%`
+    : "Review required";
 }
 
 const QUOTE_SESSION_DELETE_SINGLE_MESSAGE = "This removes the local dashboard record and any saved local exports for this quote session. This cannot be undone.";
@@ -11436,6 +12148,9 @@ function dashboardExportAvailabilityItem(session = {}, kind = "xlsx", label = "X
   const exportInfo = quoteSessionExport(session, kind);
   const generatedStatus = quoteSessionStatus(session).key === "generated";
   if (exportInfo.exists && exportInfo.url) {
+    if (exportInfo.stale) {
+      return { kind, label, exportInfo, available: true, statusText: `${label} stale - needs regeneration`, className: "is-stale" };
+    }
     return { kind, label, exportInfo, available: true, statusText: `${label} ready`, className: "is-available" };
   }
   if (exportInfo.stale) {
@@ -11619,7 +12334,9 @@ function continueDashboardDraft(sessionId) {
 function dashboardSelectedExportAction(session = {}, kind = "xlsx", label = "XLSX") {
   const item = dashboardExportAvailabilityItem(session, kind, label);
   if (item.available) {
-    return `<a class="dashboard-selected-action dashboard-export-link ${escapeHtml(item.className)}" href="${escapeHtml(item.exportInfo.url)}" download title="${escapeHtml(item.statusText)}" aria-label="Download ${escapeHtml(label)}"><span class="dashboard-selected-action-kicker">Download</span><span class="dashboard-selected-action-label">${escapeHtml(label)}</span></a>`;
+    const actionLabel = item.exportInfo.stale ? `${label} (stale)` : label;
+    const ariaLabel = item.exportInfo.stale ? `Download ${label} (stale; needs regeneration)` : `Download ${label}`;
+    return `<a class="dashboard-selected-action dashboard-export-link ${escapeHtml(item.className)}" href="${escapeHtml(item.exportInfo.url)}" download title="${escapeHtml(item.statusText)}" aria-label="${escapeHtml(ariaLabel)}"><span class="dashboard-selected-action-kicker">Download</span><span class="dashboard-selected-action-label">${escapeHtml(actionLabel)}</span></a>`;
   }
   return `<span class="dashboard-selected-action dashboard-export-missing ${escapeHtml(item.className)}" aria-disabled="true" title="${escapeHtml(item.statusText)}" aria-label="${escapeHtml(item.statusText)}"><span class="dashboard-selected-action-label">${escapeHtml(label)}</span></span>`;
 }
@@ -11725,7 +12442,7 @@ function renderDashboardSinglePanel(activeSession = {}) {
       <dl class="dashboard-selected-summary-grid">
         <div><dt>Grand Total</dt><dd><span class="dashboard-money">${escapeHtml(formatDashboardMoney(activeSession))}</span></dd></div>
         <div><dt>Subtotal</dt><dd>${escapeHtml(formatDashboardSubtotal(activeSession))}</dd></div>
-        <div><dt>Currency / FX</dt><dd>${escapeHtml(`${dashboardSessionCurrency(activeSession)} / FX ${quoteExchangeRateText(activeSession.commercials?.exchange_rate ?? 1)}`)}</dd></div>
+        <div><dt>Currency / FX</dt><dd>${escapeHtml(`${dashboardSessionCurrency(activeSession)} / FX ${quoteExchangeRateText(activeSession.commercials?.exchange_rate)}`)}</dd></div>
         <div><dt>Pricing Reference</dt><dd>${escapeHtml(pricing)}</dd></div>
         <div><dt>Tax / Rate</dt><dd>${escapeHtml(`${dashboardTaxText(activeSession)} / ${dashboardTaxRateText(activeSession)}`)}</dd></div>
         <div><dt>Show Name</dt><dd>${showName ? escapeHtml(showName) : "-"}</dd></div>
@@ -12563,6 +13280,7 @@ async function handleGenerate(options = {}) {
     setWorkflowStage("basis_review");
     return;
   }
+  const hadSuccessfulExports = quoteSessionHasFreshOutputExports();
 
   const jobType = viewPdf ? "generate_pdf" : "generate";
   const operation = normalizeActiveJob({
@@ -12578,8 +13296,6 @@ async function handleGenerate(options = {}) {
   setWorkflowStage("generating");
   setResultStatus(viewPdf ? "Generating PDF" : "Generating Excel", "is-warn");
   renderMessages([]);
-  setDownloadFiles([]);
-  renderMatchSummary({});
   clearPricingReviewMessages();
   syncControlStates();
   const synchronizedSessionId = await ensureQuoteSession({
@@ -12623,6 +13339,7 @@ async function handleGenerate(options = {}) {
   clearActiveJob();
 
   const data = polled.data.result || polled.data || {};
+  const postCommitProjectionWarning = postCommitProjectionWarningFrom(data);
   const previousContext = currentGenerationContext();
   const resultSessionId = safeQuoteSessionId(data.quote_session?.session_id || previousContext.session_id);
   const resultRunId = data.generation_run_id || polled.data.generation_run_id
@@ -12633,8 +13350,10 @@ async function handleGenerate(options = {}) {
     setResultStatus(data.status || "Failed", "is-bad");
     const blocked = polled.data.status === "blocked" || data.status === "blocked";
     renderMessages(blocked ? (data.errors || ["Generation blocked."]) : genericFailureMessages(data || polled.data), "error");
-    if (data.pricing_matches?.length) renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
-    renderMatchSummary(data);
+    if (!hadSuccessfulExports && data.pricing_matches?.length) {
+      renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
+    }
+    renderMatchSummary(hadSuccessfulExports ? { pricing_matches: state.outputRows } : data);
     syncControlStates();
     return;
   }
@@ -12647,17 +13366,25 @@ async function handleGenerate(options = {}) {
     renderMessages([]);
     clearPricingReviewMessages();
     setSidePanel("output", { force: true });
-    setDownloadFiles([]);
-    if (data.pricing_matches?.length) renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
-    renderMatchSummary(data);
+    if (!hadSuccessfulExports && data.pricing_matches?.length) {
+      renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
+    }
+    renderMatchSummary(hadSuccessfulExports ? { pricing_matches: state.outputRows } : data);
   } else {
     setWorkflowStage("completed");
     clearPricingReviewMessages();
     setSidePanel("output", { force: true });
-    setDownloadFiles(data.files || []);
+    setDownloadFiles(
+      postCommitProjectionWarning
+        ? (data.committed_files || [])
+        : (data.files || []),
+    );
     renderPricingMatches(state.outputRows);
     renderMatchSummary({ pricing_matches: state.outputRows });
-    if (viewPdf && !state.pdfFile) {
+    if (postCommitProjectionWarning) {
+      setResultStatus("Completed - refresh needed", "is-warn");
+      renderMessages([postCommitProjectionWarningMessage(postCommitProjectionWarning)], "warn");
+    } else if (viewPdf && !state.pdfFile) {
       setResultStatus("PDF unavailable", "is-bad");
       const pdfStatus = data.export_status?.pdf_status || data.export_status?.pdf_readiness || "";
       const reason = pdfStatus === "workbook_export_unavailable"
@@ -12669,9 +13396,15 @@ async function handleGenerate(options = {}) {
       renderMessages([]);
     }
   }
-  await saveQuoteSessionDraftState({ quoteGenerated: true });
+  if (postCommitProjectionWarning) {
+    saveSessionState();
+  } else {
+    await saveQuoteSessionDraftState({ quoteGenerated: true });
+  }
   syncControlStates();
-  return viewPdf ? Boolean(state.pdfFile) : Boolean(state.downloadFile);
+  return postCommitProjectionWarning
+    ? false
+    : viewPdf ? Boolean(state.pdfFile) : Boolean(state.downloadFile);
 }
 
 async function ensureSavedServerJobStarted(activeJob) {
@@ -12848,6 +13581,7 @@ async function resumeSavedJob() {
     }
 
     const data = polled.data.result || polled.data || {};
+    const postCommitProjectionWarning = postCommitProjectionWarningFrom(data);
     const previousContext = currentGenerationContext();
     const resultSessionId = safeQuoteSessionId(data.quote_session?.session_id || previousContext.session_id);
     const resultRunId = data.generation_run_id || polled.data.generation_run_id
@@ -12876,22 +13610,34 @@ async function resumeSavedJob() {
       renderMessages([]);
       clearPricingReviewMessages();
       setSidePanel("output", { force: true });
-      setDownloadFiles([]);
     } else {
       setWorkflowStage("completed");
-      setResultStatus(viewPdf ? "PDF ready" : "Completed", "is-ok");
-      renderMessages([]);
+      if (postCommitProjectionWarning) {
+        setResultStatus("Completed - refresh needed", "is-warn");
+        renderMessages([postCommitProjectionWarningMessage(postCommitProjectionWarning)], "warn");
+      } else {
+        setResultStatus(viewPdf ? "PDF ready" : "Completed", "is-ok");
+        renderMessages([]);
+      }
       clearPricingReviewMessages();
       setSidePanel("output");
-      setDownloadFiles(data.files || []);
+      setDownloadFiles(
+        postCommitProjectionWarning
+          ? (data.committed_files || [])
+          : (data.files || []),
+      );
     }
     if (data.pricing_matches?.length) renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
     renderMatchSummary(data);
-    await saveQuoteSessionDraftState({ quoteGenerated: true });
+    if (postCommitProjectionWarning) {
+      saveSessionState();
+    } else {
+      await saveQuoteSessionDraftState({ quoteGenerated: true });
+    }
     state.isGenerating = false;
     clearActiveJob();
     syncControlStates();
-    if (!needsPricingReview && showGeneratedExportReadyModal(viewPdf)) return;
+    if (!needsPricingReview && !postCommitProjectionWarning && showGeneratedExportReadyModal(viewPdf)) return;
     hideExcelGeneratingModal();
     return;
   }
@@ -13015,9 +13761,10 @@ function setSidePanel(panelName, options = {}) {
   state.activeSidePanel = nextPanel;
   if (
     state.activeSidePanel === "customer"
+    && !["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""))
     && !QUOTE_COMMERCIAL_FIELD_KEYS.some((field) => quoteCommercialFieldIsTouched(field))
   ) {
-    resetQuoteCommercialFieldsToSelectedPricingReference();
+    resetQuoteCommercialFieldsToSelectedPricingReference({ markOwned: true });
   }
   document.body.dataset.sidePanel = state.activeSidePanel;
   elements.sideDrawerTitle.textContent = title;
@@ -13299,6 +14046,15 @@ function wireEvents() {
       };
     } else {
       state.headerLogo = null;
+    }
+    if (quoteCommercialStateIsOwned() && state.quoteCommercialSnapshot) {
+      state.quoteCommercialSnapshot = {
+        ...state.quoteCommercialSnapshot,
+        presence: {
+          ...(state.quoteCommercialSnapshot.presence || {}),
+          logo: state.headerLogo ? "captured" : "intentional_empty",
+        },
+      };
     }
     renderHeaderLogoPreview();
     renderPresetStatus();
