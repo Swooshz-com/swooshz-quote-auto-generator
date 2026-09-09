@@ -13591,6 +13591,373 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
             (200, pdf_bytes),
         )
 
+    def _run466_payload(
+        self,
+        session_id: str,
+        row_description: str,
+        output_revision: int,
+        *,
+        quote_generated: bool = True,
+        workflow_stage: str = "generating",
+        file_urls: tuple[str, str] | None = None,
+    ) -> dict:
+        payload = valid_payload()
+        draft_state = {
+            "version": 1,
+            "savedAt": "2026-09-09T00:00:00Z",
+            "activeAppView": "quote",
+            "activeSidePanel": "output",
+            "workflowStage": workflow_stage,
+            "quoteCommercialLifecycle": "NEW_UNINITIALISED",
+            "quoteDetails": {
+                "quote_date": payload["quote_date"],
+                "project_number": payload["project_number"],
+                "client": copy.deepcopy(payload["client"]),
+                "project": copy.deepcopy(payload["project"]),
+                "company": copy.deepcopy(payload["company"]),
+                "quote_text": copy.deepcopy(payload["quote_text"]),
+                "signature": copy.deepcopy(payload["signature"]),
+            },
+            "outputRows": [{
+                "section": "Floor Design",
+                "description": row_description,
+                "quantity": 1,
+                "unit": "sqm",
+                "amount": 100,
+            }],
+            "outputRevision": output_revision,
+        }
+        if file_urls is not None:
+            draft_state.update({
+                "downloadFile": {
+                    "name": "quotation.xlsx",
+                    "url": file_urls[0],
+                    "output_revision": output_revision,
+                },
+                "pdfFile": {
+                    "name": "quotation.pdf",
+                    "url": file_urls[1],
+                    "output_revision": output_revision,
+                },
+                "downloadFileRevision": output_revision,
+                "pdfFileRevision": output_revision,
+            })
+        payload["quote_session"] = {
+            "session_id": session_id,
+            "commercials": {
+                "currency": "SGD",
+                "tax_label": "GST",
+                "tax_rate": 0.09,
+                "subtotal": 100,
+                "tax_amount": 9,
+                "grand_total": 109,
+            },
+            "status": {"quote_generated": quote_generated},
+            "draft_state": draft_state,
+        }
+        return payload
+
+    def _post_local_quote_session(self, runner: LocalRunnerServer, payload: dict) -> dict:
+        session = self.http_json(runner, "GET", "/api/session")
+        self.assertEqual(session["status"], 200, session)
+        body = session["body"]
+        return self.http_json(
+            runner,
+            "POST",
+            "/api/quote-sessions",
+            body=payload,
+            headers={
+                "Origin": runner.base_url,
+                body["csrf_header"]: body["csrf_token"],
+            },
+        )
+
+    @staticmethod
+    def _run466_fake_generator(outputs: dict[str, tuple[bytes, bytes | None]]):
+        def fake_generator(command, **_kwargs):
+            output_dir = Path(command[command.index("--out") + 1])
+            xlsx_bytes, pdf_bytes = outputs[output_dir.name]
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
+            if pdf_bytes is not None:
+                (output_dir / "quotation.pdf").write_bytes(pdf_bytes)
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        return fake_generator
+
+    def test_run466_local_publication_truthfulness_end_to_end(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            output_root = root / "output"
+            tmp_root = root / "tmp"
+            log_root = root / "_logs" / "app"
+            outputs = {
+                "job-466-old": (b"run466-old-xlsx", b"run466-old-pdf"),
+                "job-466-pdf-fail": (b"run466-uncommitted-xlsx", b"run466-uncommitted-pdf"),
+                "job-466-metadata-fail": (b"run466-metadata-xlsx", b"run466-metadata-pdf"),
+                "job-466-final": (b"run466-final-xlsx", b"run466-final-pdf"),
+                "job-466-partial-old": (b"run466-partial-old-xlsx", b"run466-partial-old-pdf"),
+                "job-466-partial-new": (b"run466-partial-new-xlsx", None),
+            }
+            env = isolated_env(
+                QUOTE_DATA_ROOT=str(data_root),
+                QUOTE_OUTPUT_ROOT=str(output_root),
+                QUOTE_LOG_ROOT=str(log_root),
+            )
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(webapp, "configured_data_root", return_value=data_root),
+                mock.patch.object(webapp, "configured_output_root", return_value=output_root),
+                mock.patch.object(webapp, "configured_log_root", return_value=log_root),
+                mock.patch.object(
+                    webapp.subprocess,
+                    "run",
+                    side_effect=self._run466_fake_generator(outputs),
+                ),
+                LocalRunnerServer() as runner,
+            ):
+                old_payload = self._run466_payload("quote-run466", "Run-466 old row", 0)
+                old_result = webapp.run_quote_job(
+                    old_payload,
+                    output_root=output_root,
+                    tmp_root=tmp_root,
+                    job_id="job-466-old",
+                )
+                self.assertEqual(old_result["status"], "completed", old_result)
+                old_metadata = webapp.read_quote_session_metadata("quote-run466")
+                old_publication_id = old_metadata["publication"]["active_publication_id"]
+
+                unchanged_payload = self._run466_payload(
+                    "quote-run466",
+                    "Run-466 old row",
+                    0,
+                    workflow_stage="completed",
+                    file_urls=(
+                        "/api/quote-sessions/quote-run466/download/xlsx",
+                        "/api/quote-sessions/quote-run466/download/pdf",
+                    ),
+                )
+                unchanged_response = self._post_local_quote_session(runner, unchanged_payload)
+                self.assertEqual(unchanged_response["status"], 200, unchanged_response)
+                unchanged = unchanged_response["body"]["quote_session"]
+                self.assertFalse(unchanged["exports"]["xlsx"]["stale"])
+                self.assertFalse(unchanged["exports"]["pdf"]["stale"])
+
+                changed_payload = self._run466_payload(
+                    "quote-run466", "Run-466 changed row", 1, workflow_stage="generating"
+                )
+                original_copy2 = webapp.shutil.copy2
+
+                def fail_pdf_staging(source, destination):
+                    if Path(source).name == "quotation.pdf":
+                        raise OSError("synthetic Run-466 PDF staging failure")
+                    return original_copy2(source, destination)
+
+                with mock.patch.object(webapp.shutil, "copy2", side_effect=fail_pdf_staging):
+                    failed_pdf = webapp.run_quote_job(
+                        changed_payload,
+                        output_root=output_root,
+                        tmp_root=tmp_root,
+                        job_id="job-466-pdf-fail",
+                    )
+                self.assertEqual(failed_pdf["status"], "failed", failed_pdf)
+                self.assertNotIn("files", failed_pdf)
+                self.assertNotIn("quote_session", failed_pdf)
+                self.assertNotIn("output_dir", failed_pdf)
+                self.assertNotIn("brief_path", failed_pdf)
+                self.assertEqual(
+                    webapp.read_quote_session_metadata("quote-run466")["publication"]["active_publication_id"],
+                    old_publication_id,
+                )
+                after_pdf_failure = webapp.get_quote_session("quote-run466")
+                self.assertFalse(after_pdf_failure["exports"]["xlsx"]["stale"])
+                self.assertFalse(after_pdf_failure["exports"]["pdf"]["stale"])
+                self._assert_local_pair_downloads(
+                    runner, "quote-run466", b"run466-old-xlsx", b"run466-old-pdf"
+                )
+                self.assertEqual(
+                    local_http_get_bytes(
+                        runner,
+                        "/api/jobs/job-466-pdf-fail/files/quotation.pdf",
+                    ),
+                    (200, b"run466-uncommitted-pdf"),
+                )
+
+                with mock.patch.object(
+                    webapp,
+                    "write_quote_session_metadata",
+                    side_effect=RuntimeError("synthetic Run-466 metadata commit failure"),
+                ):
+                    failed_metadata = webapp.run_quote_job(
+                        changed_payload,
+                        output_root=output_root,
+                        tmp_root=tmp_root,
+                        job_id="job-466-metadata-fail",
+                    )
+                self.assertEqual(failed_metadata["status"], "failed", failed_metadata)
+                self.assertNotIn("files", failed_metadata)
+                self.assertNotIn("quote_session", failed_metadata)
+                self.assertEqual(
+                    webapp.read_quote_session_metadata("quote-run466")["publication"]["active_publication_id"],
+                    old_publication_id,
+                )
+
+                failed_urls = (
+                    "/api/jobs/job-466-pdf-fail/files/quotation.xlsx",
+                    "/api/jobs/job-466-pdf-fail/files/quotation.pdf",
+                )
+                failed_followup_response = self._post_local_quote_session(
+                    runner,
+                    self._run466_payload(
+                        "quote-run466",
+                        "Run-466 changed row",
+                        1,
+                        workflow_stage="completed",
+                        file_urls=failed_urls,
+                    ),
+                )
+                self.assertEqual(failed_followup_response["status"], 200, failed_followup_response)
+                failed_followup = failed_followup_response["body"]["quote_session"]
+                for kind in ("xlsx", "pdf"):
+                    self.assertTrue(failed_followup["exports"][kind]["stale"])
+                self.assertEqual(webapp.quote_session_result_files(failed_followup), [])
+                self._assert_local_pair_downloads(
+                    runner, "quote-run466", b"run466-old-xlsx", b"run466-old-pdf"
+                )
+
+                malicious_response = self._post_local_quote_session(
+                    runner,
+                    self._run466_payload(
+                        "quote-run466",
+                        "Run-466 old row",
+                        0,
+                        workflow_stage="completed",
+                        file_urls=failed_urls,
+                    ),
+                )
+                self.assertEqual(malicious_response["status"], 200, malicious_response)
+                malicious = malicious_response["body"]["quote_session"]
+                self.assertTrue(malicious["exports"]["xlsx"]["stale"])
+                self.assertTrue(malicious["exports"]["pdf"]["stale"])
+                self.assertEqual(webapp.quote_session_result_files(malicious), [])
+
+                edit_response = self._post_local_quote_session(
+                    runner,
+                    self._run466_payload(
+                        "quote-run466",
+                        "Run-466 late edit",
+                        2,
+                        quote_generated=False,
+                        workflow_stage="pricing_review",
+                    ),
+                )
+                self.assertEqual(edit_response["status"], 200, edit_response)
+                edited = edit_response["body"]["quote_session"]
+                self.assertTrue(edited["exports"]["xlsx"]["stale"])
+                self.assertTrue(edited["exports"]["pdf"]["stale"])
+
+                final_payload = self._run466_payload(
+                    "quote-run466", "Run-466 final row", 2
+                )
+                final_result = webapp.run_quote_job(
+                    final_payload,
+                    output_root=output_root,
+                    tmp_root=tmp_root,
+                    job_id="job-466-final",
+                )
+                self.assertEqual(final_result["status"], "completed", final_result)
+                final_session = final_result["quote_session"]
+                self.assertEqual(
+                    {item["name"] for item in webapp.quote_session_result_files(final_session)},
+                    {"quotation.xlsx", "quotation.pdf"},
+                )
+                self.assertFalse(final_session["exports"]["xlsx"]["stale"])
+                self.assertFalse(final_session["exports"]["pdf"]["stale"])
+                self._assert_local_pair_downloads(
+                    runner, "quote-run466", b"run466-final-xlsx", b"run466-final-pdf"
+                )
+                final_followup_response = self._post_local_quote_session(
+                    runner,
+                    self._run466_payload(
+                        "quote-run466",
+                        "Run-466 final row",
+                        2,
+                        workflow_stage="completed",
+                        file_urls=(
+                            "/api/quote-sessions/quote-run466/download/xlsx",
+                            "/api/quote-sessions/quote-run466/download/pdf",
+                        ),
+                    ),
+                )
+                self.assertEqual(final_followup_response["status"], 200, final_followup_response)
+                final_followup = final_followup_response["body"]["quote_session"]
+                self.assertFalse(final_followup["exports"]["xlsx"]["stale"])
+                self.assertFalse(final_followup["exports"]["pdf"]["stale"])
+
+                partial_old = webapp.run_quote_job(
+                    self._run466_payload("quote-run466-partial", "Partial row", 0),
+                    output_root=output_root,
+                    tmp_root=tmp_root,
+                    job_id="job-466-partial-old",
+                )
+                self.assertEqual(partial_old["status"], "completed", partial_old)
+                partial_new = webapp.run_quote_job(
+                    self._run466_payload("quote-run466-partial", "Partial row", 0),
+                    output_root=output_root,
+                    tmp_root=tmp_root,
+                    job_id="job-466-partial-new",
+                )
+                self.assertEqual(partial_new["status"], "completed", partial_new)
+                self.assertEqual(
+                    {item["name"] for item in partial_new["files"]},
+                    {"quotation.xlsx"},
+                )
+                partial_session = partial_new["quote_session"]
+                self.assertTrue(partial_session["status"]["quote_generated"])
+                self.assertFalse(partial_session["exports"]["xlsx"]["stale"])
+                self.assertTrue(partial_session["exports"]["pdf"]["exists"])
+                self.assertTrue(partial_session["exports"]["pdf"]["stale"])
+                self.assertEqual(
+                    {item["name"] for item in webapp.quote_session_result_files(partial_session)},
+                    {"quotation.xlsx"},
+                )
+                self.assertEqual(
+                    local_http_get_bytes(
+                        runner,
+                        "/api/quote-sessions/quote-run466-partial/download/xlsx",
+                    ),
+                    (200, b"run466-partial-new-xlsx"),
+                )
+                self.assertEqual(
+                    local_http_get_bytes(
+                        runner,
+                        "/api/quote-sessions/quote-run466-partial/download/pdf",
+                    ),
+                    (200, b"run466-partial-old-pdf"),
+                )
+                partial_followup_response = self._post_local_quote_session(
+                    runner,
+                    self._run466_payload(
+                        "quote-run466-partial",
+                        "Partial row",
+                        0,
+                        workflow_stage="completed",
+                        file_urls=(
+                            "/api/quote-sessions/quote-run466-partial/download/xlsx",
+                            "/api/jobs/job-466-partial-old/files/quotation.pdf",
+                        ),
+                    ),
+                )
+                self.assertEqual(partial_followup_response["status"], 200, partial_followup_response)
+                partial_followup = partial_followup_response["body"]["quote_session"]
+                self.assertFalse(partial_followup["exports"]["xlsx"]["stale"])
+                self.assertTrue(partial_followup["exports"]["pdf"]["stale"])
+                self.assertEqual(
+                    {item["name"] for item in webapp.quote_session_result_files(partial_followup)},
+                    {"quotation.xlsx"},
+                )
+
     def test_local_publication_f1_xlsx_staging_failure_keeps_old_pair(self):
         with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
             root = Path(tmp)

@@ -10633,7 +10633,7 @@ class LocalSqagStorage:
         return pricing_reference_export_xlsx(reference_id, source=source)
 
     def create_or_update_quote_session(self, payload: dict[str, Any], result: dict[str, Any] | None = None, output_dir: Path | None = None, session_id: str | None = None) -> dict[str, Any]:
-        return create_or_update_quote_session(payload, result=result, output_dir=output_dir, session_id=session_id)
+        return create_or_update_quote_session(payload, result=result, output_dir=output_dir, session_id=session_id, storage=self)
 
     def list_quote_sessions(self) -> list[dict[str, Any]]:
         return list_quote_sessions()
@@ -14118,6 +14118,9 @@ class DatabaseSqagStorage:
             "job_id": job_id,
             "error_code": "",
         }
+        metadata["publication"].update(
+            quote_session_publication_freshness_proof(patch)
+        )
         metadata["status"]["quote_generated"] = False
         for kind in QUOTE_SESSION_EXPORT_KINDS:
             metadata["status"][f"{kind}_exported"] = False
@@ -14499,6 +14502,9 @@ class DatabaseSqagStorage:
                     "job_id": safe_reference(generation_job_id, "job-"),
                     "error_code": "",
                 }
+                metadata["publication"].update(
+                    quote_session_publication_freshness_proof(patch)
+                )
                 metadata["status"]["quote_generated"] = bool(publish)
                 for kind in QUOTE_SESSION_EXPORT_KINDS:
                     metadata["status"][f"{kind}_exported"] = bool(
@@ -14550,7 +14556,11 @@ class DatabaseSqagStorage:
             else:
                 mark_quote_session_exports_stale(
                     metadata,
-                    quote_session_current_draft_export_kinds(patch),
+                    quote_session_authoritative_current_export_kinds(
+                        metadata,
+                        patch,
+                        storage=self,
+                    ),
                 )
             normalized = normalized_quote_session_metadata(metadata)
             if not normalized:
@@ -14710,6 +14720,9 @@ class DatabaseSqagStorage:
                 "job_id": safe_reference(generation_job_id, "job-"),
                 "error_code": "",
             }
+            metadata["publication"].update(
+                quote_session_publication_freshness_proof(patch)
+            )
             metadata["status"]["quote_generated"] = bool(publish)
             for kind in QUOTE_SESSION_EXPORT_KINDS:
                 metadata["status"][f"{kind}_exported"] = bool(publish and metadata["exports"].get(kind, {}).get("filename"))
@@ -14727,7 +14740,14 @@ class DatabaseSqagStorage:
                     pricing_reference_detail=self.pricing_reference_detail(pricing_reference_id, source="company") if pricing_reference_id else None,
                 )
             else:
-                mark_quote_session_exports_stale(metadata, quote_session_current_draft_export_kinds(patch))
+                mark_quote_session_exports_stale(
+                    metadata,
+                    quote_session_authoritative_current_export_kinds(
+                        metadata,
+                        patch,
+                        storage=self,
+                    ),
+                )
             normalized = normalized_quote_session_metadata(metadata)
             if not normalized:
                 raise ValueError("Quote session metadata is not valid.")
@@ -21706,6 +21726,70 @@ def quote_session_draft_state(patch: dict[str, Any]) -> dict[str, Any]:
     return sanitized if isinstance(sanitized, dict) else {}
 
 
+QUOTE_SESSION_FRESHNESS_VOLATILE_KEYS = {
+    "savedAt",
+    "activeAppView",
+    "activeSidePanel",
+    "workflowStage",
+    "downloadFile",
+    "pdfFile",
+    "downloadFileRevision",
+    "pdfFileRevision",
+    "outputRevision",
+}
+
+
+def quote_session_freshness_draft_state(draft_state: Any) -> dict[str, Any]:
+    sanitized = quote_session_draft_state_value(draft_state)
+    if not isinstance(sanitized, dict):
+        return {}
+    return {
+        key: value
+        for key, value in sanitized.items()
+        if key not in QUOTE_SESSION_FRESHNESS_VOLATILE_KEYS
+    }
+
+
+def quote_session_publication_freshness_proof(patch: dict[str, Any]) -> dict[str, Any]:
+    draft_state = quote_session_draft_state(patch)
+    return {
+        "committed_draft_state_digest": quote_session_safe_digest(
+            quote_session_freshness_draft_state(draft_state)
+        ),
+        "committed_output_revision": quote_session_revision_number(
+            draft_state.get("outputRevision"), -1
+        ),
+    }
+
+
+def quote_session_publication_freshness_proof_matches(
+    metadata: dict[str, Any],
+    patch: dict[str, Any],
+) -> bool:
+    status = patch.get("status") if isinstance(patch.get("status"), dict) else {}
+    if status.get("quote_generated") is not True:
+        return False
+    draft_state = quote_session_draft_state(patch)
+    if not draft_state:
+        return False
+    publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
+    committed_digest = clean_text(publication.get("committed_draft_state_digest")).lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", committed_digest):
+        return False
+    committed_revision = quote_session_revision_number(
+        publication.get("committed_output_revision"), -2
+    )
+    candidate_revision = quote_session_revision_number(
+        draft_state.get("outputRevision"), -2
+    )
+    if committed_revision != candidate_revision:
+        return False
+    candidate_digest = quote_session_safe_digest(
+        quote_session_freshness_draft_state(draft_state)
+    )
+    return hmac.compare_digest(committed_digest, candidate_digest)
+
+
 class EmptyReferenceFileError(ValueError):
     pass
 
@@ -22040,32 +22124,72 @@ def quote_session_revision_number(value: Any, fallback: int = -1) -> int:
     return int(number)
 
 
-def quote_session_current_draft_export_kinds(patch: dict[str, Any]) -> set[str]:
+def quote_session_authoritative_current_export_kinds(
+    metadata: dict[str, Any],
+    patch: dict[str, Any],
+    *,
+    storage: LocalSqagStorage | DatabaseSqagStorage | None,
+) -> set[str]:
     status = patch.get("status") if isinstance(patch.get("status"), dict) else {}
     if status.get("quote_generated") is not True:
         return set()
-    draft_state = patch.get("draft_state") if isinstance(patch.get("draft_state"), dict) else {}
-    if not draft_state:
+    if not quote_session_publication_freshness_proof_matches(metadata, patch):
         return set()
-    output_revision = quote_session_revision_number(draft_state.get("outputRevision"), -1)
-    candidates = {
-        "xlsx": ("downloadFile", "downloadFileRevision"),
-        "pdf": ("pdfFile", "pdfFileRevision"),
-    }
+    publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
+    if clean_text(publication.get("state")).lower() != "published":
+        return set()
+    session_id = safe_quote_session_id(metadata.get("session_id"), "")
+    if not session_id or not isinstance(storage, (LocalSqagStorage, DatabaseSqagStorage)):
+        return set()
+    exports = metadata.get("exports") if isinstance(metadata.get("exports"), dict) else {}
     current: set[str] = set()
-    for kind, (file_key, revision_key) in candidates.items():
-        file_value = draft_state.get(file_key)
-        if not isinstance(file_value, dict):
+    for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
+        export = exports.get(kind)
+        if not isinstance(export, dict) or clean_text(export.get("filename")) != filename:
             continue
-        if not clean_text(file_value.get("url")):
+        if quote_session_export_is_stale(metadata, export):
             continue
-        file_revision = quote_session_revision_number(
-            draft_state.get(revision_key, file_value.get("output_revision")),
-            -1,
+        expected_digest = clean_text(export.get("sha256")).lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+            continue
+        try:
+            expected_size = int(export.get("size_bytes") or -1)
+        except (TypeError, ValueError):
+            continue
+        if expected_size <= 0:
+            continue
+        if isinstance(storage, DatabaseSqagStorage):
+            artifact = storage.quote_session_export_artifact(session_id, kind)
+            if not isinstance(artifact, dict):
+                continue
+            try:
+                artifact_size = int(artifact.get("size_bytes") or -1)
+            except (TypeError, ValueError):
+                continue
+            if (
+                artifact_size == expected_size
+                and clean_text(artifact.get("sha256")).lower() == expected_digest
+            ):
+                current.add(kind)
+            continue
+        active_publication_id = safe_quote_publication_id(
+            publication.get("active_publication_id"), ""
         )
-        if output_revision >= 0 and file_revision >= 0 and file_revision != output_revision:
+        if (
+            not active_publication_id
+            or safe_quote_publication_id(export.get("publication_id"), "")
+            != active_publication_id
+        ):
             continue
-        current.add(kind)
+        try:
+            export_path = quote_session_recorded_export_path(session_id, kind, metadata)
+            if not export_path.is_file():
+                continue
+            content = export_path.read_bytes()
+        except (OSError, ValueError):
+            continue
+        if len(content) == expected_size and hashlib.sha256(content).hexdigest() == expected_digest:
+            current.add(kind)
     return current
 
 
@@ -22175,6 +22299,8 @@ def stage_local_quote_publication(
 def commit_local_quote_publication(
     metadata: dict[str, Any],
     staged_publication: dict[str, Any],
+    *,
+    freshness_proof: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     publication_id = safe_quote_publication_id(
         staged_publication.get("publication_id"),
@@ -22208,6 +22334,15 @@ def commit_local_quote_publication(
         "job_id": "",
         "error_code": "",
     }
+    if isinstance(freshness_proof, dict):
+        metadata["publication"].update({
+            "committed_draft_state_digest": clean_text(
+                freshness_proof.get("committed_draft_state_digest")
+            ).lower(),
+            "committed_output_revision": quote_session_revision_number(
+                freshness_proof.get("committed_output_revision"), -1
+            ),
+        })
     committed = write_quote_session_metadata(metadata)
     metadata.clear()
     metadata.update(committed)
@@ -22247,6 +22382,8 @@ def create_or_update_quote_session(
     result: dict[str, Any] | None = None,
     output_dir: Path | None = None,
     session_id: str | None = None,
+    *,
+    storage: LocalSqagStorage | None = None,
 ) -> dict[str, Any]:
     patch = quote_session_patch_payload(payload)
     resolved_session_id = safe_quote_session_id(
@@ -22256,6 +22393,7 @@ def create_or_update_quote_session(
         "",
     ) or new_quote_session_id()
     existing = read_quote_session_metadata(resolved_session_id)
+    storage = storage or LocalSqagStorage()
     now = utc_timestamp()
     metadata = normalized_quote_session_metadata(existing) if existing else blank_quote_session_metadata(resolved_session_id, now)
     metadata["updated_at"] = now
@@ -22283,13 +22421,24 @@ def create_or_update_quote_session(
                 patch,
                 created_at=now,
             )
-            commit_local_quote_publication(metadata, staged_publication)
+            commit_local_quote_publication(
+                metadata,
+                staged_publication,
+                freshness_proof=quote_session_publication_freshness_proof(patch),
+            )
             if draft_file_records is not None:
                 write_quote_session_draft_files(resolved_session_id, draft_file_records)
         else:
             if draft_file_records is not None:
                 write_quote_session_draft_files(resolved_session_id, draft_file_records)
-            mark_quote_session_exports_stale(metadata, quote_session_current_draft_export_kinds(patch))
+            mark_quote_session_exports_stale(
+                metadata,
+                quote_session_authoritative_current_export_kinds(
+                    metadata,
+                    patch,
+                    storage=storage,
+                ),
+            )
             committed = write_quote_session_metadata(metadata)
             metadata.clear()
             metadata.update(committed)
@@ -23298,7 +23447,12 @@ def forensic_request_summary(payload: dict[str, Any]) -> dict[str, Any]:
 
 def forensic_result_summary(result: dict[str, Any]) -> dict[str, Any]:
     files: list[dict[str, Any]] = []
-    for item in result.get("files") if isinstance(result.get("files"), list) else []:
+    evidence_files = (
+        result.get("_forensic_transient_files")
+        if isinstance(result.get("_forensic_transient_files"), list)
+        else result.get("files")
+    )
+    for item in evidence_files if isinstance(evidence_files, list) else []:
         if not isinstance(item, dict):
             continue
         files.append({
@@ -24394,19 +24548,27 @@ def _run_quote_job(
                 result["files"] = quote_session_result_files(result.get("quote_session"))
         except SqagStorageAccessError as exc:
             storage_error = storage_access_error_payload(exc)
+            result["_forensic_transient_files"] = copy.deepcopy(
+                result.get("files") if isinstance(result.get("files"), list) else []
+            )
             result.update(storage_error)
-            if configured_artifact_storage_mode() in {"database", "object"}:
-                result.pop("files", None)
+            result["status"] = "failed"
+            result["job_id"] = job_id
+            result.pop("files", None)
+            result.pop("quote_session", None)
         except Exception as exc:  # pragma: no cover - defensive dashboard metadata boundary
             persistence_error_reference = new_error_reference()
             write_local_log(
                 "quote_session_update_failed",
                 unexpected_error_log_details(persistence_error_reference, exc, job_id=job_id),
             )
-            if configured_app_mode() == "deploy":
-                result.update(failed_result_payload(persistence_error_reference))
-                result["job_id"] = job_id
-                result.pop("files", None)
+            result["_forensic_transient_files"] = copy.deepcopy(
+                result.get("files") if isinstance(result.get("files"), list) else []
+            )
+            result.update(failed_result_payload(persistence_error_reference))
+            result["job_id"] = job_id
+            result.pop("files", None)
+            result.pop("quote_session", None)
     profile_snapshot = copy.deepcopy(profile.config if isinstance(profile, ProfilePack) else profile)
     profile_snapshot.pop("pack", None)
     pricing_bytes = pricing_catalog_path.read_bytes()
@@ -24470,7 +24632,7 @@ def _run_quote_job(
             },
         )
 
-    if configured_app_mode() != "deploy" and status != "failed":
+    if configured_app_mode() != "deploy" and clean_text(result.get("status")) != "failed":
         result.update({
             "stdout": completed.stdout,
             "stderr": completed.stderr,
@@ -24536,6 +24698,7 @@ def _run_quote_job(
         and clean_text(finalized.get("status")) == clean_text(result.get("status"))
     ):
         finalized["_durable_publication_committed"] = True
+    finalized.pop("_forensic_transient_files", None)
     return finalized
 
 
