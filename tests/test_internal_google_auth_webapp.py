@@ -265,6 +265,50 @@ class InternalGoogleAuthWebappTest(unittest.TestCase):
                 self.assertFalse(webapp.internal_google_config_complete())
                 self.assertTrue(webapp.deploy_requires_auth_guard())
 
+    def test_internal_configuration_rejects_production_hostname_aliases(self):
+        origins = (
+            "https://quote.swooshz.com",
+            "https://QUOTE.SWOOSHZ.COM",
+            "https://quote.swooshz.com.",
+            "https://QUOTE.SWOOSHZ.COM.",
+        )
+        for origin in origins:
+            with self.subTest(origin=origin), mock.patch.dict(
+                os.environ,
+                self.internal_env(
+                    SQAG_PUBLIC_BASE_URL=origin,
+                    OIDC_REDIRECT_URI=f"{origin}/callback",
+                ),
+                clear=True,
+            ):
+                self.assertEqual(webapp.configured_sqag_public_base_url(), "")
+                self.assertFalse(webapp.internal_google_config_complete())
+                self.assertTrue(webapp.deploy_requires_auth_guard())
+
+    def test_internal_configuration_rejects_malformed_origins_before_callback_binding(self):
+        origins = {
+            "trailing_fragment": f"{INTERNAL_ALPHA_ORIGIN}#",
+            "trailing_query": f"{INTERNAL_ALPHA_ORIGIN}?",
+            "empty_port": f"{INTERNAL_ALPHA_ORIGIN}:",
+            "empty_userinfo": "https://@internal-alpha.example.test",
+            "hostname_whitespace": "https://internal alpha.example.test",
+            "double_terminal_dot": f"{INTERNAL_ALPHA_ORIGIN}..",
+            "empty_hostname_label": "https://internal-alpha..example.test",
+            "leading_hyphen_hostname_label": "https://-internal-alpha.example.test",
+        }
+        for name, origin in origins.items():
+            with self.subTest(name=name), mock.patch.dict(
+                os.environ,
+                self.internal_env(
+                    SQAG_PUBLIC_BASE_URL=origin,
+                    OIDC_REDIRECT_URI=f"{origin}/callback",
+                ),
+                clear=True,
+            ):
+                self.assertEqual(webapp.configured_sqag_public_base_url(), "")
+                self.assertFalse(webapp.internal_google_config_complete())
+                self.assertTrue(webapp.deploy_requires_auth_guard())
+
     def test_internal_alpha_origin_is_exactly_configured_and_host_bound(self):
         with mock.patch.dict(os.environ, self.internal_env(), clear=True):
             self.assertEqual(

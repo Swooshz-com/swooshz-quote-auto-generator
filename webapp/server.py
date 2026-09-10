@@ -1882,9 +1882,14 @@ def configured_platform_base_url() -> str:
 
 
 def configured_sqag_public_base_url() -> str:
-    base_url = clean_text(read_dotenv_value(SQAG_PUBLIC_BASE_URL_ENV_NAME)).rstrip("/")
+    raw_base_url = read_dotenv_value(SQAG_PUBLIC_BASE_URL_ENV_NAME)
+    base_url = clean_text(raw_base_url).rstrip("/")
     if not base_url:
         return ""
+    if configured_app_mode() == "deploy" and configured_auth_mode() == INTERNAL_AUTH_MODE:
+        base_url = strict_https_origin(raw_base_url)
+        if not base_url:
+            return ""
     parsed = urlparse(base_url)
     if (
         parsed.scheme not in {"http", "https"}
@@ -1920,7 +1925,8 @@ def configured_sqag_public_base_url() -> str:
                 or launch_mode_value != "disabled"
                 or parsed.scheme != "https"
                 or has_explicit_port
-                or base_url == PRODUCTION_SQAG_ORIGIN
+                or normalized_netloc(parsed.netloc)
+                == normalized_netloc(urlparse(PRODUCTION_SQAG_ORIGIN).netloc)
                 or clean_text(read_dotenv_value(PLATFORM_BASE_URL_ENV_NAME))
                 or clean_text(read_dotenv_value(PLATFORM_SERVICE_SECRET_ENV_NAME))
             ):
@@ -2258,7 +2264,75 @@ def deploy_session_secret_ready() -> bool:
 
 
 def url_hostname(value: str) -> str:
-    return clean_text(urlparse(value).hostname).lower().rstrip(".")
+    try:
+        hostname = urlparse(value).hostname
+    except ValueError:
+        return ""
+    return normalized_hostname_identity(hostname)
+
+
+def normalized_hostname_identity(value: str | None) -> str:
+    return clean_text(value).lower().rstrip(".")
+
+
+def strict_https_origin(value: str) -> str:
+    raw_value = str(value or "")
+    if not raw_value or any(
+        character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F
+        for character in raw_value
+    ):
+        return ""
+    try:
+        parsed = urlparse(raw_value)
+        hostname = parsed.hostname
+        port = parsed.port
+        username = parsed.username
+        password = parsed.password
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or not hostname
+        or "?" in raw_value
+        or "#" in raw_value
+        or parsed.path not in {"", "/"}
+        or parsed.params
+        or "@" in parsed.netloc
+        or username is not None
+        or password is not None
+        or port is not None
+    ):
+        return ""
+
+    if parsed.netloc.startswith("["):
+        closing_bracket = parsed.netloc.find("]")
+        if closing_bracket <= 0 or closing_bracket != len(parsed.netloc) - 1:
+            return ""
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            return ""
+        canonical_hostname = f"[{normalized_hostname_identity(hostname)}]"
+    else:
+        if ":" in parsed.netloc or "[" in parsed.netloc or "]" in parsed.netloc:
+            return ""
+        if not hostname.isascii():
+            return ""
+        canonical_hostname = normalized_hostname_identity(hostname)
+        if hostname.endswith("..") or not canonical_hostname:
+            return ""
+        labels = canonical_hostname.split(".")
+        if len(canonical_hostname) > 253 or any(
+            not 1 <= len(label) <= 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or not re.fullmatch(r"[A-Za-z0-9-]+", label)
+            for label in labels
+        ):
+            return ""
+
+    return f"https://{canonical_hostname}"
 
 
 def is_loopback_url(value: str) -> bool:
@@ -9119,7 +9193,7 @@ def validate_pricing_reference_upload(payload: dict[str, Any]) -> dict[str, Any]
 
 
 def normalized_host_name(host_header: str) -> str:
-    host = clean_text(host_header).lower()
+    host = normalized_hostname_identity(host_header)
     if not host:
         return ""
     if host.startswith("["):
@@ -9131,7 +9205,7 @@ def normalized_host_name(host_header: str) -> str:
 
 
 def normalized_netloc(value: str) -> str:
-    return clean_text(value).lower().rstrip(".")
+    return normalized_hostname_identity(value)
 
 
 def is_allowed_host_header(host_header: str) -> bool:
