@@ -86,6 +86,8 @@ PROHIBITED_OUTPUT_MARKERS = (
     "private-state",
 )
 
+SYNTHETIC_INTERNAL_ALPHA_ORIGIN = "https://internal-alpha.example.test"
+
 
 @contextlib.contextmanager
 def temporary_env(values: dict[str, str]):
@@ -159,7 +161,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
         "SQAG_TRACKING_HMAC_KEY_VERSION": "synthetic-v1",
         "SQAG_TRUSTED_PROXY_CIDRS": "127.0.0.1/32",
         "SQAG_PLATFORM_LAUNCH_MODE": "disabled",
-        "SQAG_PUBLIC_BASE_URL": "https://quote.swooshz.com",
+        "SQAG_PUBLIC_BASE_URL": SYNTHETIC_INTERNAL_ALPHA_ORIGIN,
         "SQAG_INTERNAL_WORKSPACE_ID": "workspace-synthetic-alpha",
         "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON": json.dumps(
             [
@@ -174,7 +176,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
         "OIDC_ISSUER_URL": "https://accounts.google.com",
         "OIDC_CLIENT_ID": "synthetic-client-id",
         "OIDC_CLIENT_SECRET": "synthetic-client-secret",
-        "OIDC_REDIRECT_URI": "https://quote.swooshz.com/callback",
+        "OIDC_REDIRECT_URI": f"{SYNTHETIC_INTERNAL_ALPHA_ORIGIN}/callback",
         "OIDC_AUTHORIZE_URL": "https://accounts.google.com/o/oauth2/v2/auth",
         "OIDC_TOKEN_URL": "https://oauth2.googleapis.com/token",
         "SQAG_STORAGE_MODE": "database",

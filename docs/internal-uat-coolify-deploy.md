@@ -32,7 +32,8 @@ storage for generated artifact bytes:
 - `SQAG_DATABASE_URL` is configured only through the host secret manager.
 - The canonical `SQAG_OBJECT_STORAGE_*` names are configured only through the
   host secret manager.
-- Platform/workspace launch context is required for protected hosted use.
+- Platform/workspace launch context is required for protected hosted use in
+  Platform mode; internal Google uses its fixed configured workspace instead.
 - `SQAG_TRUSTED_PROXY_CIDRS` is configured in the host environment manager with
   only the exact Coolify/Traefik proxy network CIDRs that connect directly to
   SQAG. A trust-all network is not permitted.

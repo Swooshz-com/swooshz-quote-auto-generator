@@ -75,14 +75,19 @@ The deploy/auth surface is already represented in `.env.example` and
 - `SQAG_DATABASE_URL`: database connection configured through the host secret
   manager only.
 - `SQAG_PLATFORM_LAUNCH_MODE`, `SQAG_PLATFORM_BASE_URL`,
-  `SQAG_PUBLIC_BASE_URL`, and `SQAG_PLATFORM_SERVICE_SECRET`: mandatory platform/workspace launch,
-  finalization, validation, and revoke boundary for protected hosted/deploy
-  use. The shared service secret must be configured separately in both runtimes
-  and contain at least 32 characters; it must not appear in repositories, logs,
-  screenshots, reports, or chat. `SQAG_PLATFORM_REQUEST_TIMEOUT_SECONDS` is an optional bounded,
-  non-secret timeout. The
-  deploy mode fixes these origins to `https://swooshz.com` and
-  `https://quote.swooshz.com`; loopback flexibility is local-mode only.
+  `SQAG_PUBLIC_BASE_URL`, and `SQAG_PLATFORM_SERVICE_SECRET`: the Platform
+  launch/finalization/validation/revoke boundary for `SQAG_AUTH_MODE=platform`.
+  The shared service secret must be configured separately in both runtimes and
+  contain at least 32 characters; it must not appear in repositories, logs,
+  screenshots, reports, or chat. `SQAG_PLATFORM_REQUEST_TIMEOUT_SECONDS` is an
+  optional bounded, non-secret timeout. Platform deploy mode keeps the fixed
+  production origins; loopback flexibility is local-mode only.
+- For `SQAG_AUTH_MODE=internal_google`, `SQAG_PLATFORM_LAUNCH_MODE` must be
+  `disabled`, and `SQAG_PUBLIC_BASE_URL` must be the one dedicated
+  host-configured internal-alpha HTTPS origin. It must be origin-only and
+  distinct from the production SQAG origin; `OIDC_REDIRECT_URI` must equal
+  `<SQAG_PUBLIC_BASE_URL>/callback`. The exact configured hostname is the only
+  accepted deploy `Host` value.
 - `SQAG_TRUSTED_PROXY_CIDRS`: mandatory deploy-mode comma-separated CIDRs for
   only the reverse-proxy peers that connect directly to SQAG. SQAG accepts a
   bounded, valid `X-Forwarded-For` chain only from those peers, walks the chain
@@ -106,10 +111,11 @@ state cookies are emitted with `Secure`, `HttpOnly`, and `SameSite=Lax`.
 - Deploy mode is intended to require authentication by default.
 - Deploy mode refuses to start when auth is required and the auth boundary is
   incomplete.
-- Deploy mode also refuses to start without a complete Swooshz Platform launch
-  boundary because database and object-storage records require the consumed
-  Platform workspace identity. Standalone OIDC claims are never converted into
-  a workspace, membership role, or entitlement.
+- The Platform deploy path refuses to start without a complete Swooshz Platform
+  launch boundary because database and object-storage records require the
+  consumed Platform workspace identity. The internal-Google path is separate:
+  it uses the fixed configured internal workspace and does not convert
+  standalone OIDC claims into Platform membership or entitlement.
 - Deploy preflight, startup, Platform launch, and protected request handling
   fail closed when the trusted-proxy CIDR boundary is missing or malformed.
   Forwarded headers are not logged and cannot be used by a direct untrusted
