@@ -218,6 +218,7 @@ const state = {
   quoteCommercialLifecycle: "NEW_UNINITIALISED",
   quoteCommercialSnapshot: null,
   quoteCommercialRecoveryError: "",
+  restoredPricingReferenceIdentity: null,
   quoteCommercialPreservedQuoteText: {},
   dashboardStatusFilter: "all",
   dashboardDateFilter: "all",
@@ -639,9 +640,10 @@ function syncAnalysisCreditLabels() {
 function pricingReferenceSelectValue(reference = {}) {
   const referenceId = String(reference.id || "").trim();
   if (!referenceId) return "";
+  const defaultReference = { source: "bundled" };
   const source = reference.source === "company"
       ? "company"
-      : reference.source === "local" ? "local" : "bundled";
+      : reference.source === "local" ? "local" : defaultReference.source;
   return `${source}::${referenceId}`;
 }
 
@@ -1186,6 +1188,14 @@ function currentPricingReference() {
   const pricingReferenceId = String(state.pricingReferenceId || "").trim();
   const source = String(state.pricingReferenceSource || "").trim();
   if (!pricingReferenceId) return null;
+  const restoredIdentity = state.restoredPricingReferenceIdentity;
+  if (restoredIdentity) {
+    if (restoredIdentity.valid !== true) return null;
+    return state.pricingReferences.find((reference) => {
+      const selection = pricingReferenceSelectionFromValue(pricingReferenceSelectValue(reference));
+      return selection.pricingReferenceId === restoredIdentity.id && selection.source === restoredIdentity.source;
+    }) || null;
+  }
   return state.pricingReferences.find((reference) => reference.id === pricingReferenceId && (!source || pricingReferenceSelectValue(reference).startsWith(`${source}::`)))
     || state.pricingReferences.find((reference) => reference.id === pricingReferenceId && !source)
     || null;
@@ -1355,6 +1365,7 @@ function generationProfileIdForPayload() {
 }
 
 function syncSelectedPricingReference() {
+  if (state.restoredPricingReferenceIdentity) return;
   const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
   const savedBasis = state.quoteCommercialSnapshot?.pricing_basis;
   if (ownedCommercial && (
@@ -2310,6 +2321,97 @@ function normalizeQuoteCommercialSnapshot(snapshot = {}, lifecycleOverride = "")
     presence,
     pricing_basis: pricingBasis,
   };
+}
+
+function savedPricingReferenceIdentityCandidate(idValue, sourceValue, options = {}) {
+  const id = typeof idValue === "string" ? idValue.trim() : "";
+  const source = typeof sourceValue === "string" ? sourceValue.trim() : "";
+  const fieldsPresent = options.fieldsPresent === true;
+  const allowEmpty = options.allowEmpty === true;
+  const malformedType = fieldsPresent && (
+    (idValue !== undefined && typeof idValue !== "string")
+    || (sourceValue !== undefined && typeof sourceValue !== "string")
+  );
+  const hasValues = Boolean(id || source);
+  const validPair = Boolean(
+    id
+    && source
+    && /^[A-Za-z0-9_-]+$/.test(id)
+    && ["bundled", "company", "local"].includes(source)
+  );
+  const malformedPair = hasValues && !validPair;
+  const emptyFieldsMalformed = fieldsPresent && !allowEmpty && !hasValues && !malformedType;
+  return {
+    id,
+    source,
+    present: fieldsPresent && (hasValues || malformedType || emptyFieldsMalformed),
+    valid: !malformedType && !malformedPair && !emptyFieldsMalformed,
+  };
+}
+
+function savedPricingReferenceIdentityFromSnapshot(saved = {}, snapshot = null) {
+  const topLevel = savedPricingReferenceIdentityCandidate(
+    saved.pricingReferenceId,
+    saved.pricingReferenceSource,
+    {
+      fieldsPresent: hasOwnValue(saved, "pricingReferenceId") || hasOwnValue(saved, "pricingReferenceSource"),
+      allowEmpty: true,
+    },
+  );
+  const rawBasis = snapshot
+    && typeof snapshot === "object"
+    && !Array.isArray(snapshot)
+    && snapshot.pricing_basis
+    && typeof snapshot.pricing_basis === "object"
+    && !Array.isArray(snapshot.pricing_basis)
+    ? snapshot.pricing_basis
+    : null;
+  const basis = rawBasis
+    ? savedPricingReferenceIdentityCandidate(rawBasis.id, rawBasis.source, {
+      fieldsPresent: hasOwnValue(rawBasis, "id") || hasOwnValue(rawBasis, "source"),
+    })
+    : { id: "", source: "", present: false, valid: true };
+  const candidates = [topLevel, basis].filter((candidate) => candidate.present);
+  const selected = candidates.find((candidate) => candidate.id || candidate.source) || candidates[0] || { id: "", source: "" };
+  const conflicting = candidates.length > 1 && candidates.some((candidate) => (
+    candidate.id !== selected.id || candidate.source !== selected.source
+  ));
+  return {
+    id: selected.id,
+    source: selected.source,
+    present: candidates.length > 0,
+    valid: !conflicting && candidates.every((candidate) => candidate.valid),
+  };
+}
+
+function freshQuoteRestorationEvidenceIsValid(saved = {}, snapshot = null) {
+  if (!saved || typeof saved !== "object" || !snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return false;
+  if (saved.quoteCommercialLifecycle !== "NEW_UNINITIALISED") return false;
+  if (
+    snapshot.schema !== QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA
+    || snapshot.version !== QUOTE_COMMERCIAL_SNAPSHOT_VERSION
+    || snapshot.owner !== "quote"
+    || snapshot.lifecycle !== "NEW_UNINITIALISED"
+    || snapshot.origin !== "new_quote"
+  ) return false;
+  const rawPresence = snapshot.presence;
+  if (!rawPresence || typeof rawPresence !== "object" || Array.isArray(rawPresence)) return false;
+  if (QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS.some((key) => (
+    !hasOwnValue(rawPresence, key)
+    || !["captured", "intentional_empty"].includes(rawPresence[key])
+  ))) return false;
+  const rawBasis = snapshot.pricing_basis;
+  if (!rawBasis || typeof rawBasis !== "object" || Array.isArray(rawBasis)) return false;
+  const allowedBasisKeys = new Set(["currency", "source", "id", "digest"]);
+  if (Object.keys(rawBasis).some((key) => !allowedBasisKeys.has(key))) return false;
+  if (Object.keys(rawBasis).some((key) => typeof rawBasis[key] !== "string")) return false;
+  const basisHasValues = Object.values(rawBasis).some((value) => String(value || "").trim());
+  if (basisHasValues && (!hasOwnValue(rawBasis, "id") || !hasOwnValue(rawBasis, "source"))) return false;
+  const identity = savedPricingReferenceIdentityFromSnapshot(saved, snapshot);
+  if (!identity.valid || (basisHasValues && !identity.present)) return false;
+  if (basisHasValues && !hasOwnValue(rawBasis, "currency")) return false;
+  if (hasOwnValue(rawBasis, "currency") && !/^[A-Za-z]{3}$/.test(String(rawBasis.currency || "").trim())) return false;
+  return true;
 }
 
 function quoteCommercialSnapshotForDetails(details = {}, options = {}) {
@@ -3696,8 +3798,9 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   invalidateAuthorityProfileRequests();
   let rejectedRestoredActiveJob = false;
   state.profileId = saved.profileId || "";
-  state.pricingReferenceId = saved.pricingReferenceId || saved.profileId || "";
-  state.pricingReferenceSource = saved.pricingReferenceSource || "";
+  state.pricingReferenceId = typeof saved.pricingReferenceId === "string" ? saved.pricingReferenceId.trim() : "";
+  state.pricingReferenceSource = typeof saved.pricingReferenceSource === "string" ? saved.pricingReferenceSource.trim() : "";
+  state.restoredPricingReferenceIdentity = null;
   const targetSessionId = safeQuoteSessionId(options.sessionId || saved.quoteSessionId || "");
   const savedGenerationContext = saved.generationContext && typeof saved.generationContext === "object"
     ? saved.generationContext : {};
@@ -3714,11 +3817,16 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
     : PRICING_REFERENCE_SETTINGS_MODE_MANAGE;
   state.selectedPresetValue = saved.selectedPresetValue || presetValueFromQuoteDetails(saved.quoteDetails || {}) || "";
   const savedCommercialSnapshot = saved.quoteDetails?.commercial_snapshot;
+  const savedPricingReferenceIdentity = savedPricingReferenceIdentityFromSnapshot(saved, savedCommercialSnapshot);
+  if (savedPricingReferenceIdentity.present) {
+    state.pricingReferenceId = savedPricingReferenceIdentity.id;
+    state.pricingReferenceSource = savedPricingReferenceIdentity.source;
+    state.restoredPricingReferenceIdentity = savedPricingReferenceIdentity;
+  }
   const savedLifecycle = String(saved.quoteCommercialLifecycle || "").trim();
   const normalizedSavedCommercialSnapshot = normalizeQuoteCommercialSnapshot(savedCommercialSnapshot);
-  const hasSavedCommercialSnapshot = savedCommercialSnapshot !== undefined && savedCommercialSnapshot !== null;
   const restoresFreshDraft = savedLifecycle === "NEW_UNINITIALISED"
-    && (!hasSavedCommercialSnapshot || normalizedSavedCommercialSnapshot?.lifecycle === "NEW_UNINITIALISED");
+    && freshQuoteRestorationEvidenceIsValid(saved, savedCommercialSnapshot);
   const restoredLifecycle = restoresFreshDraft ? "NEW_UNINITIALISED" : "RECOVERED";
   const normalizedCommercialSnapshot = restoresFreshDraft
     ? normalizedSavedCommercialSnapshot
@@ -3726,12 +3834,8 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.quoteCommercialLifecycle = restoredLifecycle;
   state.quoteCommercialSnapshot = normalizedCommercialSnapshot
     || (restoredLifecycle === "RECOVERED" ? quoteCommercialSnapshotFromLegacyRecovery() : null);
-  const savedPricingBasis = normalizedCommercialSnapshot?.pricing_basis;
-  if (savedPricingBasis && typeof savedPricingBasis === "object" && String(savedPricingBasis.id || "").trim()) {
-    state.pricingReferenceId = String(savedPricingBasis.id).trim();
-    state.pricingReferenceSource = String(savedPricingBasis.source || "").trim();
-  }
-  state.quoteCommercialRecoveryError = restoredLifecycle === "RECOVERED" && !normalizedCommercialSnapshot
+  const rejectedFreshEvidence = savedLifecycle === "NEW_UNINITIALISED" && !restoresFreshDraft;
+  state.quoteCommercialRecoveryError = restoredLifecycle === "RECOVERED" && (rejectedFreshEvidence || !normalizedCommercialSnapshot)
     ? "Saved quote commercial state requires pricing review before generation."
     : "";
   const savedQuoteText = saved.quoteDetails?.quote_text;
@@ -4768,6 +4872,7 @@ function resetCurrentQuoteDraftState() {
   state.quoteCommercialLifecycle = "NEW_UNINITIALISED";
   state.quoteCommercialSnapshot = null;
   state.quoteCommercialRecoveryError = "";
+  state.restoredPricingReferenceIdentity = null;
   state.quoteCommercialPreservedQuoteText = {};
   resetQuoteCommercialTouched();
   state.profileId = "";
@@ -5119,6 +5224,8 @@ function renderProfileOptions() {
     state.quoteCommercialLifecycle === "RECOVERED"
     || (savedBasis && typeof savedBasis === "object" && String(savedBasis.id || "").trim())
   );
+  const preserveRestoredReference = Boolean(state.restoredPricingReferenceIdentity);
+  const preserveReferenceSelection = preserveOwnedReference || preserveRestoredReference;
   const references = sortedPricingReferencesForDisplay(state.pricingReferences);
   const selectedValue = currentPricingReference() ? pricingReferenceSelectValue(currentPricingReference()) : "";
   const referenceOption = (reference) => {
@@ -5128,20 +5235,20 @@ function renderProfileOptions() {
   elements.profileSelect.innerHTML = references.length
     ? references.map(referenceOption).join("")
     : `<option value="">${escapeHtml(MISSING_PRICING_REFERENCES_MESSAGE)}</option>`;
-  const preferredReference = preserveOwnedReference
+  const preferredReference = preserveReferenceSelection
     ? currentPricingReference()
     : currentPricingReference() || lastSelectedPricingReference() || defaultPricingReference() || references[0] || null;
   if (preferredReference) {
     state.pricingReferenceId = preferredReference.id || "";
     state.pricingReferenceSource = pricingReferenceSelectionFromValue(pricingReferenceSelectValue(preferredReference)).source;
-  } else if (!preserveOwnedReference) {
+  } else if (!preserveReferenceSelection) {
     state.pricingReferenceId = "";
     state.pricingReferenceSource = "";
   }
   const selectedReference = currentPricingReference();
   elements.profileSelect.value = selectedReference
     ? pricingReferenceSelectValue(selectedReference)
-    : preserveOwnedReference ? "" : selectedValue;
+    : preserveReferenceSelection ? "" : selectedValue;
   elements.profileSelect.disabled = references.length === 0;
   elements.profileSelect.title = references.length ? "" : MISSING_PRICING_REFERENCES_MESSAGE;
   elements.profileSelect.setAttribute("aria-disabled", String(elements.profileSelect.disabled));
@@ -5155,8 +5262,13 @@ function firstPricingReferenceOptionValue() {
 }
 
 function selectPricingReferenceOptionValue(value = "") {
-  const selection = pricingReferenceSelectionFromValue(value || "");
-  if (!selection.pricingReferenceId) return false;
+  const selectedValue = String(value || "").trim();
+  const selectedReference = state.pricingReferences.find((reference) => (
+    pricingReferenceSelectValue(reference) === selectedValue
+  ));
+  if (!selectedReference) return false;
+  const selection = pricingReferenceSelectionFromValue(selectedValue);
+  state.restoredPricingReferenceIdentity = null;
   state.pricingReferenceId = selection.pricingReferenceId;
   state.pricingReferenceSource = selection.source;
   syncSelectedPricingReference();
@@ -7247,7 +7359,7 @@ async function deleteRepoPricingReference(referenceId, source = "local") {
     state.pricingReferences = mergePricingReferences(Array.isArray(data.pricing_references) ? data.pricing_references : state.pricingReferences);
     if (state.pricingReferenceId === reference.id) {
       const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
-      if (!ownedCommercial) {
+      if (!ownedCommercial && !state.restoredPricingReferenceIdentity) {
         const fallback = defaultPricingReference() || state.pricingReferences[0] || null;
         state.pricingReferenceId = fallback?.id || "";
         state.pricingReferenceSource = fallback ? pricingReferenceSelectionFromValue(pricingReferenceSelectValue(fallback)).source : "";
@@ -7532,11 +7644,18 @@ function pendingPricingReferenceSelection() {
 }
 
 function applyPendingPricingReferenceSelection() {
-  const nextSelection = pendingPricingReferenceSelection();
-  if (!nextSelection.pricingReferenceId) return false;
-  if (nextSelection.pricingReferenceId === state.pricingReferenceId && nextSelection.source === state.pricingReferenceSource) {
+  const pendingValue = String(elements.profileSelect?.value || "").trim();
+  const nextReference = state.pricingReferences.find((reference) => (
+    pricingReferenceSelectValue(reference) === pendingValue
+  ));
+  if (!nextReference) return false;
+  const nextSelection = pricingReferenceSelectionFromValue(pendingValue);
+  if (!state.restoredPricingReferenceIdentity
+    && nextSelection.pricingReferenceId === state.pricingReferenceId
+    && nextSelection.source === state.pricingReferenceSource) {
     return false;
   }
+  state.restoredPricingReferenceIdentity = null;
   state.pricingReferenceId = nextSelection.pricingReferenceId;
   state.pricingReferenceSource = nextSelection.source;
   syncSelectedPricingReference();
@@ -7578,7 +7697,17 @@ function buildPayload(options = {}) {
       source: pricingReference.source || "bundled",
       tax: pricingReference.tax || selectedPricingReferenceTax(),
       currency: selectedPricingReferenceCurrency(),
-    } : { id: state.pricingReferenceId || "", source: state.pricingReferenceSource || "bundled", tax: selectedPricingReferenceTax(), currency: selectedPricingReferenceCurrency() },
+    } : state.restoredPricingReferenceIdentity ? {
+      id: state.pricingReferenceId || "",
+      source: state.pricingReferenceSource || "unavailable",
+      tax: selectedPricingReferenceTax(),
+      currency: selectedPricingReferenceCurrency(),
+    } : {
+      id: state.pricingReferenceId || "",
+      source: state.pricingReferenceSource || "bundled",
+      tax: selectedPricingReferenceTax(),
+      currency: selectedPricingReferenceCurrency(),
+    },
     quote_session: currentQuoteSessionPayload({
       quoteGenerated: Boolean(state.basisConfirmed || state.outputRows.length),
       includeDraftState: true,
@@ -7650,9 +7779,14 @@ function buildLineItemNormalizePayload() {
       source: pricingReference.source || "bundled",
       tax: pricingReference.tax || selectedPricingReferenceTax(),
       currency: selectedPricingReferenceCurrency(),
+    } : state.restoredPricingReferenceIdentity ? {
+      id: state.pricingReferenceId || "",
+      source: state.pricingReferenceSource || "unavailable",
+      tax: selectedPricingReferenceTax(),
+      currency: selectedPricingReferenceCurrency(),
     } : {
       id: state.pricingReferenceId || "",
-      source: "bundled",
+      source: state.pricingReferenceSource || "bundled",
       tax: selectedPricingReferenceTax(),
       currency: selectedPricingReferenceCurrency(),
     },
