@@ -2119,6 +2119,1131 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(brief["line_items"][0]["effective_unit_price"], 77)
         self.assertEqual(brief["line_items"][0]["pricing_basis_amount"], 154)
 
+    def test_fresh_quote_save_restore_round_trip_preserves_lifecycle_and_automatic_pricing(self):
+        node = require_node(self)
+        client_script = r'''
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const normal = `function ${name}(`;
+  const asyncMarker = `async function ${name}(`;
+  const asyncStart = source.indexOf(asyncMarker);
+  const normalStart = source.indexOf(normal);
+  const start = asyncStart >= 0 ? asyncStart : normalStart;
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  if (bodyStart < 2) throw new Error(`Missing body for function ${name}`);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const QUOTE_SESSION_STATE_VERSION = 5;
+const QUOTE_SESSION_STORAGE_KEY = "swooshz_quote_session_v1";
+const QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA = "swooshz.quote-commercial-snapshot.v1";
+const QUOTE_COMMERCIAL_SNAPSHOT_VERSION = 1;
+const QUOTE_COMMERCIAL_LIFECYCLES = new Set(["NEW_UNINITIALISED", "EXISTING", "RECOVERED"]);
+const QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS = [
+  "currency", "exchange_rate", "tax", "company_name", "header_details", "logo",
+  "terms_heading", "payment_terms", "notes_heading", "standard_notes", "acceptance_text",
+  "person_label", "stamp_label", "date_label", "company_signatory", "company_title",
+  "company_date_label", "rich_text",
+];
+const PRICING_REFERENCE_SETTINGS_MODE_MANAGE = "manage";
+const DEFAULT_PROFILE_ID = "synthetic-exhibition-fixture-template";
+const DEFAULT_PRICING_REFERENCE_ID = "g3-workspace-pricing";
+const DEFAULT_TAX_LABEL = "GST";
+const DEFAULT_TAX_RATE = 0.09;
+const DEFAULT_CURRENCY_LABEL = "SGD";
+const MAX_REFERENCE_IMAGES = 8;
+const SIDE_PANEL_SEQUENCE = ["images", "customer", "basis", "output"];
+
+const state = {
+  browserRecoveryScope: "workspace-g3-round-trip",
+  profileId: DEFAULT_PROFILE_ID,
+  defaultProfileId: DEFAULT_PROFILE_ID,
+  pricingReferenceId: DEFAULT_PRICING_REFERENCE_ID,
+  pricingReferenceSource: "company",
+  pricingReferences: [{
+    id: DEFAULT_PRICING_REFERENCE_ID,
+    source: "company",
+    label: "Workspace Pricing",
+    currency: "SGD",
+    tax: { label: "GST", rate: 0.09 },
+  }],
+  profiles: [{ id: DEFAULT_PROFILE_ID, label: "Workspace Profile", default_pricing_reference: DEFAULT_PRICING_REFERENCE_ID }],
+  selectedPresetValue: `profile:${DEFAULT_PROFILE_ID}:default`,
+  quoteSessionId: "quote-g3-round-trip",
+  quoteSessionDraftSaveStarted: true,
+  quoteSessionRestoredSessionId: "",
+  quoteSessionRestoredDraftKey: "",
+  activeAppView: "quote",
+  activeSidePanel: "basis",
+  restorableOverlay: "",
+  pricingReferenceSettingsMode: PRICING_REFERENCE_SETTINGS_MODE_MANAGE,
+  generationContext: { session_id: "quote-g3-round-trip", run_id: "" },
+  quoteCommercialLifecycle: "NEW_UNINITIALISED",
+  quoteCommercialSnapshot: null,
+  quoteCommercialRecoveryError: "",
+  quoteCommercialPreservedQuoteText: {},
+  quoteCommercialTouched: { quoteCurrency: false, quoteExchangeRate: false, quoteTaxLabel: false, quoteTaxRate: false },
+  images: [{ name: "booth-render.png", type: "image/png", size: 4, data_url: "data:image/png;base64,ZmFrZQ==" }],
+  quoteBasis: { graphics: "Confirm: workspace printed graphics." },
+  quoteBasisSections: [{
+    id: "graphics",
+    title: "Graphics",
+    lines: [{ id: "basis-graphics", tag: "Include", text: "[ sqm Workspace printed graphics ]", quantity: 3, unit: "sqm" }],
+  }],
+  lineItems: [{
+    section: "Graphics", quantity: 3, unit: "sqm", description: "Workspace printed graphics",
+    pricing_keyword: "", source_basis_line_id: "basis-graphics",
+  }],
+  outputRows: [],
+  originalOutputRows: [],
+  outputErrors: [],
+  outputSortMode: "pricing_reference",
+  analysisFindings: [],
+  blockingClarificationQuestions: [],
+  boothDimensions: { booth_width: "6", booth_depth: "6", booth_size: "6m x 6m", dimension_source: "test" },
+  originalAnalysisSnapshot: null,
+  basisConfirmed: true,
+  aiFailed: false,
+  draftSource: "",
+  lastAnalysisMode: "standard",
+  pendingAnalysisMode: "standard",
+  pendingFeedback: "",
+  basisChat: {},
+  downloadFile: null,
+  pdfFile: null,
+  outputRevision: 0,
+  downloadFileRevision: -1,
+  pdfFileRevision: -1,
+  pricingMatches: [],
+  pricingIssues: [],
+  activeJob: null,
+  isRecoveryScopeTransitioning: false,
+  isBooting: false,
+};
+
+const values = {
+  quoteDate: "2026-09-11", projectNumber: "G3-ROUND-TRIP", clientName: "Synthetic Workspace",
+  clientAttention: "Tester", clientTitle: "Operator", clientAddress: "Synthetic Address",
+  projectTitle: "Synthetic Booth", showName: "Synthetic Show", quoteCompanyName: "Workspace Quote Co",
+  headerDetails: "Workspace Quote Co\nSynthetic Header", quoteCurrency: "SGD", quoteExchangeRate: "1",
+  quoteTaxLabel: "GST", quoteTaxRate: "9", taxLabel: "GST", taxRate: "9", termsHeading: "Terms",
+  paymentTerms: "Payment", notesHeading: "Notes", standardNotes: "Note", acceptanceText: "Accepted",
+  personLabel: "Person", stampLabel: "Stamp", dateLabel: "Date:", companySignatory: "Signer",
+  companyTitle: "Director", companyDateLabel: "Date:",
+};
+const elements = Object.fromEntries(Object.entries(values).map(([key, value]) => [key, { value }]));
+Object.assign(elements, {
+  quoteCurrencyCustom: { value: "", hidden: true, required: false },
+  quoteExchangeRateField: { hidden: true },
+  presetSelect: { value: state.selectedPresetValue },
+  richTextEditors: [],
+});
+
+const savedStorage = new Map();
+const window = { localStorage: {
+  getItem(key) { return savedStorage.get(key) || null; },
+  setItem(key, value) { savedStorage.set(key, String(value)); },
+  removeItem(key) { savedStorage.delete(key); },
+} };
+
+function safeQuoteSessionId(value = "") { return String(value || "").trim(); }
+function currentBrowserRecoveryScope() { return state.browserRecoveryScope; }
+function currentGenerationContext() { return state.generationContext || {}; }
+function normalizedContentFingerprint(value = "") { return String(value || ""); }
+function invalidateAuthorityProfileRequests() {}
+function transitionGenerationContext(sessionId, runId) {
+  state.quoteSessionId = sessionId;
+  state.generationContext = { session_id: sessionId, run_id: runId || "" };
+}
+function normalizeRestorableOverlay() { return ""; }
+function normalizePricingReferenceSettingsMode() { return PRICING_REFERENCE_SETTINGS_MODE_MANAGE; }
+function presetValueFromQuoteDetails() { return ""; }
+function currentPricingReference() {
+  return state.pricingReferences.find((item) => item.id === state.pricingReferenceId && item.source === state.pricingReferenceSource)
+    || state.pricingReferences[0] || null;
+}
+function defaultPricingReference() { return state.pricingReferences[0] || null; }
+function pricingReferenceSelectValue(reference = {}) { return `${reference.source || "bundled"}::${reference.id || ""}`; }
+function pricingReferenceSelectionFromValue(value = "") {
+  const [source, ...rest] = String(value || "").split("::");
+  return { source, pricingReferenceId: rest.join("::") };
+}
+function selectedPricingReferenceTax() { return currentPricingReference()?.tax || { label: DEFAULT_TAX_LABEL, rate: DEFAULT_TAX_RATE }; }
+function selectedPricingReferenceCurrency() { return currentPricingReference()?.currency || DEFAULT_CURRENCY_LABEL; }
+function selectedPreset() { return { name: "Default", details: {} }; }
+function currentProfile() { return state.profiles[0]; }
+function generationProfileIdForPayload() { return state.profileId; }
+function quoteSessionHasFreshOutputExports() { return false; }
+function dashboardCommercialsFromState() {
+  const tax = collectTaxDetails();
+  return { currency: collectQuoteCurrency(), tax_label: tax.label, tax_rate: tax.rate, exchange_rate: collectQuoteExchangeRate(), subtotal: null, tax_amount: null, grand_total: null };
+}
+function quoteSessionDraftStateCanSave() { return true; }
+function furthestQuoteSessionSidePanel() { return "basis"; }
+function quoteDetailsWithSessionLogoMetadata(details) { return details; }
+function quoteDetailsWithFallbackDefaults(_defaults, details) { return details && typeof details === "object" ? details : {}; }
+async function restoreQuoteDetailsLogo(details) { return details; }
+async function restoreSessionImages(images) { return Array.isArray(images) ? images : []; }
+function cloneQuoteBasis(value) { return JSON.parse(JSON.stringify(value || {})); }
+function cloneQuoteBasisSections(value) { return JSON.parse(JSON.stringify(value || [])); }
+function normalizeQuoteCommercialTouched() { return { quoteCurrency: false, quoteExchangeRate: false, quoteTaxLabel: false, quoteTaxRate: false }; }
+function normalizeQuoteBasisSections(value) { return Array.isArray(value) ? value : []; }
+function normalizeLineItem(value) { return { ...value }; }
+function normalizeOutputRow(value) { return { ...value }; }
+function revisionNumber(value, fallback) { const number = Number(value); return Number.isFinite(number) ? number : fallback; }
+function normalizeAnalysisMode(value) { return String(value || "standard"); }
+function normalizeActiveJob(value) { return value && typeof value === "object" && Object.keys(value).length ? value : null; }
+function sessionImageMetadata(value) { return { ...value }; }
+function renderProfileOptions() {}
+function renderPresetOptions() {}
+function renderFiles() {}
+function renderPricingMatches() {}
+function renderMatchSummary() {}
+function clearPricingReviewMessages() {}
+function clearAiFailedDraftState() {}
+function renderBasisFailureState() {}
+function updateQuoteBasisCard() {}
+function renderBasisEmptyState() {}
+function updateDownloadButton() {}
+function setResultStatus() {}
+function setWorkflowStage(value) { state.workflowStage = value; }
+function clearAiFailureBanner() {}
+function showAiFailureBanner() {}
+function restoredWorkflowStage() { return "basis_review"; }
+function restoredQuoteSessionSidePanel() { return "basis"; }
+function setSidePanel(value) { state.activeSidePanel = value; }
+function sessionFileRecordsFromDraft() { return []; }
+function persistSessionFiles() { return Promise.resolve(); }
+function syncRichTextSources() {}
+function collectRichTextDetails() { return {}; }
+function splitLines(value) { return Array.isArray(value) ? value.join("\n") : String(value || ""); }
+function normalizeCurrencyLabel(value) { return String(value || DEFAULT_CURRENCY_LABEL).trim().toUpperCase(); }
+function normalizeTaxLabel(value) { return String(value || DEFAULT_TAX_LABEL).trim().toUpperCase(); }
+function commercialTaxRateOrNull(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? (number > 1 ? number / 100 : number) : null;
+}
+function taxRatePercentText(value) {
+  const rate = commercialTaxRateOrNull(value);
+  return rate === null ? "" : String(rate * 100);
+}
+function setInputValue(element, value) { if (element) element.value = Array.isArray(value) ? value.join("\n") : String(value ?? ""); }
+function hasOwnValue(object, key) { return Object.prototype.hasOwnProperty.call(object || {}, key); }
+function shouldApply(object, key, partial) { return !partial || hasOwnValue(object, key); }
+function shouldApplyQuoteCommercialField(_key, hasValue, partial) { return !partial || hasValue; }
+function setQuoteCurrencyControls(value) { elements.quoteCurrency.value = String(value || ""); elements.quoteCurrencyCustom.value = ""; }
+function syncQuoteCurrencyCustomInput() {}
+function syncQuoteExchangeRateField() {}
+function syncQuoteCommercialContextPills() {}
+function linesValue(value) { return Array.isArray(value) ? value.join("\n") : String(value || ""); }
+function normalizeBoothDimensions(value = {}) { return { booth_width: String(value.booth_width || "6"), booth_depth: String(value.booth_depth || "6"), booth_size: value.booth_size || "6m x 6m", dimension_source: value.dimension_source || "test" }; }
+function restoreRichTextDetails() {}
+function applyDefaultQuoteDate() {}
+function renderHeaderLogoPreview() {}
+function renderPresetStatus() {}
+function quoteBasisFromSections() { return {}; }
+function collectQuoteCurrency() { return String(elements.quoteCurrency.value || selectedPricingReferenceCurrency()).trim(); }
+function collectQuoteExchangeRate() { const number = Number(elements.quoteExchangeRate.value); return Number.isFinite(number) && number > 0 ? number : 1; }
+function collectTaxDetails() { return { label: String(elements.quoteTaxLabel.value || DEFAULT_TAX_LABEL), rate: commercialTaxRateOrNull(elements.quoteTaxRate.value) ?? DEFAULT_TAX_RATE }; }
+function quoteExchangeRateText(value = collectQuoteExchangeRate()) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return "-";
+  return number.toLocaleString(undefined, { maximumFractionDigits: 4 });
+}
+
+eval([
+  "hasMeaningfulQuoteDetailValue", "quoteCommercialSnapshotPresence", "normalizeQuoteCommercialSnapshot",
+  "savedPricingReferenceIdentityCandidate", "savedPricingReferenceIdentityFromSnapshot",
+  "freshQuoteRestorationEvidenceIsValid",
+  "quoteCommercialSnapshotFromLegacyRecovery", "quoteCommercialSnapshotForDetails", "collectQuoteDetails",
+  "buildSessionSnapshot", "currentQuoteSessionDraftState", "currentQuoteSessionPayload",
+  "buildLineItemNormalizePayload", "syncSelectedPricingReference", "applyQuoteDetails",
+  "applyQuoteSessionSnapshot",
+].map(extractFunction).join("\n"));
+
+(async () => {
+  const saved = buildSessionSnapshot();
+  window.localStorage.setItem(QUOTE_SESSION_STORAGE_KEY, JSON.stringify(saved));
+  const savedForRestore = JSON.parse(window.localStorage.getItem(QUOTE_SESSION_STORAGE_KEY));
+  assert.strictEqual(savedForRestore.quoteCommercialLifecycle, "NEW_UNINITIALISED");
+  assert.strictEqual(savedForRestore.quoteDetails.commercial_snapshot.lifecycle, "NEW_UNINITIALISED");
+
+  state.quoteCommercialLifecycle = "";
+  state.quoteCommercialSnapshot = null;
+  await applyQuoteSessionSnapshot(savedForRestore);
+  const request = buildLineItemNormalizePayload();
+  assert.strictEqual(state.quoteCommercialLifecycle, "NEW_UNINITIALISED");
+  assert.strictEqual(state.quoteCommercialSnapshot.lifecycle, "NEW_UNINITIALISED");
+  assert.strictEqual(request.quote_session.draft_state.quoteCommercialLifecycle, "NEW_UNINITIALISED");
+  assert.strictEqual(request.quote_session.draft_state.quoteDetails.commercial_snapshot.lifecycle, "NEW_UNINITIALISED");
+  assert.ok(!Object.prototype.hasOwnProperty.call(request.line_items[0], "unit_price_override"));
+  process.stdout.write(JSON.stringify({
+    saved_lifecycle: savedForRestore.quoteCommercialLifecycle,
+    saved_snapshot_lifecycle: savedForRestore.quoteDetails.commercial_snapshot.lifecycle,
+    restored_lifecycle: state.quoteCommercialLifecycle,
+    restored_snapshot_lifecycle: state.quoteCommercialSnapshot.lifecycle,
+    request_lifecycle: request.quote_session.draft_state.quoteCommercialLifecycle,
+    request_snapshot_lifecycle: request.quote_session.draft_state.quoteDetails.commercial_snapshot.lifecycle,
+    request,
+  }));
+})().catch((error) => { console.error(error); process.exit(1); });
+'''
+        with tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{(root / 'sqag-storage.sqlite3').as_posix()}"
+            workspace_id = "workspace-g3-round-trip"
+            reference_id = "g3-workspace-pricing"
+            auth_session = self.platform_auth_session(workspace_id, membership_role="operator", user_id="g3-operator")
+            reference = workspace_pricing_reference(reference_id)
+            env = {
+                "APP_MODE": "local",
+                "USER_TYPE": "operator",
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_DATABASE_URL": database_url,
+                "QUOTE_LOG_ROOT": str(root / "logs"),
+            }
+            node_env = os.environ.copy()
+
+            with mock.patch.dict(os.environ, env, clear=True):
+                webapp.apply_sqag_storage_migrations(database_url)
+                storage = webapp.app_storage_for_auth_session(auth_session)
+                storage.save_pricing_reference(reference)
+
+                completed = subprocess.run(
+                    [node, "-e", client_script],
+                    cwd=str(ROOT),
+                    text=True,
+                    capture_output=True,
+                    env=node_env,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+                client = json.loads(completed.stdout)
+                request = client["request"]
+                self.assertEqual(client["saved_lifecycle"], "NEW_UNINITIALISED")
+                self.assertEqual(client["saved_snapshot_lifecycle"], "NEW_UNINITIALISED")
+                self.assertEqual(client["restored_lifecycle"], "NEW_UNINITIALISED")
+                self.assertEqual(client["restored_snapshot_lifecycle"], "NEW_UNINITIALISED")
+                self.assertEqual(client["request_lifecycle"], "NEW_UNINITIALISED")
+                self.assertEqual(client["request_snapshot_lifecycle"], "NEW_UNINITIALISED")
+                self.assertNotIn("unit_price_override", request["line_items"][0])
+
+                resolved = webapp.payload_with_database_pricing_reference_detail(request, auth_session=auth_session)
+                self.assertIsNotNone(resolved)
+                self.assertEqual(resolved["pricing_reference"]["id"], reference_id)
+                self.assertEqual(resolved["pricing_reference"]["source"], "company")
+                self.assertFalse(webapp.quote_commercial_state(resolved)["owned"])
+
+                [normalized] = webapp.normalize_line_items_for_quote_basis_review(resolved)
+                self.assertIn(normalized["status"], {"matched", "matched-from-ambiguous"})
+                self.assertEqual(normalized["pricing_keyword"], "workspace-row")
+                self.assertEqual(normalized["catalog_unit_price"], 20.0)
+                self.assertEqual(normalized["effective_unit_price"], 20.0)
+                self.assertEqual(normalized["pricing_basis_amount"], 60.0)
+                self.assertEqual(normalized["approved_quote_amount"], 60.0)
+                self.assertEqual(normalized["pricing_reference_source"], "company")
+                self.assertEqual(normalized["pricing_reference_id"], reference_id)
+
+                totals_script = r'''
+const fs = require("fs");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+function extractFunction(name) {
+  const marker = `function ${name}(`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+const input = JSON.parse(fs.readFileSync(0, "utf8"));
+const DEFAULT_TAX_RATE = 0.09;
+const state = { quoteCommercialLifecycle: "NEW_UNINITIALISED", outputRows: [] };
+const elements = {
+  quoteCurrency: { value: "SGD" }, quoteCurrencyCustom: { value: "", hidden: true, required: false },
+  quoteExchangeRate: { value: "1" }, quoteTaxLabel: { value: "GST" }, quoteTaxRate: { value: "9" },
+};
+function quoteCommercialStateIsOwned() { return ["EXISTING", "RECOVERED"].includes(state.quoteCommercialLifecycle); }
+function selectedPricingReferenceCurrency() { return "SGD"; }
+function collectQuoteCurrency() { return elements.quoteCurrency.value; }
+function collectQuoteExchangeRate() { return Number(elements.quoteExchangeRate.value); }
+function collectTaxDetails() { return { label: elements.quoteTaxLabel.value, rate: Number(elements.quoteTaxRate.value) / 100 }; }
+function quoteFxMultiplier() { return 1; }
+eval([
+  "numberOrNull", "formatAmount", "commercialTaxRateOrNull", "effectiveOutputUnitPrice",
+  "roundCommercialCents", "quoteAmountValue", "recalculateOutputRow", "outputCellDisplayValue",
+  "rowNeedsManualInput", "matchSummaryStats", "dashboardCommercialsFromState",
+].map(extractFunction).join("\n"));
+const row = recalculateOutputRow(input.row);
+state.outputRows = [row];
+process.stdout.write(JSON.stringify({ row, totals: dashboardCommercialsFromState() }));
+'''
+                totals_completed = subprocess.run(
+                    [node, "-e", totals_script],
+                    cwd=str(ROOT),
+                    input=json.dumps({"row": normalized}),
+                    text=True,
+                    capture_output=True,
+                    env=node_env,
+                    check=False,
+                )
+                self.assertEqual(totals_completed.returncode, 0, totals_completed.stderr or totals_completed.stdout)
+                totals_result = json.loads(totals_completed.stdout)
+                self.assertEqual(totals_result["row"]["amount"], 60)
+                self.assertEqual(totals_result["totals"], {
+                    "currency": "SGD",
+                    "tax_label": "GST",
+                    "tax_rate": 0.09,
+                    "exchange_rate": 1,
+                    "subtotal": 60,
+                    "tax_amount": 5.4,
+                    "grand_total": 65.4,
+                })
+
+    def test_fresh_workspace_pricing_reference_normalization_is_scoped_and_automatic(self):
+        with tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{(root / 'sqag-storage.sqlite3').as_posix()}"
+            workspace_id = "workspace-g3-fresh-pricing"
+            reference_id = "g3-workspace-pricing"
+            auth_session = self.platform_auth_session(workspace_id, membership_role="operator", user_id="g3-operator")
+            cross_workspace_session = self.platform_auth_session("workspace-g3-other", membership_role="operator", user_id="g3-other")
+            reference = workspace_pricing_reference(reference_id)
+            payload = payload_with_workspace_pricing(reference_id)
+            payload["quote_exchange_rate"] = 1
+            payload["quote_basis_sections"] = [{
+                "id": "graphics",
+                "title": "Graphics",
+                "lines": [{
+                    "id": "basis-graphics",
+                    "tag": "Include",
+                    "text": "[ sqm Workspace printed graphics ] - Fresh workspace pricing line.",
+                    "quantity": 3,
+                    "unit": "sqm",
+                }],
+            }]
+            payload["line_items"] = [{
+                "section": "Graphics",
+                "quantity": 3,
+                "unit": "sqm",
+                "description": "Workspace printed graphics",
+                "pricing_keyword": "",
+                "source_basis_line_id": "basis-graphics",
+            }]
+            payload["quote_session"] = {
+                "session_id": "quote-g3-fresh-pricing",
+                "commercials": {},
+                "draft_state": {
+                    "quoteCommercialLifecycle": "NEW_UNINITIALISED",
+                    "pricingReferenceId": reference_id,
+                    "pricingReferenceSource": "company",
+                    "selectedPresetValue": payload["profile_id"],
+                },
+            }
+            env = {
+                "APP_MODE": "local",
+                "USER_TYPE": "operator",
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_DATABASE_URL": database_url,
+                "QUOTE_LOG_ROOT": str(root / "logs"),
+            }
+
+            with mock.patch.dict(os.environ, env, clear=True):
+                webapp.apply_sqag_storage_migrations(database_url)
+                storage = webapp.app_storage_for_auth_session(auth_session)
+                storage.save_pricing_reference(reference)
+
+                resolved = webapp.payload_with_database_pricing_reference_detail(payload, auth_session=auth_session)
+                self.assertIsNotNone(resolved)
+                self.assertEqual(resolved["pricing_reference"]["id"], reference_id)
+                self.assertEqual(resolved["pricing_reference"]["source"], "company")
+                self.assertEqual(resolved["pricing_reference"]["items"][0]["sale_unit_price"], 20.0)
+                self.assertFalse(webapp.quote_commercial_state(resolved)["owned"])
+                self.assertNotIn("unit_price_override", payload["line_items"][0])
+
+                [normalized] = webapp.normalize_line_items_for_quote_basis_review(resolved)
+                self.assertEqual(normalized["pricing_keyword"], "workspace-row")
+                self.assertIn(normalized["status"], {"matched", "matched-from-ambiguous"})
+                self.assertEqual(normalized["catalog_unit_price"], 20.0)
+                self.assertEqual(normalized["effective_unit_price"], 20.0)
+                self.assertEqual(normalized["unit_price_override"], 20.0)
+                self.assertEqual(normalized["pricing_basis_amount"], 60.0)
+                self.assertEqual(normalized["approved_quote_amount"], 60.0)
+                self.assertEqual(normalized["pricing_reference_source"], "company")
+                self.assertEqual(normalized["pricing_reference_id"], reference_id)
+                fresh_subtotal = sum(item["approved_quote_amount"] for item in [normalized])
+                fresh_tax = webapp.round_commercial_cents(fresh_subtotal * 0.09)
+                fresh_grand_total = webapp.round_commercial_cents(fresh_subtotal + fresh_tax)
+                self.assertEqual(
+                    {
+                        "currency": "SGD",
+                        "tax_label": "GST",
+                        "tax_rate": 0.09,
+                        "exchange_rate": 1,
+                        "subtotal": fresh_subtotal,
+                        "tax_amount": fresh_tax,
+                        "grand_total": fresh_grand_total,
+                    },
+                    {
+                        "currency": "SGD",
+                        "tax_label": "GST",
+                        "tax_rate": 0.09,
+                        "exchange_rate": 1,
+                        "subtotal": 60.0,
+                        "tax_amount": 5.4,
+                        "grand_total": 65.4,
+                    },
+                )
+
+                missing_reference = copy.deepcopy(payload)
+                missing_reference["pricing_reference_id"] = ""
+                missing_reference["pricing_reference"] = {"id": "", "source": "company"}
+                mismatched_source = copy.deepcopy(payload)
+                mismatched_source["pricing_reference"] = {"id": reference_id, "source": "local"}
+                unowned_reference = copy.deepcopy(payload)
+                unowned_reference["pricing_reference_id"] = "g3-unowned-pricing"
+                unowned_reference["pricing_reference"] = {"id": "g3-unowned-pricing", "source": "company"}
+                self.assertIsNone(webapp.payload_with_database_pricing_reference_detail(missing_reference, auth_session=auth_session))
+                self.assertIsNone(webapp.payload_with_database_pricing_reference_detail(mismatched_source, auth_session=auth_session))
+                self.assertIsNone(webapp.payload_with_database_pricing_reference_detail(unowned_reference, auth_session=auth_session))
+                self.assertIsNone(webapp.payload_with_database_pricing_reference_detail(payload, auth_session=cross_workspace_session))
+                self.assertIsNone(webapp.payload_with_database_pricing_reference_detail(payload, auth_session=None))
+
+                historical_line_item = {
+                    "section": "Graphics",
+                    "quantity": 2,
+                    "unit": "sqm",
+                    "description": "Historical workspace printed graphics",
+                    "pricing_keyword": "workspace-row",
+                    "price_mode": "Priced",
+                    "effective_unit_price": 31,
+                    "unit_price_override": 31,
+                    "pricing_basis_amount": 62,
+                    "approved_quote_amount": 84.94,
+                }
+                for lifecycle in ("EXISTING", "RECOVERED"):
+                    with self.subTest(lifecycle=lifecycle):
+                        persisted = copy.deepcopy(resolved)
+                        persisted["line_items"] = [copy.deepcopy(historical_line_item)]
+                        persisted["quote_session"] = {
+                            "session_id": f"quote-g3-{lifecycle.lower()}",
+                            "commercials": {},
+                            "draft_state": {
+                                "quoteCommercialLifecycle": lifecycle,
+                                "selectedPresetValue": payload["profile_id"],
+                                "quoteDetails": {
+                                    "client": copy.deepcopy(payload["client"]),
+                                    "project": copy.deepcopy(payload["project"]),
+                                    "company": copy.deepcopy(payload["company"]),
+                                    "currency": "USD",
+                                    "exchange_rate": 1.37,
+                                    "tax": {"label": "GST", "rate": 0.09},
+                                    "commercial_snapshot": {
+                                        "schema": webapp.QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+                                        "version": webapp.QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+                                        "owner": "quote",
+                                        "lifecycle": lifecycle,
+                                        "origin": "session_recovery",
+                                        "presence": {
+                                            key: "captured"
+                                            for key in webapp.QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS
+                                        },
+                                        "pricing_basis": {
+                                            "currency": "SGD",
+                                            "source": "company",
+                                            "id": reference_id,
+                                            "digest": "sha256:" + "a" * 64,
+                                        },
+                                    },
+                                },
+                            },
+                        }
+                        persisted_state = webapp.quote_commercial_state(persisted)
+                        self.assertTrue(persisted_state["owned"])
+                        self.assertEqual(webapp.quote_commercial_state_errors(persisted), [])
+                        [historical] = webapp.normalize_line_items_for_quote_basis_review(persisted)
+                        self.assertEqual(historical["effective_unit_price"], 31)
+                        self.assertEqual(historical["pricing_basis_amount"], 62)
+                        self.assertEqual(historical["approved_quote_amount"], 84.94)
+                        self.assertNotEqual(historical["effective_unit_price"], 20.0)
+                        self.assertEqual(webapp.quote_session_commercials(persisted, {"commercials": {}}), {
+                            "currency": "USD",
+                            "tax_label": "GST",
+                            "tax_rate": 0.09,
+                            "exchange_rate": 1.37,
+                            "subtotal": 84.94,
+                            "tax_amount": 7.64,
+                            "grand_total": 92.58,
+                        })
+
+    def test_repair2_restore_evidence_and_reference_authority_round_trip(self):
+        node = require_node(self)
+        client_script = r'''
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const normalMarker = `function ${name}(`;
+  const asyncMarker = `async function ${name}(`;
+  const asyncStart = source.indexOf(asyncMarker);
+  const normalStart = source.indexOf(normalMarker);
+  const start = asyncStart >= 0 ? asyncStart : normalStart;
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  if (bodyStart < 2) throw new Error(`Missing body for function ${name}`);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const QUOTE_SESSION_STATE_VERSION = 5;
+const QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA = "swooshz.quote-commercial-snapshot.v1";
+const QUOTE_COMMERCIAL_SNAPSHOT_VERSION = 1;
+const QUOTE_COMMERCIAL_LIFECYCLES = new Set(["NEW_UNINITIALISED", "EXISTING", "RECOVERED"]);
+const QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS = [
+  "currency", "exchange_rate", "tax", "company_name", "header_details", "logo",
+  "terms_heading", "payment_terms", "notes_heading", "standard_notes", "acceptance_text",
+  "person_label", "stamp_label", "date_label", "company_signatory", "company_title",
+  "company_date_label", "rich_text",
+];
+const PRICING_REFERENCE_SETTINGS_MODE_MANAGE = "manage";
+const DEFAULT_PROFILE_ID = "profile-a";
+const DEFAULT_PRICING_REFERENCE_ID = "reference-b";
+const DEFAULT_TAX_LABEL = "GST";
+const DEFAULT_TAX_RATE = 0.09;
+const DEFAULT_CURRENCY_LABEL = "SGD";
+const MISSING_PRICING_REFERENCES_MESSAGE = "No pricing references found.";
+const PROFILE_PRESET_PREFIX = "profile:";
+const COMPANY_PROFILE_PRESET_PREFIX = "company:";
+
+const REF_A = "saved-reference-a";
+const REF_B = "fallback-reference-b";
+
+const state = {
+  browserRecoveryScope: "repair2-scope",
+  profileId: DEFAULT_PROFILE_ID,
+  defaultProfileId: DEFAULT_PROFILE_ID,
+  defaultPricingReferenceId: REF_B,
+  pricingReferenceId: REF_A,
+  pricingReferenceSource: "company",
+  pricingReferences: [],
+  profiles: [{ id: DEFAULT_PROFILE_ID, label: "Synthetic Profile", default_pricing_reference: REF_B }],
+  selectedPresetValue: `${PROFILE_PRESET_PREFIX}${DEFAULT_PROFILE_ID}:default`,
+  quoteSessionId: "quote-repair2",
+  quoteSessionDraftSaveStarted: true,
+  quoteSessionRestoredSessionId: "",
+  quoteSessionRestoredDraftKey: "",
+  activeAppView: "quote",
+  activeSidePanel: "basis",
+  restorableOverlay: "",
+  pricingReferenceSettingsMode: PRICING_REFERENCE_SETTINGS_MODE_MANAGE,
+  generationContext: { session_id: "quote-repair2", run_id: "" },
+  quoteCommercialLifecycle: "NEW_UNINITIALISED",
+  quoteCommercialSnapshot: null,
+  quoteCommercialRecoveryError: "",
+  quoteCommercialPreservedQuoteText: {},
+  quoteCommercialTouched: {},
+  images: [],
+  quoteBasis: { graphics: "Confirm: Workspace printed graphics." },
+  quoteBasisSections: [{
+    id: "graphics",
+    title: "Graphics",
+    lines: [{ id: "basis-graphics", tag: "Include", text: "[ sqm Workspace printed graphics ]", quantity: 3, unit: "sqm" }],
+  }],
+  lineItems: [{
+    section: "Graphics",
+    quantity: 3,
+    unit: "sqm",
+    description: "Workspace printed graphics",
+    pricing_keyword: "workspace-row",
+    source_basis_line_id: "basis-graphics",
+  }],
+  outputRows: [],
+  originalOutputRows: [],
+  outputErrors: [],
+  pricingMatches: [],
+  pricingIssues: [],
+  blockingClarificationQuestions: [],
+  analysisFindings: [],
+  basisConfirmed: true,
+  aiFailed: false,
+  draftSource: "",
+  pendingAnalysisMode: "standard",
+  lastAnalysisMode: "standard",
+  pendingFeedback: "",
+  basisChat: {},
+  outputRevision: 0,
+  downloadFileRevision: -1,
+  pdfFileRevision: -1,
+  downloadFile: null,
+  pdfFile: null,
+  activeJob: null,
+  isRecoveryScopeTransitioning: false,
+  isBooting: false,
+};
+
+const inputKeys = [
+  "quoteDate", "projectNumber", "clientName", "clientAttention", "clientTitle", "clientAddress",
+  "projectTitle", "showName", "quoteCompanyName", "headerDetails", "taxLabel", "taxRate",
+  "quoteTaxLabel", "quoteTaxRate", "quoteCurrency", "quoteCurrencyCustom", "quoteExchangeRate",
+  "termsHeading", "paymentTerms", "notesHeading", "standardNotes", "acceptanceText",
+  "companySignatory", "companyTitle", "companyDateLabel", "personLabel", "stampLabel", "dateLabel",
+];
+const elements = Object.fromEntries(inputKeys.map((key) => [key, { value: "" }]));
+Object.assign(elements, {
+  quoteCurrencyCustom: { value: "", hidden: true, required: false },
+  quoteExchangeRateField: { hidden: true },
+  profileSelect: {
+    value: "",
+    innerHTML: "",
+    disabled: false,
+    title: "",
+    setAttribute(name, value) { this[name] = value; },
+  },
+  presetSelect: { value: state.selectedPresetValue },
+  richTextEditors: [],
+});
+
+function reference(id, sourceName) {
+  return {
+    id,
+    source: sourceName,
+    label: sourceName === "company" ? `Workspace ${id}` : `Local ${id}`,
+    currency: "SGD",
+    tax: { label: "GST", rate: 0.09 },
+  };
+}
+
+function clone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function validCommercialSnapshot(id = REF_A, sourceName = "company") {
+  return {
+    schema: QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+    version: QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+    owner: "quote",
+    lifecycle: "NEW_UNINITIALISED",
+    origin: "new_quote",
+    presence: Object.fromEntries(QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS.map((key) => [key, "intentional_empty"])),
+    pricing_basis: {
+      currency: "SGD",
+      source: sourceName,
+      id,
+      digest: "sha256:" + "a".repeat(64),
+    },
+  };
+}
+
+function savedDraft({ id = REF_A, sourceName = "company", snapshot = validCommercialSnapshot(id, sourceName) } = {}) {
+  return {
+    version: QUOTE_SESSION_STATE_VERSION,
+    browserRecoveryScope: state.browserRecoveryScope,
+    savedAt: "2026-09-11T00:00:00.000Z",
+    activeAppView: "quote",
+    activeSidePanel: "basis",
+    profileId: DEFAULT_PROFILE_ID,
+    pricingReferenceId: id,
+    pricingReferenceSource: sourceName,
+    selectedPresetValue: state.selectedPresetValue,
+    quoteSessionId: state.quoteSessionId,
+    generationContext: { session_id: state.quoteSessionId, run_id: "" },
+    quoteSessionDraftSaveStarted: true,
+    quoteCommercialLifecycle: "NEW_UNINITIALISED",
+    quoteCommercialTouched: {},
+    quoteDetails: { commercial_snapshot: snapshot },
+    images: [],
+    quoteBasis: clone(state.quoteBasis),
+    quoteBasisSections: clone(state.quoteBasisSections),
+    lineItems: clone(state.lineItems),
+    outputRows: [],
+    originalOutputRows: [],
+    outputErrors: [],
+    pricingMatches: [],
+    pricingIssues: [],
+    analysisFindings: [],
+    blockingClarificationQuestions: [],
+    basisConfirmed: true,
+    aiFailed: false,
+    draftSource: "",
+    pendingAnalysisMode: "standard",
+    lastAnalysisMode: "standard",
+    pendingFeedback: "",
+    basisChat: {},
+    outputRevision: 0,
+    downloadFileRevision: -1,
+    pdfFileRevision: -1,
+    downloadFile: null,
+    pdfFile: null,
+    activeJob: null,
+  };
+}
+
+function resetState(references) {
+  state.profileId = DEFAULT_PROFILE_ID;
+  state.defaultProfileId = DEFAULT_PROFILE_ID;
+  state.defaultPricingReferenceId = REF_B;
+  state.pricingReferenceId = REF_A;
+  state.pricingReferenceSource = "company";
+  state.pricingReferences = references;
+  state.selectedPresetValue = `${PROFILE_PRESET_PREFIX}${DEFAULT_PROFILE_ID}:default`;
+  state.quoteCommercialLifecycle = "NEW_UNINITIALISED";
+  state.quoteCommercialSnapshot = null;
+  state.quoteCommercialRecoveryError = "";
+  state.restoredPricingReferenceIdentity = null;
+  state.lineItems = clone(savedDraft().lineItems);
+  state.quoteBasis = { graphics: "Confirm: Workspace printed graphics." };
+  state.quoteBasisSections = clone(savedDraft().quoteBasisSections);
+  elements.profileSelect.value = "";
+}
+
+function safeQuoteSessionId(value = "") { return String(value || "").trim(); }
+function currentBrowserRecoveryScope() { return state.browserRecoveryScope; }
+function currentGenerationContext() { return state.generationContext || {}; }
+function normalizedContentFingerprint(value = "") { return String(value || ""); }
+function invalidateAuthorityProfileRequests() {}
+function transitionGenerationContext(sessionId, runId) {
+  state.quoteSessionId = sessionId;
+  state.generationContext = { session_id: sessionId, run_id: runId || "" };
+}
+function normalizeRestorableOverlay() { return ""; }
+function normalizePricingReferenceSettingsMode() { return PRICING_REFERENCE_SETTINGS_MODE_MANAGE; }
+function presetValueFromQuoteDetails() { return ""; }
+function currentProfile() { return state.profiles[0]; }
+function selectedPreset() { return { name: "Default", details: {} }; }
+function generationProfileIdForPayload() { return state.profileId; }
+function quoteSessionHasFreshOutputExports() { return false; }
+function quoteSessionDraftStateCanSave() { return true; }
+function currentQuoteSessionPayload() {
+  return {
+    draft_state: {
+      quoteCommercialLifecycle: state.quoteCommercialLifecycle,
+      quoteDetails: { commercial_snapshot: state.quoteCommercialSnapshot },
+    },
+  };
+}
+function collectQuoteExchangeRate() { return 1; }
+function selectedPricingReferenceTax() { return { label: DEFAULT_TAX_LABEL, rate: DEFAULT_TAX_RATE }; }
+function selectedPricingReferenceCurrency() { return currentPricingReference()?.currency || DEFAULT_CURRENCY_LABEL; }
+function quoteBasisFromSections() { return {}; }
+function cloneQuoteBasis(value) { return clone(value || {}); }
+function cloneQuoteBasisSections(value) { return clone(value || []); }
+function normalizeQuoteBasisSections(value) { return Array.isArray(value) ? value : []; }
+function normalizeLineItem(value) { return { ...value }; }
+function normalizeOutputRow(value) { return { ...value }; }
+function revisionNumber(value, fallback = 0) { const number = Number(value); return Number.isFinite(number) ? Math.trunc(number) : fallback; }
+function normalizeActiveJob() { return null; }
+function normalizeAnalysisMode(value) { return String(value || "standard"); }
+function normalizeBoothDimensions(value = {}) { return { ...value }; }
+function normalizeQuoteCommercialTouched() { return {}; }
+function quoteDetailsCommercialTouched() { return {}; }
+function hasOwnValue(object, key) { return Object.prototype.hasOwnProperty.call(object || {}, key); }
+function quoteDetailsWithFallbackDefaults(_defaults, details) { return details && typeof details === "object" ? details : {}; }
+async function restoreQuoteDetailsLogo(details) { return details; }
+async function restoreSessionImages(images) { return Array.isArray(images) ? images : []; }
+function applyQuoteDetails() {}
+function renderProfileOptionsNoop() {}
+function renderSelectedPricingReferenceSummary() {}
+function renderPricingReferenceDeleteOptions() {}
+function renderPresetOptions() {}
+function renderFiles() {}
+function renderPricingMatches() {}
+function renderMatchSummary() {}
+function clearPricingReviewMessages() {}
+function clearAiFailedDraftState() {}
+function renderBasisFailureState() {}
+function updateQuoteBasisCard() {}
+function renderBasisEmptyState() {}
+function updateDownloadButton() {}
+function setResultStatus() {}
+function setWorkflowStage(value) { state.workflowStage = value; }
+function restoredWorkflowStage() { return "basis_review"; }
+function clearAiFailureBanner() {}
+function clearGeneratedQuoteState() {}
+function restoredQuoteSessionSidePanel() { return "basis"; }
+function setSidePanel(value) { state.activeSidePanel = value; }
+function syncControlStates() {}
+function persistLastPricingReferenceSelection() {}
+function lastSelectedPricingReference() { return null; }
+function escapeHtml(value = "") { return String(value); }
+function sortedPricingReferencesForDisplay(references = []) { return references.slice(); }
+
+eval([
+  "pricingReferenceSelectValue",
+  "pricingReferenceSelectionFromValue",
+  "currentPricingReference",
+  "defaultPricingReference",
+  "syncSelectedPricingReference",
+  "renderProfileOptions",
+  "pendingPricingReferenceSelection",
+  "applyPendingPricingReferenceSelection",
+  "normalizeQuoteCommercialSnapshot",
+  "savedPricingReferenceIdentityCandidate",
+  "savedPricingReferenceIdentityFromSnapshot",
+  "freshQuoteRestorationEvidenceIsValid",
+  "quoteCommercialSnapshotFromLegacyRecovery",
+  "applyQuoteSessionSnapshot",
+  "buildLineItemNormalizePayload",
+].map(extractFunction).join("\n"));
+
+function requestSnapshot(request) {
+  return request.quote_session.draft_state.quoteDetails.commercial_snapshot;
+}
+
+async function restoreScenario(saved, references) {
+  resetState(references);
+  await applyQuoteSessionSnapshot(saved, { forceQuoteView: true });
+  renderProfileOptions();
+  renderProfileOptions();
+  const request = buildLineItemNormalizePayload();
+  return {
+    lifecycle: state.quoteCommercialLifecycle,
+    recoveryError: state.quoteCommercialRecoveryError,
+    pricingReferenceId: state.pricingReferenceId,
+    pricingReferenceSource: state.pricingReferenceSource,
+    currentReferenceId: currentPricingReference()?.id || null,
+    renderedValue: elements.profileSelect.value,
+    restoredIdentity: state.restoredPricingReferenceIdentity ? { ...state.restoredPricingReferenceIdentity } : null,
+    request,
+    requestSnapshot: requestSnapshot(request),
+  };
+}
+
+const referenceA = reference(REF_A, "company");
+const referenceB = reference(REF_B, "company");
+const localReferenceA = reference(REF_A, "local");
+const results = {};
+
+(async () => {
+  results.validFresh = await restoreScenario(savedDraft(), [referenceA, referenceB]);
+  assert.strictEqual(results.validFresh.lifecycle, "NEW_UNINITIALISED");
+  assert.strictEqual(results.validFresh.pricingReferenceId, REF_A);
+  assert.strictEqual(results.validFresh.pricingReferenceSource, "company");
+  assert.strictEqual(results.validFresh.currentReferenceId, REF_A);
+  assert.strictEqual(results.validFresh.renderedValue, "company::" + REF_A);
+  assert.strictEqual(results.validFresh.request.pricing_reference_id, REF_A);
+  assert.strictEqual(results.validFresh.request.pricing_reference.source, "company");
+
+  const malformedCases = {
+    missing_presence: (snapshot) => { delete snapshot.presence; },
+    non_object_presence: (snapshot) => { snapshot.presence = "captured"; },
+    unsupported_presence: (snapshot) => { snapshot.presence.tax = "future_unknown"; },
+    legacy_unknown_presence: (snapshot) => { snapshot.presence.tax = "legacy_unknown"; },
+    missing_required_presence: (snapshot) => { delete snapshot.presence.tax; },
+    malformed_schema: (snapshot) => { snapshot.schema = "swooshz.quote-commercial-snapshot.legacy"; },
+    malformed_version: (snapshot) => { snapshot.version = String(QUOTE_COMMERCIAL_SNAPSHOT_VERSION); },
+    malformed_owner: (snapshot) => { snapshot.owner = "profile"; },
+    malformed_origin: (snapshot) => { snapshot.origin = "captured"; },
+    malformed_pricing_basis: (snapshot) => { snapshot.pricing_basis = { id: REF_A }; },
+    incomplete_pricing_basis: (snapshot) => { snapshot.pricing_basis = { currency: "SGD" }; },
+    no_commercial_snapshot: (draft) => { delete draft.quoteDetails.commercial_snapshot; },
+  };
+  for (const [name, mutate] of Object.entries(malformedCases)) {
+    const draft = savedDraft();
+    if (name === "no_commercial_snapshot") mutate(draft);
+    else mutate(draft.quoteDetails.commercial_snapshot);
+    results[name] = await restoreScenario(draft, [referenceA, referenceB]);
+    assert.strictEqual(results[name].lifecycle, "RECOVERED", name);
+    assert.match(results[name].recoveryError, /pricing review/i, name);
+    assert.strictEqual(results[name].request.quote_session.draft_state.quoteCommercialLifecycle, "RECOVERED", name);
+    assert.strictEqual(results[name].requestSnapshot.lifecycle, "RECOVERED", name);
+    assert.notStrictEqual(results[name].requestSnapshot.lifecycle, "NEW_UNINITIALISED", name);
+  }
+
+  results.deletedReference = await restoreScenario(savedDraft(), [referenceB]);
+  assert.strictEqual(results.deletedReference.lifecycle, "NEW_UNINITIALISED");
+  assert.strictEqual(results.deletedReference.pricingReferenceId, REF_A);
+  assert.strictEqual(results.deletedReference.pricingReferenceSource, "company");
+  assert.strictEqual(results.deletedReference.currentReferenceId, null);
+  assert.strictEqual(results.deletedReference.renderedValue, "");
+  assert.strictEqual(results.deletedReference.request.pricing_reference_id, REF_A);
+  assert.strictEqual(results.deletedReference.request.pricing_reference.source, "company");
+  assert.deepStrictEqual(results.deletedReference.restoredIdentity, { id: REF_A, source: "company", present: true, valid: true });
+
+  results.sourceMismatch = await restoreScenario(savedDraft(), [localReferenceA, referenceB]);
+  assert.strictEqual(results.sourceMismatch.lifecycle, "NEW_UNINITIALISED");
+  assert.strictEqual(results.sourceMismatch.pricingReferenceId, REF_A);
+  assert.strictEqual(results.sourceMismatch.pricingReferenceSource, "company");
+  assert.strictEqual(results.sourceMismatch.currentReferenceId, null);
+  assert.strictEqual(results.sourceMismatch.renderedValue, "");
+  assert.strictEqual(results.sourceMismatch.request.pricing_reference_id, REF_A);
+  assert.strictEqual(results.sourceMismatch.request.pricing_reference.source, "company");
+
+  const malformedIdentityDraft = savedDraft({ id: REF_A, sourceName: "" });
+  malformedIdentityDraft.quoteDetails.commercial_snapshot.pricing_basis = { currency: "SGD", id: REF_A };
+  results.malformedIdentity = await restoreScenario(malformedIdentityDraft, [referenceB]);
+  assert.strictEqual(results.malformedIdentity.lifecycle, "RECOVERED");
+  assert.strictEqual(results.malformedIdentity.pricingReferenceId, REF_A);
+  assert.strictEqual(results.malformedIdentity.pricingReferenceSource, "");
+  assert.strictEqual(results.malformedIdentity.currentReferenceId, null);
+  assert.strictEqual(results.malformedIdentity.renderedValue, "");
+  assert.strictEqual(results.malformedIdentity.request.pricing_reference_id, REF_A);
+  assert.strictEqual(results.malformedIdentity.request.pricing_reference.source, "unavailable");
+  assert.deepStrictEqual(results.malformedIdentity.restoredIdentity, { id: REF_A, source: "", present: true, valid: false });
+
+  resetState([referenceB]);
+  await applyQuoteSessionSnapshot(savedDraft(), { forceQuoteView: true });
+  renderProfileOptions();
+  renderProfileOptions();
+  elements.profileSelect.value = "company::" + REF_B;
+  assert.strictEqual(applyPendingPricingReferenceSelection(), true);
+  renderProfileOptions();
+  const explicit = buildLineItemNormalizePayload();
+  results.explicitReselection = {
+    pricingReferenceId: state.pricingReferenceId,
+    pricingReferenceSource: state.pricingReferenceSource,
+    currentReferenceId: currentPricingReference()?.id || null,
+    renderedValue: elements.profileSelect.value,
+    restoredIdentity: state.restoredPricingReferenceIdentity,
+    request: explicit,
+  };
+  assert.strictEqual(results.explicitReselection.pricingReferenceId, REF_B);
+  assert.strictEqual(results.explicitReselection.pricingReferenceSource, "company");
+  assert.strictEqual(results.explicitReselection.currentReferenceId, REF_B);
+  assert.strictEqual(results.explicitReselection.renderedValue, "company::" + REF_B);
+  assert.strictEqual(results.explicitReselection.restoredIdentity, null);
+  assert.strictEqual(results.explicitReselection.request.pricing_reference_id, REF_B);
+  assert.strictEqual(results.explicitReselection.request.pricing_reference.source, "company");
+
+  process.stdout.write(JSON.stringify(results));
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+'''
+        with tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{(root / 'sqag-storage.sqlite3').as_posix()}"
+            workspace_id = "workspace-g3-repair2"
+            auth_session = self.platform_auth_session(workspace_id, membership_role="operator", user_id="g3-repair2")
+            reference_a = webapp.normalize_pricing_reference_payload({
+                "id": "saved-reference-a",
+                "label": "Saved Reference A",
+                "items": [with_required_pricing_metadata({
+                    "id": "workspace-row",
+                    "section": "Graphics",
+                    "description": "Workspace printed graphics",
+                    "unit_hint": "sqm",
+                    "internal_cost": 10,
+                    "markup_multiplier": 2,
+                })],
+            })
+            reference_b = webapp.normalize_pricing_reference_payload({
+                "id": "fallback-reference-b",
+                "label": "Fallback Reference B",
+                "items": [with_required_pricing_metadata({
+                    "id": "workspace-row",
+                    "section": "Graphics",
+                    "description": "Workspace printed graphics",
+                    "unit_hint": "sqm",
+                    "internal_cost": 10,
+                    "markup_multiplier": 7,
+                })],
+            })
+            env = {
+                "APP_MODE": "local",
+                "USER_TYPE": "operator",
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_DATABASE_URL": database_url,
+                "QUOTE_LOG_ROOT": str(root / "_logs"),
+            }
+            node_env = os.environ.copy()
+            with mock.patch.dict(os.environ, env, clear=True):
+                webapp.apply_sqag_storage_migrations(database_url)
+                storage = webapp.app_storage_for_auth_session(auth_session)
+                storage.save_pricing_reference(reference_a)
+                storage.save_pricing_reference(reference_b)
+                completed = subprocess.run(
+                    [node, "-e", client_script],
+                    cwd=str(ROOT),
+                    text=True,
+                    capture_output=True,
+                    env=node_env,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+                client = json.loads(completed.stdout)
+
+                valid_request = client["validFresh"]["request"]
+                resolved = webapp.payload_with_database_pricing_reference_detail(valid_request, auth_session=auth_session)
+                self.assertIsNotNone(resolved)
+                self.assertFalse(webapp.quote_commercial_state(resolved)["owned"])
+                [normalized] = webapp.normalize_line_items_for_quote_basis_review(resolved)
+                self.assertEqual(normalized["pricing_reference_id"], "saved-reference-a")
+                self.assertEqual(normalized["catalog_unit_price"], 20.0)
+                self.assertEqual(normalized["effective_unit_price"], 20.0)
+                self.assertEqual(normalized["pricing_basis_amount"], 60.0)
+                self.assertEqual(normalized["approved_quote_amount"], 60.0)
+
+                for name in (
+                    "missing_presence",
+                    "non_object_presence",
+                    "unsupported_presence",
+                    "legacy_unknown_presence",
+                    "missing_required_presence",
+                    "malformed_schema",
+                    "malformed_version",
+                    "malformed_owner",
+                    "malformed_origin",
+                    "malformed_pricing_basis",
+                    "incomplete_pricing_basis",
+                    "no_commercial_snapshot",
+                ):
+                    request = client[name]["request"]
+                    self.assertTrue(webapp.quote_commercial_state(request)["owned"], name)
+                    self.assertTrue(webapp.quote_commercial_state_errors(request), name)
+                    resolved = webapp.payload_with_database_pricing_reference_detail(request, auth_session=auth_session)
+                    self.assertIsNotNone(resolved, name)
+                    [normalized] = webapp.normalize_line_items_for_quote_basis_review(resolved)
+                    self.assertNotIn("effective_unit_price", normalized, name)
+                    self.assertNotIn("pricing_basis_amount", normalized, name)
+                    self.assertNotIn("approved_quote_amount", normalized, name)
+
+                self.assertTrue(storage.delete_pricing_reference("saved-reference-a", source="company"))
+                for name in ("deletedReference", "sourceMismatch", "malformedIdentity"):
+                    request = client[name]["request"]
+                    self.assertIsNone(
+                        webapp.payload_with_database_pricing_reference_detail(request, auth_session=auth_session),
+                        name,
+                    )
+                    self.assertEqual(request["pricing_reference_id"], "saved-reference-a", name)
+
+                explicit_request = client["explicitReselection"]["request"]
+                resolved = webapp.payload_with_database_pricing_reference_detail(explicit_request, auth_session=auth_session)
+                self.assertIsNotNone(resolved)
+                [explicit_normalized] = webapp.normalize_line_items_for_quote_basis_review(resolved)
+                self.assertEqual(explicit_normalized["pricing_reference_id"], "fallback-reference-b")
+                self.assertEqual(explicit_normalized["catalog_unit_price"], 70.0)
+                self.assertEqual(explicit_normalized["effective_unit_price"], 70.0)
+                self.assertEqual(explicit_normalized["pricing_basis_amount"], 210.0)
+                self.assertEqual(explicit_normalized["approved_quote_amount"], 210.0)
+
     def test_server_and_browser_generation_paths_use_explicit_half_up_cents(self):
         payload = recovered_convergence_payload(
             effective_unit_price=10.625,
@@ -17995,6 +19120,30 @@ quoteCurrency = "SGD";
 fxRate = 1;
 taxRate = 0.09;
 
+const freshAutomaticRow = recalculateOutputRow({
+  status: "matched",
+  price_mode: "Priced",
+  section: "Graphics",
+  description: "Workspace printed graphics",
+  quantity: 2,
+  unit: "sqm",
+  pricing_keyword: "workspace-row",
+  catalog_unit_price: 77,
+  unit_price_override: "",
+});
+assert.strictEqual(freshAutomaticRow.unit_price_override, "");
+assert.strictEqual(freshAutomaticRow.amount, 154);
+state.outputRows = [freshAutomaticRow];
+assert.deepStrictEqual(dashboardCommercialsFromState(), {
+  currency: "SGD",
+  tax_label: "GST",
+  tax_rate: 0.09,
+  exchange_rate: 1,
+  subtotal: 154,
+  tax_amount: 13.86,
+  grand_total: 167.86,
+});
+
 quoteCurrency = "AUD";
 fxRate = 2;
 const fxStats = matchSummaryStats([{ price_mode: "Priced", description: "FX row", quantity: 1, pricing_keyword: "fx", catalog_unit_price: 100, amount: 100 }]);
@@ -19392,6 +20541,8 @@ function extractFunction(name) {
 const PROFILE_PRESET_PREFIX = "profile:";
 const COMPANY_PROFILE_PRESET_PREFIX = "company:";
 const state = {
+  quoteCommercialLifecycle: "NEW_UNINITIALISED",
+  quoteCommercialSnapshot: null,
   selectedPresetValue: "profile:default:default",
   profiles: [{
     id: "default",
@@ -19462,6 +20613,8 @@ eval([
 loadSelectedPreset();
 
 assert.strictEqual(state.selectedPresetValue, "profile:default:default");
+assert.strictEqual(state.quoteCommercialLifecycle, "NEW_UNINITIALISED");
+assert.strictEqual(state.quoteCommercialSnapshot, null);
 assert.strictEqual(clearedPendingPack, true);
 assert.deepStrictEqual(appliedDetails, {});
 assert.deepStrictEqual(appliedOptions, { includeLogo: true, clearLogo: false, partial: true });
@@ -19486,6 +20639,8 @@ elements.headerDetails.value = "Analysis header";
 state.images = [{ name: "reference.pdf" }];
 state.quoteBasisSections = [{ id: "basis", lines: [{ text: "AI line" }] }];
 loadSelectedPreset({ silent: true });
+assert.strictEqual(state.quoteCommercialLifecycle, "NEW_UNINITIALISED");
+assert.strictEqual(state.quoteCommercialSnapshot, null);
 assert.strictEqual(clearedGeneratedState, false);
 assert.strictEqual(workflowStage, "basis_review");
 assert.strictEqual(appliedDetails, null);
@@ -23616,6 +24771,8 @@ const elements = {
   selectedPricingReferenceTax: { textContent: "" },
 };
 const state = {
+  quoteCommercialLifecycle: "NEW_UNINITIALISED",
+  quoteCommercialSnapshot: null,
   pricingReferenceId: "koncept-eq",
   pricingReferenceSource: "local",
   pricingReferences: [
@@ -23687,6 +24844,8 @@ eval([
 
 clearCustomerDetails();
 
+assert.strictEqual(state.quoteCommercialLifecycle, "NEW_UNINITIALISED");
+assert.strictEqual(state.quoteCommercialSnapshot, null);
 assert.strictEqual(state.pricingReferenceId, "koncept-eq");
 assert.strictEqual(state.pricingReferenceSource, "local");
 assert.strictEqual(elements.quoteCurrency.value, "SGD");
@@ -23771,6 +24930,8 @@ const elements = {
   sideWorkspace: { setAttribute() {} },
 };
 const state = {
+  quoteCommercialLifecycle: "NEW_UNINITIALISED",
+  quoteCommercialSnapshot: null,
   activeSidePanel: "images",
   pricingReferenceId: "koncept-eq",
   pricingReferenceSource: "local",
@@ -23841,6 +25002,8 @@ eval([
 
 assert.strictEqual(setSidePanel("customer", { notify: true }), true);
 assert.strictEqual(state.activeSidePanel, "customer");
+assert.strictEqual(state.quoteCommercialLifecycle, "NEW_UNINITIALISED");
+assert.strictEqual(state.quoteCommercialSnapshot, null);
 assert.strictEqual(elements.quoteCurrency.value, "SGD");
 assert.strictEqual(elements.quoteExchangeRate.value, "1");
 assert.strictEqual(elements.quoteTaxLabel.value, "GST");
@@ -24116,11 +25279,15 @@ assert.strictEqual(collectQuoteCurrency(), "JPY");
         draft_state_body = js.split("function currentQuoteSessionDraftState()", 1)[1].split("function quoteSessionDraftComparisonKey", 1)[0]
         restore_body = js.split("async function applyQuoteSessionSnapshot", 1)[1].split("function quoteOutputProgressForNavigation", 1)[0]
         current_session_body = js.split("function currentQuoteSessionPayload(options = {})", 1)[1].split("async function saveCurrentQuoteSession", 1)[0]
+        normalize_body = js.split("function buildLineItemNormalizePayload()", 1)[1].split("function setResultStatus", 1)[0]
 
         self.assertIn("quote_tax: collectTaxDetails()", build_payload_body)
         self.assertIn("quote_currency: collectQuoteCurrency()", build_payload_body)
         self.assertIn("quote_exchange_rate: collectQuoteExchangeRate()", build_payload_body)
         self.assertIn("commercials: dashboardCommercialsFromState()", current_session_body)
+        self.assertIn("quoteCommercialLifecycle: state.quoteCommercialLifecycle", snapshot_body)
+        self.assertIn("quoteCommercialLifecycle: snapshot.quoteCommercialLifecycle", draft_state_body)
+        self.assertIn("quote_session: currentQuoteSessionPayload({", normalize_body)
         self.assertIn("quoteCommercialTouched: normalizeQuoteCommercialTouched(state.quoteCommercialTouched || {})", snapshot_body)
         self.assertIn("quoteCommercialTouched: snapshot.quoteCommercialTouched", draft_state_body)
         self.assertIn("quoteDetailsCommercialTouched(saved.quoteDetails || {})", restore_body)
