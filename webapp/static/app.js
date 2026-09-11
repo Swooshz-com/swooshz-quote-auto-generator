@@ -3714,17 +3714,26 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
     : PRICING_REFERENCE_SETTINGS_MODE_MANAGE;
   state.selectedPresetValue = saved.selectedPresetValue || presetValueFromQuoteDetails(saved.quoteDetails || {}) || "";
   const savedCommercialSnapshot = saved.quoteDetails?.commercial_snapshot;
-  const normalizedCommercialSnapshot = normalizeQuoteCommercialSnapshot(savedCommercialSnapshot, "RECOVERED");
-  state.quoteCommercialLifecycle = "RECOVERED";
-  state.quoteCommercialSnapshot = normalizedCommercialSnapshot || quoteCommercialSnapshotFromLegacyRecovery();
+  const savedLifecycle = String(saved.quoteCommercialLifecycle || "").trim();
+  const normalizedSavedCommercialSnapshot = normalizeQuoteCommercialSnapshot(savedCommercialSnapshot);
+  const hasSavedCommercialSnapshot = savedCommercialSnapshot !== undefined && savedCommercialSnapshot !== null;
+  const restoresFreshDraft = savedLifecycle === "NEW_UNINITIALISED"
+    && (!hasSavedCommercialSnapshot || normalizedSavedCommercialSnapshot?.lifecycle === "NEW_UNINITIALISED");
+  const restoredLifecycle = restoresFreshDraft ? "NEW_UNINITIALISED" : "RECOVERED";
+  const normalizedCommercialSnapshot = restoresFreshDraft
+    ? normalizedSavedCommercialSnapshot
+    : normalizeQuoteCommercialSnapshot(savedCommercialSnapshot, "RECOVERED");
+  state.quoteCommercialLifecycle = restoredLifecycle;
+  state.quoteCommercialSnapshot = normalizedCommercialSnapshot
+    || (restoredLifecycle === "RECOVERED" ? quoteCommercialSnapshotFromLegacyRecovery() : null);
   const savedPricingBasis = normalizedCommercialSnapshot?.pricing_basis;
   if (savedPricingBasis && typeof savedPricingBasis === "object" && String(savedPricingBasis.id || "").trim()) {
     state.pricingReferenceId = String(savedPricingBasis.id).trim();
     state.pricingReferenceSource = String(savedPricingBasis.source || "").trim();
   }
-  state.quoteCommercialRecoveryError = normalizedCommercialSnapshot
-    ? ""
-    : "Saved quote commercial state requires pricing review before generation.";
+  state.quoteCommercialRecoveryError = restoredLifecycle === "RECOVERED" && !normalizedCommercialSnapshot
+    ? "Saved quote commercial state requires pricing review before generation."
+    : "";
   const savedQuoteText = saved.quoteDetails?.quote_text;
   state.quoteCommercialPreservedQuoteText = savedQuoteText
     && Object.prototype.hasOwnProperty.call(savedQuoteText, "cheque_payee")
