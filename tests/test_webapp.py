@@ -24176,6 +24176,9 @@ function extractFunction(name) {
 const DEFAULT_TAX_LABEL = "GST";
 const DEFAULT_TAX_RATE = 0.09;
 const DEFAULT_CURRENCY_LABEL = "SGD";
+const DEFAULT_PRICING_REFERENCE_ID = "koncept-eq";
+const PRICING_REFERENCE_SOURCES = new Set(["company", "local", "bundled"]);
+const QUOTE_COMMERCIAL_REVIEW_STATUS = "REVIEW_REQUIRED";
 const CUSTOM_CURRENCY_VALUE = "__CUSTOM__";
 const CURRENCY_OPTIONS = [["SGD"], ["AUD"], ["CNY"], ["EUR"], ["GBP"], ["IDR"], ["MYR"], ["THB"], ["USD"]];
 const SIDE_PANEL_SEQUENCE = ["images", "customer", "quote_company", "basis", "output"];
@@ -24183,6 +24186,7 @@ const QUOTE_COMMERCIAL_FIELD_KEYS = ["quoteCurrency", "quoteExchangeRate", "quot
 const elements = {
   quoteCurrency: { value: "SGD" },
   quoteCurrencyCustom: { value: "", hidden: true, required: false },
+  profileSelect: { value: "" },
   quoteExchangeRate: { value: "1" },
   quoteExchangeRateField: { hidden: true },
   quoteTaxLabel: { value: "GST" },
@@ -24201,8 +24205,16 @@ const elements = {
 };
 const state = {
   activeSidePanel: "images",
-  pricingReferenceId: "koncept-eq",
-  pricingReferenceSource: "local",
+  profileId: "",
+  defaultPricingReferenceId: "",
+  pricingReferenceId: "",
+  pricingReferenceSource: "",
+  quoteCommercialLifecycle: "NEW_UNINITIALISED",
+  quoteCommercialSnapshot: null,
+  quoteCommercialReview: null,
+  quoteSessionRestoredSessionId: "",
+  pricingReferenceSelectionIntent: null,
+  profiles: [{ id: "default", default_pricing_reference: "koncept-eq" }],
   pricingReferences: [
     { id: "koncept-eq", source: "local", label: "Koncept EQ", currency: "SGD", tax: { label: "GST", rate: 0.09 } },
   ],
@@ -24222,6 +24234,7 @@ const document = {
 const window = { scrollTo() {} };
 
 function currentGenerator() { return { intakeSubtitle: "Reference images and PDFs." }; }
+function currentProfile() { return state.profiles[0]; }
 function currentPricingReference() {
   return state.pricingReferences.find((reference) => reference.id === state.pricingReferenceId && reference.source === state.pricingReferenceSource) || null;
 }
@@ -24253,8 +24266,12 @@ eval([
   "quoteCommercialFieldKeyForElement",
   "quoteCommercialFieldIsTouched",
   "quoteCommercialFieldHasValue",
+  "pricingReferenceSelectValue",
+  "pricingReferenceSelectionFromValue",
+  "defaultPricingReference",
   "selectedPricingReferenceTax",
   "selectedPricingReferenceCurrency",
+  "quoteCommercialReviewRequired",
   "collectTaxDetails",
   "collectQuoteCurrency",
   "collectQuoteExchangeRate",
@@ -24264,24 +24281,52 @@ eval([
   "syncQuoteCommercialContextPills",
   "applyPricingReferenceCommercialDefaults",
   "resetQuoteCommercialFieldsToSelectedPricingReference",
+  "initializeFreshPricingReferenceForCustomer",
   "activeSidePanelIndex",
   "setSidePanel",
 ].map(extractFunction).join("\n"));
 
 assert.strictEqual(setSidePanel("customer", { notify: true }), true);
 assert.strictEqual(state.activeSidePanel, "customer");
+assert.strictEqual(state.pricingReferenceId, "koncept-eq");
+assert.strictEqual(state.pricingReferenceSource, "local");
+assert.strictEqual(elements.profileSelect.value, "local::koncept-eq");
+assert.strictEqual(state.quoteCommercialLifecycle, "NEW_UNINITIALISED");
+assert.strictEqual(state.quoteCommercialSnapshot, null);
+assert.strictEqual(state.pricingReferenceSelectionIntent, null);
 assert.strictEqual(elements.quoteCurrency.value, "SGD");
 assert.strictEqual(elements.quoteExchangeRate.value, "1");
 assert.strictEqual(elements.quoteTaxLabel.value, "GST");
-assert.strictEqual(elements.quoteTaxRate.value, "0");
+assert.strictEqual(elements.quoteTaxRate.value, "9");
 assert.strictEqual(elements.taxLabel.value, "GST");
-assert.strictEqual(elements.taxRate.value, "0");
+assert.strictEqual(elements.taxRate.value, "9");
 assert.deepStrictEqual(state.quoteCommercialTouched, {
   quoteCurrency: false,
   quoteExchangeRate: false,
   quoteTaxLabel: false,
   quoteTaxRate: false,
 });
+
+state.activeSidePanel = "images";
+state.pricingReferenceId = "";
+state.pricingReferenceSource = "";
+state.quoteCommercialReview = {
+  status: "REVIEW_REQUIRED",
+};
+elements.profileSelect.value = "";
+assert.strictEqual(setSidePanel("customer", { force: true }), true);
+assert.strictEqual(state.pricingReferenceId, "");
+assert.strictEqual(state.pricingReferenceSource, "");
+assert.strictEqual(elements.profileSelect.value, "");
+
+state.quoteCommercialReview = null;
+state.pricingReferenceId = "missing-saved-reference";
+state.pricingReferenceSource = "local";
+elements.profileSelect.value = "local::missing-saved-reference";
+assert.strictEqual(setSidePanel("customer", { force: true }), true);
+assert.strictEqual(state.pricingReferenceId, "missing-saved-reference");
+assert.strictEqual(state.pricingReferenceSource, "local");
+assert.strictEqual(elements.profileSelect.value, "local::missing-saved-reference");
 """
         completed = subprocess.run(
             [node, "-e", script],

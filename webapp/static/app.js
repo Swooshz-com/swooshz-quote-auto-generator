@@ -1405,6 +1405,32 @@ function syncSelectedPricingReference() {
   state.pricingReferenceSource = "";
 }
 
+function initializeFreshPricingReferenceForCustomer() {
+  if (
+    state.quoteCommercialLifecycle !== "NEW_UNINITIALISED"
+    || quoteCommercialReviewRequired()
+    || (state.quoteCommercialSnapshot && typeof state.quoteCommercialSnapshot === "object")
+    || String(state.quoteSessionRestoredSessionId || "").trim()
+    || state.pricingReferenceSelectionIntent
+    || QUOTE_COMMERCIAL_FIELD_KEYS.some((field) => quoteCommercialFieldIsTouched(field))
+  ) return false;
+  const currentReference = currentPricingReference();
+  const savedReferenceId = String(state.pricingReferenceId || "").trim();
+  const savedReferenceSource = String(state.pricingReferenceSource || "").trim();
+  if (!currentReference && (savedReferenceId || savedReferenceSource)) return false;
+  const reference = currentReference || defaultPricingReference();
+  const referenceValue = pricingReferenceSelectValue(reference || {});
+  const selection = pricingReferenceSelectionFromValue(referenceValue);
+  if (!reference || !selection.pricingReferenceId || !PRICING_REFERENCE_SOURCES.has(selection.source)) return false;
+  if (!currentReference) {
+    state.pricingReferenceId = selection.pricingReferenceId;
+    state.pricingReferenceSource = selection.source;
+  }
+  resetQuoteCommercialFieldsToSelectedPricingReference({ markOwned: false });
+  if (elements.profileSelect) elements.profileSelect.value = referenceValue;
+  return Boolean(currentPricingReference());
+}
+
 function currentGenerator() {
   const pricingReference = currentPricingReference();
   return {
@@ -14055,6 +14081,9 @@ function setSidePanel(panelName, options = {}) {
   }
   const [title, eyebrow, subtitle] = panelTitles[nextPanel] || panelTitles.images;
   state.activeSidePanel = nextPanel;
+  if (nextPanel === "customer" && previousPanel !== "customer") {
+    initializeFreshPricingReferenceForCustomer();
+  }
   document.body.dataset.sidePanel = state.activeSidePanel;
   elements.sideDrawerTitle.textContent = title;
   elements.sideDrawerEyebrow.textContent = eyebrow;
