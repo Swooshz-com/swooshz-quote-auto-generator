@@ -296,10 +296,17 @@ PRICING_REFERENCE_TEMPLATE_EXAMPLE_ROWS = [
 ]
 DOWNLOADABLE_FILES = {"quotation.pdf", "quotation.xlsx"}
 QUOTE_SESSION_SCHEMA_VERSION = 1
-QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA = "swooshz.quote-commercial-snapshot.v1"
-QUOTE_COMMERCIAL_SNAPSHOT_VERSION = 1
+QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA = "swooshz.quote-commercial-snapshot.v2"
+QUOTE_COMMERCIAL_SNAPSHOT_VERSION = 2
 QUOTE_COMMERCIAL_LIFECYCLES = {"NEW_UNINITIALISED", "EXISTING", "RECOVERED"}
-QUOTE_COMMERCIAL_PRESENCE_VALUES = {"captured", "intentional_empty", "legacy_unknown"}
+QUOTE_COMMERCIAL_SNAPSHOT_ORIGINS = {
+    "new_quote",
+    "captured",
+    "session_recovery",
+    "explicit_initialization",
+    "explicit_reselection",
+}
+QUOTE_COMMERCIAL_PRESENCE_VALUES = {"captured", "intentional_empty"}
 QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS = (
     "currency",
     "exchange_rate",
@@ -320,7 +327,24 @@ QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS = (
     "company_date_label",
     "rich_text",
 )
-QUOTE_COMMERCIAL_REVIEW_MESSAGE = "Saved quote commercial state requires pricing review before generation."
+QUOTE_COMMERCIAL_REVIEW_MESSAGE = "Pricing review required: saved quote commercial state requires review before generation."
+QUOTE_COMMERCIAL_REVIEW_SCHEMA = "swooshz.quote-commercial-review.v1"
+QUOTE_COMMERCIAL_REVIEW_VERSION = 1
+QUOTE_COMMERCIAL_REVIEW_STATUS = "REVIEW_REQUIRED"
+QUOTE_COMMERCIAL_REVIEW_REASONS = {
+    "missing_snapshot",
+    "invalid_snapshot",
+    "lifecycle_mismatch",
+    "pricing_basis_incomplete",
+    "pricing_reference_unavailable",
+    "pricing_reference_source_mismatch",
+    "pricing_reference_identity_mismatch",
+    "pricing_reference_digest_mismatch",
+    "unsupported_pricing_reference_source",
+    "review_state_invalid",
+}
+PRICING_REFERENCE_SOURCES = {"company", "local", "bundled"}
+PRICING_REFERENCE_DIGEST_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
 QUOTE_SESSION_ID_RE = re.compile(r"^quote-[A-Za-z0-9_-]{3,64}$")
 QUOTE_SESSION_DIR_NAME = "quote-sessions"
 QUOTE_SESSION_METADATA_FILENAME = "quote-session.json"
@@ -4031,43 +4055,175 @@ def quote_commercial_saved_details(payload: dict[str, Any]) -> tuple[dict[str, A
     return details, snapshot, draft_state
 
 
+def quote_commercial_value_is_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, dict, set)):
+        return bool(value)
+    return True
+
+
+def quote_commercial_snapshot_raw_values(details: dict[str, Any]) -> dict[str, Any]:
+    company = details.get("company") if isinstance(details.get("company"), dict) else {}
+    quote_text = details.get("quote_text") if isinstance(details.get("quote_text"), dict) else {}
+    signature = details.get("signature") if isinstance(details.get("signature"), dict) else {}
+    rich_text = details.get("rich_text") if isinstance(details.get("rich_text"), dict) else {}
+    return {
+        "currency": details.get("currency"),
+        "exchange_rate": details.get("exchange_rate"),
+        "tax": details.get("tax"),
+        "company_name": company.get("name"),
+        "header_details": company.get("header_details"),
+        "logo": (
+            company.get("logo_data_url")
+            or company.get("logo_session_file_key")
+            or company.get("logo_content_fingerprint")
+        ),
+        "terms_heading": quote_text.get("terms_heading"),
+        "payment_terms": quote_text.get("payment_terms"),
+        "notes_heading": quote_text.get("notes_heading"),
+        "standard_notes": quote_text.get("standard_notes"),
+        "acceptance_text": quote_text.get("acceptance_text"),
+        "person_label": quote_text.get("person_label"),
+        "stamp_label": quote_text.get("stamp_label"),
+        "date_label": quote_text.get("date_label"),
+        "company_signatory": signature.get("company_signatory"),
+        "company_title": signature.get("company_title"),
+        "company_date_label": signature.get("company_date_label"),
+        "rich_text": rich_text,
+    }
+
+
+def normalized_quote_commercial_review(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    if set(value) != {"schema", "version", "status", "reason_code", "blocked_identity"}:
+        return None
+    if (
+        value.get("schema") != QUOTE_COMMERCIAL_REVIEW_SCHEMA
+        or type(value.get("version")) is not int
+        or value.get("version") != QUOTE_COMMERCIAL_REVIEW_VERSION
+        or value.get("status") != QUOTE_COMMERCIAL_REVIEW_STATUS
+        or value.get("reason_code") not in QUOTE_COMMERCIAL_REVIEW_REASONS
+    ):
+        return None
+    blocked_identity = value.get("blocked_identity")
+    if not isinstance(blocked_identity, dict) or set(blocked_identity) != {"id", "source"}:
+        return None
+    blocked_id = blocked_identity.get("id")
+    blocked_source = blocked_identity.get("source")
+    if not isinstance(blocked_id, str) or not isinstance(blocked_source, str):
+        return None
+    if blocked_id and not PROFILE_ID_RE.fullmatch(blocked_id):
+        return None
+    if blocked_source and blocked_source not in PRICING_REFERENCE_SOURCES:
+        return None
+    return {
+        "schema": QUOTE_COMMERCIAL_REVIEW_SCHEMA,
+        "version": QUOTE_COMMERCIAL_REVIEW_VERSION,
+        "status": QUOTE_COMMERCIAL_REVIEW_STATUS,
+        "reason_code": value["reason_code"],
+        "blocked_identity": {"id": blocked_id, "source": blocked_source},
+    }
+
+
+def quote_commercial_review_from_payload(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
+    draft_state = quote_session_draft_state_from_payload(payload)
+    if "quoteCommercialReview" in draft_state:
+        raw_review = draft_state.get("quoteCommercialReview")
+        return (None, False) if raw_review is None else (normalized_quote_commercial_review(raw_review), True)
+    if "quote_commercial_review" in draft_state:
+        raw_review = draft_state.get("quote_commercial_review")
+        return (None, False) if raw_review is None else (normalized_quote_commercial_review(raw_review), True)
+    if "quoteCommercialReview" in payload:
+        raw_review = payload.get("quoteCommercialReview")
+        return (None, False) if raw_review is None else (normalized_quote_commercial_review(raw_review), True)
+    if "quote_commercial_review" in payload:
+        raw_review = payload.get("quote_commercial_review")
+        return (None, False) if raw_review is None else (normalized_quote_commercial_review(raw_review), True)
+    return None, False
+
+
 def normalized_quote_commercial_snapshot(
     value: Any,
     *,
     lifecycle_override: str = "",
+    details: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    if not isinstance(value, dict):
+    if not isinstance(value, dict) or set(value) != {
+        "schema",
+        "version",
+        "owner",
+        "lifecycle",
+        "origin",
+        "presence",
+        "pricing_basis",
+    }:
         return None
     if (
         value.get("schema") != QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA
+        or type(value.get("version")) is not int
         or value.get("version") != QUOTE_COMMERCIAL_SNAPSHOT_VERSION
         or value.get("owner") != "quote"
+        or not isinstance(value.get("lifecycle"), str)
+        or value.get("lifecycle") not in QUOTE_COMMERCIAL_LIFECYCLES
+        or not isinstance(value.get("origin"), str)
+        or value.get("origin") not in QUOTE_COMMERCIAL_SNAPSHOT_ORIGINS
     ):
         return None
-    lifecycle = clean_text(lifecycle_override or value.get("lifecycle"))
-    if lifecycle not in QUOTE_COMMERCIAL_LIFECYCLES:
+    lifecycle = value.get("lifecycle")
+    if lifecycle_override and lifecycle_override != lifecycle:
         return None
-    raw_presence = value.get("presence") if isinstance(value.get("presence"), dict) else {}
+    valid_origins = {
+        "new_quote": {"NEW_UNINITIALISED"},
+        "captured": {"EXISTING"},
+        "session_recovery": {"RECOVERED"},
+        "explicit_initialization": {"EXISTING"},
+        "explicit_reselection": QUOTE_COMMERCIAL_LIFECYCLES,
+    }
+    if lifecycle not in valid_origins.get(value.get("origin"), set()):
+        return None
+    raw_presence = value.get("presence")
+    if not isinstance(raw_presence, dict) or set(raw_presence) != set(QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS):
+        return None
     presence: dict[str, str] = {}
     for key in QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS:
-        item = clean_text(raw_presence.get(key))
+        item = raw_presence.get(key)
         if item not in QUOTE_COMMERCIAL_PRESENCE_VALUES:
             return None
         presence[key] = item
-    raw_basis = value.get("pricing_basis") if isinstance(value.get("pricing_basis"), dict) else {}
+    raw_basis = value.get("pricing_basis")
+    if not isinstance(raw_basis, dict) or set(raw_basis) != {"currency", "source", "id", "digest"}:
+        return None
+    if any(not isinstance(raw_basis.get(key), str) for key in ("currency", "source", "id", "digest")):
+        return None
     basis = {
-        "currency": clean_text(raw_basis.get("currency")).upper(),
-        "source": clean_text(raw_basis.get("source")),
-        "id": clean_text(raw_basis.get("id")),
-        "digest": clean_text(raw_basis.get("digest")),
+        "currency": raw_basis["currency"],
+        "source": raw_basis["source"],
+        "id": raw_basis["id"],
+        "digest": raw_basis["digest"],
     }
-    basis = {key: item for key, item in basis.items() if item}
+    if (
+        not re.fullmatch(r"[A-Z]{3}", basis["currency"])
+        or basis["source"] not in PRICING_REFERENCE_SOURCES
+        or not PROFILE_ID_RE.fullmatch(basis["id"])
+        or not PRICING_REFERENCE_DIGEST_RE.fullmatch(basis["digest"])
+    ):
+        return None
+    if details is not None:
+        raw_values = quote_commercial_snapshot_raw_values(details)
+        for key, presence_value in presence.items():
+            present = quote_commercial_value_is_present(raw_values.get(key))
+            if (presence_value == "captured") != present:
+                return None
     return {
         "schema": QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
         "version": QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
         "owner": "quote",
         "lifecycle": lifecycle,
-        "origin": dashboard_safe_text(value.get("origin"), 80) or "captured",
+        "origin": value["origin"],
         "presence": presence,
         "pricing_basis": basis,
     }
@@ -4075,29 +4231,56 @@ def normalized_quote_commercial_snapshot(
 
 def quote_commercial_state(payload: dict[str, Any]) -> dict[str, Any]:
     details, raw_snapshot, draft_state = quote_commercial_saved_details(payload)
-    snapshot = normalized_quote_commercial_snapshot(raw_snapshot)
-    lifecycle = clean_text(
+    raw_lifecycle = (
         draft_state.get("quoteCommercialLifecycle")
-        or draft_state.get("quote_commercial_lifecycle")
-    ).upper()
+        if "quoteCommercialLifecycle" in draft_state
+        else draft_state.get("quote_commercial_lifecycle")
+        if "quote_commercial_lifecycle" in draft_state
+        else payload.get("quoteCommercialLifecycle")
+    )
+    lifecycle = raw_lifecycle if isinstance(raw_lifecycle, str) else ""
+    review, review_supplied = quote_commercial_review_from_payload(payload)
+    snapshot = normalized_quote_commercial_snapshot(raw_snapshot, details=details if raw_snapshot else None)
     has_saved_state = bool(
         details
         or draft_state.get("outputRows")
         or "quoteDetails" in draft_state
         or "quote_details" in draft_state
         or "quoteCommercialLifecycle" in draft_state
+        or "quote_commercial_lifecycle" in draft_state
+        or review_supplied
     )
-    if snapshot:
+    lifecycle_valid = lifecycle in QUOTE_COMMERCIAL_LIFECYCLES
+    snapshot_lifecycle_matches = bool(snapshot and lifecycle_valid and snapshot["lifecycle"] == lifecycle)
+    review_required = review_supplied
+    if has_saved_state and not snapshot_lifecycle_matches:
+        review_required = True
+    if snapshot and snapshot["lifecycle"] == "NEW_UNINITIALISED" and not lifecycle_valid:
+        review_required = True
+    if snapshot_lifecycle_matches and not review_required:
         return {
             "owned": snapshot["lifecycle"] in {"EXISTING", "RECOVERED"},
             "legacy": False,
+            "review_required": False,
+            "review": review,
+            "review_reason": "",
+            "evidence_valid": True,
             "details": details,
             "snapshot": snapshot,
             "draft_state": draft_state,
         }
+    reason = "review_state_invalid" if review_supplied and review is None else (
+        "missing_snapshot" if not raw_snapshot else "invalid_snapshot"
+    )
+    if snapshot and lifecycle_valid and snapshot["lifecycle"] != lifecycle:
+        reason = "lifecycle_mismatch"
     return {
-        "owned": has_saved_state and lifecycle != "NEW_UNINITIALISED",
-        "legacy": has_saved_state and lifecycle != "NEW_UNINITIALISED",
+        "owned": has_saved_state and lifecycle in {"EXISTING", "RECOVERED"},
+        "legacy": has_saved_state,
+        "review_required": review_required,
+        "review": review,
+        "review_reason": review.get("reason_code") if review else reason,
+        "evidence_valid": False,
         "details": details,
         "snapshot": None,
         "draft_state": draft_state,
@@ -4161,6 +4344,8 @@ def quote_commercial_row_from_output_row(row: dict[str, Any]) -> dict[str, Any]:
 
 def quote_commercial_payload(payload: dict[str, Any]) -> dict[str, Any]:
     state = quote_commercial_state(payload)
+    if state.get("review_required"):
+        return copy.deepcopy(payload)
     if not state["owned"]:
         return copy.deepcopy(payload)
     resolved = copy.deepcopy(payload)
@@ -4278,6 +4463,8 @@ def quote_commercial_state_errors(
     state: dict[str, Any] | None = None,
 ) -> list[str]:
     commercial_state = state or quote_commercial_state(payload)
+    if commercial_state.get("review_required"):
+        return [QUOTE_COMMERCIAL_REVIEW_MESSAGE]
     if not commercial_state.get("owned"):
         return []
     errors: list[str] = []
@@ -4301,7 +4488,7 @@ def quote_commercial_state_errors(
         "company_title",
         "company_date_label",
     }
-    if any(presence.get(key) == "legacy_unknown" for key in required_presence):
+    if any(presence.get(key) not in QUOTE_COMMERCIAL_PRESENCE_VALUES for key in required_presence):
         errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
     details = commercial_state.get("details") if isinstance(commercial_state.get("details"), dict) else {}
     currency = clean_text(details.get("currency")).upper()
@@ -4318,20 +4505,25 @@ def quote_commercial_state_errors(
     if tax_label not in {"GST", "VAT"} or tax_rate is None or not 0 <= tax_rate <= 1:
         errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
     basis = snapshot.get("pricing_basis") if isinstance(snapshot.get("pricing_basis"), dict) else {}
-    basis_currency = clean_text(basis.get("currency")).upper()
-    basis_source = clean_text(basis.get("source"))
-    basis_id = clean_text(basis.get("id"))
-    if not re.fullmatch(r"[A-Z]{3}", basis_currency) or not basis_source or not basis_id:
+    basis_currency = basis.get("currency") if isinstance(basis.get("currency"), str) else ""
+    basis_source = basis.get("source") if isinstance(basis.get("source"), str) else ""
+    basis_id = basis.get("id") if isinstance(basis.get("id"), str) else ""
+    basis_digest = basis.get("digest") if isinstance(basis.get("digest"), str) else ""
+    if (
+        not re.fullmatch(r"[A-Z]{3}", basis_currency)
+        or basis_source not in PRICING_REFERENCE_SOURCES
+        or not PROFILE_ID_RE.fullmatch(basis_id)
+        or not PRICING_REFERENCE_DIGEST_RE.fullmatch(basis_digest)
+    ):
         errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
     current_reference = payload.get("pricing_reference") if isinstance(payload.get("pricing_reference"), dict) else {}
-    current_id = clean_text(payload.get("pricing_reference_id") or current_reference.get("id"))
-    current_source = clean_text(
-        payload.get("pricing_reference_source")
-        or (payload.get("pricing_reference", {}).get("source") if isinstance(payload.get("pricing_reference"), dict) else "")
-    )
-    if current_id and current_id != basis_id:
+    current_id = payload.get("pricing_reference_id") if "pricing_reference_id" in payload else current_reference.get("id")
+    current_source = payload.get("pricing_reference_source") if "pricing_reference_source" in payload else current_reference.get("source")
+    if not isinstance(current_id, str) or not isinstance(current_source, str):
         errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
-    if current_source and current_source != basis_source:
+    if isinstance(current_id, str) and current_id != basis_id:
+        errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+    if isinstance(current_source, str) and current_source != basis_source:
         errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
     saved_draft_state = commercial_state.get("draft_state") if isinstance(commercial_state.get("draft_state"), dict) else {}
     saved_profile_id = profile_authority_identity_from_selection(
@@ -4401,8 +4593,13 @@ def normalize_tax_rate(value: Any, fallback: float = DEFAULT_TAX_RATE) -> float:
     return min(1.0, max(0.0, rate))
 
 
-def quote_tax_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def quote_tax_from_payload(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     commercial_state = quote_commercial_state(payload)
+    if commercial_state.get("review_required"):
+        return {"label": "", "rate": None}
     if commercial_state.get("owned"):
         details = commercial_state.get("details") if isinstance(commercial_state.get("details"), dict) else {}
         tax = details.get("tax") if isinstance(details.get("tax"), dict) else {}
@@ -4417,8 +4614,11 @@ def quote_tax_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     reference = payload.get("pricing_reference") if isinstance(payload.get("pricing_reference"), dict) else {}
     reference_tax = reference.get("tax") if isinstance(reference.get("tax"), dict) else None
     if reference_tax is None:
-        reference_id = safe_resource_id(payload.get("pricing_reference_id"), "")
-        reference_tax = pricing_reference_tax(reference_id) if reference_id and "pricing_reference_tax" in globals() else None
+        authority_detail = exact_pricing_reference_detail_for_payload(payload, auth_session=auth_session)
+        reference_tax = authority_detail.get("tax") if isinstance(authority_detail, dict) and isinstance(authority_detail.get("tax"), dict) else None
+        if reference_tax is None:
+            reference_id = safe_resource_id(payload.get("pricing_reference_id"), "")
+            reference_tax = pricing_reference_tax(reference_id) if reference_id and "pricing_reference_tax" in globals() else None
     quote_text = payload.get("quote_text") if isinstance(payload.get("quote_text"), dict) else {}
     tax = reference_tax if isinstance(reference_tax, dict) else payload.get("tax") if isinstance(payload.get("tax"), dict) else {}
     if not tax and isinstance(quote_text.get("tax"), dict):
@@ -4428,8 +4628,13 @@ def quote_tax_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {"label": label, "rate": normalize_tax_rate(rate_source)}
 
 
-def quote_currency_from_payload(payload: dict[str, Any]) -> str:
+def quote_currency_from_payload(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> str:
     commercial_state = quote_commercial_state(payload)
+    if commercial_state.get("review_required"):
+        return ""
     if commercial_state.get("owned"):
         details = commercial_state.get("details") if isinstance(commercial_state.get("details"), dict) else {}
         currency = clean_text(details.get("currency")).upper()
@@ -4437,7 +4642,7 @@ def quote_currency_from_payload(payload: dict[str, Any]) -> str:
     explicit_currency = clean_text(payload.get("quote_currency"))
     if explicit_currency:
         return normalize_currency_label(explicit_currency)
-    runtime_reference = runtime_pricing_reference_from_payload(payload)
+    runtime_reference = runtime_pricing_reference_from_payload(payload, auth_session=auth_session)
     runtime_currency = clean_text(runtime_reference.get("currency")) if runtime_reference else ""
     if runtime_currency:
         return normalize_currency_label(runtime_currency)
@@ -4447,12 +4652,10 @@ def quote_currency_from_payload(payload: dict[str, Any]) -> str:
     if reference_currency:
         return normalize_currency_label(reference_currency)
 
-    reference_id = pricing_reference_id_from_payload(payload)
-    if reference_id:
-        pack = load_pricing_reference_pack(reference_id, source=pricing_reference_source_from_payload(payload))
-        pack_currency = clean_text(pack.config.get("currency"))
-        if pack_currency:
-            return normalize_currency_label(pack_currency)
+    authority_detail = exact_pricing_reference_detail_for_payload(payload, auth_session=auth_session)
+    pack_currency = clean_text(authority_detail.get("currency")) if isinstance(authority_detail, dict) else ""
+    if pack_currency:
+        return normalize_currency_label(pack_currency)
     return DEFAULT_CURRENCY_LABEL
 
 
@@ -7825,6 +8028,16 @@ def pricing_reference_catalog_payload(reference: dict[str, Any]) -> dict[str, An
     }
 
 
+def pricing_reference_catalog_digest(reference: dict[str, Any]) -> str:
+    if not isinstance(reference, dict):
+        return ""
+    catalog = pricing_reference_catalog_payload(reference)
+    if not catalog.get("items"):
+        return ""
+    raw = json.dumps(catalog, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return f"sha256:{hashlib.sha256(raw).hexdigest()}"
+
+
 def pricing_reference_catalog_ai_markdown(catalog: dict[str, Any], catalog_name: str = "pricing-catalog.json") -> str:
     currency = normalize_currency_label(catalog.get("currency"))
     lines = [
@@ -8282,34 +8495,46 @@ def pricing_reference_section_names(reference_id: str | None = None, source: str
     return sections
 
 
-def pricing_reference_section_names_for_payload(payload: dict[str, Any]) -> list[str]:
-    runtime_reference = runtime_pricing_reference_from_payload(payload)
+def pricing_reference_section_names_for_payload(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> list[str]:
+    runtime_reference = runtime_pricing_reference_from_payload(payload, auth_session=auth_session)
     if runtime_reference:
         sections: list[str] = []
         seen: set[str] = set()
-        for item in local_pricing_reference_items(payload, limit=None):
+        for item in local_pricing_reference_items(payload, limit=None, auth_session=auth_session):
             section = clean_basis_section_title(item.get("reference_section") or item.get("section"))
             key = section.casefold()
             if section and key not in seen:
                 sections.append(section)
                 seen.add(key)
         return sections
-    return pricing_reference_section_names(
-        pricing_reference_id_from_payload(payload),
-        source=pricing_reference_source_from_payload(payload),
-    )
+    selection = explicit_pricing_reference_selection(payload)
+    if not selection["ok"]:
+        return []
+    return pricing_reference_section_names(selection["id"], source=selection["source"])
 
 
 def pricing_reference_pack_for_payload(payload: dict[str, Any]) -> PricingReferencePack:
-    return load_pricing_reference_pack(
-        pricing_reference_id_from_payload(payload),
-        source=pricing_reference_source_from_payload(payload),
-    )
+    selection = explicit_pricing_reference_selection(payload)
+    if not selection["ok"] or selection["source"] not in {"local", "bundled"}:
+        raise ValueError("Selected pricing reference is not available.")
+    pack = PricingReferencePack.resolve_exact(selection["id"], selection["source"])
+    if pack is None:
+        raise ValueError("Selected pricing reference is not available.")
+    return pack
 
 
-def pricing_reference_section_order_map_for_payload(payload: dict[str, Any]) -> dict[str, int]:
+def pricing_reference_section_order_map_for_payload(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, int]:
     order: dict[str, int] = {}
-    for index, section in enumerate(pricing_reference_section_names_for_payload(payload), start=1):
+    for index, section in enumerate(
+        pricing_reference_section_names_for_payload(payload, auth_session=auth_session),
+        start=1,
+    ):
         for value in (section, normalize_catalog_section(section)):
             key = safe_section_id(value, "")
             if key and key not in order:
@@ -8345,8 +8570,12 @@ def line_item_pricing_reference_order(
     )
 
 
-def sort_line_items_by_pricing_reference_order(payload: dict[str, Any], line_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    section_order = pricing_reference_section_order_map_for_payload(payload)
+def sort_line_items_by_pricing_reference_order(
+    payload: dict[str, Any],
+    line_items: list[dict[str, Any]],
+    auth_session: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    section_order = pricing_reference_section_order_map_for_payload(payload, auth_session=auth_session)
     return [
         item
         for _index, item in sorted(
@@ -8387,8 +8616,12 @@ def quote_basis_section_order(
     return (category_order, fallback_index, title.casefold())
 
 
-def sort_quote_basis_sections_by_pricing_reference_order(payload: dict[str, Any], sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    section_order = pricing_reference_section_order_map_for_payload(payload)
+def sort_quote_basis_sections_by_pricing_reference_order(
+    payload: dict[str, Any],
+    sections: list[dict[str, Any]],
+    auth_session: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    section_order = pricing_reference_section_order_map_for_payload(payload, auth_session=auth_session)
     sorted_sections: list[dict[str, Any]] = []
     for section in sections:
         next_section = {**section}
@@ -15840,19 +16073,8 @@ def explicit_profile_id_from_payload(payload: dict[str, Any]) -> str:
 
 
 def pricing_reference_id_from_payload(payload: dict[str, Any]) -> str:
-    explicit_reference_id = safe_resource_id(payload.get("pricing_reference_id"), "")
-    if explicit_reference_id:
-        return explicit_reference_id
-    workspace_reference_id = workspace_pricing_reference_id()
-    if workspace_reference_id:
-        return workspace_reference_id
-    source, profile_id = profile_authority_from_payload(payload)
-    profile = (
-        load_company_profile_pack(profile_id, DEFAULT_COMPANY_ID)
-        if source == "company"
-        else load_template_profile_pack(profile_id or workspace_profile_pack_id())
-    )
-    return profile.default_pricing_reference_id() if profile is not None else ""
+    selection = explicit_pricing_reference_selection(payload)
+    return selection["id"] if selection["ok"] else ""
 
 
 def pricing_reference_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -15861,13 +16083,49 @@ def pricing_reference_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def pricing_reference_source_from_payload(payload: dict[str, Any]) -> str:
-    source = clean_text(pricing_reference_payload(payload).get("source")).lower()
-    return source if source in {"bundled", "company", "local"} else ""
+    reference = pricing_reference_payload(payload)
+    raw_source = reference.get("source") if "source" in reference else payload.get("pricing_reference_source")
+    return raw_source.strip().lower() if isinstance(raw_source, str) else ""
 
 
 def explicit_pricing_reference_id_from_payload(payload: dict[str, Any]) -> str:
-    reference = pricing_reference_payload(payload)
-    return safe_resource_id(payload.get("pricing_reference_id") or reference.get("id"), "")
+    selection = explicit_pricing_reference_selection(payload)
+    return selection["id"] if selection["ok"] else ""
+
+
+def explicit_pricing_reference_selection(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {"ok": False, "reason": "pricing_reference_identity_mismatch", "id": "", "source": ""}
+    has_reference = "pricing_reference" in payload
+    raw_reference = payload.get("pricing_reference")
+    if has_reference and not isinstance(raw_reference, dict):
+        return {"ok": False, "reason": "pricing_reference_identity_mismatch", "id": "", "source": ""}
+    reference = raw_reference if isinstance(raw_reference, dict) else {}
+    raw_id_values = []
+    if "pricing_reference_id" in payload:
+        raw_id_values.append(payload.get("pricing_reference_id"))
+    if "id" in reference:
+        raw_id_values.append(reference.get("id"))
+    if any(not isinstance(value, str) or not value or not PROFILE_ID_RE.fullmatch(value) for value in raw_id_values):
+        return {"ok": False, "reason": "pricing_reference_identity_mismatch", "id": "", "source": ""}
+    explicit_ids = [value for value in raw_id_values if isinstance(value, str)]
+    if not explicit_ids or len(set(explicit_ids)) != 1:
+        return {"ok": False, "reason": "pricing_reference_identity_mismatch", "id": "", "source": ""}
+
+    raw_source_values = []
+    if "pricing_reference_source" in payload:
+        raw_source_values.append(payload.get("pricing_reference_source"))
+    if "source" in reference:
+        raw_source_values.append(reference.get("source"))
+    if any(not isinstance(value, str) or not value for value in raw_source_values):
+        return {"ok": False, "reason": "unsupported_pricing_reference_source", "id": explicit_ids[0], "source": ""}
+    explicit_sources = [value for value in raw_source_values if isinstance(value, str)]
+    if not explicit_sources or len(set(explicit_sources)) != 1:
+        return {"ok": False, "reason": "unsupported_pricing_reference_source", "id": explicit_ids[0], "source": ""}
+    source = explicit_sources[0]
+    if source not in PRICING_REFERENCE_SOURCES:
+        return {"ok": False, "reason": "unsupported_pricing_reference_source", "id": explicit_ids[0], "source": source}
+    return {"ok": True, "reason": "", "id": explicit_ids[0], "source": source}
 
 
 def pricing_reference_company_id_from_payload(payload: dict[str, Any]) -> str:
@@ -15881,10 +16139,10 @@ def pricing_reference_company_id_from_payload(payload: dict[str, Any]) -> str:
 def database_pricing_reference_detail_for_payload(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any] | None:
     if configured_storage_mode() != "database":
         return None
-    reference_id = explicit_pricing_reference_id_from_payload(payload)
-    if not reference_id:
+    selection = explicit_pricing_reference_selection(payload)
+    if not selection["ok"] or selection["source"] != "company":
         return None
-    if pricing_reference_source_from_payload(payload) not in {"", "company"}:
+    if not auth_session:
         return None
     try:
         storage = app_storage_for_auth_session(auth_session)
@@ -15892,7 +16150,106 @@ def database_pricing_reference_detail_for_payload(payload: dict[str, Any], auth_
         return None
     if not isinstance(storage, DatabaseSqagStorage):
         return None
-    return storage.pricing_reference_detail(reference_id, source="company")
+    detail = storage.pricing_reference_detail(selection["id"], source="company")
+    if not isinstance(detail, dict):
+        return None
+    if detail.get("id") != selection["id"] or detail.get("source") != "company":
+        return None
+    return detail
+
+
+def exact_pricing_reference_detail_for_payload(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    selection = explicit_pricing_reference_selection(payload)
+    if not selection["ok"]:
+        return None
+    reference = pricing_reference_payload(payload)
+    if configured_storage_mode() == "database":
+        return database_pricing_reference_detail_for_payload(payload, auth_session=auth_session)
+    if selection["source"] in {"local", "bundled"}:
+        inline_items = reference.get("items")
+        if (
+            isinstance(inline_items, list)
+            and reference.get("id") == selection["id"]
+            and reference.get("source") == selection["source"]
+            and inline_items
+        ):
+            detail = copy.deepcopy(reference)
+            detail["id"] = selection["id"]
+            detail["source"] = selection["source"]
+            detail["digest_sha256"] = pricing_reference_catalog_digest(detail)
+            return detail if detail.get("digest_sha256") else None
+        pack = PricingReferencePack.resolve_exact(selection["id"], selection["source"])
+        return pack.public_detail() if pack is not None else None
+    company_id = pricing_reference_company_id_from_payload(payload)
+    for candidate in company_config_store().list_pricing_references(company_id):
+        if candidate.get("id") == selection["id"]:
+            raw_items = candidate.get("items") if isinstance(candidate.get("items"), list) else []
+            detail = {
+                "id": selection["id"],
+                "label": clean_text(candidate.get("label")) or selection["id"],
+                "description": clean_text(candidate.get("description")),
+                "tax": normalized_tax_config(candidate.get("tax")),
+                "currency": normalize_currency_label(candidate.get("currency")),
+                "source": "company",
+                "schema_version": int(parse_pricing_number(candidate.get("schema_version")) or 1),
+                "items": [dict(item) for item in raw_items if isinstance(item, dict)],
+            }
+            detail["item_count"] = len(detail["items"])
+            detail["digest_sha256"] = pricing_reference_catalog_digest(detail)
+            return detail if detail.get("digest_sha256") else None
+    if reference.get("id") == selection["id"] and reference.get("source") == "company" and reference.get("items"):
+        detail = copy.deepcopy(reference)
+        detail["digest_sha256"] = pricing_reference_catalog_digest(detail)
+        return detail if detail.get("digest_sha256") else None
+    return None
+
+
+def exact_pricing_reference_authority(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    selection = explicit_pricing_reference_selection(payload)
+    if not selection["ok"]:
+        return {**selection, "detail": None}
+    detail = exact_pricing_reference_detail_for_payload(payload, auth_session=auth_session)
+    if detail is None:
+        return {**selection, "ok": False, "reason": "pricing_reference_unavailable", "detail": None}
+    if detail.get("id") != selection["id"] or detail.get("source") != selection["source"]:
+        return {**selection, "ok": False, "reason": "pricing_reference_source_mismatch", "detail": None}
+    return {**selection, "ok": True, "reason": "", "detail": detail}
+
+
+def pricing_reference_authority_error(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> str:
+    commercial_state = quote_commercial_state(payload)
+    if commercial_state.get("review_required"):
+        return QUOTE_COMMERCIAL_REVIEW_MESSAGE
+    authority = exact_pricing_reference_authority(payload, auth_session=auth_session)
+    if not authority.get("ok"):
+        return (
+            QUOTE_COMMERCIAL_REVIEW_MESSAGE
+            if commercial_state.get("evidence_valid") or commercial_state.get("legacy")
+            else PRICING_REFERENCE_SELECTION_ERROR_MESSAGE
+        )
+    snapshot = commercial_state.get("snapshot") if isinstance(commercial_state.get("snapshot"), dict) else None
+    if not snapshot:
+        return ""
+    basis = snapshot.get("pricing_basis") if isinstance(snapshot.get("pricing_basis"), dict) else {}
+    if basis.get("id") != authority.get("id") or basis.get("source") != authority.get("source"):
+        return QUOTE_COMMERCIAL_REVIEW_MESSAGE
+    detail = authority.get("detail") if isinstance(authority.get("detail"), dict) else {}
+    current_digest = detail.get("digest_sha256") if isinstance(detail.get("digest_sha256"), str) else ""
+    if basis.get("digest") != current_digest:
+        return QUOTE_COMMERCIAL_REVIEW_MESSAGE
+    current_currency = normalize_currency_label(detail.get("currency"))
+    if basis.get("currency") != current_currency:
+        return QUOTE_COMMERCIAL_REVIEW_MESSAGE
+    return ""
 
 
 PROFILE_SELECTION_ERROR_MESSAGE = "Select a valid company profile before generating a quote."
@@ -15973,6 +16330,8 @@ def payload_with_database_profile_defaults(payload: dict[str, Any], auth_session
 
 def generation_payload_with_profile_defaults(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any]:
     commercial_state = quote_commercial_state(payload)
+    if commercial_state.get("review_required"):
+        return copy.deepcopy(payload)
     if commercial_state.get("owned"):
         return quote_commercial_payload(payload)
     if configured_storage_mode() == "database":
@@ -15993,34 +16352,48 @@ def write_database_profile_layout_for_generation(payload: dict[str, Any], job_tm
     return path
 
 
-def runtime_pricing_reference_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def runtime_pricing_reference_from_payload(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     reference = pricing_reference_payload(payload)
     source = pricing_reference_source_from_payload(payload)
+    selection = explicit_pricing_reference_selection(payload)
+    if not selection["ok"] or selection["source"] == "bundled":
+        return {}
+    if configured_storage_mode() == "database":
+        detail = database_pricing_reference_detail_for_payload(payload, auth_session=auth_session)
+        return detail if isinstance(detail, dict) else {}
     if source == "local":
-        return reference if isinstance(reference.get("items"), list) else {}
+        return reference if reference.get("id") == selection["id"] and reference.get("source") == "local" and isinstance(reference.get("items"), list) else {}
     if source != "company":
         return {}
     raw_items = reference.get("items") if isinstance(reference.get("items"), list) else []
-    if raw_items:
+    if raw_items and reference.get("id") == selection["id"] and reference.get("source") == "company":
         return reference
-    reference_id = safe_resource_id(reference.get("id") or payload.get("pricing_reference_id"), "")
-    if not reference_id:
-        return {}
     company_id = pricing_reference_company_id_from_payload(payload)
     for item in company_config_store().list_pricing_references(company_id):
-        if safe_resource_id(item.get("id"), "") == reference_id:
+        if item.get("id") == selection["id"]:
             return item
     return {}
 
 
-def runtime_pricing_reference_visual_base_dir(payload: dict[str, Any]) -> Path | None:
+def runtime_pricing_reference_visual_base_dir(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> Path | None:
     if pricing_reference_source_from_payload(payload) != "company":
+        return None
+    if configured_storage_mode() == "database" and not database_pricing_reference_detail_for_payload(payload, auth_session=auth_session):
         return None
     return company_config_store().company_dir(pricing_reference_company_id_from_payload(payload))
 
 
-def runtime_pricing_catalog_payload_for_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
-    reference = runtime_pricing_reference_from_payload(payload)
+def runtime_pricing_catalog_payload_for_payload(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    reference = runtime_pricing_reference_from_payload(payload, auth_session=auth_session)
     return pricing_reference_catalog_payload(reference) if reference else None
 
 
@@ -16048,21 +16421,13 @@ def payload_with_database_pricing_reference_detail(payload: dict[str, Any], auth
         return None
     next_payload = copy.deepcopy(payload)
     next_payload["pricing_reference_id"] = safe_resource_id(pricing_detail.get("id"), "")
+    next_payload["pricing_reference_source"] = "company"
     next_payload["pricing_reference"] = pricing_detail
     return next_payload
 
 
 def selected_pricing_reference_is_resolved(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> bool:
-    if configured_storage_mode() == "database":
-        return database_pricing_reference_detail_for_payload(payload, auth_session=auth_session) is not None
-    reference_id = pricing_reference_id_from_payload(payload)
-    if not reference_id:
-        return False
-    if runtime_pricing_reference_from_payload(payload):
-        return True
-    source = pricing_reference_source_from_payload(payload)
-    pack = load_pricing_reference_pack(reference_id, source=source)
-    return pack.id == reference_id and bool(pack.config)
+    return bool(exact_pricing_reference_authority(payload, auth_session=auth_session).get("ok"))
 
 
 def pricing_reference_selection_error(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> str:
@@ -16070,14 +16435,17 @@ def pricing_reference_selection_error(payload: dict[str, Any], auth_session: dic
 
 
 def pricing_catalog_path_for_payload(payload: dict[str, Any], job_tmp: Path, auth_session: dict[str, Any] | None = None) -> Path:
+    authority = exact_pricing_reference_authority(payload, auth_session=auth_session)
+    if not authority.get("ok"):
+        raise ValueError("Selected pricing reference is not available.")
     if configured_storage_mode() == "database":
-        detail = database_pricing_reference_detail_for_payload(payload, auth_session=auth_session)
+        detail = authority.get("detail") if isinstance(authority.get("detail"), dict) else None
         if detail is None:
             raise ValueError("Selected pricing reference is not available.")
         catalog_path = job_tmp / "pricing-catalog.json"
         catalog_path.write_text(json.dumps(pricing_reference_catalog_payload(detail), indent=2), encoding="utf-8")
         return catalog_path
-    runtime_catalog = runtime_pricing_catalog_payload_for_payload(payload)
+    runtime_catalog = runtime_pricing_catalog_payload_for_payload(payload, auth_session=auth_session)
     if runtime_catalog is None:
         return pricing_reference_pack_for_payload(payload).pricing_catalog_path
     catalog_path = job_tmp / "pricing-catalog.json"
@@ -16320,6 +16688,30 @@ class PricingReferencePack:
         reference_id_from_config = safe_resource_id(config.get("id"), resolved_id)
         return cls(reference_id_from_config, reference_dir, dict(config))
 
+    @classmethod
+    def resolve_exact(cls, reference_id: Any, source: Any) -> "PricingReferencePack" | None:
+        if not isinstance(reference_id, str) or not PROFILE_ID_RE.fullmatch(reference_id):
+            return None
+        if not isinstance(source, str) or source not in {"local", "bundled"}:
+            return None
+        root = pricing_references_root() if source == "local" else bundled_pricing_references_root()
+        reference_dir = root / reference_id
+        try:
+            reference_dir.resolve().relative_to(root.resolve())
+        except ValueError:
+            return None
+        config = load_json_file(reference_dir / "reference.json")
+        if (
+            not isinstance(config, dict)
+            or not isinstance(config.get("id"), str)
+            or config.get("id") != reference_id
+        ):
+            return None
+        catalog = load_json_file(reference_dir / (clean_text(config.get("pricing_catalog")) or "pricing-catalog.json"))
+        if not isinstance(catalog, dict) or not isinstance(catalog.get("items"), list) or not catalog.get("items"):
+            return None
+        return cls(reference_id, reference_dir, dict(config), source)
+
     def asset_path(self, key: str, fallback_filename: str) -> Path:
         filename = clean_text(self.config.get(key)) or fallback_filename
         path = self.directory / filename
@@ -16349,6 +16741,7 @@ class PricingReferencePack:
             "currency": normalize_currency_label(self.config.get("currency")),
             "item_count": len(items),
             "source": self.source,
+            "digest_sha256": pricing_reference_catalog_digest(catalog),
         }
 
     def public_detail(self) -> dict[str, Any]:
@@ -16524,6 +16917,7 @@ def public_company_pricing_reference(reference: dict[str, Any]) -> dict[str, Any
         "currency": normalize_currency_label(reference.get("currency")),
         "item_count": len(items),
         "source": "company",
+        "digest_sha256": pricing_reference_catalog_digest(reference),
     }
 
 
@@ -17653,12 +18047,37 @@ def normalize_owned_line_item(raw: dict[str, Any], *, exchange_rate: float | Non
     return item
 
 
-def normalize_line_items(payload: dict[str, Any], use_catalog: bool = True) -> list[dict[str, Any]]:
+def normalize_line_items(
+    payload: dict[str, Any],
+    use_catalog: bool = True,
+    auth_session: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     raw_items = payload.get("line_items")
     if not isinstance(raw_items, list):
         return []
 
-    if quote_commercial_state(payload).get("owned"):
+    commercial_state = quote_commercial_state(payload)
+    if commercial_state.get("review_required"):
+        return []
+    authority_error = (
+        pricing_reference_authority_error(payload, auth_session=auth_session)
+        if use_catalog
+        else ""
+    )
+    if authority_error:
+        return []
+    authority = (
+        exact_pricing_reference_authority(payload, auth_session=auth_session)
+        if use_catalog
+        else {"id": "", "source": "", "detail": {}}
+    )
+    reference_detail = authority.get("detail") if isinstance(authority.get("detail"), dict) else {}
+    authority_id = authority.get("id") if isinstance(authority.get("id"), str) else ""
+    authority_source = authority.get("source") if isinstance(authority.get("source"), str) else ""
+    authority_currency = normalize_currency_label(reference_detail.get("currency"))
+    authority_digest = reference_detail.get("digest_sha256") if isinstance(reference_detail.get("digest_sha256"), str) else ""
+
+    if commercial_state.get("owned"):
         exchange_rate = quote_exchange_rate_from_payload(payload)
         return [
             item
@@ -17668,7 +18087,15 @@ def normalize_line_items(payload: dict[str, Any], use_catalog: bool = True) -> l
             if item
         ]
 
-    catalog_lookup = pricing_catalog_runtime_lookup_for_payload(payload, profile_id_from_payload(payload)) if use_catalog else {}
+    catalog_lookup = (
+        pricing_catalog_runtime_lookup_for_payload(
+            payload,
+            profile_id_from_payload(payload),
+            auth_session=auth_session,
+        )
+        if use_catalog
+        else {}
+    )
     items: list[dict[str, Any]] = []
     for raw in raw_items:
         if not isinstance(raw, dict):
@@ -17784,27 +18211,10 @@ def normalize_line_items(payload: dict[str, Any], use_catalog: bool = True) -> l
                     item["pricing_basis_amount"] = basis_amount
                     exchange_rate = quote_exchange_rate_from_payload(payload) or 1
                     item["approved_quote_amount"] = round_commercial_cents(basis_amount * exchange_rate) if basis_amount is not None else None
-                reference = pricing_reference_payload(payload)
-                basis_currency = clean_text(raw.get("pricing_basis_currency") or reference.get("currency")).upper()
-                basis_source = clean_text(
-                    raw.get("pricing_reference_source")
-                    or payload.get("pricing_reference_source")
-                    or reference.get("source")
-                ).lower()
-                basis_id = safe_resource_id(
-                    raw.get("pricing_reference_id")
-                    or payload.get("pricing_reference_id")
-                    or reference.get("id"),
-                    "",
-                )
-                if not basis_id:
-                    basis_id = safe_resource_id(pricing_reference_id_from_payload(payload), "")
-                basis_digest = clean_text(
-                    raw.get("pricing_basis_digest")
-                    or reference.get("digest_sha256")
-                    or reference.get("reference_digest")
-                    or reference.get("content_fingerprint")
-                )
+                basis_currency = authority_currency
+                basis_source = authority_source
+                basis_id = authority_id
+                basis_digest = authority_digest
                 if basis_currency:
                     item["pricing_basis_currency"] = basis_currency
                 if basis_source:
@@ -17829,7 +18239,7 @@ def quote_detail_missing_fields(payload: dict[str, Any]) -> list[str]:
 
     acceptance = quote_text.get("acceptance") if isinstance(quote_text.get("acceptance"), dict) else {}
     checks: list[tuple[str, bool]] = [
-        ("Quote Pricing Reference", bool(clean_text(payload.get("pricing_reference_id")) or isinstance(payload.get("pricing_reference"), dict) or pricing_reference_id_from_payload(payload))),
+        ("Quote Pricing Reference", bool(explicit_pricing_reference_selection(payload).get("ok"))),
         ("Client name", bool(clean_text(nested_value(payload, "client", "name", "client_name")))),
         ("Attention person", bool(clean_text(nested_value(payload, "client", "attention", "client_attention")))),
         ("Attention title", bool(clean_text(nested_value(payload, "client", "title", "client_title")))),
@@ -17856,6 +18266,12 @@ def validate_generation_payload(payload: dict[str, Any], auth_session: dict[str,
     errors: list[str] = []
     commercial_state = quote_commercial_state(payload)
     errors.extend(quote_commercial_state_errors(payload, commercial_state))
+    pricing_reference_authority_error_value = pricing_reference_authority_error(
+        payload,
+        auth_session=auth_session,
+    )
+    if pricing_reference_authority_error_value and pricing_reference_authority_error_value not in errors:
+        errors.append(pricing_reference_authority_error_value)
     payload = quote_commercial_payload(payload)
     if not image_entries(payload):
         errors.append(MISSING_IMAGES_MESSAGE)
@@ -17887,7 +18303,11 @@ def validate_generation_payload(payload: dict[str, Any], auth_session: dict[str,
     if not dimensions:
         errors.append("Booth size must be determined by analysis before generating.")
 
-    line_items = normalize_line_items(payload)
+    line_items = (
+        normalize_line_items(payload, auth_session=auth_session)
+        if not pricing_reference_authority_error_value
+        else []
+    )
     if not line_items:
         errors.append("At least one line item is required.")
     for index, item in enumerate(line_items, start=1):
@@ -17898,9 +18318,15 @@ def validate_generation_payload(payload: dict[str, Any], auth_session: dict[str,
     return errors
 
 
-def quote_basis_notes(payload: dict[str, Any]) -> list[str]:
+def quote_basis_notes(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> list[str]:
     notes = ["Quote basis confirmed from webapp."]
-    sections = normalize_quote_basis_sections(payload, pricing_reference_section_names_for_payload(payload))
+    sections = normalize_quote_basis_sections(
+        payload,
+        pricing_reference_section_names_for_payload(payload, auth_session=auth_session),
+    )
     if sections:
         for section in sections:
             lines = [
@@ -17929,9 +18355,15 @@ def quote_detail_rich_text(payload: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def payload_to_brief(payload: dict[str, Any]) -> dict[str, Any]:
+def payload_to_brief(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     commercial_state = quote_commercial_state(payload)
     commercial_errors = quote_commercial_state_errors(payload, commercial_state)
+    authority_error = pricing_reference_authority_error(payload, auth_session=auth_session)
+    if authority_error and authority_error not in commercial_errors:
+        commercial_errors.append(authority_error)
     if commercial_errors:
         raise QuoteCommercialStateError(" ".join(commercial_errors))
     payload = quote_commercial_payload(payload)
@@ -17975,10 +18407,10 @@ def payload_to_brief(payload: dict[str, Any]) -> dict[str, Any]:
             "header_lines": multiline_list(header_source, preserve_blank=True, html_breaks=True),
             "logo_data_url": header_logo,
         },
-        "currency": quote_currency_from_payload(payload),
+        "currency": quote_currency_from_payload(payload, auth_session=auth_session),
         "exchange_rate": quote_exchange_rate_from_payload(payload),
-        "tax": quote_tax_from_payload(payload),
-        "line_items": normalize_line_items_for_final_brief(payload),
+        "tax": quote_tax_from_payload(payload, auth_session=auth_session),
+        "line_items": normalize_line_items_for_final_brief(payload, auth_session=auth_session),
         "payment_terms": multiline_list(quote_text.get("payment_terms") or payload.get("payment_terms")),
         "terms_heading": clean_text(quote_text.get("terms_heading")),
         "cheque_payee": clean_text(quote_text.get("cheque_payee")),
@@ -17997,7 +18429,7 @@ def payload_to_brief(payload: dict[str, Any]) -> dict[str, Any]:
             "company_date_label": clean_text(signature.get("company_date_label")),
         },
         "rich_text": quote_detail_rich_text(payload),
-        "notes": quote_basis_notes(payload),
+        "notes": quote_basis_notes(payload, auth_session=auth_session),
     }
 
 
@@ -18090,7 +18522,10 @@ def default_line_items(payload: dict[str, Any], auth_session: dict[str, Any] | N
                 "pricing_keyword": clean_text(raw.get("pricing_keyword")),
             }
         )
-    return normalize_line_items({"line_items": items})
+    return normalize_line_items(
+        {**payload, "line_items": items},
+        auth_session=auth_session,
+    )
 
 
 class OpenAIAnalysisError(RuntimeError):
@@ -18431,11 +18866,15 @@ def pricing_catalog_prompt_rows(reference_id: str | None = None, source: str = "
     return rows
 
 
-def local_pricing_reference_items(payload: dict[str, Any], limit: int | None = MAX_PROMPT_CATALOG_ROWS) -> list[dict[str, Any]]:
-    reference = runtime_pricing_reference_from_payload(payload)
+def local_pricing_reference_items(
+    payload: dict[str, Any],
+    limit: int | None = MAX_PROMPT_CATALOG_ROWS,
+    auth_session: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    reference = runtime_pricing_reference_from_payload(payload, auth_session=auth_session)
     if not reference:
         return []
-    visual_base_dir = runtime_pricing_reference_visual_base_dir(payload)
+    visual_base_dir = runtime_pricing_reference_visual_base_dir(payload, auth_session=auth_session)
     raw_items = reference.get("items") if isinstance(reference.get("items"), list) else []
     source_items = raw_items if limit is None else raw_items[:limit]
     items: list[dict[str, Any]] = []
@@ -18491,9 +18930,15 @@ def local_pricing_reference_items(payload: dict[str, Any], limit: int | None = M
     return items
 
 
-def pricing_catalog_prompt_rows_for_payload(payload: dict[str, Any], profile_id: str | None = None) -> list[dict[str, Any]]:
-    if runtime_pricing_reference_from_payload(payload):
-        return local_pricing_reference_items(payload)
+def pricing_catalog_prompt_rows_for_payload(
+    payload: dict[str, Any],
+    profile_id: str | None = None,
+    auth_session: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if pricing_reference_authority_error(payload, auth_session=auth_session):
+        return []
+    if runtime_pricing_reference_from_payload(payload, auth_session=auth_session):
+        return local_pricing_reference_items(payload, auth_session=auth_session)
     return pricing_catalog_prompt_rows(
         pricing_reference_id_from_payload(payload),
         source=pricing_reference_source_from_payload(payload),
@@ -18516,8 +18961,14 @@ def visual_reference_prompt_metadata(value: Any) -> list[dict[str, Any]]:
     return metadata
 
 
-def catalog_visual_image_entries_for_payload(payload: dict[str, Any], limit: int = MAX_PROMPT_CATALOG_VISUAL_IMAGES) -> list[dict[str, Any]]:
-    if runtime_pricing_reference_from_payload(payload):
+def catalog_visual_image_entries_for_payload(
+    payload: dict[str, Any],
+    limit: int = MAX_PROMPT_CATALOG_VISUAL_IMAGES,
+    auth_session: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if pricing_reference_authority_error(payload, auth_session=auth_session):
+        return []
+    if runtime_pricing_reference_from_payload(payload, auth_session=auth_session):
         return []
     try:
         pack = pricing_reference_pack_for_payload(payload)
@@ -18607,8 +19058,12 @@ def legacy_pricing_catalog_id_aliases(item_id: str, item: dict[str, Any] | None 
     return aliases
 
 
-def pricing_catalog_runtime_lookup_for_payload(payload: dict[str, Any], profile_id: str | None = None) -> dict[str, dict[str, Any]]:
-    payload_json = runtime_pricing_catalog_payload_for_payload(payload)
+def pricing_catalog_runtime_lookup_for_payload(
+    payload: dict[str, Any],
+    profile_id: str | None = None,
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    payload_json = runtime_pricing_catalog_payload_for_payload(payload, auth_session=auth_session)
     if payload_json is None:
         try:
             payload_json = json.loads(pricing_reference_pack_for_payload(payload).pricing_catalog_path.read_text(encoding="utf-8-sig"))
@@ -18655,29 +19110,18 @@ def pricing_catalog_runtime_lookup_for_payload(payload: dict[str, Any], profile_
     return lookup
 
 
-def build_quote_draft_prompt(payload: dict[str, Any]) -> str:
+def build_quote_draft_prompt(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> str:
     project = payload.get("project") if isinstance(payload.get("project"), dict) else {}
     client = payload.get("client") if isinstance(payload.get("client"), dict) else {}
-    if configured_storage_mode() == "database":
-        profile = load_profile_pack(profile_id_from_payload(payload))
-    else:
-        source, profile_id = profile_authority_from_payload(payload)
-        profile = (
-            load_company_profile_pack(profile_id, DEFAULT_COMPANY_ID)
-            if source == "company"
-            else load_template_profile_pack(profile_id or workspace_profile_pack_id())
-        )
-        if profile is None:
-            raise SqagStorageAccessError(
-                PROFILE_SELECTION_ERROR_MESSAGE,
-                status=400,
-                reason="workspace_profile_missing_or_unavailable",
-            )
+    profile = profile_defaults_source_for_payload(payload, auth_session=auth_session)
     generator_label = clean_text(payload.get("generator_label")) or clean_text(profile.config.get("label")) or "Quotation"
     user_feedback = clean_multiline(payload.get("user_feedback"))
     include_current_draft = bool(user_feedback)
     line_items = payload.get("line_items") if include_current_draft and isinstance(payload.get("line_items"), list) else []
-    pricing_reference_sections = pricing_reference_section_names_for_payload(payload)
+    pricing_reference_sections = pricing_reference_section_names_for_payload(payload, auth_session=auth_session)
     sections = normalize_quote_basis_sections(payload, pricing_reference_sections) if include_current_draft else []
     derived_dimensions = booth_dimensions_from_payload(payload)
     brief_context = {
@@ -18702,7 +19146,11 @@ def build_quote_draft_prompt(payload: dict[str, Any]) -> str:
         "analysis_findings": normalize_analysis_findings(payload.get("analysis_findings")),
         "clarification_answers": normalize_blocking_clarification_questions(payload.get("blocking_clarification_questions")),
         "pricing_reference_sections": pricing_reference_sections,
-        "pricing_catalog": pricing_catalog_prompt_rows_for_payload(payload, profile.id),
+        "pricing_catalog": pricing_catalog_prompt_rows_for_payload(
+            payload,
+            profile.id if isinstance(profile, ProfilePack) else profile_id_from_payload(payload),
+            auth_session=auth_session,
+        ),
         "line_items": [
             {
                 "section": clean_text(item.get("section")),
@@ -18783,11 +19231,14 @@ def build_quote_draft_prompt(payload: dict[str, Any]) -> str:
     )
 
 
-def build_basis_chat_prompt(payload: dict[str, Any]) -> str:
+def build_basis_chat_prompt(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> str:
     basis_chat = payload.get("basis_chat") if isinstance(payload.get("basis_chat"), dict) else {}
     project = payload.get("project") if isinstance(payload.get("project"), dict) else {}
     client = payload.get("client") if isinstance(payload.get("client"), dict) else {}
-    pricing_reference_sections = pricing_reference_section_names_for_payload(payload)
+    pricing_reference_sections = pricing_reference_section_names_for_payload(payload, auth_session=auth_session)
     sections = normalize_quote_basis_sections(payload, pricing_reference_sections)
     line_items = payload.get("line_items") if isinstance(payload.get("line_items"), list) else []
     question = clean_multiline(basis_chat.get("question") or payload.get("user_feedback"))
@@ -19262,12 +19713,19 @@ def find_basis_chat_target(
     return None
 
 
-def normalized_basis_chat_line_items(raw_items: Any, payload: dict[str, Any]) -> list[dict[str, Any]]:
+def normalized_basis_chat_line_items(
+    raw_items: Any,
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     if isinstance(raw_items, list):
-        normalized = normalize_line_items({**payload, "line_items": raw_items})
+        normalized = normalize_line_items(
+            {**payload, "line_items": raw_items},
+            auth_session=auth_session,
+        )
         if normalized:
             return normalized
-    return normalize_line_items(payload)
+    return normalize_line_items(payload, auth_session=auth_session)
 
 
 def basis_chat_proposal_from_sections(
@@ -20279,15 +20737,30 @@ def line_items_aligned_to_quote_basis(
     return aligned if approved_only else (aligned or line_items)
 
 
-def normalize_line_items_for_quote_basis_review(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    line_items = normalize_line_items(payload)
-    if quote_commercial_state(payload).get("owned"):
-        return sort_line_items_by_pricing_reference_order(payload, line_items)
-    sections = normalize_quote_basis_sections(payload, pricing_reference_section_names_for_payload(payload))
+def normalize_line_items_for_quote_basis_review(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    commercial_state = quote_commercial_state(payload)
+    if commercial_state.get("review_required"):
+        return []
+    if pricing_reference_authority_error(payload, auth_session=auth_session):
+        return []
+    line_items = normalize_line_items(payload, auth_session=auth_session)
+    if commercial_state.get("owned"):
+        return sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
+    sections = normalize_quote_basis_sections(
+        payload,
+        pricing_reference_section_names_for_payload(payload, auth_session=auth_session),
+    )
     if not sections:
-        return sort_line_items_by_pricing_reference_order(payload, line_items)
+        return sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
 
-    catalog_lookup = pricing_catalog_runtime_lookup_for_payload(payload, profile_id_from_payload(payload))
+    catalog_lookup = pricing_catalog_runtime_lookup_for_payload(
+        payload,
+        profile_id_from_payload(payload),
+        auth_session=auth_session,
+    )
     sections = quote_basis_sections_with_catalog_exact_lines(
         sections,
         line_items,
@@ -20300,25 +20773,47 @@ def normalize_line_items_for_quote_basis_review(payload: dict[str, Any]) -> list
         catalog_lookup,
         approved_only=True,
     )
-    return sort_line_items_by_pricing_reference_order(payload, line_items)
+    return sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
 
 
-def normalize_line_items_for_final_brief(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    line_items = normalize_line_items(payload)
+def normalize_line_items_for_final_brief(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    commercial_state = quote_commercial_state(payload)
+    if commercial_state.get("review_required"):
+        return []
+    if pricing_reference_authority_error(payload, auth_session=auth_session):
+        return []
+    line_items = normalize_line_items(payload, auth_session=auth_session)
     if not line_items:
         return []
-    if quote_commercial_state(payload).get("owned"):
-        return sort_line_items_by_pricing_reference_order(payload, line_items)
+    if commercial_state.get("owned"):
+        return sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
 
-    sections = normalize_quote_basis_sections(payload, pricing_reference_section_names_for_payload(payload))
+    sections = normalize_quote_basis_sections(
+        payload,
+        pricing_reference_section_names_for_payload(payload, auth_session=auth_session),
+    )
     if sections:
-        catalog_lookup = pricing_catalog_runtime_lookup_for_payload(payload, profile_id_from_payload(payload))
+        catalog_lookup = pricing_catalog_runtime_lookup_for_payload(
+            payload,
+            profile_id_from_payload(payload),
+            auth_session=auth_session,
+        )
         line_items = line_items_with_resolved_basis_catalog(line_items, sections, catalog_lookup)
-    return sort_line_items_by_pricing_reference_order(payload, line_items)
+    return sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
 
 
-def replacement_line_sections(payload: dict[str, Any], replacement_line: Any) -> list[dict[str, Any]]:
-    sections = normalize_quote_basis_sections(payload, pricing_reference_section_names_for_payload(payload))
+def replacement_line_sections(
+    payload: dict[str, Any],
+    replacement_line: Any,
+    auth_session: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    sections = normalize_quote_basis_sections(
+        payload,
+        pricing_reference_section_names_for_payload(payload, auth_session=auth_session),
+    )
     if not sections:
         raise OpenAIAnalysisError("AI basis chat could not find the current quote basis.")
     replacement = normalize_basis_line(replacement_line)
@@ -20358,8 +20853,12 @@ def replacement_line_sections(payload: dict[str, Any], replacement_line: Any) ->
 def quote_basis_sections_preserve_custom_pricing(
     payload: dict[str, Any],
     sections: list[dict[str, Any]],
+    auth_session: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    current_sections = normalize_quote_basis_sections(payload, pricing_reference_section_names_for_payload(payload))
+    current_sections = normalize_quote_basis_sections(
+        payload,
+        pricing_reference_section_names_for_payload(payload, auth_session=auth_session),
+    )
     next_sections = copy.deepcopy(sections)
 
     def section_key(section: dict[str, Any]) -> tuple[str, str]:
@@ -20403,7 +20902,12 @@ def basis_chat_words(value: Any) -> set[str]:
     return words
 
 
-def normalize_basis_chat_result(parsed: dict[str, Any], payload: dict[str, Any], source: str) -> dict[str, Any]:
+def normalize_basis_chat_result(
+    parsed: dict[str, Any],
+    payload: dict[str, Any],
+    source: str,
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     intent = clean_text(parsed.get("intent")).lower()
     raw_proposal = parsed.get("proposal") if isinstance(parsed.get("proposal"), dict) else {}
     has_proposal = intent == "proposal" or bool(raw_proposal)
@@ -20416,13 +20920,25 @@ def normalize_basis_chat_result(parsed: dict[str, Any], payload: dict[str, Any],
         if required_intent == "answer":
             raise OpenAIAnalysisError("AI basis chat returned a proposal for a question instead of an answer.")
         message = clean_multiline(raw_proposal.get("message") or parsed.get("message"))
-        line_items = normalized_basis_chat_line_items(raw_proposal.get("line_items") or parsed.get("line_items"), payload)
-        sections = replacement_line_sections(payload, raw_proposal.get("replacement_line"))
-        sections = quote_basis_sections_preserve_custom_pricing(payload, sections)
+        line_items = normalized_basis_chat_line_items(
+            raw_proposal.get("line_items") or parsed.get("line_items"),
+            payload,
+            auth_session=auth_session,
+        )
+        sections = replacement_line_sections(
+            payload,
+            raw_proposal.get("replacement_line"),
+            auth_session=auth_session,
+        )
+        sections = quote_basis_sections_preserve_custom_pricing(
+            payload,
+            sections,
+            auth_session=auth_session,
+        )
         if not sections:
             raise OpenAIAnalysisError("AI basis chat did not return a usable proposal.")
-        line_items = sort_line_items_by_pricing_reference_order(payload, line_items)
-        sections = sort_quote_basis_sections_by_pricing_reference_order(payload, sections)
+        line_items = sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
+        sections = sort_quote_basis_sections_by_pricing_reference_order(payload, sections, auth_session=auth_session)
 
         return {
             "status": "answered",
@@ -20520,15 +21036,36 @@ def require_basis_confidence(sections: list[dict[str, Any]], provider: str = "AI
         )
 
 
-def normalize_ai_draft(parsed: dict[str, Any], payload: dict[str, Any] | None = None, require_confidence: bool = False) -> dict[str, Any]:
+def normalize_ai_draft(
+    parsed: dict[str, Any],
+    payload: dict[str, Any] | None = None,
+    require_confidence: bool = False,
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     has_payload_context = payload is not None
     payload = payload or {}
     raw_line_items = parsed.get("line_items") if isinstance(parsed.get("line_items"), list) else []
     raw_project = parsed.get("project") if isinstance(parsed.get("project"), dict) else {}
     dimensions = booth_dimensions_from_payload({"project": raw_project}) if raw_project else {}
-    pricing_reference_sections = pricing_reference_section_names_for_payload(payload) if has_payload_context else []
-    line_items = normalize_line_items({**payload, "line_items": raw_line_items}, use_catalog=has_payload_context)
-    catalog_lookup = pricing_catalog_runtime_lookup_for_payload(payload, profile_id_from_payload(payload)) if has_payload_context else {}
+    pricing_reference_sections = (
+        pricing_reference_section_names_for_payload(payload, auth_session=auth_session)
+        if has_payload_context
+        else []
+    )
+    line_items = normalize_line_items(
+        {**payload, "line_items": raw_line_items},
+        use_catalog=has_payload_context,
+        auth_session=auth_session,
+    )
+    catalog_lookup = (
+        pricing_catalog_runtime_lookup_for_payload(
+            payload,
+            profile_id_from_payload(payload),
+            auth_session=auth_session,
+        )
+        if has_payload_context
+        else {}
+    )
     sections = quote_basis_sections_with_catalog_exact_lines(
         confirm_only_basis_sections(normalize_quote_basis_sections(parsed, pricing_reference_sections)),
         line_items,
@@ -20536,7 +21073,7 @@ def normalize_ai_draft(parsed: dict[str, Any], payload: dict[str, Any] | None = 
         mark_unmatched_confirm_custom=has_payload_context,
     )
     line_items = line_items_with_resolved_basis_catalog(line_items, sections, catalog_lookup)
-    sections = sort_quote_basis_sections_by_pricing_reference_order(payload, sections)
+    sections = sort_quote_basis_sections_by_pricing_reference_order(payload, sections, auth_session=auth_session)
     line_items = line_items_aligned_to_quote_basis(line_items, sections, catalog_lookup)
     legacy_basis = quote_basis_from_sections(sections)
     blockers = normalize_blocking_clarification_questions(parsed.get("blocking_clarification_questions"))
@@ -20560,8 +21097,12 @@ def normalize_ai_draft(parsed: dict[str, Any], payload: dict[str, Any] | None = 
     }
 
 
-def request_openai_quote_basis(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
-    prompt = build_quote_draft_prompt(payload)
+def request_openai_quote_basis(
+    payload: dict[str, Any],
+    api_key: str,
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    prompt = build_quote_draft_prompt(payload, auth_session=auth_session)
     content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
     rendered_pdf_pages_remaining = MAX_RENDERED_PDF_PAGES
     for image in image_entries(payload)[:MAX_REFERENCE_IMAGES]:
@@ -20595,7 +21136,7 @@ def request_openai_quote_basis(payload: dict[str, Any], api_key: str) -> dict[st
                     rendered_pdf_pages_remaining -= len(rendered_pages)
         elif mime_type.startswith("image/"):
             content.append({"type": "input_image", "image_url": data_url, "detail": "high"})
-    catalog_visuals = catalog_visual_image_entries_for_payload(payload)
+    catalog_visuals = catalog_visual_image_entries_for_payload(payload, auth_session=auth_session)
     catalog_visual_prompt = catalog_visual_prompt_text(catalog_visuals)
     if catalog_visual_prompt:
         content.append({"type": "input_text", "text": catalog_visual_prompt})
@@ -20702,7 +21243,12 @@ def request_openai_quote_basis(payload: dict[str, Any], api_key: str) -> dict[st
             diagnostics={**response_diagnostics, "failure_boundary": "model_output_json"},
         ) from exc
     try:
-        return normalize_ai_draft(parsed, payload, require_confidence=True)
+        return normalize_ai_draft(
+            parsed,
+            payload,
+            require_confidence=True,
+            auth_session=auth_session,
+        )
     except OpenAIAnalysisError as exc:
         raise OpenAIAnalysisError(
             str(exc),
@@ -20715,10 +21261,15 @@ def request_openai_quote_basis(payload: dict[str, Any], api_key: str) -> dict[st
         ) from exc
 
 
-def request_openai_basis_chat_with_model(payload: dict[str, Any], api_key: str, model: str) -> dict[str, Any]:
+def request_openai_basis_chat_with_model(
+    payload: dict[str, Any],
+    api_key: str,
+    model: str,
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     body = {
         "model": model,
-        "input": [{"role": "user", "content": [{"type": "input_text", "text": build_basis_chat_prompt(payload)}]}],
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": build_basis_chat_prompt(payload, auth_session=auth_session)}]}],
         "max_output_tokens": 1200,
     }
     request = urllib.request.Request(
@@ -20749,26 +21300,56 @@ def request_openai_basis_chat_with_model(payload: dict[str, Any], api_key: str, 
         except json.JSONDecodeError as exc:
             raise OpenAIAnalysisError("OpenAI chat returned invalid JSON.") from exc
     try:
-        return normalize_basis_chat_result(parse_json_object(response_output_text(data)), payload, "openai")
+        return normalize_basis_chat_result(
+            parse_json_object(response_output_text(data)),
+            payload,
+            "openai",
+            auth_session=auth_session,
+        )
     except OpenAIAnalysisError as exc:
         raise AIModelOutputError(str(exc)) from exc
 
 
-def request_deepseek_basis_chat_with_model(payload: dict[str, Any], api_key: str, model: str) -> dict[str, Any]:
-    data = request_deepseek_chat_completion_json_data(build_basis_chat_prompt(payload), api_key, model, 1200, "chat")
+def request_deepseek_basis_chat_with_model(
+    payload: dict[str, Any],
+    api_key: str,
+    model: str,
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    data = request_deepseek_chat_completion_json_data(
+        build_basis_chat_prompt(payload, auth_session=auth_session),
+        api_key,
+        model,
+        1200,
+        "chat",
+    )
     try:
-        return normalize_basis_chat_result(parse_json_object(chat_completions_output_text(data)), payload, "deepseek")
+        return normalize_basis_chat_result(
+            parse_json_object(chat_completions_output_text(data)),
+            payload,
+            "deepseek",
+            auth_session=auth_session,
+        )
     except OpenAIAnalysisError as exc:
         raise AIModelOutputError(str(exc)) from exc
 
 
-def request_openai_basis_chat(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
+def request_openai_basis_chat(
+    payload: dict[str, Any],
+    api_key: str,
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     models = openai_basis_chat_models(payload)
     errors: list[str] = []
     for index, model in enumerate(models):
         attempt_started_at = time.perf_counter()
         try:
-            result = request_openai_basis_chat_with_model(payload, api_key, model)
+            result = request_openai_basis_chat_with_model(
+                payload,
+                api_key,
+                model,
+                auth_session=auth_session,
+            )
             log_ai_call_attempt(
                 feature="basis_chat",
                 provider=AI_PROVIDER_OPENAI,
@@ -20800,13 +21381,22 @@ def request_openai_basis_chat(payload: dict[str, Any], api_key: str) -> dict[str
     raise OpenAIAnalysisError(" ".join(safe_error_messages(errors)))
 
 
-def request_deepseek_basis_chat(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
+def request_deepseek_basis_chat(
+    payload: dict[str, Any],
+    api_key: str,
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     models = deepseek_basis_chat_models(payload)
     errors: list[str] = []
     for index, model in enumerate(models):
         attempt_started_at = time.perf_counter()
         try:
-            result = request_deepseek_basis_chat_with_model(payload, api_key, model)
+            result = request_deepseek_basis_chat_with_model(
+                payload,
+                api_key,
+                model,
+                auth_session=auth_session,
+            )
             log_ai_call_attempt(
                 feature="basis_chat",
                 provider=AI_PROVIDER_DEEPSEEK,
@@ -20838,7 +21428,10 @@ def request_deepseek_basis_chat(payload: dict[str, Any], api_key: str) -> dict[s
     raise OpenAIAnalysisError(" ".join(safe_error_messages(errors)))
 
 
-def request_configured_basis_chat(payload: dict[str, Any]) -> dict[str, Any]:
+def request_configured_basis_chat(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     candidates = basis_chat_provider_model_candidates(payload)
     errors: list[str] = []
     for index, candidate in enumerate(candidates):
@@ -20860,9 +21453,19 @@ def request_configured_basis_chat(payload: dict[str, Any]) -> dict[str, Any]:
         attempt_started_at = time.perf_counter()
         try:
             if provider == AI_PROVIDER_DEEPSEEK:
-                result = request_deepseek_basis_chat_with_model(payload, api_key, model)
+                result = request_deepseek_basis_chat_with_model(
+                    payload,
+                    api_key,
+                    model,
+                    auth_session=auth_session,
+                )
             else:
-                result = request_openai_basis_chat_with_model(payload, api_key, model)
+                result = request_openai_basis_chat_with_model(
+                    payload,
+                    api_key,
+                    model,
+                    auth_session=auth_session,
+                )
             log_ai_call_attempt(
                 feature="basis_chat",
                 provider=provider,
@@ -20903,12 +21506,31 @@ def data_url_inline_image(data_url: str) -> dict[str, str] | None:
     return {"mime_type": mime_type, "data": data}
 
 
-def unpack_ai_draft(ai_draft: dict[str, Any], payload: dict[str, Any] | None = None) -> tuple[dict[str, str], list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
+def unpack_ai_draft(
+    ai_draft: dict[str, Any],
+    payload: dict[str, Any] | None = None,
+    auth_session: dict[str, Any] | None = None,
+) -> tuple[dict[str, str], list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
     has_payload_context = payload is not None
     payload = payload or {}
-    line_items = normalize_line_items({**payload, "line_items": ai_draft.get("line_items")}, use_catalog=has_payload_context)
-    pricing_reference_sections = pricing_reference_section_names_for_payload(payload)
-    catalog_lookup = pricing_catalog_runtime_lookup_for_payload(payload, profile_id_from_payload(payload)) if has_payload_context else {}
+    line_items = normalize_line_items(
+        {**payload, "line_items": ai_draft.get("line_items")},
+        use_catalog=has_payload_context,
+        auth_session=auth_session,
+    )
+    pricing_reference_sections = pricing_reference_section_names_for_payload(
+        payload,
+        auth_session=auth_session,
+    )
+    catalog_lookup = (
+        pricing_catalog_runtime_lookup_for_payload(
+            payload,
+            profile_id_from_payload(payload),
+            auth_session=auth_session,
+        )
+        if has_payload_context
+        else {}
+    )
     sections = quote_basis_sections_with_catalog_exact_lines(
         confirm_only_basis_sections(normalize_quote_basis_sections(ai_draft, pricing_reference_sections)),
         line_items,
@@ -20916,7 +21538,7 @@ def unpack_ai_draft(ai_draft: dict[str, Any], payload: dict[str, Any] | None = N
         mark_unmatched_confirm_custom=has_payload_context,
     )
     line_items = line_items_with_resolved_basis_catalog(line_items, sections, catalog_lookup)
-    sections = sort_quote_basis_sections_by_pricing_reference_order(payload, sections)
+    sections = sort_quote_basis_sections_by_pricing_reference_order(payload, sections, auth_session=auth_session)
     line_items = line_items_aligned_to_quote_basis(line_items, sections, catalog_lookup)
     require_basis_confidence(sections, provider=clean_text(ai_draft.get("source")) or "AI")
     raw_basis = quote_basis_from_sections(sections)
@@ -20972,9 +21594,14 @@ def finalized_remote_draft_result(
     fallback_project: dict[str, Any],
     fallback_line_items: list[dict[str, Any]],
     diagnostic_metadata: dict[str, Any] | None = None,
+    auth_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     has_payload_context = payload is not None
-    basis, line_items, project, sections = unpack_ai_draft(ai_basis, payload)
+    basis, line_items, project, sections = unpack_ai_draft(
+        ai_basis,
+        payload,
+        auth_session=auth_session,
+    )
     blockers = normalize_blocking_clarification_questions(ai_basis.get("blocking_clarification_questions"))
     if blockers:
         raise OpenAIAnalysisError(f"{provider_label} returned clarification questions instead of a usable quote basis.")
@@ -20985,7 +21612,15 @@ def finalized_remote_draft_result(
         sections or normalize_quote_basis_sections({"quote_basis": adjusted_basis}),
         project,
     )
-    catalog_lookup = pricing_catalog_runtime_lookup_for_payload(payload, profile_id_from_payload(payload)) if has_payload_context else {}
+    catalog_lookup = (
+        pricing_catalog_runtime_lookup_for_payload(
+            payload,
+            profile_id_from_payload(payload),
+            auth_session=auth_session,
+        )
+        if has_payload_context
+        else {}
+    )
     adjusted_sections = quote_basis_sections_with_catalog_exact_lines(
         adjusted_sections,
         line_items,
@@ -20993,7 +21628,11 @@ def finalized_remote_draft_result(
         mark_unmatched_confirm_custom=True,
     )
     line_items = line_items_with_resolved_basis_catalog(line_items, adjusted_sections, catalog_lookup)
-    adjusted_sections = sort_quote_basis_sections_by_pricing_reference_order(payload, adjusted_sections)
+    adjusted_sections = sort_quote_basis_sections_by_pricing_reference_order(
+        payload,
+        adjusted_sections,
+        auth_session=auth_session,
+    )
     line_items = line_items_aligned_to_quote_basis(line_items, adjusted_sections, catalog_lookup)
     for section in adjusted_sections:
         for line in section.get("lines") or []:
@@ -21075,6 +21714,17 @@ def log_protected_ai_draft_block(
 
 
 def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any]:
+    pricing_reference_error = pricing_reference_authority_error(
+        payload,
+        auth_session=auth_session,
+    )
+    if pricing_reference_error:
+        if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
+            log_database_pricing_reference_resolution_block(payload)
+        return {
+            "status": "blocked",
+            "errors": safe_error_messages([pricing_reference_error]),
+        }
     protected_mode = protected_ai_draft_mode_enabled(auth_session)
     provider = "openai"
     provider_label = "OpenAI"
@@ -21119,9 +21769,13 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
     if openai_key:
         attempt_started_at = time.perf_counter()
         try:
-            ai_basis = request_openai_quote_basis(payload, openai_key)
+            ai_basis = request_openai_quote_basis(
+                payload,
+                openai_key,
+                auth_session=auth_session,
+            )
             try:
-                fallback_line_items = normalize_line_items(payload) or default_line_items(payload, auth_session=auth_session)
+                fallback_line_items = normalize_line_items(payload, auth_session=auth_session) or default_line_items(payload, auth_session=auth_session)
             except SqagStorageAccessError:
                 log_database_profile_resolution_block(payload)
                 return profile_defaults_blocked_result()
@@ -21141,6 +21795,7 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
                         "image_count": image_count,
                         "pdf_count": pdf_count,
                     },
+                    auth_session=auth_session,
                 )
             except OpenAIAnalysisError as exc:
                 raise OpenAIAnalysisError(
@@ -21210,7 +21865,7 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
 
     if remote_errors:
         try:
-            fallback_line_items = normalize_line_items(payload) or default_line_items(payload, auth_session=auth_session)
+            fallback_line_items = normalize_line_items(payload, auth_session=auth_session) or default_line_items(payload, auth_session=auth_session)
             fallback, fallback_sections = confirm_only_basis_from_basis(default_quote_basis(payload, auth_session=auth_session))
         except SqagStorageAccessError:
             log_database_profile_resolution_block(payload)
@@ -21248,7 +21903,7 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
 
     error_reference = new_error_reference()
     try:
-        fallback_line_items = normalize_line_items(payload) or default_line_items(payload, auth_session=auth_session)
+        fallback_line_items = normalize_line_items(payload, auth_session=auth_session) or default_line_items(payload, auth_session=auth_session)
         fallback, fallback_sections = confirm_only_basis_from_basis(default_quote_basis(payload, auth_session=auth_session))
     except SqagStorageAccessError:
         log_database_profile_resolution_block(payload)
@@ -21294,9 +21949,12 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
     }
 
 
-def answer_basis_chat(payload: dict[str, Any]) -> dict[str, Any]:
+def answer_basis_chat(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     try:
-        return request_configured_basis_chat(payload)
+        return request_configured_basis_chat(payload, auth_session=auth_session)
     except OpenAIAnalysisError as exc:
         error = str(exc)
         provider = configured_text_ai_provider(basis_chat_provider_env_name(payload))
@@ -21601,15 +22259,25 @@ def quote_session_pricing_reference_summary(payload: dict[str, Any], patch: dict
     supplied = patch.get("pricing_reference") if isinstance(patch.get("pricing_reference"), dict) else {}
     supplied_id, supplied_name = safe_display_pair(supplied)
     reference = pricing_reference_payload(payload)
-    reference_id = supplied_id or safe_resource_id(reference.get("id") or payload.get("pricing_reference_id"), "")
+    raw_source = supplied.get("source") if "source" in supplied else (
+        reference.get("source") if "source" in reference else payload.get("pricing_reference_source")
+    )
+    source = raw_source if isinstance(raw_source, str) and raw_source in PRICING_REFERENCE_SOURCES else ""
+    selection_payload = dict(payload)
+    if supplied_id and "pricing_reference_id" not in selection_payload:
+        selection_payload["pricing_reference_id"] = supplied_id
+    if source and "pricing_reference_source" not in selection_payload:
+        selection_payload["pricing_reference_source"] = source
+    selection = explicit_pricing_reference_selection(selection_payload)
+    reference_id = selection["id"] if selection["ok"] else ""
     display_name = supplied_name or dashboard_safe_text(reference.get("label") or reference.get("display_name"))
     if not display_name and reference_id:
-        source = pricing_reference_source_from_payload(payload)
         with contextlib.suppress(Exception):
             display_name = load_pricing_reference_pack(reference_id, source=source).public_summary().get("label", "")
     return {
         "id": reference_id,
         "display_name": dashboard_safe_text(display_name) or "Pricing Reference",
+        "source": source,
     }
 
 
@@ -21644,7 +22312,8 @@ def quote_session_snapshot_resource(
         or summary.get("label")
         or summary.get("name")
     )
-    source = safe_resource_id(detail.get("source") or summary.get("source") or "company", "company")
+    raw_source = detail.get("source") if "source" in detail else summary.get("source")
+    source = raw_source if isinstance(raw_source, str) and raw_source in PRICING_REFERENCE_SOURCES else ""
     resource = {
         "id": resource_id,
         "display_name": display_name or dashboard_safe_text(summary.get("display_name")) or "Workspace Data",
@@ -21753,6 +22422,16 @@ def normalized_quote_session_generation_snapshot(value: Any) -> dict[str, Any]:
 def quote_session_commercials(payload: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     supplied = patch.get("commercials") if isinstance(patch.get("commercials"), dict) else {}
     commercial_state = quote_commercial_state(payload)
+    if commercial_state.get("review_required"):
+        return {
+            "currency": "",
+            "tax_label": "",
+            "tax_rate": None,
+            "exchange_rate": None,
+            "subtotal": None,
+            "tax_amount": None,
+            "grand_total": None,
+        }
     if commercial_state.get("owned"):
         if commercial_state.get("legacy"):
             details = commercial_state.get("details") if isinstance(commercial_state.get("details"), dict) else {}
@@ -22133,6 +22812,7 @@ def blank_quote_session_metadata(session_id: str, created_at: str) -> dict[str, 
         "pricing_reference": {
             "id": "",
             "display_name": "Pricing Reference",
+            "source": "",
         },
         "commercials": {
             "currency": DEFAULT_CURRENCY_LABEL,
@@ -23383,7 +24063,7 @@ def finish_basis_chat_job(
     auth_session: dict[str, Any] | None = None,
 ) -> None:
     try:
-        result = answer_basis_chat(payload)
+        result = answer_basis_chat(payload, auth_session=auth_session)
         set_job_state(job_id, status="completed", result=result, errors=result.get("warnings") or [])
     except OpenAIAnalysisError as exc:
         error_reference = new_error_reference()
@@ -24607,6 +25287,14 @@ def create_job(
     image_error = image_limit_error(payload)
     if image_error:
         return blocked([image_error], "image_limit")
+    pricing_reference_error = pricing_reference_authority_error(
+        payload,
+        auth_session=auth_session,
+    )
+    if pricing_reference_error:
+        if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
+            log_database_pricing_reference_resolution_block(payload)
+        return blocked([pricing_reference_error], "pricing_reference_invalid")
     if normalized_type in {"generate", "generate_pdf"}:
         payload = generation_payload_with_profile_defaults(payload, auth_session=auth_session)
     missing_details = quote_detail_missing_fields(payload)
@@ -24620,9 +25308,10 @@ def create_job(
             [f"Fill quote details before {action_label}: {', '.join(missing_details)}."],
             "quote_details_missing",
         )
-    pricing_reference_error = pricing_reference_selection_error(payload, auth_session=auth_session)
+    pricing_reference_error = pricing_reference_authority_error(payload, auth_session=auth_session)
     if pricing_reference_error:
-        log_database_pricing_reference_resolution_block(payload)
+        if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
+            log_database_pricing_reference_resolution_block(payload)
         return blocked([pricing_reference_error], "pricing_reference_invalid")
     profile_error = profile_selection_error(payload, auth_session=auth_session) if normalized_type in {"generate", "generate_pdf"} else ""
     if profile_error:
@@ -24908,7 +25597,7 @@ def _run_quote_job(
         layout_template_path = profile.quotation_layout_path
     pricing_catalog_path = pricing_catalog_path_for_payload(payload, job_tmp, auth_session=auth_session)
     uploaded_images = save_uploaded_images(image_entries(payload), job_tmp)
-    brief = payload_to_brief(payload)
+    brief = payload_to_brief(payload, auth_session=auth_session)
     brief["_webapp"] = {
         "job_id": job_id,
         "profile": profile_prompt_summary(profile),
@@ -25941,13 +26630,28 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             if not allowed:
                 self.send_json(error, status=403)
                 return
+            pricing_reference_error = pricing_reference_authority_error(
+                payload,
+                auth_session=self.current_auth_session(),
+            )
+            if pricing_reference_error:
+                if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
+                    log_database_pricing_reference_resolution_block(payload)
+                self.send_json({"status": "blocked", "errors": [pricing_reference_error]}, status=400)
+                return
             resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=self.current_auth_session())
             if resolved_payload is None:
                 log_database_pricing_reference_resolution_block(payload)
                 self.send_json({"status": "blocked", "errors": [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE]}, status=400)
                 return
             payload = resolved_payload
-            self.send_json({"status": "normalized", "line_items": normalize_line_items_for_quote_basis_review(payload)})
+            self.send_json({
+                "status": "normalized",
+                "line_items": normalize_line_items_for_quote_basis_review(
+                    payload,
+                    auth_session=self.current_auth_session(),
+                ),
+            })
             return
 
         if parsed.path == "/api/quote-sessions":
@@ -25998,15 +26702,27 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                     write_local_log("draft_blocked", {"errors": errors})
                     self.send_json({"status": "blocked", "errors": errors}, status=400)
                     return
+                pricing_reference_error = pricing_reference_authority_error(
+                    payload,
+                    auth_session=self.current_auth_session(),
+                )
+                if pricing_reference_error:
+                    if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
+                        log_database_pricing_reference_resolution_block(payload)
+                    errors = safe_error_messages([pricing_reference_error])
+                    write_local_log("draft_blocked", {"errors": errors})
+                    self.send_json({"status": "blocked", "errors": errors}, status=400)
+                    return
                 missing_details = quote_detail_missing_fields(payload)
                 if missing_details:
                     errors = safe_error_messages([f"Fill quote details before AI analysis: {', '.join(missing_details)}."])
                     write_local_log("draft_blocked", {"errors": errors})
                     self.send_json({"status": "blocked", "errors": errors}, status=400)
                     return
-                pricing_reference_error = pricing_reference_selection_error(payload, auth_session=self.current_auth_session())
+                pricing_reference_error = pricing_reference_authority_error(payload, auth_session=self.current_auth_session())
                 if pricing_reference_error:
-                    log_database_pricing_reference_resolution_block(payload)
+                    if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
+                        log_database_pricing_reference_resolution_block(payload)
                     errors = safe_error_messages([pricing_reference_error])
                     write_local_log("draft_blocked", {"errors": errors})
                     self.send_json({"status": "blocked", "errors": errors}, status=400)
@@ -26115,7 +26831,14 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 return
             try:
                 query = parse_qs(parsed.query)
-                source = clean_text((query.get("source") or ["local"])[0]) or "local"
+                raw_source = (query.get("source") or [None])[0]
+                source = raw_source if isinstance(raw_source, str) else ""
+                if source not in PRICING_REFERENCE_SOURCES:
+                    self.send_json(
+                        {"status": "blocked", "errors": ["Pricing reference source is required and unsupported sources are not allowed."]},
+                        status=400,
+                    )
+                    return
                 storage = self.current_app_storage()
                 if storage is None:
                     return
