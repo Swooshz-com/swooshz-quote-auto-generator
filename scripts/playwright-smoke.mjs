@@ -218,6 +218,7 @@ async function verifyMobileHeaderOrder(page) {
 async function verifyMobileBasisLegendAndOutputCards(page) {
   await page.setViewportSize({ width: 520, height: 720 });
   await page.evaluate(() => {
+    selectPricingReferenceOptionValue(firstPricingReferenceOptionValue());
     state.quoteBasis = {};
     state.quoteBasisSections = [{
       id: "graphics",
@@ -1370,6 +1371,7 @@ async function installMockProfiles(page) {
           currency: "SGD",
           tax: { label: "GST", rate: 0.09 },
           item_count: 1,
+          digest_sha256: "sha256:4827a901f0d6dd810562e4209ae684a55ce72742bcdd8414be7297b51616338d",
         }],
         default_profile_id: "synthetic-exhibition-fixture-template",
         default_pricing_reference_id: "synthetic-exhibition-fixture-pricing",
