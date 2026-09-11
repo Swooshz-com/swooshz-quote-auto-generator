@@ -2740,6 +2740,8 @@ eval([
   "normalizeQuoteCommercialTouched", "resetQuoteCommercialTouched", "quoteCommercialFieldKeyForElement",
   "quoteCommercialFieldIsTouched", "quoteCommercialFieldHasValue", "shouldApplyQuoteCommercialField", "shouldApply",
   "quoteCommercialSnapshotPresence", "quoteCommercialSnapshotForDetails", "quoteDetailsWithFallbackDefaults",
+  "quoteCommercialSnapshotPricingBasis", "pricingReferenceAuthorityBasis", "pricingReferenceAuthorityReviewReason",
+  "quoteCommercialSnapshotOriginForLifecycle",
   "quoteCommercialReviewRequired",
   "collectRichTextDetails", "collectQuoteDetails", "setInputValue", "collectTaxDetails", "collectQuoteCurrency",
   "collectQuoteExchangeRate", "syncQuoteExchangeRateField", "quoteCommercialTaxText", "quoteExchangeRateText",
@@ -18675,6 +18677,7 @@ eval([
   "defaultPricingReference",
   "resolvedProfileIdForPayload",
   "syncSelectedPricingReference",
+  "quoteCommercialSnapshotPricingBasis",
 ].map(extractFunction).join("\n"));
 
 state.pricingReferences = mergePricingReferences(rawPricingReferences);
@@ -20721,6 +20724,7 @@ eval([
   "syncQuoteExchangeRateField",
   "applyPricingReferenceCommercialDefaults",
   "renderSelectedPricingReferenceSummary",
+  "quoteCommercialSnapshotPricingBasis",
   "renderProfileOptions",
   "updateSidePanelNav",
 ].map(extractFunction).join("\n"));
@@ -21672,6 +21676,7 @@ eval([
   "currentProfile",
   "defaultPricingReference",
   "syncSelectedPricingReference",
+  "quoteCommercialSnapshotPricingBasis",
   "deleteRepoPricingReference",
 ].map(extractFunction).join("\n"));
 
@@ -22475,7 +22480,9 @@ assert.strictEqual(sanitizeRichTextHtml("<blink>Plain <em>x</em></blink>"), "Pla
         self.assertIn("state.pricingReferenceSavedNotice", save_reference_body)
         self.assertIn("Matching clues updated.", save_reference_body)
         self.assertIn("Saved, but matching clue enrichment did not complete.", save_reference_body)
-        self.assertIn("state.pricingReferenceId = savedReference.id || \"\";", save_reference_body)
+        self.assertIn("await loadProfiles();", save_reference_body)
+        self.assertIn("syncSelectedPricingReference();", save_reference_body)
+        self.assertNotIn("state.pricingReferenceId = savedReference.id || \"\";", save_reference_body)
         self.assertIn("updatePricingReferenceDeleteButton();", save_reference_body)
         render_preview_body = js.split("function renderPricingReferencePreview", 1)[1].split("function pricingReferenceModalTax", 1)[0]
         self.assertIn("const requiredDetailsBlocked = pricingReferenceSaveBlockReasonIsRequiredDetails(saveBlockReason);", render_preview_body)
@@ -24558,6 +24565,161 @@ assert.strictEqual(elements.quoteCurrency.value, CUSTOM_CURRENCY_VALUE);
 assert.strictEqual(elements.quoteCurrencyCustom.value, "JPY");
 assert.strictEqual(elements.quoteCurrencyCustom.hidden, false);
 assert.strictEqual(collectQuoteCurrency(), "JPY");
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_static_v3_persisted_pricing_basis_is_lifecycle_independent_and_fail_closed(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const marker = `function ${name}(`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  if (bodyStart < 2) throw new Error(`Missing body for function ${name}`);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA = "swooshz.quote-commercial-snapshot.v2";
+const QUOTE_COMMERCIAL_SNAPSHOT_VERSION = 2;
+const QUOTE_COMMERCIAL_LIFECYCLES = new Set(["NEW_UNINITIALISED", "EXISTING", "RECOVERED"]);
+const QUOTE_COMMERCIAL_SNAPSHOT_ORIGINS = new Set(["new_quote", "captured", "session_recovery", "explicit_initialization", "explicit_reselection"]);
+const QUOTE_COMMERCIAL_PRESENCE_VALUES = new Set(["captured", "intentional_empty"]);
+const PRICING_REFERENCE_SOURCES = new Set(["company", "local", "bundled"]);
+const QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS = [
+  "currency", "exchange_rate", "tax", "company_name", "header_details", "logo",
+  "terms_heading", "payment_terms", "notes_heading", "standard_notes", "acceptance_text",
+  "person_label", "stamp_label", "date_label", "company_signatory", "company_title",
+  "company_date_label", "rich_text",
+];
+const state = {
+  quoteCommercialLifecycle: "NEW_UNINITIALISED",
+  quoteCommercialSnapshot: null,
+  quoteCommercialReview: null,
+  pricingReferenceId: "v3-reference",
+  pricingReferenceSource: "local",
+  pricingReferences: [],
+};
+function currentPricingReference() {
+  return state.pricingReferences.find((reference) => reference.id === state.pricingReferenceId && reference.source === state.pricingReferenceSource) || null;
+}
+function quoteCommercialReviewRequired() {
+  return Boolean(state.quoteCommercialReview && state.quoteCommercialReview.status === "REVIEW_REQUIRED");
+}
+function setQuoteCommercialReview(reason, id, source) {
+  state.quoteCommercialReview = {
+    status: "REVIEW_REQUIRED",
+    reason_code: reason,
+    blocked_identity: { id, source },
+  };
+}
+function clearReview() {
+  state.quoteCommercialReview = null;
+}
+
+eval([
+  "hasMeaningfulQuoteDetailValue",
+  "quoteCommercialSnapshotPresence",
+  "quoteCommercialSnapshotPricingBasis",
+  "pricingReferenceAuthorityBasis",
+  "pricingReferenceAuthorityReviewReason",
+  "quoteCommercialSnapshotOriginForLifecycle",
+  "quoteCommercialSnapshotForDetails",
+].map(extractFunction).join("\n"));
+
+const digestA = "sha256:" + "a".repeat(64);
+const digestB = "sha256:" + "b".repeat(64);
+const reference = {
+  id: "v3-reference",
+  source: "local",
+  currency: "SGD",
+  digest_sha256: digestA,
+};
+state.pricingReferences = [reference];
+const emptyDetails = {
+  currency: "SGD",
+  exchange_rate: 1,
+  tax: {},
+  company: {},
+  quote_text: {},
+  signature: {},
+  rich_text: {},
+};
+
+const fresh = quoteCommercialSnapshotForDetails(emptyDetails);
+assert.ok(fresh);
+assert.strictEqual(fresh.lifecycle, "NEW_UNINITIALISED");
+assert.deepStrictEqual(fresh.pricing_basis, {
+  currency: "SGD",
+  source: "local",
+  id: "v3-reference",
+  digest: digestA,
+});
+
+state.quoteCommercialSnapshot = fresh;
+state.quoteCommercialLifecycle = "EXISTING";
+const lifecycleTransition = quoteCommercialSnapshotForDetails(emptyDetails);
+assert.deepStrictEqual(lifecycleTransition.pricing_basis, fresh.pricing_basis);
+assert.strictEqual(lifecycleTransition.lifecycle, "EXISTING");
+assert.strictEqual(lifecycleTransition.origin, "captured");
+
+state.quoteCommercialSnapshot = lifecycleTransition;
+state.pricingReferences[0] = { ...reference, digest_sha256: digestB };
+const blocked = quoteCommercialSnapshotForDetails(emptyDetails);
+assert.strictEqual(blocked.pricing_basis.digest, digestA);
+assert.strictEqual(state.quoteCommercialReview.reason_code, "pricing_reference_digest_mismatch");
+assert.deepStrictEqual(state.quoteCommercialReview.blocked_identity, {
+  id: "v3-reference",
+  source: "local",
+});
+
+clearReview();
+state.quoteCommercialSnapshot = null;
+state.quoteCommercialLifecycle = "NEW_UNINITIALISED";
+const replaced = quoteCommercialSnapshotForDetails(emptyDetails, {
+  lifecycle: "RECOVERED",
+  origin: "explicit_reselection",
+  reference: state.pricingReferences[0],
+  replacePricingAuthority: true,
+});
+assert.ok(replaced);
+assert.strictEqual(replaced.lifecycle, "RECOVERED");
+assert.strictEqual(replaced.origin, "explicit_reselection");
+assert.strictEqual(replaced.pricing_basis.digest, digestB);
+
+state.quoteCommercialSnapshot = null;
+state.quoteCommercialLifecycle = "NEW_UNINITIALISED";
+state.pricingReferenceId = "";
+state.pricingReferenceSource = "";
+state.pricingReferences = [];
+assert.strictEqual(quoteCommercialSnapshotForDetails(emptyDetails), null);
+
+const saveBody = source.split("async function savePricingReferenceFromModal")[1].split("async function deleteRepoPricingReference")[0];
+assert.ok(saveBody.includes("await loadProfiles();"));
+assert.ok(!saveBody.includes("state.pricingReferenceId = savedReference.id"));
+assert.ok(!saveBody.includes("state.pricingReferenceSource = pricingReferenceSelectionFromValue(pricingReferenceSelectValue(savedReference)).source"));
+assert.ok(!saveBody.includes("persistLastPricingReferenceSelection(savedReference)"));
 """
         completed = subprocess.run(
             [node, "-e", script],

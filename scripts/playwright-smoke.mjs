@@ -1386,6 +1386,92 @@ async function installMockProfiles(page) {
   });
 }
 
+async function verifyFreshPricingAuthorityInitializesBeforeCustomer(page) {
+  let sessionId = "";
+  try {
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
+    await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+    const emptyNewQuoteButton = page.locator("#dashboardEmptyNewQuoteButton:not([disabled])");
+    if (await emptyNewQuoteButton.isVisible()) await emptyNewQuoteButton.click();
+    else await page.locator("#newQuoteButton:not([disabled])").click();
+    await page.locator("#imageIntake.is-active").waitFor({ state: "visible", timeout: 15000 });
+    await page.locator("#imageInput").setInputFiles({
+      name: "v3-authority-render.png",
+      mimeType: "image/png",
+      buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=", "base64"),
+    });
+    await page.locator("#fileList .file-item", { hasText: "v3-authority-render.png" }).waitFor({ state: "visible", timeout: 15000 });
+    await page.waitForFunction(() => {
+      try {
+        const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "null");
+        return Boolean(saved && saved.activeAppView === "quote" && saved.quoteCommercialLifecycle === "NEW_UNINITIALISED");
+      } catch {
+        return false;
+      }
+    }, null, { timeout: 15000 });
+    const beforeCustomer = await page.evaluate(() => {
+      const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "null");
+      return {
+        stateSnapshot: state.quoteCommercialSnapshot,
+        persistedSnapshot: saved?.quoteDetails?.commercial_snapshot || null,
+        lifecycle: state.quoteCommercialLifecycle,
+        sessionId: state.quoteSessionId,
+      };
+    });
+    if (beforeCustomer.stateSnapshot || beforeCustomer.persistedSnapshot || beforeCustomer.sessionId) {
+      throw new Error(`Fresh authority was serialized before Customer initialization: ${JSON.stringify(beforeCustomer)}.`);
+    }
+
+    await page.locator("#sideNextButton", { hasText: "Next: Customer" }).click();
+    await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+    await page.waitForFunction(() => Boolean(
+      state.pricingReferenceId
+      && state.pricingReferenceSource
+      && state.quoteCommercialSnapshot?.pricing_basis?.id
+      && state.quoteCommercialSnapshot?.pricing_basis?.digest
+    ), null, { timeout: 15000 });
+    const afterCustomer = await page.evaluate(() => {
+      const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "null");
+      return {
+        lifecycle: state.quoteCommercialLifecycle,
+        review: state.quoteCommercialReview,
+        pricingReferenceId: state.pricingReferenceId,
+        pricingReferenceSource: state.pricingReferenceSource,
+        selectedValue: elements.profileSelect.value,
+        snapshot: state.quoteCommercialSnapshot,
+        persistedSnapshot: saved?.quoteDetails?.commercial_snapshot || null,
+        sessionId: state.quoteSessionId,
+      };
+    });
+    const expectedValue = "local::synthetic-exhibition-fixture-pricing";
+    if (
+      afterCustomer.lifecycle !== "NEW_UNINITIALISED"
+      || afterCustomer.review
+      || afterCustomer.pricingReferenceId !== "synthetic-exhibition-fixture-pricing"
+      || afterCustomer.pricingReferenceSource !== "local"
+      || afterCustomer.selectedValue !== expectedValue
+      || afterCustomer.snapshot?.pricing_basis?.id !== "synthetic-exhibition-fixture-pricing"
+      || afterCustomer.snapshot?.pricing_basis?.source !== "local"
+      || afterCustomer.snapshot?.pricing_basis?.currency !== "SGD"
+      || afterCustomer.snapshot?.pricing_basis?.digest !== "sha256:4827a901f0d6dd810562e4209ae684a55ce72742bcdd8414be7297b51616338d"
+      || afterCustomer.persistedSnapshot?.pricing_basis?.id !== "synthetic-exhibition-fixture-pricing"
+      || afterCustomer.persistedSnapshot?.pricing_basis?.digest !== afterCustomer.snapshot?.pricing_basis?.digest
+    ) {
+      throw new Error(`Fresh authority did not initialize and persist the configured reference at Customer: ${JSON.stringify(afterCustomer)}.`);
+    }
+    sessionId = afterCustomer.sessionId;
+  } finally {
+    sessionId = sessionId || await page.evaluate(() => state.quoteSessionId).catch(() => "");
+    if (sessionId) {
+      await page.evaluate(async (id) => {
+        await deleteQuoteSessionRecord(id);
+      }, sessionId).catch(() => {});
+    }
+    await page.evaluate(() => clearSessionState()).catch(() => {});
+  }
+}
+
 async function verifyRecoveredTemplateOwnerFailsClosed(page) {
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
@@ -2059,6 +2145,7 @@ async function main() {
   try {
     await installMockProfiles(page);
     await verifyRecoveredTemplateOwnerFailsClosed(page);
+    await verifyFreshPricingAuthorityInitializesBeforeCustomer(page);
     if (args.includes("--recovery-only")) {
       await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
       await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
