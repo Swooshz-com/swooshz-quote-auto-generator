@@ -2646,6 +2646,36 @@ function clearQuoteCommercialReview() {
   state.quoteCommercialRecoveryError = "";
 }
 
+function serverQuoteCommercialReviewFromResponse(data = {}) {
+  const candidates = [
+    data?.quoteCommercialReview,
+    data?.result?.quoteCommercialReview,
+  ];
+  for (const candidate of candidates) {
+    const normalized = normalizeQuoteCommercialReview(candidate);
+    if (normalized) return normalized;
+  }
+  return null;
+}
+
+async function adoptServerQuoteCommercialReview(data = {}) {
+  const review = serverQuoteCommercialReviewFromResponse(data);
+  if (!review) return false;
+  state.quoteCommercialReview = review;
+  state.quoteCommercialRecoveryError = QUOTE_COMMERCIAL_REVIEW_MESSAGE;
+  renderQuoteCommercialReviewState();
+  syncControlStates();
+  saveSessionState();
+  if (quoteSessionDraftStateCanSave()) {
+    try {
+      await saveQuoteSessionDraftState({ quoteGenerated: Boolean(state.basisConfirmed || state.outputRows.length) });
+    } catch {
+      // The local snapshot has already been persisted; keep the server rejection fail-closed.
+    }
+  }
+  return true;
+}
+
 function quoteCommercialStateIsOwned() {
   return ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
 }
@@ -11215,6 +11245,7 @@ async function postJson(url, payload) {
       return postJsonFetchFailure(url, error);
     }
   }
+  await adoptServerQuoteCommercialReview(data);
   if (!response.ok) {
     logClientEvent("server_error", { url, status: response.status, errors: data.errors || [] });
   }
@@ -11252,6 +11283,7 @@ async function getJson(url, options = {}) {
       errors: genericFailureMessages(),
     };
   }
+  await adoptServerQuoteCommercialReview(data);
   if (!response.ok) {
     logClientEvent("server_error", {
       url,

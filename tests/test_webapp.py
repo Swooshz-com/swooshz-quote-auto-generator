@@ -27923,13 +27923,129 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                     )
                     self.assertEqual(webapp.normalize_line_items(mismatched, auth_session=workspace_a_session), [])
 
+    def test_server_pricing_reference_mismatch_returns_durable_review_only_for_established_basis(self):
+        reference_id = "repair-review-pricing"
+        payload = valid_payload()
+        payload["pricing_reference_id"] = reference_id
+        payload["pricing_reference_source"] = "local"
+        payload["pricing_reference"] = {
+            "id": reference_id,
+            "source": "local",
+            "currency": "SGD",
+            "tax": {"label": "GST", "rate": 0.09},
+        }
+        details = {
+            "quote_date": payload["quote_date"],
+            "project_number": payload["project_number"],
+            "client": copy.deepcopy(payload["client"]),
+            "project": copy.deepcopy(payload["project"]),
+            "company": copy.deepcopy(payload["company"]),
+            "currency": "SGD",
+            "exchange_rate": 1,
+            "tax": {"label": "GST", "rate": 0.09},
+            "quote_text": copy.deepcopy(payload["quote_text"]),
+            "signature": copy.deepcopy(payload["signature"]),
+            "rich_text": copy.deepcopy(payload["rich_text"]),
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pricing_root = Path(tmp)
+            write_test_pricing_reference(pricing_root, reference_id, [with_required_pricing_metadata({
+                "id": "repair-row",
+                "section": "Graphics",
+                "description": "Workspace printed graphics",
+                "unit_hint": "sqm",
+                "internal_cost": 10,
+                "markup_multiplier": 2,
+            })])
+            with mock.patch.object(webapp, "pricing_references_root", return_value=pricing_root):
+                authority_a = webapp.exact_pricing_reference_detail_for_payload(payload)
+                self.assertIsNotNone(authority_a)
+                details["commercial_snapshot"] = {
+                    "schema": webapp.QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+                    "version": webapp.QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+                    "owner": "quote",
+                    "lifecycle": "NEW_UNINITIALISED",
+                    "origin": "new_quote",
+                    "presence": {
+                        key: "captured" if webapp.quote_commercial_value_is_present(value) else "intentional_empty"
+                        for key, value in webapp.quote_commercial_snapshot_raw_values(details).items()
+                    },
+                    "pricing_basis": {
+                        "currency": "SGD",
+                        "source": "local",
+                        "id": reference_id,
+                        "digest": authority_a["digest_sha256"],
+                    },
+                }
+                payload["quote_session"] = {
+                    "session_id": "quote-repair-review",
+                    "draft_state": {
+                        "quoteCommercialLifecycle": "NEW_UNINITIALISED",
+                        "quoteDetails": details,
+                        "outputRows": [{
+                            "section": "Graphics",
+                            "description": "Workspace printed graphics",
+                            "quantity": 2,
+                            "unit": "sqm",
+                            "price_mode": "Priced",
+                            "effective_unit_price": 20,
+                            "pricing_basis_amount": 40,
+                            "approved_quote_amount": 40,
+                        }],
+                    },
+                }
+                self.assertIsNone(webapp.pricing_reference_authority_review(payload))
+
+                write_test_pricing_reference(pricing_root, reference_id, [with_required_pricing_metadata({
+                    "id": "repair-row",
+                    "section": "Graphics",
+                    "description": "Workspace printed graphics",
+                    "unit_hint": "sqm",
+                    "internal_cost": 11,
+                    "markup_multiplier": 2,
+                })])
+                review = webapp.pricing_reference_authority_review(payload)
+                self.assertEqual(review, {
+                    "schema": webapp.QUOTE_COMMERCIAL_REVIEW_SCHEMA,
+                    "version": webapp.QUOTE_COMMERCIAL_REVIEW_VERSION,
+                    "status": webapp.QUOTE_COMMERCIAL_REVIEW_STATUS,
+                    "reason_code": "pricing_reference_digest_mismatch",
+                    "blocked_identity": {"id": reference_id, "source": "local"},
+                })
+                self.assertEqual(
+                    payload["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"]["digest"],
+                    authority_a["digest_sha256"],
+                )
+                self.assertEqual(
+                    webapp.pricing_reference_authority_error(payload),
+                    webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE,
+                )
+                draft_result = webapp.draft_quote_basis(payload)
+                self.assertEqual(draft_result.get("quoteCommercialReview"), review)
+
+                invalid = valid_payload()
+                invalid["pricing_reference_id"] = "repair-invalid"
+                invalid["pricing_reference_source"] = "unsupported"
+                invalid["pricing_reference"] = {"id": "repair-invalid", "source": "unsupported"}
+                ordinary_result = webapp.pricing_reference_authority_blocked_result(
+                    invalid,
+                    [webapp.PRICING_REFERENCE_SELECTION_ERROR_MESSAGE],
+                )
+                self.assertNotIn("quoteCommercialReview", ordinary_result)
+                self.assertIsNone(webapp.pricing_reference_authority_review(invalid))
+                self.assertEqual(
+                    webapp.pricing_reference_authority_error(invalid),
+                    webapp.PRICING_REFERENCE_SELECTION_ERROR_MESSAGE,
+                )
+
     def test_g3_restoration_review_and_pricing_use_real_browser_session_and_database_path(self):
         node = require_node(self)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             database_url = f"sqlite:///{(root / 'sqag-g3-browser.sqlite3').as_posix()}"
             reference_id = "g3-browser-pricing"
-            platform_session = self.platform_auth_session("workspace-g3-browser", membership_role="operator")
+            platform_session = self.platform_auth_session("workspace-g3-browser", membership_role="admin")
             env = self.platform_launch_env(
                 SQAG_STORAGE_MODE="database",
                 SQAG_ARTIFACT_STORAGE_MODE="database",
@@ -27997,6 +28113,36 @@ async function expectReviewError(result, label) {
     (result.data?.errors || []).some((error) => String(error).includes("Pricing review required")),
     `${label} should report durable pricing review: ${JSON.stringify(result.data)}`,
   );
+  const review = result.data?.quoteCommercialReview;
+  assert.ok(review, `${label} should return structured pricing review: ${JSON.stringify(result.data)}`);
+  assert.strictEqual(review.schema, "swooshz.quote-commercial-review.v1");
+  assert.strictEqual(review.version, 1);
+  assert.strictEqual(review.status, "REVIEW_REQUIRED");
+  assert.strictEqual(review.blocked_identity.id, referenceId);
+  assert.strictEqual(review.blocked_identity.source, "company");
+  return review;
+}
+
+async function saveAuthoritativePricingReference(page, internalCost) {
+  return page.evaluate(async ({ referenceId, internalCost }) => postJson("/api/settings/pricing-references", {
+    id: referenceId,
+    label: "Workspace Pricing",
+    source: "company",
+    currency: "SGD",
+    tax: { label: "GST", rate: 0.09 },
+    items: [{
+      id: "workspace-row",
+      section: "Graphics",
+      description: "Workspace printed graphics",
+      unit_hint: "sqm",
+      internal_cost: internalCost,
+      markup_multiplier: 2,
+      match_terms: ["workspace printed graphics"],
+      object_families: ["test_family"],
+    }],
+    update_existing: true,
+    editing_reference_id: referenceId,
+  }), { referenceId, internalCost });
 }
 
 async function main() {
@@ -28170,20 +28316,53 @@ async function main() {
     }));
     assert.deepStrictEqual(unchangedAfter, unchangedBefore);
 
-    const reviewSave = await page.evaluate(async () => {
-      setQuoteCommercialReview("pricing_reference_digest_mismatch", state.pricingReferenceId, state.pricingReferenceSource);
-      renderQuoteCommercialReviewState();
-      syncControlStates();
-      const saved = await saveQuoteSessionDraftState({ quoteGenerated: true });
-      if (!saved?.session_id) throw new Error("blocked review state was not saved");
-      return { sessionId: state.quoteSessionId, rows: JSON.stringify(state.outputRows) };
+    const changedToB = await saveAuthoritativePricingReference(page, 11);
+    assert.strictEqual(changedToB.ok, true, JSON.stringify(changedToB));
+    assert.strictEqual(changedToB.data.status, "saved");
+    const serverMismatch = await page.evaluate(async () => postJson(
+      "/api/line-items/normalize",
+      buildLineItemNormalizePayload(),
+    ));
+    const mismatchReview = await expectReviewError(serverMismatch, "server catalogue mismatch");
+    assert.strictEqual(mismatchReview.reason_code, "pricing_reference_digest_mismatch");
+    const adoptedMismatch = await page.evaluate(() => {
+      const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
+      return {
+        review: state.quoteCommercialReview,
+        persistedReview: saved.quoteCommercialReview,
+        snapshot: state.quoteCommercialSnapshot,
+        rows: JSON.stringify(state.outputRows),
+      };
     });
-    assert.strictEqual(reviewSave.sessionId, fresh.sessionId);
+    assert.deepStrictEqual(adoptedMismatch.review, mismatchReview);
+    assert.deepStrictEqual(adoptedMismatch.persistedReview, mismatchReview);
+    assert.strictEqual(adoptedMismatch.snapshot.pricing_basis.digest, fresh.snapshot.pricing_basis.digest);
+    assert.strictEqual(adoptedMismatch.rows, unchangedBefore.output);
+
     const blockedDetail = await responseJson(page, `/api/quote-sessions/${fresh.sessionId}`);
     assert.strictEqual(blockedDetail.status, 200, JSON.stringify(blockedDetail.body));
     const blockedDraft = blockedDetail.body.quote_session?.draft_state || {};
-    assert.strictEqual(blockedDraft.quoteCommercialReview?.status, "REVIEW_REQUIRED");
+    assert.deepStrictEqual(blockedDraft.quoteCommercialReview, mismatchReview);
+    assert.strictEqual(
+      blockedDraft.quoteDetails?.commercial_snapshot?.pricing_basis?.digest,
+      fresh.snapshot.pricing_basis.digest,
+    );
     assert.strictEqual(blockedDraft.outputRows.length, 1);
+
+    const changedBackToA = await saveAuthoritativePricingReference(page, 10);
+    assert.strictEqual(changedBackToA.ok, true, JSON.stringify(changedBackToA));
+    assert.strictEqual(changedBackToA.data.status, "saved");
+    const refreshedCatalogue = await page.evaluate(async () => {
+      await loadProfiles();
+      return {
+        review: state.quoteCommercialReview,
+        snapshot: state.quoteCommercialSnapshot,
+        selected: elements.profileSelect.value,
+      };
+    });
+    assert.deepStrictEqual(refreshedCatalogue.review, mismatchReview);
+    assert.strictEqual(refreshedCatalogue.snapshot.pricing_basis.digest, fresh.snapshot.pricing_basis.digest);
+    assert.strictEqual(refreshedCatalogue.selected, referenceValue);
 
     await page.locator("#backToDashboardButton", { hasText: "Dashboard" }).click();
     await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 30000 });
@@ -28197,27 +28376,28 @@ async function main() {
       output: JSON.stringify(state.outputRows),
       selected: elements.profileSelect.value,
     }));
-    assert.strictEqual(blockedRestored.review.status, "REVIEW_REQUIRED");
-    assert.strictEqual(blockedRestored.output, reviewSave.rows);
+    assert.deepStrictEqual(blockedRestored.review, mismatchReview);
+    assert.strictEqual(blockedRestored.output, unchangedBefore.output);
     assert.strictEqual(blockedRestored.selected, referenceValue);
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForFunction(() => state.isBooting === false, null, { timeout: 30000 });
     const blockedReloaded = await page.evaluate(() => ({
       review: state.quoteCommercialReview,
       output: JSON.stringify(state.outputRows),
+      snapshot: state.quoteCommercialSnapshot,
     }));
-    assert.strictEqual(blockedReloaded.review.status, "REVIEW_REQUIRED");
-    assert.strictEqual(blockedReloaded.output, reviewSave.rows);
+    assert.deepStrictEqual(blockedReloaded.review, mismatchReview);
+    assert.strictEqual(blockedReloaded.output, unchangedBefore.output);
+    assert.strictEqual(blockedReloaded.snapshot.pricing_basis.digest, fresh.snapshot.pricing_basis.digest);
 
-    assert.deepStrictEqual(consoleProblems, []);
     consoleProblems.length = 0;
     const blockedNormalize = await page.evaluate(async () => postJson("/api/line-items/normalize", buildLineItemNormalizePayload()));
-    await expectReviewError(blockedNormalize, "blocked normalization");
+    assert.deepStrictEqual(await expectReviewError(blockedNormalize, "blocked normalization"), mismatchReview);
     const blockedGeneration = await page.evaluate(async () => postJson("/api/jobs", {
       type: "generate",
       payload: buildPayload(),
     }));
-    await expectReviewError(blockedGeneration, "blocked generation");
+    assert.deepStrictEqual(await expectReviewError(blockedGeneration, "blocked generation"), mismatchReview);
     assert.deepStrictEqual(consoleProblems, [
       "error: Failed to load resource: the server responded with a status of 400 (Bad Request)",
       "error: Failed to load resource: the server responded with a status of 400 (Bad Request)",
@@ -28245,6 +28425,19 @@ async function main() {
     assert.strictEqual(recovered.output, unchangedBefore.output);
     assert.strictEqual(recovered.snapshot.pricing_basis.id, referenceId);
     assert.strictEqual(recovered.snapshot.pricing_basis.source, "company");
+    const recoveredProgression = await page.evaluate(async () => {
+      const result = await refreshLineItemsFromServer();
+      return {
+        ok: result.ok,
+        status: result.data?.status,
+        review: state.quoteCommercialReview,
+        snapshot: state.quoteCommercialSnapshot,
+      };
+    });
+    assert.strictEqual(recoveredProgression.ok, true, JSON.stringify(recoveredProgression));
+    assert.strictEqual(recoveredProgression.status, "normalized");
+    assert.strictEqual(recoveredProgression.review, null);
+    assert.strictEqual(recoveredProgression.snapshot.pricing_basis.digest, fresh.snapshot.pricing_basis.digest);
     assert.deepStrictEqual(consoleProblems, []);
     console.log(JSON.stringify({ status: "ok", sessionId: fresh.sessionId }));
   } finally {

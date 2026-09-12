@@ -16222,11 +16222,72 @@ def exact_pricing_reference_authority(
     return {**selection, "ok": True, "reason": "", "detail": detail}
 
 
+def pricing_reference_authority_review(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Return a durable review only for an established saved pricing basis."""
+    commercial_state = quote_commercial_state(payload)
+    existing_review = commercial_state.get("review")
+    if isinstance(existing_review, dict):
+        return normalized_quote_commercial_review(existing_review)
+    if not commercial_state.get("evidence_valid"):
+        return None
+
+    snapshot = commercial_state.get("snapshot") if isinstance(commercial_state.get("snapshot"), dict) else {}
+    basis = snapshot.get("pricing_basis") if isinstance(snapshot.get("pricing_basis"), dict) else {}
+    blocked_id = basis.get("id") if isinstance(basis.get("id"), str) else ""
+    blocked_source = basis.get("source") if isinstance(basis.get("source"), str) else ""
+    authority = exact_pricing_reference_authority(payload, auth_session=auth_session)
+    if not authority.get("ok"):
+        reason_code = clean_text(authority.get("reason")) or "pricing_reference_unavailable"
+    elif basis.get("id") != authority.get("id"):
+        reason_code = "pricing_reference_identity_mismatch"
+    elif basis.get("source") != authority.get("source"):
+        reason_code = "pricing_reference_source_mismatch"
+    else:
+        detail = authority.get("detail") if isinstance(authority.get("detail"), dict) else {}
+        current_digest = detail.get("digest_sha256") if isinstance(detail.get("digest_sha256"), str) else ""
+        current_currency = normalize_currency_label(detail.get("currency"))
+        if basis.get("digest") != current_digest or basis.get("currency") != current_currency:
+            reason_code = "pricing_reference_digest_mismatch"
+        else:
+            return None
+
+    if reason_code not in QUOTE_COMMERCIAL_REVIEW_REASONS:
+        return None
+    return normalized_quote_commercial_review({
+        "schema": QUOTE_COMMERCIAL_REVIEW_SCHEMA,
+        "version": QUOTE_COMMERCIAL_REVIEW_VERSION,
+        "status": QUOTE_COMMERCIAL_REVIEW_STATUS,
+        "reason_code": reason_code,
+        "blocked_identity": {"id": blocked_id, "source": blocked_source},
+    })
+
+
+def pricing_reference_authority_blocked_result(
+    payload: dict[str, Any],
+    errors: list[str],
+    auth_session: dict[str, Any] | None = None,
+    *,
+    job_id: str = "",
+) -> dict[str, Any]:
+    result: dict[str, Any] = {"status": "blocked", "errors": list(errors)}
+    if job_id:
+        result["job_id"] = job_id
+    review = pricing_reference_authority_review(payload, auth_session=auth_session)
+    if review:
+        result["quoteCommercialReview"] = review
+    return result
+
+
 def pricing_reference_authority_error(
     payload: dict[str, Any],
     auth_session: dict[str, Any] | None = None,
 ) -> str:
     commercial_state = quote_commercial_state(payload)
+    if pricing_reference_authority_review(payload, auth_session=auth_session):
+        return QUOTE_COMMERCIAL_REVIEW_MESSAGE
     if commercial_state.get("review_required"):
         return QUOTE_COMMERCIAL_REVIEW_MESSAGE
     authority = exact_pricing_reference_authority(payload, auth_session=auth_session)
@@ -21721,10 +21782,11 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
     if pricing_reference_error:
         if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
             log_database_pricing_reference_resolution_block(payload)
-        return {
-            "status": "blocked",
-            "errors": safe_error_messages([pricing_reference_error]),
-        }
+        return pricing_reference_authority_blocked_result(
+            payload,
+            safe_error_messages([pricing_reference_error]),
+            auth_session=auth_session,
+        )
     protected_mode = protected_ai_draft_mode_enabled(auth_session)
     provider = "openai"
     provider_label = "OpenAI"
@@ -25197,10 +25259,23 @@ def create_job(
         return {"status": "blocked", "errors": ["Job type must be draft, basis_chat, generate, or generate_pdf."]}
     generation_run_id = ""
     validated_session_id = ""
-    def blocked(errors: list[str], category: str) -> dict[str, Any]:
+    def blocked(
+        errors: list[str],
+        category: str,
+        *,
+        pricing_reference_rejected: bool = False,
+    ) -> dict[str, Any]:
+        result = {"status": "blocked", "errors": errors}
+        if pricing_reference_rejected:
+            result = pricing_reference_authority_blocked_result(
+                payload,
+                errors,
+                auth_session=auth_session,
+                job_id=job_id,
+            )
         return finish_generation_forensics(
             generation_run_id,
-            {"status": "blocked", "errors": errors},
+            result,
             auth_session,
             error_category=category,
             validated_session_id=validated_session_id,
@@ -25294,7 +25369,11 @@ def create_job(
     if pricing_reference_error:
         if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
             log_database_pricing_reference_resolution_block(payload)
-        return blocked([pricing_reference_error], "pricing_reference_invalid")
+        return blocked(
+            [pricing_reference_error],
+            "pricing_reference_invalid",
+            pricing_reference_rejected=True,
+        )
     if normalized_type in {"generate", "generate_pdf"}:
         payload = generation_payload_with_profile_defaults(payload, auth_session=auth_session)
     missing_details = quote_detail_missing_fields(payload)
@@ -25312,7 +25391,11 @@ def create_job(
     if pricing_reference_error:
         if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
             log_database_pricing_reference_resolution_block(payload)
-        return blocked([pricing_reference_error], "pricing_reference_invalid")
+        return blocked(
+            [pricing_reference_error],
+            "pricing_reference_invalid",
+            pricing_reference_rejected=True,
+        )
     profile_error = profile_selection_error(payload, auth_session=auth_session) if normalized_type in {"generate", "generate_pdf"} else ""
     if profile_error:
         log_database_profile_resolution_block(payload)
@@ -25320,7 +25403,11 @@ def create_job(
     resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=auth_session)
     if resolved_payload is None:
         log_database_pricing_reference_resolution_block(payload)
-        return blocked([PRICING_REFERENCE_SELECTION_ERROR_MESSAGE], "pricing_reference_unavailable")
+        return blocked(
+            [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE],
+            "pricing_reference_unavailable",
+            pricing_reference_rejected=True,
+        )
     payload = resolved_payload
 
     if generation_run_id:
@@ -25492,10 +25579,23 @@ def _run_quote_job(
                 clean_text(result.get("status")) or "failed", exc.reason, "storage_posture"
             ),
         )
-    def blocked(errors: list[str], category: str) -> dict[str, Any]:
+    def blocked(
+        errors: list[str],
+        category: str,
+        *,
+        pricing_reference_rejected: bool = False,
+    ) -> dict[str, Any]:
+        result = {"job_id": job_id, "status": "blocked", "errors": errors}
+        if pricing_reference_rejected:
+            result = pricing_reference_authority_blocked_result(
+                payload,
+                errors,
+                auth_session=auth_session,
+                job_id=job_id,
+            )
         return finish_generation_forensics(
             generation_run_id,
-            {"job_id": job_id, "status": "blocked", "errors": errors},
+            result,
             auth_session,
             canonical_manifest=terminal_manifest("blocked", category),
             error_category=category,
@@ -25526,11 +25626,21 @@ def _run_quote_job(
             log_database_pricing_reference_resolution_block(payload)
         if PROFILE_SELECTION_ERROR_MESSAGE in errors:
             log_database_profile_resolution_block(payload)
-        return blocked(errors, "generation_validation_failed")
+        return blocked(
+            errors,
+            "generation_validation_failed",
+            pricing_reference_rejected=bool(
+                pricing_reference_authority_review(payload, auth_session=auth_session)
+            ),
+        )
     resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=auth_session)
     if resolved_payload is None:
         log_database_pricing_reference_resolution_block(payload)
-        return blocked([PRICING_REFERENCE_SELECTION_ERROR_MESSAGE], "pricing_reference_unavailable")
+        return blocked(
+            [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE],
+            "pricing_reference_unavailable",
+            pricing_reference_rejected=True,
+        )
     payload = resolved_payload
 
     quote_session_storage: LocalSqagStorage | DatabaseSqagStorage | None = None
@@ -26637,12 +26747,26 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             if pricing_reference_error:
                 if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
                     log_database_pricing_reference_resolution_block(payload)
-                self.send_json({"status": "blocked", "errors": [pricing_reference_error]}, status=400)
+                self.send_json(
+                    pricing_reference_authority_blocked_result(
+                        payload,
+                        [pricing_reference_error],
+                        auth_session=self.current_auth_session(),
+                    ),
+                    status=400,
+                )
                 return
             resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=self.current_auth_session())
             if resolved_payload is None:
                 log_database_pricing_reference_resolution_block(payload)
-                self.send_json({"status": "blocked", "errors": [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE]}, status=400)
+                self.send_json(
+                    pricing_reference_authority_blocked_result(
+                        payload,
+                        [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE],
+                        auth_session=self.current_auth_session(),
+                    ),
+                    status=400,
+                )
                 return
             payload = resolved_payload
             self.send_json({
@@ -26711,7 +26835,14 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                         log_database_pricing_reference_resolution_block(payload)
                     errors = safe_error_messages([pricing_reference_error])
                     write_local_log("draft_blocked", {"errors": errors})
-                    self.send_json({"status": "blocked", "errors": errors}, status=400)
+                    self.send_json(
+                        pricing_reference_authority_blocked_result(
+                            payload,
+                            errors,
+                            auth_session=self.current_auth_session(),
+                        ),
+                        status=400,
+                    )
                     return
                 missing_details = quote_detail_missing_fields(payload)
                 if missing_details:
@@ -26725,14 +26856,28 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                         log_database_pricing_reference_resolution_block(payload)
                     errors = safe_error_messages([pricing_reference_error])
                     write_local_log("draft_blocked", {"errors": errors})
-                    self.send_json({"status": "blocked", "errors": errors}, status=400)
+                    self.send_json(
+                        pricing_reference_authority_blocked_result(
+                            payload,
+                            errors,
+                            auth_session=self.current_auth_session(),
+                        ),
+                        status=400,
+                    )
                     return
                 resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=self.current_auth_session())
                 if resolved_payload is None:
                     log_database_pricing_reference_resolution_block(payload)
                     errors = safe_error_messages([PRICING_REFERENCE_SELECTION_ERROR_MESSAGE])
                     write_local_log("draft_blocked", {"errors": errors})
-                    self.send_json({"status": "blocked", "errors": errors}, status=400)
+                    self.send_json(
+                        pricing_reference_authority_blocked_result(
+                            payload,
+                            errors,
+                            auth_session=self.current_auth_session(),
+                        ),
+                        status=400,
+                    )
                     return
                 payload = resolved_payload
                 try:
