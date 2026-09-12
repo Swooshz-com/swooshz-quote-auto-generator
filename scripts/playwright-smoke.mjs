@@ -1592,9 +1592,37 @@ async function verifyServerPricingReferenceReviewDurability(page) {
 
     await page.locator('[data-side-panel="customer"]:not([disabled])').click();
     await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
-    const referenceValue = "local::synthetic-exhibition-fixture-pricing";
-    await page.locator("#profileSelect").selectOption(referenceValue);
-    await page.locator("#profileSelect").evaluate((select) => select.dispatchEvent(new Event("change", { bubbles: true })));
+    await page.locator("#profileSelect").click();
+    const afterPointerOpen = await page.evaluate(() => ({
+      review: state.quoteCommercialReview,
+      intent: state.pricingReferenceSelectionIntent,
+      selectedValue: elements.profileSelect.value,
+    }));
+    if (
+      JSON.stringify(stableJson(afterPointerOpen.review)) !== JSON.stringify(stableJson(review))
+      || afterPointerOpen.intent !== null
+      || afterPointerOpen.selectedValue !== "local::synthetic-exhibition-fixture-pricing"
+    ) {
+      throw new Error(`Opening the one-reference selector changed recovery state: ${JSON.stringify(afterPointerOpen)}.`);
+    }
+    await page.locator("#profileSelect").press("Escape");
+    await page.locator("#profileSelect").focus();
+    await page.locator("#profileSelect").press("Enter");
+    const afterKeyboardReselection = await page.evaluate(() => ({
+      review: state.quoteCommercialReview,
+      intent: state.pricingReferenceSelectionIntent,
+      selectedValue: elements.profileSelect.value,
+    }));
+    if (
+      JSON.stringify(stableJson(afterKeyboardReselection.review)) !== JSON.stringify(stableJson(review))
+      || JSON.stringify(stableJson(afterKeyboardReselection.intent)) !== JSON.stringify(stableJson({
+        id: "synthetic-exhibition-fixture-pricing",
+        source: "local",
+      }))
+      || afterKeyboardReselection.selectedValue !== "local::synthetic-exhibition-fixture-pricing"
+    ) {
+      throw new Error(`Ordinary keyboard reselection did not establish explicit intent: ${JSON.stringify(afterKeyboardReselection)}.`);
+    }
     await page.locator("#sideNextButton", { hasText: "Next: Quote Company" }).click();
     await page.locator("#quoteCompanyPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
     const recovered = await page.evaluate(async () => {

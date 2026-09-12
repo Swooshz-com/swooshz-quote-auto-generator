@@ -24731,6 +24731,13 @@ assert.ok(!saveBody.includes("persistLastPricingReferenceSelection(savedReferenc
 
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
 
+        js = (ROOT / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
+        keydown_body = js.split("function handleProfileSelectionKeydown", 1)[1].split("function buildPayload", 1)[0]
+        self.assertIn('event?.key !== "Enter"', keydown_body)
+        self.assertIn("elements.profileSelect.options.length !== 1", keydown_body)
+        self.assertIn("handleProfileSelectionChange();", keydown_body)
+        self.assertIn('elements.profileSelect.addEventListener("keydown", handleProfileSelectionKeydown);', js)
+
     def test_static_analysis_completion_restores_quote_commercial_snapshot_before_save(self):
         js = (ROOT / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
         self.assertIn("function quoteCommercialOverrideSnapshot", js)
@@ -28406,8 +28413,26 @@ async function main() {
 
     await page.locator('[data-side-panel="customer"]:not([disabled])').click();
     await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
-    await page.locator("#profileSelect").selectOption(referenceValue);
-    await page.locator("#profileSelect").evaluate((select) => select.dispatchEvent(new Event("change", { bubbles: true })));
+    await page.locator("#profileSelect").click();
+    const afterPointerOpen = await page.evaluate(() => ({
+      review: state.quoteCommercialReview,
+      intent: state.pricingReferenceSelectionIntent,
+      selectedValue: elements.profileSelect.value,
+    }));
+    assert.deepStrictEqual(afterPointerOpen.review, mismatchReview);
+    assert.strictEqual(afterPointerOpen.intent, null);
+    assert.strictEqual(afterPointerOpen.selectedValue, referenceValue);
+    await page.locator("#profileSelect").press("Escape");
+    await page.locator("#profileSelect").focus();
+    await page.locator("#profileSelect").press("Enter");
+    const afterKeyboardReselection = await page.evaluate(() => ({
+      review: state.quoteCommercialReview,
+      intent: state.pricingReferenceSelectionIntent,
+      selectedValue: elements.profileSelect.value,
+    }));
+    assert.deepStrictEqual(afterKeyboardReselection.review, mismatchReview);
+    assert.deepStrictEqual(afterKeyboardReselection.intent, { id: referenceId, source: "company" });
+    assert.strictEqual(afterKeyboardReselection.selectedValue, referenceValue);
     await page.locator("#sideNextButton", { hasText: "Next: Quote Company" }).click();
     await page.locator("#quoteCompanyPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
     const recovered = await page.evaluate(() => ({

@@ -7988,6 +7988,16 @@ function handleProfileSelectionChange() {
   updateSidePanelNav();
 }
 
+function handleProfileSelectionKeydown(event) {
+  if (
+    event?.key !== "Enter"
+    || event.defaultPrevented
+    || !elements.profileSelect
+    || elements.profileSelect.options.length !== 1
+  ) return;
+  handleProfileSelectionChange();
+}
+
 function buildPayload(options = {}) {
   syncRichTextSources();
   const generator = currentGenerator();
@@ -14686,6 +14696,7 @@ function wireEvents() {
   });
   elements.settingsButton?.addEventListener("click", openSettingsModal);
   elements.profileSelect.addEventListener("change", handleProfileSelectionChange);
+  elements.profileSelect.addEventListener("keydown", handleProfileSelectionKeydown);
   elements.newPricingReferenceButton?.addEventListener("click", openPricingReferenceModal);
   elements.pricingReferenceManageTab?.addEventListener("click", () => setPricingReferenceSettingsMode(PRICING_REFERENCE_SETTINGS_MODE_MANAGE, { focus: true }));
   elements.pricingReferenceImportTab?.addEventListener("click", handlePricingReferenceImportTabClick);
