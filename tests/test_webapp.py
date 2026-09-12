@@ -2004,6 +2004,377 @@ class WebappServerTest(unittest.TestCase):
         self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.validate_generation_payload(review_payload))
         self.assertIsNone(webapp.quote_session_commercials(review_payload, {"commercials": {}})["grand_total"])
 
+    def test_quote_commercial_normalizers_reject_malformed_json_types_without_throwing(self):
+        valid_review = {
+            "schema": webapp.QUOTE_COMMERCIAL_REVIEW_SCHEMA,
+            "version": webapp.QUOTE_COMMERCIAL_REVIEW_VERSION,
+            "status": webapp.QUOTE_COMMERCIAL_REVIEW_STATUS,
+            "reason_code": "invalid_snapshot",
+            "blocked_identity": {"id": "", "source": ""},
+        }
+        for raw_reason in ({"reason": "invalid_snapshot"}, [], None, 0, 1, False, True, "unsupported"):
+            candidate = copy.deepcopy(valid_review)
+            candidate["reason_code"] = raw_reason
+            with self.subTest(kind="reason_code", value=repr(raw_reason)):
+                self.assertIsNone(webapp.normalized_quote_commercial_review(candidate))
+
+        for blocked_identity in (
+            {"id": "saved-reference", "source": ""},
+            {"id": "", "source": "local"},
+            {"id": [], "source": "local"},
+            {"id": "saved-reference", "source": []},
+            {"id": "saved-reference", "source": "unsupported"},
+            {"id": "bad id", "source": "local"},
+            {"id": "saved-reference"},
+            {"id": "saved-reference", "source": "local", "extra": True},
+        ):
+            candidate = copy.deepcopy(valid_review)
+            candidate["blocked_identity"] = blocked_identity
+            with self.subTest(kind="blocked_identity", value=repr(blocked_identity)):
+                self.assertIsNone(webapp.normalized_quote_commercial_review(candidate))
+
+        valid_snapshot = {
+            "schema": webapp.QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+            "version": webapp.QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+            "owner": "quote",
+            "lifecycle": "NEW_UNINITIALISED",
+            "origin": "new_quote",
+            "presence": {
+                key: "intentional_empty"
+                for key in webapp.QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS
+            },
+            "pricing_basis": {
+                "currency": "SGD",
+                "source": "local",
+                "id": "saved-reference",
+                "digest": "sha256:" + "a" * 64,
+            },
+        }
+        malformed_presence_values = ({"bad": True}, [], None, 0, 1.5, False, True, "unsupported")
+        for key in webapp.QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS:
+            for raw_presence in malformed_presence_values:
+                candidate = copy.deepcopy(valid_snapshot)
+                candidate["presence"][key] = raw_presence
+                with self.subTest(kind="presence", key=key, value=repr(raw_presence)):
+                    self.assertIsNone(webapp.normalized_quote_commercial_snapshot(candidate))
+
+        for container in (None, [], "snapshot", 0, False, {"schema": "wrong"}):
+            with self.subTest(kind="snapshot_container", value=repr(container)):
+                self.assertIsNone(webapp.normalized_quote_commercial_snapshot(container))
+
+        for field in ("currency", "source", "id", "digest"):
+            for raw_value in ({"bad": True}, [], None, 0, False, True):
+                candidate = copy.deepcopy(valid_snapshot)
+                candidate["pricing_basis"][field] = raw_value
+                with self.subTest(kind="pricing_basis_type", field=field, value=repr(raw_value)):
+                    self.assertIsNone(webapp.normalized_quote_commercial_snapshot(candidate))
+
+        malformed_basis_cases = (
+            ("missing", {"currency": "SGD", "source": "local", "id": "saved-reference"}),
+            ("extra", {"currency": "SGD", "source": "local", "id": "saved-reference", "digest": "sha256:" + "a" * 64, "extra": "x"}),
+            ("source", {"currency": "SGD", "source": "company-db", "id": "saved-reference", "digest": "sha256:" + "a" * 64}),
+            ("id", {"currency": "SGD", "source": "local", "id": "bad id", "digest": "sha256:" + "a" * 64}),
+            ("currency", {"currency": "SG", "source": "local", "id": "saved-reference", "digest": "sha256:" + "a" * 64}),
+            ("digest", {"currency": "SGD", "source": "local", "id": "saved-reference", "digest": "not-a-digest"}),
+        )
+        for label, basis in malformed_basis_cases:
+            candidate = copy.deepcopy(valid_snapshot)
+            candidate["pricing_basis"] = basis
+            with self.subTest(kind="pricing_basis_structure", case=label):
+                self.assertIsNone(webapp.normalized_quote_commercial_snapshot(candidate))
+
+        for field in ("schema", "version", "status", "reason_code", "blocked_identity"):
+            candidate = copy.deepcopy(valid_review)
+            candidate.pop(field)
+            with self.subTest(kind="review_missing_key", field=field):
+                self.assertIsNone(webapp.normalized_quote_commercial_review(candidate))
+        extra_review = copy.deepcopy(valid_review)
+        extra_review["extra"] = True
+        self.assertIsNone(webapp.normalized_quote_commercial_review(extra_review))
+
+        for field in ("schema", "version", "owner", "lifecycle", "origin", "presence", "pricing_basis"):
+            candidate = copy.deepcopy(valid_snapshot)
+            candidate.pop(field)
+            with self.subTest(kind="snapshot_missing_key", field=field):
+                self.assertIsNone(webapp.normalized_quote_commercial_snapshot(candidate))
+        extra_snapshot = copy.deepcopy(valid_snapshot)
+        extra_snapshot["extra"] = True
+        self.assertIsNone(webapp.normalized_quote_commercial_snapshot(extra_snapshot))
+
+    def test_quote_commercial_state_preserves_snapshot_kinds_reason_precedence_and_saved_identity(self):
+        baseline = recovered_convergence_payload()
+        details = baseline["quote_session"]["draft_state"]["quoteDetails"]
+        saved_basis = details["commercial_snapshot"]["pricing_basis"]
+        expected_identity = {"id": saved_basis["id"], "source": saved_basis["source"]}
+
+        cases = {}
+        missing = copy.deepcopy(baseline)
+        missing["quote_session"]["draft_state"]["quoteDetails"].pop("commercial_snapshot")
+        cases["absent"] = (missing, "missing_snapshot", {"id": "", "source": ""})
+        for label, raw_snapshot in (
+            ("null", None),
+            ("empty_object", {}),
+            ("array", []),
+            ("scalar", "corrupt"),
+        ):
+            candidate = copy.deepcopy(baseline)
+            candidate["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"] = raw_snapshot
+            cases[label] = (candidate, "invalid_snapshot", {"id": "", "source": ""})
+
+        malformed_object = copy.deepcopy(baseline)
+        malformed_object["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["presence"]["currency"] = []
+        cases["malformed_object"] = (malformed_object, "invalid_snapshot", expected_identity)
+
+        for label, lifecycle in (("lifecycle_absent", None), ("lifecycle_invalid", "UNKNOWN"), ("lifecycle_mismatch", "EXISTING")):
+            candidate = copy.deepcopy(baseline)
+            if lifecycle is None:
+                candidate["quote_session"]["draft_state"].pop("quoteCommercialLifecycle")
+            else:
+                candidate["quote_session"]["draft_state"]["quoteCommercialLifecycle"] = lifecycle
+            cases[label] = (candidate, "lifecycle_mismatch", expected_identity)
+
+        malformed_review = copy.deepcopy(baseline)
+        malformed_review["quote_session"]["draft_state"]["quoteCommercialReview"] = {
+            "schema": webapp.QUOTE_COMMERCIAL_REVIEW_SCHEMA,
+            "version": webapp.QUOTE_COMMERCIAL_REVIEW_VERSION,
+            "status": webapp.QUOTE_COMMERCIAL_REVIEW_STATUS,
+            "reason_code": [],
+            "blocked_identity": {"id": "active-reference", "source": "local"},
+        }
+        cases["malformed_review"] = (malformed_review, "review_state_invalid", expected_identity)
+
+        for label, (candidate, expected_reason, identity) in cases.items():
+            with self.subTest(label=label):
+                state = webapp.quote_commercial_state(candidate)
+                self.assertTrue(state["review_required"])
+                self.assertEqual(state["review_reason"], expected_reason)
+                self.assertEqual(state["review"]["reason_code"], expected_reason)
+                self.assertEqual(state["review"]["blocked_identity"], identity)
+                self.assertEqual(webapp.pricing_reference_authority_review(candidate), state["review"])
+
+        valid = copy.deepcopy(baseline)
+        valid["quote_session"]["draft_state"]["quoteCommercialReview"] = None
+        valid_state = webapp.quote_commercial_state(valid)
+        self.assertFalse(valid_state["review_required"])
+        self.assertTrue(valid_state["evidence_valid"])
+        self.assertIsNone(valid_state["review"])
+
+        durable_review = {
+            "schema": webapp.QUOTE_COMMERCIAL_REVIEW_SCHEMA,
+            "version": webapp.QUOTE_COMMERCIAL_REVIEW_VERSION,
+            "status": webapp.QUOTE_COMMERCIAL_REVIEW_STATUS,
+            "reason_code": "pricing_reference_digest_mismatch",
+            "blocked_identity": expected_identity,
+        }
+        reviewed = copy.deepcopy(baseline)
+        reviewed["quote_session"]["draft_state"]["quoteCommercialReview"] = copy.deepcopy(durable_review)
+        reviewed["pricing_reference_id"] = "active-reference"
+        reviewed["pricing_reference"]["id"] = "active-reference"
+        reviewed_state = webapp.quote_commercial_state(reviewed)
+        self.assertTrue(reviewed_state["durable_review_valid"])
+        self.assertEqual(reviewed_state["review"], durable_review)
+        self.assertEqual(webapp.pricing_reference_authority_review(reviewed), durable_review)
+
+        saved_only = copy.deepcopy(baseline)
+        saved_only["pricing_reference_id"] = "active-reference"
+        saved_only["pricing_reference"]["id"] = "active-reference"
+        with mock.patch.object(
+            webapp,
+            "exact_pricing_reference_authority",
+            return_value={"ok": False, "reason": "pricing_reference_unavailable"},
+        ):
+            saved_review = webapp.pricing_reference_authority_review(saved_only)
+        self.assertEqual(saved_review["blocked_identity"], expected_identity)
+        self.assertNotEqual(saved_review["blocked_identity"]["id"], "active-reference")
+
+    def test_quote_commercial_review_preflight_blocks_all_authorised_http_surfaces_before_downstream_work(self):
+        payload = recovered_convergence_payload()
+        payload["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["presence"]["currency"] = []
+        expected_review = {
+            "schema": webapp.QUOTE_COMMERCIAL_REVIEW_SCHEMA,
+            "version": webapp.QUOTE_COMMERCIAL_REVIEW_VERSION,
+            "status": webapp.QUOTE_COMMERCIAL_REVIEW_STATUS,
+            "reason_code": "invalid_snapshot",
+            "blocked_identity": {
+                "id": payload["pricing_reference_id"],
+                "source": "local",
+            },
+        }
+        expected = {
+            "status": "blocked",
+            "errors": [webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE],
+            "quoteCommercialReview": expected_review,
+        }
+        jobs_before = copy.deepcopy(webapp.JOBS)
+        with LocalRunnerServer() as runner:
+            with (
+                mock.patch.object(webapp, "secrets") as secrets_module,
+                mock.patch.object(webapp, "image_entries", side_effect=AssertionError("image validation ran")),
+                mock.patch.object(webapp, "image_limit_error", side_effect=AssertionError("image limit ran")),
+                mock.patch.object(webapp, "ai_log_tracking_scope", side_effect=AssertionError("AI tracking ran")),
+                mock.patch.object(webapp, "begin_generation_forensics", side_effect=AssertionError("forensics ran")),
+                mock.patch.object(webapp, "run_job_worker", side_effect=AssertionError("worker ran")),
+                mock.patch.object(webapp, "normalize_line_items_for_quote_basis_review", side_effect=AssertionError("normalization ran")),
+                mock.patch.object(webapp, "draft_quote_basis", side_effect=AssertionError("AI draft ran")),
+                mock.patch.object(webapp, "append_runtime_telemetry", side_effect=AssertionError("telemetry ran")),
+                mock.patch.object(webapp, "quote_session_storage_for_auth_session", side_effect=AssertionError("session writer ran")),
+                mock.patch.object(webapp, "stage_local_quote_publication", side_effect=AssertionError("publication ran")),
+            ):
+                secrets_module.token_hex.side_effect = AssertionError("job identity ran")
+                for corruption in ([], {"bad": True}):
+                    corrupted_payload = copy.deepcopy(payload)
+                    corrupted_payload["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["presence"]["currency"] = corruption
+                    requests = [
+                        *[
+                            (f"/api/jobs:{label}", "/api/jobs", {"type": label, "payload": copy.deepcopy(corrupted_payload)})
+                            for label in ("draft", "basis_chat", "generate", "generate_pdf")
+                        ],
+                        ("draft", "/api/draft", copy.deepcopy(corrupted_payload)),
+                        ("normalize", "/api/line-items/normalize", copy.deepcopy(corrupted_payload)),
+                        ("generate", "/api/generate", copy.deepcopy(corrupted_payload)),
+                        ("quote_sessions", "/api/quote-sessions", copy.deepcopy(corrupted_payload)),
+                    ]
+                    for label, path, body in requests:
+                        with self.subTest(corruption=repr(corruption), route=label):
+                            response = self.http_json(runner, "POST", path, body=body)
+                            self.assertEqual(response["status"], 400)
+                            self.assertEqual(response["body"], expected)
+        self.assertEqual(webapp.JOBS, jobs_before)
+
+    def test_quote_session_prewrite_invariant_rejects_malformed_state_and_preserves_valid_review(self):
+        malformed = recovered_convergence_payload()
+        malformed["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["presence"]["currency"] = []
+        expected_review = webapp.quote_commercial_state(malformed)["review"]
+        with (
+            mock.patch.object(webapp, "new_quote_session_id", side_effect=AssertionError("session id allocated")),
+            mock.patch.object(webapp, "stage_local_quote_publication", side_effect=AssertionError("publication staged")),
+            mock.patch.object(webapp, "write_quote_session_metadata", side_effect=AssertionError("metadata written")),
+        ):
+            with self.assertRaises(webapp.QuoteCommercialStateError) as local_error:
+                webapp.create_or_update_quote_session(malformed)
+        self.assertEqual(local_error.exception.args, (webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE,))
+        self.assertEqual(local_error.exception.quote_commercial_review, expected_review)
+
+        database_storage = webapp.DatabaseSqagStorage(
+            "sqlite:///g3-prewrite-not-used.sqlite3",
+            "workspace-g3-prewrite",
+            role="admin",
+            user_id="g3-user",
+        )
+        with (
+            mock.patch.object(webapp, "new_quote_session_id", side_effect=AssertionError("database session id allocated")),
+            mock.patch.object(database_storage, "connection", side_effect=AssertionError("database opened")),
+        ):
+            with self.assertRaises(webapp.QuoteCommercialStateError) as database_error:
+                database_storage.create_or_update_quote_session(malformed)
+        self.assertEqual(database_error.exception.quote_commercial_review, expected_review)
+
+        durable_review = {
+            "schema": webapp.QUOTE_COMMERCIAL_REVIEW_SCHEMA,
+            "version": webapp.QUOTE_COMMERCIAL_REVIEW_VERSION,
+            "status": webapp.QUOTE_COMMERCIAL_REVIEW_STATUS,
+            "reason_code": "pricing_reference_digest_mismatch",
+            "blocked_identity": {
+                "id": malformed["pricing_reference_id"],
+                "source": "local",
+            },
+        }
+        reviewed = copy.deepcopy(recovered_convergence_payload())
+        reviewed["quote_session"]["draft_state"]["quoteCommercialReview"] = copy.deepcopy(durable_review)
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"QUOTE_DATA_ROOT": tmp}, clear=False):
+                saved = webapp.create_or_update_quote_session(reviewed)
+                restored = webapp.get_quote_session(
+                    reviewed["quote_session"]["session_id"],
+                    include_draft_state=True,
+                )
+        self.assertEqual(saved["session_id"], reviewed["quote_session"]["session_id"])
+        self.assertEqual(restored["draft_state"]["quoteCommercialReview"], durable_review)
+
+    def test_quote_session_reads_omit_malformed_generation_snapshot_commercial_evidence_for_local_and_database(self):
+        malformed_snapshot = copy.deepcopy(
+            recovered_convergence_payload()["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]
+        )
+        malformed_snapshot["presence"]["currency"] = []
+
+        def raw_metadata(session_id, owner_id=""):
+            metadata = webapp.blank_quote_session_metadata(session_id, "2026-09-12T10:00:00Z")
+            metadata["owner"] = {"user_id": owner_id}
+            metadata["generation_snapshot"] = {
+                "schema": "swooshz.sqag.quote-generation-snapshot.v1",
+                "created_at": "2026-09-12T10:00:00Z",
+                "profile": {},
+                "pricing_reference": {},
+                "workspace": {"scope": "workspace", "workspace_id": "workspace-safe"},
+                "storage": {"app_mode": "local", "storage_mode": "database", "artifact_storage_mode": "database"},
+                "commercial_snapshot": malformed_snapshot,
+                "digest_sha256": "a" * 64,
+            }
+            return metadata
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"QUOTE_DATA_ROOT": tmp}, clear=False):
+                session_id = "quote-safe-local"
+                path = webapp.quote_session_metadata_path(session_id)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(raw_metadata(session_id)), encoding="utf-8")
+                local_list = webapp.list_quote_sessions()
+                local_detail = webapp.get_quote_session(session_id, include_draft_state=True)
+        self.assertEqual(len(local_list), 1)
+        self.assertIn("generation_snapshot", local_list[0])
+        self.assertNotIn("commercial_snapshot", local_list[0]["generation_snapshot"])
+        self.assertNotIn("commercial_snapshot", local_detail["generation_snapshot"])
+
+        with tempfile.TemporaryDirectory() as db_tmp:
+            database_url = f"sqlite:///{(Path(db_tmp) / 'sqag-safe-read.sqlite3').as_posix()}"
+            database_session = self.platform_auth_session("workspace-safe-db", user_id="reader")
+            with mock.patch.dict(
+                os.environ,
+                {"SQAG_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url},
+                clear=False,
+            ):
+                webapp.apply_sqag_storage_migrations(database_url)
+                storage = webapp.app_storage_for_auth_session(database_session)
+                session_id = "quote-safe-database"
+                metadata = raw_metadata(session_id, owner_id="reader")
+                with storage.connection() as connection:
+                    connection.execute(
+                        "insert into sqag_quote_sessions (workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at) values (?, ?, ?, ?, ?, ?)",
+                        (
+                            storage.workspace_id,
+                            session_id,
+                            json.dumps(metadata, ensure_ascii=True, sort_keys=True),
+                            "[]",
+                            metadata["created_at"],
+                            metadata["updated_at"],
+                        ),
+                    )
+                    connection.commit()
+                database_list = storage.list_quote_sessions()
+                database_detail = storage.get_quote_session(session_id, include_draft_state=True)
+                reviewed = recovered_convergence_payload()
+                reviewed["quote_session"]["session_id"] = "quote-safe-durable-review"
+                durable_review = {
+                    "schema": webapp.QUOTE_COMMERCIAL_REVIEW_SCHEMA,
+                    "version": webapp.QUOTE_COMMERCIAL_REVIEW_VERSION,
+                    "status": webapp.QUOTE_COMMERCIAL_REVIEW_STATUS,
+                    "reason_code": "pricing_reference_digest_mismatch",
+                    "blocked_identity": {
+                        "id": reviewed["pricing_reference_id"],
+                        "source": "local",
+                    },
+                }
+                reviewed["quote_session"]["draft_state"]["quoteCommercialReview"] = durable_review
+                storage.create_or_update_quote_session(reviewed)
+                restored_review = storage.get_quote_session(
+                    "quote-safe-durable-review",
+                    include_draft_state=True,
+                )
+        self.assertEqual(len(database_list), 1)
+        self.assertNotIn("commercial_snapshot", database_list[0]["generation_snapshot"])
+        self.assertNotIn("commercial_snapshot", database_detail["generation_snapshot"])
+        self.assertEqual(restored_review["draft_state"]["quoteCommercialReview"], durable_review)
+
     def test_recovered_quote_rejects_changed_exact_pricing_identity(self):
         payload = valid_payload()
         details = {
@@ -28248,7 +28619,13 @@ async function main() {
       setWorkflowStage("completed");
       setSidePanel("output", { force: true });
       const saved = await saveQuoteSessionDraftState({ quoteGenerated: true });
-      if (!saved?.session_id) throw new Error("fresh quote session was not saved");
+      if (!saved?.session_id) throw new Error(`fresh quote session was not saved: ${JSON.stringify({
+        saved,
+        loadError: state.quoteSessionLoadError,
+        lifecycle: state.quoteCommercialLifecycle,
+        review: state.quoteCommercialReview,
+        snapshot: state.quoteCommercialSnapshot,
+      })}`);
       return {
         sessionId: state.quoteSessionId,
         lifecycle: state.quoteCommercialLifecycle,

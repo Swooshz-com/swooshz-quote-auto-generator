@@ -4046,13 +4046,14 @@ def quote_session_draft_state_from_payload(payload: dict[str, Any]) -> dict[str,
     return draft_state
 
 
-def quote_commercial_saved_details(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+def quote_commercial_saved_details(payload: dict[str, Any]) -> tuple[dict[str, Any], Any, dict[str, Any], bool]:
     draft_state = quote_session_draft_state_from_payload(payload)
     details = draft_state.get("quoteDetails") if isinstance(draft_state.get("quoteDetails"), dict) else None
     if details is None:
         details = draft_state.get("quote_details") if isinstance(draft_state.get("quote_details"), dict) else {}
-    snapshot = details.get("commercial_snapshot") if isinstance(details.get("commercial_snapshot"), dict) else {}
-    return details, snapshot, draft_state
+    snapshot_supplied = "commercial_snapshot" in details
+    snapshot = details.get("commercial_snapshot") if snapshot_supplied else None
+    return details, snapshot, draft_state, snapshot_supplied
 
 
 def quote_commercial_value_is_present(value: Any) -> bool:
@@ -4096,36 +4097,101 @@ def quote_commercial_snapshot_raw_values(details: dict[str, Any]) -> dict[str, A
     }
 
 
+def normalized_quote_commercial_pricing_basis(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict) or set(value) != {"currency", "source", "id", "digest"}:
+        return None
+    if any(not isinstance(value.get(key), str) for key in ("currency", "source", "id", "digest")):
+        return None
+    basis = {
+        "currency": value["currency"],
+        "source": value["source"],
+        "id": value["id"],
+        "digest": value["digest"],
+    }
+    if (
+        not re.fullmatch(r"[A-Z]{3}", basis["currency"])
+        or basis["source"] not in PRICING_REFERENCE_SOURCES
+        or not PROFILE_ID_RE.fullmatch(basis["id"])
+        or not PRICING_REFERENCE_DIGEST_RE.fullmatch(basis["digest"])
+    ):
+        return None
+    return basis
+
+
+def normalized_quote_commercial_blocked_identity(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict) or set(value) != {"id", "source"}:
+        return None
+    blocked_id = value.get("id")
+    blocked_source = value.get("source")
+    if not isinstance(blocked_id, str) or not isinstance(blocked_source, str):
+        return None
+    if not blocked_id and not blocked_source:
+        return {"id": "", "source": ""}
+    if (
+        not blocked_id
+        or not blocked_source
+        or not PROFILE_ID_RE.fullmatch(blocked_id)
+        or blocked_source not in PRICING_REFERENCE_SOURCES
+    ):
+        return None
+    return {"id": blocked_id, "source": blocked_source}
+
+
+def quote_commercial_blocked_identity_from_pricing_basis(value: Any) -> dict[str, str]:
+    basis = normalized_quote_commercial_pricing_basis(value)
+    if not basis:
+        return {"id": "", "source": ""}
+    return {"id": basis["id"], "source": basis["source"]}
+
+
+def build_quote_commercial_review(
+    reason_code: str,
+    *,
+    pricing_basis: Any = None,
+    blocked_identity: Any = None,
+) -> dict[str, Any]:
+    if not isinstance(reason_code, str) or reason_code not in QUOTE_COMMERCIAL_REVIEW_REASONS:
+        raise ValueError("Quote commercial review reason is not supported.")
+    if pricing_basis is not None:
+        identity = quote_commercial_blocked_identity_from_pricing_basis(pricing_basis)
+    else:
+        identity = normalized_quote_commercial_blocked_identity(blocked_identity) or {
+            "id": "",
+            "source": "",
+        }
+    return {
+        "schema": QUOTE_COMMERCIAL_REVIEW_SCHEMA,
+        "version": QUOTE_COMMERCIAL_REVIEW_VERSION,
+        "status": QUOTE_COMMERCIAL_REVIEW_STATUS,
+        "reason_code": reason_code,
+        "blocked_identity": identity,
+    }
+
+
 def normalized_quote_commercial_review(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     if set(value) != {"schema", "version", "status", "reason_code", "blocked_identity"}:
         return None
+    reason_code = value.get("reason_code")
     if (
         value.get("schema") != QUOTE_COMMERCIAL_REVIEW_SCHEMA
         or type(value.get("version")) is not int
         or value.get("version") != QUOTE_COMMERCIAL_REVIEW_VERSION
         or value.get("status") != QUOTE_COMMERCIAL_REVIEW_STATUS
-        or value.get("reason_code") not in QUOTE_COMMERCIAL_REVIEW_REASONS
+        or not isinstance(reason_code, str)
+        or reason_code not in QUOTE_COMMERCIAL_REVIEW_REASONS
     ):
         return None
-    blocked_identity = value.get("blocked_identity")
-    if not isinstance(blocked_identity, dict) or set(blocked_identity) != {"id", "source"}:
-        return None
-    blocked_id = blocked_identity.get("id")
-    blocked_source = blocked_identity.get("source")
-    if not isinstance(blocked_id, str) or not isinstance(blocked_source, str):
-        return None
-    if blocked_id and not PROFILE_ID_RE.fullmatch(blocked_id):
-        return None
-    if blocked_source and blocked_source not in PRICING_REFERENCE_SOURCES:
+    blocked_identity = normalized_quote_commercial_blocked_identity(value.get("blocked_identity"))
+    if blocked_identity is None:
         return None
     return {
         "schema": QUOTE_COMMERCIAL_REVIEW_SCHEMA,
         "version": QUOTE_COMMERCIAL_REVIEW_VERSION,
         "status": QUOTE_COMMERCIAL_REVIEW_STATUS,
-        "reason_code": value["reason_code"],
-        "blocked_identity": {"id": blocked_id, "source": blocked_source},
+        "reason_code": reason_code,
+        "blocked_identity": blocked_identity,
     }
 
 
@@ -4191,26 +4257,11 @@ def normalized_quote_commercial_snapshot(
     presence: dict[str, str] = {}
     for key in QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS:
         item = raw_presence.get(key)
-        if item not in QUOTE_COMMERCIAL_PRESENCE_VALUES:
+        if not isinstance(item, str) or item not in QUOTE_COMMERCIAL_PRESENCE_VALUES:
             return None
         presence[key] = item
-    raw_basis = value.get("pricing_basis")
-    if not isinstance(raw_basis, dict) or set(raw_basis) != {"currency", "source", "id", "digest"}:
-        return None
-    if any(not isinstance(raw_basis.get(key), str) for key in ("currency", "source", "id", "digest")):
-        return None
-    basis = {
-        "currency": raw_basis["currency"],
-        "source": raw_basis["source"],
-        "id": raw_basis["id"],
-        "digest": raw_basis["digest"],
-    }
-    if (
-        not re.fullmatch(r"[A-Z]{3}", basis["currency"])
-        or basis["source"] not in PRICING_REFERENCE_SOURCES
-        or not PROFILE_ID_RE.fullmatch(basis["id"])
-        or not PRICING_REFERENCE_DIGEST_RE.fullmatch(basis["digest"])
-    ):
+    basis = normalized_quote_commercial_pricing_basis(value.get("pricing_basis"))
+    if basis is None:
         return None
     if details is not None:
         raw_values = quote_commercial_snapshot_raw_values(details)
@@ -4230,7 +4281,7 @@ def normalized_quote_commercial_snapshot(
 
 
 def quote_commercial_state(payload: dict[str, Any]) -> dict[str, Any]:
-    details, raw_snapshot, draft_state = quote_commercial_saved_details(payload)
+    details, raw_snapshot, draft_state, snapshot_supplied = quote_commercial_saved_details(payload)
     raw_lifecycle = (
         draft_state.get("quoteCommercialLifecycle")
         if "quoteCommercialLifecycle" in draft_state
@@ -4240,7 +4291,10 @@ def quote_commercial_state(payload: dict[str, Any]) -> dict[str, Any]:
     )
     lifecycle = raw_lifecycle if isinstance(raw_lifecycle, str) else ""
     review, review_supplied = quote_commercial_review_from_payload(payload)
-    snapshot = normalized_quote_commercial_snapshot(raw_snapshot, details=details if raw_snapshot else None)
+    snapshot = normalized_quote_commercial_snapshot(
+        raw_snapshot,
+        details=details if isinstance(raw_snapshot, dict) else None,
+    )
     has_saved_state = bool(
         details
         or draft_state.get("outputRows")
@@ -4249,13 +4303,45 @@ def quote_commercial_state(payload: dict[str, Any]) -> dict[str, Any]:
         or "quoteCommercialLifecycle" in draft_state
         or "quote_commercial_lifecycle" in draft_state
         or review_supplied
+        or snapshot_supplied
     )
-    lifecycle_valid = lifecycle in QUOTE_COMMERCIAL_LIFECYCLES
+    commercial_state_required = bool(
+        details
+        or "quoteDetails" in draft_state
+        or "quote_details" in draft_state
+        or "quoteCommercialLifecycle" in draft_state
+        or "quote_commercial_lifecycle" in draft_state
+        or review_supplied
+        or snapshot_supplied
+    )
+    has_saved_commercial_progress = bool(
+        draft_state.get("outputRows")
+        or draft_state.get("lineItems")
+        or draft_state.get("quoteBasis")
+        or draft_state.get("quoteBasisSections")
+        or draft_state.get("analysisFindings")
+        or draft_state.get("basisConfirmed")
+        or (
+            isinstance(draft_state.get("workflowStage"), str)
+            and draft_state.get("workflowStage") in {"pricing_review", "completed", "generating"}
+        )
+    )
+    persistence_state_required = bool(
+        snapshot_supplied
+        or review_supplied
+        or lifecycle in {"EXISTING", "RECOVERED"}
+        or (
+            ("quoteDetails" in draft_state or "quote_details" in draft_state)
+            and has_saved_commercial_progress
+        )
+    )
+    lifecycle_valid = isinstance(raw_lifecycle, str) and lifecycle in QUOTE_COMMERCIAL_LIFECYCLES
     snapshot_lifecycle_matches = bool(snapshot and lifecycle_valid and snapshot["lifecycle"] == lifecycle)
+    durable_review_valid = review_supplied and isinstance(review, dict)
     review_required = review_supplied
     if has_saved_state and not snapshot_lifecycle_matches:
         review_required = True
-    if snapshot and snapshot["lifecycle"] == "NEW_UNINITIALISED" and not lifecycle_valid:
+    if snapshot and not lifecycle_valid:
         review_required = True
     if snapshot_lifecycle_matches and not review_required:
         return {
@@ -4265,22 +4351,54 @@ def quote_commercial_state(payload: dict[str, Any]) -> dict[str, Any]:
             "review": review,
             "review_reason": "",
             "evidence_valid": True,
+            "snapshot_supplied": snapshot_supplied,
+            "review_supplied": review_supplied,
+            "durable_review_valid": durable_review_valid,
+            "commercial_state_required": commercial_state_required,
+            "persistence_state_required": persistence_state_required,
             "details": details,
             "snapshot": snapshot,
             "draft_state": draft_state,
         }
-    reason = "review_state_invalid" if review_supplied and review is None else (
-        "missing_snapshot" if not raw_snapshot else "invalid_snapshot"
-    )
-    if snapshot and lifecycle_valid and snapshot["lifecycle"] != lifecycle:
+    if durable_review_valid:
+        reason = review["reason_code"]
+        resolved_review = review
+    elif review_supplied:
+        reason = "review_state_invalid"
+        resolved_review = build_quote_commercial_review(
+            reason,
+            pricing_basis=raw_snapshot.get("pricing_basis") if isinstance(raw_snapshot, dict) else None,
+        )
+    elif not snapshot_supplied:
+        reason = "missing_snapshot"
+        resolved_review = build_quote_commercial_review(
+            reason,
+            pricing_basis=raw_snapshot.get("pricing_basis") if isinstance(raw_snapshot, dict) else None,
+        )
+    elif snapshot is None:
+        reason = "invalid_snapshot"
+        resolved_review = build_quote_commercial_review(
+            reason,
+            pricing_basis=raw_snapshot.get("pricing_basis") if isinstance(raw_snapshot, dict) else None,
+        )
+    else:
         reason = "lifecycle_mismatch"
+        resolved_review = build_quote_commercial_review(
+            reason,
+            pricing_basis=raw_snapshot.get("pricing_basis") if isinstance(raw_snapshot, dict) else None,
+        )
     return {
         "owned": has_saved_state and lifecycle in {"EXISTING", "RECOVERED"},
         "legacy": has_saved_state,
         "review_required": review_required,
-        "review": review,
-        "review_reason": review.get("reason_code") if review else reason,
+        "review": resolved_review if review_required else None,
+        "review_reason": reason if review_required else "",
         "evidence_valid": False,
+        "snapshot_supplied": snapshot_supplied,
+        "review_supplied": review_supplied,
+        "durable_review_valid": durable_review_valid,
+        "commercial_state_required": commercial_state_required,
+        "persistence_state_required": persistence_state_required,
         "details": details,
         "snapshot": None,
         "draft_state": draft_state,
@@ -4488,7 +4606,11 @@ def quote_commercial_state_errors(
         "company_title",
         "company_date_label",
     }
-    if any(presence.get(key) not in QUOTE_COMMERCIAL_PRESENCE_VALUES for key in required_presence):
+    if any(
+        not isinstance(presence.get(key), str)
+        or presence.get(key) not in QUOTE_COMMERCIAL_PRESENCE_VALUES
+        for key in required_presence
+    ):
         errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
     details = commercial_state.get("details") if isinstance(commercial_state.get("details"), dict) else {}
     currency = clean_text(details.get("currency")).upper()
@@ -4505,17 +4627,12 @@ def quote_commercial_state_errors(
     if tax_label not in {"GST", "VAT"} or tax_rate is None or not 0 <= tax_rate <= 1:
         errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
     basis = snapshot.get("pricing_basis") if isinstance(snapshot.get("pricing_basis"), dict) else {}
-    basis_currency = basis.get("currency") if isinstance(basis.get("currency"), str) else ""
-    basis_source = basis.get("source") if isinstance(basis.get("source"), str) else ""
-    basis_id = basis.get("id") if isinstance(basis.get("id"), str) else ""
-    basis_digest = basis.get("digest") if isinstance(basis.get("digest"), str) else ""
-    if (
-        not re.fullmatch(r"[A-Z]{3}", basis_currency)
-        or basis_source not in PRICING_REFERENCE_SOURCES
-        or not PROFILE_ID_RE.fullmatch(basis_id)
-        or not PRICING_REFERENCE_DIGEST_RE.fullmatch(basis_digest)
-    ):
+    normalized_basis = normalized_quote_commercial_pricing_basis(basis)
+    if normalized_basis is None:
         errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+    basis_currency = normalized_basis["currency"] if normalized_basis else ""
+    basis_source = normalized_basis["source"] if normalized_basis else ""
+    basis_id = normalized_basis["id"] if normalized_basis else ""
     current_reference = payload.get("pricing_reference") if isinstance(payload.get("pricing_reference"), dict) else {}
     current_id = payload.get("pricing_reference_id") if "pricing_reference_id" in payload else current_reference.get("id")
     current_source = payload.get("pricing_reference_source") if "pricing_reference_source" in payload else current_reference.get("source")
@@ -15009,6 +15126,11 @@ class DatabaseSqagStorage:
             raise PostCommitQuoteSessionProjectionError(committed_metadata) from exc
 
     def create_or_update_quote_session(self, payload: dict[str, Any], result: dict[str, Any] | None = None, output_dir: Path | None = None, session_id: str | None = None, *, publish: bool = True, generation_run_id: str = "", generation_job_id: str = "") -> dict[str, Any]:
+        persistence_review = quote_commercial_persistence_preflight(payload)
+        if persistence_review:
+            error = QuoteCommercialStateError(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+            error.quote_commercial_review = persistence_review
+            raise error
         patch = copy.deepcopy(quote_session_patch_payload(payload))
         resolved_session_id = safe_quote_session_id(session_id or patch.get("session_id") or payload.get("session_id"), "") or new_quote_session_id()
         existing, _draft_files = self._read_quote_session_metadata_for_workspace(resolved_session_id)
@@ -16229,15 +16351,15 @@ def pricing_reference_authority_review(
     """Return a durable review only for an established saved pricing basis."""
     commercial_state = quote_commercial_state(payload)
     existing_review = commercial_state.get("review")
-    if isinstance(existing_review, dict):
-        return normalized_quote_commercial_review(existing_review)
+    if commercial_state.get("review_required"):
+        if commercial_state.get("durable_review_valid") and isinstance(existing_review, dict):
+            return normalized_quote_commercial_review(existing_review)
+        return existing_review if isinstance(existing_review, dict) else None
     if not commercial_state.get("evidence_valid"):
         return None
 
     snapshot = commercial_state.get("snapshot") if isinstance(commercial_state.get("snapshot"), dict) else {}
     basis = snapshot.get("pricing_basis") if isinstance(snapshot.get("pricing_basis"), dict) else {}
-    blocked_id = basis.get("id") if isinstance(basis.get("id"), str) else ""
-    blocked_source = basis.get("source") if isinstance(basis.get("source"), str) else ""
     authority = exact_pricing_reference_authority(payload, auth_session=auth_session)
     if not authority.get("ok"):
         reason_code = clean_text(authority.get("reason")) or "pricing_reference_unavailable"
@@ -16256,13 +16378,10 @@ def pricing_reference_authority_review(
 
     if reason_code not in QUOTE_COMMERCIAL_REVIEW_REASONS:
         return None
-    return normalized_quote_commercial_review({
-        "schema": QUOTE_COMMERCIAL_REVIEW_SCHEMA,
-        "version": QUOTE_COMMERCIAL_REVIEW_VERSION,
-        "status": QUOTE_COMMERCIAL_REVIEW_STATUS,
-        "reason_code": reason_code,
-        "blocked_identity": {"id": blocked_id, "source": blocked_source},
-    })
+    return build_quote_commercial_review(
+        reason_code,
+        pricing_basis=basis,
+    )
 
 
 def pricing_reference_authority_blocked_result(
@@ -16279,6 +16398,43 @@ def pricing_reference_authority_blocked_result(
     if review:
         result["quoteCommercialReview"] = review
     return result
+
+
+def quote_commercial_review_preflight(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+    *,
+    job_id: str = "",
+) -> dict[str, Any] | None:
+    review = pricing_reference_authority_review(payload, auth_session=auth_session)
+    if not review:
+        return None
+    result: dict[str, Any] = {
+        "status": "blocked",
+        "errors": [QUOTE_COMMERCIAL_REVIEW_MESSAGE],
+        "quoteCommercialReview": copy.deepcopy(review),
+    }
+    if job_id:
+        result["job_id"] = job_id
+    return result
+
+
+def quote_commercial_persistence_preflight(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    commercial_state = quote_commercial_state(payload)
+    if not commercial_state.get("persistence_state_required") or commercial_state.get("durable_review_valid"):
+        return None
+    if commercial_state.get("review_required"):
+        review = commercial_state.get("review")
+        return copy.deepcopy(review) if isinstance(review, dict) else None
+    if auth_session is None:
+        return None
+    review = pricing_reference_authority_review(payload, auth_session=auth_session)
+    if review:
+        return copy.deepcopy(review)
+    return None
 
 
 def pricing_reference_authority_error(
@@ -23377,6 +23533,11 @@ def create_or_update_quote_session(
     *,
     storage: LocalSqagStorage | None = None,
 ) -> dict[str, Any]:
+    persistence_review = quote_commercial_persistence_preflight(payload)
+    if persistence_review:
+        error = QuoteCommercialStateError(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+        error.quote_commercial_review = persistence_review
+        raise error
     patch = quote_session_patch_payload(payload)
     resolved_session_id = safe_quote_session_id(
         session_id
@@ -25252,11 +25413,17 @@ def create_job(
     auth_session: dict[str, Any] | None = None,
     requested_job_id: str | None = None,
 ) -> dict[str, Any]:
-    normalized_type = clean_text(job_type).lower()
+    normalized_type = job_type.strip().lower() if isinstance(job_type, str) else ""
     payload = dict(payload)
     payload.pop("_generation_run_id", None)
     if normalized_type not in {"draft", "generate", "generate_pdf", "basis_chat"}:
         return {"status": "blocked", "errors": ["Job type must be draft, basis_chat, generate, or generate_pdf."]}
+    commercial_review_block = quote_commercial_review_preflight(
+        payload,
+        auth_session=auth_session,
+    )
+    if commercial_review_block:
+        return commercial_review_block
     generation_run_id = ""
     validated_session_id = ""
     def blocked(
@@ -26084,6 +26251,12 @@ def run_quote_job(
     pdf_mode: str = "none",
     auth_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    commercial_review_block = quote_commercial_review_preflight(
+        payload,
+        auth_session=auth_session,
+    )
+    if commercial_review_block:
+        return commercial_review_block
     resolved_job_id = safe_resource_id(job_id, f"job-{secrets.token_hex(6)}")
     resolved_output_root = output_root or configured_output_root()
     resolved_tmp_root = tmp_root or configured_tmp_root()
@@ -26719,7 +26892,8 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/jobs":
             job_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
-            job_type = clean_text(payload.get("type") or payload.get("job_type"))
+            raw_job_type = payload.get("type") if "type" in payload else payload.get("job_type")
+            job_type = raw_job_type if isinstance(raw_job_type, str) else ""
             allowed, error = self.require_permission("canGenerateQuote")
             if not allowed:
                 self.send_json(error, status=403)
@@ -26739,6 +26913,13 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             allowed, error = self.require_permission("canGenerateQuote")
             if not allowed:
                 self.send_json(error, status=403)
+                return
+            commercial_review_block = quote_commercial_review_preflight(
+                payload,
+                auth_session=auth_session,
+            )
+            if commercial_review_block:
+                self.send_json(commercial_review_block, status=400)
                 return
             pricing_reference_error = pricing_reference_authority_error(
                 payload,
@@ -26783,6 +26964,20 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             if not allowed:
                 self.send_json(error, status=403)
                 return
+            persistence_review = quote_commercial_persistence_preflight(
+                payload,
+                auth_session=auth_session,
+            )
+            if persistence_review:
+                self.send_json(
+                    {
+                        "status": "blocked",
+                        "errors": [QUOTE_COMMERCIAL_REVIEW_MESSAGE],
+                        "quoteCommercialReview": persistence_review,
+                    },
+                    status=400,
+                )
+                return
             try:
                 storage = self.current_quote_session_storage()
                 if storage is None:
@@ -26810,6 +27005,13 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             allowed, error = self.require_permission("canGenerateQuote")
             if not allowed:
                 self.send_json(error, status=403)
+                return
+            commercial_review_block = quote_commercial_review_preflight(
+                payload,
+                auth_session=auth_session,
+            )
+            if commercial_review_block:
+                self.send_json(commercial_review_block, status=400)
                 return
             with ai_log_tracking_scope(
                 request_ai_tracking,
