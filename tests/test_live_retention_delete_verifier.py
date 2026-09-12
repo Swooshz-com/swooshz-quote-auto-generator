@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import importlib.util
 import io
 import json
@@ -829,24 +830,81 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
 
     def test_real_database_storage_fixture_completes_runtime_download_and_delete_lifecycle(self):
         verifier = load_verifier()
+        observations = {}
+        writer_payloads = []
+        storage_holder = {}
+
+        def storage_factory(database_url, workspace_id):
+            storage = verifier._build_default_storage(database_url, workspace_id)
+            storage_holder["storage"] = storage
+            original_writer = storage.create_or_update_quote_session
+
+            def observed_writer(payload, **kwargs):
+                writer_payloads.append(copy.deepcopy(payload))
+                result = original_writer(payload, **kwargs)
+                current, _draft_files = storage._read_quote_session_metadata_for_workspace(
+                    payload["session_id"]
+                )
+                observations["immediate"] = copy.deepcopy(current)
+                return result
+
+            storage.create_or_update_quote_session = observed_writer
+            return storage
+
+        original_publish = verifier._persist_synthetic_published_session
+
+        def observed_publish(storage, session_id, metadata):
+            original_publish(storage, session_id, metadata)
+            current, _draft_files = storage._read_quote_session_metadata_for_workspace(session_id)
+            observations["published"] = copy.deepcopy(current)
+
         with local_test_directory() as temp_dir:
             database_url = f"sqlite:///{(Path(temp_dir) / 'sqag.sqlite3').as_posix()}"
             env = complete_env()
             env[webapp.SQAG_DATABASE_URL_ENV_NAME] = database_url
             env[webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME] = database_url
             backend = webapp.InMemoryObjectStorageBackend()
-            with mock.patch.dict(os.environ, env, clear=True):
-                webapp.apply_sqag_storage_migrations(database_url)
-                report = verifier.run_verification(
-                    env=env,
-                    storage_factory=verifier._build_default_storage,
-                    backend_factory=lambda _env: backend,
-                    migration_inspector=lambda _database_url: trusted_migration_report(verifier),
-                    test_injected_backend=True,
-                )
+            with mock.patch.object(
+                verifier,
+                "_persist_synthetic_published_session",
+                side_effect=observed_publish,
+            ) as publication_helper:
+                with mock.patch.dict(os.environ, env, clear=True):
+                    webapp.apply_sqag_storage_migrations(database_url)
+                    report = verifier.run_verification(
+                        env=env,
+                        storage_factory=storage_factory,
+                        backend_factory=lambda _env: backend,
+                        migration_inspector=lambda _database_url: trusted_migration_report(verifier),
+                        test_injected_backend=True,
+                    )
 
         self.assertEqual(report["status"], "passed")
         self.assertEqual(report["runtime_download_failure_stage"], "")
+        expected_review = webapp.build_quote_commercial_review("missing_snapshot")
+        self.assertEqual(len(writer_payloads), 1)
+        self.assertEqual(
+            writer_payloads[0]["draft_state"],
+            {"quoteCommercialReview": expected_review},
+        )
+        publication_helper.assert_called_once()
+        self.assertEqual(
+            observations["immediate"]["draft_state"]["quoteCommercialReview"],
+            expected_review,
+        )
+        self.assertEqual(
+            observations["published"]["draft_state"]["quoteCommercialReview"],
+            expected_review,
+        )
+        commercial_state = webapp.quote_commercial_state(writer_payloads[0])
+        self.assertTrue(commercial_state["durable_review_valid"])
+        self.assertTrue(commercial_state["review_required"])
+        self.assertFalse(commercial_state["evidence_valid"])
+        self.assertEqual(commercial_state["review_reason"], "missing_snapshot")
+        self.assertEqual(
+            commercial_state["review"]["blocked_identity"],
+            {"id": "", "source": ""},
+        )
         for check in (
             "db_metadata_active_verified",
             "object_write_read_verified",
@@ -862,6 +920,158 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
             "cleanup_completed",
         ):
             self.assertTrue(report["checks"][check], check)
+        self.assertEqual(report["active_db_synthetic_rows_written"], 2)
+        self.assertEqual(report["active_object_synthetic_objects_written"], 1)
+        self.assertEqual(report["active_object_synthetic_objects_deleted"], 1)
+        self.assertIsNone(
+            storage_holder["storage"].get_quote_session(writer_payloads[0]["session_id"])
+        )
+        self.assertEqual(
+            verifier._object_artifact_rows_for_session(
+                storage_holder["storage"], writer_payloads[0]["session_id"]
+            ),
+            [],
+        )
+        self.assertEqual(backend._objects, {})
+
+    def test_successor_canonical_review_passes_normal_writer_and_publication_reload_without_pricing_lookup(self):
+        verifier = load_verifier()
+        first = verifier._synthetic_commercial_draft_state()
+        second = verifier._synthetic_commercial_draft_state()
+        expected_review = webapp.build_quote_commercial_review("missing_snapshot")
+        self.assertEqual(first, {"quoteCommercialReview": expected_review})
+        self.assertEqual(second, {"quoteCommercialReview": expected_review})
+        self.assertIsNot(first, second)
+        self.assertIsNot(first["quoteCommercialReview"], second["quoteCommercialReview"])
+        self.assertIsNot(
+            first["quoteCommercialReview"]["blocked_identity"],
+            second["quoteCommercialReview"]["blocked_identity"],
+        )
+        first["quoteCommercialReview"]["blocked_identity"]["id"] = "mutated"
+        self.assertEqual(second["quoteCommercialReview"], expected_review)
+
+        observations = {}
+        writer_payloads = []
+        with local_test_directory() as temp_dir:
+            database_url = f"sqlite:///{(Path(temp_dir) / 'sqag.sqlite3').as_posix()}"
+            env = complete_env()
+            env[webapp.SQAG_DATABASE_URL_ENV_NAME] = database_url
+            env[webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME] = database_url
+            storage = verifier._build_default_storage(database_url, "workspace-successor")
+            ids = {"session_a": "quote-successor-review"}
+            backend = webapp.InMemoryObjectStorageBackend()
+            payload = b"synthetic-successor-review"
+            with mock.patch.dict(os.environ, env, clear=True):
+                webapp.apply_sqag_storage_migrations(database_url)
+                metadata = backend.store_artifact(
+                    workspace_id=storage.workspace_id,
+                    owner_type="generated_quote",
+                    owner_id=ids["session_a"],
+                    artifact_kind="xlsx",
+                    filename=verifier.SYNTHETIC_FILENAME,
+                    content_type=verifier.SYNTHETIC_CONTENT_TYPE,
+                    content=payload,
+                )
+                original_writer = storage.create_or_update_quote_session
+
+                def observed_writer(writer_payload, **kwargs):
+                    writer_payloads.append(copy.deepcopy(writer_payload))
+                    result = original_writer(writer_payload, **kwargs)
+                    current, _draft_files = storage._read_quote_session_metadata_for_workspace(
+                        ids["session_a"]
+                    )
+                    observations["immediate"] = copy.deepcopy(current)
+                    return result
+
+                original_publish = verifier._persist_synthetic_published_session
+
+                def observed_publish(published_storage, session_id, published_metadata):
+                    original_publish(published_storage, session_id, published_metadata)
+                    current, _draft_files = published_storage._read_quote_session_metadata_for_workspace(
+                        session_id
+                    )
+                    observations["published"] = copy.deepcopy(current)
+
+                try:
+                    with mock.patch.object(
+                        storage,
+                        "create_or_update_quote_session",
+                        side_effect=observed_writer,
+                    ) as writer:
+                        with mock.patch.object(
+                            verifier,
+                            "_persist_synthetic_published_session",
+                            side_effect=observed_publish,
+                        ) as publication_helper:
+                            with (
+                                mock.patch.object(
+                                    webapp,
+                                    "pricing_catalog_runtime_lookup_for_payload",
+                                    side_effect=AssertionError(
+                                        "durable review must not consult the pricing catalog"
+                                    ),
+                                ) as pricing_lookup,
+                                mock.patch.object(
+                                    webapp,
+                                    "exact_pricing_reference_authority",
+                                    side_effect=AssertionError(
+                                        "durable review must not resolve pricing authority"
+                                    ),
+                                ) as authority_lookup,
+                            ):
+                                rows = verifier._write_synthetic_metadata(storage, ids, metadata)
+                                commercial_state = webapp.quote_commercial_state(writer_payloads[0])
+                                self.assertTrue(commercial_state["durable_review_valid"])
+                                self.assertTrue(commercial_state["review_required"])
+                                self.assertFalse(commercial_state["evidence_valid"])
+                                self.assertEqual(commercial_state["review_reason"], "missing_snapshot")
+                                with self.assertRaises(webapp.QuoteCommercialStateError):
+                                    webapp.payload_to_brief(writer_payloads[0])
+                                self.assertEqual(pricing_lookup.call_count, 0)
+                                self.assertEqual(authority_lookup.call_count, 0)
+                    self.assertEqual(rows, 2)
+                    writer.assert_called_once()
+                    publication_helper.assert_called_once()
+                finally:
+                    self.assertTrue(
+                        verifier._cleanup(
+                            storage=storage,
+                            maintenance_storage=storage,
+                            backend=backend,
+                            metadata=metadata,
+                            ids=ids,
+                            env=env,
+                        )
+                    )
+
+        self.assertEqual(len(writer_payloads), 1)
+        self.assertEqual(
+            writer_payloads[0]["draft_state"],
+            {"quoteCommercialReview": expected_review},
+        )
+        for stage in ("immediate", "published"):
+            self.assertEqual(
+                observations[stage]["draft_state"]["quoteCommercialReview"],
+                expected_review,
+            )
+        self.assertEqual(
+            observations["published"]["pricing_reference"],
+            {
+                "id": "",
+                "display_name": "Pricing Reference",
+                "source": "",
+            },
+        )
+        self.assertNotIn("pricing_reference_id", writer_payloads[0])
+        self.assertNotIn("pricing_reference_source", writer_payloads[0])
+        self.assertEqual(
+            observations["published"]["draft_state"],
+            {"quoteCommercialReview": expected_review},
+        )
+        self.assertEqual(
+            observations["published"]["draft_state"]["quoteCommercialReview"]["blocked_identity"],
+            {"id": "", "source": ""},
+        )
 
     def test_real_database_storage_unpublished_session_is_not_runtime_download_verified(self):
         verifier = load_verifier()
@@ -885,22 +1095,42 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
                     content_type=verifier.SYNTHETIC_CONTENT_TYPE,
                     content=payload,
                 )
-                storage.create_or_update_quote_session(
+                draft_state = verifier._synthetic_commercial_draft_state()
+                with mock.patch.object(verifier, "_persist_synthetic_published_session") as publication_helper:
+                    storage.create_or_update_quote_session(
+                        {
+                            "session_id": session_id,
+                            "draft_state": draft_state,
+                            "status": {"quote_generated": True, "xlsx_exported": True},
+                            "exports": {
+                                "xlsx": {
+                                    "filename": verifier.SYNTHETIC_FILENAME,
+                                    "created_at": metadata.created_at,
+                                    "size_bytes": metadata.size_bytes,
+                                    "sha256": metadata.checksum_sha256,
+                                    "stale": False,
+                                }
+                            },
+                        },
+                        session_id=session_id,
+                    )
+                publication_helper.assert_not_called()
+                reloaded, _draft_files = storage._read_quote_session_metadata_for_workspace(session_id)
+                expected_review = webapp.build_quote_commercial_review("missing_snapshot")
+                self.assertEqual(
+                    reloaded["draft_state"]["quoteCommercialReview"],
+                    expected_review,
+                )
+                self.assertFalse(webapp.quote_session_is_published(reloaded))
+                commercial_state = webapp.quote_commercial_state(
                     {
                         "session_id": session_id,
-                        "status": {"quote_generated": True, "xlsx_exported": True},
-                        "exports": {
-                            "xlsx": {
-                                "filename": verifier.SYNTHETIC_FILENAME,
-                                "created_at": metadata.created_at,
-                                "size_bytes": metadata.size_bytes,
-                                "sha256": metadata.checksum_sha256,
-                                "stale": False,
-                            }
-                        },
-                    },
-                    session_id=session_id,
+                        "draft_state": draft_state,
+                        "status": {"quote_generated": True},
+                    }
                 )
+                self.assertTrue(commercial_state["review_required"])
+                self.assertFalse(commercial_state["evidence_valid"])
                 storage._upsert_object_quote_artifact(
                     session_id,
                     "xlsx",
@@ -918,9 +1148,83 @@ class LiveRetentionDeleteVerifierTest(unittest.TestCase):
                     payload=payload,
                     diagnostics=diagnostics,
                 )
+                self.assertTrue(
+                    verifier._cleanup(
+                        storage=storage,
+                        maintenance_storage=storage,
+                        backend=backend,
+                        metadata=metadata,
+                        ids={"session_a": session_id},
+                        env=env,
+                    )
+                )
 
         self.assertFalse(verified)
         self.assertEqual(diagnostics["failure_stage"], "session_not_published")
+
+    def test_successor_progressed_metadata_without_review_fails_before_session_persistence(self):
+        verifier = load_verifier()
+        with local_test_directory() as temp_dir:
+            database_url = f"sqlite:///{(Path(temp_dir) / 'sqag.sqlite3').as_posix()}"
+            env = complete_env()
+            env[webapp.SQAG_DATABASE_URL_ENV_NAME] = database_url
+            env[webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME] = database_url
+            session_id = "quote-successor-no-review"
+            with mock.patch.dict(os.environ, env, clear=True):
+                webapp.apply_sqag_storage_migrations(database_url)
+                storage = verifier._build_default_storage(database_url, "workspace-no-review")
+                draft_state = verifier._synthetic_commercial_draft_state()
+                draft_state.pop("quoteCommercialReview")
+                payload = {
+                    "session_id": session_id,
+                    "draft_state": draft_state,
+                    "status": {"quote_generated": True, "xlsx_exported": True},
+                    "publication": {"state": "published"},
+                }
+                with mock.patch.object(storage, "connection", wraps=storage.connection) as connection:
+                    with self.assertRaises(webapp.QuoteCommercialStateError) as raised:
+                        storage.create_or_update_quote_session(payload, session_id=session_id)
+                self.assertEqual(connection.call_count, 0)
+                self.assertEqual(
+                    raised.exception.quote_commercial_review,
+                    webapp.build_quote_commercial_review("missing_snapshot"),
+                )
+                self.assertIsNone(storage.get_quote_session(session_id))
+                self.assertEqual(verifier._object_artifact_rows_for_session(storage, session_id), [])
+
+    def test_successor_progressed_metadata_with_malformed_review_fails_before_session_persistence(self):
+        verifier = load_verifier()
+        with local_test_directory() as temp_dir:
+            database_url = f"sqlite:///{(Path(temp_dir) / 'sqag.sqlite3').as_posix()}"
+            env = complete_env()
+            env[webapp.SQAG_DATABASE_URL_ENV_NAME] = database_url
+            env[webapp.SQAG_MAINTENANCE_DATABASE_URL_ENV_NAME] = database_url
+            session_id = "quote-successor-malformed-review"
+            with mock.patch.dict(os.environ, env, clear=True):
+                webapp.apply_sqag_storage_migrations(database_url)
+                storage = verifier._build_default_storage(database_url, "workspace-malformed-review")
+                draft_state = verifier._synthetic_commercial_draft_state()
+                draft_state["quoteCommercialReview"]["reason_code"] = []
+                payload = {
+                    "session_id": session_id,
+                    "draft_state": draft_state,
+                    "status": {"quote_generated": True, "xlsx_exported": True},
+                    "publication": {"state": "published"},
+                }
+                with mock.patch.object(storage, "connection", wraps=storage.connection) as connection:
+                    with self.assertRaises(webapp.QuoteCommercialStateError) as raised:
+                        storage.create_or_update_quote_session(payload, session_id=session_id)
+                self.assertEqual(connection.call_count, 0)
+                self.assertEqual(
+                    raised.exception.quote_commercial_review,
+                    webapp.build_quote_commercial_review("review_state_invalid"),
+                )
+                self.assertEqual(
+                    webapp.quote_commercial_state(payload)["review_reason"],
+                    "review_state_invalid",
+                )
+                self.assertIsNone(storage.get_quote_session(session_id))
+                self.assertEqual(verifier._object_artifact_rows_for_session(storage, session_id), [])
 
     def test_runtime_download_report_drops_unallowlisted_failure_detail(self):
         verifier = load_verifier()

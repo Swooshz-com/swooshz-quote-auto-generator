@@ -433,10 +433,19 @@ def _tombstone_verified(storage: object, session_id: str) -> bool:
     )
 
 
+def _synthetic_commercial_draft_state() -> dict[str, Any]:
+    return {
+        "quoteCommercialReview": webapp.build_quote_commercial_review(
+            "missing_snapshot"
+        )
+    }
+
+
 def _write_synthetic_metadata(storage: object, ids: Mapping[str, str], metadata: ObjectArtifactMetadata) -> int:
     storage.create_or_update_quote_session(
         {
             "session_id": ids["session_a"],
+            "draft_state": _synthetic_commercial_draft_state(),
             "customer_summary": {"name": "Synthetic Retention Delete Drill"},
             "status": {
                 "quote_generated": True,
