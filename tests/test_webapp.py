@@ -247,6 +247,16 @@ def valid_payload():
     }
 
 
+def durable_missing_snapshot_review():
+    return {
+        "schema": webapp.QUOTE_COMMERCIAL_REVIEW_SCHEMA,
+        "version": webapp.QUOTE_COMMERCIAL_REVIEW_VERSION,
+        "status": webapp.QUOTE_COMMERCIAL_REVIEW_STATUS,
+        "reason_code": "missing_snapshot",
+        "blocked_identity": {"id": "", "source": ""},
+    }
+
+
 def recovered_convergence_payload(
     *,
     effective_unit_price: float | None = 100,
@@ -2186,6 +2196,98 @@ class WebappServerTest(unittest.TestCase):
             saved_review = webapp.pricing_reference_authority_review(saved_only)
         self.assertEqual(saved_review["blocked_identity"], expected_identity)
         self.assertNotEqual(saved_review["blocked_identity"]["id"], "active-reference")
+
+    def test_quote_commercial_state_preserves_outer_container_provenance_and_reason_precedence(self):
+        baseline = recovered_convergence_payload()
+        saved_basis = baseline["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"]
+        saved_identity = {"id": saved_basis["id"], "source": saved_basis["source"]}
+        empty_identity = {"id": "", "source": ""}
+
+        malformed_review = {
+            "schema": webapp.QUOTE_COMMERCIAL_REVIEW_SCHEMA,
+            "version": webapp.QUOTE_COMMERCIAL_REVIEW_VERSION,
+            "status": webapp.QUOTE_COMMERCIAL_REVIEW_STATUS,
+            "reason_code": [],
+            "blocked_identity": copy.deepcopy(saved_identity),
+        }
+        cases = []
+
+        candidate = copy.deepcopy(baseline)
+        candidate["quote_session"] = None
+        cases.append(("quote_session_null", candidate, "invalid_snapshot", empty_identity))
+
+        candidate = copy.deepcopy(baseline)
+        candidate["quote_session"] = []
+        cases.append(("quote_session_array", candidate, "invalid_snapshot", empty_identity))
+
+        candidate = copy.deepcopy(baseline)
+        candidate["quote_session"]["draft_state"] = []
+        cases.append(("nested_draft_state_array", candidate, "invalid_snapshot", empty_identity))
+
+        candidate = copy.deepcopy(baseline)
+        candidate["draft_state"] = []
+        cases.append(("top_level_draft_state_array", candidate, "invalid_snapshot", empty_identity))
+
+        candidate = copy.deepcopy(baseline)
+        candidate["quote_session"]["draft_state"]["quote_details"] = []
+        cases.append(("invalid_details_alias", candidate, "invalid_snapshot", empty_identity))
+
+        candidate = copy.deepcopy(baseline)
+        candidate["quote_session"]["draft_state"]["quote_details"] = copy.deepcopy(
+            candidate["quote_session"]["draft_state"]["quoteDetails"]
+        )
+        candidate["quote_session"]["draft_state"]["quote_details"]["currency"] = "EUR"
+        cases.append(("conflicting_details_alias", candidate, "invalid_snapshot", empty_identity))
+
+        candidate = copy.deepcopy(baseline)
+        candidate["quote_session"]["draft_state"]["quote_commercial_lifecycle"] = []
+        cases.append(("invalid_lifecycle_alias", candidate, "invalid_snapshot", saved_identity))
+
+        candidate = copy.deepcopy(baseline)
+        candidate["quote_session"]["draft_state"]["quote_commercial_lifecycle"] = "EXISTING"
+        cases.append(("conflicting_lifecycle_alias", candidate, "invalid_snapshot", saved_identity))
+
+        candidate = copy.deepcopy(baseline)
+        candidate["quote_session"]["draft_state"]["quoteDetails"].pop("commercial_snapshot")
+        cases.append(("populated_output_without_snapshot", candidate, "missing_snapshot", empty_identity))
+
+        candidate = copy.deepcopy(baseline)
+        candidate["quote_session"] = None
+        candidate["quoteCommercialReview"] = malformed_review
+        cases.append(("invalid_review_precedes_outer_container", candidate, "review_state_invalid", empty_identity))
+
+        canonical_review = {
+            "schema": webapp.QUOTE_COMMERCIAL_REVIEW_SCHEMA,
+            "version": webapp.QUOTE_COMMERCIAL_REVIEW_VERSION,
+            "status": webapp.QUOTE_COMMERCIAL_REVIEW_STATUS,
+            "reason_code": "pricing_reference_digest_mismatch",
+            "blocked_identity": copy.deepcopy(saved_identity),
+        }
+        candidate = copy.deepcopy(baseline)
+        candidate["quote_session"] = None
+        candidate["quoteCommercialReview"] = canonical_review
+        cases.append(("canonical_review_cannot_hide_outer_container", candidate, "invalid_snapshot", empty_identity))
+
+        for label, candidate, expected_reason, expected_identity in cases:
+            with self.subTest(label=label):
+                state = webapp.quote_commercial_state(candidate)
+                self.assertTrue(state["review_required"])
+                self.assertEqual(state["review_reason"], expected_reason)
+                self.assertEqual(state["review"]["reason_code"], expected_reason)
+                self.assertEqual(state["review"]["blocked_identity"], expected_identity)
+                self.assertEqual(webapp.pricing_reference_authority_review(candidate), state["review"])
+                self.assertEqual(webapp.quote_commercial_persistence_preflight(candidate), state["review"])
+
+        fresh = {"images": copy.deepcopy(baseline["images"]), "profile_id": "fresh-precommercial"}
+        fresh_state = webapp.quote_commercial_state(fresh)
+        self.assertFalse(fresh_state["review_required"])
+        self.assertIsNone(webapp.quote_commercial_persistence_preflight(fresh))
+
+        malformed = cases[0][1]
+        with mock.patch.object(webapp, "new_quote_session_id", side_effect=AssertionError("session id allocated")):
+            with self.assertRaises(webapp.QuoteCommercialStateError) as error:
+                webapp.create_or_update_quote_session(malformed)
+        self.assertEqual(error.exception.quote_commercial_review, webapp.quote_commercial_state(malformed)["review"])
 
     def test_quote_commercial_review_preflight_blocks_all_authorised_http_surfaces_before_downstream_work(self):
         payload = recovered_convergence_payload()
@@ -14155,6 +14257,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                     "draft_state": {
                         "outputRows": [{"description": "Edited output row", "quantity": 2}],
                         "workflowStage": "completed",
+                        "quoteCommercialReview": durable_missing_snapshot_review(),
                         "activeSidePanel": "output",
                         "analysisFindings": [{"text": "Synthetic visible finding"}],
                         "images": [{
@@ -15729,6 +15832,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 "draft_state": {
                     "version": 1,
                     "activeSidePanel": "output",
+                    "quoteCommercialReview": durable_missing_snapshot_review(),
                     "outputRows": [{"description": "Output draft only", "amount": 100}],
                     "outputRevision": 1,
                 },
@@ -24947,6 +25051,244 @@ assert.strictEqual(collectQuoteCurrency(), "JPY");
 
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
 
+    def test_static_quote_commercial_restoration_preserves_canonical_review_and_saved_basis_identity(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name, isAsync = false) {
+  const marker = `${isAsync ? "async " : ""}function ${name}(`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  if (bodyStart < 2) throw new Error(`Missing body for function ${name}`);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const QUOTE_SESSION_STATE_VERSION = 5;
+const QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA = "swooshz.quote-commercial-snapshot.v2";
+const QUOTE_COMMERCIAL_SNAPSHOT_VERSION = 2;
+const QUOTE_COMMERCIAL_LIFECYCLES = new Set(["NEW_UNINITIALISED", "EXISTING", "RECOVERED"]);
+const QUOTE_COMMERCIAL_SNAPSHOT_ORIGINS = new Set(["new_quote", "captured", "session_recovery", "explicit_initialization", "explicit_reselection"]);
+const QUOTE_COMMERCIAL_PRESENCE_VALUES = new Set(["captured", "intentional_empty"]);
+const PRICING_REFERENCE_SOURCES = new Set(["company", "local", "bundled"]);
+const PRICING_REFERENCE_ID_RE = /^[A-Za-z0-9_-]+$/;
+const PRICING_REFERENCE_DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
+const QUOTE_COMMERCIAL_REVIEW_SCHEMA = "swooshz.quote-commercial-review.v1";
+const QUOTE_COMMERCIAL_REVIEW_VERSION = 1;
+const QUOTE_COMMERCIAL_REVIEW_STATUS = "REVIEW_REQUIRED";
+const QUOTE_COMMERCIAL_REVIEW_MESSAGE = "Pricing review required: saved quote commercial state requires review before generation.";
+const PRICING_REFERENCE_SETTINGS_MODE_MANAGE = "manage";
+const QUOTE_COMMERCIAL_REVIEW_REASONS = new Set([
+  "missing_snapshot", "invalid_snapshot", "lifecycle_mismatch", "pricing_basis_incomplete",
+  "pricing_reference_unavailable", "pricing_reference_source_mismatch", "pricing_reference_identity_mismatch",
+  "pricing_reference_digest_mismatch", "unsupported_pricing_reference_source", "review_state_invalid",
+]);
+const QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS = [
+  "currency", "exchange_rate", "tax", "company_name", "header_details", "logo",
+  "terms_heading", "payment_terms", "notes_heading", "standard_notes", "acceptance_text",
+  "person_label", "stamp_label", "date_label", "company_signatory", "company_title",
+  "company_date_label", "rich_text",
+];
+
+const activeDigest = "sha256:" + "a".repeat(64);
+const savedDigest = "sha256:" + "b".repeat(64);
+const state = {
+  profileId: "",
+  pricingReferenceId: "",
+  pricingReferenceSource: "",
+  quoteCommercialLifecycle: "NEW_UNINITIALISED",
+  quoteCommercialSnapshot: null,
+  quoteCommercialReview: null,
+  quoteCommercialRecoveryError: "",
+  quoteCommercialTouched: {},
+  pricingReferenceSelectionIntent: null,
+  pricingReferences: [],
+  profiles: [],
+  companyProfiles: [],
+  quoteSessionId: "",
+  feedbackContextRequestId: 0,
+  feedbackContext: null,
+  feedbackContextLoadPromise: null,
+  basisChat: {},
+  images: [],
+  quoteBasis: {},
+  quoteBasisSections: [],
+  lineItems: [],
+  outputRows: [],
+  originalOutputRows: [],
+  outputErrors: [],
+  analysisFindings: [],
+  blockingClarificationQuestions: [],
+  pricingMatches: [],
+  pricingIssues: [],
+  activeJob: null,
+};
+const elements = {};
+const document = { activeElement: null };
+const window = { localStorage: { setItem() {} } };
+
+function isPlainObject(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+function objectHasExactKeys(value, keys = []) {
+  return isPlainObject(value) && Object.keys(value).length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+function hasMeaningfulQuoteDetailValue(value) {
+  if (Array.isArray(value)) return value.length > 0;
+  if (value && typeof value === "object") return Object.keys(value).length > 0;
+  return String(value ?? "").trim().length > 0;
+}
+function normalizeCurrencyLabel(value) { return String(value ?? "").trim().toUpperCase(); }
+function safeQuoteSessionId(value = "") {
+  const text = String(value || "").trim();
+  return /^quote-[A-Za-z0-9_-]{3,64}$/.test(text) ? text : "";
+}
+function currentPricingReference() {
+  return { id: "active-reference", source: "local", currency: "SGD", digest_sha256: activeDigest };
+}
+function invalidateAuthorityProfileRequests() {}
+function transitionGenerationContext(sessionId = "") { state.quoteSessionId = sessionId; }
+function normalizeRestorableOverlay(value = "") { return value; }
+function normalizePricingReferenceSettingsMode(value = "") { return value; }
+function presetValueFromQuoteDetails() { return ""; }
+function normalizeQuoteCommercialTouched(value = {}) { return value; }
+function quoteDetailsCommercialTouched() { return {}; }
+function syncSelectedPricingReference() {}
+function renderProfileOptions() {}
+function renderPresetOptions() {}
+function selectedPreset() { return null; }
+function quoteDetailsWithFallbackDefaults(defaults = {}, details = {}) { return details; }
+async function restoreQuoteDetailsLogo(details) { return details; }
+function applyQuoteDetails() {}
+async function restoreSessionImages() { return []; }
+function cloneQuoteBasis(value = {}) { return value; }
+function normalizeQuoteBasisSections(value = []) { return value; }
+function normalizeLineItem(value) { return value; }
+function normalizeOutputRow(value) { return value; }
+function normalizeBoothDimensions(value = {}) { return value; }
+function normalizeAnalysisMode(value = "") { return value; }
+function normalizeActiveJob() { return null; }
+function renderFiles() {}
+function renderPricingMatches() {}
+function renderMatchSummary() {}
+function clearPricingReviewMessages() {}
+function clearAiFailedDraftState() {}
+function renderBasisFailureState() {}
+function updateQuoteBasisCard() {}
+function renderBasisEmptyState() {}
+function updateDownloadButton() {}
+function setResultStatus() {}
+function setWorkflowStage(value) { state.workflowStage = value; }
+function showAiFailureBanner() {}
+function clearAiFailureBanner() {}
+function restoredQuoteSessionSidePanel() { return "images"; }
+function setSidePanel() {}
+function renderQuoteCommercialReviewState() {}
+function restoredWorkflowStage() { return "images"; }
+function revisionNumber(value, fallback) { return Number.isFinite(Number(value)) ? Number(value) : fallback; }
+function buildSessionSnapshot() { return {}; }
+function sessionFileRecordsFromDraft() { return []; }
+function currentBrowserRecoveryScope() { return "scope"; }
+function persistSessionFiles() { return Promise.resolve(); }
+
+eval([
+  "quoteCommercialSnapshotRawValues",
+  "normalizeQuoteCommercialSnapshot",
+  "quoteCommercialSnapshotPricingBasis",
+  "quoteCommercialReviewIdentity",
+  "normalizeQuoteCommercialReview",
+  "quoteCommercialRestorationReviewReason",
+].map((name) => extractFunction(name)).join("\n"));
+eval(extractFunction("setQuoteCommercialReview"));
+eval(extractFunction("applyQuoteSessionSnapshot", true));
+
+const savedBasis = { currency: "SGD", source: "local", id: "saved-reference", digest: savedDigest };
+const savedDetails = {
+  currency: "",
+  exchange_rate: null,
+  tax: {},
+  company: {},
+  quote_text: {},
+  signature: {},
+  rich_text: {},
+  commercial_snapshot: {
+    schema: QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+    version: QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+    owner: "quote",
+    lifecycle: "RECOVERED",
+    origin: "session_recovery",
+    presence: QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS.reduce((out, key) => {
+      out[key] = "intentional_empty";
+      return out;
+    }, {}),
+    pricing_basis: savedBasis,
+  },
+};
+const durableReview = {
+  schema: QUOTE_COMMERCIAL_REVIEW_SCHEMA,
+  version: QUOTE_COMMERCIAL_REVIEW_VERSION,
+  status: QUOTE_COMMERCIAL_REVIEW_STATUS,
+  reason_code: "pricing_reference_identity_mismatch",
+  blocked_identity: { id: "saved-reference", source: "local" },
+};
+const saved = {
+  version: QUOTE_SESSION_STATE_VERSION,
+  browserRecoveryScope: "scope",
+  profileId: "saved-profile",
+  pricingReferenceId: "saved-reference",
+  pricingReferenceSource: "local",
+  quoteCommercialLifecycle: "RECOVERED",
+  quoteSessionId: "quote-saved-123",
+  quoteDetails: savedDetails,
+  quoteCommercialReview: durableReview,
+  images: [],
+  quoteBasis: {},
+  quoteBasisSections: [],
+  lineItems: [],
+  outputRows: [],
+  originalOutputRows: [],
+  analysisFindings: [],
+  blockingClarificationQuestions: [],
+  pricingMatches: [],
+  basisChat: {},
+};
+
+assert.deepStrictEqual(quoteCommercialSnapshotPricingBasis({ pricing_basis: savedBasis }), savedBasis);
+assert.deepStrictEqual(quoteCommercialReviewIdentity("saved-reference", ""), { id: "", source: "" });
+assert.deepStrictEqual(normalizeQuoteCommercialReview(durableReview), durableReview);
+
+(async () => {
+  assert.strictEqual(await applyQuoteSessionSnapshot(saved, { forceQuoteView: true }), true);
+  assert.deepStrictEqual(state.quoteCommercialSnapshot.pricing_basis, savedBasis);
+  assert.deepStrictEqual(state.quoteCommercialReview, durableReview);
+  assert.strictEqual(state.quoteCommercialReview.blocked_identity.id, savedBasis.id);
+  assert.strictEqual(state.quoteCommercialReview.blocked_identity.source, savedBasis.source);
+  assert.notStrictEqual(state.quoteCommercialReview.blocked_identity.id, "active-reference");
+})();
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
     def test_static_v3_persisted_pricing_basis_is_lifecycle_independent_and_fail_closed(self):
         node = require_node(self)
 
@@ -25139,7 +25481,7 @@ assert.ok(!saveBody.includes("persistLastPricingReferenceSelection(savedReferenc
         self.assertIn("commercials: dashboardCommercialsFromState()", current_session_body)
         self.assertIn("quoteCommercialTouched: normalizeQuoteCommercialTouched(state.quoteCommercialTouched || {})", snapshot_body)
         self.assertIn("quoteCommercialTouched: snapshot.quoteCommercialTouched", draft_state_body)
-        self.assertIn("quoteDetailsCommercialTouched(saved.quoteDetails || {})", restore_body)
+        self.assertIn("quoteDetailsCommercialTouched(savedQuoteDetails)", restore_body)
 
     def test_browser_generation_serializes_and_confirms_latest_draft_save(self):
         node = require_node(self)
@@ -28232,7 +28574,10 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 payload["quote_session"] = {
                     "session_id": "quote-team-a",
                     "customer_summary": {"customer_name": "Workspace A Customer"},
-                    "draft_state": {"workflowStage": "pricing_review"},
+                    "draft_state": {
+                        "workflowStage": "pricing_review",
+                        "quoteCommercialReview": durable_missing_snapshot_review(),
+                    },
                 }
                 saved_session = workspace_a.create_or_update_quote_session(payload, session_id="quote-team-a")
                 self.assertEqual(saved_session["session_id"], "quote-team-a")
@@ -29280,6 +29625,7 @@ main().catch((error) => {
                     "customer_summary": {"customer_name": "Basis Customer"},
                     "draft_state": {
                         "activeSidePanel": "basis",
+                        "quoteCommercialReview": durable_missing_snapshot_review(),
                         "quoteBasisSections": [{"id": "graphics", "title": "Graphics", "lines": [{"tag": "Include", "text": "Graphics"}]}],
                     },
                 }
@@ -29289,7 +29635,11 @@ main().catch((error) => {
                 output_payload["quote_session"] = {
                     "session_id": "quote-owner-output",
                     "customer_summary": {"customer_name": "Output Customer"},
-                    "draft_state": {"activeSidePanel": "output", "outputRows": [{"description": "Graphics"}]},
+                    "draft_state": {
+                        "activeSidePanel": "output",
+                        "quoteCommercialReview": durable_missing_snapshot_review(),
+                        "outputRows": [{"description": "Graphics"}],
+                    },
                 }
                 owner_storage.create_or_update_quote_session(output_payload)
 
@@ -29298,7 +29648,10 @@ main().catch((error) => {
                     "session_id": "quote-owner-generated",
                     "customer_summary": {"customer_name": "Generated Customer"},
                     "status": {"quote_generated": True},
-                    "draft_state": {"activeSidePanel": "customer"},
+                    "draft_state": {
+                        "activeSidePanel": "customer",
+                        "quoteCommercialReview": durable_missing_snapshot_review(),
+                    },
                 }
                 owner_storage.create_or_update_quote_session(generated_payload)
 

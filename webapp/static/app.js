@@ -2445,15 +2445,21 @@ function normalizeQuoteCommercialSnapshot(snapshot = {}, lifecycleOverride = "",
 }
 
 function quoteCommercialSnapshotPricingBasis(snapshot = state.quoteCommercialSnapshot) {
-  const rawBasis = snapshot && typeof snapshot === "object" ? snapshot.pricing_basis : null;
-  if (!rawBasis || typeof rawBasis !== "object" || Array.isArray(rawBasis)) return null;
+  const isPlain = (value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+  };
+  const rawBasis = isPlain(snapshot) ? snapshot.pricing_basis : null;
+  if (!isPlain(rawBasis)) return null;
   const keys = Object.keys(rawBasis);
   if (keys.length !== 4 || !["currency", "source", "id", "digest"].every((key) => keys.includes(key))) return null;
+  if (["currency", "source", "id", "digest"].some((key) => typeof rawBasis[key] !== "string")) return null;
   const pricingBasis = {
-    currency: String(rawBasis.currency || "").trim().toUpperCase(),
-    source: String(rawBasis.source || "").trim(),
-    id: String(rawBasis.id || "").trim(),
-    digest: String(rawBasis.digest || "").trim(),
+    currency: rawBasis.currency,
+    source: rawBasis.source,
+    id: rawBasis.id,
+    digest: rawBasis.digest,
   };
   if (
     !/^[A-Z]{3}$/.test(pricingBasis.currency)
@@ -2587,15 +2593,21 @@ function quoteCommercialSnapshotForDetails(details = {}, options = {}) {
 }
 
 function quoteCommercialReviewIdentity(id = "", source = "") {
-  const safeId = typeof id === "string" && PRICING_REFERENCE_ID_RE.test(id) ? id : "";
-  const safeSource = typeof source === "string" && PRICING_REFERENCE_SOURCES.has(source) ? source : "";
-  return { id: safeId, source: safeSource };
+  if (id === "" && source === "") return { id: "", source: "" };
+  if (
+    typeof id === "string"
+    && typeof source === "string"
+    && PRICING_REFERENCE_ID_RE.test(id)
+    && PRICING_REFERENCE_SOURCES.has(source)
+  ) return { id, source };
+  return { id: "", source: "" };
 }
 
 function normalizeQuoteCommercialReview(review = null) {
   if (!objectHasExactKeys(review, ["schema", "version", "status", "reason_code", "blocked_identity"])) return null;
   if (
     review.schema !== QUOTE_COMMERCIAL_REVIEW_SCHEMA
+    || !Number.isInteger(review.version)
     || review.version !== QUOTE_COMMERCIAL_REVIEW_VERSION
     || review.status !== QUOTE_COMMERCIAL_REVIEW_STATUS
     || !QUOTE_COMMERCIAL_REVIEW_REASONS.has(review.reason_code)
@@ -2603,14 +2615,20 @@ function normalizeQuoteCommercialReview(review = null) {
     || typeof review.blocked_identity.id !== "string"
     || typeof review.blocked_identity.source !== "string"
   ) return null;
-  if (review.blocked_identity.id && !PRICING_REFERENCE_ID_RE.test(review.blocked_identity.id)) return null;
-  if (review.blocked_identity.source && !PRICING_REFERENCE_SOURCES.has(review.blocked_identity.source)) return null;
+  const blockedIdentity = quoteCommercialReviewIdentity(
+    review.blocked_identity.id,
+    review.blocked_identity.source,
+  );
+  if (
+    (review.blocked_identity.id !== "" || review.blocked_identity.source !== "")
+    && (blockedIdentity.id !== review.blocked_identity.id || blockedIdentity.source !== review.blocked_identity.source)
+  ) return null;
   return {
     schema: QUOTE_COMMERCIAL_REVIEW_SCHEMA,
     version: QUOTE_COMMERCIAL_REVIEW_VERSION,
     status: QUOTE_COMMERCIAL_REVIEW_STATUS,
     reason_code: review.reason_code,
-    blocked_identity: { ...review.blocked_identity },
+    blocked_identity: blockedIdentity,
   };
 }
 
@@ -4015,22 +4033,60 @@ function restoredQuoteSessionSidePanel(saved = {}, options = {}) {
 }
 
 function quoteCommercialRestorationReviewReason(saved = {}, normalizedSnapshot = null, lifecycle = "", currentReference = null) {
-  if (!QUOTE_COMMERCIAL_LIFECYCLES.has(lifecycle)) return "invalid_snapshot";
-  const details = isPlainObject(saved.quoteDetails) ? saved.quoteDetails : {};
+  const savedState = isPlainObject(saved) ? saved : {};
+  const hasOwn = (key) => Object.prototype.hasOwnProperty.call(savedState, key);
+  const detailKeys = ["quoteDetails", "quote_details"].filter(hasOwn);
+  const detailCandidates = detailKeys.map((key) => savedState[key]);
+  if (detailCandidates.some((candidate) => !isPlainObject(candidate))) return "invalid_snapshot";
+  if (
+    detailCandidates.length > 1
+    && JSON.stringify(detailCandidates[0]) !== JSON.stringify(detailCandidates[1])
+  ) return "invalid_snapshot";
+  const details = detailCandidates[0] || {};
+  for (const key of ["client", "project", "company", "tax", "quote_text", "signature", "rich_text"]) {
+    if (Object.prototype.hasOwnProperty.call(details, key) && !isPlainObject(details[key])) return "invalid_snapshot";
+  }
+  if (isPlainObject(details.company)) {
+    for (const key of ["logo_data_url", "logo_session_file_key", "logo_content_fingerprint"]) {
+      if (Object.prototype.hasOwnProperty.call(details.company, key) && typeof details.company[key] !== "string") {
+        return "invalid_snapshot";
+      }
+    }
+  }
+  const lifecycleValues = ["quoteCommercialLifecycle", "quote_commercial_lifecycle"]
+    .filter(hasOwn)
+    .map((key) => savedState[key]);
+  if (lifecycleValues.some((value) => typeof value !== "string")) return "invalid_snapshot";
+  if (new Set(lifecycleValues).size > 1) return "invalid_snapshot";
+  const savedLifecycle = lifecycleValues.length ? lifecycleValues[0] : lifecycle;
+  if (typeof savedLifecycle !== "string") return "invalid_snapshot";
+  const hasProgress = [
+    "outputRows", "originalOutputRows", "lineItems", "quoteBasis", "quoteBasisSections",
+    "analysisFindings", "blockingClarificationQuestions", "pricingMatches", "downloadFile",
+    "pdfFile", "originalAnalysisSnapshot", "draftSource",
+  ].some((key) => hasOwn(key) && hasMeaningfulQuoteDetailValue(savedState[key]))
+    || savedState.basisConfirmed === true
+    || (["pricing_review", "completed", "generating"].includes(savedState.workflowStage));
+  if (!detailCandidates.length && !hasProgress && ["", "NEW_UNINITIALISED"].includes(savedLifecycle)) return "";
+  if (!detailCandidates.length) return "missing_snapshot";
+  if (!Object.prototype.hasOwnProperty.call(details, "commercial_snapshot")) return "missing_snapshot";
   const rawSnapshot = details.commercial_snapshot;
-  if (!isPlainObject(rawSnapshot)) return "missing_snapshot";
+  if (!isPlainObject(rawSnapshot)) return "invalid_snapshot";
   if (!normalizedSnapshot) return "invalid_snapshot";
-  const topId = saved.pricingReferenceId;
-  const topSource = saved.pricingReferenceSource;
+  if (!QUOTE_COMMERCIAL_LIFECYCLES.has(savedLifecycle) || normalizedSnapshot.lifecycle !== savedLifecycle) {
+    return "lifecycle_mismatch";
+  }
+  const topId = savedState.pricingReferenceId;
+  const topSource = savedState.pricingReferenceSource;
   if (typeof topId !== "string" || !PRICING_REFERENCE_ID_RE.test(topId)) return "pricing_reference_identity_mismatch";
   if (typeof topSource !== "string" || !PRICING_REFERENCE_SOURCES.has(topSource)) return "unsupported_pricing_reference_source";
   const basis = normalizedSnapshot.pricing_basis || {};
   if (topId !== basis.id || topSource !== basis.source) return "pricing_reference_identity_mismatch";
   if (!currentReference) return "pricing_reference_unavailable";
-  if (String(currentReference.id || "") !== basis.id) return "pricing_reference_identity_mismatch";
-  if (String(currentReference.source || "") !== basis.source) return "pricing_reference_source_mismatch";
-  if (String(currentReference.digest_sha256 || "") !== basis.digest) return "pricing_reference_digest_mismatch";
-  if (String(currentReference.currency || "").trim().toUpperCase() !== basis.currency) return "pricing_reference_digest_mismatch";
+  if (currentReference.id !== basis.id) return "pricing_reference_identity_mismatch";
+  if (currentReference.source !== basis.source) return "pricing_reference_source_mismatch";
+  if (currentReference.digest_sha256 !== basis.digest) return "pricing_reference_digest_mismatch";
+  if (normalizeCurrencyLabel(currentReference.currency) !== basis.currency) return "pricing_reference_digest_mismatch";
   return "";
 }
 
@@ -4041,9 +4097,10 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   invalidateAuthorityProfileRequests();
   let rejectedRestoredActiveJob = false;
   state.profileId = typeof saved.profileId === "string" ? saved.profileId : "";
-  const savedLifecycle = typeof saved.quoteCommercialLifecycle === "string"
-    ? saved.quoteCommercialLifecycle
-    : "";
+  const lifecycleKeys = ["quoteCommercialLifecycle", "quote_commercial_lifecycle"]
+    .filter((key) => Object.prototype.hasOwnProperty.call(saved, key));
+  const lifecycleValues = lifecycleKeys.map((key) => saved[key]);
+  const savedLifecycle = lifecycleValues.length ? lifecycleValues[0] : "";
   state.pricingReferenceId = typeof saved.pricingReferenceId === "string" ? saved.pricingReferenceId : "";
   state.pricingReferenceSource = typeof saved.pricingReferenceSource === "string" ? saved.pricingReferenceSource : "";
   state.quoteCommercialLifecycle = savedLifecycle;
@@ -4064,52 +4121,76 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.pricingReferenceSettingsMode = state.restorableOverlay
     ? normalizePricingReferenceSettingsMode(saved.pricingReferenceSettingsMode)
     : PRICING_REFERENCE_SETTINGS_MODE_MANAGE;
-  state.selectedPresetValue = saved.selectedPresetValue || presetValueFromQuoteDetails(saved.quoteDetails || {}) || "";
-  const savedQuoteDetails = isPlainObject(saved.quoteDetails) ? saved.quoteDetails : {};
+  const detailKeys = ["quoteDetails", "quote_details"]
+    .filter((key) => Object.prototype.hasOwnProperty.call(saved, key));
+  const detailValues = detailKeys.map((key) => saved[key]);
+  const savedDetailsAreValid = detailValues.every(isPlainObject)
+    && (detailValues.length < 2 || JSON.stringify(detailValues[0]) === JSON.stringify(detailValues[1]));
+  const savedQuoteDetails = savedDetailsAreValid && detailValues.length ? detailValues[0] : {};
+  state.selectedPresetValue = saved.selectedPresetValue || presetValueFromQuoteDetails(savedQuoteDetails) || "";
   const savedCommercialSnapshot = savedQuoteDetails.commercial_snapshot;
   const normalizedCommercialSnapshot = normalizeQuoteCommercialSnapshot(
     savedCommercialSnapshot,
-    savedLifecycle,
+    "",
     savedQuoteDetails,
   );
   state.quoteCommercialSnapshot = normalizedCommercialSnapshot;
-  const suppliedReview = Object.prototype.hasOwnProperty.call(saved, "quoteCommercialReview")
-    ? saved.quoteCommercialReview
-    : saved.quote_commercial_review;
-  const reviewSupplied = suppliedReview !== null && suppliedReview !== undefined && (
-    Object.prototype.hasOwnProperty.call(saved, "quoteCommercialReview")
-      || Object.prototype.hasOwnProperty.call(saved, "quote_commercial_review")
+  const savedBasis = isPlainObject(savedCommercialSnapshot)
+    ? quoteCommercialSnapshotPricingBasis({ pricing_basis: savedCommercialSnapshot.pricing_basis })
+    : null;
+  const savedReviewIdentity = savedBasis
+    ? { id: savedBasis.id, source: savedBasis.source }
+    : { id: "", source: "" };
+  const reviewKeys = ["quoteCommercialReview", "quote_commercial_review"]
+    .filter((key) => Object.prototype.hasOwnProperty.call(saved, key));
+  const reviewValues = reviewKeys.map((key) => saved[key]);
+  let normalizedReview = null;
+  let reviewInvalid = false;
+  let reviewCleared = false;
+  for (const rawReview of reviewValues) {
+    if (rawReview === null) {
+      reviewCleared = true;
+      continue;
+    }
+    const candidate = normalizeQuoteCommercialReview(rawReview);
+    if (!candidate) {
+      reviewInvalid = true;
+      continue;
+    }
+    if (normalizedReview && JSON.stringify(normalizedReview) !== JSON.stringify(candidate)) reviewInvalid = true;
+    else normalizedReview = candidate;
+  }
+  if (reviewCleared && normalizedReview) reviewInvalid = true;
+  const restorationReason = quoteCommercialRestorationReviewReason(
+    saved,
+    normalizedCommercialSnapshot,
+    savedLifecycle,
+    currentPricingReference(),
   );
-  const normalizedReview = reviewSupplied ? normalizeQuoteCommercialReview(suppliedReview) : null;
-  if (reviewSupplied && !normalizedReview) setQuoteCommercialReview("review_state_invalid", state.pricingReferenceId, state.pricingReferenceSource);
-  else if (normalizedReview) state.quoteCommercialReview = normalizedReview;
-  const restorationReason = state.quoteCommercialReview
-    ? state.quoteCommercialReview.reason_code
-    : quoteCommercialRestorationReviewReason(
-      saved,
-      normalizedCommercialSnapshot,
-      savedLifecycle,
-      currentPricingReference(),
-    );
-  if (restorationReason) {
-    setQuoteCommercialReview(restorationReason, state.pricingReferenceId, state.pricingReferenceSource);
+  if (reviewInvalid) {
+    setQuoteCommercialReview("review_state_invalid", savedReviewIdentity.id, savedReviewIdentity.source);
+  } else if (normalizedReview && restorationReason !== "invalid_snapshot") {
+    state.quoteCommercialReview = normalizedReview;
+    state.quoteCommercialRecoveryError = QUOTE_COMMERCIAL_REVIEW_MESSAGE;
+  } else if (restorationReason) {
+    setQuoteCommercialReview(restorationReason, savedReviewIdentity.id, savedReviewIdentity.source);
   } else {
     state.quoteCommercialRecoveryError = "";
   }
-  const savedQuoteText = saved.quoteDetails?.quote_text;
+  const savedQuoteText = savedQuoteDetails.quote_text;
   state.quoteCommercialPreservedQuoteText = savedQuoteText
     && Object.prototype.hasOwnProperty.call(savedQuoteText, "cheque_payee")
     ? { cheque_payee: savedQuoteText.cheque_payee }
     : {};
   state.quoteCommercialTouched = normalizeQuoteCommercialTouched(
-    saved.quoteCommercialTouched || quoteDetailsCommercialTouched(saved.quoteDetails || {})
+    saved.quoteCommercialTouched || quoteDetailsCommercialTouched(savedQuoteDetails)
   );
   syncSelectedPricingReference();
   renderProfileOptions();
   renderPresetOptions();
   state.pendingFeedback = String(saved.pendingFeedback || "");
   const restoredQuoteDetails = await restoreQuoteDetailsLogo(
-    quoteDetailsWithFallbackDefaults(selectedPreset()?.details || {}, saved.quoteDetails || {}, { preserveSavedState: true }),
+    quoteDetailsWithFallbackDefaults(selectedPreset()?.details || {}, savedQuoteDetails, { preserveSavedState: true }),
     { preserveMissingLogo: true }
   );
   applyQuoteDetails(restoredQuoteDetails, { includeLogo: true, clearLogo: true });
@@ -4123,7 +4204,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.outputSortMode = "pricing_reference";
   state.analysisFindings = Array.isArray(saved.analysisFindings) ? saved.analysisFindings : [];
   state.blockingClarificationQuestions = Array.isArray(saved.blockingClarificationQuestions) ? saved.blockingClarificationQuestions : [];
-  state.boothDimensions = normalizeBoothDimensions(saved.boothDimensions || saved.quoteDetails?.project || {});
+  state.boothDimensions = normalizeBoothDimensions(saved.boothDimensions || savedQuoteDetails.project || {});
   state.originalAnalysisSnapshot = saved.originalAnalysisSnapshot || null;
   state.basisConfirmed = Boolean(saved.basisConfirmed);
   state.draftSource = saved.draftSource || "";

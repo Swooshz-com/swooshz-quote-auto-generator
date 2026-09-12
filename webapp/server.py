@@ -4038,22 +4038,30 @@ def round_commercial_cents(value: Any) -> float | None:
     return float(rounded) if rounded else 0.0
 
 
+@dataclass(frozen=True)
+class QuoteCommercialSavedState:
+    draft_state: dict[str, Any]
+    details: dict[str, Any]
+    raw_snapshot: Any
+    snapshot_supplied: bool
+    lifecycle: Any
+    lifecycle_supplied: bool
+    review: dict[str, Any] | None
+    review_supplied: bool
+    review_valid: bool
+    review_cleared: bool
+    malformed: bool
+    details_supplied: bool
+    commercial_progress: bool
+
+
 def quote_session_draft_state_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    patch = payload.get("quote_session") if isinstance(payload.get("quote_session"), dict) else payload
-    draft_state = patch.get("draft_state") if isinstance(patch, dict) else None
-    if not isinstance(draft_state, dict):
-        draft_state = payload.get("draft_state") if isinstance(payload.get("draft_state"), dict) else {}
-    return draft_state
+    return _quote_commercial_saved_state_from_payload(payload).draft_state
 
 
 def quote_commercial_saved_details(payload: dict[str, Any]) -> tuple[dict[str, Any], Any, dict[str, Any], bool]:
-    draft_state = quote_session_draft_state_from_payload(payload)
-    details = draft_state.get("quoteDetails") if isinstance(draft_state.get("quoteDetails"), dict) else None
-    if details is None:
-        details = draft_state.get("quote_details") if isinstance(draft_state.get("quote_details"), dict) else {}
-    snapshot_supplied = "commercial_snapshot" in details
-    snapshot = details.get("commercial_snapshot") if snapshot_supplied else None
-    return details, snapshot, draft_state, snapshot_supplied
+    saved = _quote_commercial_saved_state_from_payload(payload)
+    return saved.details, saved.raw_snapshot, saved.draft_state, saved.snapshot_supplied
 
 
 def quote_commercial_value_is_present(value: Any) -> bool:
@@ -4066,22 +4074,208 @@ def quote_commercial_value_is_present(value: Any) -> bool:
     return True
 
 
+def _quote_commercial_saved_state_from_payload(payload: Any) -> QuoteCommercialSavedState:
+    """Read saved quote state without letting an invalid container disappear."""
+    if not isinstance(payload, dict):
+        return QuoteCommercialSavedState(
+            draft_state={},
+            details={},
+            raw_snapshot=None,
+            snapshot_supplied=False,
+            lifecycle="",
+            lifecycle_supplied=False,
+            review=None,
+            review_supplied=False,
+            review_valid=False,
+            review_cleared=False,
+            malformed=True,
+            details_supplied=False,
+            commercial_progress=False,
+        )
+
+    malformed = False
+    draft_container_malformed = False
+    nested_draft: dict[str, Any] | None = None
+    top_level_draft: dict[str, Any] | None = None
+    quote_session_supplied = "quote_session" in payload
+    quote_session_value: Any = None
+
+    if quote_session_supplied:
+        quote_session_value = payload.get("quote_session")
+        if not isinstance(quote_session_value, dict):
+            malformed = True
+            draft_container_malformed = True
+        elif "draft_state" in quote_session_value:
+            raw_nested_draft = quote_session_value.get("draft_state")
+            if not isinstance(raw_nested_draft, dict):
+                malformed = True
+                draft_container_malformed = True
+            else:
+                nested_draft = raw_nested_draft
+
+    if "draft_state" in payload:
+        raw_top_level_draft = payload.get("draft_state")
+        if not isinstance(raw_top_level_draft, dict):
+            malformed = True
+            draft_container_malformed = True
+        else:
+            top_level_draft = raw_top_level_draft
+
+    if nested_draft is not None and top_level_draft is not None and nested_draft != top_level_draft:
+        malformed = True
+        draft_container_malformed = True
+    if draft_container_malformed:
+        draft_state: dict[str, Any] = {}
+    else:
+        draft_state = nested_draft or top_level_draft or {}
+
+    details_supplied = False
+    details_valid = True
+    detail_candidates: list[dict[str, Any]] = []
+    if not draft_container_malformed:
+        for key in ("quoteDetails", "quote_details"):
+            if key not in draft_state:
+                continue
+            details_supplied = True
+            raw_details = draft_state.get(key)
+            if not isinstance(raw_details, dict):
+                malformed = True
+                details_valid = False
+                continue
+            detail_candidates.append(raw_details)
+        if len(detail_candidates) == 2 and detail_candidates[0] != detail_candidates[1]:
+            malformed = True
+            details_valid = False
+
+    details = detail_candidates[0] if details_valid and detail_candidates else {}
+    if details_valid and detail_candidates:
+        for key in ("client", "project", "company", "tax", "quote_text", "signature", "rich_text"):
+            if key in details and not isinstance(details.get(key), dict):
+                malformed = True
+                details_valid = False
+        company = details.get("company") if isinstance(details.get("company"), dict) else {}
+        for key in ("logo_data_url", "logo_session_file_key", "logo_content_fingerprint"):
+            if key in company and not isinstance(company.get(key), str):
+                malformed = True
+                details_valid = False
+    if not details_valid:
+        details = {}
+
+    snapshot_supplied = details_valid and "commercial_snapshot" in details
+    raw_snapshot = details.get("commercial_snapshot") if snapshot_supplied else None
+
+    lifecycle_values: list[Any] = []
+    if not draft_container_malformed:
+        for key in ("quoteCommercialLifecycle", "quote_commercial_lifecycle"):
+            if key in draft_state:
+                lifecycle_values.append(draft_state.get(key))
+    for key in ("quoteCommercialLifecycle", "quote_commercial_lifecycle"):
+        if key in payload:
+            lifecycle_values.append(payload.get(key))
+    lifecycle_supplied = bool(lifecycle_values)
+    if any(not isinstance(value, str) for value in lifecycle_values):
+        malformed = True
+    if len({value for value in lifecycle_values if isinstance(value, str)}) > 1:
+        malformed = True
+    lifecycle = lifecycle_values[0] if lifecycle_values else ""
+
+    review_values: list[Any] = []
+    if not draft_container_malformed:
+        for key in ("quoteCommercialReview", "quote_commercial_review"):
+            if key in draft_state:
+                review_values.append(draft_state.get(key))
+    for key in ("quoteCommercialReview", "quote_commercial_review"):
+        if key in payload:
+            review_values.append(payload.get(key))
+    review_supplied = any(value is not None for value in review_values)
+    review_cleared = any(value is None for value in review_values)
+    normalized_reviews: list[dict[str, Any]] = []
+    review_invalid = False
+    for raw_review in review_values:
+        if raw_review is None:
+            continue
+        normalized_review = normalized_quote_commercial_review(raw_review)
+        if normalized_review is None:
+            review_invalid = True
+        else:
+            normalized_reviews.append(normalized_review)
+    if len(normalized_reviews) > 1 and any(review != normalized_reviews[0] for review in normalized_reviews[1:]):
+        review_invalid = True
+    if review_cleared and normalized_reviews:
+        review_invalid = True
+    review_valid = bool(normalized_reviews) and not review_invalid
+    review = normalized_reviews[0] if review_valid else None
+
+    progress_keys = (
+        "outputRows",
+        "originalOutputRows",
+        "lineItems",
+        "quoteBasis",
+        "quoteBasisSections",
+        "analysisFindings",
+        "blockingClarificationQuestions",
+        "pricingMatches",
+        "downloadFile",
+        "pdfFile",
+        "originalAnalysisSnapshot",
+        "draftSource",
+    )
+    commercial_progress = any(
+        key in draft_state and quote_commercial_value_is_present(draft_state.get(key))
+        for key in progress_keys
+    )
+    commercial_progress = commercial_progress or draft_state.get("basisConfirmed") is True
+    commercial_progress = commercial_progress or (
+        isinstance(draft_state.get("workflowStage"), str)
+        and draft_state.get("workflowStage") in {"pricing_review", "completed", "generating"}
+    )
+    if isinstance(quote_session_value, dict):
+        status = quote_session_value.get("status")
+        commercial_progress = commercial_progress or (
+            isinstance(status, dict) and status.get("quote_generated") is True
+        )
+        commercial_progress = commercial_progress or any(
+            key in quote_session_value and quote_commercial_value_is_present(quote_session_value.get(key))
+            for key in ("publication", "generation_snapshot")
+        )
+
+    return QuoteCommercialSavedState(
+        draft_state=draft_state,
+        details=details,
+        raw_snapshot=raw_snapshot,
+        snapshot_supplied=snapshot_supplied,
+        lifecycle=lifecycle,
+        lifecycle_supplied=lifecycle_supplied,
+        review=review,
+        review_supplied=review_supplied,
+        review_valid=review_valid,
+        review_cleared=review_cleared,
+        malformed=malformed or review_invalid,
+        details_supplied=details_supplied,
+        commercial_progress=commercial_progress,
+    )
+
+
 def quote_commercial_snapshot_raw_values(details: dict[str, Any]) -> dict[str, Any]:
     company = details.get("company") if isinstance(details.get("company"), dict) else {}
     quote_text = details.get("quote_text") if isinstance(details.get("quote_text"), dict) else {}
     signature = details.get("signature") if isinstance(details.get("signature"), dict) else {}
     rich_text = details.get("rich_text") if isinstance(details.get("rich_text"), dict) else {}
+    logo = next(
+        (
+            company.get(key)
+            for key in ("logo_data_url", "logo_session_file_key", "logo_content_fingerprint")
+            if isinstance(company.get(key), str) and company.get(key)
+        ),
+        None,
+    )
     return {
         "currency": details.get("currency"),
         "exchange_rate": details.get("exchange_rate"),
         "tax": details.get("tax"),
         "company_name": company.get("name"),
         "header_details": company.get("header_details"),
-        "logo": (
-            company.get("logo_data_url")
-            or company.get("logo_session_file_key")
-            or company.get("logo_content_fingerprint")
-        ),
+        "logo": logo,
         "terms_heading": quote_text.get("terms_heading"),
         "payment_terms": quote_text.get("payment_terms"),
         "notes_heading": quote_text.get("notes_heading"),
@@ -4196,20 +4390,8 @@ def normalized_quote_commercial_review(value: Any) -> dict[str, Any] | None:
 
 
 def quote_commercial_review_from_payload(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
-    draft_state = quote_session_draft_state_from_payload(payload)
-    if "quoteCommercialReview" in draft_state:
-        raw_review = draft_state.get("quoteCommercialReview")
-        return (None, False) if raw_review is None else (normalized_quote_commercial_review(raw_review), True)
-    if "quote_commercial_review" in draft_state:
-        raw_review = draft_state.get("quote_commercial_review")
-        return (None, False) if raw_review is None else (normalized_quote_commercial_review(raw_review), True)
-    if "quoteCommercialReview" in payload:
-        raw_review = payload.get("quoteCommercialReview")
-        return (None, False) if raw_review is None else (normalized_quote_commercial_review(raw_review), True)
-    if "quote_commercial_review" in payload:
-        raw_review = payload.get("quote_commercial_review")
-        return (None, False) if raw_review is None else (normalized_quote_commercial_review(raw_review), True)
-    return None, False
+    saved = _quote_commercial_saved_state_from_payload(payload)
+    return saved.review, saved.review_supplied
 
 
 def normalized_quote_commercial_snapshot(
@@ -4264,6 +4446,13 @@ def normalized_quote_commercial_snapshot(
     if basis is None:
         return None
     if details is not None:
+        for key in ("client", "project", "company", "tax", "quote_text", "signature", "rich_text"):
+            if key in details and not isinstance(details.get(key), dict):
+                return None
+        company = details.get("company") if isinstance(details.get("company"), dict) else {}
+        for key in ("logo_data_url", "logo_session_file_key", "logo_content_fingerprint"):
+            if key in company and not isinstance(company.get(key), str):
+                return None
         raw_values = quote_commercial_snapshot_raw_values(details)
         for key, presence_value in presence.items():
             present = quote_commercial_value_is_present(raw_values.get(key))
@@ -4281,74 +4470,54 @@ def normalized_quote_commercial_snapshot(
 
 
 def quote_commercial_state(payload: dict[str, Any]) -> dict[str, Any]:
-    details, raw_snapshot, draft_state, snapshot_supplied = quote_commercial_saved_details(payload)
-    raw_lifecycle = (
-        draft_state.get("quoteCommercialLifecycle")
-        if "quoteCommercialLifecycle" in draft_state
-        else draft_state.get("quote_commercial_lifecycle")
-        if "quote_commercial_lifecycle" in draft_state
-        else payload.get("quoteCommercialLifecycle")
-    )
+    saved = _quote_commercial_saved_state_from_payload(payload)
+    details = saved.details
+    raw_snapshot = saved.raw_snapshot
+    draft_state = saved.draft_state
+    snapshot_supplied = saved.snapshot_supplied
+    raw_lifecycle = saved.lifecycle
     lifecycle = raw_lifecycle if isinstance(raw_lifecycle, str) else ""
-    review, review_supplied = quote_commercial_review_from_payload(payload)
     snapshot = normalized_quote_commercial_snapshot(
         raw_snapshot,
-        details=details if isinstance(raw_snapshot, dict) else None,
+        details=details if snapshot_supplied and isinstance(raw_snapshot, dict) else None,
+    )
+    snapshot_invalid = snapshot_supplied and snapshot is None
+    structurally_malformed = saved.malformed or snapshot_invalid
+    fresh_precommercial = bool(
+        not structurally_malformed
+        and not saved.details_supplied
+        and not saved.lifecycle_supplied
+        and not snapshot_supplied
+        and not saved.review_supplied
+        and not saved.commercial_progress
     )
     has_saved_state = bool(
-        details
-        or draft_state.get("outputRows")
-        or "quoteDetails" in draft_state
-        or "quote_details" in draft_state
-        or "quoteCommercialLifecycle" in draft_state
-        or "quote_commercial_lifecycle" in draft_state
-        or review_supplied
+        structurally_malformed
+        or saved.details_supplied
+        or saved.lifecycle_supplied
+        or saved.review_supplied
         or snapshot_supplied
+        or saved.commercial_progress
     )
-    commercial_state_required = bool(
-        details
-        or "quoteDetails" in draft_state
-        or "quote_details" in draft_state
-        or "quoteCommercialLifecycle" in draft_state
-        or "quote_commercial_lifecycle" in draft_state
-        or review_supplied
-        or snapshot_supplied
-    )
-    has_saved_commercial_progress = bool(
-        draft_state.get("outputRows")
-        or draft_state.get("lineItems")
-        or draft_state.get("quoteBasis")
-        or draft_state.get("quoteBasisSections")
-        or draft_state.get("analysisFindings")
-        or draft_state.get("basisConfirmed")
-        or (
-            isinstance(draft_state.get("workflowStage"), str)
-            and draft_state.get("workflowStage") in {"pricing_review", "completed", "generating"}
-        )
-    )
-    persistence_state_required = bool(
-        snapshot_supplied
-        or review_supplied
-        or lifecycle in {"EXISTING", "RECOVERED"}
-        or (
-            ("quoteDetails" in draft_state or "quote_details" in draft_state)
-            and has_saved_commercial_progress
-        )
-    )
+    commercial_state_required = has_saved_state and not fresh_precommercial
     lifecycle_valid = isinstance(raw_lifecycle, str) and lifecycle in QUOTE_COMMERCIAL_LIFECYCLES
     snapshot_lifecycle_matches = bool(snapshot and lifecycle_valid and snapshot["lifecycle"] == lifecycle)
-    durable_review_valid = review_supplied and isinstance(review, dict)
-    review_required = review_supplied
-    if has_saved_state and not snapshot_lifecycle_matches:
-        review_required = True
-    if snapshot and not lifecycle_valid:
-        review_required = True
-    if snapshot_lifecycle_matches and not review_required:
+    review_supplied = saved.review_supplied
+    review = saved.review
+    durable_review_valid = bool(
+        review_supplied
+        and saved.review_valid
+        and isinstance(review, dict)
+        and not structurally_malformed
+    )
+    persistence_state_required = commercial_state_required
+
+    if snapshot_lifecycle_matches and not review_supplied and not structurally_malformed:
         return {
             "owned": snapshot["lifecycle"] in {"EXISTING", "RECOVERED"},
             "legacy": False,
             "review_required": False,
-            "review": review,
+            "review": None,
             "review_reason": "",
             "evidence_valid": True,
             "snapshot_supplied": snapshot_supplied,
@@ -4360,36 +4529,30 @@ def quote_commercial_state(payload: dict[str, Any]) -> dict[str, Any]:
             "snapshot": snapshot,
             "draft_state": draft_state,
         }
-    if durable_review_valid:
+
+    review_required = not fresh_precommercial
+    saved_basis = raw_snapshot.get("pricing_basis") if isinstance(raw_snapshot, dict) else None
+    if review_supplied and not saved.review_valid:
+        reason = "review_state_invalid"
+        resolved_review = build_quote_commercial_review(reason, pricing_basis=saved_basis)
+    elif structurally_malformed:
+        reason = "invalid_snapshot"
+        resolved_review = build_quote_commercial_review(reason, pricing_basis=saved_basis)
+    elif saved.review_valid and isinstance(review, dict):
         reason = review["reason_code"]
         resolved_review = review
-    elif review_supplied:
-        reason = "review_state_invalid"
-        resolved_review = build_quote_commercial_review(
-            reason,
-            pricing_basis=raw_snapshot.get("pricing_basis") if isinstance(raw_snapshot, dict) else None,
-        )
     elif not snapshot_supplied:
         reason = "missing_snapshot"
-        resolved_review = build_quote_commercial_review(
-            reason,
-            pricing_basis=raw_snapshot.get("pricing_basis") if isinstance(raw_snapshot, dict) else None,
-        )
+        resolved_review = build_quote_commercial_review(reason, pricing_basis=saved_basis)
     elif snapshot is None:
         reason = "invalid_snapshot"
-        resolved_review = build_quote_commercial_review(
-            reason,
-            pricing_basis=raw_snapshot.get("pricing_basis") if isinstance(raw_snapshot, dict) else None,
-        )
+        resolved_review = build_quote_commercial_review(reason, pricing_basis=saved_basis)
     else:
         reason = "lifecycle_mismatch"
-        resolved_review = build_quote_commercial_review(
-            reason,
-            pricing_basis=raw_snapshot.get("pricing_basis") if isinstance(raw_snapshot, dict) else None,
-        )
+        resolved_review = build_quote_commercial_review(reason, pricing_basis=saved_basis)
     return {
         "owned": has_saved_state and lifecycle in {"EXISTING", "RECOVERED"},
-        "legacy": has_saved_state,
+        "legacy": has_saved_state and not fresh_precommercial,
         "review_required": review_required,
         "review": resolved_review if review_required else None,
         "review_reason": reason if review_required else "",
@@ -16424,11 +16587,13 @@ def quote_commercial_persistence_preflight(
     auth_session: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     commercial_state = quote_commercial_state(payload)
-    if not commercial_state.get("persistence_state_required") or commercial_state.get("durable_review_valid"):
-        return None
     if commercial_state.get("review_required"):
+        if commercial_state.get("durable_review_valid"):
+            return None
         review = commercial_state.get("review")
         return copy.deepcopy(review) if isinstance(review, dict) else None
+    if not commercial_state.get("persistence_state_required"):
+        return None
     if auth_session is None:
         return None
     review = pricing_reference_authority_review(payload, auth_session=auth_session)
