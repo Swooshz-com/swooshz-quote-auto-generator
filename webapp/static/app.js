@@ -4032,54 +4032,153 @@ function restoredQuoteSessionSidePanel(saved = {}, options = {}) {
     : furthestQuoteSessionSidePanel(saved);
 }
 
+function quoteCommercialStrictDataEqual(left, right, depth = 0) {
+  if (depth > 64 || typeof left !== typeof right) return false;
+  if (Object.is(left, right)) return true;
+  if (left === null || right === null) return false;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left)
+      && Array.isArray(right)
+      && left.length === right.length
+      && left.every((value, index) => quoteCommercialStrictDataEqual(value, right[index], depth + 1));
+  }
+  if (typeof left === "object") {
+    if (!isPlainObject(left) || !isPlainObject(right)) return false;
+    const leftKeys = Object.keys(left);
+    const rightKeys = Object.keys(right);
+    return leftKeys.length === rightKeys.length
+      && leftKeys.every((key) => (
+        Object.prototype.hasOwnProperty.call(right, key)
+        && quoteCommercialStrictDataEqual(left[key], right[key], depth + 1)
+      ));
+  }
+  return false;
+}
+
 function quoteCommercialRestorationReviewReason(saved = {}, normalizedSnapshot = null, lifecycle = "", currentReference = null) {
   const savedState = isPlainObject(saved) ? saved : {};
-  const hasOwn = (key) => Object.prototype.hasOwnProperty.call(savedState, key);
-  const detailKeys = ["quoteDetails", "quote_details"].filter(hasOwn);
-  const detailCandidates = detailKeys.map((key) => savedState[key]);
-  if (detailCandidates.some((candidate) => !isPlainObject(candidate))) return "invalid_snapshot";
-  if (
-    detailCandidates.length > 1
-    && JSON.stringify(detailCandidates[0]) !== JSON.stringify(detailCandidates[1])
-  ) return "invalid_snapshot";
-  const details = detailCandidates[0] || {};
-  for (const key of ["client", "project", "company", "tax", "quote_text", "signature", "rich_text"]) {
-    if (Object.prototype.hasOwnProperty.call(details, key) && !isPlainObject(details[key])) return "invalid_snapshot";
+  const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
+  const containers = [savedState];
+  let containerMalformed = !isPlainObject(saved);
+  const addContainer = (value) => {
+    if (!hasOwn(value, "draft_state")) return;
+    const draft = value.draft_state;
+    if (!isPlainObject(draft)) {
+      containerMalformed = true;
+      return;
+    }
+    containers.push(draft);
+  };
+  if (hasOwn(savedState, "quote_session")) {
+    if (!isPlainObject(savedState.quote_session)) {
+      containerMalformed = true;
+    } else {
+      containers.push(savedState.quote_session);
+      addContainer(savedState.quote_session);
+    }
   }
-  if (isPlainObject(details.company)) {
-    for (const key of ["logo_data_url", "logo_session_file_key", "logo_content_fingerprint"]) {
-      if (Object.prototype.hasOwnProperty.call(details.company, key) && typeof details.company[key] !== "string") {
-        return "invalid_snapshot";
+  addContainer(savedState);
+
+  let normalizedReview = null;
+  let reviewInvalid = false;
+  let reviewCleared = false;
+  for (const container of containers) {
+    for (const key of ["quoteCommercialReview", "quote_commercial_review"]) {
+      if (!hasOwn(container, key)) continue;
+      const rawReview = container[key];
+      if (rawReview === null) {
+        reviewCleared = true;
+        continue;
+      }
+      const candidate = normalizeQuoteCommercialReview(rawReview);
+      if (!candidate) {
+        reviewInvalid = true;
+        continue;
+      }
+      if (normalizedReview && !quoteCommercialStrictDataEqual(normalizedReview, candidate)) {
+        reviewInvalid = true;
+      } else {
+        normalizedReview = candidate;
       }
     }
   }
-  const lifecycleValues = ["quoteCommercialLifecycle", "quote_commercial_lifecycle"]
-    .filter(hasOwn)
-    .map((key) => savedState[key]);
+  if (reviewCleared && normalizedReview) reviewInvalid = true;
+  if (reviewInvalid) return "review_state_invalid";
+
+  const detailCandidates = [];
+  for (const container of containers) {
+    for (const key of ["quoteDetails", "quote_details"]) {
+      if (hasOwn(container, key)) detailCandidates.push(container[key]);
+    }
+  }
+  if (detailCandidates.some((candidate) => !isPlainObject(candidate))) return "invalid_snapshot";
+  if (
+    detailCandidates.length > 1
+    && detailCandidates.slice(1).some((candidate) => !quoteCommercialStrictDataEqual(detailCandidates[0], candidate))
+  ) return "invalid_snapshot";
+  const details = detailCandidates[0] || {};
+  for (const key of ["client", "project", "company", "tax", "quote_text", "signature", "rich_text"]) {
+    if (hasOwn(details, key) && !isPlainObject(details[key])) return "invalid_snapshot";
+  }
+  if (isPlainObject(details.company)) {
+    for (const key of ["logo_data_url", "logo_session_file_key", "logo_content_fingerprint"]) {
+      if (hasOwn(details.company, key) && typeof details.company[key] !== "string") return "invalid_snapshot";
+    }
+  }
+
+  const lifecycleValues = [];
+  for (const container of containers) {
+    for (const key of ["quoteCommercialLifecycle", "quote_commercial_lifecycle"]) {
+      if (hasOwn(container, key)) lifecycleValues.push(container[key]);
+    }
+  }
   if (lifecycleValues.some((value) => typeof value !== "string")) return "invalid_snapshot";
   if (new Set(lifecycleValues).size > 1) return "invalid_snapshot";
   const savedLifecycle = lifecycleValues.length ? lifecycleValues[0] : lifecycle;
   if (typeof savedLifecycle !== "string") return "invalid_snapshot";
-  const hasProgress = [
+
+  const progressKeys = [
     "outputRows", "originalOutputRows", "lineItems", "quoteBasis", "quoteBasisSections",
     "analysisFindings", "blockingClarificationQuestions", "pricingMatches", "downloadFile",
     "pdfFile", "originalAnalysisSnapshot", "draftSource",
-  ].some((key) => hasOwn(key) && hasMeaningfulQuoteDetailValue(savedState[key]))
-    || savedState.basisConfirmed === true
-    || (["pricing_review", "completed", "generating"].includes(savedState.workflowStage));
+  ];
+  const hasProgress = containers.some((container) => (
+    progressKeys.some((key) => hasOwn(container, key) && hasMeaningfulQuoteDetailValue(container[key]))
+    || container.basisConfirmed === true
+    || ["pricing_review", "completed", "generating"].includes(container.workflowStage)
+    || (isPlainObject(container.status) && container.status.quote_generated === true)
+    || ["publication", "generation_snapshot"].some((key) => (
+      hasOwn(container, key) && hasMeaningfulQuoteDetailValue(container[key])
+    ))
+  ));
+  if (containerMalformed) return "invalid_snapshot";
+  if (normalizedReview) return normalizedReview.reason_code;
   if (!detailCandidates.length && !hasProgress && ["", "NEW_UNINITIALISED"].includes(savedLifecycle)) return "";
   if (!detailCandidates.length) return "missing_snapshot";
-  if (!Object.prototype.hasOwnProperty.call(details, "commercial_snapshot")) return "missing_snapshot";
+  if (!hasOwn(details, "commercial_snapshot")) return "missing_snapshot";
   const rawSnapshot = details.commercial_snapshot;
-  if (!isPlainObject(rawSnapshot)) return "invalid_snapshot";
-  if (!normalizedSnapshot) return "invalid_snapshot";
+  if (!isPlainObject(rawSnapshot) || !normalizedSnapshot) return "invalid_snapshot";
   if (!QUOTE_COMMERCIAL_LIFECYCLES.has(savedLifecycle) || normalizedSnapshot.lifecycle !== savedLifecycle) {
     return "lifecycle_mismatch";
   }
-  const topId = savedState.pricingReferenceId;
-  const topSource = savedState.pricingReferenceSource;
-  if (typeof topId !== "string" || !PRICING_REFERENCE_ID_RE.test(topId)) return "pricing_reference_identity_mismatch";
-  if (typeof topSource !== "string" || !PRICING_REFERENCE_SOURCES.has(topSource)) return "unsupported_pricing_reference_source";
+
+  const identityValues = { id: [], source: [] };
+  for (const container of containers) {
+    for (const key of ["pricingReferenceId", "pricing_reference_id"]) {
+      if (hasOwn(container, key)) identityValues.id.push(container[key]);
+    }
+    for (const key of ["pricingReferenceSource", "pricing_reference_source"]) {
+      if (hasOwn(container, key)) identityValues.source.push(container[key]);
+    }
+  }
+  if (identityValues.id.some((value) => typeof value !== "string") || identityValues.source.some((value) => typeof value !== "string")) {
+    return "invalid_snapshot";
+  }
+  if (new Set(identityValues.id).size > 1 || new Set(identityValues.source).size > 1) return "invalid_snapshot";
+  const topId = identityValues.id.length ? identityValues.id[0] : "";
+  const topSource = identityValues.source.length ? identityValues.source[0] : "";
+  if (!PRICING_REFERENCE_ID_RE.test(topId)) return "pricing_reference_identity_mismatch";
+  if (!PRICING_REFERENCE_SOURCES.has(topSource)) return "unsupported_pricing_reference_source";
   const basis = normalizedSnapshot.pricing_basis || {};
   if (topId !== basis.id || topSource !== basis.source) return "pricing_reference_identity_mismatch";
   if (!currentReference) return "pricing_reference_unavailable";
@@ -4091,43 +4190,96 @@ function quoteCommercialRestorationReviewReason(saved = {}, normalizedSnapshot =
 }
 
 async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
-  if (!saved || typeof saved !== "object" || saved.version !== QUOTE_SESSION_STATE_VERSION) {
+  if (!isPlainObject(saved) || saved.version !== QUOTE_SESSION_STATE_VERSION) {
     return false;
   }
+  const savedState = saved;
+  const containers = [savedState];
+  const draftCandidates = [];
+  let containerMalformed = false;
+  let nestedSession = null;
+  if (Object.prototype.hasOwnProperty.call(savedState, "quote_session")) {
+    if (!isPlainObject(savedState.quote_session)) {
+      containerMalformed = true;
+    } else {
+      nestedSession = savedState.quote_session;
+      containers.push(nestedSession);
+      if (Object.prototype.hasOwnProperty.call(nestedSession, "draft_state")) {
+        if (!isPlainObject(nestedSession.draft_state)) containerMalformed = true;
+        else draftCandidates.push(nestedSession.draft_state);
+      }
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(savedState, "draft_state")) {
+    if (!isPlainObject(savedState.draft_state)) containerMalformed = true;
+    else draftCandidates.push(savedState.draft_state);
+  }
+  containers.push(...draftCandidates);
+  if (
+    draftCandidates.length > 1
+    && !quoteCommercialStrictDataEqual(draftCandidates[0], draftCandidates[1])
+  ) containerMalformed = true;
+  const restoredState = containerMalformed
+    ? savedState
+    : {
+      ...(nestedSession || {}),
+      ...(draftCandidates[0] || {}),
+      ...savedState,
+    };
   invalidateAuthorityProfileRequests();
   let rejectedRestoredActiveJob = false;
-  state.profileId = typeof saved.profileId === "string" ? saved.profileId : "";
-  const lifecycleKeys = ["quoteCommercialLifecycle", "quote_commercial_lifecycle"]
-    .filter((key) => Object.prototype.hasOwnProperty.call(saved, key));
-  const lifecycleValues = lifecycleKeys.map((key) => saved[key]);
-  const savedLifecycle = lifecycleValues.length ? lifecycleValues[0] : "";
-  state.pricingReferenceId = typeof saved.pricingReferenceId === "string" ? saved.pricingReferenceId : "";
-  state.pricingReferenceSource = typeof saved.pricingReferenceSource === "string" ? saved.pricingReferenceSource : "";
+  state.profileId = typeof restoredState.profileId === "string" ? restoredState.profileId : "";
+  const lifecycleValues = [];
+  for (const container of containers) {
+    for (const key of ["quoteCommercialLifecycle", "quote_commercial_lifecycle"]) {
+      if (Object.prototype.hasOwnProperty.call(container, key)) lifecycleValues.push(container[key]);
+    }
+  }
+  const savedLifecycle = lifecycleValues.find((value) => typeof value === "string") || "";
+  const identityValues = { id: [], source: [] };
+  for (const container of containers) {
+    for (const key of ["pricingReferenceId", "pricing_reference_id"]) {
+      if (Object.prototype.hasOwnProperty.call(container, key)) identityValues.id.push(container[key]);
+    }
+    for (const key of ["pricingReferenceSource", "pricing_reference_source"]) {
+      if (Object.prototype.hasOwnProperty.call(container, key)) identityValues.source.push(container[key]);
+    }
+  }
+  const savedReferenceId = identityValues.id.find((value) => typeof value === "string") || "";
+  const savedReferenceSource = identityValues.source.find((value) => typeof value === "string") || "";
+  state.pricingReferenceId = savedReferenceId;
+  state.pricingReferenceSource = savedReferenceSource;
   state.quoteCommercialLifecycle = savedLifecycle;
   state.quoteCommercialSnapshot = null;
   state.quoteCommercialReview = null;
   state.pricingReferenceSelectionIntent = null;
-  const targetSessionId = safeQuoteSessionId(options.sessionId || saved.quoteSessionId || "");
-  const savedGenerationContext = saved.generationContext && typeof saved.generationContext === "object"
-    ? saved.generationContext : {};
+  const targetSessionId = safeQuoteSessionId(options.sessionId || restoredState.quoteSessionId || "");
+  const savedGenerationContext = restoredState.generationContext && typeof restoredState.generationContext === "object"
+    ? restoredState.generationContext : {};
   const savedRunMatchesSession = safeQuoteSessionId(savedGenerationContext.session_id || "") === targetSessionId;
   transitionGenerationContext(targetSessionId, savedRunMatchesSession ? savedGenerationContext.run_id : "");
-  state.quoteSessionDraftSaveStarted = Boolean(saved.quoteSessionDraftSaveStarted || options.sessionId);
-  const restoredSessionId = safeQuoteSessionId(saved.quoteSessionRestoredSessionId || "");
+  state.quoteSessionDraftSaveStarted = Boolean(restoredState.quoteSessionDraftSaveStarted || options.sessionId);
+  const restoredSessionId = safeQuoteSessionId(restoredState.quoteSessionRestoredSessionId || "");
   state.quoteSessionRestoredSessionId = restoredSessionId && restoredSessionId === state.quoteSessionId ? restoredSessionId : "";
-  state.quoteSessionRestoredDraftKey = state.quoteSessionRestoredSessionId ? String(saved.quoteSessionRestoredDraftKey || "") : "";
-  state.activeAppView = saved.activeAppView === "quote" || options.forceQuoteView ? "quote" : "dashboard";
-  state.restorableOverlay = normalizeRestorableOverlay(saved.restorableOverlay);
+  state.quoteSessionRestoredDraftKey = state.quoteSessionRestoredSessionId ? String(restoredState.quoteSessionRestoredDraftKey || "") : "";
+  state.activeAppView = restoredState.activeAppView === "quote" || options.forceQuoteView ? "quote" : "dashboard";
+  state.restorableOverlay = normalizeRestorableOverlay(restoredState.restorableOverlay);
   state.pricingReferenceSettingsMode = state.restorableOverlay
-    ? normalizePricingReferenceSettingsMode(saved.pricingReferenceSettingsMode)
+    ? normalizePricingReferenceSettingsMode(restoredState.pricingReferenceSettingsMode)
     : PRICING_REFERENCE_SETTINGS_MODE_MANAGE;
-  const detailKeys = ["quoteDetails", "quote_details"]
-    .filter((key) => Object.prototype.hasOwnProperty.call(saved, key));
-  const detailValues = detailKeys.map((key) => saved[key]);
-  const savedDetailsAreValid = detailValues.every(isPlainObject)
-    && (detailValues.length < 2 || JSON.stringify(detailValues[0]) === JSON.stringify(detailValues[1]));
+  const detailValues = [];
+  for (const container of containers) {
+    for (const key of ["quoteDetails", "quote_details"]) {
+      if (Object.prototype.hasOwnProperty.call(container, key)) detailValues.push(container[key]);
+    }
+  }
+  const savedDetailsAreValid = !containerMalformed
+    && detailValues.every(isPlainObject)
+    && (detailValues.length < 2 || detailValues.slice(1).every((value) => (
+      quoteCommercialStrictDataEqual(detailValues[0], value)
+    )));
   const savedQuoteDetails = savedDetailsAreValid && detailValues.length ? detailValues[0] : {};
-  state.selectedPresetValue = saved.selectedPresetValue || presetValueFromQuoteDetails(savedQuoteDetails) || "";
+  state.selectedPresetValue = restoredState.selectedPresetValue || presetValueFromQuoteDetails(savedQuoteDetails) || "";
   const savedCommercialSnapshot = savedQuoteDetails.commercial_snapshot;
   const normalizedCommercialSnapshot = normalizeQuoteCommercialSnapshot(
     savedCommercialSnapshot,
@@ -4141,9 +4293,12 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   const savedReviewIdentity = savedBasis
     ? { id: savedBasis.id, source: savedBasis.source }
     : { id: "", source: "" };
-  const reviewKeys = ["quoteCommercialReview", "quote_commercial_review"]
-    .filter((key) => Object.prototype.hasOwnProperty.call(saved, key));
-  const reviewValues = reviewKeys.map((key) => saved[key]);
+  const reviewValues = [];
+  for (const container of containers) {
+    for (const key of ["quoteCommercialReview", "quote_commercial_review"]) {
+      if (Object.prototype.hasOwnProperty.call(container, key)) reviewValues.push(container[key]);
+    }
+  }
   let normalizedReview = null;
   let reviewInvalid = false;
   let reviewCleared = false;
@@ -4157,17 +4312,17 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
       reviewInvalid = true;
       continue;
     }
-    if (normalizedReview && JSON.stringify(normalizedReview) !== JSON.stringify(candidate)) reviewInvalid = true;
+    if (normalizedReview && !quoteCommercialStrictDataEqual(normalizedReview, candidate)) reviewInvalid = true;
     else normalizedReview = candidate;
   }
   if (reviewCleared && normalizedReview) reviewInvalid = true;
   const restorationReason = quoteCommercialRestorationReviewReason(
-    saved,
+    savedState,
     normalizedCommercialSnapshot,
     savedLifecycle,
     currentPricingReference(),
   );
-  if (reviewInvalid) {
+  if (reviewInvalid || restorationReason === "review_state_invalid") {
     setQuoteCommercialReview("review_state_invalid", savedReviewIdentity.id, savedReviewIdentity.source);
   } else if (normalizedReview && restorationReason !== "invalid_snapshot") {
     state.quoteCommercialReview = normalizedReview;
@@ -4183,56 +4338,56 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
     ? { cheque_payee: savedQuoteText.cheque_payee }
     : {};
   state.quoteCommercialTouched = normalizeQuoteCommercialTouched(
-    saved.quoteCommercialTouched || quoteDetailsCommercialTouched(savedQuoteDetails)
+    restoredState.quoteCommercialTouched || quoteDetailsCommercialTouched(savedQuoteDetails)
   );
   syncSelectedPricingReference();
   renderProfileOptions();
   renderPresetOptions();
-  state.pendingFeedback = String(saved.pendingFeedback || "");
+  state.pendingFeedback = String(restoredState.pendingFeedback || "");
   const restoredQuoteDetails = await restoreQuoteDetailsLogo(
     quoteDetailsWithFallbackDefaults(selectedPreset()?.details || {}, savedQuoteDetails, { preserveSavedState: true }),
     { preserveMissingLogo: true }
   );
   applyQuoteDetails(restoredQuoteDetails, { includeLogo: true, clearLogo: true });
-  state.images = await restoreSessionImages(saved.images);
-  state.quoteBasis = cloneQuoteBasis(saved.quoteBasis || {});
-  state.quoteBasisSections = normalizeQuoteBasisSections(saved.quoteBasisSections || saved.quoteBasis || {});
-  state.lineItems = Array.isArray(saved.lineItems) ? saved.lineItems.map(normalizeLineItem) : [];
-  state.outputRows = Array.isArray(saved.outputRows) ? saved.outputRows.map(normalizeOutputRow) : [];
-  state.originalOutputRows = Array.isArray(saved.originalOutputRows) ? saved.originalOutputRows.map(normalizeOutputRow) : [];
-  state.outputErrors = Array.isArray(saved.outputErrors) ? saved.outputErrors : [];
+  state.images = await restoreSessionImages(restoredState.images);
+  state.quoteBasis = cloneQuoteBasis(restoredState.quoteBasis || {});
+  state.quoteBasisSections = normalizeQuoteBasisSections(restoredState.quoteBasisSections || restoredState.quoteBasis || {});
+  state.lineItems = Array.isArray(restoredState.lineItems) ? restoredState.lineItems.map(normalizeLineItem) : [];
+  state.outputRows = Array.isArray(restoredState.outputRows) ? restoredState.outputRows.map(normalizeOutputRow) : [];
+  state.originalOutputRows = Array.isArray(restoredState.originalOutputRows) ? restoredState.originalOutputRows.map(normalizeOutputRow) : [];
+  state.outputErrors = Array.isArray(restoredState.outputErrors) ? restoredState.outputErrors : [];
   state.outputSortMode = "pricing_reference";
-  state.analysisFindings = Array.isArray(saved.analysisFindings) ? saved.analysisFindings : [];
-  state.blockingClarificationQuestions = Array.isArray(saved.blockingClarificationQuestions) ? saved.blockingClarificationQuestions : [];
-  state.boothDimensions = normalizeBoothDimensions(saved.boothDimensions || savedQuoteDetails.project || {});
-  state.originalAnalysisSnapshot = saved.originalAnalysisSnapshot || null;
-  state.basisConfirmed = Boolean(saved.basisConfirmed);
-  state.draftSource = saved.draftSource || "";
-  state.lastAnalysisMode = normalizeAnalysisMode(saved.lastAnalysisMode || saved.originalAnalysisSnapshot?.analysis_mode);
-  state.pendingAnalysisMode = normalizeAnalysisMode(saved.pendingAnalysisMode || state.lastAnalysisMode);
-  const savedBasisChat = saved.basisChat && typeof saved.basisChat === "object" ? saved.basisChat : {};
+  state.analysisFindings = Array.isArray(restoredState.analysisFindings) ? restoredState.analysisFindings : [];
+  state.blockingClarificationQuestions = Array.isArray(restoredState.blockingClarificationQuestions) ? restoredState.blockingClarificationQuestions : [];
+  state.boothDimensions = normalizeBoothDimensions(restoredState.boothDimensions || savedQuoteDetails.project || {});
+  state.originalAnalysisSnapshot = restoredState.originalAnalysisSnapshot || null;
+  state.basisConfirmed = Boolean(restoredState.basisConfirmed);
+  state.draftSource = restoredState.draftSource || "";
+  state.lastAnalysisMode = normalizeAnalysisMode(restoredState.lastAnalysisMode || restoredState.originalAnalysisSnapshot?.analysis_mode);
+  state.pendingAnalysisMode = normalizeAnalysisMode(restoredState.pendingAnalysisMode || state.lastAnalysisMode);
+  const savedBasisChat = restoredState.basisChat && typeof restoredState.basisChat === "object" ? restoredState.basisChat : {};
   state.basisChat = {
     ...state.basisChat,
     ...savedBasisChat,
     lineIndex: Number.isInteger(Number(savedBasisChat.lineIndex)) ? Number(savedBasisChat.lineIndex) : -1,
     proposal: savedBasisChat.proposal && typeof savedBasisChat.proposal === "object" ? savedBasisChat.proposal : null,
   };
-  state.aiFailed = Boolean(saved.aiFailed || state.draftSource === "local");
-  state.downloadFile = saved.downloadFile || null;
-  state.pdfFile = saved.pdfFile || null;
-  state.outputRevision = revisionNumber(saved.outputRevision, 0);
+  state.aiFailed = Boolean(restoredState.aiFailed || state.draftSource === "local");
+  state.downloadFile = restoredState.downloadFile || null;
+  state.pdfFile = restoredState.pdfFile || null;
+  state.outputRevision = revisionNumber(restoredState.outputRevision, 0);
   state.downloadFileRevision = revisionNumber(
-    saved.downloadFileRevision ?? saved.downloadFile?.output_revision,
+    restoredState.downloadFileRevision ?? restoredState.downloadFile?.output_revision,
     -1
   );
   state.pdfFileRevision = revisionNumber(
-    saved.pdfFileRevision ?? saved.pdfFile?.output_revision,
+    restoredState.pdfFileRevision ?? restoredState.pdfFile?.output_revision,
     -1
   );
-  state.pricingMatches = Array.isArray(saved.pricingMatches) ? saved.pricingMatches : [];
+  state.pricingMatches = Array.isArray(restoredState.pricingMatches) ? restoredState.pricingMatches : [];
   state.pricingIssues = [];
-  state.activeJob = normalizeActiveJob(saved.activeJob || {}, { restoring: true });
-  rejectedRestoredActiveJob = Boolean(saved.activeJob && typeof saved.activeJob === "object" && !state.activeJob);
+  state.activeJob = normalizeActiveJob(restoredState.activeJob || {}, { restoring: true });
+  rejectedRestoredActiveJob = Boolean(restoredState.activeJob && typeof restoredState.activeJob === "object" && !state.activeJob);
   if (rejectedRestoredActiveJob) {
     state.isAnalysisRunning = false;
     state.isGenerating = false;
@@ -4247,19 +4402,19 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
     clearAiFailedDraftState();
     renderBasisFailureState();
   } else if (state.lineItems.length || state.quoteBasisSections.length || Object.values(state.quoteBasis).some((value) => splitLines(value).length > 0)) {
-    updateQuoteBasisCard(saved.draftSource || "restored");
+    updateQuoteBasisCard(restoredState.draftSource || "restored");
   } else {
     renderBasisEmptyState();
   }
   updateDownloadButton();
   setResultStatus(state.aiFailed ? "No usable AI draft" : state.downloadFile ? "Completed" : "No job yet", state.aiFailed ? "is-bad" : state.downloadFile ? "is-ok" : "");
-  setWorkflowStage(restoredWorkflowStage(rejectedRestoredActiveJob ? { ...saved, workflowStage: "" } : saved));
+  setWorkflowStage(restoredWorkflowStage(rejectedRestoredActiveJob ? { ...restoredState, workflowStage: "" } : restoredState));
   if (state.aiFailed) {
     showAiFailureBanner();
   } else {
     clearAiFailureBanner();
   }
-  const restoredPanel = restoredQuoteSessionSidePanel(saved, options);
+  const restoredPanel = restoredQuoteSessionSidePanel(restoredState, options);
   setSidePanel(restoredPanel, { force: true });
   renderQuoteCommercialReviewState();
   try {
@@ -5566,7 +5721,44 @@ function renderProfileOptions() {
   if (!elements.profileSelect) return;
   const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
   const establishedBasis = quoteCommercialSnapshotPricingBasis();
-  const authorityReviewReason = establishedBasis
+  const canonicalDurableReview = (() => {
+    const review = state.quoteCommercialReview;
+    if (!review || typeof review !== "object" || Array.isArray(review)) return null;
+    const reviewKeys = ["schema", "version", "status", "reason_code", "blocked_identity"];
+    if (Object.keys(review).length !== reviewKeys.length || !reviewKeys.every((key) => Object.prototype.hasOwnProperty.call(review, key))) return null;
+    const reviewSchema = typeof QUOTE_COMMERCIAL_REVIEW_SCHEMA === "string"
+      ? QUOTE_COMMERCIAL_REVIEW_SCHEMA : "swooshz.quote-commercial-review.v1";
+    const reviewVersion = typeof QUOTE_COMMERCIAL_REVIEW_VERSION === "number"
+      ? QUOTE_COMMERCIAL_REVIEW_VERSION : 1;
+    const reviewStatus = typeof QUOTE_COMMERCIAL_REVIEW_STATUS === "string"
+      ? QUOTE_COMMERCIAL_REVIEW_STATUS : "REVIEW_REQUIRED";
+    const reviewReasons = typeof QUOTE_COMMERCIAL_REVIEW_REASONS !== "undefined"
+      ? QUOTE_COMMERCIAL_REVIEW_REASONS : null;
+    const identity = review.blocked_identity;
+    if (
+      review.schema !== reviewSchema
+      || review.version !== reviewVersion
+      || review.status !== reviewStatus
+      || typeof review.reason_code !== "string"
+      || (reviewReasons && !reviewReasons.has(review.reason_code))
+      || !identity
+      || typeof identity !== "object"
+      || Array.isArray(identity)
+      || Object.keys(identity).length !== 2
+      || !Object.prototype.hasOwnProperty.call(identity, "id")
+      || !Object.prototype.hasOwnProperty.call(identity, "source")
+      || typeof identity.id !== "string"
+      || typeof identity.source !== "string"
+    ) return null;
+    const referenceSources = typeof PRICING_REFERENCE_SOURCES !== "undefined"
+      ? PRICING_REFERENCE_SOURCES : new Set(["company", "local", "bundled"]);
+    if (
+      (identity.id !== "" || identity.source !== "")
+      && (!/^[A-Za-z0-9_-]+$/.test(identity.id) || !referenceSources.has(identity.source))
+    ) return null;
+    return review;
+  })();
+  const authorityReviewReason = !canonicalDurableReview && establishedBasis
     ? pricingReferenceAuthorityReviewReason(establishedBasis, currentPricingReference())
     : "";
   if (authorityReviewReason) setQuoteCommercialReview(authorityReviewReason, establishedBasis.id, establishedBasis.source);
@@ -12433,25 +12625,44 @@ function hydrateDashboardDraftImagePayloads(draftState = {}, sessionId = "") {
 }
 
 function mergeDashboardDraftSummaryDetails(draftState = {}, session = {}) {
-  const summary = session?.customer_summary && typeof session.customer_summary === "object"
+  const isPlain = (value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+  };
+  const summary = isPlain(session?.customer_summary)
     ? session.customer_summary
     : {};
-  const showName = String(summary.show_name || "").trim();
-  const projectNumber = String(summary.project_number || "").trim();
+  const showName = typeof summary.show_name === "string" ? summary.show_name.trim() : "";
+  const projectNumber = typeof summary.project_number === "string" ? summary.project_number.trim() : "";
   if (!showName && !projectNumber) return draftState;
+  if (!isPlain(draftState)) return draftState;
 
-  const quoteDetails = draftState?.quoteDetails && typeof draftState.quoteDetails === "object"
-    ? draftState.quoteDetails
-    : {};
-  const project = quoteDetails.project && typeof quoteDetails.project === "object" ? quoteDetails.project : {};
+  const detailKeys = ["quoteDetails", "quote_details"]
+    .filter((key) => Object.prototype.hasOwnProperty.call(draftState, key));
+  if (detailKeys.length !== 1) return draftState;
+  const detailKey = detailKeys[0];
+  const quoteDetails = draftState[detailKey];
+  if (!isPlain(quoteDetails)) return draftState;
+  if (
+    Object.prototype.hasOwnProperty.call(quoteDetails, "project")
+    && !isPlain(quoteDetails.project)
+  ) return draftState;
+
+  const project = isPlain(quoteDetails.project) ? quoteDetails.project : {};
   const nextProject = { ...project };
-  if (showName && !String(nextProject.show_name || "").trim()) nextProject.show_name = showName;
-
-  const nextQuoteDetails = { ...quoteDetails, project: nextProject };
-  if (projectNumber && !String(nextQuoteDetails.project_number || "").trim()) {
-    nextQuoteDetails.project_number = projectNumber;
+  const nextQuoteDetails = { ...quoteDetails };
+  let changed = false;
+  if (showName && !Object.prototype.hasOwnProperty.call(project, "show_name")) {
+    nextProject.show_name = showName;
+    nextQuoteDetails.project = nextProject;
+    changed = true;
   }
-  return { ...draftState, quoteDetails: nextQuoteDetails };
+  if (projectNumber && !Object.prototype.hasOwnProperty.call(quoteDetails, "project_number")) {
+    nextQuoteDetails.project_number = projectNumber;
+    changed = true;
+  }
+  return changed ? { ...draftState, [detailKey]: nextQuoteDetails } : draftState;
 }
 
 function dashboardSessionCanModify(session = {}) {

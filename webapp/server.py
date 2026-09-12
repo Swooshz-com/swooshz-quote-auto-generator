@@ -4055,8 +4055,52 @@ class QuoteCommercialSavedState:
     commercial_progress: bool
 
 
+def _quote_commercial_strict_data_equal(left: Any, right: Any, depth: int = 0) -> bool:
+    """Compare JSON-like values without Python's bool/int or int/float coercion."""
+    if depth > 64 or type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        if len(left) != len(right):
+            return False
+        unmatched = list(right.items())
+        for left_key, left_value in left.items():
+            match_index = next(
+                (
+                    index
+                    for index, (right_key, _right_value) in enumerate(unmatched)
+                    if _quote_commercial_strict_data_equal(left_key, right_key, depth + 1)
+                ),
+                None,
+            )
+            if match_index is None:
+                return False
+            _right_key, right_value = unmatched.pop(match_index)
+            if not _quote_commercial_strict_data_equal(left_value, right_value, depth + 1):
+                return False
+        return not unmatched
+    if isinstance(left, (list, tuple)):
+        return len(left) == len(right) and all(
+            _quote_commercial_strict_data_equal(left_item, right_item, depth + 1)
+            for left_item, right_item in zip(left, right)
+        )
+    try:
+        return left == right
+    except Exception:
+        return False
+
+
 def quote_session_draft_state_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    return _quote_commercial_saved_state_from_payload(payload).draft_state
+    saved = _quote_commercial_saved_state_from_payload(payload)
+    draft_state = copy.deepcopy(saved.draft_state)
+    if not isinstance(draft_state, dict) or saved.malformed:
+        return draft_state if isinstance(draft_state, dict) else {}
+    if saved.review_valid and isinstance(saved.review, dict):
+        draft_state["quoteCommercialReview"] = copy.deepcopy(saved.review)
+        draft_state.pop("quote_commercial_review", None)
+    elif saved.review_cleared:
+        draft_state.pop("quoteCommercialReview", None)
+        draft_state.pop("quote_commercial_review", None)
+    return draft_state
 
 
 def quote_commercial_saved_details(payload: dict[str, Any]) -> tuple[dict[str, Any], Any, dict[str, Any], bool]:
@@ -4121,7 +4165,12 @@ def _quote_commercial_saved_state_from_payload(payload: Any) -> QuoteCommercialS
         else:
             top_level_draft = raw_top_level_draft
 
-    if nested_draft is not None and top_level_draft is not None and nested_draft != top_level_draft:
+    draft_candidates = [candidate for candidate in (nested_draft, top_level_draft) if candidate is not None]
+    if (
+        nested_draft is not None
+        and top_level_draft is not None
+        and not _quote_commercial_strict_data_equal(nested_draft, top_level_draft)
+    ):
         malformed = True
         draft_container_malformed = True
     if draft_container_malformed:
@@ -4133,27 +4182,31 @@ def _quote_commercial_saved_state_from_payload(payload: Any) -> QuoteCommercialS
     details_valid = True
     detail_candidates: list[dict[str, Any]] = []
     if not draft_container_malformed:
-        for key in ("quoteDetails", "quote_details"):
-            if key not in draft_state:
-                continue
-            details_supplied = True
-            raw_details = draft_state.get(key)
-            if not isinstance(raw_details, dict):
-                malformed = True
-                details_valid = False
-                continue
-            detail_candidates.append(raw_details)
-        if len(detail_candidates) == 2 and detail_candidates[0] != detail_candidates[1]:
-            malformed = True
-            details_valid = False
+        for candidate_draft in draft_candidates:
+            for key in ("quoteDetails", "quote_details"):
+                if key not in candidate_draft:
+                    continue
+                details_supplied = True
+                raw_details = candidate_draft.get(key)
+                if not isinstance(raw_details, dict):
+                    malformed = True
+                    details_valid = False
+                    continue
+                detail_candidates.append(raw_details)
+    if len(detail_candidates) > 1 and any(
+        not _quote_commercial_strict_data_equal(detail_candidates[0], candidate)
+        for candidate in detail_candidates[1:]
+    ):
+        malformed = True
+        details_valid = False
 
     details = detail_candidates[0] if details_valid and detail_candidates else {}
-    if details_valid and detail_candidates:
+    for candidate_details in detail_candidates:
         for key in ("client", "project", "company", "tax", "quote_text", "signature", "rich_text"):
-            if key in details and not isinstance(details.get(key), dict):
+            if key in candidate_details and not isinstance(candidate_details.get(key), dict):
                 malformed = True
                 details_valid = False
-        company = details.get("company") if isinstance(details.get("company"), dict) else {}
+        company = candidate_details.get("company") if isinstance(candidate_details.get("company"), dict) else {}
         for key in ("logo_data_url", "logo_session_file_key", "logo_content_fingerprint"):
             if key in company and not isinstance(company.get(key), str):
                 malformed = True
@@ -4165,13 +4218,14 @@ def _quote_commercial_saved_state_from_payload(payload: Any) -> QuoteCommercialS
     raw_snapshot = details.get("commercial_snapshot") if snapshot_supplied else None
 
     lifecycle_values: list[Any] = []
-    if not draft_container_malformed:
+    lifecycle_containers: list[dict[str, Any]] = list(draft_candidates)
+    if isinstance(quote_session_value, dict):
+        lifecycle_containers.append(quote_session_value)
+    lifecycle_containers.append(payload)
+    for container in lifecycle_containers:
         for key in ("quoteCommercialLifecycle", "quote_commercial_lifecycle"):
-            if key in draft_state:
-                lifecycle_values.append(draft_state.get(key))
-    for key in ("quoteCommercialLifecycle", "quote_commercial_lifecycle"):
-        if key in payload:
-            lifecycle_values.append(payload.get(key))
+            if key in container:
+                lifecycle_values.append(container.get(key))
     lifecycle_supplied = bool(lifecycle_values)
     if any(not isinstance(value, str) for value in lifecycle_values):
         malformed = True
@@ -4180,13 +4234,14 @@ def _quote_commercial_saved_state_from_payload(payload: Any) -> QuoteCommercialS
     lifecycle = lifecycle_values[0] if lifecycle_values else ""
 
     review_values: list[Any] = []
-    if not draft_container_malformed:
+    review_containers: list[dict[str, Any]] = list(draft_candidates)
+    if isinstance(quote_session_value, dict):
+        review_containers.append(quote_session_value)
+    review_containers.append(payload)
+    for container in review_containers:
         for key in ("quoteCommercialReview", "quote_commercial_review"):
-            if key in draft_state:
-                review_values.append(draft_state.get(key))
-    for key in ("quoteCommercialReview", "quote_commercial_review"):
-        if key in payload:
-            review_values.append(payload.get(key))
+            if key in container:
+                review_values.append(container.get(key))
     review_supplied = any(value is not None for value in review_values)
     review_cleared = any(value is None for value in review_values)
     normalized_reviews: list[dict[str, Any]] = []
@@ -4199,7 +4254,10 @@ def _quote_commercial_saved_state_from_payload(payload: Any) -> QuoteCommercialS
             review_invalid = True
         else:
             normalized_reviews.append(normalized_review)
-    if len(normalized_reviews) > 1 and any(review != normalized_reviews[0] for review in normalized_reviews[1:]):
+    if len(normalized_reviews) > 1 and any(
+        not _quote_commercial_strict_data_equal(normalized_reviews[0], review)
+        for review in normalized_reviews[1:]
+    ):
         review_invalid = True
     if review_cleared and normalized_reviews:
         review_invalid = True
@@ -4220,22 +4278,27 @@ def _quote_commercial_saved_state_from_payload(payload: Any) -> QuoteCommercialS
         "originalAnalysisSnapshot",
         "draftSource",
     )
-    commercial_progress = any(
-        key in draft_state and quote_commercial_value_is_present(draft_state.get(key))
-        for key in progress_keys
-    )
-    commercial_progress = commercial_progress or draft_state.get("basisConfirmed") is True
-    commercial_progress = commercial_progress or (
-        isinstance(draft_state.get("workflowStage"), str)
-        and draft_state.get("workflowStage") in {"pricing_review", "completed", "generating"}
-    )
+    commercial_progress = False
+    progress_containers: list[dict[str, Any]] = list(draft_candidates)
     if isinstance(quote_session_value, dict):
-        status = quote_session_value.get("status")
+        progress_containers.append(quote_session_value)
+    progress_containers.append(payload)
+    for container in progress_containers:
+        commercial_progress = commercial_progress or any(
+            key in container and quote_commercial_value_is_present(container.get(key))
+            for key in progress_keys
+        )
+        commercial_progress = commercial_progress or container.get("basisConfirmed") is True
+        commercial_progress = commercial_progress or (
+            isinstance(container.get("workflowStage"), str)
+            and container.get("workflowStage") in {"pricing_review", "completed", "generating"}
+        )
+        status = container.get("status")
         commercial_progress = commercial_progress or (
             isinstance(status, dict) and status.get("quote_generated") is True
         )
         commercial_progress = commercial_progress or any(
-            key in quote_session_value and quote_commercial_value_is_present(quote_session_value.get(key))
+            key in container and quote_commercial_value_is_present(container.get(key))
             for key in ("publication", "generation_snapshot")
         )
 
@@ -22588,8 +22651,24 @@ def dashboard_safe_exchange_rate(value: Any) -> float | None:
 
 
 def quote_session_patch_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    patch = payload.get("quote_session") if isinstance(payload.get("quote_session"), dict) else None
-    return patch if patch is not None else payload
+    if not isinstance(payload, dict):
+        return {}
+    raw_patch = payload.get("quote_session") if isinstance(payload.get("quote_session"), dict) else payload
+    patch = copy.deepcopy(raw_patch)
+    saved = _quote_commercial_saved_state_from_payload(payload)
+    draft_supplied = "draft_state" in payload or (
+        isinstance(payload.get("quote_session"), dict)
+        and "draft_state" in payload["quote_session"]
+    )
+    if not saved.malformed and (
+        draft_supplied
+        or saved.review_valid
+        or saved.review_cleared
+    ):
+        patch["draft_state"] = quote_session_draft_state_from_payload(payload)
+        patch.pop("quoteCommercialReview", None)
+        patch.pop("quote_commercial_review", None)
+    return patch
 
 
 def quote_session_customer_summary(payload: dict[str, Any], patch: dict[str, Any]) -> dict[str, str]:
@@ -22944,9 +23023,18 @@ def quote_session_draft_state_value(value: Any, depth: int = 0) -> Any:
 
 
 def quote_session_draft_state(patch: dict[str, Any]) -> dict[str, Any]:
-    supplied = patch.get("draft_state") if isinstance(patch.get("draft_state"), dict) else {}
+    saved = _quote_commercial_saved_state_from_payload(patch)
+    supplied = patch.get("draft_state") if isinstance(patch.get("draft_state"), dict) else saved.draft_state
     sanitized = quote_session_draft_state_value(supplied)
-    return sanitized if isinstance(sanitized, dict) else {}
+    if not isinstance(sanitized, dict):
+        return {}
+    if not saved.malformed and saved.review_valid and isinstance(saved.review, dict):
+        sanitized["quoteCommercialReview"] = copy.deepcopy(saved.review)
+        sanitized.pop("quote_commercial_review", None)
+    elif not saved.malformed and saved.review_cleared:
+        sanitized.pop("quoteCommercialReview", None)
+        sanitized.pop("quote_commercial_review", None)
+    return sanitized
 
 
 QUOTE_SESSION_FRESHNESS_VOLATILE_KEYS = {

@@ -2477,6 +2477,320 @@ class WebappServerTest(unittest.TestCase):
         self.assertNotIn("commercial_snapshot", database_detail["generation_snapshot"])
         self.assertEqual(restored_review["draft_state"]["quoteCommercialReview"], durable_review)
 
+    def test_repair2_review_aliases_round_trip_losslessly_for_local_and_sqlite(self):
+        durable_review = {
+            "schema": webapp.QUOTE_COMMERCIAL_REVIEW_SCHEMA,
+            "version": webapp.QUOTE_COMMERCIAL_REVIEW_VERSION,
+            "status": webapp.QUOTE_COMMERCIAL_REVIEW_STATUS,
+            "reason_code": "pricing_reference_digest_mismatch",
+            "blocked_identity": {
+                "id": "synthetic-exhibition-fixture-pricing",
+                "source": "local",
+            },
+        }
+
+        def payload_for(location, alias, session_id):
+            payload = recovered_convergence_payload()
+            payload.pop("quoteCommercialReview", None)
+            payload.pop("quote_commercial_review", None)
+            draft = payload["quote_session"]["draft_state"]
+            draft.pop("quoteCommercialReview", None)
+            draft.pop("quote_commercial_review", None)
+            if location == "nested_draft":
+                draft[alias] = copy.deepcopy(durable_review)
+                payload["quote_session"]["session_id"] = session_id
+            elif location == "top_level_draft":
+                payload.pop("quote_session")
+                payload["draft_state"] = draft
+                payload["draft_state"][alias] = copy.deepcopy(durable_review)
+                payload["session_id"] = session_id
+            elif location == "top_level":
+                draft.pop(alias, None)
+                payload[alias] = copy.deepcopy(durable_review)
+                payload["quote_session"]["session_id"] = session_id
+            else:
+                raise AssertionError(location)
+            return payload
+
+        variants = (
+            ("nested_draft", "quoteCommercialReview"),
+            ("nested_draft", "quote_commercial_review"),
+            ("top_level_draft", "quoteCommercialReview"),
+            ("top_level_draft", "quote_commercial_review"),
+            ("top_level", "quoteCommercialReview"),
+            ("top_level", "quote_commercial_review"),
+        )
+
+        with tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+            with mock.patch.object(webapp, "configured_data_root", return_value=Path(tmp) / "local"):
+                for index, (location, alias) in enumerate(variants):
+                    session_id = f"quote-repair2-local-{index}"
+                    webapp.create_or_update_quote_session(
+                        payload_for(location, alias, session_id),
+                        session_id=session_id,
+                    )
+                    restored = webapp.get_quote_session(session_id, include_draft_state=True)
+                    self.assertIsNotNone(restored)
+                    persisted = restored["draft_state"]
+                    self.assertEqual(persisted["quoteCommercialReview"], durable_review)
+                    self.assertNotIn("quote_commercial_review", persisted)
+
+        with tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+            database_url = f"sqlite:///{(Path(tmp) / 'repair2-review.sqlite3').as_posix()}"
+            with mock.patch.dict(
+                os.environ,
+                {"SQAG_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url},
+                clear=False,
+            ):
+                webapp.apply_sqag_storage_migrations(database_url)
+                storage = webapp.DatabaseSqagStorage(
+                    database_url,
+                    "workspace-repair2-review",
+                    role="admin",
+                    user_id="repair2-user",
+                )
+                for index, (location, alias) in enumerate(variants):
+                    session_id = f"quote-repair2-db-{index}"
+                    storage.create_or_update_quote_session(
+                        payload_for(location, alias, session_id),
+                        session_id=session_id,
+                    )
+                    restored = storage.get_quote_session(session_id, include_draft_state=True)
+                    self.assertIsNotNone(restored)
+                    persisted = restored["draft_state"]
+                    self.assertEqual(persisted["quoteCommercialReview"], durable_review)
+                    self.assertNotIn("quote_commercial_review", persisted)
+
+    def test_repair2_strict_duplicate_aliases_reconcile_and_reject_type_traps(self):
+        self.assertTrue(
+            webapp._quote_commercial_strict_data_equal(
+                {"outer": {"first": 1, "second": ["x", {"y": True}]}},
+                {"outer": {"second": ["x", {"y": True}], "first": 1}},
+            )
+        )
+        self.assertFalse(webapp._quote_commercial_strict_data_equal({"value": 2}, {"value": 2.0}))
+        self.assertFalse(webapp._quote_commercial_strict_data_equal({"value": True}, {"value": 1}))
+
+        equivalent = recovered_convergence_payload()
+        details = equivalent["quote_session"]["draft_state"]["quoteDetails"]
+        details_alias = dict(reversed(list(details.items())))
+        equivalent["quote_session"]["draft_state"]["quote_details"] = details_alias
+        self.assertFalse(webapp.quote_commercial_state(equivalent)["review_required"])
+
+        for trap_value in (2.0, True):
+            trapped = recovered_convergence_payload()
+            trapped_details = copy.deepcopy(trapped["quote_session"]["draft_state"]["quoteDetails"])
+            trapped_alias = copy.deepcopy(trapped_details)
+            trapped_alias["commercial_snapshot"]["version"] = trap_value
+            trapped["quote_session"]["draft_state"]["quote_details"] = trapped_alias
+            with self.subTest(trap_value=repr(trap_value)):
+                self.assertEqual(
+                    webapp.quote_commercial_state(trapped)["review_reason"],
+                    "invalid_snapshot",
+                )
+
+        durable_review = {
+            "schema": webapp.QUOTE_COMMERCIAL_REVIEW_SCHEMA,
+            "version": webapp.QUOTE_COMMERCIAL_REVIEW_VERSION,
+            "status": webapp.QUOTE_COMMERCIAL_REVIEW_STATUS,
+            "reason_code": "pricing_reference_digest_mismatch",
+            "blocked_identity": {
+                "id": "synthetic-exhibition-fixture-pricing",
+                "source": "local",
+            },
+        }
+        reviewed = recovered_convergence_payload()
+        reviewed["quote_session"]["draft_state"]["quoteCommercialReview"] = copy.deepcopy(durable_review)
+        reviewed["quote_session"]["draft_state"]["quote_commercial_review"] = {
+            "blocked_identity": copy.deepcopy(durable_review["blocked_identity"]),
+            "reason_code": durable_review["reason_code"],
+            "status": durable_review["status"],
+            "version": durable_review["version"],
+            "schema": durable_review["schema"],
+        }
+        self.assertEqual(
+            webapp.quote_commercial_state(reviewed)["review"],
+            durable_review,
+        )
+        conflicting_review = copy.deepcopy(reviewed)
+        conflicting_review["quote_session"]["draft_state"]["quote_commercial_review"]["reason_code"] = "missing_snapshot"
+        self.assertEqual(
+            webapp.quote_commercial_state(conflicting_review)["review_reason"],
+            "review_state_invalid",
+        )
+
+        malformed_enclosing = recovered_convergence_payload()
+        malformed_enclosing["quote_session"]["draft_state"]["quoteCommercialReview"] = {
+            "schema": webapp.QUOTE_COMMERCIAL_REVIEW_SCHEMA,
+            "version": webapp.QUOTE_COMMERCIAL_REVIEW_VERSION,
+            "status": webapp.QUOTE_COMMERCIAL_REVIEW_STATUS,
+            "reason_code": [],
+            "blocked_identity": {"id": "", "source": ""},
+        }
+        malformed_enclosing["draft_state"] = []
+        self.assertEqual(
+            webapp.quote_commercial_state(malformed_enclosing)["review_reason"],
+            "review_state_invalid",
+        )
+
+        malformed_details = recovered_convergence_payload()
+        malformed_details["draft_state"] = {"quote_details": []}
+        self.assertEqual(
+            webapp.quote_commercial_state(malformed_details)["review_reason"],
+            "invalid_snapshot",
+        )
+
+    def test_repair2_review_alias_rejection_precedes_allocation_and_storage(self):
+        durable_review = {
+            "schema": webapp.QUOTE_COMMERCIAL_REVIEW_SCHEMA,
+            "version": webapp.QUOTE_COMMERCIAL_REVIEW_VERSION,
+            "status": webapp.QUOTE_COMMERCIAL_REVIEW_STATUS,
+            "reason_code": "pricing_reference_digest_mismatch",
+            "blocked_identity": {
+                "id": "synthetic-exhibition-fixture-pricing",
+                "source": "local",
+            },
+        }
+        cases = []
+
+        malformed = recovered_convergence_payload()
+        malformed["quote_session"]["draft_state"]["quoteCommercialReview"] = copy.deepcopy(durable_review)
+        malformed["quote_session"]["draft_state"]["quote_commercial_review"] = []
+        cases.append(("invalid_alias", malformed))
+
+        conflicting = recovered_convergence_payload()
+        conflicting["quote_session"]["draft_state"]["quoteCommercialReview"] = copy.deepcopy(durable_review)
+        conflicting["quote_session"]["draft_state"]["quote_commercial_review"] = copy.deepcopy(durable_review)
+        conflicting["quote_session"]["draft_state"]["quote_commercial_review"]["reason_code"] = "missing_snapshot"
+        cases.append(("conflicting_alias", conflicting))
+
+        malformed_outer = recovered_convergence_payload()
+        malformed_outer["quote_session"]["draft_state"]["quoteCommercialReview"] = {
+            "schema": webapp.QUOTE_COMMERCIAL_REVIEW_SCHEMA,
+            "version": webapp.QUOTE_COMMERCIAL_REVIEW_VERSION,
+            "status": webapp.QUOTE_COMMERCIAL_REVIEW_STATUS,
+            "reason_code": [],
+            "blocked_identity": {"id": "", "source": ""},
+        }
+        malformed_outer["draft_state"] = []
+        cases.append(("invalid_nested_review_with_malformed_outer", malformed_outer))
+
+        database_storage = webapp.DatabaseSqagStorage(
+            "sqlite:///repair2-review-preflight.sqlite3",
+            "workspace-repair2-review-preflight",
+            role="admin",
+            user_id="repair2-user",
+        )
+        for label, payload in cases:
+            with self.subTest(label=label):
+                self.assertEqual(webapp.quote_commercial_state(payload)["review_reason"], "review_state_invalid")
+                with mock.patch.object(webapp, "new_quote_session_id", side_effect=AssertionError("session id allocated")):
+                    with self.assertRaises(webapp.QuoteCommercialStateError):
+                        webapp.create_or_update_quote_session(payload)
+                with (
+                    mock.patch.object(webapp, "new_quote_session_id", side_effect=AssertionError("database session id allocated")),
+                    mock.patch.object(database_storage, "connection", side_effect=AssertionError("database opened")),
+                ):
+                    with self.assertRaises(webapp.QuoteCommercialStateError):
+                        database_storage.create_or_update_quote_session(payload)
+
+    def test_repair2_progress_forms_are_representation_independent_and_block_writers(self):
+        progress_values = (
+            ("status", {"quote_generated": True}),
+            ("publication", {"publication_id": "synthetic-publication"}),
+            ("generation_snapshot", {"created_at": "2026-09-12T00:00:00Z"}),
+        )
+        locations = ("nested_draft", "nested_session", "top_level_draft", "top_level")
+        database_storage = webapp.DatabaseSqagStorage(
+            "sqlite:///repair2-progress-preflight.sqlite3",
+            "workspace-repair2-progress-preflight",
+            role="admin",
+            user_id="repair2-user",
+        )
+        for location in locations:
+            for key, value in progress_values:
+                payload = valid_payload()
+                payload.pop("quote_session", None)
+                if location in {"nested_draft", "nested_session"}:
+                    payload["quote_session"] = {"draft_state": {}}
+                    target = payload["quote_session"]["draft_state"] if location == "nested_draft" else payload["quote_session"]
+                else:
+                    target = {}
+                    if location == "top_level_draft":
+                        payload["draft_state"] = target
+                target[key] = copy.deepcopy(value)
+                if location == "top_level":
+                    payload[key] = copy.deepcopy(value)
+                with self.subTest(location=location, key=key):
+                    state = webapp.quote_commercial_state(payload)
+                    self.assertTrue(state["review_required"])
+                    self.assertEqual(state["review_reason"], "missing_snapshot")
+                    self.assertEqual(state["review"]["blocked_identity"], {"id": "", "source": ""})
+                    with mock.patch.object(webapp, "new_quote_session_id", side_effect=AssertionError("session id allocated")):
+                        with self.assertRaises(webapp.QuoteCommercialStateError):
+                            webapp.create_or_update_quote_session(payload)
+                    with (
+                        mock.patch.object(webapp, "new_quote_session_id", side_effect=AssertionError("database session id allocated")),
+                        mock.patch.object(database_storage, "connection", side_effect=AssertionError("database opened")),
+                    ):
+                        with self.assertRaises(webapp.QuoteCommercialStateError):
+                            database_storage.create_or_update_quote_session(payload)
+
+    def test_repair2_http_invalid_review_alias_blocks_all_surfaces_before_downstream_work(self):
+        payload = recovered_convergence_payload()
+        durable_review = {
+            "schema": webapp.QUOTE_COMMERCIAL_REVIEW_SCHEMA,
+            "version": webapp.QUOTE_COMMERCIAL_REVIEW_VERSION,
+            "status": webapp.QUOTE_COMMERCIAL_REVIEW_STATUS,
+            "reason_code": "pricing_reference_digest_mismatch",
+            "blocked_identity": {
+                "id": payload["pricing_reference_id"],
+                "source": "local",
+            },
+        }
+        payload["quote_session"]["draft_state"]["quoteCommercialReview"] = copy.deepcopy(durable_review)
+        payload["quote_session"]["draft_state"]["quote_commercial_review"] = copy.deepcopy(durable_review)
+        payload["quote_session"]["draft_state"]["quote_commercial_review"]["reason_code"] = "missing_snapshot"
+        expected_review = copy.deepcopy(durable_review)
+        expected_review["reason_code"] = "review_state_invalid"
+        expected = {
+            "status": "blocked",
+            "errors": [webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE],
+            "quoteCommercialReview": expected_review,
+        }
+        jobs_before = copy.deepcopy(webapp.JOBS)
+        with LocalRunnerServer() as runner:
+            with (
+                mock.patch.object(webapp, "secrets") as secrets_module,
+                mock.patch.object(webapp, "image_entries", side_effect=AssertionError("image validation ran")),
+                mock.patch.object(webapp, "image_limit_error", side_effect=AssertionError("image limit ran")),
+                mock.patch.object(webapp, "ai_log_tracking_scope", side_effect=AssertionError("AI tracking ran")),
+                mock.patch.object(webapp, "begin_generation_forensics", side_effect=AssertionError("forensics ran")),
+                mock.patch.object(webapp, "run_job_worker", side_effect=AssertionError("worker ran")),
+                mock.patch.object(webapp, "normalize_line_items_for_quote_basis_review", side_effect=AssertionError("normalization ran")),
+                mock.patch.object(webapp, "draft_quote_basis", side_effect=AssertionError("AI draft ran")),
+                mock.patch.object(webapp, "append_runtime_telemetry", side_effect=AssertionError("telemetry ran")),
+                mock.patch.object(webapp, "quote_session_storage_for_auth_session", side_effect=AssertionError("session writer ran")),
+                mock.patch.object(webapp, "stage_local_quote_publication", side_effect=AssertionError("publication ran")),
+            ):
+                secrets_module.token_hex.side_effect = AssertionError("job identity ran")
+                requests = [
+                    *[
+                        (f"/api/jobs:{label}", "/api/jobs", {"type": label, "payload": copy.deepcopy(payload)})
+                        for label in ("draft", "basis_chat", "generate", "generate_pdf")
+                    ],
+                    ("draft", "/api/draft", copy.deepcopy(payload)),
+                    ("normalize", "/api/line-items/normalize", copy.deepcopy(payload)),
+                    ("generate", "/api/generate", copy.deepcopy(payload)),
+                    ("quote_sessions", "/api/quote-sessions", copy.deepcopy(payload)),
+                ]
+                for label, path, body in requests:
+                    with self.subTest(route=label):
+                        response = self.http_json(runner, "POST", path, body=body)
+                        self.assertEqual(response["status"], 400)
+                        self.assertEqual(response["body"], expected)
+        self.assertEqual(webapp.JOBS, jobs_before)
+
     def test_recovered_quote_rejects_changed_exact_pricing_identity(self):
         payload = valid_payload()
         details = {
@@ -25279,6 +25593,571 @@ assert.deepStrictEqual(normalizeQuoteCommercialReview(durableReview), durableRev
   assert.strictEqual(state.quoteCommercialReview.blocked_identity.source, savedBasis.source);
   assert.notStrictEqual(state.quoteCommercialReview.blocked_identity.id, "active-reference");
 })();
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_static_repair2_restore_keeps_durable_review_until_explicit_customer_reselection(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const marker = `function ${name}(`;
+  const asyncMarker = `async function ${name}(`;
+  const start = source.indexOf(asyncMarker) >= 0 ? source.indexOf(asyncMarker) : source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  if (bodyStart < 2) throw new Error(`Missing body for function ${name}`);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const QUOTE_SESSION_STATE_VERSION = 5;
+const QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA = "swooshz.quote-commercial-snapshot.v2";
+const QUOTE_COMMERCIAL_SNAPSHOT_VERSION = 2;
+const QUOTE_COMMERCIAL_LIFECYCLES = new Set(["NEW_UNINITIALISED", "EXISTING", "RECOVERED"]);
+const QUOTE_COMMERCIAL_SNAPSHOT_ORIGINS = new Set(["new_quote", "captured", "session_recovery", "explicit_initialization", "explicit_reselection"]);
+const QUOTE_COMMERCIAL_PRESENCE_VALUES = new Set(["captured", "intentional_empty"]);
+const PRICING_REFERENCE_SOURCES = new Set(["company", "local", "bundled"]);
+const PRICING_REFERENCE_ID_RE = /^[A-Za-z0-9_-]+$/;
+const PRICING_REFERENCE_DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
+const QUOTE_COMMERCIAL_REVIEW_SCHEMA = "swooshz.quote-commercial-review.v1";
+const QUOTE_COMMERCIAL_REVIEW_VERSION = 1;
+const QUOTE_COMMERCIAL_REVIEW_STATUS = "REVIEW_REQUIRED";
+const QUOTE_COMMERCIAL_REVIEW_MESSAGE = "Pricing review required: saved quote commercial state requires review before generation.";
+const PRICING_REFERENCE_SETTINGS_MODE_MANAGE = "manage";
+const QUOTE_COMMERCIAL_REVIEW_REASONS = new Set([
+  "missing_snapshot", "invalid_snapshot", "lifecycle_mismatch", "pricing_basis_incomplete",
+  "pricing_reference_unavailable", "pricing_reference_source_mismatch", "pricing_reference_identity_mismatch",
+  "pricing_reference_digest_mismatch", "unsupported_pricing_reference_source", "review_state_invalid",
+]);
+const QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS = [
+  "currency", "exchange_rate", "tax", "company_name", "header_details", "logo",
+  "terms_heading", "payment_terms", "notes_heading", "standard_notes", "acceptance_text",
+  "person_label", "stamp_label", "date_label", "company_signatory", "company_title",
+  "company_date_label", "rich_text",
+];
+
+const savedDigest = "sha256:" + "b".repeat(64);
+const state = {
+  profileId: "",
+  pricingReferenceId: "",
+  pricingReferenceSource: "",
+  quoteCommercialLifecycle: "NEW_UNINITIALISED",
+  quoteCommercialSnapshot: null,
+  quoteCommercialReview: null,
+  quoteCommercialRecoveryError: "",
+  quoteCommercialTouched: {},
+  pricingReferenceSelectionIntent: null,
+  pricingReferences: [
+    { id: "active-reference", source: "local", label: "Active Reference", currency: "SGD", digest_sha256: "sha256:" + "a".repeat(64) },
+    { id: "replacement-reference", source: "local", label: "Replacement Reference", currency: "SGD", digest_sha256: "sha256:" + "c".repeat(64) },
+  ],
+  profiles: [],
+  companyProfiles: [],
+  quoteSessionId: "",
+  quoteSessionDraftSaveStarted: false,
+  quoteSessionRestoredSessionId: "",
+  quoteSessionRestoredDraftKey: "",
+  activeAppView: "dashboard",
+  restorableOverlay: "",
+  pricingReferenceSettingsMode: "manage",
+  pendingFeedback: "",
+  images: [],
+  quoteBasis: {},
+  quoteBasisSections: [],
+  lineItems: [],
+  outputRows: [],
+  originalOutputRows: [],
+  outputErrors: [],
+  analysisFindings: [],
+  blockingClarificationQuestions: [],
+  boothDimensions: {},
+  originalAnalysisSnapshot: null,
+  basisConfirmed: false,
+  draftSource: "",
+  lastAnalysisMode: "",
+  pendingAnalysisMode: "",
+  basisChat: {},
+  aiFailed: false,
+  downloadFile: null,
+  pdfFile: null,
+  outputRevision: 0,
+  downloadFileRevision: -1,
+  pdfFileRevision: -1,
+  pricingMatches: [],
+  pricingIssues: [],
+  activeJob: null,
+};
+const elements = {
+  profileSelect: {
+    value: "",
+    innerHTML: "",
+    disabled: false,
+    title: "",
+    setAttribute(name, value) { this[name] = value; },
+  },
+};
+const window = { localStorage: { setItem() {} } };
+
+function isPlainObject(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+function objectHasExactKeys(value, keys = []) {
+  return isPlainObject(value) && Object.keys(value).length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+function hasMeaningfulQuoteDetailValue(value) {
+  if (Array.isArray(value)) return value.length > 0;
+  if (value && typeof value === "object") return Object.keys(value).length > 0;
+  return String(value ?? "").trim().length > 0;
+}
+function normalizeCurrencyLabel(value) { return String(value ?? "").trim().toUpperCase(); }
+function safeQuoteSessionId(value = "") {
+  const text = String(value || "").trim();
+  return /^quote-[A-Za-z0-9_-]{3,64}$/.test(text) ? text : "";
+}
+function currentPricingReference() {
+  return state.pricingReferences.find((reference) => reference.id === state.pricingReferenceId && reference.source === state.pricingReferenceSource) || null;
+}
+function pricingReferenceAuthorityReviewReason() { return "pricing_reference_digest_mismatch"; }
+function sortedPricingReferencesForDisplay(references = []) { return references; }
+function pricingReferenceSelectValue(reference = {}) { return `${reference.source || ""}::${reference.id || ""}`; }
+function pricingReferenceSelectionFromValue(value = "") {
+  const [source, ...idParts] = String(value || "").split("::");
+  return { source, pricingReferenceId: idParts.join("::") };
+}
+function pricingReferenceFromSelectionValue(value = "") {
+  const selection = pricingReferenceSelectionFromValue(value);
+  return state.pricingReferences.find((reference) => reference.id === selection.pricingReferenceId && reference.source === selection.source) || null;
+}
+function escapeHtml(value = "") { return String(value); }
+function renderSelectedPricingReferenceSummary() {}
+function renderPricingReferenceDeleteOptions() {}
+function invalidateAuthorityProfileRequests() {}
+function transitionGenerationContext(sessionId = "") { state.quoteSessionId = sessionId; }
+function normalizeRestorableOverlay(value = "") { return value; }
+function normalizePricingReferenceSettingsMode(value = "") { return value; }
+function presetValueFromQuoteDetails() { return ""; }
+function normalizeQuoteCommercialTouched(value = {}) { return value; }
+function quoteDetailsCommercialTouched() { return {}; }
+function renderPresetOptions() {}
+function selectedPreset() { return null; }
+function quoteDetailsWithFallbackDefaults(defaults = {}, details = {}) { return details; }
+async function restoreQuoteDetailsLogo(details) { return details; }
+function applyQuoteDetails() {}
+async function restoreSessionImages() { return []; }
+function cloneQuoteBasis(value = {}) { return value; }
+function normalizeQuoteBasisSections(value = []) { return value; }
+function normalizeLineItem(value) { return value; }
+function normalizeOutputRow(value) { return value; }
+function normalizeBoothDimensions(value = {}) { return value; }
+function normalizeAnalysisMode(value = "") { return value; }
+function normalizeActiveJob() { return null; }
+function renderFiles() {}
+function renderPricingMatches() {}
+function renderMatchSummary() {}
+function clearPricingReviewMessages() {}
+function clearAiFailedDraftState() {}
+function renderBasisFailureState() {}
+function updateQuoteBasisCard() {}
+function renderBasisEmptyState() {}
+function updateDownloadButton() {}
+function setResultStatus() {}
+function setWorkflowStage(value) { state.workflowStage = value; }
+function showAiFailureBanner() {}
+function clearAiFailureBanner() {}
+function restoredQuoteSessionSidePanel() { return "images"; }
+function setSidePanel() {}
+function renderQuoteCommercialReviewState() {}
+function restoredWorkflowStage() { return "images"; }
+function revisionNumber(value, fallback) { return Number.isFinite(Number(value)) ? Number(value) : fallback; }
+function buildSessionSnapshot() { return {}; }
+function sessionFileRecordsFromDraft() { return []; }
+function currentBrowserRecoveryScope() { return "scope"; }
+function persistSessionFiles() { return Promise.resolve(); }
+function quoteCommercialReviewRequired() { return Boolean(state.quoteCommercialReview && state.quoteCommercialReview.status === QUOTE_COMMERCIAL_REVIEW_STATUS); }
+function pendingPricingReferenceSelection() {
+  const intent = state.pricingReferenceSelectionIntent || {};
+  return { pricingReferenceId: intent.id || intent.pricingReferenceId || "", source: intent.source || "" };
+}
+function clearQuoteCommercialReview() { state.quoteCommercialReview = null; state.quoteCommercialRecoveryError = ""; }
+function persistLastPricingReferenceSelection() {}
+function clearGeneratedQuoteState() {}
+function canStartAnalysis() { return false; }
+function syncControlStates() {}
+
+eval([
+  "quoteCommercialSnapshotRawValues",
+  "normalizeQuoteCommercialSnapshot",
+  "quoteCommercialSnapshotPricingBasis",
+  "quoteCommercialReviewIdentity",
+  "normalizeQuoteCommercialReview",
+  "quoteCommercialStrictDataEqual",
+  "quoteCommercialRestorationReviewReason",
+  "setQuoteCommercialReview",
+  "syncSelectedPricingReference",
+  "renderProfileOptions",
+  "applyQuoteSessionSnapshot",
+  "applyPendingPricingReferenceSelection",
+].map((name) => extractFunction(name)).join("\n"));
+
+const savedBasis = { currency: "SGD", source: "local", id: "saved-reference", digest: savedDigest };
+const savedDetails = {
+  currency: "",
+  exchange_rate: null,
+  tax: {},
+  company: {},
+  quote_text: {},
+  signature: {},
+  rich_text: {},
+  commercial_snapshot: {
+    schema: QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+    version: QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+    owner: "quote",
+    lifecycle: "RECOVERED",
+    origin: "session_recovery",
+    presence: QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS.reduce((presence, key) => {
+      presence[key] = "intentional_empty";
+      return presence;
+    }, {}),
+    pricing_basis: savedBasis,
+  },
+};
+const durableReview = {
+  schema: QUOTE_COMMERCIAL_REVIEW_SCHEMA,
+  version: QUOTE_COMMERCIAL_REVIEW_VERSION,
+  status: QUOTE_COMMERCIAL_REVIEW_STATUS,
+  reason_code: "pricing_reference_identity_mismatch",
+  blocked_identity: { id: "saved-reference", source: "local" },
+};
+const saved = {
+  version: QUOTE_SESSION_STATE_VERSION,
+  browserRecoveryScope: "scope",
+  profileId: "saved-profile",
+  pricingReferenceId: "saved-reference",
+  pricingReferenceSource: "local",
+  quoteCommercialLifecycle: "RECOVERED",
+  quoteSessionId: "quote-saved-123",
+  quoteDetails: savedDetails,
+  quoteCommercialReview: durableReview,
+  images: [],
+  quoteBasis: {},
+  quoteBasisSections: [],
+  lineItems: [],
+  outputRows: [],
+  originalOutputRows: [],
+  analysisFindings: [],
+  blockingClarificationQuestions: [],
+  pricingMatches: [],
+  basisChat: {},
+};
+
+(async () => {
+  const expectedReview = JSON.parse(JSON.stringify(durableReview));
+  assert.strictEqual(await applyQuoteSessionSnapshot(saved, { forceQuoteView: true }), true);
+  assert.deepStrictEqual(state.quoteCommercialReview, expectedReview);
+  assert.strictEqual(state.quoteCommercialReview.reason_code, "pricing_reference_identity_mismatch");
+  assert.strictEqual(state.pricingReferenceId, "saved-reference");
+  assert.strictEqual(currentPricingReference(), null);
+
+  for (let index = 0; index < 5; index += 1) {
+    renderProfileOptions();
+    renderSelectedPricingReferenceSummary();
+    assert.deepStrictEqual(state.quoteCommercialReview, expectedReview);
+  }
+
+  state.pricingReferenceSelectionIntent = { id: "replacement-reference", source: "local" };
+  assert.strictEqual(applyPendingPricingReferenceSelection(), true);
+  assert.strictEqual(state.quoteCommercialReview, null);
+  assert.strictEqual(state.quoteCommercialLifecycle, "NEW_UNINITIALISED");
+  assert.strictEqual(state.pricingReferenceId, "replacement-reference");
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_static_repair2_dashboard_details_provenance_reaches_actual_restoration(self):
+        node = require_node(self)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const marker = `function ${name}(`;
+  const asyncMarker = `async function ${name}(`;
+  const asyncStart = source.indexOf(asyncMarker);
+  const start = asyncStart >= 0 ? asyncStart : source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  if (bodyStart < 2) throw new Error(`Missing body for function ${name}`);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const QUOTE_SESSION_STATE_VERSION = 5;
+const QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA = "swooshz.quote-commercial-snapshot.v2";
+const QUOTE_COMMERCIAL_SNAPSHOT_VERSION = 2;
+const QUOTE_COMMERCIAL_LIFECYCLES = new Set(["NEW_UNINITIALISED", "EXISTING", "RECOVERED"]);
+const QUOTE_COMMERCIAL_SNAPSHOT_ORIGINS = new Set(["new_quote", "captured", "session_recovery", "explicit_initialization", "explicit_reselection"]);
+const QUOTE_COMMERCIAL_PRESENCE_VALUES = new Set(["captured", "intentional_empty"]);
+const PRICING_REFERENCE_SOURCES = new Set(["company", "local", "bundled"]);
+const PRICING_REFERENCE_ID_RE = /^[A-Za-z0-9_-]+$/;
+const PRICING_REFERENCE_DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
+const QUOTE_COMMERCIAL_REVIEW_SCHEMA = "swooshz.quote-commercial-review.v1";
+const QUOTE_COMMERCIAL_REVIEW_VERSION = 1;
+const QUOTE_COMMERCIAL_REVIEW_STATUS = "REVIEW_REQUIRED";
+const QUOTE_COMMERCIAL_REVIEW_MESSAGE = "Pricing review required: saved quote commercial state requires review before generation.";
+const PRICING_REFERENCE_SETTINGS_MODE_MANAGE = "manage";
+const QUOTE_COMMERCIAL_REVIEW_REASONS = new Set([
+  "missing_snapshot", "invalid_snapshot", "lifecycle_mismatch", "pricing_basis_incomplete",
+  "pricing_reference_unavailable", "pricing_reference_source_mismatch", "pricing_reference_identity_mismatch",
+  "pricing_reference_digest_mismatch", "unsupported_pricing_reference_source", "review_state_invalid",
+]);
+const QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS = [
+  "currency", "exchange_rate", "tax", "company_name", "header_details", "logo",
+  "terms_heading", "payment_terms", "notes_heading", "standard_notes", "acceptance_text",
+  "person_label", "stamp_label", "date_label", "company_signatory", "company_title",
+  "company_date_label", "rich_text",
+];
+
+const savedDigest = "sha256:" + "b".repeat(64);
+const state = {
+  profileId: "",
+  pricingReferenceId: "",
+  pricingReferenceSource: "",
+  quoteCommercialLifecycle: "NEW_UNINITIALISED",
+  quoteCommercialSnapshot: null,
+  quoteCommercialReview: null,
+  quoteCommercialRecoveryError: "",
+  quoteCommercialTouched: {},
+  pricingReferenceSelectionIntent: null,
+  pricingReferences: [{ id: "saved-reference", source: "local", currency: "SGD", digest_sha256: savedDigest }],
+  quoteSessionId: "",
+  images: [],
+  quoteBasis: {},
+  quoteBasisSections: [],
+  lineItems: [],
+  outputRows: [],
+  originalOutputRows: [],
+  outputErrors: [],
+  analysisFindings: [],
+  blockingClarificationQuestions: [],
+  basisChat: {},
+  activeJob: null,
+  pricingMatches: [],
+  pricingIssues: [],
+};
+const elements = {};
+const window = { localStorage: { setItem() {} } };
+
+function isPlainObject(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+function objectHasExactKeys(value, keys = []) {
+  return isPlainObject(value) && Object.keys(value).length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+function hasMeaningfulQuoteDetailValue(value) {
+  if (Array.isArray(value)) return value.length > 0;
+  if (value && typeof value === "object") return Object.keys(value).length > 0;
+  return String(value ?? "").trim().length > 0;
+}
+function normalizeCurrencyLabel(value) { return String(value ?? "").trim().toUpperCase(); }
+function safeQuoteSessionId(value = "") {
+  const text = String(value || "").trim();
+  return /^quote-[A-Za-z0-9_-]{3,64}$/.test(text) ? text : "";
+}
+function currentPricingReference() {
+  return state.pricingReferences.find((reference) => reference.id === state.pricingReferenceId && reference.source === state.pricingReferenceSource) || null;
+}
+function invalidateAuthorityProfileRequests() {}
+function transitionGenerationContext(sessionId = "") { state.quoteSessionId = sessionId; }
+function normalizeRestorableOverlay(value = "") { return value; }
+function normalizePricingReferenceSettingsMode(value = "") { return value; }
+function presetValueFromQuoteDetails() { return ""; }
+function normalizeQuoteCommercialTouched(value = {}) { return value; }
+function quoteDetailsCommercialTouched() { return {}; }
+function syncSelectedPricingReference() {}
+function renderProfileOptions() {}
+function renderPresetOptions() {}
+function selectedPreset() { return null; }
+function quoteDetailsWithFallbackDefaults(defaults = {}, details = {}) { return details; }
+async function restoreQuoteDetailsLogo(details) { return details; }
+function applyQuoteDetails() {}
+async function restoreSessionImages() { return []; }
+function cloneQuoteBasis(value = {}) { return value; }
+function normalizeQuoteBasisSections(value = []) { return value; }
+function normalizeLineItem(value) { return value; }
+function normalizeOutputRow(value) { return value; }
+function normalizeBoothDimensions(value = {}) { return value; }
+function normalizeAnalysisMode(value = "") { return value; }
+function normalizeActiveJob() { return null; }
+function renderFiles() {}
+function renderPricingMatches() {}
+function renderMatchSummary() {}
+function clearPricingReviewMessages() {}
+function clearAiFailedDraftState() {}
+function renderBasisFailureState() {}
+function updateQuoteBasisCard() {}
+function renderBasisEmptyState() {}
+function updateDownloadButton() {}
+function setResultStatus() {}
+function setWorkflowStage(value) { state.workflowStage = value; }
+function showAiFailureBanner() {}
+function clearAiFailureBanner() {}
+function restoredQuoteSessionSidePanel() { return "images"; }
+function setSidePanel() {}
+function renderQuoteCommercialReviewState() {}
+function restoredWorkflowStage() { return "images"; }
+function revisionNumber(value, fallback) { return Number.isFinite(Number(value)) ? Number(value) : fallback; }
+function buildSessionSnapshot() { return {}; }
+function sessionFileRecordsFromDraft() { return []; }
+function persistSessionFiles() { return Promise.resolve(); }
+function quoteCommercialReviewRequired() { return Boolean(state.quoteCommercialReview && state.quoteCommercialReview.status === QUOTE_COMMERCIAL_REVIEW_STATUS); }
+
+eval([
+  "quoteCommercialSnapshotRawValues",
+  "normalizeQuoteCommercialSnapshot",
+  "quoteCommercialSnapshotPricingBasis",
+  "quoteCommercialReviewIdentity",
+  "normalizeQuoteCommercialReview",
+  "quoteCommercialStrictDataEqual",
+  "quoteCommercialRestorationReviewReason",
+  "setQuoteCommercialReview",
+  "applyQuoteSessionSnapshot",
+  "mergeDashboardDraftSummaryDetails",
+].map((name) => extractFunction(name)).join("\n"));
+
+function savedDetails() {
+  const details = {
+    project: { booth_width: "6" },
+    currency: "",
+    exchange_rate: null,
+    tax: {},
+    company: {},
+    quote_text: {},
+    signature: {},
+    rich_text: {},
+  };
+  details.commercial_snapshot = {
+    schema: QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+    version: QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+    owner: "quote",
+    lifecycle: "RECOVERED",
+    origin: "session_recovery",
+    presence: QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS.reduce((presence, key) => {
+      presence[key] = "intentional_empty";
+      return presence;
+    }, {}),
+    pricing_basis: { currency: "SGD", source: "local", id: "saved-reference", digest: savedDigest },
+  };
+  return details;
+}
+function savedDraft(detailsMarker) {
+  const saved = {
+    version: QUOTE_SESSION_STATE_VERSION,
+    browserRecoveryScope: "scope",
+    pricingReferenceId: "saved-reference",
+    pricingReferenceSource: "local",
+    quoteCommercialLifecycle: "RECOVERED",
+  };
+  if (detailsMarker !== "absent") saved.quoteDetails = detailsMarker;
+  return saved;
+}
+
+(async () => {
+  const summary = { customer_summary: { show_name: "Dashboard Show", project_number: "DASH-001" } };
+
+  const absent = savedDraft("absent");
+  assert.strictEqual(mergeDashboardDraftSummaryDetails(absent, summary), absent);
+  await applyQuoteSessionSnapshot(absent);
+  assert.strictEqual(state.quoteCommercialReview.reason_code, "missing_snapshot");
+
+  for (const malformed of [null, "bad-details", [], 3]) {
+    const draft = savedDraft(malformed);
+    assert.strictEqual(mergeDashboardDraftSummaryDetails(draft, summary), draft);
+    await applyQuoteSessionSnapshot(draft);
+    assert.strictEqual(state.quoteCommercialReview.reason_code, "invalid_snapshot");
+  }
+
+  const malformedProjectDetails = savedDetails();
+  malformedProjectDetails.project = [];
+  const malformedProject = savedDraft(malformedProjectDetails);
+  assert.strictEqual(mergeDashboardDraftSummaryDetails(malformedProject, summary), malformedProject);
+  await applyQuoteSessionSnapshot(malformedProject);
+  assert.strictEqual(state.quoteCommercialReview.reason_code, "invalid_snapshot");
+
+  const singleDetails = savedDetails();
+  const single = savedDraft(singleDetails);
+  const singleMerged = mergeDashboardDraftSummaryDetails(single, summary);
+  assert.notStrictEqual(singleMerged, single);
+  assert.strictEqual(singleMerged.quoteDetails.project.show_name, "Dashboard Show");
+  assert.strictEqual(singleMerged.quoteDetails.project_number, "DASH-001");
+  assert.deepStrictEqual(singleMerged.quoteDetails.commercial_snapshot, singleDetails.commercial_snapshot);
+  await applyQuoteSessionSnapshot(singleMerged);
+  assert.strictEqual(state.quoteCommercialReview, null);
+
+  const equivalentDetails = savedDetails();
+  const equivalentAlias = JSON.parse(JSON.stringify(equivalentDetails));
+  const reorderedAlias = {};
+  for (const key of Object.keys(equivalentAlias).reverse()) reorderedAlias[key] = equivalentAlias[key];
+  const equivalent = savedDraft(equivalentDetails);
+  equivalent.quote_details = reorderedAlias;
+  assert.strictEqual(mergeDashboardDraftSummaryDetails(equivalent, summary), equivalent);
+  await applyQuoteSessionSnapshot(equivalent);
+  assert.strictEqual(state.quoteCommercialReview, null);
+  assert.strictEqual(state.quoteCommercialSnapshot.pricing_basis.id, "saved-reference");
+
+  const conflictingDetails = savedDetails();
+  const conflictingAlias = JSON.parse(JSON.stringify(conflictingDetails));
+  conflictingAlias.project_number = "OTHER-PROJECT";
+  const conflicting = savedDraft(conflictingDetails);
+  conflicting.quote_details = conflictingAlias;
+  assert.strictEqual(mergeDashboardDraftSummaryDetails(conflicting, summary), conflicting);
+  await applyQuoteSessionSnapshot(conflicting);
+  assert.strictEqual(state.quoteCommercialReview.reason_code, "invalid_snapshot");
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
 """
         completed = subprocess.run(
             [node, "-e", script],
