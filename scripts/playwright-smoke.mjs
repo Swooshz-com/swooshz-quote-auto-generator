@@ -30,6 +30,14 @@ const baseUrl = `http://${options.host}:${options.port}`;
 const outputDir = path.join(root, "_logs", "browser", "playwright-smoke");
 const quoteDataRoot = path.join(root, "_tmp", "playwright-quote-data");
 
+function stableJson(value) {
+  if (Array.isArray(value)) return value.map(stableJson);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableJson(value[key])]));
+  }
+  return value;
+}
+
 function pythonCommand() {
   if (process.env.PYTHON) return process.env.PYTHON;
   if (process.platform !== "win32") return "python3";
@@ -218,6 +226,7 @@ async function verifyMobileHeaderOrder(page) {
 async function verifyMobileBasisLegendAndOutputCards(page) {
   await page.setViewportSize({ width: 520, height: 720 });
   await page.evaluate(() => {
+    selectPricingReferenceOptionValue(firstPricingReferenceOptionValue());
     state.quoteBasis = {};
     state.quoteBasisSections = [{
       id: "graphics",
@@ -1305,6 +1314,10 @@ async function verifyPricingReferenceSelectionCommitsOnCustomerNext(page) {
 }
 async function installMockProfiles(page) {
   await page.route("**/api/settings/pricing-references/synthetic-exhibition-fixture-pricing**", async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.fallback();
+      return;
+    }
     await route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -1370,6 +1383,7 @@ async function installMockProfiles(page) {
           currency: "SGD",
           tax: { label: "GST", rate: 0.09 },
           item_count: 1,
+          digest_sha256: "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7",
         }],
         default_profile_id: "synthetic-exhibition-fixture-template",
         default_pricing_reference_id: "synthetic-exhibition-fixture-pricing",
@@ -1382,6 +1396,353 @@ async function installMockProfiles(page) {
       }),
     });
   });
+}
+
+async function saveSmokePricingReference(page, internalCost) {
+  return page.evaluate(async ({ internalCost }) => postJson("/api/settings/pricing-references", {
+    id: "synthetic-exhibition-fixture-pricing",
+    label: "Synthetic Exhibition Fixture Pricing",
+    source: "local",
+    currency: "SGD",
+    tax: { label: "GST", rate: 0.09 },
+    items: [{
+      id: "synthetic-floor-needle-punch-carpet",
+      section: "Floor Design",
+      description: "Needle punch carpet in colour",
+      unit_hint: "sqm",
+      internal_cost: internalCost,
+      markup_multiplier: 1.5,
+      remarks: "Synthetic smoke fixture row",
+    }],
+    update_existing: true,
+    editing_reference_id: "synthetic-exhibition-fixture-pricing",
+  }), { internalCost });
+}
+
+async function verifyServerPricingReferenceReviewDurability(page) {
+  let sessionId = "";
+  const isolatedContext = await page.context().browser().newContext({ viewport: { width: 1365, height: 768 } });
+  const expectedDigest = "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7";
+  try {
+    page = await isolatedContext.newPage();
+    await installMockProfiles(page);
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
+    await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+    const savedA = await saveSmokePricingReference(page, 10);
+    if (!savedA.ok || savedA.data?.status !== "saved") {
+      throw new Error(`Could not establish smoke pricing catalogue A: ${JSON.stringify(savedA)}.`);
+    }
+    const emptyNewQuoteButton = page.locator("#dashboardEmptyNewQuoteButton:not([disabled])");
+    if (await emptyNewQuoteButton.isVisible()) await emptyNewQuoteButton.click();
+    else await page.locator("#newQuoteButton:not([disabled])").click();
+    await seedQuoteDraftFromTestFixture(page);
+    await page.locator("#sideNextButton", { hasText: "Next: Customer" }).click();
+    await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+    await page.waitForFunction(() => Boolean(state.quoteSessionId && state.quoteCommercialSnapshot?.pricing_basis?.digest), null, { timeout: 15000 });
+
+    const established = await page.evaluate(async () => {
+      state.quoteBasisSections = normalizeQuoteBasisSections([{
+        id: "smoke-floor",
+        title: "Floor Design",
+        lines: [{
+          tag: "Include",
+          text: "Needle punch carpet in colour",
+          include: true,
+          quantity: 2,
+          unit: "sqm",
+          pricing_keyword: "synthetic-floor-needle-punch-carpet",
+        }],
+      }]);
+      state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
+      state.lineItems = [normalizeLineItem({
+        section: "Floor Design",
+        quantity: 2,
+        unit: "sqm",
+        description: "Needle punch carpet in colour",
+        pricing_keyword: "synthetic-floor-needle-punch-carpet",
+      })];
+      const normalized = await refreshLineItemsFromServer();
+      if (!normalized.ok) throw new Error(`Catalogue A normalization failed: ${JSON.stringify(normalized.data)}.`);
+      captureOriginalAnalysisSnapshot({ source: "playwright-server-review-durability" });
+      refreshOutputRowsFromLineItems();
+      state.originalOutputRows = snapshotOutputRows(state.outputRows);
+      state.basisConfirmed = true;
+      setWorkflowStage("completed");
+      setSidePanel("output", { force: true });
+      const saved = await saveQuoteSessionDraftState({ quoteGenerated: true });
+      if (!saved?.session_id) throw new Error("Catalogue A quote session was not saved.");
+      return {
+        sessionId: state.quoteSessionId,
+        lifecycle: state.quoteCommercialLifecycle,
+        snapshot: state.quoteCommercialSnapshot,
+        lineItem: state.lineItems[0],
+        output: JSON.stringify(state.outputRows),
+      };
+    });
+    sessionId = established.sessionId;
+    if (
+      established.lifecycle !== "NEW_UNINITIALISED"
+      || established.snapshot?.pricing_basis?.digest !== expectedDigest
+      || established.lineItem?.catalog_unit_price !== 15
+      || established.lineItem?.pricing_basis_amount !== 30
+      || established.lineItem?.approved_quote_amount !== 30
+    ) {
+      throw new Error(`Catalogue A quote was not established with the expected authority: ${JSON.stringify(established)}.`);
+    }
+
+    const savedB = await saveSmokePricingReference(page, 11);
+    if (!savedB.ok || savedB.data?.status !== "saved") {
+      throw new Error(`Could not switch smoke pricing catalogue to B: ${JSON.stringify(savedB)}.`);
+    }
+    const mismatch = await page.evaluate(async () => postJson(
+      "/api/line-items/normalize",
+      buildLineItemNormalizePayload(),
+    ));
+    if (mismatch.ok || mismatch.status !== 400) {
+      throw new Error(`Catalogue B should reject the saved A basis: ${JSON.stringify(mismatch)}.`);
+    }
+    const review = mismatch.data?.quoteCommercialReview;
+    if (
+      !review
+      || review.schema !== "swooshz.quote-commercial-review.v1"
+      || review.version !== 1
+      || review.status !== "REVIEW_REQUIRED"
+      || review.reason_code !== "pricing_reference_digest_mismatch"
+      || review.blocked_identity?.id !== "synthetic-exhibition-fixture-pricing"
+      || review.blocked_identity?.source !== "local"
+    ) {
+      throw new Error(`Catalogue B rejection did not return the canonical review: ${JSON.stringify(mismatch)}.`);
+    }
+    const adopted = await page.evaluate(() => {
+      const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
+      return {
+        review: state.quoteCommercialReview,
+        persistedReview: saved.quoteCommercialReview,
+        snapshot: state.quoteCommercialSnapshot,
+        output: JSON.stringify(state.outputRows),
+      };
+    });
+    if (
+      JSON.stringify(stableJson(adopted.review)) !== JSON.stringify(stableJson(review))
+      || JSON.stringify(stableJson(adopted.persistedReview)) !== JSON.stringify(stableJson(review))
+      || adopted.snapshot?.pricing_basis?.digest !== expectedDigest
+      || adopted.output !== established.output
+    ) {
+      throw new Error(`The client did not durably adopt the server review while preserving A: ${JSON.stringify(adopted)}.`);
+    }
+    const persisted = await dashboardQuoteSessionDetail(page, sessionId);
+    const persistedDraft = persisted.quote_session?.draft_state || {};
+    if (
+      persisted.status !== "ok"
+      || JSON.stringify(stableJson(persistedDraft.quoteCommercialReview)) !== JSON.stringify(stableJson(review))
+      || persistedDraft.quoteDetails?.commercial_snapshot?.pricing_basis?.digest !== expectedDigest
+    ) {
+      throw new Error(`The server session did not persist the review and saved A basis: ${JSON.stringify(persisted)}.`);
+    }
+
+    const restoredA = await saveSmokePricingReference(page, 10);
+    if (!restoredA.ok || restoredA.data?.status !== "saved") {
+      throw new Error(`Could not restore smoke pricing catalogue A: ${JSON.stringify(restoredA)}.`);
+    }
+    const refreshedCatalogue = await page.evaluate(async () => {
+      await loadProfiles();
+      return {
+        review: state.quoteCommercialReview,
+        snapshot: state.quoteCommercialSnapshot,
+        selected: currentPricingReference()?.id || "",
+      };
+    });
+    if (
+      JSON.stringify(stableJson(refreshedCatalogue.review)) !== JSON.stringify(stableJson(review))
+      || refreshedCatalogue.snapshot?.pricing_basis?.digest !== expectedDigest
+      || refreshedCatalogue.selected !== "synthetic-exhibition-fixture-pricing"
+    ) {
+      throw new Error(`Catalogue refresh silently recovered the review: ${JSON.stringify(refreshedCatalogue)}.`);
+    }
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+    await page.waitForFunction(() => state.quoteSessionRestoreBusy === false, null, { timeout: 15000 });
+    const reloaded = await page.evaluate(() => ({
+      review: state.quoteCommercialReview,
+      snapshot: state.quoteCommercialSnapshot,
+      output: JSON.stringify(state.outputRows),
+    }));
+    if (
+      JSON.stringify(stableJson(reloaded.review)) !== JSON.stringify(stableJson(review))
+      || reloaded.snapshot?.pricing_basis?.digest !== expectedDigest
+      || reloaded.output !== established.output
+    ) {
+      throw new Error(`Reload did not preserve the server-issued review: ${JSON.stringify(reloaded)}.`);
+    }
+    const blockedAfterRestore = await page.evaluate(async () => postJson(
+      "/api/line-items/normalize",
+      buildLineItemNormalizePayload(),
+    ));
+    if (!blockedAfterRestore.data?.quoteCommercialReview || blockedAfterRestore.ok) {
+      throw new Error(`Catalogue A should remain review-locked after reload: ${JSON.stringify(blockedAfterRestore)}.`);
+    }
+    const blockedGeneration = await page.evaluate(async () => postJson("/api/jobs", {
+      type: "generate",
+      payload: buildPayload(),
+    }));
+    if (!blockedGeneration.data?.quoteCommercialReview || blockedGeneration.ok) {
+      throw new Error(`Generation should remain review-locked after catalogue restoration: ${JSON.stringify(blockedGeneration)}.`);
+    }
+
+    await page.locator('[data-side-panel="customer"]:not([disabled])').click();
+    await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+    await page.locator("#profileSelect").click();
+    const afterPointerOpen = await page.evaluate(() => ({
+      review: state.quoteCommercialReview,
+      intent: state.pricingReferenceSelectionIntent,
+      selectedValue: elements.profileSelect.value,
+    }));
+    if (
+      JSON.stringify(stableJson(afterPointerOpen.review)) !== JSON.stringify(stableJson(review))
+      || afterPointerOpen.intent !== null
+      || afterPointerOpen.selectedValue !== "local::synthetic-exhibition-fixture-pricing"
+    ) {
+      throw new Error(`Opening the one-reference selector changed recovery state: ${JSON.stringify(afterPointerOpen)}.`);
+    }
+    await page.locator("#profileSelect").press("Escape");
+    await page.locator("#profileSelect").focus();
+    await page.locator("#profileSelect").press("Enter");
+    const afterKeyboardReselection = await page.evaluate(() => ({
+      review: state.quoteCommercialReview,
+      intent: state.pricingReferenceSelectionIntent,
+      selectedValue: elements.profileSelect.value,
+    }));
+    if (
+      JSON.stringify(stableJson(afterKeyboardReselection.review)) !== JSON.stringify(stableJson(review))
+      || JSON.stringify(stableJson(afterKeyboardReselection.intent)) !== JSON.stringify(stableJson({
+        id: "synthetic-exhibition-fixture-pricing",
+        source: "local",
+      }))
+      || afterKeyboardReselection.selectedValue !== "local::synthetic-exhibition-fixture-pricing"
+    ) {
+      throw new Error(`Ordinary keyboard reselection did not establish explicit intent: ${JSON.stringify(afterKeyboardReselection)}.`);
+    }
+    await page.locator("#sideNextButton", { hasText: "Next: Quote Company" }).click();
+    await page.locator("#quoteCompanyPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+    const recovered = await page.evaluate(async () => {
+      const normalized = await refreshLineItemsFromServer();
+      return {
+        ok: normalized.ok,
+        status: normalized.data?.status,
+        review: state.quoteCommercialReview,
+        lifecycle: state.quoteCommercialLifecycle,
+        snapshot: state.quoteCommercialSnapshot,
+      };
+    });
+    if (
+      !recovered.ok
+      || recovered.status !== "normalized"
+      || recovered.review !== null
+      || recovered.lifecycle !== "RECOVERED"
+      || recovered.snapshot?.pricing_basis?.digest !== expectedDigest
+    ) {
+      throw new Error(`Committed Customer reselection did not recover the quote: ${JSON.stringify(recovered)}.`);
+    }
+  } finally {
+    sessionId = sessionId || await page.evaluate(() => state.quoteSessionId).catch(() => "");
+    if (sessionId) {
+      await page.evaluate(async (id) => deleteQuoteSessionRecord(id), sessionId).catch(() => {});
+    }
+    await page.evaluate(() => clearSessionState()).catch(() => {});
+    await isolatedContext.close().catch(() => {});
+  }
+}
+
+async function verifyFreshPricingAuthorityInitializesBeforeCustomer(page) {
+  let sessionId = "";
+  try {
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
+    await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+    const emptyNewQuoteButton = page.locator("#dashboardEmptyNewQuoteButton:not([disabled])");
+    if (await emptyNewQuoteButton.isVisible()) await emptyNewQuoteButton.click();
+    else await page.locator("#newQuoteButton:not([disabled])").click();
+    await page.locator("#imageIntake.is-active").waitFor({ state: "visible", timeout: 15000 });
+    await page.locator("#imageInput").setInputFiles({
+      name: "v3-authority-render.png",
+      mimeType: "image/png",
+      buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=", "base64"),
+    });
+    await page.locator("#fileList .file-item", { hasText: "v3-authority-render.png" }).waitFor({ state: "visible", timeout: 15000 });
+    await page.waitForFunction(() => {
+      try {
+        const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "null");
+        return Boolean(saved && saved.activeAppView === "quote" && saved.quoteCommercialLifecycle === "NEW_UNINITIALISED");
+      } catch {
+        return false;
+      }
+    }, null, { timeout: 15000 });
+    const beforeCustomer = await page.evaluate(() => {
+      const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "null");
+      return {
+        stateSnapshot: state.quoteCommercialSnapshot,
+        persistedSnapshot: saved?.quoteDetails?.commercial_snapshot || null,
+        lifecycle: state.quoteCommercialLifecycle,
+        sessionId: state.quoteSessionId,
+      };
+    });
+    if (beforeCustomer.stateSnapshot || beforeCustomer.persistedSnapshot || beforeCustomer.sessionId) {
+      throw new Error(`Fresh authority was serialized before Customer initialization: ${JSON.stringify(beforeCustomer)}.`);
+    }
+
+    await page.locator("#sideNextButton", { hasText: "Next: Customer" }).click();
+    await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+    await page.waitForFunction(() => Boolean(
+      state.pricingReferenceId
+      && state.pricingReferenceSource
+      && state.quoteCommercialSnapshot?.pricing_basis?.id
+      && state.quoteCommercialSnapshot?.pricing_basis?.digest
+    ), null, { timeout: 15000 });
+    const afterCustomer = await page.evaluate(() => {
+      const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "null");
+      return {
+        lifecycle: state.quoteCommercialLifecycle,
+        review: state.quoteCommercialReview,
+        pricingReferenceId: state.pricingReferenceId,
+        pricingReferenceSource: state.pricingReferenceSource,
+        selectedValue: elements.profileSelect.value,
+        snapshot: state.quoteCommercialSnapshot,
+        persistedSnapshot: saved?.quoteDetails?.commercial_snapshot || null,
+        sessionId: state.quoteSessionId,
+      };
+    });
+    const expectedValue = "local::synthetic-exhibition-fixture-pricing";
+    if (
+      afterCustomer.lifecycle !== "NEW_UNINITIALISED"
+      || afterCustomer.review
+      || afterCustomer.pricingReferenceId !== "synthetic-exhibition-fixture-pricing"
+      || afterCustomer.pricingReferenceSource !== "local"
+      || afterCustomer.selectedValue !== expectedValue
+      || afterCustomer.snapshot?.pricing_basis?.id !== "synthetic-exhibition-fixture-pricing"
+      || afterCustomer.snapshot?.pricing_basis?.source !== "local"
+      || afterCustomer.snapshot?.pricing_basis?.currency !== "SGD"
+      || afterCustomer.snapshot?.pricing_basis?.digest !== "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7"
+      || afterCustomer.persistedSnapshot?.pricing_basis?.id !== "synthetic-exhibition-fixture-pricing"
+      || afterCustomer.persistedSnapshot?.pricing_basis?.digest !== afterCustomer.snapshot?.pricing_basis?.digest
+    ) {
+      throw new Error(`Fresh authority did not initialize and persist the configured reference at Customer: ${JSON.stringify(afterCustomer)}.`);
+    }
+    sessionId = afterCustomer.sessionId;
+  } finally {
+    await page.evaluate(async () => {
+      clearQuoteSessionDraftSaveTimer();
+      const pendingSaves = [quoteSessionInitialSavePromise, quoteSessionDraftSavePromise].filter(Boolean);
+      await Promise.all(pendingSaves.map((pendingSave) => pendingSave.catch(() => null)));
+    }).catch(() => {});
+    sessionId = sessionId || await page.evaluate(() => state.quoteSessionId).catch(() => "");
+    if (sessionId) {
+      await page.evaluate(async (id) => {
+        await deleteQuoteSessionRecord(id);
+      }, sessionId).catch(() => {});
+    }
+    await page.evaluate(() => clearSessionState()).catch(() => {});
+  }
 }
 
 async function verifyRecoveredTemplateOwnerFailsClosed(page) {
@@ -1730,7 +2091,8 @@ async function verifyStaleTabMutationIsRejected(page) {
 async function dashboardQuoteSessionDetail(page, sessionId) {
   return page.evaluate(async (safeSessionId) => {
     const response = await fetch(`/api/quote-sessions/${encodeURIComponent(safeSessionId)}`);
-    return response.json();
+    const body = await response.json();
+    return { ...body, status: response.ok ? "ok" : "error" };
   }, sessionId);
 }
 
@@ -2057,6 +2419,8 @@ async function main() {
   try {
     await installMockProfiles(page);
     await verifyRecoveredTemplateOwnerFailsClosed(page);
+    await verifyFreshPricingAuthorityInitializesBeforeCustomer(page);
+    await verifyServerPricingReferenceReviewDurability(page);
     if (args.includes("--recovery-only")) {
       await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
       await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();

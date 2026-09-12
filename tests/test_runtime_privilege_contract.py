@@ -3468,6 +3468,35 @@ order by object_kind, object_schema, object_name, object_type
             "verify_live_retention_delete.py",
             "run146_verify_live_retention_delete",
         )
+        expected_review = webapp.build_quote_commercial_review("missing_snapshot")
+        observations = {}
+        writer_payloads = []
+
+        original_write = verifier._write_synthetic_metadata
+
+        def observed_write(storage, ids, metadata):
+            original_writer = storage.create_or_update_quote_session
+
+            def observed_writer(payload, **kwargs):
+                writer_payloads.append(copy.deepcopy(payload))
+                result = original_writer(payload, **kwargs)
+                current, _draft_files = storage._read_quote_session_metadata_for_workspace(
+                    ids["session_a"]
+                )
+                observations["immediate"] = copy.deepcopy(current)
+                return result
+
+            with mock.patch.object(
+                storage,
+                "create_or_update_quote_session",
+                side_effect=observed_writer,
+            ) as writer:
+                result = original_write(storage, ids, metadata)
+                observations["writer_call_count"] = writer.call_count
+            current, _draft_files = storage._read_quote_session_metadata_for_workspace(ids["session_a"])
+            observations["published"] = copy.deepcopy(current)
+            return result
+
         env = {
             verifier.LIVE_RETENTION_DELETE_ENV_NAME: "1",
             webapp.SQAG_DATABASE_URL_ENV_NAME: safe_postgres_url("sqag_runtime", self.database_name),
@@ -3487,16 +3516,57 @@ order by object_kind, object_schema, object_name, object_type
             webapp.OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME: "REDACTED",
         }
         backend = webapp.InMemoryObjectStorageBackend()
-        with mock.patch.dict(os.environ, env, clear=True):
+        with (
+            mock.patch.object(
+                webapp,
+                "pricing_catalog_runtime_lookup_for_payload",
+                side_effect=AssertionError(
+                    "durable review must not consult the pricing catalog"
+                ),
+            ) as pricing_lookup,
+            mock.patch.object(
+                webapp,
+                "exact_pricing_reference_authority",
+                side_effect=AssertionError(
+                    "durable review must not resolve pricing authority"
+                ),
+            ) as authority_lookup,
+            mock.patch.object(verifier, "_write_synthetic_metadata", side_effect=observed_write) as write_spy,
+            mock.patch.dict(os.environ, env, clear=True),
+        ):
             report = verifier.run_verification(
                 env=env,
                 backend_factory=lambda _env: backend,
                 test_injected_backend=True,
             )
+            with self.assertRaises(webapp.QuoteCommercialStateError):
+                webapp.payload_to_brief(writer_payloads[0])
+        write_spy.assert_called_once()
         self.assertEqual(report["status"], "passed")
         self.assertEqual(report["blockers"], [])
         self.assertTrue(report["checks"]["active_runtime_download_verified"])
         self.assertTrue(report["checks"]["tombstone_metadata_verified"])
+        self.assertEqual(observations["writer_call_count"], 1)
+        self.assertEqual(len(writer_payloads), 1)
+        self.assertEqual(
+            writer_payloads[0]["draft_state"],
+            {"quoteCommercialReview": expected_review},
+        )
+        self.assertEqual(
+            observations["immediate"]["draft_state"]["quoteCommercialReview"],
+            expected_review,
+        )
+        self.assertEqual(
+            observations["published"]["draft_state"]["quoteCommercialReview"],
+            expected_review,
+        )
+        commercial_state = webapp.quote_commercial_state(writer_payloads[0])
+        self.assertTrue(commercial_state["durable_review_valid"])
+        self.assertTrue(commercial_state["review_required"])
+        self.assertFalse(commercial_state["evidence_valid"])
+        self.assertEqual(commercial_state["review_reason"], "missing_snapshot")
+        self.assertEqual(pricing_lookup.call_count, 0)
+        self.assertEqual(authority_lookup.call_count, 0)
 
     def test_real_pg17_backup_restore_verifier_uses_operation_specific_default_factories(self):
         verifier = load_script_module(
