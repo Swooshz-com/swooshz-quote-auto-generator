@@ -29,6 +29,47 @@ const options = {
 const baseUrl = `http://${options.host}:${options.port}`;
 const outputDir = path.join(root, "_logs", "browser", "playwright-ai-basis-chat-stress");
 const quoteDataRoot = path.join(root, "_tmp", "playwright-ai-basis-chat-quote-data");
+const pricingReferenceRoot = path.join(quoteDataRoot, "pricing-references");
+const syntheticPricingReferenceId = "synthetic-playwright-pricing";
+const syntheticPricingCatalog = {
+  schema_version: 1,
+  currency: "SGD",
+  items: [{
+    category_order: 1,
+    item_order: 1,
+    section: "AV Equipment Rental Items",
+    description: 'nos. 85" LED TV Monitor (With Speaker - Full HD)',
+    unit_hint: "nos",
+    sale_unit_price: 850,
+    aliases: ["85 inch LED TV monitor"],
+    match_terms: ["85 led tv monitor"],
+    object_families: ["led_tv_monitor"],
+  }],
+};
+const syntheticPricingReferenceDigest = "sha256:d429a361782955f5146ac941ea4e51c212103917b9f35d8bdfb1437a4ad4c788";
+
+async function prepareSyntheticPricingReference() {
+  const referenceDir = path.join(pricingReferenceRoot, syntheticPricingReferenceId);
+  await fs.mkdir(referenceDir, { recursive: true });
+  await fs.writeFile(
+    path.join(referenceDir, "reference.json"),
+    `${JSON.stringify({
+      id: syntheticPricingReferenceId,
+      label: "Synthetic Playwright Pricing",
+      description: "Test-only authority-backed pricing reference.",
+      source: "local",
+      currency: "SGD",
+      tax: { label: "GST", rate: 0.09 },
+      pricing_catalog: "pricing-catalog.json",
+    }, null, 2)}\n`,
+    "utf8",
+  );
+  await fs.writeFile(
+    path.join(referenceDir, "pricing-catalog.json"),
+    `${JSON.stringify(syntheticPricingCatalog, null, 2)}\n`,
+    "utf8",
+  );
+}
 
 function pythonCommand() {
   if (process.env.PYTHON) return process.env.PYTHON;
@@ -62,7 +103,12 @@ function startServer() {
     ["webapp/server.py", "--host", options.host, "--port", String(options.port)],
     {
       cwd: root,
-      env: { ...process.env, APP_MODE: "local", QUOTE_DATA_ROOT: process.env.QUOTE_DATA_ROOT || quoteDataRoot },
+      env: {
+        ...process.env,
+        APP_MODE: "local",
+        QUOTE_DATA_ROOT: quoteDataRoot,
+        SQAG_LOCAL_PRICING_REFERENCES_ROOT: pricingReferenceRoot,
+      },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     },
@@ -275,6 +321,9 @@ async function installMockJobs(page) {
           currency: "SGD",
           tax: { label: "GST", rate: 0.09 },
           item_count: 1,
+          schema_version: syntheticPricingCatalog.schema_version,
+          items: syntheticPricingCatalog.items,
+          digest_sha256: syntheticPricingReferenceDigest,
         }],
         default_profile_id: "synthetic-playwright-profile",
         default_pricing_reference_id: "synthetic-playwright-pricing",
@@ -349,6 +398,7 @@ async function retagBasisLineAndWait(page, text, tag, expectedPill = tag) {
 
 async function main() {
   let serverInfo = null;
+  await prepareSyntheticPricingReference();
   if (!(await healthOk())) {
     serverInfo = startServer();
     if (!(await waitForHealth())) {
@@ -488,6 +538,7 @@ async function main() {
   } finally {
     await browser.close();
     await stopServer(serverInfo);
+    if (!options.keepServer) await fs.rm(quoteDataRoot, { recursive: true, force: true });
   }
 }
 
