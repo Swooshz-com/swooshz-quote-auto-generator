@@ -2101,45 +2101,267 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
     const sessionResponse = await fetch("/api/session");
     if (!sessionResponse.ok) throw new Error(`Session bootstrap failed: ${sessionResponse.status}`);
     const session = await sessionResponse.json();
-    const headers = { "Content-Type": "application/json" };
-    if (session.csrf_token) headers[session.csrf_header || "X-CSRF-Token"] = session.csrf_token;
+    if (!await applySessionData(session)) throw new Error("Session bootstrap state could not be applied.");
+
+    clearQuoteSessionDraftSaveTimer();
+    state.quoteSessionId = "";
+    state.lastGenerationRunId = "";
+    state.lastGenerationRunSessionId = "";
+    state.quoteSessionDraftSaveStarted = false;
+    state.quoteSessionRestoredSessionId = "";
+    state.quoteSessionRestoredDraftKey = "";
+    state.quoteCommercialLifecycle = "NEW_UNINITIALISED";
+    state.quoteCommercialSnapshot = null;
+    state.quoteCommercialReview = null;
+    state.quoteCommercialPreservedQuoteText = {};
+    state.quoteCommercialRecoveryError = "";
+    state.pricingReferenceSelectionIntent = null;
+    state.images = [];
+    state.headerLogo = null;
+    state.quoteBasis = {};
+    state.quoteBasisSections = [];
+    state.lineItems = [];
+    state.outputRows = [];
+    state.originalOutputRows = [];
+    state.outputErrors = [];
+    state.analysisFindings = [];
+    state.blockingClarificationQuestions = [];
+    state.originalAnalysisSnapshot = null;
+    state.basisConfirmed = false;
+    state.aiFailed = false;
+    state.draftSource = "";
+    state.activeJob = null;
+    state.downloadFile = null;
+    state.pdfFile = null;
+    state.outputRevision = 0;
+    state.downloadFileRevision = -1;
+    state.pdfFileRevision = -1;
+    resetQuoteCommercialTouched();
+
+    const generatorProfileId = "default";
+    if (!await loadProfiles()) throw new Error("Synthetic fixture profiles could not be loaded.");
+    const profile = state.profiles.find((item) => item.id === "synthetic-exhibition-fixture-template");
+    const reference = state.pricingReferences.find((item) => (
+      item.id === "synthetic-exhibition-fixture-pricing" && item.source === "local"
+    ));
+    if (!profile || !reference) throw new Error("Synthetic fixture profile or pricing reference is unavailable.");
+
+    state.profileId = profile.id;
+    state.pricingReferenceId = reference.id;
+    state.pricingReferenceSource = reference.source;
+    renderProfileOptions();
+    renderPresetOptions();
+    if (!selectPricingReferenceOptionValue(pricingReferenceSelectValue(reference))) {
+      throw new Error("Synthetic fixture pricing reference could not be selected.");
+    }
+    const presetValue = profilePresetOptionValue(profile.id, "synthetic-fixture-default");
+    if (!selectPresetValue(presetValue)) throw new Error("Synthetic fixture quote-company preset could not be selected.");
+    loadSelectedPreset({ silent: true, allowOwnedInitialization: true });
+    state.profileId = generatorProfileId;
+    state.selectedPresetValue = profilePresetOptionValue(generatorProfileId, "default");
+
     const safeSuffix = String(suffix || "session").replace(/[^A-Za-z0-9_-]/g, "-");
-    const safePrefix = String(sessionIdPrefix || `playwright-bulk-${safeSuffix}`).replace(/[^A-Za-z0-9_-]/g, "-");
-    const customer = customerName === undefined ? "Marina Bay Product Launch" : String(customerName);
-    const project = projectName === undefined ? "Orchard Road Pop-up Booth" : String(projectName);
-    const response = await fetch("/api/quote-sessions", {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        session_id: `${safePrefix}-${Date.now()}`,
-        customer_summary: {
-          customer_name: customer,
-          project_name: project,
-        },
-        quote_company_profile: {
-          id: "synthetic-fixture-default",
-          display_name: "Demo Quote Company",
-        },
-        pricing_reference: {
-          id: "synthetic-exhibition-fixture-pricing",
-          display_name: "Synthetic Exhibition Fixture Pricing",
-        },
-        commercials: {
-          currency: "SGD",
-          tax_label: "GST",
-          tax_rate: 0.09,
-          subtotal: 1200,
-          tax_amount: 108,
-          grand_total: 1308,
-        },
-        status: {
-          quote_generated: true,
-        },
-      }),
+    const safePrefix = String(sessionIdPrefix || `quote-playwright-bulk-${safeSuffix}`).replace(/[^A-Za-z0-9_-]/g, "-");
+    const customerOverride = customerName === undefined ? "Marina Bay Product Launch" : String(customerName).trim();
+    const projectOverride = projectName === undefined ? "Orchard Road Pop-up Booth" : String(projectName).trim();
+    const customer = customerOverride || "Untitled customer";
+    const project = projectOverride || "Untitled quote";
+    state.quoteCommercialLifecycle = "EXISTING";
+    resetQuoteCommercialFieldsToSelectedPricingReference({ markOwned: true });
+    applyQuoteDetails({
+      quote_date: new Date().toISOString().slice(0, 10),
+      project_number: `SMOKE-${safeSuffix.toUpperCase()}`,
+      client: {
+        name: customer,
+        attention: "Synthetic Contact",
+        title: "Synthetic Manager",
+        address: "1 Synthetic Way\nSingapore 000001",
+      },
+      project: {
+        title: project,
+        show_name: "Synthetic Exhibition Fixture",
+        booth_width: "6",
+        booth_depth: "6",
+        booth_size: "6m x 6m",
+        dimension_source: "analysis",
+      },
+    }, { partial: true });
+    if (state.headerLogo?.data_url) state.headerLogo = await ensureContentFingerprint(state.headerLogo);
+    state.images = [await ensureContentFingerprint({
+      name: "test-workspace-reference.pdf",
+      type: "application/pdf",
+      size: 24,
+      data_url: "data:application/pdf;base64,JVBERi0xLjQKJVRlc3QK",
+    })];
+    state.quoteBasisSections = normalizeQuoteBasisSections([{
+      id: "smoke-floor",
+      title: "Floor Design",
+      lines: [{
+        tag: "Include",
+        text: "Needle punch carpet in colour",
+        include: true,
+        quantity: 2,
+        unit: "sqm",
+        pricing_keyword: "synthetic-floor-needle-punch-carpet",
+      }],
+    }]);
+    state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
+    state.lineItems = [normalizeLineItem({
+      section: "Floor Design",
+      description: "Needle punch carpet in colour",
+      quantity: 2,
+      unit: "sqm",
+      pricing_keyword: "synthetic-floor-needle-punch-carpet",
+      price_mode: "Priced",
+      unit_price_override: 15,
+      catalog_unit_price: 15,
+    })];
+    refreshOutputRowsFromLineItems();
+    state.originalOutputRows = snapshotOutputRows(state.outputRows);
+    state.basisConfirmed = true;
+    state.activeSidePanel = "basis";
+    state.workflowStage = "basis_review";
+    state.quoteSessionDraftSaveStarted = true;
+
+    const expectedPricing = {
+      currency: "SGD",
+      source: "local",
+      id: "synthetic-exhibition-fixture-pricing",
+      digest: "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7",
+    };
+    const referenceBasis = pricingReferenceAuthorityBasis(reference);
+    if (!referenceBasis || Object.keys(expectedPricing).some((key) => referenceBasis[key] !== expectedPricing[key])) {
+      throw new Error("Synthetic fixture pricing authority does not match the required identity.");
+    }
+    const detailsBeforeInitialization = collectQuoteDetails();
+    const initializedSnapshot = quoteCommercialSnapshotForDetails(detailsBeforeInitialization, {
+      lifecycle: "EXISTING",
+      origin: "explicit_initialization",
+      reference,
+      replacePricingAuthority: true,
     });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(`Quote session fixture failed: ${response.status}`);
-    return data.quote_session?.session_id || "";
+    if (!initializedSnapshot) throw new Error("Synthetic fixture commercial snapshot could not be initialized.");
+    state.quoteCommercialSnapshot = initializedSnapshot;
+    state.quoteCommercialReview = null;
+    const assertFixturePayload = (payload, label, expectedGenerated, isGenerationPayload = false) => {
+      const sessionPayload = payload?.quote_session || payload;
+      const draftState = sessionPayload?.draft_state;
+      const details = draftState?.quoteDetails;
+      const snapshot = details?.commercial_snapshot;
+      const sessionPricing = sessionPayload?.pricing_reference || {};
+      const summary = sessionPayload?.customer_summary || {};
+      const normalizedSnapshot = normalizeQuoteCommercialSnapshot(snapshot, "EXISTING", details);
+      const customerValues = [summary.customer_name, details?.client?.name];
+      const projectValues = [summary.project_name, details?.project?.title];
+      if (isGenerationPayload) {
+        customerValues.push(payload?.client?.name);
+        projectValues.push(payload?.project?.title);
+      }
+      const pricingBasis = normalizedSnapshot?.pricing_basis || {};
+      const topPricing = payload?.pricing_reference || {};
+      if (
+        sessionPayload?.status?.quote_generated !== expectedGenerated
+        || draftState?.quoteCommercialLifecycle !== "EXISTING"
+        || draftState?.quoteCommercialReview !== null && draftState?.quoteCommercialReview !== undefined
+        || !normalizedSnapshot
+        || snapshot.origin !== "explicit_initialization"
+        || sessionPricing.id !== expectedPricing.id
+        || sessionPricing.source !== expectedPricing.source
+        || draftState?.pricingReferenceId !== expectedPricing.id
+        || draftState?.pricingReferenceSource !== expectedPricing.source
+        || pricingBasis.currency !== expectedPricing.currency
+        || pricingBasis.source !== expectedPricing.source
+        || pricingBasis.id !== expectedPricing.id
+        || pricingBasis.digest !== expectedPricing.digest
+        || customerValues.some((value) => value !== customer)
+        || projectValues.some((value) => value !== project)
+      ) {
+        throw new Error(`${label} does not preserve the canonical commercial, pricing, customer, or project contract.`);
+      }
+      if (isGenerationPayload && (
+        payload.pricing_reference_id !== expectedPricing.id
+        || payload.pricing_reference_source !== expectedPricing.source
+        || topPricing.id !== expectedPricing.id
+        || topPricing.source !== expectedPricing.source
+        || topPricing.currency !== expectedPricing.currency
+        || topPricing.digest_sha256 !== expectedPricing.digest
+      )) {
+        throw new Error(`${label} does not carry the exact pricing authority identity.`);
+      }
+    };
+
+    const candidateSessionId = safeQuoteSessionId(`${safePrefix}-${Date.now()}`);
+    const sessionId = candidateSessionId || newClientQuoteSessionId();
+    state.quoteSessionId = sessionId;
+    const draftFiles = sessionFileRecordsFromDraft();
+    const initialDraftState = currentQuoteSessionDraftState();
+    const initialPayload = currentQuoteSessionPayload({
+      sessionId,
+      quoteGenerated: false,
+      includeDraftState: true,
+      includeDraftFiles: true,
+      draftState: initialDraftState,
+      draftFiles,
+    });
+    if (initialPayload.status?.quote_generated !== false) {
+      throw new Error("Synthetic fixture initial session must begin with quote_generated=false.");
+    }
+    assertFixturePayload(initialPayload, "Initial synthetic fixture session", false);
+    const initialSaved = await saveCurrentQuoteSession({
+      sessionId,
+      quoteGenerated: false,
+      includeDraftState: true,
+      includeDraftFiles: true,
+      draftState: initialDraftState,
+      draftFiles,
+    });
+    if (
+      !initialSaved
+      || initialSaved.session_id !== sessionId
+      || initialSaved.status?.quote_generated !== false
+    ) {
+      throw new Error("Synthetic fixture initial non-generated quote session was not persisted.");
+    }
+
+    const generationPayload = buildPayload({ viewPdf: false });
+    assertFixturePayload(generationPayload, "Canonical synthetic generation payload", false, true);
+    const generationJobId = newClientJobId();
+    const started = await startJob("generate", generationPayload, { jobId: generationJobId });
+    if (!started.ok) throw new Error("Canonical synthetic generation job was rejected before execution.");
+    const acceptedJobId = String(started.data?.job_id || generationJobId).trim();
+    const polled = await pollJob(acceptedJobId);
+    if (
+      !polled.ok
+      || polled.data?.status !== "completed"
+      || polled.data?.result?.status !== "completed"
+    ) {
+      throw new Error(`Canonical synthetic generation did not reach terminal success: ${polled.data?.status || "unknown"}.`);
+    }
+    const resultSessionId = safeQuoteSessionId(polled.data.result.quote_session?.session_id || "");
+    if (resultSessionId && resultSessionId !== sessionId) {
+      throw new Error("Canonical synthetic generation returned a different quote session.");
+    }
+
+    const detailResponse = await fetch(`/api/quote-sessions/${encodeURIComponent(sessionId)}`);
+    const detailData = await detailResponse.json().catch(() => ({}));
+    if (!detailResponse.ok) throw new Error("Generated synthetic quote session could not be re-read.");
+    const persisted = detailData.quote_session || {};
+    assertFixturePayload({ quote_session: persisted }, "Persisted generated synthetic session", true);
+    const xlsx = persisted.exports?.xlsx || {};
+    if (
+      xlsx.filename !== "quotation.xlsx"
+      || xlsx.exists !== true
+      || xlsx.missing === true
+      || xlsx.stale === true
+      || !String(xlsx.url || "").trim()
+    ) {
+      throw new Error("Persisted generated synthetic session does not expose a current quotation.xlsx artifact.");
+    }
+    const pdf = persisted.exports?.pdf || {};
+    if (pdf.exists === true || pdf.filename === "quotation.pdf") {
+      throw new Error("Synthetic dashboard fixture unexpectedly generated a PDF.");
+    }
+    return sessionId;
   }, {
     suffix,
     sessionIdPrefix: options.sessionIdPrefix || "",
