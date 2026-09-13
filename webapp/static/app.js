@@ -4350,10 +4350,24 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   );
   applyQuoteDetails(restoredQuoteDetails, { includeLogo: true, clearLogo: true });
   state.images = await restoreSessionImages(restoredState.images);
-  state.quoteBasis = cloneQuoteBasis(restoredState.quoteBasis || {});
-  state.quoteBasisSections = normalizeQuoteBasisSections(restoredState.quoteBasisSections || restoredState.quoteBasis || {});
-  state.lineItems = Array.isArray(restoredState.lineItems) ? restoredState.lineItems.map(normalizeLineItem) : [];
-  state.outputRows = Array.isArray(restoredState.outputRows) ? restoredState.outputRows.map(normalizeOutputRow) : [];
+  const restoredBasisSections = Array.isArray(restoredState.quoteBasisSections)
+    ? normalizeQuoteBasisSections(restoredState.quoteBasisSections)
+    : [];
+  state.quoteBasisSections = restoredBasisSections;
+  state.quoteBasis = restoredBasisSections.length
+    ? quoteBasisFromSections(restoredBasisSections)
+    : cloneQuoteBasis(restoredState.quoteBasis || {});
+  const restoredOutputRows = Array.isArray(restoredState.outputRows)
+    ? sortOutputRows(restoredState.outputRows.map(normalizeOutputRow))
+    : [];
+  state.outputRows = restoredOutputRows;
+  if (state.outputRows.length) {
+    state.pricingMatches = snapshotOutputRows(state.outputRows);
+    state.lineItems = outputRowsToLineItems(state.outputRows);
+  } else {
+    state.lineItems = Array.isArray(restoredState.lineItems) ? restoredState.lineItems.map(normalizeLineItem) : [];
+    state.pricingMatches = Array.isArray(restoredState.pricingMatches) ? restoredState.pricingMatches : [];
+  }
   state.originalOutputRows = Array.isArray(restoredState.originalOutputRows) ? restoredState.originalOutputRows.map(normalizeOutputRow) : [];
   state.outputErrors = Array.isArray(restoredState.outputErrors) ? restoredState.outputErrors : [];
   state.outputSortMode = "pricing_reference";
@@ -4384,7 +4398,6 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
     restoredState.pdfFileRevision ?? restoredState.pdfFile?.output_revision,
     -1
   );
-  state.pricingMatches = Array.isArray(restoredState.pricingMatches) ? restoredState.pricingMatches : [];
   state.pricingIssues = [];
   state.activeJob = normalizeActiveJob(restoredState.activeJob || {}, { restoring: true });
   rejectedRestoredActiveJob = Boolean(restoredState.activeJob && typeof restoredState.activeJob === "object" && !state.activeJob);
@@ -9667,13 +9680,15 @@ function renderMatchSummary(result = {}) {
 }
 
 function renderPricingMatches(rows = [], options = {}) {
-  state.pricingMatches = Array.isArray(rows) ? rows : [];
-  if (options.fromPricingMatches) {
-    state.outputRows = state.pricingMatches.map(outputRowFromPricingMatch);
-  } else if (Array.isArray(rows) && rows.length && rows[0]?.price_mode) {
-    state.outputRows = rows.map(normalizeOutputRow);
-  }
+  const incomingRows = Array.isArray(rows) ? rows : [];
+  const fromPricingMatches = options.fromPricingMatches === true
+    || (incomingRows.length > 0 && !incomingRows[0]?.price_mode);
+  const derivedOutputRows = fromPricingMatches
+    ? incomingRows.map(outputRowFromPricingMatch)
+    : incomingRows.map(normalizeOutputRow);
+  state.outputRows = snapshotOutputRows(derivedOutputRows);
   state.outputRows = sortOutputRows(state.outputRows);
+  state.pricingMatches = snapshotOutputRows(state.outputRows);
   if (elements.outputSortMode) elements.outputSortMode.value = state.outputSortMode;
   const outputRows = state.outputRows;
   updateOutputHeader(outputRows);
@@ -11707,6 +11722,13 @@ function quoteDraftShouldPersistToDashboard() {
 
 function currentQuoteSessionDraftState() {
   const snapshot = buildSessionSnapshot();
+  const selectedPresetValue = String(snapshot.selectedPresetValue || "").trim();
+  const quoteBasisSections = Array.isArray(snapshot.quoteBasisSections)
+    ? normalizeQuoteBasisSections(snapshot.quoteBasisSections)
+    : [];
+  const quoteBasis = quoteBasisSections.length
+    ? quoteBasisFromSections(quoteBasisSections)
+    : snapshot.quoteBasis;
   return {
     version: snapshot.version,
     savedAt: snapshot.savedAt,
@@ -11715,15 +11737,15 @@ function currentQuoteSessionDraftState() {
     profileId: snapshot.profileId,
     pricingReferenceId: snapshot.pricingReferenceId,
     pricingReferenceSource: snapshot.pricingReferenceSource,
-    selectedPresetValue: snapshot.selectedPresetValue,
+    selectedPresetValue: availablePresetValues().has(selectedPresetValue) ? selectedPresetValue : "",
     quoteCommercialLifecycle: snapshot.quoteCommercialLifecycle,
     quoteCommercialReview: snapshot.quoteCommercialReview,
     quoteCommercialTouched: snapshot.quoteCommercialTouched,
     images: snapshot.images,
     quoteDetails: snapshot.quoteDetails,
     workflowStage: snapshot.workflowStage,
-    quoteBasis: snapshot.quoteBasis,
-    quoteBasisSections: snapshot.quoteBasisSections,
+    quoteBasis,
+    quoteBasisSections,
     lineItems: snapshot.lineItems,
     outputRows: snapshot.outputRows,
     originalOutputRows: snapshot.originalOutputRows,

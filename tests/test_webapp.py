@@ -25493,6 +25493,7 @@ function cloneQuoteBasis(value = {}) { return value; }
 function normalizeQuoteBasisSections(value = []) { return value; }
 function normalizeLineItem(value) { return value; }
 function normalizeOutputRow(value) { return value; }
+function sortOutputRows(value = []) { return value; }
 function normalizeBoothDimensions(value = {}) { return value; }
 function normalizeAnalysisMode(value = "") { return value; }
 function normalizeActiveJob() { return null; }
@@ -25769,6 +25770,7 @@ function cloneQuoteBasis(value = {}) { return value; }
 function normalizeQuoteBasisSections(value = []) { return value; }
 function normalizeLineItem(value) { return value; }
 function normalizeOutputRow(value) { return value; }
+function sortOutputRows(value = []) { return value; }
 function normalizeBoothDimensions(value = {}) { return value; }
 function normalizeAnalysisMode(value = "") { return value; }
 function normalizeActiveJob() { return null; }
@@ -29069,6 +29071,446 @@ assert.strictEqual(outputRowsToLineItems(state.outputRows)[0].description, manua
 
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
 
+    def test_static_quote_session_restore_is_canonical_idempotent_and_freshness_safe(self):
+        static_dir = ROOT / "webapp" / "static"
+        js = (static_dir / "app.js").read_text(encoding="utf-8")
+        render_body = js.split("function renderPricingMatches", 1)[1].split("function clearPricingReviewMessages", 1)[0]
+        restore_body = js.split("async function applyQuoteSessionSnapshot", 1)[1].split("async function restoreSessionState", 1)[0]
+        draft_body = js.split("function currentQuoteSessionDraftState", 1)[1].split("function quoteSessionDraftComparisonKey", 1)[0]
+
+        self.assertIn("state.pricingMatches = snapshotOutputRows(state.outputRows);", render_body)
+        self.assertIn("state.lineItems = outputRowsToLineItems(state.outputRows);", restore_body)
+        self.assertIn("state.lineItems = Array.isArray(restoredState.lineItems) ? restoredState.lineItems.map(normalizeLineItem) : [];", restore_body)
+        self.assertIn("quoteBasisFromSections(restoredBasisSections)", restore_body)
+        self.assertIn("availablePresetValues().has(selectedPresetValue)", draft_body)
+
+        node = require_node(self)
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+;(async () => {
+
+function extractFunction(name) {
+  const markers = [`async function ${name}(`, `function ${name}(`];
+  let start = -1;
+  for (const marker of markers) {
+    const candidate = source.indexOf(marker);
+    if (candidate >= 0 && (start < 0 || candidate < start)) start = candidate;
+  }
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf("{", source.indexOf(")", start)) + 1;
+  if (bodyStart < 1) throw new Error(`Missing body for function ${name}`);
+  let depth = 1;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+function deepClone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+const BASIS_FIELDS = [
+  ["surfaces", "Surfaces / Structures"],
+  ["counters", "Cabinets / Counters"],
+  ["platform", "Platform / Flooring"],
+  ["graphics", "Graphics / Signage"],
+  ["furniture", "Furniture / Plants / AV"],
+  ["electrical", "Electrical"],
+];
+const EMPTY_BASIS = Object.fromEntries(BASIS_FIELDS.map(([key]) => [key, ""]));
+const QUOTE_SESSION_STATE_VERSION = 5;
+const PRICING_REFERENCE_SETTINGS_MODE_MANAGE = "manage";
+const PRICING_REFERENCE_SOURCES = new Set(["company", "local", "bundled"]);
+const QUOTE_COMMERCIAL_REVIEW_MESSAGE = "Synthetic review";
+const QUOTE_COMMERCIAL_FIELD_KEYS = [
+  "clientName", "clientAttention", "clientTitle", "clientAddress", "projectTitle",
+  "projectNumber", "quoteDate", "currency", "tax", "exchangeRate", "paymentTerms",
+  "chequePayee", "companySignatory", "companyTitle", "companyDateLabel",
+];
+
+function isPlainObject(value) { return Boolean(value && typeof value === "object" && !Array.isArray(value)); }
+function quoteCommercialStrictDataEqual(left, right) { return JSON.stringify(left) === JSON.stringify(right); }
+function invalidateAuthorityProfileRequests() {}
+function safeQuoteSessionId(value, fallback = "") {
+  const candidate = String(value || "").trim();
+  return /^quote-[A-Za-z0-9_-]{3,64}$/.test(candidate) ? candidate : fallback;
+}
+function transitionGenerationContext(sessionId, runId) { state.generationContext = { session_id: sessionId, run_id: String(runId || "") }; }
+function normalizeRestorableOverlay(value) { return typeof value === "string" ? value : ""; }
+function normalizePricingReferenceSettingsMode(value) { return value === "import" ? "import" : "manage"; }
+function presetValueFromQuoteDetails() { return ""; }
+function normalizeQuoteCommercialSnapshot(snapshot) { return isPlainObject(snapshot) ? deepClone(snapshot) : null; }
+function quoteCommercialSnapshotPricingBasis(snapshot) { return isPlainObject(snapshot?.pricing_basis) ? deepClone(snapshot.pricing_basis) : null; }
+function normalizeQuoteCommercialReview(review) { return isPlainObject(review) ? deepClone(review) : null; }
+function quoteCommercialRestorationReviewReason() { return ""; }
+function currentPricingReference() {
+  const basis = state.quoteCommercialSnapshot?.pricing_basis || {};
+  return {
+    id: state.pricingReferenceId,
+    source: state.pricingReferenceSource,
+    digest_sha256: basis.digest,
+    currency: basis.currency,
+  };
+}
+function setQuoteCommercialReview(reason, id, source) {
+  state.quoteCommercialReview = { reason_code: reason, blocked_identity: { id, source } };
+}
+function normalizeQuoteCommercialTouched(touched = {}) {
+  return Object.fromEntries(QUOTE_COMMERCIAL_FIELD_KEYS.map((key) => [key, Boolean(touched?.[key])]));
+}
+function quoteDetailsCommercialTouched() { return {}; }
+function syncSelectedPricingReference() {}
+function renderProfileOptions() {}
+function renderPresetOptions() {}
+function selectedPreset() { return null; }
+function quoteDetailsWithFallbackDefaults(defaults, details) { return deepClone(details || defaults || {}); }
+async function restoreQuoteDetailsLogo(details) { return details; }
+function applyQuoteDetails(details) { state.quoteDetails = deepClone(details || {}); }
+async function restoreSessionImages(images) { return Array.isArray(images) ? deepClone(images) : []; }
+function cloneQuoteBasis(basis = {}) { return { ...EMPTY_BASIS, ...Object.fromEntries(BASIS_FIELDS.map(([key]) => [key, basis[key] || ""])) }; }
+function normalizeBoothDimensions(value) { return deepClone(value || {}); }
+function normalizeAnalysisMode(value) { return String(value || ""); }
+function normalizeActiveJob() { return null; }
+function renderFiles() {}
+function renderMatchSummary() {}
+function clearPricingReviewMessages() {}
+function updateOutputHeader() {}
+function updateQuoteBasisCard() {}
+function renderBasisFailureState() {}
+function renderBasisEmptyState() {}
+function updateDownloadButton() {}
+function setResultStatus() {}
+function setWorkflowStage(value) { state.workflowStage = value; }
+function restoredWorkflowStage(saved = {}) { return saved.workflowStage || "completed"; }
+function showAiFailureBanner() {}
+function clearAiFailureBanner() {}
+function restoredQuoteSessionSidePanel(saved = {}) { return saved.activeSidePanel || "output"; }
+function setSidePanel(value) { state.activeSidePanel = value; }
+function renderQuoteCommercialReviewState() {}
+function sessionFileRecordsFromDraft() { return []; }
+function persistSessionFiles() { return Promise.resolve(); }
+function availablePresetValues() { return new Set(["profile:profile-authority:current"]); }
+function furthestQuoteSessionSidePanel(snapshot = {}) { return snapshot.activeSidePanel || "output"; }
+function quoteFxMultiplier() { return 1; }
+function normalizeCategoryTitle(value = "") { return String(value || "").trim(); }
+function outputCellDisplayValue(row = {}, field = "") { return String(row?.[field] ?? ""); }
+function renderOutputEditCell() { return ""; }
+function escapeHtml(value = "") { return String(value); }
+function renderOutputValidationMessages() {}
+function syncControlStates() {}
+function queueQuoteSessionDraftStateSave() {}
+
+const state = {
+  quoteSessionId: "quote-canonical-restore",
+  quoteSessionRestoredSessionId: "",
+  quoteSessionRestoredDraftKey: "",
+  quoteSessionDraftSaveStarted: true,
+  activeAppView: "quote",
+  activeSidePanel: "output",
+  profileId: "profile-authority",
+  pricingReferenceId: "pricing-authority",
+  pricingReferenceSource: "local",
+  selectedPresetValue: "legacy:non-selectable-alias",
+  quoteCommercialLifecycle: "EXISTING",
+  quoteCommercialSnapshot: null,
+  quoteCommercialReview: null,
+  quoteCommercialRecoveryError: "",
+  quoteCommercialTouched: {},
+  quoteCommercialPreservedQuoteText: {},
+  pricingReferenceSelectionIntent: null,
+  pricingReferenceSettingsMode: PRICING_REFERENCE_SETTINGS_MODE_MANAGE,
+  restorableOverlay: "",
+  pendingFeedback: "",
+  quoteDetails: {},
+  images: [],
+  quoteBasis: {},
+  quoteBasisSections: [],
+  lineItems: [],
+  outputRows: [],
+  originalOutputRows: [],
+  outputErrors: [],
+  outputSortMode: "pricing_reference",
+  analysisFindings: [],
+  blockingClarificationQuestions: [],
+  boothDimensions: {},
+  originalAnalysisSnapshot: null,
+  basisConfirmed: true,
+  draftSource: "synthetic",
+  lastAnalysisMode: "",
+  pendingAnalysisMode: "",
+  basisChat: {},
+  aiFailed: false,
+  downloadFile: null,
+  pdfFile: null,
+  outputRevision: 7,
+  downloadFileRevision: 7,
+  pdfFileRevision: 7,
+  pricingMatches: [],
+  pricingIssues: [],
+  activeJob: null,
+  isAnalysisRunning: false,
+  isGenerating: false,
+  isPreparingOutput: false,
+};
+const elements = {
+  outputSortMode: { value: "pricing_reference" },
+  pricingTableWrap: { hidden: false },
+  pricingEmptyState: { hidden: false },
+  pricingReviewMessages: { innerHTML: "" },
+  pricingMatchesBody: { innerHTML: "", textContent: "" },
+};
+const window = { localStorage: { setItem() {} } };
+
+let saveNumber = 0;
+function buildSessionSnapshot() {
+  saveNumber += 1;
+  return deepClone({
+    version: QUOTE_SESSION_STATE_VERSION,
+    savedAt: `save-${saveNumber}`,
+    activeAppView: state.activeAppView,
+    quoteSessionDraftSaveStarted: state.quoteSessionDraftSaveStarted,
+    profileId: state.profileId,
+    pricingReferenceId: state.pricingReferenceId,
+    pricingReferenceSource: state.pricingReferenceSource,
+    selectedPresetValue: state.selectedPresetValue,
+    quoteCommercialLifecycle: state.quoteCommercialLifecycle,
+    quoteCommercialReview: state.quoteCommercialReview,
+    quoteCommercialTouched: state.quoteCommercialTouched,
+    images: state.images,
+    quoteDetails: state.quoteDetails,
+    workflowStage: state.workflowStage,
+    quoteBasis: state.quoteBasis,
+    quoteBasisSections: state.quoteBasisSections,
+    lineItems: state.lineItems,
+    outputRows: state.outputRows,
+    originalOutputRows: state.originalOutputRows,
+    outputErrors: state.outputErrors,
+    outputSortMode: state.outputSortMode,
+    analysisFindings: state.analysisFindings,
+    blockingClarificationQuestions: state.blockingClarificationQuestions,
+    boothDimensions: state.boothDimensions,
+    originalAnalysisSnapshot: state.originalAnalysisSnapshot,
+    basisConfirmed: state.basisConfirmed,
+    aiFailed: state.aiFailed,
+    draftSource: state.draftSource,
+    lastAnalysisMode: state.lastAnalysisMode,
+    activeSidePanel: state.activeSidePanel,
+    downloadFile: state.downloadFile,
+    pdfFile: state.pdfFile,
+    outputRevision: state.outputRevision,
+    downloadFileRevision: state.downloadFileRevision,
+    pdfFileRevision: state.pdfFileRevision,
+    pricingMatches: state.pricingMatches,
+  });
+}
+
+eval([
+  "normalizeTextNewlines", "splitLines", "safeId", "basisDisplayTitle", "sectionTitleKey",
+  "referenceSectionTitleAliases", "exactPricingReferenceSectionTitle", "normalizeQuoteBasisTitle",
+  "normalizeUnit", "normalizeCategoryTitle", "cleanCustomerQuoteLineText", "pricingReferenceLineText",
+  "bracketedCatalogReferenceParts", "leadingNumber", "formatQuantityNumber", "normalizeQuantityPrefixUnit",
+  "leadingQuantityPrefix", "quantityUnitAliases", "startsWithQuantityUnit", "stripLeadingQuantityCountFromLineText",
+  "normalizedLineTextQuantityParts", "normalizeBasisTag", "isCustomPricingBasisLine", "isPendingAiProposalLine",
+  "normalizeConfidence", "normalizePossiblePricingMatches", "splitBasisDecisionText", "normalizeBasisLines",
+  "normalizeQuoteBasisSections", "quoteBasisFromSections", "numberOrNull", "orderNumber", "unitPriceEditKind",
+  "effectiveOutputUnitPrice", "roundCommercialCents", "quoteAmountValue", "synchronizeOwnedOutputRowPrice",
+  "recalculateOutputRow", "normalizeLineItem", "outputCatalogDescription", "normalizeOutputRow",
+  "pricingMatchStatus", "outputQuantityPartsFromPricingMatch", "outputRowFromPricingMatch", "categoryOrderValue",
+  "pricingReferenceOrder", "compareOrderValues", "sortOutputRows", "snapshotOutputRows", "outputRowsToLineItems",
+  "outputRowsValid", "revisionNumber", "markOutputRowsDirty", "downloadFileIsFresh", "pdfFileIsFresh",
+  "renderPricingMatches", "commitOutputEditor", "applyQuoteSessionSnapshot", "currentQuoteSessionDraftState",
+].map(extractFunction).join("\n"));
+
+const pricingDigest = "sha256:" + "a".repeat(64);
+const rawPricingMatches = [
+  {
+    status: "manual-price",
+    section: "Graphics",
+    description: "Manual display package",
+    quantity: "1 sqm",
+    unit: "sqm",
+    unit_price: 15,
+    keyword: "manual-display-package",
+    category_order: 2,
+    item_order: 1,
+  },
+  {
+    status: "matched",
+    section: "Floor Design",
+    description: "Needle punch carpet",
+    quantity: "2 sqm",
+    unit: "sqm",
+    unit_price: 20,
+    keyword: "needle-punch-carpet",
+    category_order: 1,
+    item_order: 1,
+  },
+  {
+    status: "included",
+    section: "Services",
+    description: "Coordination",
+    quantity: "1 lot",
+    unit: "lot",
+    keyword: "coordination",
+    category_order: 3,
+    item_order: 1,
+  },
+];
+
+renderPricingMatches(rawPricingMatches, { fromPricingMatches: true });
+assert.strictEqual(state.outputRows.length, 3);
+const manualRow = state.outputRows.find((row) => row.status === "manual-price");
+const catalogueRow = state.outputRows.find((row) => row.status === "matched");
+const includedRow = state.outputRows.find((row) => row.status === "included");
+assert.strictEqual(manualRow.unit_price_override, 15);
+assert.strictEqual(manualRow.catalog_unit_price, "");
+assert.strictEqual(catalogueRow.catalog_unit_price, 20);
+assert.strictEqual(catalogueRow.price_mode, "Priced");
+assert.strictEqual(includedRow.price_mode, "Included");
+assert.notStrictEqual(state.pricingMatches, state.outputRows);
+assert.ok(state.pricingMatches.every((row, index) => row !== state.outputRows[index]));
+
+const canonicalPass0 = deepClone({ outputRows: state.outputRows, pricingMatches: state.pricingMatches });
+renderPricingMatches(state.outputRows);
+const canonicalPass1 = deepClone({ outputRows: state.outputRows, pricingMatches: state.pricingMatches });
+renderPricingMatches(state.outputRows);
+const canonicalPass2 = deepClone({ outputRows: state.outputRows, pricingMatches: state.pricingMatches });
+assert.deepStrictEqual(canonicalPass1, canonicalPass0);
+assert.deepStrictEqual(canonicalPass2, canonicalPass1);
+
+const sessionId = state.quoteSessionId;
+const pricingBasis = {
+  id: "pricing-authority",
+  source: "local",
+  currency: "SGD",
+  digest: pricingDigest,
+};
+const canonicalSections = [{
+  id: "graphics",
+  title: "Graphics",
+  lines: [{ id: "graphics-line", tag: "Include", text: "Printed wall graphics", quantity: 1, unit: "sqm" }],
+}];
+const saved = {
+  version: QUOTE_SESSION_STATE_VERSION,
+  browserRecoveryScope: "scope",
+  quoteSessionId: sessionId,
+  activeAppView: "quote",
+  quoteSessionDraftSaveStarted: true,
+  profileId: "profile-authority",
+  pricingReferenceId: pricingBasis.id,
+  pricingReferenceSource: pricingBasis.source,
+  selectedPresetValue: "legacy:non-selectable-alias",
+  quoteCommercialLifecycle: "EXISTING",
+  quoteCommercialReview: null,
+  quoteCommercialTouched: {},
+  images: [{ name: "synthetic-render.png", type: "image/png", size: 10 }],
+  quoteDetails: {
+    client: { name: "Synthetic Client" },
+    project: { title: "Canonical Restore" },
+    commercial_snapshot: {
+      lifecycle: "EXISTING",
+      origin: "explicit_initialization",
+      pricing_basis: pricingBasis,
+      tax: { label: "GST", rate: 0.09 },
+      exchange_rate: 1,
+    },
+  },
+  workflowStage: "completed",
+  quoteBasis: deepClone(EMPTY_BASIS),
+  quoteBasisSections: canonicalSections,
+  lineItems: [{ section: "Drift", description: "Alias/default drift", quantity: 99, unit: "lot", unit_price: 999, output_unit_locked: false }],
+  outputRows: deepClone(state.outputRows),
+  originalOutputRows: deepClone(state.outputRows),
+  outputErrors: [],
+  outputSortMode: "name",
+  analysisFindings: [],
+  blockingClarificationQuestions: [],
+  boothDimensions: {},
+  originalAnalysisSnapshot: null,
+  basisConfirmed: true,
+  aiFailed: false,
+  draftSource: "synthetic",
+  lastAnalysisMode: "",
+  activeSidePanel: "output",
+  downloadFile: { name: "quotation.xlsx", url: `/api/quote-sessions/${sessionId}/files/quotation.xlsx`, output_revision: 7 },
+  pdfFile: { name: "quotation.pdf", url: `/api/quote-sessions/${sessionId}/files/quotation.pdf`, output_revision: 7 },
+  outputRevision: 7,
+  downloadFileRevision: 7,
+  pdfFileRevision: 7,
+  pricingMatches: [{ status: "legacy-raw", description: "must not own output" }],
+};
+
+await applyQuoteSessionSnapshot(saved, { forceQuoteView: true, sessionId });
+assert.strictEqual(state.profileId, "profile-authority");
+assert.strictEqual(state.pricingReferenceId, pricingBasis.id);
+assert.strictEqual(state.pricingReferenceSource, pricingBasis.source);
+assert.deepStrictEqual(state.quoteCommercialSnapshot.pricing_basis, pricingBasis);
+assert.deepStrictEqual(state.quoteBasis, { graphics: "Include: Printed wall graphics" });
+assert.deepStrictEqual(state.lineItems, outputRowsToLineItems(state.outputRows));
+assert.ok(state.lineItems.every((item) => item.output_unit_locked === true));
+assert.ok(state.lineItems.every((item) => !Object.prototype.hasOwnProperty.call(item, "unit_price")));
+assert.ok(state.lineItems.every((item) => !Object.prototype.hasOwnProperty.call(item, "sale_unit_price")));
+assert.deepStrictEqual(state.pricingMatches, snapshotOutputRows(state.outputRows));
+assert.notStrictEqual(state.pricingMatches, state.outputRows);
+assert.strictEqual(state.outputRevision, 7);
+assert.strictEqual(downloadFileIsFresh(), true);
+assert.strictEqual(pdfFileIsFresh(), true);
+
+const draft0 = currentQuoteSessionDraftState();
+assert.strictEqual(draft0.selectedPresetValue, "");
+assert.strictEqual(draft0.profileId, "profile-authority");
+assert.deepStrictEqual(draft0.quoteDetails.commercial_snapshot.pricing_basis, pricingBasis);
+const comparable = (draft) => {
+  const value = deepClone(draft);
+  delete value.savedAt;
+  delete value.activeAppView;
+  delete value.activeSidePanel;
+  return value;
+};
+const canonical0 = comparable(draft0);
+
+const restoreCycle = async (draft) => {
+  await applyQuoteSessionSnapshot({ ...deepClone(draft), quoteSessionId: sessionId, browserRecoveryScope: "scope" }, { forceQuoteView: true, sessionId });
+  return currentQuoteSessionDraftState();
+};
+const draft1 = await restoreCycle(draft0);
+const draft2 = await restoreCycle(draft1);
+assert.deepStrictEqual(comparable(draft1), canonical0);
+assert.deepStrictEqual(comparable(draft2), canonical0);
+assert.strictEqual(state.outputRevision, 7);
+assert.strictEqual(downloadFileIsFresh(), true);
+assert.strictEqual(pdfFileIsFresh(), true);
+
+commitOutputEditor({
+  dataset: { outputEditorField: "unit_price_override", outputRow: "0" },
+  value: "16",
+  isConnected: true,
+});
+assert.strictEqual(state.outputRevision, 8);
+assert.strictEqual(downloadFileIsFresh(), false);
+assert.strictEqual(pdfFileIsFresh(), false);
+assert.notStrictEqual(comparable(currentQuoteSessionDraftState()).outputRows[0].unit_price_override, canonical0.outputRows[0].unit_price_override);
+})();
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
     def test_static_unresolved_pricing_stays_as_pending_output_row(self):
         static_dir = ROOT / "webapp" / "static"
         js = (static_dir / "app.js").read_text(encoding="utf-8")
@@ -29838,6 +30280,8 @@ async function main() {
         source: "g3-browser",
       });
       refreshOutputRowsFromLineItems();
+      const canonicalOutputRows = sortOutputRows(state.outputRows.map(normalizeOutputRow));
+      const canonicalLineItems = outputRowsToLineItems(canonicalOutputRows);
       state.originalOutputRows = snapshotOutputRows(state.outputRows);
       state.basisConfirmed = true;
       setWorkflowStage("completed");
@@ -29857,7 +30301,8 @@ async function main() {
         lineItem: state.lineItems[0],
         outputRow: state.outputRows[0],
         basis: JSON.stringify(state.quoteBasisSections),
-        output: JSON.stringify(state.outputRows),
+        output: JSON.stringify(canonicalOutputRows),
+        lineItems: JSON.stringify(canonicalLineItems),
       };
     });
     assert.strictEqual(fresh.lifecycle, "NEW_UNINITIALISED");
@@ -29896,7 +30341,7 @@ async function main() {
     assert.strictEqual(restored.lifecycle, fresh.lifecycle);
     assert.strictEqual(restored.basis, fresh.basis);
     assert.strictEqual(restored.output, fresh.output);
-    assert.strictEqual(restored.lineItems, JSON.stringify([fresh.lineItem]));
+    assert.strictEqual(restored.lineItems, fresh.lineItems);
     assert.strictEqual(restored.snapshot.pricing_basis.id, referenceId);
     assert.strictEqual(restored.snapshot.pricing_basis.source, "company");
 

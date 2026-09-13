@@ -1385,6 +1385,27 @@ async function installMockProfiles(page) {
           item_count: 1,
           digest_sha256: "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7",
         }],
+        company_profiles: [{
+          id: "synthetic-g3-company-profile",
+          label: "Synthetic G3 Company Profile",
+          description: "Test-only company profile for the Playwright smoke.",
+          defaults: {
+            company: {
+              name: "Synthetic G3 Company Pte Ltd",
+              header_details: "Synthetic G3 Company Pte Ltd\n1 Synthetic Way\nSingapore 000001",
+              logo_data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+            },
+            quote_text: {
+              payment_terms: ["70% synthetic deposit upon confirmation."],
+              cheque_payee: "Synthetic G3 Company Pte Ltd",
+            },
+            signature: {
+              company_signatory: "Synthetic G3 Signatory",
+              company_title: "Synthetic G3 Title",
+              company_date_label: "Date:",
+            },
+          },
+        }],
         default_profile_id: "synthetic-exhibition-fixture-template",
         default_pricing_reference_id: "synthetic-exhibition-fixture-pricing",
         company_id: "default",
@@ -1417,6 +1438,38 @@ async function saveSmokePricingReference(page, internalCost) {
     update_existing: true,
     editing_reference_id: "synthetic-exhibition-fixture-pricing",
   }), { internalCost });
+}
+
+async function saveSmokeCompanyProfile(page) {
+  const layoutBytes = await fs.readFile(path.join(root, "templates", "quote-layout", "quotation-layout.xlsx"));
+  const layoutDataUrl = `data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${layoutBytes.toString("base64")}`;
+  return page.evaluate((layoutDataUrl) => postJson("/api/settings/profiles", {
+    id: "synthetic-g3-company-profile",
+    label: "Synthetic G3 Company Profile",
+    description: "Test-only company profile for the Playwright smoke.",
+    defaults: {
+      company: {
+        name: "Synthetic G3 Company Pte Ltd",
+        header_details: "Synthetic G3 Company Pte Ltd\n1 Synthetic Way\nSingapore 000001",
+        logo_data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+      },
+      quote_text: {
+        payment_terms: ["70% synthetic deposit upon confirmation."],
+        cheque_payee: "Synthetic G3 Company Pte Ltd",
+      },
+      signature: {
+        company_signatory: "Synthetic G3 Signatory",
+        company_title: "Synthetic G3 Title",
+        company_date_label: "Date:",
+      },
+    },
+    pack: {
+      quotation_layout: {
+        filename: "quotation-layout.xlsx",
+        data_url: layoutDataUrl,
+      },
+    },
+  }), layoutDataUrl);
 }
 
 async function verifyServerPricingReferenceReviewDurability(page) {
@@ -2085,6 +2138,448 @@ async function verifyStaleTabMutationIsRejected(page) {
     }
   } finally {
     await stalePage.close();
+  }
+}
+
+async function verifyExportArtifactPersistenceG3(parentPage) {
+  const isolatedContext = await parentPage.context().browser().newContext({ viewport: { width: 1365, height: 768 } });
+  const page = await isolatedContext.newPage();
+  const pageProblems = [];
+  page.on("console", (message) => {
+    if (["error", "warning"].includes(message.type())) pageProblems.push(`${message.type()}: ${message.text()}`);
+  });
+  page.on("pageerror", (error) => pageProblems.push(`pageerror: ${error.message}`));
+  page.on("response", (response) => {
+    if (response.status() >= 400) pageProblems.push(`${response.status()} ${response.url()}`);
+  });
+
+  const expectedPricingDigest = "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7";
+  const hasValue = (value) => value !== undefined && value !== null && String(value).trim() !== "";
+
+  async function currentArtifacts(sessionId, label, { requirePdf = false } = {}) {
+    const detail = await dashboardQuoteSessionDetail(page, sessionId);
+    const session = detail.quote_session || {};
+    const xlsx = session.exports?.xlsx || {};
+    const pdf = session.exports?.pdf || {};
+    if (
+      detail.status !== "ok"
+      || session.status?.quote_generated !== true
+      || session.status?.draft_modified !== false
+      || xlsx.filename !== "quotation.xlsx"
+      || xlsx.exists !== true
+      || xlsx.stale !== false
+      || !String(xlsx.url || "").trim()
+      || !String(xlsx.url || "").includes(`/api/quote-sessions/${sessionId}/download/xlsx`)
+    ) {
+      throw new Error(`${label} did not expose a current quotation.xlsx publication: ${JSON.stringify(detail)}.`);
+    }
+    if (!hasValue(xlsx.publication_id)) {
+      throw new Error(`${label} did not expose XLSX publication ownership metadata: ${JSON.stringify(xlsx)}.`);
+    }
+    if (requirePdf && (
+      pdf.filename !== "quotation.pdf"
+      || pdf.exists !== true
+      || pdf.stale !== false
+      || !String(pdf.url || "").trim()
+      || !String(pdf.url || "").includes(`/api/quote-sessions/${sessionId}/download/pdf`)
+      || pdf.publication_id !== xlsx.publication_id
+    )) {
+      throw new Error(`${label} did not expose a current PDF owned by the same publication: ${JSON.stringify({ xlsx, pdf })}.`);
+    }
+    return {
+      session,
+      xlsx,
+      pdf,
+      publicationId: xlsx.publication_id,
+    };
+  }
+
+  async function waitForOutput(sessionId, label) {
+    await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 20000 });
+    await page.waitForFunction(({ sessionId }) => (
+      state.isBooting === false
+      && state.quoteSessionId === sessionId
+      && state.outputRows.length > 0
+      && !state.isPreparingOutput
+      && !state.isGenerating
+    ), { sessionId }, { timeout: 20000 });
+    const outputState = await page.evaluate(() => ({
+      outputRevision: state.outputRevision,
+      outputRows: state.outputRows.length,
+      downloadFresh: downloadFileIsFresh(),
+      pdfFresh: pdfFileIsFresh(),
+      activePanel: state.activeSidePanel,
+    }));
+    if (outputState.activePanel !== "output" || outputState.outputRows < 1) {
+      throw new Error(`${label} did not restore the output state: ${JSON.stringify(outputState)}.`);
+    }
+    return outputState;
+  }
+
+  async function ordinarySaveRender(sessionId, label, requirePdf = false) {
+    const saved = await page.evaluate(async () => {
+      renderPricingMatches(state.outputRows);
+      const result = await saveQuoteSessionDraftState({ quoteGenerated: true });
+      return {
+        sessionId: state.quoteSessionId,
+        outputRevision: state.outputRevision,
+        downloadFresh: downloadFileIsFresh(),
+        pdfFresh: pdfFileIsFresh(),
+        savedSessionId: result?.session_id || "",
+      };
+    });
+    if (saved.sessionId !== sessionId || !saved.downloadFresh || (requirePdf && !saved.pdfFresh)) {
+      throw new Error(`${label} ordinary render/save changed freshness: ${JSON.stringify(saved)}.`);
+    }
+    return currentArtifacts(sessionId, label, { requirePdf });
+  }
+
+  async function reloadAndSave(sessionId, label, requirePdf = false) {
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await waitForOutput(sessionId, `${label} restore`);
+    return ordinarySaveRender(sessionId, label, requirePdf);
+  }
+
+  async function terminalJob(jobId, label) {
+    const terminal = await page.evaluate(async (safeJobId) => {
+      const response = await fetch(`/api/jobs/${encodeURIComponent(safeJobId)}`);
+      const body = await response.json().catch(() => ({}));
+      return { ok: response.ok, ...body };
+    }, jobId);
+    if (!terminal.ok || terminal.status !== "completed" || terminal.result?.status !== "completed") {
+      throw new Error(`${label} did not reach genuine terminal success: ${JSON.stringify(terminal)}.`);
+    }
+    return terminal;
+  }
+
+  try {
+    await installMockProfiles(page);
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 20000 });
+    await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 20000 });
+    await page.waitForFunction(() => state.isBooting === false, null, { timeout: 20000 });
+
+    const savedPricing = await saveSmokePricingReference(page, 10);
+    if (!savedPricing.ok || savedPricing.data?.status !== "saved") {
+      throw new Error(`G3 could not establish the synthetic pricing reference: ${JSON.stringify(savedPricing)}.`);
+    }
+    const savedProfile = await saveSmokeCompanyProfile(page);
+    if (!savedProfile.ok || savedProfile.data?.status !== "saved") {
+      throw new Error(`G3 could not establish the synthetic company profile: ${JSON.stringify(savedProfile)}.`);
+    }
+    const emptyNewQuoteButton = page.locator("#dashboardEmptyNewQuoteButton:not([disabled])");
+    if (await emptyNewQuoteButton.isVisible()) await emptyNewQuoteButton.click();
+    else await page.locator("#newQuoteButton:not([disabled])").click();
+    await page.locator("#imageIntake").waitFor({ state: "visible", timeout: 20000 });
+    await seedQuoteDraftFromTestFixture(page, { fileName: "g3-override-only-reference.pdf" });
+
+    await page.locator("#sideNextButton", { hasText: "Next: Customer" }).click();
+    await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 20000 });
+    await page.waitForFunction(() => Boolean(state.quoteSessionId && state.quoteCommercialSnapshot?.pricing_basis?.digest), null, { timeout: 20000 });
+    const authority = await page.evaluate(() => ({
+      profileId: state.profileId,
+      defaultProfileId: state.defaultProfileId,
+      selectedPresetValue: state.selectedPresetValue,
+      pricingReferenceId: state.pricingReferenceId,
+      pricingReferenceSource: state.pricingReferenceSource,
+      pricingDigest: state.quoteCommercialSnapshot?.pricing_basis?.digest || "",
+    }));
+    if (
+      (authority.profileId || authority.defaultProfileId) !== "synthetic-exhibition-fixture-template"
+      || authority.selectedPresetValue !== "profile:synthetic-exhibition-fixture-template:synthetic-fixture-default"
+      || authority.pricingReferenceId !== "synthetic-exhibition-fixture-pricing"
+      || authority.pricingReferenceSource !== "local"
+      || authority.pricingDigest !== expectedPricingDigest
+    ) {
+      throw new Error(`G3 synthetic quote did not establish the expected profile/pricing authority: ${JSON.stringify(authority)}.`);
+    }
+
+    await page.locator("#sideNextButton", { hasText: "Next: Quote Company" }).click();
+    await page.locator("#quoteCompanyPanel.is-active").waitFor({ state: "visible", timeout: 20000 });
+    const g3CompanyProfileValue = "company:synthetic-g3-company-profile";
+    await page.locator("#presetSelect").selectOption(g3CompanyProfileValue);
+    await page.locator("#loadPresetButton").click();
+    await page.locator("#profileLoadModal").waitFor({ state: "visible", timeout: 10000 });
+    await page.locator("#confirmProfileLoadButton").click();
+    await page.locator("#profileLoadModal").waitFor({ state: "hidden", timeout: 10000 });
+    await page.waitForFunction((expectedValue) => (
+      state.selectedPresetValue === expectedValue
+      && generationProfileIdForPayload() === expectedValue
+      && selectedPreset()?.source === "company"
+    ), g3CompanyProfileValue, { timeout: 15000 });
+    await page.evaluate(() => {
+      applyDraftBasis([{
+        id: "g3-override-only",
+        title: "Synthetic Override",
+        lines: [{
+          id: "g3-override-only-line",
+          tag: "Include",
+          text: "Synthetic manual override target",
+          quantity: 1,
+          unit: "lot",
+        }],
+      }]);
+      applyDraftLineItems([{
+        section: "Synthetic Override",
+        description: "Synthetic manual override target",
+        quantity: 1,
+        unit: "lot",
+        price_mode: "Priced",
+      }]);
+      retagBasisSectionConfirmLines("g3-override-only", "Include");
+      state.blockingClarificationQuestions = [];
+      state.aiFailed = false;
+      state.draftSource = "playwright-g3-synthetic";
+      captureOriginalAnalysisSnapshot({ source: "playwright-g3-synthetic", quote_basis_sections: state.quoteBasisSections });
+      updateQuoteBasisCard("playwright-g3-synthetic");
+      setWorkflowStage("basis_review");
+      setSidePanel("basis", { force: true });
+      syncControlStates();
+    });
+    const basisSetup = await page.evaluate(() => ({
+      lineItems: state.lineItems.length,
+      outputRows: state.outputRows.length,
+      basisTags: state.quoteBasisSections.flatMap((section) => section.lines || []).map((line) => line.tag),
+      nextDisabled: document.querySelector("#sideNextButton")?.getAttribute("aria-disabled"),
+    }));
+    if (
+      basisSetup.lineItems !== 1
+      || basisSetup.outputRows !== 0
+      || JSON.stringify(basisSetup.basisTags) !== JSON.stringify(["Include"])
+      || basisSetup.nextDisabled === "true"
+    ) {
+      throw new Error(`G3 synthetic basis was not ready for ordinary confirmation: ${JSON.stringify(basisSetup)}.`);
+    }
+
+    const normalizeResponsePromise = page.waitForResponse((response) => (
+      response.request().method() === "POST"
+      && new URL(response.url()).pathname.endsWith("/api/line-items/normalize")
+    ), { timeout: 20000 });
+    await page.locator("#sideNextButton").click();
+    const normalizeResponse = await normalizeResponsePromise;
+    if (!normalizeResponse.ok()) {
+      throw new Error(`G3 ordinary basis confirmation was rejected: ${normalizeResponse.status()}.`);
+    }
+    const sessionId = await page.evaluate(() => state.quoteSessionId);
+    await waitForOutput(sessionId, "G3 initial basis confirmation");
+    const initialRow = await page.evaluate(() => {
+      const row = state.outputRows[0] || {};
+      return {
+        description: row.description,
+        catalogUnitPrice: row.catalog_unit_price,
+        unitPriceOverride: row.unit_price_override,
+        priceMode: row.price_mode,
+      };
+    });
+    if (
+      initialRow.priceMode !== "Priced"
+      || hasValue(initialRow.catalogUnitPrice)
+      || hasValue(initialRow.unitPriceOverride)
+    ) {
+      throw new Error(`G3 target row did not begin without catalog or override pricing: ${JSON.stringify(initialRow)}.`);
+    }
+
+    await page.locator('#pricingMatchesBody [data-output-edit-field="unit_price_override"]').first().click();
+    const unitPriceEditor = page.locator('[data-output-editor-field="unit_price_override"]').first();
+    await unitPriceEditor.fill("15");
+    await unitPriceEditor.press("Enter");
+    await page.waitForFunction(() => Number(state.outputRows[0]?.unit_price_override) === 15 && state.outputRows[0]?.price_mode === "Priced", null, { timeout: 15000 });
+
+    const generatePostPromise = page.waitForResponse((response) => (
+      response.request().method() === "POST"
+      && new URL(response.url()).pathname === "/api/jobs"
+    ), { timeout: 30000 });
+    const automaticXlsxDownloadPromise = page.waitForEvent("download", { timeout: 30000 }).catch(() => null);
+    const downloadButtonState = await page.locator("#sideDownloadButton").getAttribute("aria-disabled");
+    if (downloadButtonState !== "false") {
+      throw new Error(`G3 override-only output was not enabled for normal Generate: aria-disabled=${downloadButtonState}.`);
+    }
+    await page.locator("#sideDownloadButton").click();
+    const generatePost = await generatePostPromise;
+    const generateStart = await generatePost.json().catch(() => ({}));
+    if (!generatePost.ok() || !generateStart.job_id) {
+      const generationDiagnostic = await page.evaluate(() => {
+        let payload = null;
+        let payloadError = "";
+        try {
+          payload = buildPayload({ viewPdf: false });
+        } catch (error) {
+          payloadError = String(error?.message || error);
+        }
+        return {
+          profileId: state.profileId,
+          defaultProfileId: state.defaultProfileId,
+          selectedPresetValue: state.selectedPresetValue,
+          presetSelectValue: elements.presetSelect?.value || "",
+          availablePresetValues: [...availablePresetValues()],
+          currentProfileId: currentProfile()?.id || "",
+          selectedPreset: selectedPreset() ? {
+            id: selectedPreset().id || "",
+            source: selectedPreset().source || "",
+            profileId: selectedPreset().profile_id || "",
+          } : null,
+          generationProfileId: generationProfileIdForPayload(),
+          payloadProfileId: payload?.profile_id || "",
+          payloadQuoteCompanyId: payload?.quote_company_profile?.id || "",
+          payloadError,
+        };
+      });
+      throw new Error(`G3 normal Generate did not start a genuine job: ${JSON.stringify({ generateStart, generationDiagnostic })}.`);
+    }
+    await page.waitForFunction(({ sessionId }) => (
+      state.quoteSessionId === sessionId
+      && state.isGenerating === false
+      && !state.activeJob
+      && Boolean(state.downloadFile?.url)
+      && downloadFileIsFresh()
+    ), { sessionId }, { timeout: 60000 });
+    await terminalJob(generateStart.job_id, "G3 XLSX generation");
+    const automaticXlsxDownload = await automaticXlsxDownloadPromise;
+    if (automaticXlsxDownload && automaticXlsxDownload.suggestedFilename() !== "quotation.xlsx") {
+      throw new Error(`G3 normal Generate returned an unexpected automatic download: ${automaticXlsxDownload.suggestedFilename()}.`);
+    }
+    const firstXlsx = await currentArtifacts(sessionId, "G3 initial XLSX publication");
+    await ordinarySaveRender(sessionId, "G3 ordinary post-Generate save/render");
+    const reloadCycle1 = await reloadAndSave(sessionId, "G3 reload cycle 1");
+    const reloadCycle2 = await reloadAndSave(sessionId, "G3 reload cycle 2");
+    if (reloadCycle1.publicationId !== firstXlsx.publicationId || reloadCycle2.publicationId !== firstXlsx.publicationId) {
+      throw new Error(`G3 unchanged XLSX cycles changed publication ownership: ${JSON.stringify({ first: firstXlsx.publicationId, reloadCycle1: reloadCycle1.publicationId, reloadCycle2: reloadCycle2.publicationId })}.`);
+    }
+
+    await page.locator("#backToDashboardButton", { hasText: "Dashboard" }).click();
+    await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 20000 });
+    await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 20000 });
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 20000 });
+    await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 20000 });
+    const dashboardXlsx = await currentArtifacts(sessionId, "G3 Dashboard XLSX reload");
+    const dashboardCard = page.locator(`.dashboard-session-card[data-quote-session-id="${sessionId}"]`);
+    await dashboardCard.waitFor({ state: "visible", timeout: 20000 });
+    const dashboardXlsxCardText = await dashboardCard.innerText();
+    if (!/Generated/i.test(dashboardXlsxCardText) || /Draft Modified/i.test(dashboardXlsxCardText)) {
+      throw new Error(`G3 Dashboard did not report the XLSX quote as current: ${dashboardXlsxCardText}.`);
+    }
+    await dashboardCard.click();
+    await page.locator("#dashboardSelectedSessionPanel").waitFor({ state: "visible", timeout: 20000 });
+    const xlsxLink = page.locator('#dashboardSelectedSessionPanel a[aria-label="Download XLSX"]');
+    await xlsxLink.waitFor({ state: "visible", timeout: 20000 });
+    const xlsxDownloadPromise = page.waitForEvent("download", { timeout: 20000 });
+    await xlsxLink.click();
+    const xlsxDownload = await xlsxDownloadPromise;
+    if (xlsxDownload.suggestedFilename() !== "quotation.xlsx") {
+      throw new Error(`G3 authorized XLSX download returned ${xlsxDownload.suggestedFilename()}.`);
+    }
+    const xlsxDownloadResponse = await page.evaluate(async (url) => {
+      const response = await fetch(url);
+      return {
+        ok: response.ok,
+        status: response.status,
+        contentType: response.headers.get("Content-Type") || "",
+        contentDisposition: response.headers.get("Content-Disposition") || "",
+      };
+    }, await xlsxLink.getAttribute("href"));
+    if (
+      !xlsxDownloadResponse.ok
+      || xlsxDownloadResponse.status !== 200
+      || !xlsxDownloadResponse.contentType.startsWith("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+      || !xlsxDownloadResponse.contentDisposition.includes("quotation.xlsx")
+    ) {
+      throw new Error(`G3 authorized XLSX response was not a current attachment: ${JSON.stringify(xlsxDownloadResponse)}.`);
+    }
+
+    await page.locator('[data-dashboard-panel-action="modify-session"]', { hasText: "Modify quote" }).click();
+    await waitForOutput(sessionId, "G3 Dashboard XLSX modify restore");
+    const pdfFailurePostPromise = page.waitForResponse((response) => (
+      response.request().method() === "POST"
+      && new URL(response.url()).pathname === "/api/jobs"
+    ), { timeout: 30000 });
+    await page.locator("#sideViewPdfButton").click();
+    const pdfFailurePost = await pdfFailurePostPromise;
+    const pdfFailureStart = await pdfFailurePost.json().catch(() => ({}));
+    if (!pdfFailurePost.ok() || !pdfFailureStart.job_id) {
+      throw new Error(`G3 PDF blocker observation did not start a genuine job: ${JSON.stringify(pdfFailureStart)}.`);
+    }
+    await page.waitForFunction(() => state.isGenerating === false && !state.activeJob, null, { timeout: 150000 });
+    const pdfFailure = await page.evaluate(async (safeJobId) => {
+      const response = await fetch(`/api/jobs/${encodeURIComponent(safeJobId)}`);
+      const body = await response.json().catch(() => ({}));
+      return { ok: response.ok, ...body };
+    }, pdfFailureStart.job_id);
+    if (
+      !pdfFailure.ok
+      || pdfFailure.status !== "failed"
+      || pdfFailure.result?.status !== "failed"
+      || pdfFailure.result?.export_status?.pdf_status !== "workbook_export_unavailable"
+      || pdfFailure.result?.pdf_mode !== "workbook"
+      || pdfFailure.result?.quote_session?.exports?.pdf?.exists !== false
+    ) {
+      throw new Error(`G3 PDF blocker observation changed or produced an unexpected result: ${JSON.stringify(pdfFailure)}.`);
+    }
+    const xlsxAfterPdfBlocker = await currentArtifacts(sessionId, "G3 XLSX after independent PDF blocker");
+
+    const beforeEdit = await page.evaluate(() => ({
+      outputRevision: state.outputRevision,
+      downloadFresh: downloadFileIsFresh(),
+      pdfFresh: pdfFileIsFresh(),
+      unitPrice: state.outputRows[0]?.unit_price_override,
+    }));
+    if (!beforeEdit.downloadFresh || Number(beforeEdit.unitPrice) !== 15) {
+      throw new Error(`G3 genuine edit did not start from a current XLSX with unit price 15: ${JSON.stringify(beforeEdit)}.`);
+    }
+    await page.locator('#pricingMatchesBody [data-output-edit-field="unit_price_override"]').first().click();
+    const editedUnitPriceEditor = page.locator('[data-output-editor-field="unit_price_override"]').first();
+    await editedUnitPriceEditor.fill("16");
+    await editedUnitPriceEditor.press("Enter");
+    await page.waitForFunction(({ revision }) => (
+      state.outputRevision > revision
+      && Number(state.outputRows[0]?.unit_price_override) === 16
+      && !downloadFileIsFresh()
+    ), { revision: beforeEdit.outputRevision }, { timeout: 15000 });
+    await page.evaluate(async () => {
+      renderPricingMatches(state.outputRows);
+      await saveQuoteSessionDraftState({ quoteGenerated: true });
+    });
+    const invalidatedDetail = await dashboardQuoteSessionDetail(page, sessionId);
+    const invalidatedSession = invalidatedDetail.quote_session || {};
+    if (
+      invalidatedSession.status?.quote_generated !== false
+      || invalidatedSession.status?.draft_modified !== true
+      || invalidatedSession.exports?.xlsx?.stale !== true
+    ) {
+      throw new Error(`G3 genuine commercial edit did not invalidate the committed XLSX: ${JSON.stringify(invalidatedSession)}.`);
+    }
+    await page.locator("#backToDashboardButton", { hasText: "Dashboard" }).click();
+    await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 20000 });
+    await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 20000 });
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 20000 });
+    await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 20000 });
+    const invalidatedCard = page.locator(`.dashboard-session-card[data-quote-session-id="${sessionId}"]`);
+    await invalidatedCard.waitFor({ state: "visible", timeout: 20000 });
+    const invalidatedCardText = await invalidatedCard.innerText();
+    if (!/Draft Modified/i.test(invalidatedCardText)) {
+      throw new Error(`G3 Dashboard did not surface the genuine edit as Draft Modified: ${invalidatedCardText}.`);
+    }
+
+    if (pageProblems.length) {
+      throw new Error(`G3 browser page reported console/network problems: ${JSON.stringify(pageProblems)}.`);
+    }
+    return {
+      sessionId,
+      xlsxPublicationId: firstXlsx.publicationId,
+      pdfPublicationId: "",
+      reloadCycle1: true,
+      reloadCycle2: true,
+      dashboardXlsxCurrent: dashboardXlsx.session.status?.quote_generated === true,
+      dashboardPdfCurrent: false,
+      xlsxDownload: true,
+      pdfDownload: false,
+      realEditInvalidates: true,
+      independentPdfBlocker: pdfFailure.result.export_status.pdf_status,
+      xlsxAfterPdfBlockerPublicationId: xlsxAfterPdfBlocker.publicationId,
+    };
+  } finally {
+    await isolatedContext.close();
   }
 }
 
@@ -3448,6 +3943,16 @@ async function main() {
     await verifyConfirmBasisSurvivesImmediateRefresh(page);
     await verifyGenerationLoadingModalSurvivesRefresh(page);
     await verifyGenerationTerminalRecoveryAfterRefresh(page);
+    if (serverInfo && !options.keepServer) {
+      await stopServer(serverInfo);
+      serverInfo = startServer();
+      if (!(await waitForHealth())) {
+        const serverOutput = serverInfo.output.join("").trim();
+        await stopServer(serverInfo);
+        throw new Error(`Could not restart webapp for G3.${serverOutput ? `\n\n${serverOutput}` : ""}`);
+      }
+    }
+    const exportArtifactPersistenceG3 = await verifyExportArtifactPersistenceG3(page);
 
     console.log(JSON.stringify({
       status: "ok",
@@ -3462,6 +3967,7 @@ async function main() {
         dashboardSelectedMobileShot,
         dashboardDeleteModalShot,
       ].filter(Boolean),
+      exportArtifactPersistenceG3,
       consoleProblems,
       networkProblems,
     }, null, 2));
