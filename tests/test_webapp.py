@@ -29172,6 +29172,7 @@ function syncSelectedPricingReference() {}
 function renderProfileOptions() {}
 function renderPresetOptions() {}
 function selectedPreset() { return null; }
+function generationProfileIdForPayload() { return ""; }
 function quoteDetailsWithFallbackDefaults(defaults, details) { return deepClone(details || defaults || {}); }
 async function restoreQuoteDetailsLogo(details) { return details; }
 function applyQuoteDetails(details) { state.quoteDetails = deepClone(details || {}); }
@@ -29327,7 +29328,8 @@ eval([
   "pricingMatchStatus", "outputQuantityPartsFromPricingMatch", "outputRowFromPricingMatch", "categoryOrderValue",
   "pricingReferenceOrder", "compareOrderValues", "sortOutputRows", "snapshotOutputRows", "outputRowsToLineItems",
   "outputRowsValid", "revisionNumber", "markOutputRowsDirty", "downloadFileIsFresh", "pdfFileIsFresh",
-  "renderPricingMatches", "commitOutputEditor", "applyQuoteSessionSnapshot", "currentQuoteSessionDraftState",
+  "cloneQuoteBasisSections", "renderPricingMatches", "commitOutputEditor", "applyQuoteSessionSnapshot", "currentQuoteSessionDraftState",
+  "basisLineAcceptsAsAiProposal", "retagBasisLine",
 ].map(extractFunction).join("\n"));
 
 const pricingDigest = "sha256:" + "a".repeat(64);
@@ -29399,6 +29401,8 @@ const canonicalSections = [{
   title: "Graphics",
   lines: [{ id: "graphics-line", tag: "Include", text: "Printed wall graphics", quantity: 1, unit: "sqm" }],
 }];
+state.outputSortMode = "name";
+elements.outputSortMode.value = "name";
 const saved = {
   version: QUOTE_SESSION_STATE_VERSION,
   browserRecoveryScope: "scope",
@@ -29461,6 +29465,11 @@ assert.ok(state.lineItems.every((item) => !Object.prototype.hasOwnProperty.call(
 assert.ok(state.lineItems.every((item) => !Object.prototype.hasOwnProperty.call(item, "sale_unit_price")));
 assert.deepStrictEqual(state.pricingMatches, snapshotOutputRows(state.outputRows));
 assert.notStrictEqual(state.pricingMatches, state.outputRows);
+assert.strictEqual(state.outputSortMode, "pricing_reference");
+assert.deepStrictEqual(
+  state.outputRows.map((row) => row.description),
+  saved.outputRows.map((row) => row.description),
+);
 assert.strictEqual(state.outputRevision, 7);
 assert.strictEqual(downloadFileIsFresh(), true);
 assert.strictEqual(pdfFileIsFresh(), true);
@@ -29499,6 +29508,294 @@ assert.strictEqual(state.outputRevision, 8);
 assert.strictEqual(downloadFileIsFresh(), false);
 assert.strictEqual(pdfFileIsFresh(), false);
 assert.notStrictEqual(comparable(currentQuoteSessionDraftState()).outputRows[0].unit_price_override, canonical0.outputRows[0].unit_price_override);
+
+const legacySaved = deepClone(saved);
+delete legacySaved.quoteBasisSections;
+legacySaved.quoteBasis = { ...deepClone(EMPTY_BASIS), graphics: "Confirm: Historical printed panel" };
+await applyQuoteSessionSnapshot(legacySaved, { forceQuoteView: true, sessionId });
+assert.strictEqual(state.quoteBasisSections.length, 1);
+assert.strictEqual(state.quoteBasisSections[0].id, "graphics");
+assert.strictEqual(state.quoteBasisSections[0].lines[0].text, "Historical printed panel");
+assert.strictEqual(state.quoteBasisSections[0].lines[0].tag, "Confirm");
+retagBasisLine("graphics", 0, "Include");
+assert.strictEqual(state.quoteBasisSections[0].lines[0].tag, "Include");
+assert.strictEqual(state.quoteBasis.graphics, "Include: Historical printed panel");
+const legacyAfterAction = currentQuoteSessionDraftState();
+await applyQuoteSessionSnapshot({ ...deepClone(legacyAfterAction), quoteSessionId: sessionId, browserRecoveryScope: "scope" }, { forceQuoteView: true, sessionId });
+assert.strictEqual(state.quoteBasisSections[0].lines[0].tag, "Include");
+assert.strictEqual(state.quoteBasis.graphics, "Include: Historical printed panel");
+})();
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_static_unavailable_preset_authority_survives_draft_save_restore(self):
+        node = require_node(self)
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+;(async () => {
+function extractFunction(name) {
+  const markers = [`async function ${name}(`, `function ${name}(`];
+  let start = -1;
+  for (const marker of markers) {
+    const candidate = source.indexOf(marker);
+    if (candidate >= 0 && (start < 0 || candidate < start)) start = candidate;
+  }
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf("{", source.indexOf(")", start)) + 1;
+  if (bodyStart < 1) throw new Error(`Missing body for function ${name}`);
+  let depth = 1;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+function deepClone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+function isPlainObject(value) { return Boolean(value && typeof value === "object" && !Array.isArray(value)); }
+function quoteCommercialStrictDataEqual(left, right) { return JSON.stringify(left) === JSON.stringify(right); }
+function invalidateAuthorityProfileRequests() {}
+function safeQuoteSessionId(value, fallback = "") {
+  const candidate = String(value || "").trim();
+  return /^quote-[A-Za-z0-9_-]{3,64}$/.test(candidate) ? candidate : fallback;
+}
+function transitionGenerationContext(sessionId, runId) {
+  state.quoteSessionId = safeQuoteSessionId(sessionId);
+  state.generationContext = { session_id: state.quoteSessionId, run_id: String(runId || "") };
+}
+function normalizeRestorableOverlay(value) { return typeof value === "string" ? value : ""; }
+function normalizePricingReferenceSettingsMode(value) { return value === "import" ? "import" : "manage"; }
+function presetValueFromQuoteDetails() { return ""; }
+function normalizeQuoteCommercialSnapshot(snapshot) { return isPlainObject(snapshot) ? deepClone(snapshot) : null; }
+function quoteCommercialSnapshotPricingBasis(snapshot) { return isPlainObject(snapshot?.pricing_basis) ? deepClone(snapshot.pricing_basis) : null; }
+function normalizeQuoteCommercialReview(review) { return isPlainObject(review) ? deepClone(review) : null; }
+function quoteCommercialRestorationReviewReason() { return ""; }
+function currentPricingReference() { return null; }
+function setQuoteCommercialReview(reason, id, source) {
+  state.quoteCommercialReview = { reason_code: reason, blocked_identity: { id, source } };
+}
+function normalizeQuoteCommercialTouched(touched = {}) { return deepClone(touched || {}); }
+function quoteDetailsCommercialTouched() { return {}; }
+function syncSelectedPricingReference() {}
+function renderProfileOptions() {}
+function updatePresetButtons() {}
+function lastSelectedPresetValue() { return ""; }
+function quoteDetailsWithFallbackDefaults(defaults, details) { return deepClone(details || defaults || {}); }
+async function restoreQuoteDetailsLogo(details) { return details; }
+function applyQuoteDetails(details) { state.quoteDetails = deepClone(details || {}); }
+async function restoreSessionImages(images) { return Array.isArray(images) ? deepClone(images) : []; }
+function normalizeQuoteBasisSections() { return []; }
+function quoteBasisFromSections() { return {}; }
+function cloneQuoteBasis(basis = {}) { return deepClone(basis || {}); }
+function normalizeOutputRow(value = {}) { return deepClone(value || {}); }
+function sortOutputRows(rows = []) { return rows; }
+function normalizeLineItem(value = {}) { return deepClone(value || {}); }
+function revisionNumber(value, fallback = 0) { return Number.isFinite(Number(value)) ? Number(value) : fallback; }
+function normalizeBoothDimensions(value) { return deepClone(value || {}); }
+function normalizeAnalysisMode(value) { return String(value || ""); }
+function normalizeActiveJob() { return null; }
+function renderFiles() {}
+function renderPricingMatches() {}
+function renderMatchSummary() {}
+function clearPricingReviewMessages() {}
+function updateQuoteHeader() {}
+function updateOutputHeader() {}
+function updateQuoteBasisCard() {}
+function renderBasisFailureState() {}
+function renderBasisEmptyState() {}
+function updateDownloadButton() {}
+function setResultStatus() {}
+function setWorkflowStage(value) { state.workflowStage = value; }
+function restoredWorkflowStage(saved = {}) { return saved.workflowStage || "completed"; }
+function showAiFailureBanner() {}
+function clearAiFailureBanner() {}
+function restoredQuoteSessionSidePanel(saved = {}) { return saved.activeSidePanel || "output"; }
+function setSidePanel(value) { state.activeSidePanel = value; }
+function renderQuoteCommercialReviewState() {}
+function sessionFileRecordsFromDraft() { return []; }
+function persistSessionFiles() { return Promise.resolve(); }
+function furthestQuoteSessionSidePanel(snapshot = {}) { return snapshot.activeSidePanel || "output"; }
+function splitLines(value = "") { return String(value || "").split(/\r?\n/).filter(Boolean); }
+function escapeHtml(value = "") { return String(value); }
+function safeId(value = "", fallback = "item") {
+  const slug = String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return slug || fallback;
+}
+function neutralizeFormulaText(value = "") { return String(value || "").trim(); }
+
+const DEFAULT_PROFILE_ID = "";
+const PROFILE_PRESET_PREFIX = "profile:";
+const COMPANY_PROFILE_PRESET_PREFIX = "company:";
+const QUOTE_SESSION_STATE_VERSION = 5;
+const PRICING_REFERENCE_SETTINGS_MODE_MANAGE = "manage";
+const PRICING_REFERENCE_SOURCES = new Set(["company", "local", "bundled"]);
+
+const state = {
+  quoteSessionId: "quote-authority-restore",
+  defaultProfileId: "owner-b",
+  profileId: "owner-b",
+  profiles: [{
+    id: "owner-b",
+    label: "Owner B",
+    source: "profile",
+    quote_detail_presets: [{ id: "shared", name: "Shared", details: {} }],
+  }],
+  companyProfiles: [],
+  selectedPresetValue: "company:historical-company",
+  quoteCommercialLifecycle: "NEW",
+  quoteCommercialSnapshot: null,
+  quoteCommercialReview: null,
+  quoteCommercialRecoveryError: "",
+  quoteCommercialTouched: {},
+  quoteCommercialPreservedQuoteText: {},
+  pricingReferenceSelectionIntent: null,
+  pricingReferenceSettingsMode: PRICING_REFERENCE_SETTINGS_MODE_MANAGE,
+  restorableOverlay: "",
+  pendingFeedback: "",
+  quoteDetails: {},
+  images: [],
+  quoteBasis: {},
+  quoteBasisSections: [],
+  lineItems: [],
+  outputRows: [],
+  originalOutputRows: [],
+  outputErrors: [],
+  outputSortMode: "name",
+  analysisFindings: [],
+  blockingClarificationQuestions: [],
+  boothDimensions: {},
+  originalAnalysisSnapshot: null,
+  basisConfirmed: false,
+  draftSource: "",
+  lastAnalysisMode: "",
+  pendingAnalysisMode: "",
+  basisChat: {},
+  aiFailed: false,
+  downloadFile: null,
+  pdfFile: null,
+  outputRevision: 0,
+  downloadFileRevision: -1,
+  pdfFileRevision: -1,
+  pricingMatches: [],
+  pricingIssues: [],
+  activeJob: null,
+  activeAppView: "quote",
+  activeSidePanel: "output",
+  quoteSessionDraftSaveStarted: true,
+  quoteSessionRestoredSessionId: "",
+  quoteSessionRestoredDraftKey: "",
+  isAnalysisRunning: false,
+  isGenerating: false,
+  isPreparingOutput: false,
+};
+const elements = {
+  presetSelect: {
+    value: "company:historical-company",
+    innerHTML: "",
+    disabled: false,
+    title: "",
+    setAttribute() {},
+  },
+  outputSortMode: { value: "name" },
+};
+const window = { localStorage: { setItem() {} } };
+
+function buildSessionSnapshot() {
+  return {
+    version: QUOTE_SESSION_STATE_VERSION,
+    savedAt: "snapshot",
+    activeAppView: "quote",
+    quoteSessionDraftSaveStarted: true,
+    profileId: state.profileId,
+    pricingReferenceId: "",
+    pricingReferenceSource: "",
+    selectedPresetValue: state.selectedPresetValue,
+    quoteCommercialLifecycle: state.quoteCommercialLifecycle,
+    quoteCommercialReview: null,
+    quoteCommercialTouched: {},
+    images: [],
+    quoteDetails: {},
+    workflowStage: "",
+    quoteBasis: {},
+    quoteBasisSections: [],
+    lineItems: [],
+    outputRows: [],
+    originalOutputRows: [],
+    outputErrors: [],
+    outputSortMode: state.outputSortMode,
+    analysisFindings: [],
+    blockingClarificationQuestions: [],
+    boothDimensions: {},
+    originalAnalysisSnapshot: null,
+    basisConfirmed: false,
+    aiFailed: false,
+    draftSource: "",
+    lastAnalysisMode: "",
+    activeSidePanel: "output",
+    downloadFile: null,
+    pdfFile: null,
+    outputRevision: 0,
+    downloadFileRevision: -1,
+    pdfFileRevision: -1,
+    pricingMatches: [],
+  };
+}
+
+eval([
+  "safeProfileId", "safeProfileLabel", "profilePresetOptionValue", "profilePresetOptionParts",
+  "companyProfileOptionValue", "selectedPresetId", "templateProfilePresets",
+  "selectableTemplateProfilePresets", "normalizeCompanyProfile", "companyProfilePresets",
+  "presetOptionValue", "selectedPreset", "availablePresetValues", "resolvedProfileIdForPayload",
+  "generationProfileIdForPayload", "preservedOwnedPresetValue", "renderPresetOptions",
+  "applyQuoteSessionSnapshot", "currentQuoteSessionDraftState",
+].map(extractFunction).join("\n"));
+
+const unavailablePreset = "company:historical-company";
+assert.strictEqual(availablePresetValues().has(unavailablePreset), false);
+assert.strictEqual(generationProfileIdForPayload(), "");
+
+const draft = currentQuoteSessionDraftState();
+assert.strictEqual(draft.selectedPresetValue, unavailablePreset);
+assert.strictEqual(generationProfileIdForPayload(), "");
+
+state.selectedPresetValue = "";
+elements.presetSelect.value = "";
+assert.strictEqual(generationProfileIdForPayload(), "profile:owner-b");
+
+await applyQuoteSessionSnapshot({
+  ...deepClone(draft),
+  quoteSessionId: state.quoteSessionId,
+  browserRecoveryScope: "scope",
+}, { forceQuoteView: true, sessionId: state.quoteSessionId });
+
+assert.strictEqual(state.selectedPresetValue, unavailablePreset);
+assert.strictEqual(elements.presetSelect.value, "");
+assert.strictEqual(generationProfileIdForPayload(), "");
+assert.notStrictEqual(generationProfileIdForPayload(), "profile:owner-b");
+assert.strictEqual(currentQuoteSessionDraftState().selectedPresetValue, unavailablePreset);
+
+state.selectedPresetValue = "profile:owner-b:shared";
+elements.presetSelect.value = "profile:owner-b:shared";
+assert.strictEqual(availablePresetValues().has(state.selectedPresetValue), true);
+assert.strictEqual(generationProfileIdForPayload(), "profile:owner-b");
+assert.strictEqual(currentQuoteSessionDraftState().selectedPresetValue, "profile:owner-b:shared");
 })();
 """
         completed = subprocess.run(

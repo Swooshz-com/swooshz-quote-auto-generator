@@ -4341,8 +4341,21 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
     restoredState.quoteCommercialTouched || quoteDetailsCommercialTouched(savedQuoteDetails)
   );
   syncSelectedPricingReference();
+  const restoredSelectedPresetValue = String(state.selectedPresetValue || "").trim();
+  const restoredUnavailablePresetAuthority = restoredSelectedPresetValue
+    && !availablePresetValues().has(restoredSelectedPresetValue)
+    ? generationProfileIdForPayload()
+    : "";
   renderProfileOptions();
   renderPresetOptions();
+  if (
+    restoredSelectedPresetValue
+    && !availablePresetValues().has(restoredSelectedPresetValue)
+    && generationProfileIdForPayload() !== restoredUnavailablePresetAuthority
+  ) {
+    state.selectedPresetValue = restoredSelectedPresetValue;
+    if (elements.presetSelect) elements.presetSelect.value = "";
+  }
   state.pendingFeedback = String(restoredState.pendingFeedback || "");
   const restoredQuoteDetails = await restoreQuoteDetailsLogo(
     quoteDetailsWithFallbackDefaults(selectedPreset()?.details || {}, savedQuoteDetails, { preserveSavedState: true }),
@@ -4350,13 +4363,18 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   );
   applyQuoteDetails(restoredQuoteDetails, { includeLogo: true, clearLogo: true });
   state.images = await restoreSessionImages(restoredState.images);
-  const restoredBasisSections = Array.isArray(restoredState.quoteBasisSections)
+  const canonicalBasisSections = Array.isArray(restoredState.quoteBasisSections)
     ? normalizeQuoteBasisSections(restoredState.quoteBasisSections)
     : [];
+  const restoredBasisSections = canonicalBasisSections.length
+    ? canonicalBasisSections
+    : normalizeQuoteBasisSections(restoredState.quoteBasis || {});
   state.quoteBasisSections = restoredBasisSections;
   state.quoteBasis = restoredBasisSections.length
     ? quoteBasisFromSections(restoredBasisSections)
     : cloneQuoteBasis(restoredState.quoteBasis || {});
+  state.outputSortMode = "pricing_reference";
+  if (elements.outputSortMode) elements.outputSortMode.value = state.outputSortMode;
   const restoredOutputRows = Array.isArray(restoredState.outputRows)
     ? sortOutputRows(restoredState.outputRows.map(normalizeOutputRow))
     : [];
@@ -4370,7 +4388,6 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   }
   state.originalOutputRows = Array.isArray(restoredState.originalOutputRows) ? restoredState.originalOutputRows.map(normalizeOutputRow) : [];
   state.outputErrors = Array.isArray(restoredState.outputErrors) ? restoredState.outputErrors : [];
-  state.outputSortMode = "pricing_reference";
   state.analysisFindings = Array.isArray(restoredState.analysisFindings) ? restoredState.analysisFindings : [];
   state.blockingClarificationQuestions = Array.isArray(restoredState.blockingClarificationQuestions) ? restoredState.blockingClarificationQuestions : [];
   state.boothDimensions = normalizeBoothDimensions(restoredState.boothDimensions || savedQuoteDetails.project || {});
@@ -11729,6 +11746,27 @@ function currentQuoteSessionDraftState() {
   const quoteBasis = quoteBasisSections.length
     ? quoteBasisFromSections(quoteBasisSections)
     : snapshot.quoteBasis;
+  let serializedSelectedPresetValue = availablePresetValues().has(selectedPresetValue)
+    ? selectedPresetValue
+    : "";
+  if (selectedPresetValue && !serializedSelectedPresetValue) {
+    const previousStateSelectedPresetValue = state.selectedPresetValue;
+    const previousElementPresetValue = elements.presetSelect?.value;
+    try {
+      state.selectedPresetValue = selectedPresetValue;
+      if (elements.presetSelect) elements.presetSelect.value = selectedPresetValue;
+      const selectedPresetAuthority = generationProfileIdForPayload();
+      state.selectedPresetValue = "";
+      if (elements.presetSelect) elements.presetSelect.value = "";
+      const clearedPresetAuthority = generationProfileIdForPayload();
+      if (selectedPresetAuthority !== clearedPresetAuthority) {
+        serializedSelectedPresetValue = selectedPresetValue;
+      }
+    } finally {
+      state.selectedPresetValue = previousStateSelectedPresetValue;
+      if (elements.presetSelect) elements.presetSelect.value = previousElementPresetValue;
+    }
+  }
   return {
     version: snapshot.version,
     savedAt: snapshot.savedAt,
@@ -11737,7 +11775,7 @@ function currentQuoteSessionDraftState() {
     profileId: snapshot.profileId,
     pricingReferenceId: snapshot.pricingReferenceId,
     pricingReferenceSource: snapshot.pricingReferenceSource,
-    selectedPresetValue: availablePresetValues().has(selectedPresetValue) ? selectedPresetValue : "",
+    selectedPresetValue: serializedSelectedPresetValue,
     quoteCommercialLifecycle: snapshot.quoteCommercialLifecycle,
     quoteCommercialReview: snapshot.quoteCommercialReview,
     quoteCommercialTouched: snapshot.quoteCommercialTouched,
