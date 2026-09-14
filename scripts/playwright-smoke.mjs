@@ -2149,7 +2149,6 @@ async function verifyReplacementExportArtifactPersistenceG3(parentPage, replacem
   page.on("response", (response) => {
     if (response.status() >= 400) pageProblems.push(`${response.status()} ${response.url()}`);
   });
-
   const hasValue = (value) => value !== undefined && value !== null && String(value).trim() !== "";
 
   async function currentXlsx(sessionId, label) {
@@ -2347,6 +2346,10 @@ async function verifyReplacementExportArtifactPersistenceG3(parentPage, replacem
     await unitPriceEditor.fill("15");
     await unitPriceEditor.press("Enter");
     await page.waitForFunction(() => Number(state.outputRows[0]?.unit_price_override) === 15, null, { timeout: 15000 });
+    const settledDraftSave = await page.evaluate(async () => saveQuoteSessionDraftState({ quoteGenerated: false }));
+    if (!settledDraftSave?.session_id || settledDraftSave.session_id !== sessionId) {
+      throw new Error(`Replacement manual override draft save did not settle the current session: ${JSON.stringify(settledDraftSave)}.`);
+    }
 
     const generatePostPromise = page.waitForResponse((response) => (
       response.request().method() === "POST"
@@ -2364,11 +2367,103 @@ async function verifyReplacementExportArtifactPersistenceG3(parentPage, replacem
     await genuineJob(generateStart.job_id, "Replacement XLSX generation");
     await waitForGeneratedOutput(sessionId, "Replacement XLSX generation");
     const firstXlsx = await currentXlsx(sessionId, "Replacement initial XLSX publication");
-    await ordinarySaveRender(sessionId, "Replacement ordinary post-Generate save/render");
-    const reloadCycle1 = await reloadAndSave(sessionId, "Replacement reload cycle 1");
-    const reloadCycle2 = await reloadAndSave(sessionId, "Replacement reload cycle 2");
-    if (reloadCycle1.publicationId !== firstXlsx.publicationId || reloadCycle2.publicationId !== firstXlsx.publicationId) {
-      throw new Error(`Unchanged replacement cycles changed XLSX publication ownership: ${JSON.stringify({ first: firstXlsx.publicationId, reloadCycle1: reloadCycle1.publicationId, reloadCycle2: reloadCycle2.publicationId })}.`);
+    const generatedBaseline = await page.evaluate(() => ({
+      outputRevision: state.outputRevision,
+      outputSortMode: state.outputSortMode,
+      outputRows: state.outputRows.map((row) => ({
+        description: row.description,
+        unitPriceOverride: row.unit_price_override,
+      })),
+      downloadFresh: downloadFileIsFresh(),
+    }));
+    if (
+      generatedBaseline.outputSortMode !== "pricing_reference"
+      || !generatedBaseline.downloadFresh
+      || !generatedBaseline.outputRows.length
+    ) {
+      throw new Error(`Replacement generated baseline was not current and canonical before sort-mode coverage: ${JSON.stringify(generatedBaseline)}.`);
+    }
+
+    const supportedSortModes = ["pricing_reference", "name", "category", "category_name"];
+    const sortModeResults = {};
+    for (const displaySortMode of supportedSortModes) {
+      await page.locator("#outputSortMode").selectOption(displaySortMode);
+      await page.waitForFunction(({ mode }) => (
+        state.outputSortMode === mode
+        && document.querySelector("#outputSortMode")?.value === mode
+      ), { mode: displaySortMode }, { timeout: 15000 });
+      const beforeSave = await page.evaluate(() => ({
+        outputRevision: state.outputRevision,
+        outputSortMode: state.outputSortMode,
+        outputRows: state.outputRows.map((row) => ({
+          description: row.description,
+          unitPriceOverride: row.unit_price_override,
+        })),
+        downloadFresh: downloadFileIsFresh(),
+      }));
+      if (
+        beforeSave.outputRevision !== generatedBaseline.outputRevision
+        || beforeSave.outputSortMode !== displaySortMode
+        || JSON.stringify(beforeSave.outputRows) !== JSON.stringify(generatedBaseline.outputRows)
+        || !beforeSave.downloadFresh
+      ) {
+        throw new Error(`Display sort ${displaySortMode} changed the current commercial state before save: ${JSON.stringify({ generatedBaseline, beforeSave })}.`);
+      }
+      const beforeSaveXlsx = await currentXlsx(sessionId, `Replacement ${displaySortMode} before save`);
+      const savedXlsx = await ordinarySaveRender(sessionId, `Replacement ${displaySortMode} ordinary save/render`);
+      const afterSave = await page.evaluate(() => ({
+        outputRevision: state.outputRevision,
+        outputSortMode: state.outputSortMode,
+        downloadFresh: downloadFileIsFresh(),
+      }));
+      if (
+        afterSave.outputRevision !== generatedBaseline.outputRevision
+        || afterSave.outputSortMode !== displaySortMode
+        || !afterSave.downloadFresh
+      ) {
+        throw new Error(`Display sort ${displaySortMode} changed the live commercial state during save: ${JSON.stringify({ generatedBaseline, afterSave })}.`);
+      }
+      const persistedDetail = await dashboardQuoteSessionDetail(page, sessionId);
+      const persistedDraft = persistedDetail.quote_session?.draft_state || {};
+      const persistedDescriptions = Array.isArray(persistedDraft.outputRows)
+        ? persistedDraft.outputRows.map((row) => ({
+          description: row.description,
+          unitPriceOverride: row.unit_price_override,
+        }))
+        : [];
+      if (
+        persistedDraft.outputSortMode !== "pricing_reference"
+        || JSON.stringify(persistedDescriptions) !== JSON.stringify(generatedBaseline.outputRows)
+      ) {
+        throw new Error(`Display sort ${displaySortMode} did not persist canonical generated state: ${JSON.stringify({ persistedDraft, expectedRows: generatedBaseline.outputRows })}.`);
+      }
+      const reloadedXlsx = await reloadAndSave(sessionId, `Replacement ${displaySortMode} reload/save`);
+      const afterReloadSave = await page.evaluate(() => ({
+        outputRevision: state.outputRevision,
+        outputSortMode: state.outputSortMode,
+        downloadFresh: downloadFileIsFresh(),
+      }));
+      if (
+        afterReloadSave.outputRevision !== generatedBaseline.outputRevision
+        || afterReloadSave.outputSortMode !== "pricing_reference"
+        || !afterReloadSave.downloadFresh
+      ) {
+        throw new Error(`Display sort ${displaySortMode} changed the restored commercial state: ${JSON.stringify({ generatedBaseline, afterReloadSave })}.`);
+      }
+      if (
+        beforeSaveXlsx.publicationId !== firstXlsx.publicationId
+        || savedXlsx.publicationId !== firstXlsx.publicationId
+        || reloadedXlsx.publicationId !== firstXlsx.publicationId
+      ) {
+        throw new Error(`Unchanged display sort ${displaySortMode} changed XLSX publication ownership: ${JSON.stringify({ first: firstXlsx.publicationId, beforeSave: beforeSaveXlsx.publicationId, saved: savedXlsx.publicationId, reloaded: reloadedXlsx.publicationId })}.`);
+      }
+      sortModeResults[displaySortMode] = {
+        beforeSaveCurrent: true,
+        ordinarySaveCurrent: true,
+        reloadSaveCurrent: true,
+        persistedSortMode: "pricing_reference",
+        revisionUnchanged: true,
+      };
     }
 
     await page.locator("#backToDashboardButton", { hasText: "Dashboard" }).click();
@@ -2461,8 +2556,8 @@ async function verifyReplacementExportArtifactPersistenceG3(parentPage, replacem
     return {
       sessionId,
       xlsxPublicationId: firstXlsx.publicationId,
-      reloadCycle1: true,
-      reloadCycle2: true,
+      sortModeResults,
+      allSortModesCurrent: true,
       dashboardXlsxCurrent: dashboardXlsx.session.status?.quote_generated === true,
       xlsxDownload: true,
       realEditInvalidates: true,
@@ -3835,9 +3930,10 @@ async function main() {
     await verifyGenerationTerminalRecoveryAfterRefresh(page);
     const replacementPort = options.port + 1;
     const replacementBaseUrl = `http://${options.host}:${replacementPort}`;
-    const replacementDataRoot = path.join(root, "_tmp", "playwright-replacement-quote-data");
-    const replacementOutputRoot = path.join(root, "_tmp", "playwright-replacement-output");
-    const replacementTmpRoot = path.join(root, "_tmp", "playwright-replacement-tmp");
+    const replacementRoot = process.env.PLAYWRIGHT_REPLACEMENT_ROOT || path.join(root, "_tmp");
+    const replacementDataRoot = path.join(replacementRoot, "playwright-replacement-quote-data");
+    const replacementOutputRoot = path.join(replacementRoot, "playwright-replacement-output");
+    const replacementTmpRoot = path.join(replacementRoot, "playwright-replacement-tmp");
     await Promise.all([
       fs.rm(replacementDataRoot, { recursive: true, force: true }),
       fs.rm(replacementOutputRoot, { recursive: true, force: true }),

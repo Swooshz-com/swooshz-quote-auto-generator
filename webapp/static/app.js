@@ -11763,9 +11763,16 @@ function currentQuoteSessionDraftState() {
   const draftOutputRows = Array.isArray(snapshot.outputRows) && snapshot.outputRows.length
     ? snapshot.outputRows
     : (savedLineItems.length ? [] : savedPricingMatches.map(outputRowFromPricingMatch));
-  const outputRows = draftOutputRows.length
-    ? snapshotOutputRows(sortOutputRows(draftOutputRows.map(normalizeOutputRow)))
-    : [];
+  const liveOutputSortMode = state.outputSortMode;
+  let outputRows = [];
+  try {
+    state.outputSortMode = "pricing_reference";
+    outputRows = draftOutputRows.length
+      ? snapshotOutputRows(sortOutputRows(draftOutputRows.map(normalizeOutputRow)))
+      : [];
+  } finally {
+    state.outputSortMode = liveOutputSortMode;
+  }
   const lineItems = outputRows.length
     ? outputRowsToLineItems(outputRows)
     : savedLineItems;
@@ -11793,7 +11800,7 @@ function currentQuoteSessionDraftState() {
     outputRows,
     originalOutputRows: snapshot.originalOutputRows,
     outputErrors: snapshot.outputErrors,
-    outputSortMode: snapshot.outputSortMode,
+    outputSortMode: "pricing_reference",
     analysisFindings: snapshot.analysisFindings,
     blockingClarificationQuestions: snapshot.blockingClarificationQuestions,
     boothDimensions: snapshot.boothDimensions,

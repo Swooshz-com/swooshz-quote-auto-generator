@@ -29245,6 +29245,59 @@ const saved = {
   pdfFileRevision: 11,
   pricingMatches: [{ status: "stale", description: "must not own output" }],
 };
+state.quoteDetails = {
+  client: { name: "Synthetic Client" },
+  company: { name: "Synthetic Company", header_details: "Synthetic company authority" },
+  commercial_snapshot: { pricing_basis: pricingBasis },
+};
+state.quoteBasis = { ...EMPTY_BASIS, graphics: "Include: Printed fascia" };
+state.quoteBasisSections = [{ id: "graphics", title: "Graphics", lines: [{ tag: "Include", text: "Printed fascia" }] }];
+const comparable = (value) => {
+  const copy = deepClone(value);
+  delete copy.savedAt;
+  return copy;
+};
+const freshnessProjection = (value) => {
+  const copy = comparable(value);
+  return {
+    outputSortMode: copy.outputSortMode,
+    outputRows: copy.outputRows,
+    pricingMatches: copy.pricingMatches,
+    lineItems: copy.lineItems,
+    outputRevision: copy.outputRevision,
+    profileId: copy.profileId,
+    selectedPresetValue: copy.selectedPresetValue,
+    pricingReferenceId: copy.pricingReferenceId,
+    pricingReferenceSource: copy.pricingReferenceSource,
+    quoteCommercialLifecycle: copy.quoteCommercialLifecycle,
+    quoteCommercialReview: copy.quoteCommercialReview,
+    quoteCommercialTouched: copy.quoteCommercialTouched,
+    quoteDetails: copy.quoteDetails,
+    quoteBasis: copy.quoteBasis,
+    quoteBasisSections: copy.quoteBasisSections,
+  };
+};
+const supportedSortModes = ["pricing_reference", "name", "category", "category_name"];
+for (const displaySortMode of supportedSortModes) {
+  state.outputSortMode = displaySortMode;
+  const baselineA = currentQuoteSessionDraftState();
+  assert.strictEqual(state.outputSortMode, displaySortMode);
+  assert.strictEqual(baselineA.outputSortMode, "pricing_reference");
+  assert.deepStrictEqual(baselineA.outputRows.map((row) => row.description), [
+    "Custom platform finish", "Printed fascia", "On-site coordination",
+  ]);
+  assert.deepStrictEqual(baselineA.pricingMatches, snapshotOutputRows(baselineA.outputRows));
+  assert.deepStrictEqual(baselineA.lineItems, outputRowsToLineItems(baselineA.outputRows));
+  const baselineAProjection = freshnessProjection(baselineA);
+
+  await applyQuoteSessionSnapshot({ ...deepClone(baselineA), browserRecoveryScope: "scope-231" }, { forceQuoteView: true, sessionId: "quote-canonical-231" });
+  const baselineB = currentQuoteSessionDraftState();
+  await applyQuoteSessionSnapshot({ ...deepClone(baselineB), browserRecoveryScope: "scope-231" }, { forceQuoteView: true, sessionId: "quote-canonical-231" });
+  const baselineC = currentQuoteSessionDraftState();
+  assert.deepStrictEqual(freshnessProjection(baselineB), baselineAProjection);
+  assert.deepStrictEqual(freshnessProjection(baselineC), baselineAProjection);
+  console.log(`${displaySortMode}=PASS`);
+}
 await applyQuoteSessionSnapshot(saved, { forceQuoteView: true, sessionId: "quote-canonical-231" });
 assert.strictEqual(state.outputSortMode, "pricing_reference");
 assert.deepStrictEqual(state.outputRows.map((row) => row.description), [
@@ -29254,17 +29307,6 @@ assert.deepStrictEqual(state.pricingMatches, snapshotOutputRows(state.outputRows
 assert.deepStrictEqual(state.lineItems, outputRowsToLineItems(state.outputRows));
 assert.deepStrictEqual(state.quoteCommercialSnapshot.pricing_basis, pricingBasis);
 assert.strictEqual(state.quoteBasis.graphics, "Include: Printed fascia");
-const firstDraft = currentQuoteSessionDraftState();
-const comparable = (value) => {
-  const copy = deepClone(value);
-  delete copy.savedAt;
-  return copy;
-};
-const canonicalDraft = comparable(firstDraft);
-await applyQuoteSessionSnapshot({ ...deepClone(firstDraft), browserRecoveryScope: "scope-231" }, { forceQuoteView: true, sessionId: "quote-canonical-231" });
-const secondDraft = currentQuoteSessionDraftState();
-await applyQuoteSessionSnapshot({ ...deepClone(secondDraft), browserRecoveryScope: "scope-231" }, { forceQuoteView: true, sessionId: "quote-canonical-231" });
-assert.deepStrictEqual(comparable(currentQuoteSessionDraftState()), canonicalDraft);
 
 const draftWithStaleMatches = {
   ...deepClone(saved),
@@ -29307,6 +29349,9 @@ assert.strictEqual(state.quoteBasis.graphics, "Include: Historical printed panel
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        for sort_mode in ("pricing_reference", "name", "category", "category_name"):
+            self.assertIn(f"{sort_mode}=PASS", completed.stdout)
+        print(completed.stdout, end="")
 
     def test_static_replacement_explicit_preset_ownership_survives_two_restore_save_cycles(self):
         node = require_node(self)
