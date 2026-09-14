@@ -25493,6 +25493,7 @@ function cloneQuoteBasis(value = {}) { return value; }
 function normalizeQuoteBasisSections(value = []) { return value; }
 function normalizeLineItem(value) { return value; }
 function normalizeOutputRow(value) { return value; }
+function sortOutputRows(rows = []) { return rows; }
 function normalizeBoothDimensions(value = {}) { return value; }
 function normalizeAnalysisMode(value = "") { return value; }
 function normalizeActiveJob() { return null; }
@@ -25769,6 +25770,7 @@ function cloneQuoteBasis(value = {}) { return value; }
 function normalizeQuoteBasisSections(value = []) { return value; }
 function normalizeLineItem(value) { return value; }
 function normalizeOutputRow(value) { return value; }
+function sortOutputRows(rows = []) { return rows; }
 function normalizeBoothDimensions(value = {}) { return value; }
 function normalizeAnalysisMode(value = "") { return value; }
 function normalizeActiveJob() { return null; }
@@ -26027,6 +26029,7 @@ function cloneQuoteBasis(value = {}) { return value; }
 function normalizeQuoteBasisSections(value = []) { return value; }
 function normalizeLineItem(value) { return value; }
 function normalizeOutputRow(value) { return value; }
+function sortOutputRows(rows = []) { return rows; }
 function normalizeBoothDimensions(value = {}) { return value; }
 function normalizeAnalysisMode(value = "") { return value; }
 function normalizeActiveJob() { return null; }
@@ -28872,6 +28875,755 @@ assert.strictEqual(line.unit, "nos");
         self.assertIn('categoryOrderValue', js)
         self.assertIn('pricingReferenceOrder', js)
 
+    def test_static_replacement_projection_preserves_commercial_rows_basis_and_sort(self):
+        static_dir = ROOT / "webapp" / "static"
+        js = (static_dir / "app.js").read_text(encoding="utf-8")
+        render_body = js.split("function renderPricingMatches", 1)[1].split("function clearPricingReviewMessages", 1)[0]
+        restore_body = js.split("async function applyQuoteSessionSnapshot", 1)[1].split("async function restoreSessionState", 1)[0]
+        self.assertIn("state.pricingMatches = snapshotOutputRows(state.outputRows);", render_body)
+        self.assertIn("state.lineItems = outputRowsToLineItems(state.outputRows);", render_body)
+        self.assertIn('state.outputSortMode = "pricing_reference";', restore_body)
+        self.assertIn("quoteBasisFromSections(state.quoteBasisSections)", restore_body)
+
+        node = require_node(self)
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+;(async () => {
+function extractFunction(name) {
+  const markers = [`async function ${name}(`, `function ${name}(`];
+  let start = -1;
+  for (const marker of markers) {
+    const candidate = source.indexOf(marker);
+    if (candidate >= 0 && (start < 0 || candidate < start)) start = candidate;
+  }
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf("{", source.indexOf(")", start)) + 1;
+  let depth = 1;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+function deepClone(value) { return JSON.parse(JSON.stringify(value)); }
+function isPlainObject(value) { return Boolean(value && typeof value === "object" && !Array.isArray(value)); }
+
+const BASIS_FIELDS = [
+  ["surfaces", "Surfaces / Structures"],
+  ["counters", "Cabinets / Counters"],
+  ["platform", "Platform / Flooring"],
+  ["graphics", "Graphics / Signage"],
+  ["furniture", "Furniture / Plants / AV"],
+  ["electrical", "Electrical"],
+];
+const EMPTY_BASIS = Object.fromEntries(BASIS_FIELDS.map(([key]) => [key, ""]));
+const QUOTE_SESSION_STATE_VERSION = 5;
+const PROFILE_PRESET_PREFIX = "profile:";
+const COMPANY_PROFILE_PRESET_PREFIX = "company:";
+const PRICING_REFERENCE_SETTINGS_MODE_MANAGE = "manage";
+const PRICING_REFERENCE_SOURCES = new Set(["company", "local", "bundled"]);
+
+function normalizeTextNewlines(value) { return String(value || "").replace(/\r\n?/g, "\n"); }
+function splitLines(value) { return normalizeTextNewlines(value).split(/\n/).map((line) => line.trim()).filter(Boolean); }
+function basisDisplayTitle(value = "") { return String(value || "").trim(); }
+function exactPricingReferenceSectionTitle() { return ""; }
+function quoteCommercialStateIsOwned() {
+  return ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
+}
+function collectQuoteExchangeRate() { return 1; }
+function collectQuoteCurrency() { return "SGD"; }
+function collectTaxDetails() { return { label: "GST", rate: 0.09 }; }
+function outputCellDisplayValue(row = {}, field = "") { return String(row?.[field] ?? ""); }
+function renderOutputEditCell() { return "<td></td>"; }
+function escapeHtml(value = "") { return String(value); }
+function updateOutputHeader() {}
+function updateDownloadButton() {}
+function renderOutputValidationMessages() {}
+function updateQuoteBasisCard() {}
+function syncControlStates() {}
+function markOutputRowsDirty() { state.outputRevision = Number(state.outputRevision || 0) + 1; }
+function invalidateAuthorityProfileRequests() {}
+function safeQuoteSessionId(value, fallback = "") {
+  const candidate = String(value || "").trim();
+  return /^quote-[A-Za-z0-9_-]{3,64}$/.test(candidate) ? candidate : fallback;
+}
+function transitionGenerationContext(sessionId, runId) {
+  state.quoteSessionId = safeQuoteSessionId(sessionId);
+  state.generationContext = { session_id: state.quoteSessionId, run_id: String(runId || "") };
+}
+function normalizeRestorableOverlay(value) { return typeof value === "string" ? value : ""; }
+function normalizePricingReferenceSettingsMode(value) { return value === "import" ? "import" : "manage"; }
+function normalizeQuoteCommercialSnapshot(snapshot) { return snapshot && typeof snapshot === "object" ? deepClone(snapshot) : null; }
+function quoteCommercialSnapshotPricingBasis(snapshot) { return snapshot?.pricing_basis ? deepClone(snapshot.pricing_basis) : null; }
+function normalizeQuoteCommercialReview(review) { return review && typeof review === "object" ? deepClone(review) : null; }
+function quoteCommercialRestorationReviewReason() { return ""; }
+function currentPricingReference() {
+  return { id: state.pricingReferenceId, source: state.pricingReferenceSource };
+}
+function setQuoteCommercialReview(reason, id, source) {
+  state.quoteCommercialReview = { reason_code: reason, blocked_identity: { id, source } };
+}
+function normalizeQuoteCommercialTouched(value = {}) { return deepClone(value || {}); }
+function quoteDetailsCommercialTouched() { return {}; }
+function normalizeLineItem(value = {}) { return deepClone(value || {}); }
+function revisionNumber(value, fallback = 0) { return Number.isFinite(Number(value)) ? Number(value) : fallback; }
+function syncSelectedPricingReference() {}
+function renderProfileOptions() {}
+function renderPresetOptions() {}
+function presetValueFromQuoteDetails() { return ""; }
+function selectedPreset() { return null; }
+function quoteDetailsWithFallbackDefaults(defaults, details) { return deepClone(details || defaults || {}); }
+async function restoreQuoteDetailsLogo(details) { return details; }
+function applyQuoteDetails(details) { state.quoteDetails = deepClone(details || {}); }
+async function restoreSessionImages(images) { return Array.isArray(images) ? deepClone(images) : []; }
+function cloneQuoteBasis(basis = {}) { return { ...EMPTY_BASIS, ...basis }; }
+function normalizeBoothDimensions(value) { return deepClone(value || {}); }
+function normalizeAnalysisMode(value) { return String(value || ""); }
+function normalizeActiveJob() { return null; }
+function renderFiles() {}
+function renderMatchSummary() {}
+function clearPricingReviewMessages() {}
+function renderBasisFailureState() {}
+function renderBasisEmptyState() {}
+function setResultStatus() {}
+function setWorkflowStage(value) { state.workflowStage = value; }
+function restoredWorkflowStage(saved = {}) { return saved.workflowStage || "completed"; }
+function restoredQuoteSessionSidePanel(saved = {}) { return saved.activeSidePanel || "output"; }
+function setSidePanel(value) { state.activeSidePanel = value; }
+function renderQuoteCommercialReviewState() {}
+function sessionFileRecordsFromDraft() { return []; }
+function persistSessionFiles() { return Promise.resolve(); }
+function showAiFailureBanner() {}
+function clearAiFailureBanner() {}
+function furthestQuoteSessionSidePanel(snapshot = {}) { return snapshot.activeSidePanel || "output"; }
+function availablePresetValues() { return new Set(); }
+function preservedOwnedPresetValue() { return ""; }
+
+const elements = {
+  outputSortMode: { value: "pricing_reference" },
+  pricingTableWrap: { hidden: false },
+  pricingEmptyState: { hidden: false },
+  pricingReviewMessages: { innerHTML: "" },
+  pricingMatchesBody: { innerHTML: "", textContent: "" },
+};
+const state = {
+  quoteSessionId: "quote-canonical-231",
+  quoteSessionRestoredSessionId: "",
+  quoteSessionRestoredDraftKey: "",
+  quoteSessionDraftSaveStarted: true,
+  activeAppView: "quote",
+  activeSidePanel: "output",
+  profileId: "profile-authority",
+  defaultProfileId: "profile-authority",
+  pricingReferenceId: "pricing-authority",
+  pricingReferenceSource: "local",
+  selectedPresetValue: "legacy:unselectable-alias",
+  quoteCommercialLifecycle: "NEW_UNINITIALISED",
+  quoteCommercialSnapshot: null,
+  quoteCommercialReview: null,
+  quoteCommercialRecoveryError: "",
+  quoteCommercialTouched: {},
+  quoteCommercialPreservedQuoteText: {},
+  pricingReferenceSelectionIntent: null,
+  pricingReferenceSettingsMode: PRICING_REFERENCE_SETTINGS_MODE_MANAGE,
+  restorableOverlay: "",
+  pendingFeedback: "",
+  quoteDetails: {},
+  images: [],
+  quoteBasis: {},
+  quoteBasisSections: [],
+  lineItems: [],
+  outputRows: [],
+  originalOutputRows: [],
+  outputErrors: [],
+  outputSortMode: "pricing_reference",
+  analysisFindings: [],
+  blockingClarificationQuestions: [],
+  boothDimensions: {},
+  originalAnalysisSnapshot: null,
+  basisConfirmed: true,
+  draftSource: "synthetic-replacement",
+  lastAnalysisMode: "",
+  pendingAnalysisMode: "",
+  basisChat: {},
+  aiFailed: false,
+  downloadFile: null,
+  pdfFile: null,
+  outputRevision: 11,
+  downloadFileRevision: 11,
+  pdfFileRevision: 11,
+  pricingMatches: [],
+  pricingIssues: [],
+  activeJob: null,
+  isAnalysisRunning: false,
+  isGenerating: false,
+  isPreparingOutput: false,
+};
+const window = { localStorage: { setItem() {} } };
+let saveNumber = 0;
+function buildSessionSnapshot() {
+  saveNumber += 1;
+  return deepClone({
+    version: QUOTE_SESSION_STATE_VERSION,
+    savedAt: `save-${saveNumber}`,
+    activeAppView: state.activeAppView,
+    quoteSessionDraftSaveStarted: state.quoteSessionDraftSaveStarted,
+    profileId: state.profileId,
+    pricingReferenceId: state.pricingReferenceId,
+    pricingReferenceSource: state.pricingReferenceSource,
+    selectedPresetValue: state.selectedPresetValue,
+    quoteCommercialLifecycle: state.quoteCommercialLifecycle,
+    quoteCommercialReview: state.quoteCommercialReview,
+    quoteCommercialTouched: state.quoteCommercialTouched,
+    images: state.images,
+    quoteDetails: state.quoteDetails,
+    workflowStage: state.workflowStage,
+    quoteBasis: state.quoteBasis,
+    quoteBasisSections: state.quoteBasisSections,
+    lineItems: state.lineItems,
+    outputRows: state.outputRows,
+    originalOutputRows: state.originalOutputRows,
+    outputErrors: state.outputErrors,
+    outputSortMode: state.outputSortMode,
+    analysisFindings: state.analysisFindings,
+    blockingClarificationQuestions: state.blockingClarificationQuestions,
+    boothDimensions: state.boothDimensions,
+    originalAnalysisSnapshot: state.originalAnalysisSnapshot,
+    basisConfirmed: state.basisConfirmed,
+    aiFailed: state.aiFailed,
+    draftSource: state.draftSource,
+    lastAnalysisMode: state.lastAnalysisMode,
+    activeSidePanel: state.activeSidePanel,
+    downloadFile: state.downloadFile,
+    pdfFile: state.pdfFile,
+    outputRevision: state.outputRevision,
+    downloadFileRevision: state.downloadFileRevision,
+    pdfFileRevision: state.pdfFileRevision,
+    pricingMatches: state.pricingMatches,
+  });
+}
+
+eval([
+  "safeId", "normalizeQuoteBasisTitle", "normalizeCategoryTitle", "normalizeUnit",
+  "cleanCustomerQuoteLineText", "pricingReferenceLineText", "bracketedCatalogReferenceParts",
+  "outputCatalogDescription", "leadingNumber", "formatQuantityNumber", "normalizeQuantityPrefixUnit",
+  "leadingQuantityPrefix", "quantityUnitAliases", "startsWithQuantityUnit",
+  "stripLeadingQuantityCountFromLineText", "normalizedLineTextQuantityParts", "normalizeBasisTag",
+  "isCustomPricingBasisLine", "normalizeConfidence", "normalizePossiblePricingMatches",
+  "splitBasisDecisionText", "normalizeBasisLines", "normalizeQuoteBasisSections",
+  "quoteBasisFromSections", "cloneQuoteBasisSections", "basisLineAcceptsAsAiProposal", "retagBasisLine",
+  "numberOrNull", "orderNumber", "unitPriceEditKind", "effectiveOutputUnitPrice", "roundCommercialCents",
+  "quoteFxMultiplier", "quoteAmountValue", "synchronizeOwnedOutputRowPrice", "recalculateOutputRow",
+  "normalizeOutputRow", "pricingMatchStatus", "outputQuantityPartsFromPricingMatch", "outputRowFromPricingMatch",
+  "categoryOrderValue", "pricingReferenceOrder", "compareOrderValues", "sortOutputRows", "snapshotOutputRows",
+  "outputRowsToLineItems", "renderPricingMatches", "applyQuoteSessionSnapshot", "currentQuoteSessionDraftState",
+].map(extractFunction).join("\n"));
+
+const authority = {
+  pricing_reference_id: "pricing-authority",
+  pricing_reference_source: "local",
+  pricing_basis_currency: "SGD",
+  pricing_basis_digest: "sha256:" + "b".repeat(64),
+};
+const rawPricingMatches = [
+  {
+    ...authority,
+    status: "included",
+    section: "Services",
+    description: "On-site coordination",
+    quantity: "1 lot",
+    keyword: "coordination",
+    category_order: 3,
+    item_order: 1,
+  },
+  {
+    ...authority,
+    status: "matched",
+    section: "Graphics",
+    description: "Printed fascia",
+    quantity: "2 sqm",
+    unit_price: 25,
+    keyword: "printed-fascia",
+    category_order: 2,
+    item_order: 1,
+  },
+  {
+    ...authority,
+    status: "manual-display",
+    section: "Platform",
+    description: "Custom platform finish",
+    quantity: "1 lot",
+    amount: 15,
+    keyword: "custom-platform-finish",
+    category_order: 1,
+    item_order: 1,
+  },
+];
+
+renderPricingMatches(rawPricingMatches, { fromPricingMatches: true });
+assert.deepStrictEqual(
+  state.outputRows.map((row) => row.description),
+  ["Custom platform finish", "Printed fascia", "On-site coordination"],
+);
+assert.deepStrictEqual(state.outputRows.map((row) => ({
+  id: row.pricing_reference_id,
+  source: row.pricing_reference_source,
+  currency: row.pricing_basis_currency,
+  digest: row.pricing_basis_digest,
+})), rawPricingMatches
+  .slice()
+  .sort((left, right) => left.category_order - right.category_order)
+  .map(() => ({
+    id: authority.pricing_reference_id,
+    source: authority.pricing_reference_source,
+    currency: authority.pricing_basis_currency,
+    digest: authority.pricing_basis_digest,
+  })));
+const manualRow = state.outputRows[0];
+const catalogueRow = state.outputRows[1];
+const includedRow = state.outputRows[2];
+assert.strictEqual(manualRow.unit_price_override, 15);
+assert.strictEqual(manualRow.catalog_unit_price, "");
+assert.strictEqual(catalogueRow.catalog_unit_price, 25);
+assert.strictEqual(catalogueRow.price_mode, "Priced");
+assert.strictEqual(includedRow.price_mode, "Included");
+assert.deepStrictEqual(state.lineItems, outputRowsToLineItems(state.outputRows));
+assert.strictEqual(state.lineItems[0].unit_price_override, 15);
+assert.strictEqual(state.lineItems[1].catalog_unit_price, 25);
+assert.strictEqual(state.lineItems[2].price_mode, "Included");
+const firstCanonical = deepClone({ outputRows: state.outputRows, pricingMatches: state.pricingMatches, lineItems: state.lineItems });
+renderPricingMatches(state.outputRows);
+assert.deepStrictEqual({ outputRows: state.outputRows, pricingMatches: state.pricingMatches, lineItems: state.lineItems }, firstCanonical);
+
+const pricingBasis = {
+  id: "pricing-authority",
+  source: "local",
+  currency: "SGD",
+  digest: authority.pricing_basis_digest,
+};
+const restoreRows = deepClone(state.outputRows).reverse();
+state.quoteCommercialLifecycle = "EXISTING";
+const saved = {
+  version: QUOTE_SESSION_STATE_VERSION,
+  browserRecoveryScope: "scope-231",
+  quoteSessionId: "quote-canonical-231",
+  activeAppView: "quote",
+  quoteSessionDraftSaveStarted: true,
+  profileId: "profile-authority",
+  pricingReferenceId: pricingBasis.id,
+  pricingReferenceSource: pricingBasis.source,
+  selectedPresetValue: "legacy:unselectable-alias",
+  quoteCommercialLifecycle: "EXISTING",
+  quoteDetails: { client: { name: "Synthetic Client" }, commercial_snapshot: { pricing_basis: pricingBasis } },
+  workflowStage: "completed",
+  quoteBasis: { ...EMPTY_BASIS, graphics: "Stale legacy value" },
+  quoteBasisSections: [{ id: "graphics", title: "Graphics", lines: [{ tag: "Include", text: "Printed fascia" }] }],
+  lineItems: [{ section: "Drift", description: "Stale independently owned item", quantity: 99, unit: "lot", unit_price: 999 }],
+  outputRows: restoreRows,
+  originalOutputRows: restoreRows,
+  outputErrors: [],
+  outputSortMode: "name",
+  analysisFindings: [],
+  blockingClarificationQuestions: [],
+  boothDimensions: {},
+  originalAnalysisSnapshot: null,
+  basisConfirmed: true,
+  aiFailed: false,
+  draftSource: "synthetic-replacement",
+  lastAnalysisMode: "",
+  activeSidePanel: "output",
+  downloadFile: null,
+  pdfFile: null,
+  outputRevision: 11,
+  downloadFileRevision: 11,
+  pdfFileRevision: 11,
+  pricingMatches: [{ status: "stale", description: "must not own output" }],
+};
+await applyQuoteSessionSnapshot(saved, { forceQuoteView: true, sessionId: "quote-canonical-231" });
+assert.strictEqual(state.outputSortMode, "pricing_reference");
+assert.deepStrictEqual(state.outputRows.map((row) => row.description), [
+  "Custom platform finish", "Printed fascia", "On-site coordination",
+]);
+assert.deepStrictEqual(state.pricingMatches, snapshotOutputRows(state.outputRows));
+assert.deepStrictEqual(state.lineItems, outputRowsToLineItems(state.outputRows));
+assert.deepStrictEqual(state.quoteCommercialSnapshot.pricing_basis, pricingBasis);
+assert.strictEqual(state.quoteBasis.graphics, "Include: Printed fascia");
+const firstDraft = currentQuoteSessionDraftState();
+const comparable = (value) => {
+  const copy = deepClone(value);
+  delete copy.savedAt;
+  return copy;
+};
+const canonicalDraft = comparable(firstDraft);
+await applyQuoteSessionSnapshot({ ...deepClone(firstDraft), browserRecoveryScope: "scope-231" }, { forceQuoteView: true, sessionId: "quote-canonical-231" });
+const secondDraft = currentQuoteSessionDraftState();
+await applyQuoteSessionSnapshot({ ...deepClone(secondDraft), browserRecoveryScope: "scope-231" }, { forceQuoteView: true, sessionId: "quote-canonical-231" });
+assert.deepStrictEqual(comparable(currentQuoteSessionDraftState()), canonicalDraft);
+
+const draftWithStaleMatches = {
+  ...deepClone(saved),
+  lineItems: [{ section: "Draft", description: "Draft item", quantity: 1, unit: "lot", catalog_unit_price: 50 }],
+  outputRows: [],
+  pricingMatches: [{ status: "stale", description: "must not replace draft item" }],
+  outputSortMode: "category_name",
+  workflowStage: "basis_review",
+  basisConfirmed: false,
+};
+await applyQuoteSessionSnapshot(draftWithStaleMatches, { forceQuoteView: true, sessionId: "quote-canonical-231" });
+assert.deepStrictEqual(state.outputRows, []);
+assert.deepStrictEqual(state.pricingMatches, []);
+assert.strictEqual(state.lineItems[0].description, "Draft item");
+assert.strictEqual(state.lineItems[0].catalog_unit_price, 50);
+assert.strictEqual(currentQuoteSessionDraftState().lineItems[0].description, "Draft item");
+
+const legacy = deepClone(saved);
+delete legacy.quoteBasisSections;
+legacy.quoteBasis = { ...EMPTY_BASIS, graphics: "Confirm: Historical printed panel" };
+await applyQuoteSessionSnapshot(legacy, { forceQuoteView: true, sessionId: "quote-canonical-231" });
+assert.deepStrictEqual(state.quoteBasisSections.map((section) => section.id), ["graphics"]);
+assert.strictEqual(state.quoteBasisSections[0].lines[0].tag, "Confirm");
+assert.strictEqual(state.quoteBasisSections[0].lines[0].text, "Historical printed panel");
+retagBasisLine("graphics", 0, "Include");
+assert.strictEqual(state.quoteBasisSections[0].lines[0].tag, "Include");
+assert.strictEqual(state.quoteBasis.graphics, "Include: Historical printed panel");
+const legacyDraft = currentQuoteSessionDraftState();
+await applyQuoteSessionSnapshot({ ...deepClone(legacyDraft), browserRecoveryScope: "scope-231" }, { forceQuoteView: true, sessionId: "quote-canonical-231" });
+assert.strictEqual(state.quoteBasisSections[0].lines[0].tag, "Include");
+assert.strictEqual(state.quoteBasis.graphics, "Include: Historical printed panel");
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_static_replacement_explicit_preset_ownership_survives_two_restore_save_cycles(self):
+        node = require_node(self)
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+;(async () => {
+function extractFunction(name) {
+  const markers = [`async function ${name}(`, `function ${name}(`];
+  let start = -1;
+  for (const marker of markers) {
+    const candidate = source.indexOf(marker);
+    if (candidate >= 0 && (start < 0 || candidate < start)) start = candidate;
+  }
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf("{", source.indexOf(")", start)) + 1;
+  let depth = 1;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+function deepClone(value) { return JSON.parse(JSON.stringify(value)); }
+function isPlainObject(value) { return Boolean(value && typeof value === "object" && !Array.isArray(value)); }
+function quoteCommercialStrictDataEqual(left, right) { return JSON.stringify(left) === JSON.stringify(right); }
+function invalidateAuthorityProfileRequests() {}
+function safeQuoteSessionId(value, fallback = "") {
+  const candidate = String(value || "").trim();
+  return /^quote-[A-Za-z0-9_-]{3,64}$/.test(candidate) ? candidate : fallback;
+}
+function transitionGenerationContext(sessionId, runId) {
+  state.quoteSessionId = safeQuoteSessionId(sessionId);
+  state.generationContext = { session_id: state.quoteSessionId, run_id: String(runId || "") };
+}
+function normalizeRestorableOverlay(value) { return typeof value === "string" ? value : ""; }
+function normalizePricingReferenceSettingsMode(value) { return value === "import" ? "import" : "manage"; }
+function normalizeQuoteCommercialSnapshot(value) { return isPlainObject(value) ? deepClone(value) : null; }
+function quoteCommercialSnapshotPricingBasis(value) { return isPlainObject(value?.pricing_basis) ? deepClone(value.pricing_basis) : null; }
+function normalizeQuoteCommercialReview(value) { return isPlainObject(value) ? deepClone(value) : null; }
+function quoteCommercialRestorationReviewReason() { return ""; }
+function currentPricingReference() { return null; }
+function setQuoteCommercialReview(reason, id, source) {
+  state.quoteCommercialReview = { reason_code: reason, blocked_identity: { id, source } };
+}
+function normalizeQuoteCommercialTouched(value = {}) { return deepClone(value || {}); }
+function quoteDetailsCommercialTouched() { return {}; }
+function syncSelectedPricingReference() {}
+function renderProfileOptions() {}
+function renderPricingMatches() {}
+function revisionNumber(value, fallback = 0) { return Number.isFinite(Number(value)) ? Number(value) : fallback; }
+function quoteDetailsWithFallbackDefaults(defaults, details) { return deepClone(details || defaults || {}); }
+async function restoreQuoteDetailsLogo(details) { return details; }
+function applyQuoteDetails(details) { state.quoteDetails = deepClone(details || {}); }
+async function restoreSessionImages(images) { return Array.isArray(images) ? deepClone(images) : []; }
+function normalizeQuoteBasisSections() { return []; }
+function quoteBasisFromSections() { return {}; }
+function cloneQuoteBasis(value = {}) { return deepClone(value || {}); }
+function outputRowFromPricingMatch() { return {}; }
+function normalizeLineItem(value = {}) { return deepClone(value || {}); }
+function normalizeOutputRow(value = {}) { return deepClone(value || {}); }
+function sortOutputRows(rows = []) { return rows; }
+function normalizeBoothDimensions(value) { return deepClone(value || {}); }
+function normalizeAnalysisMode(value) { return String(value || ""); }
+function normalizeActiveJob() { return null; }
+function renderFiles() {}
+function renderMatchSummary() {}
+function clearPricingReviewMessages() {}
+function updateQuoteBasisCard() {}
+function renderBasisFailureState() {}
+function renderBasisEmptyState() {}
+function updateDownloadButton() {}
+function setResultStatus() {}
+function setWorkflowStage(value) { state.workflowStage = value; }
+function restoredWorkflowStage(saved = {}) { return saved.workflowStage || "completed"; }
+function restoredQuoteSessionSidePanel(saved = {}) { return saved.activeSidePanel || "output"; }
+function setSidePanel(value) { state.activeSidePanel = value; }
+function renderQuoteCommercialReviewState() {}
+function sessionFileRecordsFromDraft() { return []; }
+function persistSessionFiles() { return Promise.resolve(); }
+function showAiFailureBanner() {}
+function clearAiFailureBanner() {}
+function furthestQuoteSessionSidePanel(snapshot = {}) { return snapshot.activeSidePanel || "output"; }
+function updatePresetButtons() {}
+function lastSelectedPresetValue() { return ""; }
+function neutralizeFormulaText(value = "") { return String(value || ""); }
+function escapeHtml(value = "") { return String(value); }
+function safeId(value = "", fallback = "item") {
+  const slug = String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return slug || fallback;
+}
+function splitLines() { return []; }
+function currentBrowserRecoveryScope() { return "scope-231"; }
+
+const DEFAULT_PROFILE_ID = "owner-b";
+const PROFILE_PRESET_PREFIX = "profile:";
+const COMPANY_PROFILE_PRESET_PREFIX = "company:";
+const QUOTE_SESSION_STATE_VERSION = 5;
+const PRICING_REFERENCE_SETTINGS_MODE_MANAGE = "manage";
+const PRICING_REFERENCE_SOURCES = new Set(["company", "local", "bundled"]);
+
+const state = {
+  quoteSessionId: "quote-authority-231",
+  quoteSessionRestoredSessionId: "",
+  quoteSessionRestoredDraftKey: "",
+  quoteSessionDraftSaveStarted: true,
+  activeAppView: "quote",
+  activeSidePanel: "output",
+  profileId: "owner-b",
+  defaultProfileId: "owner-b",
+  profiles: [{
+    id: "owner-b",
+    label: "Owner B",
+    source: "profile",
+    quote_detail_presets: [
+      { id: "default", name: "Owner B Default", details: { company: { name: "Owner B", header_details: "Owner B header" } } },
+      { id: "shared", name: "Owner B Shared", details: { company: { name: "Owner B Shared", header_details: "Owner B shared header" } } },
+    ],
+  }],
+  companyProfiles: [{
+    id: "different-owner",
+    label: "Different Owner",
+    defaults: { company: { name: "Different Owner", header_details: "Different owner header" } },
+  }],
+  selectedPresetValue: "",
+  quoteCommercialLifecycle: "NEW_UNINITIALISED",
+  quoteCommercialSnapshot: null,
+  quoteCommercialReview: null,
+  quoteCommercialRecoveryError: "",
+  quoteCommercialTouched: {},
+  quoteCommercialPreservedQuoteText: {},
+  pricingReferenceSelectionIntent: null,
+  pricingReferenceSettingsMode: PRICING_REFERENCE_SETTINGS_MODE_MANAGE,
+  restorableOverlay: "",
+  pendingFeedback: "",
+  quoteDetails: { company: { name: "Different Owner", header_details: "Different owner header" } },
+  images: [],
+  quoteBasis: {},
+  quoteBasisSections: [],
+  lineItems: [],
+  outputRows: [],
+  originalOutputRows: [],
+  outputErrors: [],
+  outputSortMode: "name",
+  analysisFindings: [],
+  blockingClarificationQuestions: [],
+  boothDimensions: {},
+  originalAnalysisSnapshot: null,
+  basisConfirmed: false,
+  draftSource: "",
+  lastAnalysisMode: "",
+  pendingAnalysisMode: "",
+  basisChat: {},
+  aiFailed: false,
+  downloadFile: null,
+  pdfFile: null,
+  outputRevision: 0,
+  downloadFileRevision: -1,
+  pdfFileRevision: -1,
+  pricingMatches: [],
+  pricingIssues: [],
+  activeJob: null,
+  isAnalysisRunning: false,
+  isGenerating: false,
+  isPreparingOutput: false,
+};
+const elements = {
+  presetSelect: {
+    value: "",
+    innerHTML: "",
+    disabled: false,
+    title: "",
+    setAttribute() {},
+  },
+  outputSortMode: { value: "name" },
+};
+const window = { localStorage: { setItem() {} } };
+let saveNumber = 0;
+function buildSessionSnapshot() {
+  saveNumber += 1;
+  return deepClone({
+    version: QUOTE_SESSION_STATE_VERSION,
+    savedAt: `save-${saveNumber}`,
+    activeAppView: state.activeAppView,
+    quoteSessionDraftSaveStarted: true,
+    profileId: state.profileId,
+    pricingReferenceId: "pricing-authority",
+    pricingReferenceSource: "local",
+    selectedPresetValue: state.selectedPresetValue,
+    quoteCommercialLifecycle: state.quoteCommercialLifecycle,
+    quoteCommercialReview: null,
+    quoteCommercialTouched: {},
+    images: [],
+    quoteDetails: state.quoteDetails,
+    workflowStage: "",
+    quoteBasis: {},
+    quoteBasisSections: [],
+    lineItems: [],
+    outputRows: [],
+    originalOutputRows: [],
+    outputErrors: [],
+    outputSortMode: state.outputSortMode,
+    analysisFindings: [],
+    blockingClarificationQuestions: [],
+    boothDimensions: {},
+    originalAnalysisSnapshot: null,
+    basisConfirmed: false,
+    aiFailed: false,
+    draftSource: "",
+    lastAnalysisMode: "",
+    activeSidePanel: "output",
+    downloadFile: null,
+    pdfFile: null,
+    outputRevision: 0,
+    downloadFileRevision: -1,
+    pdfFileRevision: -1,
+    pricingMatches: [],
+  });
+}
+
+eval([
+  "safeProfileId", "safeProfileLabel", "profilePresetOptionValue", "profilePresetOptionParts",
+  "companyProfileOptionValue", "selectedPresetId", "templateProfilePresets",
+  "selectableTemplateProfilePresets", "normalizeCompanyProfile", "companyProfilePresets",
+  "presetOptionValue", "selectedPreset", "normalizePresetComparisonValue", "quoteDetailsMatchPreset",
+  "presetValueFromQuoteDetails", "availablePresetValues", "currentProfile", "resolvedProfileIdForPayload",
+  "generationProfileIdForPayload", "preservedOwnedPresetValue", "renderPresetOptions",
+  "applyQuoteSessionSnapshot", "currentQuoteSessionDraftState",
+].map(extractFunction).join("\n"));
+
+const explicitProfile = "profile:owner-b:default";
+assert.strictEqual(availablePresetValues().has(explicitProfile), false);
+assert.strictEqual(presetValueFromQuoteDetails(state.quoteDetails), "company:different-owner");
+state.selectedPresetValue = explicitProfile;
+elements.presetSelect.value = explicitProfile;
+renderPresetOptions();
+assert.strictEqual(state.selectedPresetValue, explicitProfile);
+assert.strictEqual(elements.presetSelect.value, "");
+assert.strictEqual(generationProfileIdForPayload(), "profile:owner-b");
+assert.strictEqual(presetValueFromQuoteDetails(state.quoteDetails), "company:different-owner");
+
+function authoritySnapshot(selector, lifecycle) {
+  state.selectedPresetValue = selector;
+  state.quoteCommercialLifecycle = lifecycle;
+  elements.presetSelect.value = selector;
+  renderPresetOptions();
+  return deepClone(currentQuoteSessionDraftState());
+}
+async function restoreAndSave(snapshot, expectedSelector, expectedAuthority) {
+  await applyQuoteSessionSnapshot({ ...deepClone(snapshot), browserRecoveryScope: "scope-231" }, {
+    forceQuoteView: true,
+    sessionId: "quote-authority-231",
+  });
+  assert.strictEqual(state.selectedPresetValue, expectedSelector);
+  assert.strictEqual(currentQuoteSessionDraftState().selectedPresetValue, expectedSelector);
+  assert.strictEqual(generationProfileIdForPayload(), expectedAuthority);
+  assert.notStrictEqual(generationProfileIdForPayload(), "company:different-owner");
+  assert.strictEqual(presetValueFromQuoteDetails(state.quoteDetails), "company:different-owner");
+  return deepClone(currentQuoteSessionDraftState());
+}
+
+for (const lifecycle of ["NEW_UNINITIALISED", "", "EXISTING", "RECOVERED"]) {
+  let saved = authoritySnapshot(explicitProfile, lifecycle);
+  assert.strictEqual(saved.selectedPresetValue, explicitProfile);
+  assert.strictEqual(generationProfileIdForPayload(), "profile:owner-b");
+  saved = await restoreAndSave(saved, explicitProfile, "profile:owner-b");
+  saved = await restoreAndSave(saved, explicitProfile, "profile:owner-b");
+}
+
+const unavailableCompany = "company:missing-company";
+let companySaved = authoritySnapshot(unavailableCompany, "NEW_UNINITIALISED");
+assert.strictEqual(companySaved.selectedPresetValue, unavailableCompany);
+assert.strictEqual(generationProfileIdForPayload(), "");
+companySaved = await restoreAndSave(companySaved, unavailableCompany, "");
+companySaved = await restoreAndSave(companySaved, unavailableCompany, "");
+
+state.selectedPresetValue = "profile:owner-b:shared";
+elements.presetSelect.value = state.selectedPresetValue;
+renderPresetOptions();
+assert.strictEqual(elements.presetSelect.value, "profile:owner-b:shared");
+assert.strictEqual(generationProfileIdForPayload(), "profile:owner-b");
+assert.strictEqual(currentQuoteSessionDraftState().selectedPresetValue, "profile:owner-b:shared");
+
+state.selectedPresetValue = "company:different-owner";
+elements.presetSelect.value = state.selectedPresetValue;
+renderPresetOptions();
+assert.strictEqual(elements.presetSelect.value, "company:different-owner");
+assert.strictEqual(generationProfileIdForPayload(), "company:different-owner");
+assert.strictEqual(currentQuoteSessionDraftState().selectedPresetValue, "company:different-owner");
+
+state.selectedPresetValue = "";
+elements.presetSelect.value = "";
+const inferred = currentQuoteSessionDraftState();
+assert.strictEqual(inferred.selectedPresetValue, "");
+await applyQuoteSessionSnapshot({ ...deepClone(inferred), browserRecoveryScope: "scope-231" }, {
+  forceQuoteView: true,
+  sessionId: "quote-authority-231",
+});
+assert.strictEqual(state.selectedPresetValue, "company:different-owner");
+assert.strictEqual(generationProfileIdForPayload(), "company:different-owner");
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
     def test_static_catalog_output_description_edits_survive_normalize_render_snapshot_and_line_items(self):
         node = require_node(self)
 
@@ -29891,12 +30643,13 @@ async function main() {
       basis: JSON.stringify(state.quoteBasisSections),
       output: JSON.stringify(state.outputRows),
       lineItems: JSON.stringify(state.lineItems),
+      derivedLineItems: JSON.stringify(outputRowsToLineItems(state.outputRows)),
     }));
     assert.strictEqual(restored.review, null);
     assert.strictEqual(restored.lifecycle, fresh.lifecycle);
     assert.strictEqual(restored.basis, fresh.basis);
     assert.strictEqual(restored.output, fresh.output);
-    assert.strictEqual(restored.lineItems, JSON.stringify([fresh.lineItem]));
+    assert.strictEqual(restored.lineItems, restored.derivedLineItems);
     assert.strictEqual(restored.snapshot.pricing_basis.id, referenceId);
     assert.strictEqual(restored.snapshot.pricing_basis.source, "company");
 

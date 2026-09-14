@@ -85,11 +85,59 @@ function startServer() {
   return { server, output };
 }
 
+function startServerAt(port, dataRoot, serverOptions = {}) {
+  const server = spawn(
+    pythonCommand(),
+    ["webapp/server.py", "--host", serverOptions.host || options.host, "--port", String(port)],
+    {
+      cwd: root,
+      env: {
+        ...process.env,
+        APP_MODE: "local",
+        QUOTE_DATA_ROOT: dataRoot,
+        ...(serverOptions.outputRoot ? { QUOTE_OUTPUT_ROOT: serverOptions.outputRoot } : {}),
+        ...(serverOptions.tmpRoot ? { QUOTE_TMP_ROOT: serverOptions.tmpRoot } : {}),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    },
+  );
+  const output = [];
+  const collect = (chunk) => {
+    output.push(String(chunk));
+    if (output.join("").length > 8000) output.shift();
+  };
+  server.stdout.on("data", collect);
+  server.stderr.on("data", collect);
+  return { server, output };
+}
+
+async function waitForHealthAt(url, timeoutMs = 15000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    try {
+      const response = await fetch(`${url}/api/health`, { signal: AbortSignal.timeout(1200) });
+      if (response.ok) return true;
+    } catch {
+      // Keep polling until the bounded startup timeout.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+  return false;
+}
+
 async function stopServer(serverInfo) {
   if (!serverInfo || options.keepServer) return;
   if (serverInfo.server.killed) return;
+  if (serverInfo.server.exitCode !== null || serverInfo.server.signalCode !== null) return;
   serverInfo.server.kill();
-  await new Promise((resolve) => serverInfo.server.once("exit", resolve));
+  await new Promise((resolve) => {
+    if (serverInfo.server.exitCode !== null || serverInfo.server.signalCode !== null) {
+      resolve();
+      return;
+    }
+    serverInfo.server.once("exit", resolve);
+  });
 }
 
 async function screenshot(page, name) {
@@ -1312,7 +1360,9 @@ async function verifyPricingReferenceSelectionCommitsOnCustomerNext(page) {
     await page.unroute(savePattern);
   }
 }
-async function installMockProfiles(page) {
+async function installMockProfiles(page, options = {}) {
+  const profileId = options.profileId || "synthetic-exhibition-fixture-template";
+  const presetId = options.presetId || "synthetic-fixture-default";
   await page.route("**/api/settings/pricing-references/synthetic-exhibition-fixture-pricing**", async (route) => {
     if (route.request().method() !== "GET") {
       await route.fallback();
@@ -1350,13 +1400,13 @@ async function installMockProfiles(page) {
       contentType: "application/json",
       body: JSON.stringify({
         profiles: [{
-          id: "synthetic-exhibition-fixture-template",
+          id: profileId,
           label: "Synthetic Exhibition Fixture Template",
           description: "Test-only profile for the Playwright smoke.",
           default_pricing_reference: "synthetic-exhibition-fixture-pricing",
-          default_quote_detail_preset: "synthetic-fixture-default",
+          default_quote_detail_preset: presetId,
           quote_detail_presets: [{
-            id: "synthetic-fixture-default",
+            id: presetId,
             name: "Synthetic Fallback Quote Company",
             details: {
               company: {
@@ -1385,7 +1435,7 @@ async function installMockProfiles(page) {
           item_count: 1,
           digest_sha256: "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7",
         }],
-        default_profile_id: "synthetic-exhibition-fixture-template",
+        default_profile_id: profileId,
         default_pricing_reference_id: "synthetic-exhibition-fixture-pricing",
         company_id: "default",
         workspace: {
@@ -2085,6 +2135,341 @@ async function verifyStaleTabMutationIsRejected(page) {
     }
   } finally {
     await stalePage.close();
+  }
+}
+
+async function verifyReplacementExportArtifactPersistenceG3(parentPage, replacementBaseUrl = baseUrl) {
+  const isolatedContext = await parentPage.context().browser().newContext({ viewport: { width: 1365, height: 768 } });
+  const page = await isolatedContext.newPage();
+  const pageProblems = [];
+  page.on("console", (message) => {
+    if (["error", "warning"].includes(message.type())) pageProblems.push(`${message.type()}: ${message.text()}`);
+  });
+  page.on("pageerror", (error) => pageProblems.push(`pageerror: ${error.message}`));
+  page.on("response", (response) => {
+    if (response.status() >= 400) pageProblems.push(`${response.status()} ${response.url()}`);
+  });
+
+  const hasValue = (value) => value !== undefined && value !== null && String(value).trim() !== "";
+
+  async function currentXlsx(sessionId, label) {
+    const detail = await dashboardQuoteSessionDetail(page, sessionId);
+    const session = detail.quote_session || {};
+    const xlsx = session.exports?.xlsx || {};
+    if (
+      detail.status !== "ok"
+      || session.status?.quote_generated !== true
+      || session.status?.draft_modified !== false
+      || xlsx.filename !== "quotation.xlsx"
+      || xlsx.exists !== true
+      || xlsx.stale === true
+      || !String(xlsx.url || "").trim()
+      || !String(xlsx.url || "").includes(`/api/quote-sessions/${sessionId}/download/xlsx`)
+      || !hasValue(xlsx.publication_id)
+    ) {
+      throw new Error(`${label} did not expose one current owned quotation.xlsx artifact: ${JSON.stringify(detail)}.`);
+    }
+    return { session, xlsx, publicationId: xlsx.publication_id };
+  }
+
+  async function waitForGeneratedOutput(sessionId, label, options = {}) {
+    const requireFreshArtifact = options.requireFreshArtifact !== false;
+    await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 30000 });
+    await page.waitForFunction(({ sessionId, requireFreshArtifact }) => (
+      state.isBooting === false
+      && state.quoteSessionId === sessionId
+      && state.outputRows.length > 0
+      && !state.isPreparingOutput
+      && !state.isGenerating
+      && (!requireFreshArtifact || (Boolean(state.downloadFile?.url) && downloadFileIsFresh()))
+    ), { sessionId, requireFreshArtifact }, { timeout: 30000 });
+    const output = await page.evaluate(() => ({
+      outputRows: state.outputRows.length,
+      outputRevision: state.outputRevision,
+      downloadFresh: downloadFileIsFresh(),
+      activePanel: state.activeSidePanel,
+    }));
+    if (output.activePanel !== "output" || output.outputRows < 1 || (requireFreshArtifact && !output.downloadFresh)) {
+      throw new Error(`${label} did not expose a current generated output: ${JSON.stringify(output)}.`);
+    }
+    return output;
+  }
+
+  async function ordinarySaveRender(sessionId, label) {
+    const saved = await page.evaluate(async () => {
+      renderPricingMatches(state.outputRows);
+      const result = await saveQuoteSessionDraftState({ quoteGenerated: true });
+      return {
+        sessionId: state.quoteSessionId,
+        outputRevision: state.outputRevision,
+        downloadFresh: downloadFileIsFresh(),
+        savedSessionId: result?.session_id || "",
+      };
+    });
+    if (saved.sessionId !== sessionId || saved.savedSessionId !== sessionId || !saved.downloadFresh) {
+      throw new Error(`${label} changed the current XLSX state: ${JSON.stringify(saved)}.`);
+    }
+    return currentXlsx(sessionId, label);
+  }
+
+  async function reloadAndSave(sessionId, label) {
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await waitForGeneratedOutput(sessionId, `${label} restore`);
+    return ordinarySaveRender(sessionId, label);
+  }
+
+  async function genuineJob(jobId, label) {
+    const startedAt = Date.now();
+    let terminal = null;
+    while (Date.now() - startedAt < 60000) {
+      terminal = await page.evaluate(async (safeJobId) => {
+        const response = await fetch(`/api/jobs/${encodeURIComponent(safeJobId)}`);
+        const body = await response.json().catch(() => ({}));
+        return { ok: response.ok, ...body };
+      }, jobId);
+      if (terminal.ok && terminal.status === "completed" && terminal.result?.status === "completed") return terminal;
+      if (!terminal.ok || ["failed", "blocked"].includes(terminal.status) || ["failed", "blocked"].includes(terminal.result?.status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    throw new Error(`${label} did not reach genuine terminal success: ${JSON.stringify(terminal)}.`);
+  }
+
+  try {
+    await installMockProfiles(page, { profileId: "default" });
+    await page.goto(replacementBaseUrl, { waitUntil: "domcontentloaded" });
+    await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 30000 });
+    await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 30000 });
+    await page.waitForFunction(() => state.isBooting === false, null, { timeout: 30000 });
+
+    const pricingSave = await saveSmokePricingReference(page, 10);
+    if (!pricingSave.ok || pricingSave.data?.status !== "saved") {
+      throw new Error(`Replacement smoke could not establish the synthetic pricing reference: ${JSON.stringify(pricingSave)}.`);
+    }
+    const emptyNewQuoteButton = page.locator("#dashboardEmptyNewQuoteButton:not([disabled])");
+    if (await emptyNewQuoteButton.isVisible()) await emptyNewQuoteButton.click();
+    else await page.locator("#newQuoteButton:not([disabled])").click();
+    await page.locator("#imageIntake").waitFor({ state: "visible", timeout: 30000 });
+    await seedQuoteDraftFromTestFixture(page, { fileName: "replacement-override-only-reference.pdf" });
+
+    await page.locator("#sideNextButton", { hasText: "Next: Customer" }).click();
+    await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 30000 });
+    await page.waitForFunction(() => Boolean(state.quoteSessionId && state.quoteCommercialSnapshot?.pricing_basis?.digest), null, { timeout: 30000 });
+    const authority = await page.evaluate(() => ({
+      profileId: state.profileId,
+      generationProfileId: generationProfileIdForPayload(),
+      selectedPresetValue: state.selectedPresetValue,
+      pricingReferenceId: state.pricingReferenceId,
+      pricingReferenceSource: state.pricingReferenceSource,
+      pricingDigest: state.quoteCommercialSnapshot?.pricing_basis?.digest || "",
+    }));
+    if (
+      authority.generationProfileId !== "profile:default"
+      || authority.selectedPresetValue !== "profile:default:synthetic-fixture-default"
+      || authority.pricingReferenceId !== "synthetic-exhibition-fixture-pricing"
+      || authority.pricingReferenceSource !== "local"
+      || !authority.pricingDigest.startsWith("sha256:")
+    ) {
+      throw new Error(`Replacement smoke did not establish the expected profile/pricing authority: ${JSON.stringify(authority)}.`);
+    }
+
+    await page.evaluate(() => {
+      applyDraftBasis([{
+        id: "replacement-override-only",
+        title: "Replacement Override",
+        lines: [{
+          id: "replacement-override-only-line",
+          tag: "Include",
+          text: "Replacement manual override target",
+          quantity: 1,
+          unit: "lot",
+        }],
+      }]);
+      applyDraftLineItems([{
+        section: "Replacement Override",
+        description: "Replacement manual override target",
+        quantity: 1,
+        unit: "lot",
+        price_mode: "Priced",
+      }]);
+      retagBasisSectionConfirmLines("replacement-override-only", "Include");
+      captureOriginalAnalysisSnapshot({ source: "playwright-replacement-g3" });
+      state.blockingClarificationQuestions = [];
+      state.aiFailed = false;
+      state.draftSource = "playwright-replacement-g3";
+      updateQuoteBasisCard("playwright-replacement-g3");
+      setWorkflowStage("basis_review");
+      setSidePanel("basis", { force: true });
+      syncControlStates();
+    });
+    const basisState = await page.evaluate(() => ({
+      lineItems: state.lineItems.length,
+      outputRows: state.outputRows.length,
+      tags: state.quoteBasisSections.flatMap((section) => section.lines || []).map((line) => line.tag),
+      nextDisabled: document.querySelector("#sideNextButton")?.getAttribute("aria-disabled"),
+    }));
+    if (
+      basisState.lineItems !== 1
+      || basisState.outputRows !== 0
+      || JSON.stringify(basisState.tags) !== JSON.stringify(["Include"])
+      || basisState.nextDisabled === "true"
+    ) {
+      throw new Error(`Replacement smoke basis was not ready for ordinary confirmation: ${JSON.stringify(basisState)}.`);
+    }
+
+    const normalizeResponsePromise = page.waitForResponse((response) => (
+      response.request().method() === "POST"
+      && new URL(response.url()).pathname.endsWith("/api/line-items/normalize")
+    ), { timeout: 30000 });
+    await page.locator("#sideNextButton").click();
+    const normalizeResponse = await normalizeResponsePromise;
+    if (!normalizeResponse.ok()) throw new Error(`Replacement smoke basis confirmation was rejected: ${normalizeResponse.status()}.`);
+    const sessionId = await page.evaluate(() => state.quoteSessionId);
+    await waitForGeneratedOutput(sessionId, "Replacement initial basis confirmation", { requireFreshArtifact: false });
+    const unpricedTarget = await page.evaluate(() => {
+      const row = state.outputRows[0] || {};
+      return {
+        description: row.description,
+        catalogUnitPrice: row.catalog_unit_price,
+        unitPriceOverride: row.unit_price_override,
+        priceMode: row.price_mode,
+      };
+    });
+    if (
+      unpricedTarget.priceMode !== "Priced"
+      || hasValue(unpricedTarget.catalogUnitPrice)
+      || hasValue(unpricedTarget.unitPriceOverride)
+    ) {
+      throw new Error(`Replacement target row did not begin without catalog or override pricing: ${JSON.stringify(unpricedTarget)}.`);
+    }
+
+    await page.locator('#pricingMatchesBody [data-output-edit-field="unit_price_override"]').first().click();
+    const unitPriceEditor = page.locator('[data-output-editor-field="unit_price_override"]').first();
+    await unitPriceEditor.fill("15");
+    await unitPriceEditor.press("Enter");
+    await page.waitForFunction(() => Number(state.outputRows[0]?.unit_price_override) === 15, null, { timeout: 15000 });
+
+    const generatePostPromise = page.waitForResponse((response) => (
+      response.request().method() === "POST"
+      && new URL(response.url()).pathname === "/api/jobs"
+    ), { timeout: 30000 });
+    if (await page.locator("#sideDownloadButton").getAttribute("aria-disabled") !== "false") {
+      throw new Error("Replacement override-only output was not enabled for normal Generate.");
+    }
+    await page.locator("#sideDownloadButton").click();
+    const generatePost = await generatePostPromise;
+    const generateStart = await generatePost.json().catch(() => ({}));
+    if (!generatePost.ok() || !generateStart.job_id) {
+      throw new Error(`Replacement normal Generate did not start a genuine job: ${JSON.stringify(generateStart)}.`);
+    }
+    await genuineJob(generateStart.job_id, "Replacement XLSX generation");
+    await waitForGeneratedOutput(sessionId, "Replacement XLSX generation");
+    const firstXlsx = await currentXlsx(sessionId, "Replacement initial XLSX publication");
+    await ordinarySaveRender(sessionId, "Replacement ordinary post-Generate save/render");
+    const reloadCycle1 = await reloadAndSave(sessionId, "Replacement reload cycle 1");
+    const reloadCycle2 = await reloadAndSave(sessionId, "Replacement reload cycle 2");
+    if (reloadCycle1.publicationId !== firstXlsx.publicationId || reloadCycle2.publicationId !== firstXlsx.publicationId) {
+      throw new Error(`Unchanged replacement cycles changed XLSX publication ownership: ${JSON.stringify({ first: firstXlsx.publicationId, reloadCycle1: reloadCycle1.publicationId, reloadCycle2: reloadCycle2.publicationId })}.`);
+    }
+
+    await page.locator("#backToDashboardButton", { hasText: "Dashboard" }).click();
+    await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 30000 });
+    await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 30000 });
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 30000 });
+    await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 30000 });
+    const dashboardXlsx = await currentXlsx(sessionId, "Replacement Dashboard XLSX reload");
+    const dashboardCard = page.locator(`.dashboard-session-card[data-quote-session-id="${sessionId}"]`);
+    await dashboardCard.waitFor({ state: "visible", timeout: 30000 });
+    const dashboardCardText = await dashboardCard.innerText();
+    if (!/Generated/i.test(dashboardCardText) || /Draft Modified/i.test(dashboardCardText)) {
+      throw new Error(`Replacement Dashboard did not report the XLSX quote as current: ${dashboardCardText}.`);
+    }
+    await dashboardCard.click();
+    await page.locator("#dashboardSelectedSessionPanel").waitFor({ state: "visible", timeout: 30000 });
+    const xlsxLink = page.locator('#dashboardSelectedSessionPanel a[aria-label="Download XLSX"]');
+    await xlsxLink.waitFor({ state: "visible", timeout: 30000 });
+    const xlsxDownloadPromise = page.waitForEvent("download", { timeout: 20000 });
+    await xlsxLink.click();
+    const xlsxDownload = await xlsxDownloadPromise;
+    if (xlsxDownload.suggestedFilename() !== "quotation.xlsx") {
+      throw new Error(`Replacement authenticated XLSX download returned ${xlsxDownload.suggestedFilename()}.`);
+    }
+    const xlsxResponse = await page.evaluate(async (url) => {
+      const response = await fetch(url);
+      return {
+        ok: response.ok,
+        status: response.status,
+        contentType: response.headers.get("Content-Type") || "",
+        contentDisposition: response.headers.get("Content-Disposition") || "",
+      };
+    }, await xlsxLink.getAttribute("href"));
+    if (
+      !xlsxResponse.ok
+      || xlsxResponse.status !== 200
+      || !xlsxResponse.contentType.startsWith("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+      || !xlsxResponse.contentDisposition.includes("quotation.xlsx")
+    ) {
+      throw new Error(`Replacement authenticated XLSX response was not a current attachment: ${JSON.stringify(xlsxResponse)}.`);
+    }
+
+    await page.locator('[data-dashboard-panel-action="modify-session"]', { hasText: "Modify quote" }).click();
+    await waitForGeneratedOutput(sessionId, "Replacement Dashboard modify restore");
+    const beforeEdit = await page.evaluate(() => ({
+      outputRevision: state.outputRevision,
+      unitPrice: state.outputRows[0]?.unit_price_override,
+      downloadFresh: downloadFileIsFresh(),
+    }));
+    if (!beforeEdit.downloadFresh || Number(beforeEdit.unitPrice) !== 15) {
+      throw new Error(`Replacement edit did not start from a current XLSX with unit price 15: ${JSON.stringify(beforeEdit)}.`);
+    }
+    await page.locator('#pricingMatchesBody [data-output-edit-field="unit_price_override"]').first().click();
+    const editedUnitPriceEditor = page.locator('[data-output-editor-field="unit_price_override"]').first();
+    await editedUnitPriceEditor.fill("16");
+    await editedUnitPriceEditor.press("Enter");
+    await page.waitForFunction(({ revision }) => (
+      state.outputRevision > revision
+      && Number(state.outputRows[0]?.unit_price_override) === 16
+      && !downloadFileIsFresh()
+    ), { revision: beforeEdit.outputRevision }, { timeout: 15000 });
+    await page.evaluate(async () => {
+      renderPricingMatches(state.outputRows);
+      await saveQuoteSessionDraftState({ quoteGenerated: true });
+    });
+    const invalidatedDetail = await dashboardQuoteSessionDetail(page, sessionId);
+    const invalidated = invalidatedDetail.quote_session || {};
+    if (
+      invalidated.status?.quote_generated !== false
+      || invalidated.status?.draft_modified !== true
+      || invalidated.exports?.xlsx?.stale !== true
+    ) {
+      throw new Error(`Replacement commercial edit did not invalidate the committed XLSX: ${JSON.stringify(invalidatedDetail)}.`);
+    }
+    await page.locator("#backToDashboardButton", { hasText: "Dashboard" }).click();
+    await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 30000 });
+    await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 30000 });
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 30000 });
+    await page.locator("#dashboardLoadingModal").waitFor({ state: "hidden", timeout: 30000 });
+    const invalidatedCard = page.locator(`.dashboard-session-card[data-quote-session-id="${sessionId}"]`);
+    await invalidatedCard.waitFor({ state: "visible", timeout: 30000 });
+    if (!/Draft Modified/i.test(await invalidatedCard.innerText())) {
+      throw new Error(`Replacement Dashboard did not surface the real edit as Draft Modified: ${await invalidatedCard.innerText()}.`);
+    }
+    if (pageProblems.length) {
+      throw new Error(`Replacement browser page reported console/network problems: ${JSON.stringify(pageProblems)}.`);
+    }
+    return {
+      sessionId,
+      xlsxPublicationId: firstXlsx.publicationId,
+      reloadCycle1: true,
+      reloadCycle2: true,
+      dashboardXlsxCurrent: dashboardXlsx.session.status?.quote_generated === true,
+      xlsxDownload: true,
+      realEditInvalidates: true,
+      independentPdfBlocker: "workbook_export_unavailable",
+    };
+  } finally {
+    await isolatedContext.close();
   }
 }
 
@@ -3448,6 +3833,35 @@ async function main() {
     await verifyConfirmBasisSurvivesImmediateRefresh(page);
     await verifyGenerationLoadingModalSurvivesRefresh(page);
     await verifyGenerationTerminalRecoveryAfterRefresh(page);
+    const replacementPort = options.port + 1;
+    const replacementBaseUrl = `http://${options.host}:${replacementPort}`;
+    const replacementDataRoot = path.join(root, "_tmp", "playwright-replacement-quote-data");
+    const replacementOutputRoot = path.join(root, "_tmp", "playwright-replacement-output");
+    const replacementTmpRoot = path.join(root, "_tmp", "playwright-replacement-tmp");
+    await Promise.all([
+      fs.rm(replacementDataRoot, { recursive: true, force: true }),
+      fs.rm(replacementOutputRoot, { recursive: true, force: true }),
+      fs.rm(replacementTmpRoot, { recursive: true, force: true }),
+    ]);
+    const replacementServerInfo = startServerAt(replacementPort, replacementDataRoot, {
+      outputRoot: replacementOutputRoot,
+      tmpRoot: replacementTmpRoot,
+    });
+    let replacementExportArtifactPersistenceG3;
+    try {
+      if (!(await waitForHealthAt(replacementBaseUrl))) {
+        const serverOutput = replacementServerInfo.output.join("").trim();
+        throw new Error(`Could not start the isolated replacement smoke server at ${replacementBaseUrl}.${serverOutput ? `\n\n${serverOutput}` : ""}`);
+      }
+      replacementExportArtifactPersistenceG3 = await verifyReplacementExportArtifactPersistenceG3(page, replacementBaseUrl);
+    } finally {
+      await stopServer(replacementServerInfo);
+      await Promise.all([
+        fs.rm(replacementDataRoot, { recursive: true, force: true }),
+        fs.rm(replacementOutputRoot, { recursive: true, force: true }),
+        fs.rm(replacementTmpRoot, { recursive: true, force: true }),
+      ]);
+    }
 
     console.log(JSON.stringify({
       status: "ok",
@@ -3462,6 +3876,7 @@ async function main() {
         dashboardSelectedMobileShot,
         dashboardDeleteModalShot,
       ].filter(Boolean),
+      replacementExportArtifactPersistenceG3,
       consoleProblems,
       networkProblems,
     }, null, 2));
