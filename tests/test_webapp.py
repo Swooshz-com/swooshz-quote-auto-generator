@@ -19618,6 +19618,15 @@ renderPresetOptions();
 assert.strictEqual(state.selectedPresetValue, "company:missing-profile");
 assert.strictEqual(elements.presetSelect.value, "");
 
+for (const lifecycle of ["NEW_UNINITIALISED", "", "EXISTING", "RECOVERED"]) {
+  state.selectedPresetValue = "company:missing-profile";
+  state.quoteCommercialLifecycle = lifecycle;
+  renderPresetOptions();
+  renderPresetOptions();
+  assert.strictEqual(state.selectedPresetValue, "company:missing-profile");
+  assert.strictEqual(elements.presetSelect.value, "");
+}
+
 state.profiles = [{
   id: "owner-b",
   label: "Owner B",
@@ -19634,6 +19643,22 @@ assert.strictEqual(elements.presetSelect.value, "");
 loadDefaultProfilePreset();
 assert.strictEqual(state.selectedPresetValue, "profile:owner-a:shared");
 assert.strictEqual(elements.presetSelect.value, "");
+
+for (const lifecycle of ["NEW_UNINITIALISED", "", "EXISTING", "RECOVERED"]) {
+  state.selectedPresetValue = "profile:owner-a:shared";
+  state.quoteCommercialLifecycle = lifecycle;
+  renderPresetOptions();
+  renderPresetOptions();
+  assert.strictEqual(state.selectedPresetValue, "profile:owner-a:shared");
+  assert.strictEqual(elements.presetSelect.value, "");
+}
+
+for (const malformed of ["profile:", "profile:owner", "profile:owner:preset:extra", "company:", "company:bad value", "arbitrary"]) {
+  state.selectedPresetValue = malformed;
+  state.quoteCommercialLifecycle = "RECOVERED";
+  renderPresetOptions();
+  assert.notStrictEqual(state.selectedPresetValue, malformed);
+}
 
 state.profiles = [{
   id: "quote-layout",
@@ -25522,6 +25547,10 @@ function sessionFileRecordsFromDraft() { return []; }
 function currentBrowserRecoveryScope() { return "scope"; }
 function persistSessionFiles() { return Promise.resolve(); }
 
+const PROFILE_PRESET_PREFIX = "profile:";
+const COMPANY_PROFILE_PRESET_PREFIX = "company:";
+eval(["safeId", "safeProfileId", "profilePresetOptionValue", "profilePresetOptionParts", "companyProfileOptionValue"]
+  .map((name) => extractFunction(name)).join("\n"));
 eval([
   "quoteCommercialSnapshotRawValues",
   "normalizeQuoteCommercialSnapshot",
@@ -25811,6 +25840,10 @@ function clearGeneratedQuoteState() {}
 function canStartAnalysis() { return false; }
 function syncControlStates() {}
 
+const PROFILE_PRESET_PREFIX = "profile:";
+const COMPANY_PROFILE_PRESET_PREFIX = "company:";
+eval(["safeId", "safeProfileId", "profilePresetOptionValue", "profilePresetOptionParts", "companyProfileOptionValue"]
+  .map((name) => extractFunction(name)).join("\n"));
 eval([
   "quoteCommercialSnapshotRawValues",
   "normalizeQuoteCommercialSnapshot",
@@ -26062,6 +26095,10 @@ function sessionFileRecordsFromDraft() { return []; }
 function persistSessionFiles() { return Promise.resolve(); }
 function quoteCommercialReviewRequired() { return Boolean(state.quoteCommercialReview && state.quoteCommercialReview.status === QUOTE_COMMERCIAL_REVIEW_STATUS); }
 
+const PROFILE_PRESET_PREFIX = "profile:";
+const COMPANY_PROFILE_PRESET_PREFIX = "company:";
+eval(["safeId", "safeProfileId", "profilePresetOptionValue", "profilePresetOptionParts", "companyProfileOptionValue"]
+  .map((name) => extractFunction(name)).join("\n"));
 eval([
   "quoteCommercialSnapshotRawValues",
   "normalizeQuoteCommercialSnapshot",
@@ -28984,6 +29021,7 @@ const CANONICAL_OUTPUT_TIE_FIELDS = [
 ];
 
 eval([
+  "canonicalPrimaryOrderValue",
   "canonicalOrderSlot",
   "canonicalValueSlot",
   "compareCanonicalValues",
@@ -29103,6 +29141,49 @@ assert.strictEqual(canonical.length, rows.length);
 assert.strictEqual(canonical.filter((item) => item.source_basis_line_id === "exact-duplicate").length, 2);
 assert.notStrictEqual(canonical, rows);
 assert.strictEqual(JSON.stringify(canonicalOutputRowOrderKey(rows[5])), JSON.stringify(canonicalOutputRowOrderKey(rows[6])));
+
+const invalidOrderValues = [undefined, "", null, 0, -1, 0.5, 1.5, "abc"];
+for (const field of ["basis_order", "category_order", "item_order"]) {
+  const invalidRows = invalidOrderValues.map((value, index) => {
+    const candidate = row({ source_basis_line_id: `invalid-${field}-${index}` });
+    if (value !== undefined) candidate[field] = value;
+    return candidate;
+  });
+  const canonicalInvalid = canonicalPersistedOutputRows(invalidRows);
+  assert.ok(canonicalInvalid.every((item) => item[field] === ""));
+  assert.ok(canonicalInvalid.every((item) => canonicalOrderSlot(item[field])[0] === 1));
+
+  const absent = row({ source_basis_line_id: `same-key-${field}` });
+  const fractional = row({ source_basis_line_id: `same-key-${field}`, [field]: 0.5 });
+  const [canonicalAbsent, canonicalFractional] = canonicalPersistedOutputRows([absent, fractional]);
+  assert.deepStrictEqual(canonicalOutputRowOrderKey(canonicalAbsent), canonicalOutputRowOrderKey(canonicalFractional));
+  assert.deepStrictEqual(canonicalAbsent, canonicalFractional);
+}
+const validOrders = canonicalPersistedOutputRows([
+  row({ source_basis_line_id: "valid-number-one", basis_order: 1, category_order: 1, item_order: 1 }),
+  row({ source_basis_line_id: "valid-number-two", basis_order: 2, category_order: 2, item_order: 2 }),
+  row({ source_basis_line_id: "valid-string-two", basis_order: "2", category_order: "2", item_order: "2" }),
+]);
+assert.deepStrictEqual(
+  validOrders.map((item) => [item.basis_order, item.category_order, item.item_order]),
+  [[1, 1, 1], [2, 2, 2], [2, 2, 2]],
+);
+
+const malformedRows = [
+  row({ source_basis_line_id: "invalid-a", basis_order: 0.5, category_order: null, item_order: "abc" }),
+  row({ source_basis_line_id: "invalid-b", basis_order: "", category_order: -1, item_order: 1.5 }),
+  row({ source_basis_line_id: "invalid-c", category_order: 0, item_order: null }),
+];
+const canonicalOnce = canonicalPersistedOutputRows(malformedRows);
+const canonicalTwice = canonicalPersistedOutputRows(canonicalOnce);
+assert.deepStrictEqual(canonicalTwice, canonicalOnce);
+const malformedPermutations = [
+  malformedRows,
+  [malformedRows[2], malformedRows[0], malformedRows[1]],
+  [malformedRows[1], malformedRows[2], malformedRows[0]],
+];
+const malformedBytes = malformedPermutations.map((items) => JSON.stringify(canonicalPersistedOutputRows(items)));
+assert.strictEqual(new Set(malformedBytes).size, 1);
 
 const primaryOrder = canonical.map((item) => item.source_basis_line_id);
 assert.deepStrictEqual(primaryOrder.slice(0, 3), [
@@ -29233,6 +29314,26 @@ assert.strictEqual(liveSnapshot.outputSortMode, "name");
 
 liveSnapshot = {
   ...liveSnapshot,
+  outputRows: malformedRows,
+  originalOutputRows: malformedRows,
+  lineItems: [],
+  pricingMatches: [],
+};
+const invalidSavedA = currentQuoteSessionDraftState();
+liveSnapshot = { ...liveSnapshot, ...invalidSavedA };
+const invalidSavedB = currentQuoteSessionDraftState();
+liveSnapshot = { ...liveSnapshot, ...invalidSavedB };
+const invalidSavedC = currentQuoteSessionDraftState();
+assert.strictEqual(JSON.stringify(invalidSavedA), JSON.stringify(invalidSavedB));
+assert.strictEqual(JSON.stringify(invalidSavedB), JSON.stringify(invalidSavedC));
+assert.strictEqual(JSON.stringify(invalidSavedA.outputRows), JSON.stringify(invalidSavedA.pricingMatches));
+assert.deepStrictEqual(
+  invalidSavedA.lineItems.map((item) => item.source_basis_line_id),
+  invalidSavedA.outputRows.map((item) => item.source_basis_line_id),
+);
+
+liveSnapshot = {
+  ...liveSnapshot,
   outputRows: [],
   originalOutputRows: [],
   lineItems: [{ source_basis_line_id: "legitimate-draft" }],
@@ -29270,6 +29371,62 @@ assert.strictEqual(legacyGenerated.outputSortMode, "pricing_reference");
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_run548_authenticated_workspace_browser_stable_ordering_and_download_rejections(self):
+        node = require_node(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{(root / 'sqag-run548-browser.sqlite3').as_posix()}"
+            owner_session = self.platform_auth_session("workspace-run548", membership_role="admin", user_id="run548-owner")
+            cross_workspace_session = self.platform_auth_session("workspace-run548-other", membership_role="admin", user_id="run548-other")
+            env = self.platform_launch_env(
+                SQAG_STORAGE_MODE="database",
+                SQAG_ARTIFACT_STORAGE_MODE="database",
+                SQAG_DATABASE_URL=database_url,
+                QUOTE_DATA_ROOT=str(root / "data"),
+                QUOTE_OUTPUT_ROOT=str(root / "output"),
+                QUOTE_TMP_ROOT=str(root / "tmp"),
+                QUOTE_LOG_ROOT=str(root / "logs"),
+            )
+            host_runtime_env = {
+                name: os.environ[name]
+                for name in (
+                    "PATH", "SystemRoot", "WINDIR", "COMSPEC", "TEMP", "TMP",
+                    "SystemDrive", "PROGRAMDATA", "USERPROFILE", "LOCALAPPDATA", "APPDATA",
+                    "PLAYWRIGHT_BROWSERS_PATH",
+                )
+                if os.environ.get(name)
+            }
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(webapp, "validated_platform_auth_session", side_effect=lambda session: session),
+            ):
+                webapp.apply_sqag_storage_migrations(database_url)
+                storage = webapp.app_storage_for_auth_session(owner_session)
+                storage.save_profile(workspace_profile_with_layout("default"))
+                browser_env = host_runtime_env.copy()
+                browser_env.update(os.environ)
+                browser_env.update({
+                    "RUN548_AUTHENTICATED_BASE_URL": "",
+                    "RUN548_SESSION_COOKIE_NAME": webapp.SESSION_COOKIE_NAME,
+                    "RUN548_SESSION_COOKIE_VALUE": webapp.signed_cookie_value(owner_session),
+                    "RUN548_CROSS_WORKSPACE_COOKIE_VALUE": webapp.signed_cookie_value(cross_workspace_session),
+                    "RUN548_DATABASE_PATH": str(root / "sqag-run548-browser.sqlite3"),
+                    "RUN548_WORKSPACE_ID": "workspace-run548",
+                })
+                with LocalRunnerServer() as runner:
+                    browser_env["RUN548_AUTHENTICATED_BASE_URL"] = runner.base_url
+                    completed = subprocess.run(
+                        [node, "scripts/playwright-smoke.mjs", "--run548-authenticated-only"],
+                        cwd=str(ROOT),
+                        env=browser_env,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                        timeout=240,
+                    )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn("Run-548 authenticated stable-ordering and artifact boundary: PASS", completed.stdout)
 
     def test_static_catalog_output_description_edits_survive_normalize_render_snapshot_and_line_items(self):
         node = require_node(self)

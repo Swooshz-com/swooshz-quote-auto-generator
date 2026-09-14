@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
@@ -28,11 +28,39 @@ const options = {
 };
 
 const baseUrl = `http://${options.host}:${options.port}`;
+const run548AuthenticatedOnly = args.includes("--run548-authenticated-only");
+const run548AuthenticatedBaseUrl = String(process.env.RUN548_AUTHENTICATED_BASE_URL || "").trim();
+const run548SessionCookieName = String(process.env.RUN548_SESSION_COOKIE_NAME || "").trim();
+const run548SessionCookieValue = String(process.env.RUN548_SESSION_COOKIE_VALUE || "").trim();
+const run548CrossWorkspaceCookieValue = String(process.env.RUN548_CROSS_WORKSPACE_COOKIE_VALUE || "").trim();
+const run548DatabasePath = String(process.env.RUN548_DATABASE_PATH || "").trim();
+const run548WorkspaceId = String(process.env.RUN548_WORKSPACE_ID || "").trim();
 const outputDir = path.join(root, "_logs", "browser", "playwright-smoke");
 const quoteDataRoot = path.join(root, "_tmp", "playwright-quote-data");
 const run546QuoteDataRoot = path.join(root, "_tmp", "run546-quote-data");
 const run546Port = options.port === 8765 ? 8766 : options.port + 1;
-const run546BaseUrl = `http://${options.host}:${run546Port}`;
+const run546BaseUrl = run548AuthenticatedBaseUrl || `http://${options.host}:${run546Port}`;
+const run546PricingReferenceSource = run548AuthenticatedOnly ? "company" : "local";
+let run546ObservedRunId = "";
+let run546ObservedJobId = "";
+
+async function newRun546Context(browser) {
+  const context = await browser.newContext({ viewport: { width: 1365, height: 768 } });
+  if (run548AuthenticatedOnly) {
+    if (!run548AuthenticatedBaseUrl || !run548SessionCookieName || !run548SessionCookieValue) {
+      throw new Error("Run-548 authenticated browser context is missing its synthetic workspace session boundary.");
+    }
+    const target = new URL(run548AuthenticatedBaseUrl);
+    await context.addCookies([{
+      name: run548SessionCookieName,
+      value: run548SessionCookieValue,
+      domain: target.hostname,
+      path: "/",
+      httpOnly: true,
+    }]);
+  }
+  return context;
+}
 
 function stableJson(value) {
   if (Array.isArray(value)) return value.map(stableJson);
@@ -1395,7 +1423,7 @@ async function installMockProfiles(page, options = {}) {
           id: "synthetic-exhibition-fixture-pricing",
           label: "Synthetic Exhibition Fixture Pricing",
           description: "Test-only pricing reference for the Playwright smoke.",
-          source: "local",
+          source: run546PricingReferenceSource,
           schema_version: 1,
           currency: "SGD",
           tax: { label: "GST", rate: 0.09 },
@@ -1419,10 +1447,15 @@ async function installMockProfiles(page, options = {}) {
       contentType: "application/json",
       body: JSON.stringify({
         profiles,
+        company_profiles: run548AuthenticatedOnly ? [{
+          id: "default",
+          label: "Run-548 Authenticated Workspace Profile",
+          defaults: syntheticPresetDetails,
+        }] : [],
         pricing_references: [{
           id: "synthetic-exhibition-fixture-pricing",
           label: "Synthetic Exhibition Fixture Pricing",
-          source: "local",
+          source: run546PricingReferenceSource,
           currency: "SGD",
           tax: { label: "GST", rate: 0.09 },
           item_count: 1,
@@ -1442,10 +1475,10 @@ async function installMockProfiles(page, options = {}) {
 }
 
 async function saveSmokePricingReference(page, internalCost) {
-  return page.evaluate(async ({ internalCost }) => postJson("/api/settings/pricing-references", {
+  return page.evaluate(async ({ internalCost, referenceSource }) => postJson("/api/settings/pricing-references", {
     id: "synthetic-exhibition-fixture-pricing",
     label: "Synthetic Exhibition Fixture Pricing",
-    source: "local",
+    source: referenceSource,
     currency: "SGD",
     tax: { label: "GST", rate: 0.09 },
     items: [{
@@ -1459,7 +1492,7 @@ async function saveSmokePricingReference(page, internalCost) {
     }],
     update_existing: true,
     editing_reference_id: "synthetic-exhibition-fixture-pricing",
-  }), { internalCost });
+  }), { internalCost, referenceSource: run546PricingReferenceSource });
 }
 
 async function verifyServerPricingReferenceReviewDurability(page) {
@@ -1788,11 +1821,11 @@ async function verifyFreshPricingAuthorityInitializesBeforeCustomer(page) {
   }
 }
 
-async function verifyRecoveredTemplateOwnerFailsClosed(page) {
-  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+async function verifyRecoveredTemplateOwnerFailsClosed(page, targetUrl = baseUrl) {
+  await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
   await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
   await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
-  const result = await page.evaluate(() => {
+  const result = await page.evaluate(async () => {
     const original = {
       profiles: structuredClone(state.profiles),
       companyProfiles: structuredClone(state.companyProfiles),
@@ -1807,7 +1840,10 @@ async function verifyRecoveredTemplateOwnerFailsClosed(page) {
       id: "owner-b",
       label: "Owner B",
       default_quote_detail_preset: "shared",
-      quote_detail_presets: [{ id: "shared", name: "Owner B Shared", details: {} }],
+      quote_detail_presets: [
+        { id: "shared", name: "Owner B Shared", details: {} },
+        { id: "valid", name: "Owner B Valid", details: { company: { name: "Owner B Valid", header_details: "Owner B" } } },
+      ],
     }];
     try {
       state.profiles = ownerBProfiles;
@@ -1848,6 +1884,85 @@ async function verifyRecoveredTemplateOwnerFailsClosed(page) {
       const recoveredSessionProfileId = currentQuoteSessionPayload().quote_company_profile?.id || "";
       const recoveredSnapshot = buildSessionSnapshot();
 
+      const matchingAlternativeDetails = {
+        company: {
+          name: "Different Owner Company",
+          header_details: "Different Owner Company\n1 Alternative Street",
+        },
+      };
+      state.companyProfiles = [{
+        id: "different-owner",
+        label: "Different Owner",
+        defaults: matchingAlternativeDetails,
+      }];
+      const ownershipCycles = {};
+      const runOwnershipCycles = async (selector, lifecycle) => {
+        const snapshot = buildSessionSnapshot();
+        snapshot.selectedPresetValue = selector;
+        snapshot.quoteCommercialLifecycle = lifecycle;
+        snapshot.quoteDetails = structuredClone(matchingAlternativeDetails);
+        snapshot.quoteSessionId = "";
+        snapshot.quoteSessionDraftSaveStarted = false;
+        snapshot.outputRows = [];
+        snapshot.originalOutputRows = [];
+        snapshot.lineItems = [];
+        snapshot.pricingMatches = [];
+        const values = [];
+        let current = snapshot;
+        for (let cycle = 0; cycle < 3; cycle += 1) {
+          if (cycle > 0) {
+            const applied = await applyQuoteSessionSnapshot(current, {
+              forceQuoteView: true,
+              sessionId: current.quoteSessionId,
+            });
+            if (!applied) throw new Error(`Ownership cycle ${cycle} could not restore.`);
+          } else {
+            state.selectedPresetValue = selector;
+            state.quoteCommercialLifecycle = lifecycle;
+          }
+          renderPresetOptions();
+          renderPresetOptions();
+          current = currentQuoteSessionDraftState();
+          current.quoteSessionId = "";
+          current.quoteSessionDraftSaveStarted = false;
+          values.push({
+            selector: state.selectedPresetValue,
+            generationProfileId: generationProfileIdForPayload(),
+          });
+        }
+        return values;
+      };
+      for (const lifecycle of ["NEW_UNINITIALISED", "", "EXISTING", "RECOVERED"]) {
+        ownershipCycles[`profile:${lifecycle || "legacy"}`] = await runOwnershipCycles("profile:owner-a:shared", lifecycle);
+        ownershipCycles[`company:${lifecycle || "legacy"}`] = await runOwnershipCycles("company:missing-owner", lifecycle);
+      }
+
+      state.profiles = ownerBProfiles;
+      state.companyProfiles = [{
+        id: "different-owner",
+        label: "Different Owner",
+        defaults: matchingAlternativeDetails,
+      }];
+      state.quoteCommercialLifecycle = "NEW_UNINITIALISED";
+      state.selectedPresetValue = "profile:owner-b:valid";
+      renderPresetOptions();
+      const validProfile = state.selectedPresetValue;
+      state.selectedPresetValue = "company:different-owner";
+      renderPresetOptions();
+      const validCompany = state.selectedPresetValue;
+      const inferredSnapshot = buildSessionSnapshot();
+      inferredSnapshot.selectedPresetValue = "";
+      inferredSnapshot.quoteCommercialLifecycle = "NEW_UNINITIALISED";
+      inferredSnapshot.quoteDetails = structuredClone(matchingAlternativeDetails);
+      inferredSnapshot.quoteSessionId = "";
+      inferredSnapshot.quoteSessionDraftSaveStarted = false;
+      await applyQuoteSessionSnapshot(inferredSnapshot, {
+        forceQuoteView: true,
+        sessionId: inferredSnapshot.quoteSessionId,
+      });
+      renderPresetOptions();
+      const inferredCompany = state.selectedPresetValue;
+
       window.localStorage.removeItem(LAST_SELECTION_STORAGE_KEY);
       state.quoteCommercialLifecycle = "NEW_UNINITIALISED";
       state.selectedPresetValue = "";
@@ -1870,6 +1985,10 @@ async function verifyRecoveredTemplateOwnerFailsClosed(page) {
         recoveredSessionProfileId,
         generationPayloadError,
         recoveredSnapshotSelected: recoveredSnapshot.selectedPresetValue,
+        ownershipCycles,
+        validProfile,
+        validCompany,
+        inferredCompany,
         normalNewQuote,
       };
     } finally {
@@ -1894,6 +2013,19 @@ async function verifyRecoveredTemplateOwnerFailsClosed(page) {
   }
   if (result.recoveredSnapshotSelected !== "profile:owner-a:shared") {
     throw new Error(`Recovered template owner identity was not preserved in the session snapshot: ${JSON.stringify(result)}.`);
+  }
+  for (const [caseName, cycles] of Object.entries(result.ownershipCycles)) {
+    const expectedSelector = caseName.startsWith("profile:") ? "profile:owner-a:shared" : "company:missing-owner";
+    if (cycles.length !== 3 || cycles.some((cycle) => cycle.selector !== expectedSelector || cycle.generationProfileId !== "")) {
+      throw new Error(`Explicit ownership was not durable and fail-closed for ${caseName}: ${JSON.stringify(result)}.`);
+    }
+  }
+  if (
+    result.validProfile !== "profile:owner-b:valid"
+    || result.validCompany !== "company:different-owner"
+    || result.inferredCompany !== "company:different-owner"
+  ) {
+    throw new Error(`Valid preset or empty-selector inference control failed: ${JSON.stringify(result)}.`);
   }
   if (
     result.normalNewQuote.selected !== "profile:owner-b:shared"
@@ -2175,6 +2307,31 @@ function run546HasPositiveOrder(value) {
 }
 
 async function run546LocalPublicationReceipt(sessionId) {
+  if (run548AuthenticatedOnly) {
+    if (!run548DatabasePath || !run548WorkspaceId) {
+      throw new Error("Run-548 authenticated publication receipt is missing its synthetic database binding.");
+    }
+    const metadataText = execFileSync(pythonCommand(), [
+      "-c",
+      "import json,sqlite3,sys; c=sqlite3.connect(sys.argv[1]); r=c.execute('select metadata_json from sqag_quote_sessions where workspace_id = ? and session_id = ?', (sys.argv[2],sys.argv[3])).fetchone(); print(r[0] if r else '{}')",
+      run548DatabasePath,
+      run548WorkspaceId,
+      sessionId,
+    ], { cwd: root, encoding: "utf8", windowsHide: true });
+    const metadata = JSON.parse(metadataText);
+    const publication = metadata.publication && typeof metadata.publication === "object" ? metadata.publication : {};
+    const xlsx = metadata.exports?.xlsx && typeof metadata.exports.xlsx === "object" ? metadata.exports.xlsx : {};
+    return {
+      publication: {
+        active_publication_id: String(publication.active_publication_id || ""),
+        run_id: String(publication.run_id || run546ObservedRunId),
+        job_id: String(publication.job_id || run546ObservedJobId),
+        committed_draft_state_digest: String(publication.committed_draft_state_digest || ""),
+        committed_output_revision: Number(publication.committed_output_revision),
+      },
+      xlsx: { publication_id: String(xlsx.publication_id || "") },
+    };
+  }
   const metadataPath = path.join(run546QuoteDataRoot, "quote-sessions", sessionId, "quote-session.json");
   const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
   const publication = metadata.publication && typeof metadata.publication === "object" ? metadata.publication : {};
@@ -2306,10 +2463,11 @@ async function run546AssertCurrentPublication(detail, sessionId, baseline, label
 
 async function verifyRun546CanonicalExportArtifactPersistence(page) {
   let sessionId = "";
-  const isolatedContext = await page.context().browser().newContext({ viewport: { width: 1365, height: 768 } });
+  const isolatedContext = await newRun546Context(page.context().browser());
   const runPage = await isolatedContext.newPage();
   let generationPostCount = 0;
   let generationJobId = "";
+  let generationResponse = null;
   runPage.on("request", (request) => {
     if (request.method() !== "POST" || !request.url().endsWith("/api/jobs")) return;
     const payload = request.postDataJSON();
@@ -2317,6 +2475,13 @@ async function verifyRun546CanonicalExportArtifactPersistence(page) {
       generationPostCount += 1;
       generationJobId = String(payload.job_id || "");
     }
+  });
+  runPage.on("response", async (response) => {
+    if (!response.url().endsWith("/api/jobs") || response.request().method() !== "POST") return;
+    generationResponse = {
+      status: response.status(),
+      body: await response.json().catch(() => ({})),
+    };
   });
   try {
     await installMockProfiles(runPage, { generationProfileId: "default" });
@@ -2327,7 +2492,7 @@ async function verifyRun546CanonicalExportArtifactPersistence(page) {
     if (!savedReference.ok || savedReference.data?.status !== "saved") {
       throw new Error("Run-546 could not establish the synthetic pricing reference.");
     }
-    const legacyContext = await page.context().browser().newContext({ viewport: { width: 1365, height: 768 } });
+    const legacyContext = await newRun546Context(page.context().browser());
     const legacyPage = await legacyContext.newPage();
     try {
       await installMockProfiles(legacyPage, { generationProfileId: "default" });
@@ -2437,6 +2602,17 @@ async function verifyRun546CanonicalExportArtifactPersistence(page) {
     await runPage.locator("#sideNextButton", { hasText: "Next: Customer" }).click();
     await runPage.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
     await runPage.waitForFunction(() => Boolean(state.quoteSessionId && state.quoteCommercialSnapshot?.pricing_basis?.digest), null, { timeout: 15000 });
+    if (run548AuthenticatedOnly) {
+      const selectedWorkspaceProfile = await runPage.evaluate(() => {
+        const value = companyProfileOptionValue("default");
+        if (!selectPresetValue(value)) return false;
+        loadSelectedPreset({ silent: true, allowOwnedInitialization: true, resetGeneratedState: false });
+        return state.selectedPresetValue === value;
+      });
+      if (!selectedWorkspaceProfile) {
+        throw new Error("Run-548 could not select the authenticated workspace company profile.");
+      }
+    }
 
     const seeded = await runPage.evaluate(() => {
       state.quoteBasisSections = normalizeQuoteBasisSections([
@@ -2619,6 +2795,7 @@ async function verifyRun546CanonicalExportArtifactPersistence(page) {
         selectedPresetSource: selectedPreset()?.source || "",
         generationPostCount: postCount,
       }), generationPostCount);
+      generationFailure.generationResponse = generationResponse;
       throw new Error(`Run-546 normal generation did not publish quotation.xlsx: ${JSON.stringify(generationFailure)}.`);
     }
     if (generationPostCount !== 1) throw new Error("Run-546 did not use exactly one normal generate job.");
@@ -2628,6 +2805,8 @@ async function verifyRun546CanonicalExportArtifactPersistence(page) {
     const generationContext = await runPage.evaluate(() => ({
       runId: String(state.lastGenerationRunId || ""),
     }));
+    run546ObservedRunId = generationContext.runId;
+    run546ObservedJobId = generationJobId;
     publicationReceiptA.publication.run_id = generationContext.runId;
     publicationReceiptA.publication.job_id = generationJobId;
     if (!publicationReceiptA.publication.run_id || !publicationReceiptA.publication.job_id) {
@@ -2636,10 +2815,10 @@ async function verifyRun546CanonicalExportArtifactPersistence(page) {
     const publicationA = run546PublicationProjection(publicationDetail, publicationReceiptA);
     if (
       publicationDetail.status !== "ok"
-      || !publicationA.identity.activePublicationId
       || !publicationA.identity.runId
       || !publicationA.identity.jobId
-      || !publicationA.identity.xlsxPublicationId
+      || (!run548AuthenticatedOnly && !publicationA.identity.activePublicationId)
+      || (!run548AuthenticatedOnly && !publicationA.identity.xlsxPublicationId)
       || !/^[0-9a-f]{64}$/i.test(publicationA.committedDraftStateDigest)
       || !Number.isInteger(publicationA.committedOutputRevision)
       || publicationA.committedOutputRevision < 1
@@ -2778,6 +2957,45 @@ async function verifyRun546CanonicalExportArtifactPersistence(page) {
     if (download.suggestedFilename() !== "quotation.xlsx") throw new Error("Run-546 authenticated XLSX download had an unexpected filename.");
     await download.delete().catch(() => {});
 
+    if (run548AuthenticatedOnly) {
+      const downloadUrl = dashboardDetail.quote_session.exports.xlsx.url;
+      const unauthenticatedContext = await page.context().browser().newContext();
+      try {
+        const unauthenticated = await unauthenticatedContext.request.get(`${run546BaseUrl}${downloadUrl}`);
+        if (unauthenticated.status() !== 401) {
+          throw new Error(`Run-548 unauthenticated download was not rejected: ${unauthenticated.status()}.`);
+        }
+      } finally {
+        await unauthenticatedContext.close();
+      }
+      if (!run548CrossWorkspaceCookieValue) {
+        throw new Error("Run-548 cross-workspace rejection is missing its synthetic workspace identity.");
+      }
+      const crossWorkspaceContext = await page.context().browser().newContext();
+      try {
+        const target = new URL(run546BaseUrl);
+        await crossWorkspaceContext.addCookies([{
+          name: run548SessionCookieName,
+          value: run548CrossWorkspaceCookieValue,
+          domain: target.hostname,
+          path: "/",
+          httpOnly: true,
+        }]);
+        const crossWorkspace = await crossWorkspaceContext.request.get(`${run546BaseUrl}${downloadUrl}`);
+        if (crossWorkspace.status() !== 404) {
+          throw new Error(`Run-548 cross-workspace download was not rejected: ${crossWorkspace.status()}.`);
+        }
+      } finally {
+        await crossWorkspaceContext.close();
+      }
+      const wrongVersion = await isolatedContext.request.get(
+        `${run546BaseUrl}/api/jobs/job-run548-wrong-version/files/quotation.xlsx`,
+      );
+      if (wrongVersion.status() !== 404) {
+        throw new Error(`Run-548 wrong publication/job version was not rejected: ${wrongVersion.status()}.`);
+      }
+    }
+
     await runPage.locator('[data-dashboard-panel-action="modify-session"]', { hasText: "Modify quote" }).click();
     await runPage.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 30000 });
     await runPage.waitForFunction(() => state.isBooting === false && !state.isPreparingOutput && state.outputRows.length === 3, null, { timeout: 30000 });
@@ -2798,6 +3016,19 @@ async function verifyRun546CanonicalExportArtifactPersistence(page) {
     const stalePublication = run546PublicationProjection(staleDetail, await run546LocalPublicationReceipt(sessionId));
     if (!stalePublication.draftModified || stalePublication.quoteGenerated || !stalePublication.xlsx.stale) {
       throw new Error("Run-546 genuine commercial edit did not invalidate the prior publication.");
+    }
+    if (run548AuthenticatedOnly) {
+      await runPage.locator("#backToDashboardButton").click();
+      await runPage.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
+      const staleCard = runPage.locator(`.dashboard-session-card[data-quote-session-id="${sessionId}"]`);
+      await staleCard.waitFor({ state: "visible", timeout: 15000 });
+      await staleCard.click();
+      const staleXlsxAction = runPage.locator(
+        "#dashboardSelectedSessionPanel a.dashboard-export-link[download][aria-label*='stale']",
+      );
+      if (await staleXlsxAction.count() !== 1 || !stalePublication.xlsx.stale || stalePublication.quoteGenerated) {
+        throw new Error("Run-548 stale/superseded publication was not rejected as current.");
+      }
     }
   } finally {
     sessionId = sessionId || await runPage.evaluate(() => state.quoteSessionId).catch(() => "");
@@ -3324,6 +3555,26 @@ async function verifyDashboardClearsStaleSessionsBeforeRefresh(page) {
   }
 }
 async function main() {
+  if (run548AuthenticatedOnly) {
+    const browser = await chromium.launch({ headless: !options.headed });
+    const context = await newRun546Context(browser);
+    const page = await context.newPage();
+    try {
+      await verifyRun546CanonicalExportArtifactPersistence(page);
+      const ownershipContext = await newRun546Context(browser);
+      try {
+        const ownershipPage = await ownershipContext.newPage();
+        await verifyRecoveredTemplateOwnerFailsClosed(ownershipPage, run546BaseUrl);
+      } finally {
+        await ownershipContext.close().catch(() => {});
+      }
+      console.log("Run-548 authenticated stable-ordering and artifact boundary: PASS");
+    } finally {
+      await context.close().catch(() => {});
+      await browser.close().catch(() => {});
+    }
+    return;
+  }
   let serverInfo = null;
   let run546ServerInfo = null;
   const hasExistingServer = await healthOk();
@@ -3365,7 +3616,14 @@ async function main() {
   try {
     await installMockProfiles(page);
     await verifyRun546CanonicalExportArtifactPersistence(page);
-    await verifyRecoveredTemplateOwnerFailsClosed(page);
+    const ownershipContext = await browser.newContext({ viewport: { width: 1365, height: 768 } });
+    try {
+      const ownershipPage = await ownershipContext.newPage();
+      await installMockProfiles(ownershipPage);
+      await verifyRecoveredTemplateOwnerFailsClosed(ownershipPage);
+    } finally {
+      await ownershipContext.close().catch(() => {});
+    }
     await verifyFreshPricingAuthorityInitializesBeforeCustomer(page);
     await verifyServerPricingReferenceReviewDurability(page);
     if (args.includes("--recovery-only")) {
@@ -4198,6 +4456,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(error.message || error);
+  console.error(error.stack || error.message || error);
   process.exitCode = 1;
 });

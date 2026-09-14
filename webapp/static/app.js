@@ -4300,7 +4300,23 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
       quoteCommercialStrictDataEqual(detailValues[0], value)
     )));
   const savedQuoteDetails = savedDetailsAreValid && detailValues.length ? detailValues[0] : {};
-  const savedPresetValue = restoredState.selectedPresetValue || presetValueFromQuoteDetails(savedQuoteDetails) || "";
+  const rawSavedPresetValue = typeof restoredState.selectedPresetValue === "string"
+    ? restoredState.selectedPresetValue.trim()
+    : "";
+  const savedProfilePreset = profilePresetOptionParts(rawSavedPresetValue);
+  const savedCompanyId = rawSavedPresetValue.startsWith(COMPANY_PROFILE_PRESET_PREFIX)
+    ? safeProfileId(rawSavedPresetValue.slice(COMPANY_PROFILE_PRESET_PREFIX.length), "")
+    : "";
+  const savedOwnedPresetValue = savedProfilePreset
+    ? profilePresetOptionValue(savedProfilePreset.profileId, savedProfilePreset.presetId)
+    : (
+      savedCompanyId && companyProfileOptionValue(savedCompanyId) === rawSavedPresetValue
+        ? rawSavedPresetValue
+        : ""
+    );
+  const savedPresetValue = savedOwnedPresetValue
+    || (!rawSavedPresetValue ? presetValueFromQuoteDetails(savedQuoteDetails) : "")
+    || "";
   state.selectedPresetValue = savedPresetValue;
   const savedCommercialSnapshot = savedQuoteDetails.commercial_snapshot;
   const normalizedCommercialSnapshot = normalizeQuoteCommercialSnapshot(
@@ -4658,10 +4674,12 @@ function lastSelectedPresetValue() {
 }
 
 function preservedOwnedPresetValue() {
-  if (!["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""))) return "";
   const value = String(state.selectedPresetValue || "").trim();
-  if (value.startsWith(COMPANY_PROFILE_PRESET_PREFIX)) return value;
-  return profilePresetOptionParts(value) ? value : "";
+  const profileParts = profilePresetOptionParts(value);
+  if (profileParts) return profilePresetOptionValue(profileParts.profileId, profileParts.presetId);
+  if (!value.startsWith(COMPANY_PROFILE_PRESET_PREFIX)) return "";
+  const companyId = safeProfileId(value.slice(COMPANY_PROFILE_PRESET_PREFIX.length), "");
+  return companyId && companyProfileOptionValue(companyId) === value ? value : "";
 }
 
 function persistLastProfilePresetSelection(value = state.selectedPresetValue) {
@@ -9255,9 +9273,14 @@ function pricingReferenceOrder(row = {}, fallbackIndex = 0) {
   ];
 }
 
+function canonicalPrimaryOrderValue(value) {
+  const number = numberOrNull(value);
+  return number !== null && Number.isInteger(number) && number > 0 ? number : "";
+}
+
 function canonicalOrderSlot(value) {
-  const number = orderNumber(value);
-  return number === null ? [1, 0] : [0, number];
+  const number = canonicalPrimaryOrderValue(value);
+  return number === "" ? [1, 0] : [0, number];
 }
 
 function canonicalValueSlot(row, field) {
@@ -9301,7 +9324,13 @@ function canonicalOutputRowOrderKey(normalizedRow) {
 
 function canonicalPersistedOutputRows(normalizedRows = []) {
   return (Array.isArray(normalizedRows) ? normalizedRows : [])
-    .map((row) => JSON.parse(JSON.stringify(row)))
+    .map((row) => {
+      const canonical = JSON.parse(JSON.stringify(row));
+      canonical.basis_order = canonicalPrimaryOrderValue(canonical.basis_order);
+      canonical.category_order = canonicalPrimaryOrderValue(canonical.category_order);
+      canonical.item_order = canonicalPrimaryOrderValue(canonical.item_order);
+      return canonical;
+    })
     .sort((left, right) => compareCanonicalValues(
       canonicalOutputRowOrderKey(left),
       canonicalOutputRowOrderKey(right),
