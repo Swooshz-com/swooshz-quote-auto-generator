@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -29,6 +30,9 @@ const options = {
 const baseUrl = `http://${options.host}:${options.port}`;
 const outputDir = path.join(root, "_logs", "browser", "playwright-smoke");
 const quoteDataRoot = path.join(root, "_tmp", "playwright-quote-data");
+const run546QuoteDataRoot = path.join(root, "_tmp", "run546-quote-data");
+const run546Port = options.port === 8765 ? 8766 : options.port + 1;
+const run546BaseUrl = `http://${options.host}:${run546Port}`;
 
 function stableJson(value) {
   if (Array.isArray(value)) return value.map(stableJson);
@@ -46,31 +50,34 @@ function pythonCommand() {
   return "python";
 }
 
-async function healthOk() {
+async function healthOk(url = baseUrl) {
   try {
-    const response = await fetch(`${baseUrl}/api/health`, { signal: AbortSignal.timeout(1200) });
+    const response = await fetch(`${url}/api/health`, { signal: AbortSignal.timeout(1200) });
     return response.ok;
   } catch {
     return false;
   }
 }
 
-async function waitForHealth(timeoutMs = 15000) {
+async function waitForHealth(timeoutMs = 15000, url = baseUrl) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    if (await healthOk()) return true;
+    if (await healthOk(url)) return true;
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
   return false;
 }
 
-function startServer() {
+function startServer(serverOptions = {}) {
+  const serverHost = serverOptions.host || options.host;
+  const serverPort = Number(serverOptions.port || options.port);
+  const serverDataRoot = serverOptions.dataRoot || (process.env.QUOTE_DATA_ROOT || quoteDataRoot);
   const server = spawn(
     pythonCommand(),
-    ["webapp/server.py", "--host", options.host, "--port", String(options.port)],
+    ["webapp/server.py", "--host", serverHost, "--port", String(serverPort)],
     {
       cwd: root,
-      env: { ...process.env, APP_MODE: "local", QUOTE_DATA_ROOT: process.env.QUOTE_DATA_ROOT || quoteDataRoot },
+      env: { ...process.env, APP_MODE: "local", QUOTE_DATA_ROOT: serverDataRoot },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     },
@@ -82,7 +89,12 @@ function startServer() {
   };
   server.stdout.on("data", collect);
   server.stderr.on("data", collect);
-  return { server, output };
+  return {
+    server,
+    output,
+    baseUrl: `http://${serverHost}:${serverPort}`,
+    dataRoot: serverDataRoot,
+  };
 }
 
 async function stopServer(serverInfo) {
@@ -308,21 +320,25 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
     renderPricingMatches(state.outputRows);
     setSidePanel("output", { force: true });
   });
-  await page.locator("#pricingMatchesBody tr").first().waitFor({ state: "visible", timeout: 15000 });
-  const renderedDescription = (await page.locator('#pricingMatchesBody tr:first-child [data-output-label="Description"]').innerText()).trim();
+  const graphicsRow = page.locator("#pricingMatchesBody tr").filter({ hasText: "sqm of printed wall graphics" });
+  await graphicsRow.waitFor({ state: "visible", timeout: 15000 });
+  const renderedDescription = (await graphicsRow.locator('[data-output-label="Description"]').innerText()).trim();
   if (renderedDescription !== "sqm of printed wall graphics") {
     throw new Error(`Output should show the customer-facing bracket-free description, found ${JSON.stringify(renderedDescription)}.`);
   }
   const manualDescription = "Premium reception counter with lockable storage";
-  const descriptionCell = page.locator('#pricingMatchesBody tr:first-child [data-output-edit-field="description"]');
+  const descriptionCell = graphicsRow.locator('[data-output-edit-field="description"]');
   await descriptionCell.click();
   const descriptionEditor = page.locator('[data-output-editor-field="description"]');
   await descriptionEditor.waitFor({ state: "visible", timeout: 15000 });
   await descriptionEditor.fill(manualDescription);
-  await page.locator('#pricingMatchesBody tr:first-child [data-output-edit-field="quantity"]').click();
+  await graphicsRow.locator('[data-output-edit-field="quantity"]').click();
   await page.waitForFunction((expected) => (
-    state.outputRows[0]?.description === expected
-    && document.querySelector('#pricingMatchesBody tr:first-child [data-output-label="Description"]')?.textContent?.trim() === expected
+    state.outputRows.find((row) => row.pricing_keyword === "graphics-vinyl-printed-graphics")?.description === expected
+    && Array.from(document.querySelectorAll('#pricingMatchesBody tr')).some((row) => (
+      row.textContent?.includes(expected)
+      && row.querySelector('[data-output-label="Description"]')?.textContent?.trim() === expected
+    ))
   ), manualDescription, { timeout: 15000 });
   await page.evaluate(() => clearQuoteSessionDraftSaveTimer());
 
@@ -332,16 +348,22 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
     const snapshot = snapshotOutputRows(state.outputRows);
     const lineItems = outputRowsToLineItems(state.outputRows);
     const payload = buildPayload();
+    const outputRow = state.outputRows.find((row) => row.pricing_keyword === "graphics-vinyl-printed-graphics") || {};
+    const snapshotRow = snapshot.find((row) => row.pricing_keyword === "graphics-vinyl-printed-graphics") || {};
+    const lineItem = lineItems.find((row) => row.pricing_keyword === "graphics-vinyl-printed-graphics") || {};
+    const payloadRow = payload.line_items?.find((row) => row.pricing_keyword === "graphics-vinyl-printed-graphics") || {};
     return {
-      stateDescription: state.outputRows[0]?.description || "",
-      renderedDescription: document.querySelector('#pricingMatchesBody tr:first-child [data-output-label="Description"]')?.textContent?.trim() || "",
-      pricingKeyword: state.outputRows[0]?.pricing_keyword || "",
-      catalogUnitPrice: state.outputRows[0]?.catalog_unit_price,
-      snapshotDescription: snapshot[0]?.description || "",
-      lineItemDescription: lineItems[0]?.description || "",
-      lineItemPricingKeyword: lineItems[0]?.pricing_keyword || "",
-      payloadDescription: payload.line_items?.[0]?.description || "",
-      stable: state.outputRows[0]?.description === expected,
+      stateDescription: outputRow.description || "",
+      renderedDescription: Array.from(document.querySelectorAll('#pricingMatchesBody tr'))
+        .find((row) => row.textContent?.includes(expected))
+        ?.querySelector('[data-output-label="Description"]')?.textContent?.trim() || "",
+      pricingKeyword: outputRow.pricing_keyword || "",
+      catalogUnitPrice: outputRow.catalog_unit_price,
+      snapshotDescription: snapshotRow.description || "",
+      lineItemDescription: lineItem.description || "",
+      lineItemPricingKeyword: lineItem.pricing_keyword || "",
+      payloadDescription: payloadRow.description || "",
+      stable: outputRow.description === expected,
     };
   }, manualDescription);
   if (!editEvidence.stable
@@ -366,10 +388,12 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
     });
     return {
       restored,
-      description: state.outputRows[0]?.description || "",
-      renderedDescription: document.querySelector('#pricingMatchesBody tr:first-child [data-output-label="Description"]')?.textContent?.trim() || "",
-      pricingKeyword: state.outputRows[0]?.pricing_keyword || "",
-      matchesExpected: state.outputRows[0]?.description === expected,
+      description: state.outputRows.find((row) => row.pricing_keyword === "graphics-vinyl-printed-graphics")?.description || "",
+      renderedDescription: Array.from(document.querySelectorAll('#pricingMatchesBody tr'))
+        .find((row) => row.textContent?.includes(expected))
+        ?.querySelector('[data-output-label="Description"]')?.textContent?.trim() || "",
+      pricingKeyword: state.outputRows.find((row) => row.description === expected)?.pricing_keyword || "",
+      matchesExpected: state.outputRows.some((row) => row.description === expected && row.pricing_keyword === "graphics-vinyl-printed-graphics"),
     };
   }, manualDescription);
   if (!quoteRestoreEvidence.restored
@@ -386,12 +410,14 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
   await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
   const browserRestoreEvidence = await page.evaluate((expected) => {
     const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
+    const outputRow = state.outputRows.find((row) => row.pricing_keyword === "graphics-vinyl-printed-graphics") || {};
+    const renderedRow = Array.from(document.querySelectorAll('#pricingMatchesBody tr')).find((row) => row.textContent?.includes(expected));
     return {
-      stateDescription: state.outputRows[0]?.description || "",
-      renderedDescription: document.querySelector('#pricingMatchesBody tr:first-child [data-output-label="Description"]')?.textContent?.trim() || "",
-      savedDescription: saved.outputRows?.[0]?.description || "",
-      pricingKeyword: state.outputRows[0]?.pricing_keyword || "",
-      matchesExpected: state.outputRows[0]?.description === expected,
+      stateDescription: outputRow.description || "",
+      renderedDescription: renderedRow?.querySelector('[data-output-label="Description"]')?.textContent?.trim() || "",
+      savedDescription: saved.outputRows?.find((row) => row.pricing_keyword === "graphics-vinyl-printed-graphics")?.description || "",
+      pricingKeyword: outputRow.pricing_keyword || "",
+      matchesExpected: outputRow.description === expected,
     };
   }, manualDescription);
   if (!browserRestoreEvidence.matchesExpected
@@ -425,7 +451,8 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
   if (outputMetrics.rowWidth > 500 || outputMetrics.cells.some((cell) => cell.width > 500)) {
     throw new Error(`Mobile output card overflows the viewport: ${JSON.stringify(outputMetrics)}.`);
   }
-  await page.locator('#pricingMatchesBody tr:first-child [data-output-edit-field="unit_price_override"]').click();
+  const pricedOutputRow = page.locator("#pricingMatchesBody tr").filter({ hasText: manualDescription });
+  await pricedOutputRow.locator('[data-output-edit-field="unit_price_override"]').click();
   await page.locator('[data-output-editor-field="unit_price_override"]').waitFor({ state: "visible", timeout: 15000 });
   await page.locator('[data-output-included-action="true"]').waitFor({ state: "visible", timeout: 15000 });
   await page.keyboard.press("Escape");
@@ -1312,7 +1339,49 @@ async function verifyPricingReferenceSelectionCommitsOnCustomerNext(page) {
     await page.unroute(savePattern);
   }
 }
-async function installMockProfiles(page) {
+async function installMockProfiles(page, options = {}) {
+  const generationProfileId = String(options.generationProfileId || "").trim();
+  const syntheticPresetDetails = {
+    company: {
+      name: "Synthetic Fallback Quote Company Pte Ltd",
+      header_details: "Synthetic Fallback Quote Company Pte Ltd\n1 Synthetic Way\nSingapore 000001",
+      logo_data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+    },
+    quote_text: {
+      payment_terms: ["70% synthetic deposit upon confirmation."],
+      cheque_payee: "Synthetic Fallback Quote Company Pte Ltd",
+    },
+    signature: {
+      company_signatory: "Synthetic Signatory",
+      company_title: "Synthetic Title",
+      company_date_label: "Date:",
+    },
+  };
+  const profiles = generationProfileId
+    ? [{
+      id: generationProfileId,
+      label: "Run-546 Default Generation Profile",
+      description: "Test-only default-backed profile for the Run-546 Playwright smoke.",
+      default_pricing_reference: "synthetic-exhibition-fixture-pricing",
+      default_quote_detail_preset: "run546-generation-default",
+      quote_detail_presets: [{
+        id: "run546-generation-default",
+        name: "Run-546 Synthetic Quote Company",
+        details: syntheticPresetDetails,
+      }],
+    }]
+    : [{
+      id: "synthetic-exhibition-fixture-template",
+      label: "Synthetic Exhibition Fixture Template",
+      description: "Test-only profile for the Playwright smoke.",
+      default_pricing_reference: "synthetic-exhibition-fixture-pricing",
+      default_quote_detail_preset: "synthetic-fixture-default",
+      quote_detail_presets: [{
+        id: "synthetic-fixture-default",
+        name: "Synthetic Fallback Quote Company",
+        details: syntheticPresetDetails,
+      }],
+    }];
   await page.route("**/api/settings/pricing-references/synthetic-exhibition-fixture-pricing**", async (route) => {
     if (route.request().method() !== "GET") {
       await route.fallback();
@@ -1349,33 +1418,7 @@ async function installMockProfiles(page) {
       status: 200,
       contentType: "application/json",
       body: JSON.stringify({
-        profiles: [{
-          id: "synthetic-exhibition-fixture-template",
-          label: "Synthetic Exhibition Fixture Template",
-          description: "Test-only profile for the Playwright smoke.",
-          default_pricing_reference: "synthetic-exhibition-fixture-pricing",
-          default_quote_detail_preset: "synthetic-fixture-default",
-          quote_detail_presets: [{
-            id: "synthetic-fixture-default",
-            name: "Synthetic Fallback Quote Company",
-            details: {
-              company: {
-                name: "Synthetic Fallback Quote Company Pte Ltd",
-                header_details: "Synthetic Fallback Quote Company Pte Ltd\n1 Synthetic Way\nSingapore 000001",
-                logo_data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
-              },
-              quote_text: {
-                payment_terms: ["70% synthetic deposit upon confirmation."],
-                cheque_payee: "Synthetic Fallback Quote Company Pte Ltd",
-              },
-              signature: {
-                company_signatory: "Synthetic Signatory",
-                company_title: "Synthetic Title",
-                company_date_label: "Date:",
-              },
-            },
-          }],
-        }],
+        profiles,
         pricing_references: [{
           id: "synthetic-exhibition-fixture-pricing",
           label: "Synthetic Exhibition Fixture Pricing",
@@ -1385,7 +1428,7 @@ async function installMockProfiles(page) {
           item_count: 1,
           digest_sha256: "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7",
         }],
-        default_profile_id: "synthetic-exhibition-fixture-template",
+        default_profile_id: generationProfileId || "synthetic-exhibition-fixture-template",
         default_pricing_reference_id: "synthetic-exhibition-fixture-pricing",
         company_id: "default",
         workspace: {
@@ -2096,6 +2139,674 @@ async function dashboardQuoteSessionDetail(page, sessionId) {
   }, sessionId);
 }
 
+function run546DraftProjection(draft = {}) {
+  const details = draft.quoteDetails && typeof draft.quoteDetails === "object" ? draft.quoteDetails : {};
+  const commercialSnapshot = details.commercial_snapshot && typeof details.commercial_snapshot === "object"
+    ? details.commercial_snapshot
+    : {};
+  return {
+    outputSortMode: draft.outputSortMode || "",
+    outputRows: Array.isArray(draft.outputRows) ? draft.outputRows : [],
+    pricingMatches: Array.isArray(draft.pricingMatches) ? draft.pricingMatches : [],
+    lineItems: Array.isArray(draft.lineItems) ? draft.lineItems : [],
+    originalOutputRows: Array.isArray(draft.originalOutputRows) ? draft.originalOutputRows : [],
+    outputRevision: draft.outputRevision,
+    profileId: draft.profileId || "",
+    selectedPresetValue: draft.selectedPresetValue || "",
+    pricingReferenceId: draft.pricingReferenceId || "",
+    pricingReferenceSource: draft.pricingReferenceSource || "",
+    pricingBasis: draft.pricingBasis || commercialSnapshot.pricing_basis || null,
+    quoteBasis: run546NormalizeQuoteBasis(draft.quoteBasis || {}),
+    quoteBasisSections: Array.isArray(draft.quoteBasisSections) ? draft.quoteBasisSections : [],
+  };
+}
+
+function run546NormalizeQuoteBasis(value) {
+  if (Array.isArray(value)) return value.map(run546NormalizeQuoteBasis);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, run546NormalizeQuoteBasis(child)]));
+  }
+  return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : value;
+}
+
+function run546HasPositiveOrder(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0;
+}
+
+async function run546LocalPublicationReceipt(sessionId) {
+  const metadataPath = path.join(run546QuoteDataRoot, "quote-sessions", sessionId, "quote-session.json");
+  const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
+  const publication = metadata.publication && typeof metadata.publication === "object" ? metadata.publication : {};
+  const xlsx = metadata.exports?.xlsx && typeof metadata.exports.xlsx === "object" ? metadata.exports.xlsx : {};
+  return {
+    publication: {
+      active_publication_id: String(publication.active_publication_id || ""),
+      run_id: String(publication.run_id || ""),
+      job_id: String(publication.job_id || ""),
+      committed_draft_state_digest: String(publication.committed_draft_state_digest || ""),
+      committed_output_revision: Number(publication.committed_output_revision),
+    },
+    xlsx: {
+      publication_id: String(xlsx.publication_id || ""),
+    },
+  };
+}
+
+function run546PublicationProjection(detail = {}, receipt = {}) {
+  const session = detail.quote_session && typeof detail.quote_session === "object" ? detail.quote_session : {};
+  const publicPublication = session.publication && typeof session.publication === "object" ? session.publication : {};
+  const receiptPublication = receipt.publication && typeof receipt.publication === "object" ? receipt.publication : {};
+  const publication = { ...receiptPublication, ...publicPublication };
+  const xlsx = session.exports?.xlsx && typeof session.exports.xlsx === "object" ? session.exports.xlsx : {};
+  return {
+    identity: {
+      activePublicationId: String(publication.active_publication_id || ""),
+      runId: String(publication.run_id || ""),
+      jobId: String(publication.job_id || ""),
+      xlsxPublicationId: String(xlsx.publication_id || receipt.xlsx?.publication_id || ""),
+    },
+    committedDraftStateDigest: String(publication.committed_draft_state_digest || ""),
+    committedOutputRevision: Number(publication.committed_output_revision),
+    quoteGenerated: session.status?.quote_generated === true,
+    draftModified: session.status?.draft_modified === true,
+    xlsx: {
+      filename: String(xlsx.filename || ""),
+      exists: xlsx.exists === true,
+      missing: xlsx.missing === true,
+      stale: xlsx.stale === true,
+      url: String(xlsx.url || ""),
+    },
+  };
+}
+
+function run546SafeFingerprint(value) {
+  return createHash("sha256")
+    .update(JSON.stringify(stableJson(value)))
+    .digest("hex")
+    .slice(0, 16);
+}
+
+function run546SafeShape(value) {
+  if (Array.isArray(value)) {
+    return {
+      type: "array",
+      length: value.length,
+      itemKeys: value[0] && typeof value[0] === "object" ? Object.keys(value[0]).sort() : [],
+    };
+  }
+  if (value && typeof value === "object") return { type: "object", keys: Object.keys(value).sort() };
+  return { type: typeof value };
+}
+
+function run546SafeDifferencePaths(expected, actual, prefix = "") {
+  if (JSON.stringify(stableJson(expected)) === JSON.stringify(stableJson(actual))) return [];
+  if (Array.isArray(expected) && Array.isArray(actual)) {
+    const paths = [];
+    const length = Math.max(expected.length, actual.length);
+    for (let index = 0; index < length; index += 1) {
+      paths.push(...run546SafeDifferencePaths(expected[index], actual[index], `${prefix}[${index}]`));
+    }
+    return paths;
+  }
+  if (expected && typeof expected === "object" && actual && typeof actual === "object") {
+    const paths = [];
+    const keys = new Set([...Object.keys(expected), ...Object.keys(actual)]);
+    for (const key of [...keys].sort()) {
+      const child = prefix ? `${prefix}.${key}` : key;
+      paths.push(...run546SafeDifferencePaths(expected[key], actual[key], child));
+    }
+    return paths;
+  }
+  return [{
+    path: prefix,
+    expected: run546SafeShape(expected),
+    actual: run546SafeShape(actual),
+    expectedFingerprint: run546SafeFingerprint(expected),
+    actualFingerprint: run546SafeFingerprint(actual),
+  }];
+}
+
+function run546AssertDraftProjection(detail, baseline, label) {
+  const actual = run546DraftProjection(detail.quote_session?.draft_state || {});
+  const differingFields = Object.keys(baseline).filter((field) => (
+    JSON.stringify(stableJson(actual[field])) !== JSON.stringify(stableJson(baseline[field]))
+  ));
+  if (differingFields.length) {
+    const differences = Object.fromEntries(differingFields.map((field) => [field, {
+      expected: run546SafeShape(baseline[field]),
+      actual: run546SafeShape(actual[field]),
+      expectedFingerprint: run546SafeFingerprint(baseline[field]),
+      actualFingerprint: run546SafeFingerprint(actual[field]),
+      differingPaths: run546SafeDifferencePaths(baseline[field], actual[field]),
+    }]));
+    throw new Error(`Run-546 ${label} changed the canonical draft projection: ${JSON.stringify(differences)}.`);
+  }
+}
+
+async function run546AssertCurrentPublication(detail, sessionId, baseline, label) {
+  const receipt = await run546LocalPublicationReceipt(sessionId);
+  if (!receipt.publication.run_id) receipt.publication.run_id = baseline.identity.runId;
+  if (!receipt.publication.job_id) receipt.publication.job_id = baseline.identity.jobId;
+  const actual = run546PublicationProjection(detail, receipt);
+  if (
+    !actual.quoteGenerated
+    || actual.xlsx.filename !== "quotation.xlsx"
+    || !actual.xlsx.exists
+    || actual.xlsx.missing
+    || actual.xlsx.stale
+    || !actual.xlsx.url
+    || JSON.stringify(stableJson(actual.identity)) !== JSON.stringify(stableJson(baseline.identity))
+    || actual.committedDraftStateDigest !== baseline.committedDraftStateDigest
+    || actual.committedOutputRevision !== baseline.committedOutputRevision
+  ) {
+    throw new Error(`Run-546 ${label} did not preserve the current publication identity and freshness proof.`);
+  }
+}
+
+async function verifyRun546CanonicalExportArtifactPersistence(page) {
+  let sessionId = "";
+  const isolatedContext = await page.context().browser().newContext({ viewport: { width: 1365, height: 768 } });
+  const runPage = await isolatedContext.newPage();
+  let generationPostCount = 0;
+  let generationJobId = "";
+  runPage.on("request", (request) => {
+    if (request.method() !== "POST" || !request.url().endsWith("/api/jobs")) return;
+    const payload = request.postDataJSON();
+    if (payload?.type === "generate") {
+      generationPostCount += 1;
+      generationJobId = String(payload.job_id || "");
+    }
+  });
+  try {
+    await installMockProfiles(runPage, { generationProfileId: "default" });
+    await runPage.goto(run546BaseUrl, { waitUntil: "domcontentloaded" });
+    await runPage.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
+    await runPage.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+    const savedReference = await saveSmokePricingReference(runPage, 10);
+    if (!savedReference.ok || savedReference.data?.status !== "saved") {
+      throw new Error("Run-546 could not establish the synthetic pricing reference.");
+    }
+    const legacyContext = await page.context().browser().newContext({ viewport: { width: 1365, height: 768 } });
+    const legacyPage = await legacyContext.newPage();
+    try {
+      await installMockProfiles(legacyPage, { generationProfileId: "default" });
+      await legacyPage.goto(run546BaseUrl, { waitUntil: "domcontentloaded" });
+      await legacyPage.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
+      await legacyPage.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+      const legacyRestore = await legacyPage.evaluate(async () => {
+        const snapshot = buildSessionSnapshot();
+        const historicalSessionId = newClientQuoteSessionId();
+        snapshot.quoteSessionId = historicalSessionId;
+        snapshot.activeAppView = "quote";
+        snapshot.activeSidePanel = "basis";
+        snapshot.workflowStage = "basis_review";
+        snapshot.quoteSessionDraftSaveStarted = true;
+        snapshot.quoteBasis = { graphics: "Confirm: Historical printed panel" };
+        snapshot.quoteBasisSections = [];
+        snapshot.lineItems = [];
+        snapshot.outputRows = [];
+        snapshot.originalOutputRows = [];
+        snapshot.pricingMatches = [];
+        snapshot.outputErrors = [];
+        snapshot.basisConfirmed = false;
+        snapshot.draftSource = "run546-legacy-basis";
+        snapshot.downloadFile = null;
+        snapshot.pdfFile = null;
+        snapshot.outputRevision = 0;
+        snapshot.downloadFileRevision = -1;
+        snapshot.pdfFileRevision = -1;
+        const applied = await applyQuoteSessionSnapshot(snapshot, {
+          forceQuoteView: true,
+          sessionId: historicalSessionId,
+        });
+        if (applied) showQuoteFlow();
+        return {
+          applied,
+          sessionId: historicalSessionId,
+          sectionCount: state.quoteBasisSections.length,
+          lineTag: state.quoteBasisSections[0]?.lines?.[0]?.tag || "",
+          lineText: state.quoteBasisSections[0]?.lines?.[0]?.text || "",
+        };
+      });
+      if (
+        !legacyRestore.applied
+        || !legacyRestore.sessionId
+        || legacyRestore.sectionCount !== 1
+        || legacyRestore.lineTag !== "Confirm"
+        || legacyRestore.lineText !== "Historical printed panel"
+      ) {
+        throw new Error(`Run-546 legacy quoteBasis did not restore into an actionable Confirm section: ${JSON.stringify(legacyRestore)}.`);
+      }
+      await legacyPage.locator("#quoteBasisPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+      const legacyLine = legacyPage.locator("#basisReviewSurface .basis-line-row").filter({ hasText: "Historical printed panel" }).first();
+      await legacyLine.waitFor({ state: "visible", timeout: 15000 });
+      if (await legacyLine.locator(".basis-line-pill").innerText() !== "Confirm") {
+        throw new Error("Run-546 legacy basis line did not render with Confirm actionability.");
+      }
+      await legacyLine.locator('[data-basis-tag="Include"]').click();
+      const legacyIncluded = await legacyPage.evaluate(() => ({
+        lineTag: state.quoteBasisSections[0]?.lines?.[0]?.tag || "",
+        basisText: state.quoteBasis.graphics || "",
+      }));
+      if (legacyIncluded.lineTag !== "Include" || legacyIncluded.basisText !== "Include: Historical printed panel") {
+        throw new Error(`Run-546 legacy Confirm -> Include action failed: ${JSON.stringify(legacyIncluded)}.`);
+      }
+      const legacySaved = await legacyPage.evaluate(() => {
+        saveSessionState();
+        let savedSnapshot = null;
+        try {
+          savedSnapshot = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "null");
+        } catch {
+          savedSnapshot = null;
+        }
+        return {
+          saved: Boolean(savedSnapshot?.quoteSessionId === state.quoteSessionId),
+          savedSnapshot,
+        };
+      });
+      if (!legacySaved.saved) throw new Error("Run-546 legacy basis client draft save did not complete.");
+      const legacyReapplied = await legacyPage.evaluate(async (savedSnapshot) => {
+        const applied = await applyQuoteSessionSnapshot(savedSnapshot, {
+          forceQuoteView: true,
+          sessionId: savedSnapshot.quoteSessionId,
+        });
+        return {
+          applied,
+          lineTag: state.quoteBasisSections[0]?.lines?.[0]?.tag || "",
+          lineText: state.quoteBasisSections[0]?.lines?.[0]?.text || "",
+          basisText: state.quoteBasis.graphics || "",
+        };
+      }, legacySaved.savedSnapshot);
+      if (
+        !legacyReapplied.applied
+        || legacyReapplied.lineTag !== "Include"
+        || legacyReapplied.lineText !== "Historical printed panel"
+        || legacyReapplied.basisText !== "Include: Historical printed panel"
+      ) {
+        throw new Error(`Run-546 legacy basis Include state did not survive save -> restore: ${JSON.stringify(legacyReapplied)}.`);
+      }
+      await legacyPage.evaluate(() => clearSessionState());
+    } finally {
+      await legacyContext.close().catch(() => {});
+    }
+    const emptyNewQuoteButton = runPage.locator("#dashboardEmptyNewQuoteButton:not([disabled])");
+    if (await emptyNewQuoteButton.isVisible()) await emptyNewQuoteButton.click();
+    else await runPage.locator("#newQuoteButton:not([disabled])").click();
+    await seedQuoteDraftFromTestFixture(runPage);
+    await runPage.locator("#sideNextButton", { hasText: "Next: Customer" }).click();
+    await runPage.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+    await runPage.waitForFunction(() => Boolean(state.quoteSessionId && state.quoteCommercialSnapshot?.pricing_basis?.digest), null, { timeout: 15000 });
+
+    const seeded = await runPage.evaluate(() => {
+      state.quoteBasisSections = normalizeQuoteBasisSections([
+        {
+          id: "run546-shared-scope",
+          title: "Shared Display Scope",
+          lines: [
+            {
+              id: "run546-shared-one",
+              tag: "Include",
+              text: "Shared display service",
+              include: true,
+              quantity: 1,
+              unit: "lot",
+              pricing_keyword: "run546-manual-one",
+              category_order: 1,
+              item_order: 1,
+            },
+            {
+              id: "run546-shared-two",
+              tag: "Include",
+              text: "Shared display service",
+              include: true,
+              quantity: 2,
+              unit: "nos",
+              pricing_keyword: "run546-manual-two",
+              category_order: 1,
+              item_order: 1,
+            },
+          ],
+        },
+        {
+          id: "run546-unordered-scope",
+          title: "Alpha Display Scope",
+          lines: [{
+            id: "run546-unordered-three",
+            tag: "Include",
+            text: "Alpha display service",
+            include: true,
+            quantity: 3,
+            unit: "sqm",
+            pricing_keyword: "run546-manual-three",
+          }],
+        },
+      ]);
+      state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
+      state.lineItems = [
+        normalizeLineItem({
+          section: "Shared Display Scope",
+          description: "Shared display service",
+          quantity: 1,
+          unit: "lot",
+          pricing_keyword: "run546-manual-one",
+          price_mode: "Priced",
+          source_basis_line_id: "run546-shared-one",
+          category_order: 1,
+          item_order: 1,
+        }),
+        normalizeLineItem({
+          section: "Shared Display Scope",
+          description: "Shared display service",
+          quantity: 2,
+          unit: "nos",
+          pricing_keyword: "run546-manual-two",
+          price_mode: "Priced",
+          source_basis_line_id: "run546-shared-two",
+          category_order: 1,
+          item_order: 1,
+        }),
+        normalizeLineItem({
+          section: "Alpha Display Scope",
+          description: "Alpha display service",
+          quantity: 3,
+          unit: "sqm",
+          pricing_keyword: "run546-manual-three",
+          price_mode: "Priced",
+          source_basis_line_id: "run546-unordered-three",
+        }),
+      ];
+      captureOriginalAnalysisSnapshot({
+        source: "run546-genuine-browser",
+        quote_basis_sections: state.quoteBasisSections,
+        quote_basis: state.quoteBasis,
+        analysis_mode: state.lastAnalysisMode,
+      });
+      state.basisConfirmed = false;
+      state.draftSource = "run546-genuine-browser";
+      updateQuoteBasisCard("run546-genuine-browser");
+      setWorkflowStage("basis_review");
+      setSidePanel("basis", { force: true });
+      syncControlStates();
+      saveSessionState();
+      return {
+        quoteSessionId: state.quoteSessionId,
+        lineCount: state.lineItems.length,
+      };
+    });
+    sessionId = String(seeded.quoteSessionId || "");
+    if (!sessionId || seeded.lineCount !== 3) throw new Error("Run-546 did not seed three genuine basis-backed rows.");
+    await runPage.locator("#sideNextButton:not([disabled])").click();
+    try {
+      await runPage.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 30000 });
+    } catch {
+      const basisFailure = await runPage.evaluate(() => ({
+        activeSidePanel: state.activeSidePanel,
+        basisConfirmed: state.basisConfirmed,
+        isPreparingOutput: state.isPreparingOutput,
+        sideNextDisabled: elements.sideNextButton?.getAttribute("aria-disabled") || "",
+        outputErrors: Array.isArray(state.outputErrors) ? state.outputErrors : [],
+        resultStatus: elements.resultStatus?.textContent?.trim() || "",
+        commercialLifecycle: state.quoteCommercialLifecycle,
+        commercialReview: state.quoteCommercialReview ? state.quoteCommercialReview.reason_code || "present" : "",
+        commercialSnapshotLifecycle: state.quoteCommercialSnapshot?.lifecycle || "",
+        commercialSnapshotDigest: state.quoteCommercialSnapshot?.pricing_basis?.digest || "",
+        selectedPricingReference: state.pricingReferenceId,
+        selectedPricingReferenceSource: state.pricingReferenceSource,
+      }));
+      throw new Error(`Run-546 Confirm Quotation Basis did not open Output: ${JSON.stringify(basisFailure)}.`);
+    }
+    await runPage.waitForFunction(() => state.isBooting === false && !state.isPreparingOutput && state.outputRows.length === 3, null, { timeout: 30000 });
+    const initialRows = await runPage.evaluate(() => state.outputRows.map((row) => ({
+      source_basis_line_id: row.source_basis_line_id,
+      section: row.section,
+      description: row.description,
+      quantity: row.quantity,
+      unit: row.unit,
+      catalog_unit_price: row.catalog_unit_price,
+      unit_price_override: row.unit_price_override,
+      category_order: row.category_order,
+      item_order: row.item_order,
+    })));
+    const duplicateLikeRows = initialRows.filter((row) => row.section === "Shared Display Scope" && row.description === "Shared display service");
+    const missingOrderRows = initialRows.filter((row) => !run546HasPositiveOrder(row.category_order) && !run546HasPositiveOrder(row.item_order));
+    if (
+      initialRows.length !== 3
+      || duplicateLikeRows.length !== 2
+      || missingOrderRows.length < 1
+      || duplicateLikeRows[0].category_order !== duplicateLikeRows[1].category_order
+      || duplicateLikeRows[0].item_order !== duplicateLikeRows[1].item_order
+      || initialRows.some((row) => row.catalog_unit_price !== "" || row.unit_price_override !== "")
+    ) {
+      throw new Error("Run-546 genuine rows did not contain the required duplicate-like and missing-order fixture.");
+    }
+
+    const priceValues = [15, 22, 31];
+    for (let index = 0; index < priceValues.length; index += 1) {
+      const cell = runPage.locator("#pricingMatchesBody tr").nth(index).locator('[data-output-edit-field="unit_price_override"]');
+      await cell.click();
+      const editor = runPage.locator('[data-output-editor-field="unit_price_override"]');
+      await editor.waitFor({ state: "visible", timeout: 15000 });
+      await editor.fill(String(priceValues[index]));
+      await editor.press("Enter");
+      await runPage.waitForFunction(({ index: rowIndex, value }) => (
+        Number(state.outputRows[rowIndex]?.unit_price_override) === value
+      ), { index, value: priceValues[index] }, { timeout: 15000 });
+    }
+    await runPage.waitForFunction(() => outputRowsValid().valid && state.outputRows.length === 3, null, { timeout: 15000 });
+    if (generationPostCount !== 0) throw new Error("Run-546 generated before the genuine export action.");
+    await runPage.locator("#sideDownloadButton:not([aria-disabled='true'])").click();
+    try {
+      await runPage.waitForFunction(() => (
+        state.isGenerating === false
+        && state.downloadFile?.name === "quotation.xlsx"
+        && state.downloadFileRevision === state.outputRevision
+        && state.outputRows.length === 3
+      ), null, { timeout: 60000 });
+    } catch {
+      const generationFailure = await runPage.evaluate((postCount) => ({
+        isGenerating: state.isGenerating,
+        activeJob: state.activeJob ? state.activeJob.type || "present" : "",
+        outputRevision: state.outputRevision,
+        downloadFileRevision: state.downloadFileRevision,
+        downloadName: state.downloadFile?.name || "",
+        outputRowCount: state.outputRows.length,
+        resultStatus: elements.resultStatus?.textContent?.trim() || "",
+        commercialReview: state.quoteCommercialReview ? state.quoteCommercialReview.reason_code || "present" : "",
+        profileId: state.profileId,
+        selectedPresetValue: state.selectedPresetValue,
+        generationProfileId: generationProfileIdForPayload(),
+        selectedPresetSource: selectedPreset()?.source || "",
+        generationPostCount: postCount,
+      }), generationPostCount);
+      throw new Error(`Run-546 normal generation did not publish quotation.xlsx: ${JSON.stringify(generationFailure)}.`);
+    }
+    if (generationPostCount !== 1) throw new Error("Run-546 did not use exactly one normal generate job.");
+
+    const publicationDetail = await dashboardQuoteSessionDetail(runPage, sessionId);
+    const publicationReceiptA = await run546LocalPublicationReceipt(sessionId);
+    const generationContext = await runPage.evaluate(() => ({
+      runId: String(state.lastGenerationRunId || ""),
+    }));
+    publicationReceiptA.publication.run_id = generationContext.runId;
+    publicationReceiptA.publication.job_id = generationJobId;
+    if (!publicationReceiptA.publication.run_id || !publicationReceiptA.publication.job_id) {
+      throw new Error("Run-546 genuine publication did not expose the generation run and job identity.");
+    }
+    const publicationA = run546PublicationProjection(publicationDetail, publicationReceiptA);
+    if (
+      publicationDetail.status !== "ok"
+      || !publicationA.identity.activePublicationId
+      || !publicationA.identity.runId
+      || !publicationA.identity.jobId
+      || !publicationA.identity.xlsxPublicationId
+      || !/^[0-9a-f]{64}$/i.test(publicationA.committedDraftStateDigest)
+      || !Number.isInteger(publicationA.committedOutputRevision)
+      || publicationA.committedOutputRevision < 1
+    ) {
+      throw new Error(`Run-546 publication did not expose complete currentness metadata: ${JSON.stringify({
+        status: publicationDetail.status,
+        projection: publicationA,
+        publicationKeys: Object.keys(publicationDetail.quote_session?.publication || {}),
+        xlsxKeys: Object.keys(publicationDetail.quote_session?.exports?.xlsx || {}),
+      })}.`);
+    }
+    const baselineRaw = await runPage.evaluate(() => {
+      const snapshot = currentQuoteSessionDraftState();
+      return {
+        outputSortMode: snapshot.outputSortMode,
+        outputRows: snapshot.outputRows,
+        pricingMatches: snapshot.pricingMatches,
+        lineItems: snapshot.lineItems,
+        originalOutputRows: snapshot.originalOutputRows,
+        outputRevision: snapshot.outputRevision,
+        profileId: snapshot.profileId,
+        selectedPresetValue: snapshot.selectedPresetValue,
+        pricingReferenceId: snapshot.pricingReferenceId,
+        pricingReferenceSource: snapshot.pricingReferenceSource,
+        pricingBasis: snapshot.quoteDetails?.commercial_snapshot?.pricing_basis || null,
+        quoteBasis: snapshot.quoteBasis,
+        quoteBasisSections: snapshot.quoteBasisSections,
+      };
+    });
+    const baselineA = run546DraftProjection(baselineRaw);
+    if (baselineA.outputSortMode !== "pricing_reference" || baselineA.outputRows.length !== 3) {
+      throw new Error("Run-546 baseline was not captured as canonical generated state.");
+    }
+    run546AssertDraftProjection(publicationDetail, baselineA, "publication baseline");
+
+    const baselineOrder = baselineA.outputRows.map((row) => row.source_basis_line_id);
+    const displayModes = ["pricing_reference", "name", "category", "category_name"];
+    for (const mode of displayModes) {
+      await runPage.locator("#outputSortMode").selectOption(mode);
+      await runPage.waitForFunction((expectedMode) => state.outputSortMode === expectedMode, mode, { timeout: 15000 });
+      const displayedOrder = await runPage.evaluate(() => state.outputRows.map((row) => row.source_basis_line_id));
+      if (mode !== "pricing_reference" && JSON.stringify(displayedOrder) === JSON.stringify(baselineOrder)) {
+        throw new Error(`Run-546 display mode ${mode} did not visibly reorder the fixture rows.`);
+      }
+      const serialized = await runPage.evaluate(() => {
+        const liveMode = state.outputSortMode;
+        const snapshot = currentQuoteSessionDraftState();
+        return {
+          liveMode,
+          projection: {
+            outputSortMode: snapshot.outputSortMode,
+            outputRows: snapshot.outputRows,
+            pricingMatches: snapshot.pricingMatches,
+            lineItems: snapshot.lineItems,
+            originalOutputRows: snapshot.originalOutputRows,
+            outputRevision: snapshot.outputRevision,
+            profileId: snapshot.profileId,
+            selectedPresetValue: snapshot.selectedPresetValue,
+            pricingReferenceId: snapshot.pricingReferenceId,
+            pricingReferenceSource: snapshot.pricingReferenceSource,
+            pricingBasis: snapshot.quoteDetails?.commercial_snapshot?.pricing_basis || null,
+            quoteBasis: snapshot.quoteBasis,
+            quoteBasisSections: snapshot.quoteBasisSections,
+          },
+        };
+      });
+      if (serialized.liveMode !== mode || serialized.projection.outputSortMode !== "pricing_reference") {
+        throw new Error(`Run-546 serializer changed or failed to persist display mode ${mode}.`);
+      }
+      if (JSON.stringify(stableJson(run546DraftProjection(serialized.projection))) !== JSON.stringify(stableJson(baselineA))) {
+        throw new Error(`Run-546 display mode ${mode} changed canonical persisted state.`);
+      }
+      const saved = await runPage.evaluate(async () => {
+        const result = await saveQuoteSessionDraftState({ quoteGenerated: true });
+        return Boolean(result?.session_id);
+      });
+      if (!saved) throw new Error(`Run-546 ordinary save failed in display mode ${mode}.`);
+      const afterSave = await dashboardQuoteSessionDetail(runPage, sessionId);
+      await run546AssertCurrentPublication(afterSave, sessionId, publicationA, `display mode ${mode} save`);
+      run546AssertDraftProjection(afterSave, baselineA, `display mode ${mode} save`);
+
+      await runPage.reload({ waitUntil: "domcontentloaded" });
+      await runPage.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 30000 });
+      await runPage.waitForFunction(() => state.isBooting === false && !state.isPreparingOutput && state.outputRows.length === 3, null, { timeout: 30000 });
+      const restored = await runPage.evaluate(() => {
+        const snapshot = currentQuoteSessionDraftState();
+        return {
+          liveMode: state.outputSortMode,
+          projection: {
+            outputSortMode: snapshot.outputSortMode,
+            outputRows: snapshot.outputRows,
+            pricingMatches: snapshot.pricingMatches,
+            lineItems: snapshot.lineItems,
+            originalOutputRows: snapshot.originalOutputRows,
+            outputRevision: snapshot.outputRevision,
+            profileId: snapshot.profileId,
+            selectedPresetValue: snapshot.selectedPresetValue,
+            pricingReferenceId: snapshot.pricingReferenceId,
+            pricingReferenceSource: snapshot.pricingReferenceSource,
+            pricingBasis: snapshot.quoteDetails?.commercial_snapshot?.pricing_basis || null,
+            quoteBasis: snapshot.quoteBasis,
+            quoteBasisSections: snapshot.quoteBasisSections,
+          },
+        };
+      });
+      if (restored.liveMode !== "pricing_reference" || JSON.stringify(stableJson(run546DraftProjection(restored.projection))) !== JSON.stringify(stableJson(baselineA))) {
+        throw new Error(`Run-546 reload after display mode ${mode} changed canonical state.`);
+      }
+      const savedAfterReload = await runPage.evaluate(async () => {
+        const result = await saveQuoteSessionDraftState({ quoteGenerated: true });
+        return Boolean(result?.session_id);
+      });
+      if (!savedAfterReload) throw new Error(`Run-546 reload save failed in display mode ${mode}.`);
+      const afterReloadSave = await dashboardQuoteSessionDetail(runPage, sessionId);
+      await run546AssertCurrentPublication(afterReloadSave, sessionId, publicationA, `display mode ${mode} reload save`);
+      run546AssertDraftProjection(afterReloadSave, baselineA, `display mode ${mode} reload save`);
+    }
+
+    await runPage.locator("#backToDashboardButton").click();
+    await runPage.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
+    const dashboardCard = runPage.locator(`.dashboard-session-card[data-quote-session-id="${sessionId}"]`);
+    await dashboardCard.waitFor({ state: "visible", timeout: 15000 });
+    const dashboardCardText = await dashboardCard.innerText();
+    if (!/Generated/.test(dashboardCardText)) throw new Error("Run-546 dashboard did not show the generated/current status.");
+    const dashboardDetail = await dashboardQuoteSessionDetail(runPage, sessionId);
+    await run546AssertCurrentPublication(dashboardDetail, sessionId, publicationA, "dashboard currentness");
+    await dashboardCard.click();
+    const xlsxLink = runPage.locator("#dashboardSelectedSessionPanel a.dashboard-export-link[download]").first();
+    await xlsxLink.waitFor({ state: "visible", timeout: 15000 });
+    if (await xlsxLink.getAttribute("href") !== dashboardDetail.quote_session.exports.xlsx.url) {
+      throw new Error("Run-546 dashboard XLSX link did not match the current publication.");
+    }
+    const downloadPromise = runPage.waitForEvent("download", { timeout: 15000 });
+    await xlsxLink.click();
+    const download = await downloadPromise;
+    if (download.suggestedFilename() !== "quotation.xlsx") throw new Error("Run-546 authenticated XLSX download had an unexpected filename.");
+    await download.delete().catch(() => {});
+
+    await runPage.locator('[data-dashboard-panel-action="modify-session"]', { hasText: "Modify quote" }).click();
+    await runPage.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 30000 });
+    await runPage.waitForFunction(() => state.isBooting === false && !state.isPreparingOutput && state.outputRows.length === 3, null, { timeout: 30000 });
+    const firstPriceCell = runPage.locator("#pricingMatchesBody tr").first().locator('[data-output-edit-field="unit_price_override"]');
+    await firstPriceCell.click();
+    const firstPriceEditor = runPage.locator('[data-output-editor-field="unit_price_override"]');
+    await firstPriceEditor.waitFor({ state: "visible", timeout: 15000 });
+    await firstPriceEditor.fill("16");
+    await firstPriceEditor.press("Enter");
+    await runPage.waitForFunction(() => Number(state.outputRows[0]?.unit_price_override) === 16, null, { timeout: 15000 });
+    await runPage.waitForFunction(() => state.outputRevision > 0 && state.downloadFileRevision !== state.outputRevision, null, { timeout: 15000 });
+    const invalidated = await runPage.evaluate(async () => {
+      const result = await saveQuoteSessionDraftState({ quoteGenerated: true });
+      return Boolean(result?.session_id);
+    });
+    if (!invalidated) throw new Error("Run-546 ordinary commercial edit save failed.");
+    const staleDetail = await dashboardQuoteSessionDetail(runPage, sessionId);
+    const stalePublication = run546PublicationProjection(staleDetail, await run546LocalPublicationReceipt(sessionId));
+    if (!stalePublication.draftModified || stalePublication.quoteGenerated || !stalePublication.xlsx.stale) {
+      throw new Error("Run-546 genuine commercial edit did not invalidate the prior publication.");
+    }
+  } finally {
+    sessionId = sessionId || await runPage.evaluate(() => state.quoteSessionId).catch(() => "");
+    if (sessionId) await runPage.evaluate(async (id) => deleteQuoteSessionRecord(id), sessionId).catch(() => {});
+    await runPage.evaluate(() => clearSessionState()).catch(() => {});
+    await isolatedContext.close().catch(() => {});
+  }
+}
+
 async function createDashboardSmokeSession(page, suffix, options = {}) {
   return page.evaluate(async ({ suffix, sessionIdPrefix, customerName, projectName }) => {
     const sessionResponse = await fetch("/api/session");
@@ -2614,6 +3325,7 @@ async function verifyDashboardClearsStaleSessionsBeforeRefresh(page) {
 }
 async function main() {
   let serverInfo = null;
+  let run546ServerInfo = null;
   const hasExistingServer = await healthOk();
   if (!hasExistingServer) {
     await fs.rm(quoteDataRoot, { recursive: true, force: true });
@@ -2623,6 +3335,18 @@ async function main() {
       await stopServer(serverInfo);
       throw new Error(`Could not start webapp at ${baseUrl}.${serverOutput ? `\n\n${serverOutput}` : ""}`);
     }
+  }
+  await fs.rm(run546QuoteDataRoot, { recursive: true, force: true });
+  run546ServerInfo = startServer({
+    host: options.host,
+    port: run546Port,
+    dataRoot: run546QuoteDataRoot,
+  });
+  if (!(await waitForHealth(15000, run546BaseUrl))) {
+    const serverOutput = run546ServerInfo.output.join("").trim();
+    await stopServer(run546ServerInfo);
+    await stopServer(serverInfo);
+    throw new Error(`Could not start the isolated Run-546 webapp at ${run546BaseUrl}.${serverOutput ? `\n\n${serverOutput}` : ""}`);
   }
 
   const browser = await chromium.launch({ headless: !options.headed });
@@ -2640,6 +3364,7 @@ async function main() {
 
   try {
     await installMockProfiles(page);
+    await verifyRun546CanonicalExportArtifactPersistence(page);
     await verifyRecoveredTemplateOwnerFailsClosed(page);
     await verifyFreshPricingAuthorityInitializesBeforeCustomer(page);
     await verifyServerPricingReferenceReviewDurability(page);
@@ -3467,6 +4192,7 @@ async function main() {
     }, null, 2));
   } finally {
     await browser.close();
+    await stopServer(run546ServerInfo);
     await stopServer(serverInfo);
   }
 }

@@ -75,6 +75,27 @@ const QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS = [
   "rich_text",
 ];
 const OUTPUT_SORT_MODES = ["pricing_reference", "category", "name", "category_name"];
+const CANONICAL_OUTPUT_TIE_FIELDS = [
+  "source_basis_line_id",
+  "section",
+  "description",
+  "pricing_keyword",
+  "quantity",
+  "unit",
+  "price_mode",
+  "catalog_description",
+  "pricing_reference_description",
+  "unit_price_override",
+  "catalog_unit_price",
+  "effective_unit_price",
+  "pricing_basis_amount",
+  "approved_quote_amount",
+  "pricing_reference_id",
+  "pricing_reference_source",
+  "pricing_basis_currency",
+  "pricing_basis_digest",
+  "status",
+];
 const ANALYSIS_MODE_STANDARD = "standard";
 const ANALYSIS_MODE_HIGH_QUALITY = "high_quality";
 const ANALYSIS_CREDIT_COSTS = {
@@ -4279,7 +4300,8 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
       quoteCommercialStrictDataEqual(detailValues[0], value)
     )));
   const savedQuoteDetails = savedDetailsAreValid && detailValues.length ? detailValues[0] : {};
-  state.selectedPresetValue = restoredState.selectedPresetValue || presetValueFromQuoteDetails(savedQuoteDetails) || "";
+  const savedPresetValue = restoredState.selectedPresetValue || presetValueFromQuoteDetails(savedQuoteDetails) || "";
+  state.selectedPresetValue = savedPresetValue;
   const savedCommercialSnapshot = savedQuoteDetails.commercial_snapshot;
   const normalizedCommercialSnapshot = normalizeQuoteCommercialSnapshot(
     savedCommercialSnapshot,
@@ -4343,6 +4365,9 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   syncSelectedPricingReference();
   renderProfileOptions();
   renderPresetOptions();
+  if (savedPresetValue && !availablePresetValues().has(savedPresetValue)) {
+    state.selectedPresetValue = savedPresetValue;
+  }
   state.pendingFeedback = String(restoredState.pendingFeedback || "");
   const restoredQuoteDetails = await restoreQuoteDetailsLogo(
     quoteDetailsWithFallbackDefaults(selectedPreset()?.details || {}, savedQuoteDetails, { preserveSavedState: true }),
@@ -4350,11 +4375,39 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   );
   applyQuoteDetails(restoredQuoteDetails, { includeLogo: true, clearLogo: true });
   state.images = await restoreSessionImages(restoredState.images);
-  state.quoteBasis = cloneQuoteBasis(restoredState.quoteBasis || {});
-  state.quoteBasisSections = normalizeQuoteBasisSections(restoredState.quoteBasisSections || restoredState.quoteBasis || {});
-  state.lineItems = Array.isArray(restoredState.lineItems) ? restoredState.lineItems.map(normalizeLineItem) : [];
-  state.outputRows = Array.isArray(restoredState.outputRows) ? restoredState.outputRows.map(normalizeOutputRow) : [];
-  state.originalOutputRows = Array.isArray(restoredState.originalOutputRows) ? restoredState.originalOutputRows.map(normalizeOutputRow) : [];
+  const restoredBasisSections = normalizeQuoteBasisSections(
+    Array.isArray(restoredState.quoteBasisSections) && restoredState.quoteBasisSections.length
+      ? restoredState.quoteBasisSections
+      : restoredState.quoteBasis || {},
+  );
+  state.quoteBasisSections = restoredBasisSections;
+  state.quoteBasis = restoredBasisSections.length
+    ? quoteBasisFromSections(restoredBasisSections)
+    : cloneQuoteBasis(restoredState.quoteBasis || {});
+  const restoredLineItems = Array.isArray(restoredState.lineItems)
+    ? restoredState.lineItems.map(normalizeLineItem)
+    : [];
+  const restoredOutputRows = Array.isArray(restoredState.outputRows)
+    ? restoredState.outputRows
+    : [];
+  const restoredPricingMatches = Array.isArray(restoredState.pricingMatches)
+    ? restoredState.pricingMatches
+    : [];
+  const restoredGeneratedRows = restoredOutputRows.length
+    ? restoredOutputRows
+    : (!restoredLineItems.length && restoredPricingMatches.length
+      ? restoredPricingMatches.map(outputRowFromPricingMatch)
+      : []);
+  const canonicalOutputRows = restoredGeneratedRows.length
+    ? canonicalPersistedOutputRows(snapshotOutputRows(restoredGeneratedRows))
+    : [];
+  state.outputRows = canonicalOutputRows;
+  state.lineItems = canonicalOutputRows.length
+    ? outputRowsToLineItems(canonicalOutputRows)
+    : restoredLineItems;
+  state.originalOutputRows = Array.isArray(restoredState.originalOutputRows)
+    ? canonicalPersistedOutputRows(snapshotOutputRows(restoredState.originalOutputRows))
+    : [];
   state.outputErrors = Array.isArray(restoredState.outputErrors) ? restoredState.outputErrors : [];
   state.outputSortMode = "pricing_reference";
   state.analysisFindings = Array.isArray(restoredState.analysisFindings) ? restoredState.analysisFindings : [];
@@ -4384,7 +4437,9 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
     restoredState.pdfFileRevision ?? restoredState.pdfFile?.output_revision,
     -1
   );
-  state.pricingMatches = Array.isArray(restoredState.pricingMatches) ? restoredState.pricingMatches : [];
+  state.pricingMatches = canonicalOutputRows.length
+    ? snapshotOutputRows(canonicalOutputRows)
+    : [];
   state.pricingIssues = [];
   state.activeJob = normalizeActiveJob(restoredState.activeJob || {}, { restoring: true });
   rejectedRestoredActiveJob = Boolean(restoredState.activeJob && typeof restoredState.activeJob === "object" && !state.activeJob);
@@ -4395,7 +4450,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
     state.restorableOverlay = "";
   }
   renderFiles();
-  renderPricingMatches(state.outputRows.length ? state.outputRows : state.pricingMatches, { fromPricingMatches: !state.outputRows.length && state.pricingMatches.length });
+  renderPricingMatches(state.outputRows, { fromPricingMatches: false });
   renderMatchSummary({ pricing_matches: state.pricingMatches });
   clearPricingReviewMessages();
   if (state.aiFailed) {
@@ -9200,6 +9255,59 @@ function pricingReferenceOrder(row = {}, fallbackIndex = 0) {
   ];
 }
 
+function canonicalOrderSlot(value) {
+  const number = orderNumber(value);
+  return number === null ? [1, 0] : [0, number];
+}
+
+function canonicalValueSlot(row, field) {
+  if (!Object.prototype.hasOwnProperty.call(row, field)) return [1];
+
+  const value = row[field];
+  if (value === null) return [0, 0];
+  if (typeof value === "boolean") return [0, 1, value ? 1 : 0];
+  if (typeof value === "number") {
+    return [0, 2, Object.is(value, -0) ? 0 : value];
+  }
+  if (typeof value === "string") return [0, 3, value];
+
+  throw new Error("Canonical output rows may contain only normalized scalar fields.");
+}
+
+function compareCanonicalValues(left, right) {
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left)) return -1;
+    if (!Array.isArray(right)) return 1;
+    const length = Math.min(left.length, right.length);
+    for (let position = 0; position < length; position += 1) {
+      const comparison = compareCanonicalValues(left[position], right[position]);
+      if (comparison) return comparison;
+    }
+    return left.length - right.length;
+  }
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
+}
+
+function canonicalOutputRowOrderKey(normalizedRow) {
+  const row = JSON.parse(JSON.stringify(normalizedRow));
+  return [
+    canonicalOrderSlot(row.basis_order),
+    canonicalOrderSlot(row.category_order),
+    canonicalOrderSlot(row.item_order),
+    ...CANONICAL_OUTPUT_TIE_FIELDS.map((field) => canonicalValueSlot(row, field)),
+  ];
+}
+
+function canonicalPersistedOutputRows(normalizedRows = []) {
+  return (Array.isArray(normalizedRows) ? normalizedRows : [])
+    .map((row) => JSON.parse(JSON.stringify(row)))
+    .sort((left, right) => compareCanonicalValues(
+      canonicalOutputRowOrderKey(left),
+      canonicalOutputRowOrderKey(right),
+    ));
+}
+
 function compareOrderValues(left = [], right = []) {
   const length = Math.max(left.length, right.length);
   for (let index = 0; index < length; index += 1) {
@@ -9667,13 +9775,15 @@ function renderMatchSummary(result = {}) {
 }
 
 function renderPricingMatches(rows = [], options = {}) {
-  state.pricingMatches = Array.isArray(rows) ? rows : [];
+  const incomingRows = Array.isArray(rows) ? rows : [];
   if (options.fromPricingMatches) {
-    state.outputRows = state.pricingMatches.map(outputRowFromPricingMatch);
-  } else if (Array.isArray(rows) && rows.length && rows[0]?.price_mode) {
-    state.outputRows = rows.map(normalizeOutputRow);
+    state.outputRows = incomingRows.map(outputRowFromPricingMatch);
+  } else if (incomingRows.length && incomingRows[0]?.price_mode) {
+    state.outputRows = incomingRows.map(normalizeOutputRow);
   }
   state.outputRows = sortOutputRows(state.outputRows);
+  state.pricingMatches = state.outputRows.length ? snapshotOutputRows(state.outputRows) : [];
+  if (state.outputRows.length) state.lineItems = outputRowsToLineItems(state.outputRows);
   if (elements.outputSortMode) elements.outputSortMode.value = state.outputSortMode;
   const outputRows = state.outputRows;
   updateOutputHeader(outputRows);
@@ -11707,6 +11817,23 @@ function quoteDraftShouldPersistToDashboard() {
 
 function currentQuoteSessionDraftState() {
   const snapshot = buildSessionSnapshot();
+  const sourceOutputRows = Array.isArray(snapshot.outputRows) && snapshot.outputRows.length
+    ? snapshot.outputRows
+    : (!Array.isArray(snapshot.lineItems) || !snapshot.lineItems.length) && Array.isArray(snapshot.pricingMatches) && snapshot.pricingMatches.length
+      ? snapshot.pricingMatches.map(outputRowFromPricingMatch)
+      : [];
+  const canonicalOutputRows = sourceOutputRows.length
+    ? canonicalPersistedOutputRows(snapshotOutputRows(sourceOutputRows))
+    : [];
+  const persistedPricingMatches = canonicalOutputRows.length
+    ? snapshotOutputRows(canonicalOutputRows)
+    : [];
+  const persistedLineItems = canonicalOutputRows.length
+    ? outputRowsToLineItems(canonicalOutputRows)
+    : (Array.isArray(snapshot.lineItems) ? snapshot.lineItems : []);
+  const persistedOriginalOutputRows = Array.isArray(snapshot.originalOutputRows) && snapshot.originalOutputRows.length
+    ? canonicalPersistedOutputRows(snapshotOutputRows(snapshot.originalOutputRows))
+    : [];
   return {
     version: snapshot.version,
     savedAt: snapshot.savedAt,
@@ -11724,11 +11851,11 @@ function currentQuoteSessionDraftState() {
     workflowStage: snapshot.workflowStage,
     quoteBasis: snapshot.quoteBasis,
     quoteBasisSections: snapshot.quoteBasisSections,
-    lineItems: snapshot.lineItems,
-    outputRows: snapshot.outputRows,
-    originalOutputRows: snapshot.originalOutputRows,
+    lineItems: persistedLineItems,
+    outputRows: canonicalOutputRows,
+    originalOutputRows: persistedOriginalOutputRows,
     outputErrors: snapshot.outputErrors,
-    outputSortMode: snapshot.outputSortMode,
+    outputSortMode: canonicalOutputRows.length ? "pricing_reference" : snapshot.outputSortMode,
     analysisFindings: snapshot.analysisFindings,
     blockingClarificationQuestions: snapshot.blockingClarificationQuestions,
     boothDimensions: snapshot.boothDimensions,
@@ -11743,7 +11870,7 @@ function currentQuoteSessionDraftState() {
     outputRevision: snapshot.outputRevision,
     downloadFileRevision: snapshot.downloadFileRevision,
     pdfFileRevision: snapshot.pdfFileRevision,
-    pricingMatches: snapshot.pricingMatches,
+    pricingMatches: persistedPricingMatches,
   };
 }
 

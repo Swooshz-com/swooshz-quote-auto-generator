@@ -25496,6 +25496,9 @@ function normalizeOutputRow(value) { return value; }
 function normalizeBoothDimensions(value = {}) { return value; }
 function normalizeAnalysisMode(value = "") { return value; }
 function normalizeActiveJob() { return null; }
+function canonicalPersistedOutputRows(value = []) { return value; }
+function snapshotOutputRows(value = []) { return value; }
+function outputRowsToLineItems(value = []) { return value; }
 function renderFiles() {}
 function renderPricingMatches() {}
 function renderMatchSummary() {}
@@ -25772,6 +25775,9 @@ function normalizeOutputRow(value) { return value; }
 function normalizeBoothDimensions(value = {}) { return value; }
 function normalizeAnalysisMode(value = "") { return value; }
 function normalizeActiveJob() { return null; }
+function canonicalPersistedOutputRows(value = []) { return value; }
+function snapshotOutputRows(value = []) { return value; }
+function outputRowsToLineItems(value = []) { return value; }
 function renderFiles() {}
 function renderPricingMatches() {}
 function renderMatchSummary() {}
@@ -26030,6 +26036,9 @@ function normalizeOutputRow(value) { return value; }
 function normalizeBoothDimensions(value = {}) { return value; }
 function normalizeAnalysisMode(value = "") { return value; }
 function normalizeActiveJob() { return null; }
+function canonicalPersistedOutputRows(value = []) { return value; }
+function snapshotOutputRows(value = []) { return value; }
+function outputRowsToLineItems(value = []) { return value; }
 function renderFiles() {}
 function renderPricingMatches() {}
 function renderMatchSummary() {}
@@ -28872,6 +28881,396 @@ assert.strictEqual(line.unit, "nos");
         self.assertIn('categoryOrderValue', js)
         self.assertIn('pricingReferenceOrder', js)
 
+    def test_static_canonical_persisted_output_rows_are_deterministic_and_shared_by_save_restore(self):
+        static_dir = ROOT / "webapp" / "static"
+        js = (static_dir / "app.js").read_text(encoding="utf-8")
+        node = require_node(self)
+
+        self.assertIn('const CANONICAL_OUTPUT_TIE_FIELDS = [', js)
+        canonical_fields = [
+            "source_basis_line_id",
+            "section",
+            "description",
+            "pricing_keyword",
+            "quantity",
+            "unit",
+            "price_mode",
+            "catalog_description",
+            "pricing_reference_description",
+            "unit_price_override",
+            "catalog_unit_price",
+            "effective_unit_price",
+            "pricing_basis_amount",
+            "approved_quote_amount",
+            "pricing_reference_id",
+            "pricing_reference_source",
+            "pricing_basis_currency",
+            "pricing_basis_digest",
+            "status",
+        ]
+        field_source = js.split("const CANONICAL_OUTPUT_TIE_FIELDS = [", 1)[1].split("];", 1)[0]
+        self.assertEqual(
+            [line.strip().rstrip(",").strip('"') for line in field_source.splitlines() if line.strip().startswith('"')],
+            canonical_fields,
+        )
+        current_start = js.index("function currentQuoteSessionDraftState")
+        current_body = js[current_start:js.index("function quoteSessionDraftComparisonKey", current_start)]
+        restore_start = js.index("async function applyQuoteSessionSnapshot")
+        restore_body = js[restore_start:js.index("async function restoreSessionState", restore_start)]
+        self.assertIn("canonicalPersistedOutputRows", current_body)
+        self.assertIn("canonicalPersistedOutputRows", restore_body)
+        self.assertNotIn("sortOutputRows(", restore_body)
+        self.assertNotIn("dedupeOutputRows(", current_body)
+        self.assertNotIn("state.outputSortMode =", current_body)
+        recalculate_start = js.index("function recalculateOutputRow")
+        recalculate_body = js[recalculate_start:js.index("function synchronizeOwnedOutputRowPrice", recalculate_start)]
+        self.assertIn("quantity * unitPrice", recalculate_body)
+        self.assertNotIn('"amount"', field_source)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const marker = `function ${name}`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  if (bodyStart < 2) throw new Error(`Missing body for function ${name}`);
+  let depth = 0;
+  for (let position = bodyStart; position < source.length; position += 1) {
+    const char = source[position];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, position + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+function numberOrNull(value) {
+  if (value === "" || value === null || value === undefined) return null;
+  const number = Number(String(value).replaceAll(",", "").trim());
+  return Number.isFinite(number) ? number : null;
+}
+
+function orderNumber(value) {
+  const number = numberOrNull(value);
+  return number !== null && number > 0 ? Math.trunc(number) : null;
+}
+
+const CANONICAL_OUTPUT_TIE_FIELDS = [
+  "source_basis_line_id",
+  "section",
+  "description",
+  "pricing_keyword",
+  "quantity",
+  "unit",
+  "price_mode",
+  "catalog_description",
+  "pricing_reference_description",
+  "unit_price_override",
+  "catalog_unit_price",
+  "effective_unit_price",
+  "pricing_basis_amount",
+  "approved_quote_amount",
+  "pricing_reference_id",
+  "pricing_reference_source",
+  "pricing_basis_currency",
+  "pricing_basis_digest",
+  "status",
+];
+
+eval([
+  "canonicalOrderSlot",
+  "canonicalValueSlot",
+  "compareCanonicalValues",
+  "canonicalOutputRowOrderKey",
+  "canonicalPersistedOutputRows",
+].map(extractFunction).join("\n"));
+
+function row(overrides = {}) {
+  return {
+    section: "Shared Section",
+    description: "Shared visible description",
+    pricing_keyword: "",
+    quantity: 1,
+    unit: "lot",
+    price_mode: "Priced",
+    catalog_description: "",
+    pricing_reference_description: "",
+    unit_price_override: "",
+    catalog_unit_price: "",
+    effective_unit_price: 10,
+    pricing_basis_amount: 10,
+    approved_quote_amount: 10,
+    pricing_reference_id: "run546-ref",
+    pricing_reference_source: "local",
+    pricing_basis_currency: "SGD",
+    pricing_basis_digest: "sha256:run546",
+    status: "matched",
+    ...overrides,
+  };
+}
+
+const exact = row({
+  basis_order: 9,
+  category_order: 9,
+  item_order: 9,
+  source_basis_line_id: "exact-duplicate",
+});
+const rows = [
+  row({
+    basis_order: 2,
+    category_order: 2,
+    item_order: 1,
+    source_basis_line_id: "catalogue-row",
+    section: "Zeta",
+    description: "Catalogue row",
+    quantity: 3,
+    unit: "sqm",
+    catalog_unit_price: 20,
+    effective_unit_price: 20,
+    pricing_basis_amount: 60,
+    approved_quote_amount: 60,
+  }),
+  row({
+    basis_order: 1,
+    category_order: 1,
+    item_order: 2,
+    source_basis_line_id: "duplicate-like-priced",
+    quantity: 2,
+    unit: "nos",
+    unit_price_override: 15,
+    effective_unit_price: 15,
+    pricing_basis_amount: 30,
+    approved_quote_amount: 30,
+    pricing_reference_id: "manual-ref",
+    pricing_basis_digest: "sha256:manual",
+  }),
+  row({
+    basis_order: 1,
+    category_order: 1,
+    item_order: 1,
+    source_basis_line_id: "duplicate-like-included",
+    price_mode: "Included",
+    quantity: 1,
+    unit: "lot",
+    unit_price_override: null,
+    catalog_unit_price: null,
+    effective_unit_price: null,
+    pricing_basis_amount: null,
+    approved_quote_amount: 0,
+    pricing_reference_id: "included-ref",
+    pricing_reference_source: "bundled",
+    pricing_basis_digest: "sha256:included",
+    status: "included",
+  }),
+  row({
+    source_basis_line_id: "missing-order-z",
+    section: "No Order Z",
+    description: "Z missing order",
+    quantity: 4,
+    unit: "set",
+  }),
+  row({
+    source_basis_line_id: "missing-order-a",
+    section: "No Order A",
+    description: "A missing order",
+    quantity: 5,
+    unit: "set",
+  }),
+  exact,
+  { ...exact },
+];
+
+const sourceBefore = JSON.stringify(rows);
+const permutations = [
+  rows,
+  [rows[4], rows[1], rows[6], rows[2], rows[0], rows[5], rows[3]],
+  [rows[2], rows[5], rows[3], rows[0], rows[6], rows[4], rows[1]],
+];
+const canonicalSerializations = permutations.map((permutation) => (
+  JSON.stringify(canonicalPersistedOutputRows(permutation))
+));
+assert.strictEqual(canonicalSerializations[0], canonicalSerializations[1]);
+assert.strictEqual(canonicalSerializations[1], canonicalSerializations[2]);
+assert.strictEqual(JSON.stringify(rows), sourceBefore);
+const canonical = JSON.parse(canonicalSerializations[0]);
+assert.strictEqual(canonical.length, rows.length);
+assert.strictEqual(canonical.filter((item) => item.source_basis_line_id === "exact-duplicate").length, 2);
+assert.notStrictEqual(canonical, rows);
+assert.strictEqual(JSON.stringify(canonicalOutputRowOrderKey(rows[5])), JSON.stringify(canonicalOutputRowOrderKey(rows[6])));
+
+const primaryOrder = canonical.map((item) => item.source_basis_line_id);
+assert.deepStrictEqual(primaryOrder.slice(0, 3), [
+  "duplicate-like-included",
+  "duplicate-like-priced",
+  "catalogue-row",
+]);
+assert.ok(primaryOrder.indexOf("missing-order-a") > primaryOrder.indexOf("catalogue-row"));
+assert.ok(primaryOrder.indexOf("missing-order-z") > primaryOrder.indexOf("catalogue-row"));
+
+const typedRows = [
+  row({ basis_order: 4, category_order: 4, item_order: 4, source_basis_line_id: "typed", status: null }),
+  row({ basis_order: 4, category_order: 4, item_order: 4, source_basis_line_id: "typed", status: false }),
+  row({ basis_order: 4, category_order: 4, item_order: 4, source_basis_line_id: "typed", status: 0 }),
+  row({ basis_order: 4, category_order: 4, item_order: 4, source_basis_line_id: "typed", status: "a" }),
+  row({ basis_order: 4, category_order: 4, item_order: 4, source_basis_line_id: "typed" }),
+];
+delete typedRows[4].status;
+assert.deepStrictEqual(
+  canonicalPersistedOutputRows(typedRows).map((item) => (
+    Object.prototype.hasOwnProperty.call(item, "status") ? item.status : "absent"
+  )),
+  [null, false, 0, "a", "absent"],
+);
+assert.strictEqual(compareCanonicalValues(canonicalValueSlot({ value: -0 }, "value"), canonicalValueSlot({ value: 0 }, "value")), 0);
+assert.throws(
+  () => canonicalOutputRowOrderKey(row({ section: { invalid: true } })),
+  /Canonical output rows may contain only normalized scalar fields/,
+);
+
+const displayRows = [
+  row({ source_basis_line_id: "display-z", section: "Zeta", description: "Alpha", basis_order: 2, category_order: 1, item_order: 1 }),
+  row({ source_basis_line_id: "display-zulu", section: "Alpha", description: "Zulu", basis_order: 1, category_order: 2, item_order: 1 }),
+  row({ source_basis_line_id: "display-beta", section: "Alpha", description: "Beta" }),
+  row({ source_basis_line_id: "display-middle", section: "Middle", description: "Omega" }),
+];
+const state = { outputSortMode: "pricing_reference" };
+function categoryOrderValue(item) { return orderNumber(item.category_order) || 999999; }
+function pricingReferenceOrder(item, fallbackPosition = 0) {
+  return [categoryOrderValue(item), orderNumber(item.item_order) || 999999, fallbackPosition];
+}
+function compareOrderValues(left, right) {
+  for (let position = 0; position < Math.max(left.length, right.length); position += 1) {
+    const difference = (left[position] || 0) - (right[position] || 0);
+    if (difference) return difference;
+  }
+  return 0;
+}
+eval(["sortOutputRows"].map(extractFunction).join("\n"));
+const displayOrders = Object.fromEntries([
+  "pricing_reference",
+  "name",
+  "category",
+  "category_name",
+].map((mode) => {
+  state.outputSortMode = mode;
+  return [mode, sortOutputRows(displayRows).map((item) => item.source_basis_line_id)];
+}));
+assert.deepStrictEqual(displayOrders.pricing_reference, ["display-zulu", "display-z", "display-beta", "display-middle"]);
+assert.deepStrictEqual(displayOrders.name, ["display-z", "display-beta", "display-middle", "display-zulu"]);
+assert.deepStrictEqual(displayOrders.category, ["display-zulu", "display-beta", "display-middle", "display-z"]);
+assert.deepStrictEqual(displayOrders.category_name, ["display-beta", "display-zulu", "display-middle", "display-z"]);
+
+function outputRowFromPricingMatch(item) { return { ...item }; }
+function snapshotOutputRows(items) { return items.map((item) => JSON.parse(JSON.stringify(item))); }
+function outputRowsToLineItems(items) {
+  return items.map((item) => ({
+    source_basis_line_id: item.source_basis_line_id,
+    quantity: item.quantity,
+    unit: item.unit,
+    price_mode: item.price_mode,
+  }));
+}
+function furthestQuoteSessionSidePanel() { return "output"; }
+let liveSnapshot = {
+  version: 5,
+  savedAt: "run546",
+  quoteSessionDraftSaveStarted: true,
+  profileId: "owner-b",
+  pricingReferenceId: "run546-ref",
+  pricingReferenceSource: "local",
+  selectedPresetValue: "profile:owner-b:default",
+  quoteCommercialLifecycle: "EXISTING",
+  quoteCommercialReview: null,
+  quoteCommercialTouched: {},
+  images: [],
+  quoteDetails: {},
+  workflowStage: "output",
+  quoteBasis: {},
+  quoteBasisSections: [],
+  lineItems: [{ source_basis_line_id: "stale-draft" }],
+  outputRows: rows,
+  originalOutputRows: rows,
+  outputErrors: [],
+  outputSortMode: "name",
+  analysisFindings: [],
+  blockingClarificationQuestions: [],
+  boothDimensions: {},
+  originalAnalysisSnapshot: null,
+  basisConfirmed: true,
+  aiFailed: false,
+  draftSource: "run546",
+  lastAnalysisMode: "standard",
+  downloadFile: null,
+  pdfFile: null,
+  outputRevision: 7,
+  downloadFileRevision: 7,
+  pdfFileRevision: -1,
+  pricingMatches: [{ source_basis_line_id: "stale-match" }],
+};
+function buildSessionSnapshot() { return JSON.parse(JSON.stringify(liveSnapshot)); }
+eval(["currentQuoteSessionDraftState"].map(extractFunction).join("\n"));
+const persisted = currentQuoteSessionDraftState();
+assert.strictEqual(persisted.outputSortMode, "pricing_reference");
+assert.deepStrictEqual(
+  persisted.outputRows.map((item) => item.source_basis_line_id),
+  canonical.map((item) => item.source_basis_line_id),
+);
+assert.deepStrictEqual(
+  persisted.pricingMatches.map((item) => item.source_basis_line_id),
+  persisted.outputRows.map((item) => item.source_basis_line_id),
+);
+assert.deepStrictEqual(
+  persisted.lineItems.map((item) => item.source_basis_line_id),
+  persisted.outputRows.map((item) => item.source_basis_line_id),
+);
+assert.strictEqual(liveSnapshot.outputSortMode, "name");
+
+liveSnapshot = {
+  ...liveSnapshot,
+  outputRows: [],
+  originalOutputRows: [],
+  lineItems: [{ source_basis_line_id: "legitimate-draft" }],
+  pricingMatches: [{ source_basis_line_id: "stale-match" }],
+  outputSortMode: "category",
+};
+const draftOnly = currentQuoteSessionDraftState();
+assert.deepStrictEqual(draftOnly.outputRows, []);
+assert.deepStrictEqual(draftOnly.pricingMatches, []);
+assert.deepStrictEqual(draftOnly.lineItems, [{ source_basis_line_id: "legitimate-draft" }]);
+
+liveSnapshot = {
+  ...liveSnapshot,
+  lineItems: [],
+  pricingMatches: rows,
+  outputSortMode: "name",
+};
+const legacyGenerated = currentQuoteSessionDraftState();
+assert.deepStrictEqual(
+  legacyGenerated.outputRows.map((item) => item.source_basis_line_id),
+  canonical.map((item) => item.source_basis_line_id),
+);
+assert.deepStrictEqual(
+  legacyGenerated.lineItems.map((item) => item.source_basis_line_id),
+  canonical.map((item) => item.source_basis_line_id),
+);
+assert.strictEqual(legacyGenerated.outputSortMode, "pricing_reference");
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
     def test_static_catalog_output_description_edits_survive_normalize_render_snapshot_and_line_items(self):
         node = require_node(self)
 
@@ -29850,6 +30249,7 @@ async function main() {
         review: state.quoteCommercialReview,
         snapshot: state.quoteCommercialSnapshot,
       })}`);
+      const canonicalOutputRows = snapshotOutputRows(state.outputRows);
       return {
         sessionId: state.quoteSessionId,
         lifecycle: state.quoteCommercialLifecycle,
@@ -29857,7 +30257,8 @@ async function main() {
         lineItem: state.lineItems[0],
         outputRow: state.outputRows[0],
         basis: JSON.stringify(state.quoteBasisSections),
-        output: JSON.stringify(state.outputRows),
+        output: JSON.stringify(canonicalOutputRows),
+        lineItems: JSON.stringify(outputRowsToLineItems(canonicalOutputRows)),
       };
     });
     assert.strictEqual(fresh.lifecycle, "NEW_UNINITIALISED");
@@ -29896,7 +30297,7 @@ async function main() {
     assert.strictEqual(restored.lifecycle, fresh.lifecycle);
     assert.strictEqual(restored.basis, fresh.basis);
     assert.strictEqual(restored.output, fresh.output);
-    assert.strictEqual(restored.lineItems, JSON.stringify([fresh.lineItem]));
+    assert.strictEqual(restored.lineItems, fresh.lineItems);
     assert.strictEqual(restored.snapshot.pricing_basis.id, referenceId);
     assert.strictEqual(restored.snapshot.pricing_basis.source, "company");
 
