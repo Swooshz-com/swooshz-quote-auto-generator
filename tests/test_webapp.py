@@ -29128,6 +29128,8 @@ const BASIS_FIELDS = [
 ];
 const EMPTY_BASIS = Object.fromEntries(BASIS_FIELDS.map(([key]) => [key, ""]));
 const QUOTE_SESSION_STATE_VERSION = 5;
+const PROFILE_PRESET_PREFIX = "profile:";
+const COMPANY_PROFILE_PRESET_PREFIX = "company:";
 const PRICING_REFERENCE_SETTINGS_MODE_MANAGE = "manage";
 const PRICING_REFERENCE_SOURCES = new Set(["company", "local", "bundled"]);
 const QUOTE_COMMERCIAL_REVIEW_MESSAGE = "Synthetic review";
@@ -29536,7 +29538,7 @@ assert.strictEqual(state.quoteBasis.graphics, "Include: Historical printed panel
 
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
 
-    def test_static_unavailable_preset_authority_survives_draft_save_restore(self):
+    def test_static_explicit_unavailable_preset_ownership_survives_restore_inference(self):
         node = require_node(self)
         script = r"""
 const fs = require("fs");
@@ -29582,7 +29584,6 @@ function transitionGenerationContext(sessionId, runId) {
 }
 function normalizeRestorableOverlay(value) { return typeof value === "string" ? value : ""; }
 function normalizePricingReferenceSettingsMode(value) { return value === "import" ? "import" : "manage"; }
-function presetValueFromQuoteDetails() { return ""; }
 function normalizeQuoteCommercialSnapshot(snapshot) { return isPlainObject(snapshot) ? deepClone(snapshot) : null; }
 function quoteCommercialSnapshotPricingBasis(snapshot) { return isPlainObject(snapshot?.pricing_basis) ? deepClone(snapshot.pricing_basis) : null; }
 function normalizeQuoteCommercialReview(review) { return isPlainObject(review) ? deepClone(review) : null; }
@@ -29655,11 +29656,18 @@ const state = {
     id: "owner-b",
     label: "Owner B",
     source: "profile",
-    quote_detail_presets: [{ id: "shared", name: "Shared", details: {} }],
+    quote_detail_presets: [
+      { id: "default", name: "Owner B Default", details: { company: { name: "Owner B", header_details: "Owner B header" } } },
+      { id: "shared", name: "Shared", details: {} },
+    ],
   }],
-  companyProfiles: [],
-  selectedPresetValue: "company:historical-company",
-  quoteCommercialLifecycle: "NEW",
+  companyProfiles: [{
+    id: "different-owner",
+    label: "Different Owner",
+    defaults: { company: { name: "Different Owner", header_details: "Different owner header" } },
+  }],
+  selectedPresetValue: "profile:owner-b:default",
+  quoteCommercialLifecycle: "EXISTING",
   quoteCommercialSnapshot: null,
   quoteCommercialReview: null,
   quoteCommercialRecoveryError: "",
@@ -29669,7 +29677,9 @@ const state = {
   pricingReferenceSettingsMode: PRICING_REFERENCE_SETTINGS_MODE_MANAGE,
   restorableOverlay: "",
   pendingFeedback: "",
-  quoteDetails: {},
+  quoteDetails: {
+    company: { name: "Different Owner", header_details: "Different owner header" },
+  },
   images: [],
   quoteBasis: {},
   quoteBasisSections: [],
@@ -29707,7 +29717,7 @@ const state = {
 };
 const elements = {
   presetSelect: {
-    value: "company:historical-company",
+    value: "profile:owner-b:default",
     innerHTML: "",
     disabled: false,
     title: "",
@@ -29731,7 +29741,7 @@ function buildSessionSnapshot() {
     quoteCommercialReview: null,
     quoteCommercialTouched: {},
     images: [],
-    quoteDetails: {},
+    quoteDetails: state.quoteDetails,
     workflowStage: "",
     quoteBasis: {},
     quoteBasisSections: [],
@@ -29762,33 +29772,30 @@ eval([
   "safeProfileId", "safeProfileLabel", "profilePresetOptionValue", "profilePresetOptionParts",
   "companyProfileOptionValue", "selectedPresetId", "templateProfilePresets",
   "selectableTemplateProfilePresets", "normalizeCompanyProfile", "companyProfilePresets",
-  "presetOptionValue", "selectedPreset", "availablePresetValues", "resolvedProfileIdForPayload",
+  "presetOptionValue", "selectedPreset", "normalizePresetComparisonValue", "quoteDetailsMatchPreset",
+  "presetValueFromQuoteDetails", "availablePresetValues", "resolvedProfileIdForPayload",
   "generationProfileIdForPayload", "preservedOwnedPresetValue", "renderPresetOptions",
   "applyQuoteSessionSnapshot", "currentQuoteSessionDraftState",
 ].map(extractFunction).join("\n"));
 
-const unavailablePreset = "company:historical-company";
+const unavailablePreset = "profile:owner-b:default";
 assert.strictEqual(availablePresetValues().has(unavailablePreset), false);
-assert.strictEqual(generationProfileIdForPayload(), "");
+assert.strictEqual(generationProfileIdForPayload(), "profile:owner-b");
 
 const draft = currentQuoteSessionDraftState();
 assert.strictEqual(draft.selectedPresetValue, unavailablePreset);
-assert.strictEqual(generationProfileIdForPayload(), "");
-
-state.selectedPresetValue = "";
-elements.presetSelect.value = "";
 assert.strictEqual(generationProfileIdForPayload(), "profile:owner-b");
+assert.strictEqual(presetValueFromQuoteDetails(draft.quoteDetails), "company:different-owner");
 
 await applyQuoteSessionSnapshot({
   ...deepClone(draft),
-  quoteSessionId: state.quoteSessionId,
   browserRecoveryScope: "scope",
-}, { forceQuoteView: true, sessionId: state.quoteSessionId });
+});
 
 assert.strictEqual(state.selectedPresetValue, unavailablePreset);
 assert.strictEqual(elements.presetSelect.value, "");
-assert.strictEqual(generationProfileIdForPayload(), "");
-assert.notStrictEqual(generationProfileIdForPayload(), "profile:owner-b");
+assert.strictEqual(generationProfileIdForPayload(), "profile:owner-b");
+assert.notStrictEqual(generationProfileIdForPayload(), "company:different-owner");
 assert.strictEqual(currentQuoteSessionDraftState().selectedPresetValue, unavailablePreset);
 
 state.selectedPresetValue = "profile:owner-b:shared";
@@ -29796,6 +29803,33 @@ elements.presetSelect.value = "profile:owner-b:shared";
 assert.strictEqual(availablePresetValues().has(state.selectedPresetValue), true);
 assert.strictEqual(generationProfileIdForPayload(), "profile:owner-b");
 assert.strictEqual(currentQuoteSessionDraftState().selectedPresetValue, "profile:owner-b:shared");
+
+state.selectedPresetValue = "company:different-owner";
+elements.presetSelect.value = "company:different-owner";
+assert.strictEqual(availablePresetValues().has(state.selectedPresetValue), true);
+assert.strictEqual(generationProfileIdForPayload(), "company:different-owner");
+assert.strictEqual(currentQuoteSessionDraftState().selectedPresetValue, "company:different-owner");
+
+const unavailableCompanyPreset = "company:missing-company";
+state.selectedPresetValue = unavailableCompanyPreset;
+elements.presetSelect.value = unavailableCompanyPreset;
+assert.strictEqual(availablePresetValues().has(unavailableCompanyPreset), false);
+assert.strictEqual(generationProfileIdForPayload(), "");
+const unavailableCompanyDraft = currentQuoteSessionDraftState();
+assert.strictEqual(unavailableCompanyDraft.selectedPresetValue, unavailableCompanyPreset);
+await applyQuoteSessionSnapshot({ ...deepClone(unavailableCompanyDraft), browserRecoveryScope: "scope" });
+assert.strictEqual(state.selectedPresetValue, unavailableCompanyPreset);
+assert.strictEqual(generationProfileIdForPayload(), "");
+assert.notStrictEqual(generationProfileIdForPayload(), "company:different-owner");
+
+state.selectedPresetValue = "";
+elements.presetSelect.value = "";
+const inferredDraft = currentQuoteSessionDraftState();
+assert.strictEqual(inferredDraft.selectedPresetValue, "");
+await applyQuoteSessionSnapshot({ ...deepClone(inferredDraft), browserRecoveryScope: "scope" });
+assert.strictEqual(presetValueFromQuoteDetails(state.quoteDetails), "company:different-owner");
+assert.strictEqual(state.selectedPresetValue, "company:different-owner");
+assert.strictEqual(generationProfileIdForPayload(), "company:different-owner");
 })();
 """
         completed = subprocess.run(

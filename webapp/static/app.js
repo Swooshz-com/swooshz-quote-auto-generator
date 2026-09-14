@@ -11750,21 +11750,27 @@ function currentQuoteSessionDraftState() {
     ? selectedPresetValue
     : "";
   if (selectedPresetValue && !serializedSelectedPresetValue) {
-    const previousStateSelectedPresetValue = state.selectedPresetValue;
-    const previousElementPresetValue = elements.presetSelect?.value;
-    try {
-      state.selectedPresetValue = selectedPresetValue;
-      if (elements.presetSelect) elements.presetSelect.value = selectedPresetValue;
-      const selectedPresetAuthority = generationProfileIdForPayload();
-      state.selectedPresetValue = "";
-      if (elements.presetSelect) elements.presetSelect.value = "";
-      const clearedPresetAuthority = generationProfileIdForPayload();
-      if (selectedPresetAuthority !== clearedPresetAuthority) {
-        serializedSelectedPresetValue = selectedPresetValue;
+    const explicitPresetSelector = selectedPresetValue.startsWith(PROFILE_PRESET_PREFIX)
+      || selectedPresetValue.startsWith(COMPANY_PROFILE_PRESET_PREFIX);
+    if (explicitPresetSelector) {
+      serializedSelectedPresetValue = selectedPresetValue;
+    } else {
+      const previousStateSelectedPresetValue = state.selectedPresetValue;
+      const previousElementPresetValue = elements.presetSelect?.value;
+      try {
+        state.selectedPresetValue = selectedPresetValue;
+        if (elements.presetSelect) elements.presetSelect.value = selectedPresetValue;
+        const selectedPresetAuthority = generationProfileIdForPayload();
+        state.selectedPresetValue = "";
+        if (elements.presetSelect) elements.presetSelect.value = "";
+        const clearedPresetAuthority = generationProfileIdForPayload();
+        if (selectedPresetAuthority !== clearedPresetAuthority) {
+          serializedSelectedPresetValue = selectedPresetValue;
+        }
+      } finally {
+        state.selectedPresetValue = previousStateSelectedPresetValue;
+        if (elements.presetSelect) elements.presetSelect.value = previousElementPresetValue;
       }
-    } finally {
-      state.selectedPresetValue = previousStateSelectedPresetValue;
-      if (elements.presetSelect) elements.presetSelect.value = previousElementPresetValue;
     }
   }
   return {
