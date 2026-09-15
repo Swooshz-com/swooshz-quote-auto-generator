@@ -364,12 +364,15 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
       forceQuoteView: true,
       sessionId: snapshot.quoteSessionId,
     });
+    const restoredRow = state.outputRows.find((row) => row.pricing_keyword === "graphics-vinyl-printed-graphics");
+    const renderedDescriptions = Array.from(document.querySelectorAll('#pricingMatchesBody [data-output-label="Description"]'))
+      .map((cell) => cell.textContent?.trim() || "");
     return {
       restored,
-      description: state.outputRows[0]?.description || "",
-      renderedDescription: document.querySelector('#pricingMatchesBody tr:first-child [data-output-label="Description"]')?.textContent?.trim() || "",
-      pricingKeyword: state.outputRows[0]?.pricing_keyword || "",
-      matchesExpected: state.outputRows[0]?.description === expected,
+      description: restoredRow?.description || "",
+      renderedDescription: renderedDescriptions.includes(expected) ? expected : "",
+      pricingKeyword: restoredRow?.pricing_keyword || "",
+      matchesExpected: restoredRow?.description === expected,
     };
   }, manualDescription);
   if (!quoteRestoreEvidence.restored
@@ -386,12 +389,16 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
   await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
   const browserRestoreEvidence = await page.evaluate((expected) => {
     const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
+    const restoredRow = state.outputRows.find((row) => row.pricing_keyword === "graphics-vinyl-printed-graphics");
+    const savedRow = saved.outputRows?.find((row) => row.pricing_keyword === "graphics-vinyl-printed-graphics");
+    const renderedDescriptions = Array.from(document.querySelectorAll('#pricingMatchesBody [data-output-label="Description"]'))
+      .map((cell) => cell.textContent?.trim() || "");
     return {
-      stateDescription: state.outputRows[0]?.description || "",
-      renderedDescription: document.querySelector('#pricingMatchesBody tr:first-child [data-output-label="Description"]')?.textContent?.trim() || "",
-      savedDescription: saved.outputRows?.[0]?.description || "",
-      pricingKeyword: state.outputRows[0]?.pricing_keyword || "",
-      matchesExpected: state.outputRows[0]?.description === expected,
+      stateDescription: restoredRow?.description || "",
+      renderedDescription: renderedDescriptions.includes(expected) ? expected : "",
+      savedDescription: savedRow?.description || "",
+      pricingKeyword: restoredRow?.pricing_keyword || "",
+      matchesExpected: restoredRow?.description === expected,
     };
   }, manualDescription);
   if (!browserRestoreEvidence.matchesExpected
@@ -400,7 +407,8 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
     || browserRestoreEvidence.pricingKeyword !== "graphics-vinyl-printed-graphics") {
     throw new Error(`Browser recovery changed a manual Output description: ${JSON.stringify(browserRestoreEvidence)}.`);
   }
-  const outputMetrics = await page.locator("#pricingMatchesBody tr").first().evaluate((row) => {
+  const manualRow = page.getByText(manualDescription, { exact: true }).locator("xpath=ancestor::tr");
+  const outputMetrics = await manualRow.evaluate((row) => {
     const cells = Array.from(row.querySelectorAll("td")).map((cell) => ({
       label: cell.getAttribute("data-output-label") || "",
       display: window.getComputedStyle(cell).display,
@@ -425,11 +433,11 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
   if (outputMetrics.rowWidth > 500 || outputMetrics.cells.some((cell) => cell.width > 500)) {
     throw new Error(`Mobile output card overflows the viewport: ${JSON.stringify(outputMetrics)}.`);
   }
-  await page.locator('#pricingMatchesBody tr:first-child [data-output-edit-field="unit_price_override"]').click();
+  await manualRow.locator('[data-output-edit-field="unit_price_override"]').click();
   await page.locator('[data-output-editor-field="unit_price_override"]').waitFor({ state: "visible", timeout: 15000 });
   await page.locator('[data-output-included-action="true"]').waitFor({ state: "visible", timeout: 15000 });
   await page.keyboard.press("Escape");
-  await page.locator('#pricingMatchesBody tr:first-child [data-output-delete-row]').click();
+  await manualRow.locator('[data-output-delete-row]').click();
   await page.locator("#outputDeleteModal").waitFor({ state: "visible", timeout: 15000 });
   await page.locator("#cancelOutputDeleteButton").click();
   await page.locator("#outputDeleteModal").waitFor({ state: "hidden", timeout: 15000 });
@@ -2612,6 +2620,217 @@ async function verifyDashboardClearsStaleSessionsBeforeRefresh(page) {
     throw new Error(`Dashboard should clear stale rows before refreshed sessions load, found ${staleCountDuringRefresh}.`);
   }
 }
+
+async function verifyRun560PrimaryOrderIngressMatrix(page, { expectRed = false } = {}) {
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
+  await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+  const evidence = await page.evaluate(async () => {
+    const fields = ["basis_order", "category_order", "item_order"];
+    const invalidValues = [
+      [1], { value: 1 }, true, false, "1,234", "1x", 1.5, "1.5", "1e3",
+      "+1", "-1", 0, -1, "bad", "", " \t\r\n", null, undefined, NaN,
+      Infinity, 9007199254740992, "9007199254740992", "\u0661",
+    ];
+    const validValues = [
+      [1, 1], [27, 27], ["27", 27], [" \t003\r\n", 3], ["0000007", 7],
+      [9007199254740991, 9007199254740991], ["9007199254740991", 9007199254740991],
+    ];
+    const failures = [];
+    const families = new Set();
+    const own = (value, key) => Object.prototype.hasOwnProperty.call(value || {}, key);
+    const checkRow = (family, row, expected, { omitted = false } = {}) => {
+      families.add(family);
+      for (const field of fields) {
+        if (omitted && expected[field] === "") {
+          if (own(row, field)) failures.push({ family, field, expected: "omitted", actual: row[field] });
+        } else if (row?.[field] !== expected[field]) {
+          failures.push({ family, field, expected: expected[field], actual: row?.[field] });
+        }
+      }
+    };
+    const invalidExpected = { basis_order: "", category_order: "", item_order: "" };
+    const validExpected = { basis_order: 3, category_order: 7, item_order: 9007199254740991 };
+    const baseRow = (id, orders) => ({
+      source_basis_line_id: id,
+      section: "Synthetic",
+      description: `Run 560 ${id}`,
+      quantity: 1,
+      unit: "unit",
+      price_mode: "Priced",
+      catalog_unit_price: 15,
+      ...orders,
+    });
+    const invalidRow = () => baseRow("invalid", {
+      basis_order: "1,234", category_order: 1.5, item_order: [3],
+    });
+    const validRow = () => baseRow("valid", {
+      basis_order: " 003 ", category_order: "0007", item_order: "9007199254740991",
+    });
+    const findRows = (rows) => ({
+      invalid: (rows || []).find((row) => row.source_basis_line_id === "invalid"),
+      valid: (rows || []).find((row) => row.source_basis_line_id === "valid"),
+    });
+    const checkPair = (family, rows, options = {}) => {
+      const found = findRows(rows);
+      checkRow(family, found.invalid, invalidExpected, options);
+      checkRow(family, found.valid, validExpected, options);
+      const expectedCount = options.rowCount ?? 2;
+      if ((rows || []).length !== expectedCount) failures.push({ family, row_count: (rows || []).length, expectedCount });
+    };
+
+    if (typeof canonicalPrimaryOrderValue !== "function" || typeof canonicalizePrimaryOrderFields !== "function") {
+      failures.push({ family: "direct-helper", missing: true });
+    } else {
+      families.add("direct-helper");
+      for (const field of fields) {
+        for (const value of invalidValues) {
+          const actual = canonicalPrimaryOrderValue(value);
+          if (actual !== "") failures.push({ family: "direct-helper", field, value: String(value), actual });
+        }
+        for (const [value, expected] of validValues) {
+          const actual = canonicalPrimaryOrderValue(value);
+          if (actual !== expected) failures.push({ family: "direct-helper", field, value: String(value), expected, actual });
+        }
+        const source = { description: "unchanged", quantity: "1", [field]: "1.5" };
+        const admitted = canonicalizePrimaryOrderFields(source);
+        if (source[field] !== "1.5" || admitted[field] !== "" || admitted.description !== "unchanged" || admitted.quantity !== "1") {
+          failures.push({ family: "direct-helper-copy", field, source, admitted });
+        }
+      }
+    }
+
+    checkPair("normalizer-line-item", [normalizeLineItem(invalidRow()), normalizeLineItem(validRow())]);
+    checkPair("normalizer-output-row", [normalizeOutputRow(invalidRow()), normalizeOutputRow(validRow())]);
+    const matches = [invalidRow(), validRow()].map((row) => ({
+      ...row, status: "matched", unit_price: 15,
+    }));
+    checkPair("normalizer-pricing-match", matches.map(outputRowFromPricingMatch));
+
+    const invalidBasis = normalizeBasisLines({ ...invalidRow(), text: "Run 560 invalid" });
+    const validBasis = normalizeBasisLines({ ...validRow(), text: "Run 560 valid" });
+    const basisRows = [
+      { ...invalidBasis[0], source_basis_line_id: "invalid" },
+      { ...validBasis[0], source_basis_line_id: "valid" },
+    ];
+    checkRow("normalizer-basis-line", basisRows[0], invalidExpected, { omitted: true });
+    checkRow("normalizer-basis-line", basisRows[1], { basis_order: "", category_order: 7, item_order: 9007199254740991 }, { omitted: true });
+
+    const baseSnapshot = buildSessionSnapshot();
+    const restore = async (patch) => applyQuoteSessionSnapshot({
+      ...baseSnapshot,
+      quoteSessionId: `quote-run560-${Math.random().toString(36).slice(2, 10)}`,
+      quoteSessionDraftSaveStarted: true,
+      outputRows: [], originalOutputRows: [], lineItems: [], pricingMatches: [],
+      ...patch,
+    }, { forceQuoteView: true });
+
+    await restore({ outputRows: [invalidRow(), validRow()] });
+    checkPair("outputRows restoration", state.outputRows);
+
+    await restore({ pricingMatches: matches });
+    checkPair("pricingMatches restoration", state.outputRows);
+
+    await restore({ originalOutputRows: [invalidRow(), validRow()] });
+    await resetOutputDraft();
+    checkPair("originalOutputRows restoration -> Reset Output", state.outputRows);
+
+    await restore({ lineItems: [invalidRow(), validRow()] });
+    const legacyPersisted = currentQuoteSessionDraftState().lineItems;
+    checkPair("legacy lineItems restoration -> persistence", legacyPersisted);
+    refreshOutputRowsFromLineItems();
+    checkPair("legacy lineItems output promotion", state.outputRows);
+
+    await restore({
+      originalAnalysisSnapshot: {
+        quote_basis_sections: [{ id: "synthetic", title: "Synthetic", lines: [
+          { ...invalidRow(), text: "Run 560 invalid" }, { ...validRow(), text: "Run 560 valid" },
+        ] }],
+        line_items: [invalidRow(), validRow()],
+      },
+    });
+    resetQuoteBasisToOriginal();
+    checkPair("original analysis -> Reset Basis", state.lineItems);
+
+    const proposal = normalizeServerBasisChatProposal({
+      quote_basis_sections: [{ id: "synthetic", title: "Synthetic", lines: [] }],
+      line_items: [invalidRow(), validRow()],
+    });
+    setBasisChatProposal(proposal);
+    applyBasisChatProposal();
+    checkPair("proposal restore/receive -> acceptance", state.lineItems);
+
+    const sections = normalizeQuoteBasisSections([{ id: "synthetic", title: "Synthetic", lines: [
+      { ...invalidRow(), text: "Run 560 invalid" }, { ...validRow(), text: "Run 560 valid" },
+    ] }]);
+    checkRow("basis-section reconstruction", sections[0].lines[0], invalidExpected, { omitted: true });
+    checkRow("basis-section reconstruction", sections[0].lines[1], { basis_order: "", category_order: 7, item_order: 9007199254740991 }, { omitted: true });
+
+    applyDraftLineItems([invalidRow(), validRow()]);
+    checkPair("draft/resumed job result ingestion", state.lineItems);
+
+    state.lineItems = [validRow()];
+    const originalPostJson = postJson;
+    postJson = async () => ({ ok: true, data: { status: "normalized", line_items: [invalidRow(), validRow()] } });
+    try {
+      await refreshLineItemsFromServer();
+      checkPair("/api/line-items/normalize response ingestion", state.lineItems);
+    } finally {
+      postJson = originalPostJson;
+    }
+
+    state.outputRows = [invalidRow(), validRow(), { ...validRow() }];
+    state.lineItems = [];
+    state.pricingMatches = [];
+    const snapshotA = buildSessionSnapshot();
+    const draftA = currentQuoteSessionDraftState();
+    saveSessionState();
+    const localA = JSON.parse(window.localStorage.getItem(QUOTE_SESSION_STORAGE_KEY) || "{}");
+    checkPair("browser persistence buildSessionSnapshot", snapshotA.outputRows, { rowCount: 3 });
+    checkPair("browser persistence currentQuoteSessionDraftState", draftA.outputRows, { rowCount: 3 });
+    checkPair("browser persistence saveSessionState", localA.outputRows, { rowCount: 3 });
+    if (snapshotA.outputRows.length !== 3 || draftA.outputRows.length !== 3 || localA.outputRows.length !== 3) {
+      failures.push({ family: "browser persistence duplicate multiplicity", counts: [snapshotA.outputRows.length, draftA.outputRows.length, localA.outputRows.length] });
+    }
+    await applyQuoteSessionSnapshot(localA, { forceQuoteView: true });
+    saveSessionState();
+    const localB = JSON.parse(window.localStorage.getItem(QUOTE_SESSION_STORAGE_KEY) || "{}");
+    await applyQuoteSessionSnapshot(localB, { forceQuoteView: true });
+    const localC = buildSessionSnapshot();
+    if (JSON.stringify(localB.outputRows) !== JSON.stringify(localC.outputRows)) {
+      failures.push({ family: "browser persistence two-cycle determinism" });
+    }
+
+    const adapterCases = [
+      ["adapter-rows", "canonicalizePrimaryOrderRows", () => canonicalizePrimaryOrderRows([invalidRow(), validRow()])],
+      ["adapter-sections", "canonicalizeBasisSectionsPrimaryOrders", () => canonicalizeBasisSectionsPrimaryOrders([{ id: "x", lines: [invalidRow(), validRow()] }])],
+      ["adapter-original", "canonicalizeOriginalAnalysisPrimaryOrders", () => canonicalizeOriginalAnalysisPrimaryOrders({ line_items: [invalidRow(), validRow()] })],
+      ["adapter-proposal", "canonicalizeBasisChatProposalPrimaryOrders", () => canonicalizeBasisChatProposalPrimaryOrders({ lineItems: [invalidRow(), validRow()] })],
+      ["adapter-result", "canonicalizeDraftResultPrimaryOrders", () => canonicalizeDraftResultPrimaryOrders({ line_items: [invalidRow(), validRow()] })],
+      ["adapter-snapshot", "canonicalizeQuoteSessionSnapshotPrimaryOrders", () => canonicalizeQuoteSessionSnapshotPrimaryOrders({ outputRows: [invalidRow(), validRow()] })],
+    ];
+    for (const [family, name, call] of adapterCases) {
+      families.add(family);
+      if (typeof window[name] !== "function") failures.push({ family, missing: true });
+      else call();
+    }
+
+    clearQuoteSessionDraftSaveTimer();
+    clearSessionState();
+    return { failures, families: [...families] };
+  });
+  if (expectRed) {
+    if (!evidence.failures.length) throw new Error("Run-560 RED unexpectedly passed on canonical main.");
+    console.log(`Run-560 RED matrix reproduced ${evidence.failures.length} violations across ${evidence.families.length} production-boundary families.`);
+    return evidence;
+  }
+  if (evidence.failures.length) {
+    throw new Error(`Run-560 primary-order ingress matrix failed: ${JSON.stringify(evidence.failures.slice(0, 20))}.`);
+  }
+  console.log(`Run-560 GREEN matrix passed across ${evidence.families.length} production-boundary families.`);
+  return evidence;
+}
+
 async function main() {
   let serverInfo = null;
   const hasExistingServer = await healthOk();
@@ -2640,6 +2859,10 @@ async function main() {
 
   try {
     await installMockProfiles(page);
+    if (args.includes("--run560-red") || args.includes("--run560-green")) {
+      await verifyRun560PrimaryOrderIngressMatrix(page, { expectRed: args.includes("--run560-red") });
+      return;
+    }
     await verifyRecoveredTemplateOwnerFailsClosed(page);
     await verifyFreshPricingAuthorityInitializesBeforeCustomer(page);
     await verifyServerPricingReferenceReviewDurability(page);

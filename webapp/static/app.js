@@ -3066,6 +3066,7 @@ function renderFiles() {
 }
 
 function normalizeLineItem(item = {}) {
+  item = canonicalizePrimaryOrderFields(item);
   const priceMode = item.price_mode === "Included" || String(item.display_price || "").toLowerCase() === "included"
     ? "Included"
     : "Priced";
@@ -3772,8 +3773,132 @@ function clearSessionFiles() {
   }));
 }
 
-function buildSessionSnapshot() {
+function canonicalizePrimaryOrderRows(rows = []) {
+  return (Array.isArray(rows) ? rows : []).map(canonicalizePrimaryOrderFields);
+}
+
+function canonicalizeBasisSectionsPrimaryOrders(sections = []) {
+  return (Array.isArray(sections) ? sections : []).map((section) => ({
+    ...section,
+    ...(Array.isArray(section?.lines) ? { lines: canonicalizePrimaryOrderRows(section.lines) } : {}),
+  }));
+}
+
+function canonicalizeOriginalAnalysisPrimaryOrders(snapshot = {}) {
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return snapshot;
+  const admitted = { ...snapshot };
+  if (Array.isArray(admitted.quote_basis_sections)) {
+    admitted.quote_basis_sections = canonicalizeBasisSectionsPrimaryOrders(admitted.quote_basis_sections);
+  }
+  if (Array.isArray(admitted.line_items)) admitted.line_items = canonicalizePrimaryOrderRows(admitted.line_items);
+  return admitted;
+}
+
+function canonicalizeBasisChatProposalPrimaryOrders(proposal = {}) {
+  if (!proposal || typeof proposal !== "object" || Array.isArray(proposal)) return proposal;
+  const admitted = { ...proposal };
+  for (const key of ["lineItems", "line_items"]) {
+    if (Array.isArray(admitted[key])) admitted[key] = canonicalizePrimaryOrderRows(admitted[key]);
+  }
+  if (admitted.proposal && typeof admitted.proposal === "object" && !Array.isArray(admitted.proposal)) {
+    const nested = { ...admitted.proposal };
+    for (const key of ["lineItems", "line_items"]) {
+      if (Array.isArray(nested[key])) nested[key] = canonicalizePrimaryOrderRows(nested[key]);
+    }
+    admitted.proposal = nested;
+  }
+  return admitted;
+}
+
+function canonicalizeDraftResultPrimaryOrders(result = {}) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+  const admitted = { ...result };
+  if (Array.isArray(admitted.line_items)) admitted.line_items = canonicalizePrimaryOrderRows(admitted.line_items);
+  return admitted;
+}
+
+function canonicalizeQuoteSessionSnapshotPrimaryOrders(snapshot = {}) {
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return snapshot;
+  const admitted = { ...snapshot };
+  for (const key of ["outputRows", "pricingMatches", "originalOutputRows", "lineItems"]) {
+    if (Array.isArray(admitted[key])) admitted[key] = canonicalizePrimaryOrderRows(admitted[key]);
+  }
+  if (Array.isArray(admitted.quoteBasisSections)) {
+    admitted.quoteBasisSections = canonicalizeBasisSectionsPrimaryOrders(admitted.quoteBasisSections);
+  }
+  if (admitted.originalAnalysisSnapshot) {
+    admitted.originalAnalysisSnapshot = canonicalizeOriginalAnalysisPrimaryOrders(admitted.originalAnalysisSnapshot);
+  }
+  if (admitted.basisChat) admitted.basisChat = canonicalizeBasisChatProposalPrimaryOrders(admitted.basisChat);
+  if (admitted.result) admitted.result = canonicalizeDraftResultPrimaryOrders(admitted.result);
+  return admitted;
+}
+
+function stableCanonicalJson(value) {
+  const canonical = (item) => {
+    if (Array.isArray(item)) return item.map(canonical);
+    if (item && typeof item === "object") {
+      return Object.fromEntries(Object.keys(item).sort().map((key) => [key, canonical(item[key])]));
+    }
+    return item;
+  };
+  return JSON.stringify(canonical(value));
+}
+
+function primaryOrderSlot(value) {
+  const admitted = canonicalPrimaryOrderValue(value);
+  return admitted === "" ? [1, 0] : [0, admitted];
+}
+
+function comparePrimaryOrderSlots(left, right) {
+  if (left[0] !== right[0]) return left[0] - right[0];
+  return left[1] - right[1];
+}
+
+function canonicalPersistedOutputRows(rows = []) {
+  return [...(Array.isArray(rows) ? rows : [])].sort((left, right) => {
+    const primary = comparePrimaryOrderSlots(primaryOrderSlot(left.basis_order), primaryOrderSlot(right.basis_order))
+      || comparePrimaryOrderSlots(primaryOrderSlot(left.category_order), primaryOrderSlot(right.category_order))
+      || comparePrimaryOrderSlots(primaryOrderSlot(left.item_order), primaryOrderSlot(right.item_order));
+    if (primary) return primary;
+    const leftJson = stableCanonicalJson(left);
+    const rightJson = stableCanonicalJson(right);
+    return leftJson === rightJson ? 0 : (leftJson < rightJson ? -1 : 1);
+  });
+}
+
+function canonicalRowsForPersistence(rows = [], options = {}) {
+  const admitted = canonicalizePrimaryOrderRows(rows);
+  const normalized = options.fromPricingMatches
+    ? admitted.map(outputRowFromPricingMatch)
+    : admitted.map(normalizeOutputRow);
+  return canonicalPersistedOutputRows(normalized);
+}
+
+function canonicalQuoteSessionPersistenceProjection(snapshot = {}) {
+  const admitted = canonicalizeQuoteSessionSnapshotPrimaryOrders(snapshot);
+  const restoredLineItems = canonicalizePrimaryOrderRows(admitted.lineItems).map(normalizeLineItem);
+  let outputRows = [];
+  if (Array.isArray(admitted.outputRows) && admitted.outputRows.length) {
+    outputRows = canonicalRowsForPersistence(admitted.outputRows);
+  } else if (!restoredLineItems.length && Array.isArray(admitted.pricingMatches) && admitted.pricingMatches.length) {
+    outputRows = canonicalRowsForPersistence(admitted.pricingMatches, { fromPricingMatches: true });
+  }
+  const generated = outputRows.length > 0;
   return {
+    ...admitted,
+    quoteBasisSections: canonicalizeBasisSectionsPrimaryOrders(admitted.quoteBasisSections),
+    lineItems: generated ? outputRowsToLineItems(outputRows) : restoredLineItems,
+    outputRows,
+    originalOutputRows: canonicalRowsForPersistence(admitted.originalOutputRows),
+    originalAnalysisSnapshot: canonicalizeOriginalAnalysisPrimaryOrders(admitted.originalAnalysisSnapshot),
+    basisChat: canonicalizeBasisChatProposalPrimaryOrders(admitted.basisChat),
+    pricingMatches: generated ? outputRows.map((row) => ({ ...row })) : [],
+  };
+}
+
+function buildSessionSnapshot() {
+  return canonicalQuoteSessionPersistenceProjection({
     version: QUOTE_SESSION_STATE_VERSION,
     browserRecoveryScope: currentBrowserRecoveryScope(),
     savedAt: new Date().toISOString(),
@@ -3822,7 +3947,7 @@ function buildSessionSnapshot() {
     pricingMatches: state.pricingMatches,
     pricingIssues: state.pricingIssues,
     activeJob: normalizeActiveJob(state.activeJob || {}),
-  };
+  });
 }
 
 function clearSessionState() {
@@ -4219,13 +4344,14 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
     draftCandidates.length > 1
     && !quoteCommercialStrictDataEqual(draftCandidates[0], draftCandidates[1])
   ) containerMalformed = true;
-  const restoredState = containerMalformed
+  let restoredState = containerMalformed
     ? savedState
     : {
       ...(nestedSession || {}),
       ...(draftCandidates[0] || {}),
       ...savedState,
     };
+  restoredState = canonicalizeQuoteSessionSnapshotPrimaryOrders(restoredState);
   invalidateAuthorityProfileRequests();
   let rejectedRestoredActiveJob = false;
   state.profileId = typeof restoredState.profileId === "string" ? restoredState.profileId : "";
@@ -4352,20 +4478,32 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.images = await restoreSessionImages(restoredState.images);
   state.quoteBasis = cloneQuoteBasis(restoredState.quoteBasis || {});
   state.quoteBasisSections = normalizeQuoteBasisSections(restoredState.quoteBasisSections || restoredState.quoteBasis || {});
-  state.lineItems = Array.isArray(restoredState.lineItems) ? restoredState.lineItems.map(normalizeLineItem) : [];
-  state.outputRows = Array.isArray(restoredState.outputRows) ? restoredState.outputRows.map(normalizeOutputRow) : [];
-  state.originalOutputRows = Array.isArray(restoredState.originalOutputRows) ? restoredState.originalOutputRows.map(normalizeOutputRow) : [];
+  const restoredLineItems = Array.isArray(restoredState.lineItems) ? restoredState.lineItems.map(normalizeLineItem) : [];
+  const restoredOutputRows = Array.isArray(restoredState.outputRows) ? restoredState.outputRows : [];
+  const restoredPricingMatches = Array.isArray(restoredState.pricingMatches) ? restoredState.pricingMatches : [];
+  const restoredGeneratedRows = restoredOutputRows.length
+    ? canonicalRowsForPersistence(restoredOutputRows)
+    : (!restoredLineItems.length && restoredPricingMatches.length
+      ? canonicalRowsForPersistence(restoredPricingMatches, { fromPricingMatches: true })
+      : []);
+  state.outputRows = restoredGeneratedRows;
+  state.lineItems = restoredGeneratedRows.length ? outputRowsToLineItems(restoredGeneratedRows) : restoredLineItems;
+  state.originalOutputRows = Array.isArray(restoredState.originalOutputRows)
+    ? restoredState.originalOutputRows.map(normalizeOutputRow)
+    : [];
   state.outputErrors = Array.isArray(restoredState.outputErrors) ? restoredState.outputErrors : [];
   state.outputSortMode = "pricing_reference";
   state.analysisFindings = Array.isArray(restoredState.analysisFindings) ? restoredState.analysisFindings : [];
   state.blockingClarificationQuestions = Array.isArray(restoredState.blockingClarificationQuestions) ? restoredState.blockingClarificationQuestions : [];
   state.boothDimensions = normalizeBoothDimensions(restoredState.boothDimensions || savedQuoteDetails.project || {});
-  state.originalAnalysisSnapshot = restoredState.originalAnalysisSnapshot || null;
+  state.originalAnalysisSnapshot = canonicalizeOriginalAnalysisPrimaryOrders(restoredState.originalAnalysisSnapshot) || null;
   state.basisConfirmed = Boolean(restoredState.basisConfirmed);
   state.draftSource = restoredState.draftSource || "";
   state.lastAnalysisMode = normalizeAnalysisMode(restoredState.lastAnalysisMode || restoredState.originalAnalysisSnapshot?.analysis_mode);
   state.pendingAnalysisMode = normalizeAnalysisMode(restoredState.pendingAnalysisMode || state.lastAnalysisMode);
-  const savedBasisChat = restoredState.basisChat && typeof restoredState.basisChat === "object" ? restoredState.basisChat : {};
+  const savedBasisChat = restoredState.basisChat && typeof restoredState.basisChat === "object"
+    ? canonicalizeBasisChatProposalPrimaryOrders(restoredState.basisChat)
+    : {};
   state.basisChat = {
     ...state.basisChat,
     ...savedBasisChat,
@@ -4384,9 +4522,17 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
     restoredState.pdfFileRevision ?? restoredState.pdfFile?.output_revision,
     -1
   );
-  state.pricingMatches = Array.isArray(restoredState.pricingMatches) ? restoredState.pricingMatches : [];
+  state.pricingMatches = restoredGeneratedRows.length ? restoredGeneratedRows.map((row) => ({ ...row })) : [];
   state.pricingIssues = [];
-  state.activeJob = normalizeActiveJob(restoredState.activeJob || {}, { restoring: true });
+  const restoredActiveJob = restoredState.activeJob && typeof restoredState.activeJob === "object"
+    ? {
+      ...restoredState.activeJob,
+      ...(restoredState.activeJob.result ? {
+        result: canonicalizeDraftResultPrimaryOrders(restoredState.activeJob.result),
+      } : {}),
+    }
+    : {};
+  state.activeJob = normalizeActiveJob(restoredActiveJob, { restoring: true });
   rejectedRestoredActiveJob = Boolean(restoredState.activeJob && typeof restoredState.activeJob === "object" && !state.activeJob);
   if (rejectedRestoredActiveJob) {
     state.isAnalysisRunning = false;
@@ -4395,7 +4541,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
     state.restorableOverlay = "";
   }
   renderFiles();
-  renderPricingMatches(state.outputRows.length ? state.outputRows : state.pricingMatches, { fromPricingMatches: !state.outputRows.length && state.pricingMatches.length });
+  renderPricingMatches(state.outputRows, { fromPricingMatches: false });
   renderMatchSummary({ pricing_matches: state.pricingMatches });
   clearPricingReviewMessages();
   if (state.aiFailed) {
@@ -6534,6 +6680,9 @@ function splitBasisDecisionText(text = "", defaultTag = "Confirm") {
 }
 
 function normalizeBasisLines(line = "") {
+  if (line && typeof line === "object" && !Array.isArray(line)) {
+    line = canonicalizePrimaryOrderFields(line);
+  }
   if (line && typeof line === "object") {
     const quantityParts = normalizedLineTextQuantityParts(
       line.text || line.line || line.description || "",
@@ -6717,6 +6866,7 @@ function reviewBasisProposalSections(nextSections = [], currentSections = []) {
 }
 
 function normalizeOutputRow(row = {}) {
+  row = canonicalizePrimaryOrderFields(row);
   const priceMode = row.price_mode === "Included" || String(row.display_price || "").toLowerCase() === "included"
     ? "Included"
     : "Priced";
@@ -8697,6 +8847,28 @@ function numberOrNull(value) {
   return Number.isFinite(numeric) ? numeric : null;
 }
 
+function canonicalPrimaryOrderValue(value) {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value >= 1 && value <= 9007199254740991 ? value : "";
+  }
+  if (typeof value !== "string") return "";
+  const text = value.replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, "");
+  if (!/^[0-9]+$/.test(text)) return "";
+  const exact = BigInt(text);
+  if (exact < 1n || exact > 9007199254740991n) return "";
+  return Number(exact);
+}
+
+function canonicalizePrimaryOrderFields(row = {}) {
+  const admitted = row && typeof row === "object" && !Array.isArray(row) ? { ...row } : {};
+  ["basis_order", "category_order", "item_order"].forEach((field) => {
+    if (Object.prototype.hasOwnProperty.call(admitted, field)) {
+      admitted[field] = canonicalPrimaryOrderValue(admitted[field]);
+    }
+  });
+  return admitted;
+}
+
 function orderNumber(value) {
   const number = numberOrNull(value);
   return number !== null && number > 0 ? Math.trunc(number) : null;
@@ -9149,6 +9321,7 @@ function outputQuantityPartsFromPricingMatch(row = {}) {
 }
 
 function outputRowFromPricingMatch(row = {}) {
+  row = canonicalizePrimaryOrderFields(row);
   const status = pricingMatchStatus(row);
   const amount = String(row.amount ?? "").trim();
   const quantityParts = outputQuantityPartsFromPricingMatch(row);
@@ -9177,6 +9350,7 @@ function outputRowFromPricingMatch(row = {}) {
     pricing_reference_description: referenceDescription,
     pricing_keyword: row.keyword || row.pricing_keyword || "",
     source_basis_line_id: row.source_basis_line_id || "",
+    basis_order: row.basis_order ?? "",
     category_order: row.category_order ?? "",
     item_order: row.item_order ?? "",
     status: row.status,
@@ -9667,11 +9841,12 @@ function renderMatchSummary(result = {}) {
 }
 
 function renderPricingMatches(rows = [], options = {}) {
-  state.pricingMatches = Array.isArray(rows) ? rows : [];
+  const admittedRows = canonicalizePrimaryOrderRows(rows);
+  state.pricingMatches = admittedRows;
   if (options.fromPricingMatches) {
     state.outputRows = state.pricingMatches.map(outputRowFromPricingMatch);
-  } else if (Array.isArray(rows) && rows.length && rows[0]?.price_mode) {
-    state.outputRows = rows.map(normalizeOutputRow);
+  } else if (admittedRows.length && admittedRows[0]?.price_mode) {
+    state.outputRows = admittedRows.map(normalizeOutputRow);
   }
   state.outputRows = sortOutputRows(state.outputRows);
   if (elements.outputSortMode) elements.outputSortMode.value = state.outputSortMode;
@@ -10501,6 +10676,7 @@ function renderBasisChatProposalCard(proposal, changedFields = []) {
 }
 
 function setBasisChatProposal(proposal) {
+  proposal = canonicalizeBasisChatProposalPrimaryOrders(proposal);
   state.basisChat.proposal = proposal;
   const changedFields = proposalChangedFields(proposal);
   elements.basisChatProposal.hidden = false;
@@ -10626,6 +10802,7 @@ function basisChatPayload(text) {
 }
 
 function normalizeServerBasisChatProposal(proposal = {}) {
+  proposal = canonicalizeBasisChatProposalPrimaryOrders(proposal);
   const quoteBasis = proposal.quoteBasis || proposal.quote_basis || {};
   const sections = mergeBasisProposalLineMetadata(
     normalizeQuoteBasisSections(proposal.quoteBasisSections || proposal.quote_basis_sections || quoteBasis),
@@ -10968,7 +11145,7 @@ async function handleBasisChatSubmit(event) {
 }
 
 function applyBasisChatProposal() {
-  const proposal = state.basisChat.proposal;
+  const proposal = canonicalizeBasisChatProposalPrimaryOrders(state.basisChat.proposal);
   if (!proposal) return;
   state.basisConfirmed = false;
   const currentSections = state.quoteBasisSections;
@@ -11086,7 +11263,7 @@ function applyDraftBasis(basis = {}) {
 
 function applyDraftLineItems(lineItems = []) {
   state.basisConfirmed = false;
-  state.lineItems = lineItems.map(normalizeLineItem);
+  state.lineItems = canonicalizePrimaryOrderRows(lineItems).map(normalizeLineItem);
   state.outputRows = [];
   state.originalOutputRows = [];
   state.outputErrors = [];
@@ -11096,24 +11273,27 @@ async function refreshLineItemsFromServer() {
   if (!state.lineItems.length) return { ok: true, data: { status: "normalized", line_items: [] } };
   const result = await postJson("/api/line-items/normalize", buildLineItemNormalizePayload());
   if (!result.ok || !Array.isArray(result.data.line_items)) return result;
-  state.lineItems = result.data.line_items.map(normalizeLineItem);
+  state.lineItems = canonicalizePrimaryOrderRows(result.data.line_items).map(normalizeLineItem);
   state.outputRows = [];
   state.outputErrors = [];
   return result;
 }
 
 function captureOriginalAnalysisSnapshot(data = {}) {
-  const sections = normalizeQuoteBasisSections(data.quote_basis_sections || data.quote_basis || state.quoteBasisSections);
-  state.originalAnalysisSnapshot = {
+  const admitted = canonicalizeOriginalAnalysisPrimaryOrders(data);
+  const sections = normalizeQuoteBasisSections(admitted.quote_basis_sections || admitted.quote_basis || state.quoteBasisSections);
+  state.originalAnalysisSnapshot = canonicalizeOriginalAnalysisPrimaryOrders({
     quote_basis_sections: cloneQuoteBasisSections(sections),
     quote_basis: { ...state.quoteBasis, ...quoteBasisFromSections(sections) },
-    line_items: state.lineItems.map(normalizeLineItem),
+    line_items: Array.isArray(admitted.line_items)
+      ? admitted.line_items.map(normalizeLineItem)
+      : state.lineItems.map(normalizeLineItem),
     boothDimensions: { ...state.boothDimensions },
     source: data.source || state.draftSource || "",
     analysis_mode: normalizeAnalysisMode(data.analysis_mode || state.lastAnalysisMode),
     reference_file_signature: referenceFilesDependencySignature(),
     warnings: Array.isArray(data.warnings) ? [...data.warnings] : [],
-  };
+  });
 }
 
 function openBlockingClarifications(questions = [], findings = [], project = {}) {
@@ -11249,7 +11429,7 @@ function showAiFailedDraftState(data = {}) {
 }
 
 function resetQuoteBasisToOriginal() {
-  const snapshot = state.originalAnalysisSnapshot;
+  const snapshot = canonicalizeOriginalAnalysisPrimaryOrders(state.originalAnalysisSnapshot);
   if (!snapshot) return;
   state.quoteBasisSections = cloneQuoteBasisSections(snapshot.quote_basis_sections || snapshot.quote_basis || []);
   state.quoteBasis = cloneQuoteBasis(snapshot.quote_basis || quoteBasisFromSections(state.quoteBasisSections));
