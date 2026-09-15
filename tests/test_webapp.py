@@ -14,6 +14,7 @@ import os
 import queue
 import re
 import shutil
+import socket
 import sqlite3
 import struct
 import subprocess
@@ -37763,9 +37764,11 @@ main().catch((error) => {
     def test_run566_loaded_app_quote_basis_restoration_preserves_freshness(self):
         node = require_node(self)
         browser_env = os.environ.copy()
-        browser_env.pop("QUOTE_DATA_ROOT", None)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as port_socket:
+            port_socket.bind(("127.0.0.1", 0))
+            port = port_socket.getsockname()[1]
         completed = subprocess.run(
-            [node, str(ROOT / "scripts" / "playwright-smoke.mjs"), "--run566-green"],
+            [node, str(ROOT / "scripts" / "playwright-smoke.mjs"), "--run566-green", "--port", str(port)],
             cwd=str(ROOT),
             env=browser_env,
             text=True,
@@ -37778,6 +37781,102 @@ main().catch((error) => {
         self.assertIn('"secondCycleCurrent": true', completed.stdout)
         self.assertIn('"genuinePriceEditStale": true', completed.stdout)
         self.assertIn('"genuineQuoteBasisEditStale": true', completed.stdout)
+        self.assertIn('"xlsxZipSignature": true', completed.stdout)
+        self.assertIn('"authorityDigest": "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7"', completed.stdout)
+
+    def run_run569_loaded_app(self, mode, *, port=None, timeout=180, extra_args=()):
+        node = require_node(self)
+        if port is None:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as port_socket:
+                port_socket.bind(("127.0.0.1", 0))
+                port = port_socket.getsockname()[1]
+        return subprocess.run(
+            [
+                node,
+                str(ROOT / "scripts" / "playwright-smoke.mjs"),
+                mode,
+                "--port",
+                str(port),
+                *extra_args,
+            ],
+            cwd=str(ROOT),
+            env=os.environ.copy(),
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+
+    def run569_disposable_roots(self):
+        roots = set()
+        for parent, prefix in (
+            (ROOT / "_tmp" / "tests", "run569-state-"),
+            (ROOT / "_logs" / "browser", "run569-logs-"),
+        ):
+            if parent.exists():
+                roots.update(path for path in parent.iterdir() if path.name.startswith(prefix))
+        return roots
+
+    def test_run569_provisioned_loaded_app_is_repeatable_from_empty_authority(self):
+        before = self.run569_disposable_roots()
+        outputs = []
+        for iteration in range(2):
+            with self.subTest(iteration=iteration + 1):
+                completed = self.run_run569_loaded_app("--run569-positive")
+                self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+                self.assertIn('"mode": "run569-positive"', completed.stdout)
+                self.assertIn('"firstCycleCurrent": true', completed.stdout)
+                self.assertIn('"secondCycleCurrent": true', completed.stdout)
+                self.assertIn('"regenerationCurrent": true', completed.stdout)
+                self.assertIn('"genuinePriceEditStale": true', completed.stdout)
+                self.assertIn('"genuineQuoteBasisEditStale": true', completed.stdout)
+                self.assertIn('"xlsxZipSignature": true', completed.stdout)
+                self.assertIn('"authorityDigest": "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7"', completed.stdout)
+                outputs.append(completed.stdout)
+        self.assertEqual(self.run569_disposable_roots(), before)
+        self.assertEqual(len(outputs), 2)
+
+    def test_run569_missing_authority_fails_closed_without_xlsx(self):
+        before = self.run569_disposable_roots()
+        completed = self.run_run569_loaded_app("--run569-missing")
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn('"reasonCode": "pricing_reference_unavailable"', completed.stdout)
+        self.assertIn('"noUsableXlsx": true', completed.stdout)
+        self.assertEqual(self.run569_disposable_roots(), before)
+
+    def test_run569_mismatched_authority_fails_closed_without_xlsx(self):
+        before = self.run569_disposable_roots()
+        completed = self.run_run569_loaded_app("--run569-mismatch")
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn('"reasonCode": "pricing_reference_digest_mismatch"', completed.stdout)
+        self.assertIn('"noUsableXlsx": true', completed.stdout)
+        self.assertEqual(self.run569_disposable_roots(), before)
+
+    def test_run569_refuses_ambient_healthy_server_before_browser_or_provisioning(self):
+        before = self.run569_disposable_roots()
+        with LocalRunnerServer() as runner:
+            completed = self.run_run569_loaded_app(
+                "--run569-positive",
+                port=runner.server.server_address[1],
+                timeout=30,
+            )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(
+            "Run-569 refuses an ambient healthy server before pricing provisioning or browser execution.",
+            completed.stderr,
+        )
+        self.assertNotIn('"mode": "run569-positive"', completed.stdout)
+        self.assertEqual(self.run569_disposable_roots(), before)
+
+    def test_run569_loaded_app_prohibits_keep_server(self):
+        before = self.run569_disposable_roots()
+        completed = self.run_run569_loaded_app(
+            "--run569-positive",
+            timeout=30,
+            extra_args=("--keep-server",),
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("Run-569 loaded-app modes prohibit --keep-server.", completed.stderr)
+        self.assertEqual(self.run569_disposable_roots(), before)
 
     def test_run560_protected_export_rejects_stale_and_mismatched_versions_before_artifact_lookup(self):
         content = b"run560-protected-export"

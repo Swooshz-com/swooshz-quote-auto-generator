@@ -29,6 +29,13 @@ const options = {
 const baseUrl = `http://${options.host}:${options.port}`;
 const outputDir = path.join(root, "_logs", "browser", "playwright-smoke");
 const quoteDataRoot = path.join(root, "_tmp", "playwright-quote-data");
+const run569LoadedAppMode = [
+  "--run566-red",
+  "--run566-green",
+  "--run569-positive",
+  "--run569-missing",
+  "--run569-mismatch",
+].some((flag) => args.includes(flag));
 
 function stableJson(value) {
   if (Array.isArray(value)) return value.map(stableJson);
@@ -55,22 +62,113 @@ async function healthOk() {
   }
 }
 
-async function waitForHealth(timeoutMs = 15000) {
+async function waitForHealth(timeoutMs = 15000, serverInfo = null) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    if (await healthOk()) return true;
+    if (await healthOk()) {
+      if (serverInfo && (serverInfo.server.exitCode !== null || serverInfo.server.killed)) {
+        throw new Error("Owned webapp child exited before its healthy endpoint was accepted.");
+      }
+      return true;
+    }
+    if (serverInfo && serverInfo.server.exitCode !== null) return false;
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
   return false;
 }
 
-function startServer() {
+function isolatedServerEnvironment(runtime) {
+  const environment = {};
+  for (const name of ["PATH", "Path", "SystemRoot", "SYSTEMROOT", "COMSPEC", "PATHEXT", "WINDIR"]) {
+    if (process.env[name]) environment[name] = process.env[name];
+  }
+  return {
+    ...environment,
+    APP_MODE: "local",
+    AUTH_MODE: "local",
+    AUTH_REQUIRED: "false",
+    LOCAL_USER_ROLE: "admin",
+    SQAG_STORAGE_MODE: "local",
+    SQAG_ARTIFACT_STORAGE_MODE: "local",
+    SQAG_PLATFORM_LAUNCH_MODE: "disabled",
+    QUOTE_DATA_ROOT: runtime.dataRoot,
+    QUOTE_OUTPUT_ROOT: runtime.outputRoot,
+    QUOTE_TMP_ROOT: runtime.tmpRoot,
+    QUOTE_LOG_ROOT: runtime.logRoot,
+    SQAG_LOCAL_PRICING_REFERENCES_ROOT: runtime.pricingRoot,
+    TEMP: runtime.tempRoot,
+    TMP: runtime.tempRoot,
+    // Non-empty whitespace prevents read_dotenv_value() from falling through to repo .env,
+    // while clean_text() still treats both provider credentials as unavailable.
+    OPENAI_API_KEY: " ",
+    DEEPSEEK_API_KEY: " ",
+    PYTHONIOENCODING: "utf-8",
+  };
+}
+
+async function createRun569Runtime() {
+  const stateParent = path.join(root, "_tmp", "tests");
+  const logParent = path.join(root, "_logs", "browser");
+  await fs.mkdir(stateParent, { recursive: true });
+  await fs.mkdir(logParent, { recursive: true });
+  const stateRoot = await fs.mkdtemp(path.join(stateParent, "run569-state-"));
+  const logRoot = await fs.mkdtemp(path.join(logParent, "run569-logs-"));
+  const runtime = {
+    stateRoot,
+    logRoot,
+    dataRoot: path.join(stateRoot, "data"),
+    outputRoot: path.join(stateRoot, "output"),
+    tmpRoot: path.join(stateRoot, "tmp"),
+    pricingRoot: path.join(stateRoot, "pricing-references"),
+    tempRoot: path.join(stateRoot, "temp"),
+  };
+  await Promise.all([
+    fs.mkdir(runtime.dataRoot, { recursive: true }),
+    fs.mkdir(runtime.outputRoot, { recursive: true }),
+    fs.mkdir(runtime.tmpRoot, { recursive: true }),
+    fs.mkdir(runtime.pricingRoot, { recursive: true }),
+    fs.mkdir(runtime.tempRoot, { recursive: true }),
+  ]);
+  return runtime;
+}
+
+async function cleanupRun569Runtime(runtime) {
+  if (!runtime) return;
+  await fs.rm(runtime.stateRoot, { recursive: true, force: true });
+  await fs.rm(runtime.logRoot, { recursive: true, force: true });
+}
+
+async function assertRun569PricingRootEmpty(runtime) {
+  const entries = await fs.readdir(runtime.pricingRoot);
+  if (entries.length) {
+    throw new Error(`Run-569 isolated pricing authority did not begin empty: ${entries.join(", ")}.`);
+  }
+}
+
+async function assertNoRun569Xlsx(runtime) {
+  const pending = [runtime.outputRoot];
+  while (pending.length) {
+    const current = pending.pop();
+    const entries = await fs.readdir(current, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const candidate = path.join(current, entry.name);
+      if (entry.isDirectory()) pending.push(candidate);
+      if (entry.isFile() && entry.name.toLowerCase() === "quotation.xlsx") {
+        throw new Error("Run-569 negative authority case generated quotation.xlsx.");
+      }
+    }
+  }
+}
+
+function startServer(runtime = null) {
   const server = spawn(
     pythonCommand(),
     ["webapp/server.py", "--host", options.host, "--port", String(options.port)],
     {
       cwd: root,
-      env: { ...process.env, APP_MODE: "local", QUOTE_DATA_ROOT: process.env.QUOTE_DATA_ROOT || quoteDataRoot },
+      env: runtime
+        ? isolatedServerEnvironment(runtime)
+        : { ...process.env, APP_MODE: "local", QUOTE_DATA_ROOT: process.env.QUOTE_DATA_ROOT || quoteDataRoot },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     },
@@ -86,10 +184,11 @@ function startServer() {
 }
 
 async function stopServer(serverInfo) {
-  if (!serverInfo || options.keepServer) return;
-  if (serverInfo.server.killed) return;
+  if (!serverInfo || (!run569LoadedAppMode && options.keepServer)) return;
+  if (serverInfo.server.exitCode !== null) return;
+  const exited = new Promise((resolve) => serverInfo.server.once("exit", resolve));
   serverInfo.server.kill();
-  await new Promise((resolve) => serverInfo.server.once("exit", resolve));
+  if (serverInfo.server.exitCode === null) await exited;
 }
 
 async function screenshot(page, name) {
@@ -1427,6 +1526,56 @@ async function saveSmokePricingReference(page, internalCost) {
   }), { internalCost });
 }
 
+async function verifyRun569ServerPricingAuthority(page, internalCost, expectedDigest = "") {
+  const response = await page.context().request.get(
+    `${baseUrl}/api/settings/pricing-references/synthetic-exhibition-fixture-pricing?source=local`,
+  );
+  const body = await response.json().catch(() => ({}));
+  const detail = body.pricing_reference || {};
+  const items = Array.isArray(detail.items) ? detail.items : [];
+  const item = items[0] || {};
+  const exact = (
+    response.ok()
+    && detail.source === "local"
+    && detail.id === "synthetic-exhibition-fixture-pricing"
+    && detail.schema_version === 1
+    && detail.currency === "SGD"
+    && detail.tax?.label === "GST"
+    && detail.tax?.rate === 0.09
+    && items.length === 1
+    && item.id === "synthetic-floor-needle-punch-carpet"
+    && item.section === "Floor Design"
+    && item.reference_section === "Floor Design"
+    && item.description === "Needle punch carpet in colour"
+    && (item.unit === "sqm" || item.unit_hint === "sqm")
+    && item.internal_cost === internalCost
+    && item.markup_multiplier === 1.5
+    && item.sale_unit_price === internalCost * 1.5
+    && Array.isArray(item.remarks)
+    && item.remarks.length === 1
+    && item.remarks[0] === "Synthetic smoke fixture row"
+    && item.category_order === 1
+    && item.item_order === 1
+    && (!expectedDigest || detail.digest_sha256 === expectedDigest)
+  );
+  if (!exact) {
+    throw new Error(`Run-569 unintercepted pricing-authority verification failed: ${JSON.stringify({ status: response.status(), detail })}.`);
+  }
+  return detail.digest_sha256;
+}
+
+async function provisionRun569PricingAuthority(page, internalCost, expectedDigest = "") {
+  const saved = await saveSmokePricingReference(page, internalCost);
+  if (
+    !saved.ok
+    || saved.data?.status !== "saved"
+    || saved.data?.metadata_enrichment_status !== "not_configured"
+  ) {
+    throw new Error(`Run-569 local pricing provision failed: ${JSON.stringify(saved)}.`);
+  }
+  return verifyRun569ServerPricingAuthority(page, internalCost, expectedDigest);
+}
+
 async function verifyServerPricingReferenceReviewDurability(page) {
   let sessionId = "";
   const isolatedContext = await page.context().browser().newContext({ viewport: { width: 1365, height: 768 } });
@@ -2111,6 +2260,7 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
     customerName,
     projectName,
     useHandleGenerate,
+    expectedGenerationFailureReason,
     quoteBasisSections,
     includeLegacyBasisDefaults,
   }) => {
@@ -2307,6 +2457,7 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
         || topPricing.source !== expectedPricing.source
         || topPricing.currency !== expectedPricing.currency
         || topPricing.digest_sha256 !== expectedPricing.digest
+        || Object.prototype.hasOwnProperty.call(topPricing, "items")
       )) {
         throw new Error(`${label} does not carry the exact pricing authority identity.`);
       }
@@ -2347,6 +2498,25 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
 
     if (useHandleGenerate) {
       const generated = await handleGenerate();
+      if (expectedGenerationFailureReason) {
+        const review = state.quoteCommercialReview;
+        if (generated || review?.reason_code !== expectedGenerationFailureReason) {
+          throw new Error(`Canonical synthetic handleGenerate() did not fail with ${expectedGenerationFailureReason}: ${JSON.stringify({ generated, review })}.`);
+        }
+        const detailResponse = await fetch(`/api/quote-sessions/${encodeURIComponent(sessionId)}`);
+        const detailData = await detailResponse.json().catch(() => ({}));
+        if (!detailResponse.ok) throw new Error("Failed synthetic quote session could not be re-read.");
+        const xlsx = detailData.quote_session?.exports?.xlsx || {};
+        if (
+          xlsx.exists === true
+          || String(xlsx.url || "").trim()
+          || xlsx.filename === "quotation.xlsx"
+          || Number(xlsx.size_bytes || 0) > 0
+        ) {
+          throw new Error(`Failed synthetic generation exposed usable XLSX metadata: ${JSON.stringify(xlsx)}.`);
+        }
+        return { sessionId, reasonCode: review.reason_code, xlsx };
+      }
       if (!generated) throw new Error(`Canonical synthetic handleGenerate() did not produce quotation.xlsx: ${JSON.stringify({
         workflowStage: state.workflowStage,
         activeSidePanel: state.activeSidePanel,
@@ -2408,6 +2578,7 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
     customerName: Object.prototype.hasOwnProperty.call(options, "customerName") ? options.customerName : undefined,
     projectName: Object.prototype.hasOwnProperty.call(options, "projectName") ? options.projectName : undefined,
     useHandleGenerate: options.useHandleGenerate === true,
+    expectedGenerationFailureReason: String(options.expectedGenerationFailureReason || ""),
     quoteBasisSections: Array.isArray(options.quoteBasisSections) ? options.quoteBasisSections : [],
     includeLegacyBasisDefaults: options.includeLegacyBasisDefaults === true,
   });
@@ -2488,6 +2659,16 @@ async function verifyRun566QuoteBasisRestorationFreshness(page, options = {}) {
   const generated = await detail(sessionId);
   if (!exportIsCurrent(generated)) {
     throw new Error(`Run-566 freshly generated handleGenerate() export is not current: ${JSON.stringify(generated.exports)}.`);
+  }
+  const xlsxResponse = await page.context().request.get(new URL(generated.exports.xlsx.url, baseUrl).href);
+  const xlsxBody = await xlsxResponse.body();
+  if (
+    !xlsxResponse.ok()
+    || xlsxBody.length === 0
+    || xlsxBody[0] !== 0x50
+    || xlsxBody[1] !== 0x4b
+  ) {
+    throw new Error(`Run-569 generated XLSX download is not a non-empty ZIP response: ${xlsxResponse.status()} / ${xlsxBody.length}.`);
   }
   const generatedDraft = generated.draft_state || {};
   for (const [key, value] of Object.entries(sectionBasis)) {
@@ -2620,6 +2801,25 @@ async function verifyRun566QuoteBasisRestorationFreshness(page, options = {}) {
     regenerationCurrent: exportIsCurrent(afterRegeneration),
     genuinePriceEditStale: !exportIsCurrent(afterPriceEdit),
     genuineQuoteBasisEditStale: !exportIsCurrent(afterBasisEdit),
+    xlsxDownloadBytes: xlsxBody.length,
+    xlsxZipSignature: true,
+  }, null, 2));
+}
+
+async function verifyRun569NegativeAuthority(page, reasonCode) {
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => state.isBooting === false, null, { timeout: 30000 });
+  const result = await createDashboardSmokeSession(page, `run569-${reasonCode}`, {
+    sessionIdPrefix: `quote-run569-${reasonCode}`,
+    useHandleGenerate: true,
+    expectedGenerationFailureReason: reasonCode,
+    includeLegacyBasisDefaults: true,
+  });
+  console.log(JSON.stringify({
+    status: "ok",
+    mode: `run569-${reasonCode}`,
+    reasonCode: result.reasonCode,
+    noUsableXlsx: true,
   }, null, 2));
 }
 
@@ -3078,34 +3278,78 @@ async function verifyRun560PrimaryOrderIngressMatrix(page, { expectRed = false }
 
 async function main() {
   let serverInfo = null;
-  const hasExistingServer = await healthOk();
-  if (!hasExistingServer) {
-    await fs.rm(quoteDataRoot, { recursive: true, force: true });
-    serverInfo = startServer();
-    if (!(await waitForHealth())) {
-      const serverOutput = serverInfo.output.join("").trim();
-      await stopServer(serverInfo);
-      throw new Error(`Could not start webapp at ${baseUrl}.${serverOutput ? `\n\n${serverOutput}` : ""}`);
-    }
-  }
-
-  const browser = await chromium.launch({ headless: !options.headed });
-  const context = await browser.newContext({ viewport: { width: 1365, height: 768 } });
-  const page = await context.newPage();
-  const consoleProblems = [];
-  const networkProblems = [];
-  page.on("console", (message) => {
-    if (["error", "warning"].includes(message.type())) consoleProblems.push(`${message.type()}: ${message.text()}`);
-  });
-  page.on("pageerror", (error) => consoleProblems.push(`pageerror: ${error.message}`));
-  page.on("response", (response) => {
-    if (response.status() >= 400) networkProblems.push(`${response.status()} ${response.url()}`);
-  });
-
+  let browser = null;
+  let run569Runtime = null;
   try {
+    const hasExistingServer = await healthOk();
+    if (run569LoadedAppMode) {
+      if (options.keepServer) throw new Error("Run-569 loaded-app modes prohibit --keep-server.");
+      if (options.host !== "127.0.0.1" || !args.some((arg) => arg === "--port" || arg.startsWith("--port="))) {
+        throw new Error("Run-569 loaded-app modes require an explicit fresh 127.0.0.1 --port.");
+      }
+      run569Runtime = await createRun569Runtime();
+      if (hasExistingServer) {
+        throw new Error("Run-569 refuses an ambient healthy server before pricing provisioning or browser execution.");
+      }
+      await assertRun569PricingRootEmpty(run569Runtime);
+      serverInfo = startServer(run569Runtime);
+      if (!(await waitForHealth(15000, serverInfo))) {
+        const serverOutput = serverInfo.output.join("").trim();
+        throw new Error(`Could not start owned Run-569 webapp at ${baseUrl}.${serverOutput ? `\n\n${serverOutput}` : ""}`);
+      }
+    } else if (!hasExistingServer) {
+      await fs.rm(quoteDataRoot, { recursive: true, force: true });
+      serverInfo = startServer();
+      if (!(await waitForHealth(15000, serverInfo))) {
+        const serverOutput = serverInfo.output.join("").trim();
+        throw new Error(`Could not start webapp at ${baseUrl}.${serverOutput ? `\n\n${serverOutput}` : ""}`);
+      }
+    }
+
+    browser = await chromium.launch({ headless: !options.headed });
+    const context = await browser.newContext({ viewport: { width: 1365, height: 768 } });
+    const page = await context.newPage();
+    const consoleProblems = [];
+    const networkProblems = [];
+    page.on("console", (message) => {
+      if (["error", "warning"].includes(message.type())) consoleProblems.push(`${message.type()}: ${message.text()}`);
+    });
+    page.on("pageerror", (error) => consoleProblems.push(`pageerror: ${error.message}`));
+    page.on("response", (response) => {
+      if (response.status() >= 400) networkProblems.push(`${response.status()} ${response.url()}`);
+    });
+
     await installMockProfiles(page);
-    if (args.includes("--run566-red") || args.includes("--run566-green")) {
-      await verifyRun566QuoteBasisRestorationFreshness(page, { expectRed: args.includes("--run566-red") });
+    if (args.includes("--run566-green") || args.includes("--run569-positive")) {
+      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+      await page.waitForFunction(() => state.isBooting === false, null, { timeout: 30000 });
+      const digest = await provisionRun569PricingAuthority(
+        page,
+        10,
+        "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7",
+      );
+      await verifyRun566QuoteBasisRestorationFreshness(page, { expectRed: false });
+      console.log(JSON.stringify({ status: "ok", mode: "run569-positive", authorityDigest: digest }, null, 2));
+      return;
+    }
+    if (args.includes("--run569-missing")) {
+      await verifyRun569NegativeAuthority(page, "pricing_reference_unavailable");
+      await assertNoRun569Xlsx(run569Runtime);
+      return;
+    }
+    if (args.includes("--run569-mismatch")) {
+      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+      await page.waitForFunction(() => state.isBooting === false, null, { timeout: 30000 });
+      const mismatchDigest = await provisionRun569PricingAuthority(page, 11);
+      if (mismatchDigest === "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7") {
+        throw new Error("Run-569 mismatched authority unexpectedly retained the cost-10 digest.");
+      }
+      await verifyRun569NegativeAuthority(page, "pricing_reference_digest_mismatch");
+      await assertNoRun569Xlsx(run569Runtime);
+      return;
+    }
+    if (args.includes("--run566-red")) {
+      await verifyRun566QuoteBasisRestorationFreshness(page, { expectRed: true });
       return;
     }
     if (args.includes("--run560-red") || args.includes("--run560-green")) {
@@ -3938,8 +4182,9 @@ async function main() {
       networkProblems,
     }, null, 2));
   } finally {
-    await browser.close();
+    if (browser) await browser.close();
     await stopServer(serverInfo);
+    await cleanupRun569Runtime(run569Runtime);
   }
 }
 
