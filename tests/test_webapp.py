@@ -23720,6 +23720,8 @@ eval([
   "outputRowsAlignedToBasis",
   "includedBasisOutputRows",
   "outputRowFromLineItem",
+  "canonicalRawPrimaryOrderValue",
+  "canonicalizeRawPrimaryOrderFields",
   "categoryOrderValue",
   "pricingReferenceOrder",
   "compareOrderValues",
@@ -28872,6 +28874,76 @@ assert.strictEqual(line.unit, "nos");
         self.assertIn('categoryOrderValue', js)
         self.assertIn('pricingReferenceOrder', js)
 
+    def test_raw_primary_order_is_canonical_before_normalization_and_persistence(self):
+        js = (ROOT / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
+        node = require_node(self)
+        save_body = js.split("function currentQuoteSessionDraftState()", 1)[1].split(
+            "function quoteSessionDraftComparisonKey", 1
+        )[0]
+        restore_body = js.split("async function applyQuoteSessionSnapshot", 1)[1].split(
+            "function quoteOutputProgressForNavigation", 1
+        )[0]
+        self.assertIn("canonicalRowsForPersistence", save_body)
+        self.assertIn("canonicalRowsForPersistence", restore_body)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+function extractFunction(name) {
+  const start = source.indexOf(`function ${name}`);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}" && --depth === 0) return source.slice(start, index + 1);
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+const CANONICAL_OUTPUT_TIE_FIELDS = [
+  "source_basis_line_id", "section", "description", "pricing_keyword", "quantity", "unit",
+  "price_mode", "catalog_description", "pricing_reference_description", "unit_price_override",
+  "catalog_unit_price", "effective_unit_price", "pricing_basis_amount", "approved_quote_amount",
+  "pricing_reference_id", "pricing_reference_source", "pricing_basis_currency",
+  "pricing_basis_digest", "status",
+];
+function numberOrNull(value) {
+  if (value === "" || value === null || value === undefined) return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+function orderNumber(value) { return numberOrNull(value); }
+function normalizeOutputRow(row) { return { ...row, basis_order: orderNumber(row.basis_order) ?? "", category_order: orderNumber(row.category_order) ?? "", item_order: orderNumber(row.item_order) ?? "" }; }
+function snapshotOutputRows(rows) { return rows.map((row) => normalizeOutputRow({ ...row })); }
+function outputRowFromPricingMatch(row) { return normalizeOutputRow(row); }
+eval([
+  "canonicalRawPrimaryOrderValue", "canonicalizeRawPrimaryOrderFields", "canonicalOrderSlot",
+  "canonicalValueSlot", "compareCanonicalValues", "canonicalOutputRowOrderKey",
+  "canonicalPersistedOutputRows", "canonicalRowsForPersistence",
+].map(extractFunction).join("\n"));
+const row = (id, order) => ({
+  source_basis_line_id: id, section: "Synthetic", description: id, quantity: 1, unit: "lot",
+  price_mode: "Priced", catalog_unit_price: 15, basis_order: order,
+});
+for (const invalid of [undefined, "", null, 0, -1, 0.5, "1.5", "bad", NaN, Infinity]) {
+  const persisted = canonicalRowsForPersistence([row(`invalid-${String(invalid)}`, invalid)])[0];
+  assert.strictEqual(persisted.basis_order, "");
+}
+for (const valid of [1, 2, "2"]) {
+  assert.strictEqual(canonicalRowsForPersistence([row(`valid-${valid}`, valid)])[0].basis_order, Number(valid));
+}
+const rows = [row("c", 2), row("a", 1), row("b", 1), { ...row("b", 1) }];
+const bytes = [rows, [rows[3], rows[0], rows[2], rows[1]], [rows[1], rows[2], rows[0], rows[3]]]
+  .map((items) => JSON.stringify(canonicalRowsForPersistence(items)));
+assert.strictEqual(new Set(bytes).size, 1);
+assert.strictEqual(JSON.parse(bytes[0]).filter((item) => item.source_basis_line_id === "b").length, 2);
+"""
+        completed = subprocess.run(
+            [node, "-e", script], cwd=str(ROOT), text=True, capture_output=True, check=False
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
     def test_static_catalog_output_description_edits_survive_normalize_render_snapshot_and_line_items(self):
         node = require_node(self)
 
@@ -28928,6 +29000,8 @@ eval([
   "synchronizeOwnedOutputRowPrice",
   "recalculateOutputRow",
   "normalizeOutputRow",
+  "canonicalRawPrimaryOrderValue",
+  "canonicalizeRawPrimaryOrderFields",
   "categoryOrderValue",
   "pricingReferenceOrder",
   "compareOrderValues",
@@ -29875,6 +29949,8 @@ async function main() {
     assert.strictEqual(savedDraft.pricingReferenceId, referenceId);
     assert.strictEqual(savedDraft.pricingReferenceSource, "company");
     assert.ok(savedDraft.quoteDetails?.commercial_snapshot?.pricing_basis?.digest);
+    const canonicalSavedOutput = JSON.stringify(savedDraft.outputRows || []);
+    const canonicalSavedLineItems = JSON.stringify(savedDraft.lineItems || []);
 
     await page.locator("#backToDashboardButton", { hasText: "Dashboard" }).click();
     await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 30000 });
@@ -29895,8 +29971,8 @@ async function main() {
     assert.strictEqual(restored.review, null);
     assert.strictEqual(restored.lifecycle, fresh.lifecycle);
     assert.strictEqual(restored.basis, fresh.basis);
-    assert.strictEqual(restored.output, fresh.output);
-    assert.strictEqual(restored.lineItems, JSON.stringify([fresh.lineItem]));
+    assert.deepStrictEqual(JSON.parse(restored.output), JSON.parse(canonicalSavedOutput));
+    assert.deepStrictEqual(JSON.parse(restored.lineItems), JSON.parse(canonicalSavedLineItems));
     assert.strictEqual(restored.snapshot.pricing_basis.id, referenceId);
     assert.strictEqual(restored.snapshot.pricing_basis.source, "company");
 
@@ -31105,6 +31181,64 @@ main().catch((error) => {
         self.assertEqual(status, 200)
         self.assertEqual(downloaded, xlsx_bytes)
 
+    def test_database_artifact_guard_rejects_stale_and_noncurrent_versions_before_artifact_lookup(self):
+        export = {
+            "filename": "quotation.xlsx",
+            "sha256": hashlib.sha256(b"xlsx-version-guard").hexdigest(),
+            "size_bytes": len(b"xlsx-version-guard"),
+            "stale": False,
+        }
+        metadata = {
+            "session_id": "quote-version-guard",
+            "publication": {"state": "published", "run_id": "run-version-guard"},
+            "exports": {"xlsx": export},
+        }
+        expected_artifact = {
+            "filename": "quotation.xlsx",
+            "sha256": export["sha256"],
+            "size_bytes": export["size_bytes"],
+            "content": b"xlsx-version-guard",
+        }
+
+        def storage_for(candidate_metadata, version):
+            storage = object.__new__(webapp.DatabaseSqagStorage)
+            storage._read_quote_session_metadata = mock.Mock(return_value=(candidate_metadata, []))
+            storage._publication_version_row = mock.Mock(return_value=version)
+            storage._publication_version_artifact = mock.Mock(return_value=expected_artifact)
+            return storage
+
+        with mock.patch.object(webapp, "configured_artifact_storage_mode", return_value="database"):
+            stale_metadata = copy.deepcopy(metadata)
+            stale_metadata["exports"]["xlsx"]["stale"] = True
+            stale_storage = storage_for(
+                stale_metadata,
+                {"session_id": "quote-version-guard", "state": "published"},
+            )
+            self.assertIsNone(stale_storage.quote_session_export_artifact("quote-version-guard", "xlsx"))
+            stale_storage._publication_version_row.assert_not_called()
+            stale_storage._publication_version_artifact.assert_not_called()
+
+            for label, version in (
+                ("superseded", {"session_id": "quote-version-guard", "state": "superseded"}),
+                ("wrong-session", {"session_id": "quote-other", "state": "published"}),
+            ):
+                with self.subTest(label=label):
+                    blocked_storage = storage_for(copy.deepcopy(metadata), version)
+                    self.assertIsNone(blocked_storage.quote_session_export_artifact("quote-version-guard", "xlsx"))
+                    blocked_storage._publication_version_artifact.assert_not_called()
+
+            current_storage = storage_for(
+                copy.deepcopy(metadata),
+                {"session_id": "quote-version-guard", "state": "published"},
+            )
+            self.assertEqual(
+                current_storage.quote_session_export_artifact("quote-version-guard", "xlsx"),
+                expected_artifact,
+            )
+            current_storage._publication_version_artifact.assert_called_once_with(
+                "quote-version-guard", "run-version-guard", "xlsx"
+            )
+
     def test_database_artifact_download_fails_after_session_delete_and_legacy_route_stays_locked(self):
         tmp_path = test_temp_root() / f"db-artifact-delete-route-{time.time_ns()}"
         tmp_path.mkdir(parents=True)
@@ -31184,7 +31318,7 @@ main().catch((error) => {
         self.assertEqual(delete_response["status"], "deleted")
         self.assertIsNone(artifact_after_delete)
 
-    def test_database_artifact_stale_export_remains_downloadable_and_snapshot_is_preserved(self):
+    def test_database_artifact_stale_export_is_not_downloadable_and_snapshot_is_preserved(self):
         tmp_path = test_temp_root() / f"db-artifact-stale-{time.time_ns()}"
         tmp_path.mkdir(parents=True)
         database_url = f"sqlite:///{(tmp_path / 'sqag-storage.sqlite3').as_posix()}"
@@ -31261,10 +31395,10 @@ main().catch((error) => {
         self.assertEqual(webapp.quote_session_result_files(fetched), [])
         self.assertEqual(fetched["generation_snapshot"]["profile"]["display_name"], "Generated Stale Profile")
         self.assertEqual(fetched["generation_snapshot"]["pricing_reference"]["display_name"], "Generated Stale Pricing")
-        self.assertEqual(artifact["content"], b"xlsx-db-stale")
-        self.assertEqual(pdf_artifact["content"], b"pdf-db-stale")
-        self.assertEqual(stale_downloads["xlsx"], (200, b"xlsx-db-stale"))
-        self.assertEqual(stale_downloads["pdf"], (200, b"pdf-db-stale"))
+        self.assertIsNone(artifact)
+        self.assertIsNone(pdf_artifact)
+        self.assertEqual(stale_downloads["xlsx"][0], 404)
+        self.assertEqual(stale_downloads["pdf"][0], 404)
         self.assertEqual(cross_workspace_downloads["xlsx"][0], 404)
         self.assertEqual(cross_workspace_downloads["pdf"][0], 404)
         self.assertIn(unauthorised_downloads["xlsx"][0], {401, 403})
@@ -31415,8 +31549,8 @@ main().catch((error) => {
         for kind, expected in (("xlsx", xlsx_bytes), ("pdf", pdf_bytes)):
             self.assertTrue(stale_session["exports"][kind]["exists"])
             self.assertTrue(stale_session["exports"][kind]["stale"])
-            self.assertEqual(stale_artifacts[kind]["content"], expected)
-            self.assertEqual(stale_downloads[kind], (200, expected))
+            self.assertIsNone(stale_artifacts[kind])
+            self.assertEqual(stale_downloads[kind][0], 404)
             self.assertEqual(replacement_artifacts[kind]["content"], expected)
             self.assertFalse(replaced_session["exports"][kind]["stale"])
             self.assertEqual(replacement_downloads[kind], (200, expected))

@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -9,6 +10,9 @@ import { TEST_REFERENCE_FILE_NAME, seedQuoteDraftFromTestFixture } from "./playw
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const args = process.argv.slice(2);
+const run552AuthenticatedOnly = args.includes("--run552-authenticated-only");
+const run552AuthenticatedBaseUrl = String(process.env.RUN552_AUTHENTICATED_BASE_URL || "").trim();
+let run552PricingDigest = "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7";
 
 function readArg(name, fallback = "") {
   const index = args.indexOf(name);
@@ -26,7 +30,7 @@ const options = {
   port: Number(readArg("--port", process.env.PLAYWRIGHT_PORT || "8765")),
 };
 
-const baseUrl = `http://${options.host}:${options.port}`;
+const baseUrl = run552AuthenticatedBaseUrl || `http://${options.host}:${options.port}`;
 const outputDir = path.join(root, "_logs", "browser", "playwright-smoke");
 const quoteDataRoot = path.join(root, "_tmp", "playwright-quote-data");
 
@@ -364,17 +368,21 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
       forceQuoteView: true,
       sessionId: snapshot.quoteSessionId,
     });
+    const restoredRow = state.outputRows.find((row) => row.description === expected);
+    const renderedDescriptions = Array.from(document.querySelectorAll(
+      '#pricingMatchesBody [data-output-label="Description"]',
+    )).map((cell) => cell.textContent?.trim() || "");
     return {
       restored,
-      description: state.outputRows[0]?.description || "",
-      renderedDescription: document.querySelector('#pricingMatchesBody tr:first-child [data-output-label="Description"]')?.textContent?.trim() || "",
-      pricingKeyword: state.outputRows[0]?.pricing_keyword || "",
-      matchesExpected: state.outputRows[0]?.description === expected,
+      description: restoredRow?.description || "",
+      rendered: renderedDescriptions.includes(expected),
+      pricingKeyword: restoredRow?.pricing_keyword || "",
+      matchesExpected: Boolean(restoredRow),
     };
   }, manualDescription);
   if (!quoteRestoreEvidence.restored
     || !quoteRestoreEvidence.matchesExpected
-    || quoteRestoreEvidence.renderedDescription !== manualDescription
+    || !quoteRestoreEvidence.rendered
     || quoteRestoreEvidence.pricingKeyword !== "graphics-vinyl-printed-graphics") {
     throw new Error(`Quote-session restore changed a manual Output description: ${JSON.stringify(quoteRestoreEvidence)}.`);
   }
@@ -386,16 +394,21 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
   await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
   const browserRestoreEvidence = await page.evaluate((expected) => {
     const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
+    const restoredRow = state.outputRows.find((row) => row.description === expected);
+    const savedRow = saved.outputRows?.find((row) => row.description === expected);
+    const renderedDescriptions = Array.from(document.querySelectorAll(
+      '#pricingMatchesBody [data-output-label="Description"]',
+    )).map((cell) => cell.textContent?.trim() || "");
     return {
-      stateDescription: state.outputRows[0]?.description || "",
-      renderedDescription: document.querySelector('#pricingMatchesBody tr:first-child [data-output-label="Description"]')?.textContent?.trim() || "",
-      savedDescription: saved.outputRows?.[0]?.description || "",
-      pricingKeyword: state.outputRows[0]?.pricing_keyword || "",
-      matchesExpected: state.outputRows[0]?.description === expected,
+      stateDescription: restoredRow?.description || "",
+      rendered: renderedDescriptions.includes(expected),
+      savedDescription: savedRow?.description || "",
+      pricingKeyword: restoredRow?.pricing_keyword || "",
+      matchesExpected: Boolean(restoredRow),
     };
   }, manualDescription);
   if (!browserRestoreEvidence.matchesExpected
-    || browserRestoreEvidence.renderedDescription !== manualDescription
+    || !browserRestoreEvidence.rendered
     || browserRestoreEvidence.savedDescription !== manualDescription
     || browserRestoreEvidence.pricingKeyword !== "graphics-vinyl-printed-graphics") {
     throw new Error(`Browser recovery changed a manual Output description: ${JSON.stringify(browserRestoreEvidence)}.`);
@@ -425,7 +438,8 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
   if (outputMetrics.rowWidth > 500 || outputMetrics.cells.some((cell) => cell.width > 500)) {
     throw new Error(`Mobile output card overflows the viewport: ${JSON.stringify(outputMetrics)}.`);
   }
-  await page.locator('#pricingMatchesBody tr:first-child [data-output-edit-field="unit_price_override"]').click();
+  const restoredManualRow = page.locator("#pricingMatchesBody tr").filter({ hasText: manualDescription }).first();
+  await restoredManualRow.locator('[data-output-edit-field="unit_price_override"]').click();
   await page.locator('[data-output-editor-field="unit_price_override"]').waitFor({ state: "visible", timeout: 15000 });
   await page.locator('[data-output-included-action="true"]').waitFor({ state: "visible", timeout: 15000 });
   await page.keyboard.press("Escape");
@@ -1326,11 +1340,11 @@ async function installMockProfiles(page) {
           id: "synthetic-exhibition-fixture-pricing",
           label: "Synthetic Exhibition Fixture Pricing",
           description: "Test-only pricing reference for the Playwright smoke.",
-          source: "local",
+          source: run552AuthenticatedOnly ? "company" : "local",
           schema_version: 1,
           currency: "SGD",
           tax: { label: "GST", rate: 0.09 },
-          item_count: 1,
+          item_count: run552AuthenticatedOnly ? 3 : 1,
           items: [{
             id: "synthetic-floor-needle-punch-carpet",
             section: "Floor Design",
@@ -1339,7 +1353,23 @@ async function installMockProfiles(page) {
             internal_cost: 10,
             markup_multiplier: 1.5,
             remarks: "Synthetic smoke fixture row",
-          }],
+          }, ...(run552AuthenticatedOnly ? [{
+            id: "synthetic-wall-structure",
+            section: "Structures",
+            description: "Synthetic wall structure",
+            unit_hint: "sqm",
+            internal_cost: 8,
+            markup_multiplier: 1.5,
+            remarks: "Synthetic smoke fixture row",
+          }, {
+            id: "synthetic-counter",
+            section: "Furniture",
+            description: "Synthetic duplicate-like counter",
+            unit_hint: "nos",
+            internal_cost: 10,
+            markup_multiplier: 1.5,
+            remarks: "Synthetic smoke fixture row",
+          }] : [])],
         },
       }),
     });
@@ -1379,12 +1409,33 @@ async function installMockProfiles(page) {
         pricing_references: [{
           id: "synthetic-exhibition-fixture-pricing",
           label: "Synthetic Exhibition Fixture Pricing",
-          source: "local",
+          source: run552AuthenticatedOnly ? "company" : "local",
           currency: "SGD",
           tax: { label: "GST", rate: 0.09 },
-          item_count: 1,
-          digest_sha256: "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7",
+          item_count: run552AuthenticatedOnly ? 3 : 1,
+          digest_sha256: run552PricingDigest,
         }],
+        company_profiles: run552AuthenticatedOnly ? [{
+          id: "synthetic-run552-company-profile",
+          label: "Synthetic Run 552 Company Profile",
+          description: "Test-only company profile for authenticated export evidence.",
+          defaults: {
+            company: {
+              name: "Synthetic Run 552 Company Pte Ltd",
+              header_details: "Synthetic Run 552 Company Pte Ltd\n1 Synthetic Way\nSingapore 000001",
+              logo_data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+            },
+            quote_text: {
+              payment_terms: ["70% synthetic deposit upon confirmation."],
+              cheque_payee: "Synthetic Run 552 Company Pte Ltd",
+            },
+            signature: {
+              company_signatory: "Synthetic Run 552 Signatory",
+              company_title: "Synthetic Run 552 Title",
+              company_date_label: "Date:",
+            },
+          },
+        }] : [],
         default_profile_id: "synthetic-exhibition-fixture-template",
         default_pricing_reference_id: "synthetic-exhibition-fixture-pricing",
         company_id: "default",
@@ -1399,10 +1450,10 @@ async function installMockProfiles(page) {
 }
 
 async function saveSmokePricingReference(page, internalCost) {
-  return page.evaluate(async ({ internalCost }) => postJson("/api/settings/pricing-references", {
+  return page.evaluate(async ({ internalCost, source, authenticatedEvidence }) => postJson("/api/settings/pricing-references", {
     id: "synthetic-exhibition-fixture-pricing",
     label: "Synthetic Exhibition Fixture Pricing",
-    source: "local",
+    source,
     currency: "SGD",
     tax: { label: "GST", rate: 0.09 },
     items: [{
@@ -1413,10 +1464,59 @@ async function saveSmokePricingReference(page, internalCost) {
       internal_cost: internalCost,
       markup_multiplier: 1.5,
       remarks: "Synthetic smoke fixture row",
-    }],
+    }, ...(authenticatedEvidence ? [{
+      id: "synthetic-wall-structure",
+      section: "Structures",
+      description: "Synthetic wall structure",
+      unit_hint: "sqm",
+      internal_cost: 8,
+      markup_multiplier: 1.5,
+      remarks: "Synthetic smoke fixture row",
+    }, {
+      id: "synthetic-counter",
+      section: "Furniture",
+      description: "Synthetic duplicate-like counter",
+      unit_hint: "nos",
+      internal_cost: 10,
+      markup_multiplier: 1.5,
+      remarks: "Synthetic smoke fixture row",
+    }] : [])],
     update_existing: true,
     editing_reference_id: "synthetic-exhibition-fixture-pricing",
-  }), { internalCost });
+  }), {
+    internalCost,
+    source: run552AuthenticatedOnly ? "company" : "local",
+    authenticatedEvidence: run552AuthenticatedOnly,
+  });
+}
+
+async function saveSmokeCompanyProfile(page) {
+  const layoutBytes = await fs.readFile(path.join(root, "templates", "quote-layout", "quotation-layout.xlsx"));
+  const layoutDataUrl = `data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${layoutBytes.toString("base64")}`;
+  return page.evaluate((dataUrl) => postJson("/api/settings/profiles", {
+    id: "synthetic-run552-company-profile",
+    label: "Synthetic Run 552 Company Profile",
+    description: "Test-only company profile for authenticated export evidence.",
+    defaults: {
+      company: {
+        name: "Synthetic Run 552 Company Pte Ltd",
+        header_details: "Synthetic Run 552 Company Pte Ltd\n1 Synthetic Way\nSingapore 000001",
+        logo_data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+      },
+      quote_text: {
+        payment_terms: ["70% synthetic deposit upon confirmation."],
+        cheque_payee: "Synthetic Run 552 Company Pte Ltd",
+      },
+      signature: {
+        company_signatory: "Synthetic Run 552 Signatory",
+        company_title: "Synthetic Run 552 Title",
+        company_date_label: "Date:",
+      },
+    },
+    pack: {
+      quotation_layout: { filename: "quotation-layout.xlsx", data_url: dataUrl },
+    },
+  }), layoutDataUrl);
 }
 
 async function verifyServerPricingReferenceReviewDurability(page) {
@@ -2097,7 +2197,7 @@ async function dashboardQuoteSessionDetail(page, sessionId) {
 }
 
 async function createDashboardSmokeSession(page, suffix, options = {}) {
-  return page.evaluate(async ({ suffix, sessionIdPrefix, customerName, projectName }) => {
+  return page.evaluate(async ({ suffix, sessionIdPrefix, customerName, projectName, authenticatedEvidence, pricingDigest }) => {
     const sessionResponse = await fetch("/api/session");
     if (!sessionResponse.ok) throw new Error(`Session bootstrap failed: ${sessionResponse.status}`);
     const session = await sessionResponse.json();
@@ -2138,11 +2238,14 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
     state.pdfFileRevision = -1;
     resetQuoteCommercialTouched();
 
-    const generatorProfileId = "default";
+    const generatorProfileId = authenticatedEvidence
+      ? "company:synthetic-run552-company-profile"
+      : "default";
     if (!await loadProfiles()) throw new Error("Synthetic fixture profiles could not be loaded.");
     const profile = state.profiles.find((item) => item.id === "synthetic-exhibition-fixture-template");
     const reference = state.pricingReferences.find((item) => (
-      item.id === "synthetic-exhibition-fixture-pricing" && item.source === "local"
+      item.id === "synthetic-exhibition-fixture-pricing"
+      && item.source === (authenticatedEvidence ? "company" : "local")
     ));
     if (!profile || !reference) throw new Error("Synthetic fixture profile or pricing reference is unavailable.");
 
@@ -2157,8 +2260,16 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
     const presetValue = profilePresetOptionValue(profile.id, "synthetic-fixture-default");
     if (!selectPresetValue(presetValue)) throw new Error("Synthetic fixture quote-company preset could not be selected.");
     loadSelectedPreset({ silent: true, allowOwnedInitialization: true });
+    if (authenticatedEvidence) {
+      if (!selectPresetValue(companyProfileOptionValue("synthetic-run552-company-profile"))) {
+        throw new Error("Synthetic authenticated company profile could not be selected.");
+      }
+      loadSelectedPreset({ silent: true, allowOwnedInitialization: true });
+    }
     state.profileId = generatorProfileId;
-    state.selectedPresetValue = profilePresetOptionValue(generatorProfileId, "default");
+    state.selectedPresetValue = authenticatedEvidence
+      ? companyProfileOptionValue("synthetic-run552-company-profile")
+      : profilePresetOptionValue(generatorProfileId, "default");
 
     const safeSuffix = String(suffix || "session").replace(/[^A-Za-z0-9_-]/g, "-");
     const safePrefix = String(sessionIdPrefix || `quote-playwright-bulk-${safeSuffix}`).replace(/[^A-Za-z0-9_-]/g, "-");
@@ -2203,7 +2314,21 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
         quantity: 2,
         unit: "sqm",
         pricing_keyword: "synthetic-floor-needle-punch-carpet",
-      }],
+      }, ...(authenticatedEvidence ? [{
+        tag: "Include",
+        text: "Synthetic wall structure",
+        include: true,
+        quantity: 3,
+        unit: "sqm",
+        pricing_keyword: "synthetic-wall-structure",
+      }, {
+        tag: "Include",
+        text: "Synthetic duplicate-like counter",
+        include: true,
+        quantity: 1,
+        unit: "nos",
+        pricing_keyword: "synthetic-counter",
+      }] : [])],
     }]);
     state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
     state.lineItems = [normalizeLineItem({
@@ -2216,7 +2341,65 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
       unit_price_override: 15,
       catalog_unit_price: 15,
     })];
+    if (authenticatedEvidence) {
+      state.lineItems.push(
+        normalizeLineItem({
+          section: "Structures",
+          description: "Synthetic wall structure",
+          quantity: 3,
+          unit: "sqm",
+          pricing_keyword: "synthetic-wall-structure",
+          price_mode: "Priced",
+          unit_price_override: 12,
+          catalog_unit_price: 12,
+          basis_order: 1,
+          category_order: 1,
+          item_order: 1,
+        }),
+        normalizeLineItem({
+          section: "Furniture",
+          description: "Synthetic duplicate-like counter",
+          quantity: 1,
+          unit: "nos",
+          pricing_keyword: "synthetic-counter",
+          price_mode: "Priced",
+          unit_price_override: 15,
+          catalog_unit_price: 15,
+          basis_order: 1,
+          category_order: 1,
+          item_order: 1,
+        }),
+      );
+    }
     refreshOutputRowsFromLineItems();
+    if (authenticatedEvidence && state.outputRows[0]) {
+      state.outputRows[0].basis_order = 1.5;
+      state.outputRows[0].category_order = "bad-order";
+      state.outputRows = state.outputRows.map((row) => {
+        if (row.description === "Synthetic wall structure") {
+          return recalculateOutputRow({
+            ...row,
+            price_mode: "Included",
+            unit_price_override: "",
+            status: "included",
+          });
+        }
+        if (row.description === "Synthetic duplicate-like counter") {
+          return recalculateOutputRow({
+            ...row,
+            price_mode: "Priced",
+            unit_price_override: 15,
+            catalog_unit_price: 15,
+            effective_unit_price: 15,
+            pricing_basis_amount: 15,
+            approved_quote_amount: 15,
+            status: "manual-price",
+          });
+        }
+        return row;
+      });
+      state.lineItems = outputRowsToLineItems(state.outputRows);
+    }
     state.originalOutputRows = snapshotOutputRows(state.outputRows);
     state.basisConfirmed = true;
     state.activeSidePanel = "basis";
@@ -2225,9 +2408,9 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
 
     const expectedPricing = {
       currency: "SGD",
-      source: "local",
+      source: authenticatedEvidence ? "company" : "local",
       id: "synthetic-exhibition-fixture-pricing",
-      digest: "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7",
+      digest: pricingDigest,
     };
     const referenceBasis = pricingReferenceAuthorityBasis(reference);
     if (!referenceBasis || Object.keys(expectedPricing).some((key) => referenceBasis[key] !== expectedPricing[key])) {
@@ -2325,21 +2508,33 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
 
     const generationPayload = buildPayload({ viewPdf: false });
     assertFixturePayload(generationPayload, "Canonical synthetic generation payload", false, true);
-    const generationJobId = newClientJobId();
-    const started = await startJob("generate", generationPayload, { jobId: generationJobId });
-    if (!started.ok) throw new Error("Canonical synthetic generation job was rejected before execution.");
-    const acceptedJobId = String(started.data?.job_id || generationJobId).trim();
-    const polled = await pollJob(acceptedJobId);
-    if (
-      !polled.ok
-      || polled.data?.status !== "completed"
-      || polled.data?.result?.status !== "completed"
-    ) {
-      throw new Error(`Canonical synthetic generation did not reach terminal success: ${polled.data?.status || "unknown"}.`);
-    }
-    const resultSessionId = safeQuoteSessionId(polled.data.result.quote_session?.session_id || "");
-    if (resultSessionId && resultSessionId !== sessionId) {
-      throw new Error("Canonical synthetic generation returned a different quote session.");
+    if (authenticatedEvidence) {
+      setSidePanel("output", { force: true });
+      const generated = await handleGenerate({ viewPdf: false });
+      if (!generated || state.downloadFile?.name !== "quotation.xlsx") {
+        throw new Error(`Canonical synthetic generation did not reach terminal success: ${JSON.stringify({
+          generated,
+          resultStatus: elements.resultStatus?.textContent || "",
+          messages: elements.messages?.textContent || "",
+        })}.`);
+      }
+    } else {
+      const generationJobId = newClientJobId();
+      const started = await startJob("generate", generationPayload, { jobId: generationJobId });
+      if (!started.ok) throw new Error("Canonical synthetic generation job was rejected before execution.");
+      const acceptedJobId = String(started.data?.job_id || generationJobId).trim();
+      const polled = await pollJob(acceptedJobId);
+      if (
+        !polled.ok
+        || polled.data?.status !== "completed"
+        || polled.data?.result?.status !== "completed"
+      ) {
+        throw new Error(`Canonical synthetic generation did not reach terminal success: ${polled.data?.status || "unknown"}.`);
+      }
+      const resultSessionId = safeQuoteSessionId(polled.data.result.quote_session?.session_id || "");
+      if (resultSessionId && resultSessionId !== sessionId) {
+        throw new Error("Canonical synthetic generation returned a different quote session.");
+      }
     }
 
     const detailResponse = await fetch(`/api/quote-sessions/${encodeURIComponent(sessionId)}`);
@@ -2367,7 +2562,295 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
     sessionIdPrefix: options.sessionIdPrefix || "",
     customerName: Object.prototype.hasOwnProperty.call(options, "customerName") ? options.customerName : undefined,
     projectName: Object.prototype.hasOwnProperty.call(options, "projectName") ? options.projectName : undefined,
+    authenticatedEvidence: run552AuthenticatedOnly,
+    pricingDigest: run552PricingDigest,
   });
+}
+
+async function verifyRun552AuthenticatedExport(page, browser) {
+  const session = await page.evaluate(async () => {
+    const response = await fetch("/api/session");
+    return { status: response.status, body: await response.json() };
+  });
+  if (session.status !== 200 || !session.body.authenticated) {
+    throw new Error("Run-552 native internal-Google login did not create an authenticated session.");
+  }
+
+  const savedReference = await saveSmokePricingReference(page, 10);
+  if (!savedReference.ok) throw new Error("Run-552 could not save its synthetic pricing reference.");
+  run552PricingDigest = String(savedReference.data?.pricing_reference?.digest_sha256 || "");
+  if (!/^sha256:[0-9a-f]{64}$/i.test(run552PricingDigest)) {
+    throw new Error("Run-552 synthetic pricing reference did not return a canonical digest.");
+  }
+  const savedProfile = await saveSmokeCompanyProfile(page);
+  if (!savedProfile.ok) throw new Error("Run-552 could not save its synthetic company profile.");
+
+  const sessionId = await createDashboardSmokeSession(page, "run552-a", {
+    sessionIdPrefix: "quote-run552-a",
+    customerName: "Synthetic Run 552 Customer",
+    projectName: "Synthetic Run 552 Export",
+  });
+  const readProjection = async (targetSessionId) => {
+    const [detail, receipt] = await Promise.all([
+      dashboardQuoteSessionDetail(page, targetSessionId),
+      page.evaluate(async (id) => {
+        const response = await fetch(`/__run552/publication-receipt?session_id=${encodeURIComponent(id)}`);
+        return response.ok ? response.json() : {};
+      }, targetSessionId),
+    ]);
+    const quote = detail.quote_session || {};
+    const publication = { ...(receipt.publication || {}), ...(quote.publication || {}) };
+    const xlsx = quote.exports?.xlsx || {};
+    const draft = quote.draft_state || {};
+    return {
+      identity: {
+        sessionId: String(quote.session_id || targetSessionId),
+        runId: String(publication.run_id || ""),
+      },
+      publicationState: String(publication.state || ""),
+      versionState: String(receipt.version?.state || ""),
+      digest: String(publication.committed_draft_state_digest || ""),
+      revision: Number(publication.committed_output_revision),
+      draftRevision: Number(draft.outputRevision),
+      url: String(xlsx.url || ""),
+      expectedSha256: String(receipt.xlsx?.sha256 || ""),
+      expectedSize: Number(receipt.xlsx?.size_bytes),
+      current: quote.status?.quote_generated === true && xlsx.exists === true && xlsx.stale !== true,
+      arrays: {
+        outputRows: JSON.stringify(draft.outputRows || []),
+        pricingMatches: JSON.stringify(draft.pricingMatches || []),
+        lineItems: JSON.stringify(draft.lineItems || []),
+      },
+      draftState: draft,
+    };
+  };
+  const auditCounts = async () => page.evaluate(async () => {
+    const response = await fetch("/__run552/artifact-audit");
+    const body = await response.json();
+    return (body.events || []).reduce((counts, event) => {
+      counts[event.stage] = (counts[event.stage] || 0) + 1;
+      return counts;
+    }, { version: 0, artifact: 0 });
+  });
+  const restoreSession = async (targetSessionId) => page.evaluate(async (id) => {
+    const detailed = await loadQuoteSessionDetail(id);
+    let draft = detailed?.draft_state || {};
+    const draftFiles = Array.isArray(detailed?.draft_files) ? detailed.draft_files : [];
+    if (draftFiles.length) {
+      await persistSessionFiles(draftFiles);
+      draft = mergeDashboardDraftImagesWithAvailablePayloads(draft, draftFiles);
+    }
+    draft = mergeDashboardDraftSummaryDetails(draft, detailed || {});
+    draft = hydrateDashboardDraftImagePayloads(draft, id);
+    const restored = await applyQuoteSessionSnapshot(
+      { ...draft, quoteSessionId: id },
+      { sessionId: id, forceQuoteView: true, restoreFurthestPanel: true },
+    );
+    if (!restored) throw new Error("Run-552 quote-session restore failed.");
+    rememberRestoredQuoteSessionBaseline(id);
+    return true;
+  }, targetSessionId);
+
+  const publicationA = await readProjection(sessionId);
+  if (
+    !publicationA.current
+    || publicationA.publicationState !== "published"
+    || publicationA.versionState !== "published"
+    || !publicationA.identity.runId
+    || !/^[0-9a-f]{64}$/i.test(publicationA.digest)
+    || !/^[0-9a-f]{64}$/i.test(publicationA.expectedSha256)
+    || !Number.isInteger(publicationA.expectedSize)
+    || publicationA.expectedSize <= 0
+    || !publicationA.url.includes(`/api/quote-sessions/${sessionId}/download/xlsx`)
+  ) {
+    throw new Error(`Run-552 publication A identity is incomplete: ${JSON.stringify(publicationA)}.`);
+  }
+  const baselineRows = JSON.parse(publicationA.arrays.outputRows);
+  if (baselineRows.length < 3) throw new Error("Run-552 requires at least three generated rows.");
+  if (baselineRows.some((row) => [row.basis_order, row.category_order, row.item_order].includes(1.5))) {
+    throw new Error("Run-552 persisted a fractional primary-order value.");
+  }
+
+  const assertUnchanged = async (label) => {
+    const current = await readProjection(sessionId);
+    if (
+      !current.current
+      || current.digest !== publicationA.digest
+      || current.revision !== publicationA.revision
+      || current.draftRevision !== publicationA.draftRevision
+      || JSON.stringify(current.identity) !== JSON.stringify(publicationA.identity)
+      || JSON.stringify(current.arrays) !== JSON.stringify(publicationA.arrays)
+    ) {
+      throw new Error(`${label} changed canonical persisted commercial state.`);
+    }
+  };
+  const visibleOrders = {};
+  for (const mode of ["pricing_reference", "name", "category", "category_name"]) {
+    visibleOrders[mode] = await page.evaluate(async (sortMode) => {
+      state.outputSortMode = sortMode;
+      renderPricingMatches(state.outputRows);
+      const visible = state.outputRows.map((row) => row.source_basis_line_id || row.description);
+      const saved = await saveQuoteSessionDraftState({ quoteGenerated: true });
+      if (!saved) throw new Error(`Display mode ${sortMode} did not save.`);
+      return visible;
+    }, mode);
+    await assertUnchanged(`display mode ${mode}`);
+  }
+  if (new Set(Object.values(visibleOrders).map(JSON.stringify)).size < 2) {
+    throw new Error("Run-552 display sort modes did not visibly reorder rows.");
+  }
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => !state.isBooting && !state.quoteSessionRestoreBusy, null, { timeout: 15000 });
+  await restoreSession(sessionId);
+  await page.evaluate(async () => {
+    const saved = await saveQuoteSessionDraftState({ quoteGenerated: true });
+    if (!saved) throw new Error("Run-552 browser recovery save failed.");
+  });
+  await assertUnchanged("browser recovery");
+
+  const matching = await page.context().request.get(`${baseUrl}${publicationA.url}`);
+  const matchingBytes = await matching.body();
+  const matchingDigest = createHash("sha256").update(matchingBytes).digest("hex");
+  if (
+    matching.status() !== 200
+    || matchingBytes.length !== publicationA.expectedSize
+    || matchingDigest !== publicationA.expectedSha256
+  ) {
+    throw new Error(`Run-552 matching publication integrity failed: ${matching.status()}.`);
+  }
+  const anonymousContext = await browser.newContext();
+  try {
+    const denied = await anonymousContext.request.get(`${baseUrl}${publicationA.url}`);
+    if (denied.status() !== 401) {
+      throw new Error(`Run-552 unauthenticated download was not rejected: ${denied.status()}.`);
+    }
+  } finally {
+    await anonymousContext.close();
+  }
+
+  const quoteBSessionId = await createDashboardSmokeSession(page, "run552-b", {
+    sessionIdPrefix: "quote-run552-b",
+    customerName: "Synthetic Run 552 Other Quote",
+    projectName: "Synthetic Run 552 Other Publication",
+  });
+  const quoteB = await readProjection(quoteBSessionId);
+  if (!quoteB.current || !quoteB.identity.runId || quoteB.identity.runId === publicationA.identity.runId) {
+    throw new Error("Run-552 could not create a distinct real publication for quote B.");
+  }
+  const generationPayload = await page.evaluate(() => buildPayload({ viewPdf: false }));
+  const workspaceBSessionId = "quote-run552-workspace-b";
+  const workspaceBRunId = "run-run552-workspace-b";
+  const materialized = await page.evaluate(async (fixture) => postJson(
+    "/__run552/materialize-cross-workspace", fixture,
+  ), {
+    session_id: workspaceBSessionId,
+    run_id: workspaceBRunId,
+    generation_payload: generationPayload,
+  });
+  if (!materialized.ok) throw new Error("Run-552 could not materialize the real workspace-B publication.");
+  const crossAuditBefore = await auditCounts();
+  const crossWorkspace = await page.context().request.get(
+    `${baseUrl}/api/quote-sessions/${workspaceBSessionId}/download/xlsx`,
+  );
+  const crossAuditAfter = await auditCounts();
+  if (crossWorkspace.status() !== 404 || crossAuditAfter.artifact !== crossAuditBefore.artifact) {
+    throw new Error("Run-552 cross-workspace request reached foreign artifact retrieval.");
+  }
+
+  await restoreSession(sessionId);
+  const wrongVersionFixture = await page.evaluate(async (fixture) => postJson(
+    "/__run552/clone-wrong-version", fixture,
+  ), {
+    source_session_id: sessionId,
+    target_session_id: "quote-run552-wrong-publication",
+    other_run_id: quoteB.identity.runId,
+  });
+  if (!wrongVersionFixture.ok) throw new Error("Run-552 could not create the wrong-version fixture.");
+  const wrongFixtureReceipt = await page.evaluate(async () => {
+    const response = await fetch("/__run552/publication-receipt?session_id=quote-run552-wrong-publication");
+    return { status: response.status, body: await response.json() };
+  });
+  const wrongAuditBefore = await auditCounts();
+  const wrongVersion = await page.context().request.get(
+    `${baseUrl}/api/quote-sessions/quote-run552-wrong-publication/download/xlsx`,
+  );
+  const wrongAuditAfter = await auditCounts();
+  if (
+    wrongVersion.status() !== 404
+    || wrongAuditAfter.version !== wrongAuditBefore.version + 1
+    || wrongAuditAfter.artifact !== wrongAuditBefore.artifact
+  ) {
+    throw new Error(`Run-552 wrong-session publication was not rejected before artifact retrieval: ${JSON.stringify({
+      status: wrongVersion.status(), before: wrongAuditBefore, after: wrongAuditAfter, receipt: wrongFixtureReceipt,
+    })}.`);
+  }
+
+  const pricedIndex = await page.evaluate(() => state.outputRows.findIndex((row) => (
+    row.price_mode !== "Included" && Number(row.unit_price_override) === 15
+  )));
+  if (pricedIndex < 0) throw new Error("Run-552 could not locate the 15.00 commercial edit control.");
+  await page.evaluate(() => {
+    showQuoteFlow();
+    setSidePanel("output", { force: true });
+  });
+  await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+  const priceCell = page.locator(`[data-output-edit-field="unit_price_override"][data-output-row="${pricedIndex}"]`);
+  await priceCell.click();
+  const editor = page.locator(`[data-output-editor-field="unit_price_override"][data-output-row="${pricedIndex}"]`);
+  await editor.fill("16");
+  await editor.press("Enter");
+  await page.evaluate(async () => {
+    const saved = await saveQuoteSessionDraftState({ quoteGenerated: true });
+    if (!saved) throw new Error("Run-552 real commercial edit did not save.");
+  });
+  const edited = await readProjection(sessionId);
+  if (
+    edited.current
+    || edited.identity.runId !== publicationA.identity.runId
+    || edited.draftRevision === publicationA.draftRevision
+  ) {
+    throw new Error("Run-552 real 15 to 16 edit did not invalidate only publication freshness.");
+  }
+  const staleAuditBefore = await auditCounts();
+  const stale = await page.context().request.get(`${baseUrl}${publicationA.url}`);
+  const staleAuditAfter = await auditCounts();
+  if (
+    stale.status() !== 404
+    || staleAuditAfter.version !== staleAuditBefore.version
+    || staleAuditAfter.artifact !== staleAuditBefore.artifact
+  ) {
+    throw new Error(`Run-552 stale export was not rejected before publication/artifact lookup: ${JSON.stringify({
+      status: stale.status(), before: staleAuditBefore, after: staleAuditAfter,
+    })}.`);
+  }
+
+  const generatedB = await page.evaluate(async () => {
+    const generated = await handleGenerate({ viewPdf: false });
+    return Boolean(generated && state.downloadFile?.name === "quotation.xlsx");
+  });
+  if (!generatedB) throw new Error("Run-552 could not create real publication B for quote A.");
+  const publicationB = await readProjection(sessionId);
+  if (!publicationB.current || publicationB.identity.runId === publicationA.identity.runId) {
+    throw new Error("Run-552 quote A publication B did not supersede publication A.");
+  }
+  const restoredA = await page.evaluate(async (fixture) => postJson(
+    "/__run552/restore-version-metadata", fixture,
+  ), { session_id: sessionId, run_id: publicationA.identity.runId });
+  if (!restoredA.ok) throw new Error("Run-552 could not present publication A metadata.");
+  const supersededAuditBefore = await auditCounts();
+  const superseded = await page.context().request.get(`${baseUrl}${publicationA.url}`);
+  const supersededAuditAfter = await auditCounts();
+  if (
+    superseded.status() !== 404
+    || supersededAuditAfter.version !== supersededAuditBefore.version + 1
+    || supersededAuditAfter.artifact !== supersededAuditBefore.artifact
+  ) {
+    throw new Error(`Run-552 superseded publication was not rejected before artifact retrieval: ${JSON.stringify({
+      status: superseded.status(), before: supersededAuditBefore, after: supersededAuditAfter,
+    })}.`);
+  }
+
+  console.log("Run-552 native authenticated export persistence: PASS");
 }
 
 async function verifyConcurrentInitialDraftSaveUsesSingleSession(page) {
@@ -2614,6 +3097,9 @@ async function verifyDashboardClearsStaleSessionsBeforeRefresh(page) {
 }
 async function main() {
   let serverInfo = null;
+  if (run552AuthenticatedOnly && !run552AuthenticatedBaseUrl) {
+    throw new Error("Run-552 authenticated mode requires RUN552_AUTHENTICATED_BASE_URL.");
+  }
   const hasExistingServer = await healthOk();
   if (!hasExistingServer) {
     await fs.rm(quoteDataRoot, { recursive: true, force: true });
@@ -2640,6 +3126,19 @@ async function main() {
 
   try {
     await installMockProfiles(page);
+    if (run552AuthenticatedOnly) {
+      await page.goto(`${baseUrl}/login`, { waitUntil: "domcontentloaded", timeout: 15000 });
+      if (new URL(page.url()).origin !== new URL(baseUrl).origin) {
+        throw new Error("Run-552 synthetic OIDC flow escaped the local harness.");
+      }
+      await verifyRun552AuthenticatedExport(page, browser);
+      console.log(JSON.stringify({
+        status: "ok",
+        mode: "run552-authenticated",
+        sessionValidationBypassed: false,
+      }, null, 2));
+      return;
+    }
     await verifyRecoveredTemplateOwnerFailsClosed(page);
     await verifyFreshPricingAuthorityInitializesBeforeCustomer(page);
     await verifyServerPricingReferenceReviewDurability(page);
