@@ -4411,7 +4411,9 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.lineItems = restoredGeneratedRows.length
     ? outputRowsToLineItems(restoredGeneratedRows)
     : restoredLineItems;
-  state.originalOutputRows = Array.isArray(restoredState.originalOutputRows) ? restoredState.originalOutputRows.map(normalizeOutputRow) : [];
+  state.originalOutputRows = Array.isArray(restoredState.originalOutputRows)
+    ? restoredState.originalOutputRows.map((row) => normalizeOutputRow(canonicalizeRawPrimaryOrderFields(row)))
+    : [];
   state.outputErrors = Array.isArray(restoredState.outputErrors) ? restoredState.outputErrors : [];
   state.outputSortMode = "pricing_reference";
   state.analysisFindings = Array.isArray(restoredState.analysisFindings) ? restoredState.analysisFindings : [];

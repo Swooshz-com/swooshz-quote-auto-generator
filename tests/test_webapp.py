@@ -28885,6 +28885,10 @@ assert.strictEqual(line.unit, "nos");
         )[0]
         self.assertIn("canonicalRowsForPersistence", save_body)
         self.assertIn("canonicalRowsForPersistence", restore_body)
+        self.assertIn(
+            "restoredState.originalOutputRows.map((row) => normalizeOutputRow(canonicalizeRawPrimaryOrderFields(row)))",
+            restore_body,
+        )
 
         script = r"""
 const fs = require("fs");

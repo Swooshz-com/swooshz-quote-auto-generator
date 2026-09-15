@@ -2628,6 +2628,103 @@ async function verifyRepair1RawPrimaryOrderBoundary(page) {
   }
 }
 
+async function verifyRepair2SnapshotResetPersistenceBoundary(page) {
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
+  await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+  const evidence = await page.evaluate(async () => {
+    const fields = ["basis_order", "category_order", "item_order"];
+    const invalidValues = [
+      [1, 2], { value: 1 }, true, "1,000", 1.5, "1.5", 0, -1, "bad",
+    ];
+    const rows = [];
+    for (const field of fields) {
+      invalidValues.forEach((value, index) => {
+        rows.push({
+          source_basis_line_id: `repair2-invalid-${field}-${index}`,
+          section: "Synthetic",
+          description: `Repair 2 invalid ${field} ${index}`,
+          quantity: 1,
+          unit: "lot",
+          price_mode: "Priced",
+          catalog_unit_price: 15,
+          basis_order: 7,
+          category_order: 7,
+          item_order: 7,
+          [field]: value,
+        });
+      });
+      for (const [index, value] of [1, "2", " 003 "].entries()) {
+        rows.push({
+          source_basis_line_id: `repair2-valid-${field}-${index}`,
+          section: "Synthetic",
+          description: `Repair 2 valid ${field} ${index}`,
+          quantity: 1,
+          unit: "lot",
+          price_mode: "Priced",
+          catalog_unit_price: 15,
+          basis_order: 7,
+          category_order: 7,
+          item_order: 7,
+          [field]: value,
+        });
+      }
+    }
+    const saved = buildSessionSnapshot();
+    saved.quoteSessionId = "quote-repair2-restore-reset-boundary";
+    saved.quoteSessionDraftSaveStarted = true;
+    saved.outputRows = [];
+    saved.lineItems = [];
+    saved.pricingMatches = [];
+    saved.originalOutputRows = rows;
+    const restored = await applyQuoteSessionSnapshot(saved, {
+      forceQuoteView: true,
+      sessionId: saved.quoteSessionId,
+    });
+    const restoredRows = snapshotOutputRows(state.originalOutputRows);
+    await resetOutputDraft();
+    const activeRows = snapshotOutputRows(state.outputRows);
+    const persistedRows = currentQuoteSessionDraftState().outputRows;
+    const result = { restored, restoredRows, activeRows, persistedRows };
+    clearQuoteSessionDraftSaveTimer();
+    clearSessionState();
+    return result;
+  });
+  if (!evidence.restored) throw new Error("Repair 2 ordinary snapshot restoration failed.");
+  const byId = (rows) => new Map(rows.map((row) => [row.source_basis_line_id, row]));
+  const restoredById = byId(evidence.restoredRows);
+  const activeById = byId(evidence.activeRows);
+  const persistedById = byId(evidence.persistedRows);
+  const invalidConversions = [];
+  for (const field of ["basis_order", "category_order", "item_order"]) {
+    for (let index = 0; index < 9; index += 1) {
+      const id = `repair2-invalid-${field}-${index}`;
+      const values = {
+        restored: restoredById.get(id)?.[field],
+        active: activeById.get(id)?.[field],
+        persisted: persistedById.get(id)?.[field],
+      };
+      if (values.restored !== "" || values.active !== "" || values.persisted !== "") {
+        invalidConversions.push({ id, field, ...values });
+      }
+    }
+    [1, 2, 3].forEach((expected, index) => {
+      const id = `repair2-valid-${field}-${index}`;
+      for (const [stage, rowsById] of [["restored", restoredById], ["active", activeById], ["persisted", persistedById]]) {
+        if (rowsById.get(id)?.[field] !== expected) {
+          throw new Error(`Repair 2 valid ${field} control failed after ${stage}: ${JSON.stringify(rowsById.get(id))}.`);
+        }
+      }
+    });
+  }
+  if (evidence.activeRows.length !== evidence.restoredRows.length || evidence.persistedRows.length !== evidence.restoredRows.length) {
+    throw new Error(`Repair 2 Reset Output did not retain legitimate original rows: ${JSON.stringify(evidence)}.`);
+  }
+  if (invalidConversions.length) {
+    throw new Error(`Repair 2 restore -> Reset Output -> persistence accepted invalid primary orders: ${JSON.stringify(invalidConversions)}.`);
+  }
+}
+
 async function verifyRepair1FreshPresetInitializationAndRestoredOwnership(page) {
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
@@ -3304,6 +3401,12 @@ async function main() {
       }, null, 2));
       return;
     }
+    if (args.includes("--repair2-f1-only")) {
+      await verifyRepair2SnapshotResetPersistenceBoundary(page);
+      console.log(JSON.stringify({ status: "ok", mode: "repair2-f1-only" }, null, 2));
+      return;
+    }
+    await verifyRepair2SnapshotResetPersistenceBoundary(page);
     if (!args.includes("--repair1-f2-only")) await verifyRepair1RawPrimaryOrderBoundary(page);
     if (args.includes("--repair1-f1-only")) {
       console.log(JSON.stringify({ status: "ok", mode: "repair1-f1-only" }, null, 2));
