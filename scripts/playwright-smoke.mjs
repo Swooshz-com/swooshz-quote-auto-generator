@@ -29,6 +29,13 @@ const options = {
 const baseUrl = `http://${options.host}:${options.port}`;
 const outputDir = path.join(root, "_logs", "browser", "playwright-smoke");
 const quoteDataRoot = path.join(root, "_tmp", "playwright-quote-data");
+const run569LoadedAppMode = [
+  "--run566-red",
+  "--run566-green",
+  "--run569-positive",
+  "--run569-missing",
+  "--run569-mismatch",
+].some((flag) => args.includes(flag));
 
 function stableJson(value) {
   if (Array.isArray(value)) return value.map(stableJson);
@@ -55,22 +62,113 @@ async function healthOk() {
   }
 }
 
-async function waitForHealth(timeoutMs = 15000) {
+async function waitForHealth(timeoutMs = 15000, serverInfo = null) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    if (await healthOk()) return true;
+    if (await healthOk()) {
+      if (serverInfo && (serverInfo.server.exitCode !== null || serverInfo.server.killed)) {
+        throw new Error("Owned webapp child exited before its healthy endpoint was accepted.");
+      }
+      return true;
+    }
+    if (serverInfo && serverInfo.server.exitCode !== null) return false;
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
   return false;
 }
 
-function startServer() {
+function isolatedServerEnvironment(runtime) {
+  const environment = {};
+  for (const name of ["PATH", "Path", "SystemRoot", "SYSTEMROOT", "COMSPEC", "PATHEXT", "WINDIR"]) {
+    if (process.env[name]) environment[name] = process.env[name];
+  }
+  return {
+    ...environment,
+    APP_MODE: "local",
+    AUTH_MODE: "local",
+    AUTH_REQUIRED: "false",
+    LOCAL_USER_ROLE: "admin",
+    SQAG_STORAGE_MODE: "local",
+    SQAG_ARTIFACT_STORAGE_MODE: "local",
+    SQAG_PLATFORM_LAUNCH_MODE: "disabled",
+    QUOTE_DATA_ROOT: runtime.dataRoot,
+    QUOTE_OUTPUT_ROOT: runtime.outputRoot,
+    QUOTE_TMP_ROOT: runtime.tmpRoot,
+    QUOTE_LOG_ROOT: runtime.logRoot,
+    SQAG_LOCAL_PRICING_REFERENCES_ROOT: runtime.pricingRoot,
+    TEMP: runtime.tempRoot,
+    TMP: runtime.tempRoot,
+    // Non-empty whitespace prevents read_dotenv_value() from falling through to repo .env,
+    // while clean_text() still treats both provider credentials as unavailable.
+    OPENAI_API_KEY: " ",
+    DEEPSEEK_API_KEY: " ",
+    PYTHONIOENCODING: "utf-8",
+  };
+}
+
+async function createRun569Runtime() {
+  const stateParent = path.join(root, "_tmp", "tests");
+  const logParent = path.join(root, "_logs", "browser");
+  await fs.mkdir(stateParent, { recursive: true });
+  await fs.mkdir(logParent, { recursive: true });
+  const stateRoot = await fs.mkdtemp(path.join(stateParent, "run569-state-"));
+  const logRoot = await fs.mkdtemp(path.join(logParent, "run569-logs-"));
+  const runtime = {
+    stateRoot,
+    logRoot,
+    dataRoot: path.join(stateRoot, "data"),
+    outputRoot: path.join(stateRoot, "output"),
+    tmpRoot: path.join(stateRoot, "tmp"),
+    pricingRoot: path.join(stateRoot, "pricing-references"),
+    tempRoot: path.join(stateRoot, "temp"),
+  };
+  await Promise.all([
+    fs.mkdir(runtime.dataRoot, { recursive: true }),
+    fs.mkdir(runtime.outputRoot, { recursive: true }),
+    fs.mkdir(runtime.tmpRoot, { recursive: true }),
+    fs.mkdir(runtime.pricingRoot, { recursive: true }),
+    fs.mkdir(runtime.tempRoot, { recursive: true }),
+  ]);
+  return runtime;
+}
+
+async function cleanupRun569Runtime(runtime) {
+  if (!runtime) return;
+  await fs.rm(runtime.stateRoot, { recursive: true, force: true });
+  await fs.rm(runtime.logRoot, { recursive: true, force: true });
+}
+
+async function assertRun569PricingRootEmpty(runtime) {
+  const entries = await fs.readdir(runtime.pricingRoot);
+  if (entries.length) {
+    throw new Error(`Run-569 isolated pricing authority did not begin empty: ${entries.join(", ")}.`);
+  }
+}
+
+async function assertNoRun569Xlsx(runtime) {
+  const pending = [runtime.outputRoot];
+  while (pending.length) {
+    const current = pending.pop();
+    const entries = await fs.readdir(current, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const candidate = path.join(current, entry.name);
+      if (entry.isDirectory()) pending.push(candidate);
+      if (entry.isFile() && entry.name.toLowerCase() === "quotation.xlsx") {
+        throw new Error("Run-569 negative authority case generated quotation.xlsx.");
+      }
+    }
+  }
+}
+
+function startServer(runtime = null) {
   const server = spawn(
     pythonCommand(),
     ["webapp/server.py", "--host", options.host, "--port", String(options.port)],
     {
       cwd: root,
-      env: { ...process.env, APP_MODE: "local", QUOTE_DATA_ROOT: process.env.QUOTE_DATA_ROOT || quoteDataRoot },
+      env: runtime
+        ? isolatedServerEnvironment(runtime)
+        : { ...process.env, APP_MODE: "local", QUOTE_DATA_ROOT: process.env.QUOTE_DATA_ROOT || quoteDataRoot },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     },
@@ -86,10 +184,11 @@ function startServer() {
 }
 
 async function stopServer(serverInfo) {
-  if (!serverInfo || options.keepServer) return;
-  if (serverInfo.server.killed) return;
+  if (!serverInfo || (!run569LoadedAppMode && options.keepServer)) return;
+  if (serverInfo.server.exitCode !== null) return;
+  const exited = new Promise((resolve) => serverInfo.server.once("exit", resolve));
   serverInfo.server.kill();
-  await new Promise((resolve) => serverInfo.server.once("exit", resolve));
+  if (serverInfo.server.exitCode === null) await exited;
 }
 
 async function screenshot(page, name) {
@@ -364,12 +463,15 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
       forceQuoteView: true,
       sessionId: snapshot.quoteSessionId,
     });
+    const restoredRow = state.outputRows.find((row) => row.pricing_keyword === "graphics-vinyl-printed-graphics");
+    const renderedDescriptions = Array.from(document.querySelectorAll('#pricingMatchesBody [data-output-label="Description"]'))
+      .map((cell) => cell.textContent?.trim() || "");
     return {
       restored,
-      description: state.outputRows[0]?.description || "",
-      renderedDescription: document.querySelector('#pricingMatchesBody tr:first-child [data-output-label="Description"]')?.textContent?.trim() || "",
-      pricingKeyword: state.outputRows[0]?.pricing_keyword || "",
-      matchesExpected: state.outputRows[0]?.description === expected,
+      description: restoredRow?.description || "",
+      renderedDescription: renderedDescriptions.includes(expected) ? expected : "",
+      pricingKeyword: restoredRow?.pricing_keyword || "",
+      matchesExpected: restoredRow?.description === expected,
     };
   }, manualDescription);
   if (!quoteRestoreEvidence.restored
@@ -386,12 +488,16 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
   await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
   const browserRestoreEvidence = await page.evaluate((expected) => {
     const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
+    const restoredRow = state.outputRows.find((row) => row.pricing_keyword === "graphics-vinyl-printed-graphics");
+    const savedRow = saved.outputRows?.find((row) => row.pricing_keyword === "graphics-vinyl-printed-graphics");
+    const renderedDescriptions = Array.from(document.querySelectorAll('#pricingMatchesBody [data-output-label="Description"]'))
+      .map((cell) => cell.textContent?.trim() || "");
     return {
-      stateDescription: state.outputRows[0]?.description || "",
-      renderedDescription: document.querySelector('#pricingMatchesBody tr:first-child [data-output-label="Description"]')?.textContent?.trim() || "",
-      savedDescription: saved.outputRows?.[0]?.description || "",
-      pricingKeyword: state.outputRows[0]?.pricing_keyword || "",
-      matchesExpected: state.outputRows[0]?.description === expected,
+      stateDescription: restoredRow?.description || "",
+      renderedDescription: renderedDescriptions.includes(expected) ? expected : "",
+      savedDescription: savedRow?.description || "",
+      pricingKeyword: restoredRow?.pricing_keyword || "",
+      matchesExpected: restoredRow?.description === expected,
     };
   }, manualDescription);
   if (!browserRestoreEvidence.matchesExpected
@@ -400,7 +506,8 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
     || browserRestoreEvidence.pricingKeyword !== "graphics-vinyl-printed-graphics") {
     throw new Error(`Browser recovery changed a manual Output description: ${JSON.stringify(browserRestoreEvidence)}.`);
   }
-  const outputMetrics = await page.locator("#pricingMatchesBody tr").first().evaluate((row) => {
+  const manualRow = page.getByText(manualDescription, { exact: true }).locator("xpath=ancestor::tr");
+  const outputMetrics = await manualRow.evaluate((row) => {
     const cells = Array.from(row.querySelectorAll("td")).map((cell) => ({
       label: cell.getAttribute("data-output-label") || "",
       display: window.getComputedStyle(cell).display,
@@ -425,11 +532,11 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
   if (outputMetrics.rowWidth > 500 || outputMetrics.cells.some((cell) => cell.width > 500)) {
     throw new Error(`Mobile output card overflows the viewport: ${JSON.stringify(outputMetrics)}.`);
   }
-  await page.locator('#pricingMatchesBody tr:first-child [data-output-edit-field="unit_price_override"]').click();
+  await manualRow.locator('[data-output-edit-field="unit_price_override"]').click();
   await page.locator('[data-output-editor-field="unit_price_override"]').waitFor({ state: "visible", timeout: 15000 });
   await page.locator('[data-output-included-action="true"]').waitFor({ state: "visible", timeout: 15000 });
   await page.keyboard.press("Escape");
-  await page.locator('#pricingMatchesBody tr:first-child [data-output-delete-row]').click();
+  await manualRow.locator('[data-output-delete-row]').click();
   await page.locator("#outputDeleteModal").waitFor({ state: "visible", timeout: 15000 });
   await page.locator("#cancelOutputDeleteButton").click();
   await page.locator("#outputDeleteModal").waitFor({ state: "hidden", timeout: 15000 });
@@ -1419,6 +1526,56 @@ async function saveSmokePricingReference(page, internalCost) {
   }), { internalCost });
 }
 
+async function verifyRun569ServerPricingAuthority(page, internalCost, expectedDigest = "") {
+  const response = await page.context().request.get(
+    `${baseUrl}/api/settings/pricing-references/synthetic-exhibition-fixture-pricing?source=local`,
+  );
+  const body = await response.json().catch(() => ({}));
+  const detail = body.pricing_reference || {};
+  const items = Array.isArray(detail.items) ? detail.items : [];
+  const item = items[0] || {};
+  const exact = (
+    response.ok()
+    && detail.source === "local"
+    && detail.id === "synthetic-exhibition-fixture-pricing"
+    && detail.schema_version === 1
+    && detail.currency === "SGD"
+    && detail.tax?.label === "GST"
+    && detail.tax?.rate === 0.09
+    && items.length === 1
+    && item.id === "synthetic-floor-needle-punch-carpet"
+    && item.section === "Floor Design"
+    && item.reference_section === "Floor Design"
+    && item.description === "Needle punch carpet in colour"
+    && (item.unit === "sqm" || item.unit_hint === "sqm")
+    && item.internal_cost === internalCost
+    && item.markup_multiplier === 1.5
+    && item.sale_unit_price === internalCost * 1.5
+    && Array.isArray(item.remarks)
+    && item.remarks.length === 1
+    && item.remarks[0] === "Synthetic smoke fixture row"
+    && item.category_order === 1
+    && item.item_order === 1
+    && (!expectedDigest || detail.digest_sha256 === expectedDigest)
+  );
+  if (!exact) {
+    throw new Error(`Run-569 unintercepted pricing-authority verification failed: ${JSON.stringify({ status: response.status(), detail })}.`);
+  }
+  return detail.digest_sha256;
+}
+
+async function provisionRun569PricingAuthority(page, internalCost, expectedDigest = "") {
+  const saved = await saveSmokePricingReference(page, internalCost);
+  if (
+    !saved.ok
+    || saved.data?.status !== "saved"
+    || saved.data?.metadata_enrichment_status !== "not_configured"
+  ) {
+    throw new Error(`Run-569 local pricing provision failed: ${JSON.stringify(saved)}.`);
+  }
+  return verifyRun569ServerPricingAuthority(page, internalCost, expectedDigest);
+}
+
 async function verifyServerPricingReferenceReviewDurability(page) {
   let sessionId = "";
   const isolatedContext = await page.context().browser().newContext({ viewport: { width: 1365, height: 768 } });
@@ -2097,7 +2254,16 @@ async function dashboardQuoteSessionDetail(page, sessionId) {
 }
 
 async function createDashboardSmokeSession(page, suffix, options = {}) {
-  return page.evaluate(async ({ suffix, sessionIdPrefix, customerName, projectName }) => {
+  return page.evaluate(async ({
+    suffix,
+    sessionIdPrefix,
+    customerName,
+    projectName,
+    useHandleGenerate,
+    expectedGenerationFailureReason,
+    quoteBasisSections,
+    includeLegacyBasisDefaults,
+  }) => {
     const sessionResponse = await fetch("/api/session");
     if (!sessionResponse.ok) throw new Error(`Session bootstrap failed: ${sessionResponse.status}`);
     const session = await sessionResponse.json();
@@ -2193,7 +2359,9 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
       size: 24,
       data_url: "data:application/pdf;base64,JVBERi0xLjQKJVRlc3QK",
     })];
-    state.quoteBasisSections = normalizeQuoteBasisSections([{
+    const requestedQuoteBasisSections = Array.isArray(quoteBasisSections) && quoteBasisSections.length
+      ? quoteBasisSections
+      : [{
       id: "smoke-floor",
       title: "Floor Design",
       lines: [{
@@ -2204,8 +2372,12 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
         unit: "sqm",
         pricing_keyword: "synthetic-floor-needle-punch-carpet",
       }],
-    }]);
-    state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
+    }];
+    state.quoteBasisSections = normalizeQuoteBasisSections(requestedQuoteBasisSections);
+    state.quoteBasis = {
+      ...(includeLegacyBasisDefaults ? EMPTY_BASIS : {}),
+      ...quoteBasisFromSections(state.quoteBasisSections),
+    };
     state.lineItems = [normalizeLineItem({
       section: "Floor Design",
       description: "Needle punch carpet in colour",
@@ -2285,6 +2457,7 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
         || topPricing.source !== expectedPricing.source
         || topPricing.currency !== expectedPricing.currency
         || topPricing.digest_sha256 !== expectedPricing.digest
+        || Object.prototype.hasOwnProperty.call(topPricing, "items")
       )) {
         throw new Error(`${label} does not carry the exact pricing authority identity.`);
       }
@@ -2323,23 +2496,60 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
       throw new Error("Synthetic fixture initial non-generated quote session was not persisted.");
     }
 
-    const generationPayload = buildPayload({ viewPdf: false });
-    assertFixturePayload(generationPayload, "Canonical synthetic generation payload", false, true);
-    const generationJobId = newClientJobId();
-    const started = await startJob("generate", generationPayload, { jobId: generationJobId });
-    if (!started.ok) throw new Error("Canonical synthetic generation job was rejected before execution.");
-    const acceptedJobId = String(started.data?.job_id || generationJobId).trim();
-    const polled = await pollJob(acceptedJobId);
-    if (
-      !polled.ok
-      || polled.data?.status !== "completed"
-      || polled.data?.result?.status !== "completed"
-    ) {
-      throw new Error(`Canonical synthetic generation did not reach terminal success: ${polled.data?.status || "unknown"}.`);
-    }
-    const resultSessionId = safeQuoteSessionId(polled.data.result.quote_session?.session_id || "");
-    if (resultSessionId && resultSessionId !== sessionId) {
-      throw new Error("Canonical synthetic generation returned a different quote session.");
+    if (useHandleGenerate) {
+      const generated = await handleGenerate();
+      if (expectedGenerationFailureReason) {
+        const review = state.quoteCommercialReview;
+        if (generated || review?.reason_code !== expectedGenerationFailureReason) {
+          throw new Error(`Canonical synthetic handleGenerate() did not fail with ${expectedGenerationFailureReason}: ${JSON.stringify({ generated, review })}.`);
+        }
+        const detailResponse = await fetch(`/api/quote-sessions/${encodeURIComponent(sessionId)}`);
+        const detailData = await detailResponse.json().catch(() => ({}));
+        if (!detailResponse.ok) throw new Error("Failed synthetic quote session could not be re-read.");
+        const xlsx = detailData.quote_session?.exports?.xlsx || {};
+        if (
+          xlsx.exists === true
+          || String(xlsx.url || "").trim()
+          || xlsx.filename === "quotation.xlsx"
+          || Number(xlsx.size_bytes || 0) > 0
+        ) {
+          throw new Error(`Failed synthetic generation exposed usable XLSX metadata: ${JSON.stringify(xlsx)}.`);
+        }
+        return { sessionId, reasonCode: review.reason_code, xlsx };
+      }
+      if (!generated) throw new Error(`Canonical synthetic handleGenerate() did not produce quotation.xlsx: ${JSON.stringify({
+        workflowStage: state.workflowStage,
+        activeSidePanel: state.activeSidePanel,
+        basisConfirmed: state.basisConfirmed,
+        isGenerating: state.isGenerating,
+        missing: missingDetailFields(),
+        outputValidation: outputRowsValid(),
+        resultStatus: elements.resultStatus?.textContent || "",
+        messages: elements.messageList?.textContent || "",
+        review: state.quoteCommercialReview,
+        lifecycle: state.quoteCommercialLifecycle,
+        pricingReference: currentPricingReference(),
+        snapshot: state.quoteCommercialSnapshot,
+      })}.`);
+    } else {
+      const generationPayload = buildPayload({ viewPdf: false });
+      assertFixturePayload(generationPayload, "Canonical synthetic generation payload", false, true);
+      const generationJobId = newClientJobId();
+      const started = await startJob("generate", generationPayload, { jobId: generationJobId });
+      if (!started.ok) throw new Error("Canonical synthetic generation job was rejected before execution.");
+      const acceptedJobId = String(started.data?.job_id || generationJobId).trim();
+      const polled = await pollJob(acceptedJobId);
+      if (
+        !polled.ok
+        || polled.data?.status !== "completed"
+        || polled.data?.result?.status !== "completed"
+      ) {
+        throw new Error(`Canonical synthetic generation did not reach terminal success: ${polled.data?.status || "unknown"}.`);
+      }
+      const resultSessionId = safeQuoteSessionId(polled.data.result.quote_session?.session_id || "");
+      if (resultSessionId && resultSessionId !== sessionId) {
+        throw new Error("Canonical synthetic generation returned a different quote session.");
+      }
     }
 
     const detailResponse = await fetch(`/api/quote-sessions/${encodeURIComponent(sessionId)}`);
@@ -2367,7 +2577,250 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
     sessionIdPrefix: options.sessionIdPrefix || "",
     customerName: Object.prototype.hasOwnProperty.call(options, "customerName") ? options.customerName : undefined,
     projectName: Object.prototype.hasOwnProperty.call(options, "projectName") ? options.projectName : undefined,
+    useHandleGenerate: options.useHandleGenerate === true,
+    expectedGenerationFailureReason: String(options.expectedGenerationFailureReason || ""),
+    quoteBasisSections: Array.isArray(options.quoteBasisSections) ? options.quoteBasisSections : [],
+    includeLegacyBasisDefaults: options.includeLegacyBasisDefaults === true,
   });
+}
+
+async function verifyRun566QuoteBasisRestorationFreshness(page, options = {}) {
+  const expectRed = options.expectRed === true;
+  const volatileDraftKeys = new Set([
+    "savedAt", "activeAppView", "activeSidePanel", "workflowStage", "downloadFile", "pdfFile",
+    "downloadFileRevision", "pdfFileRevision", "outputRevision",
+  ]);
+  const comparableDraft = (draft = {}) => Object.fromEntries(
+    Object.entries(draft || {}).filter(([key]) => !volatileDraftKeys.has(key)),
+  );
+  const detail = async (sessionId) => {
+    const response = await dashboardQuoteSessionDetail(page, sessionId);
+    if (response.status !== "ok") throw new Error(`Run-566 could not read ${sessionId}: ${JSON.stringify(response)}.`);
+    return response.quote_session;
+  };
+  const restoreAndSave = async (sessionId) => {
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForFunction(() => state.isBooting === false, null, { timeout: 30000 });
+    const dashboardButton = page.locator("#backToDashboardButton", { hasText: "Dashboard" });
+    if (await dashboardButton.isVisible()) await dashboardButton.click();
+    await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 30000 });
+    const sessionCard = page.locator(`.dashboard-session-card[data-quote-session-id="${sessionId}"]`);
+    await sessionCard.waitFor({ state: "visible", timeout: 30000 });
+    await sessionCard.click();
+    await page.locator(`[data-dashboard-panel-action="modify-session"][data-quote-session-id="${sessionId}"]`).click();
+    await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 30000 });
+    await page.waitForFunction(() => state.quoteSessionRestoreBusy === false, null, { timeout: 30000 });
+    const saved = await page.evaluate(() => saveQuoteSessionDraftState({ quoteGenerated: true }));
+    if (!saved?.session_id) throw new Error(`Run-566 unchanged save failed: ${JSON.stringify(saved)}.`);
+    return detail(sessionId);
+  };
+  const exportIsCurrent = (session) => (
+    session?.exports?.xlsx?.exists === true
+    && session.exports.xlsx.stale !== true
+    && Boolean(String(session.exports.xlsx.url || "").trim())
+  );
+
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => state.isBooting === false, null, { timeout: 30000 });
+  const sectionBasis = {
+    surfaces: "Include: Needle punch carpet in colour",
+    "g4-custom-floor": "Exclude: Raised platform not required",
+    "g4-custom-signage": "Exclude: Suspended signage not required",
+  };
+  const sessionId = await createDashboardSmokeSession(page, "run566", {
+    sessionIdPrefix: "quote-run566-freshness",
+    useHandleGenerate: true,
+    includeLegacyBasisDefaults: true,
+    quoteBasisSections: [
+      {
+        id: "surfaces",
+        title: "Floor Design",
+        lines: [{
+          tag: "Include",
+          text: "Needle punch carpet in colour",
+          include: true,
+          quantity: 2,
+          unit: "sqm",
+          pricing_keyword: "synthetic-floor-needle-punch-carpet",
+        }],
+      },
+      {
+        id: "g4-custom-floor",
+        title: "Custom Floor Scope",
+        lines: [{ tag: "Exclude", text: "Raised platform not required" }],
+      },
+      {
+        id: "g4-custom-signage",
+        title: "Custom Signage Scope",
+        lines: [{ tag: "Exclude", text: "Suspended signage not required" }],
+      },
+    ],
+  });
+  const generated = await detail(sessionId);
+  if (!exportIsCurrent(generated)) {
+    throw new Error(`Run-566 freshly generated handleGenerate() export is not current: ${JSON.stringify(generated.exports)}.`);
+  }
+  const xlsxResponse = await page.context().request.get(new URL(generated.exports.xlsx.url, baseUrl).href);
+  const xlsxBody = await xlsxResponse.body();
+  if (
+    !xlsxResponse.ok()
+    || xlsxBody.length === 0
+    || xlsxBody[0] !== 0x50
+    || xlsxBody[1] !== 0x4b
+  ) {
+    throw new Error(`Run-569 generated XLSX download is not a non-empty ZIP response: ${xlsxResponse.status()} / ${xlsxBody.length}.`);
+  }
+  const generatedDraft = generated.draft_state || {};
+  for (const [key, value] of Object.entries(sectionBasis)) {
+    if (generatedDraft.quoteBasis?.[key] !== value) {
+      throw new Error(`Run-566 generated quoteBasis lost ${key}: ${JSON.stringify(generatedDraft.quoteBasis)}.`);
+    }
+  }
+  for (const key of ["surfaces", "counters", "platform", "graphics", "furniture", "electrical"]) {
+    if (!Object.prototype.hasOwnProperty.call(generatedDraft.quoteBasis || {}, key)) {
+      throw new Error(`Run-566 generated quoteBasis is missing legacy key ${key}.`);
+    }
+  }
+
+  const firstCycle = await restoreAndSave(sessionId);
+  const firstDraft = firstCycle.draft_state || {};
+  const generatedComparable = comparableDraft(generatedDraft);
+  const firstComparable = comparableDraft(firstDraft);
+  const changedAfterFirst = Array.from(new Set([
+    ...Object.keys(generatedComparable), ...Object.keys(firstComparable),
+  ])).filter((key) => JSON.stringify(generatedComparable[key]) !== JSON.stringify(firstComparable[key])).sort();
+  const firstCustomKeysSurvive = Object.entries(sectionBasis).every(([key, value]) => firstDraft.quoteBasis?.[key] === value);
+
+  const secondCycle = await restoreAndSave(sessionId);
+  const secondDraft = secondCycle.draft_state || {};
+  const secondComparable = comparableDraft(secondDraft);
+  const changedAfterSecond = Array.from(new Set([
+    ...Object.keys(firstComparable), ...Object.keys(secondComparable),
+  ])).filter((key) => JSON.stringify(firstComparable[key]) !== JSON.stringify(secondComparable[key])).sort();
+  const secondCustomKeysSurvive = Object.entries(sectionBasis).every(([key, value]) => secondDraft.quoteBasis?.[key] === value);
+
+  if (expectRed) {
+    if (exportIsCurrent(firstCycle) || exportIsCurrent(secondCycle)) {
+      throw new Error("Run-566 RED expected unchanged restoration to make the export stale.");
+    }
+    if (JSON.stringify(changedAfterFirst) !== JSON.stringify(["quoteBasis"])) {
+      throw new Error(`Run-566 RED expected quoteBasis-only non-volatile drift, found ${JSON.stringify(changedAfterFirst)}.`);
+    }
+    if (firstCustomKeysSurvive || secondCustomKeysSurvive) {
+      throw new Error("Run-566 RED expected section-derived quoteBasis keys to be lost by cloneQuoteBasis().");
+    }
+  } else {
+    if (!exportIsCurrent(firstCycle) || !exportIsCurrent(secondCycle)) {
+      throw new Error(`Run-566 GREEN unchanged restoration made the export stale: ${JSON.stringify({ first: firstCycle.exports, second: secondCycle.exports })}.`);
+    }
+    if (changedAfterFirst.length || changedAfterSecond.length) {
+      throw new Error(`Run-566 GREEN restoration drifted non-volatile draft state: ${JSON.stringify({ changedAfterFirst, changedAfterSecond })}.`);
+    }
+    if (!firstCustomKeysSurvive || !secondCustomKeysSurvive) {
+      throw new Error("Run-566 GREEN did not preserve every section-derived quoteBasis entry.");
+    }
+    const cloneSafety = await page.evaluate(() => {
+      const candidate = Object.create(null);
+      candidate.surfaces = "Include: safe legacy surface";
+      candidate["custom-safe-section"] = "Exclude: safe custom section";
+      Object.defineProperty(candidate, "__proto__", { value: "unsafe prototype key", enumerable: true });
+      candidate.constructor = "unsafe constructor key";
+      candidate.prototype = "unsafe prototype field";
+      candidate["function-value"] = () => "unsafe executable value";
+      candidate["object-value"] = { unsafe: true };
+      const cloned = cloneQuoteBasis(candidate);
+      return {
+        cloned,
+        hasOwnProto: Object.prototype.hasOwnProperty.call(cloned, "__proto__"),
+        hasOwnConstructor: Object.prototype.hasOwnProperty.call(cloned, "constructor"),
+        hasOwnPrototype: Object.prototype.hasOwnProperty.call(cloned, "prototype"),
+        hasFunction: Object.prototype.hasOwnProperty.call(cloned, "function-value"),
+        hasObject: Object.prototype.hasOwnProperty.call(cloned, "object-value"),
+        prototypeIsPlain: Object.getPrototypeOf(cloned) === Object.prototype,
+      };
+    });
+    if (
+      cloneSafety.cloned.surfaces !== "Include: safe legacy surface"
+      || cloneSafety.cloned["custom-safe-section"] !== "Exclude: safe custom section"
+      || cloneSafety.hasOwnProto
+      || cloneSafety.hasOwnConstructor
+      || cloneSafety.hasOwnPrototype
+      || cloneSafety.hasFunction
+      || cloneSafety.hasObject
+      || !cloneSafety.prototypeIsPlain
+    ) {
+      throw new Error(`Run-566 GREEN quoteBasis clone safety failed: ${JSON.stringify(cloneSafety)}.`);
+    }
+  }
+
+  const regenerated = await page.evaluate(() => handleGenerate());
+  if (!regenerated) throw new Error("Run-566 regeneration did not produce a current XLSX.");
+  const afterRegeneration = await detail(sessionId);
+  if (!exportIsCurrent(afterRegeneration)) throw new Error("Run-566 regeneration did not restore currentness.");
+
+  await page.locator('#pricingMatchesBody tr:first-child [data-output-edit-field="unit_price_override"]').click();
+  const unitPriceEditor = page.locator('[data-output-editor-field="unit_price_override"]');
+  await unitPriceEditor.waitFor({ state: "visible", timeout: 15000 });
+  const priorPrice = Number(await unitPriceEditor.inputValue());
+  await unitPriceEditor.fill(String((Number.isFinite(priorPrice) ? priorPrice : 15) + 1));
+  await page.keyboard.press("Tab");
+  await page.evaluate(() => saveQuoteSessionDraftState({ quoteGenerated: true }));
+  const afterPriceEdit = await detail(sessionId);
+  if (exportIsCurrent(afterPriceEdit)) throw new Error("Run-566 genuine Output price edit did not invalidate freshness.");
+
+  const regeneratedAfterPrice = await page.evaluate(() => handleGenerate());
+  if (!regeneratedAfterPrice || !exportIsCurrent(await detail(sessionId))) {
+    throw new Error("Run-566 regeneration after a genuine price edit did not restore currentness.");
+  }
+
+  await page.evaluate(() => {
+    setSidePanel("basis", { force: true });
+    updateQuoteBasisCard("edited");
+  });
+  const basisAction = page.locator('[data-basis-section="g4-custom-floor"][data-basis-section-action="Include"]');
+  await basisAction.waitFor({ state: "visible", timeout: 15000 });
+  await basisAction.click();
+  await page.evaluate(() => saveQuoteSessionDraftState({ quoteGenerated: true }));
+  const afterBasisEdit = await detail(sessionId);
+  if (exportIsCurrent(afterBasisEdit)) throw new Error("Run-566 genuine quoteBasis content edit did not invalidate freshness.");
+  if (!String(afterBasisEdit.draft_state?.quoteBasis?.["g4-custom-floor"] || "").startsWith("Include:")) {
+    throw new Error("Run-566 quoteBasis product edit did not persist its changed Include/Exclude value.");
+  }
+
+  console.log(JSON.stringify({
+    status: "ok",
+    mode: expectRed ? "run566-red" : "run566-green",
+    sessionId,
+    generatedCurrent: exportIsCurrent(generated),
+    firstCycleCurrent: exportIsCurrent(firstCycle),
+    secondCycleCurrent: exportIsCurrent(secondCycle),
+    changedAfterFirst,
+    changedAfterSecond,
+    firstCustomKeysSurvive,
+    secondCustomKeysSurvive,
+    regenerationCurrent: exportIsCurrent(afterRegeneration),
+    genuinePriceEditStale: !exportIsCurrent(afterPriceEdit),
+    genuineQuoteBasisEditStale: !exportIsCurrent(afterBasisEdit),
+    xlsxDownloadBytes: xlsxBody.length,
+    xlsxZipSignature: true,
+  }, null, 2));
+}
+
+async function verifyRun569NegativeAuthority(page, reasonCode) {
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => state.isBooting === false, null, { timeout: 30000 });
+  const result = await createDashboardSmokeSession(page, `run569-${reasonCode}`, {
+    sessionIdPrefix: `quote-run569-${reasonCode}`,
+    useHandleGenerate: true,
+    expectedGenerationFailureReason: reasonCode,
+    includeLegacyBasisDefaults: true,
+  });
+  console.log(JSON.stringify({
+    status: "ok",
+    mode: `run569-${reasonCode}`,
+    reasonCode: result.reasonCode,
+    noUsableXlsx: true,
+  }, null, 2));
 }
 
 async function verifyConcurrentInitialDraftSaveUsesSingleSession(page) {
@@ -2612,34 +3065,297 @@ async function verifyDashboardClearsStaleSessionsBeforeRefresh(page) {
     throw new Error(`Dashboard should clear stale rows before refreshed sessions load, found ${staleCountDuringRefresh}.`);
   }
 }
+
+async function verifyRun560PrimaryOrderIngressMatrix(page, { expectRed = false } = {}) {
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
+  await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+  const evidence = await page.evaluate(async () => {
+    const fields = ["basis_order", "category_order", "item_order"];
+    const invalidValues = [
+      [1], { value: 1 }, true, false, "1,234", "1x", 1.5, "1.5", "1e3",
+      "+1", "-1", 0, -1, "bad", "", " \t\r\n", null, undefined, NaN,
+      Infinity, 9007199254740992, "9007199254740992", "\u0661",
+    ];
+    const validValues = [
+      [1, 1], [27, 27], ["27", 27], [" \t003\r\n", 3], ["0000007", 7],
+      [9007199254740991, 9007199254740991], ["9007199254740991", 9007199254740991],
+    ];
+    const failures = [];
+    const families = new Set();
+    const own = (value, key) => Object.prototype.hasOwnProperty.call(value || {}, key);
+    const checkRow = (family, row, expected, { omitted = false } = {}) => {
+      families.add(family);
+      for (const field of fields) {
+        if (omitted && expected[field] === "") {
+          if (own(row, field)) failures.push({ family, field, expected: "omitted", actual: row[field] });
+        } else if (row?.[field] !== expected[field]) {
+          failures.push({ family, field, expected: expected[field], actual: row?.[field] });
+        }
+      }
+    };
+    const invalidExpected = { basis_order: "", category_order: "", item_order: "" };
+    const validExpected = { basis_order: 3, category_order: 7, item_order: 9007199254740991 };
+    const baseRow = (id, orders) => ({
+      source_basis_line_id: id,
+      section: "Synthetic",
+      description: `Run 560 ${id}`,
+      quantity: 1,
+      unit: "unit",
+      price_mode: "Priced",
+      catalog_unit_price: 15,
+      ...orders,
+    });
+    const invalidRow = () => baseRow("invalid", {
+      basis_order: "1,234", category_order: 1.5, item_order: [3],
+    });
+    const validRow = () => baseRow("valid", {
+      basis_order: " 003 ", category_order: "0007", item_order: "9007199254740991",
+    });
+    const findRows = (rows) => ({
+      invalid: (rows || []).find((row) => row.source_basis_line_id === "invalid"),
+      valid: (rows || []).find((row) => row.source_basis_line_id === "valid"),
+    });
+    const checkPair = (family, rows, options = {}) => {
+      const found = findRows(rows);
+      checkRow(family, found.invalid, invalidExpected, options);
+      checkRow(family, found.valid, validExpected, options);
+      const expectedCount = options.rowCount ?? 2;
+      if ((rows || []).length !== expectedCount) failures.push({ family, row_count: (rows || []).length, expectedCount });
+    };
+
+    if (typeof canonicalPrimaryOrderValue !== "function" || typeof canonicalizePrimaryOrderFields !== "function") {
+      failures.push({ family: "direct-helper", missing: true });
+    } else {
+      families.add("direct-helper");
+      for (const field of fields) {
+        for (const value of invalidValues) {
+          const actual = canonicalPrimaryOrderValue(value);
+          if (actual !== "") failures.push({ family: "direct-helper", field, value: String(value), actual });
+        }
+        for (const [value, expected] of validValues) {
+          const actual = canonicalPrimaryOrderValue(value);
+          if (actual !== expected) failures.push({ family: "direct-helper", field, value: String(value), expected, actual });
+        }
+        const source = { description: "unchanged", quantity: "1", [field]: "1.5" };
+        const admitted = canonicalizePrimaryOrderFields(source);
+        if (source[field] !== "1.5" || admitted[field] !== "" || admitted.description !== "unchanged" || admitted.quantity !== "1") {
+          failures.push({ family: "direct-helper-copy", field, source, admitted });
+        }
+      }
+    }
+
+    checkPair("normalizer-line-item", [normalizeLineItem(invalidRow()), normalizeLineItem(validRow())]);
+    checkPair("normalizer-output-row", [normalizeOutputRow(invalidRow()), normalizeOutputRow(validRow())]);
+    const matches = [invalidRow(), validRow()].map((row) => ({
+      ...row, status: "matched", unit_price: 15,
+    }));
+    checkPair("normalizer-pricing-match", matches.map(outputRowFromPricingMatch));
+
+    const invalidBasis = normalizeBasisLines({ ...invalidRow(), text: "Run 560 invalid" });
+    const validBasis = normalizeBasisLines({ ...validRow(), text: "Run 560 valid" });
+    const basisRows = [
+      { ...invalidBasis[0], source_basis_line_id: "invalid" },
+      { ...validBasis[0], source_basis_line_id: "valid" },
+    ];
+    checkRow("normalizer-basis-line", basisRows[0], invalidExpected, { omitted: true });
+    checkRow("normalizer-basis-line", basisRows[1], { basis_order: "", category_order: 7, item_order: 9007199254740991 }, { omitted: true });
+
+    const baseSnapshot = buildSessionSnapshot();
+    const restore = async (patch) => applyQuoteSessionSnapshot({
+      ...baseSnapshot,
+      quoteSessionId: `quote-run560-${Math.random().toString(36).slice(2, 10)}`,
+      quoteSessionDraftSaveStarted: true,
+      outputRows: [], originalOutputRows: [], lineItems: [], pricingMatches: [],
+      ...patch,
+    }, { forceQuoteView: true });
+
+    await restore({ outputRows: [invalidRow(), validRow()] });
+    checkPair("outputRows restoration", state.outputRows);
+
+    await restore({ pricingMatches: matches });
+    checkPair("pricingMatches restoration", state.outputRows);
+
+    await restore({ originalOutputRows: [invalidRow(), validRow()] });
+    await resetOutputDraft();
+    checkPair("originalOutputRows restoration -> Reset Output", state.outputRows);
+
+    await restore({ lineItems: [invalidRow(), validRow()] });
+    const legacyPersisted = currentQuoteSessionDraftState().lineItems;
+    checkPair("legacy lineItems restoration -> persistence", legacyPersisted);
+    refreshOutputRowsFromLineItems();
+    checkPair("legacy lineItems output promotion", state.outputRows);
+
+    await restore({
+      originalAnalysisSnapshot: {
+        quote_basis_sections: [{ id: "synthetic", title: "Synthetic", lines: [
+          { ...invalidRow(), text: "Run 560 invalid" }, { ...validRow(), text: "Run 560 valid" },
+        ] }],
+        line_items: [invalidRow(), validRow()],
+      },
+    });
+    resetQuoteBasisToOriginal();
+    checkPair("original analysis -> Reset Basis", state.lineItems);
+
+    const proposal = normalizeServerBasisChatProposal({
+      quote_basis_sections: [{ id: "synthetic", title: "Synthetic", lines: [] }],
+      line_items: [invalidRow(), validRow()],
+    });
+    setBasisChatProposal(proposal);
+    applyBasisChatProposal();
+    checkPair("proposal restore/receive -> acceptance", state.lineItems);
+
+    const sections = normalizeQuoteBasisSections([{ id: "synthetic", title: "Synthetic", lines: [
+      { ...invalidRow(), text: "Run 560 invalid" }, { ...validRow(), text: "Run 560 valid" },
+    ] }]);
+    checkRow("basis-section reconstruction", sections[0].lines[0], invalidExpected, { omitted: true });
+    checkRow("basis-section reconstruction", sections[0].lines[1], { basis_order: "", category_order: 7, item_order: 9007199254740991 }, { omitted: true });
+
+    applyDraftLineItems([invalidRow(), validRow()]);
+    checkPair("draft/resumed job result ingestion", state.lineItems);
+
+    state.lineItems = [validRow()];
+    const originalPostJson = postJson;
+    postJson = async () => ({ ok: true, data: { status: "normalized", line_items: [invalidRow(), validRow()] } });
+    try {
+      await refreshLineItemsFromServer();
+      checkPair("/api/line-items/normalize response ingestion", state.lineItems);
+    } finally {
+      postJson = originalPostJson;
+    }
+
+    state.outputRows = [invalidRow(), validRow(), { ...validRow() }];
+    state.lineItems = [];
+    state.pricingMatches = [];
+    const snapshotA = buildSessionSnapshot();
+    const draftA = currentQuoteSessionDraftState();
+    saveSessionState();
+    const localA = JSON.parse(window.localStorage.getItem(QUOTE_SESSION_STORAGE_KEY) || "{}");
+    checkPair("browser persistence buildSessionSnapshot", snapshotA.outputRows, { rowCount: 3 });
+    checkPair("browser persistence currentQuoteSessionDraftState", draftA.outputRows, { rowCount: 3 });
+    checkPair("browser persistence saveSessionState", localA.outputRows, { rowCount: 3 });
+    if (snapshotA.outputRows.length !== 3 || draftA.outputRows.length !== 3 || localA.outputRows.length !== 3) {
+      failures.push({ family: "browser persistence duplicate multiplicity", counts: [snapshotA.outputRows.length, draftA.outputRows.length, localA.outputRows.length] });
+    }
+    await applyQuoteSessionSnapshot(localA, { forceQuoteView: true });
+    saveSessionState();
+    const localB = JSON.parse(window.localStorage.getItem(QUOTE_SESSION_STORAGE_KEY) || "{}");
+    await applyQuoteSessionSnapshot(localB, { forceQuoteView: true });
+    const localC = buildSessionSnapshot();
+    if (JSON.stringify(localB.outputRows) !== JSON.stringify(localC.outputRows)) {
+      failures.push({ family: "browser persistence two-cycle determinism" });
+    }
+
+    const adapterCases = [
+      ["adapter-rows", "canonicalizePrimaryOrderRows", () => canonicalizePrimaryOrderRows([invalidRow(), validRow()])],
+      ["adapter-sections", "canonicalizeBasisSectionsPrimaryOrders", () => canonicalizeBasisSectionsPrimaryOrders([{ id: "x", lines: [invalidRow(), validRow()] }])],
+      ["adapter-original", "canonicalizeOriginalAnalysisPrimaryOrders", () => canonicalizeOriginalAnalysisPrimaryOrders({ line_items: [invalidRow(), validRow()] })],
+      ["adapter-proposal", "canonicalizeBasisChatProposalPrimaryOrders", () => canonicalizeBasisChatProposalPrimaryOrders({ lineItems: [invalidRow(), validRow()] })],
+      ["adapter-result", "canonicalizeDraftResultPrimaryOrders", () => canonicalizeDraftResultPrimaryOrders({ line_items: [invalidRow(), validRow()] })],
+      ["adapter-snapshot", "canonicalizeQuoteSessionSnapshotPrimaryOrders", () => canonicalizeQuoteSessionSnapshotPrimaryOrders({ outputRows: [invalidRow(), validRow()] })],
+    ];
+    for (const [family, name, call] of adapterCases) {
+      families.add(family);
+      if (typeof window[name] !== "function") failures.push({ family, missing: true });
+      else call();
+    }
+
+    clearQuoteSessionDraftSaveTimer();
+    clearSessionState();
+    return { failures, families: [...families] };
+  });
+  if (expectRed) {
+    if (!evidence.failures.length) throw new Error("Run-560 RED unexpectedly passed on canonical main.");
+    console.log(`Run-560 RED matrix reproduced ${evidence.failures.length} violations across ${evidence.families.length} production-boundary families.`);
+    return evidence;
+  }
+  if (evidence.failures.length) {
+    throw new Error(`Run-560 primary-order ingress matrix failed: ${JSON.stringify(evidence.failures.slice(0, 20))}.`);
+  }
+  console.log(`Run-560 GREEN matrix passed across ${evidence.families.length} production-boundary families.`);
+  return evidence;
+}
+
 async function main() {
   let serverInfo = null;
-  const hasExistingServer = await healthOk();
-  if (!hasExistingServer) {
-    await fs.rm(quoteDataRoot, { recursive: true, force: true });
-    serverInfo = startServer();
-    if (!(await waitForHealth())) {
-      const serverOutput = serverInfo.output.join("").trim();
-      await stopServer(serverInfo);
-      throw new Error(`Could not start webapp at ${baseUrl}.${serverOutput ? `\n\n${serverOutput}` : ""}`);
-    }
-  }
-
-  const browser = await chromium.launch({ headless: !options.headed });
-  const context = await browser.newContext({ viewport: { width: 1365, height: 768 } });
-  const page = await context.newPage();
-  const consoleProblems = [];
-  const networkProblems = [];
-  page.on("console", (message) => {
-    if (["error", "warning"].includes(message.type())) consoleProblems.push(`${message.type()}: ${message.text()}`);
-  });
-  page.on("pageerror", (error) => consoleProblems.push(`pageerror: ${error.message}`));
-  page.on("response", (response) => {
-    if (response.status() >= 400) networkProblems.push(`${response.status()} ${response.url()}`);
-  });
-
+  let browser = null;
+  let run569Runtime = null;
   try {
+    const hasExistingServer = await healthOk();
+    if (run569LoadedAppMode) {
+      if (options.keepServer) throw new Error("Run-569 loaded-app modes prohibit --keep-server.");
+      if (options.host !== "127.0.0.1" || !args.some((arg) => arg === "--port" || arg.startsWith("--port="))) {
+        throw new Error("Run-569 loaded-app modes require an explicit fresh 127.0.0.1 --port.");
+      }
+      run569Runtime = await createRun569Runtime();
+      if (hasExistingServer) {
+        throw new Error("Run-569 refuses an ambient healthy server before pricing provisioning or browser execution.");
+      }
+      await assertRun569PricingRootEmpty(run569Runtime);
+      serverInfo = startServer(run569Runtime);
+      if (!(await waitForHealth(15000, serverInfo))) {
+        const serverOutput = serverInfo.output.join("").trim();
+        throw new Error(`Could not start owned Run-569 webapp at ${baseUrl}.${serverOutput ? `\n\n${serverOutput}` : ""}`);
+      }
+    } else if (!hasExistingServer) {
+      await fs.rm(quoteDataRoot, { recursive: true, force: true });
+      serverInfo = startServer();
+      if (!(await waitForHealth(15000, serverInfo))) {
+        const serverOutput = serverInfo.output.join("").trim();
+        throw new Error(`Could not start webapp at ${baseUrl}.${serverOutput ? `\n\n${serverOutput}` : ""}`);
+      }
+    }
+
+    browser = await chromium.launch({ headless: !options.headed });
+    const context = await browser.newContext({ viewport: { width: 1365, height: 768 } });
+    const page = await context.newPage();
+    const consoleProblems = [];
+    const networkProblems = [];
+    page.on("console", (message) => {
+      if (["error", "warning"].includes(message.type())) consoleProblems.push(`${message.type()}: ${message.text()}`);
+    });
+    page.on("pageerror", (error) => consoleProblems.push(`pageerror: ${error.message}`));
+    page.on("response", (response) => {
+      if (response.status() >= 400) networkProblems.push(`${response.status()} ${response.url()}`);
+    });
+
     await installMockProfiles(page);
+    if (args.includes("--run566-green") || args.includes("--run569-positive")) {
+      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+      await page.waitForFunction(() => state.isBooting === false, null, { timeout: 30000 });
+      const digest = await provisionRun569PricingAuthority(
+        page,
+        10,
+        "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7",
+      );
+      await verifyRun566QuoteBasisRestorationFreshness(page, { expectRed: false });
+      console.log(JSON.stringify({ status: "ok", mode: "run569-positive", authorityDigest: digest }, null, 2));
+      return;
+    }
+    if (args.includes("--run569-missing")) {
+      await verifyRun569NegativeAuthority(page, "pricing_reference_unavailable");
+      await assertNoRun569Xlsx(run569Runtime);
+      return;
+    }
+    if (args.includes("--run569-mismatch")) {
+      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+      await page.waitForFunction(() => state.isBooting === false, null, { timeout: 30000 });
+      const mismatchDigest = await provisionRun569PricingAuthority(page, 11);
+      if (mismatchDigest === "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7") {
+        throw new Error("Run-569 mismatched authority unexpectedly retained the cost-10 digest.");
+      }
+      await verifyRun569NegativeAuthority(page, "pricing_reference_digest_mismatch");
+      await assertNoRun569Xlsx(run569Runtime);
+      return;
+    }
+    if (args.includes("--run566-red")) {
+      await verifyRun566QuoteBasisRestorationFreshness(page, { expectRed: true });
+      return;
+    }
+    if (args.includes("--run560-red") || args.includes("--run560-green")) {
+      await verifyRun560PrimaryOrderIngressMatrix(page, { expectRed: args.includes("--run560-red") });
+      return;
+    }
     await verifyRecoveredTemplateOwnerFailsClosed(page);
     await verifyFreshPricingAuthorityInitializesBeforeCustomer(page);
     await verifyServerPricingReferenceReviewDurability(page);
@@ -3466,8 +4182,9 @@ async function main() {
       networkProblems,
     }, null, 2));
   } finally {
-    await browser.close();
+    if (browser) await browser.close();
     await stopServer(serverInfo);
+    await cleanupRun569Runtime(run569Runtime);
   }
 }
 

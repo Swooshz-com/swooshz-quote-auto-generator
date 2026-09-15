@@ -14,6 +14,7 @@ import os
 import queue
 import re
 import shutil
+import socket
 import sqlite3
 import struct
 import subprocess
@@ -3521,6 +3522,7 @@ function renderPresetStatus() {}
 function syncQuoteCommercialContextPills() {}
 
 eval([
+  "canonicalPrimaryOrderValue", "canonicalizePrimaryOrderFields",
   "hasOwnValue", "hasMeaningfulQuoteDetailValue", "normalizeTaxLabel", "normalizeTaxRate", "taxRatePercentText", "commercialTaxRateOrNull",
   "normalizeCurrencyLabel", "isStandardCurrencyCode", "normalizedCustomCurrencyInput", "customCurrencyInputIsValid",
   "setQuoteCurrencyControls", "syncQuoteCurrencyCustomInput", "quoteCurrencyControlValue", "emptyQuoteCommercialTouched",
@@ -19052,6 +19054,8 @@ function extractFunction(name) {
 const DEFAULT_TAX_LABEL = "GST";
 const DEFAULT_TAX_RATE = 0.09;
 const DEFAULT_CURRENCY_LABEL = "SGD";
+eval(extractFunction("canonicalPrimaryOrderValue"));
+eval(extractFunction("canonicalizePrimaryOrderFields"));
 eval(extractFunction("pricingMatchStatus"));
 eval(extractFunction("pricingStatusLabel"));
 eval(extractFunction("numberOrNull"));
@@ -22834,6 +22838,7 @@ function persistSessionFiles(records) {
 function normalizeRestorableOverlay(value) { return value || ""; }
 function normalizeActiveJob(job) { return job?.id ? job : null; }
 function saveWorkspaceViewState() {}
+function canonicalQuoteSessionPersistenceProjection(snapshot) { return snapshot; }
 
 eval([
   "safeQuoteSessionId",
@@ -23654,6 +23659,8 @@ const state = {
 };
 
 eval([
+  "canonicalPrimaryOrderValue",
+  "canonicalizePrimaryOrderFields",
   "normalizeTextNewlines",
   "splitLines",
   "safeId",
@@ -25518,6 +25525,10 @@ function buildSessionSnapshot() { return {}; }
 function sessionFileRecordsFromDraft() { return []; }
 function currentBrowserRecoveryScope() { return "scope"; }
 function persistSessionFiles() { return Promise.resolve(); }
+function canonicalizeQuoteSessionSnapshotPrimaryOrders(value) { return value; }
+function canonicalizeOriginalAnalysisPrimaryOrders(value) { return value; }
+function canonicalizeBasisChatProposalPrimaryOrders(value) { return value; }
+function canonicalizeDraftResultPrimaryOrders(value) { return value; }
 
 eval([
   "quoteCommercialSnapshotRawValues",
@@ -25794,6 +25805,10 @@ function buildSessionSnapshot() { return {}; }
 function sessionFileRecordsFromDraft() { return []; }
 function currentBrowserRecoveryScope() { return "scope"; }
 function persistSessionFiles() { return Promise.resolve(); }
+function canonicalizeQuoteSessionSnapshotPrimaryOrders(value) { return value; }
+function canonicalizeOriginalAnalysisPrimaryOrders(value) { return value; }
+function canonicalizeBasisChatProposalPrimaryOrders(value) { return value; }
+function canonicalizeDraftResultPrimaryOrders(value) { return value; }
 function quoteCommercialReviewRequired() { return Boolean(state.quoteCommercialReview && state.quoteCommercialReview.status === QUOTE_COMMERCIAL_REVIEW_STATUS); }
 function pendingPricingReferenceSelection() {
   const intent = state.pricingReferenceSelectionIntent || {};
@@ -26051,6 +26066,10 @@ function revisionNumber(value, fallback) { return Number.isFinite(Number(value))
 function buildSessionSnapshot() { return {}; }
 function sessionFileRecordsFromDraft() { return []; }
 function persistSessionFiles() { return Promise.resolve(); }
+function canonicalizeQuoteSessionSnapshotPrimaryOrders(value) { return value; }
+function canonicalizeOriginalAnalysisPrimaryOrders(value) { return value; }
+function canonicalizeBasisChatProposalPrimaryOrders(value) { return value; }
+function canonicalizeDraftResultPrimaryOrders(value) { return value; }
 function quoteCommercialReviewRequired() { return Boolean(state.quoteCommercialReview && state.quoteCommercialReview.status === QUOTE_COMMERCIAL_REVIEW_STATUS); }
 
 eval([
@@ -27853,6 +27872,8 @@ function markOutputRowsDirty() { state.downloadFile = null; }
 function quoteCommercialReviewRequired() { return Boolean(state.quoteCommercialReview && state.quoteCommercialReview.status === QUOTE_COMMERCIAL_REVIEW_STATUS); }
 eval([
   "normalizeAnalysisMode",
+  "canonicalPrimaryOrderValue",
+  "canonicalizePrimaryOrderFields",
   "normalizeTextNewlines",
   "splitLines",
   "safeId",
@@ -28437,6 +28458,10 @@ function closeBasisChatOverlay() { state.overlayClosed = true; }
 function syncControlStates() { state.synced = true; }
 
 eval([
+  "canonicalPrimaryOrderValue",
+  "canonicalizePrimaryOrderFields",
+  "canonicalizePrimaryOrderRows",
+  "canonicalizeBasisChatProposalPrimaryOrders",
   "safeId",
   "pricingReferenceLineText",
   "bracketedCatalogReferenceParts",
@@ -28591,6 +28616,8 @@ function sectionTitleKey(value = "") { return String(value || "").toLowerCase().
 function referenceSectionTitleAliases(value = "") { return [String(value || "").trim()].filter(Boolean); }
 
 eval([
+  "canonicalPrimaryOrderValue",
+  "canonicalizePrimaryOrderFields",
   "safeId",
   "pricingReferenceLineText",
   "bracketedCatalogReferenceParts",
@@ -28715,6 +28742,8 @@ function sectionTitleKey(value = "") { return String(value || "").toLowerCase().
 function referenceSectionTitleAliases(value = "") { return [String(value || "").trim()].filter(Boolean); }
 
 eval([
+  "canonicalPrimaryOrderValue",
+  "canonicalizePrimaryOrderFields",
   "safeId",
   "normalizeQuoteBasisTitle",
   "cleanCustomerQuoteLineText",
@@ -28912,6 +28941,9 @@ function normalizeCategoryTitle(value = "") {
   return String(value || "").trim();
 }
 eval([
+  "canonicalPrimaryOrderValue",
+  "canonicalizePrimaryOrderFields",
+  "canonicalizePrimaryOrderRows",
   "normalizeUnit",
   "cleanCustomerQuoteLineText",
   "pricingReferenceLineText",
@@ -29112,6 +29144,8 @@ function normalizeCategoryTitle(value = "") {
   return String(value || "").trim();
 }
 eval([
+  "canonicalPrimaryOrderValue",
+  "canonicalizePrimaryOrderFields",
   "normalizeUnit",
   "cleanCustomerQuoteLineText",
   "pricingReferenceLineText",
@@ -29850,6 +29884,7 @@ async function main() {
         review: state.quoteCommercialReview,
         snapshot: state.quoteCommercialSnapshot,
       })}`);
+      const persisted = buildSessionSnapshot();
       return {
         sessionId: state.quoteSessionId,
         lifecycle: state.quoteCommercialLifecycle,
@@ -29858,6 +29893,8 @@ async function main() {
         outputRow: state.outputRows[0],
         basis: JSON.stringify(state.quoteBasisSections),
         output: JSON.stringify(state.outputRows),
+        persistedOutput: JSON.stringify(persisted.outputRows),
+        persistedLineItems: JSON.stringify(persisted.lineItems),
       };
     });
     assert.strictEqual(fresh.lifecycle, "NEW_UNINITIALISED");
@@ -29895,8 +29932,8 @@ async function main() {
     assert.strictEqual(restored.review, null);
     assert.strictEqual(restored.lifecycle, fresh.lifecycle);
     assert.strictEqual(restored.basis, fresh.basis);
-    assert.strictEqual(restored.output, fresh.output);
-    assert.strictEqual(restored.lineItems, JSON.stringify([fresh.lineItem]));
+    assert.strictEqual(restored.output, fresh.persistedOutput);
+    assert.strictEqual(restored.lineItems, fresh.persistedLineItems);
     assert.strictEqual(restored.snapshot.pricing_basis.id, referenceId);
     assert.strictEqual(restored.snapshot.pricing_basis.source, "company");
 
@@ -31184,7 +31221,7 @@ main().catch((error) => {
         self.assertEqual(delete_response["status"], "deleted")
         self.assertIsNone(artifact_after_delete)
 
-    def test_database_artifact_stale_export_remains_downloadable_and_snapshot_is_preserved(self):
+    def test_database_artifact_stale_export_is_rejected_and_snapshot_is_preserved(self):
         tmp_path = test_temp_root() / f"db-artifact-stale-{time.time_ns()}"
         tmp_path.mkdir(parents=True)
         database_url = f"sqlite:///{(tmp_path / 'sqag-storage.sqlite3').as_posix()}"
@@ -31261,10 +31298,10 @@ main().catch((error) => {
         self.assertEqual(webapp.quote_session_result_files(fetched), [])
         self.assertEqual(fetched["generation_snapshot"]["profile"]["display_name"], "Generated Stale Profile")
         self.assertEqual(fetched["generation_snapshot"]["pricing_reference"]["display_name"], "Generated Stale Pricing")
-        self.assertEqual(artifact["content"], b"xlsx-db-stale")
-        self.assertEqual(pdf_artifact["content"], b"pdf-db-stale")
-        self.assertEqual(stale_downloads["xlsx"], (200, b"xlsx-db-stale"))
-        self.assertEqual(stale_downloads["pdf"], (200, b"pdf-db-stale"))
+        self.assertIsNone(artifact)
+        self.assertIsNone(pdf_artifact)
+        self.assertEqual(stale_downloads["xlsx"][0], 404)
+        self.assertEqual(stale_downloads["pdf"][0], 404)
         self.assertEqual(cross_workspace_downloads["xlsx"][0], 404)
         self.assertEqual(cross_workspace_downloads["pdf"][0], 404)
         self.assertIn(unauthorised_downloads["xlsx"][0], {401, 403})
@@ -31415,8 +31452,8 @@ main().catch((error) => {
         for kind, expected in (("xlsx", xlsx_bytes), ("pdf", pdf_bytes)):
             self.assertTrue(stale_session["exports"][kind]["exists"])
             self.assertTrue(stale_session["exports"][kind]["stale"])
-            self.assertEqual(stale_artifacts[kind]["content"], expected)
-            self.assertEqual(stale_downloads[kind], (200, expected))
+            self.assertIsNone(stale_artifacts[kind])
+            self.assertEqual(stale_downloads[kind][0], 404)
             self.assertEqual(replacement_artifacts[kind]["content"], expected)
             self.assertFalse(replaced_session["exports"][kind]["stale"])
             self.assertEqual(replacement_downloads[kind], (200, expected))
@@ -37561,6 +37598,400 @@ main().catch((error) => {
         js = (ROOT / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
         self.assertIn("errorDisplayed: true", js)
         self.assertIn("if (aiResult?.errorDisplayed) return;", js)
+
+    def test_run560_primary_order_server_admission_matrix(self):
+        fields = ("basis_order", "category_order", "item_order")
+        invalid_values = (
+            [1], {"value": 1}, True, False, "1,234", "1x", 1.5, "1.5",
+            "1e3", "+1", "-1", 0, -1, "bad", "", " \t\r\n", None,
+            float("nan"), float("inf"), 9007199254740992,
+            "9007199254740992",
+        )
+        valid_values = (
+            (1, 1), (27, 27), ("27", 27), (" \t003\r\n", 3),
+            ("0000007", 7), (9007199254740991, 9007199254740991),
+            ("9007199254740991", 9007199254740991),
+        )
+        base = {
+            "section": "Synthetic",
+            "description": "Run 560 server boundary",
+            "quantity": 1,
+            "unit": "unit",
+            "price_mode": "Priced",
+        }
+
+        for field in fields:
+            for value in invalid_values:
+                with self.subTest(boundary="owned", field=field, value=repr(value)):
+                    normalized = webapp.normalize_owned_line_item({**base, field: value})
+                    self.assertIsNotNone(normalized)
+                    self.assertNotIn(field, normalized)
+                with self.subTest(boundary="commercial", field=field, value=repr(value)):
+                    normalized = webapp.quote_commercial_row_from_output_row({**base, field: value})
+                    self.assertNotIn(field, normalized)
+                with self.subTest(boundary="draft", field=field, value=repr(value)):
+                    normalized = webapp.quote_session_draft_state_value({field: value})
+                    self.assertIn(field, normalized)
+                    self.assertIsNone(normalized[field])
+            for value, expected in valid_values:
+                with self.subTest(boundary="owned-valid", field=field, value=repr(value)):
+                    normalized = webapp.normalize_owned_line_item({**base, field: value})
+                    self.assertEqual(normalized[field], expected)
+                with self.subTest(boundary="commercial-valid", field=field, value=repr(value)):
+                    normalized = webapp.quote_commercial_row_from_output_row({**base, field: value})
+                    self.assertEqual(normalized[field], expected)
+                with self.subTest(boundary="draft-valid", field=field, value=repr(value)):
+                    normalized = webapp.quote_session_draft_state_value({field: value})
+                    self.assertEqual(normalized[field], expected)
+
+        for field in ("category_order", "item_order"):
+            invalid_basis = webapp.normalize_basis_lines({
+                "tag": "Confirm", "text": "Run 560 basis line", field: "1,234",
+            })[0]
+            self.assertNotIn(field, invalid_basis)
+            valid_basis = webapp.normalize_basis_lines({
+                "tag": "Confirm", "text": "Run 560 basis line", field: " 003 ",
+            })[0]
+            self.assertEqual(valid_basis[field], 3)
+
+        payload = {"line_items": [{**base, "basis_order": "1.5", "category_order": "2", "item_order": 3}]}
+        normalized_items = webapp.normalize_line_items(payload, use_catalog=False)
+        self.assertEqual(len(normalized_items), 1)
+        self.assertNotIn("basis_order", normalized_items[0])
+        self.assertEqual(normalized_items[0]["category_order"], 2)
+        self.assertEqual(normalized_items[0]["item_order"], 3)
+
+    def test_run560_primary_order_helpers_and_long_truncation_regression(self):
+        self.assertIsNone(webapp.canonical_primary_order_value(True))
+        self.assertIsNone(webapp.canonical_primary_order_value("\u0661"))
+        self.assertEqual(webapp.canonical_primary_order_value(" \t003\r\n"), 3)
+        self.assertEqual(webapp.canonical_primary_order_value("9007199254740991"), 9007199254740991)
+        self.assertIsNone(webapp.canonical_primary_order_value("9007199254740992"))
+
+        original = {"description": "unchanged", "quantity": "1", "basis_order": "1.5"}
+        admitted = webapp.canonicalize_primary_order_fields(original)
+        self.assertEqual(original["basis_order"], "1.5")
+        self.assertNotIn("category_order", admitted)
+        self.assertIsNone(admitted["basis_order"])
+        self.assertEqual(admitted["description"], "unchanged")
+        self.assertEqual(admitted["quantity"], "1")
+
+        attack = ("0" * 4999) + "1x"
+        sanitized = webapp.quote_session_draft_state_value({"item_order": attack})
+        self.assertEqual(sanitized, {"item_order": None})
+
+    def test_run564_quote_session_http_canonicalizes_effective_primary_order_keys(self):
+        fields = ("basis_order", "category_order", "item_order")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp) / "data"
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                with LocalRunnerServer() as runner:
+                    session = self.http_json(runner, "GET", "/api/session")
+                    headers = {
+                        "Origin": runner.base_url,
+                        session["body"]["csrf_header"]: session["body"]["csrf_token"],
+                    }
+
+                    for field in fields:
+                        for label, raw_key in (("exact", field), ("sanitized-alias", field + " ")):
+                            with self.subTest(field=field, key=label):
+                                session_id = f"quote-run564-key-{field}-{label}"
+                                saved = self.http_json(
+                                    runner,
+                                    "POST",
+                                    "/api/quote-sessions",
+                                    body={
+                                        "session_id": session_id,
+                                        "draft_state": {raw_key: "\u00a01\u00a0"},
+                                    },
+                                    headers=headers,
+                                )
+                                self.assertEqual(saved["status"], 200, saved)
+                                restored = self.http_json(
+                                    runner,
+                                    "GET",
+                                    f"/api/quote-sessions/{session_id}",
+                                )
+                                self.assertEqual(restored["status"], 200, restored)
+                                draft_state = restored["body"]["quote_session"]["draft_state"]
+                                self.assertIn(field, draft_state)
+                                self.assertIsNone(draft_state[field])
+                                if raw_key != field:
+                                    self.assertNotIn(raw_key, draft_state)
+
+    def test_run564_quote_session_http_bounds_arbitrarily_long_primary_orders(self):
+        fields = ("basis_order", "category_order", "item_order")
+        cases = (
+            ("leading-zero-in-range", ("0" * 5000) + "1", 1),
+            ("oversized-nonzero", "9" * 5001, None),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp) / "data"
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                with LocalRunnerServer() as runner:
+                    session = self.http_json(runner, "GET", "/api/session")
+                    headers = {
+                        "Origin": runner.base_url,
+                        session["body"]["csrf_header"]: session["body"]["csrf_token"],
+                    }
+
+                    for field in fields:
+                        for label, raw_value, expected in cases:
+                            with self.subTest(field=field, representation=label):
+                                session_id = f"quote-run564-long-{field}-{label}"
+                                saved = self.http_json(
+                                    runner,
+                                    "POST",
+                                    "/api/quote-sessions",
+                                    body={
+                                        "session_id": session_id,
+                                        "draft_state": {field: raw_value},
+                                    },
+                                    headers=headers,
+                                )
+                                self.assertEqual(saved["status"], 200, saved)
+                                restored = self.http_json(
+                                    runner,
+                                    "GET",
+                                    f"/api/quote-sessions/{session_id}",
+                                )
+                                self.assertEqual(restored["status"], 200, restored)
+                                draft_state = restored["body"]["quote_session"]["draft_state"]
+                                self.assertEqual(draft_state[field], expected)
+
+    def test_run566_loaded_app_quote_basis_restoration_preserves_freshness(self):
+        node = require_node(self)
+        browser_env = os.environ.copy()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as port_socket:
+            port_socket.bind(("127.0.0.1", 0))
+            port = port_socket.getsockname()[1]
+        completed = subprocess.run(
+            [node, str(ROOT / "scripts" / "playwright-smoke.mjs"), "--run566-green", "--port", str(port)],
+            cwd=str(ROOT),
+            env=browser_env,
+            text=True,
+            capture_output=True,
+            timeout=120,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn('"mode": "run566-green"', completed.stdout)
+        self.assertIn('"firstCycleCurrent": true', completed.stdout)
+        self.assertIn('"secondCycleCurrent": true', completed.stdout)
+        self.assertIn('"genuinePriceEditStale": true', completed.stdout)
+        self.assertIn('"genuineQuoteBasisEditStale": true', completed.stdout)
+        self.assertIn('"xlsxZipSignature": true', completed.stdout)
+        self.assertIn('"authorityDigest": "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7"', completed.stdout)
+
+    def run_run569_loaded_app(self, mode, *, port=None, timeout=180, extra_args=()):
+        node = require_node(self)
+        if port is None:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as port_socket:
+                port_socket.bind(("127.0.0.1", 0))
+                port = port_socket.getsockname()[1]
+        return subprocess.run(
+            [
+                node,
+                str(ROOT / "scripts" / "playwright-smoke.mjs"),
+                mode,
+                "--port",
+                str(port),
+                *extra_args,
+            ],
+            cwd=str(ROOT),
+            env=os.environ.copy(),
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+
+    def run569_disposable_roots(self):
+        roots = set()
+        for parent, prefix in (
+            (ROOT / "_tmp" / "tests", "run569-state-"),
+            (ROOT / "_logs" / "browser", "run569-logs-"),
+        ):
+            if parent.exists():
+                roots.update(path for path in parent.iterdir() if path.name.startswith(prefix))
+        return roots
+
+    def test_run569_provisioned_loaded_app_is_repeatable_from_empty_authority(self):
+        before = self.run569_disposable_roots()
+        outputs = []
+        for iteration in range(2):
+            with self.subTest(iteration=iteration + 1):
+                completed = self.run_run569_loaded_app("--run569-positive")
+                self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+                self.assertIn('"mode": "run569-positive"', completed.stdout)
+                self.assertIn('"firstCycleCurrent": true', completed.stdout)
+                self.assertIn('"secondCycleCurrent": true', completed.stdout)
+                self.assertIn('"regenerationCurrent": true', completed.stdout)
+                self.assertIn('"genuinePriceEditStale": true', completed.stdout)
+                self.assertIn('"genuineQuoteBasisEditStale": true', completed.stdout)
+                self.assertIn('"xlsxZipSignature": true', completed.stdout)
+                self.assertIn('"authorityDigest": "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7"', completed.stdout)
+                outputs.append(completed.stdout)
+        self.assertEqual(self.run569_disposable_roots(), before)
+        self.assertEqual(len(outputs), 2)
+
+    def test_run569_missing_authority_fails_closed_without_xlsx(self):
+        before = self.run569_disposable_roots()
+        completed = self.run_run569_loaded_app("--run569-missing")
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn('"reasonCode": "pricing_reference_unavailable"', completed.stdout)
+        self.assertIn('"noUsableXlsx": true', completed.stdout)
+        self.assertEqual(self.run569_disposable_roots(), before)
+
+    def test_run569_mismatched_authority_fails_closed_without_xlsx(self):
+        before = self.run569_disposable_roots()
+        completed = self.run_run569_loaded_app("--run569-mismatch")
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn('"reasonCode": "pricing_reference_digest_mismatch"', completed.stdout)
+        self.assertIn('"noUsableXlsx": true', completed.stdout)
+        self.assertEqual(self.run569_disposable_roots(), before)
+
+    def test_run569_refuses_ambient_healthy_server_before_browser_or_provisioning(self):
+        before = self.run569_disposable_roots()
+        with LocalRunnerServer() as runner:
+            completed = self.run_run569_loaded_app(
+                "--run569-positive",
+                port=runner.server.server_address[1],
+                timeout=30,
+            )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(
+            "Run-569 refuses an ambient healthy server before pricing provisioning or browser execution.",
+            completed.stderr,
+        )
+        self.assertNotIn('"mode": "run569-positive"', completed.stdout)
+        self.assertEqual(self.run569_disposable_roots(), before)
+
+    def test_run569_loaded_app_prohibits_keep_server(self):
+        before = self.run569_disposable_roots()
+        completed = self.run_run569_loaded_app(
+            "--run569-positive",
+            timeout=30,
+            extra_args=("--keep-server",),
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("Run-569 loaded-app modes prohibit --keep-server.", completed.stderr)
+        self.assertEqual(self.run569_disposable_roots(), before)
+
+    def test_run560_protected_export_rejects_stale_and_mismatched_versions_before_artifact_lookup(self):
+        content = b"run560-protected-export"
+        export = {
+            "filename": "quotation.xlsx",
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "size_bytes": len(content),
+            "stale": False,
+        }
+        metadata = {
+            "session_id": "quote-run560-export",
+            "status": {"quote_generated": True},
+            "publication": {"state": "published", "run_id": "run-run560-export"},
+            "exports": {"xlsx": export},
+        }
+        artifact = {**export, "content": content}
+
+        def storage_for(candidate_metadata, version):
+            storage = object.__new__(webapp.DatabaseSqagStorage)
+            storage._read_quote_session_metadata = mock.Mock(return_value=(candidate_metadata, []))
+            storage._publication_version_row = mock.Mock(return_value=version)
+            storage._publication_version_artifact = mock.Mock(return_value=artifact)
+            return storage
+
+        with mock.patch.object(webapp, "configured_artifact_storage_mode", return_value="database"):
+            stale_metadata = copy.deepcopy(metadata)
+            stale_metadata["exports"]["xlsx"]["stale"] = True
+            stale = storage_for(stale_metadata, {"session_id": "quote-run560-export", "state": "published"})
+            self.assertIsNone(stale.quote_session_export_artifact("quote-run560-export", "xlsx"))
+            stale._publication_version_row.assert_not_called()
+            stale._publication_version_artifact.assert_not_called()
+
+            for label, version in (
+                ("superseded", {"session_id": "quote-run560-export", "state": "superseded"}),
+                ("wrong-session", {"session_id": "quote-other", "state": "published"}),
+            ):
+                with self.subTest(label=label):
+                    blocked = storage_for(copy.deepcopy(metadata), version)
+                    self.assertIsNone(blocked.quote_session_export_artifact("quote-run560-export", "xlsx"))
+                    blocked._publication_version_row.assert_called_once_with("run-run560-export")
+                    blocked._publication_version_artifact.assert_not_called()
+
+            current_version = {"session_id": "quote-run560-export", "state": "published"}
+            current = storage_for(copy.deepcopy(metadata), current_version)
+            self.assertEqual(current.quote_session_export_artifact("quote-run560-export", "xlsx"), artifact)
+            current._publication_version_row.assert_called_once_with("run-run560-export")
+            current._publication_version_artifact.assert_called_once_with(
+                "quote-run560-export",
+                "run-run560-export",
+                "xlsx",
+                publication_version=current_version,
+            )
+
+    def test_run560_protected_export_preserves_verified_legacy_current_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{(root / 'run560-legacy.sqlite3').as_posix()}"
+            output_dir = root / "out"
+            output_dir.mkdir()
+            content = b"run560-legacy-current"
+            (output_dir / "quotation.xlsx").write_bytes(content)
+            payload = valid_payload()
+            payload["quote_session"] = {"session_id": "quote-run560-legacy"}
+            result = {"status": "completed", "files": [{"name": "quotation.xlsx"}]}
+            env = {
+                **self.platform_launch_env(),
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": "database",
+                "SQAG_DATABASE_URL": database_url,
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                webapp.apply_sqag_storage_migrations(database_url)
+                storage = webapp.app_storage_for_auth_session(
+                    self.platform_auth_session("workspace-run560-legacy")
+                )
+                storage.create_or_update_quote_session(
+                    payload, result=result, output_dir=output_dir
+                )
+                published_metadata, _draft_files = storage._read_quote_session_metadata(
+                    "quote-run560-legacy"
+                )
+                run_id = published_metadata["publication"]["run_id"]
+                with storage.connection() as connection:
+                    connection.execute(
+                        "delete from sqag_quote_publication_versions "
+                        "where workspace_id = ? and run_id = ?",
+                        (storage.workspace_id, run_id),
+                    )
+                    connection.commit()
+
+                artifact = storage.quote_session_export_artifact(
+                    "quote-run560-legacy", "xlsx"
+                )
+                self.assertEqual(artifact["content"], content)
+
+                metadata, _draft_files = storage._read_quote_session_metadata(
+                    "quote-run560-legacy"
+                )
+                metadata["exports"]["xlsx"]["sha256"] = "0" * 64
+                with storage.connection() as connection:
+                    connection.execute(
+                        "update sqag_quote_sessions set metadata_json = ? "
+                        "where workspace_id = ? and session_id = ?",
+                        (
+                            json.dumps(metadata, separators=(",", ":"), sort_keys=True),
+                            storage.workspace_id,
+                            "quote-run560-legacy",
+                        ),
+                    )
+                    connection.commit()
+                self.assertIsNone(
+                    storage.quote_session_export_artifact(
+                        "quote-run560-legacy", "xlsx"
+                    )
+                )
 
     def test_static_escape_closes_pricing_reference_modal_without_settings_hub(self):
         js = (ROOT / "webapp" / "static" / "app.js").read_text(encoding="utf-8")

@@ -4656,6 +4656,12 @@ def quote_commercial_invalid_unit_price_override(row: dict[str, Any]) -> bool:
 
 
 def quote_commercial_row_from_output_row(row: dict[str, Any]) -> dict[str, Any]:
+    row = canonicalize_primary_order_fields(row)
+    row = {
+        key: value
+        for key, value in row.items()
+        if key not in PRIMARY_ORDER_FIELDS or value is not None
+    }
     price_mode = "Included" if (
         clean_text(row.get("price_mode")).lower() == "included"
         or clean_text(row.get("display_price")).lower() == "included"
@@ -5725,6 +5731,7 @@ def split_basis_decision_text(text: Any, default_tag: Any = "Confirm") -> list[d
 
 def normalize_basis_lines(value: Any) -> list[dict[str, Any]]:
     if isinstance(value, dict):
+        value = canonicalize_primary_order_fields(value)
         quantity_parts = normalized_line_text_quantity_parts(
             value.get("text") or value.get("line") or value.get("description"),
             value.get("quantity"),
@@ -5762,6 +5769,10 @@ def normalize_basis_lines(value: Any) -> list[dict[str, Any]]:
             pricing_reference_description = clean_text(value.get("pricing_reference_description"))
             if pricing_reference_description:
                 line["pricing_reference_description"] = pricing_reference_description
+            for order_key in ("category_order", "item_order"):
+                order_value = value.get(order_key)
+                if order_value is not None:
+                    line[order_key] = order_value
             catalog_unit_price = parse_float_or_none(value.get("catalog_unit_price"))
             if catalog_unit_price is not None:
                 line["catalog_unit_price"] = catalog_unit_price
@@ -6034,6 +6045,45 @@ def pricing_reference_order_number(value: Any) -> int | None:
     if number is None or number <= 0:
         return None
     return int(number)
+
+
+PRIMARY_ORDER_FIELDS = ("basis_order", "category_order", "item_order")
+PRIMARY_ORDER_MAX = 9007199254740991
+PRIMARY_ORDER_MAX_TEXT = str(PRIMARY_ORDER_MAX)
+PRIMARY_ORDER_ASCII_DIGITS = re.compile(r"[0-9]+\Z")
+
+
+def canonical_primary_order_value(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 1 <= value <= PRIMARY_ORDER_MAX else None
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+        number = int(value)
+        return number if 1 <= number <= PRIMARY_ORDER_MAX else None
+    if isinstance(value, str):
+        text = value.strip(" \t\r\n")
+        if not text or PRIMARY_ORDER_ASCII_DIGITS.fullmatch(text) is None:
+            return None
+        significant = text.lstrip("0")
+        if not significant:
+            return None
+        if len(significant) > len(PRIMARY_ORDER_MAX_TEXT):
+            return None
+        if len(significant) == len(PRIMARY_ORDER_MAX_TEXT) and significant > PRIMARY_ORDER_MAX_TEXT:
+            return None
+        return int(significant, 10)
+    return None
+
+
+def canonicalize_primary_order_fields(row: dict[str, Any]) -> dict[str, Any]:
+    admitted = dict(row) if isinstance(row, dict) else {}
+    for key in PRIMARY_ORDER_FIELDS:
+        if key in admitted:
+            admitted[key] = canonical_primary_order_value(admitted[key])
+    return admitted
 
 
 def pricing_reference_order_from_raw(raw: dict[str, Any], keys: tuple[str, ...]) -> int | None:
@@ -11402,6 +11452,9 @@ class ObjectArtifactDeletionPlan:
     state: str = 'prepared'
 
 
+UNRESOLVED_PUBLICATION_VERSION = object()
+
+
 class DatabaseSqagStorage:
     storage_backend = "database"
     supports_atomic_forensic_publication = True
@@ -14035,12 +14088,17 @@ class DatabaseSqagStorage:
         *,
         connection: Any | None = None,
         include_content: bool = True,
+        publication_version: Any = UNRESOLVED_PUBLICATION_VERSION,
     ) -> dict[str, Any] | None:
         safe_id = safe_quote_session_id(session_id, "")
         safe_run_id = safe_reference(run_id, "run-")
         safe_kind = clean_text(kind).lower()
         expected_filename = QUOTE_SESSION_EXPORT_KINDS.get(safe_kind)
-        version = self._publication_version_row(safe_run_id, connection)
+        version = (
+            self._publication_version_row(safe_run_id, connection)
+            if publication_version is UNRESOLVED_PUBLICATION_VERSION
+            else publication_version
+        )
         if (
             not safe_id
             or not safe_run_id
@@ -14239,10 +14297,23 @@ class DatabaseSqagStorage:
         export = metadata.get("exports", {}).get(safe_kind) if metadata else None
         if not isinstance(export, dict) or clean_text(export.get("filename")) != expected_filename:
             return None
+        if quote_session_export_is_stale(metadata, export):
+            return None
         publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
         current_run_id = safe_reference(publication.get("run_id"), "run-")
-        if current_run_id and self._publication_version_row(current_run_id) is not None:
-            artifact = self._publication_version_artifact(safe_id, current_run_id, safe_kind)
+        publication_version = self._publication_version_row(current_run_id) if current_run_id else None
+        if publication_version is not None:
+            if (
+                clean_text(publication_version["session_id"]) != safe_id
+                or clean_text(publication_version["state"]).lower() != "published"
+            ):
+                return None
+            artifact = self._publication_version_artifact(
+                safe_id,
+                current_run_id,
+                safe_kind,
+                publication_version=publication_version,
+            )
             if (
                 artifact is None
                 or clean_text(artifact.get("sha256")).lower() != clean_text(export.get("sha256")).lower()
@@ -14263,7 +14334,13 @@ class DatabaseSqagStorage:
                 return None
             if not self._object_quote_artifact_row_is_current(safe_id, safe_kind, row):
                 return None
-            return {"filename": row["filename"], "content_type": row["content_type"], "size_bytes": object_metadata.size_bytes, "sha256": object_metadata.checksum_sha256, "content": content}
+            artifact = {"filename": row["filename"], "content_type": row["content_type"], "size_bytes": object_metadata.size_bytes, "sha256": object_metadata.checksum_sha256, "content": content}
+            if (
+                clean_text(artifact["sha256"]).lower() != clean_text(export.get("sha256")).lower()
+                or artifact["size_bytes"] != int(export.get("size_bytes") or -1)
+            ):
+                return None
+            return artifact
         with self.connection() as connection:
             row = connection.execute(
                 "select filename, content_type, size_bytes, content_blob, updated_at from sqag_quote_artifacts where workspace_id = ? and session_id = ? and artifact_kind = ?",
@@ -14276,7 +14353,13 @@ class DatabaseSqagStorage:
             return None
         if not self._database_quote_artifact_row_is_current(safe_id, safe_kind, row):
             return None
-        return {"filename": row["filename"], "content_type": row["content_type"], "size_bytes": int(row["size_bytes"] or 0), "sha256": hashlib.sha256(content).hexdigest(), "content": content}
+        artifact = {"filename": row["filename"], "content_type": row["content_type"], "size_bytes": int(row["size_bytes"] or 0), "sha256": hashlib.sha256(content).hexdigest(), "content": content}
+        if (
+            artifact["sha256"] != clean_text(export.get("sha256")).lower()
+            or artifact["size_bytes"] != int(export.get("size_bytes") or -1)
+        ):
+            return None
+        return artifact
 
     def tombstone_object_quote_artifacts(self, session_id: str) -> int:
         safe_id = safe_quote_session_id(session_id, "")
@@ -18418,6 +18501,7 @@ def resolve_tied_catalog_attribute_item(query_text: str, items: list[dict[str, A
 
 
 def normalize_owned_line_item(raw: dict[str, Any], *, exchange_rate: float | None = None) -> dict[str, Any] | None:
+    raw = canonicalize_primary_order_fields(raw)
     display_price = clean_text(raw.get("display_price"))
     price_mode = clean_text(raw.get("price_mode")).title()
     if clean_text(raw.get("unit_price_override")).lower() == "included" or display_price.lower() == "included":
@@ -18439,8 +18523,8 @@ def normalize_owned_line_item(raw: dict[str, Any], *, exchange_rate: float | Non
         "price_mode": price_mode,
         "source_basis_line_id": safe_resource_id(raw.get("source_basis_line_id"), ""),
     }
-    for order_key in ("category_order", "item_order", "basis_order"):
-        order_value = pricing_reference_order_number(raw.get(order_key))
+    for order_key in PRIMARY_ORDER_FIELDS:
+        order_value = raw.get(order_key)
         if order_value is not None:
             item[order_key] = order_value
     for key in ("reference_section", "status"):
@@ -18545,6 +18629,7 @@ def normalize_line_items(
     for raw in raw_items:
         if not isinstance(raw, dict):
             continue
+        raw = canonicalize_primary_order_fields(raw)
         display_price = clean_text(raw.get("display_price"))
         pricing_keyword = clean_text(raw.get("pricing_keyword"))
         catalog_item = catalog_lookup.get(pricing_keyword)
@@ -18615,9 +18700,11 @@ def normalize_line_items(
             "source_basis_line_id": safe_resource_id(raw.get("source_basis_line_id"), ""),
         }
         for order_key in ("category_order", "item_order"):
-            order_value = pricing_reference_order_number((catalog_item or {}).get(order_key)) or pricing_reference_order_number(raw.get(order_key))
+            order_value = pricing_reference_order_number((catalog_item or {}).get(order_key)) or raw.get(order_key)
             if order_value is not None:
                 item[order_key] = order_value
+        if raw.get("basis_order") is not None:
+            item["basis_order"] = raw["basis_order"]
         if catalog_item and clean_text(catalog_item.get("reference_section")):
             item["reference_section"] = clean_basis_section_title(catalog_item.get("reference_section"))
         if unit_price_override is not None:
@@ -23016,6 +23103,9 @@ def quote_session_draft_state_value(value: Any, depth: int = 0) -> Any:
                 or any(part in key_kind for part in ("token", "secret", "cookie", "nonce"))
                 or key_kind in {"authorization", "auth_code", "state"}
             ):
+                continue
+            if key in PRIMARY_ORDER_FIELDS:
+                sanitized[key] = canonical_primary_order_value(raw_value)
                 continue
             sanitized[key] = quote_session_draft_state_value(raw_value, depth + 1)
         return sanitized
