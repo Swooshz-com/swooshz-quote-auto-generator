@@ -2567,6 +2567,171 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
   });
 }
 
+async function verifyRepair1RawPrimaryOrderBoundary(page) {
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
+  await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+  const evidence = await page.evaluate(() => {
+    const fields = ["basis_order", "category_order", "item_order"];
+    const invalidValues = [
+      [1, 2], { value: 1 }, true, false, "1,2", "1,000", "1.5", 1.5, 0, -1, null, undefined, "",
+    ];
+    const invalid = [];
+    const valid = [];
+    for (const field of fields) {
+      for (const value of invalidValues) {
+        const row = {
+          source_basis_line_id: `invalid-${field}`,
+          section: "Synthetic",
+          description: `Invalid ${field}`,
+          quantity: 1,
+          unit: "lot",
+          price_mode: "Priced",
+          catalog_unit_price: 15,
+          basis_order: 7,
+          category_order: 7,
+          item_order: 7,
+          [field]: value,
+        };
+        invalid.push({ field, value, persisted: canonicalRowsForPersistence([row])[0][field] });
+      }
+      for (const value of [1, 2, "2", " 003 "]) {
+        const row = {
+          source_basis_line_id: `valid-${field}-${String(value)}`,
+          section: "Synthetic",
+          description: `Valid ${field}`,
+          quantity: 1,
+          unit: "lot",
+          price_mode: "Priced",
+          catalog_unit_price: 15,
+          basis_order: 7,
+          category_order: 7,
+          item_order: 7,
+          [field]: value,
+        };
+        valid.push({ field, value, persisted: canonicalRowsForPersistence([row])[0][field] });
+      }
+    }
+    const rows = [
+      { source_basis_line_id: "c", section: "Synthetic", description: "C", quantity: 1, unit: "lot", basis_order: 2 },
+      { source_basis_line_id: "a", section: "Synthetic", description: "A", quantity: 1, unit: "lot", basis_order: 1 },
+      { source_basis_line_id: "b", section: "Synthetic", description: "B", quantity: 1, unit: "lot", basis_order: 1 },
+    ];
+    const permutations = [rows, [rows[2], rows[0], rows[1]], [rows[1], rows[2], rows[0]]]
+      .map((items) => JSON.stringify(canonicalRowsForPersistence(items)));
+    return { invalid, valid, deterministic: new Set(permutations).size === 1 };
+  });
+  const acceptedInvalid = evidence.invalid.filter((item) => item.persisted !== "");
+  const rejectedValid = evidence.valid.filter((item) => item.persisted !== Number(item.value));
+  if (acceptedInvalid.length || rejectedValid.length || !evidence.deterministic) {
+    throw new Error(`Repair 1 raw primary-order boundary failed: ${JSON.stringify({ acceptedInvalid, rejectedValid, deterministic: evidence.deterministic })}.`);
+  }
+}
+
+async function verifyRepair1FreshPresetInitializationAndRestoredOwnership(page) {
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
+  await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+  const evidence = await page.evaluate(async () => {
+    const profile = state.profiles.find((item) => item.id === "synthetic-exhibition-fixture-template");
+    if (!profile) throw new Error("Synthetic preset lifecycle profile is unavailable.");
+    profile.quote_detail_presets = [
+      ...profile.quote_detail_presets,
+      {
+        id: "repair1-remembered",
+        name: "Repair 1 Remembered Company",
+        details: {
+          company: {
+            name: "Repair 1 Remembered Company Pte Ltd",
+            header_details: "Repair 1 Remembered Company Pte Ltd\n1 Remembered Way",
+          },
+          quote_text: { payment_terms: ["Remembered preset payment terms."] },
+          signature: { company_signatory: "Remembered Signatory", company_title: "Remembered Title" },
+        },
+      },
+    ];
+    state.profileId = profile.id;
+    state.defaultProfileId = profile.id;
+    const rememberedValue = profilePresetOptionValue(profile.id, "repair1-remembered");
+    const restoredValue = profilePresetOptionValue(profile.id, "synthetic-fixture-default");
+    window.localStorage.setItem(LAST_SELECTION_STORAGE_KEY, JSON.stringify({
+      browserRecoveryScope: currentBrowserRecoveryScope(),
+      presetValue: rememberedValue,
+    }));
+
+    resetCurrentQuoteDraftState();
+    const fresh = {
+      lifecycle: state.quoteCommercialLifecycle,
+      selected: state.selectedPresetValue,
+      domValue: elements.presetSelect.value,
+      companyName: elements.quoteCompanyName.value,
+      headerDetails: elements.headerDetails.value,
+      paymentTerms: elements.paymentTerms.value,
+    };
+
+    const restored = [];
+    for (const lifecycle of ["EXISTING", "RECOVERED"]) {
+      if (!selectPresetValue(restoredValue)) throw new Error("Restored preset fixture could not be selected.");
+      loadSelectedPreset({ silent: true, allowOwnedInitialization: true });
+      state.quoteCommercialLifecycle = lifecycle;
+      const saved = buildSessionSnapshot();
+      saved.quoteCommercialLifecycle = lifecycle;
+      saved.selectedPresetValue = restoredValue;
+      saved.quoteSessionId = `quote-repair1-restored-preset-${lifecycle.toLowerCase()}`;
+      saved.quoteSessionDraftSaveStarted = true;
+      window.localStorage.setItem(LAST_SELECTION_STORAGE_KEY, JSON.stringify({
+        browserRecoveryScope: currentBrowserRecoveryScope(),
+        presetValue: rememberedValue,
+      }));
+      state.selectedPresetValue = rememberedValue;
+      elements.presetSelect.value = rememberedValue;
+      elements.quoteCompanyName.value = "";
+      elements.headerDetails.value = "";
+      elements.paymentTerms.value = "";
+      const restoredOk = await applyQuoteSessionSnapshot(saved, {
+        forceQuoteView: true,
+        sessionId: saved.quoteSessionId,
+      });
+      restored.push({
+        ok: restoredOk,
+        expectedLifecycle: lifecycle,
+        lifecycle: state.quoteCommercialLifecycle,
+        selected: state.selectedPresetValue,
+        domValue: elements.presetSelect.value,
+        companyName: elements.quoteCompanyName.value,
+        headerDetails: elements.headerDetails.value,
+        paymentTerms: elements.paymentTerms.value,
+      });
+    }
+    const result = { rememberedValue, restoredValue, fresh, restored };
+    clearQuoteSessionDraftSaveTimer();
+    clearSessionState();
+    return result;
+  });
+  if (
+    evidence.fresh.lifecycle !== "NEW_UNINITIALISED"
+    || evidence.fresh.selected !== evidence.rememberedValue
+    || evidence.fresh.domValue !== evidence.rememberedValue
+    || evidence.fresh.companyName !== "Repair 1 Remembered Company Pte Ltd"
+    || !evidence.fresh.headerDetails.includes("1 Remembered Way")
+    || !evidence.fresh.paymentTerms.includes("Remembered preset payment terms.")
+  ) {
+    throw new Error(`Fresh remembered preset selection/details diverged: ${JSON.stringify(evidence)}.`);
+  }
+  const invalidRestored = evidence.restored.filter((item) => (
+    !item.ok
+    || item.lifecycle !== item.expectedLifecycle
+    || item.selected !== evidence.restoredValue
+    || item.domValue !== evidence.restoredValue
+    || item.companyName !== "Synthetic Fallback Quote Company Pte Ltd"
+    || !item.headerDetails.includes("1 Synthetic Way")
+    || !item.paymentTerms.includes("70% synthetic deposit")
+  ));
+  if (invalidRestored.length) {
+    throw new Error(`Restored explicit preset ownership/details changed: ${JSON.stringify(evidence)}.`);
+  }
+}
+
 async function verifyRun552AuthenticatedExport(page, browser) {
   const session = await page.evaluate(async () => {
     const response = await fetch("/api/session");
@@ -3137,6 +3302,16 @@ async function main() {
         mode: "run552-authenticated",
         sessionValidationBypassed: false,
       }, null, 2));
+      return;
+    }
+    if (!args.includes("--repair1-f2-only")) await verifyRepair1RawPrimaryOrderBoundary(page);
+    if (args.includes("--repair1-f1-only")) {
+      console.log(JSON.stringify({ status: "ok", mode: "repair1-f1-only" }, null, 2));
+      return;
+    }
+    await verifyRepair1FreshPresetInitializationAndRestoredOwnership(page);
+    if (args.includes("--repair1-f2-only")) {
+      console.log(JSON.stringify({ status: "ok", mode: "repair1-f2-only" }, null, 2));
       return;
     }
     await verifyRecoveredTemplateOwnerFailsClosed(page);

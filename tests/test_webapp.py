@@ -28908,16 +28908,12 @@ const CANONICAL_OUTPUT_TIE_FIELDS = [
   "pricing_reference_id", "pricing_reference_source", "pricing_basis_currency",
   "pricing_basis_digest", "status",
 ];
-function numberOrNull(value) {
-  if (value === "" || value === null || value === undefined) return null;
-  const number = Number(value);
-  return Number.isFinite(number) ? number : null;
-}
 function orderNumber(value) { return numberOrNull(value); }
 function normalizeOutputRow(row) { return { ...row, basis_order: orderNumber(row.basis_order) ?? "", category_order: orderNumber(row.category_order) ?? "", item_order: orderNumber(row.item_order) ?? "" }; }
 function snapshotOutputRows(rows) { return rows.map((row) => normalizeOutputRow({ ...row })); }
 function outputRowFromPricingMatch(row) { return normalizeOutputRow(row); }
 eval([
+  "numberOrNull",
   "canonicalRawPrimaryOrderValue", "canonicalizeRawPrimaryOrderFields", "canonicalOrderSlot",
   "canonicalValueSlot", "compareCanonicalValues", "canonicalOutputRowOrderKey",
   "canonicalPersistedOutputRows", "canonicalRowsForPersistence",
@@ -28926,12 +28922,16 @@ const row = (id, order) => ({
   source_basis_line_id: id, section: "Synthetic", description: id, quantity: 1, unit: "lot",
   price_mode: "Priced", catalog_unit_price: 15, basis_order: order,
 });
-for (const invalid of [undefined, "", null, 0, -1, 0.5, "1.5", "bad", NaN, Infinity]) {
-  const persisted = canonicalRowsForPersistence([row(`invalid-${String(invalid)}`, invalid)])[0];
-  assert.strictEqual(persisted.basis_order, "");
-}
-for (const valid of [1, 2, "2"]) {
-  assert.strictEqual(canonicalRowsForPersistence([row(`valid-${valid}`, valid)])[0].basis_order, Number(valid));
+for (const field of ["basis_order", "category_order", "item_order"]) {
+  for (const invalid of [undefined, "", "   ", null, 0, -1, 0.5, "1.5", "1,2", "1,000", "bad", NaN, Infinity, [1, 2], { value: 1 }, true, false]) {
+    const candidate = { ...row(`invalid-${field}`, 7), [field]: invalid };
+    const persisted = canonicalRowsForPersistence([candidate])[0];
+    assert.strictEqual(persisted[field], "", `${field} accepted ${JSON.stringify(invalid)}`);
+  }
+  for (const valid of [1, 2, "2", " 003 "]) {
+    const candidate = { ...row(`valid-${field}-${valid}`, 7), [field]: valid };
+    assert.strictEqual(canonicalRowsForPersistence([candidate])[0][field], Number(valid));
+  }
 }
 const rows = [row("c", 2), row("a", 1), row("b", 1), { ...row("b", 1) }];
 const bytes = [rows, [rows[3], rows[0], rows[2], rows[1]], [rows[1], rows[2], rows[0], rows[3]]]

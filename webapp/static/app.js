@@ -4662,6 +4662,7 @@ function lastSelectedPresetValue() {
 }
 
 function preservedOwnedPresetValue() {
+  if (!["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""))) return "";
   const value = String(state.selectedPresetValue || "").trim();
   const profileParts = profilePresetOptionParts(value);
   if (profileParts) return profilePresetOptionValue(profileParts.profileId, profileParts.presetId);
@@ -9263,7 +9264,10 @@ function pricingReferenceOrder(row = {}, fallbackIndex = 0) {
 }
 
 function canonicalRawPrimaryOrderValue(value) {
-  const number = numberOrNull(value);
+  if (typeof value !== "number" && typeof value !== "string") return "";
+  const text = typeof value === "string" ? value.trim() : "";
+  if (typeof value === "string" && !/^\d+$/.test(text)) return "";
+  const number = typeof value === "number" ? value : Number(text);
   return number !== null && Number.isInteger(number) && number > 0 ? number : "";
 }
 
