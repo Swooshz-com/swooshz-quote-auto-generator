@@ -6049,6 +6049,7 @@ def pricing_reference_order_number(value: Any) -> int | None:
 
 PRIMARY_ORDER_FIELDS = ("basis_order", "category_order", "item_order")
 PRIMARY_ORDER_MAX = 9007199254740991
+PRIMARY_ORDER_MAX_TEXT = str(PRIMARY_ORDER_MAX)
 PRIMARY_ORDER_ASCII_DIGITS = re.compile(r"[0-9]+\Z")
 
 
@@ -6066,8 +6067,14 @@ def canonical_primary_order_value(value: Any) -> int | None:
         text = value.strip(" \t\r\n")
         if not text or PRIMARY_ORDER_ASCII_DIGITS.fullmatch(text) is None:
             return None
-        number = int(text, 10)
-        return number if 1 <= number <= PRIMARY_ORDER_MAX else None
+        significant = text.lstrip("0")
+        if not significant:
+            return None
+        if len(significant) > len(PRIMARY_ORDER_MAX_TEXT):
+            return None
+        if len(significant) == len(PRIMARY_ORDER_MAX_TEXT) and significant > PRIMARY_ORDER_MAX_TEXT:
+            return None
+        return int(significant, 10)
     return None
 
 
@@ -23097,7 +23104,7 @@ def quote_session_draft_state_value(value: Any, depth: int = 0) -> Any:
                 or key_kind in {"authorization", "auth_code", "state"}
             ):
                 continue
-            if raw_key in PRIMARY_ORDER_FIELDS:
+            if key in PRIMARY_ORDER_FIELDS:
                 sanitized[key] = canonical_primary_order_value(raw_value)
                 continue
             sanitized[key] = quote_session_draft_state_value(raw_value, depth + 1)

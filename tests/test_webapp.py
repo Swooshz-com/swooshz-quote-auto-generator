@@ -37679,6 +37679,87 @@ main().catch((error) => {
         sanitized = webapp.quote_session_draft_state_value({"item_order": attack})
         self.assertEqual(sanitized, {"item_order": None})
 
+    def test_run564_quote_session_http_canonicalizes_effective_primary_order_keys(self):
+        fields = ("basis_order", "category_order", "item_order")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp) / "data"
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                with LocalRunnerServer() as runner:
+                    session = self.http_json(runner, "GET", "/api/session")
+                    headers = {
+                        "Origin": runner.base_url,
+                        session["body"]["csrf_header"]: session["body"]["csrf_token"],
+                    }
+
+                    for field in fields:
+                        for label, raw_key in (("exact", field), ("sanitized-alias", field + " ")):
+                            with self.subTest(field=field, key=label):
+                                session_id = f"quote-run564-key-{field}-{label}"
+                                saved = self.http_json(
+                                    runner,
+                                    "POST",
+                                    "/api/quote-sessions",
+                                    body={
+                                        "session_id": session_id,
+                                        "draft_state": {raw_key: "\u00a01\u00a0"},
+                                    },
+                                    headers=headers,
+                                )
+                                self.assertEqual(saved["status"], 200, saved)
+                                restored = self.http_json(
+                                    runner,
+                                    "GET",
+                                    f"/api/quote-sessions/{session_id}",
+                                )
+                                self.assertEqual(restored["status"], 200, restored)
+                                draft_state = restored["body"]["quote_session"]["draft_state"]
+                                self.assertIn(field, draft_state)
+                                self.assertIsNone(draft_state[field])
+                                if raw_key != field:
+                                    self.assertNotIn(raw_key, draft_state)
+
+    def test_run564_quote_session_http_bounds_arbitrarily_long_primary_orders(self):
+        fields = ("basis_order", "category_order", "item_order")
+        cases = (
+            ("leading-zero-in-range", ("0" * 5000) + "1", 1),
+            ("oversized-nonzero", "9" * 5001, None),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp) / "data"
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                with LocalRunnerServer() as runner:
+                    session = self.http_json(runner, "GET", "/api/session")
+                    headers = {
+                        "Origin": runner.base_url,
+                        session["body"]["csrf_header"]: session["body"]["csrf_token"],
+                    }
+
+                    for field in fields:
+                        for label, raw_value, expected in cases:
+                            with self.subTest(field=field, representation=label):
+                                session_id = f"quote-run564-long-{field}-{label}"
+                                saved = self.http_json(
+                                    runner,
+                                    "POST",
+                                    "/api/quote-sessions",
+                                    body={
+                                        "session_id": session_id,
+                                        "draft_state": {field: raw_value},
+                                    },
+                                    headers=headers,
+                                )
+                                self.assertEqual(saved["status"], 200, saved)
+                                restored = self.http_json(
+                                    runner,
+                                    "GET",
+                                    f"/api/quote-sessions/{session_id}",
+                                )
+                                self.assertEqual(restored["status"], 200, restored)
+                                draft_state = restored["body"]["quote_session"]["draft_state"]
+                                self.assertEqual(draft_state[field], expected)
+
     def test_run560_protected_export_rejects_stale_and_mismatched_versions_before_artifact_lookup(self):
         content = b"run560-protected-export"
         export = {
