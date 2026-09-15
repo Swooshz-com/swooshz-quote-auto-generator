@@ -3099,15 +3099,20 @@ function normalizeLineItem(item = {}) {
 }
 
 function cloneQuoteBasis(basis = {}) {
-  return {
-    ...EMPTY_BASIS,
-    surfaces: basis.surfaces || "",
-    counters: basis.counters || "",
-    platform: basis.platform || "",
-    graphics: basis.graphics || "",
-    furniture: basis.furniture || "",
-    electrical: basis.electrical || "",
-  };
+  const clone = { ...EMPTY_BASIS };
+  const prototype = basis && typeof basis === "object" && !Array.isArray(basis)
+    ? Object.getPrototypeOf(basis)
+    : undefined;
+  if (prototype !== Object.prototype && prototype !== null) return clone;
+  Object.keys(basis).forEach((key) => {
+    if (
+      !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(key)
+      || ["constructor", "prototype"].includes(key)
+      || typeof basis[key] !== "string"
+    ) return;
+    clone[key] = basis[key];
+  });
+  return clone;
 }
 
 function linesValue(value) {

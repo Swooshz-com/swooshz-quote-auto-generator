@@ -2105,7 +2105,15 @@ async function dashboardQuoteSessionDetail(page, sessionId) {
 }
 
 async function createDashboardSmokeSession(page, suffix, options = {}) {
-  return page.evaluate(async ({ suffix, sessionIdPrefix, customerName, projectName }) => {
+  return page.evaluate(async ({
+    suffix,
+    sessionIdPrefix,
+    customerName,
+    projectName,
+    useHandleGenerate,
+    quoteBasisSections,
+    includeLegacyBasisDefaults,
+  }) => {
     const sessionResponse = await fetch("/api/session");
     if (!sessionResponse.ok) throw new Error(`Session bootstrap failed: ${sessionResponse.status}`);
     const session = await sessionResponse.json();
@@ -2201,7 +2209,9 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
       size: 24,
       data_url: "data:application/pdf;base64,JVBERi0xLjQKJVRlc3QK",
     })];
-    state.quoteBasisSections = normalizeQuoteBasisSections([{
+    const requestedQuoteBasisSections = Array.isArray(quoteBasisSections) && quoteBasisSections.length
+      ? quoteBasisSections
+      : [{
       id: "smoke-floor",
       title: "Floor Design",
       lines: [{
@@ -2212,8 +2222,12 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
         unit: "sqm",
         pricing_keyword: "synthetic-floor-needle-punch-carpet",
       }],
-    }]);
-    state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
+    }];
+    state.quoteBasisSections = normalizeQuoteBasisSections(requestedQuoteBasisSections);
+    state.quoteBasis = {
+      ...(includeLegacyBasisDefaults ? EMPTY_BASIS : {}),
+      ...quoteBasisFromSections(state.quoteBasisSections),
+    };
     state.lineItems = [normalizeLineItem({
       section: "Floor Design",
       description: "Needle punch carpet in colour",
@@ -2331,23 +2345,41 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
       throw new Error("Synthetic fixture initial non-generated quote session was not persisted.");
     }
 
-    const generationPayload = buildPayload({ viewPdf: false });
-    assertFixturePayload(generationPayload, "Canonical synthetic generation payload", false, true);
-    const generationJobId = newClientJobId();
-    const started = await startJob("generate", generationPayload, { jobId: generationJobId });
-    if (!started.ok) throw new Error("Canonical synthetic generation job was rejected before execution.");
-    const acceptedJobId = String(started.data?.job_id || generationJobId).trim();
-    const polled = await pollJob(acceptedJobId);
-    if (
-      !polled.ok
-      || polled.data?.status !== "completed"
-      || polled.data?.result?.status !== "completed"
-    ) {
-      throw new Error(`Canonical synthetic generation did not reach terminal success: ${polled.data?.status || "unknown"}.`);
-    }
-    const resultSessionId = safeQuoteSessionId(polled.data.result.quote_session?.session_id || "");
-    if (resultSessionId && resultSessionId !== sessionId) {
-      throw new Error("Canonical synthetic generation returned a different quote session.");
+    if (useHandleGenerate) {
+      const generated = await handleGenerate();
+      if (!generated) throw new Error(`Canonical synthetic handleGenerate() did not produce quotation.xlsx: ${JSON.stringify({
+        workflowStage: state.workflowStage,
+        activeSidePanel: state.activeSidePanel,
+        basisConfirmed: state.basisConfirmed,
+        isGenerating: state.isGenerating,
+        missing: missingDetailFields(),
+        outputValidation: outputRowsValid(),
+        resultStatus: elements.resultStatus?.textContent || "",
+        messages: elements.messageList?.textContent || "",
+        review: state.quoteCommercialReview,
+        lifecycle: state.quoteCommercialLifecycle,
+        pricingReference: currentPricingReference(),
+        snapshot: state.quoteCommercialSnapshot,
+      })}.`);
+    } else {
+      const generationPayload = buildPayload({ viewPdf: false });
+      assertFixturePayload(generationPayload, "Canonical synthetic generation payload", false, true);
+      const generationJobId = newClientJobId();
+      const started = await startJob("generate", generationPayload, { jobId: generationJobId });
+      if (!started.ok) throw new Error("Canonical synthetic generation job was rejected before execution.");
+      const acceptedJobId = String(started.data?.job_id || generationJobId).trim();
+      const polled = await pollJob(acceptedJobId);
+      if (
+        !polled.ok
+        || polled.data?.status !== "completed"
+        || polled.data?.result?.status !== "completed"
+      ) {
+        throw new Error(`Canonical synthetic generation did not reach terminal success: ${polled.data?.status || "unknown"}.`);
+      }
+      const resultSessionId = safeQuoteSessionId(polled.data.result.quote_session?.session_id || "");
+      if (resultSessionId && resultSessionId !== sessionId) {
+        throw new Error("Canonical synthetic generation returned a different quote session.");
+      }
     }
 
     const detailResponse = await fetch(`/api/quote-sessions/${encodeURIComponent(sessionId)}`);
@@ -2375,7 +2407,220 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
     sessionIdPrefix: options.sessionIdPrefix || "",
     customerName: Object.prototype.hasOwnProperty.call(options, "customerName") ? options.customerName : undefined,
     projectName: Object.prototype.hasOwnProperty.call(options, "projectName") ? options.projectName : undefined,
+    useHandleGenerate: options.useHandleGenerate === true,
+    quoteBasisSections: Array.isArray(options.quoteBasisSections) ? options.quoteBasisSections : [],
+    includeLegacyBasisDefaults: options.includeLegacyBasisDefaults === true,
   });
+}
+
+async function verifyRun566QuoteBasisRestorationFreshness(page, options = {}) {
+  const expectRed = options.expectRed === true;
+  const volatileDraftKeys = new Set([
+    "savedAt", "activeAppView", "activeSidePanel", "workflowStage", "downloadFile", "pdfFile",
+    "downloadFileRevision", "pdfFileRevision", "outputRevision",
+  ]);
+  const comparableDraft = (draft = {}) => Object.fromEntries(
+    Object.entries(draft || {}).filter(([key]) => !volatileDraftKeys.has(key)),
+  );
+  const detail = async (sessionId) => {
+    const response = await dashboardQuoteSessionDetail(page, sessionId);
+    if (response.status !== "ok") throw new Error(`Run-566 could not read ${sessionId}: ${JSON.stringify(response)}.`);
+    return response.quote_session;
+  };
+  const restoreAndSave = async (sessionId) => {
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForFunction(() => state.isBooting === false, null, { timeout: 30000 });
+    const dashboardButton = page.locator("#backToDashboardButton", { hasText: "Dashboard" });
+    if (await dashboardButton.isVisible()) await dashboardButton.click();
+    await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 30000 });
+    const sessionCard = page.locator(`.dashboard-session-card[data-quote-session-id="${sessionId}"]`);
+    await sessionCard.waitFor({ state: "visible", timeout: 30000 });
+    await sessionCard.click();
+    await page.locator(`[data-dashboard-panel-action="modify-session"][data-quote-session-id="${sessionId}"]`).click();
+    await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 30000 });
+    await page.waitForFunction(() => state.quoteSessionRestoreBusy === false, null, { timeout: 30000 });
+    const saved = await page.evaluate(() => saveQuoteSessionDraftState({ quoteGenerated: true }));
+    if (!saved?.session_id) throw new Error(`Run-566 unchanged save failed: ${JSON.stringify(saved)}.`);
+    return detail(sessionId);
+  };
+  const exportIsCurrent = (session) => (
+    session?.exports?.xlsx?.exists === true
+    && session.exports.xlsx.stale !== true
+    && Boolean(String(session.exports.xlsx.url || "").trim())
+  );
+
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => state.isBooting === false, null, { timeout: 30000 });
+  const sectionBasis = {
+    surfaces: "Include: Needle punch carpet in colour",
+    "g4-custom-floor": "Exclude: Raised platform not required",
+    "g4-custom-signage": "Exclude: Suspended signage not required",
+  };
+  const sessionId = await createDashboardSmokeSession(page, "run566", {
+    sessionIdPrefix: "quote-run566-freshness",
+    useHandleGenerate: true,
+    includeLegacyBasisDefaults: true,
+    quoteBasisSections: [
+      {
+        id: "surfaces",
+        title: "Floor Design",
+        lines: [{
+          tag: "Include",
+          text: "Needle punch carpet in colour",
+          include: true,
+          quantity: 2,
+          unit: "sqm",
+          pricing_keyword: "synthetic-floor-needle-punch-carpet",
+        }],
+      },
+      {
+        id: "g4-custom-floor",
+        title: "Custom Floor Scope",
+        lines: [{ tag: "Exclude", text: "Raised platform not required" }],
+      },
+      {
+        id: "g4-custom-signage",
+        title: "Custom Signage Scope",
+        lines: [{ tag: "Exclude", text: "Suspended signage not required" }],
+      },
+    ],
+  });
+  const generated = await detail(sessionId);
+  if (!exportIsCurrent(generated)) {
+    throw new Error(`Run-566 freshly generated handleGenerate() export is not current: ${JSON.stringify(generated.exports)}.`);
+  }
+  const generatedDraft = generated.draft_state || {};
+  for (const [key, value] of Object.entries(sectionBasis)) {
+    if (generatedDraft.quoteBasis?.[key] !== value) {
+      throw new Error(`Run-566 generated quoteBasis lost ${key}: ${JSON.stringify(generatedDraft.quoteBasis)}.`);
+    }
+  }
+  for (const key of ["surfaces", "counters", "platform", "graphics", "furniture", "electrical"]) {
+    if (!Object.prototype.hasOwnProperty.call(generatedDraft.quoteBasis || {}, key)) {
+      throw new Error(`Run-566 generated quoteBasis is missing legacy key ${key}.`);
+    }
+  }
+
+  const firstCycle = await restoreAndSave(sessionId);
+  const firstDraft = firstCycle.draft_state || {};
+  const generatedComparable = comparableDraft(generatedDraft);
+  const firstComparable = comparableDraft(firstDraft);
+  const changedAfterFirst = Array.from(new Set([
+    ...Object.keys(generatedComparable), ...Object.keys(firstComparable),
+  ])).filter((key) => JSON.stringify(generatedComparable[key]) !== JSON.stringify(firstComparable[key])).sort();
+  const firstCustomKeysSurvive = Object.entries(sectionBasis).every(([key, value]) => firstDraft.quoteBasis?.[key] === value);
+
+  const secondCycle = await restoreAndSave(sessionId);
+  const secondDraft = secondCycle.draft_state || {};
+  const secondComparable = comparableDraft(secondDraft);
+  const changedAfterSecond = Array.from(new Set([
+    ...Object.keys(firstComparable), ...Object.keys(secondComparable),
+  ])).filter((key) => JSON.stringify(firstComparable[key]) !== JSON.stringify(secondComparable[key])).sort();
+  const secondCustomKeysSurvive = Object.entries(sectionBasis).every(([key, value]) => secondDraft.quoteBasis?.[key] === value);
+
+  if (expectRed) {
+    if (exportIsCurrent(firstCycle) || exportIsCurrent(secondCycle)) {
+      throw new Error("Run-566 RED expected unchanged restoration to make the export stale.");
+    }
+    if (JSON.stringify(changedAfterFirst) !== JSON.stringify(["quoteBasis"])) {
+      throw new Error(`Run-566 RED expected quoteBasis-only non-volatile drift, found ${JSON.stringify(changedAfterFirst)}.`);
+    }
+    if (firstCustomKeysSurvive || secondCustomKeysSurvive) {
+      throw new Error("Run-566 RED expected section-derived quoteBasis keys to be lost by cloneQuoteBasis().");
+    }
+  } else {
+    if (!exportIsCurrent(firstCycle) || !exportIsCurrent(secondCycle)) {
+      throw new Error(`Run-566 GREEN unchanged restoration made the export stale: ${JSON.stringify({ first: firstCycle.exports, second: secondCycle.exports })}.`);
+    }
+    if (changedAfterFirst.length || changedAfterSecond.length) {
+      throw new Error(`Run-566 GREEN restoration drifted non-volatile draft state: ${JSON.stringify({ changedAfterFirst, changedAfterSecond })}.`);
+    }
+    if (!firstCustomKeysSurvive || !secondCustomKeysSurvive) {
+      throw new Error("Run-566 GREEN did not preserve every section-derived quoteBasis entry.");
+    }
+    const cloneSafety = await page.evaluate(() => {
+      const candidate = Object.create(null);
+      candidate.surfaces = "Include: safe legacy surface";
+      candidate["custom-safe-section"] = "Exclude: safe custom section";
+      Object.defineProperty(candidate, "__proto__", { value: "unsafe prototype key", enumerable: true });
+      candidate.constructor = "unsafe constructor key";
+      candidate.prototype = "unsafe prototype field";
+      candidate["function-value"] = () => "unsafe executable value";
+      candidate["object-value"] = { unsafe: true };
+      const cloned = cloneQuoteBasis(candidate);
+      return {
+        cloned,
+        hasOwnProto: Object.prototype.hasOwnProperty.call(cloned, "__proto__"),
+        hasOwnConstructor: Object.prototype.hasOwnProperty.call(cloned, "constructor"),
+        hasOwnPrototype: Object.prototype.hasOwnProperty.call(cloned, "prototype"),
+        hasFunction: Object.prototype.hasOwnProperty.call(cloned, "function-value"),
+        hasObject: Object.prototype.hasOwnProperty.call(cloned, "object-value"),
+        prototypeIsPlain: Object.getPrototypeOf(cloned) === Object.prototype,
+      };
+    });
+    if (
+      cloneSafety.cloned.surfaces !== "Include: safe legacy surface"
+      || cloneSafety.cloned["custom-safe-section"] !== "Exclude: safe custom section"
+      || cloneSafety.hasOwnProto
+      || cloneSafety.hasOwnConstructor
+      || cloneSafety.hasOwnPrototype
+      || cloneSafety.hasFunction
+      || cloneSafety.hasObject
+      || !cloneSafety.prototypeIsPlain
+    ) {
+      throw new Error(`Run-566 GREEN quoteBasis clone safety failed: ${JSON.stringify(cloneSafety)}.`);
+    }
+  }
+
+  const regenerated = await page.evaluate(() => handleGenerate());
+  if (!regenerated) throw new Error("Run-566 regeneration did not produce a current XLSX.");
+  const afterRegeneration = await detail(sessionId);
+  if (!exportIsCurrent(afterRegeneration)) throw new Error("Run-566 regeneration did not restore currentness.");
+
+  await page.locator('#pricingMatchesBody tr:first-child [data-output-edit-field="unit_price_override"]').click();
+  const unitPriceEditor = page.locator('[data-output-editor-field="unit_price_override"]');
+  await unitPriceEditor.waitFor({ state: "visible", timeout: 15000 });
+  const priorPrice = Number(await unitPriceEditor.inputValue());
+  await unitPriceEditor.fill(String((Number.isFinite(priorPrice) ? priorPrice : 15) + 1));
+  await page.keyboard.press("Tab");
+  await page.evaluate(() => saveQuoteSessionDraftState({ quoteGenerated: true }));
+  const afterPriceEdit = await detail(sessionId);
+  if (exportIsCurrent(afterPriceEdit)) throw new Error("Run-566 genuine Output price edit did not invalidate freshness.");
+
+  const regeneratedAfterPrice = await page.evaluate(() => handleGenerate());
+  if (!regeneratedAfterPrice || !exportIsCurrent(await detail(sessionId))) {
+    throw new Error("Run-566 regeneration after a genuine price edit did not restore currentness.");
+  }
+
+  await page.evaluate(() => {
+    setSidePanel("basis", { force: true });
+    updateQuoteBasisCard("edited");
+  });
+  const basisAction = page.locator('[data-basis-section="g4-custom-floor"][data-basis-section-action="Include"]');
+  await basisAction.waitFor({ state: "visible", timeout: 15000 });
+  await basisAction.click();
+  await page.evaluate(() => saveQuoteSessionDraftState({ quoteGenerated: true }));
+  const afterBasisEdit = await detail(sessionId);
+  if (exportIsCurrent(afterBasisEdit)) throw new Error("Run-566 genuine quoteBasis content edit did not invalidate freshness.");
+  if (!String(afterBasisEdit.draft_state?.quoteBasis?.["g4-custom-floor"] || "").startsWith("Include:")) {
+    throw new Error("Run-566 quoteBasis product edit did not persist its changed Include/Exclude value.");
+  }
+
+  console.log(JSON.stringify({
+    status: "ok",
+    mode: expectRed ? "run566-red" : "run566-green",
+    sessionId,
+    generatedCurrent: exportIsCurrent(generated),
+    firstCycleCurrent: exportIsCurrent(firstCycle),
+    secondCycleCurrent: exportIsCurrent(secondCycle),
+    changedAfterFirst,
+    changedAfterSecond,
+    firstCustomKeysSurvive,
+    secondCustomKeysSurvive,
+    regenerationCurrent: exportIsCurrent(afterRegeneration),
+    genuinePriceEditStale: !exportIsCurrent(afterPriceEdit),
+    genuineQuoteBasisEditStale: !exportIsCurrent(afterBasisEdit),
+  }, null, 2));
 }
 
 async function verifyConcurrentInitialDraftSaveUsesSingleSession(page) {
@@ -2859,6 +3104,10 @@ async function main() {
 
   try {
     await installMockProfiles(page);
+    if (args.includes("--run566-red") || args.includes("--run566-green")) {
+      await verifyRun566QuoteBasisRestorationFreshness(page, { expectRed: args.includes("--run566-red") });
+      return;
+    }
     if (args.includes("--run560-red") || args.includes("--run560-green")) {
       await verifyRun560PrimaryOrderIngressMatrix(page, { expectRed: args.includes("--run560-red") });
       return;

@@ -37760,6 +37760,25 @@ main().catch((error) => {
                                 draft_state = restored["body"]["quote_session"]["draft_state"]
                                 self.assertEqual(draft_state[field], expected)
 
+    def test_run566_loaded_app_quote_basis_restoration_preserves_freshness(self):
+        node = require_node(self)
+        browser_env = os.environ.copy()
+        browser_env.pop("QUOTE_DATA_ROOT", None)
+        completed = subprocess.run(
+            [node, str(ROOT / "scripts" / "playwright-smoke.mjs"), "--run566-green"],
+            cwd=str(ROOT),
+            env=browser_env,
+            text=True,
+            capture_output=True,
+            timeout=120,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn('"mode": "run566-green"', completed.stdout)
+        self.assertIn('"firstCycleCurrent": true', completed.stdout)
+        self.assertIn('"secondCycleCurrent": true', completed.stdout)
+        self.assertIn('"genuinePriceEditStale": true', completed.stdout)
+        self.assertIn('"genuineQuoteBasisEditStale": true', completed.stdout)
+
     def test_run560_protected_export_rejects_stale_and_mismatched_versions_before_artifact_lookup(self):
         content = b"run560-protected-export"
         export = {
