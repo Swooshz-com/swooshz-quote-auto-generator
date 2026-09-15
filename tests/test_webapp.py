@@ -23720,6 +23720,8 @@ eval([
   "outputRowsAlignedToBasis",
   "includedBasisOutputRows",
   "outputRowFromLineItem",
+  "canonicalRawPrimaryOrderValue",
+  "canonicalizeRawPrimaryOrderFields",
   "categoryOrderValue",
   "pricingReferenceOrder",
   "compareOrderValues",
@@ -28872,6 +28874,168 @@ assert.strictEqual(line.unit, "nos");
         self.assertIn('categoryOrderValue', js)
         self.assertIn('pricingReferenceOrder', js)
 
+    def test_run550_raw_primary_order_is_canonical_before_real_normalizer_and_persistence(self):
+        js = (ROOT / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
+        node = require_node(self)
+
+        save_body = js.split("function currentQuoteSessionDraftState()", 1)[1].split(
+            "function quoteSessionDraftComparisonKey", 1
+        )[0]
+        restore_body = js.split("async function applyQuoteSessionSnapshot", 1)[1].split(
+            "function quoteOutputProgressForNavigation", 1
+        )[0]
+        helper_body = js.split("function canonicalRowsForPersistence", 1)[1].split(
+            "function compareOrderValues", 1
+        )[0]
+        self.assertIn("canonicalRowsForPersistence", save_body)
+        self.assertIn("canonicalRowsForPersistence", restore_body)
+        self.assertLess(
+            helper_body.index("map(canonicalizeRawPrimaryOrderFields)"),
+            helper_body.index("snapshotOutputRows"),
+        )
+        self.assertLess(
+            helper_body.index("map(canonicalizeRawPrimaryOrderFields)"),
+            helper_body.index("map(outputRowFromPricingMatch)"),
+        )
+        self.assertNotIn("sortOutputRows(", save_body)
+        self.assertNotIn("localeCompare", helper_body)
+
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+
+function extractFunction(name) {
+  const marker = `function ${name}`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+
+const CANONICAL_OUTPUT_TIE_FIELDS = [
+  "source_basis_line_id", "section", "description", "pricing_keyword",
+  "quantity", "unit", "price_mode", "catalog_description",
+  "pricing_reference_description", "unit_price_override", "catalog_unit_price",
+  "effective_unit_price", "pricing_basis_amount", "approved_quote_amount",
+  "pricing_reference_id", "pricing_reference_source", "pricing_basis_currency",
+  "pricing_basis_digest", "status",
+];
+const state = { quoteCommercialLifecycle: "NEW_UNINITIALISED" };
+function normalizeCategoryTitle(value) { return String(value || "").trim(); }
+function cleanCustomerQuoteLineText(value) { return String(value || "").trim(); }
+function pricingReferenceLineText(value) { return String(value || "").trim(); }
+function outputCatalogDescription() { return ""; }
+function bracketedCatalogReferenceParts() { return null; }
+function normalizeUnit(value) { return String(value || "").trim(); }
+function recalculateOutputRow(row) { return row; }
+function synchronizeOwnedOutputRowPrice(row) { return row; }
+function effectiveOutputUnitPrice(row) { return numberOrNull(row.catalog_unit_price); }
+function pricingMatchStatus(row) { return String(row.status || "matched"); }
+function outputQuantityPartsFromPricingMatch(row) {
+  return { quantity: row.quantity ?? "", unit: row.unit ?? "" };
+}
+function roundCommercialCents(value) { return Number(value); }
+function quoteAmountValue(value) { return Number(value); }
+
+eval([
+  "numberOrNull", "orderNumber", "normalizeOutputRow", "snapshotOutputRows",
+  "outputRowFromPricingMatch", "canonicalRawPrimaryOrderValue",
+  "canonicalizeRawPrimaryOrderFields", "canonicalOrderSlot", "canonicalValueSlot",
+  "compareCanonicalValues", "canonicalOutputRowOrderKey",
+  "canonicalPersistedOutputRows", "canonicalRowsForPersistence",
+].map(extractFunction).join("\n"));
+
+function row(id, overrides = {}) {
+  return {
+    source_basis_line_id: id,
+    section: "Synthetic section",
+    description: `Synthetic ${id}`,
+    quantity: 1,
+    unit: "lot",
+    price_mode: "Priced",
+    unit_price_override: 15,
+    catalog_unit_price: 15,
+    effective_unit_price: 15,
+    pricing_basis_amount: null,
+    status: "matched",
+    ...overrides,
+  };
+}
+
+const invalidValues = [undefined, "", null, 0, -1, 0.5, 1.5, "1.5", "abc", NaN, Infinity];
+const validValues = [1, 2, "2"];
+for (const field of ["basis_order", "category_order", "item_order"]) {
+  for (const [index, value] of invalidValues.entries()) {
+    const raw = row(`${field}-invalid-${index}`);
+    if (value !== undefined) raw[field] = value;
+    const [persisted] = canonicalRowsForPersistence([raw]);
+    assert.strictEqual(persisted[field], "", `${field} accepted ${String(value)}`);
+  }
+  for (const value of validValues) {
+    const [persisted] = canonicalRowsForPersistence([row(`${field}-valid-${value}`, { [field]: value })]);
+    assert.strictEqual(persisted[field], Number(value));
+  }
+}
+
+const fractional = [
+  row("fractional-basis", { basis_order: 1.5, category_order: 2, item_order: 3 }),
+  row("fractional-category", { basis_order: 1, category_order: "1.5", item_order: 3 }),
+  row("fractional-item", { basis_order: 1, category_order: 2, item_order: 0.5 }),
+  row("malformed", { basis_order: "abc", category_order: -1, item_order: null }),
+];
+const serialize = (rows) => JSON.stringify(canonicalRowsForPersistence(rows));
+const a = serialize(fractional);
+const b = serialize(JSON.parse(a));
+const c = serialize(JSON.parse(b));
+assert.strictEqual(a, b);
+assert.strictEqual(b, c);
+assert.strictEqual(JSON.parse(a)[0].basis_order, 1);
+assert.ok(JSON.parse(a).find((item) => item.source_basis_line_id === "fractional-basis").basis_order === "");
+assert.ok(JSON.parse(a).find((item) => item.source_basis_line_id === "fractional-category").category_order === "");
+assert.ok(JSON.parse(a).find((item) => item.source_basis_line_id === "fractional-item").item_order === "");
+
+const duplicate = row("exact", { basis_order: 4, category_order: 4, item_order: 4 });
+const multiset = [...fractional, duplicate, { ...duplicate }];
+const permutations = [
+  multiset,
+  [multiset[4], multiset[2], multiset[0], multiset[5], multiset[1], multiset[3]],
+  [multiset[3], multiset[5], multiset[1], multiset[4], multiset[0], multiset[2]],
+];
+const bytes = permutations.map(serialize);
+assert.strictEqual(new Set(bytes).size, 1);
+const canonical = JSON.parse(bytes[0]);
+assert.strictEqual(canonical.length, multiset.length);
+assert.strictEqual(canonical.filter((item) => item.source_basis_line_id === "exact").length, 2);
+const exactRows = canonical.filter((item) => item.source_basis_line_id === "exact");
+assert.deepStrictEqual(canonicalOutputRowOrderKey(exactRows[0]), canonicalOutputRowOrderKey(exactRows[1]));
+assert.deepStrictEqual(exactRows[0], exactRows[1]);
+
+const legacy = canonicalRowsForPersistence([
+  row("legacy-fraction", { basis_order: 1.5, category_order: "1.5", item_order: 0.5 }),
+], { fromPricingMatches: true });
+assert.deepStrictEqual(
+  [legacy[0].basis_order, legacy[0].category_order, legacy[0].item_order],
+  ["", "", ""],
+);
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
     def test_static_catalog_output_description_edits_survive_normalize_render_snapshot_and_line_items(self):
         node = require_node(self)
 
@@ -28928,6 +29092,8 @@ eval([
   "synchronizeOwnedOutputRowPrice",
   "recalculateOutputRow",
   "normalizeOutputRow",
+  "canonicalRawPrimaryOrderValue",
+  "canonicalizeRawPrimaryOrderFields",
   "categoryOrderValue",
   "pricingReferenceOrder",
   "compareOrderValues",
@@ -29875,6 +30041,8 @@ async function main() {
     assert.strictEqual(savedDraft.pricingReferenceId, referenceId);
     assert.strictEqual(savedDraft.pricingReferenceSource, "company");
     assert.ok(savedDraft.quoteDetails?.commercial_snapshot?.pricing_basis?.digest);
+    const canonicalSavedOutput = JSON.stringify(savedDraft.outputRows || []);
+    const canonicalSavedLineItems = JSON.stringify(savedDraft.lineItems || []);
 
     await page.locator("#backToDashboardButton", { hasText: "Dashboard" }).click();
     await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 30000 });
@@ -29895,8 +30063,8 @@ async function main() {
     assert.strictEqual(restored.review, null);
     assert.strictEqual(restored.lifecycle, fresh.lifecycle);
     assert.strictEqual(restored.basis, fresh.basis);
-    assert.strictEqual(restored.output, fresh.output);
-    assert.strictEqual(restored.lineItems, JSON.stringify([fresh.lineItem]));
+    assert.deepStrictEqual(JSON.parse(restored.output), JSON.parse(canonicalSavedOutput));
+    assert.deepStrictEqual(JSON.parse(restored.lineItems), JSON.parse(canonicalSavedLineItems));
     assert.strictEqual(restored.snapshot.pricing_basis.id, referenceId);
     assert.strictEqual(restored.snapshot.pricing_basis.source, "company");
 
@@ -31184,7 +31352,7 @@ main().catch((error) => {
         self.assertEqual(delete_response["status"], "deleted")
         self.assertIsNone(artifact_after_delete)
 
-    def test_database_artifact_stale_export_remains_downloadable_and_snapshot_is_preserved(self):
+    def test_database_artifact_stale_export_is_not_downloadable_and_snapshot_is_preserved(self):
         tmp_path = test_temp_root() / f"db-artifact-stale-{time.time_ns()}"
         tmp_path.mkdir(parents=True)
         database_url = f"sqlite:///{(tmp_path / 'sqag-storage.sqlite3').as_posix()}"
@@ -31261,10 +31429,10 @@ main().catch((error) => {
         self.assertEqual(webapp.quote_session_result_files(fetched), [])
         self.assertEqual(fetched["generation_snapshot"]["profile"]["display_name"], "Generated Stale Profile")
         self.assertEqual(fetched["generation_snapshot"]["pricing_reference"]["display_name"], "Generated Stale Pricing")
-        self.assertEqual(artifact["content"], b"xlsx-db-stale")
-        self.assertEqual(pdf_artifact["content"], b"pdf-db-stale")
-        self.assertEqual(stale_downloads["xlsx"], (200, b"xlsx-db-stale"))
-        self.assertEqual(stale_downloads["pdf"], (200, b"pdf-db-stale"))
+        self.assertIsNone(artifact)
+        self.assertIsNone(pdf_artifact)
+        self.assertEqual(stale_downloads["xlsx"][0], 404)
+        self.assertEqual(stale_downloads["pdf"][0], 404)
         self.assertEqual(cross_workspace_downloads["xlsx"][0], 404)
         self.assertEqual(cross_workspace_downloads["pdf"][0], 404)
         self.assertIn(unauthorised_downloads["xlsx"][0], {401, 403})
@@ -31415,8 +31583,8 @@ main().catch((error) => {
         for kind, expected in (("xlsx", xlsx_bytes), ("pdf", pdf_bytes)):
             self.assertTrue(stale_session["exports"][kind]["exists"])
             self.assertTrue(stale_session["exports"][kind]["stale"])
-            self.assertEqual(stale_artifacts[kind]["content"], expected)
-            self.assertEqual(stale_downloads[kind], (200, expected))
+            self.assertIsNone(stale_artifacts[kind])
+            self.assertEqual(stale_downloads[kind][0], 404)
             self.assertEqual(replacement_artifacts[kind]["content"], expected)
             self.assertFalse(replaced_session["exports"][kind]["stale"])
             self.assertEqual(replacement_downloads[kind], (200, expected))

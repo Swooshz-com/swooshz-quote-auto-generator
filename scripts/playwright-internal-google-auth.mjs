@@ -126,6 +126,26 @@ try {
   const revoked = await authenticatedApi.get(`${baseUrl}/api/session`);
   if (revoked.status() !== 401) throw new Error("Logged-out session remained usable.");
   if (consoleProblems.length) throw new Error(`Browser console problems: ${consoleProblems.join(" | ")}`);
+
+  const exportEvidence = await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["scripts/playwright-smoke.mjs", "--run550-authenticated-only"], {
+      cwd: process.cwd(),
+      env: { ...process.env, RUN550_AUTHENTICATED_BASE_URL: baseUrl },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let childStderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk) => { childStderr += chunk.toString(); });
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      if (code === 0) resolve(stdout);
+      else reject(new Error(`Authenticated export evidence failed (${code}). ${childStderr || stdout}`));
+    });
+  });
+  if (!exportEvidence.includes("Run-550 native authenticated export persistence: PASS")) {
+    throw new Error("Authenticated export evidence did not emit its completion receipt.");
+  }
   console.log("Internal Google synthetic Playwright flow passed.");
 } finally {
   if (authenticatedApi) await authenticatedApi.dispose();

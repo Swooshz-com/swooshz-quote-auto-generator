@@ -14239,6 +14239,8 @@ class DatabaseSqagStorage:
         export = metadata.get("exports", {}).get(safe_kind) if metadata else None
         if not isinstance(export, dict) or clean_text(export.get("filename")) != expected_filename:
             return None
+        if quote_session_export_is_stale(metadata, export):
+            return None
         publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
         current_run_id = safe_reference(publication.get("run_id"), "run-")
         if current_run_id and self._publication_version_row(current_run_id) is not None:
