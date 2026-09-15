@@ -14239,9 +14239,17 @@ class DatabaseSqagStorage:
         export = metadata.get("exports", {}).get(safe_kind) if metadata else None
         if not isinstance(export, dict) or clean_text(export.get("filename")) != expected_filename:
             return None
+        if quote_session_export_is_stale(metadata, export):
+            return None
         publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
         current_run_id = safe_reference(publication.get("run_id"), "run-")
-        if current_run_id and self._publication_version_row(current_run_id) is not None:
+        publication_version = self._publication_version_row(current_run_id) if current_run_id else None
+        if publication_version is not None:
+            if (
+                clean_text(publication_version["session_id"]) != safe_id
+                or clean_text(publication_version["state"]).lower() != "published"
+            ):
+                return None
             artifact = self._publication_version_artifact(safe_id, current_run_id, safe_kind)
             if (
                 artifact is None
