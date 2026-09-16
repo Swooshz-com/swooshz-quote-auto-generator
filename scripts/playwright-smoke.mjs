@@ -2727,6 +2727,45 @@ async function run573LoadedAppOnce(runIndex) {
     await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
 
+    const parityPage = await context.newPage();
+    await parityPage.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    await parityPage.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+    const basisRestorationParity = await parityPage.evaluate(async () => {
+      const admittedBasis = {
+        graphics: "  leading\r\n\rtrailing\t  ",
+        "custom-only": "Custom value\rSecond line\r\n\r\n  tail  ",
+      };
+      const expectedBasis = {
+        graphics: "  leading\n\ntrailing\t  ",
+        "custom-only": "Custom value\nSecond line\n\n  tail  ",
+      };
+      const snapshot = {
+        version: QUOTE_SESSION_STATE_VERSION,
+        activeAppView: "quote",
+        quoteBasis: admittedBasis,
+        quoteBasisSections: [],
+        workflowStage: "quote_basis",
+      };
+      for (let cycle = 1; cycle <= 2; cycle += 1) {
+        const restored = await applyQuoteSessionSnapshot(snapshot, { forceQuoteView: true });
+        if (!restored || JSON.stringify(state.quoteBasis) !== JSON.stringify(expectedBasis) || state.quoteBasisSections.length !== 0) {
+          throw new Error(`Basis-only restoration cycle ${cycle} changed canonical authority.`);
+        }
+      }
+      let collisionRejected = false;
+      try {
+        canonicalQuoteBasisSections([
+          { id: " same ", title: "One", lines: [{ text: "First" }] },
+          { id: "same", title: "Two", lines: [{ text: "Second" }] },
+        ]);
+      } catch (error) {
+        collisionRejected = /colliding identities/.test(String(error?.message || error));
+      }
+      if (!collisionRejected) throw new Error("Browser accepted a server-colliding section identity.");
+      return { cycles: 2, collisionRejected };
+    });
+    await parityPage.close();
+
     const prepared = await page.evaluate(async (index) => {
       const referenceId = `run573-override-pricing-${index}`;
       const saved = await postJson("/api/settings/pricing-references", {
@@ -2910,7 +2949,7 @@ async function run573LoadedAppOnce(runIndex) {
       cycles.push({ cycle, ...await verifyProtectedXlsx(`Cycle ${cycle}`) });
     }
     await context.close();
-    return { run: runIndex, sessionId: prepared.sessionId, checksum: initialDownload.checksum, sizeBytes: initialDownload.sizeBytes, pricingDigest: prepared.authorityDigest, cycles };
+    return { run: runIndex, sessionId: prepared.sessionId, checksum: initialDownload.checksum, sizeBytes: initialDownload.sizeBytes, pricingDigest: prepared.authorityDigest, basisRestorationParity, cycles };
   } finally {
     if (browser) await browser.close().catch(() => {});
     let exit = { exitCode: null, signalCode: null };

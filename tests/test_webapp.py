@@ -31201,8 +31201,31 @@ main().catch((error) => {
                     finally:
                         connection.close()
 
+                    metadata, _draft_files = storage._read_quote_session_metadata("quote-http-artifact")
+                    metadata["exports"]["xlsx"]["stale"] = True
+                    with storage.connection() as update_connection:
+                        update_connection.execute(
+                            "update sqag_quote_sessions set metadata_json = ? where workspace_id = ? and session_id = ?",
+                            (json.dumps(metadata), storage.workspace_id, "quote-http-artifact"),
+                        )
+                        update_connection.commit()
+                    stale_connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
+                    try:
+                        stale_connection.request(
+                            "GET",
+                            "/api/quote-sessions/quote-http-artifact/download/xlsx",
+                            headers={"Cookie": session_cookie},
+                        )
+                        stale_response = stale_connection.getresponse()
+                        stale_body = stale_response.read()
+                        stale_status = stale_response.status
+                    finally:
+                        stale_connection.close()
+
         self.assertEqual(status, 200)
         self.assertEqual(downloaded, xlsx_bytes)
+        self.assertEqual(stale_status, 404)
+        self.assertNotEqual(stale_body, xlsx_bytes)
 
     def test_database_artifact_download_fails_after_session_delete_and_legacy_route_stays_locked(self):
         tmp_path = test_temp_root() / f"db-artifact-delete-route-{time.time_ns()}"
@@ -37812,7 +37835,12 @@ main().catch((error) => {
         }
         publication_id = "pub-57357357357357357357357357357357"
         metadata["exports"]["xlsx"].update({"publication_id": publication_id, "run_id": ""})
-        metadata["publication"] = {"state": "published", "active_publication_id": publication_id}
+        metadata["publication"] = {
+            "state": "published",
+            "active_publication_id": publication_id,
+            "run_id": "",
+            "job_id": "",
+        }
         metadata["publication"]["proof"] = webapp.quote_session_publication_proof(
             metadata,
             patch,
@@ -37932,6 +37960,13 @@ main().catch((error) => {
             ("artifact_type", lambda proof: proof["artifacts"]["xlsx"].__setitem__("content_type", "application/octet-stream")),
             ("artifact_size", lambda proof: proof["artifacts"]["xlsx"].__setitem__("size_bytes", 0)),
             ("artifact_checksum", lambda proof: proof["artifacts"]["xlsx"].__setitem__("sha256", "5" * 64)),
+            ("missing_run_id", lambda proof: proof["publication"].pop("run_id")),
+            ("missing_job_id", lambda proof: proof["publication"].pop("job_id")),
+            ("container_run_id", lambda proof: proof["publication"].__setitem__("run_id", [])),
+            ("container_job_id", lambda proof: proof["publication"].__setitem__("job_id", {})),
+            ("numeric_run_id", lambda proof: proof["publication"].__setitem__("run_id", 0)),
+            ("numeric_job_id", lambda proof: proof["publication"].__setitem__("job_id", 0)),
+            ("case_session", lambda proof: proof["subject"].__setitem__("session_id", "quote-Run575-proof")),
         ]
         for label, mutate in mutations:
             candidate = copy.deepcopy(metadata)
@@ -37941,6 +37976,31 @@ main().catch((error) => {
         wrong_authority = copy.deepcopy(authority)
         wrong_authority["pricing_reference"]["digest"] = "6" * 64
         self.assertIsNone(validate(candidate_authority=wrong_authority))
+        case_only_pricing_authority = copy.deepcopy(authority)
+        case_only_pricing_authority["pricing_reference"]["id"] = authority["pricing_reference"]["id"].upper()
+        self.assertIsNone(validate(candidate_authority=case_only_pricing_authority))
+        case_only_profile_authority = copy.deepcopy(authority)
+        case_only_profile_authority["profile"]["id"] = authority["profile"]["id"].upper()
+        self.assertIsNone(validate(candidate_authority=case_only_profile_authority))
+        case_only_profile_source = copy.deepcopy(authority)
+        case_only_profile_source["profile"]["id"] = authority["profile"]["id"].replace("profile:", "PROFILE:")
+        case_only_profile_source["profile"]["source"] = "PROFILE"
+        self.assertIsNone(validate(candidate_authority=case_only_profile_source))
+        explicitly_empty_generation_ids = copy.deepcopy(metadata)
+        explicitly_empty_generation_ids["publication"]["proof"]["publication"].update({"run_id": "", "job_id": ""})
+        self.assertIsNotNone(validate(candidate_metadata=explicitly_empty_generation_ids))
+        stale_export = copy.deepcopy(metadata)
+        stale_export["exports"]["xlsx"]["stale"] = True
+        self.assertIsNone(validate(candidate_metadata=stale_export))
+        for label, mutate_export in (
+            ("missing_export_run_id", lambda export: export.pop("run_id")),
+            ("malformed_export_run_id", lambda export: export.__setitem__("run_id", [])),
+            ("malformed_export_publication_id", lambda export: export.__setitem__("publication_id", {})),
+        ):
+            candidate = copy.deepcopy(metadata)
+            mutate_export(candidate["exports"]["xlsx"])
+            with self.subTest(label=label):
+                self.assertIsNone(validate(candidate_metadata=candidate))
         self.assertIsNone(validate(workspace="workspace-wrong"))
         self.assertIsNone(validate(owner="owner-wrong"))
         fractional_patch = copy.deepcopy(patch)
@@ -38006,6 +38066,17 @@ main().catch((error) => {
             self.assertIsNone(metadata["exports"]["pdf"]["filename"])
             self.assertFalse(metadata["status"]["pdf_exported"])
 
+            discovered_metadata = webapp.blank_quote_session_metadata("quote-run575-discovery", "2026-09-16T00:00:00Z")
+            discovered, discovered_pending, discovered_plan = storage._prepare_quote_export_artifacts(
+                "quote-run575-discovery",
+                discovered_metadata,
+                {"status": "completed", "_publication_authority": synthetic_publication_authority()},
+                output_dir,
+            )
+            self.assertFalse(discovered)
+            self.assertEqual(discovered_pending, [])
+            self.assertIsNone(discovered_plan)
+
     def test_run575_basis_sections_are_lossless_and_collision_safe_across_two_cycles(self):
         raw_sections = [
             {"id": "custom-only", "title": "Custom", "lines": [{"tag": "Custom", "text": "\r\n  lead\t  middle  \rtrail  \r\n"}]},
@@ -38057,6 +38128,41 @@ main().catch((error) => {
         changed_commercial["outputRows"][0]["quantity"] = 3
         self.assertNotEqual(base, webapp.quote_session_commercial_state({"draft_state": changed_commercial}))
 
+        basis_only_a = copy.deepcopy(draft)
+        basis_only_a.pop("quoteBasisSections")
+        basis_only_a["quoteBasis"] = {"custom-only": "  leading\r\n\rtrailing\t  "}
+        basis_only_b = copy.deepcopy(basis_only_a)
+        basis_only_b["quoteBasis"]["custom-only"] = "  changed\n\ntrailing\t  "
+        basis_only_state_a = webapp.quote_session_commercial_state({"draft_state": basis_only_a})
+        basis_only_state_b = webapp.quote_session_commercial_state({"draft_state": basis_only_b})
+        self.assertNotEqual(basis_only_state_a, basis_only_state_b)
+        self.assertEqual(
+            basis_only_state_a["commercial"]["quote_basis"],
+            {"custom-only": "  leading\n\ntrailing\t  "},
+        )
+
+        logo_a = copy.deepcopy(draft)
+        logo_a["quoteDetails"]["company"] = {
+            "name": "Synthetic Company",
+            "logo_content_fingerprint": "sha256:" + "7" * 64,
+            "logo_session_file_key": "recovery-a",
+        }
+        logo_b = copy.deepcopy(logo_a)
+        logo_b["quoteDetails"]["company"]["logo_session_file_key"] = "recovery-b"
+        self.assertEqual(
+            webapp.quote_session_commercial_state({"draft_state": logo_a}),
+            webapp.quote_session_commercial_state({"draft_state": logo_b}),
+        )
+
+        selected_a = copy.deepcopy(draft)
+        selected_a["quoteBasisSections"][0]["lines"][0]["selected"] = False
+        selected_b = copy.deepcopy(selected_a)
+        selected_b["quoteBasisSections"][0]["lines"][0]["selected"] = True
+        self.assertEqual(
+            webapp.quote_session_commercial_state({"draft_state": selected_a}),
+            webapp.quote_session_commercial_state({"draft_state": selected_b}),
+        )
+
     def test_run575_primary_order_collisions_fail_before_invalid_omission_in_both_orders(self):
         for pairs in (
             [("basis_order", "invalid"), (" basis_order ", "2")],
@@ -38106,6 +38212,7 @@ assert.strictEqual(quoteBasisFromSections(first)["custom-only"], "Custom: \n  le
 for (const sections of [
   [{ id: "same", title: "One", lines: [] }, { id: "same", title: "Two", lines: [{ text: "kept" }] }],
   [{ id: "same", title: "One", lines: [{ text: "kept" }] }, { id: "same", title: "Two", lines: [] }],
+  [{ id: " same ", title: "One", lines: [{ text: "kept" }] }, { id: "same", title: "Two", lines: [{ text: "kept" }] }],
 ]) assert.throws(() => canonicalQuoteBasisSections(sections), /colliding identities/);
 for (const row of [
   { basis_order: "invalid", " basis_order ": "2" },

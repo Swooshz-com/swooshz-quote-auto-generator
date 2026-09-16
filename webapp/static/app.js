@@ -4387,12 +4387,19 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   );
   applyQuoteDetails(restoredQuoteDetails, { includeLogo: true, clearLogo: true });
   state.images = await restoreSessionImages(restoredState.images);
-  const restoredSections = typeof canonicalQuoteBasisSections === "function"
-    ? canonicalQuoteBasisSections(restoredState.quoteBasisSections || restoredState.quoteBasis || {})
-    : normalizeQuoteBasisSections(restoredState.quoteBasisSections || restoredState.quoteBasis || {});
-  state.quoteBasis = typeof canonicalQuoteBasisForPersistence === "function"
-    ? canonicalQuoteBasisForPersistence(restoredState.quoteBasis || {}, restoredSections)
+  const restoredBasis = typeof canonicalQuoteBasis === "function"
+    ? canonicalQuoteBasis(restoredState.quoteBasis || {})
     : cloneQuoteBasis(restoredState.quoteBasis || {});
+  const hasRestoredSections = Array.isArray(restoredState.quoteBasisSections)
+    && restoredState.quoteBasisSections.length > 0;
+  const restoredSections = hasRestoredSections
+    ? (typeof canonicalQuoteBasisSections === "function"
+      ? canonicalQuoteBasisSections(restoredState.quoteBasisSections)
+      : normalizeQuoteBasisSections(restoredState.quoteBasisSections))
+    : [];
+  state.quoteBasis = typeof canonicalQuoteBasisForPersistence === "function"
+    ? canonicalQuoteBasisForPersistence(restoredBasis, restoredSections)
+    : restoredBasis;
   state.quoteBasisSections = restoredSections;
   state.lineItems = Array.isArray(restoredState.lineItems) ? restoredState.lineItems.map(normalizeLineItem) : [];
   state.outputRows = Array.isArray(restoredState.outputRows) ? restoredState.outputRows.map(normalizeOutputRow) : [];
@@ -6647,7 +6654,8 @@ function canonicalQuoteBasisSections(value = {}) {
     return rawSections
       .map((section, index) => {
         const title = normalizeQuoteBasisTitle(section?.title || "Section") || "Section";
-        const id = safeId(section?.id && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(String(section.id)) ? section.id : title, `section-${index + 1}`);
+        const rawId = String(section?.id ?? "").trim().replace(/\s+/g, " ");
+        const id = safeId(rawId && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(rawId) ? rawId : title, `section-${index + 1}`);
         if (usedIds.has(id)) throw new TypeError("Quote basis sections contain colliding identities.");
         usedIds.add(id);
         const rawLines = Array.isArray(section?.lines)
