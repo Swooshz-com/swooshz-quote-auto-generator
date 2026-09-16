@@ -11419,7 +11419,7 @@ class LocalSqagStorage:
     def delete_quote_session(self, session_id: str) -> bool:
         return delete_quote_session(session_id)
 
-    def quote_session_export_artifact(self, session_id: str, kind: str, *, require_current_proof: bool = True) -> dict[str, Any] | None:
+    def quote_session_export_artifact(self, session_id: str, kind: str, *, require_current_proof: bool | None = None) -> dict[str, Any] | None:
         _ = session_id, kind, require_current_proof
         return None
 
@@ -14049,11 +14049,18 @@ class DatabaseSqagStorage:
     ) -> tuple[bool, list[ArtifactBatchItem], ObjectArtifactBatchPlan | None]:
         if not result_has_generated_quote(result) or output_dir is None:
             return False, [], None
+        result_files = result.get("files") if isinstance(result, dict) else None
         declared_names = {
             clean_text(item.get("name"))
-            for item in ((result.get("files") or []) if isinstance(result, dict) else [])
+            for item in (result_files if isinstance(result_files, list) else [])
             if isinstance(item, dict)
         }
+        if isinstance(result, dict) and "files" not in result:
+            declared_names = {
+                filename
+                for filename in QUOTE_SESSION_EXPORT_KINDS.values()
+                if (output_dir / filename).is_file()
+            }
         pending_artifacts: list[ArtifactBatchItem] = []
         for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
             if filename not in declared_names:
@@ -14331,7 +14338,7 @@ class DatabaseSqagStorage:
             "content": content,
         }
 
-    def quote_session_export_artifact(self, session_id: str, kind: str, *, require_current_proof: bool = True) -> dict[str, Any] | None:
+    def quote_session_export_artifact(self, session_id: str, kind: str, *, require_current_proof: bool | None = None) -> dict[str, Any] | None:
         artifact_mode = configured_artifact_storage_mode()
         if artifact_mode not in {"database", "object"}:
             return None
@@ -14343,6 +14350,8 @@ class DatabaseSqagStorage:
         metadata, _draft_files = self._read_quote_session_metadata(safe_id)
         publication_proof: dict[str, Any] | None = None
         publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
+        if require_current_proof is None:
+            require_current_proof = isinstance(publication.get("proof"), dict)
         current_run_id = safe_reference(publication.get("run_id"), "run-")
         publication_id = safe_quote_publication_id(publication.get("active_publication_id"), "") or current_run_id
         if require_current_proof:
