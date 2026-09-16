@@ -2799,7 +2799,63 @@ async function run573LoadedAppOnce(runIndex) {
           }
         }
       }
-      return { cycles: 2, collisionRejected, whitespaceIdentity: whitespaceIdentity[0].id };
+      const run586LosslessText = "\r\n  lead\t  middle  \rtrail  \r\n";
+      const run586ExpectedText = "\n  lead\t  middle  \ntrail  \n";
+      state.quoteBasisSections = canonicalQuoteBasisSections([{
+        id: "run586-target",
+        title: "Furniture",
+        basis_order: "0003",
+        lines: [{ id: "run586-target-line", tag: "Include", text: "Bistro chair", quantity: 1, unit: "nos" }],
+      }, {
+        id: "run586-untouched",
+        title: "Untouched",
+        section_order: "0002",
+        lines: [{ id: "run586-untouched-line", tag: "Exclude", text: run586LosslessText }],
+      }]);
+      state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
+      state.lineItems = [];
+      state.basisChat = {
+        ...state.basisChat,
+        scope: "line",
+        sectionId: "run586-target",
+        lineIndex: 0,
+        line: "Bistro chair",
+        quantity: "1",
+        unit: "nos",
+        proposal: null,
+      };
+      const run586Proposal = buildSelectedLineFragmentReplacementProposal("quantity to 2");
+      if (!run586Proposal) throw new Error("Run-586 loaded-app quantity proposal was not built.");
+      state.basisChat.proposal = run586Proposal;
+      applyBasisChatProposal();
+      const assertRun586CanonicalState = (label, sections, basis) => {
+        const target = sections.find((section) => section.id === "run586-target");
+        const untouched = sections.find((section) => section.id === "run586-untouched");
+        if (
+          target?.lines?.[0]?.quantity !== 2
+          || target?.basis_order !== 3
+          || untouched?.lines?.[0]?.text !== run586ExpectedText
+          || untouched?.section_order !== 2
+          || JSON.stringify(basis) !== JSON.stringify(quoteBasisFromSections(sections))
+        ) {
+          throw new Error(`Run-586 ${label} lost canonical basis state.`);
+        }
+      };
+      assertRun586CanonicalState("authoritative mutation", state.quoteBasisSections, state.quoteBasis);
+      const run586Snapshot = buildSessionSnapshot();
+      assertRun586CanonicalState("session snapshot", run586Snapshot.quoteBasisSections, run586Snapshot.quoteBasis);
+      const run586Payload = buildPayload();
+      assertRun586CanonicalState("generation payload", run586Payload.quote_basis_sections, run586Payload.quote_basis);
+      if (!await applyQuoteSessionSnapshot(run586Snapshot, { forceQuoteView: true })) {
+        throw new Error("Run-586 loaded-app snapshot restoration failed.");
+      }
+      assertRun586CanonicalState("snapshot restoration", state.quoteBasisSections, state.quoteBasis);
+      return {
+        cycles: 2,
+        collisionRejected,
+        whitespaceIdentity: whitespaceIdentity[0].id,
+        run586BasisMutation: { quantity: 2, basisOrder: 3, sectionOrder: 2, text: run586ExpectedText },
+      };
     });
     await parityPage.close();
 

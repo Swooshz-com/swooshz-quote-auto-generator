@@ -28175,15 +28175,21 @@ assert.ok(!excludedPossibleMatchHtml.includes("Possible match"));
 const confirmedDraftSections = confirmOnlyQuoteBasisSections([{
   id: "graphics",
   title: "Graphics",
+  section_order: "0002",
+  basis_order: "0003",
   lines: [
     { tag: "Include", text: "catalog graphics", pricing_keyword: "graphics-vinyl-printed-graphics" },
     { tag: "Include", text: "uncertain add-on" },
     { tag: "Custom", text: "manual feature panel", custom_pricing: true },
+    { tag: "Exclude", text: "\r\n  lead\t  middle  \rtrail  \r\n" },
   ],
 }]);
 assert.strictEqual(confirmedDraftSections[0].lines[0].tag, "Confirm");
 assert.strictEqual(confirmedDraftSections[0].lines[1].tag, "Confirm");
 assert.strictEqual(confirmedDraftSections[0].lines[2].tag, "Custom");
+assert.strictEqual(confirmedDraftSections[0].lines[3].text, "\n  lead\t  middle  \ntrail  \n");
+assert.strictEqual(confirmedDraftSections[0].section_order, 2);
+assert.strictEqual(confirmedDraftSections[0].basis_order, 3);
 assert.strictEqual(basisCatalogReferenceTitle(catalogBackedLine), "");
 assert.strictEqual(basisLineTitle(catalogBackedLine), "");
 assert.strictEqual(basisPillTitle(catalogBackedLine, "Confirm"), "");
@@ -28605,6 +28611,11 @@ const state = {
         unit: "nos",
       }],
     }],
+  }, {
+    id: "untouched-lossless",
+    title: "Untouched",
+    section_order: 2,
+    lines: [{ id: "untouched-line", tag: "Exclude", text: "\n  lead\t  middle  \ntrail  \n" }],
   }],
   basisChat: { proposal: null },
   lineItems: [],
@@ -28698,6 +28709,11 @@ state.basisChat.proposal = {
       unit: "nos",
       custom_pricing: true,
     }],
+  }, {
+    id: "untouched-lossless",
+    title: "Untouched",
+    section_order: 2,
+    lines: [{ id: "untouched-line", tag: "Exclude", text: "\n  lead\t  middle  \ntrail  \n" }],
   }],
 };
 
@@ -28713,6 +28729,8 @@ assert.strictEqual(newCatalogLine.pricing_keyword, "electrical-db-drawing");
 const untouchedLine = state.quoteBasisSections[0].lines[2];
 assert.strictEqual(untouchedLine.possible_pricing_matches.length, 1);
 assert.strictEqual(untouchedLine.possible_pricing_matches[0].pricing_keyword, "counter-laminated");
+assert.strictEqual(state.quoteBasisSections[1].lines[0].text, "\n  lead\t  middle  \ntrail  \n");
+assert.strictEqual(state.quoteBasisSections[1].section_order, 2);
 assert.deepStrictEqual(state.outputRows, []);
 assert.strictEqual(state.overlayClosed, true);
 assert.strictEqual(state.synced, true);

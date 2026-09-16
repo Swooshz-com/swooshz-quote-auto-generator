@@ -6743,7 +6743,7 @@ function normalizeQuoteBasisSections(value = {}) {
 }
 
 function confirmOnlyQuoteBasisSections(sections = []) {
-  return normalizeQuoteBasisSections(sections).map((section) => ({
+  return canonicalQuoteBasisSections(sections).map((section) => ({
     ...section,
     lines: (section.lines || []).map((line) => {
       const tag = normalizeBasisTag(line.tag);
@@ -10823,7 +10823,7 @@ function basisChatPayload(text) {
 function normalizeServerBasisChatProposal(proposal = {}) {
   const quoteBasis = proposal.quoteBasis || proposal.quote_basis || {};
   const sections = mergeBasisProposalLineMetadata(
-    normalizeQuoteBasisSections(proposal.quoteBasisSections || proposal.quote_basis_sections || quoteBasis),
+    canonicalQuoteBasisSections(proposal.quoteBasisSections || proposal.quote_basis_sections || quoteBasis),
     state.quoteBasisSections
   );
   return {
@@ -11168,10 +11168,10 @@ function applyBasisChatProposal() {
   state.basisConfirmed = false;
   const currentSections = state.quoteBasisSections;
   const mergedSections = mergeBasisProposalLineMetadata(
-    normalizeQuoteBasisSections(proposal.quoteBasisSections || proposal.quoteBasis || state.quoteBasisSections),
+    canonicalQuoteBasisSections(proposal.quoteBasisSections || proposal.quoteBasis || state.quoteBasisSections),
     currentSections
   );
-  state.quoteBasisSections = reviewBasisProposalSections(mergedSections, currentSections);
+  state.quoteBasisSections = canonicalQuoteBasisSections(reviewBasisProposalSections(mergedSections, currentSections));
   state.quoteBasis = { ...cloneQuoteBasis(proposal.quoteBasis || state.quoteBasis), ...quoteBasisFromSections(state.quoteBasisSections) };
   state.lineItems = Array.isArray(proposal.lineItems) ? proposal.lineItems.map(normalizeLineItem) : [];
   state.outputRows = [];
