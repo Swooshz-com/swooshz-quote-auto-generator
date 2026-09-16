@@ -5862,20 +5862,25 @@ def canonical_quote_basis_sections(payload: dict[str, Any]) -> list[dict[str, An
         for index, raw_section in enumerate(raw_sections, start=1):
             if not isinstance(raw_section, dict):
                 continue
-            title = clean_basis_section_title(raw_section.get("title")) or "Section"
-            raw_id = clean_text(raw_section.get("id"))
+            admitted_section = canonicalize_order_fields(raw_section, QUOTE_BASIS_SECTION_ORDER_FIELDS)
+            title = clean_basis_section_title(admitted_section.get("title")) or "Section"
+            raw_id = clean_text(admitted_section.get("id"))
             section_id = raw_id if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", raw_id) else safe_section_id(title)
             section_id = section_id or f"section-{index}"
             if section_id in used_ids:
                 raise ValueError("Quote basis sections contain colliding identities.")
             used_ids.add(section_id)
-            raw_lines = raw_section.get("lines")
+            raw_lines = admitted_section.get("lines")
             if not isinstance(raw_lines, list):
-                raw_value = raw_section.get("text") if "text" in raw_section else raw_section.get("body")
+                raw_value = admitted_section.get("text") if "text" in admitted_section else admitted_section.get("body")
                 raw_lines = [raw_value] if isinstance(raw_value, str) else []
             lines = [line for item in raw_lines for line in [canonical_basis_section_line(item)] if line is not None]
             if lines:
-                sections.append({"id": section_id, "title": title, "lines": lines})
+                section = {"id": section_id, "title": title, "lines": lines}
+                for order_key in QUOTE_BASIS_SECTION_ORDER_FIELDS:
+                    if order_key in admitted_section:
+                        section[order_key] = admitted_section[order_key]
+                sections.append(section)
         return sections
 
     raw_basis = canonical_quote_basis(
@@ -5905,23 +5910,28 @@ def normalize_quote_basis_sections(
         for index, raw_section in enumerate(raw_sections, start=1):
             if not isinstance(raw_section, dict):
                 continue
-            raw_title = clean_basis_section_title(raw_section.get("title"))
+            admitted_section = canonicalize_order_fields(raw_section, QUOTE_BASIS_SECTION_ORDER_FIELDS)
+            raw_title = clean_basis_section_title(admitted_section.get("title"))
             title = normalize_quote_basis_section_title(raw_title, pricing_reference_sections)
             section_id = (
-                clean_text(raw_section.get("id"))
-                if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", clean_text(raw_section.get("id")))
+                clean_text(admitted_section.get("id"))
+                if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", clean_text(admitted_section.get("id")))
                 else safe_section_id(title)
             )
             section_id = section_id or f"section-{index}"
             if section_id in used_ids:
                 raise ValueError("Quote basis sections contain colliding identities.")
             used_ids.add(section_id)
-            raw_lines = raw_section.get("lines")
+            raw_lines = admitted_section.get("lines")
             if not isinstance(raw_lines, list):
-                raw_lines = multiline_list(raw_section.get("text") or raw_section.get("body"))
+                raw_lines = multiline_list(admitted_section.get("text") or admitted_section.get("body"))
             lines = [line for item in raw_lines for line in normalize_basis_lines(item)]
             if lines:
-                sections.append({"id": section_id, "title": title, "lines": lines})
+                section = {"id": section_id, "title": title, "lines": lines}
+                for order_key in QUOTE_BASIS_SECTION_ORDER_FIELDS:
+                    if order_key in admitted_section:
+                        section[order_key] = admitted_section[order_key]
+                sections.append(section)
         return sections
 
     raw_basis = payload.get("quote_basis") if isinstance(payload.get("quote_basis"), dict) else {}
@@ -19037,16 +19047,20 @@ def quote_basis_notes(
     auth_session: dict[str, Any] | None = None,
 ) -> list[str]:
     notes = ["Quote basis confirmed from webapp."]
-    sections = normalize_quote_basis_sections(
-        payload,
-        pricing_reference_section_names_for_payload(payload, auth_session=auth_session),
+    sections = (
+        canonical_quote_basis_sections(payload)
+        if isinstance(payload.get("quote_basis_sections"), list)
+        else normalize_quote_basis_sections(
+            payload,
+            pricing_reference_section_names_for_payload(payload, auth_session=auth_session),
+        )
     )
     if sections:
         for section in sections:
             lines = [
-                f"{normalize_basis_tag(line.get('tag'))}: {clean_text(line.get('text'))}"
+                f"{normalize_basis_tag(line.get('tag'))}: {canonical_basis_section_text(line.get('text'))}"
                 for line in section.get("lines") or []
-                if isinstance(line, dict) and clean_text(line.get("text"))
+                if isinstance(line, dict) and canonical_basis_section_text(line.get("text")) != ""
             ]
             if lines:
                 notes.append(f"{clean_text(section.get('title')) or 'Section'}: {'; '.join(lines)}")
@@ -19098,6 +19112,7 @@ def payload_to_brief(
         or company.get("logo")
         or payload.get("header_logo")
     )
+    canonical_basis_sections = canonical_quote_basis_sections(payload)
 
     return {
         "company_identity": clean_text(payload.get("company_identity")) or quote_company_name,
@@ -19143,6 +19158,7 @@ def payload_to_brief(
             "company_date_label": clean_text(signature.get("company_date_label")),
         },
         "rich_text": quote_detail_rich_text(payload),
+        "quote_basis_sections": canonical_basis_sections,
         "notes": quote_basis_notes(payload, auth_session=auth_session),
     }
 
@@ -23273,6 +23289,7 @@ QUOTE_BASIS_LEGACY_ORDER = (
 QUOTE_BASIS_KEY_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 QUOTE_BASIS_UNSAFE_KEYS = {"__proto__", "constructor", "prototype"}
 PRIMARY_ORDER_FIELDS = ("basis_order", "category_order", "item_order")
+QUOTE_BASIS_SECTION_ORDER_FIELDS = (*PRIMARY_ORDER_FIELDS, "section_order")
 PRIMARY_ORDER_MAX = 9007199254740991
 PRIMARY_ORDER_MAX_TEXT = str(PRIMARY_ORDER_MAX)
 PRIMARY_ORDER_ASCII_DIGITS_RE = re.compile(r"[0-9]+\Z")
@@ -23327,23 +23344,28 @@ def canonical_primary_order_value(value: Any) -> int | None:
     return int(significant, 10)
 
 
-def canonicalize_primary_order_fields(value: Any) -> Any:
+def canonicalize_order_fields(value: Any, fields: tuple[str, ...]) -> Any:
     if not isinstance(value, dict):
         return value
     admitted: dict[str, Any] = {}
-    seen_primary: set[str] = set()
+    admitted_fields = frozenset(fields)
+    seen_orders: set[str] = set()
     for raw_key, raw_value in value.items():
         key = clean_text(raw_key)
-        if key in PRIMARY_ORDER_FIELDS:
-            if key in seen_primary:
-                raise ValueError("Primary order fields contain colliding keys.")
-            seen_primary.add(key)
+        if key in admitted_fields:
+            if key in seen_orders:
+                raise ValueError("Order fields contain colliding keys.")
+            seen_orders.add(key)
             order = canonical_primary_order_value(raw_value)
             if order is not None:
                 admitted[key] = order
             continue
         admitted[raw_key] = raw_value
     return admitted
+
+
+def canonicalize_primary_order_fields(value: Any) -> Any:
+    return canonicalize_order_fields(value, PRIMARY_ORDER_FIELDS)
 
 
 def quote_session_draft_state_value(value: Any, depth: int = 0) -> Any:
@@ -23653,15 +23675,11 @@ def quote_publication_artifact_proof(
             continue
         if item.get("stale") is True or item.get("superseded") is True or item.get("state") == "superseded":
             continue
-        if (
-            (
-                safe_quote_publication_id(item.get("publication_id"), "")
-                or safe_reference(item.get("publication_id"), "run-")
-            ) != publication_id
-            or safe_reference(item.get("run_id"), "run-") != run_id
-        ):
+        raw_publication_id = item["publication_id"]
+        raw_run_id = item["run_id"]
+        digest = item["sha256"]
+        if raw_publication_id != publication_id or raw_run_id != run_id:
             continue
-        digest = clean_text(item.get("sha256")).lower()
         size_bytes = item["size_bytes"]
         if size_bytes <= 0 or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
             continue
@@ -23812,7 +23830,7 @@ def quote_session_current_v2_publication_proof(
         return None
     if committed_revision < 0 or committed_revision != candidate_revision:
         return None
-    committed_digest = clean_text(proof.get("commercial_state_digest")).lower()
+    committed_digest = proof.get("commercial_state_digest")
     candidate_digest = quote_session_safe_digest(quote_session_commercial_state(patch))
     if (
         re.fullmatch(r"[0-9a-f]{64}", committed_digest) is None
@@ -23851,23 +23869,31 @@ def quote_artifact_matches_publication_proof(
     content = artifact.get("content")
     if not isinstance(content, bytes) or not content:
         return False
-    try:
-        expected_size = int(expected.get("size_bytes"))
-        artifact_size = int(artifact.get("size_bytes"))
-    except (TypeError, ValueError):
+    expected_size = expected.get("size_bytes")
+    artifact_size = artifact.get("size_bytes")
+    expected_digest = expected.get("sha256")
+    artifact_digest = artifact.get("sha256")
+    if (
+        type(expected_size) is not int
+        or type(artifact_size) is not int
+        or not isinstance(expected_digest, str)
+        or not isinstance(artifact_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+        or re.fullmatch(r"[0-9a-f]{64}", artifact_digest) is None
+    ):
         return False
     digest = hashlib.sha256(content).hexdigest()
     return bool(
         expected.get("session_id") == session_id
         and expected.get("publication_id") == publication_id
         and expected.get("run_id") == run_id
-        and clean_text(artifact.get("filename")) == clean_text(expected.get("filename"))
-        and clean_text(artifact.get("content_type")) == clean_text(expected.get("content_type"))
+        and artifact.get("filename") == expected.get("filename")
+        and artifact.get("content_type") == expected.get("content_type")
         and expected_size > 0
         and artifact_size == expected_size
         and len(content) == expected_size
-        and clean_text(artifact.get("sha256")).lower() == clean_text(expected.get("sha256")).lower()
-        and digest == clean_text(expected.get("sha256")).lower()
+        and artifact_digest == expected_digest
+        and digest == expected_digest
     )
 
 

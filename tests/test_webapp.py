@@ -6688,6 +6688,36 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertIn("Include: White painted walling.", brief["notes"][1])
         self.assertIn("Exclude: Rigging above booth.", brief["notes"][1])
 
+    def test_run582_payload_to_brief_preserves_canonical_multiline_basis_text(self):
+        payload = valid_payload()
+        payload.pop("quote_basis")
+        payload["quote_basis_sections"] = [{
+            "id": "custom-lossless",
+            "title": "Custom Lossless",
+            "section_order": "0002",
+            "basis_order": 7,
+            "lines": [{
+                "tag": "Custom",
+                "text": "\tleading  spaces\r\n\r\n  middle\tvalue  \rtrailing  ",
+            }],
+        }]
+        admitted = webapp.canonical_quote_basis_sections(payload)
+        persisted = webapp.quote_session_draft_state({
+            "draft_state": {"quoteBasisSections": admitted},
+        })["quoteBasisSections"]
+        brief = webapp.payload_to_brief({**payload, "quote_basis_sections": persisted})
+
+        expected_text = "\tleading  spaces\n\n  middle\tvalue  \ntrailing  "
+        self.assertEqual(admitted[0]["lines"][0]["text"], expected_text)
+        self.assertEqual(persisted[0]["lines"][0]["text"], expected_text)
+        self.assertEqual(brief["quote_basis_sections"][0]["lines"][0]["text"], expected_text)
+        self.assertEqual(brief["quote_basis_sections"][0]["section_order"], 2)
+        self.assertEqual(brief["quote_basis_sections"][0]["basis_order"], 7)
+        self.assertEqual(
+            brief["notes"][1],
+            f"Custom Lossless: Custom: {expected_text}",
+        )
+
     def test_ai_prompt_requests_dynamic_quote_basis_sections(self):
         prompt = webapp.build_quote_draft_prompt(valid_payload())
 
@@ -38004,7 +38034,11 @@ main().catch((error) => {
         for label, mutate_export in (
             ("missing_export_run_id", lambda export: export.pop("run_id")),
             ("malformed_export_run_id", lambda export: export.__setitem__("run_id", [])),
+            ("nonempty_export_run_id", lambda export: export.__setitem__("run_id", "not-a-valid-run")),
             ("malformed_export_publication_id", lambda export: export.__setitem__("publication_id", {})),
+            ("padded_export_publication_id", lambda export: export.__setitem__("publication_id", f" {publication_id} ")),
+            ("uppercase_export_digest", lambda export: export.__setitem__("sha256", export["sha256"].upper())),
+            ("padded_export_digest", lambda export: export.__setitem__("sha256", f" {export['sha256']} ")),
         ):
             candidate = copy.deepcopy(metadata)
             mutate_export(candidate["exports"]["xlsx"])
@@ -38021,6 +38055,15 @@ main().catch((error) => {
             with self.subTest(raw_revision=raw_revision):
                 self.assertIsNone(validate(candidate_patch=coerced_patch))
 
+        for label, raw_digest in (
+            ("uppercase_commercial_digest", metadata["publication"]["proof"]["commercial_state_digest"].upper()),
+            ("padded_commercial_digest", f" {metadata['publication']['proof']['commercial_state_digest']} "),
+        ):
+            candidate = copy.deepcopy(metadata)
+            candidate["publication"]["proof"]["commercial_state_digest"] = raw_digest
+            with self.subTest(label=label):
+                self.assertIsNone(validate(candidate_metadata=candidate))
+
         for label, mutate_authority in (
             ("unqualified_profile", lambda current: current["profile"].__setitem__("id", "synthetic-exhibition-fixture-template")),
             ("wrong_case_profile_source", lambda current: current["profile"].update({"id": "PROFILE:synthetic-exhibition-fixture-template", "source": "PROFILE"})),
@@ -38033,6 +38076,105 @@ main().catch((error) => {
             mutate_authority(candidate_authority)
             with self.subTest(label=label):
                 self.assertIsNone(validate(candidate_authority=candidate_authority))
+
+    def test_run582_local_download_rejects_malformed_raw_authority_before_artifact_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            session_id = "quote-run582-raw-authority"
+            content = b"PK\x03\x04run582-canonical-xlsx"
+            payload, result, output_dir = self._local_publication_case(
+                root,
+                session_id,
+                content,
+                b"run582-pdf",
+            )
+            result["files"] = result["files"][:1]
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                webapp.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+                metadata_path = webapp.quote_session_metadata_path(session_id)
+                original_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                artifact_path = webapp.quote_session_recorded_export_path(
+                    session_id,
+                    "xlsx",
+                    original_metadata,
+                )
+                with LocalRunnerServer() as runner:
+                    self.assertEqual(
+                        local_http_get_bytes(
+                            runner,
+                            f"/api/quote-sessions/{session_id}/download/xlsx",
+                        ),
+                        (200, content),
+                    )
+
+                    original_read_bytes = Path.read_bytes
+                    invalid_cases = (
+                        (
+                            "nonempty_export_run_id",
+                            lambda candidate: candidate["exports"]["xlsx"].__setitem__(
+                                "run_id", "not-a-valid-run"
+                            ),
+                        ),
+                        (
+                            "padded_export_publication_id",
+                            lambda candidate: candidate["exports"]["xlsx"].__setitem__(
+                                "publication_id",
+                                f" {candidate['exports']['xlsx']['publication_id']} ",
+                            ),
+                        ),
+                        (
+                            "uppercase_export_digest",
+                            lambda candidate: candidate["exports"]["xlsx"].__setitem__(
+                                "sha256", candidate["exports"]["xlsx"]["sha256"].upper()
+                            ),
+                        ),
+                        (
+                            "padded_export_digest",
+                            lambda candidate: candidate["exports"]["xlsx"].__setitem__(
+                                "sha256", f" {candidate['exports']['xlsx']['sha256']} "
+                            ),
+                        ),
+                        (
+                            "uppercase_commercial_digest",
+                            lambda candidate: candidate["publication"]["proof"].__setitem__(
+                                "commercial_state_digest",
+                                candidate["publication"]["proof"]["commercial_state_digest"].upper(),
+                            ),
+                        ),
+                        (
+                            "padded_commercial_digest",
+                            lambda candidate: candidate["publication"]["proof"].__setitem__(
+                                "commercial_state_digest",
+                                f" {candidate['publication']['proof']['commercial_state_digest']} ",
+                            ),
+                        ),
+                    )
+                    for label, mutate in invalid_cases:
+                        candidate = copy.deepcopy(original_metadata)
+                        mutate(candidate)
+                        metadata_path.write_text(json.dumps(candidate), encoding="utf-8")
+                        artifact_reads: list[Path] = []
+
+                        def tracked_read_bytes(path: Path) -> bytes:
+                            if path.resolve() == artifact_path.resolve():
+                                artifact_reads.append(path)
+                            return original_read_bytes(path)
+
+                        with self.subTest(label=label), mock.patch.object(
+                            Path,
+                            "read_bytes",
+                            new=tracked_read_bytes,
+                        ):
+                            status, body = local_http_get_bytes(
+                                runner,
+                                f"/api/quote-sessions/{session_id}/download/xlsx",
+                            )
+                            self.assertEqual(status, 404)
+                            self.assertNotEqual(body, content)
+                            self.assertEqual(artifact_reads, [])
+
+                metadata_path.write_text(json.dumps(original_metadata), encoding="utf-8")
 
     def test_run575_database_artifact_bytes_must_match_validated_proof(self):
         content = b"PK\x03\x04run575-proof-bound-xlsx"
@@ -38145,8 +38287,8 @@ main().catch((error) => {
 
     def test_run575_basis_sections_are_lossless_and_collision_safe_across_two_cycles(self):
         raw_sections = [
-            {"id": "custom-only", "title": "Custom", "lines": [{"tag": "Custom", "text": "\r\n  lead\t  middle  \rtrail  \r\n"}]},
-            {"id": "graphics", "title": "Graphics", "lines": [{"tag": "Confirm", "text": "Legacy\r\n\r\n  custom tail\t"}]},
+            {"id": "custom-only", "title": "Custom", "section_order": "0002", "basis_order": 4, "lines": [{"tag": "Custom", "text": "\r\n  lead\t  middle  \rtrail  \r\n"}]},
+            {"id": "graphics", "title": "Graphics", "section_order": 1, "basis_order": "0003", "lines": [{"tag": "Confirm", "text": "Legacy\r\n\r\n  custom tail\t"}]},
         ]
         first = webapp.canonical_quote_basis_sections({"quote_basis_sections": raw_sections})
         second = webapp.canonical_quote_basis_sections({"quote_basis_sections": copy.deepcopy(first)})
@@ -38154,6 +38296,13 @@ main().catch((error) => {
         self.assertEqual(first, second)
         self.assertEqual(second, third)
         self.assertEqual(first[0]["lines"][0]["text"], "\n  lead\t  middle  \ntrail  \n")
+        self.assertEqual((first[0]["section_order"], first[0]["basis_order"]), (2, 4))
+        persisted = webapp.quote_session_draft_state({
+            "draft_state": {"quoteBasisSections": copy.deepcopy(first)},
+        })
+        reloaded = webapp.quote_session_draft_state({"draft_state": copy.deepcopy(persisted)})
+        self.assertEqual(persisted["quoteBasisSections"], first)
+        self.assertEqual(reloaded["quoteBasisSections"], first)
         basis = webapp.quote_basis_from_sections(first)
         self.assertEqual(basis["custom-only"], "Custom: \n  lead\t  middle  \ntrail  \n")
         mixed = webapp.canonical_quote_basis({"graphics": basis["graphics"], "custom-only": basis["custom-only"]})
@@ -38164,6 +38313,16 @@ main().catch((error) => {
         ):
             with self.assertRaises(ValueError):
                 webapp.canonical_quote_basis_sections({"quote_basis_sections": sections})
+        for order_key in ("section_order", "basis_order"):
+            colliding = dict([
+                (order_key, "invalid"),
+                (f"{order_key}\u0085", "2"),
+                ("id", "ordered"),
+                ("title", "Ordered"),
+                ("lines", [{"text": "kept"}]),
+            ])
+            with self.subTest(order_key=order_key), self.assertRaises(ValueError):
+                webapp.canonical_quote_basis_sections({"quote_basis_sections": [colliding]})
 
     def test_run575_commercial_projection_excludes_duplicate_and_ui_state(self):
         draft = {
@@ -38197,6 +38356,25 @@ main().catch((error) => {
         changed_derived["quoteDetails"]["active_tab"] = "internal"
         changed_derived["quoteDetails"].setdefault("company", {})["recovery_file_key"] = "company-recovery"
         self.assertEqual(base, webapp.quote_session_commercial_state({"draft_state": changed_derived}))
+        ordered = copy.deepcopy(draft)
+        ordered["quoteBasisSections"][0].update({"section_order": "0001", "basis_order": 2})
+        ordered_state = webapp.quote_session_commercial_state({"draft_state": ordered})
+        unchanged_order = copy.deepcopy(ordered)
+        unchanged_order["quoteBasisSections"][0]["section_order"] = 1
+        self.assertEqual(
+            ordered_state,
+            webapp.quote_session_commercial_state({"draft_state": unchanged_order}),
+        )
+        changed_order = copy.deepcopy(ordered)
+        changed_order["quoteBasisSections"][0]["section_order"] = 3
+        self.assertNotEqual(
+            ordered_state,
+            webapp.quote_session_commercial_state({"draft_state": changed_order}),
+        )
+        self.assertEqual(
+            json.dumps(ordered_state["commercial"]).count('"section_order"'),
+            1,
+        )
         changed_commercial = copy.deepcopy(draft)
         changed_commercial["outputRows"][0]["quantity"] = 3
         self.assertNotEqual(base, webapp.quote_session_commercial_state({"draft_state": changed_commercial}))
@@ -38256,6 +38434,36 @@ main().catch((error) => {
 
     def test_run575_browser_basis_and_primary_order_parity(self):
         node = require_node(self)
+        vectors = []
+        for character_name, character in (
+            ("feff", "\ufeff"),
+            ("nel", "\u0085"),
+            ("file_separator", "\u001c"),
+            ("nbsp", "\u00a0"),
+        ):
+            for field in webapp.PRIMARY_ORDER_FIELDS:
+                wrapped = f"{character}{field}{character}"
+                cases = (
+                    ("invalid_first_valid_second", [(field, "invalid"), (wrapped, "2")]),
+                    ("valid_first_invalid_second", [(wrapped, "2"), (field, "invalid")]),
+                    ("canonical_valid_wrapped_invalid", [(field, "2"), (wrapped, "invalid")]),
+                    ("wrapped_invalid_canonical_valid", [(wrapped, "invalid"), (field, "2")]),
+                    ("standalone_wrapped_valid", [(wrapped, "2")]),
+                    ("standalone_wrapped_invalid", [(wrapped, "invalid")]),
+                )
+                for case_name, entries in cases:
+                    try:
+                        expected = {
+                            "ok": True,
+                            "value": webapp.canonicalize_primary_order_fields(dict(entries)),
+                        }
+                    except ValueError:
+                        expected = {"ok": False}
+                    vectors.append({
+                        "label": f"{character_name}:{field}:{case_name}",
+                        "entries": entries,
+                        "expected": expected,
+                    })
         script = r'''
 const fs = require("fs");
 const assert = require("assert");
@@ -38277,10 +38485,10 @@ function normalizeQuoteBasisTitle(value) { return String(value || "").trim(); }
 function normalizeBasisTag(value) { return ["Include", "Confirm", "Custom", "Exclude"].includes(value) ? value : "Confirm"; }
 function safeId(value, fallback) { const result = String(value || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""); return result || fallback; }
 function canonicalQuoteBasis(value) { return value || {}; }
-eval(["pythonWhitespaceText", "canonicalPrimaryOrderValue", "canonicalizePrimaryOrderFields", "canonicalBasisSectionText", "canonicalBasisSectionLine", "canonicalQuoteBasisSections", "quoteBasisFromSections", "canonicalQuoteBasisForPersistence", "quoteBasisPersistenceProjection"].map(extractFunction).join("\n"));
+eval(["pythonWhitespaceText", "canonicalPrimaryOrderValue", "canonicalizeOrderFields", "canonicalizePrimaryOrderFields", "canonicalBasisSectionText", "canonicalBasisSectionLine", "canonicalQuoteBasisSections", "quoteBasisFromSections", "canonicalQuoteBasisForPersistence", "quoteBasisPersistenceProjection"].map(extractFunction).join("\n"));
 const raw = [
-  { id: "custom-only", title: "Custom", lines: [{ tag: "Custom", text: "\r\n  lead\t  middle  \rtrail  \r\n" }] },
-  { id: "graphics", title: "Graphics", lines: [{ tag: "Confirm", text: "Legacy\r\n\r\n  custom tail\t" }] },
+  { id: "custom-only", title: "Custom", section_order: "0002", basis_order: 4, lines: [{ tag: "Custom", text: "\r\n  lead\t  middle  \rtrail  \r\n" }] },
+  { id: "graphics", title: "Graphics", section_order: 1, basis_order: "0003", lines: [{ tag: "Confirm", text: "Legacy\r\n\r\n  custom tail\t" }] },
 ];
 const first = canonicalQuoteBasisSections(raw);
 const second = canonicalQuoteBasisSections(JSON.parse(JSON.stringify(first)));
@@ -38288,6 +38496,7 @@ const third = canonicalQuoteBasisSections(JSON.parse(JSON.stringify(second)));
 assert.deepStrictEqual(first, second);
 assert.deepStrictEqual(second, third);
 assert.strictEqual(first[0].lines[0].text, "\n  lead\t  middle  \ntrail  \n");
+assert.deepStrictEqual([first[0].section_order, first[0].basis_order], [2, 4]);
 assert.strictEqual(quoteBasisFromSections(first)["custom-only"], "Custom: \n  lead\t  middle  \ntrail  \n");
 const persisted = quoteBasisPersistenceProjection(quoteBasisFromSections(first), first);
 assert.deepStrictEqual(persisted.quote_basis_sections, first);
@@ -38301,15 +38510,41 @@ assert.deepStrictEqual(
   canonicalQuoteBasisSections([{ id: "\u0085", title: "Whitespace Identity", lines: [{ text: "kept" }] }]),
   [{ id: "whitespace-identity", title: "Whitespace Identity", lines: [{ tag: "Confirm", text: "kept" }] }],
 );
-for (const field of ["basis_order", "category_order", "item_order"]) {
-  for (const entries of [
-    [[field, "invalid"], [`${field}\u0085`, "2"]],
-    [[`${field}\u0085`, "2"], [field, "invalid"]],
-  ]) assert.throws(() => canonicalizePrimaryOrderFields(Object.fromEntries(entries)), /colliding keys/);
+for (const field of ["section_order", "basis_order"]) {
+  assert.throws(
+    () => canonicalQuoteBasisSections([Object.fromEntries([
+      [field, "invalid"], [`${field}\u0085`, "2"], ["id", "ordered"],
+      ["title", "Ordered"], ["lines", [{ text: "kept" }]],
+    ])]),
+    /colliding keys/,
+  );
 }
+const payload = JSON.parse(fs.readFileSync(0, "utf8"));
+const observed = payload.vectors.map(({ label, entries }) => {
+  try {
+    return { label, outcome: { ok: true, value: canonicalizePrimaryOrderFields(Object.fromEntries(entries)) } };
+  } catch (_error) {
+    return { label, outcome: { ok: false } };
+  }
+});
+process.stdout.write(JSON.stringify(observed));
 '''
-        completed = subprocess.run([node, "-e", script], cwd=str(ROOT), text=True, capture_output=True, check=False)
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            input=json.dumps({"vectors": vectors}),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            check=False,
+        )
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        observed = json.loads(completed.stdout)
+        self.assertEqual(len(observed), len(vectors))
+        for actual, vector in zip(observed, vectors, strict=True):
+            with self.subTest(vector=vector["label"]):
+                self.assertEqual(actual["label"], vector["label"])
+                self.assertEqual(actual["outcome"], vector["expected"])
 
     def test_run575_loaded_app_cleanup_uses_one_overall_deadline(self):
         source = (ROOT / "scripts" / "playwright-smoke.mjs").read_text(encoding="utf-8")

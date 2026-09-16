@@ -6629,7 +6629,9 @@ function canonicalBasisSectionText(value = "") {
 }
 
 function pythonWhitespaceText(value = "") {
-  return String(value ?? "").replace(/[\s\u001c-\u001f\u0085]+/gu, " ").trim();
+  return String(value ?? "")
+    .replace(/[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/gu, " ")
+    .replace(/^ +| +$/g, "");
 }
 
 function canonicalBasisSectionLine(value = "") {
@@ -6663,20 +6665,29 @@ function canonicalQuoteBasisSections(value = {}) {
   if (rawSections) {
     return rawSections
       .map((section, index) => {
-        const title = normalizeQuoteBasisTitle(section?.title || "Section") || "Section";
-        const rawId = pythonWhitespaceText(section?.id);
+        const admittedSection = canonicalizeOrderFields(
+          section,
+          new Set(["basis_order", "category_order", "item_order", "section_order"]),
+        );
+        const title = normalizeQuoteBasisTitle(admittedSection?.title || "Section") || "Section";
+        const rawId = pythonWhitespaceText(admittedSection?.id);
         const id = safeId(rawId && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(rawId) ? rawId : title, `section-${index + 1}`);
         if (usedIds.has(id)) throw new TypeError("Quote basis sections contain colliding identities.");
         usedIds.add(id);
-        const rawLines = Array.isArray(section?.lines)
-          ? section.lines
-          : typeof section?.text === "string"
-            ? [section.text]
-            : typeof section?.body === "string"
-              ? [section.body]
+        const rawLines = Array.isArray(admittedSection?.lines)
+          ? admittedSection.lines
+          : typeof admittedSection?.text === "string"
+            ? [admittedSection.text]
+            : typeof admittedSection?.body === "string"
+              ? [admittedSection.body]
               : [];
         const lines = rawLines.map(canonicalBasisSectionLine).filter(Boolean);
-        return lines.length ? { id, title, lines } : null;
+        if (!lines.length) return null;
+        const result = { id, title, lines };
+        ["basis_order", "category_order", "item_order", "section_order"].forEach((key) => {
+          if (Object.prototype.hasOwnProperty.call(admittedSection, key)) result[key] = admittedSection[key];
+        });
+        return result;
       })
       .filter(Boolean);
   }
@@ -8855,9 +8866,8 @@ function canonicalPrimaryOrderValue(value) {
   return Number(significant);
 }
 
-function canonicalizePrimaryOrderFields(row = {}) {
+function canonicalizeOrderFields(row = {}, fields = new Set()) {
   if (!row || typeof row !== "object" || Array.isArray(row)) return {};
-  const fields = new Set(["basis_order", "category_order", "item_order"]);
   const seen = new Set();
   const admitted = {};
   Object.keys(row).forEach((rawKey) => {
@@ -8866,12 +8876,16 @@ function canonicalizePrimaryOrderFields(row = {}) {
       admitted[rawKey] = row[rawKey];
       return;
     }
-    if (seen.has(key)) throw new TypeError("Primary order fields contain colliding keys.");
+    if (seen.has(key)) throw new TypeError("Order fields contain colliding keys.");
     seen.add(key);
     const order = canonicalPrimaryOrderValue(row[rawKey]);
     if (order !== null) admitted[key] = order;
   });
   return admitted;
+}
+
+function canonicalizePrimaryOrderFields(row = {}) {
+  return canonicalizeOrderFields(row, new Set(["basis_order", "category_order", "item_order"]));
 }
 
 function orderNumber(value) {

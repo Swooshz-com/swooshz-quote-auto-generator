@@ -2768,18 +2768,35 @@ async function run573LoadedAppOnce(runIndex) {
       if (whitespaceIdentity[0]?.id !== "whitespace-identity") {
         throw new Error("Browser section identity normalization diverges from the server.");
       }
-      for (const field of ["basis_order", "category_order", "item_order"]) {
-        for (const entries of [
-          [[field, "invalid"], [`${field}\u0085`, "2"]],
-          [[`${field}\u0085`, "2"], [field, "invalid"]],
-        ]) {
-          let rejected = false;
-          try {
-            canonicalizePrimaryOrderFields(Object.fromEntries(entries));
-          } catch (error) {
-            rejected = /colliding keys/.test(String(error?.message || error));
+      for (const [characterName, character, expectedCollision] of [
+        ["FEFF", "\ufeff", false],
+        ["NEL", "\u0085", true],
+        ["FILE_SEPARATOR", "\u001c", true],
+        ["NBSP", "\u00a0", true],
+      ]) {
+        for (const field of ["basis_order", "category_order", "item_order"]) {
+          const wrapped = `${character}${field}${character}`;
+          for (const entries of [
+            [[field, "invalid"], [wrapped, "2"]],
+            [[wrapped, "2"], [field, "invalid"]],
+            [[field, "2"], [wrapped, "invalid"]],
+            [[wrapped, "invalid"], [field, "2"]],
+          ]) {
+            let rejected = false;
+            try {
+              canonicalizePrimaryOrderFields(Object.fromEntries(entries));
+            } catch (error) {
+              rejected = /colliding keys/.test(String(error?.message || error));
+            }
+            if (rejected !== expectedCollision) {
+              throw new Error(`Browser/server ${characterName} parity diverged for ${field}.`);
+            }
           }
-          if (!rejected) throw new Error(`Browser accepted a ${field} normalized-key collision.`);
+          const standalone = canonicalizePrimaryOrderFields({ [wrapped]: "2" });
+          const expectedKey = expectedCollision ? field : wrapped;
+          if (standalone[expectedKey] !== (expectedCollision ? 2 : "2")) {
+            throw new Error(`Browser/server standalone ${characterName} parity diverged for ${field}.`);
+          }
         }
       }
       return { cycles: 2, collisionRejected, whitespaceIdentity: whitespaceIdentity[0].id };
@@ -2861,11 +2878,15 @@ async function run573LoadedAppOnce(runIndex) {
         {
           id: "run573-override",
           title: "Custom",
+          section_order: "0002",
+          basis_order: 4,
           lines: [{ id: "run573-override-line", tag: "Custom", text: "Custom override-only fabrication\nPreserve this second line", include: true, custom_pricing: true, custom_confirmed: true, quantity: 2, unit: "nos" }],
         },
         {
           id: "run580-lossless",
           title: "Lossless",
+          section_order: 1,
+          basis_order: "0003",
           lines: [{ id: "run580-lossless-line", tag: "Exclude", text: losslessText }],
         },
       ]);
@@ -2873,6 +2894,10 @@ async function run573LoadedAppOnce(runIndex) {
       const persistenceProjection = quoteBasisPersistenceProjection();
       if (
         persistenceProjection.quote_basis_sections[1]?.lines?.[0]?.text !== expectedLosslessText
+        || persistenceProjection.quote_basis_sections[0]?.section_order !== 2
+        || persistenceProjection.quote_basis_sections[0]?.basis_order !== 4
+        || persistenceProjection.quote_basis_sections[1]?.section_order !== 1
+        || persistenceProjection.quote_basis_sections[1]?.basis_order !== 3
         || JSON.stringify(persistenceProjection.quote_basis) !== JSON.stringify(quoteBasisFromSections(persistenceProjection.quote_basis_sections))
       ) {
         throw new Error("Generation basis serialization is not lossless or internally consistent.");
