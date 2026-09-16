@@ -4387,7 +4387,9 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   );
   applyQuoteDetails(restoredQuoteDetails, { includeLogo: true, clearLogo: true });
   state.images = await restoreSessionImages(restoredState.images);
-  const restoredSections = normalizeQuoteBasisSections(restoredState.quoteBasisSections || restoredState.quoteBasis || {});
+  const restoredSections = typeof canonicalQuoteBasisSections === "function"
+    ? canonicalQuoteBasisSections(restoredState.quoteBasisSections || restoredState.quoteBasis || {})
+    : normalizeQuoteBasisSections(restoredState.quoteBasisSections || restoredState.quoteBasis || {});
   state.quoteBasis = typeof canonicalQuoteBasisForPersistence === "function"
     ? canonicalQuoteBasisForPersistence(restoredState.quoteBasis || {}, restoredSections)
     : cloneQuoteBasis(restoredState.quoteBasis || {});
@@ -6608,6 +6610,73 @@ function normalizeBasisLines(line = "") {
   return splitBasisDecisionText(cleanCustomerQuoteLineText(line));
 }
 
+function canonicalBasisSectionText(value = "") {
+  if (typeof value !== "string") throw new TypeError("Quote basis section text must be a string.");
+  return value.replace(/\r\n?/g, "\n");
+}
+
+function canonicalBasisSectionLine(value = "") {
+  if (typeof value === "string") {
+    const text = canonicalBasisSectionText(value);
+    return text === "" ? null : { tag: "Confirm", text };
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const admitted = canonicalizePrimaryOrderFields(value);
+  const rawText = Object.prototype.hasOwnProperty.call(admitted, "text")
+    ? admitted.text
+    : Object.prototype.hasOwnProperty.call(admitted, "line")
+      ? admitted.line
+      : admitted.description ?? "";
+  const text = canonicalBasisSectionText(rawText);
+  if (text === "") return null;
+  const line = { tag: normalizeBasisTag(admitted.tag), text };
+  Object.entries(admitted).forEach(([key, item]) => {
+    if (!["tag", "text", "line", "description"].includes(key)) line[key] = item;
+  });
+  return line;
+}
+
+function canonicalQuoteBasisSections(value = {}) {
+  const rawSections = Array.isArray(value)
+    ? value
+    : Array.isArray(value.quote_basis_sections)
+      ? value.quote_basis_sections
+      : null;
+  const usedIds = new Set();
+  if (rawSections) {
+    return rawSections
+      .map((section, index) => {
+        const title = normalizeQuoteBasisTitle(section?.title || "Section") || "Section";
+        const id = safeId(section?.id && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(String(section.id)) ? section.id : title, `section-${index + 1}`);
+        if (usedIds.has(id)) throw new TypeError("Quote basis sections contain colliding identities.");
+        usedIds.add(id);
+        const rawLines = Array.isArray(section?.lines)
+          ? section.lines
+          : typeof section?.text === "string"
+            ? [section.text]
+            : typeof section?.body === "string"
+              ? [section.body]
+              : [];
+        const lines = rawLines.map(canonicalBasisSectionLine).filter(Boolean);
+        return lines.length ? { id, title, lines } : null;
+      })
+      .filter(Boolean);
+  }
+  const basis = value.quote_basis && typeof value.quote_basis === "object" ? value.quote_basis : value;
+  const admittedBasis = canonicalQuoteBasis(basis);
+  const titles = Object.fromEntries(BASIS_FIELDS);
+  return Object.keys(admittedBasis)
+    .map((key) => {
+      const id = safeId(key, "section");
+      if (usedIds.has(id)) throw new TypeError("Quote basis sections contain colliding identities.");
+      usedIds.add(id);
+      const title = titles[key] || key.replace(/[-_]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+      const lines = [canonicalBasisSectionLine(admittedBasis[key])].filter(Boolean);
+      return lines.length ? { id, title, lines } : null;
+    })
+    .filter(Boolean);
+}
+
 function parseBasisLine(line = "") {
   return normalizeBasisLines(line)[0] || { tag: "Confirm", text: "" };
 }
@@ -6619,10 +6688,13 @@ function normalizeQuoteBasisSections(value = {}) {
       ? value.quote_basis_sections
       : null;
   if (rawSections) {
+    const usedIds = new Set();
     return rawSections
       .map((section, index) => {
         const title = normalizeQuoteBasisTitle(section?.title || "Section") || "Section";
         const id = safeId(section?.id && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(String(section.id)) ? section.id : title, `section-${index + 1}`);
+        if (usedIds.has(id)) throw new TypeError("Quote basis sections contain colliding identities.");
+        usedIds.add(id);
         const rawLines = Array.isArray(section?.lines) ? section.lines : splitLines(section?.text || "");
         const lines = rawLines.flatMap(normalizeBasisLines).filter((line) => line.text);
         return lines.length ? { id, title, lines } : null;
@@ -6651,11 +6723,18 @@ function confirmOnlyQuoteBasisSections(sections = []) {
 }
 
 function quoteBasisFromSections(sections = []) {
-  return (Array.isArray(sections) ? sections : []).reduce((basis, section) => {
+  const usedIds = new Set();
+  return (Array.isArray(sections) ? sections : []).reduce((basis, section, index) => {
     const id = safeId(section.id || section.title, "section");
+    if (usedIds.has(id)) throw new TypeError("Quote basis sections contain colliding identities.");
+    usedIds.add(id);
     basis[id] = (section.lines || [])
-      .map((line) => `${normalizeBasisTag(line.tag)}: ${line.text || ""}`.trim())
-      .filter((line) => !/:\s*$/.test(line))
+      .map((line) => {
+        if (typeof line?.text !== "string") throw new TypeError("Quote basis section text must be a string.");
+        return { tag: normalizeBasisTag(line.tag), text: line.text.replace(/\r\n?/g, "\n") };
+      })
+      .filter((line) => line.text !== "")
+      .map((line) => `${line.tag}: ${line.text}`)
       .join("\n");
     return basis;
   }, {});
@@ -8755,12 +8834,19 @@ function canonicalPrimaryOrderValue(value) {
 
 function canonicalizePrimaryOrderFields(row = {}) {
   if (!row || typeof row !== "object" || Array.isArray(row)) return {};
-  const admitted = { ...row };
-  ["basis_order", "category_order", "item_order"].forEach((field) => {
-    if (!Object.prototype.hasOwnProperty.call(admitted, field)) return;
-    const order = canonicalPrimaryOrderValue(admitted[field]);
-    if (order === null) delete admitted[field];
-    else admitted[field] = order;
+  const fields = new Set(["basis_order", "category_order", "item_order"]);
+  const seen = new Set();
+  const admitted = {};
+  Object.keys(row).forEach((rawKey) => {
+    const key = rawKey.trim();
+    if (!fields.has(key)) {
+      admitted[rawKey] = row[rawKey];
+      return;
+    }
+    if (seen.has(key)) throw new TypeError("Primary order fields contain colliding keys.");
+    seen.add(key);
+    const order = canonicalPrimaryOrderValue(row[rawKey]);
+    if (order !== null) admitted[key] = order;
   });
   return admitted;
 }

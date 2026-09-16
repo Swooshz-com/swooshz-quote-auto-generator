@@ -2695,15 +2695,16 @@ async function startIsolatedLoadedAppServer(runRoot) {
 
 async function stopIsolatedLoadedAppServer(serverInfo) {
   if (!serverInfo) return { exitCode: null, signalCode: null };
+  const deadline = Date.now() + 5000;
   if (serverInfo.child.exitCode === null && serverInfo.child.signalCode === null) serverInfo.child.kill();
-  const cleanupTimeout = new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(null), 5000);
+  const waitUntil = (limit) => new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), Math.max(0, limit - Date.now()));
     timer.unref?.();
   });
-  let exited = await Promise.race([serverInfo.exitPromise, cleanupTimeout]);
+  let exited = await Promise.race([serverInfo.exitPromise, waitUntil(Math.min(deadline, Date.now() + 4000))]);
   if (!exited) {
     serverInfo.child.kill("SIGKILL");
-    exited = await Promise.race([serverInfo.exitPromise, new Promise((resolve) => setTimeout(() => resolve(null), 1000))]);
+    exited = await Promise.race([serverInfo.exitPromise, waitUntil(deadline)]);
   }
   const exitCode = serverInfo.child.exitCode ?? exited?.code ?? null;
   const signalCode = serverInfo.child.signalCode ?? exited?.signal ?? null;
@@ -2860,18 +2861,56 @@ async function run573LoadedAppOnce(runIndex) {
       return { sessionId, authorityDigest: authority.digest_sha256, xlsx };
     }, runIndex);
 
-    const download = await page.request.get(new URL(prepared.xlsx.url, baseUrl).href);
-    if (download.status() !== 200) throw new Error(`Protected XLSX retrieval returned ${download.status()}.`);
-    const bytes = await download.body();
-    const checksum = createHash("sha256").update(bytes).digest("hex");
-    if (bytes.length !== prepared.xlsx.size_bytes || checksum !== prepared.xlsx.sha256) {
-      throw new Error("Downloaded genuine XLSX bytes do not match the published size/checksum.");
-    }
-    if (bytes.length < 4 || bytes[0] !== 0x50 || bytes[1] !== 0x4b || !bytes.includes(Buffer.from("[Content_Types].xml"))) {
-      throw new Error("Downloaded artifact is not a genuine XLSX ZIP package.");
+    const verifyProtectedXlsx = async (label) => {
+      const download = await page.request.get(new URL(prepared.xlsx.url, baseUrl).href);
+      if (download.status() !== 200) throw new Error(`${label} protected XLSX retrieval returned ${download.status()}.`);
+      const bytes = await download.body();
+      const checksum = createHash("sha256").update(bytes).digest("hex");
+      if (bytes.length !== prepared.xlsx.size_bytes || checksum !== prepared.xlsx.sha256) {
+        throw new Error(`${label} downloaded XLSX bytes do not match the published size/checksum.`);
+      }
+      if (bytes.length < 4 || bytes[0] !== 0x50 || bytes[1] !== 0x4b || !bytes.includes(Buffer.from("[Content_Types].xml"))) {
+        throw new Error(`${label} artifact is not a genuine XLSX ZIP package.`);
+      }
+      return { checksum, sizeBytes: bytes.length };
+    };
+    const initialDownload = await verifyProtectedXlsx("Initial");
+    const cycles = [];
+    for (let cycle = 1; cycle <= 2; cycle += 1) {
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+      await page.waitForFunction(() => !appIsBusy(), null, { timeout: 15000 });
+      const restored = await page.evaluate(async ({ sessionId, expectedSha, expectedSize }) => {
+        const didRestore = await modifyDashboardQuote(sessionId);
+        if (!didRestore) throw new Error(`Could not restore ${sessionId}.`);
+        const before = state.downloadFile ? { ...state.downloadFile } : null;
+        const saved = await saveCurrentQuoteSession({
+          quoteGenerated: true,
+          includeDraftState: true,
+          includeDraftFiles: false,
+          draftState: currentQuoteSessionDraftState(),
+        });
+        const detail = await loadQuoteSessionDetail(sessionId);
+        const xlsx = detail?.exports?.xlsx || {};
+        return {
+          saved: Boolean(saved),
+          fresh: Boolean(state.downloadFile && downloadFileIsFresh(state.downloadFile)),
+          beforeSha: before?.sha256 || "",
+          sha: xlsx.sha256 || "",
+          size: xlsx.size_bytes || 0,
+          stale: xlsx.stale,
+          url: xlsx.url || "",
+          expectedSha,
+          expectedSize,
+        };
+      }, { sessionId: prepared.sessionId, expectedSha: prepared.xlsx.sha256, expectedSize: prepared.xlsx.size_bytes });
+      if (!restored.saved || !restored.fresh || restored.stale === true || restored.sha !== prepared.xlsx.sha256 || restored.size !== prepared.xlsx.size_bytes || !restored.url) {
+        throw new Error(`Unchanged restoration/save cycle ${cycle} did not preserve current publication: ${JSON.stringify(restored)}.`);
+      }
+      cycles.push({ cycle, ...await verifyProtectedXlsx(`Cycle ${cycle}`) });
     }
     await context.close();
-    return { run: runIndex, sessionId: prepared.sessionId, checksum, sizeBytes: bytes.length, pricingDigest: prepared.authorityDigest };
+    return { run: runIndex, sessionId: prepared.sessionId, checksum: initialDownload.checksum, sizeBytes: initialDownload.sizeBytes, pricingDigest: prepared.authorityDigest, cycles };
   } finally {
     if (browser) await browser.close().catch(() => {});
     let exit = { exitCode: null, signalCode: null };
