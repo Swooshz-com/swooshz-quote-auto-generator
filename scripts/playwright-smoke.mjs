@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { createServer } from "node:http";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -2614,7 +2615,61 @@ async function verifyDashboardClearsStaleSessionsBeforeRefresh(page) {
   }
 }
 
-function isolatedLoadedAppEnvironment(runRoot) {
+async function startSyntheticDeepSeekProvider() {
+  const requests = [];
+  const replacements = new Map([
+    ["make the selected panel blue", "Selected panel painted blue"],
+    ["update this panel so it has a satin navy finish", "Selected panel updated so it has a satin navy finish"],
+    ["revise the selected line so the panel is coated in cobalt blue", "Revised selected line so the panel is coated in cobalt blue"],
+  ]);
+  const server = createServer((request, response) => {
+    const chunks = [];
+    request.on("data", (chunk) => chunks.push(chunk));
+    request.on("end", () => {
+      try {
+        const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        const prompt = (payload.messages || []).map((message) => String(message?.content || "")).join("\n");
+        const editRequest = [...replacements.keys()].find((candidate) => prompt.includes(candidate));
+        if (request.method !== "POST" || request.url !== "/chat/completions" || !editRequest) {
+          response.writeHead(400, { "content-type": "application/json" });
+          response.end(JSON.stringify({ error: { message: "Unexpected synthetic provider request." } }));
+          return;
+        }
+        requests.push({ editRequest, model: String(payload.model || "") });
+        const content = JSON.stringify({
+          intent: "proposal",
+          proposal: {
+            message: `Synthetic server-backed proposal for: ${editRequest}`,
+            replacement_line: { text: replacements.get(editRequest), confidence: 93 },
+            quote_basis_sections: [{ id: "provider-rewrite", lines: [{ text: "must be ignored" }] }],
+            line_items: [{ description: "provider rewrite must be ignored" }],
+          },
+        });
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({
+          id: `synthetic-${requests.length}`,
+          choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+        }));
+      } catch (error) {
+        response.writeHead(500, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { message: String(error?.message || error) } }));
+      }
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Synthetic DeepSeek provider did not bind to loopback.");
+  return {
+    endpoint: `http://127.0.0.1:${address.port}`,
+    requests,
+    close: () => new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),
+  };
+}
+
+function isolatedLoadedAppEnvironment(runRoot, overrides = {}) {
   const inheritedNames = process.platform === "win32"
     ? ["PATH", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "PLAYWRIGHT_BROWSERS_PATH"]
     : ["PATH", "PLAYWRIGHT_BROWSERS_PATH"];
@@ -2641,11 +2696,12 @@ function isolatedLoadedAppEnvironment(runRoot) {
     QUOTE_LOG_ROOT: path.join(runRoot, "server-log"),
     TEMP: path.join(runRoot, "process-temp"),
     TMP: path.join(runRoot, "process-temp"),
+    ...overrides,
   };
 }
 
-async function startIsolatedLoadedAppServer(runRoot) {
-  const env = isolatedLoadedAppEnvironment(runRoot);
+async function startIsolatedLoadedAppServer(runRoot, environmentOverrides = {}) {
+  const env = isolatedLoadedAppEnvironment(runRoot, environmentOverrides);
   await Promise.all([
     fs.mkdir(env.TEMP, { recursive: true }),
     fs.mkdir(path.join(runRoot, "browser-log"), { recursive: true }),
@@ -2717,9 +2773,16 @@ async function stopIsolatedLoadedAppServer(serverInfo) {
 async function run573LoadedAppOnce(runIndex) {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), `sqag-run573-loaded-${runIndex}-`));
   let serverInfo = null;
+  let providerInfo = null;
   let browser = null;
   try {
-    serverInfo = await startIsolatedLoadedAppServer(parent);
+    providerInfo = await startSyntheticDeepSeekProvider();
+    serverInfo = await startIsolatedLoadedAppServer(parent, {
+      AI_BASIS_LINE_PROVIDER: "deepseek",
+      DEEPSEEK_API_KEY: "synthetic-loopback-provider-key",
+      DEEPSEEK_BASE_URL: providerInfo.endpoint,
+      DEEPSEEK_BASIS_LINE_MODEL: "synthetic-basis-line-model",
+    });
     baseUrl = serverInfo.endpoint;
     browser = await chromium.launch({ headless: !options.headed });
     const context = await browser.newContext({ viewport: { width: 1365, height: 900 } });
@@ -2730,7 +2793,9 @@ async function run573LoadedAppOnce(runIndex) {
     const parityPage = await context.newPage();
     await parityPage.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await parityPage.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
-    const basisRestorationParity = await parityPage.evaluate(async () => {
+    let basisRestorationParity;
+    try {
+      basisRestorationParity = await parityPage.evaluate(async (index) => {
       const admittedBasis = {
         graphics: "  leading\r\n\rtrailing\t  ",
         "custom-only": "Custom value\rSecond line\r\n\r\n  tail  ",
@@ -2850,14 +2915,253 @@ async function run573LoadedAppOnce(runIndex) {
         throw new Error("Run-586 loaded-app snapshot restoration failed.");
       }
       assertRun586CanonicalState("snapshot restoration", state.quoteBasisSections, state.quoteBasis);
+
+      const run589Requests = [
+        ["make the selected panel blue", "Selected panel painted blue"],
+        ["update this panel so it has a satin navy finish", "Selected panel updated so it has a satin navy finish"],
+        ["revise the selected line so the panel is coated in cobalt blue", "Revised selected line so the panel is coated in cobalt blue"],
+      ];
+      const run589ReferenceId = `run589-server-backed-reference-${index}`;
+      const run589ReferenceSave = await postJson("/api/settings/pricing-references", {
+        id: run589ReferenceId,
+        label: `Run 589 Server-backed Reference ${index}`,
+        source: "local",
+        currency: "SGD",
+        tax: { label: "GST", rate: 0.09 },
+        items: [{
+          id: "run589-selected-panel",
+          section: "Target",
+          description: "Existing bound line item",
+          unit_hint: "nos",
+          internal_cost: 10,
+          markup_multiplier: 2,
+          match_terms: ["selected panel"],
+          object_families: ["panel"],
+        }],
+        update_existing: true,
+        editing_reference_id: run589ReferenceId,
+      });
+      if (!run589ReferenceSave.ok || !["saved", "unchanged"].includes(run589ReferenceSave.data?.status)) {
+        throw new Error(`Run-589 pricing reference save failed: ${JSON.stringify(run589ReferenceSave.data)}.`);
+      }
+      await loadProfiles();
+      const run589Reference = state.pricingReferences.find((item) => item.id === run589ReferenceId && item.source === "local");
+      if (!run589Reference) throw new Error("Run-589 pricing reference was not available to the loaded app.");
+      state.pricingReferenceId = run589Reference.id;
+      state.pricingReferenceSource = run589Reference.source;
+      renderProfileOptions();
+      if (!selectPricingReferenceOptionValue(pricingReferenceSelectValue(run589Reference))) {
+        throw new Error("Run-589 pricing reference could not be selected.");
+      }
+      applyQuoteDetails({
+        quote_date: "2026-09-17",
+        project_number: `RUN589-${index}`,
+        client: { name: "Run 589 Client", attention: "Synthetic Contact", title: "Manager", address: "1 Synthetic Street\nSingapore 000001" },
+        project: { title: "Server-backed Basis Proof", show_name: "Run 589 Loaded App", booth_width: "3", booth_depth: "3", booth_size: "3m x 3m", dimension_source: "analysis" },
+        company: { name: "Run 589 Quote Company", header_details: "Run 589 Quote Company\n1 Synthetic Street" },
+        quote_text: { acceptance_text: "We accept this synthetic quotation.", person_label: "Authorised person", stamp_label: "Company stamp", date_label: "Signed date:" },
+        signature: { company_signatory: "Synthetic Signatory", company_title: "Director", company_date_label: "Date:" },
+      }, { partial: true });
+      state.headerLogo = await ensureContentFingerprint({
+        name: "run589-synthetic-logo.png",
+        type: "image/png",
+        size: 68,
+        data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      });
+      const run589ExpectedUnrelatedText = "\n  lead\t  middle  \ntrail  \n";
+      const run589InitialSections = () => canonicalQuoteBasisSections([{
+        id: "run589-target",
+        title: "Target",
+        basis_order: "0003",
+        section_order: "0002",
+        lines: [{
+          id: "run589-target-line",
+          tag: "Confirm",
+          text: "Selected panel",
+          quantity: 1,
+          unit: "nos",
+          confidence_pct: 81,
+          source_line_item_id: "run589-source-target",
+          pricing_keyword: "run589-selected-panel",
+          category_order: "0004",
+          item_order: "0005",
+          admitted_metadata: { origin: "synthetic", sequence: [2, 1] },
+        }, {
+          id: "run589-duplicate-one",
+          tag: "Confirm",
+          text: "Selected panel",
+          admitted_metadata: { duplicate: 1 },
+        }],
+      }, {
+        id: "run589-unrelated",
+        title: "Unrelated",
+        basis_order: "0007",
+        section_order: "0008",
+        lines: [{
+          id: "run589-unrelated-line",
+          tag: "Exclude",
+          text: "\r\n  lead\t  middle  \rtrail  \r\n",
+          source_line_item_id: "run589-source-unrelated",
+          admitted_metadata: { keep: true, nested: ["a", "b"] },
+          category_order: "0009",
+          item_order: "0010",
+        }, {
+          id: "run589-duplicate-two",
+          tag: "Confirm",
+          text: "Selected panel",
+        }],
+      }]);
+      const assertRun589State = (label, sections, basis, expectedTargetText, lineItems = null) => {
+        const targetSection = sections.find((section) => section.id === "run589-target");
+        const unrelatedSection = sections.find((section) => section.id === "run589-unrelated");
+        const target = targetSection?.lines?.[0];
+        const duplicateOne = targetSection?.lines?.[1];
+        const unrelated = unrelatedSection?.lines?.[0];
+        const duplicateTwo = unrelatedSection?.lines?.[1];
+        if (
+          sections.length !== 2
+          || targetSection?.lines?.length !== 2
+          || unrelatedSection?.lines?.length !== 2
+          || target?.text !== expectedTargetText
+          || target?.id !== "run589-target-line"
+          || target?.source_line_item_id !== "run589-source-target"
+          || target?.pricing_keyword !== "run589-selected-panel"
+          || target?.category_order !== 4
+          || target?.item_order !== 5
+          || JSON.stringify(target?.admitted_metadata) !== JSON.stringify({ origin: "synthetic", sequence: [2, 1] })
+          || duplicateOne?.id !== "run589-duplicate-one"
+          || duplicateOne?.text !== "Selected panel"
+          || unrelated?.text !== run589ExpectedUnrelatedText
+          || unrelated?.id !== "run589-unrelated-line"
+          || unrelated?.source_line_item_id !== "run589-source-unrelated"
+          || unrelated?.category_order !== 9
+          || unrelated?.item_order !== 10
+          || JSON.stringify(unrelated?.admitted_metadata) !== JSON.stringify({ keep: true, nested: ["a", "b"] })
+          || duplicateTwo?.id !== "run589-duplicate-two"
+          || targetSection?.basis_order !== 3
+          || targetSection?.section_order !== 2
+          || unrelatedSection?.basis_order !== 7
+          || unrelatedSection?.section_order !== 8
+          || JSON.stringify(basis) !== JSON.stringify(quoteBasisFromSections(sections))
+        ) {
+          throw new Error(`Run-589 ${label} lost canonical selected-line state.`);
+        }
+        if (lineItems) {
+          const existing = lineItems[0];
+          if (
+            lineItems.length !== 1
+            || existing?.description !== "Existing bound line item"
+            || existing?.pricing_keyword !== "run589-selected-panel"
+            || Number(existing?.category_order) !== 4
+            || Number(existing?.item_order) !== 5
+          ) {
+            throw new Error(`Run-589 ${label} accepted a provider line-item rewrite or lost pricing bindings.`);
+          }
+        }
+      };
+      const run589Proofs = [];
+      for (const [editRequest, expectedTargetText] of run589Requests) {
+        state.images = [{
+          name: "run589-synthetic-render.png",
+          type: "image/png",
+          size: 68,
+          data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+        }];
+        state.quoteBasisSections = run589InitialSections();
+        state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
+        state.lineItems = [normalizeLineItem({
+          section: "Target",
+          description: "Existing bound line item",
+          quantity: 1,
+          unit: "nos",
+          pricing_keyword: "run589-selected-panel",
+          category_order: 4,
+          item_order: 5,
+        })];
+        state.basisChat = {
+          ...state.basisChat,
+          scope: "line",
+          sectionId: "run589-target",
+          field: "run589-target",
+          lineIndex: 0,
+          line: "Confirm: Selected panel",
+          quantity: 1,
+          unit: "nos",
+          quantityLabel: "1 nos",
+          proposal: null,
+        };
+        if (parseLiteralReplacementCommand(editRequest) || buildSelectedLineFragmentReplacementProposal(editRequest)) {
+          throw new Error(`Run-589 request did not bypass local proposal shortcuts: ${editRequest}`);
+        }
+        const jobId = newClientJobId();
+        const started = await startJob("basis_chat", basisChatPayload(editRequest), { jobId });
+        if (!started.ok) throw new Error(`Run-589 server-backed job did not start: ${JSON.stringify(started.data)}.`);
+        const polled = await pollJob(started.data.job_id || jobId);
+        if (!polled.ok || polled.data?.status !== "completed") {
+          throw new Error(`Run-589 server-backed job did not complete: ${JSON.stringify(polled.data)}.`);
+        }
+        const rawProposal = polled.data?.result?.proposal;
+        if (!rawProposal) throw new Error("Run-589 server-backed job returned no raw proposal.");
+        assertRun589State(
+          "raw server proposal",
+          rawProposal.quote_basis_sections,
+          rawProposal.quote_basis,
+          expectedTargetText,
+          rawProposal.line_items,
+        );
+        const normalizedProposal = normalizeServerBasisChatProposal(rawProposal);
+        assertRun589State(
+          "normalized server proposal",
+          normalizedProposal.quoteBasisSections,
+          normalizedProposal.quoteBasis,
+          expectedTargetText,
+          normalizedProposal.lineItems,
+        );
+        state.basisChat.proposal = normalizedProposal;
+        applyBasisChatProposal();
+        assertRun589State("authoritative state", state.quoteBasisSections, state.quoteBasis, expectedTargetText, state.lineItems);
+        const snapshot = buildSessionSnapshot();
+        assertRun589State("session snapshot", snapshot.quoteBasisSections, snapshot.quoteBasis, expectedTargetText, snapshot.lineItems);
+        const generationPayload = buildPayload();
+        assertRun589State(
+          "generation payload",
+          generationPayload.quote_basis_sections,
+          generationPayload.quote_basis,
+          expectedTargetText,
+          generationPayload.line_items,
+        );
+        if (!await applyQuoteSessionSnapshot(snapshot, { forceQuoteView: true })) {
+          throw new Error("Run-589 loaded-app snapshot restoration failed.");
+        }
+        assertRun589State("snapshot restoration", state.quoteBasisSections, state.quoteBasis, expectedTargetText, state.lineItems);
+        run589Proofs.push({ editRequest, expectedTargetText });
+      }
       return {
         cycles: 2,
         collisionRejected,
         whitespaceIdentity: whitespaceIdentity[0].id,
         run586BasisMutation: { quantity: 2, basisOrder: 3, sectionOrder: 2, text: run586ExpectedText },
+        run589ServerBackedProofs: run589Proofs,
       };
-    });
+      }, runIndex);
+    } catch (error) {
+      const serverLogRoot = path.join(parent, "server-log");
+      const logNames = await fs.readdir(serverLogRoot).catch(() => []);
+      const logExcerpts = await Promise.all(logNames.slice(-5).map(async (name) => {
+        const content = await fs.readFile(path.join(serverLogRoot, name), "utf8").catch(() => "");
+        return `${name}:\n${content.slice(-4000)}`;
+      }));
+      throw new Error([
+        String(error?.message || error),
+        `Synthetic provider calls: ${JSON.stringify(providerInfo.requests)}`,
+        ...logExcerpts,
+      ].filter(Boolean).join("\n"));
+    }
     await parityPage.close();
+    if (providerInfo.requests.length !== 3) {
+      throw new Error(`Run-589 expected three synthetic provider calls, received ${providerInfo.requests.length}.`);
+    }
+    basisRestorationParity.run589SyntheticProviderRequests = providerInfo.requests.map(({ editRequest, model }) => ({ editRequest, model }));
 
     const prepared = await page.evaluate(async (index) => {
       const referenceId = `run573-override-pricing-${index}`;
@@ -3109,7 +3413,11 @@ async function run573LoadedAppOnce(runIndex) {
     try {
       exit = await stopIsolatedLoadedAppServer(serverInfo);
     } finally {
-      await fs.rm(parent, { recursive: true, force: true });
+      try {
+        if (providerInfo) await providerInfo.close();
+      } finally {
+        await fs.rm(parent, { recursive: true, force: true });
+      }
     }
     if (serverInfo && exit.exitCode === null && exit.signalCode === null) {
       throw new Error("Loaded-app child cleanup state was not inspectable.");

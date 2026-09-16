@@ -12516,9 +12516,162 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(result["type"], "proposal")
         self.assertEqual(section["title"], "Flooring & Platform")
         self.assertEqual(line["tag"], "Confirm")
-        self.assertEqual(line["confidence"], 90)
+        self.assertEqual(line["confidence_pct"], 90)
         self.assertEqual(line["text"], "Full 200mm raised platform visible across entire 6.0m x 6.0m footprint.")
         self.assertIn("Confirm: Full 200mm raised platform", proposal["quote_basis"]["flooring-platform"])
+
+    def test_run589_server_proposal_is_target_only_and_canonically_lossless(self):
+        payload = valid_payload()
+        payload["quote_basis_sections"] = [
+            {
+                "id": "selected-section",
+                "title": "Selected",
+                "basis_order": "0003",
+                "section_order": 2,
+                "lines": [
+                    {
+                        "id": "selected-line",
+                        "tag": "Include",
+                        "text": "Selected panel",
+                        "quantity": 1,
+                        "unit": "nos",
+                        "confidence_pct": 81,
+                        "source_line_item_id": "source-selected",
+                        "pricing_keyword": "selected-panel",
+                        "arbitrary_metadata": {"origin": "synthetic", "sequence": [2, 1]},
+                        "category_order": "0004",
+                        "item_order": 5,
+                    },
+                    {
+                        "id": "same-words-in-target-section",
+                        "tag": "Confirm",
+                        "text": "Selected panel",
+                        "metadata": "must stay second",
+                    },
+                ],
+            },
+            {
+                "id": "unrelated-section",
+                "title": "Unrelated",
+                "basis_order": 7,
+                "section_order": "0008",
+                "lines": [
+                    {
+                        "id": "unrelated-line",
+                        "tag": "Exclude",
+                        "text": "\r\n  lead\t  middle  \rtrail  \r\n",
+                        "source_line_item_id": "source-unrelated",
+                        "metadata": {"keep": True, "nested": ["a", "b"]},
+                        "category_order": 9,
+                        "item_order": "0010",
+                    },
+                    {
+                        "id": "same-words-elsewhere",
+                        "tag": "Confirm",
+                        "text": "Selected panel",
+                    },
+                ],
+            },
+        ]
+        payload["line_items"] = [{
+            "id": "existing-item",
+            "description": "Existing bound line item",
+            "quantity": 1,
+            "unit": "nos",
+            "pricing_keyword": "selected-panel",
+            "category_order": 4,
+            "item_order": 5,
+        }]
+        payload["basis_chat"] = {
+            "question": "make the selected panel blue",
+            "field": "selected-section",
+            "line_index": 0,
+            "line": "Include: Selected panel",
+        }
+        parsed = {
+            "intent": "proposal",
+            "proposal": {
+                "message": "Synthetic server-backed edit.",
+                "replacement_line": {"text": "Selected panel in blue", "confidence": 94},
+                "quote_basis_sections": [{"id": "provider-rewrite", "lines": [{"text": "must be ignored"}]}],
+                "line_items": [{"id": "provider-item", "description": "must be ignored"}],
+            },
+        }
+
+        result = webapp.normalize_basis_chat_result(parsed, payload, "deepseek")
+
+        proposal = result["proposal"]
+        sections = proposal["quote_basis_sections"]
+        self.assertEqual([section["id"] for section in sections], ["selected-section", "unrelated-section"])
+        self.assertEqual([len(section["lines"]) for section in sections], [2, 2])
+        selected = sections[0]["lines"][0]
+        duplicate = sections[0]["lines"][1]
+        unrelated = sections[1]["lines"][0]
+        elsewhere = sections[1]["lines"][1]
+        self.assertEqual(selected["text"], "Selected panel in blue")
+        self.assertEqual(selected["confidence"], 94)
+        self.assertNotIn("confidence_pct", selected)
+        self.assertEqual(selected["id"], "selected-line")
+        self.assertEqual(selected["source_line_item_id"], "source-selected")
+        self.assertEqual(selected["pricing_keyword"], "selected-panel")
+        self.assertEqual(selected["arbitrary_metadata"], {"origin": "synthetic", "sequence": [2, 1]})
+        self.assertEqual((selected["category_order"], selected["item_order"]), (4, 5))
+        self.assertEqual(duplicate["id"], "same-words-in-target-section")
+        self.assertEqual(duplicate["text"], "Selected panel")
+        self.assertEqual(unrelated["text"], "\n  lead\t  middle  \ntrail  \n")
+        self.assertEqual(unrelated["metadata"], {"keep": True, "nested": ["a", "b"]})
+        self.assertEqual((unrelated["category_order"], unrelated["item_order"]), (9, 10))
+        self.assertEqual(elsewhere["id"], "same-words-elsewhere")
+        self.assertEqual((sections[0]["basis_order"], sections[0]["section_order"]), (3, 2))
+        self.assertEqual((sections[1]["basis_order"], sections[1]["section_order"]), (7, 8))
+        self.assertEqual(proposal["quote_basis"], webapp.quote_basis_from_sections(sections))
+        self.assertEqual([item["id"] for item in proposal["line_items"]], ["existing-item"])
+
+    def test_run589_selected_line_target_selection_fails_closed(self):
+        base = valid_payload()
+        base["quote_basis_sections"] = [
+            {
+                "id": "exact-section",
+                "title": "Exact Section",
+                "lines": [
+                    {"id": "first", "tag": "Include", "text": "Duplicate wording"},
+                    {"id": "second", "tag": "Confirm", "text": "Other wording"},
+                ],
+            },
+            {
+                "id": "elsewhere",
+                "title": "Elsewhere",
+                "lines": [{"id": "duplicate", "tag": "Include", "text": "Duplicate wording"}],
+            },
+        ]
+        valid_chat = {
+            "question": "make the selected panel blue",
+            "field": "exact-section",
+            "line_index": 0,
+            "line": "Include: Duplicate wording",
+        }
+        cases = {
+            "missing section id": {key: value for key, value in valid_chat.items() if key != "field"},
+            "wrong section id": {**valid_chat, "field": "elsewhere-wrong"},
+            "normalized title": {**valid_chat, "field": "Exact Section"},
+            "slug fallback": {**valid_chat, "field": "exact section"},
+            "out of range": {**valid_chat, "line_index": 9},
+            "invalid index": {**valid_chat, "line_index": "0"},
+            "negative index": {**valid_chat, "line_index": -1},
+            "selected line mismatch": {**valid_chat, "line": "Include: Other wording"},
+            "duplicate wording does not redirect": {**valid_chat, "field": "elsewhere", "line_index": 0, "line": "Confirm: Other wording"},
+        }
+        for label, basis_chat in cases.items():
+            payload = copy.deepcopy(base)
+            payload["basis_chat"] = basis_chat
+            with self.subTest(label=label), self.assertRaises(webapp.OpenAIAnalysisError):
+                webapp.replacement_line_sections(payload, {"text": "Replacement in blue"})
+
+        colliding = copy.deepcopy(base)
+        colliding["quote_basis_sections"][1]["id"] = "exact-section"
+        colliding["basis_chat"] = valid_chat
+        with self.assertRaises(webapp.OpenAIAnalysisError):
+            webapp.replacement_line_sections(colliding, {"text": "Replacement in blue"})
 
     def test_basis_chat_replacement_preserves_quantity_and_unit_when_only_text_changes(self):
         payload = valid_payload()
@@ -12787,7 +12940,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         line = result["proposal"]["quote_basis_sections"][0]["lines"][0]
         self.assertEqual(line["text"], "Needle punch carpet in Brazil red colour zones.")
-        self.assertEqual(line["quantity"], "36")
+        self.assertEqual(line["quantity"], 36)
         self.assertEqual(line["unit"], "sqm")
 
     def test_basis_chat_edit_request_rejects_replacement_missing_requested_phrase(self):

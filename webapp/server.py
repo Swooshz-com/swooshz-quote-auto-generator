@@ -20379,64 +20379,43 @@ def validate_basis_chat_replacement_line(
 
 
 def parse_basis_chat_line_index(value: Any) -> int:
-    try:
-        return int(str(value).strip())
-    except (TypeError, ValueError):
+    if isinstance(value, bool) or not isinstance(value, int):
         return -1
+    return value if value >= 0 else -1
 
 
-def basis_chat_line_display(line: dict[str, Any]) -> str:
-    text = clean_text(line.get("text"))
-    return f"{normalize_basis_tag(line.get('tag'))}: {text}" if text else ""
-
-
-def same_basis_line(a: dict[str, Any], selected_line: str) -> bool:
-    selected = clean_multiline(selected_line)
-    if not selected:
+def basis_chat_selected_line_matches(line: dict[str, Any], selected_line: Any) -> bool:
+    if not isinstance(selected_line, str) or selected_line == "":
         return False
-    selected_normalized = normalize_basis_line(selected)
-    selected_text = clean_text(selected_normalized.get("text")) if selected_normalized else selected
-    return (
-        clean_text(a.get("text")).lower() == selected_text.lower()
-        or basis_chat_line_display(a).lower() == selected.lower()
-    )
-
-
-def basis_chat_section_matches(section: dict[str, Any], field: str) -> bool:
-    if not field:
-        return True
-    section_id = clean_text(section.get("id"))
-    section_title = clean_basis_section_title(section.get("title"))
-    normalized_field = clean_basis_section_title(field)
-    return (
-        section_id == field
-        or section_id == safe_section_id(field)
-        or section_title.lower() == normalized_field.lower()
-    )
+    assertion = canonical_basis_section_text(selected_line)
+    text = canonical_basis_section_text(line.get("text") if line.get("text") is not None else "")
+    display = f"{normalize_basis_tag(line.get('tag'))}: {text}"
+    return assertion in {text, display}
 
 
 def find_basis_chat_target(
     sections: list[dict[str, Any]],
     basis_chat: dict[str, Any],
 ) -> tuple[int, int, dict[str, Any]] | None:
-    field = clean_text(basis_chat.get("field"))
+    field = basis_chat.get("field")
     line_index = parse_basis_chat_line_index(basis_chat.get("line_index"))
-    selected_line = clean_multiline(basis_chat.get("line"))
-
-    for section_index, section in enumerate(sections):
-        if not basis_chat_section_matches(section, field):
-            continue
-        lines = section.get("lines") if isinstance(section.get("lines"), list) else []
-        if 0 <= line_index < len(lines) and isinstance(lines[line_index], dict):
-            return section_index, line_index, lines[line_index]
-        for index, line in enumerate(lines):
-            if isinstance(line, dict) and same_basis_line(line, selected_line):
-                return section_index, index, line
-
-    if field:
-        fallback_chat = {**basis_chat, "field": ""}
-        return find_basis_chat_target(sections, fallback_chat)
-    return None
+    if not isinstance(field, str) or not field or line_index < 0:
+        return None
+    matches = [
+        (section_index, section)
+        for section_index, section in enumerate(sections)
+        if section.get("id") == field
+    ]
+    if len(matches) != 1:
+        return None
+    section_index, section = matches[0]
+    lines = section.get("lines") if isinstance(section.get("lines"), list) else []
+    if line_index >= len(lines) or not isinstance(lines[line_index], dict):
+        return None
+    line = lines[line_index]
+    if not basis_chat_selected_line_matches(line, basis_chat.get("line")):
+        return None
+    return section_index, line_index, line
 
 
 def normalized_basis_chat_line_items(
@@ -20444,13 +20423,9 @@ def normalized_basis_chat_line_items(
     payload: dict[str, Any],
     auth_session: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    if isinstance(raw_items, list):
-        normalized = normalize_line_items(
-            {**payload, "line_items": raw_items},
-            auth_session=auth_session,
-        )
-        if normalized:
-            return normalized
+    current_items = payload.get("line_items")
+    if isinstance(current_items, list):
+        return [copy.deepcopy(item) for item in current_items if isinstance(item, dict)]
     return normalize_line_items(payload, auth_session=auth_session)
 
 
@@ -21536,14 +21511,14 @@ def replacement_line_sections(
     replacement_line: Any,
     auth_session: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    sections = normalize_quote_basis_sections(
-        payload,
-        pricing_reference_section_names_for_payload(payload, auth_session=auth_session),
-    )
+    try:
+        sections = canonical_quote_basis_sections(payload)
+    except ValueError as exc:
+        raise OpenAIAnalysisError("AI basis chat could not admit the current quote basis.") from exc
     if not sections:
         raise OpenAIAnalysisError("AI basis chat could not find the current quote basis.")
-    replacement = normalize_basis_line(replacement_line)
-    if not replacement:
+    candidate = normalize_basis_line(replacement_line)
+    if not candidate:
         raise OpenAIAnalysisError("AI basis chat did not return a usable replacement line.")
 
     basis_chat = payload.get("basis_chat") if isinstance(payload.get("basis_chat"), dict) else {}
@@ -21552,21 +21527,29 @@ def replacement_line_sections(
         raise OpenAIAnalysisError("AI basis chat could not match the selected quote-basis line.")
 
     section_index, line_index, current_line = target
-    if isinstance(replacement_line, dict) and not clean_text(replacement_line.get("tag")):
-        replacement["tag"] = normalize_basis_tag(current_line.get("tag"))
-    if (
-        current_line.get("custom_pricing")
-        or normalize_basis_tag(current_line.get("tag")) == "Custom"
-        or (isinstance(replacement_line, dict) and replacement_line.get("custom_pricing"))
+    replacement = copy.deepcopy(current_line)
+    replacement["text"] = candidate["text"]
+    if isinstance(replacement_line, dict) and clean_text(replacement_line.get("tag")):
+        replacement["tag"] = normalize_basis_tag(candidate.get("tag"))
+    if isinstance(replacement_line, dict) and (
+        "confidence" in replacement_line or "confidence_pct" in replacement_line
     ):
-        replacement["custom_pricing"] = True
-    confidence = None
-    if isinstance(replacement_line, dict):
-        confidence = normalize_confidence_percent(replacement_line.get("confidence_pct", replacement_line.get("confidence")))
-    if confidence is None:
-        confidence = normalize_confidence_percent(current_line.get("confidence"))
-    if confidence is not None:
-        replacement["confidence"] = confidence
+        confidence = normalize_confidence_percent(
+            replacement_line.get("confidence_pct", replacement_line.get("confidence"))
+        )
+        if confidence is None:
+            replacement.pop("confidence", None)
+            replacement.pop("confidence_pct", None)
+        else:
+            replacement["confidence"] = confidence
+            replacement.pop("confidence_pct", None)
+    if basis_chat_quantity_change_requested(
+        basis_chat.get("question") or basis_chat.get("user_feedback")
+    ):
+        if candidate.get("quantity") not in (None, ""):
+            replacement["quantity"] = candidate["quantity"]
+        if clean_text(candidate.get("unit")):
+            replacement["unit"] = candidate["unit"]
     preserve_basis_chat_quantity(basis_chat, current_line, replacement)
     unbind_replacement_if_catalog_reference_changed(current_line, replacement)
     validate_basis_chat_replacement_line(payload, current_line, replacement)
@@ -21646,25 +21629,14 @@ def normalize_basis_chat_result(
         if required_intent == "answer":
             raise OpenAIAnalysisError("AI basis chat returned a proposal for a question instead of an answer.")
         message = clean_multiline(raw_proposal.get("message") or parsed.get("message"))
-        line_items = normalized_basis_chat_line_items(
-            raw_proposal.get("line_items") or parsed.get("line_items"),
-            payload,
-            auth_session=auth_session,
-        )
+        line_items = normalized_basis_chat_line_items(None, payload, auth_session=auth_session)
         sections = replacement_line_sections(
             payload,
             raw_proposal.get("replacement_line"),
             auth_session=auth_session,
         )
-        sections = quote_basis_sections_preserve_custom_pricing(
-            payload,
-            sections,
-            auth_session=auth_session,
-        )
         if not sections:
             raise OpenAIAnalysisError("AI basis chat did not return a usable proposal.")
-        line_items = sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
-        sections = sort_quote_basis_sections_by_pricing_reference_order(payload, sections, auth_session=auth_session)
 
         return {
             "status": "answered",
