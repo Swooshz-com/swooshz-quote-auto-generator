@@ -348,6 +348,24 @@ def recovered_convergence_payload(
     return payload
 
 
+def synthetic_publication_authority() -> dict:
+    digest = hashlib.sha256(b"synthetic-publication-authority").hexdigest()
+    return {
+        "pricing_reference": {
+            "id": "synthetic-exhibition-fixture-pricing",
+            "source": "local",
+            "digest": digest,
+        },
+        "profile": {
+            "id": "synthetic-exhibition-fixture-template",
+            "source": "profile",
+            "digest": digest,
+            "layout_digest": digest,
+            "layout_rules_digest": digest,
+        },
+    }
+
+
 def wait_for_job(job_id: str, timeout: float = 2.0, auth_session: dict | None = None) -> dict:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -7849,7 +7867,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             )
             payload = payload_with_workspace_pricing("workspace-platform-uat-pricing")
             payload["profile_id"] = "workspace-platform-uat-profile"
-            payload["quote_session"] = {"session_id": "quote-platform-uat-smoke"}
+            payload["quote_session"] = {
+                "session_id": "quote-platform-uat-smoke",
+                "draft_state": {"outputRevision": 1},
+            }
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
             with mock.patch.dict(os.environ, env, clear=True):
@@ -14656,9 +14677,16 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
             output_dir.mkdir(parents=True)
             (output_dir / "quotation.xlsx").write_bytes(b"xlsx")
             (output_dir / "quotation.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
-            payload = valid_payload()
-            payload["quote_session"] = {
+            payload = recovered_convergence_payload(
+                effective_unit_price=100,
+                pricing_basis_amount=100,
+                approved_quote_amount=100,
+                exchange_rate=1.3499,
+                include_included_row=False,
+            )
+            payload["quote_session"].update({
                 "session_id": "quote-export",
+                "status": {"quote_generated": True},
                 "commercials": {
                     "currency": "SGD",
                     "tax_label": "GST",
@@ -14667,10 +14695,16 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                     "tax_amount": 9,
                     "grand_total": 109,
                 },
-            }
+            })
+            payload["quote_session"]["draft_state"]["outputRevision"] = 1
             payload["quote_exchange_rate"] = 1.3499
+            expected_commercials = webapp.quote_session_commercials(
+                payload,
+                webapp.quote_session_patch_payload(payload),
+            )
             result = {
                 "status": "completed",
+                "_publication_authority": synthetic_publication_authority(),
                 "files": [
                     {"name": "quotation.xlsx", "url": "/api/jobs/job-exports/files/quotation.xlsx"},
                     {"name": "quotation.pdf", "url": "/api/jobs/job-exports/files/quotation.pdf"},
@@ -14685,7 +14719,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
 
             self.assertEqual(session["exports"]["xlsx"]["filename"], "quotation.xlsx")
             self.assertEqual(session["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-export/download/xlsx")
-            self.assertEqual(session["commercials"]["grand_total"], 109)
+            self.assertEqual(session["commercials"]["grand_total"], expected_commercials["grand_total"])
             self.assertEqual(session["commercials"]["exchange_rate"], 1.3499)
             self.assertEqual(refreshed["exports"]["xlsx"]["exists"], True)
             self.assertEqual(refreshed["exports"]["pdf"]["exists"], False)
@@ -14704,10 +14738,18 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
         (output_dir / "quotation.pdf").write_bytes(pdf_bytes)
-        payload = valid_payload()
-        payload["quote_session"] = {"session_id": session_id}
+        payload = recovered_convergence_payload(
+            effective_unit_price=100,
+            pricing_basis_amount=100,
+            approved_quote_amount=100,
+            include_included_row=False,
+        )
+        payload["quote_session"]["session_id"] = session_id
+        payload["quote_session"]["status"] = {"quote_generated": True}
+        payload["quote_session"]["draft_state"]["outputRevision"] = 1
         result = {
             "status": "completed",
+            "_publication_authority": synthetic_publication_authority(),
             "files": [
                 {"name": "quotation.xlsx", "url": f"/api/jobs/{session_id}/files/quotation.xlsx"},
                 {"name": "quotation.pdf", "url": f"/api/jobs/{session_id}/files/quotation.pdf"},
@@ -14730,6 +14772,18 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
             local_http_get_bytes(runner, f"/api/quote-sessions/{session_id}/download/pdf"),
             (200, pdf_bytes),
         )
+
+    def _assert_local_pair_unavailable(
+        self,
+        runner: LocalRunnerServer,
+        session_id: str,
+    ) -> None:
+        for kind in ("xlsx", "pdf"):
+            status, _body = local_http_get_bytes(
+                runner,
+                f"/api/quote-sessions/{session_id}/download/{kind}",
+            )
+            self.assertEqual(status, 404)
 
     def _run466_payload(
         self,
@@ -14987,9 +15041,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 for kind in ("xlsx", "pdf"):
                     self.assertTrue(failed_followup["exports"][kind]["stale"])
                 self.assertEqual(webapp.quote_session_result_files(failed_followup), [])
-                self._assert_local_pair_downloads(
-                    runner, "quote-run466", b"run466-old-xlsx", b"run466-old-pdf"
-                )
+                self._assert_local_pair_unavailable(runner, "quote-run466")
 
                 malicious_response = self._post_local_quote_session(
                     runner,
@@ -15378,12 +15430,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                     refreshed["draft_files"][0]["session_file_key"],
                     "run469-follow-up-reference",
                 )
-                self._assert_local_pair_downloads(
-                    runner,
-                    "quote-run469",
-                    b"run469-old-xlsx",
-                    b"run469-old-pdf",
-                )
+                self._assert_local_pair_unavailable(runner, "quote-run469")
                 self.assertFalse(
                     any(
                         path.name.startswith("pub-")
@@ -16002,7 +16049,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 )
                 self._assert_local_pair_downloads(runner, "quote-f6a", new_xlsx, new_pdf)
 
-    def test_local_legacy_publication_stays_downloadable_and_migrates_safely(self):
+    def test_local_legacy_publication_is_historical_until_genuine_regeneration(self):
         with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
             root = Path(tmp)
             data_root = root / "data"
@@ -16031,7 +16078,8 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 self.assertTrue(stale["exports"]["xlsx"]["stale"])
                 self.assertTrue(stale["exports"]["pdf"]["stale"])
                 self.assertEqual(webapp.quote_session_result_files(stale), [])
-                self._assert_local_pair_downloads(runner, session_id, legacy_xlsx, legacy_pdf)
+                self.assertEqual(local_http_get_bytes(runner, f"/api/quote-sessions/{session_id}/download/xlsx")[0], 404)
+                self.assertEqual(local_http_get_bytes(runner, f"/api/quote-sessions/{session_id}/download/pdf")[0], 404)
 
                 new_payload, new_result, new_output = self._local_publication_case(
                     root, session_id, new_xlsx, new_pdf, variant="new"
@@ -16049,7 +16097,8 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                         webapp.create_or_update_quote_session(
                             new_payload, result=new_result, output_dir=new_output
                         )
-                self._assert_local_pair_downloads(runner, session_id, legacy_xlsx, legacy_pdf)
+                self.assertEqual(local_http_get_bytes(runner, f"/api/quote-sessions/{session_id}/download/xlsx")[0], 404)
+                self.assertEqual(local_http_get_bytes(runner, f"/api/quote-sessions/{session_id}/download/pdf")[0], 404)
                 migrated = webapp.create_or_update_quote_session(
                     new_payload, result=new_result, output_dir=new_output
                 )
@@ -16103,6 +16152,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
             payload["quote_session"]["draft_state"]["quoteDetails"] = commercial_details
             result = {
                 "status": "completed",
+                "_publication_authority": synthetic_publication_authority(),
                 "files": [
                     {"name": "quotation.xlsx", "url": "/api/jobs/job-stale/files/quotation.xlsx"},
                     {"name": "quotation.pdf", "url": "/api/jobs/job-stale/files/quotation.pdf"},
@@ -16152,7 +16202,9 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 },
             }
 
-            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), mock.patch.object(
+                webapp, "local_current_publication_authority", return_value=synthetic_publication_authority()
+            ), LocalRunnerServer() as runner:
                 generated = webapp.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
                 stale = webapp.create_or_update_quote_session(stale_payload)
                 stale_downloads = {
@@ -16240,11 +16292,10 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 self.assertTrue(attempted["exports"]["pdf"]["stale"])
                 self.assertEqual(attempted["exports"]["pdf"]["url"], "/api/quote-sessions/quote-stale/download/pdf")
                 self.assertEqual(webapp.quote_session_result_files(attempted), [])
-            self.assertTrue(stale_download_path.is_file())
-            self.assertEqual(stale_download_path.read_bytes(), b"xlsx")
+            self.assertIsNone(stale_download_path)
             for downloads in (stale_downloads, blocked_downloads, failed_downloads):
-                self.assertEqual(downloads["xlsx"], (200, b"xlsx"))
-                self.assertEqual(downloads["pdf"], (200, b"pdf"))
+                self.assertEqual(downloads["xlsx"][0], 404)
+                self.assertEqual(downloads["pdf"][0], 404)
             self.assertNotIn(str(tmp_path), json.dumps(stale))
             self.assertIsNotNone(persisted_stale)
             self.assertEqual(
@@ -16314,22 +16365,22 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                     }
                     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
-                    with urllib.request.urlopen(
-                        f"{runner.base_url}/api/quote-sessions/quote-api/download/xlsx",
-                        timeout=3,
-                    ) as response:
-                        self.assertEqual(response.status, 200)
-                        self.assertEqual(response.read(), b"xlsx")
+                    with self.assertRaises(urllib.error.HTTPError) as legacy_error:
+                        urllib.request.urlopen(
+                            f"{runner.base_url}/api/quote-sessions/quote-api/download/xlsx",
+                            timeout=3,
+                        )
+                    self.assertEqual(legacy_error.exception.code, 404)
 
                     metadata["updated_at"] = "2026-01-03T00:00:00Z"
                     metadata["exports"]["xlsx"]["created_at"] = "2026-01-02T00:00:00Z"
                     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-                    with urllib.request.urlopen(
-                        f"{runner.base_url}/api/quote-sessions/quote-api/download/xlsx",
-                        timeout=3,
-                    ) as response:
-                        self.assertEqual(response.status, 200)
-                        self.assertEqual(response.read(), b"xlsx")
+                    with self.assertRaises(urllib.error.HTTPError) as stale_error:
+                        urllib.request.urlopen(
+                            f"{runner.base_url}/api/quote-sessions/quote-api/download/xlsx",
+                            timeout=3,
+                        )
+                    self.assertEqual(stale_error.exception.code, 404)
 
                     for path in (
                         "/api/quote-sessions/quote-api/download/docx",
@@ -31046,9 +31097,16 @@ main().catch((error) => {
             output_dir.mkdir(parents=True)
             xlsx_bytes = b"xlsx-db-artifact"
             (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
-            payload = valid_payload()
-            payload["quote_session"] = {"session_id": "quote-artifact"}
-            result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-artifact/files/quotation.xlsx"}]}
+            payload = recovered_convergence_payload(
+                effective_unit_price=100,
+                pricing_basis_amount=100,
+                approved_quote_amount=100,
+                include_included_row=False,
+            )
+            payload["quote_session"]["session_id"] = "quote-artifact"
+            payload["quote_session"]["status"] = {"quote_generated": True}
+            payload["quote_session"]["draft_state"]["outputRevision"] = 1
+            result = {"status": "completed", "_publication_authority": synthetic_publication_authority(), "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-artifact/files/quotation.xlsx"}]}
             env = {"SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
             with mock.patch.dict(os.environ, env, clear=True):
                 webapp.apply_sqag_storage_migrations(database_url)
@@ -31075,9 +31133,16 @@ main().catch((error) => {
             output_dir.mkdir(parents=True)
             xlsx_bytes = b"xlsx-http-artifact"
             (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
-            payload = valid_payload()
-            payload["quote_session"] = {"session_id": "quote-http-artifact"}
-            result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-http-artifact/files/quotation.xlsx"}]}
+            payload = recovered_convergence_payload(
+                effective_unit_price=100,
+                pricing_basis_amount=100,
+                approved_quote_amount=100,
+                include_included_row=False,
+            )
+            payload["quote_session"]["session_id"] = "quote-http-artifact"
+            payload["quote_session"]["status"] = {"quote_generated": True}
+            payload["quote_session"]["draft_state"]["outputRevision"] = 1
+            result = {"status": "completed", "_publication_authority": synthetic_publication_authority(), "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-http-artifact/files/quotation.xlsx"}]}
             env = {**self.platform_launch_env(), "SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
             with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
                 webapp, "validated_platform_auth_session", side_effect=lambda session: session
@@ -31113,9 +31178,16 @@ main().catch((error) => {
         output_dir.mkdir(parents=True)
         xlsx_bytes = b"xlsx-db-delete"
         (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
-        payload = valid_payload()
-        payload["quote_session"] = {"session_id": "quote-db-delete"}
-        result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-db-delete/files/quotation.xlsx"}]}
+        payload = recovered_convergence_payload(
+            effective_unit_price=100,
+            pricing_basis_amount=100,
+            approved_quote_amount=100,
+            include_included_row=False,
+        )
+        payload["quote_session"]["session_id"] = "quote-db-delete"
+        payload["quote_session"]["status"] = {"quote_generated": True}
+        payload["quote_session"]["draft_state"]["outputRevision"] = 1
+        result = {"status": "completed", "_publication_authority": synthetic_publication_authority(), "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-db-delete/files/quotation.xlsx"}]}
         env = {**self.platform_launch_env(), "SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
         with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
             webapp, "validated_platform_auth_session", side_effect=lambda session: session
@@ -31184,7 +31256,7 @@ main().catch((error) => {
         self.assertEqual(delete_response["status"], "deleted")
         self.assertIsNone(artifact_after_delete)
 
-    def test_database_artifact_stale_export_remains_downloadable_and_snapshot_is_preserved(self):
+    def test_database_artifact_stale_export_is_protected_and_snapshot_is_preserved(self):
         tmp_path = test_temp_root() / f"db-artifact-stale-{time.time_ns()}"
         tmp_path.mkdir(parents=True)
         database_url = f"sqlite:///{(tmp_path / 'sqag-storage.sqlite3').as_posix()}"
@@ -31263,8 +31335,8 @@ main().catch((error) => {
         self.assertEqual(fetched["generation_snapshot"]["pricing_reference"]["display_name"], "Generated Stale Pricing")
         self.assertEqual(artifact["content"], b"xlsx-db-stale")
         self.assertEqual(pdf_artifact["content"], b"pdf-db-stale")
-        self.assertEqual(stale_downloads["xlsx"], (200, b"xlsx-db-stale"))
-        self.assertEqual(stale_downloads["pdf"], (200, b"pdf-db-stale"))
+        self.assertEqual(stale_downloads["xlsx"][0], 404)
+        self.assertEqual(stale_downloads["pdf"][0], 404)
         self.assertEqual(cross_workspace_downloads["xlsx"][0], 404)
         self.assertEqual(cross_workspace_downloads["pdf"][0], 404)
         self.assertIn(unauthorised_downloads["xlsx"][0], {401, 403})
@@ -31281,8 +31353,15 @@ main().catch((error) => {
         pdf_bytes = b"pdf-object-artifact"
         (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
         (output_dir / "quotation.pdf").write_bytes(pdf_bytes)
-        payload = valid_payload()
-        payload["quote_session"] = {"session_id": "quote-object-artifact"}
+        payload = recovered_convergence_payload(
+            effective_unit_price=100,
+            pricing_basis_amount=100,
+            approved_quote_amount=100,
+            include_included_row=False,
+        )
+        payload["quote_session"]["session_id"] = "quote-object-artifact"
+        payload["quote_session"]["status"] = {"quote_generated": True}
+        payload["quote_session"]["draft_state"]["outputRevision"] = 1
         result = {"status": "completed", "files": [
             {"name": "quotation.xlsx", "url": "/api/jobs/job-object-artifact/files/quotation.xlsx"},
             {"name": "quotation.pdf", "url": "/api/jobs/job-object-artifact/files/quotation.pdf"},
@@ -31307,11 +31386,25 @@ main().catch((error) => {
             webapp.apply_sqag_storage_migrations(database_url)
             workspace_a = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-a"))
             workspace_b = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-b"))
-            workspace_a.save_profile(webapp.normalize_profile_payload({"id": "object-snapshot-profile", "label": "Object Snapshot Profile"}))
+            workspace_a.save_profile(workspace_profile_with_layout("object-snapshot-profile") | {"label": "Object Snapshot Profile"})
             workspace_a.save_pricing_reference(workspace_pricing_reference("object-snapshot-pricing") | {"label": "Object Snapshot Pricing"})
             payload["profile_id"] = "object-snapshot-profile"
             payload["pricing_reference_id"] = "object-snapshot-pricing"
+            payload["pricing_reference_source"] = "company"
+            payload["pricing_reference"] = {"id": "object-snapshot-pricing", "source": "company"}
+            object_pricing = workspace_a.pricing_reference_detail("object-snapshot-pricing", source="company")
+            payload["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"].update({
+                "currency": object_pricing["currency"],
+                "source": "company",
+                "id": "object-snapshot-pricing",
+                "digest": object_pricing["digest_sha256"],
+            })
+            result["_publication_authority"] = webapp.database_publication_authority_for_payload(workspace_a, payload)
+            self.assertTrue(result["_publication_authority"], result["_publication_authority"])
             session = workspace_a.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+            raw_session, _ = workspace_a._read_quote_session_metadata("quote-object-artifact")
+            self.assertTrue(webapp.quote_session_has_current_v2_publication(raw_session), raw_session.get("publication"))
+            self.assertTrue(webapp.quote_session_publication_authority_matches(raw_session, webapp.database_current_publication_authority(workspace_a, payload)))
             artifact = workspace_a.quote_session_export_artifact("quote-object-artifact", "xlsx")
             pdf_artifact = workspace_a.quote_session_export_artifact("quote-object-artifact", "pdf")
             blocked_artifact = workspace_b.quote_session_export_artifact("quote-object-artifact", "xlsx")
@@ -31416,7 +31509,7 @@ main().catch((error) => {
             self.assertTrue(stale_session["exports"][kind]["exists"])
             self.assertTrue(stale_session["exports"][kind]["stale"])
             self.assertEqual(stale_artifacts[kind]["content"], expected)
-            self.assertEqual(stale_downloads[kind], (200, expected))
+            self.assertEqual(stale_downloads[kind][0], 404)
             self.assertEqual(replacement_artifacts[kind]["content"], expected)
             self.assertFalse(replaced_session["exports"][kind]["stale"])
             self.assertEqual(replacement_downloads[kind], (200, expected))
@@ -37593,6 +37686,107 @@ main().catch((error) => {
         self.assertIn("Generate final Quote Basis", js)
         self.assertIn('state.basisConfirmed = false', js)
         self.assertIn('setDownloadFiles([])', js)
+
+    def test_run573_quote_basis_and_primary_order_admission_are_canonical(self):
+        basis = webapp.canonical_quote_basis({
+            "custom-z": "  first\r\n\rsecond\t ",
+            "graphics": " ",
+            "custom-a": "tail\rline",
+            "surfaces": "",
+        })
+        self.assertEqual(list(basis), ["graphics", "custom-a", "custom-z"])
+        self.assertEqual(basis["graphics"], " ")
+        self.assertEqual(basis["custom-a"], "tail\nline")
+        self.assertEqual(basis["custom-z"], "  first\n\nsecond\t ")
+        for invalid in ({"Bad_Key": "x"}, {"constructor": "x"}, {"valid": 1}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                webapp.canonical_quote_basis(invalid)
+
+        accepted = {
+            1: 1,
+            9007199254740991: 9007199254740991,
+            "\t00042\r\n": 42,
+        }
+        for raw, expected in accepted.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(webapp.canonical_primary_order_value(raw), expected)
+        for raw in (True, False, 0, -1, 1.5, float("inf"), "", "0", "+1", "1e2", "１", "9007199254740992", [], {}):
+            with self.subTest(raw=raw):
+                self.assertIsNone(webapp.canonical_primary_order_value(raw))
+
+    def test_run573_v2_publication_proof_requires_regeneration_and_invalidates_commercial_edits(self):
+        patch = {
+            "status": {"quote_generated": True},
+            "draft_state": {
+                "outputRevision": 7,
+                "quoteBasis": {"graphics": "Include: Printed wall\r\nSecond line"},
+                "quoteBasisSections": [{
+                    "id": "graphics",
+                    "title": "Graphics",
+                    "lines": [{"tag": "Include", "text": "Printed wall"}, {"tag": "Confirm", "text": "Second line"}],
+                }],
+                "outputRows": [{"description": "Printed wall", "quantity": 2, "unit": "sqm", "unit_price_override": 10}],
+                "quoteDetails": {"project_number": "SYN-573"},
+            },
+        }
+        # Use the canonical section projection as the persisted basis authority.
+        patch["draft_state"]["quoteBasis"] = webapp.canonical_quote_basis(
+            webapp.quote_basis_from_sections(
+                webapp.normalize_quote_basis_sections({"quote_basis_sections": patch["draft_state"]["quoteBasisSections"]})
+            )
+        )
+        metadata = webapp.blank_quote_session_metadata("quote-run573", "2026-09-16T00:00:00Z")
+        metadata["status"]["quote_generated"] = True
+        metadata["draft_state"] = webapp.quote_session_draft_state(patch)
+        xlsx = b"PK\x03\x04synthetic-run573-xlsx"
+        metadata["exports"]["xlsx"] = {
+            "filename": "quotation.xlsx",
+            "size_bytes": len(xlsx),
+            "sha256": hashlib.sha256(xlsx).hexdigest(),
+            "stale": False,
+        }
+        publication_id = "pub-57357357357357357357357357357357"
+        metadata["publication"] = {"state": "published", "active_publication_id": publication_id}
+        metadata["publication"]["proof"] = webapp.quote_session_publication_proof(
+            metadata,
+            patch,
+            publication_id=publication_id,
+            authority={
+                **synthetic_publication_authority(),
+                "pricing_reference": {
+                    **synthetic_publication_authority()["pricing_reference"],
+                    "digest": "sha256:" + synthetic_publication_authority()["pricing_reference"]["digest"],
+                },
+            },
+        )
+        self.assertRegex(metadata["publication"]["proof"]["pricing_reference"]["digest"], r"^[0-9a-f]{64}$")
+        self.assertTrue(webapp.quote_session_publication_freshness_proof_matches(metadata, patch))
+        self.assertTrue(webapp.quote_session_publication_authority_matches(metadata, {
+            **synthetic_publication_authority(),
+            "pricing_reference": {
+                **synthetic_publication_authority()["pricing_reference"],
+                "digest": "sha256:" + synthetic_publication_authority()["pricing_reference"]["digest"],
+            },
+        }))
+
+        for field, changed in (
+            ("quantity", 3),
+            ("unit_price_override", 11),
+            ("description", "Changed detail"),
+        ):
+            edited = copy.deepcopy(patch)
+            edited["draft_state"]["outputRows"][0][field] = changed
+            with self.subTest(field=field):
+                self.assertFalse(webapp.quote_session_publication_freshness_proof_matches(metadata, edited))
+        basis_edit = copy.deepcopy(patch)
+        basis_edit["draft_state"]["quoteBasis"]["graphics"] += "\nConfirm: Changed"
+        basis_edit["draft_state"]["quoteBasisSections"][0]["lines"].append({"tag": "Confirm", "text": "Changed"})
+        self.assertFalse(webapp.quote_session_publication_freshness_proof_matches(metadata, basis_edit))
+
+        legacy = copy.deepcopy(metadata)
+        legacy["publication"].pop("proof")
+        legacy["publication"]["committed_draft_state_digest"] = metadata["publication"]["proof"]["commercial_state_digest"]
+        self.assertFalse(webapp.quote_session_publication_freshness_proof_matches(legacy, patch))
 
 
 if __name__ == "__main__":

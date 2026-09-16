@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -26,7 +27,7 @@ const options = {
   port: Number(readArg("--port", process.env.PLAYWRIGHT_PORT || "8765")),
 };
 
-const baseUrl = `http://${options.host}:${options.port}`;
+let baseUrl = `http://${options.host}:${options.port}`;
 const outputDir = path.join(root, "_logs", "browser", "playwright-smoke");
 const quoteDataRoot = path.join(root, "_tmp", "playwright-quote-data");
 
@@ -2612,7 +2613,290 @@ async function verifyDashboardClearsStaleSessionsBeforeRefresh(page) {
     throw new Error(`Dashboard should clear stale rows before refreshed sessions load, found ${staleCountDuringRefresh}.`);
   }
 }
+
+function isolatedLoadedAppEnvironment(runRoot) {
+  const inheritedNames = process.platform === "win32"
+    ? ["PATH", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "PLAYWRIGHT_BROWSERS_PATH"]
+    : ["PATH", "PLAYWRIGHT_BROWSERS_PATH"];
+  const env = Object.fromEntries(inheritedNames.filter((name) => process.env[name]).map((name) => [name, process.env[name]]));
+  return {
+    ...env,
+    PYTHONUNBUFFERED: "1",
+    APP_MODE: "local",
+    AUTH_MODE: "local",
+    USER_TYPE: "admin",
+    SQAG_DISABLE_DOTENV: "true",
+    SQAG_STORAGE_MODE: "local",
+    SQAG_ARTIFACT_STORAGE_MODE: "local",
+    AI_PROVIDER: "none",
+    AI_BASIS_LINE_PROVIDER: "none",
+    AI_BASIS_ANSWER_PROVIDER: "none",
+    AI_PRICING_IMPORT_PROVIDER: "none",
+    OPENAI_API_KEY: "",
+    DEEPSEEK_API_KEY: "",
+    QUOTE_DATA_ROOT: path.join(runRoot, "quote-data"),
+    QUOTE_OUTPUT_ROOT: path.join(runRoot, "output"),
+    QUOTE_TMP_ROOT: path.join(runRoot, "tmp"),
+    SQAG_LOCAL_PRICING_REFERENCES_ROOT: path.join(runRoot, "pricing"),
+    QUOTE_LOG_ROOT: path.join(runRoot, "server-log"),
+    TEMP: path.join(runRoot, "process-temp"),
+    TMP: path.join(runRoot, "process-temp"),
+  };
+}
+
+async function startIsolatedLoadedAppServer(runRoot) {
+  const env = isolatedLoadedAppEnvironment(runRoot);
+  await Promise.all([
+    fs.mkdir(env.TEMP, { recursive: true }),
+    fs.mkdir(path.join(runRoot, "browser-log"), { recursive: true }),
+  ]);
+  const child = spawn(pythonCommand(), ["webapp/server.py", "--host", "127.0.0.1", "--port", "0"], {
+    cwd: root,
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  const exitPromise = new Promise((resolve) => {
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+  const output = [];
+  let buffered = "";
+  let resolveEndpoint;
+  const endpointPromise = new Promise((resolve) => { resolveEndpoint = resolve; });
+  const collect = (chunk) => {
+    const text = String(chunk);
+    output.push(text);
+    if (output.join("").length > 12000) output.shift();
+    buffered += text;
+    const match = buffered.match(/(?:^|\r?\n)SQAG_SERVER_ENDPOINT=(http:\/\/127\.0\.0\.1:\d+)/);
+    if (match) resolveEndpoint(match[1]);
+  };
+  child.stdout.on("data", collect);
+  child.stderr.on("data", collect);
+  const serverInfo = { child, endpoint: "", exitPromise, output, runRoot };
+  const startupTimeout = new Promise((_, reject) => {
+    const timer = setTimeout(() => reject(new Error("Isolated loaded-app server startup exceeded 15 seconds.")), 15000);
+    timer.unref?.();
+  });
+  const earlyExit = exitPromise.then(({ code, signal }) => {
+    throw new Error(`Isolated loaded-app server exited before bind (exitCode=${code}, signalCode=${signal}).`);
+  });
+  try {
+    const endpoint = await Promise.race([endpointPromise, startupTimeout, earlyExit]);
+    serverInfo.endpoint = endpoint;
+    const health = await fetch(`${endpoint}/api/health`, { signal: AbortSignal.timeout(3000) });
+    if (!health.ok) throw new Error(`Isolated loaded-app health check returned ${health.status}.`);
+    return serverInfo;
+  } catch (error) {
+    await stopIsolatedLoadedAppServer(serverInfo).catch(() => {});
+    throw error;
+  }
+}
+
+async function stopIsolatedLoadedAppServer(serverInfo) {
+  if (!serverInfo) return { exitCode: null, signalCode: null };
+  if (serverInfo.child.exitCode === null && serverInfo.child.signalCode === null) serverInfo.child.kill();
+  const cleanupTimeout = new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), 5000);
+    timer.unref?.();
+  });
+  let exited = await Promise.race([serverInfo.exitPromise, cleanupTimeout]);
+  if (!exited) {
+    serverInfo.child.kill("SIGKILL");
+    exited = await Promise.race([serverInfo.exitPromise, new Promise((resolve) => setTimeout(() => resolve(null), 1000))]);
+  }
+  const exitCode = serverInfo.child.exitCode ?? exited?.code ?? null;
+  const signalCode = serverInfo.child.signalCode ?? exited?.signal ?? null;
+  if (exitCode === null && signalCode === null) {
+    throw new Error("Isolated loaded-app child did not expose an exitCode or signalCode after bounded cleanup.");
+  }
+  return { exitCode, signalCode };
+}
+
+async function run573LoadedAppOnce(runIndex) {
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), `sqag-run573-loaded-${runIndex}-`));
+  let serverInfo = null;
+  let browser = null;
+  try {
+    serverInfo = await startIsolatedLoadedAppServer(parent);
+    baseUrl = serverInfo.endpoint;
+    browser = await chromium.launch({ headless: !options.headed });
+    const context = await browser.newContext({ viewport: { width: 1365, height: 900 } });
+    const page = await context.newPage();
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+
+    const prepared = await page.evaluate(async (index) => {
+      const referenceId = `run573-override-pricing-${index}`;
+      const saved = await postJson("/api/settings/pricing-references", {
+        id: referenceId,
+        label: `Run 573 Override Pricing ${index}`,
+        source: "local",
+        currency: "SGD",
+        tax: { label: "GST", rate: 0.09 },
+        items: [{
+          id: "catalog-control-row",
+          section: "Control",
+          description: "Catalog control row",
+          unit_hint: "nos",
+          internal_cost: 10,
+          markup_multiplier: 2,
+          match_terms: ["catalog control row"],
+          object_families: ["control"],
+        }],
+        update_existing: true,
+        editing_reference_id: referenceId,
+      });
+      if (!saved.ok || !["saved", "unchanged"].includes(saved.data?.status)) {
+        throw new Error(`Exact pricing reference save failed: ${JSON.stringify(saved.data)}.`);
+      }
+      const detailResponse = await fetch(`/api/settings/pricing-references/${encodeURIComponent(referenceId)}?source=local`);
+      const detail = await detailResponse.json();
+      if (!detailResponse.ok) throw new Error(`Exact server-side pricing readback failed: ${detailResponse.status}.`);
+      const authority = detail.pricing_reference || {};
+      if (!authority.digest_sha256 || authority.id !== referenceId || authority.source !== "local") {
+        throw new Error(`Exact server-side pricing authority is incomplete: ${JSON.stringify(authority)}.`);
+      }
+
+      await loadProfiles();
+      const reference = state.pricingReferences.find((item) => item.id === referenceId && item.source === "local");
+      if (!reference || reference.digest_sha256 !== authority.digest_sha256) {
+        throw new Error("Loaded-app pricing authority differs from the exact server readback.");
+      }
+      state.pricingReferenceId = reference.id;
+      state.pricingReferenceSource = reference.source;
+      renderProfileOptions();
+      if (!selectPricingReferenceOptionValue(pricingReferenceSelectValue(reference))) {
+        throw new Error("Loaded-app pricing reference could not be selected.");
+      }
+      if (state.profiles.length) {
+        state.profileId = state.profiles[0].id;
+        renderPresetOptions();
+        loadSelectedPreset({ silent: true, allowOwnedInitialization: true });
+      }
+      applyQuoteDetails({
+        quote_date: "2026-09-16",
+        project_number: `RUN573-${index}`,
+        client: { name: "Run 573 Client", attention: "Test Contact", title: "Manager", address: "1 Test Street\nSingapore 000001" },
+        project: { title: "Override-only Quote", show_name: "Loaded App Proof", booth_width: "3", booth_depth: "3", booth_size: "3m x 3m", dimension_source: "analysis" },
+        company: { name: "Run 573 Quote Company", header_details: "Run 573 Quote Company\n1 Test Street" },
+        quote_text: { acceptance_text: "We accept this quotation." },
+        signature: { company_signatory: "Test Signatory", company_title: "Director", company_date_label: "Date:", person_label: "Authorised person", stamp_label: "Company stamp", date_label: "Signed date:" },
+      }, { partial: true });
+      state.headerLogo = await ensureContentFingerprint({
+        name: "run573-logo.png",
+        type: "image/png",
+        size: 68,
+        data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+      });
+      state.images = [await ensureContentFingerprint({
+        name: "run573-render.png",
+        type: "image/png",
+        size: 68,
+        data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+      })];
+      state.quoteBasisSections = normalizeQuoteBasisSections([{
+        id: "run573-override",
+        title: "Custom",
+        lines: [{ id: "run573-override-line", tag: "Custom", text: "Custom override-only fabrication\nPreserve this second line", include: true, custom_pricing: true, custom_confirmed: true, quantity: 2, unit: "nos" }],
+      }]);
+      state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
+      state.lineItems = [normalizeLineItem({
+        section: "Custom",
+        description: "Custom override-only fabrication",
+        quantity: 2,
+        unit: "nos",
+        pricing_keyword: "override-only-not-in-catalog",
+        source_basis_line_id: "run573-override-line",
+        price_mode: "Priced",
+        unit_price_override: 37,
+      })];
+      state.quoteCommercialLifecycle = "NEW_UNINITIALISED";
+      state.quoteCommercialSnapshot = null;
+      const normalized = await postJson("/api/line-items/normalize", {
+        profile_id: generationProfileIdForPayload(),
+        quote_exchange_rate: 1,
+        pricing_reference_id: reference.id,
+        pricing_reference_source: reference.source,
+        pricing_reference: { id: reference.id, source: reference.source, currency: authority.currency, digest_sha256: authority.digest_sha256 },
+        project: { booth_width: "3", booth_depth: "3", booth_size: "3m x 3m", dimension_source: "analysis" },
+        quote_basis: canonicalQuoteBasisForPersistence(),
+        quote_basis_sections: cloneQuoteBasisSections(state.quoteBasisSections),
+        line_items: state.lineItems.map(normalizeLineItem),
+      });
+      if (normalized.ok && Array.isArray(normalized.data?.line_items)) {
+        state.lineItems = normalized.data.line_items.map(normalizeLineItem);
+      }
+      if (!normalized.ok || state.lineItems[0]?.approved_quote_amount !== 74) {
+        throw new Error(`Override-only normalization failed: ${JSON.stringify(normalized.data)}.`);
+      }
+      state.quoteCommercialSnapshot = quoteCommercialSnapshotForDetails(collectQuoteDetails(), {
+        lifecycle: "NEW_UNINITIALISED",
+        origin: "explicit_initialization",
+        reference,
+        replacePricingAuthority: true,
+      });
+      captureOriginalAnalysisSnapshot({ quote_basis_sections: state.quoteBasisSections, source: "run573-loaded-app" });
+      refreshOutputRowsFromLineItems();
+      state.originalOutputRows = snapshotOutputRows(state.outputRows);
+      state.basisConfirmed = true;
+      state.quoteSessionDraftSaveStarted = true;
+      setWorkflowStage("completed");
+      setSidePanel("output", { force: true });
+      await handleGenerate();
+      if (!state.downloadFile || !downloadFileIsFresh(state.downloadFile)) {
+        throw new Error(`Genuine handleGenerate() did not publish a current XLSX: ${JSON.stringify({ status: state.workflowStage, file: state.downloadFile, review: state.quoteCommercialReview, missing: missingDetailFields(), messages: elements.messageList?.textContent, result: elements.resultStatus?.textContent, rows: state.outputRows })}.`);
+      }
+      const sessionId = state.quoteSessionId;
+      const sessionResponse = await fetch(`/api/quote-sessions/${encodeURIComponent(sessionId)}`);
+      const sessionBody = await sessionResponse.json();
+      if (!sessionResponse.ok) throw new Error(`Generated session readback failed: ${sessionResponse.status}.`);
+      const persisted = sessionBody.quote_session || {};
+      const xlsx = persisted.exports?.xlsx || {};
+      const persistedPricing = persisted.draft_state?.quoteDetails?.commercial_snapshot?.pricing_basis || {};
+      if (persistedPricing.id !== authority.id || persistedPricing.source !== authority.source || persistedPricing.digest !== authority.digest_sha256) {
+        throw new Error("Persisted generated session does not retain the exact server-side pricing authority.");
+      }
+      return { sessionId, authorityDigest: authority.digest_sha256, xlsx };
+    }, runIndex);
+
+    const download = await page.request.get(new URL(prepared.xlsx.url, baseUrl).href);
+    if (download.status() !== 200) throw new Error(`Protected XLSX retrieval returned ${download.status()}.`);
+    const bytes = await download.body();
+    const checksum = createHash("sha256").update(bytes).digest("hex");
+    if (bytes.length !== prepared.xlsx.size_bytes || checksum !== prepared.xlsx.sha256) {
+      throw new Error("Downloaded genuine XLSX bytes do not match the published size/checksum.");
+    }
+    if (bytes.length < 4 || bytes[0] !== 0x50 || bytes[1] !== 0x4b || !bytes.includes(Buffer.from("[Content_Types].xml"))) {
+      throw new Error("Downloaded artifact is not a genuine XLSX ZIP package.");
+    }
+    await context.close();
+    return { run: runIndex, sessionId: prepared.sessionId, checksum, sizeBytes: bytes.length, pricingDigest: prepared.authorityDigest };
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+    let exit = { exitCode: null, signalCode: null };
+    try {
+      exit = await stopIsolatedLoadedAppServer(serverInfo);
+    } finally {
+      await fs.rm(parent, { recursive: true, force: true });
+    }
+    if (serverInfo && exit.exitCode === null && exit.signalCode === null) {
+      throw new Error("Loaded-app child cleanup state was not inspectable.");
+    }
+  }
+}
+
+async function run573LoadedAppTwice() {
+  const runs = [];
+  for (let index = 1; index <= 2; index += 1) runs.push(await run573LoadedAppOnce(index));
+  console.log(JSON.stringify({ status: "ok", mode: "run573-loaded-app-twice", runs }, null, 2));
+}
+
 async function main() {
+  if (args.includes("--run573-loaded-app")) {
+    await run573LoadedAppTwice();
+    return;
+  }
   let serverInfo = null;
   const hasExistingServer = await healthOk();
   if (!hasExistingServer) {

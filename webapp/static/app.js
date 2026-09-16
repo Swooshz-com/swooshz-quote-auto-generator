@@ -3066,6 +3066,7 @@ function renderFiles() {
 }
 
 function normalizeLineItem(item = {}) {
+  item = typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(item) : item;
   const priceMode = item.price_mode === "Included" || String(item.display_price || "").toLowerCase() === "included"
     ? "Included"
     : "Priced";
@@ -3098,15 +3099,48 @@ function normalizeLineItem(item = {}) {
 }
 
 function cloneQuoteBasis(basis = {}) {
-  return {
-    ...EMPTY_BASIS,
-    surfaces: basis.surfaces || "",
-    counters: basis.counters || "",
-    platform: basis.platform || "",
-    graphics: basis.graphics || "",
-    furniture: basis.furniture || "",
-    electrical: basis.electrical || "",
-  };
+  return typeof canonicalQuoteBasis === "function" ? canonicalQuoteBasis(basis) : { ...basis };
+}
+
+const QUOTE_BASIS_LEGACY_ORDER = ["surfaces", "counters", "platform", "graphics", "furniture", "electrical"];
+const QUOTE_BASIS_KEY_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const QUOTE_BASIS_UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function canonicalQuoteBasis(value = {}) {
+  if (value === null || value === undefined) return {};
+  if (typeof value !== "object" || Array.isArray(value)) throw new TypeError("Quote basis must be a plain string map.");
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) throw new TypeError("Quote basis must be a plain string map.");
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const admitted = {};
+  Object.keys(descriptors).forEach((key) => {
+    const descriptor = descriptors[key];
+    if (
+      key.length < 1
+      || key.length > 80
+      || !QUOTE_BASIS_KEY_PATTERN.test(key)
+      || QUOTE_BASIS_UNSAFE_KEYS.has(key)
+      || descriptor.get
+      || descriptor.set
+      || typeof descriptor.value !== "string"
+    ) throw new TypeError("Quote basis contains an invalid entry.");
+    const text = descriptor.value.replace(/\r\n?/g, "\n");
+    if (text !== "") admitted[key] = text;
+  });
+  const orderedKeys = QUOTE_BASIS_LEGACY_ORDER.filter((key) => Object.prototype.hasOwnProperty.call(admitted, key));
+  orderedKeys.push(...Object.keys(admitted).filter((key) => !QUOTE_BASIS_LEGACY_ORDER.includes(key)).sort());
+  return Object.fromEntries(orderedKeys.map((key) => [key, admitted[key]]));
+}
+
+function canonicalQuoteBasisForPersistence(basis = state.quoteBasis, sections = state.quoteBasisSections) {
+  const admitted = canonicalQuoteBasis(basis);
+  const sectionProjection = canonicalQuoteBasis(quoteBasisFromSections(Array.isArray(sections) ? sections : []));
+  if (!Object.keys(sectionProjection).length) return admitted;
+  if (!Object.keys(admitted).length) return sectionProjection;
+  if (JSON.stringify(admitted) !== JSON.stringify(sectionProjection)) {
+    throw new TypeError("Quote basis sections do not agree with quote basis.");
+  }
+  return admitted;
 }
 
 function linesValue(value) {
@@ -3773,6 +3807,9 @@ function clearSessionFiles() {
 }
 
 function buildSessionSnapshot() {
+  const persistedQuoteBasis = typeof canonicalQuoteBasisForPersistence === "function"
+    ? canonicalQuoteBasisForPersistence()
+    : { ...(state.quoteBasis || {}) };
   return {
     version: QUOTE_SESSION_STATE_VERSION,
     browserRecoveryScope: currentBrowserRecoveryScope(),
@@ -3795,7 +3832,7 @@ function buildSessionSnapshot() {
     images: state.images.slice(0, MAX_REFERENCE_IMAGES).map(sessionImageMetadata),
     quoteDetails: quoteDetailsWithSessionLogoMetadata(collectQuoteDetails()),
     workflowStage: state.workflowStage,
-    quoteBasis: state.quoteBasis,
+    quoteBasis: persistedQuoteBasis,
     quoteBasisSections: state.quoteBasisSections,
     lineItems: state.lineItems,
     outputRows: state.outputRows,
@@ -4350,8 +4387,11 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   );
   applyQuoteDetails(restoredQuoteDetails, { includeLogo: true, clearLogo: true });
   state.images = await restoreSessionImages(restoredState.images);
-  state.quoteBasis = cloneQuoteBasis(restoredState.quoteBasis || {});
-  state.quoteBasisSections = normalizeQuoteBasisSections(restoredState.quoteBasisSections || restoredState.quoteBasis || {});
+  const restoredSections = normalizeQuoteBasisSections(restoredState.quoteBasisSections || restoredState.quoteBasis || {});
+  state.quoteBasis = typeof canonicalQuoteBasisForPersistence === "function"
+    ? canonicalQuoteBasisForPersistence(restoredState.quoteBasis || {}, restoredSections)
+    : cloneQuoteBasis(restoredState.quoteBasis || {});
+  state.quoteBasisSections = restoredSections;
   state.lineItems = Array.isArray(restoredState.lineItems) ? restoredState.lineItems.map(normalizeLineItem) : [];
   state.outputRows = Array.isArray(restoredState.outputRows) ? restoredState.outputRows.map(normalizeOutputRow) : [];
   state.originalOutputRows = Array.isArray(restoredState.originalOutputRows) ? restoredState.originalOutputRows.map(normalizeOutputRow) : [];
@@ -6534,6 +6574,7 @@ function splitBasisDecisionText(text = "", defaultTag = "Confirm") {
 }
 
 function normalizeBasisLines(line = "") {
+  if (line && typeof line === "object" && !Array.isArray(line) && typeof canonicalizePrimaryOrderFields === "function") line = canonicalizePrimaryOrderFields(line);
   if (line && typeof line === "object") {
     const quantityParts = normalizedLineTextQuantityParts(
       line.text || line.line || line.description || "",
@@ -6717,6 +6758,7 @@ function reviewBasisProposalSections(nextSections = [], currentSections = []) {
 }
 
 function normalizeOutputRow(row = {}) {
+  row = typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(row) : row;
   const priceMode = row.price_mode === "Included" || String(row.display_price || "").toLowerCase() === "included"
     ? "Included"
     : "Priced";
@@ -8333,7 +8375,7 @@ function buildPayload(options = {}) {
     quote_currency: collectQuoteCurrency(),
     quote_exchange_rate: collectQuoteExchangeRate(),
     user_feedback: state.pendingFeedback,
-    quote_basis: includeDraftContext ? { ...state.quoteBasis, ...quoteBasisFromSections(state.quoteBasisSections) } : {},
+    quote_basis: includeDraftContext ? canonicalQuoteBasisForPersistence() : {},
     quote_basis_sections: includeDraftContext ? cloneQuoteBasisSections(state.quoteBasisSections) : [],
     line_items: includeDraftContext ? (state.outputRows.length ? outputRowsToLineItems(state.outputRows) : state.lineItems) : [],
     analysis_findings: state.analysisFindings,
@@ -8391,7 +8433,7 @@ function buildLineItemNormalizePayload() {
       booth_size: state.boothDimensions.booth_size,
       dimension_source: state.boothDimensions.dimension_source,
     },
-    quote_basis: { ...state.quoteBasis, ...quoteBasisFromSections(state.quoteBasisSections) },
+    quote_basis: canonicalQuoteBasisForPersistence(),
     quote_basis_sections: cloneQuoteBasisSections(state.quoteBasisSections),
     line_items: state.lineItems.map(normalizeLineItem),
   };
@@ -8695,6 +8737,32 @@ function numberOrNull(value) {
   if (String(value).trim().toLowerCase() === "included") return null;
   const numeric = Number(String(value ?? "").replaceAll(",", "").trim());
   return Number.isFinite(numeric) ? numeric : null;
+}
+
+function canonicalPrimaryOrderValue(value) {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value >= 1 ? value : null;
+  }
+  if (typeof value !== "string") return null;
+  const text = value.replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, "");
+  if (!/^[0-9]+$/.test(text)) return null;
+  const significant = text.replace(/^0+/, "");
+  if (!significant) return null;
+  const maximum = "9007199254740991";
+  if (significant.length > maximum.length || (significant.length === maximum.length && significant > maximum)) return null;
+  return Number(significant);
+}
+
+function canonicalizePrimaryOrderFields(row = {}) {
+  if (!row || typeof row !== "object" || Array.isArray(row)) return {};
+  const admitted = { ...row };
+  ["basis_order", "category_order", "item_order"].forEach((field) => {
+    if (!Object.prototype.hasOwnProperty.call(admitted, field)) return;
+    const order = canonicalPrimaryOrderValue(admitted[field]);
+    if (order === null) delete admitted[field];
+    else admitted[field] = order;
+  });
+  return admitted;
 }
 
 function orderNumber(value) {
@@ -9149,6 +9217,7 @@ function outputQuantityPartsFromPricingMatch(row = {}) {
 }
 
 function outputRowFromPricingMatch(row = {}) {
+  row = typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(row) : row;
   const status = pricingMatchStatus(row);
   const amount = String(row.amount ?? "").trim();
   const quantityParts = outputQuantityPartsFromPricingMatch(row);
@@ -9177,6 +9246,7 @@ function outputRowFromPricingMatch(row = {}) {
     pricing_reference_description: referenceDescription,
     pricing_keyword: row.keyword || row.pricing_keyword || "",
     source_basis_line_id: row.source_basis_line_id || "",
+    basis_order: row.basis_order ?? "",
     category_order: row.category_order ?? "",
     item_order: row.item_order ?? "",
     status: row.status,
@@ -9667,11 +9737,13 @@ function renderMatchSummary(result = {}) {
 }
 
 function renderPricingMatches(rows = [], options = {}) {
-  state.pricingMatches = Array.isArray(rows) ? rows : [];
+  state.pricingMatches = (Array.isArray(rows) ? rows : []).map((row) => (
+    typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(row) : row
+  ));
   if (options.fromPricingMatches) {
     state.outputRows = state.pricingMatches.map(outputRowFromPricingMatch);
-  } else if (Array.isArray(rows) && rows.length && rows[0]?.price_mode) {
-    state.outputRows = rows.map(normalizeOutputRow);
+  } else if (state.pricingMatches.length && state.pricingMatches[0]?.price_mode) {
+    state.outputRows = state.pricingMatches.map(normalizeOutputRow);
   }
   state.outputRows = sortOutputRows(state.outputRows);
   if (elements.outputSortMode) elements.outputSortMode.value = state.outputSortMode;
@@ -11086,7 +11158,9 @@ function applyDraftBasis(basis = {}) {
 
 function applyDraftLineItems(lineItems = []) {
   state.basisConfirmed = false;
-  state.lineItems = lineItems.map(normalizeLineItem);
+  state.lineItems = lineItems.map((item) => (
+    typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(item) : item
+  )).map(normalizeLineItem);
   state.outputRows = [];
   state.originalOutputRows = [];
   state.outputErrors = [];
@@ -11096,7 +11170,9 @@ async function refreshLineItemsFromServer() {
   if (!state.lineItems.length) return { ok: true, data: { status: "normalized", line_items: [] } };
   const result = await postJson("/api/line-items/normalize", buildLineItemNormalizePayload());
   if (!result.ok || !Array.isArray(result.data.line_items)) return result;
-  state.lineItems = result.data.line_items.map(normalizeLineItem);
+  state.lineItems = result.data.line_items.map((item) => (
+    typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(item) : item
+  )).map(normalizeLineItem);
   state.outputRows = [];
   state.outputErrors = [];
   return result;

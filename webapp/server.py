@@ -1595,6 +1595,8 @@ def read_dotenv_value(name: str, env_path: Path | None = None) -> str:
     direct = os.environ.get(name)
     if direct not in (None, ""):
         return str(direct)
+    if clean_text(os.environ.get("SQAG_DISABLE_DOTENV")).lower() in {"1", "true", "yes", "on"}:
+        return ""
     path = env_path or PROJECT_ROOT / ".env"
     if not path.exists():
         return ""
@@ -4656,6 +4658,7 @@ def quote_commercial_invalid_unit_price_override(row: dict[str, Any]) -> bool:
 
 
 def quote_commercial_row_from_output_row(row: dict[str, Any]) -> dict[str, Any]:
+    row = canonicalize_primary_order_fields(row)
     price_mode = "Included" if (
         clean_text(row.get("price_mode")).lower() == "included"
         or clean_text(row.get("display_price")).lower() == "included"
@@ -5725,6 +5728,7 @@ def split_basis_decision_text(text: Any, default_tag: Any = "Confirm") -> list[d
 
 def normalize_basis_lines(value: Any) -> list[dict[str, Any]]:
     if isinstance(value, dict):
+        value = canonicalize_primary_order_fields(value)
         quantity_parts = normalized_line_text_quantity_parts(
             value.get("text") or value.get("line") or value.get("description"),
             value.get("quantity"),
@@ -11330,8 +11334,8 @@ class LocalSqagStorage:
     def delete_quote_session(self, session_id: str) -> bool:
         return delete_quote_session(session_id)
 
-    def quote_session_export_artifact(self, session_id: str, kind: str) -> dict[str, Any] | None:
-        _ = session_id, kind
+    def quote_session_export_artifact(self, session_id: str, kind: str, *, require_current_proof: bool = False) -> dict[str, Any] | None:
+        _ = session_id, kind, require_current_proof
         return None
 
     def quote_session_export_file_path(self, session_id: str, kind: str) -> Path | None:
@@ -11340,12 +11344,23 @@ class LocalSqagStorage:
         if not safe_id or not expected_filename:
             return None
         metadata = read_quote_session_metadata(safe_id)
+        if not quote_session_has_current_v2_publication(metadata):
+            return None
         export = metadata.get("exports", {}).get(clean_text(kind).lower()) if metadata else None
         filename = clean_text(export.get("filename")) if isinstance(export, dict) else ""
         if filename != expected_filename:
             return None
         path = quote_session_recorded_export_path(safe_id, clean_text(kind).lower(), metadata)
-        return path if path.exists() and path.is_file() else None
+        if not path.exists() or not path.is_file():
+            return None
+        content = path.read_bytes()
+        try:
+            expected_size = int(export.get("size_bytes") or -1)
+        except (TypeError, ValueError):
+            return None
+        if len(content) != expected_size or hashlib.sha256(content).hexdigest() != clean_text(export.get("sha256")).lower():
+            return None
+        return path
 
 
 @dataclass(frozen=True)
@@ -14224,7 +14239,7 @@ class DatabaseSqagStorage:
             "content": content,
         }
 
-    def quote_session_export_artifact(self, session_id: str, kind: str) -> dict[str, Any] | None:
+    def quote_session_export_artifact(self, session_id: str, kind: str, *, require_current_proof: bool = False) -> dict[str, Any] | None:
         artifact_mode = configured_artifact_storage_mode()
         if artifact_mode not in {"database", "object"}:
             return None
@@ -14234,8 +14249,16 @@ class DatabaseSqagStorage:
         if not safe_id or not expected_filename:
             return None
         metadata, _draft_files = self._read_quote_session_metadata(safe_id)
-        if not quote_session_is_published(metadata):
-            return None
+        if require_current_proof:
+            if not quote_session_has_current_v2_publication(metadata):
+                return None
+            publication_proof = (metadata.get("publication") or {}).get("proof") if isinstance(metadata.get("publication"), dict) else {}
+            proof_subject = publication_proof.get("subject") if isinstance(publication_proof, dict) and isinstance(publication_proof.get("subject"), dict) else {}
+            if (
+                safe_resource_id(proof_subject.get("workspace_id"), "") != self.workspace_id
+                or safe_resource_id(proof_subject.get("owner_id"), "") != safe_resource_id(self._quote_session_owner_id(metadata), "")
+            ):
+                return None
         export = metadata.get("exports", {}).get(safe_kind) if metadata else None
         if not isinstance(export, dict) or clean_text(export.get("filename")) != expected_filename:
             return None
@@ -14326,7 +14349,11 @@ class DatabaseSqagStorage:
             public["exports"][kind] = export
         public["status"]["draft_modified"] = bool(has_stale_export and not has_available_export)
         if has_stale_export and not has_available_export:
-            public["status"]["quote_generated"] = False
+            source_status = metadata.get("status") if isinstance(metadata.get("status"), dict) else {}
+            public["status"]["quote_generated"] = bool(
+                source_status.get("quote_generated") is True
+                and not quote_session_has_current_v2_publication(metadata)
+            )
         elif has_available_export:
             public["status"]["quote_generated"] = True
         else:
@@ -14998,6 +15025,18 @@ class DatabaseSqagStorage:
                     status=503,
                     reason="object_artifact_storage_unavailable",
                 )
+            publication_authority = result.get("_publication_authority")
+            if isinstance(publication_authority, dict) and publication_authority:
+                metadata["publication"]["proof"] = quote_session_publication_proof(
+                    metadata,
+                    patch,
+                    publication_id=run_id,
+                    run_id=run_id,
+                    job_id=job_id,
+                    workspace_id=self.workspace_id,
+                    owner_id=self.user_id,
+                    authority=publication_authority,
+                )
             return {
                 "metadata": metadata,
                 "pending_artifacts": pending_artifacts,
@@ -15219,6 +15258,18 @@ class DatabaseSqagStorage:
                 metadata["publication"].update(
                     quote_session_publication_freshness_proof(patch)
                 )
+                publication_authority = (result or {}).get("_publication_authority")
+                if isinstance(publication_authority, dict) and publication_authority:
+                    metadata["publication"]["proof"] = quote_session_publication_proof(
+                        metadata,
+                        patch,
+                        publication_id=safe_reference(generation_run_id, "run-") or new_quote_publication_id(),
+                        run_id=generation_run_id,
+                        job_id=generation_job_id,
+                        workspace_id=self.workspace_id,
+                        owner_id=self.user_id,
+                        authority=publication_authority,
+                    )
                 metadata["status"]["quote_generated"] = bool(publish)
                 for kind in QUOTE_SESSION_EXPORT_KINDS:
                     metadata["status"][f"{kind}_exported"] = bool(
@@ -15274,6 +15325,7 @@ class DatabaseSqagStorage:
                         metadata,
                         patch,
                         storage=self,
+                        authority=database_current_publication_authority(self, payload),
                     ),
                 )
             normalized = normalized_quote_session_metadata(metadata)
@@ -15452,6 +15504,18 @@ class DatabaseSqagStorage:
             metadata["publication"].update(
                 quote_session_publication_freshness_proof(patch)
             )
+            publication_authority = (result or {}).get("_publication_authority")
+            if isinstance(publication_authority, dict) and publication_authority:
+                metadata["publication"]["proof"] = quote_session_publication_proof(
+                    metadata,
+                    patch,
+                    publication_id=safe_reference(generation_run_id, "run-") or new_quote_publication_id(),
+                    run_id=generation_run_id,
+                    job_id=generation_job_id,
+                    workspace_id=self.workspace_id,
+                    owner_id=self.user_id,
+                    authority=publication_authority,
+                )
             metadata["status"]["quote_generated"] = bool(publish)
             for kind in QUOTE_SESSION_EXPORT_KINDS:
                 metadata["status"][f"{kind}_exported"] = bool(publish and metadata["exports"].get(kind, {}).get("filename"))
@@ -15475,6 +15539,7 @@ class DatabaseSqagStorage:
                         metadata,
                         patch,
                         storage=self,
+                        authority=database_current_publication_authority(self, payload),
                     ),
                 )
             normalized = normalized_quote_session_metadata(metadata)
@@ -15699,6 +15764,8 @@ class DatabaseSqagStorage:
             ("superseded", now, self.workspace_id, safe_id, "published", safe_run_id),
         )
         metadata["publication"]["state"] = "published"
+        metadata["publication"]["run_id"] = safe_run_id
+        metadata["publication"]["job_id"] = safe_reference(version["job_id"], "job-")
         metadata["publication"]["error_code"] = ""
         metadata["publication"].pop("pending_run_id", None)
         metadata["publication"].pop("pending_job_id", None)
@@ -18418,6 +18485,7 @@ def resolve_tied_catalog_attribute_item(query_text: str, items: list[dict[str, A
 
 
 def normalize_owned_line_item(raw: dict[str, Any], *, exchange_rate: float | None = None) -> dict[str, Any] | None:
+    raw = canonicalize_primary_order_fields(raw)
     display_price = clean_text(raw.get("display_price"))
     price_mode = clean_text(raw.get("price_mode")).title()
     if clean_text(raw.get("unit_price_override")).lower() == "included" or display_price.lower() == "included":
@@ -18439,8 +18507,8 @@ def normalize_owned_line_item(raw: dict[str, Any], *, exchange_rate: float | Non
         "price_mode": price_mode,
         "source_basis_line_id": safe_resource_id(raw.get("source_basis_line_id"), ""),
     }
-    for order_key in ("category_order", "item_order", "basis_order"):
-        order_value = pricing_reference_order_number(raw.get(order_key))
+    for order_key in PRIMARY_ORDER_FIELDS:
+        order_value = raw.get(order_key)
         if order_value is not None:
             item[order_key] = order_value
     for key in ("reference_section", "status"):
@@ -18545,6 +18613,7 @@ def normalize_line_items(
     for raw in raw_items:
         if not isinstance(raw, dict):
             continue
+        raw = canonicalize_primary_order_fields(raw)
         display_price = clean_text(raw.get("display_price"))
         pricing_keyword = clean_text(raw.get("pricing_keyword"))
         catalog_item = catalog_lookup.get(pricing_keyword)
@@ -18615,9 +18684,11 @@ def normalize_line_items(
             "source_basis_line_id": safe_resource_id(raw.get("source_basis_line_id"), ""),
         }
         for order_key in ("category_order", "item_order"):
-            order_value = pricing_reference_order_number((catalog_item or {}).get(order_key)) or pricing_reference_order_number(raw.get(order_key))
+            order_value = pricing_reference_order_number((catalog_item or {}).get(order_key)) or raw.get(order_key)
             if order_value is not None:
                 item[order_key] = order_value
+        if raw.get("basis_order") is not None:
+            item["basis_order"] = raw["basis_order"]
         if catalog_item and clean_text(catalog_item.get("reference_section")):
             item["reference_section"] = clean_basis_section_title(catalog_item.get("reference_section"))
         if unit_price_override is not None:
@@ -18668,6 +18739,26 @@ def normalize_line_items(
                     item["pricing_reference_id"] = basis_id
                 if basis_digest:
                     item["pricing_basis_digest"] = basis_digest
+        elif (
+            price_mode == "Priced"
+            and catalog_item is None
+            and unit_price_override is not None
+            and unit_price_override >= 0
+            and quantity is not None
+            and quantity > 0
+            and bool(description)
+            and bool(unit)
+        ):
+            item["status"] = "manual-price"
+            item["effective_unit_price"] = unit_price_override
+            basis_amount = round_commercial_cents(quantity * unit_price_override)
+            item["pricing_basis_amount"] = basis_amount
+            exchange_rate = quote_exchange_rate_from_payload(payload) or 1
+            item["approved_quote_amount"] = round_commercial_cents(basis_amount * exchange_rate)
+            item["pricing_basis_currency"] = authority_currency
+            item["pricing_reference_source"] = authority_source
+            item["pricing_reference_id"] = authority_id
+            item["pricing_basis_digest"] = authority_digest
         if not item["source_basis_line_id"]:
             item.pop("source_basis_line_id", None)
         if display_price:
@@ -22993,6 +23084,84 @@ QUOTE_SESSION_DRAFT_STATE_STRIP_KEYS = {
     "stderr",
 }
 
+QUOTE_BASIS_LEGACY_ORDER = (
+    "surfaces",
+    "counters",
+    "platform",
+    "graphics",
+    "furniture",
+    "electrical",
+)
+QUOTE_BASIS_KEY_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+QUOTE_BASIS_UNSAFE_KEYS = {"__proto__", "constructor", "prototype"}
+PRIMARY_ORDER_FIELDS = ("basis_order", "category_order", "item_order")
+PRIMARY_ORDER_MAX = 9007199254740991
+PRIMARY_ORDER_MAX_TEXT = str(PRIMARY_ORDER_MAX)
+PRIMARY_ORDER_ASCII_DIGITS_RE = re.compile(r"[0-9]+\Z")
+
+
+def canonical_quote_basis(value: Any) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("Quote basis must be a plain string map.")
+    admitted: dict[str, str] = {}
+    for key, raw_text in value.items():
+        if (
+            not isinstance(key, str)
+            or not 1 <= len(key) <= 80
+            or QUOTE_BASIS_KEY_RE.fullmatch(key) is None
+            or key in QUOTE_BASIS_UNSAFE_KEYS
+        ):
+            raise ValueError("Quote basis contains an invalid key.")
+        if not isinstance(raw_text, str):
+            raise ValueError("Quote basis values must be strings.")
+        text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+        if text != "":
+            admitted[key] = text
+    ordered_keys = [key for key in QUOTE_BASIS_LEGACY_ORDER if key in admitted]
+    ordered_keys.extend(sorted(key for key in admitted if key not in QUOTE_BASIS_LEGACY_ORDER))
+    return {key: admitted[key] for key in ordered_keys}
+
+
+def canonical_primary_order_value(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 1 <= value <= PRIMARY_ORDER_MAX else None
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+        number = int(value)
+        return number if 1 <= number <= PRIMARY_ORDER_MAX else None
+    if not isinstance(value, str):
+        return None
+    text = value.strip(" \t\r\n")
+    if not text or PRIMARY_ORDER_ASCII_DIGITS_RE.fullmatch(text) is None:
+        return None
+    significant = text.lstrip("0")
+    if not significant:
+        return None
+    if len(significant) > len(PRIMARY_ORDER_MAX_TEXT):
+        return None
+    if len(significant) == len(PRIMARY_ORDER_MAX_TEXT) and significant > PRIMARY_ORDER_MAX_TEXT:
+        return None
+    return int(significant, 10)
+
+
+def canonicalize_primary_order_fields(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    admitted = dict(value)
+    for field in PRIMARY_ORDER_FIELDS:
+        if field in admitted:
+            order = canonical_primary_order_value(admitted[field])
+            if order is None:
+                admitted.pop(field, None)
+            else:
+                admitted[field] = order
+    return admitted
+
 
 def quote_session_draft_state_value(value: Any, depth: int = 0) -> Any:
     if depth > 8:
@@ -23017,6 +23186,16 @@ def quote_session_draft_state_value(value: Any, depth: int = 0) -> Any:
                 or key_kind in {"authorization", "auth_code", "state"}
             ):
                 continue
+            if key in sanitized:
+                raise ValueError("Draft state contains colliding keys.")
+            if key in PRIMARY_ORDER_FIELDS:
+                order = canonical_primary_order_value(raw_value)
+                if order is not None:
+                    sanitized[key] = order
+                continue
+            if key in {"quoteBasis", "quote_basis"}:
+                sanitized[key] = canonical_quote_basis(raw_value)
+                continue
             sanitized[key] = quote_session_draft_state_value(raw_value, depth + 1)
         return sanitized
     return dashboard_safe_text(value, 5000)
@@ -23028,6 +23207,19 @@ def quote_session_draft_state(patch: dict[str, Any]) -> dict[str, Any]:
     sanitized = quote_session_draft_state_value(supplied)
     if not isinstance(sanitized, dict):
         return {}
+    if "quoteBasis" in sanitized:
+        sanitized["quoteBasis"] = canonical_quote_basis(sanitized["quoteBasis"])
+    sections = sanitized.get("quoteBasisSections")
+    if isinstance(sections, list) and sections:
+        section_basis = canonical_quote_basis(
+            quote_basis_from_sections(
+                normalize_quote_basis_sections({"quote_basis_sections": sections})
+            )
+        )
+        basis = sanitized.get("quoteBasis") if isinstance(sanitized.get("quoteBasis"), dict) else {}
+        if basis and basis != section_basis:
+            raise ValueError("Quote basis sections do not agree with quote basis.")
+        sanitized["quoteBasis"] = section_basis
     if not saved.malformed and saved.review_valid and isinstance(saved.review, dict):
         sanitized["quoteCommercialReview"] = copy.deepcopy(saved.review)
         sanitized.pop("quote_commercial_review", None)
@@ -23049,27 +23241,45 @@ QUOTE_SESSION_FRESHNESS_VOLATILE_KEYS = {
     "outputRevision",
 }
 
+QUOTE_SESSION_COMMERCIAL_STATE_SCHEMA = "swooshz.sqag.commercial-state.v1"
+QUOTE_SESSION_PUBLICATION_PROOF_SCHEMA = "swooshz.sqag.quote-publication-proof.v2"
+QUOTE_SESSION_COMMERCIAL_KEYS = {
+    "profileId",
+    "pricingReferenceId",
+    "pricingReferenceSource",
+    "images",
+    "quoteDetails",
+    "quoteBasis",
+    "quoteBasisSections",
+    "lineItems",
+    "outputRows",
+    "boothDimensions",
+    "quoteCommercialSnapshot",
+}
+
 
 def quote_session_freshness_draft_state(draft_state: Any) -> dict[str, Any]:
     sanitized = quote_session_draft_state_value(draft_state)
     if not isinstance(sanitized, dict):
         return {}
+    return {key: sanitized[key] for key in sorted(QUOTE_SESSION_COMMERCIAL_KEYS) if key in sanitized}
+
+
+def quote_session_commercial_state(patch: dict[str, Any]) -> dict[str, Any]:
+    draft_state = quote_session_draft_state(patch)
     return {
-        key: value
-        for key, value in sanitized.items()
-        if key not in QUOTE_SESSION_FRESHNESS_VOLATILE_KEYS
+        "schema": QUOTE_SESSION_COMMERCIAL_STATE_SCHEMA,
+        "commercial": quote_session_freshness_draft_state(draft_state),
     }
 
 
 def quote_session_publication_freshness_proof(patch: dict[str, Any]) -> dict[str, Any]:
     draft_state = quote_session_draft_state(patch)
+    commercial_state = quote_session_commercial_state(patch)
     return {
-        "committed_draft_state_digest": quote_session_safe_digest(
-            quote_session_freshness_draft_state(draft_state)
-        ),
-        "committed_output_revision": quote_session_revision_number(
-            draft_state.get("outputRevision"), -1
-        ),
+        "commercial_state_schema": QUOTE_SESSION_COMMERCIAL_STATE_SCHEMA,
+        "commercial_state_digest": quote_session_safe_digest(commercial_state),
+        "output_revision": quote_session_revision_number(draft_state.get("outputRevision"), -1),
     }
 
 
@@ -23084,21 +23294,238 @@ def quote_session_publication_freshness_proof_matches(
     if not draft_state:
         return False
     publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
-    committed_digest = clean_text(publication.get("committed_draft_state_digest")).lower()
+    proof = publication.get("proof") if isinstance(publication.get("proof"), dict) else {}
+    if (
+        proof.get("schema") != QUOTE_SESSION_PUBLICATION_PROOF_SCHEMA
+        or proof.get("version") != 2
+        or proof.get("commercial_state_schema") != QUOTE_SESSION_COMMERCIAL_STATE_SCHEMA
+    ):
+        return False
+    subject = proof.get("subject") if isinstance(proof.get("subject"), dict) else {}
+    if safe_quote_session_id(subject.get("session_id"), "") != safe_quote_session_id(metadata.get("session_id"), ""):
+        return False
+    proof_artifacts = proof.get("artifacts") if isinstance(proof.get("artifacts"), dict) else {}
+    try:
+        if quote_publication_artifact_proof(metadata.get("exports")) != proof_artifacts:
+            return False
+    except ValueError:
+        return False
+    committed_digest = clean_text(proof.get("commercial_state_digest")).lower()
     if not re.fullmatch(r"[0-9a-f]{64}", committed_digest):
         return False
     committed_revision = quote_session_revision_number(
-        publication.get("committed_output_revision"), -2
+        proof.get("output_revision"), -2
     )
     candidate_revision = quote_session_revision_number(
         draft_state.get("outputRevision"), -2
     )
     if committed_revision != candidate_revision:
         return False
-    candidate_digest = quote_session_safe_digest(
-        quote_session_freshness_draft_state(draft_state)
-    )
+    candidate_digest = quote_session_safe_digest(quote_session_commercial_state(patch))
     return hmac.compare_digest(committed_digest, candidate_digest)
+
+
+def quote_publication_artifact_proof(exports: Any) -> dict[str, Any]:
+    admitted: dict[str, Any] = {}
+    source = exports if isinstance(exports, dict) else {}
+    for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
+        item = source.get(kind)
+        if not isinstance(item, dict) or clean_text(item.get("filename")) != filename:
+            continue
+        digest = clean_text(item.get("sha256")).lower()
+        try:
+            size_bytes = int(item.get("size_bytes") or -1)
+        except (TypeError, ValueError):
+            continue
+        if size_bytes <= 0 or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            continue
+        admitted[kind] = {
+            "filename": filename,
+            "content_type": (
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                if kind == "xlsx"
+                else "application/pdf"
+            ),
+            "size_bytes": size_bytes,
+            "sha256": digest,
+        }
+    if "xlsx" not in admitted:
+        raise ValueError("Quotation XLSX publication evidence is missing.")
+    return admitted
+
+
+def quote_session_publication_proof(
+    metadata: dict[str, Any],
+    patch: dict[str, Any],
+    *,
+    publication_id: str,
+    run_id: str = "",
+    job_id: str = "",
+    workspace_id: str = "",
+    owner_id: str = "",
+    authority: Any = None,
+) -> dict[str, Any]:
+    authority = authority if isinstance(authority, dict) else {}
+    pricing = authority.get("pricing_reference") if isinstance(authority.get("pricing_reference"), dict) else {}
+    profile = authority.get("profile") if isinstance(authority.get("profile"), dict) else {}
+    freshness = quote_session_publication_freshness_proof(patch)
+    session_id = safe_quote_session_id(metadata.get("session_id"), "")
+    safe_publication = safe_quote_publication_id(publication_id, "") or safe_reference(run_id, "run-")
+    digest_hex = lambda value: clean_text(value).lower().removeprefix("sha256:")
+    proof = {
+        "schema": QUOTE_SESSION_PUBLICATION_PROOF_SCHEMA,
+        "version": 2,
+        "commercial_state_schema": QUOTE_SESSION_COMMERCIAL_STATE_SCHEMA,
+        "commercial_state_digest": freshness["commercial_state_digest"],
+        "output_revision": freshness["output_revision"],
+        "publication": {
+            "id": safe_publication,
+            "run_id": safe_reference(run_id, "run-"),
+            "job_id": safe_reference(job_id, "job-"),
+        },
+        "subject": {
+            "session_id": session_id,
+            "scope": "workspace",
+            "workspace_id": safe_resource_id(workspace_id, ""),
+            "owner_id": safe_resource_id(owner_id, ""),
+        },
+        "pricing_reference": {
+            "id": safe_resource_id(pricing.get("id"), ""),
+            "source": clean_text(pricing.get("source")),
+            "digest": digest_hex(pricing.get("digest")),
+        },
+        "profile": {
+            "id": profile_identity_value(profile.get("id"), profile.get("source")),
+            "digest": digest_hex(profile.get("digest")),
+            "layout_digest": digest_hex(profile.get("layout_digest")),
+            "layout_rules_digest": digest_hex(profile.get("layout_rules_digest")),
+        },
+        "artifacts": quote_publication_artifact_proof(metadata.get("exports")),
+    }
+    required_digests = [
+        proof["pricing_reference"]["digest"],
+        proof["profile"]["digest"],
+        proof["profile"]["layout_digest"],
+        proof["profile"]["layout_rules_digest"],
+    ]
+    if (
+        not session_id
+        or not safe_publication
+        or proof["output_revision"] < 0
+        or not proof["pricing_reference"]["id"]
+        or proof["pricing_reference"]["source"] not in PRICING_REFERENCE_SOURCES
+        or not proof["profile"]["id"]
+        or any(re.fullmatch(r"[0-9a-f]{64}", digest) is None for digest in required_digests)
+    ):
+        raise ValueError("Quote publication authority evidence is incomplete.")
+    return proof
+
+
+def local_publication_authority_for_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    authority = exact_pricing_reference_authority(payload)
+    detail = authority.get("detail") if isinstance(authority.get("detail"), dict) else {}
+    profile = profile_defaults_source_for_payload(payload)
+    if profile is None:
+        return {}
+    profile_snapshot = copy.deepcopy(profile.config if isinstance(profile, ProfilePack) else profile)
+    profile_snapshot.pop("pack", None)
+    layout_path = profile.quotation_layout_path if isinstance(profile, ProfilePack) else None
+    if not isinstance(layout_path, Path) or not layout_path.is_file():
+        return {}
+    layout_bytes = layout_path.read_bytes()
+    layout_rules = embedded_layout_rules_from_xlsx_bytes(layout_bytes)
+    if not layout_rules and isinstance(profile, ProfilePack) and profile.layout_rules_path.suffix.lower() == ".json":
+        layout_rules = load_json_file(profile.layout_rules_path)
+    profile_id = explicit_profile_id_from_payload(payload)
+    return {
+        "pricing_reference": {
+            "id": authority.get("id"),
+            "source": authority.get("source"),
+            "digest": detail.get("digest_sha256"),
+        },
+        "profile": {
+            "id": profile_id,
+            "source": profile_identity_parts(profile_id)[0],
+            "digest": hashlib.sha256(json.dumps(profile_snapshot, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
+            "layout_digest": hashlib.sha256(layout_bytes).hexdigest(),
+            "layout_rules_digest": hashlib.sha256(json.dumps(layout_rules, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
+        },
+    }
+
+
+def database_publication_authority_for_payload(
+    storage: "DatabaseSqagStorage",
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    selection = explicit_pricing_reference_selection(payload)
+    profile_id = explicit_profile_id_from_payload(payload)
+    if not selection.get("ok") or not profile_id:
+        return {}
+    profile_source, raw_profile_id = profile_identity_parts(profile_id)
+    profile_detail = storage.profile_detail(raw_profile_id, source="company")
+    pricing_detail = storage.pricing_reference_detail(selection["id"], source=selection["source"])
+    if not isinstance(profile_detail, dict) or not isinstance(pricing_detail, dict):
+        return {}
+    layout = storage.profile_layout_artifact(raw_profile_id)
+    layout_bytes = layout.get("content") if isinstance(layout, dict) and isinstance(layout.get("content"), bytes) else b""
+    if not layout_bytes:
+        return {}
+    layout_rules = embedded_layout_rules_from_xlsx_bytes(layout_bytes)
+    profile_snapshot = copy.deepcopy(profile_detail)
+    profile_snapshot.pop("pack", None)
+    return {
+        "pricing_reference": {
+            "id": selection["id"],
+            "source": selection["source"],
+            "digest": pricing_detail.get("digest_sha256") or pricing_reference_catalog_digest(pricing_detail),
+        },
+        "profile": {
+            "id": profile_id,
+            "source": profile_source,
+            "digest": hashlib.sha256(json.dumps(profile_snapshot, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
+            "layout_digest": hashlib.sha256(layout_bytes).hexdigest(),
+            "layout_rules_digest": hashlib.sha256(json.dumps(layout_rules, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
+        },
+    }
+
+
+def quote_session_publication_authority_matches(metadata: dict[str, Any], authority: Any) -> bool:
+    if not isinstance(authority, dict):
+        return False
+    publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
+    proof = publication.get("proof") if isinstance(publication.get("proof"), dict) else {}
+    for section, fields in (
+        ("pricing_reference", ("id", "source", "digest")),
+        ("profile", ("id", "digest", "layout_digest", "layout_rules_digest")),
+    ):
+        expected = proof.get(section) if isinstance(proof.get(section), dict) else {}
+        current = authority.get(section) if isinstance(authority.get(section), dict) else {}
+        current_values = dict(current)
+        if section == "profile":
+            current_values["id"] = profile_identity_value(current.get("id"), current.get("source"))
+        for digest_field in ("digest", "layout_digest", "layout_rules_digest"):
+            if digest_field in current_values:
+                current_values[digest_field] = clean_text(current_values[digest_field]).lower().removeprefix("sha256:")
+        if any(clean_text(expected.get(field)).lower() != clean_text(current_values.get(field)).lower() for field in fields):
+            return False
+    return True
+
+
+def local_current_publication_authority(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return local_publication_authority_for_payload(payload)
+    except (OSError, ValueError, SqagStorageAccessError):
+        return {}
+
+
+def database_current_publication_authority(
+    storage: "DatabaseSqagStorage",
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        return database_publication_authority_for_payload(storage, payload)
+    except (OSError, ValueError, SqagStorageAccessError):
+        return {}
 
 
 class EmptyReferenceFileError(ValueError):
@@ -23455,6 +23882,14 @@ def quote_session_export_is_stale(metadata: dict[str, Any], export: dict[str, An
         return False
     if not clean_text(export.get("filename")):
         return False
+    publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
+    proof = publication.get("proof") if isinstance(publication.get("proof"), dict) else {}
+    if (
+        proof.get("schema") != QUOTE_SESSION_PUBLICATION_PROOF_SCHEMA
+        or proof.get("version") != 2
+        or proof.get("commercial_state_schema") != QUOTE_SESSION_COMMERCIAL_STATE_SCHEMA
+    ):
+        return True
     if export.get("stale") is True:
         return True
     if export.get("stale") is False:
@@ -23479,11 +23914,14 @@ def quote_session_authoritative_current_export_kinds(
     patch: dict[str, Any],
     *,
     storage: LocalSqagStorage | DatabaseSqagStorage | None,
+    authority: dict[str, Any] | None = None,
 ) -> set[str]:
     status = patch.get("status") if isinstance(patch.get("status"), dict) else {}
     if status.get("quote_generated") is not True:
         return set()
     if not quote_session_publication_freshness_proof_matches(metadata, patch):
+        return set()
+    if not quote_session_publication_authority_matches(metadata, authority):
         return set()
     publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
     if clean_text(publication.get("state")).lower() != "published":
@@ -23509,7 +23947,7 @@ def quote_session_authoritative_current_export_kinds(
         if expected_size <= 0:
             continue
         if isinstance(storage, DatabaseSqagStorage):
-            artifact = storage.quote_session_export_artifact(session_id, kind)
+            artifact = storage.quote_session_export_artifact(session_id, kind, require_current_proof=True)
             if not isinstance(artifact, dict):
                 continue
             try:
@@ -23541,6 +23979,18 @@ def quote_session_authoritative_current_export_kinds(
         if len(content) == expected_size and hashlib.sha256(content).hexdigest() == expected_digest:
             current.add(kind)
     return current
+
+
+def quote_session_has_current_v2_publication(metadata: dict[str, Any]) -> bool:
+    if not quote_session_is_published(metadata):
+        return False
+    return quote_session_publication_freshness_proof_matches(
+        metadata,
+        {
+            "status": copy.deepcopy(metadata.get("status")) if isinstance(metadata.get("status"), dict) else {},
+            "draft_state": copy.deepcopy(metadata.get("draft_state")) if isinstance(metadata.get("draft_state"), dict) else {},
+        },
+    )
 
 
 def mark_quote_session_exports_stale(metadata: dict[str, Any], preserve_kinds: set[str] | None = None) -> None:
@@ -23672,6 +24122,8 @@ def commit_local_quote_publication(
     staged_publication: dict[str, Any],
     *,
     freshness_proof: dict[str, Any] | None = None,
+    patch: dict[str, Any] | None = None,
+    authority: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     publication_id = safe_quote_publication_id(
         staged_publication.get("publication_id"),
@@ -23707,15 +24159,13 @@ def commit_local_quote_publication(
     }
     if staged_publication.get("draft_files_bound") is True:
         metadata["publication"]["draft_files_publication_id"] = publication_id
-    if isinstance(freshness_proof, dict):
-        metadata["publication"].update({
-            "committed_draft_state_digest": clean_text(
-                freshness_proof.get("committed_draft_state_digest")
-            ).lower(),
-            "committed_output_revision": quote_session_revision_number(
-                freshness_proof.get("committed_output_revision"), -1
-            ),
-        })
+    if isinstance(patch, dict):
+        metadata["publication"]["proof"] = quote_session_publication_proof(
+            metadata,
+            patch,
+            publication_id=publication_id,
+            authority=authority,
+        )
     committed = write_quote_session_metadata(metadata)
     metadata.clear()
     metadata.update(committed)
@@ -23846,6 +24296,8 @@ def create_or_update_quote_session(
                 metadata,
                 staged_publication,
                 freshness_proof=quote_session_publication_freshness_proof(patch),
+                patch=patch,
+                authority=(result or {}).get("_publication_authority") or local_publication_authority_for_payload(payload),
             )
         else:
             if draft_state_supplied and draft_file_records is not None:
@@ -23857,6 +24309,7 @@ def create_or_update_quote_session(
                     metadata,
                     patch,
                     storage=storage,
+                    authority=local_current_publication_authority(payload),
                 ),
             )
             committed = write_quote_session_metadata(metadata)
@@ -26212,6 +26665,44 @@ def _run_quote_job(
         "pdf_mode": normalized_pdf_mode,
         "errors": errors_for_response,
     }
+    profile_snapshot_for_publication = copy.deepcopy(profile.config if isinstance(profile, ProfilePack) else profile)
+    profile_snapshot_for_publication.pop("pack", None)
+    pricing_snapshot_for_publication = load_json_file(pricing_catalog_path)
+    layout_bytes_for_publication = layout_template_path.read_bytes()
+    layout_rules_for_publication = embedded_layout_rules_from_xlsx_bytes(layout_bytes_for_publication)
+    if not layout_rules_for_publication and isinstance(profile, ProfilePack) and profile.layout_rules_path.suffix.lower() == ".json":
+        layout_rules_for_publication = load_json_file(profile.layout_rules_path)
+    selected_pricing = explicit_pricing_reference_selection(payload)
+    selected_profile_id = explicit_profile_id_from_payload(payload)
+    publication_patch = quote_session_patch_payload(payload)
+    publication_draft_state = quote_session_draft_state(publication_patch)
+    if (
+        result_has_generated_quote(result)
+        and isinstance(payload.get("quote_session"), dict)
+        and quote_session_revision_number(publication_draft_state.get("outputRevision"), -1) < 0
+    ):
+        request_draft_state = payload["quote_session"].get("draft_state")
+        if not isinstance(request_draft_state, dict):
+            request_draft_state = {}
+            payload["quote_session"]["draft_state"] = request_draft_state
+        request_draft_state["outputRevision"] = 0
+        publication_patch = quote_session_patch_payload(payload)
+        publication_draft_state = quote_session_draft_state(publication_patch)
+    if quote_session_revision_number(publication_draft_state.get("outputRevision"), -1) >= 0:
+        result["_publication_authority"] = {
+            "pricing_reference": {
+                "id": selected_pricing.get("id") if selected_pricing.get("ok") else "",
+                "source": selected_pricing.get("source") if selected_pricing.get("ok") else "",
+                "digest": pricing_reference_catalog_digest(pricing_snapshot_for_publication),
+            },
+            "profile": {
+                "id": selected_profile_id,
+                "source": profile_identity_parts(selected_profile_id)[0],
+                "digest": hashlib.sha256(json.dumps(profile_snapshot_for_publication, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
+                "layout_digest": hashlib.sha256(layout_bytes_for_publication).hexdigest(),
+                "layout_rules_digest": hashlib.sha256(json.dumps(layout_rules_for_publication, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
+            },
+        }
     if error_reference:
         result["error_reference"] = error_reference
     publication_storage: DatabaseSqagStorage | None = None
@@ -26456,6 +26947,7 @@ def _run_quote_job(
     finalized.pop("_forensic_transient_files", None)
     finalized.pop("_committed_publication_artifacts", None)
     finalized.pop("_post_commit_projection_failure", None)
+    finalized.pop("_publication_authority", None)
     return finalized
 
 
@@ -28526,7 +29018,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         if not safe_id or not expected_filename:
             self.send_json({"error": "Not found"}, status=404)
             return
-        artifact = storage.quote_session_export_artifact(safe_id, normalized_kind)
+        artifact = storage.quote_session_export_artifact(safe_id, normalized_kind, require_current_proof=True)
         if artifact is not None:
             content_type = clean_text(artifact.get("content_type")) or QUOTE_SESSION_EXPORT_CONTENT_TYPES.get(normalized_kind, "application/octet-stream")
             body = bytes(artifact.get("content") or b"")
@@ -28680,7 +29172,14 @@ def main() -> int:
         if configured_app_mode() == "deploy":
             return 2
     server = ThreadingHTTPServer((args.host, args.port), QuoteRunnerHandler)
-    safe_stdout(f"Swooshz Quote Generator listening on http://{args.host}:{args.port}/")
+    server_address = getattr(server, "server_address", ())
+    if isinstance(server_address, tuple) and len(server_address) >= 2:
+        bound_host, bound_port = server_address[:2]
+    else:
+        bound_host, bound_port = args.host, args.port
+    endpoint = f"http://{bound_host}:{bound_port}"
+    safe_stdout(f"SQAG_SERVER_ENDPOINT={endpoint}\n")
+    safe_stdout(f"Swooshz Quote Generator listening on {endpoint}/")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
