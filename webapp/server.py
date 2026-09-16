@@ -14154,6 +14154,7 @@ class DatabaseSqagStorage:
         *,
         connection: Any | None = None,
         include_content: bool = True,
+        allowed_states: frozenset[str] = frozenset({"published"}),
     ) -> dict[str, Any] | None:
         safe_id = safe_quote_session_id(session_id, "")
         safe_run_id = safe_reference(run_id, "run-")
@@ -14166,6 +14167,25 @@ class DatabaseSqagStorage:
             or not expected_filename
             or not version
             or clean_text(version["session_id"]) != safe_id
+            or clean_text(version["state"]) not in allowed_states
+        ):
+            return None
+        try:
+            version_metadata = json.loads(str(version["metadata_json"] or ""))
+        except (TypeError, json.JSONDecodeError):
+            return None
+        version_export = (
+            version_metadata.get("exports", {}).get(safe_kind)
+            if isinstance(version_metadata, dict)
+            and isinstance(version_metadata.get("exports"), dict)
+            else None
+        )
+        if (
+            not isinstance(version_export, dict)
+            or version_export.get("filename") != expected_filename
+            or version_export.get("stale") is True
+            or version_export.get("superseded") is True
+            or version_export.get("state") == "superseded"
         ):
             return None
         artifact_source = clean_text(version["artifact_source"])
@@ -14282,7 +14302,12 @@ class DatabaseSqagStorage:
                 or export.get("stale") is True
             ):
                 return None
-            artifact = self._publication_version_artifact(safe_id, safe_run_id, safe_kind)
+            artifact = self._publication_version_artifact(
+                safe_id,
+                safe_run_id,
+                safe_kind,
+                allowed_states=frozenset({"published", "superseded"}),
+            )
             if artifact is None:
                 return None
             return artifact
@@ -15753,7 +15778,11 @@ class DatabaseSqagStorage:
                 continue
             artifact = (
                 self._publication_version_artifact(
-                    safe_id, effective_run_id, kind, include_content=False,
+                    safe_id,
+                    effective_run_id,
+                    kind,
+                    include_content=False,
+                    allowed_states=frozenset({"staged", "published"}),
                 )
                 if effective_run_id and self._publication_version_row(effective_run_id) is not None
                 else self._quote_artifact_metadata(safe_id, kind)
@@ -15850,7 +15879,11 @@ class DatabaseSqagStorage:
             ):
                 raise ValueError("Staged artifact evidence does not match publication metadata.")
             artifact = self._publication_version_artifact(
-                safe_id, safe_run_id, kind, connection=connection,
+                safe_id,
+                safe_run_id,
+                kind,
+                connection=connection,
+                allowed_states=frozenset({"staged"}),
             )
             if (
                 artifact is None
@@ -23427,6 +23460,61 @@ QUOTE_SESSION_COMMERCIAL_OUTPUT_ROW_FIELDS = (
     "pricing_reference_id",
     "pricing_basis_digest",
 )
+QUOTE_SESSION_COMMERCIAL_TRANSIENT_FIELDS = {
+    "active_job",
+    "download_url",
+    "job_id",
+    "job_state",
+    "logo_session_file_key",
+    "recovery_file_key",
+    "selected",
+    "session_file_key",
+    "temp_path",
+    "temporary",
+    "workflow_state",
+    "workflow_stage",
+}
+QUOTE_SESSION_COMMERCIAL_BASIS_SECTION_FIELDS = (
+    "id",
+    "title",
+    "basis_order",
+    "category_order",
+    "item_order",
+    "section_order",
+)
+QUOTE_SESSION_COMMERCIAL_BASIS_LINE_FIELDS = (
+    "id",
+    "tag",
+    "text",
+    "include",
+    "quantity",
+    "unit",
+    "custom_pricing",
+    "custom_confirmed",
+    "manual_pricing",
+    "pricing_keyword",
+    "catalog_unit_price",
+    "catalog_description",
+    "pricing_reference_description",
+    "source_line_item_id",
+    "basis_order",
+    "category_order",
+    "item_order",
+    "pricing_status",
+    "pricing_tag",
+)
+
+
+def quote_session_commercial_projection_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return [quote_session_commercial_projection_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: quote_session_commercial_projection_value(item)
+            for key, item in value.items()
+            if key not in QUOTE_SESSION_COMMERCIAL_TRANSIENT_FIELDS
+        }
+    return copy.deepcopy(value)
 
 
 def quote_session_freshness_draft_state(draft_state: Any) -> dict[str, Any]:
@@ -23435,11 +23523,15 @@ def quote_session_freshness_draft_state(draft_state: Any) -> dict[str, Any]:
         return {}
     raw_details = sanitized.get("quoteDetails") if isinstance(sanitized.get("quoteDetails"), dict) else {}
     embedded_snapshot = raw_details.get("commercial_snapshot")
-    details = {
-        key: copy.deepcopy(raw_details[key])
-        for key in QUOTE_SESSION_COMMERCIAL_DETAIL_FIELDS
-        if key in raw_details
-    }
+    details = {}
+    for key in QUOTE_SESSION_COMMERCIAL_DETAIL_FIELDS:
+        if key not in raw_details:
+            continue
+        raw_value = raw_details[key]
+        projected_value = quote_session_commercial_projection_value(raw_value)
+        if isinstance(raw_value, dict) and raw_value and projected_value == {}:
+            continue
+        details[key] = projected_value
     company = details.get("company")
     if isinstance(company, dict):
         company.pop("logo_session_file_key", None)
@@ -23470,13 +23562,25 @@ def quote_session_freshness_draft_state(draft_state: Any) -> dict[str, Any]:
     sections = sanitized.get("quoteBasisSections")
     if not isinstance(sections, list):
         sections = []
-    canonical_sections = copy.deepcopy(sections)
-    for section in canonical_sections:
-        if not isinstance(section, dict) or not isinstance(section.get("lines"), list):
+    canonical_sections = []
+    for section in sections:
+        if not isinstance(section, dict):
             continue
-        for line in section["lines"]:
-            if isinstance(line, dict):
-                line.pop("selected", None)
+        projected_section = {
+            key: copy.deepcopy(section[key])
+            for key in QUOTE_SESSION_COMMERCIAL_BASIS_SECTION_FIELDS
+            if key in section
+        }
+        projected_section["lines"] = [
+            {
+                key: copy.deepcopy(line[key])
+                for key in QUOTE_SESSION_COMMERCIAL_BASIS_LINE_FIELDS
+                if key in line
+            }
+            for line in section.get("lines", [])
+            if isinstance(line, dict)
+        ]
+        canonical_sections.append(projected_section)
     profile_id = sanitized.get("profileId") or sanitized.get("selectedPresetValue") or ""
     commercial = {
         "profile_id": profile_id,
@@ -23505,7 +23609,7 @@ def quote_session_publication_freshness_proof(patch: dict[str, Any]) -> dict[str
     return {
         "commercial_state_schema": QUOTE_SESSION_COMMERCIAL_STATE_SCHEMA,
         "commercial_state_digest": quote_session_safe_digest(commercial_state),
-        "output_revision": quote_session_revision_number(draft_state.get("outputRevision"), -1),
+        "output_revision": quote_session_strict_revision_number(draft_state.get("outputRevision"), -1),
     }
 
 
@@ -23644,7 +23748,7 @@ def quote_session_current_v2_publication_proof(
         )
         or not isinstance(publication.get("run_id"), str)
         or not isinstance(publication.get("job_id"), str)
-        or clean_text(publication.get("state")).lower() != "published"
+        or publication.get("state") != "published"
         or proof.get("schema") != QUOTE_SESSION_PUBLICATION_PROOF_SCHEMA
         or proof.get("version") != 2
         or proof.get("commercial_state_schema") != QUOTE_SESSION_COMMERCIAL_STATE_SCHEMA
@@ -23655,15 +23759,32 @@ def quote_session_current_v2_publication_proof(
         return None
     if not isinstance(metadata.get("session_id"), str) or not isinstance(workspace_id, str) or not isinstance(owner_id, str):
         return None
-    session_id = safe_quote_session_id(metadata.get("session_id"), "")
+    raw_session_id = metadata.get("session_id")
+    session_id = safe_quote_session_id(raw_session_id, "")
     expected_workspace = safe_resource_id(workspace_id, "")
     expected_owner = safe_resource_id(owner_id, "")
-    if not session_id or not expected_workspace or not expected_owner:
+    if (
+        not session_id
+        or raw_session_id != session_id
+        or not expected_workspace
+        or workspace_id != expected_workspace
+        or not expected_owner
+        or owner_id != expected_owner
+    ):
         return None
     publication_record = proof["publication"]
-    active_publication_id = safe_quote_publication_id(publication.get("active_publication_id"), "")
-    current_run_id = safe_reference(publication.get("run_id"), "run-")
-    current_job_id = safe_reference(publication.get("job_id"), "job-")
+    raw_active_publication_id = publication.get("active_publication_id", "")
+    raw_run_id = publication.get("run_id")
+    raw_job_id = publication.get("job_id")
+    active_publication_id = safe_quote_publication_id(raw_active_publication_id, "")
+    current_run_id = safe_reference(raw_run_id, "run-")
+    current_job_id = safe_reference(raw_job_id, "job-")
+    if (
+        (raw_active_publication_id and raw_active_publication_id != active_publication_id)
+        or raw_run_id != current_run_id
+        or raw_job_id != current_job_id
+    ):
+        return None
     expected_publication_id = active_publication_id or current_run_id
     if (
         not expected_publication_id
@@ -23680,8 +23801,15 @@ def quote_session_current_v2_publication_proof(
         or subject["owner_id"] != expected_owner
     ):
         return None
-    committed_revision = quote_session_revision_number(proof.get("output_revision"), -1)
-    candidate_revision = quote_session_revision_number(draft_state.get("outputRevision"), -1)
+    committed_revision = proof.get("output_revision")
+    candidate_revision = draft_state.get("outputRevision")
+    if (
+        type(committed_revision) is not int
+        or committed_revision < 0
+        or type(candidate_revision) is not int
+        or candidate_revision < 0
+    ):
+        return None
     if committed_revision < 0 or committed_revision != candidate_revision:
         return None
     committed_digest = clean_text(proof.get("commercial_state_digest")).lower()
@@ -23841,10 +23969,10 @@ def local_publication_authority_for_payload(payload: dict[str, Any]) -> dict[str
         "pricing_reference": {
             "id": authority.get("id"),
             "source": authority.get("source"),
-            "digest": detail.get("digest_sha256"),
+            "digest": clean_text(detail.get("digest_sha256")).lower().removeprefix("sha256:"),
         },
         "profile": {
-            "id": profile_id,
+            "id": profile_identity_value(profile_id, profile_source),
             "source": profile_source,
             "digest": hashlib.sha256(json.dumps(profile_snapshot, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
             "layout_digest": hashlib.sha256(layout_bytes).hexdigest(),
@@ -23877,10 +24005,13 @@ def database_publication_authority_for_payload(
         "pricing_reference": {
             "id": selection["id"],
             "source": selection["source"],
-            "digest": pricing_detail.get("digest_sha256") or pricing_reference_catalog_digest(pricing_detail),
+            "digest": clean_text(
+                pricing_detail.get("digest_sha256")
+                or pricing_reference_catalog_digest(pricing_detail)
+            ).lower().removeprefix("sha256:"),
         },
         "profile": {
-            "id": profile_id,
+            "id": profile_identity_value(profile_id, profile_source),
             "source": profile_source,
             "digest": hashlib.sha256(json.dumps(profile_snapshot, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
             "layout_digest": hashlib.sha256(layout_bytes).hexdigest(),
@@ -23901,33 +24032,34 @@ def quote_session_publication_authority_matches(metadata: dict[str, Any], author
         expected = proof.get(section) if isinstance(proof.get(section), dict) else {}
         current = authority.get(section) if isinstance(authority.get(section), dict) else {}
         current_values = dict(current)
-        if section == "profile":
-            raw_profile_id = current.get("id")
-            raw_profile_source = current.get("source")
-            if not isinstance(raw_profile_id, str) or not isinstance(raw_profile_source, str):
+        raw_id = current.get("id")
+        raw_source = current.get("source")
+        if not isinstance(raw_id, str) or not isinstance(raw_source, str):
+            return False
+        if section == "pricing_reference":
+            if safe_resource_id(raw_id, "") != raw_id or raw_source not in PRICING_REFERENCE_SOURCES:
                 return False
-            if ":" in raw_profile_id:
-                identity_source, identity_id = raw_profile_id.split(":", 1)
-                if identity_source not in {"company", "profile"} or raw_profile_source != identity_source:
-                    return False
-            else:
-                identity_source, identity_id = raw_profile_source, raw_profile_id
-                if identity_source not in {"company", "profile"}:
-                    return False
-            if not identity_id or safe_resource_id(identity_id, "") != identity_id:
+        else:
+            if ":" not in raw_id:
                 return False
-            current_values["id"] = f"{identity_source}:{identity_id}"
-            current_values["source"] = identity_source
+            identity_source, identity_id = raw_id.split(":", 1)
+            if (
+                identity_source not in {"company", "profile"}
+                or raw_source != identity_source
+                or not identity_id
+                or safe_resource_id(identity_id, "") != identity_id
+            ):
+                return False
         for digest_field in ("digest", "layout_digest", "layout_rules_digest"):
-            if digest_field in current_values:
-                current_values[digest_field] = clean_text(current_values[digest_field]).lower().removeprefix("sha256:")
+            if digest_field not in current_values:
+                continue
+            digest = current_values[digest_field]
+            if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                return False
         for field in fields:
             expected_value = expected.get(field)
             current_value = current_values.get(field)
-            if field in {"digest", "layout_digest", "layout_rules_digest"}:
-                if clean_text(expected_value).lower() != clean_text(current_value).lower():
-                    return False
-            elif expected_value != current_value:
+            if expected_value != current_value:
                 return False
     return True
 
@@ -24372,6 +24504,10 @@ def quote_session_revision_number(value: Any, fallback: int = -1) -> int:
     if not re.fullmatch(r"[0-9]+", text):
         return fallback
     return int(text, 10)
+
+
+def quote_session_strict_revision_number(value: Any, fallback: int = -1) -> int:
+    return value if type(value) is int and value >= 0 else fallback
 
 
 def quote_session_authoritative_current_export_kinds(
@@ -27169,12 +27305,16 @@ def _run_quote_job(
         layout_rules_for_publication = load_json_file(profile.layout_rules_path)
     selected_pricing = explicit_pricing_reference_selection(payload)
     selected_profile_id = explicit_profile_id_from_payload(payload)
+    selected_profile_source = profile_identity_parts(
+        selected_profile_id,
+        "profile" if isinstance(profile, ProfilePack) else "company",
+    )[0]
     publication_patch = quote_session_patch_payload(payload)
     publication_draft_state = quote_session_draft_state(publication_patch)
     if (
         result_has_generated_quote(result)
         and isinstance(payload.get("quote_session"), dict)
-        and quote_session_revision_number(publication_draft_state.get("outputRevision"), -1) < 0
+        and "outputRevision" not in publication_draft_state
     ):
         request_draft_state = payload["quote_session"].get("draft_state")
         if not isinstance(request_draft_state, dict):
@@ -27183,7 +27323,7 @@ def _run_quote_job(
         request_draft_state["outputRevision"] = 0
         publication_patch = quote_session_patch_payload(payload)
         publication_draft_state = quote_session_draft_state(publication_patch)
-    if quote_session_revision_number(publication_draft_state.get("outputRevision"), -1) >= 0:
+    if quote_session_strict_revision_number(publication_draft_state.get("outputRevision"), -1) >= 0:
         result["_publication_authority"] = {
             "pricing_reference": {
                 "id": selected_pricing.get("id") if selected_pricing.get("ok") else "",
@@ -27191,11 +27331,8 @@ def _run_quote_job(
                 "digest": pricing_reference_catalog_digest(pricing_snapshot_for_publication),
             },
             "profile": {
-                "id": selected_profile_id,
-                "source": profile_identity_parts(
-                    selected_profile_id,
-                    "profile" if isinstance(profile, ProfilePack) else "company",
-                )[0],
+                "id": profile_identity_value(selected_profile_id, selected_profile_source),
+                "source": selected_profile_source,
                 "digest": hashlib.sha256(json.dumps(profile_snapshot_for_publication, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
                 "layout_digest": hashlib.sha256(layout_bytes_for_publication).hexdigest(),
                 "layout_rules_digest": hashlib.sha256(json.dumps(layout_rules_for_publication, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),

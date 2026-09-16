@@ -2762,7 +2762,27 @@ async function run573LoadedAppOnce(runIndex) {
         collisionRejected = /colliding identities/.test(String(error?.message || error));
       }
       if (!collisionRejected) throw new Error("Browser accepted a server-colliding section identity.");
-      return { cycles: 2, collisionRejected };
+      const whitespaceIdentity = canonicalQuoteBasisSections([
+        { id: "\u0085", title: "Whitespace Identity", lines: [{ text: "kept" }] },
+      ]);
+      if (whitespaceIdentity[0]?.id !== "whitespace-identity") {
+        throw new Error("Browser section identity normalization diverges from the server.");
+      }
+      for (const field of ["basis_order", "category_order", "item_order"]) {
+        for (const entries of [
+          [[field, "invalid"], [`${field}\u0085`, "2"]],
+          [[`${field}\u0085`, "2"], [field, "invalid"]],
+        ]) {
+          let rejected = false;
+          try {
+            canonicalizePrimaryOrderFields(Object.fromEntries(entries));
+          } catch (error) {
+            rejected = /colliding keys/.test(String(error?.message || error));
+          }
+          if (!rejected) throw new Error(`Browser accepted a ${field} normalized-key collision.`);
+        }
+      }
+      return { cycles: 2, collisionRejected, whitespaceIdentity: whitespaceIdentity[0].id };
     });
     await parityPage.close();
 
@@ -2835,12 +2855,28 @@ async function run573LoadedAppOnce(runIndex) {
         size: 68,
         data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
       })];
-      state.quoteBasisSections = normalizeQuoteBasisSections([{
-        id: "run573-override",
-        title: "Custom",
-        lines: [{ id: "run573-override-line", tag: "Custom", text: "Custom override-only fabrication\nPreserve this second line", include: true, custom_pricing: true, custom_confirmed: true, quantity: 2, unit: "nos" }],
-      }]);
+      const losslessText = "\r\n  lead\t  middle  \rtrail  \r\n";
+      const expectedLosslessText = "\n  lead\t  middle  \ntrail  \n";
+      state.quoteBasisSections = canonicalQuoteBasisSections([
+        {
+          id: "run573-override",
+          title: "Custom",
+          lines: [{ id: "run573-override-line", tag: "Custom", text: "Custom override-only fabrication\nPreserve this second line", include: true, custom_pricing: true, custom_confirmed: true, quantity: 2, unit: "nos" }],
+        },
+        {
+          id: "run580-lossless",
+          title: "Lossless",
+          lines: [{ id: "run580-lossless-line", tag: "Exclude", text: losslessText }],
+        },
+      ]);
       state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
+      const persistenceProjection = quoteBasisPersistenceProjection();
+      if (
+        persistenceProjection.quote_basis_sections[1]?.lines?.[0]?.text !== expectedLosslessText
+        || JSON.stringify(persistenceProjection.quote_basis) !== JSON.stringify(quoteBasisFromSections(persistenceProjection.quote_basis_sections))
+      ) {
+        throw new Error("Generation basis serialization is not lossless or internally consistent.");
+      }
       state.lineItems = [normalizeLineItem({
         section: "Custom",
         description: "Custom override-only fabrication",
@@ -2896,6 +2932,14 @@ async function run573LoadedAppOnce(runIndex) {
       const persistedPricing = persisted.draft_state?.quoteDetails?.commercial_snapshot?.pricing_basis || {};
       if (persistedPricing.id !== authority.id || persistedPricing.source !== authority.source || persistedPricing.digest !== authority.digest_sha256) {
         throw new Error("Persisted generated session does not retain the exact server-side pricing authority.");
+      }
+      const persistedSections = persisted.draft_state?.quoteBasisSections || [];
+      const persistedLossless = persistedSections.find((section) => section.id === "run580-lossless");
+      if (
+        persistedLossless?.lines?.[0]?.text !== expectedLosslessText
+        || JSON.stringify(persisted.draft_state?.quoteBasis || {}) !== JSON.stringify(quoteBasisFromSections(persistedSections))
+      ) {
+        throw new Error("Generated session did not preserve the lossless basis projection.");
       }
       return { sessionId, authorityDigest: authority.digest_sha256, xlsx };
     }, runIndex);

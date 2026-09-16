@@ -3143,6 +3143,14 @@ function canonicalQuoteBasisForPersistence(basis = state.quoteBasis, sections = 
   return admitted;
 }
 
+function quoteBasisPersistenceProjection(basis = state.quoteBasis, sections = state.quoteBasisSections) {
+  const admittedSections = canonicalQuoteBasisSections(Array.isArray(sections) ? sections : []);
+  return {
+    quote_basis: canonicalQuoteBasisForPersistence(basis, admittedSections),
+    quote_basis_sections: admittedSections,
+  };
+}
+
 function linesValue(value) {
   return Array.isArray(value) ? value.join("\n") : String(value || "");
 }
@@ -3807,9 +3815,7 @@ function clearSessionFiles() {
 }
 
 function buildSessionSnapshot() {
-  const persistedQuoteBasis = typeof canonicalQuoteBasisForPersistence === "function"
-    ? canonicalQuoteBasisForPersistence()
-    : { ...(state.quoteBasis || {}) };
+  const persistedBasis = quoteBasisPersistenceProjection();
   return {
     version: QUOTE_SESSION_STATE_VERSION,
     browserRecoveryScope: currentBrowserRecoveryScope(),
@@ -3832,8 +3838,8 @@ function buildSessionSnapshot() {
     images: state.images.slice(0, MAX_REFERENCE_IMAGES).map(sessionImageMetadata),
     quoteDetails: quoteDetailsWithSessionLogoMetadata(collectQuoteDetails()),
     workflowStage: state.workflowStage,
-    quoteBasis: persistedQuoteBasis,
-    quoteBasisSections: state.quoteBasisSections,
+    quoteBasis: persistedBasis.quote_basis,
+    quoteBasisSections: persistedBasis.quote_basis_sections,
     lineItems: state.lineItems,
     outputRows: state.outputRows,
     originalOutputRows: state.originalOutputRows,
@@ -6622,6 +6628,10 @@ function canonicalBasisSectionText(value = "") {
   return value.replace(/\r\n?/g, "\n");
 }
 
+function pythonWhitespaceText(value = "") {
+  return String(value ?? "").replace(/[\s\u001c-\u001f\u0085]+/gu, " ").trim();
+}
+
 function canonicalBasisSectionLine(value = "") {
   if (typeof value === "string") {
     const text = canonicalBasisSectionText(value);
@@ -6654,7 +6664,7 @@ function canonicalQuoteBasisSections(value = {}) {
     return rawSections
       .map((section, index) => {
         const title = normalizeQuoteBasisTitle(section?.title || "Section") || "Section";
-        const rawId = String(section?.id ?? "").trim().replace(/\s+/g, " ");
+        const rawId = pythonWhitespaceText(section?.id);
         const id = safeId(rawId && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(rawId) ? rawId : title, `section-${index + 1}`);
         if (usedIds.has(id)) throw new TypeError("Quote basis sections contain colliding identities.");
         usedIds.add(id);
@@ -6700,7 +6710,8 @@ function normalizeQuoteBasisSections(value = {}) {
     return rawSections
       .map((section, index) => {
         const title = normalizeQuoteBasisTitle(section?.title || "Section") || "Section";
-        const id = safeId(section?.id && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(String(section.id)) ? section.id : title, `section-${index + 1}`);
+        const rawId = pythonWhitespaceText(section?.id);
+        const id = safeId(rawId && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(rawId) ? rawId : title, `section-${index + 1}`);
         if (usedIds.has(id)) throw new TypeError("Quote basis sections contain colliding identities.");
         usedIds.add(id);
         const rawLines = Array.isArray(section?.lines) ? section.lines : splitLines(section?.text || "");
@@ -8409,6 +8420,9 @@ function buildPayload(options = {}) {
   const profileId = generationProfileIdForPayload();
   const includeBoothDimensions = options.includeBoothDimensions !== false;
   const includeDraftContext = options.includeDraftContext !== false;
+  const persistedBasis = includeDraftContext
+    ? quoteBasisPersistenceProjection()
+    : { quote_basis: {}, quote_basis_sections: [] };
   const project = {
     title: elements.projectTitle.value.trim(),
     show_name: elements.showName?.value.trim() || "",
@@ -8462,8 +8476,8 @@ function buildPayload(options = {}) {
     quote_currency: collectQuoteCurrency(),
     quote_exchange_rate: collectQuoteExchangeRate(),
     user_feedback: state.pendingFeedback,
-    quote_basis: includeDraftContext ? canonicalQuoteBasisForPersistence() : {},
-    quote_basis_sections: includeDraftContext ? cloneQuoteBasisSections(state.quoteBasisSections) : [],
+    quote_basis: persistedBasis.quote_basis,
+    quote_basis_sections: persistedBasis.quote_basis_sections,
     line_items: includeDraftContext ? (state.outputRows.length ? outputRowsToLineItems(state.outputRows) : state.lineItems) : [],
     analysis_findings: state.analysisFindings,
     blocking_clarification_questions: state.blockingClarificationQuestions,
@@ -8492,6 +8506,7 @@ function buildLineItemNormalizePayload() {
   const pricingReferenceId = pricingReference?.id || state.pricingReferenceId || "";
   const pricingReferenceSource = pricingReference?.source || state.pricingReferenceSource || "";
   const profileId = generationProfileIdForPayload();
+  const persistedBasis = quoteBasisPersistenceProjection();
   return {
     profile_id: profileId,
     quote_exchange_rate: collectQuoteExchangeRate(),
@@ -8520,8 +8535,8 @@ function buildLineItemNormalizePayload() {
       booth_size: state.boothDimensions.booth_size,
       dimension_source: state.boothDimensions.dimension_source,
     },
-    quote_basis: canonicalQuoteBasisForPersistence(),
-    quote_basis_sections: cloneQuoteBasisSections(state.quoteBasisSections),
+    quote_basis: persistedBasis.quote_basis,
+    quote_basis_sections: persistedBasis.quote_basis_sections,
     line_items: state.lineItems.map(normalizeLineItem),
   };
 }
@@ -8846,7 +8861,7 @@ function canonicalizePrimaryOrderFields(row = {}) {
   const seen = new Set();
   const admitted = {};
   Object.keys(row).forEach((rawKey) => {
-    const key = rawKey.trim();
+    const key = pythonWhitespaceText(rawKey);
     if (!fields.has(key)) {
       admitted[rawKey] = row[rawKey];
       return;

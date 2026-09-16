@@ -357,7 +357,7 @@ def synthetic_publication_authority() -> dict:
             "digest": digest,
         },
         "profile": {
-            "id": "synthetic-exhibition-fixture-template",
+            "id": "profile:synthetic-exhibition-fixture-template",
             "source": "profile",
             "digest": digest,
             "layout_digest": digest,
@@ -19331,8 +19331,9 @@ assert.strictEqual(rowNeedsManualInput(manualDisplayZeroRow), false);
         self.assertIn("const hasFeedback = Boolean(state.pendingFeedback.trim())", draft_body)
         self.assertIn("includeDraftContext: hasFeedback", draft_body)
         self.assertIn("const includeDraftContext = options.includeDraftContext !== false", js)
-        self.assertIn("quote_basis: includeDraftContext ?", js)
-        self.assertIn("quote_basis_sections: includeDraftContext ?", js)
+        self.assertIn("const persistedBasis = includeDraftContext", js)
+        self.assertIn("quote_basis: persistedBasis.quote_basis", js)
+        self.assertIn("quote_basis_sections: persistedBasis.quote_basis_sections", js)
         self.assertIn("line_items: includeDraftContext ?", js)
         self.assertIn("analysisElapsed", js)
         self.assertIn("elapsedTimerIds", js)
@@ -22912,6 +22913,9 @@ function persistSessionFiles(records) {
 
 function normalizeRestorableOverlay(value) { return value || ""; }
 function normalizeActiveJob(job) { return job?.id ? job : null; }
+function quoteBasisPersistenceProjection() {
+  return { quote_basis: state.quoteBasis, quote_basis_sections: state.quoteBasisSections };
+}
 function saveWorkspaceViewState() {}
 
 eval([
@@ -23762,6 +23766,7 @@ eval([
   "splitBasisDecisionText",
   "normalizeBasisLines",
   "parseBasisLine",
+  "pythonWhitespaceText",
   "normalizeQuoteBasisSections",
   "confirmOnlyQuoteBasisSections",
   "basisSections",
@@ -27963,6 +27968,7 @@ eval([
   "splitBasisDecisionText",
   "normalizeBasisLines",
   "parseBasisLine",
+  "pythonWhitespaceText",
   "normalizeQuoteBasisSections",
   "confirmOnlyQuoteBasisSections",
   "basisSections",
@@ -28536,6 +28542,7 @@ eval([
   "splitBasisDecisionText",
   "normalizeBasisLines",
   "normalizeQuoteBasisTitle",
+  "pythonWhitespaceText",
   "normalizeQuoteBasisSections",
   "quoteBasisFromSections",
   "cloneQuoteBasis",
@@ -28691,6 +28698,7 @@ eval([
   "normalizeBasisLines",
   "parseBasisLine",
   "normalizeQuoteBasisTitle",
+  "pythonWhitespaceText",
   "normalizeQuoteBasisSections",
   "quoteBasisFromSections",
   "cloneQuoteBasisSections",
@@ -28814,6 +28822,7 @@ eval([
   "orderNumber",
   "splitBasisDecisionText",
   "normalizeBasisLines",
+  "pythonWhitespaceText",
   "normalizeQuoteBasisSections",
   "quoteBasisFromSections",
   "cloneQuoteBasisSections",
@@ -37857,7 +37866,7 @@ main().catch((error) => {
         )
         self.assertRegex(metadata["publication"]["proof"]["pricing_reference"]["digest"], r"^[0-9a-f]{64}$")
         self.assertTrue(webapp.quote_session_publication_freshness_proof_matches(metadata, patch))
-        self.assertTrue(webapp.quote_session_publication_authority_matches(metadata, {
+        self.assertFalse(webapp.quote_session_publication_authority_matches(metadata, {
             **synthetic_publication_authority(),
             "pricing_reference": {
                 **synthetic_publication_authority()["pricing_reference"],
@@ -38006,6 +38015,24 @@ main().catch((error) => {
         fractional_patch = copy.deepcopy(patch)
         fractional_patch["draft_state"]["outputRevision"] = 4.5
         self.assertIsNone(validate(candidate_patch=fractional_patch))
+        for raw_revision in (True, "4", " 004 "):
+            coerced_patch = copy.deepcopy(patch)
+            coerced_patch["draft_state"]["outputRevision"] = raw_revision
+            with self.subTest(raw_revision=raw_revision):
+                self.assertIsNone(validate(candidate_patch=coerced_patch))
+
+        for label, mutate_authority in (
+            ("unqualified_profile", lambda current: current["profile"].__setitem__("id", "synthetic-exhibition-fixture-template")),
+            ("wrong_case_profile_source", lambda current: current["profile"].update({"id": "PROFILE:synthetic-exhibition-fixture-template", "source": "PROFILE"})),
+            ("prefixed_digest", lambda current: current["pricing_reference"].__setitem__("digest", "sha256:" + current["pricing_reference"]["digest"])),
+            ("uppercase_digest", lambda current: current["pricing_reference"].__setitem__("digest", current["pricing_reference"]["digest"].upper())),
+            ("missing_pricing_source", lambda current: current["pricing_reference"].pop("source")),
+            ("malformed_pricing_source", lambda current: current["pricing_reference"].__setitem__("source", [])),
+        ):
+            candidate_authority = copy.deepcopy(authority)
+            mutate_authority(candidate_authority)
+            with self.subTest(label=label):
+                self.assertIsNone(validate(candidate_authority=candidate_authority))
 
     def test_run575_database_artifact_bytes_must_match_validated_proof(self):
         content = b"PK\x03\x04run575-proof-bound-xlsx"
@@ -38046,6 +38073,45 @@ main().catch((error) => {
         ):
             with self.subTest(label=label):
                 self.assertFalse(webapp.quote_artifact_matches_publication_proof(artifact, expected, **changed))
+
+    def test_run580_version_eligibility_rejects_before_database_or_object_byte_fetch(self):
+        session_id = "quote-run580-no-fetch"
+        run_id = "run-run580-no-fetch"
+        export = {
+            "filename": "quotation.xlsx",
+            "size_bytes": 12,
+            "sha256": "a" * 64,
+            "stale": False,
+        }
+        storage = object.__new__(webapp.DatabaseSqagStorage)
+        storage.workspace_id = "workspace-run580"
+        storage.connection = mock.Mock(side_effect=AssertionError("database artifact bytes were queried"))
+        backend = mock.Mock()
+        backend.retrieve_artifact.side_effect = AssertionError("object artifact bytes were retrieved")
+
+        cases = [
+            ("superseded", "superseded", {"xlsx": export}),
+            ("staged", "staged", {"xlsx": export}),
+            ("failed", "failed", {"xlsx": export}),
+            ("absent_kind", "published", {}),
+        ]
+        with mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend):
+            for mode in ("database", "object"):
+                for label, state, exports in cases:
+                    version = {
+                        "session_id": session_id,
+                        "state": state,
+                        "artifact_storage_mode": mode,
+                        "artifact_source": "version",
+                        "metadata_json": json.dumps({"exports": exports}),
+                    }
+                    storage._publication_version_row = mock.Mock(return_value=version)
+                    with self.subTest(mode=mode, label=label):
+                        self.assertIsNone(
+                            storage._publication_version_artifact(session_id, run_id, "xlsx")
+                        )
+        storage.connection.assert_not_called()
+        backend.retrieve_artifact.assert_not_called()
 
     def test_run575_xlsx_only_publication_does_not_adopt_historical_pdf(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -38122,7 +38188,14 @@ main().catch((error) => {
         changed_derived.update({"lineItems": [{"description": "changed"}], "originalOutputRows": [], "pricingMatches": [], "activeSidePanel": "basis", "workflowStage": "draft", "savedAt": "two"})
         changed_derived["outputRows"][0]["selected"] = False
         changed_derived["outputRows"][0]["workflow_state"] = "temporary"
+        changed_derived["outputRows"][0]["download_url"] = "/temporary/download"
+        changed_derived["quoteBasisSections"][0]["lines"][0].update({
+            "workflow_state": "reviewed",
+            "download_url": "/temporary/basis-download",
+            "recovery_file_key": "basis-recovery",
+        })
         changed_derived["quoteDetails"]["active_tab"] = "internal"
+        changed_derived["quoteDetails"].setdefault("company", {})["recovery_file_key"] = "company-recovery"
         self.assertEqual(base, webapp.quote_session_commercial_state({"draft_state": changed_derived}))
         changed_commercial = copy.deepcopy(draft)
         changed_commercial["outputRows"][0]["quantity"] = 3
@@ -38153,6 +38226,12 @@ main().catch((error) => {
             webapp.quote_session_commercial_state({"draft_state": logo_a}),
             webapp.quote_session_commercial_state({"draft_state": logo_b}),
         )
+        logo_material_edit = copy.deepcopy(logo_a)
+        logo_material_edit["quoteDetails"]["company"]["logo_content_fingerprint"] = "sha256:" + "8" * 64
+        self.assertNotEqual(
+            webapp.quote_session_commercial_state({"draft_state": logo_a}),
+            webapp.quote_session_commercial_state({"draft_state": logo_material_edit}),
+        )
 
         selected_a = copy.deepcopy(draft)
         selected_a["quoteBasisSections"][0]["lines"][0]["selected"] = False
@@ -38164,15 +38243,16 @@ main().catch((error) => {
         )
 
     def test_run575_primary_order_collisions_fail_before_invalid_omission_in_both_orders(self):
-        for pairs in (
-            [("basis_order", "invalid"), (" basis_order ", "2")],
-            [(" basis_order ", "2"), ("basis_order", "invalid")],
-        ):
-            row = dict(pairs)
-            with self.subTest(pairs=pairs), self.assertRaises(ValueError):
-                webapp.canonicalize_primary_order_fields(row)
-            with self.assertRaises(ValueError):
-                webapp.quote_session_draft_state_value({"row": row})
+        for field in webapp.PRIMARY_ORDER_FIELDS:
+            for pairs in (
+                [(field, "invalid"), (f"{field}\u0085", "2")],
+                [(f"{field}\u0085", "2"), (field, "invalid")],
+            ):
+                row = dict(pairs)
+                with self.subTest(field=field, pairs=pairs), self.assertRaises(ValueError):
+                    webapp.canonicalize_primary_order_fields(row)
+                with self.assertRaises(ValueError):
+                    webapp.quote_session_draft_state_value({"row": row})
 
     def test_run575_browser_basis_and_primary_order_parity(self):
         node = require_node(self)
@@ -38197,7 +38277,7 @@ function normalizeQuoteBasisTitle(value) { return String(value || "").trim(); }
 function normalizeBasisTag(value) { return ["Include", "Confirm", "Custom", "Exclude"].includes(value) ? value : "Confirm"; }
 function safeId(value, fallback) { const result = String(value || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""); return result || fallback; }
 function canonicalQuoteBasis(value) { return value || {}; }
-eval(["canonicalPrimaryOrderValue", "canonicalizePrimaryOrderFields", "canonicalBasisSectionText", "canonicalBasisSectionLine", "canonicalQuoteBasisSections", "quoteBasisFromSections"].map(extractFunction).join("\n"));
+eval(["pythonWhitespaceText", "canonicalPrimaryOrderValue", "canonicalizePrimaryOrderFields", "canonicalBasisSectionText", "canonicalBasisSectionLine", "canonicalQuoteBasisSections", "quoteBasisFromSections", "canonicalQuoteBasisForPersistence", "quoteBasisPersistenceProjection"].map(extractFunction).join("\n"));
 const raw = [
   { id: "custom-only", title: "Custom", lines: [{ tag: "Custom", text: "\r\n  lead\t  middle  \rtrail  \r\n" }] },
   { id: "graphics", title: "Graphics", lines: [{ tag: "Confirm", text: "Legacy\r\n\r\n  custom tail\t" }] },
@@ -38209,15 +38289,24 @@ assert.deepStrictEqual(first, second);
 assert.deepStrictEqual(second, third);
 assert.strictEqual(first[0].lines[0].text, "\n  lead\t  middle  \ntrail  \n");
 assert.strictEqual(quoteBasisFromSections(first)["custom-only"], "Custom: \n  lead\t  middle  \ntrail  \n");
+const persisted = quoteBasisPersistenceProjection(quoteBasisFromSections(first), first);
+assert.deepStrictEqual(persisted.quote_basis_sections, first);
+assert.deepStrictEqual(persisted.quote_basis, quoteBasisFromSections(persisted.quote_basis_sections));
 for (const sections of [
   [{ id: "same", title: "One", lines: [] }, { id: "same", title: "Two", lines: [{ text: "kept" }] }],
   [{ id: "same", title: "One", lines: [{ text: "kept" }] }, { id: "same", title: "Two", lines: [] }],
   [{ id: " same ", title: "One", lines: [{ text: "kept" }] }, { id: "same", title: "Two", lines: [{ text: "kept" }] }],
 ]) assert.throws(() => canonicalQuoteBasisSections(sections), /colliding identities/);
-for (const row of [
-  { basis_order: "invalid", " basis_order ": "2" },
-  { " basis_order ": "2", basis_order: "invalid" },
-]) assert.throws(() => canonicalizePrimaryOrderFields(row), /colliding keys/);
+assert.deepStrictEqual(
+  canonicalQuoteBasisSections([{ id: "\u0085", title: "Whitespace Identity", lines: [{ text: "kept" }] }]),
+  [{ id: "whitespace-identity", title: "Whitespace Identity", lines: [{ tag: "Confirm", text: "kept" }] }],
+);
+for (const field of ["basis_order", "category_order", "item_order"]) {
+  for (const entries of [
+    [[field, "invalid"], [`${field}\u0085`, "2"]],
+    [[`${field}\u0085`, "2"], [field, "invalid"]],
+  ]) assert.throws(() => canonicalizePrimaryOrderFields(Object.fromEntries(entries)), /colliding keys/);
+}
 '''
         completed = subprocess.run([node, "-e", script], cwd=str(ROOT), text=True, capture_output=True, check=False)
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
