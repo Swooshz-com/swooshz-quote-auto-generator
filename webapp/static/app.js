@@ -6771,7 +6771,7 @@ function quoteBasisFromSections(sections = []) {
 }
 
 function cloneQuoteBasisSections(sections = []) {
-  return normalizeQuoteBasisSections(JSON.parse(JSON.stringify(Array.isArray(sections) ? sections : [])));
+  return canonicalQuoteBasisSections(JSON.parse(JSON.stringify(Array.isArray(sections) ? sections : [])));
 }
 
 function basisLineMetadataMergeKey(line = {}) {
@@ -11302,7 +11302,7 @@ async function refreshLineItemsFromServer() {
 }
 
 function captureOriginalAnalysisSnapshot(data = {}) {
-  const sections = normalizeQuoteBasisSections(data.quote_basis_sections || data.quote_basis || state.quoteBasisSections);
+  const sections = canonicalQuoteBasisSections(data.quote_basis_sections || data.quote_basis || state.quoteBasisSections);
   state.originalAnalysisSnapshot = {
     quote_basis_sections: cloneQuoteBasisSections(sections),
     quote_basis: { ...state.quoteBasis, ...quoteBasisFromSections(sections) },

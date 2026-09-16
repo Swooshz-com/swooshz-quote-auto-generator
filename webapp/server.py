@@ -5858,7 +5858,7 @@ def canonical_quote_basis_sections(payload: dict[str, Any]) -> list[dict[str, An
     raw_sections = payload.get("quote_basis_sections")
     sections: list[dict[str, Any]] = []
     used_ids: set[str] = set()
-    if isinstance(raw_sections, list):
+    if isinstance(raw_sections, list) and raw_sections:
         for index, raw_section in enumerate(raw_sections, start=1):
             if not isinstance(raw_section, dict):
                 continue
@@ -14416,6 +14416,8 @@ class DatabaseSqagStorage:
             if isinstance(publication_proof, dict) and isinstance(publication_proof.get("artifacts"), dict)
             else None
         )
+        if require_current_proof and not isinstance(expected_artifact, dict):
+            return None
 
         def admitted(artifact: dict[str, Any] | None) -> dict[str, Any] | None:
             if not require_current_proof:
@@ -15453,6 +15455,7 @@ class DatabaseSqagStorage:
                 "metadata": metadata,
                 "now": now,
                 "stored_generated_quote": stored_generated_quote,
+                "existing_metadata": existing,
                 "pending_artifacts": pending_artifacts,
                 "object_plan": effective_plan,
                 "object_plan_is_quote_export": object_plan is not None,
@@ -15496,7 +15499,7 @@ class DatabaseSqagStorage:
                 mark_quote_session_exports_stale(
                     metadata,
                     quote_session_authoritative_current_export_kinds(
-                        metadata,
+                        state["existing_metadata"],
                         patch,
                         storage=self,
                         authority=database_current_publication_authority(self, payload),
@@ -15716,7 +15719,7 @@ class DatabaseSqagStorage:
                 mark_quote_session_exports_stale(
                     metadata,
                     quote_session_authoritative_current_export_kinds(
-                        metadata,
+                        existing,
                         patch,
                         storage=self,
                         authority=database_current_publication_authority(self, payload),
@@ -19047,14 +19050,7 @@ def quote_basis_notes(
     auth_session: dict[str, Any] | None = None,
 ) -> list[str]:
     notes = ["Quote basis confirmed from webapp."]
-    sections = (
-        canonical_quote_basis_sections(payload)
-        if isinstance(payload.get("quote_basis_sections"), list)
-        else normalize_quote_basis_sections(
-            payload,
-            pricing_reference_section_names_for_payload(payload, auth_session=auth_session),
-        )
-    )
+    sections = canonical_quote_basis_sections(payload)
     if sections:
         for section in sections:
             lines = [
@@ -24963,7 +24959,7 @@ def create_or_update_quote_session(
             mark_quote_session_exports_stale(
                 metadata,
                 quote_session_authoritative_current_export_kinds(
-                    metadata,
+                    existing,
                     patch,
                     storage=storage,
                     authority=local_current_publication_authority(payload),

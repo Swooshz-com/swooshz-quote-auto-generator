@@ -6718,6 +6718,76 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             f"Custom Lossless: Custom: {expected_text}",
         )
 
+    def test_run584_map_only_basis_round_trips_to_generator_notes_losslessly(self):
+        raw_text = "\tleading  spaces\r\n\r  middle\tvalue  \ntrailing  \t"
+        expected_text = "\tleading  spaces\n\n  middle\tvalue  \ntrailing  \t"
+        for sections_form in ("absent", "empty"):
+            with self.subTest(sections_form=sections_form), tempfile.TemporaryDirectory() as tmp:
+                data_root = Path(tmp) / "data"
+                payload = recovered_convergence_payload(
+                    effective_unit_price=100,
+                    pricing_basis_amount=100,
+                    approved_quote_amount=100,
+                    include_included_row=False,
+                )
+                payload["quote_basis"] = {"custom-map": raw_text}
+                draft_state = payload["quote_session"]["draft_state"]
+                draft_state["quoteBasis"] = {"custom-map": raw_text}
+                if sections_form == "empty":
+                    payload["quote_basis_sections"] = []
+                    draft_state["quoteBasisSections"] = []
+                else:
+                    payload.pop("quote_basis_sections", None)
+                    draft_state.pop("quoteBasisSections", None)
+                payload["quote_session"]["session_id"] = f"quote-run584-map-{sections_form}"
+                payload["quote_session"]["status"] = {"quote_generated": False}
+
+                with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                    saved = webapp.create_or_update_quote_session(payload)
+                    restored = webapp.get_quote_session(
+                        saved["session_id"],
+                        include_draft_state=True,
+                    )
+
+                restored_draft = restored["draft_state"]
+                self.assertEqual(
+                    restored_draft["quoteBasis"]["custom-map"],
+                    expected_text,
+                )
+                generator_payload = copy.deepcopy(payload)
+                generator_payload.pop("quote_session", None)
+                generator_payload["quote_basis"] = restored_draft["quoteBasis"]
+                if sections_form == "empty":
+                    generator_payload["quote_basis_sections"] = restored_draft["quoteBasisSections"]
+                brief = webapp.payload_to_brief(generator_payload)
+                self.assertEqual(
+                    brief["quote_basis_sections"],
+                    [{
+                        "id": "custom-map",
+                        "title": "Custom Map",
+                        "lines": [{"tag": "Confirm", "text": expected_text}],
+                    }],
+                )
+                self.assertEqual(
+                    brief["notes"][1],
+                    f"Custom Map: Confirm: {expected_text}",
+                )
+
+        section_backed = valid_payload()
+        section_backed["quote_basis"] = {"custom-map": "map must not override sections"}
+        section_backed["quote_basis_sections"] = [{
+            "id": "section-backed",
+            "title": "Section Backed",
+            "section_order": 2,
+            "basis_order": 3,
+            "lines": [{"tag": "Custom", "text": raw_text}],
+        }]
+        brief = webapp.payload_to_brief(section_backed)
+        self.assertEqual(brief["quote_basis_sections"][0]["lines"][0]["text"], expected_text)
+        self.assertEqual(brief["quote_basis_sections"][0]["section_order"], 2)
+        self.assertEqual(brief["quote_basis_sections"][0]["basis_order"], 3)
+        self.assertNotIn("map must not override sections", brief["notes"][1])
+
     def test_ai_prompt_requests_dynamic_quote_basis_sections(self):
         prompt = webapp.build_quote_draft_prompt(valid_payload())
 
@@ -28032,6 +28102,12 @@ eval([
             "renderBasisLine",
             "renderQuoteBasisMessage",
             "quoteBasisFromSections",
+            "canonicalPrimaryOrderValue",
+            "canonicalizeOrderFields",
+            "canonicalizePrimaryOrderFields",
+            "canonicalBasisSectionText",
+            "canonicalBasisSectionLine",
+            "canonicalQuoteBasisSections",
             "cloneQuoteBasisSections",
             "possibleMatchBasisDetailText",
             "catalogBackedPossibleMatchText",
@@ -28576,6 +28652,12 @@ eval([
   "normalizeQuoteBasisSections",
   "quoteBasisFromSections",
   "cloneQuoteBasis",
+  "canonicalPrimaryOrderValue",
+  "canonicalizeOrderFields",
+  "canonicalizePrimaryOrderFields",
+  "canonicalBasisSectionText",
+  "canonicalBasisSectionLine",
+  "canonicalQuoteBasisSections",
   "cloneQuoteBasisSections",
   "basisLineMetadataMergeKey",
   "basisLineCoreMatches",
@@ -28731,6 +28813,12 @@ eval([
   "pythonWhitespaceText",
   "normalizeQuoteBasisSections",
   "quoteBasisFromSections",
+  "canonicalPrimaryOrderValue",
+  "canonicalizeOrderFields",
+  "canonicalizePrimaryOrderFields",
+  "canonicalBasisSectionText",
+  "canonicalBasisSectionLine",
+  "canonicalQuoteBasisSections",
   "cloneQuoteBasisSections",
   "selectedBasisLine",
   "replaceLiteralText",
@@ -28855,6 +28943,12 @@ eval([
   "pythonWhitespaceText",
   "normalizeQuoteBasisSections",
   "quoteBasisFromSections",
+  "canonicalPrimaryOrderValue",
+  "canonicalizeOrderFields",
+  "canonicalizePrimaryOrderFields",
+  "canonicalBasisSectionText",
+  "canonicalBasisSectionLine",
+  "canonicalQuoteBasisSections",
   "cloneQuoteBasisSections",
   "unbracketedCatalogReferenceText",
   "markBasisLineAsManualPricing",
@@ -38176,6 +38270,200 @@ main().catch((error) => {
 
                 metadata_path.write_text(json.dumps(original_metadata), encoding="utf-8")
 
+    def test_run584_unchanged_http_save_does_not_rehabilitate_malformed_publication_authority(self):
+        invalid_cases = (
+            (
+                "padded_active_publication_id",
+                lambda candidate: candidate["publication"].__setitem__(
+                    "active_publication_id",
+                    f" {candidate['publication']['active_publication_id']} ",
+                ),
+            ),
+            (
+                "padded_export_publication_id",
+                lambda candidate: candidate["exports"]["xlsx"].__setitem__(
+                    "publication_id",
+                    f" {candidate['exports']['xlsx']['publication_id']} ",
+                ),
+            ),
+        )
+        for index, (label, mutate) in enumerate(invalid_cases, start=1):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                data_root = root / "data"
+                session_id = f"quote-run584-save-{index}"
+                content = f"PK\x03\x04run584-save-{index}".encode("utf-8")
+                payload, result, output_dir = self._local_publication_case(
+                    root,
+                    session_id,
+                    content,
+                    b"run584-unused-pdf",
+                )
+                result["files"] = result["files"][:1]
+                with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                    webapp.create_or_update_quote_session(
+                        payload,
+                        result=result,
+                        output_dir=output_dir,
+                    )
+                    metadata_path = webapp.quote_session_metadata_path(session_id)
+                    malformed = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    original_proof = copy.deepcopy(malformed["publication"]["proof"])
+                    original_publication_dirs = sorted(
+                        path.name
+                        for path in webapp.quote_session_publications_dir(session_id).iterdir()
+                        if path.is_dir()
+                    )
+                    mutate(malformed)
+                    metadata_path.write_text(json.dumps(malformed), encoding="utf-8")
+
+                    with LocalRunnerServer() as runner:
+                        self.assertEqual(
+                            local_http_get_bytes(
+                                runner,
+                                f"/api/quote-sessions/{session_id}/download/xlsx",
+                            )[0],
+                            404,
+                        )
+                        saved = self._post_local_quote_session(runner, payload)
+                        self.assertEqual(saved["status"], 200, saved)
+                        self.assertEqual(
+                            local_http_get_bytes(
+                                runner,
+                                f"/api/quote-sessions/{session_id}/download/xlsx",
+                            )[0],
+                            404,
+                        )
+
+                    persisted = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    self.assertEqual(persisted["publication"]["proof"], original_proof)
+                    self.assertTrue(persisted["exports"]["xlsx"]["stale"])
+                    self.assertFalse(persisted["status"]["quote_generated"])
+                    self.assertEqual(
+                        sorted(
+                            path.name
+                            for path in webapp.quote_session_publications_dir(session_id).iterdir()
+                            if path.is_dir()
+                        ),
+                        original_publication_dirs,
+                    )
+                    self.assertFalse(
+                        webapp.quote_session_has_current_v2_publication(persisted)
+                    )
+
+    def test_run584_proof_excluded_kind_is_denied_by_handler_before_database_or_object_fetch(self):
+        session_id = "quote-run584-proof-kind"
+        run_id = "run-run584-proof-kind"
+        publication_id = "pub-58458458458458458458458458458458"
+        content = b"PK\x03\x04run584-current-xlsx"
+        authority = synthetic_publication_authority()
+        patch = {
+            "status": {"quote_generated": True},
+            "draft_state": {
+                "outputRevision": 1,
+                "profileId": authority["profile"]["id"],
+                "pricingReferenceId": authority["pricing_reference"]["id"],
+                "pricingReferenceSource": authority["pricing_reference"]["source"],
+                "quoteDetails": {"project_number": "RUN-584"},
+                "outputRows": [{"description": "Current", "quantity": 1, "unit": "lot", "unit_price_override": 1}],
+            },
+        }
+        metadata = webapp.blank_quote_session_metadata(session_id, "2026-09-16T00:00:00Z")
+        metadata["owner"] = {"user_id": "user-run584"}
+        metadata["status"]["quote_generated"] = True
+        metadata["draft_state"] = webapp.quote_session_draft_state(patch)
+        metadata["exports"]["xlsx"] = {
+            "filename": "quotation.xlsx",
+            "publication_id": publication_id,
+            "run_id": run_id,
+            "size_bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "stale": False,
+        }
+        metadata["publication"] = {
+            "state": "published",
+            "active_publication_id": publication_id,
+            "run_id": run_id,
+            "job_id": "job-run584-proof-kind",
+        }
+        metadata["publication"]["proof"] = webapp.quote_session_publication_proof(
+            metadata,
+            patch,
+            publication_id=publication_id,
+            run_id=run_id,
+            job_id="job-run584-proof-kind",
+            workspace_id="workspace-run584",
+            owner_id="user-run584",
+            authority=authority,
+        )
+        retained_version = {
+            "session_id": session_id,
+            "state": "published",
+            "artifact_storage_mode": "database",
+            "metadata_json": json.dumps({
+                "exports": {
+                    "xlsx": metadata["exports"]["xlsx"],
+                    "pdf": {"filename": "quotation.pdf", "size_bytes": 99, "sha256": "f" * 64},
+                }
+            }),
+        }
+        xlsx_artifact = {
+            "filename": "quotation.xlsx",
+            "content_type": webapp.QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"],
+            "size_bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "content": content,
+        }
+
+        for mode in ("database", "object"):
+            storage = object.__new__(webapp.DatabaseSqagStorage)
+            storage.workspace_id = "workspace-run584"
+            storage.user_id = "user-run584"
+            storage._read_quote_session_metadata = mock.Mock(return_value=(copy.deepcopy(metadata), []))
+            storage._publication_version_row = mock.Mock(return_value={**retained_version, "artifact_storage_mode": mode})
+            storage._publication_version_artifact = mock.Mock(return_value=xlsx_artifact)
+            storage.connection = mock.Mock(side_effect=AssertionError("database artifact bytes were queried"))
+            backend = mock.Mock()
+            backend.retrieve_artifact.side_effect = AssertionError("object artifact bytes were retrieved")
+            with self.subTest(mode=mode), mock.patch.object(
+                webapp,
+                "configured_artifact_storage_mode",
+                return_value=mode,
+            ), mock.patch.object(
+                webapp,
+                "configured_object_storage_backend",
+                return_value=backend,
+            ), mock.patch.object(
+                webapp,
+                "database_current_publication_authority_for_metadata",
+                return_value=authority,
+            ), mock.patch.object(
+                webapp,
+                "quote_session_storage_for_auth_session",
+                return_value=storage,
+            ):
+                with LocalRunnerServer() as runner:
+                    self.assertEqual(
+                        local_http_get_bytes(
+                            runner,
+                            f"/api/quote-sessions/{session_id}/download/pdf",
+                        )[0],
+                        404,
+                    )
+                    self.assertEqual(
+                        local_http_get_bytes(
+                            runner,
+                            f"/api/quote-sessions/{session_id}/download/xlsx",
+                        ),
+                        (200, content),
+                    )
+            self.assertEqual(
+                storage._publication_version_artifact.call_args_list,
+                [mock.call(session_id, run_id, "xlsx")],
+            )
+            storage.connection.assert_not_called()
+            backend.retrieve_artifact.assert_not_called()
+
     def test_run575_database_artifact_bytes_must_match_validated_proof(self):
         content = b"PK\x03\x04run575-proof-bound-xlsx"
         digest = hashlib.sha256(content).hexdigest()
@@ -38485,7 +38773,7 @@ function normalizeQuoteBasisTitle(value) { return String(value || "").trim(); }
 function normalizeBasisTag(value) { return ["Include", "Confirm", "Custom", "Exclude"].includes(value) ? value : "Confirm"; }
 function safeId(value, fallback) { const result = String(value || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""); return result || fallback; }
 function canonicalQuoteBasis(value) { return value || {}; }
-eval(["pythonWhitespaceText", "canonicalPrimaryOrderValue", "canonicalizeOrderFields", "canonicalizePrimaryOrderFields", "canonicalBasisSectionText", "canonicalBasisSectionLine", "canonicalQuoteBasisSections", "quoteBasisFromSections", "canonicalQuoteBasisForPersistence", "quoteBasisPersistenceProjection"].map(extractFunction).join("\n"));
+eval(["pythonWhitespaceText", "canonicalPrimaryOrderValue", "canonicalizeOrderFields", "canonicalizePrimaryOrderFields", "canonicalBasisSectionText", "canonicalBasisSectionLine", "canonicalQuoteBasisSections", "quoteBasisFromSections", "cloneQuoteBasisSections", "canonicalQuoteBasisForPersistence", "quoteBasisPersistenceProjection"].map(extractFunction).join("\n"));
 const raw = [
   { id: "custom-only", title: "Custom", section_order: "0002", basis_order: 4, lines: [{ tag: "Custom", text: "\r\n  lead\t  middle  \rtrail  \r\n" }] },
   { id: "graphics", title: "Graphics", section_order: 1, basis_order: "0003", lines: [{ tag: "Confirm", text: "Legacy\r\n\r\n  custom tail\t" }] },
@@ -38495,6 +38783,7 @@ const second = canonicalQuoteBasisSections(JSON.parse(JSON.stringify(first)));
 const third = canonicalQuoteBasisSections(JSON.parse(JSON.stringify(second)));
 assert.deepStrictEqual(first, second);
 assert.deepStrictEqual(second, third);
+assert.deepStrictEqual(cloneQuoteBasisSections(first), first);
 assert.strictEqual(first[0].lines[0].text, "\n  lead\t  middle  \ntrail  \n");
 assert.deepStrictEqual([first[0].section_order, first[0].basis_order], [2, 4]);
 assert.strictEqual(quoteBasisFromSections(first)["custom-only"], "Custom: \n  lead\t  middle  \ntrail  \n");

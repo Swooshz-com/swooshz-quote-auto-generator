@@ -2938,6 +2938,22 @@ async function run573LoadedAppOnce(runIndex) {
         replacePricingAuthority: true,
       });
       captureOriginalAnalysisSnapshot({ quote_basis_sections: state.quoteBasisSections, source: "run573-loaded-app" });
+      const capturedSections = cloneQuoteBasisSections(state.quoteBasisSections);
+      state.quoteBasisSections[1].lines[0].text = "temporary lossy reset probe";
+      state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
+      resetQuoteBasisToOriginal();
+      if (JSON.stringify(state.quoteBasisSections) !== JSON.stringify(capturedSections)) {
+        throw new Error("Clone/reset did not preserve canonical basis sections.");
+      }
+      const resetProjection = quoteBasisPersistenceProjection();
+      const resetLossless = resetProjection.quote_basis_sections.find((section) => section.id === "run580-lossless");
+      if (
+        resetLossless?.lines?.[0]?.text !== expectedLosslessText
+        || resetLossless?.section_order !== 1
+        || resetLossless?.basis_order !== 3
+      ) {
+        throw new Error("Reset state-writing projection lost canonical text or ordering fields.");
+      }
       refreshOutputRowsFromLineItems();
       state.originalOutputRows = snapshotOutputRows(state.outputRows);
       state.basisConfirmed = true;
@@ -2991,6 +3007,18 @@ async function run573LoadedAppOnce(runIndex) {
       const restored = await page.evaluate(async ({ sessionId, expectedSha, expectedSize }) => {
         const didRestore = await modifyDashboardQuote(sessionId);
         if (!didRestore) throw new Error(`Could not restore ${sessionId}.`);
+        const restoredProjection = quoteBasisPersistenceProjection();
+        const generationProjection = buildPayload();
+        const restoredLossless = restoredProjection.quote_basis_sections.find((section) => section.id === "run580-lossless");
+        const generatedLossless = generationProjection.quote_basis_sections.find((section) => section.id === "run580-lossless");
+        if (
+          restoredLossless?.lines?.[0]?.text !== "\n  lead\t  middle  \ntrail  \n"
+          || restoredLossless?.section_order !== 1
+          || restoredLossless?.basis_order !== 3
+          || JSON.stringify(generatedLossless) !== JSON.stringify(restoredLossless)
+        ) {
+          throw new Error("Reloaded generation input lost canonical basis state.");
+        }
         const before = state.downloadFile ? { ...state.downloadFile } : null;
         const saved = await saveCurrentQuoteSession({
           quoteGenerated: true,
