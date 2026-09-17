@@ -40,6 +40,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import unicodedata
 import warnings
 import zipfile
 from dataclasses import dataclass, field
@@ -5820,71 +5821,210 @@ def canonical_basis_section_text(value: Any) -> str:
     return value.replace("\r\n", "\n").replace("\r", "\n")
 
 
+AUTHORITATIVE_BASIS_MAX_DEPTH = 16
+AUTHORITATIVE_BASIS_MAX_OBJECT_KEYS = 1024
+AUTHORITATIVE_BASIS_MAX_ARRAY_ELEMENTS = 4096
+AUTHORITATIVE_BASIS_MAX_KEY_BYTES = 256
+AUTHORITATIVE_BASIS_MAX_STRING_BYTES = 262144
+AUTHORITATIVE_BASIS_MAX_NODES = 20000
+AUTHORITATIVE_BASIS_MAX_TEXT_BYTES = 1048576
+AUTHORITATIVE_BASIS_SAFE_INTEGER = 9007199254740991
+AUTHORITATIVE_BASIS_BLOCKED_KEYS = {
+    "__proto__", "constructor", "prototype", "auth_code", "authorization_code",
+    "oauth_code", "state", "auth_state", "oauth_state", "session_state",
+    "runtime_auth", "session_auth", "data_url", "logo_data_url", "brief_path",
+    "output_dir", "stdout", "stderr", "active_job", "job_id", "job_state",
+    "workflow_state", "workflow_stage", "recovery_file_key", "session_file_key",
+    "logo_session_file_key", "download_url",
+}
+
+
+def authoritative_basis_key_class(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).lower()
+    return re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
+
+
+def authoritative_basis_key_is_unsafe(value: str) -> bool:
+    if value in QUOTE_BASIS_UNSAFE_KEYS:
+        return True
+    key_class = authoritative_basis_key_class(value)
+    parts = set(filter(None, key_class.split("_")))
+    if key_class in AUTHORITATIVE_BASIS_BLOCKED_KEYS or key_class.endswith("_download_url"):
+        return True
+    if parts.intersection({"token", "secret", "cookie", "nonce", "password", "passwd", "credential", "bearer"}):
+        return True
+    if key_class in {"private_key", "authorization", "auth_header"}:
+        return True
+    if key_class in {"temp_path", "temporary_path", "tmp_path", "file_handle", "file_descriptor"}:
+        return True
+    return key_class.endswith(("_file_handle", "_temp_path", "_temporary_path", "_tmp_path"))
+
+
+def admit_authoritative_basis_value(value: Any) -> Any:
+    """Admit the shared Python/JS JSON value domain without truncation or coercion."""
+    budget = {"nodes": 0, "bytes": 0}
+
+    def admit(current: Any, depth: int) -> Any:
+        if depth > AUTHORITATIVE_BASIS_MAX_DEPTH:
+            raise ValueError("Quote basis exceeds the maximum depth.")
+        budget["nodes"] += 1
+        if budget["nodes"] > AUTHORITATIVE_BASIS_MAX_NODES:
+            raise ValueError("Quote basis exceeds the aggregate node limit.")
+        if current is None or isinstance(current, bool):
+            return current
+        if isinstance(current, int):
+            if abs(current) > AUTHORITATIVE_BASIS_SAFE_INTEGER:
+                raise ValueError("Quote basis contains an unsafe integer.")
+            return current
+        if isinstance(current, float):
+            if not math.isfinite(current):
+                raise ValueError("Quote basis contains a non-finite number.")
+            if current == 0:
+                return 0
+            if current.is_integer():
+                number = int(current)
+                if abs(number) > AUTHORITATIVE_BASIS_SAFE_INTEGER:
+                    raise ValueError("Quote basis contains an unsafe integer.")
+                return number
+            return current
+        if isinstance(current, str):
+            length = len(current.encode("utf-8"))
+            if length > AUTHORITATIVE_BASIS_MAX_STRING_BYTES:
+                raise ValueError("Quote basis contains an oversized string.")
+            budget["bytes"] += length
+            if budget["bytes"] > AUTHORITATIVE_BASIS_MAX_TEXT_BYTES:
+                raise ValueError("Quote basis exceeds the aggregate text limit.")
+            return current
+        if isinstance(current, list):
+            if len(current) > AUTHORITATIVE_BASIS_MAX_ARRAY_ELEMENTS:
+                raise ValueError("Quote basis contains an oversized array.")
+            return [admit(item, depth + 1) for item in current]
+        if isinstance(current, dict):
+            if len(current) > AUTHORITATIVE_BASIS_MAX_OBJECT_KEYS:
+                raise ValueError("Quote basis contains an oversized object.")
+            admitted: dict[str, Any] = {}
+            for key, item in current.items():
+                if not isinstance(key, str):
+                    raise ValueError("Quote basis object keys must be strings.")
+                key_length = len(key.encode("utf-8"))
+                if key_length > AUTHORITATIVE_BASIS_MAX_KEY_BYTES:
+                    raise ValueError("Quote basis contains an oversized key.")
+                budget["bytes"] += key_length
+                if budget["bytes"] > AUTHORITATIVE_BASIS_MAX_TEXT_BYTES:
+                    raise ValueError("Quote basis exceeds the aggregate text limit.")
+                if authoritative_basis_key_is_unsafe(key):
+                    raise ValueError("Quote basis contains unsafe metadata.")
+                admitted[key] = admit(item, depth + 1)
+            return admitted
+        raise ValueError("Quote basis contains an unsupported runtime value.")
+
+    return admit(value, 0)
+
+
+def _canonical_basis_alias_text(value: dict[str, Any], aliases: tuple[str, ...], *, default: str = "") -> str:
+    present = [(key, value[key]) for key in aliases if key in value]
+    if not present:
+        return canonical_basis_section_text(default)
+    canonical = [canonical_basis_section_text(item) for _key, item in present]
+    if any(item != canonical[0] for item in canonical[1:]):
+        raise ValueError("Quote basis contains conflicting structural aliases.")
+    return canonical[0]
+
+
 def canonical_basis_section_line(value: Any) -> dict[str, Any] | None:
     if isinstance(value, str):
         text = canonical_basis_section_text(value)
-        return {"tag": "Confirm", "text": text} if text != "" else None
+        if text == "":
+            raise ValueError("Quote basis line text must not be empty.")
+        return {"tag": "Confirm", "text": text}
     if not isinstance(value, dict):
-        return None
-    value = canonicalize_primary_order_fields(value)
-    raw_text = value.get("text")
-    if raw_text is None:
-        raw_text = value.get("line") if "line" in value else value.get("description")
-    text = canonical_basis_section_text(raw_text if raw_text is not None else "")
+        raise ValueError("Quote basis line must be a string or object.")
+    text = _canonical_basis_alias_text(value, ("text", "line", "description"))
     if text == "":
-        return None
+        raise ValueError("Quote basis line text must not be empty.")
     line: dict[str, Any] = {"tag": normalize_basis_tag(value.get("tag")), "text": text}
-    seen_keys = {"tag", "text"}
-    for raw_key, item in value.items():
-        key = dashboard_safe_text(raw_key, 80)
+    for key, item in value.items():
         if key in {"tag", "text", "line", "description"}:
             continue
-        if key in seen_keys:
-            raise ValueError("Quote basis line contains colliding keys.")
-        seen_keys.add(key)
-        key_kind = re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
-        if (
-            not key
-            or key in QUOTE_SESSION_DRAFT_STATE_STRIP_KEYS
-            or any(part in key_kind for part in ("token", "secret", "cookie", "nonce"))
-            or key_kind in {"authorization", "auth_code", "state"}
-        ):
+        if key in PRIMARY_ORDER_FIELDS:
+            order = canonical_primary_order_value(item)
+            if order is None:
+                raise ValueError("Quote basis contains an invalid order value.")
+            line[key] = order
             continue
-        line[key] = quote_session_draft_state_value(item, 1)
+        line[key] = copy.deepcopy(item)
     return line
 
 
 def canonical_quote_basis_sections(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    raw_sections = payload.get("quote_basis_sections")
+    if not isinstance(payload, dict):
+        raise ValueError("Quote basis payload must be an object.")
+    raw_payload = admit_authoritative_basis_value({
+        key: payload[key]
+        for key in ("quote_basis_sections", "quote_basis")
+        if key in payload
+    })
+    raw_sections = raw_payload.get("quote_basis_sections")
     sections: list[dict[str, Any]] = []
     used_ids: set[str] = set()
+    sections_supplied = "quote_basis_sections" in raw_payload
+    if sections_supplied and not isinstance(raw_sections, list):
+        raise ValueError("Quote basis sections must be a list.")
     if isinstance(raw_sections, list) and raw_sections:
         for index, raw_section in enumerate(raw_sections, start=1):
             if not isinstance(raw_section, dict):
-                continue
-            admitted_section = canonicalize_order_fields(raw_section, QUOTE_BASIS_SECTION_ORDER_FIELDS)
+                raise ValueError("Quote basis section must be an object.")
+            admitted_section = raw_section
             title = clean_basis_section_title(admitted_section.get("title")) or "Section"
-            raw_id = clean_text(admitted_section.get("id"))
+            raw_id_value = admitted_section.get("id")
+            if raw_id_value is not None and not isinstance(raw_id_value, str):
+                raise ValueError("Quote basis section id must be a string.")
+            raw_id = clean_text(raw_id_value)
             section_id = raw_id if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", raw_id) else safe_section_id(title)
             section_id = section_id or f"section-{index}"
             if section_id in used_ids:
                 raise ValueError("Quote basis sections contain colliding identities.")
             used_ids.add(section_id)
-            raw_lines = admitted_section.get("lines")
-            if not isinstance(raw_lines, list):
-                raw_value = admitted_section.get("text") if "text" in admitted_section else admitted_section.get("body")
-                raw_lines = [raw_value] if isinstance(raw_value, str) else []
-            lines = [line for item in raw_lines for line in [canonical_basis_section_line(item)] if line is not None]
-            if lines:
-                section = {"id": section_id, "title": title, "lines": lines}
-                for order_key in QUOTE_BASIS_SECTION_ORDER_FIELDS:
-                    if order_key in admitted_section:
-                        section[order_key] = admitted_section[order_key]
-                sections.append(section)
-        return sections
+            if "lines" in admitted_section:
+                raw_lines = admitted_section["lines"]
+                if not isinstance(raw_lines, list):
+                    raise ValueError("Quote basis section lines must be a list.")
+                if "text" in admitted_section or "body" in admitted_section:
+                    alias_text = _canonical_basis_alias_text(admitted_section, ("text", "body"))
+                    projected = "\n".join(
+                        f"{normalize_basis_tag(line.get('tag'))}: {line.get('text')}"
+                        for line in (canonical_basis_section_line(item) for item in raw_lines)
+                        if line is not None
+                    )
+                    if alias_text != projected:
+                        raise ValueError("Quote basis contains conflicting section aliases.")
+            elif "text" in admitted_section or "body" in admitted_section:
+                raw_lines = [_canonical_basis_alias_text(admitted_section, ("text", "body"))]
+            else:
+                raw_lines = []
+            lines = [canonical_basis_section_line(item) for item in raw_lines]
+            section = {"id": section_id, "title": title, "lines": lines}
+            for key, item in admitted_section.items():
+                if key in {"id", "title", "lines", "text", "body"}:
+                    continue
+                if key in QUOTE_BASIS_SECTION_ORDER_FIELDS:
+                    order = canonical_primary_order_value(item)
+                    if order is None:
+                        raise ValueError("Quote basis contains an invalid order value.")
+                    section[key] = order
+                else:
+                    section[key] = copy.deepcopy(item)
+            sections.append(section)
+
+        derived_basis = canonical_quote_basis(quote_basis_from_sections(sections))
+        if "quote_basis" in raw_payload:
+            supplied_basis = canonical_quote_basis(raw_payload.get("quote_basis"))
+            if supplied_basis and supplied_basis != derived_basis:
+                raise ValueError("Quote basis sections do not agree with quote basis.")
+        return admit_authoritative_basis_value(sections)
 
     raw_basis = canonical_quote_basis(
-        payload.get("quote_basis") if isinstance(payload.get("quote_basis"), dict) else {}
+        raw_payload.get("quote_basis") if "quote_basis" in raw_payload else {}
     )
     ordered_keys = [key for key in QUOTE_BASIS_KEYS if key in raw_basis]
     ordered_keys.extend(key for key in raw_basis if key not in ordered_keys)
@@ -5896,7 +6036,7 @@ def canonical_quote_basis_sections(payload: dict[str, Any]) -> list[dict[str, An
         line = canonical_basis_section_line(raw_basis[key])
         if line is not None:
             sections.append({"id": section_id, "title": quote_basis_title_from_key(key), "lines": [line]})
-    return sections
+    return admit_authoritative_basis_value(sections)
 
 
 def normalize_quote_basis_sections(
@@ -20418,6 +20558,53 @@ def find_basis_chat_target(
     return section_index, line_index, line
 
 
+def raw_basis_chat_target(
+    payload: dict[str, Any],
+) -> tuple[list[dict[str, Any]], int, int, dict[str, Any]]:
+    """Bind selection to one explicit raw section id and raw line slot before admission."""
+    raw_sections = payload.get("quote_basis_sections")
+    basis_chat = payload.get("basis_chat") if isinstance(payload.get("basis_chat"), dict) else {}
+    if not isinstance(raw_sections, list):
+        raise OpenAIAnalysisError("AI basis chat requires explicit quote-basis sections.")
+    field = basis_chat.get("field")
+    line_index = parse_basis_chat_line_index(basis_chat.get("line_index"))
+    if not isinstance(field, str) or field == "" or line_index < 0:
+        raise OpenAIAnalysisError("AI basis chat selector is invalid.")
+    matches = [
+        (index, section)
+        for index, section in enumerate(raw_sections)
+        if isinstance(section, dict)
+        and isinstance(section.get("id"), str)
+        and section.get("id") == field
+    ]
+    if len(matches) != 1:
+        raise OpenAIAnalysisError("AI basis chat selector did not identify exactly one raw section.")
+    section_index, raw_section = matches[0]
+    raw_lines = raw_section.get("lines")
+    if not isinstance(raw_lines, list) or line_index >= len(raw_lines):
+        raise OpenAIAnalysisError("AI basis chat selector did not identify a raw line slot.")
+    try:
+        admitted_slot = admit_authoritative_basis_value({"line": raw_lines[line_index]})["line"]
+        selected = canonical_basis_section_line(admitted_slot)
+    except ValueError as exc:
+        raise OpenAIAnalysisError("AI basis chat selected line is invalid.") from exc
+    if selected is None or not basis_chat_selected_line_matches(selected, basis_chat.get("line")):
+        raise OpenAIAnalysisError("AI basis chat selected-line assertion did not match.")
+    try:
+        sections = canonical_quote_basis_sections(payload)
+    except ValueError as exc:
+        raise OpenAIAnalysisError("AI basis chat could not admit the current quote basis.") from exc
+    if section_index >= len(sections):
+        raise OpenAIAnalysisError("AI basis chat selector could not be mapped after admission.")
+    admitted_lines = sections[section_index].get("lines")
+    if not isinstance(admitted_lines, list) or line_index >= len(admitted_lines):
+        raise OpenAIAnalysisError("AI basis chat selector could not be mapped after admission.")
+    admitted = admitted_lines[line_index]
+    if not isinstance(admitted, dict) or admitted != selected:
+        raise OpenAIAnalysisError("AI basis chat selected-line authority changed during admission.")
+    return sections, section_index, line_index, admitted
+
+
 def normalized_basis_chat_line_items(
     raw_items: Any,
     payload: dict[str, Any],
@@ -21511,22 +21698,16 @@ def replacement_line_sections(
     replacement_line: Any,
     auth_session: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    try:
-        sections = canonical_quote_basis_sections(payload)
-    except ValueError as exc:
-        raise OpenAIAnalysisError("AI basis chat could not admit the current quote basis.") from exc
-    if not sections:
-        raise OpenAIAnalysisError("AI basis chat could not find the current quote basis.")
+    sections, section_index, line_index, current_line = raw_basis_chat_target(payload)
+    if not isinstance(replacement_line, dict) or set(replacement_line) - {
+        "text", "tag", "confidence", "confidence_pct", "quantity", "unit"
+    }:
+        raise OpenAIAnalysisError("AI basis chat returned unsupported replacement-line fields.")
     candidate = normalize_basis_line(replacement_line)
     if not candidate:
         raise OpenAIAnalysisError("AI basis chat did not return a usable replacement line.")
 
     basis_chat = payload.get("basis_chat") if isinstance(payload.get("basis_chat"), dict) else {}
-    target = find_basis_chat_target(sections, basis_chat)
-    if not target:
-        raise OpenAIAnalysisError("AI basis chat could not match the selected quote-basis line.")
-
-    section_index, line_index, current_line = target
     replacement = copy.deepcopy(current_line)
     replacement["text"] = candidate["text"]
     if isinstance(replacement_line, dict) and clean_text(replacement_line.get("tag")):
@@ -21628,6 +21809,12 @@ def normalize_basis_chat_result(
             raise OpenAIAnalysisError("AI basis chat proposals require a selected quote-basis line.")
         if required_intent == "answer":
             raise OpenAIAnalysisError("AI basis chat returned a proposal for a question instead of an answer.")
+        unexpected_proposal_keys = set(raw_proposal) - {"message", "replacement_line"}
+        replacement_value = raw_proposal.get("replacement_line")
+        if unexpected_proposal_keys or not isinstance(replacement_value, dict):
+            raise OpenAIAnalysisError("AI basis chat returned an expanded proposal payload.")
+        if set(replacement_value) - {"text", "tag", "confidence", "confidence_pct", "quantity", "unit"}:
+            raise OpenAIAnalysisError("AI basis chat returned unsupported replacement-line fields.")
         message = clean_multiline(raw_proposal.get("message") or parsed.get("message"))
         line_items = normalized_basis_chat_line_items(None, payload, auth_session=auth_session)
         sections = replacement_line_sections(
@@ -25966,12 +26153,17 @@ def compact_generation_canonical_manifest(
 
 def forensic_request_evidence_assessment(payload: dict[str, Any]) -> dict[str, Any]:
     """Measure allowed immutable evidence without retaining an oversized body."""
+    try:
+        admitted_basis = canonical_quote_basis_sections(payload)
+    except (TypeError, ValueError):
+        admitted_basis = []
+        basis_invalid = True
+    else:
+        basis_invalid = False
     sections = (
         (
             "approved_basis",
-            payload.get("quote_basis_sections")
-            if isinstance(payload.get("quote_basis_sections"), list)
-            else [],
+            admitted_basis,
         ),
         (
             "output_rows",
@@ -25983,8 +26175,10 @@ def forensic_request_evidence_assessment(payload: dict[str, Any]) -> dict[str, A
     encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
     measured = 1
     exceeded_section = ""
-    invalid_section = ""
+    invalid_section = "approved_basis" if basis_invalid else ""
     for index, (name, value) in enumerate(sections):
+        if invalid_section:
+            break
         measured += len(("," if index else "") + json.dumps(name) + ":")
         try:
             for chunk in encoder.iterencode(value):
@@ -26059,7 +26253,7 @@ def minimal_forensic_request_summary(
 
 
 def forensic_request_summary(payload: dict[str, Any]) -> dict[str, Any]:
-    approved_basis = copy.deepcopy(payload.get("quote_basis_sections")) if isinstance(payload.get("quote_basis_sections"), list) else []
+    approved_basis = canonical_quote_basis_sections(payload)
     output_rows = copy.deepcopy(payload.get("line_items")) if isinstance(payload.get("line_items"), list) else []
     return {
         "schema": "swooshz.sqag.generation-request-evidence.v1",
@@ -27468,7 +27662,7 @@ def _run_quote_job(
         "generation_schema_version": 1,
         "job_id": job_id,
         "normalized_brief": normalized_brief,
-        "approved_basis": copy.deepcopy(payload.get("quote_basis_sections") or []),
+        "approved_basis": canonical_quote_basis_sections(payload),
         "output_rows": copy.deepcopy(payload.get("line_items") or []),
         "profile": {"snapshot": profile_snapshot, "sha256": hashlib.sha256(json.dumps(profile_snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()},
         "pricing_reference": {"snapshot": json.loads(pricing_bytes.decode("utf-8")), "sha256": hashlib.sha256(pricing_bytes).hexdigest()},

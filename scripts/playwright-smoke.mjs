@@ -3117,7 +3117,31 @@ async function run573LoadedAppOnce(runIndex) {
           expectedTargetText,
           normalizedProposal.lineItems,
         );
+        const origin = normalizedProposal._origin;
+        const originalSessionId = state.quoteSessionId;
+        const originalRevision = state.outputRevision;
+        const originalBasis = state.quoteBasis;
+        const originalSections = state.quoteBasisSections;
+        const staleCases = [
+          ["session", () => { state.quoteSessionId = `${originalSessionId || "quote-run589"}-stale`; }, () => { state.quoteSessionId = originalSessionId; }],
+          ["revision", () => { state.outputRevision = originalRevision + 1; }, () => { state.outputRevision = originalRevision; }],
+          ["map", () => { state.quoteBasis = { ...originalBasis, "run589-target": "Confirm: stale map" }; }, () => { state.quoteBasis = originalBasis; }],
+          ["basis", () => { state.quoteBasisSections = cloneQuoteBasisSections(originalSections); state.quoteBasisSections[1].lines[0].metadata.keep = false; state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections); }, () => { state.quoteBasisSections = originalSections; state.quoteBasis = originalBasis; }],
+          ["target", () => { state.quoteBasisSections = cloneQuoteBasisSections(originalSections); state.quoteBasisSections[0].lines[0].text = "Different selected target"; state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections); }, () => { state.quoteBasisSections = originalSections; state.quoteBasis = originalBasis; }],
+        ];
+        for (const [label, mutate, restore] of staleCases) {
+          mutate();
+          if (basisChatOriginIsCurrent(origin)) throw new Error(`Run-593 stale ${label} proposal was accepted.`);
+          restore();
+        }
+        state.outputRevision = originalRevision + 1;
         state.basisChat.proposal = normalizedProposal;
+        applyBasisChatProposal();
+        if (JSON.stringify(state.quoteBasisSections) !== JSON.stringify(originalSections)) {
+          throw new Error("Run-593 stale proposal mutated authoritative basis state.");
+        }
+        state.outputRevision = originalRevision;
+        state.basisChat.proposal = normalizeServerBasisChatProposal(rawProposal);
         applyBasisChatProposal();
         assertRun589State("authoritative state", state.quoteBasisSections, state.quoteBasis, expectedTargetText, state.lineItems);
         const snapshot = buildSessionSnapshot();

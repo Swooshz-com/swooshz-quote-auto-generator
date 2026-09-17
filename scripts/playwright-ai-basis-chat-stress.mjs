@@ -200,6 +200,58 @@ function quoteBasisFromSections(sections) {
   ]));
 }
 
+function targetOnlyBasisChatResult(payload, options = {}) {
+  const chat = payload?.basis_chat;
+  const sections = payload?.quote_basis_sections;
+  const lineItems = payload?.line_items;
+  const field = chat?.field;
+  const lineIndex = chat?.line_index;
+  const fail = (detail) => ({
+    status: "failed",
+    errors: [`Invalid target-only basis-chat fixture input: ${detail}`],
+  });
+  if (!Array.isArray(sections)) return fail("quote_basis_sections must be an array");
+  if (!Array.isArray(lineItems)) return fail("line_items must be an array");
+  if (typeof field !== "string" || field !== options.expectedField) {
+    return fail(`expected selected section ${options.expectedField}, received ${String(field)}`);
+  }
+  if (typeof lineIndex !== "number" || !Number.isInteger(lineIndex) || lineIndex < 0) {
+    return fail("line_index must be a non-negative integer");
+  }
+  const matches = sections.map((section, index) => ({ section, index })).filter(({ section }) => (
+    section && typeof section === "object" && !Array.isArray(section) && section.id === field
+  ));
+  if (matches.length !== 1) return fail("selected section id must identify exactly one section");
+  const selectedSection = matches[0].section;
+  if (!Array.isArray(selectedSection.lines) || lineIndex >= selectedSection.lines.length) {
+    return fail("selected line index is out of range");
+  }
+  const selectedLine = selectedSection.lines[lineIndex];
+  if (!selectedLine || typeof selectedLine !== "object" || Array.isArray(selectedLine)) {
+    return fail("selected line must be an object");
+  }
+  const assertion = chat.line;
+  const taggedText = `${selectedLine.tag}: ${selectedLine.text}`;
+  if (typeof assertion !== "string" || (assertion !== selectedLine.text && assertion !== taggedText)) {
+    return fail("selected line assertion does not match the raw target");
+  }
+
+  const nextSections = structuredClone(sections);
+  const nextTarget = nextSections[matches[0].index].lines[lineIndex];
+  options.mutateTarget(nextTarget);
+  return {
+    status: "answered",
+    type: "proposal",
+    source: "playwright-mock",
+    proposal: {
+      message: options.message,
+      quote_basis: quoteBasisFromSections(nextSections),
+      quote_basis_sections: nextSections,
+      line_items: structuredClone(lineItems),
+    },
+  };
+}
+
 function draftResult() {
   const sections = quoteBasisSections();
   return {
@@ -237,18 +289,13 @@ function basisChatResult(payload) {
         errors: [`Selected line quantity was not included in basis chat payload: ${JSON.stringify(chat)}`],
       };
     }
-    const sections = quoteBasisSections("150mm raised platform with needle punch carpet.");
-    return {
-      status: "answered",
-      type: "proposal",
-      source: "playwright-mock",
-      proposal: {
-        message: "Change the selected platform line to 150mm?",
-        quote_basis: quoteBasisFromSections(sections),
-        quote_basis_sections: sections,
-        line_items: draftResult().line_items,
+    return targetOnlyBasisChatResult(payload, {
+      expectedField: "platform",
+      message: "Change the selected platform line to 150mm?",
+      mutateTarget: (line) => {
+        line.text = "150mm raised platform with needle punch carpet.";
       },
-    };
+    });
   }
   if (question.includes("what does")) {
     return {
@@ -259,18 +306,13 @@ function basisChatResult(payload) {
     };
   }
   if (question.includes("include all lighting")) {
-    const sections = quoteBasisSections("150mm raised platform with needle punch carpet.", "Include");
-    return {
-      status: "answered",
-      type: "proposal",
-      source: "playwright-mock",
-      proposal: {
-        message: "Mark lighting and electrical as included?",
-        quote_basis: quoteBasisFromSections(sections),
-        quote_basis_sections: sections,
-        line_items: draftResult().line_items,
+    return targetOnlyBasisChatResult(payload, {
+      expectedField: "electrical",
+      message: "Mark lighting and electrical as included?",
+      mutateTarget: (line) => {
+        line.tag = "Include";
       },
-    };
+    });
   }
   return {
     status: "failed",

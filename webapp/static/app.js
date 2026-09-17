@@ -6628,6 +6628,91 @@ function canonicalBasisSectionText(value = "") {
   return value.replace(/\r\n?/g, "\n");
 }
 
+const AUTHORITATIVE_BASIS_LIMITS = Object.freeze({
+  depth: 16,
+  objectKeys: 1024,
+  arrayElements: 4096,
+  keyBytes: 256,
+  stringBytes: 262144,
+  nodes: 20000,
+  textBytes: 1048576,
+});
+const AUTHORITATIVE_BASIS_BLOCKED_KEYS = new Set([
+  "__proto__", "constructor", "prototype", "auth_code", "authorization_code", "oauth_code",
+  "state", "auth_state", "oauth_state", "session_state", "runtime_auth", "session_auth",
+  "data_url", "logo_data_url", "brief_path", "output_dir", "stdout", "stderr", "active_job",
+  "job_id", "job_state", "workflow_state", "workflow_stage", "recovery_file_key",
+  "session_file_key", "logo_session_file_key", "download_url",
+]);
+
+function authoritativeBasisKeyClass(value = "") {
+  return String(value).normalize("NFKC").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
+
+function authoritativeBasisKeyIsUnsafe(value = "") {
+  if (QUOTE_BASIS_UNSAFE_KEYS.has(String(value))) return true;
+  const keyClass = authoritativeBasisKeyClass(value);
+  const parts = new Set(keyClass.split("_").filter(Boolean));
+  if (AUTHORITATIVE_BASIS_BLOCKED_KEYS.has(keyClass) || keyClass.endsWith("_download_url")) return true;
+  if (["token", "secret", "cookie", "nonce", "password", "passwd", "credential", "bearer"].some((part) => parts.has(part))) return true;
+  if (["private_key", "authorization", "auth_header", "temp_path", "temporary_path", "tmp_path", "file_handle", "file_descriptor"].includes(keyClass)) return true;
+  return ["_file_handle", "_temp_path", "_temporary_path", "_tmp_path"].some((suffix) => keyClass.endsWith(suffix));
+}
+
+function admitAuthoritativeBasisValue(value) {
+  const budget = { nodes: 0, bytes: 0 };
+  const byteLength = (text) => new TextEncoder().encode(text).length;
+  const admit = (current, depth) => {
+    if (depth > AUTHORITATIVE_BASIS_LIMITS.depth) throw new TypeError("Quote basis exceeds the maximum depth.");
+    budget.nodes += 1;
+    if (budget.nodes > AUTHORITATIVE_BASIS_LIMITS.nodes) throw new TypeError("Quote basis exceeds the aggregate node limit.");
+    if (current === null || typeof current === "boolean") return current;
+    if (typeof current === "string") {
+      const length = byteLength(current);
+      if (length > AUTHORITATIVE_BASIS_LIMITS.stringBytes) throw new TypeError("Quote basis contains an oversized string.");
+      budget.bytes += length;
+      if (budget.bytes > AUTHORITATIVE_BASIS_LIMITS.textBytes) throw new TypeError("Quote basis exceeds the aggregate text limit.");
+      return current;
+    }
+    if (typeof current === "number") {
+      if (!Number.isFinite(current)) throw new TypeError("Quote basis contains a non-finite number.");
+      if (Number.isInteger(current) && !Number.isSafeInteger(current)) throw new TypeError("Quote basis contains an unsafe integer.");
+      return Object.is(current, -0) ? 0 : current;
+    }
+    if (Array.isArray(current)) {
+      if (current.length > AUTHORITATIVE_BASIS_LIMITS.arrayElements) throw new TypeError("Quote basis contains an oversized array.");
+      return current.map((item) => admit(item, depth + 1));
+    }
+    if (!current || typeof current !== "object") throw new TypeError("Quote basis contains an unsupported runtime value.");
+    const prototype = Object.getPrototypeOf(current);
+    if (prototype !== Object.prototype && prototype !== null) throw new TypeError("Quote basis contains a non-plain object.");
+    const descriptors = Object.getOwnPropertyDescriptors(current);
+    const keys = Object.keys(descriptors);
+    if (keys.length > AUTHORITATIVE_BASIS_LIMITS.objectKeys) throw new TypeError("Quote basis contains an oversized object.");
+    const admitted = {};
+    keys.forEach((key) => {
+      const descriptor = descriptors[key];
+      if (descriptor.get || descriptor.set) throw new TypeError("Quote basis contains an accessor.");
+      const length = byteLength(key);
+      if (length > AUTHORITATIVE_BASIS_LIMITS.keyBytes) throw new TypeError("Quote basis contains an oversized key.");
+      budget.bytes += length;
+      if (budget.bytes > AUTHORITATIVE_BASIS_LIMITS.textBytes) throw new TypeError("Quote basis exceeds the aggregate text limit.");
+      if (authoritativeBasisKeyIsUnsafe(key)) throw new TypeError("Quote basis contains unsafe metadata.");
+      admitted[key] = admit(descriptor.value, depth + 1);
+    });
+    return admitted;
+  };
+  return admit(value, 0);
+}
+
+function canonicalBasisAliasText(value, aliases, defaultValue = "") {
+  const present = aliases.filter((key) => Object.prototype.hasOwnProperty.call(value, key));
+  if (!present.length) return canonicalBasisSectionText(defaultValue);
+  const values = present.map((key) => canonicalBasisSectionText(value[key]));
+  if (values.some((item) => item !== values[0])) throw new TypeError("Quote basis contains conflicting structural aliases.");
+  return values[0];
+}
+
 function pythonWhitespaceText(value = "") {
   return String(value ?? "")
     .replace(/[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/gu, " ")
@@ -6635,63 +6720,81 @@ function pythonWhitespaceText(value = "") {
 }
 
 function canonicalBasisSectionLine(value = "") {
+  value = admitAuthoritativeBasisValue(value);
   if (typeof value === "string") {
     const text = canonicalBasisSectionText(value);
-    return text === "" ? null : { tag: "Confirm", text };
+    if (text === "") throw new TypeError("Quote basis line text must not be empty.");
+    return { tag: "Confirm", text };
   }
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const admitted = canonicalizePrimaryOrderFields(value);
-  const rawText = Object.prototype.hasOwnProperty.call(admitted, "text")
-    ? admitted.text
-    : Object.prototype.hasOwnProperty.call(admitted, "line")
-      ? admitted.line
-      : admitted.description ?? "";
-  const text = canonicalBasisSectionText(rawText);
-  if (text === "") return null;
-  const line = { tag: normalizeBasisTag(admitted.tag), text };
-  Object.entries(admitted).forEach(([key, item]) => {
-    if (!["tag", "text", "line", "description"].includes(key)) line[key] = item;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new TypeError("Quote basis line must be a string or object.");
+  const text = canonicalBasisAliasText(value, ["text", "line", "description"]);
+  if (text === "") throw new TypeError("Quote basis line text must not be empty.");
+  const line = { tag: normalizeBasisTag(value.tag), text };
+  Object.entries(value).forEach(([key, item]) => {
+    if (["tag", "text", "line", "description"].includes(key)) return;
+    if (["basis_order", "category_order", "item_order"].includes(key)) {
+      const order = canonicalPrimaryOrderValue(item);
+      if (order === null) throw new TypeError("Quote basis contains an invalid order value.");
+      line[key] = order;
+      return;
+    }
+    line[key] = item;
   });
   return line;
 }
 
 function canonicalQuoteBasisSections(value = {}) {
-  const rawSections = Array.isArray(value)
-    ? value
-    : Array.isArray(value.quote_basis_sections)
-      ? value.quote_basis_sections
-      : null;
+  const source = Array.isArray(value)
+    ? { quote_basis_sections: value }
+    : value && typeof value === "object"
+      ? Object.fromEntries(["quote_basis_sections", "quote_basis"].filter((key) => Object.prototype.hasOwnProperty.call(value, key)).map((key) => [key, value[key]]))
+      : {};
+  const admittedSource = admitAuthoritativeBasisValue(source);
+  const sectionsSupplied = Object.prototype.hasOwnProperty.call(admittedSource, "quote_basis_sections");
+  const rawSections = sectionsSupplied ? admittedSource.quote_basis_sections : null;
+  if (sectionsSupplied && !Array.isArray(rawSections)) throw new TypeError("Quote basis sections must be a list.");
   const usedIds = new Set();
-  if (rawSections) {
-    return rawSections
-      .map((section, index) => {
-        const admittedSection = canonicalizeOrderFields(
-          section,
-          new Set(["basis_order", "category_order", "item_order", "section_order"]),
-        );
-        const title = normalizeQuoteBasisTitle(admittedSection?.title || "Section") || "Section";
-        const rawId = pythonWhitespaceText(admittedSection?.id);
+  if (Array.isArray(rawSections) && rawSections.length) {
+    const sections = rawSections.map((admittedSection, index) => {
+        if (!admittedSection || typeof admittedSection !== "object" || Array.isArray(admittedSection)) throw new TypeError("Quote basis section must be an object.");
+        const title = normalizeQuoteBasisTitle(admittedSection.title || "Section") || "Section";
+        if (admittedSection.id !== undefined && typeof admittedSection.id !== "string") throw new TypeError("Quote basis section id must be a string.");
+        const rawId = pythonWhitespaceText(admittedSection.id);
         const id = safeId(rawId && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(rawId) ? rawId : title, `section-${index + 1}`);
         if (usedIds.has(id)) throw new TypeError("Quote basis sections contain colliding identities.");
         usedIds.add(id);
-        const rawLines = Array.isArray(admittedSection?.lines)
-          ? admittedSection.lines
-          : typeof admittedSection?.text === "string"
-            ? [admittedSection.text]
-            : typeof admittedSection?.body === "string"
-              ? [admittedSection.body]
-              : [];
-        const lines = rawLines.map(canonicalBasisSectionLine).filter(Boolean);
-        if (!lines.length) return null;
+        let rawLines = [];
+        if (Object.prototype.hasOwnProperty.call(admittedSection, "lines")) {
+          if (!Array.isArray(admittedSection.lines)) throw new TypeError("Quote basis section lines must be a list.");
+          rawLines = admittedSection.lines;
+          if (Object.prototype.hasOwnProperty.call(admittedSection, "text") || Object.prototype.hasOwnProperty.call(admittedSection, "body")) {
+            const aliasText = canonicalBasisAliasText(admittedSection, ["text", "body"]);
+            const projected = rawLines.map(canonicalBasisSectionLine).map((line) => `${normalizeBasisTag(line.tag)}: ${line.text}`).join("\n");
+            if (aliasText !== projected) throw new TypeError("Quote basis contains conflicting section aliases.");
+          }
+        } else if (Object.prototype.hasOwnProperty.call(admittedSection, "text") || Object.prototype.hasOwnProperty.call(admittedSection, "body")) {
+          rawLines = [canonicalBasisAliasText(admittedSection, ["text", "body"])];
+        }
+        const lines = rawLines.map(canonicalBasisSectionLine);
         const result = { id, title, lines };
-        ["basis_order", "category_order", "item_order", "section_order"].forEach((key) => {
-          if (Object.prototype.hasOwnProperty.call(admittedSection, key)) result[key] = admittedSection[key];
+        Object.entries(admittedSection).forEach(([key, item]) => {
+          if (["id", "title", "lines", "text", "body"].includes(key)) return;
+          if (["basis_order", "category_order", "item_order", "section_order"].includes(key)) {
+            const order = canonicalPrimaryOrderValue(item);
+            if (order === null) throw new TypeError("Quote basis contains an invalid order value.");
+            result[key] = order;
+          } else result[key] = item;
         });
         return result;
-      })
-      .filter(Boolean);
+      });
+    const derived = canonicalQuoteBasis(quoteBasisFromSections(sections));
+    if (Object.prototype.hasOwnProperty.call(admittedSource, "quote_basis")) {
+      const supplied = canonicalQuoteBasis(admittedSource.quote_basis);
+      if (Object.keys(supplied).length && JSON.stringify(supplied) !== JSON.stringify(derived)) throw new TypeError("Quote basis sections do not agree with quote basis.");
+    }
+    return admitAuthoritativeBasisValue(sections);
   }
-  const basis = value.quote_basis && typeof value.quote_basis === "object" ? value.quote_basis : value;
+  const basis = Object.prototype.hasOwnProperty.call(admittedSource, "quote_basis") ? admittedSource.quote_basis : {};
   const admittedBasis = canonicalQuoteBasis(basis);
   const titles = Object.fromEntries(BASIS_FIELDS);
   return Object.keys(admittedBasis)
@@ -6700,8 +6803,8 @@ function canonicalQuoteBasisSections(value = {}) {
       if (usedIds.has(id)) throw new TypeError("Quote basis sections contain colliding identities.");
       usedIds.add(id);
       const title = titles[key] || key.replace(/[-_]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
-      const lines = [canonicalBasisSectionLine(admittedBasis[key])].filter(Boolean);
-      return lines.length ? { id, title, lines } : null;
+      const lines = [canonicalBasisSectionLine(admittedBasis[key])];
+      return { id, title, lines };
     })
     .filter(Boolean);
 }
@@ -10181,8 +10284,8 @@ function basisQuantityDisplayLabel(line = {}) {
 
 function basisChatLineContext(line = {}) {
   const tag = normalizeBasisTag(line.tag);
-  const text = String(line.text || "").trim();
-  return `${tag}: ${text}`.trim();
+  const text = String(line.text ?? "");
+  return `${tag}: ${text}`;
 }
 
 function hasPricingReferenceDescription(line = {}) {
@@ -10574,6 +10677,85 @@ function selectedBasisLine() {
   return section?.lines?.[state.basisChat.lineIndex] || null;
 }
 
+function rawBasisChatTarget(sections = state.quoteBasisSections, selector = state.basisChat) {
+  if (!Array.isArray(sections)) throw new TypeError("Quote basis sections must be a list.");
+  const field = selector?.sectionId || selector?.field;
+  const lineIndex = selector?.lineIndex;
+  if (typeof field !== "string" || !field || typeof lineIndex !== "number" || !Number.isInteger(lineIndex) || lineIndex < 0) {
+    throw new TypeError("Quote basis selector is invalid.");
+  }
+  const matches = sections.map((section, index) => ({ section, index })).filter(({ section }) => (
+    section && typeof section === "object" && !Array.isArray(section)
+    && typeof section.id === "string" && section.id === field
+  ));
+  if (matches.length !== 1) throw new TypeError("Quote basis selector did not identify exactly one raw section.");
+  const { section, index: sectionIndex } = matches[0];
+  if (!Array.isArray(section.lines) || lineIndex >= section.lines.length) throw new TypeError("Quote basis selector did not identify a raw line slot.");
+  const rawLine = canonicalBasisSectionLine(section.lines[lineIndex]);
+  const assertion = typeof selector.line === "string" ? canonicalBasisSectionText(selector.line) : "";
+  const display = `${normalizeBasisTag(rawLine.tag)}: ${rawLine.text}`;
+  if (!assertion || (assertion !== rawLine.text && assertion !== display)) throw new TypeError("Quote basis selected-line assertion did not match.");
+  const canonicalSections = canonicalQuoteBasisSections({ quote_basis_sections: sections });
+  const admittedLine = canonicalSections[sectionIndex]?.lines?.[lineIndex];
+  if (!admittedLine || !quoteCommercialStrictDataEqual(admittedLine, rawLine)) throw new TypeError("Quote basis selector changed during admission.");
+  return { sections: canonicalSections, sectionIndex, lineIndex, line: admittedLine };
+}
+
+function basisChatProposalOrigin() {
+  const target = rawBasisChatTarget();
+  const basis = canonicalQuoteBasisForPersistence(state.quoteBasis, target.sections);
+  return {
+    quoteSessionId: safeQuoteSessionId(state.quoteSessionId || ""),
+    outputRevision: revisionNumber(state.outputRevision, 0),
+    quoteBasisSections: target.sections,
+    quoteBasis: basis,
+    selector: {
+      sectionId: state.basisChat.sectionId || state.basisChat.field,
+      lineIndex: state.basisChat.lineIndex,
+      line: state.basisChat.line,
+    },
+    selectedLine: target.line,
+  };
+}
+
+function basisChatOriginIsCurrent(origin) {
+  if (!origin || typeof origin !== "object") return false;
+  try {
+    return quoteCommercialStrictDataEqual(origin, basisChatProposalOrigin());
+  } catch (_error) {
+    return false;
+  }
+}
+
+function canonicalTargetOnlyBasisChatProposal(proposal = {}, origin = basisChatProposalOrigin()) {
+  const sectionsValue = proposal.quoteBasisSections || proposal.quote_basis_sections;
+  if (!Array.isArray(sectionsValue)) throw new TypeError("Basis proposal must contain canonical sections.");
+  const mapValue = proposal.quoteBasis || proposal.quote_basis || quoteBasisFromSections(sectionsValue);
+  const nextSections = canonicalQuoteBasisSections({ quote_basis_sections: sectionsValue, quote_basis: mapValue });
+  const currentSections = origin.quoteBasisSections;
+  const target = origin.selector;
+  if (nextSections.length !== currentSections.length) throw new TypeError("Basis proposal changed unrelated sections.");
+  nextSections.forEach((section, sectionIndex) => {
+    const current = currentSections[sectionIndex];
+    if (!current || section.id !== current.id || section.lines.length !== current.lines.length) throw new TypeError("Basis proposal changed unrelated structure.");
+    const leftSection = { ...current, lines: undefined };
+    const rightSection = { ...section, lines: undefined };
+    if (!quoteCommercialStrictDataEqual(leftSection, rightSection)) throw new TypeError("Basis proposal changed unrelated section metadata.");
+    section.lines.forEach((line, lineIndex) => {
+      if (section.id === target.sectionId && lineIndex === target.lineIndex) return;
+      if (!quoteCommercialStrictDataEqual(line, current.lines[lineIndex])) throw new TypeError("Basis proposal changed an unrelated line.");
+    });
+  });
+  return {
+    ...proposal,
+    message: String(proposal.message || "AI drafted a proposed quote basis update.").trim(),
+    quoteBasis: canonicalQuoteBasis(quoteBasisFromSections(nextSections)),
+    quoteBasisSections: nextSections,
+    lineItems: state.lineItems,
+    _origin: origin,
+  };
+}
+
 function appendBasisChatMessage(role, text, options = {}) {
   const message = document.createElement("div");
   message.className = `basis-chat-message ${role}`;
@@ -10623,7 +10805,7 @@ function resetBasisChatProposal() {
 }
 
 function proposalChangedFields(proposal) {
-  const nextSections = normalizeQuoteBasisSections(proposal?.quoteBasisSections || proposal?.quoteBasis || {});
+  const nextSections = canonicalQuoteBasisSections(proposal?.quoteBasisSections || []);
   const currentSections = cloneQuoteBasisSections(state.quoteBasisSections);
   const currentById = new Map(currentSections.map((section) => [section.id, section]));
   return nextSections
@@ -10633,7 +10815,7 @@ function proposalChangedFields(proposal) {
 
 function proposalLineDelta(proposal) {
   if (state.basisChat.scope !== "line" || !state.basisChat.sectionId) return null;
-  const nextSections = normalizeQuoteBasisSections(proposal?.quoteBasisSections || proposal?.quoteBasis || {});
+  const nextSections = canonicalQuoteBasisSections(proposal?.quoteBasisSections || []);
   const section = nextSections.find((item) => item.id === state.basisChat.sectionId);
   const nextLine = section?.lines?.[state.basisChat.lineIndex];
   const currentLine = selectedBasisLine() || parseBasisLine(state.basisChat.line);
@@ -10696,10 +10878,18 @@ function renderBasisChatProposalCard(proposal, changedFields = []) {
 }
 
 function setBasisChatProposal(proposal) {
-  state.basisChat.proposal = proposal;
-  const changedFields = proposalChangedFields(proposal);
+  let admitted;
+  try {
+    admitted = canonicalTargetOnlyBasisChatProposal(proposal);
+  } catch (_error) {
+    resetBasisChatProposal();
+    appendBasisChatMessage("assistant", GENERIC_FAILURE_MESSAGE);
+    return;
+  }
+  state.basisChat.proposal = admitted;
+  const changedFields = proposalChangedFields(admitted);
   elements.basisChatProposal.hidden = false;
-  elements.basisChatProposal.innerHTML = renderBasisChatProposalCard(proposal, changedFields);
+  elements.basisChatProposal.innerHTML = renderBasisChatProposalCard(admitted, changedFields);
   elements.basisChatProposalActions.hidden = false;
   elements.basisChatApplyButton.disabled = false;
   elements.basisChatKeepButton.disabled = false;
@@ -10821,19 +11011,7 @@ function basisChatPayload(text) {
 }
 
 function normalizeServerBasisChatProposal(proposal = {}) {
-  const quoteBasis = proposal.quoteBasis || proposal.quote_basis || {};
-  const sections = mergeBasisProposalLineMetadata(
-    canonicalQuoteBasisSections(proposal.quoteBasisSections || proposal.quote_basis_sections || quoteBasis),
-    state.quoteBasisSections
-  );
-  return {
-    message: String(proposal.message || "AI drafted a proposed quote basis update.").trim(),
-    quoteBasis: { ...cloneQuoteBasis(quoteBasis), ...quoteBasisFromSections(sections) },
-    quoteBasisSections: sections,
-    lineItems: Array.isArray(proposal.lineItems || proposal.line_items)
-      ? (proposal.lineItems || proposal.line_items).map(normalizeLineItem)
-      : state.lineItems.map(normalizeLineItem),
-  };
+  return canonicalTargetOnlyBasisChatProposal(proposal);
 }
 
 function parseLiteralReplacementCommand(text = "") {
@@ -10893,48 +11071,31 @@ function replaceBasisLineReferenceText(line = {}, from = "", to = "") {
 }
 
 function buildLiteralReplacementProposal(command) {
-  const sections = cloneQuoteBasisSections(state.quoteBasisSections);
-  let changedLineCount = 0;
-  const affectedSectionIds = new Set();
-  const snippets = [];
-  sections.forEach((section) => {
-    (section.lines || []).forEach((line, index) => {
-      const replaced = replaceBasisLineReferenceText(line, command.from, command.to);
-      if (!replaced.changed) return;
-      snippets.push({ section: section.title, before: line.text, after: replaced.line.text });
-      section.lines[index] = {
-        ...replaced.line,
-        tag: bracketedCatalogReferenceParts(line.text || "") ? normalizeBasisTag(line.tag) : "Confirm",
-      };
-      if (isCustomPricingBasisLine(section.lines[index])) section.lines[index].custom_pricing = true;
-      changedLineCount += 1;
-      affectedSectionIds.add(section.id);
-    });
-  });
-  const legacyBasis = quoteBasisFromSections(sections);
-  Object.keys(legacyBasis).forEach((key) => {
-    legacyBasis[key] = replaceLiteralText(legacyBasis[key], command.from, command.to).text;
-  });
-  const lineItems = state.lineItems.map((item) => {
-    const replaced = replaceLiteralText(item.description, command.from, command.to);
-    return replaced.changed ? { ...item, description: replaced.text } : item;
-  });
-  const outputRows = state.outputRows.map((row) => {
-    const replaced = replaceLiteralText(row.description, command.from, command.to);
-    return replaced.changed ? recalculateOutputRow({ ...row, description: replaced.text }) : row;
-  });
-  const changedOutputRows = outputRows.filter((row, index) => row.description !== state.outputRows[index]?.description).length;
-  if (!changedLineCount && !changedOutputRows && !lineItems.some((item, index) => item.description !== state.lineItems[index]?.description)) return null;
+  let target;
+  try {
+    target = rawBasisChatTarget();
+  } catch (_error) {
+    return null;
+  }
+  const sections = target.sections;
+  const currentLine = target.line;
+  const replaced = replaceBasisLineReferenceText(currentLine, command.from, command.to);
+  if (!replaced.changed) return null;
+  const nextLine = {
+    ...replaced.line,
+    tag: bracketedCatalogReferenceParts(currentLine.text || "") ? normalizeBasisTag(currentLine.tag) : "Confirm",
+  };
+  if (isCustomPricingBasisLine(nextLine)) nextLine.custom_pricing = true;
+  sections[target.sectionIndex].lines[target.lineIndex] = nextLine;
   return {
-    message: `Literal replacement: changed ${changedLineCount} basis line${changedLineCount === 1 ? "" : "s"} across ${affectedSectionIds.size} section${affectedSectionIds.size === 1 ? "" : "s"}.`,
+    message: "Literal replacement: changed the selected basis line.",
     literalReplacement: true,
-    changedLineCount,
-    affectedSectionCount: affectedSectionIds.size,
-    snippets: snippets.slice(0, 5),
-    quoteBasis: legacyBasis,
+    changedLineCount: 1,
+    affectedSectionCount: 1,
+    snippets: [{ section: sections[target.sectionIndex].title, before: currentLine.text, after: nextLine.text }],
+    quoteBasis: quoteBasisFromSections(sections),
     quoteBasisSections: sections,
-    lineItems,
-    outputRows,
+    lineItems: state.lineItems,
   };
 }
 
@@ -10992,11 +11153,16 @@ function basisLineTextHasLiteralQuantityWord(line = {}) {
 
 function buildSelectedLineFragmentReplacementProposal(text = "") {
   if (state.basisChat.scope !== "line") return null;
-  const sections = cloneQuoteBasisSections(state.quoteBasisSections);
-  const section = sections.find((item) => item.id === state.basisChat.sectionId);
-  const lineIndex = Number(state.basisChat.lineIndex);
-  if (!section || !Number.isInteger(lineIndex) || !section.lines[lineIndex]) return null;
-  const currentLine = section.lines[lineIndex];
+  let target;
+  try {
+    target = rawBasisChatTarget();
+  } catch (_error) {
+    return null;
+  }
+  const sections = target.sections;
+  const section = sections[target.sectionIndex];
+  const lineIndex = target.lineIndex;
+  const currentLine = target.line;
   const requestedQuantity = basisChatRequestedQuantityValue(text);
   if (requestedQuantity !== null && !basisLineTextHasLiteralQuantityWord(currentLine)) {
     const currentQuantity = leadingNumber(currentLine.quantity);
@@ -11165,15 +11331,23 @@ async function handleBasisChatSubmit(event) {
 function applyBasisChatProposal() {
   const proposal = state.basisChat.proposal;
   if (!proposal) return;
+  if (!basisChatOriginIsCurrent(proposal._origin)) {
+    resetBasisChatProposal();
+    appendBasisChatMessage("assistant", "This proposal is stale. Please request the line change again.");
+    return;
+  }
+  let admitted;
+  try {
+    admitted = canonicalTargetOnlyBasisChatProposal(proposal, proposal._origin);
+  } catch (_error) {
+    resetBasisChatProposal();
+    appendBasisChatMessage("assistant", GENERIC_FAILURE_MESSAGE);
+    return;
+  }
   state.basisConfirmed = false;
-  const currentSections = state.quoteBasisSections;
-  const mergedSections = mergeBasisProposalLineMetadata(
-    canonicalQuoteBasisSections(proposal.quoteBasisSections || proposal.quoteBasis || state.quoteBasisSections),
-    currentSections
-  );
-  state.quoteBasisSections = canonicalQuoteBasisSections(reviewBasisProposalSections(mergedSections, currentSections));
-  state.quoteBasis = { ...cloneQuoteBasis(proposal.quoteBasis || state.quoteBasis), ...quoteBasisFromSections(state.quoteBasisSections) };
-  state.lineItems = Array.isArray(proposal.lineItems) ? proposal.lineItems.map(normalizeLineItem) : [];
+  state.quoteBasisSections = admitted.quoteBasisSections;
+  state.quoteBasis = admitted.quoteBasis;
+  state.lineItems = Array.isArray(state.lineItems) ? state.lineItems : [];
   state.outputRows = [];
   state.originalOutputRows = [];
   state.outputErrors = [];

@@ -6782,11 +6782,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "basis_order": 3,
             "lines": [{"tag": "Custom", "text": raw_text}],
         }]
-        brief = webapp.payload_to_brief(section_backed)
-        self.assertEqual(brief["quote_basis_sections"][0]["lines"][0]["text"], expected_text)
-        self.assertEqual(brief["quote_basis_sections"][0]["section_order"], 2)
-        self.assertEqual(brief["quote_basis_sections"][0]["basis_order"], 3)
-        self.assertNotIn("map must not override sections", brief["notes"][1])
+        with self.assertRaises(ValueError):
+            webapp.payload_to_brief(section_backed)
 
     def test_ai_prompt_requests_dynamic_quote_basis_sections(self):
         prompt = webapp.build_quote_draft_prompt(valid_payload())
@@ -12482,6 +12479,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
+                "id": "flooring-platform",
                 "title": "Flooring & Platform - Quote Basis To Confirm",
                 "lines": [
                     {
@@ -12492,6 +12490,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 ],
             }
         ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "200",
             "field": "flooring-platform",
@@ -12598,34 +12597,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             },
         }
 
-        result = webapp.normalize_basis_chat_result(parsed, payload, "deepseek")
-
-        proposal = result["proposal"]
-        sections = proposal["quote_basis_sections"]
-        self.assertEqual([section["id"] for section in sections], ["selected-section", "unrelated-section"])
-        self.assertEqual([len(section["lines"]) for section in sections], [2, 2])
-        selected = sections[0]["lines"][0]
-        duplicate = sections[0]["lines"][1]
-        unrelated = sections[1]["lines"][0]
-        elsewhere = sections[1]["lines"][1]
-        self.assertEqual(selected["text"], "Selected panel in blue")
-        self.assertEqual(selected["confidence"], 94)
-        self.assertNotIn("confidence_pct", selected)
-        self.assertEqual(selected["id"], "selected-line")
-        self.assertEqual(selected["source_line_item_id"], "source-selected")
-        self.assertEqual(selected["pricing_keyword"], "selected-panel")
-        self.assertEqual(selected["arbitrary_metadata"], {"origin": "synthetic", "sequence": [2, 1]})
-        self.assertEqual((selected["category_order"], selected["item_order"]), (4, 5))
-        self.assertEqual(duplicate["id"], "same-words-in-target-section")
-        self.assertEqual(duplicate["text"], "Selected panel")
-        self.assertEqual(unrelated["text"], "\n  lead\t  middle  \ntrail  \n")
-        self.assertEqual(unrelated["metadata"], {"keep": True, "nested": ["a", "b"]})
-        self.assertEqual((unrelated["category_order"], unrelated["item_order"]), (9, 10))
-        self.assertEqual(elsewhere["id"], "same-words-elsewhere")
-        self.assertEqual((sections[0]["basis_order"], sections[0]["section_order"]), (3, 2))
-        self.assertEqual((sections[1]["basis_order"], sections[1]["section_order"]), (7, 8))
-        self.assertEqual(proposal["quote_basis"], webapp.quote_basis_from_sections(sections))
-        self.assertEqual([item["id"] for item in proposal["line_items"]], ["existing-item"])
+        with self.assertRaises(webapp.OpenAIAnalysisError):
+            webapp.normalize_basis_chat_result(parsed, payload, "deepseek")
 
     def test_run589_selected_line_target_selection_fails_closed(self):
         base = valid_payload()
@@ -12677,6 +12650,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
+                "id": "electrical-av",
                 "title": "Electrical / AV",
                 "lines": [
                     {
@@ -12689,6 +12663,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 ],
             }
         ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "20W",
             "field": "electrical-av",
@@ -12738,6 +12713,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 ],
             }
         ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "5m",
             "field": "counters-and-cabinets",
@@ -12755,10 +12731,6 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                     "tag": "Include",
                     "text": "[ Professional Engineer Endorsement for structure above 5m ] - Custom curved coffee/service counter with Kent branding and teal/blue trim.",
                     "confidence_pct": 82,
-                    "pricing_keyword": "counters-and-cabinets-professional-engineer-endorsement-for-structure-above-4m",
-                    "catalog_description": "Professional Engineer Endorsement for structure above 4m",
-                    "pricing_reference_description": "Professional Engineer Endorsement for structure above 4m",
-                    "catalog_unit_price": 1200,
                 },
             },
         }
@@ -12785,6 +12757,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
+                "id": "furniture-rental",
                 "title": "Furniture Rental",
                 "lines": [
                     {
@@ -12797,6 +12770,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 ],
             }
         ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "change from 12 to 14 chairs",
             "field": "furniture-rental",
@@ -12827,6 +12801,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
+                "id": "furniture-rental",
                 "title": "Furniture Rental",
                 "lines": [
                     {
@@ -12839,6 +12814,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 ],
             }
         ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "60 qty",
             "field": "furniture-rental",
@@ -12871,6 +12847,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
+                "id": "booth-dimensions",
                 "title": "Booth Dimensions",
                 "lines": [
                     {
@@ -12904,6 +12881,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
+                "id": "floor-design",
                 "title": "Floor Design",
                 "lines": [
                     {
@@ -12916,6 +12894,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 ],
             }
         ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": ">blue, green and yellow\n\nred",
             "field": "floor-design",
@@ -12947,6 +12926,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
+                "id": "graphics-and-signage",
                 "title": "Graphics and Signage",
                 "lines": [
                     {
@@ -12956,6 +12936,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 ],
             }
         ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "GAY graphics",
             "field": "graphics-and-signage",
@@ -12981,6 +12962,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
+                "id": "flooring",
                 "title": "Flooring",
                 "lines": [
                     {
@@ -12990,6 +12972,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 ],
             }
         ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "remove aluminium edging",
             "field": "flooring",
@@ -13013,6 +12996,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
+                "id": "flooring",
                 "title": "Flooring",
                 "lines": [
                     {
@@ -13022,6 +13006,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 ],
             }
         ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "remove aluminium edging",
             "field": "flooring",
@@ -13061,6 +13046,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
+                "id": "graphics-and-signage",
                 "title": "Graphics and Signage",
                 "lines": [
                     {
@@ -13071,6 +13057,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 ],
             }
         ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "GAY graphics",
             "field": "graphics-and-signage",
@@ -13234,6 +13221,12 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
     def test_deepseek_basis_chat_uses_chat_completions_json_mode(self):
         payload = valid_payload()
+        payload["quote_basis_sections"] = [{
+            "id": "platform",
+            "title": "Platform",
+            "lines": [{"tag": "Confirm", "text": "100mm raised platform with needle punch carpet."}],
+        }]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "change 100mm to 150mm",
             "scope": "line",
@@ -13697,6 +13690,12 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
     def test_deepseek_basis_chat_bad_output_falls_back_to_openai(self):
         payload = valid_payload()
+        payload["quote_basis_sections"] = [{
+            "id": "platform",
+            "title": "Platform",
+            "lines": [{"tag": "Confirm", "text": "100mm raised platform with needle punch carpet."}],
+        }]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "change 100mm to 150mm",
             "scope": "line",
@@ -28173,6 +28172,9 @@ const BASIS_TAGS = [
   ["Custom", "AI Proposal", "Not found in pricing reference"],
   ["Confirm", "Confirm", "Needs include, exclude, or revision"],
 ];
+const QUOTE_BASIS_LEGACY_ORDER = ["surfaces", "counters", "platform", "graphics", "furniture", "electrical"];
+const QUOTE_BASIS_KEY_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const QUOTE_BASIS_UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 function escapeHtml(value = "") {
   return String(value).replace(/[&<>"']/g, (char) => ({
     "&": "&amp;",
@@ -28188,6 +28190,7 @@ function renderAnalysisFindings() { return ""; }
 function setDownloadFiles() { state.downloadFile = null; }
 function markOutputRowsDirty() { state.downloadFile = null; }
 function quoteCommercialReviewRequired() { return Boolean(state.quoteCommercialReview && state.quoteCommercialReview.status === QUOTE_COMMERCIAL_REVIEW_STATUS); }
+eval(source.slice(source.indexOf("function canonicalBasisSectionText"), source.indexOf("function pythonWhitespaceText")));
 eval([
   "normalizeAnalysisMode",
   "normalizeTextNewlines",
@@ -28261,6 +28264,7 @@ eval([
             "canonicalBasisSectionText",
             "canonicalBasisSectionLine",
             "canonicalQuoteBasisSections",
+            "canonicalQuoteBasis",
             "cloneQuoteBasisSections",
             "possibleMatchBasisDetailText",
             "catalogBackedPossibleMatchText",
@@ -28770,7 +28774,16 @@ const state = {
     section_order: 2,
     lines: [{ id: "untouched-line", tag: "Exclude", text: "\n  lead\t  middle  \ntrail  \n" }],
   }],
-  basisChat: { proposal: null },
+  quoteSessionId: "quote-static-target",
+  outputRevision: 0,
+  basisChat: {
+    scope: "line",
+    sectionId: "counters-and-cabinets",
+    field: "counters-and-cabinets",
+    lineIndex: 0,
+    line: "Include: [ Professional Engineer Endorsement for structure above 4m ] - Custom curved coffee/service counter with Kent branding and teal/blue trim.",
+    proposal: null,
+  },
   lineItems: [],
   outputRows: [],
   originalOutputRows: [],
@@ -28790,8 +28803,15 @@ function setSidePanel(panelName, options = {}) { state.sidePanel = panelName; st
 function resetBasisChatProposal() { state.basisChat.proposal = null; }
 function closeBasisChatOverlay() { state.overlayClosed = true; }
 function syncControlStates() { state.synced = true; }
+function safeQuoteSessionId(value) { return String(value || ""); }
+function revisionNumber(value, fallback = 0) { return Number.isInteger(Number(value)) ? Number(value) : fallback; }
+const QUOTE_BASIS_LEGACY_ORDER = ["surfaces", "counters", "platform", "graphics", "furniture", "electrical"];
+const QUOTE_BASIS_KEY_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const QUOTE_BASIS_UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
+eval(source.slice(source.indexOf("function canonicalBasisSectionText"), source.indexOf("function pythonWhitespaceText")));
 eval([
+  "isPlainObject",
   "safeId",
   "pricingReferenceLineText",
   "bracketedCatalogReferenceParts",
@@ -28822,17 +28842,20 @@ eval([
   "canonicalBasisSectionText",
   "canonicalBasisSectionLine",
   "canonicalQuoteBasisSections",
+  "canonicalQuoteBasis",
   "cloneQuoteBasisSections",
-  "basisLineMetadataMergeKey",
-  "basisLineCoreMatches",
-  "mergeBasisProposalLineMetadata",
-  "reviewBasisProposalSections",
+  "canonicalQuoteBasisForPersistence",
+  "quoteCommercialStrictDataEqual",
+  "rawBasisChatTarget",
+  "basisChatProposalOrigin",
+  "basisChatOriginIsCurrent",
+  "canonicalTargetOnlyBasisChatProposal",
   "applyBasisChatProposal",
 ].map(extractFunction).join("\n"));
 
-state.basisChat.proposal = {
+state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
+state.basisChat.proposal = canonicalTargetOnlyBasisChatProposal({
   message: "Update endorsement height.",
-  quoteBasis: {},
   quoteBasisSections: [{
     id: "counters-and-cabinets",
     title: "COUNTERS AND CABINETS",
@@ -28845,22 +28868,18 @@ state.basisChat.proposal = {
       custom_pricing: true,
       custom_confirmed: true,
     }, {
-      id: "db-drawing",
-      tag: "Include",
-      text: "[ no. single line drawing for DB box ]",
-      quantity: 1,
-      unit: "nos",
-      pricing_keyword: "electrical-db-drawing",
-      catalog_description: "no. single line drawing for DB box",
-      pricing_reference_description: "no. single line drawing for DB box",
-      catalog_unit_price: 600,
-    }, {
       id: "custom-counter",
       tag: "Custom",
       text: "Curved reception counter with Kent logo panel, teal trim and illuminated blue plinth.",
       quantity: 1,
       unit: "nos",
       custom_pricing: true,
+      possible_pricing_matches: [{
+        pricing_keyword: "counter-laminated",
+        description: "nos. of 1m length x 1m height lockable counter",
+        section: "COUNTERS AND CABINETS",
+        unit: "nos",
+      }],
     }],
   }, {
     id: "untouched-lossless",
@@ -28868,18 +28887,15 @@ state.basisChat.proposal = {
     section_order: 2,
     lines: [{ id: "untouched-line", tag: "Exclude", text: "\n  lead\t  middle  \ntrail  \n" }],
   }],
-};
+});
 
 applyBasisChatProposal();
 const editedLine = state.quoteBasisSections[0].lines[0];
 assert.strictEqual(editedLine.text.includes("above 5m"), true);
 assert.strictEqual(editedLine.pricing_keyword, undefined);
-assert.strictEqual(editedLine.tag, "Custom");
-assert.strictEqual(editedLine.custom_confirmed, false);
-const newCatalogLine = state.quoteBasisSections[0].lines[1];
-assert.strictEqual(newCatalogLine.tag, "Confirm");
-assert.strictEqual(newCatalogLine.pricing_keyword, "electrical-db-drawing");
-const untouchedLine = state.quoteBasisSections[0].lines[2];
+assert.strictEqual(editedLine.tag, "Include");
+assert.strictEqual(editedLine.custom_confirmed, true);
+const untouchedLine = state.quoteBasisSections[0].lines[1];
 assert.strictEqual(untouchedLine.possible_pricing_matches.length, 1);
 assert.strictEqual(untouchedLine.possible_pricing_matches[0].pricing_keyword, "counter-laminated");
 assert.strictEqual(state.quoteBasisSections[1].lines[0].text, "\n  lead\t  middle  \ntrail  \n");
@@ -28958,8 +28974,13 @@ function normalizeCategoryTitle(value = "") { return basisDisplayTitle(value) ||
 function exactPricingReferenceSectionTitle() { return ""; }
 function sectionTitleKey(value = "") { return String(value || "").toLowerCase().trim(); }
 function referenceSectionTitleAliases(value = "") { return [String(value || "").trim()].filter(Boolean); }
+const QUOTE_BASIS_LEGACY_ORDER = ["surfaces", "counters", "platform", "graphics", "furniture", "electrical"];
+const QUOTE_BASIS_KEY_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const QUOTE_BASIS_UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
+eval(source.slice(source.indexOf("function canonicalBasisSectionText"), source.indexOf("function pythonWhitespaceText")));
 eval([
+  "isPlainObject",
   "safeId",
   "pricingReferenceLineText",
   "bracketedCatalogReferenceParts",
@@ -28990,7 +29011,10 @@ eval([
   "canonicalBasisSectionText",
   "canonicalBasisSectionLine",
   "canonicalQuoteBasisSections",
+  "canonicalQuoteBasis",
   "cloneQuoteBasisSections",
+  "quoteCommercialStrictDataEqual",
+  "rawBasisChatTarget",
   "selectedBasisLine",
   "replaceLiteralText",
   "replaceBasisLineReferenceText",
@@ -29004,6 +29028,7 @@ eval([
   "buildSelectedLineFragmentReplacementProposal",
 ].map(extractFunction).join("\n"));
 
+state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
 const proposal = buildSelectedLineFragmentReplacementProposal("5m");
 assert.ok(proposal, "expected a deterministic proposal");
 const line = proposal.quoteBasisSections[0].lines[0];
@@ -29080,7 +29105,9 @@ const state = {
   basisChat: {
     scope: "line",
     sectionId: "furniture-rental",
+    field: "furniture-rental",
     lineIndex: 0,
+    line: "Include: [ nos. Bistro Chairs ] - Loose seating for lounge area.",
   },
 };
 function normalizeUnit(value = "") { return String(value || "").trim(); }
@@ -29089,8 +29116,13 @@ function normalizeCategoryTitle(value = "") { return basisDisplayTitle(value) ||
 function exactPricingReferenceSectionTitle() { return ""; }
 function sectionTitleKey(value = "") { return String(value || "").toLowerCase().trim(); }
 function referenceSectionTitleAliases(value = "") { return [String(value || "").trim()].filter(Boolean); }
+const QUOTE_BASIS_LEGACY_ORDER = ["surfaces", "counters", "platform", "graphics", "furniture", "electrical"];
+const QUOTE_BASIS_KEY_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const QUOTE_BASIS_UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
+eval(source.slice(source.indexOf("function canonicalBasisSectionText"), source.indexOf("function pythonWhitespaceText")));
 eval([
+  "isPlainObject",
   "safeId",
   "normalizeQuoteBasisTitle",
   "cleanCustomerQuoteLineText",
@@ -29120,7 +29152,10 @@ eval([
   "canonicalBasisSectionText",
   "canonicalBasisSectionLine",
   "canonicalQuoteBasisSections",
+  "canonicalQuoteBasis",
   "cloneQuoteBasisSections",
+  "quoteCommercialStrictDataEqual",
+  "rawBasisChatTarget",
   "unbracketedCatalogReferenceText",
   "markBasisLineAsManualPricing",
   "replaceLiteralText",
@@ -29131,6 +29166,7 @@ eval([
   "buildSelectedLineFragmentReplacementProposal",
 ].map(extractFunction).join("\n"));
 
+state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
 const proposal = buildSelectedLineFragmentReplacementProposal("60 qty");
 assert.ok(proposal);
 const line = proposal.quoteBasisSections[0].lines[0];
@@ -38073,7 +38109,7 @@ main().catch((error) => {
         self.assertIn("buildLiteralReplacementProposal", js)
         self.assertIn("replaceBasisLineReferenceText", js)
         self.assertIn("markBasisLineAsManualPricing", js)
-        self.assertIn('tag: bracketedCatalogReferenceParts(line.text || "") ? normalizeBasisTag(line.tag) : "Confirm"', js)
+        self.assertIn('tag: bracketedCatalogReferenceParts(currentLine.text || "") ? normalizeBasisTag(currentLine.tag) : "Confirm"', js)
         self.assertIn("openBlockingClarifications", js)
         self.assertIn("Generate final Quote Basis", js)
         self.assertIn('state.basisConfirmed = false', js)
@@ -38807,14 +38843,13 @@ main().catch((error) => {
         changed_derived["outputRows"][0]["selected"] = False
         changed_derived["outputRows"][0]["workflow_state"] = "temporary"
         changed_derived["outputRows"][0]["download_url"] = "/temporary/download"
-        changed_derived["quoteBasisSections"][0]["lines"][0].update({
-            "workflow_state": "reviewed",
-            "download_url": "/temporary/basis-download",
-            "recovery_file_key": "basis-recovery",
-        })
         changed_derived["quoteDetails"]["active_tab"] = "internal"
         changed_derived["quoteDetails"].setdefault("company", {})["recovery_file_key"] = "company-recovery"
         self.assertEqual(base, webapp.quote_session_commercial_state({"draft_state": changed_derived}))
+        unsafe_basis = copy.deepcopy(draft)
+        unsafe_basis["quoteBasisSections"][0]["lines"][0]["workflow_state"] = "reviewed"
+        with self.assertRaises(ValueError):
+            webapp.quote_session_commercial_state({"draft_state": unsafe_basis})
         ordered = copy.deepcopy(draft)
         ordered["quoteBasisSections"][0].update({"section_order": "0001", "basis_order": 2})
         ordered_state = webapp.quote_session_commercial_state({"draft_state": ordered})
@@ -38940,11 +38975,13 @@ function extractFunction(name) {
   throw new Error(`Unclosed ${name}`);
 }
 const BASIS_FIELDS = [["graphics", "Graphics"]];
+const QUOTE_BASIS_UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 function normalizeQuoteBasisTitle(value) { return String(value || "").trim(); }
 function normalizeBasisTag(value) { return ["Include", "Confirm", "Custom", "Exclude"].includes(value) ? value : "Confirm"; }
 function safeId(value, fallback) { const result = String(value || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""); return result || fallback; }
 function canonicalQuoteBasis(value) { return value || {}; }
-eval(["pythonWhitespaceText", "canonicalPrimaryOrderValue", "canonicalizeOrderFields", "canonicalizePrimaryOrderFields", "canonicalBasisSectionText", "canonicalBasisSectionLine", "canonicalQuoteBasisSections", "quoteBasisFromSections", "cloneQuoteBasisSections", "canonicalQuoteBasisForPersistence", "quoteBasisPersistenceProjection"].map(extractFunction).join("\n"));
+eval(source.slice(source.indexOf("function canonicalBasisSectionText"), source.indexOf("function pythonWhitespaceText")));
+eval(["pythonWhitespaceText", "canonicalPrimaryOrderValue", "canonicalizeOrderFields", "canonicalizePrimaryOrderFields", "canonicalBasisSectionLine", "canonicalQuoteBasisSections", "quoteBasisFromSections", "cloneQuoteBasisSections", "canonicalQuoteBasisForPersistence", "quoteBasisPersistenceProjection"].map(extractFunction).join("\n"));
 const raw = [
   { id: "custom-only", title: "Custom", section_order: "0002", basis_order: 4, lines: [{ tag: "Custom", text: "\r\n  lead\t  middle  \rtrail  \r\n" }] },
   { id: "graphics", title: "Graphics", section_order: 1, basis_order: "0003", lines: [{ tag: "Confirm", text: "Legacy\r\n\r\n  custom tail\t" }] },
@@ -38970,15 +39007,11 @@ assert.deepStrictEqual(
   canonicalQuoteBasisSections([{ id: "\u0085", title: "Whitespace Identity", lines: [{ text: "kept" }] }]),
   [{ id: "whitespace-identity", title: "Whitespace Identity", lines: [{ tag: "Confirm", text: "kept" }] }],
 );
-for (const field of ["section_order", "basis_order"]) {
-  assert.throws(
-    () => canonicalQuoteBasisSections([Object.fromEntries([
-      [field, "invalid"], [`${field}\u0085`, "2"], ["id", "ordered"],
-      ["title", "Ordered"], ["lines", [{ text: "kept" }]],
-    ])]),
-    /colliding keys/,
-  );
-}
+const similar = canonicalQuoteBasisSections([{
+  id: "ordered", title: "Ordered", lines: [{ text: "kept" }], safe_key: 1, "safe-key": 2,
+}]);
+assert.strictEqual(similar[0].safe_key, 1);
+assert.strictEqual(similar[0]["safe-key"], 2);
 const payload = JSON.parse(fs.readFileSync(0, "utf8"));
 const observed = payload.vectors.map(({ label, entries }) => {
   try {
@@ -39005,6 +39038,297 @@ process.stdout.write(JSON.stringify(observed));
             with self.subTest(vector=vector["label"]):
                 self.assertEqual(actual["label"], vector["label"])
                 self.assertEqual(actual["outcome"], vector["expected"])
+
+    def test_run593_authoritative_basis_metadata_value_domain_and_security(self):
+        raw_sections = [{
+            "id": "custom-safe",
+            "title": "  Custom Safe  ",
+            "section_meta": {
+                "Exact-Key": "  keep\tspaces\nand lines  ",
+                "empty_object": {},
+                "empty_array": [],
+                "null_value": None,
+                "enabled": True,
+                "safe_integer": webapp.AUTHORITATIVE_BASIS_SAFE_INTEGER,
+                "fraction": 0.125,
+                "integral_float": 4.0,
+                "negative_zero": -0.0,
+                "safe_key": "underscore",
+                "safe-key": "dash",
+            },
+            "lines": [{
+                "id": "line-safe",
+                "tag": "Custom",
+                "text": "\r\n  lead\ttrail  \r",
+                "provenance": {"source": "synthetic", "ids": [1, 2, 3]},
+                "pricing_binding": {"catalog_id": "safe-id", "unit_price": 12.5},
+            }],
+        }]
+        first = webapp.canonical_quote_basis_sections({"quote_basis_sections": raw_sections})
+        second = webapp.canonical_quote_basis_sections({"quote_basis_sections": copy.deepcopy(first)})
+        self.assertEqual(first, second)
+        self.assertEqual(first[0]["section_meta"]["Exact-Key"], "  keep\tspaces\nand lines  ")
+        self.assertEqual(first[0]["section_meta"]["integral_float"], 4)
+        self.assertEqual(first[0]["section_meta"]["negative_zero"], 0)
+        self.assertEqual(first[0]["lines"][0]["text"], "\n  lead\ttrail  \n")
+        self.assertEqual(first[0]["section_meta"]["safe_key"], "underscore")
+        self.assertEqual(first[0]["section_meta"]["safe-key"], "dash")
+
+        for invalid in (
+            webapp.AUTHORITATIVE_BASIS_SAFE_INTEGER + 1,
+            -(webapp.AUTHORITATIVE_BASIS_SAFE_INTEGER + 1),
+            float("nan"),
+            float("inf"),
+            -float("inf"),
+            (1, 2),
+            {1, 2},
+            b"bytes",
+            webapp.Decimal("1.25"),
+            object(),
+        ):
+            with self.subTest(invalid=type(invalid).__name__), self.assertRaises(ValueError):
+                webapp.admit_authoritative_basis_value({"safe": invalid})
+
+        blocked = (
+            "token", "api-token", "client_secret", "cookie", "nonce", "password", "passwd",
+            "credential", "private-key", "authorization", "auth-header", "bearer", "auth_code",
+            "authorization_code", "oauth_code", "state", "auth_state", "oauth_state", "session_state",
+            "runtime_auth", "session_auth", "data_url", "logo_data_url", "brief_path", "output_dir",
+            "stdout", "stderr", "active_job", "job_id", "job_state", "workflow_state", "workflow_stage",
+            "temporary_path", "recovery_file_key", "session_file_key", "logo_session_file_key",
+            "file_handle", "download_url", "artifact_download_url", "__proto__", "constructor", "prototype",
+        )
+        for key in blocked:
+            for value in ({key: "unsafe"}, {"nested": [{key: "unsafe"}]}):
+                with self.subTest(key=key, nested="nested" in value), self.assertRaises(ValueError):
+                    webapp.canonical_quote_basis_sections({
+                        "quote_basis_sections": [{"id": "safe", "title": "Safe", "lines": [{"text": "kept", "meta": value}]}]
+                    })
+
+    def test_run593_authoritative_basis_atomic_resource_boundaries(self):
+        admit = webapp.admit_authoritative_basis_value
+
+        exact_depth: object = "leaf"
+        for _ in range(16):
+            exact_depth = [exact_depth]
+        self.assertEqual(admit(exact_depth), exact_depth)
+        with self.assertRaises(ValueError):
+            admit([exact_depth])
+
+        exact_object = {f"k{index}": index for index in range(1024)}
+        self.assertEqual(len(admit(exact_object)), 1024)
+        with self.assertRaises(ValueError):
+            admit({**exact_object, "overflow": 1})
+
+        exact_array = [None] * 4096
+        self.assertEqual(len(admit(exact_array)), 4096)
+        with self.assertRaises(ValueError):
+            admit([None] * 4097)
+
+        exact_key = "é" * 128
+        self.assertEqual(admit({exact_key: True}), {exact_key: True})
+        with self.assertRaises(ValueError):
+            admit({exact_key + "x": True})
+
+        exact_string = "x" * 262144
+        self.assertEqual(len(admit(exact_string)), 262144)
+        with self.assertRaises(ValueError):
+            admit(exact_string + "x")
+
+        exact_nodes = [[0, 0, 0, 0] for _ in range(3999)] + [[0, 0, 0]]
+        self.assertEqual(len(exact_nodes), 4000)
+        self.assertEqual(admit(exact_nodes), exact_nodes)
+        over_nodes = copy.deepcopy(exact_nodes)
+        over_nodes[-1].append(0)
+        with self.assertRaises(ValueError):
+            admit(over_nodes)
+
+        exact_bytes = ["a" * 262144 for _ in range(4)]
+        self.assertEqual(admit(exact_bytes), exact_bytes)
+        with self.assertRaises(ValueError):
+            admit([*exact_bytes, "x"])
+
+    def test_run593_browser_authoritative_value_domain_and_limit_parity(self):
+        node = require_node(self)
+        script = r'''
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+function extractFunction(name) {
+  const marker = `function ${name}(`;
+  const start = source.indexOf(marker);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}" && --depth === 0) return source.slice(start, index + 1);
+  }
+  throw new Error(`Missing ${name}`);
+}
+const QUOTE_BASIS_UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+eval(source.slice(source.indexOf("function canonicalBasisSectionText"), source.indexOf("function pythonWhitespaceText")));
+assert.strictEqual(admitAuthoritativeBasisValue(-0), 0);
+assert.strictEqual(admitAuthoritativeBasisValue(4.0), 4);
+assert.strictEqual(admitAuthoritativeBasisValue(0.125), 0.125);
+assert.strictEqual(admitAuthoritativeBasisValue(Number.MAX_SAFE_INTEGER), Number.MAX_SAFE_INTEGER);
+for (const value of [Number.MAX_SAFE_INTEGER + 1, NaN, Infinity, -Infinity, undefined, 1n, () => {}, Symbol("x"), new Date(), new Uint8Array([1])]) {
+  assert.throws(() => admitAuthoritativeBasisValue({ safe: value }));
+}
+const accessor = {};
+Object.defineProperty(accessor, "safe", { enumerable: true, get() { return 1; } });
+assert.throws(() => admitAuthoritativeBasisValue(accessor), /accessor/);
+for (const key of ["__proto__", "api-token", "client_secret", "cookie", "nonce", "password", "credential", "private-key", "authorization", "auth-header", "state", "runtime_auth", "data_url", "workflow_state", "temporary_path", "file_handle", "artifact_download_url"]) {
+  const value = Object.create(null);
+  value[key] = "unsafe";
+  assert.throws(() => admitAuthoritativeBasisValue({ nested: value }));
+}
+const exactDepth = Array.from({ length: 16 }).reduce((value) => [value], "leaf");
+assert.deepStrictEqual(admitAuthoritativeBasisValue(exactDepth), exactDepth);
+assert.throws(() => admitAuthoritativeBasisValue([exactDepth]), /depth/);
+const exactObject = Object.fromEntries(Array.from({ length: 1024 }, (_, index) => [`k${index}`, index]));
+assert.strictEqual(Object.keys(admitAuthoritativeBasisValue(exactObject)).length, 1024);
+assert.throws(() => admitAuthoritativeBasisValue({ ...exactObject, overflow: 1 }), /object/);
+assert.strictEqual(admitAuthoritativeBasisValue(Array(4096).fill(null)).length, 4096);
+assert.throws(() => admitAuthoritativeBasisValue(Array(4097).fill(null)), /array/);
+const exactKey = "é".repeat(128);
+assert.strictEqual(admitAuthoritativeBasisValue({ [exactKey]: true })[exactKey], true);
+assert.throws(() => admitAuthoritativeBasisValue({ [`${exactKey}x`]: true }), /key/);
+const exactString = "x".repeat(262144);
+assert.strictEqual(admitAuthoritativeBasisValue(exactString).length, 262144);
+assert.throws(() => admitAuthoritativeBasisValue(`${exactString}x`), /string/);
+const exactNodes = Array.from({ length: 3999 }, () => [0, 0, 0, 0]).concat([[0, 0, 0]]);
+assert.strictEqual(admitAuthoritativeBasisValue(exactNodes).length, 4000);
+exactNodes[3999].push(0);
+assert.throws(() => admitAuthoritativeBasisValue(exactNodes), /node/);
+const exactBytes = Array.from({ length: 4 }, () => "a".repeat(262144));
+assert.strictEqual(admitAuthoritativeBasisValue(exactBytes).length, 4);
+assert.throws(() => admitAuthoritativeBasisValue([...exactBytes, "x"]), /text/);
+process.stdout.write("ok");
+'''
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertEqual(completed.stdout, "ok")
+
+    def test_run593_raw_slot_selector_and_target_only_mutation(self):
+        payload = valid_payload()
+        payload["quote_basis_sections"] = [
+            {"id": "target", "title": "Target", "section_meta": {"keep": [1, None, True]}, "lines": [
+                {"id": "before", "tag": "Confirm", "text": "Duplicate words", "meta": {"slot": 0}},
+                {"id": "selected", "tag": "Include", "text": "Duplicate words", "quantity": 2, "unit": "nos", "meta": {"slot": 1}},
+                {"id": "after", "tag": "Exclude", "text": "After", "meta": {"slot": 2}},
+            ]},
+            {"id": "elsewhere", "title": "Elsewhere", "lines": [{"tag": "Confirm", "text": "Duplicate words"}]},
+        ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
+        payload["basis_chat"] = {
+            "question": "change selected words to blue panel",
+            "field": "target",
+            "line_index": 1,
+            "line": "Include: Duplicate words",
+        }
+        before = webapp.canonical_quote_basis_sections(payload)
+        changed = webapp.replacement_line_sections(payload, {"text": "Blue panel", "confidence": 93})
+        self.assertEqual(changed[0]["lines"][1]["text"], "Blue panel")
+        self.assertEqual(changed[0]["lines"][1]["meta"], {"slot": 1})
+        self.assertEqual(changed[0]["lines"][0], before[0]["lines"][0])
+        self.assertEqual(changed[0]["lines"][2], before[0]["lines"][2])
+        self.assertEqual(changed[1], before[1])
+        self.assertEqual(changed[0]["section_meta"], before[0]["section_meta"])
+
+        for label, mutate in (
+            ("before", lambda value: value["quote_basis_sections"][0]["lines"].__setitem__(0, None)),
+            ("target", lambda value: value["quote_basis_sections"][0]["lines"].__setitem__(1, {})),
+            ("after", lambda value: value["quote_basis_sections"][0]["lines"].__setitem__(2, 7)),
+            ("boolean index", lambda value: value["basis_chat"].__setitem__("line_index", True)),
+            ("missing field", lambda value: value["basis_chat"].pop("field")),
+            ("assertion mismatch", lambda value: value["basis_chat"].__setitem__("line", "Include: other")),
+        ):
+            candidate = copy.deepcopy(payload)
+            mutate(candidate)
+            with self.subTest(label=label), self.assertRaises(webapp.OpenAIAnalysisError):
+                webapp.replacement_line_sections(candidate, {"text": "Blue panel"})
+
+    def test_run593_openai_and_deepseek_provider_expansion_is_rejected(self):
+        payload = valid_payload()
+        payload["quote_basis_sections"] = [{
+            "id": "target",
+            "title": "Target",
+            "lines": [{"tag": "Confirm", "text": "Original", "meta": {"keep": True}}],
+        }]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
+        payload["basis_chat"] = {
+            "question": "change original to replacement",
+            "field": "target",
+            "line_index": 0,
+            "line": "Confirm: Original",
+        }
+        valid = {"intent": "proposal", "proposal": {"message": "Update", "replacement_line": {"text": "Replacement"}}}
+        for provider in ("openai", "deepseek"):
+            result = webapp.normalize_basis_chat_result(copy.deepcopy(valid), payload, provider)
+            self.assertEqual(result["proposal"]["quote_basis_sections"][0]["lines"][0]["text"], "Replacement")
+            self.assertEqual(result["proposal"]["quote_basis_sections"][0]["lines"][0]["meta"], {"keep": True})
+            for key, value in (
+                ("quote_basis_sections", []),
+                ("quote_basis", {}),
+                ("line_items", []),
+                ("metadata", {"unsafe_expansion": True}),
+                ("pricing", {"catalog_unit_price": 1}),
+                ("extra_sections", [{"id": "other"}]),
+            ):
+                expanded = copy.deepcopy(valid)
+                expanded["proposal"][key] = value
+                with self.subTest(provider=provider, key=key), self.assertRaises(webapp.OpenAIAnalysisError):
+                    webapp.normalize_basis_chat_result(expanded, payload, provider)
+            for replacement in (
+                [{"text": "One"}, {"text": "Two"}],
+                {"text": "Replacement", "pricing_keyword": "forbidden"},
+                {"text": "Replacement", "arbitrary_metadata": True},
+            ):
+                expanded = copy.deepcopy(valid)
+                expanded["proposal"]["replacement_line"] = replacement
+                with self.subTest(provider=provider, replacement=type(replacement).__name__), self.assertRaises(webapp.OpenAIAnalysisError):
+                    webapp.normalize_basis_chat_result(expanded, payload, provider)
+
+    def test_run593_representation_typed_persistence_and_publication_projection(self):
+        sections = [{
+            "id": "custom",
+            "title": "Custom",
+            "section_meta": {"preserved": "  exact  "},
+            "lines": [{"tag": "Confirm", "text": "Keep", "custom_meta": {"nested": [1, {}, []]}}],
+        }]
+        basis = webapp.quote_basis_from_sections(sections)
+        self.assertEqual(webapp.canonical_quote_basis_sections({"quote_basis": basis})[0]["id"], "custom")
+        self.assertEqual(webapp.canonical_quote_basis_sections({"quote_basis_sections": [], "quote_basis": basis})[0]["id"], "custom")
+        self.assertEqual(webapp.canonical_quote_basis_sections({"quote_basis_sections": sections, "quote_basis": basis})[0]["section_meta"], {"preserved": "  exact  "})
+        with self.assertRaises(ValueError):
+            webapp.canonical_quote_basis_sections({"quote_basis_sections": sections, "quote_basis": {"custom": "Confirm: Different"}})
+
+        nested = webapp.quote_session_draft_state_value({
+            "analysis": {"quoteBasisSections": sections, "quoteBasis": basis},
+            "proposal": {"origin": {"quote_basis_sections": sections, "quote_basis": basis}},
+        })
+        self.assertEqual(nested["analysis"]["quoteBasisSections"][0]["section_meta"], {"preserved": "  exact  "})
+        self.assertEqual(nested["proposal"]["origin"]["quote_basis_sections"][0]["lines"][0]["custom_meta"], {"nested": [1, {}, []]})
+
+        draft = {
+            "profileId": "profile:run593",
+            "pricingReferenceId": "pricing-run593",
+            "pricingReferenceSource": "local",
+            "quoteBasis": basis,
+            "quoteBasisSections": sections,
+            "outputRows": [],
+        }
+        projection = webapp.quote_session_commercial_state({"draft_state": draft})
+        edited = copy.deepcopy(draft)
+        edited["quoteBasisSections"][0]["section_meta"]["preserved"] = "different excluded metadata"
+        self.assertEqual(projection, webapp.quote_session_commercial_state({"draft_state": edited}))
 
     def test_run575_loaded_app_cleanup_uses_one_overall_deadline(self):
         source = (ROOT / "scripts" / "playwright-smoke.mjs").read_text(encoding="utf-8")
