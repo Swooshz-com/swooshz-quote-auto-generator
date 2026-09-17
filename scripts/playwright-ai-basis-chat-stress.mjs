@@ -488,7 +488,12 @@ async function main() {
     await page.locator("#analysisConfirmModal:not([hidden])").waitFor({ timeout: 15000 });
     await page.locator("#analysisConfirmStartButton").click();
     await page.locator("#quoteBasisPanel.is-active").waitFor({ timeout: 15000 });
-    await page.locator('[data-revise-section="platform"]').first().waitFor({ timeout: 15000 });
+    try {
+      await page.locator('[data-revise-section="platform"]').first().waitFor({ timeout: 15000 });
+    } catch (error) {
+      const visibleText = (await page.locator("body").innerText().catch(() => "")).slice(-4000);
+      throw new Error(`${error.message}\nConsole: ${consoleProblems.join("; ")}\nVisible UI: ${visibleText}`);
+    }
     const possibleMatchText = "Large format LED video wall mounted on deep-blue feature wall.";
     const possibleMatchReference = 'nos. 85" LED TV Monitor (With Speaker - Full HD)';
     await basisLineRow(page, possibleMatchText).locator(".basis-line-possible-match", { hasText: possibleMatchReference }).waitFor({ timeout: 15000 });
@@ -514,7 +519,13 @@ async function main() {
     await basisLineRow(page, "Standard 13A sockets and LED lighting only.").locator("[data-revise-section]").click();
     await page.locator("#basisChatOverlay:not([hidden])").waitFor({ timeout: 15000 });
     await submitBasisChat(page, "what does this mean?");
-    await page.locator("#basisChatMessages", { hasText: "This basis line describes scope" }).waitFor({ timeout: 15000 });
+    try {
+      await page.locator("#basisChatMessages", { hasText: "This basis line describes scope" }).waitFor({ timeout: 15000 });
+    } catch (error) {
+      const messages = await page.locator("#basisChatMessages").innerText().catch(() => "");
+      const blockReason = await page.evaluate(() => startAnalysisBlockReason());
+      throw new Error(`${error.message}\nConsole: ${consoleProblems.join("; ")}\nMessages: ${messages}\nBlock: ${blockReason}`);
+    }
     await submitBasisChat(page, "include all lighting and electrical lines");
     await page.locator("#basisChatProposal:not([hidden])", { hasText: "Mark lighting and electrical as included" }).waitFor({ timeout: 15000 });
     await page.locator("#basisChatKeepButton:not([disabled])").click();

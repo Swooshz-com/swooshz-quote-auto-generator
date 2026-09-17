@@ -18240,7 +18240,7 @@ const job = (type, phase, startedAt, extra = {}) => ({
 });
 const restore = (value) => normalizeActiveJob(value, { restoring: true, nowMs });
 
-for (const type of ["draft", "basis_chat", "generate", "generate_pdf", "confirm_basis"]) {
+for (const type of ["draft", "generate", "generate_pdf", "confirm_basis"]) {
   assert.ok(restore(job(type, "starting", atAge(ACTIVE_JOB_STARTING_MAX_AGE_MS - 1))), `${type} fresh starting`);
   assert.strictEqual(restore(job(type, "starting", atAge(ACTIVE_JOB_STARTING_MAX_AGE_MS + 1))), null, `${type} stale starting`);
 }
@@ -18252,7 +18252,7 @@ const runningLimits = {
   generate: ACTIVE_JOB_RUNNING_GENERATION_MAX_AGE_MS,
   generate_pdf: ACTIVE_JOB_RUNNING_GENERATION_MAX_AGE_MS,
 };
-for (const [type, limit] of Object.entries(runningLimits)) {
+for (const [type, limit] of Object.entries(runningLimits).filter(([type]) => type !== "basis_chat")) {
   assert.ok(restore(job(type, "running", atAge(limit - 1))), `${type} fresh running`);
   assert.strictEqual(restore(job(type, "running", atAge(limit + 1))), null, `${type} stale running`);
 }
@@ -18266,6 +18266,7 @@ assert.strictEqual(restore(job("draft", "running", nowMs)), null);
 assert.strictEqual(restore(job("draft", "invalid", atAge(1000))), null);
 assert.strictEqual(restore(job("draft", "running", atAge(1000), { browserRecoveryScope: "scope-b" })), null);
 assert.strictEqual(restore(job("draft", "running", atAge(1000), { browserRecoveryScope: "" })), null);
+assert.strictEqual(restore(job("basis_chat", "running", atAge(1000))), null, "historical basis chat operation without immutable origin");
 
 const newlyCreated = normalizeActiveJob({
   id: "job-new-operation123",
@@ -23165,6 +23166,7 @@ function persistSessionFiles(records) {
 
 function normalizeRestorableOverlay(value) { return value || ""; }
 function normalizeActiveJob(job) { return job?.id ? job : null; }
+function currentBrowserRecoveryScope() { return "test-recovery-scope"; }
 function quoteBasisPersistenceProjection() {
   return { quote_basis: state.quoteBasis, quote_basis_sections: state.quoteBasisSections };
 }
@@ -23185,6 +23187,9 @@ eval([
   "emptyQuoteCommercialTouched",
   "normalizeQuoteCommercialTouched",
   "buildSessionSnapshot",
+  "detachedBasisChatAuthorityValue",
+  "basisChatBrowserSnapshot",
+  "activeJobBrowserSnapshot",
   "currentBrowserRecoveryScope",
   "saveSessionState",
 ].map(extractFunction).join("\n"));
@@ -26322,6 +26327,7 @@ const state = {
 };
 const elements = {};
 const window = { localStorage: { setItem() {} } };
+function currentBrowserRecoveryScope() { return "scope"; }
 
 function isPlainObject(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -28700,7 +28706,8 @@ assert.strictEqual(
 );
 assert.ok(!/AI basis chat|JSON|replacement line/i.test(friendlyError));
 assert.ok(source.includes("line_index: state.basisChat.lineIndex"));
-assert.ok(source.includes('startJob("basis_chat", basisChatPayload(text), { jobId })'));
+assert.ok(source.includes("const requestPayload = basisChatPayload(text);"));
+assert.ok(source.includes('startJob("basis_chat", requestPayload, { jobId })'));
 assert.ok(!source.includes('startJob("draft", buildPayload())'));
 """
         completed = subprocess.run(
@@ -28739,6 +28746,7 @@ function extractFunction(name) {
 }
 
 const EMPTY_BASIS = { surfaces: "", counters: "", platform: "", graphics: "", furniture: "", electrical: "" };
+const BASIS_CHAT_PROPOSAL_ORIGIN_VERSION = 1;
 const state = {
   quoteBasis: {},
   quoteBasisSections: [{
@@ -28847,6 +28855,9 @@ eval([
   "canonicalQuoteBasisForPersistence",
   "quoteCommercialStrictDataEqual",
   "rawBasisChatTarget",
+  "detachedBasisChatAuthorityValue",
+  "recursivelyFreezeBasisChatAuthority",
+  "canonicalBasisChatProposalOrigin",
   "basisChatProposalOrigin",
   "basisChatOriginIsCurrent",
   "canonicalTargetOnlyBasisChatProposal",
@@ -28854,6 +28865,7 @@ eval([
 ].map(extractFunction).join("\n"));
 
 state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
+const proposalOrigin = basisChatProposalOrigin();
 state.basisChat.proposal = canonicalTargetOnlyBasisChatProposal({
   message: "Update endorsement height.",
   quoteBasisSections: [{
@@ -28887,7 +28899,7 @@ state.basisChat.proposal = canonicalTargetOnlyBasisChatProposal({
     section_order: 2,
     lines: [{ id: "untouched-line", tag: "Exclude", text: "\n  lead\t  middle  \ntrail  \n" }],
   }],
-});
+}, proposalOrigin);
 
 applyBasisChatProposal();
 const editedLine = state.quoteBasisSections[0].lines[0];
@@ -28941,6 +28953,8 @@ function extractFunction(name) {
 
 const state = {
   quoteBasis: {},
+  quoteSessionId: "quote-fragment-test",
+  outputRevision: 0,
   quoteBasisSections: [{
     id: "counters-and-cabinets",
     title: "COUNTERS AND CABINETS",
@@ -28967,6 +28981,9 @@ const state = {
   lineItems: [],
   outputRows: [],
 };
+const BASIS_CHAT_PROPOSAL_ORIGIN_VERSION = 1;
+function safeQuoteSessionId(value) { return String(value || ""); }
+function revisionNumber(value, fallback = 0) { return Number.isInteger(Number(value)) ? Number(value) : fallback; }
 function cleanCustomerQuoteLineText(value = "") { return String(value || "").trim().replace(/\s+/g, " "); }
 function normalizeUnit(value = "") { return String(value || "").trim(); }
 function basisDisplayTitle(value = "") { return String(value || "").trim(); }
@@ -29013,8 +29030,13 @@ eval([
   "canonicalQuoteBasisSections",
   "canonicalQuoteBasis",
   "cloneQuoteBasisSections",
+  "canonicalQuoteBasisForPersistence",
   "quoteCommercialStrictDataEqual",
   "rawBasisChatTarget",
+  "detachedBasisChatAuthorityValue",
+  "recursivelyFreezeBasisChatAuthority",
+  "canonicalBasisChatProposalOrigin",
+  "basisChatProposalOrigin",
   "selectedBasisLine",
   "replaceLiteralText",
   "replaceBasisLineReferenceText",
@@ -29090,6 +29112,9 @@ function extractFunction(name) {
 }
 
 const state = {
+  quoteBasis: {},
+  quoteSessionId: "quote-quantity-test",
+  outputRevision: 0,
   quoteBasisSections: [{
     id: "furniture-rental",
     title: "Furniture Rental",
@@ -29110,6 +29135,9 @@ const state = {
     line: "Include: [ nos. Bistro Chairs ] - Loose seating for lounge area.",
   },
 };
+const BASIS_CHAT_PROPOSAL_ORIGIN_VERSION = 1;
+function safeQuoteSessionId(value) { return String(value || ""); }
+function revisionNumber(value, fallback = 0) { return Number.isInteger(Number(value)) ? Number(value) : fallback; }
 function normalizeUnit(value = "") { return String(value || "").trim(); }
 function basisDisplayTitle(value = "") { return String(value || "").trim(); }
 function normalizeCategoryTitle(value = "") { return basisDisplayTitle(value) || "General"; }
@@ -29154,8 +29182,13 @@ eval([
   "canonicalQuoteBasisSections",
   "canonicalQuoteBasis",
   "cloneQuoteBasisSections",
+  "canonicalQuoteBasisForPersistence",
   "quoteCommercialStrictDataEqual",
   "rawBasisChatTarget",
+  "detachedBasisChatAuthorityValue",
+  "recursivelyFreezeBasisChatAuthority",
+  "canonicalBasisChatProposalOrigin",
+  "basisChatProposalOrigin",
   "unbracketedCatalogReferenceText",
   "markBasisLineAsManualPricing",
   "replaceLiteralText",

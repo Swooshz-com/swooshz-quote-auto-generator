@@ -17,6 +17,7 @@ const ACTIVE_JOB_RUNNING_BASIS_CHAT_MAX_AGE_MS = 10 * 60 * 1000;
 const ACTIVE_JOB_RUNNING_CONFIRM_BASIS_MAX_AGE_MS = 5 * 60 * 1000;
 const ACTIVE_JOB_RUNNING_GENERATION_MAX_AGE_MS = 15 * 60 * 1000;
 const ACTIVE_JOB_CLOCK_SKEW_MS = 60 * 1000;
+const BASIS_CHAT_PROPOSAL_ORIGIN_VERSION = 1;
 // Starting work should survive only an immediate refresh. Draft analysis gets 30 minutes
 // for the documented 10-15 minute AI window; chat, local normalization, and exports use
 // shorter limits that cover realistic completion without replaying abandoned work later.
@@ -861,7 +862,7 @@ function normalizeActiveJob(job = {}, options = {}) {
     const maxAgeMs = activeJobMaxAgeMs(type, phase);
     if (ageMs < -ACTIVE_JOB_CLOCK_SKEW_MS || !maxAgeMs || ageMs > maxAgeMs) return null;
   }
-  return {
+  const normalized = {
     ...job,
     id,
     type,
@@ -869,6 +870,18 @@ function normalizeActiveJob(job = {}, options = {}) {
     startedAt: parsedDate.toISOString(),
     browserRecoveryScope,
   };
+  if (type === "basis_chat") {
+    try {
+      const clientOperationId = String(job.clientOperationId || "").trim();
+      if (!/^job-[A-Za-z0-9_-]{8,80}$/.test(clientOperationId)) return null;
+      normalized.clientOperationId = clientOperationId;
+      normalized.proposalOrigin = canonicalBasisChatProposalOrigin(job.proposalOrigin);
+      if (options.restoring === true && !basisChatOriginIsCurrent(normalized.proposalOrigin)) return null;
+    } catch (_error) {
+      return null;
+    }
+  }
+  return normalized;
 }
 
 function ensureClientQuoteSessionId() {
@@ -3804,6 +3817,31 @@ function loadSessionFileMap(keys = []) {
   }));
 }
 
+function basisChatBrowserSnapshot() {
+  const snapshot = {
+    ...state.basisChat,
+    proposal: null,
+  };
+  if (state.basisChat?.proposal) {
+    try {
+      const origin = canonicalBasisChatProposalOrigin(state.basisChat.proposal._origin);
+      if (basisChatOriginIsCurrent(origin)) {
+        snapshot.proposal = canonicalTargetOnlyBasisChatProposal(state.basisChat.proposal, origin);
+      }
+    } catch (_error) {
+      snapshot.proposal = null;
+    }
+  }
+  return detachedBasisChatAuthorityValue(snapshot);
+}
+
+function activeJobBrowserSnapshot() {
+  const activeJob = normalizeActiveJob(state.activeJob || {});
+  if (!activeJob) return null;
+  if (activeJob.type === "basis_chat") return detachedBasisChatAuthorityValue(activeJob);
+  return JSON.parse(JSON.stringify(activeJob));
+}
+
 function clearSessionFiles() {
   return openSessionFileDb().then((db) => new Promise((resolve, reject) => {
     const transaction = db.transaction(QUOTE_SESSION_FILE_STORE_NAME, "readwrite");
@@ -3855,7 +3893,7 @@ function buildSessionSnapshot() {
     lastAnalysisMode: state.lastAnalysisMode,
     pendingAnalysisMode: state.pendingAnalysisMode,
     pendingFeedback: state.pendingFeedback,
-    basisChat: state.basisChat,
+    basisChat: basisChatBrowserSnapshot(),
     activeSidePanel: state.activeSidePanel,
     downloadFile: state.downloadFile,
     pdfFile: state.pdfFile,
@@ -3864,7 +3902,7 @@ function buildSessionSnapshot() {
     pdfFileRevision: state.pdfFileRevision,
     pricingMatches: state.pricingMatches,
     pricingIssues: state.pricingIssues,
-    activeJob: normalizeActiveJob(state.activeJob || {}),
+    activeJob: activeJobBrowserSnapshot(),
   };
 }
 
@@ -4269,6 +4307,11 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
       ...(draftCandidates[0] || {}),
       ...savedState,
     };
+  const canRestoreBrowserTransientAuthority = !containerMalformed
+    && !nestedSession
+    && draftCandidates.length === 0
+    && !options.sessionId
+    && savedState.browserRecoveryScope === currentBrowserRecoveryScope();
   invalidateAuthorityProfileRequests();
   let rejectedRestoredActiveJob = false;
   state.profileId = typeof restoredState.profileId === "string" ? restoredState.profileId : "";
@@ -4420,12 +4463,13 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.draftSource = restoredState.draftSource || "";
   state.lastAnalysisMode = normalizeAnalysisMode(restoredState.lastAnalysisMode || restoredState.originalAnalysisSnapshot?.analysis_mode);
   state.pendingAnalysisMode = normalizeAnalysisMode(restoredState.pendingAnalysisMode || state.lastAnalysisMode);
-  const savedBasisChat = restoredState.basisChat && typeof restoredState.basisChat === "object" ? restoredState.basisChat : {};
+  const savedBasisChat = canRestoreBrowserTransientAuthority && restoredState.basisChat && typeof restoredState.basisChat === "object"
+    ? restoredState.basisChat : {};
   state.basisChat = {
     ...state.basisChat,
     ...savedBasisChat,
     lineIndex: Number.isInteger(Number(savedBasisChat.lineIndex)) ? Number(savedBasisChat.lineIndex) : -1,
-    proposal: savedBasisChat.proposal && typeof savedBasisChat.proposal === "object" ? savedBasisChat.proposal : null,
+    proposal: null,
   };
   state.aiFailed = Boolean(restoredState.aiFailed || state.draftSource === "local");
   state.downloadFile = restoredState.downloadFile || null;
@@ -4441,8 +4485,25 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   );
   state.pricingMatches = Array.isArray(restoredState.pricingMatches) ? restoredState.pricingMatches : [];
   state.pricingIssues = [];
-  state.activeJob = normalizeActiveJob(restoredState.activeJob || {}, { restoring: true });
-  rejectedRestoredActiveJob = Boolean(restoredState.activeJob && typeof restoredState.activeJob === "object" && !state.activeJob);
+  if (savedBasisChat.proposal && typeof savedBasisChat.proposal === "object") {
+    try {
+      const restoredOrigin = canonicalBasisChatProposalOrigin(savedBasisChat.proposal._origin);
+      if (basisChatOriginIsCurrent(restoredOrigin)) {
+        state.basisChat.proposal = canonicalTargetOnlyBasisChatProposal(savedBasisChat.proposal, restoredOrigin);
+      }
+    } catch (_error) {
+      state.basisChat.proposal = null;
+    }
+  }
+  state.activeJob = canRestoreBrowserTransientAuthority
+    ? normalizeActiveJob(restoredState.activeJob || {}, { restoring: true })
+    : null;
+  rejectedRestoredActiveJob = Boolean(
+    canRestoreBrowserTransientAuthority
+    && restoredState.activeJob
+    && typeof restoredState.activeJob === "object"
+    && !state.activeJob
+  );
   if (rejectedRestoredActiveJob) {
     state.isAnalysisRunning = false;
     state.isGenerating = false;
@@ -10701,10 +10762,80 @@ function rawBasisChatTarget(sections = state.quoteBasisSections, selector = stat
   return { sections: canonicalSections, sectionIndex, lineIndex, line: admittedLine };
 }
 
+function detachedBasisChatAuthorityValue(value, depth = 0) {
+  if (depth > 40) throw new TypeError("Basis proposal origin is too deeply nested.");
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError("Basis proposal origin contains an invalid number.");
+    return value;
+  }
+  if (Array.isArray(value)) return value.map((item) => detachedBasisChatAuthorityValue(item, depth + 1));
+  if (!value || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new TypeError("Basis proposal origin must contain plain data.");
+  }
+  const copy = {};
+  Object.keys(value).forEach((key) => {
+    copy[key] = detachedBasisChatAuthorityValue(value[key], depth + 1);
+  });
+  return copy;
+}
+
+function recursivelyFreezeBasisChatAuthority(value) {
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+  Object.values(value).forEach(recursivelyFreezeBasisChatAuthority);
+  return Object.freeze(value);
+}
+
+function canonicalBasisChatProposalOrigin(origin) {
+  if (!origin || typeof origin !== "object" || Array.isArray(origin)) throw new TypeError("Basis proposal origin is required.");
+  const supplied = detachedBasisChatAuthorityValue(origin);
+  const expectedKeys = ["_originVersion", "quoteSessionId", "outputRevision", "quoteBasisSections", "quoteBasis", "selector", "selectedLine"];
+  const suppliedKeys = Object.keys(supplied).sort();
+  if (supplied._originVersion !== BASIS_CHAT_PROPOSAL_ORIGIN_VERSION
+    || suppliedKeys.length !== expectedKeys.length
+    || expectedKeys.some((key) => !suppliedKeys.includes(key))) {
+    throw new TypeError("Basis proposal origin version is unsupported.");
+  }
+  if (typeof supplied.quoteSessionId !== "string" || safeQuoteSessionId(supplied.quoteSessionId) !== supplied.quoteSessionId) {
+    throw new TypeError("Basis proposal origin session is invalid.");
+  }
+  if (!Number.isInteger(supplied.outputRevision) || supplied.outputRevision < 0) {
+    throw new TypeError("Basis proposal origin revision is invalid.");
+  }
+  if (!supplied.selector || typeof supplied.selector !== "object" || Array.isArray(supplied.selector)) {
+    throw new TypeError("Basis proposal origin selector is invalid.");
+  }
+  const selectorKeys = Object.keys(supplied.selector).sort();
+  if (selectorKeys.length !== 3 || !["sectionId", "lineIndex", "line"].every((key) => selectorKeys.includes(key))) {
+    throw new TypeError("Basis proposal origin selector is incomplete.");
+  }
+  const target = rawBasisChatTarget(supplied.quoteBasisSections, supplied.selector);
+  const basis = canonicalQuoteBasisForPersistence(supplied.quoteBasis, target.sections);
+  if (!quoteCommercialStrictDataEqual(basis, supplied.quoteBasis)
+    || !quoteCommercialStrictDataEqual(target.sections, supplied.quoteBasisSections)
+    || !quoteCommercialStrictDataEqual(target.line, supplied.selectedLine)) {
+    throw new TypeError("Basis proposal origin is not canonical.");
+  }
+  return recursivelyFreezeBasisChatAuthority({
+    _originVersion: BASIS_CHAT_PROPOSAL_ORIGIN_VERSION,
+    quoteSessionId: supplied.quoteSessionId,
+    outputRevision: supplied.outputRevision,
+    quoteBasisSections: target.sections,
+    quoteBasis: basis,
+    selector: {
+      sectionId: supplied.selector.sectionId,
+      lineIndex: supplied.selector.lineIndex,
+      line: supplied.selector.line,
+    },
+    selectedLine: target.line,
+  });
+}
+
 function basisChatProposalOrigin() {
   const target = rawBasisChatTarget();
   const basis = canonicalQuoteBasisForPersistence(state.quoteBasis, target.sections);
-  return {
+  return canonicalBasisChatProposalOrigin({
+    _originVersion: BASIS_CHAT_PROPOSAL_ORIGIN_VERSION,
     quoteSessionId: safeQuoteSessionId(state.quoteSessionId || ""),
     outputRevision: revisionNumber(state.outputRevision, 0),
     quoteBasisSections: target.sections,
@@ -10715,19 +10846,23 @@ function basisChatProposalOrigin() {
       line: state.basisChat.line,
     },
     selectedLine: target.line,
-  };
+  });
 }
 
 function basisChatOriginIsCurrent(origin) {
-  if (!origin || typeof origin !== "object") return false;
   try {
-    return quoteCommercialStrictDataEqual(origin, basisChatProposalOrigin());
+    return quoteCommercialStrictDataEqual(canonicalBasisChatProposalOrigin(origin), basisChatProposalOrigin());
   } catch (_error) {
     return false;
   }
 }
 
-function canonicalTargetOnlyBasisChatProposal(proposal = {}, origin = basisChatProposalOrigin()) {
+function canonicalTargetOnlyBasisChatProposal(proposal = {}, authoritativeOrigin) {
+  const origin = canonicalBasisChatProposalOrigin(authoritativeOrigin);
+  if (Object.prototype.hasOwnProperty.call(proposal, "_origin")) {
+    const suppliedOrigin = canonicalBasisChatProposalOrigin(proposal._origin);
+    if (!quoteCommercialStrictDataEqual(suppliedOrigin, origin)) throw new TypeError("Basis proposal origin conflicts with its operation.");
+  }
   const sectionsValue = proposal.quoteBasisSections || proposal.quote_basis_sections;
   if (!Array.isArray(sectionsValue)) throw new TypeError("Basis proposal must contain canonical sections.");
   const mapValue = proposal.quoteBasis || proposal.quote_basis || quoteBasisFromSections(sectionsValue);
@@ -10877,14 +11012,46 @@ function renderBasisChatProposalCard(proposal, changedFields = []) {
   `;
 }
 
-function setBasisChatProposal(proposal) {
+function basisChatOperationToken(operation) {
+  return String(operation?.clientOperationId || operation?.id || "");
+}
+
+function basisChatOperationIsLatest(operation) {
+  const token = basisChatOperationToken(operation);
+  return Boolean(token && state.basisChat?.operationId === token);
+}
+
+function basisChatOperationOwnsActiveJob(operation) {
+  const token = basisChatOperationToken(operation);
+  if (!token || state.activeJob?.type !== "basis_chat" || basisChatOperationToken(state.activeJob) !== token) return false;
+  try {
+    return quoteCommercialStrictDataEqual(
+      canonicalBasisChatProposalOrigin(state.activeJob.proposalOrigin),
+      canonicalBasisChatProposalOrigin(operation.proposalOrigin),
+    );
+  } catch (_error) {
+    return false;
+  }
+}
+
+function clearBasisChatOperation(operation) {
+  if (!basisChatOperationOwnsActiveJob(operation)) return false;
+  state.activeJob = null;
+  saveSessionState();
+  return true;
+}
+
+function setBasisChatProposal(proposal, operation = null) {
+  if (operation && !basisChatOperationIsLatest(operation)) return false;
   let admitted;
   try {
-    admitted = canonicalTargetOnlyBasisChatProposal(proposal);
+    const origin = canonicalBasisChatProposalOrigin(proposal?._origin);
+    if (!basisChatOriginIsCurrent(origin)) throw new TypeError("Basis proposal origin is stale.");
+    admitted = canonicalTargetOnlyBasisChatProposal(proposal, origin);
   } catch (_error) {
     resetBasisChatProposal();
     appendBasisChatMessage("assistant", GENERIC_FAILURE_MESSAGE);
-    return;
+    return false;
   }
   state.basisChat.proposal = admitted;
   const changedFields = proposalChangedFields(admitted);
@@ -10894,6 +11061,8 @@ function setBasisChatProposal(proposal) {
   elements.basisChatApplyButton.disabled = false;
   elements.basisChatKeepButton.disabled = false;
   appendBasisChatMessage("assistant", "I drafted a proposed update below. Review it, then apply or discard.");
+  saveSessionState();
+  return true;
 }
 
 function basisChatFriendlyError(messages = []) {
@@ -11010,8 +11179,10 @@ function basisChatPayload(text) {
   };
 }
 
-function normalizeServerBasisChatProposal(proposal = {}) {
-  return canonicalTargetOnlyBasisChatProposal(proposal);
+function normalizeServerBasisChatProposal(proposal = {}, operation) {
+  const normalizedOperation = normalizeActiveJob(operation || {});
+  if (!normalizedOperation || normalizedOperation.type !== "basis_chat") throw new TypeError("Originating basis chat operation is required.");
+  return canonicalTargetOnlyBasisChatProposal(proposal, normalizedOperation.proposalOrigin);
 }
 
 function parseLiteralReplacementCommand(text = "") {
@@ -11071,13 +11242,14 @@ function replaceBasisLineReferenceText(line = {}, from = "", to = "") {
 }
 
 function buildLiteralReplacementProposal(command) {
-  let target;
+  let origin;
   try {
-    target = rawBasisChatTarget();
+    origin = basisChatProposalOrigin();
   } catch (_error) {
     return null;
   }
-  const sections = target.sections;
+  const sections = cloneQuoteBasisSections(origin.quoteBasisSections);
+  const target = rawBasisChatTarget(sections, origin.selector);
   const currentLine = target.line;
   const replaced = replaceBasisLineReferenceText(currentLine, command.from, command.to);
   if (!replaced.changed) return null;
@@ -11096,6 +11268,7 @@ function buildLiteralReplacementProposal(command) {
     quoteBasis: quoteBasisFromSections(sections),
     quoteBasisSections: sections,
     lineItems: state.lineItems,
+    _origin: origin,
   };
 }
 
@@ -11153,13 +11326,14 @@ function basisLineTextHasLiteralQuantityWord(line = {}) {
 
 function buildSelectedLineFragmentReplacementProposal(text = "") {
   if (state.basisChat.scope !== "line") return null;
-  let target;
+  let origin;
   try {
-    target = rawBasisChatTarget();
+    origin = basisChatProposalOrigin();
   } catch (_error) {
     return null;
   }
-  const sections = target.sections;
+  const sections = cloneQuoteBasisSections(origin.quoteBasisSections);
+  const target = rawBasisChatTarget(sections, origin.selector);
   const section = sections[target.sectionIndex];
   const lineIndex = target.lineIndex;
   const currentLine = target.line;
@@ -11179,6 +11353,7 @@ function buildSelectedLineFragmentReplacementProposal(text = "") {
       quoteBasis,
       quoteBasisSections: sections,
       lineItems: Array.isArray(state.lineItems) ? state.lineItems : [],
+      _origin: origin,
     };
   }
   const fragment = simpleBasisEditFragment(text);
@@ -11201,6 +11376,7 @@ function buildSelectedLineFragmentReplacementProposal(text = "") {
     quoteBasis,
     quoteBasisSections: sections,
     lineItems: Array.isArray(state.lineItems) ? state.lineItems : [],
+    _origin: origin,
   };
 }
 
@@ -11224,30 +11400,57 @@ function renderLiteralReplacementPreview(proposal) {
 
 async function buildAiBasisChatResponse(text, options = {}) {
   const restoredOperation = options.resume === true ? normalizeActiveJob(options.operation || state.activeJob || {}, { restoring: true }) : null;
+  if (options.resume === true && !restoredOperation) return { errorDisplayed: true };
   if (!restoredOperation && !canStartAnalysis()) return null;
+  const clientOperationId = restoredOperation ? "" : newClientJobId();
   const operation = restoredOperation?.type === "basis_chat" ? restoredOperation : normalizeActiveJob({
-    id: newClientJobId(),
+    id: clientOperationId,
+    clientOperationId,
     type: "basis_chat",
     phase: "starting",
     startedAt: new Date().toISOString(),
     text,
+    proposalOrigin: basisChatProposalOrigin(),
   });
+  if (!operation) return { errorDisplayed: true };
   state.activeJob = operation;
+  state.basisChat.operationId = basisChatOperationToken(operation);
   saveSessionState();
-  const previousRunning = state.isAnalysisRunning;
   state.isAnalysisRunning = true;
   setBasisChatBusy(true);
   syncControlStates();
   const basisChatStartedAt = Date.now();
   const typingMessage = appendBasisChatTyping();
   startElapsedTimer("basisChatElapsed", basisChatStartedAt);
+  let preserveOwnership = false;
   try {
     let jobId = operation.id;
-    if (operation.phase === "starting") {
-      const started = await startJob("basis_chat", basisChatPayload(text), { jobId });
+    let polled = null;
+    if (restoredOperation && operation.phase === "starting") {
+      const lookup = await getJson(`/api/jobs/${encodeURIComponent(jobId)}`, { logFetchFailure: false });
+      if (!basisChatOperationOwnsActiveJob(operation)) return { superseded: true };
+      if (!lookup.ok) {
+        clearBasisChatOperation(operation);
+        removeBasisChatTyping(typingMessage);
+        appendBasisChatMessage("assistant", basisChatFriendlyError(lookup.data));
+        return { errorDisplayed: true };
+      }
+      if (FINAL_JOB_STATUSES.has(lookup.data?.status)) {
+        polled = lookup;
+      } else {
+        state.activeJob = { ...operation, phase: "running", startedAt: lookup.data?.created_at || operation.startedAt };
+        saveSessionState();
+      }
+    } else if (!restoredOperation && operation.phase === "starting") {
+      const requestPayload = basisChatPayload(text);
+      const started = await startJob("basis_chat", requestPayload, { jobId });
+      if (!basisChatOperationOwnsActiveJob(operation)) return { superseded: true };
       if (!started.ok) {
-        if (started.data?.page_unloading) return { preserved: true };
-        clearActiveJob();
+        if (started.data?.page_unloading) {
+          preserveOwnership = true;
+          return { preserved: true };
+        }
+        clearBasisChatOperation(operation);
         removeBasisChatTyping(typingMessage);
         appendBasisChatMessage("assistant", basisChatFriendlyError(started.data));
         return { errorDisplayed: true };
@@ -11261,9 +11464,13 @@ async function buildAiBasisChatResponse(text, options = {}) {
       };
       saveSessionState();
     }
-    const polled = await pollJob(jobId);
-    if (polled.aborted || isInterruptedJobPoll(polled)) return { preserved: true };
-    clearActiveJob();
+    if (!polled) polled = await pollJob(jobId);
+    if (!basisChatOperationOwnsActiveJob(operation)) return { superseded: true };
+    if (polled.aborted || isInterruptedJobPoll(polled)) {
+      preserveOwnership = true;
+      return { preserved: true };
+    }
+    clearBasisChatOperation(operation);
     const data = polled.data.result || {};
     if (!polled.ok || ["blocked", "failed"].includes(polled.data.status)) {
       removeBasisChatTyping(typingMessage);
@@ -11271,15 +11478,21 @@ async function buildAiBasisChatResponse(text, options = {}) {
       return { errorDisplayed: true };
     }
     if (data.proposal) {
-      return { proposal: normalizeServerBasisChatProposal(data.proposal) };
+      return { proposal: normalizeServerBasisChatProposal(data.proposal, operation), operation };
     }
-    return { answer: data.answer || null };
+    return { answer: data.answer || null, operation };
+  } catch (_error) {
+    if (basisChatOperationOwnsActiveJob(operation)) clearBasisChatOperation(operation);
+    if (basisChatOperationIsLatest(operation)) appendBasisChatMessage("assistant", GENERIC_FAILURE_MESSAGE);
+    return { errorDisplayed: true };
   } finally {
     stopElapsedTimer("basisChatElapsed");
     removeBasisChatTyping(typingMessage);
-    state.isAnalysisRunning = previousRunning;
-    setBasisChatBusy(false);
-    syncControlStates();
+    if (!preserveOwnership && basisChatOperationIsLatest(operation) && !basisChatOperationOwnsActiveJob(operation)) {
+      state.isAnalysisRunning = false;
+      setBasisChatBusy(false);
+      syncControlStates();
+    }
   }
 }
 
@@ -11316,7 +11529,7 @@ async function handleBasisChatSubmit(event) {
 
   const aiResult = await buildAiBasisChatResponse(text);
   if (aiResult?.proposal) {
-    setBasisChatProposal(aiResult.proposal);
+    setBasisChatProposal(aiResult.proposal, aiResult.operation);
     return;
   }
   if (aiResult?.answer) {
@@ -14577,7 +14790,7 @@ async function resumeSavedJob() {
     const text = String(activeJob.text || "").trim();
     if (text) appendBasisChatMessage("user", text);
     const aiResult = await buildAiBasisChatResponse(text, { resume: true, operation: activeJob });
-    if (aiResult?.proposal) setBasisChatProposal(aiResult.proposal);
+    if (aiResult?.proposal) setBasisChatProposal(aiResult.proposal, aiResult.operation);
     else if (aiResult?.answer) appendBasisChatMessage("assistant", aiResult.answer);
     else if (!aiResult?.errorDisplayed && !aiResult?.preserved) {
       appendBasisChatMessage("assistant", "I could not produce a useful basis change. Please rephrase the request.");
