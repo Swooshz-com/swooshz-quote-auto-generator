@@ -385,29 +385,40 @@ async function installMockJobs(page) {
       return;
     }
     const body = JSON.parse(route.request().postData() || "{}");
-    const jobId = `playwright-job-${counter += 1}`;
+    counter += 1;
+    const jobId = body.job_id;
+    const createdAt = new Date().toISOString();
+    if (typeof jobId !== "string" || !jobId.startsWith("job-")) {
+      await route.fulfill({ status: 400, contentType: "application/json", body: JSON.stringify({ status: "failed", errors: ["Missing requested job id"] }) });
+      return;
+    }
     if (body.type === "draft") {
-      jobs.set(jobId, { status: "completed", result: draftResult() });
+      jobs.set(jobId, { job_id: jobId, type: body.type, status: "completed", created_at: createdAt, updated_at: createdAt, result: draftResult() });
     } else if (body.type === "basis_chat") {
       const result = basisChatResult(body.payload || {});
       jobs.set(jobId, {
+        job_id: jobId,
+        type: body.type,
         status: result.status === "failed" ? "failed" : "completed",
+        created_at: createdAt,
+        updated_at: createdAt,
         result,
         errors: result.errors || [],
       });
     } else {
-      jobs.set(jobId, { status: "failed", errors: [`Unexpected job type: ${body.type}`] });
+      jobs.set(jobId, { job_id: jobId, type: body.type, status: "failed", created_at: createdAt, updated_at: createdAt, errors: [`Unexpected job type: ${body.type}`] });
     }
     await route.fulfill({
       status: 202,
       contentType: "application/json",
-      body: JSON.stringify({ status: "queued", job_id: jobId, created_at: new Date().toISOString() }),
+      body: JSON.stringify({ status: "queued", job_id: jobId, type: body.type, created_at: createdAt, updated_at: createdAt }),
     });
   });
 
   await page.route("**/api/jobs/*", async (route) => {
     const jobId = route.request().url().split("/").pop();
-    const job = jobs.get(jobId) || { status: "failed", errors: [`Unknown mocked job: ${jobId}`] };
+    const now = new Date().toISOString();
+    const job = jobs.get(jobId) || { job_id: jobId, type: "basis_chat", status: "failed", created_at: now, updated_at: now, errors: [`Unknown mocked job: ${jobId}`] };
     await route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -532,6 +543,39 @@ async function main() {
     await page.locator("#basisChatMessages", { hasText: "Kept the current quote basis unchanged." }).waitFor({ timeout: 15000 });
     await submitBasisChat(page, "banana everything but also delete it");
     await page.locator("#basisChatMessages", { hasText: "Failed. Please try again." }).waitFor({ timeout: 15000 });
+    await page.evaluate(() => {
+      const origin = currentBasisChatAuthority();
+      const makeOperation = () => {
+        const lineage = newBasisChatLineage("server");
+        return canonicalBasisChatOperation({
+          _operationVersion: BASIS_CHAT_OPERATION_VERSION,
+          id: lineage.requestedJobId,
+          type: "basis_chat",
+          phase: "starting",
+          startedAt: new Date().toISOString(),
+          browserRecoveryScope: currentBrowserRecoveryScope(),
+          text: "reversed completion proof",
+          proposalOrigin: origin,
+          lineage,
+        });
+      };
+      const operationA = makeOperation();
+      installBasisChatOwner("running", origin, operationA.lineage);
+      state.activeJob = operationA;
+      state.basisChat.busyOwnerId = operationA.lineage.clientOperationId;
+      const operationB = makeOperation();
+      installBasisChatOwner("running", origin, operationB.lineage);
+      state.activeJob = operationB;
+      state.basisChat.busyOwnerId = operationB.lineage.clientOperationId;
+      if (basisChatOperationIsCurrent(operationA)
+        || completeBasisChatOwner(operationA.proposalOrigin, operationA.lineage)
+        || !basisChatOperationIsCurrent(operationB)
+        || state.basisChat.busyOwnerId !== operationB.lineage.clientOperationId) {
+        throw new Error("Reversed A/B completion retained stale authority.");
+      }
+      invalidateBasisChatAuthority();
+      setBasisChatBusy(false);
+    });
     const chatShot = await screenshot(page, "ai-basis-chat-stress.png");
 
     await page.locator("#basisChatCloseButton").click();

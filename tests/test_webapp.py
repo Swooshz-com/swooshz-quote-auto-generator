@@ -28707,7 +28707,7 @@ assert.strictEqual(
 assert.ok(!/AI basis chat|JSON|replacement line/i.test(friendlyError));
 assert.ok(source.includes("line_index: state.basisChat.lineIndex"));
 assert.ok(source.includes("const requestPayload = basisChatPayload(text);"));
-assert.ok(source.includes('startJob("basis_chat", requestPayload, { jobId })'));
+assert.ok(source.includes('startJob("basis_chat", requestPayload, { jobId: operation.lineage.requestedJobId })'));
 assert.ok(!source.includes('startJob("draft", buildPayload())'));
 """
         completed = subprocess.run(
@@ -28747,6 +28747,9 @@ function extractFunction(name) {
 
 const EMPTY_BASIS = { surfaces: "", counters: "", platform: "", graphics: "", furniture: "", electrical: "" };
 const BASIS_CHAT_PROPOSAL_ORIGIN_VERSION = 1;
+const BASIS_CHAT_AUTHORITY_MAX_DEPTH = 40;
+const BASIS_CHAT_AUTHORITY_MAX_NODES = 20000;
+const BASIS_CHAT_LINEAGE_VERSION = 1;
 const state = {
   quoteBasis: {},
   quoteBasisSections: [{
@@ -28791,7 +28794,12 @@ const state = {
     lineIndex: 0,
     line: "Include: [ Professional Engineer Endorsement for structure above 4m ] - Custom curved coffee/service counter with Kent branding and teal/blue trim.",
     proposal: null,
+    authorityOwner: null,
+    busyOwnerId: null,
+    completionNotice: null,
   },
+  activeJob: null,
+  isAnalysisRunning: false,
   lineItems: [],
   outputRows: [],
   originalOutputRows: [],
@@ -28809,6 +28817,7 @@ function setDownloadFiles(files = []) { state.downloadFiles = files; }
 function updateQuoteBasisCard(source) { state.updatedSource = source; }
 function setSidePanel(panelName, options = {}) { state.sidePanel = panelName; state.sidePanelOptions = options; }
 function resetBasisChatProposal() { state.basisChat.proposal = null; }
+function invalidateBasisChatAuthority() { state.activeJob = null; state.basisChat.proposal = null; state.basisChat.authorityOwner = null; state.basisChat.busyOwnerId = null; state.basisChat.completionNotice = null; }
 function closeBasisChatOverlay() { state.overlayClosed = true; }
 function syncControlStates() { state.synced = true; }
 function safeQuoteSessionId(value) { return String(value || ""); }
@@ -28854,21 +28863,41 @@ eval([
   "cloneQuoteBasisSections",
   "canonicalQuoteBasisForPersistence",
   "quoteCommercialStrictDataEqual",
+  "basisChatAuthorityRecordKeys",
+  "basisChatAuthorityStrictEqual",
+  "basisChatRequireExactKeys",
+  "admittedBasisChatSections",
+  "admittedBasisChatMap",
+  "canonicalBasisChatSelector",
+  "selectedBasisLine",
   "rawBasisChatTarget",
   "detachedBasisChatAuthorityValue",
   "recursivelyFreezeBasisChatAuthority",
   "canonicalBasisChatProposalOrigin",
+  "currentBasisChatAuthority",
   "basisChatProposalOrigin",
   "basisChatOriginIsCurrent",
+  "canonicalBasisChatLineage",
+  "basisChatLineageIsCurrent",
+  "canonicalBasisChatAuthorityOwner",
+  "basisChatProposalAlias",
   "canonicalTargetOnlyBasisChatProposal",
   "applyBasisChatProposal",
 ].map(extractFunction).join("\n"));
 
 state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
 const proposalOrigin = basisChatProposalOrigin();
-state.basisChat.proposal = canonicalTargetOnlyBasisChatProposal({
-  message: "Update endorsement height.",
-  quoteBasisSections: [{
+const lineage = canonicalBasisChatLineage({
+  _lineageVersion: BASIS_CHAT_LINEAGE_VERSION,
+  lineageId: "lineage-static-apply",
+  clientOperationId: "operation-static-apply",
+  source: "local_fragment",
+  jobType: null,
+  requestedJobId: null,
+  serverJobId: null,
+});
+state.basisChat.authorityOwner = canonicalBasisChatAuthorityOwner({ status: "running", origin: proposalOrigin, lineage });
+const proposedSections = [{
     id: "counters-and-cabinets",
     title: "COUNTERS AND CABINETS",
     lines: [{
@@ -28898,8 +28927,13 @@ state.basisChat.proposal = canonicalTargetOnlyBasisChatProposal({
     title: "Untouched",
     section_order: 2,
     lines: [{ id: "untouched-line", tag: "Exclude", text: "\n  lead\t  middle  \ntrail  \n" }],
-  }],
-}, proposalOrigin);
+  }];
+state.basisChat.proposal = canonicalTargetOnlyBasisChatProposal({
+  message: "Update endorsement height.",
+  quoteBasis: quoteBasisFromSections(proposedSections),
+  quoteBasisSections: proposedSections,
+}, proposalOrigin, lineage);
+state.basisChat.authorityOwner = canonicalBasisChatAuthorityOwner({ status: "proposal", origin: proposalOrigin, lineage });
 
 applyBasisChatProposal();
 const editedLine = state.quoteBasisSections[0].lines[0];
@@ -28982,6 +29016,8 @@ const state = {
   outputRows: [],
 };
 const BASIS_CHAT_PROPOSAL_ORIGIN_VERSION = 1;
+const BASIS_CHAT_AUTHORITY_MAX_DEPTH = 40;
+const BASIS_CHAT_AUTHORITY_MAX_NODES = 20000;
 function safeQuoteSessionId(value) { return String(value || ""); }
 function revisionNumber(value, fallback = 0) { return Number.isInteger(Number(value)) ? Number(value) : fallback; }
 function cleanCustomerQuoteLineText(value = "") { return String(value || "").trim().replace(/\s+/g, " "); }
@@ -29032,10 +29068,17 @@ eval([
   "cloneQuoteBasisSections",
   "canonicalQuoteBasisForPersistence",
   "quoteCommercialStrictDataEqual",
+  "basisChatAuthorityRecordKeys",
+  "basisChatAuthorityStrictEqual",
+  "basisChatRequireExactKeys",
+  "admittedBasisChatSections",
+  "admittedBasisChatMap",
+  "canonicalBasisChatSelector",
   "rawBasisChatTarget",
   "detachedBasisChatAuthorityValue",
   "recursivelyFreezeBasisChatAuthority",
   "canonicalBasisChatProposalOrigin",
+  "currentBasisChatAuthority",
   "basisChatProposalOrigin",
   "selectedBasisLine",
   "replaceLiteralText",
@@ -29136,6 +29179,8 @@ const state = {
   },
 };
 const BASIS_CHAT_PROPOSAL_ORIGIN_VERSION = 1;
+const BASIS_CHAT_AUTHORITY_MAX_DEPTH = 40;
+const BASIS_CHAT_AUTHORITY_MAX_NODES = 20000;
 function safeQuoteSessionId(value) { return String(value || ""); }
 function revisionNumber(value, fallback = 0) { return Number.isInteger(Number(value)) ? Number(value) : fallback; }
 function normalizeUnit(value = "") { return String(value || "").trim(); }
@@ -29184,10 +29229,18 @@ eval([
   "cloneQuoteBasisSections",
   "canonicalQuoteBasisForPersistence",
   "quoteCommercialStrictDataEqual",
+  "basisChatAuthorityRecordKeys",
+  "basisChatAuthorityStrictEqual",
+  "basisChatRequireExactKeys",
+  "admittedBasisChatSections",
+  "admittedBasisChatMap",
+  "canonicalBasisChatSelector",
+  "selectedBasisLine",
   "rawBasisChatTarget",
   "detachedBasisChatAuthorityValue",
   "recursivelyFreezeBasisChatAuthority",
   "canonicalBasisChatProposalOrigin",
+  "currentBasisChatAuthority",
   "basisChatProposalOrigin",
   "unbracketedCatalogReferenceText",
   "markBasisLineAsManualPricing",
@@ -29215,6 +29268,172 @@ assert.strictEqual(line.unit, "nos");
             check=False,
         )
 
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_basis_chat_strict_authority_identity_and_operation_lineage(self):
+        node = require_node(self)
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+function extractFunction(name) {
+  const start = source.indexOf(`function ${name}`);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}" && --depth === 0) return source.slice(start, index + 1);
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+const BASIS_CHAT_PROPOSAL_ORIGIN_VERSION = 1;
+const BASIS_CHAT_LINEAGE_VERSION = 1;
+const BASIS_CHAT_OPERATION_VERSION = 1;
+const BASIS_CHAT_AUTHORITY_MAX_DEPTH = 40;
+const BASIS_CHAT_AUTHORITY_MAX_NODES = 20000;
+const ACTIVE_JOB_CLOCK_SKEW_MS = 60000;
+const FINAL_JOB_STATUSES = new Set(["completed", "degraded", "needs_review", "blocked", "failed"]);
+const state = {
+  browserRecoveryScope: "scope-strict-authority",
+  quoteSessionId: "quote-strict-authority",
+  outputRevision: 4,
+  quoteBasisSections: [{
+    id: "section-one",
+    title: "Section One",
+    section_meta: { retained: true },
+    lines: [{ id: "line-one", tag: "Include", text: "Original", metadata: { retained: true } }],
+  }],
+  quoteBasis: { "section-one": "Include: Original" },
+  basisChat: {
+    sectionId: "section-one", lineIndex: 0, line: "Include: Original",
+    proposal: null, authorityOwner: null, busyOwnerId: null, completionNotice: null,
+  },
+  activeJob: null,
+  lineItems: [],
+  isAnalysisRunning: false,
+};
+function selectedBasisLine() { return state.quoteBasisSections[0].lines[0]; }
+function quoteBasisFromSections(sections) {
+  const result = {};
+  for (const section of sections) result[section.id] = section.lines.map((line) => `${line.tag}: ${line.text}`).join("\n");
+  return result;
+}
+function currentBrowserRecoveryScope() { return state.browserRecoveryScope; }
+function activeJobMaxAgeMs() { return 600000; }
+eval([
+  "basisChatAuthorityRecordKeys", "detachedBasisChatAuthorityValue", "recursivelyFreezeBasisChatAuthority",
+  "basisChatAuthorityStrictEqual", "basisChatRequireExactKeys", "admittedBasisChatSections",
+  "admittedBasisChatMap", "canonicalBasisChatSelector", "rawBasisChatTarget",
+  "canonicalBasisChatProposalOrigin", "currentBasisChatAuthority", "basisChatProposalOrigin",
+  "basisChatOriginIsCurrent", "canonicalBasisChatLineage", "basisChatLineageIsCurrent",
+  "canonicalBasisChatAuthorityOwner", "basisChatIsoTimestamp", "canonicalBasisChatOperation",
+  "basisChatOperationIsCurrent", "canonicalBasisChatJobResponse", "bindBasisChatServerOperation",
+  "installBasisChatOwner", "completeBasisChatOwner", "basisChatProposalAlias",
+  "canonicalTargetOnlyBasisChatProposal",
+].map(extractFunction).join("\n"));
+
+let getterCalls = 0;
+const accessor = {};
+Object.defineProperty(accessor, "danger", { enumerable: true, get() { getterCalls += 1; return "bad"; } });
+assert.throws(() => detachedBasisChatAuthorityValue(accessor), TypeError);
+assert.strictEqual(getterCalls, 0);
+for (const key of ["__proto__", "constructor", "prototype"]) {
+  const unsafe = {};
+  Object.defineProperty(unsafe, key, { value: "bad", enumerable: true, configurable: true, writable: true });
+  assert.throws(() => detachedBasisChatAuthorityValue(unsafe), TypeError);
+}
+const symbolRecord = { ok: true };
+symbolRecord[Symbol("bad")] = true;
+assert.throws(() => detachedBasisChatAuthorityValue(symbolRecord), TypeError);
+assert.throws(() => detachedBasisChatAuthorityValue(Object.create({ inherited: true })), TypeError);
+assert.throws(() => detachedBasisChatAuthorityValue(new Date()), TypeError);
+assert.throws(() => detachedBasisChatAuthorityValue(new Proxy({}, { ownKeys() { throw new Error("reflection failed"); } })), Error);
+const sparse = [];
+sparse.length = 1;
+assert.throws(() => detachedBasisChatAuthorityValue(sparse), TypeError);
+const extra = [1];
+extra.named = true;
+assert.throws(() => detachedBasisChatAuthorityValue(extra), TypeError);
+const malformed = [1];
+Object.defineProperty(malformed, "0", { value: 1, enumerable: true, configurable: false, writable: false });
+assert.throws(() => detachedBasisChatAuthorityValue(malformed), TypeError);
+
+const origin = basisChatProposalOrigin();
+assert.ok(Object.isFrozen(origin) && Object.isFrozen(origin.quoteBasisSections[0].lines[0].metadata));
+for (const revision of [undefined, null, "4", 4.9, NaN, Infinity, -1, Number.MAX_SAFE_INTEGER + 1]) {
+  const candidate = { ...origin };
+  if (revision === undefined) delete candidate.outputRevision;
+  else candidate.outputRevision = revision;
+  assert.throws(() => canonicalBasisChatProposalOrigin(candidate), TypeError);
+}
+assert.doesNotThrow(() => canonicalBasisChatProposalOrigin(origin));
+const staleSections = JSON.parse(JSON.stringify(state.quoteBasisSections));
+staleSections[0].lines[0].metadata.retained = false;
+state.quoteBasisSections = staleSections;
+state.quoteBasis = quoteBasisFromSections(staleSections);
+assert.strictEqual(basisChatOriginIsCurrent(origin), false);
+state.quoteBasisSections = JSON.parse(JSON.stringify(origin.quoteBasisSections));
+state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
+
+const lineage = canonicalBasisChatLineage({
+  _lineageVersion: 1, lineageId: "lineage-local-proof", clientOperationId: "operation-local-proof",
+  source: "local_fragment", jobType: null, requestedJobId: null, serverJobId: null,
+});
+installBasisChatOwner("running", origin, lineage);
+const proposedSections = JSON.parse(JSON.stringify(origin.quoteBasisSections));
+proposedSections[0].lines[0].text = "Changed";
+const rawProposal = { message: "Change it", quoteBasis: quoteBasisFromSections(proposedSections), quoteBasisSections: proposedSections };
+assert.throws(() => canonicalTargetOnlyBasisChatProposal({ quoteBasisSections: proposedSections }, origin, lineage), TypeError);
+assert.throws(() => canonicalTargetOnlyBasisChatProposal({ ...rawProposal, quote_basis: { "section-one": "conflict" } }, origin, lineage), TypeError);
+assert.throws(() => canonicalTargetOnlyBasisChatProposal({ ...rawProposal, unknown: true }, origin, lineage), TypeError);
+const admittedProposal = canonicalTargetOnlyBasisChatProposal(rawProposal, origin, lineage);
+assert.ok(Object.isFrozen(admittedProposal._origin) && Object.isFrozen(admittedProposal._lineage));
+assert.strictEqual(admittedProposal.quoteBasisSections[0].section_meta.retained, true);
+
+function serverLineage(suffix) {
+  return canonicalBasisChatLineage({
+    _lineageVersion: 1, lineageId: `lineage-${suffix}-proof`, clientOperationId: `operation-${suffix}-proof`,
+    source: "server", jobType: "basis_chat", requestedJobId: `job-${suffix}-proof`, serverJobId: null,
+  });
+}
+function startingOperation(lineageValue) {
+  return canonicalBasisChatOperation({
+    _operationVersion: 1, id: lineageValue.requestedJobId, type: "basis_chat", phase: "starting",
+    startedAt: "2026-09-17T00:00:00.000Z", browserRecoveryScope: state.browserRecoveryScope,
+    text: "change selected line", proposalOrigin: currentBasisChatAuthority(), lineage: lineageValue,
+  });
+}
+const lineageA = serverLineage("alpha");
+const operationA = startingOperation(lineageA);
+installBasisChatOwner("running", operationA.proposalOrigin, lineageA);
+state.activeJob = operationA;
+state.basisChat.busyOwnerId = lineageA.clientOperationId;
+assert.strictEqual(basisChatOperationIsCurrent(operationA), true);
+const lineageB = serverLineage("bravo");
+const operationB = startingOperation(lineageB);
+installBasisChatOwner("running", operationB.proposalOrigin, lineageB);
+state.activeJob = operationB;
+state.basisChat.busyOwnerId = lineageB.clientOperationId;
+assert.strictEqual(basisChatOperationIsCurrent(operationA), false);
+assert.strictEqual(completeBasisChatOwner(operationA.proposalOrigin, operationA.lineage), false);
+assert.strictEqual(state.basisChat.busyOwnerId, lineageB.clientOperationId);
+const runningB = bindBasisChatServerOperation(operationB, {
+  job_id: lineageB.requestedJobId, type: "basis_chat", status: "queued", created_at: "2026-09-17T00:00:01.000Z",
+});
+assert.strictEqual(runningB.lineage.serverJobId, lineageB.requestedJobId);
+assert.strictEqual(basisChatOperationIsCurrent(runningB), true);
+assert.throws(() => canonicalBasisChatJobResponse({
+  job_id: "job-charlie-proof", type: "basis_chat", status: "queued", created_at: "2026-09-17T00:00:01.000Z",
+}, lineageB.requestedJobId), TypeError);
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
 
     def test_static_output_header_matches_quote_basis_structure(self):

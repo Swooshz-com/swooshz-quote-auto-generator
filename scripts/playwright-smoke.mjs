@@ -2897,7 +2897,8 @@ async function run573LoadedAppOnce(runIndex) {
         || !Object.isFrozen(run586Proposal._origin.quoteBasisSections)
         || !Object.isFrozen(run586Proposal._origin.quoteBasisSections[0].lines[0])
       ) throw new Error("Run-599 local proposal origin was not recursively frozen.");
-      state.basisChat.proposal = run586Proposal;
+      const run586Lineage = beginLocalBasisChatAuthority("local_fragment", run586Proposal._origin);
+      setBasisChatProposal(run586Proposal, run586Lineage);
       applyBasisChatProposal();
       const assertRun586CanonicalState = (label, sections, basis) => {
         const target = sections.find((section) => section.id === "run586-target");
@@ -3099,26 +3100,28 @@ async function run573LoadedAppOnce(runIndex) {
         if (parseLiteralReplacementCommand(editRequest) || buildSelectedLineFragmentReplacementProposal(editRequest)) {
           throw new Error(`Run-589 request did not bypass local proposal shortcuts: ${editRequest}`);
         }
-        const jobId = newClientJobId();
-        const operation = normalizeActiveJob({
-          id: jobId,
-          clientOperationId: jobId,
+        const proposalOrigin = basisChatProposalOrigin();
+        invalidateBasisChatAuthority();
+        const lineage = newBasisChatLineage("server");
+        installBasisChatOwner("running", proposalOrigin, lineage);
+        state.basisChat.busyOwnerId = lineage.clientOperationId;
+        const operation = canonicalBasisChatOperation({
+          _operationVersion: BASIS_CHAT_OPERATION_VERSION,
+          id: lineage.requestedJobId,
           type: "basis_chat",
           phase: "starting",
           startedAt: new Date().toISOString(),
+          browserRecoveryScope: currentBrowserRecoveryScope(),
           text: editRequest,
-          proposalOrigin: basisChatProposalOrigin(),
+          proposalOrigin,
+          lineage,
         });
+        state.activeJob = operation;
         if (!operation) throw new Error("Run-599 could not capture immutable proposal origin.");
-        const started = await startJob("basis_chat", basisChatPayload(editRequest), { jobId });
+        const started = await startJob("basis_chat", basisChatPayload(editRequest), { jobId: lineage.requestedJobId });
         if (!started.ok) throw new Error(`Run-589 server-backed job did not start: ${JSON.stringify(started.data)}.`);
-        const runningOperation = {
-          ...operation,
-          id: started.data.job_id || operation.id,
-          phase: "running",
-          startedAt: started.data.created_at || operation.startedAt,
-        };
-        const polled = await pollJob(started.data.job_id || jobId);
+        const runningOperation = bindBasisChatServerOperation(operation, started.data);
+        const polled = await pollJob(runningOperation.lineage.serverJobId);
         if (!polled.ok || polled.data?.status !== "completed") {
           throw new Error(`Run-589 server-backed job did not complete: ${JSON.stringify(polled.data)}.`);
         }
@@ -3131,7 +3134,7 @@ async function run573LoadedAppOnce(runIndex) {
           expectedTargetText,
           rawProposal.line_items,
         );
-        const normalizedProposal = normalizeServerBasisChatProposal(rawProposal, runningOperation);
+        const normalizedProposal = normalizeServerBasisChatProposal(rawProposal, runningOperation, polled.data);
         let proposalOnlyNormalizationRejected = false;
         try {
           normalizeServerBasisChatProposal(rawProposal);
@@ -3151,7 +3154,7 @@ async function run573LoadedAppOnce(runIndex) {
           canonicalTargetOnlyBasisChatProposal({
             ...rawProposal,
             _origin: { ...runningOperation.proposalOrigin, outputRevision: runningOperation.proposalOrigin.outputRevision + 1 },
-          }, runningOperation.proposalOrigin);
+          }, runningOperation.proposalOrigin, runningOperation.lineage);
         } catch (_error) {
           conflictingOriginRejected = true;
         }
@@ -3185,14 +3188,17 @@ async function run573LoadedAppOnce(runIndex) {
           if (basisChatOriginIsCurrent(origin)) throw new Error(`Run-593 stale ${label} proposal was accepted.`);
           restore();
         }
+        setBasisChatProposal(normalizedProposal, runningOperation.lineage);
         state.outputRevision = originalRevision + 1;
-        state.basisChat.proposal = normalizedProposal;
         applyBasisChatProposal();
         if (JSON.stringify(state.quoteBasisSections) !== JSON.stringify(originalSections)) {
           throw new Error("Run-593 stale proposal mutated authoritative basis state.");
         }
         state.outputRevision = originalRevision;
-        state.basisChat.proposal = normalizeServerBasisChatProposal(rawProposal, runningOperation);
+        const validOrigin = basisChatProposalOrigin();
+        const validLineage = beginLocalBasisChatAuthority("local_fragment", validOrigin);
+        const validProposal = canonicalTargetOnlyBasisChatProposal(rawProposal, validOrigin, validLineage);
+        setBasisChatProposal(validProposal, validLineage);
         applyBasisChatProposal();
         assertRun589State("authoritative state", state.quoteBasisSections, state.quoteBasis, expectedTargetText, state.lineItems);
         const snapshot = buildSessionSnapshot();
