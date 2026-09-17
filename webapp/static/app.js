@@ -11426,7 +11426,6 @@ function setBasisChatProposal(proposal, authoritativeLineage) {
     admitted = canonicalTargetOnlyBasisChatProposal(detachedProposal, origin, lineage);
     if (!completeBasisChatOwner(origin, lineage, { keepProposal: true })) throw new TypeError("Basis proposal owner is stale.");
   } catch (_error) {
-    state.basisChat.proposal = null;
     return false;
   }
   state.basisChat.proposal = admitted;
