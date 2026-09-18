@@ -331,6 +331,23 @@ def as_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def explicit_nonnegative_float(value: Any) -> float | None:
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) and numeric >= 0 else None
+
+
+def line_is_included(item: dict[str, Any]) -> bool:
+    return any(
+        clean_text(item.get(key)).lower() == "included"
+        for key in ("price_mode", "display_price", "unit_price_override")
+    )
+
+
 def clean_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
@@ -616,11 +633,13 @@ def prepare_lines(brief: dict[str, Any], price_rows: list[PriceRow], allow_ambig
     prepared: list[QuoteLine] = []
     for item in brief.get("line_items", []):
         display_price = str(item.get("display_price") or "")
-        price_mode = clean_text(item.get("price_mode")).title()
+        raw_unit_price_override = item.get("unit_price_override")
+        price_mode = "Included" if line_is_included(item) else clean_text(item.get("price_mode")).title()
         if price_mode not in {"Priced", "Included"}:
-            price_mode = "Included" if display_price.lower() == "included" else "Priced"
-        unit_price_override = item.get("unit_price_override")
-        unit_price_override_num = as_float(unit_price_override, 0.0) if unit_price_override not in (None, "") else None
+            price_mode = "Priced"
+        unit_price_override_num = explicit_nonnegative_float(raw_unit_price_override)
+        invalid_explicit_override = raw_unit_price_override not in (None, "") and unit_price_override_num is None
+        requires_explicit_price = clean_text(item.get("status")).lower() in {"included", "pricing-required"}
         pricing_keyword = clean_text(item.get("pricing_keyword"))
         query = pricing_keyword or clean_text(item.get("description") or "")
         status, match, candidates = find_price_match(
@@ -639,10 +658,18 @@ def prepare_lines(brief: dict[str, Any], price_rows: list[PriceRow], allow_ambig
             amount = 0.0
             display_price = "Included"
             match = None
+            candidates = []
+            unit_price_override_num = None
         elif unit_price_override_num is not None:
             status = "manual-price"
             amount = round_commercial_cents((quantity_num or 0.0) * unit_price_override_num)
             match = None
+            candidates = []
+        elif invalid_explicit_override or requires_explicit_price:
+            status = "manual-display"
+            display_price = ""
+            match = None
+            candidates = []
         elif display_price:
             status = "manual-display"
         elif suspicious_piece_dimension_quantity(clean_text(item.get("description")), quantity_num, normalized_unit, match):

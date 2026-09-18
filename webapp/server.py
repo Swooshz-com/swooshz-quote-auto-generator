@@ -4639,53 +4639,94 @@ def quote_commercial_historical_effective_unit_price(
     *,
     quantity: float | None = None,
 ) -> float | None:
-    override = parse_float_or_none(row.get("unit_price_override"))
+    if quote_row_is_included(row):
+        return 0.0
+    override = explicit_nonnegative_float(row.get("unit_price_override"))
     if override is not None:
         return override
+    if clean_text(row.get("status")).lower() in {"included", "pricing-required"}:
+        return None
     effective = parse_float_or_none(row.get("effective_unit_price"))
-    if effective is not None:
+    if effective is not None and effective >= 0:
         return effective
     basis_amount = parse_float_or_none(row.get("pricing_basis_amount"))
     resolved_quantity = quantity if quantity is not None else parse_float_or_none(row.get("quantity"))
-    if basis_amount is not None and resolved_quantity is not None and resolved_quantity > 0:
+    if basis_amount is not None and basis_amount >= 0 and resolved_quantity is not None and resolved_quantity > 0:
         return round(basis_amount / resolved_quantity, 6)
     return None
+
+
+def explicit_nonnegative_float(value: Any) -> float | None:
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    numeric = parse_float_or_none(value)
+    return numeric if numeric is not None and numeric >= 0 else None
+
+
+def quote_row_is_included(row: dict[str, Any]) -> bool:
+    return any(
+        clean_text(row.get(key)).lower() == "included"
+        for key in ("price_mode", "display_price", "unit_price_override")
+    )
 
 
 def quote_commercial_invalid_unit_price_override(row: dict[str, Any]) -> bool:
     """Identify a non-empty persisted override that cannot be commercial state."""
     raw_override = row.get("unit_price_override")
-    return raw_override not in (None, "") and parse_float_or_none(raw_override) is None
+    return raw_override not in (None, "") and explicit_nonnegative_float(raw_override) is None
+
+
+def canonical_included_zero_charge_row(row: dict[str, Any]) -> dict[str, Any]:
+    next_row = copy.deepcopy(row)
+    next_row.update({
+        "price_mode": "Included",
+        "display_price": "Included",
+        "status": "included",
+        "unit_price_override": None,
+        "effective_unit_price": 0,
+        "pricing_basis_amount": 0,
+        "approved_quote_amount": 0,
+        "amount": 0,
+    })
+    for key in ("catalog_unit_price", "unit_price", "sale_unit_price", "_commercial_invalid_unit_price_override"):
+        next_row.pop(key, None)
+    return next_row
 
 
 def quote_commercial_row_from_output_row(row: dict[str, Any]) -> dict[str, Any]:
     row = canonicalize_primary_order_fields(row)
-    price_mode = "Included" if (
-        clean_text(row.get("price_mode")).lower() == "included"
-        or clean_text(row.get("display_price")).lower() == "included"
-    ) else "Priced"
+    price_mode = "Included" if quote_row_is_included(row) else "Priced"
     next_row = copy.deepcopy(row)
     next_row["price_mode"] = price_mode
     if price_mode == "Included":
-        next_row["display_price"] = "Included"
-        next_row["approved_quote_amount"] = 0
-        next_row["unit_price_override"] = None
-        return next_row
+        return canonical_included_zero_charge_row(next_row)
+    explicit_override = explicit_nonnegative_float(row.get("unit_price_override"))
+    requires_explicit = clean_text(row.get("status")).lower() in {"included", "pricing-required"}
+    if requires_explicit:
+        for key in ("catalog_unit_price", "unit_price", "sale_unit_price", "effective_unit_price", "pricing_basis_amount", "approved_quote_amount", "amount"):
+            next_row.pop(key, None)
+        next_row.update({"price_mode": "Priced", "display_price": ""})
+        if explicit_override is None:
+            next_row["status"] = "pricing-required"
+            return next_row
+        next_row.update({"status": "manual-price", "unit_price_override": explicit_override})
     if quote_commercial_invalid_unit_price_override(row):
         next_row["_commercial_invalid_unit_price_override"] = True
     quantity = parse_float_or_none(row.get("quantity"))
     basis_amount = parse_float_or_none(row.get("pricing_basis_amount"))
-    explicit_override = parse_float_or_none(row.get("unit_price_override"))
     effective = quote_commercial_historical_effective_unit_price(row, quantity=quantity)
     if effective is not None:
         next_row["effective_unit_price"] = effective
         next_row["unit_price_override"] = effective
     if explicit_override is not None and quantity is not None and quantity > 0:
         next_row["pricing_basis_amount"] = round_commercial_cents(quantity * effective) if effective is not None else None
+        if requires_explicit:
+            next_row["approved_quote_amount"] = next_row["pricing_basis_amount"]
+            next_row["amount"] = next_row["pricing_basis_amount"]
     elif basis_amount is not None:
         next_row["pricing_basis_amount"] = basis_amount
     approved_amount = parse_float_or_none(row.get("approved_quote_amount"))
-    if approved_amount is not None:
+    if approved_amount is not None and not requires_explicit:
         next_row["approved_quote_amount"] = approved_amount
     return next_row
 
@@ -18819,7 +18860,7 @@ def normalize_owned_line_item(raw: dict[str, Any], *, exchange_rate: float | Non
     raw = canonicalize_primary_order_fields(raw)
     display_price = clean_text(raw.get("display_price"))
     price_mode = clean_text(raw.get("price_mode")).title()
-    if clean_text(raw.get("unit_price_override")).lower() == "included" or display_price.lower() == "included":
+    if quote_row_is_included(raw):
         price_mode = "Included"
         display_price = "Included"
     if price_mode not in {"Priced", "Included"}:
@@ -18861,14 +18902,18 @@ def normalize_owned_line_item(raw: dict[str, Any], *, exchange_rate: float | Non
     quantity = parse_float_or_none(quantity_parts["quantity"])
     effective = quote_commercial_historical_effective_unit_price(raw, quantity=quantity)
     if price_mode == "Included":
-        item["approved_quote_amount"] = 0
-        item["display_price"] = "Included"
+        if not item["source_basis_line_id"]:
+            item.pop("source_basis_line_id", None)
+        return canonical_included_zero_charge_row(item)
     elif effective is not None and effective >= 0:
         item["effective_unit_price"] = effective
         item["unit_price_override"] = effective
         catalog_unit_price = parse_float_or_none(raw.get("catalog_unit_price"))
         if catalog_unit_price is not None:
             item["catalog_unit_price"] = catalog_unit_price
+        if clean_text(raw.get("status")).lower() in {"included", "pricing-required"}:
+            item["status"] = "manual-price"
+            item.pop("catalog_unit_price", None)
     else:
         item["unit_price_override"] = None
     for key in ("pricing_basis_amount", "approved_quote_amount"):
@@ -18996,12 +19041,12 @@ def normalize_line_items(
         )
         price_mode = clean_text(raw.get("price_mode")).title()
         raw_unit_price_override = clean_text(raw.get("unit_price_override"))
-        if raw_unit_price_override == "Included":
+        if quote_row_is_included(raw):
             display_price = "Included"
             price_mode = "Included"
         if price_mode not in {"Priced", "Included"}:
             price_mode = "Included" if display_price.lower() == "included" else "Priced"
-        unit_price_override = None if price_mode == "Included" else parse_float_or_none(raw.get("unit_price_override"))
+        unit_price_override = None if price_mode == "Included" else explicit_nonnegative_float(raw.get("unit_price_override"))
         catalog_unit_price = parse_float_or_none(catalog_item.get("sale_unit_price")) if catalog_item else None
         if not description and not display_price and not pricing_keyword:
             continue
@@ -19024,7 +19069,7 @@ def normalize_line_items(
             item["reference_section"] = clean_basis_section_title(catalog_item.get("reference_section"))
         if unit_price_override is not None:
             item["unit_price_override"] = unit_price_override
-        if catalog_unit_price is not None:
+        if price_mode != "Included" and catalog_unit_price is not None:
             item["catalog_unit_price"] = catalog_unit_price
         if catalog_description:
             item["catalog_description"] = catalog_description
@@ -19072,7 +19117,6 @@ def normalize_line_items(
                     item["pricing_basis_digest"] = basis_digest
         elif (
             price_mode == "Priced"
-            and catalog_item is None
             and unit_price_override is not None
             and unit_price_override >= 0
             and quantity is not None
@@ -19081,6 +19125,7 @@ def normalize_line_items(
             and bool(unit)
         ):
             item["status"] = "manual-price"
+            item.pop("catalog_unit_price", None)
             item["effective_unit_price"] = unit_price_override
             basis_amount = round_commercial_cents(quantity * unit_price_override)
             item["pricing_basis_amount"] = basis_amount
@@ -19094,6 +19139,8 @@ def normalize_line_items(
             item.pop("source_basis_line_id", None)
         if display_price:
             item["display_price"] = display_price
+        if price_mode == "Included":
+            item = canonical_included_zero_charge_row(item)
         items.append(item)
     return items
 
@@ -23570,6 +23617,112 @@ def quote_session_draft_state_value(value: Any, depth: int = 0) -> Any:
     return dashboard_safe_text(value, 5000)
 
 
+ORIGINAL_OUTPUT_ROWS_BASELINE_SCHEMA = "swooshz.original-output-rows-baseline.v1"
+
+
+def quote_session_canonicalize_included_rows(draft_state: dict[str, Any]) -> None:
+    for key in ("lineItems", "outputRows", "originalOutputRows"):
+        rows = draft_state.get(key)
+        if not isinstance(rows, list):
+            continue
+        draft_state[key] = [
+            canonical_included_zero_charge_row(row)
+            if isinstance(row, dict) and quote_row_is_included(row)
+            else row
+            for row in rows
+        ]
+
+
+def original_output_rows_digest(rows: list[dict[str, Any]]) -> str:
+    raw = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return f"sha256:{hashlib.sha256(raw).hexdigest()}"
+
+
+def original_output_rows_are_valid_reset_authority(rows: Any) -> bool:
+    if not isinstance(rows, list) or not rows or not all(isinstance(row, dict) for row in rows):
+        return False
+    for row in rows:
+        if quote_row_is_included(row):
+            if (
+                row.get("price_mode") != "Included"
+                or row.get("display_price") != "Included"
+                or row.get("status") != "included"
+                or row.get("unit_price_override") is not None
+                or any(key in row for key in (
+                    "catalog_unit_price", "unit_price", "sale_unit_price", "_commercial_invalid_unit_price_override"
+                ))
+                or any(
+                    isinstance(row.get(key), bool)
+                    or not isinstance(row.get(key), (int, float))
+                    or not math.isfinite(row[key])
+                    or row[key] != 0
+                    for key in ("effective_unit_price", "pricing_basis_amount", "approved_quote_amount", "amount")
+                )
+            ):
+                return False
+            continue
+        if clean_text(row.get("status")).lower() in {"included", "pricing-required"}:
+            return False
+        quantity = parse_float_or_none(row.get("quantity"))
+        if quote_commercial_invalid_unit_price_override(row):
+            return False
+        unit_price = quote_commercial_historical_effective_unit_price(row, quantity=quantity)
+        if quantity is None or quantity <= 0 or unit_price is None or unit_price < 0:
+            return False
+        expected_amount = round_commercial_cents(quantity * unit_price)
+        if any(parse_float_or_none(row.get(key)) != expected_amount for key in ("pricing_basis_amount", "amount")):
+            return False
+        approved_amount = parse_float_or_none(row.get("approved_quote_amount"))
+        if approved_amount is None or approved_amount < 0:
+            return False
+        if parse_float_or_none(row.get("catalog_unit_price")) is not None and not (
+            clean_text(row.get("pricing_reference_source"))
+            and clean_text(row.get("pricing_reference_id"))
+            and re.fullmatch(r"sha256:[a-f0-9]{64}", clean_text(row.get("pricing_basis_digest")).lower()) is not None
+        ):
+            return False
+    return True
+
+
+def quote_session_validate_original_output_rows_baseline(
+    draft_state: dict[str, Any],
+    patch: dict[str, Any],
+) -> None:
+    rows = draft_state.get("originalOutputRows")
+    baseline = draft_state.get("originalOutputRowsBaseline")
+    nested_session = patch.get("quote_session") if isinstance(patch.get("quote_session"), dict) else {}
+    session_id = safe_quote_session_id(patch.get("session_id") or nested_session.get("session_id"), "")
+    expected_keys = {"schema", "session_id", "confirmed_output_revision", "rows_digest"}
+    valid = (
+        isinstance(rows, list)
+        and bool(rows)
+        and all(isinstance(row, dict) for row in rows)
+        and original_output_rows_are_valid_reset_authority(rows)
+        and isinstance(baseline, dict)
+        and set(baseline) == expected_keys
+        and baseline.get("schema") == ORIGINAL_OUTPUT_ROWS_BASELINE_SCHEMA
+        and safe_quote_session_id(baseline.get("session_id"), "") == session_id
+        and bool(session_id)
+        and isinstance(baseline.get("confirmed_output_revision"), int)
+        and not isinstance(baseline.get("confirmed_output_revision"), bool)
+        and baseline.get("confirmed_output_revision") >= 0
+        and isinstance(baseline.get("rows_digest"), str)
+        and re.fullmatch(r"sha256:[a-f0-9]{64}", baseline.get("rows_digest", "")) is not None
+    )
+    if valid:
+        output_revision = draft_state.get("outputRevision")
+        valid = (
+            isinstance(output_revision, int)
+            and not isinstance(output_revision, bool)
+            and output_revision >= baseline["confirmed_output_revision"]
+            and original_output_rows_digest(rows) == baseline["rows_digest"]
+        )
+    if valid:
+        return
+    draft_state.pop("originalOutputRows", None)
+    draft_state.pop("originalOutputRowsBaseline", None)
+
+
 def quote_session_draft_state(patch: dict[str, Any]) -> dict[str, Any]:
     saved = _quote_commercial_saved_state_from_payload(patch)
     supplied = patch.get("draft_state") if isinstance(patch.get("draft_state"), dict) else saved.draft_state
@@ -23595,6 +23748,8 @@ def quote_session_draft_state(patch: dict[str, Any]) -> dict[str, Any]:
     elif not saved.malformed and saved.review_cleared:
         sanitized.pop("quoteCommercialReview", None)
         sanitized.pop("quote_commercial_review", None)
+    quote_session_validate_original_output_rows_baseline(sanitized, patch)
+    quote_session_canonicalize_included_rows(sanitized)
     return sanitized
 
 
