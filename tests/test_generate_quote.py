@@ -266,6 +266,27 @@ def defined_name_text(workbook, name):
     return defined_name.text if defined_name is not None else ""
 
 
+def drawing_anchor_geometry(anchor, shape_name):
+    def marker_values(marker_name):
+        marker = anchor.find(f"{NS_DRAWING}{marker_name}")
+        return tuple(
+            (tag, marker.find(f"{NS_DRAWING}{tag}").text)
+            for tag in ("col", "colOff", "row", "rowOff")
+        )
+
+    shape = anchor.find(f"{NS_DRAWING}{shape_name}")
+    shape_pr = shape.find(f"{NS_DRAWING}spPr") if shape is not None else None
+    xfrm = shape_pr.find(f"{NS_A}xfrm") if shape_pr is not None else None
+    body_pr = shape.find(f"{NS_DRAWING}txBody/{NS_A}bodyPr") if shape is not None else None
+    return {
+        "from": marker_values("from"),
+        "to": marker_values("to"),
+        "off": tuple(sorted((xfrm.find(f"{NS_A}off").attrib if xfrm is not None and xfrm.find(f"{NS_A}off") is not None else {}).items())),
+        "ext": tuple(sorted((xfrm.find(f"{NS_A}ext").attrib if xfrm is not None and xfrm.find(f"{NS_A}ext") is not None else {}).items())),
+        "body_pr": tuple(sorted((body_pr.attrib if body_pr is not None else {}).items())),
+    }
+
+
 def row_break_ids(sheet):
     row_breaks = sheet.find(f"{NS_MAIN}rowBreaks")
     if row_breaks is None:
@@ -491,6 +512,121 @@ def non_square_logo_data_url():
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def pdf_text_bbox(textpage, phrase):
+    text = textpage.get_text_range() or ""
+    start = text.find(phrase)
+    if start < 0:
+        raise AssertionError(f"PDF text does not contain {phrase!r}: {text[:400]!r}")
+    boxes = [
+        textpage.get_charbox(index)
+        for index in range(start, start + len(phrase))
+        if not text[index].isspace()
+    ]
+    if not boxes:
+        raise AssertionError(f"PDF text phrase has no measurable characters: {phrase!r}")
+    return (
+        min(box[0] for box in boxes),
+        min(box[1] for box in boxes),
+        max(box[2] for box in boxes),
+        max(box[3] for box in boxes),
+    )
+
+
+def pdf_phrase_font_weights(textpage, phrase):
+    text = textpage.get_text_range() or ""
+    start = text.find(phrase)
+    if start < 0:
+        raise AssertionError(f"PDF text does not contain {phrase!r}")
+    weights = []
+    for index in range(start, start + len(phrase)):
+        if text[index].isspace():
+            continue
+        text_object = textpage.get_textobj(index)
+        if text_object is None:
+            continue
+        font = text_object.get_font()
+        if font is not None:
+            weights.append(font.get_weight())
+    return weights
+
+
+def raster_bbox(image, pixel_predicate):
+    pixels = image.load()
+    coordinates = [
+        (x, y)
+        for y in range(image.height)
+        for x in range(image.width)
+        if pixel_predicate(pixels[x, y])
+    ]
+    if not coordinates:
+        return None
+    return (
+        min(x for x, _ in coordinates),
+        min(y for _, y in coordinates),
+        max(x for x, _ in coordinates) + 1,
+        max(y for _, y in coordinates) + 1,
+    )
+
+
+def synthetic_logo_bbox(image):
+    def is_logo_pixel(pixel):
+        red, green, blue = pixel[:3]
+        blue_panel = red < 100 and green < 135 and blue < 175 and blue - red >= 20 and blue - green >= 10
+        orange_panel = red > 160 and green > 70 and blue < 130 and red - green >= 35 and green - blue >= 15
+        return blue_panel or orange_panel
+
+    return raster_bbox(image, is_logo_pixel)
+
+
+def raster_ink_score(image, bbox, padding=4):
+    left, top, right, bottom = bbox
+    left = max(0, left - padding)
+    top = max(0, top - padding)
+    right = min(image.width, right + padding)
+    bottom = min(image.height, bottom + padding)
+    pixels = image.load()
+    score = 0
+    for y in range(top, bottom):
+        for x in range(left, right):
+            score += max(0, 255 - min(pixels[x, y][:3]))
+    return score
+
+
+def pdf_bbox_to_pixels(bbox, page_size, scale):
+    left, bottom, right, top = bbox
+    page_width, page_height = page_size
+    return (
+        round(left * scale),
+        round((page_height - top) * scale),
+        round(right * scale),
+        round((page_height - bottom) * scale),
+    )
+
+
+def make_nonbold_header_control(source_path, target_path):
+    with zipfile.ZipFile(source_path) as source_zip:
+        parts = {name: source_zip.read(name) for name in source_zip.namelist()}
+
+    sheet = ET.fromstring(parts["xl/worksheets/sheet1.xml"])
+    styles = ET.fromstring(parts["xl/styles.xml"])
+    cell_xfs = styles.find(f"{NS_MAIN}cellXfs")
+    fonts = styles.find(f"{NS_MAIN}fonts")
+    font_ids = {
+        int(cell_xfs[cell_style(sheet, ref)].attrib.get("fontId", "0"))
+        for ref in ("A20", "B20", "C20", "E20")
+    }
+    for font_id in font_ids:
+        font = fonts[font_id]
+        for child in list(font):
+            if child.tag == f"{NS_MAIN}b":
+                font.remove(child)
+    parts["xl/styles.xml"] = ET.tostring(styles, encoding="utf-8", xml_declaration=True)
+
+    with zipfile.ZipFile(target_path, "w", zipfile.ZIP_DEFLATED) as target_zip:
+        for name, content in parts.items():
+            target_zip.writestr(name, content)
 
 
 def commercial_test_brief(updates=None):
@@ -897,6 +1033,65 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             [],
         )
 
+    def test_existing_inherited_row_height_is_preserved_and_new_rows_use_layout_height(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inherited_template = root / "inherited-layout.xlsx"
+            with zipfile.ZipFile(KONCEPT_LAYOUT) as source_zip:
+                parts = {name: source_zip.read(name) for name in source_zip.namelist()}
+            source_sheet = ET.fromstring(parts["xl/worksheets/sheet1.xml"])
+            source_rows = source_sheet.findall(f"{NS_MAIN}sheetData/{NS_MAIN}row")
+            source_row_numbers = {int(row.attrib["r"]) for row in source_rows}
+            inherited_row = next(row for row in source_rows if row.attrib.get("r") == "24")
+            inherited_row.attrib.pop("ht", None)
+            inherited_row.attrib.pop("customHeight", None)
+            parts["xl/worksheets/sheet1.xml"] = ET.tostring(source_sheet, encoding="utf-8", xml_declaration=True)
+            with zipfile.ZipFile(inherited_template, "w", zipfile.ZIP_DEFLATED) as target_zip:
+                for name, content in parts.items():
+                    target_zip.writestr(name, content)
+
+            price = quote.PriceRow(1, "Synthetic", "synthetic component", "lot", 100, 1, 1, "")
+            lines = [
+                quote.QuoteLine(
+                    section=f"Synthetic Section {index}",
+                    quantity=1,
+                    unit="lot",
+                    description=f"Synthetic component {index}",
+                    pricing_keyword="synthetic component",
+                    display_price="",
+                    matched_price=price,
+                    amount=100,
+                    match_status="matched",
+                    match_candidates=[],
+                )
+                for index in range(1, 46)
+            ]
+            output = root / "quotation.xlsx"
+            quote.write_quote_layout_xlsx(inherited_template, output, commercial_test_brief(), lines)
+
+            with zipfile.ZipFile(output) as output_zip:
+                output_sheet = ET.fromstring(output_zip.read("xl/worksheets/sheet1.xml"))
+
+        output_rows = {
+            int(row.attrib["r"]): row
+            for row in output_sheet.findall(f"{NS_MAIN}sheetData/{NS_MAIN}row")
+        }
+        self.assertNotIn("ht", output_rows[24].attrib)
+        self.assertNotIn("customHeight", output_rows[24].attrib)
+        dynamic_rows = [
+            row
+            for row_number, row in output_rows.items()
+            if row_number not in source_row_numbers and row.findall(f"{NS_MAIN}c")
+        ]
+        self.assertTrue(dynamic_rows)
+        self.assertTrue(
+            all(
+                row.attrib.get("ht") == quote.QUOTE_LAYOUT_DEFAULT_ROW_HEIGHT
+                and row.attrib.get("customHeight") == "1"
+                for row in dynamic_rows
+            )
+        )
+
     def test_repo_default_layout_template_generates_complete_quote_workbook(self):
         tmp, path = generate_layout_workbook(layout_template=REPO_DEFAULT_LAYOUT)
         self.addCleanup(tmp.cleanup)
@@ -1139,33 +1334,42 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             markup=1,
             remark="",
         )
-        line = quote.QuoteLine(
-            section="Graphics",
-            quantity=2,
-            unit="sqm",
-            description="Non-square printed graphics",
-            pricing_keyword="non-square printed graphics",
-            display_price="",
-            matched_price=price,
-            amount=240,
-            match_status="matched",
-            match_candidates=[],
-        )
+        lines = [
+            quote.QuoteLine(
+                section=f"Graphics {index}",
+                quantity=2,
+                unit="sqm",
+                description=f"Continuation component {index:02d}",
+                pricing_keyword="continuation component",
+                display_price="",
+                matched_price=price,
+                amount=240,
+                match_status="matched",
+                match_candidates=[],
+            )
+            for index in range(1, 46)
+        ]
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             first_output = root / "first"
             second_output = root / "second"
+            negative_output = root / "negative"
             first_output.mkdir()
             second_output.mkdir()
+            negative_output.mkdir()
             xlsx_path = root / "quotation.xlsx"
+            negative_xlsx_path = root / "quotation-negative.xlsx"
             first_pdf = first_output / "quotation.pdf"
             second_pdf = second_output / "quotation.pdf"
-            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, xlsx_path, brief, [line])
+            negative_pdf = negative_output / "quotation-negative.pdf"
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, xlsx_path, brief, lines)
+            make_nonbold_header_control(xlsx_path, negative_xlsx_path)
 
             self.assertEqual(quote.libreoffice_pdf_export(xlsx_path, first_pdf), "libreoffice_exported")
             self.assertEqual(quote.libreoffice_pdf_export(xlsx_path, second_pdf), "libreoffice_exported")
-            for pdf_path in (first_pdf, second_pdf):
+            self.assertEqual(quote.libreoffice_pdf_export(negative_xlsx_path, negative_pdf), "libreoffice_exported")
+            for pdf_path in (first_pdf, second_pdf, negative_pdf):
                 self.assertTrue(pdf_path.exists())
                 self.assertGreater(pdf_path.stat().st_size, 100)
                 self.assertTrue(pdf_path.read_bytes().startswith(b"%PDF-"))
@@ -1176,6 +1380,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                 template_workbook = ET.fromstring(template_zf.read("xl/workbook.xml"))
                 output_workbook = ET.fromstring(output_zf.read("xl/workbook.xml"))
                 output_styles = ET.fromstring(output_zf.read("xl/styles.xml"))
+                template_drawing = ET.fromstring(template_zf.read("xl/drawings/drawing1.xml"))
                 drawing = ET.fromstring(output_zf.read("xl/drawings/drawing1.xml"))
 
             self.assertEqual(column_widths(output_sheet), column_widths(template_sheet))
@@ -1187,6 +1392,10 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                 output_sheet.find(f"{NS_MAIN}pageSetup").attrib,
                 template_sheet.find(f"{NS_MAIN}pageSetup").attrib,
             )
+            self.assertEqual(
+                output_sheet.find(f"{NS_MAIN}sheetFormatPr").attrib,
+                template_sheet.find(f"{NS_MAIN}sheetFormatPr").attrib,
+            )
             self.assertTrue(set(merge_refs(template_sheet)).issubset(set(merge_refs(output_sheet))))
 
             output_last_row = dimension_last_row(output_sheet)
@@ -1195,52 +1404,171 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             )
             self.assertIsNotNone(print_area)
             self.assertEqual(print_area.text, f"Quotation!$A$1:$I${output_last_row}")
+            self.assertEqual(
+                defined_name_text(output_workbook, "_xlnm.Print_Titles"),
+                defined_name_text(template_workbook, "_xlnm.Print_Titles"),
+            )
 
             for ref in ("A20", "B20", "C20", "E20"):
                 header_font = font_for_style(output_styles, cell_style(output_sheet, ref))
                 self.assertIsNotNone(header_font.find(f"{NS_MAIN}b"), ref)
 
             anchors = drawing.findall(f"{NS_DRAWING}twoCellAnchor")
+            template_anchors = template_drawing.findall(f"{NS_DRAWING}twoCellAnchor")
             text_anchor = next(anchor for anchor in anchors if anchor.find(f"{NS_DRAWING}sp") is not None)
             logo_anchor = next(anchor for anchor in anchors if anchor.find(f"{NS_DRAWING}pic") is not None)
+            template_text_anchor = next(anchor for anchor in template_anchors if anchor.find(f"{NS_DRAWING}sp") is not None)
+            self.assertEqual(
+                drawing_anchor_geometry(text_anchor, "sp"),
+                drawing_anchor_geometry(template_text_anchor, "sp"),
+            )
             logo_ext = logo_anchor.find(f"{NS_DRAWING}pic/{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}ext")
             logo_off = logo_anchor.find(f"{NS_DRAWING}pic/{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}off")
-            text_ext = text_anchor.find(f"{NS_DRAWING}sp/{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}ext")
-            text_off = text_anchor.find(f"{NS_DRAWING}sp/{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}off")
             logo_width = int(logo_ext.attrib["cx"])
             logo_height = int(logo_ext.attrib["cy"])
-            logo_bottom = int(logo_off.attrib["y"]) + logo_height
-            text_top = int(text_off.attrib["y"])
             self.assertAlmostEqual(logo_width / logo_height, 4.0, places=2)
             self.assertLessEqual(logo_width, quote.HEADER_LOGO_MAX_WIDTH_EMU)
             self.assertLessEqual(logo_height, quote.HEADER_LOGO_MAX_HEIGHT_EMU)
-            self.assertLessEqual(logo_bottom, text_top)
-            self.assertEqual(text_ext.attrib["cx"], "3350000")
+            self.assertEqual(logo_off.attrib, {"x": str(quote.HEADER_LOGO_OFFSET_X_EMU), "y": str(quote.HEADER_LOGO_OFFSET_Y_EMU)})
+            self.assertEqual(logo_anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}col").text, "7")
+            self.assertEqual(logo_anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}row").text, "1")
+            self.assertEqual(logo_anchor.find(f"{NS_DRAWING}to/{NS_DRAWING}colOff").text, "1720000")
+            self.assertEqual(logo_anchor.find(f"{NS_DRAWING}to/{NS_DRAWING}rowOff").text, "415000")
 
-            def rendered_signature(pdf_path):
+            render_scale = 2.0
+
+            def rendered_pages(pdf_path):
                 document = pdfium.PdfDocument(str(pdf_path))
                 try:
-                    self.assertEqual(len(document), 1)
-                    page = document[0]
-                    page_width, page_height = page.get_size()
-                    self.assertGreater(page_width, 0)
-                    self.assertGreater(page_height, 0)
-                    text = re.sub(r"\s+", " ", page.get_textpage().get_text_range() or "")
-                    for expected in ("Rendered Fidelity Co", "Quantity", "Service", "Estimate", "2 sqm"):
-                        self.assertIn(expected, text)
-                    image = page.render(scale=1.25).to_pil().convert("RGB")
-                    mask = image.convert("L").point(lambda value: 255 if value < 245 else 0)
-                    bbox = mask.getbbox()
-                    self.assertIsNotNone(bbox)
-                    self.assertGreater(bbox[2] - bbox[0], 100)
-                    self.assertGreater(bbox[3] - bbox[1], 100)
-                    return len(document), image.size, hashlib.sha256(image.tobytes()).hexdigest()
+                    pages = []
+                    for page in document:
+                        page_size = page.get_size()
+                        textpage = page.get_textpage()
+                        text = re.sub(r"\s+", " ", textpage.get_text_range() or "")
+                        image = page.render(scale=render_scale).to_pil().convert("RGB")
+                        dark_mask = image.convert("L").point(lambda value: 255 if value < 245 else 0)
+                        pages.append({
+                            "size": page_size,
+                            "text": text,
+                            "image": image,
+                            "ink_bbox": dark_mask.getbbox(),
+                            "logo_bbox": synthetic_logo_bbox(image),
+                            "header_bbox": pdf_text_bbox(textpage, "Rendered Fidelity Co") if "Rendered Fidelity Co" in text else None,
+                            "quantity_bbox": pdf_text_bbox(textpage, "Quantity") if "Quantity" in text else None,
+                            "quantity_weights": pdf_phrase_font_weights(textpage, "Quantity") if "Quantity" in text else [],
+                        })
+                    return pages
                 finally:
                     document.close()
 
-            first_signature = rendered_signature(first_pdf)
-            second_signature = rendered_signature(second_pdf)
+            first_pages = rendered_pages(first_pdf)
+            second_pages = rendered_pages(second_pdf)
+            negative_pages = rendered_pages(negative_pdf)
+            self.assertGreaterEqual(len(first_pages), 3)
+            self.assertEqual(len(first_pages), len(second_pages))
+            self.assertEqual(len(first_pages), len(negative_pages))
+
+            for page_data in first_pages:
+                page_width, page_height = page_data["size"]
+                self.assertAlmostEqual(page_width, 595.28, delta=1.0)
+                self.assertAlmostEqual(page_height, 841.89, delta=1.0)
+                self.assertLess(page_width, page_height)
+                self.assertTrue(page_data["text"].strip())
+                self.assertIsNotNone(page_data["ink_bbox"])
+
+            first_page = first_pages[0]
+            self.assertIn("Rendered Fidelity Co", first_page["text"])
+            for expected in ("Quantity", "Service", "Estimate", "2 sqm"):
+                self.assertIn(expected, first_page["text"])
+            self.assertIsNotNone(first_page["logo_bbox"])
+            self.assertIsNotNone(first_page["header_bbox"])
+            self.assertIsNotNone(first_page["quantity_bbox"])
+
+            logo_bbox = first_page["logo_bbox"]
+            logo_width_px = logo_bbox[2] - logo_bbox[0]
+            logo_height_px = logo_bbox[3] - logo_bbox[1]
+            logo_aspect = logo_width_px / logo_height_px
+            header_bbox_px = pdf_bbox_to_pixels(first_page["header_bbox"], first_page["size"], render_scale)
+            header_separation_px = max(
+                header_bbox_px[1] - logo_bbox[3],
+                logo_bbox[1] - header_bbox_px[3],
+                header_bbox_px[0] - logo_bbox[2],
+                logo_bbox[0] - header_bbox_px[2],
+            )
+            page_width, page_height = first_page["size"]
+            logo_pdf_bbox = (
+                logo_bbox[0] / render_scale,
+                page_height - logo_bbox[3] / render_scale,
+                logo_bbox[2] / render_scale,
+                page_height - logo_bbox[1] / render_scale,
+            )
+            self.assertGreater(logo_width_px, 20)
+            self.assertGreater(logo_height_px, 5)
+            self.assertAlmostEqual(logo_aspect, 4.0, delta=0.35)
+            self.assertGreater(logo_pdf_bbox[0], page_width * 0.30)
+            self.assertGreater(first_page["header_bbox"][0], page_width * 0.40)
+            self.assertGreater(first_page["header_bbox"][3], page_height * 0.65)
+            self.assertGreater(logo_pdf_bbox[3], page_height * 0.65)
+            self.assertGreater(header_separation_px, 1)
+
+            later_pages = first_pages[1:]
+            continuation_pages = [page for page in later_pages if "Continuation component" in page["text"]]
+            repeated_header_pages = [
+                page
+                for page in later_pages
+                if all(header in page["text"] for header in ("Quantity", "Service", "Estimate"))
+            ]
+            logo_continuation_pages = [page for page in later_pages if page["logo_bbox"] is not None]
+            self.assertTrue(continuation_pages)
+            self.assertTrue(repeated_header_pages)
+            self.assertTrue(logo_continuation_pages)
+            self.assertIn("Continuation component 45", " ".join(page["text"] for page in continuation_pages))
+
+            normal_quantity_bbox = pdf_bbox_to_pixels(first_page["quantity_bbox"], first_page["size"], render_scale)
+            negative_quantity_bbox = pdf_bbox_to_pixels(negative_pages[0]["quantity_bbox"], negative_pages[0]["size"], render_scale)
+            comparison_bbox = (
+                min(normal_quantity_bbox[0], negative_quantity_bbox[0]),
+                min(normal_quantity_bbox[1], negative_quantity_bbox[1]),
+                max(normal_quantity_bbox[2], negative_quantity_bbox[2]),
+                max(normal_quantity_bbox[3], negative_quantity_bbox[3]),
+            )
+            normal_ink = raster_ink_score(first_page["image"], comparison_bbox)
+            negative_ink = raster_ink_score(negative_pages[0]["image"], comparison_bbox)
+            self.assertGreater(normal_ink, negative_ink)
+
+            first_signature = [
+                (page["size"], hashlib.sha256(page["image"].tobytes()).hexdigest())
+                for page in first_pages
+            ]
+            second_signature = [
+                (page["size"], hashlib.sha256(page["image"].tobytes()).hexdigest())
+                for page in second_pages
+            ]
             self.assertEqual(first_signature, second_signature)
+            print(
+                "SQAG rendered fidelity measurements: "
+                + json.dumps(
+                    {
+                        "page_count": len(first_pages),
+                        "page_size_points": [round(value, 2) for value in first_page["size"]],
+                        "orientation": "portrait",
+                        "logo_bounds_px": list(logo_bbox),
+                        "logo_aspect": round(logo_aspect, 3),
+                        "header_bounds_points": [round(value, 2) for value in first_page["header_bbox"]],
+                        "header_bounds_px": list(header_bbox_px),
+                        "header_logo_separation_px": header_separation_px,
+                        "quantity_pdfium_weights": first_page["quantity_weights"],
+                        "bold_proof_method": "rendered normal-vs-regular negative control",
+                        "bold_negative_control_ink": {"normal": normal_ink, "regular_control": negative_ink},
+                        "continuation_pages": len(continuation_pages),
+                        "repeated_header_pages": len(repeated_header_pages),
+                        "logo_continuation_pages": len(logo_continuation_pages),
+                        "source_page_setup": template_sheet.find(f"{NS_MAIN}pageSetup").attrib,
+                        "source_page_margins": template_sheet.find(f"{NS_MAIN}pageMargins").attrib,
+                    },
+                    sort_keys=True,
+                )
+            )
 
     def test_layout_strips_catalog_brackets_from_customer_output_descriptions(self):
         brief = {
@@ -2512,86 +2840,75 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertEqual(cell_value(sheet, "B32"), "Koncept Image Pte Ltd")
         self.assertEqual(cell_value(sheet, "E32"), "We accept the quotation amount and the terms")
 
-    def test_company_detail_drawing_is_wide_and_top_aligned(self):
+    def test_company_detail_drawing_preserves_template_geometry_and_top_alignment(self):
         tmp, path = generate_layout_workbook()
         self.addCleanup(tmp.cleanup)
 
-        with zipfile.ZipFile(path) as zf:
-            drawing = ET.fromstring(zf.read("xl/drawings/drawing1.xml"))
+        with zipfile.ZipFile(KONCEPT_LAYOUT) as template_zf, zipfile.ZipFile(path) as output_zf:
+            template_drawing = ET.fromstring(template_zf.read("xl/drawings/drawing1.xml"))
+            drawing = ET.fromstring(output_zf.read("xl/drawings/drawing1.xml"))
 
         text_anchor = next(
             anchor
             for anchor in drawing.findall(f"{NS_DRAWING}twoCellAnchor")
             if anchor.find(f"{NS_DRAWING}sp") is not None
         )
-        from_col = int(text_anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}col").text)
-        to_col = int(text_anchor.find(f"{NS_DRAWING}to/{NS_DRAWING}col").text)
+        template_text_anchor = next(
+            anchor
+            for anchor in template_drawing.findall(f"{NS_DRAWING}twoCellAnchor")
+            if anchor.find(f"{NS_DRAWING}sp") is not None
+        )
         body_pr = text_anchor.find(f"{NS_DRAWING}sp/{NS_DRAWING}txBody/{NS_A}bodyPr")
 
-        self.assertGreater(to_col, from_col)
+        self.assertEqual(
+            drawing_anchor_geometry(text_anchor, "sp"),
+            drawing_anchor_geometry(template_text_anchor, "sp"),
+        )
         self.assertEqual(body_pr.attrib.get("anchor"), "t")
 
     def test_company_detail_drawing_starts_below_logo(self):
         tmp, path = generate_layout_workbook()
         self.addCleanup(tmp.cleanup)
 
-        with zipfile.ZipFile(path) as zf:
-            drawing = ET.fromstring(zf.read("xl/drawings/drawing1.xml"))
-            workbook = ET.fromstring(zf.read("xl/workbook.xml"))
-            media_names = set(zf.namelist())
+        with zipfile.ZipFile(KONCEPT_LAYOUT) as template_zf, zipfile.ZipFile(path) as output_zf:
+            template_drawing = ET.fromstring(template_zf.read("xl/drawings/drawing1.xml"))
+            output_drawing = ET.fromstring(output_zf.read("xl/drawings/drawing1.xml"))
+            template_workbook = ET.fromstring(template_zf.read("xl/workbook.xml"))
+            output_workbook = ET.fromstring(output_zf.read("xl/workbook.xml"))
+            media_names = set(output_zf.namelist())
 
-        anchors = drawing.findall(f"{NS_DRAWING}twoCellAnchor")
-        text_anchor = next(anchor for anchor in anchors if anchor.find(f"{NS_DRAWING}sp") is not None)
-        logo_anchor = next(anchor for anchor in anchors if anchor.find(f"{NS_DRAWING}pic") is not None)
+        template_text_anchor = next(
+            anchor for anchor in template_drawing.findall(f"{NS_DRAWING}twoCellAnchor")
+            if anchor.find(f"{NS_DRAWING}sp") is not None
+        )
+        text_anchor = next(anchor for anchor in output_drawing.findall(f"{NS_DRAWING}twoCellAnchor") if anchor.find(f"{NS_DRAWING}sp") is not None)
+        logo_anchor = next(anchor for anchor in output_drawing.findall(f"{NS_DRAWING}twoCellAnchor") if anchor.find(f"{NS_DRAWING}pic") is not None)
+
+        self.assertEqual(
+            drawing_anchor_geometry(text_anchor, "sp"),
+            drawing_anchor_geometry(template_text_anchor, "sp"),
+        )
+        self.assertEqual(
+            defined_name_text(output_workbook, "_xlnm.Print_Titles"),
+            defined_name_text(template_workbook, "_xlnm.Print_Titles"),
+        )
+
         text_from_row = int(text_anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}row").text)
         logo_to_row = int(logo_anchor.find(f"{NS_DRAWING}to/{NS_DRAWING}row").text)
-        text_ext = text_anchor.find(f"{NS_DRAWING}sp/{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}ext")
-        text_off = text_anchor.find(f"{NS_DRAWING}sp/{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}off")
         logo_ext = logo_anchor.find(f"{NS_DRAWING}pic/{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}ext")
         logo_off = logo_anchor.find(f"{NS_DRAWING}pic/{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}off")
-        text_left = int(text_off.attrib["x"])
-        text_top = int(text_off.attrib["y"])
-        text_width = int(text_ext.attrib["cx"])
-        logo_left = int(logo_off.attrib["x"])
-        logo_top = int(logo_off.attrib["y"])
         logo_width = int(logo_ext.attrib["cx"])
         logo_height = int(logo_ext.attrib["cy"])
-        text_from_col = int(text_anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}col").text)
-        text_to_col = int(text_anchor.find(f"{NS_DRAWING}to/{NS_DRAWING}col").text)
-        text_from_col_off = int(text_anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}colOff").text)
-        logo_from_col_off = int(logo_anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}colOff").text)
-        logo_to_col_off = int(logo_anchor.find(f"{NS_DRAWING}to/{NS_DRAWING}colOff").text)
-        logo_from_row_off = int(logo_anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}rowOff").text)
-        logo_to_row_off = int(logo_anchor.find(f"{NS_DRAWING}to/{NS_DRAWING}rowOff").text)
 
-        print_titles = workbook.find(f"{NS_MAIN}definedNames/{NS_MAIN}definedName[@name='_xlnm.Print_Titles']")
-        self.assertIsNotNone(print_titles)
-        self.assertEqual(print_titles.text, "Quotation!$1:$3")
         self.assertGreater(text_from_row, logo_to_row)
-        self.assertEqual(text_from_row, 3)
-        self.assertLessEqual(text_top - (logo_top + logo_height), 220000)
-        self.assertLessEqual(text_left, logo_left)
-        self.assertGreaterEqual(text_left + text_width, logo_left + logo_width)
-        self.assertEqual(logo_width, quote.HEADER_LOGO_MAX_HEIGHT_EMU)
-        self.assertEqual(logo_height, quote.HEADER_LOGO_MAX_HEIGHT_EMU)
-        self.assertLessEqual(logo_from_col_off, 0)
-        self.assertGreaterEqual(logo_to_col_off, 1720000)
-        self.assertLessEqual(logo_from_row_off, 0)
-        self.assertGreaterEqual(logo_to_row_off, 410000)
-        self.assertGreaterEqual(text_width, 3300000)
-        self.assertLessEqual(text_width, 3500000)
-        self.assertEqual(text_from_col, 7)
-        self.assertGreaterEqual(text_to_col, 9)
-        self.assertEqual(text_from_col_off, 0)
-        self.assertEqual(text_left, logo_left)
-
-        paragraph_alignments = [
-            paragraph.find(f"{NS_A}pPr").attrib.get("algn")
-            for paragraph in text_anchor.findall(f"{NS_DRAWING}sp/{NS_DRAWING}txBody/{NS_A}p")
-            if paragraph.find(f"{NS_A}pPr") is not None
-        ]
-        self.assertTrue(paragraph_alignments)
-        self.assertEqual(set(paragraph_alignments), {"l"})
+        self.assertEqual(logo_anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}col").text, "7")
+        self.assertEqual(logo_anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}row").text, "1")
+        self.assertEqual(logo_anchor.find(f"{NS_DRAWING}to/{NS_DRAWING}colOff").text, "1720000")
+        self.assertEqual(logo_anchor.find(f"{NS_DRAWING}to/{NS_DRAWING}rowOff").text, "415000")
+        self.assertEqual(logo_off.attrib, {"x": str(quote.HEADER_LOGO_OFFSET_X_EMU), "y": str(quote.HEADER_LOGO_OFFSET_Y_EMU)})
+        self.assertAlmostEqual(logo_width / logo_height, 1.0, places=2)
+        self.assertLessEqual(logo_width, quote.HEADER_LOGO_MAX_WIDTH_EMU)
+        self.assertLessEqual(logo_height, quote.HEADER_LOGO_MAX_HEIGHT_EMU)
 
         paragraphs = [
             "".join(text_node.text or "" for text_node in paragraph.findall(f".//{NS_A}t"))
@@ -2610,6 +2927,10 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertIn("xl/media/header_logo.png", media_names)
         self.assertEqual(paragraphs[project_index - 1], "")
         self.assertFalse(any(current == "" and following == "" for current, following in zip(paragraphs, paragraphs[1:])))
+        source_ppr = template_text_anchor.find(f"{NS_DRAWING}sp/{NS_DRAWING}txBody/{NS_A}p/{NS_A}pPr")
+        output_pprs = text_anchor.findall(f"{NS_DRAWING}sp/{NS_DRAWING}txBody/{NS_A}p/{NS_A}pPr")
+        self.assertTrue(output_pprs)
+        self.assertTrue(all(ppr.attrib == source_ppr.attrib for ppr in output_pprs))
 
         run_sizes = [
             int(run_props.attrib["sz"])
@@ -2619,6 +2940,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertTrue(run_sizes)
         self.assertEqual(min(run_sizes), 900)
         self.assertEqual(max(run_sizes), 900)
+        self.assertIn("xl/media/header_logo.png", media_names)
 
     def test_table_headers_bold_and_quantity_centered(self):
         tmp, path = generate_layout_workbook()

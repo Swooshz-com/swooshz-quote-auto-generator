@@ -1400,20 +1400,31 @@ def ensure_quote_layout_page_settings(root: ET.Element) -> None:
         root.append(ET.Element(f"{NS_MAIN}headerFooter", {"alignWithMargins": "0"}))
 
 
-def ensure_quote_layout_row_heights(root: ET.Element, last_row: int) -> None:
+def ensure_quote_layout_row_heights(
+    root: ET.Element,
+    last_row: int,
+    existing_row_numbers: set[int] | None = None,
+) -> None:
     sheet_data = root.find(f"{NS_MAIN}sheetData")
     if sheet_data is None:
         return
+    existing_row_numbers = existing_row_numbers or set()
     for row_number in range(1, last_row + 1):
         row = get_or_create_row(sheet_data, row_number)
+        if row_number in existing_row_numbers:
+            continue
         if row.attrib.get("ht") in {None, ""} and row.findall(f"{NS_MAIN}c"):
             row.attrib["ht"] = QUOTE_LAYOUT_DEFAULT_ROW_HEIGHT
             row.attrib["customHeight"] = "1"
 
 
-def complete_quote_layout_worksheet(root: ET.Element, last_row: int) -> None:
+def complete_quote_layout_worksheet(
+    root: ET.Element,
+    last_row: int,
+    existing_row_numbers: set[int] | None = None,
+) -> None:
     ensure_quote_layout_page_settings(root)
-    ensure_quote_layout_row_heights(root, last_row)
+    ensure_quote_layout_row_heights(root, last_row, existing_row_numbers)
     ensure_merge_ref(root, QUOTE_DATE_MERGE_REF)
 
 
@@ -1766,49 +1777,25 @@ def update_repeating_header_drawing(
     root = ET.fromstring(xml)
     anchors = root.findall(f"{NS_DRAWING}twoCellAnchor")
     text_anchor = next((anchor for anchor in anchors if anchor.find(f"{NS_DRAWING}sp") is not None), None)
-    logo_anchor = find_header_logo_anchor(root, {})
     if text_anchor is None:
         return xml
-
-    def update_marker(anchor: ET.Element, marker: str, values: dict[str, str]) -> None:
-        marker_node = anchor.find(f"{NS_DRAWING}{marker}")
-        if marker_node is None:
-            return
-        for tag, value in values.items():
-            node = marker_node.find(f"{NS_DRAWING}{tag}")
-            if node is not None:
-                node.text = value
-
-    if logo_anchor is not None:
-        update_marker(
-            logo_anchor,
-            "from",
-            {"col": "7", "colOff": "0", "row": "1", "rowOff": "0"},
-        )
-        update_marker(
-            logo_anchor,
-            "to",
-            {"col": "8", "colOff": "1720000", "row": "2", "rowOff": "415000"},
-        )
-
-    update_marker(text_anchor, "from", {"col": "7", "colOff": "0", "row": "3", "rowOff": "90000"})
-    update_marker(text_anchor, "to", {"col": "9", "colOff": "200000", "row": "13", "rowOff": "90000"})
 
     sp = text_anchor.find(f"{NS_DRAWING}sp")
     tx_body = sp.find(f"{NS_DRAWING}txBody") if sp is not None else None
     if tx_body is None:
         return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
-    body_pr = tx_body.find(f"{NS_A}bodyPr")
-    if body_pr is not None:
-        body_pr.attrib["vertOverflow"] = "overflow"
-        body_pr.attrib["wrap"] = "square"
-        body_pr.attrib["anchor"] = "t"
-        body_pr.attrib["anchorCtr"] = "0"
-        body_pr.attrib["lIns"] = "0"
-        body_pr.attrib["rIns"] = "0"
-        body_pr.attrib["tIns"] = "0"
-        body_pr.attrib["bIns"] = "0"
+    source_paragraph = tx_body.find(f"{NS_A}p")
+    source_paragraph_props = (
+        copy.deepcopy(source_paragraph.find(f"{NS_A}pPr"))
+        if source_paragraph is not None and source_paragraph.find(f"{NS_A}pPr") is not None
+        else None
+    )
+    source_end_para_props = (
+        copy.deepcopy(source_paragraph.find(f"{NS_A}endParaRPr"))
+        if source_paragraph is not None and source_paragraph.find(f"{NS_A}endParaRPr") is not None
+        else None
+    )
 
     for child in list(tx_body):
         if child.tag == f"{NS_A}p":
@@ -1821,24 +1808,18 @@ def update_repeating_header_drawing(
 
     for runs in line_runs:
         paragraph = ET.SubElement(tx_body, f"{NS_A}p")
-        paragraph_props = ET.SubElement(paragraph, f"{NS_A}pPr")
-        paragraph_props.attrib["algn"] = "l"
+        if source_paragraph_props is not None:
+            paragraph.append(copy.deepcopy(source_paragraph_props))
+        else:
+            paragraph_props = ET.SubElement(paragraph, f"{NS_A}pPr")
+            paragraph_props.attrib["algn"] = "l"
         if not runs:
             append_drawing_text_run(paragraph, RichTextRun(""))
-            continue
-        for run in runs:
-            append_drawing_text_run(paragraph, run)
-
-    sp_pr = sp.find(f"{NS_DRAWING}spPr") if sp is not None else None
-    xfrm = sp_pr.find(f"{NS_A}xfrm") if sp_pr is not None else None
-    off = xfrm.find(f"{NS_A}off") if xfrm is not None else None
-    if off is not None:
-        off.attrib["x"] = "4550000"
-        off.attrib["y"] = "950000"
-    ext = xfrm.find(f"{NS_A}ext") if xfrm is not None else None
-    if ext is not None:
-        ext.attrib["cx"] = "3350000"
-        ext.attrib["cy"] = "3300000"
+        else:
+            for run in runs:
+                append_drawing_text_run(paragraph, run)
+        if source_end_para_props is not None:
+            paragraph.append(copy.deepcopy(source_end_para_props))
 
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
@@ -2025,12 +2006,13 @@ def set_header_logo_extent(pic: ET.Element, dimensions: tuple[int, int] | None) 
     pic_xfrm = pic_pr.find(f"{NS_A}xfrm")
     if pic_xfrm is None:
         pic_xfrm = ET.SubElement(pic_pr, f"{NS_A}xfrm")
-    if pic_xfrm.find(f"{NS_A}off") is None:
-        ET.SubElement(
-            pic_xfrm,
-            f"{NS_A}off",
-            {"x": str(HEADER_LOGO_OFFSET_X_EMU), "y": str(HEADER_LOGO_OFFSET_Y_EMU)},
-        )
+    logo_off = pic_xfrm.find(f"{NS_A}off")
+    if logo_off is None:
+        logo_off = ET.SubElement(pic_xfrm, f"{NS_A}off")
+    # The admitted logo region is the source-layout contract used by the
+    # outer anchor.  Reset stale source offsets so the inner transform and
+    # worksheet anchor remain one placement after image replacement.
+    logo_off.attrib.update({"x": str(HEADER_LOGO_OFFSET_X_EMU), "y": str(HEADER_LOGO_OFFSET_Y_EMU)})
     logo_ext = pic_xfrm.find(f"{NS_A}ext")
     if logo_ext is None:
         logo_ext = ET.SubElement(pic_xfrm, f"{NS_A}ext")
@@ -2181,14 +2163,8 @@ def replace_header_logo(parts: dict[str, bytes], logo_data_url: str) -> None:
 
 
 def update_print_titles(xml: bytes) -> bytes:
-    text = xml.decode("utf-8")
-    updated = re.sub(
-        r"(<definedName[^>]*name=\"_xlnm\.Print_Titles\"[^>]*>[^<]*!\$1:\$)[0-9]+(</definedName>)",
-        r"\g<1>3\2",
-        text,
-        count=1,
-    )
-    return updated.encode("utf-8")
+    """Keep the canonical repeated-print metadata supplied by the template."""
+    return xml
 
 
 def update_print_area(xml: bytes, last_row: int, last_col: int = 9) -> bytes:
@@ -2657,6 +2633,12 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
 
     layout_styles = add_quote_layout_styles(parts)
     root = ET.fromstring(parts["xl/worksheets/sheet1.xml"])
+    sheet_data = root.find(f"{NS_MAIN}sheetData")
+    existing_row_numbers = {
+        int(row.attrib["r"])
+        for row in (sheet_data.findall(f"{NS_MAIN}row") if sheet_data is not None else [])
+        if row.attrib.get("r", "").isdigit()
+    }
     clear_ooxml_range(root, 1, 1000, 1, 100)
     price_style = layout_styles["price_amount"]
 
@@ -2817,7 +2799,7 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
     manual_pagination_enabled = manual_pagination_enabled or last_content_row > FIRST_PRINT_PAGE_END_ROW
     last_print_row = printable_last_row(root, last_content_row, manual_pagination_enabled)
     trim_layout_worksheet(root, last_print_row)
-    complete_quote_layout_worksheet(root, last_print_row)
+    complete_quote_layout_worksheet(root, last_print_row, existing_row_numbers)
     set_manual_page_breaks(root, last_print_row, manual_pagination_enabled)
     parts["xl/worksheets/sheet1.xml"] = serialize_excel_worksheet(root)
     if "xl/drawings/drawing1.xml" in parts:
