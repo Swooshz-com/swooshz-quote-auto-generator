@@ -3579,7 +3579,8 @@ eval([
   "collectRichTextDetails", "collectQuoteDetails", "setInputValue", "collectTaxDetails", "collectQuoteCurrency",
   "collectQuoteExchangeRate", "syncQuoteExchangeRateField", "quoteCommercialTaxText", "quoteExchangeRateText",
   "quoteFxMultiplier", "quoteAmountValue", "roundCommercialCents", "formatAmount", "unitPriceEditKind", "numberOrNull", "orderNumber",
-  "quoteCommercialStateIsOwned", "effectiveOutputUnitPrice", "synchronizeOwnedOutputRowPrice", "recalculateOutputRow", "normalizeOutputRow", "outputCellDisplayValue",
+  "quoteCommercialStateIsOwned", "outputRowIsIncluded", "includedZeroChargeRow", "pricedOutputRowAfterIncluded",
+  "effectiveOutputUnitPrice", "synchronizeOwnedOutputRowPrice", "recalculateOutputRow", "normalizeOutputRow", "outputCellDisplayValue",
   "rowNeedsManualInput", "matchSummaryStats", "outputRowsToLineItems", "outputRowsValid", "dashboardCommercialsFromState",
   "applyQuoteDetails", "applyPricingReferenceCommercialDefaults",
 ].map(extractFunction).join("\n"));
@@ -19404,6 +19405,8 @@ function outputCellDisplayValue(row, field) {
 }
 const state = { quoteCommercialLifecycle: "NEW_UNINITIALISED", outputRows: [] };
 eval(extractFunction("commercialTaxRateOrNull"));
+eval(extractFunction("outputRowIsIncluded"));
+eval(extractFunction("includedZeroChargeRow"));
 eval(extractFunction("effectiveOutputUnitPrice"));
 eval(extractFunction("roundCommercialCents"));
 eval(extractFunction("recalculateOutputRow"));
@@ -23165,6 +23168,9 @@ function persistSessionFiles(records) {
 }
 
 function normalizeRestorableOverlay(value) { return value || ""; }
+function normalizeLineItem(item = {}) { return { ...item }; }
+function snapshotOutputRows(rows = []) { return rows.map((row) => ({ ...row })); }
+function isPlainObject(value) { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
 function normalizeActiveJob(job) { return job?.id ? job : null; }
 function currentBrowserRecoveryScope() { return "test-recovery-scope"; }
 function quoteBasisPersistenceProjection() {
@@ -24032,6 +24038,9 @@ eval([
   "numberOrNull",
   "orderNumber",
   "unitPriceEditKind",
+  "outputRowIsIncluded",
+  "includedZeroChargeRow",
+  "pricedOutputRowAfterIncluded",
   "effectiveOutputUnitPrice",
   "roundCommercialCents",
   "synchronizeOwnedOutputRowPrice",
@@ -24546,6 +24555,9 @@ function escapeHtml(value = "") {
 eval([
   "numberOrNull",
   "unitPriceEditKind",
+  "outputRowIsIncluded",
+  "includedZeroChargeRow",
+  "pricedOutputRowAfterIncluded",
   "effectiveOutputUnitPrice",
   "roundCommercialCents",
   "synchronizeOwnedOutputRowPrice",
@@ -24580,13 +24592,14 @@ const state = {
   lineItems: [],
   downloadFile: null,
 };
+let dirtyCount = 0;
 function outputRowsToLineItems() { return []; }
 function outputRowsValid() { return { valid: true, errors: [] }; }
 function renderOutputValidationMessages() {}
 function renderPricingMatches() {}
 function renderMatchSummary() {}
 function syncControlStates() {}
-function markOutputRowsDirty() { state.downloadFile = null; }
+function markOutputRowsDirty() { state.downloadFile = null; dirtyCount += 1; }
 
 applyOutputIncludedAction({ dataset: { outputRow: "0" } });
 assert.strictEqual(state.outputRows[0].price_mode, "Included");
@@ -24594,19 +24607,27 @@ assert.strictEqual(outputCellDisplayValue(state.outputRows[0], "unit_price_overr
 
 commitOutputEditor({
   dataset: { outputEditorField: "unit_price_override", outputRow: "0" },
-  value: "",
-  isConnected: false,
+  value: "45",
+  isConnected: true,
+  outputRowIncludedAtOpen: false,
 });
 assert.strictEqual(state.outputRows[0].price_mode, "Included");
 assert.strictEqual(outputCellDisplayValue(state.outputRows[0], "unit_price_override"), "Included");
+assert.strictEqual(state.outputRows[0].unit_price_override, null);
+assert.strictEqual(state.outputRows[0].amount, 0);
+assert.strictEqual(dirtyCount, 1);
 
 commitOutputEditor({
-  dataset: { outputEditorField: "unit_price_override", outputRow: "0" },
-  value: "",
+  dataset: { outputEditorField: "unit_price_override", outputRow: "1" },
+  value: "45",
   isConnected: true,
+  outputRowIncludedAtOpen: false,
 });
-assert.strictEqual(state.outputRows[0].price_mode, "Included");
-assert.strictEqual(outputCellDisplayValue(state.outputRows[0], "unit_price_override"), "Included");
+assert.strictEqual(state.outputRows[1].price_mode, "Priced");
+assert.strictEqual(state.outputRows[1].unit_price_override, "45");
+assert.strictEqual(state.outputRows[1].status, "manual-price");
+assert.strictEqual(state.outputRows[1].amount, 45);
+assert.strictEqual(dirtyCount, 2);
 
 applyOutputIncludedAction({ dataset: { outputRow: "1" } });
 assert.strictEqual(state.outputRows[0].price_mode, "Included");
@@ -24716,6 +24737,9 @@ function extractFunction(name) {
 eval([
   "numberOrNull",
   "unitPriceEditKind",
+  "outputRowIsIncluded",
+  "includedZeroChargeRow",
+  "pricedOutputRowAfterIncluded",
   "effectiveOutputUnitPrice",
   "roundCommercialCents",
   "synchronizeOwnedOutputRowPrice",
@@ -28819,6 +28843,7 @@ function updateQuoteBasisCard(source) { state.updatedSource = source; }
 function setSidePanel(panelName, options = {}) { state.sidePanel = panelName; state.sidePanelOptions = options; }
 function resetBasisChatProposal() { state.basisChat.proposal = null; }
 function invalidateBasisChatAuthority() { state.activeJob = null; state.basisChat.proposal = null; state.basisChat.authorityOwner = null; state.basisChat.busyOwnerId = null; state.basisChat.completionNotice = null; }
+function clearOriginalOutputRowsBaseline() { state.originalOutputRows = []; state.originalOutputRowsBaseline = null; }
 function closeBasisChatOverlay() { state.overlayClosed = true; }
 function syncControlStates() { state.synced = true; }
 function safeQuoteSessionId(value) { return String(value || ""); }
@@ -29685,6 +29710,9 @@ eval([
   "numberOrNull",
   "orderNumber",
   "unitPriceEditKind",
+  "outputRowIsIncluded",
+  "includedZeroChargeRow",
+  "pricedOutputRowAfterIncluded",
   "effectiveOutputUnitPrice",
   "formatAmount",
   "quoteFxMultiplier",
@@ -29894,6 +29922,9 @@ eval([
   "normalizeLineItem",
   "numberOrNull",
   "unitPriceEditKind",
+  "outputRowIsIncluded",
+  "includedZeroChargeRow",
+  "pricedOutputRowAfterIncluded",
   "effectiveOutputUnitPrice",
   "formatAmount",
   "quoteFxMultiplier",
@@ -30035,8 +30066,10 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertIn("showBlockedBasisAction(", empty_items_branch)
         self.assertIn("await saveQuoteSessionDraftState({ quoteGenerated: false });", missing_branch)
         self.assertIn("showBlockedBasisAction(", missing_branch)
-        self.assertIn("state.outputRows = snapshotOutputRows(state.originalOutputRows);", reset_body)
+        self.assertIn("const baselineRows = await validatedOriginalOutputRowsBaseline();", reset_body)
+        self.assertIn("state.outputRows = snapshotOutputRows(baselineRows);", reset_body)
         self.assertIn("state.lineItems = outputRowsToLineItems();", reset_body)
+        self.assertIn("await saveQuoteSessionDraftState({ quoteGenerated: false });", reset_body)
         self.assertNotIn("refreshLineItemsFromServer", reset_body)
         self.assertNotIn("refreshOutputRowsFromLineItems", reset_body)
 
@@ -39675,6 +39708,337 @@ process.stdout.write("ok");
         edited = copy.deepcopy(draft)
         edited["quoteBasisSections"][0]["section_meta"]["preserved"] = "different excluded metadata"
         self.assertEqual(projection, webapp.quote_session_commercial_state({"draft_state": edited}))
+
+    def test_run611_server_included_matrix_persistence_and_publication_currentness(self):
+        priced = {
+            "section": "Furniture", "description": "Priced chairs", "quantity": 2, "unit": "nos",
+            "price_mode": "Priced", "status": "manual-price", "unit_price_override": 25,
+            "effective_unit_price": 25, "pricing_basis_amount": 50,
+            "approved_quote_amount": 50, "amount": 50,
+        }
+        authorities = (
+            {"unit_price_override": 777},
+            {"catalog_unit_price": 999},
+            {"unit_price_override": 777, "catalog_unit_price": 999},
+            {
+                "unit_price_override": 777, "catalog_unit_price": 999, "unit_price": 888,
+                "sale_unit_price": 999, "effective_unit_price": 777, "pricing_basis_amount": 1554,
+                "approved_quote_amount": 1554, "amount": 1554,
+                "_commercial_invalid_unit_price_override": True,
+            },
+        )
+        markers = (
+            {"price_mode": "iNcLuDeD"},
+            {"price_mode": "Priced", "display_price": "INCLUDED"},
+            {"price_mode": "Priced", "display_price": "", "unit_price_override": "Included"},
+        )
+        canonical_rows = []
+        for marker in markers:
+            for authority in authorities:
+                with self.subTest(marker=marker, authority=authority):
+                    raw = {
+                        "section": "Graphics", "description": "Included graphics", "quantity": 2,
+                        "unit": "sqm", "status": "matched", **authority, **marker,
+                    }
+                    normalized = webapp.quote_commercial_row_from_output_row(raw)
+                    self.assertEqual(normalized, webapp.canonical_included_zero_charge_row(raw))
+                    self.assertEqual(webapp.quote_commercial_row_from_output_row(normalized), normalized)
+                    self.assertEqual(webapp.quote_commercial_historical_effective_unit_price(raw), 0)
+                    self.assertEqual(normalized["price_mode"], "Included")
+                    self.assertEqual(normalized["display_price"], "Included")
+                    self.assertEqual(normalized["status"], "included")
+                    self.assertIsNone(normalized["unit_price_override"])
+                    for key in ("effective_unit_price", "pricing_basis_amount", "approved_quote_amount", "amount"):
+                        self.assertIs(type(normalized[key]), int)
+                        self.assertEqual(normalized[key], 0)
+                    for key in ("catalog_unit_price", "unit_price", "sale_unit_price", "_commercial_invalid_unit_price_override"):
+                        self.assertNotIn(key, normalized)
+                    canonical_rows.append(normalized)
+
+        included = canonical_rows[-1]
+        session_id = "quote-run611-zero"
+        baseline_rows = [copy.deepcopy(included), copy.deepcopy(priced)]
+        draft = {
+            "outputRevision": 4,
+            "lineItems": [copy.deepcopy(canonical_rows[0]), copy.deepcopy(priced)],
+            "outputRows": [copy.deepcopy(included), copy.deepcopy(priced)],
+            "originalOutputRows": copy.deepcopy(baseline_rows),
+            "originalOutputRowsBaseline": {
+                "schema": webapp.ORIGINAL_OUTPUT_ROWS_BASELINE_SCHEMA,
+                "session_id": session_id,
+                "confirmed_output_revision": 2,
+                "rows_digest": webapp.original_output_rows_digest(baseline_rows),
+            },
+        }
+        persisted = webapp.quote_session_draft_state({"session_id": session_id, "draft_state": draft})
+        for field in ("lineItems", "outputRows", "originalOutputRows"):
+            self.assertEqual(persisted[field][0], included)
+            self.assertEqual(persisted[field][1], priced)
+        self.assertEqual(persisted["originalOutputRowsBaseline"], draft["originalOutputRowsBaseline"])
+
+        priced_patch = {"session_id": session_id, "draft_state": {**draft, "outputRevision": 3, "outputRows": [priced]}}
+        included_patch = {"session_id": session_id, "draft_state": {**draft, "outputRevision": 4, "outputRows": [included]}}
+        priced_proof = webapp.quote_session_publication_freshness_proof(priced_patch)
+        included_proof = webapp.quote_session_publication_freshness_proof(included_patch)
+        self.assertNotEqual(priced_proof["commercial_state_digest"], included_proof["commercial_state_digest"])
+        self.assertEqual(priced_proof["output_revision"], 3)
+        self.assertEqual(included_proof["output_revision"], 4)
+        history_changed = copy.deepcopy(included_patch)
+        history_changed["draft_state"]["originalOutputRows"] = [priced]
+        history_changed["draft_state"].pop("originalOutputRowsBaseline", None)
+        self.assertEqual(
+            included_proof["commercial_state_digest"],
+            webapp.quote_session_publication_freshness_proof(history_changed)["commercial_state_digest"],
+        )
+
+    def test_run611_server_priced_transition_and_reset_baseline_fail_closed_matrix(self):
+        stale = {
+            "description": "Previously included graphics", "quantity": 2, "unit": "sqm",
+            "price_mode": "Priced", "display_price": "", "status": "pricing-required",
+            "catalog_unit_price": 90, "unit_price": 91, "sale_unit_price": 92,
+            "effective_unit_price": 90, "pricing_basis_amount": 180,
+            "approved_quote_amount": 180, "amount": 180,
+        }
+        for invalid in (None, "", -1, "-1", "bad", float("nan"), float("inf"), float("-inf"), True, False):
+            with self.subTest(invalid=invalid):
+                row = dict(stale)
+                if invalid is not None:
+                    row["unit_price_override"] = invalid
+                normalized = webapp.quote_commercial_row_from_output_row(row)
+                self.assertEqual(normalized["status"], "pricing-required")
+                self.assertIsNone(webapp.quote_commercial_historical_effective_unit_price(row))
+                for key in (
+                    "catalog_unit_price", "unit_price", "sale_unit_price", "effective_unit_price",
+                    "pricing_basis_amount", "approved_quote_amount", "amount",
+                ):
+                    self.assertNotIn(key, normalized)
+
+        for valid, expected in ((0, 0), (10, 20), (10.125, 20.25)):
+            with self.subTest(valid=valid):
+                normalized = webapp.quote_commercial_row_from_output_row({**stale, "unit_price_override": valid})
+                self.assertEqual(normalized["status"], "manual-price")
+                self.assertEqual(normalized["effective_unit_price"], valid)
+                self.assertEqual(normalized["pricing_basis_amount"], expected)
+                self.assertEqual(normalized["approved_quote_amount"], expected)
+                self.assertEqual(normalized["amount"], expected)
+                self.assertNotIn("catalog_unit_price", normalized)
+
+        rows = [{
+            "description": "Confirmed priced row", "quantity": 1, "unit": "lot",
+            "price_mode": "Priced", "status": "manual-price", "unit_price_override": 10,
+            "effective_unit_price": 10, "pricing_basis_amount": 10,
+            "approved_quote_amount": 10, "amount": 10,
+        }]
+        session_id = "quote-run611-baseline"
+        baseline = {
+            "schema": webapp.ORIGINAL_OUTPUT_ROWS_BASELINE_SCHEMA,
+            "session_id": session_id,
+            "confirmed_output_revision": 1,
+            "rows_digest": webapp.original_output_rows_digest(rows),
+        }
+        valid_draft = {
+            "outputRevision": 2,
+            "originalOutputRows": copy.deepcopy(rows),
+            "originalOutputRowsBaseline": copy.deepcopy(baseline),
+        }
+        self.assertIn("originalOutputRows", webapp.quote_session_draft_state({"session_id": session_id, "draft_state": valid_draft}))
+        variants = []
+        missing = copy.deepcopy(valid_draft)
+        missing.pop("originalOutputRowsBaseline")
+        variants.append(("missing", session_id, missing))
+        tampered = copy.deepcopy(valid_draft)
+        tampered["originalOutputRows"][0]["unit_price_override"] = 999
+        variants.append(("tampered", session_id, tampered))
+        variants.append(("cross-session", "quote-run611-other", copy.deepcopy(valid_draft)))
+        future = copy.deepcopy(valid_draft)
+        future["originalOutputRowsBaseline"]["confirmed_output_revision"] = 3
+        variants.append(("future", session_id, future))
+        extra = copy.deepcopy(valid_draft)
+        extra["originalOutputRowsBaseline"]["unexpected"] = True
+        variants.append(("extra-key", session_id, extra))
+        for label, field, value in (
+            ("negative", "unit_price_override", -1),
+            ("nan", "unit_price_override", float("nan")),
+            ("infinity", "unit_price_override", float("inf")),
+            ("boolean", "unit_price_override", True),
+            ("malformed", "unit_price_override", "bad"),
+            ("inconsistent", "amount", 9),
+            ("negative-approved", "approved_quote_amount", -1),
+        ):
+            invalid = copy.deepcopy(valid_draft)
+            invalid["originalOutputRows"][0][field] = value
+            invalid["originalOutputRowsBaseline"]["rows_digest"] = webapp.original_output_rows_digest(invalid["originalOutputRows"])
+            variants.append((label, session_id, invalid))
+        invalid_catalog = copy.deepcopy(valid_draft)
+        invalid_catalog["originalOutputRows"][0]["catalog_unit_price"] = 10
+        invalid_catalog["originalOutputRowsBaseline"]["rows_digest"] = webapp.original_output_rows_digest(invalid_catalog["originalOutputRows"])
+        variants.append(("unbound-catalog", session_id, invalid_catalog))
+        invalid_included = copy.deepcopy(valid_draft)
+        invalid_included["originalOutputRows"] = [{
+            "description": "Included", "quantity": 1, "unit": "lot", "price_mode": "Included",
+            "display_price": "Included", "status": "included", "unit_price_override": None,
+            "effective_unit_price": "0", "pricing_basis_amount": 0,
+            "approved_quote_amount": 0, "amount": 0,
+        }]
+        invalid_included["originalOutputRowsBaseline"]["rows_digest"] = webapp.original_output_rows_digest(invalid_included["originalOutputRows"])
+        variants.append(("included-string-zero", session_id, invalid_included))
+        for label, bound_session, draft in variants:
+            with self.subTest(label=label):
+                rejected = webapp.quote_session_draft_state({"session_id": bound_session, "draft_state": draft})
+                self.assertNotIn("originalOutputRows", rejected)
+                self.assertNotIn("originalOutputRowsBaseline", rejected)
+
+    def test_run611_browser_zero_authority_transition_matrix_and_run609_regression_present(self):
+        node = require_node(self)
+        script = r'''
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+function extractFunction(name) {
+  const marker = `function ${name}(`;
+  const start = source.indexOf(marker);
+  assert.ok(start >= 0, `missing ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}" && --depth === 0) return source.slice(start, index + 1);
+  }
+  throw new Error(`unterminated ${name}`);
+}
+eval([
+  "numberOrNull", "unitPriceEditKind", "outputRowIsIncluded", "includedZeroChargeRow",
+  "effectiveOutputUnitPrice", "roundCommercialCents", "quoteAmountValue", "recalculateOutputRow",
+  "synchronizeOwnedOutputRowPrice", "pricedOutputRowAfterIncluded", "orderNumber", "outputRowsToLineItems",
+].map(extractFunction).join("\n"));
+const state = { quoteCommercialLifecycle: "EXISTING", quoteCommercialSnapshot: { pricing_basis: {} } };
+function quoteCommercialStateIsOwned() { return true; }
+function quoteFxMultiplier() { return 1; }
+function normalizeUnit(value) { return String(value || ""); }
+function cleanCustomerQuoteLineText(value) { return String(value || "").trim(); }
+function pricingReferenceLineText(value) { return String(value || "").trim(); }
+const base = {
+  section: "Graphics", description: "Graphics", quantity: 2, unit: "sqm", price_mode: "Priced",
+  status: "matched", unit_price_override: 75, catalog_unit_price: 90, unit_price: 80,
+  sale_unit_price: 85, effective_unit_price: 75, pricing_basis_amount: 150,
+  approved_quote_amount: 150, amount: 150,
+};
+for (const marker of [
+  { price_mode: "included" }, { display_price: "INCLUDED" }, { unit_price_override: "Included" },
+]) {
+  const included = recalculateOutputRow({ ...base, ...marker });
+  assert.deepStrictEqual(recalculateOutputRow({ ...included }), included);
+  assert.strictEqual(included.price_mode, "Included");
+  assert.strictEqual(included.display_price, "Included");
+  assert.strictEqual(included.status, "included");
+  assert.strictEqual(included.unit_price_override, null);
+  for (const key of ["effective_unit_price", "pricing_basis_amount", "approved_quote_amount", "amount"]) assert.strictEqual(included[key], 0);
+  for (const key of ["catalog_unit_price", "unit_price", "sale_unit_price", "_commercial_invalid_unit_price_override"]) assert.ok(!(key in included));
+  const line = outputRowsToLineItems([included])[0];
+  assert.strictEqual(line.amount, 0);
+}
+const included = includedZeroChargeRow(base);
+for (const invalid of ["", "-1", "bad", "NaN", "Infinity", "-Infinity", true, false, null, undefined]) {
+  const priced = recalculateOutputRow(pricedOutputRowAfterIncluded(included, invalid));
+  assert.strictEqual(priced.status, "pricing-required", String(invalid));
+  assert.strictEqual(effectiveOutputUnitPrice(priced), null, String(invalid));
+  assert.strictEqual(priced.amount, "", String(invalid));
+}
+for (const [valid, expected] of [[0, 0], [10, 20], [10.125, 20.25]]) {
+  const priced = recalculateOutputRow(pricedOutputRowAfterIncluded(included, valid));
+  assert.strictEqual(priced.status, "manual-price");
+  assert.strictEqual(priced.effective_unit_price, valid);
+  assert.strictEqual(priced.amount, expected);
+}
+const staleRequired = { ...base, price_mode: "Priced", display_price: "", status: "pricing-required", unit_price_override: "" };
+assert.strictEqual(effectiveOutputUnitPrice(staleRequired), null);
+assert.ok(/catch \(_error\) \{\r?\n\s+return false;\r?\n\s+\}\r?\n\s+state\.basisChat\.proposal = admitted;/.test(source));
+process.stdout.write("ok");
+'''
+        completed = subprocess.run(
+            [node, "-e", script], cwd=str(ROOT), text=True, encoding="utf-8",
+            capture_output=True, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertEqual(completed.stdout, "ok")
+
+    def test_run611_browser_reset_uses_only_validated_confirmed_baseline(self):
+        node = require_node(self)
+        script = r'''
+const fs = require("fs");
+const assert = require("assert");
+const { webcrypto } = require("crypto");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+function extract(marker) {
+  const start = source.indexOf(marker);
+  assert.ok(start >= 0, `missing ${marker}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}" && --depth === 0) return source.slice(start, index + 1);
+  }
+  throw new Error(`unterminated ${marker}`);
+}
+const window = { crypto: webcrypto };
+const ORIGINAL_OUTPUT_ROWS_BASELINE_SCHEMA = "swooshz.original-output-rows-baseline.v1";
+const state = {
+  quoteSessionId: "quote-run611-browser-reset", outputRevision: 2,
+  outputRows: [], originalOutputRows: [], originalOutputRowsBaseline: null,
+  lineItems: [], outputErrors: ["old"],
+};
+function normalizedContentFingerprint(value) { const text = String(value || "").trim().toLowerCase(); return /^sha256:[0-9a-f]{64}$/.test(text) ? text : ""; }
+function numberOrNull(value) { const number = Number(value); return value === null || value === "" || !Number.isFinite(number) ? null : number; }
+function roundCommercialCents(value) { return Math.round((Number(value) + Number.EPSILON) * 100) / 100; }
+function outputRowIsIncluded(row = {}) { return [row.price_mode, row.display_price, row.unit_price_override].some((value) => String(value ?? "").trim().toLowerCase() === "included"); }
+function effectiveOutputUnitPrice(row = {}) { const value = numberOrNull(row.unit_price_override ?? row.effective_unit_price); return value !== null && value >= 0 ? value : null; }
+function snapshotOutputRows(rows = state.outputRows) { return rows.map((row) => JSON.parse(JSON.stringify(row))); }
+function ensureClientQuoteSessionId() { return state.quoteSessionId; }
+function revisionNumber(value, fallback = 0) { const number = Number(value); return Number.isFinite(number) ? Math.trunc(number) : fallback; }
+function safeQuoteSessionId(value = "") { return /^[A-Za-z0-9_-]+$/.test(String(value)) ? String(value) : ""; }
+function isPlainObject(value) { return Boolean(value) && Object.getPrototypeOf(value) === Object.prototype; }
+let invalidated = 0; let browserSaved = 0; let serverSaved = 0;
+function appIsBusy() { return false; }
+function invalidateBasisChatAuthority() { invalidated += 1; }
+function outputRowsToLineItems(rows = state.outputRows) { return rows.map((row) => ({ ...row })); }
+function markOutputRowsDirty() { state.outputRevision += 1; }
+function renderPricingMatches() {} function renderMatchSummary() {} function renderOutputValidationMessages() {}
+function outputRowsValid() { return { errors: [] }; } function setResultStatus() {}
+function saveSessionState() { browserSaved += 1; }
+async function saveQuoteSessionDraftState(options) { assert.deepStrictEqual(options, { quoteGenerated: false }); serverSaved += 1; }
+function syncControlStates() {}
+eval([
+  extract("async function sha256ContentFingerprint("), extract("function canonicalJsonValue("),
+  extract("async function originalOutputRowsFingerprint("), extract("function originalOutputRowsAreValidResetAuthority("),
+  extract("function clearOriginalOutputRowsBaseline("), extract("async function captureOriginalOutputRowsBaseline("),
+  extract("async function validatedOriginalOutputRowsBaseline("), extract("async function resetOutputDraft("),
+].join("\n"));
+(async () => {
+  const confirmed = [{ description: "Confirmed", quantity: 1, price_mode: "Priced", status: "manual-price", unit_price_override: 12, effective_unit_price: 12, pricing_basis_amount: 12, approved_quote_amount: 12, amount: 12 }];
+  assert.strictEqual(await captureOriginalOutputRowsBaseline(confirmed), true);
+  confirmed[0].unit_price_override = 999;
+  assert.strictEqual(state.originalOutputRows[0].unit_price_override, 12);
+  state.outputRows = [{ description: "Included", price_mode: "Included", amount: 0 }];
+  await resetOutputDraft();
+  assert.strictEqual(state.outputRows[0].unit_price_override, 12);
+  assert.strictEqual(state.outputRevision, 3);
+  assert.strictEqual(invalidated, 1);
+  assert.strictEqual(browserSaved, 1);
+  assert.strictEqual(serverSaved, 1);
+  state.originalOutputRows[0].unit_price_override = 77;
+  assert.strictEqual(await validatedOriginalOutputRowsBaseline(), null);
+  state.originalOutputRows = snapshotOutputRows(confirmed);
+  state.originalOutputRowsBaseline.session_id = "quote-other-session";
+  assert.strictEqual(await validatedOriginalOutputRowsBaseline(), null);
+  process.stdout.write("ok");
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+'''
+        completed = subprocess.run(
+            [node, "-e", script], cwd=str(ROOT), text=True, encoding="utf-8",
+            capture_output=True, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertEqual(completed.stdout, "ok")
 
     def test_run575_loaded_app_cleanup_uses_one_overall_deadline(self):
         source = (ROOT / "scripts" / "playwright-smoke.mjs").read_text(encoding="utf-8")

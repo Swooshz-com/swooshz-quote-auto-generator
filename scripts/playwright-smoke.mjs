@@ -300,10 +300,10 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
         description: "Curved service counter",
         quantity: 1,
         unit: "set",
-        price_mode: "Included",
-        unit_price_override: "Included",
-        catalog_unit_price: "",
-        amount: 0,
+        price_mode: "Priced",
+        unit_price_override: 25,
+        catalog_unit_price: 25,
+        amount: 25,
       },
     ];
     state.lineItems = outputRowsToLineItems();
@@ -429,8 +429,82 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
   }
   await page.locator('#pricingMatchesBody tr:first-child [data-output-edit-field="unit_price_override"]').click();
   await page.locator('[data-output-editor-field="unit_price_override"]').waitFor({ state: "visible", timeout: 15000 });
-  await page.locator('[data-output-included-action="true"]').waitFor({ state: "visible", timeout: 15000 });
-  await page.keyboard.press("Escape");
+  const includedButton = page.locator('[data-output-included-action="true"]');
+  await includedButton.waitFor({ state: "visible", timeout: 15000 });
+  const includedRowIndex = Number(await includedButton.getAttribute("data-output-row"));
+  if (!Number.isInteger(includedRowIndex) || includedRowIndex < 0) {
+    throw new Error(`Included browser action did not expose a valid row index: ${includedRowIndex}.`);
+  }
+  const beforeIncludedRevision = await page.evaluate(() => {
+    state.downloadFile = { url: "blob:run611-xlsx" };
+    state.pdfFile = { url: "blob:run611-pdf" };
+    state.downloadFileRevision = state.outputRevision;
+    state.pdfFileRevision = state.outputRevision;
+    return state.outputRevision;
+  });
+  await includedButton.click();
+  await page.waitForTimeout(100);
+  const postIncludedClick = await page.evaluate((index) => ({
+    row: state.outputRows[index],
+    activeEditor: Boolean(document.querySelector('[data-output-editor-field="unit_price_override"]')),
+    includedButton: document.querySelector('[data-output-included-action="true"]')?.outerHTML || "",
+  }), includedRowIndex);
+  if (postIncludedClick.row?.price_mode !== "Included") {
+    throw new Error(`Included browser click did not commit: ${JSON.stringify({ includedRowIndex, ...postIncludedClick })}.`);
+  }
+  const includedEvidence = await page.evaluate((index) => {
+    const row = state.outputRows[index];
+    const normalized = normalizeOutputRow({ ...row });
+    const renormalized = normalizeOutputRow({ ...normalized });
+    const lineItems = outputRowsToLineItems(state.outputRows);
+    const stats = matchSummaryStats(state.outputRows);
+    saveSessionState();
+    const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
+    return {
+      row,
+      normalized,
+      renormalized,
+      lineItem: lineItems[0],
+      unrelated: state.outputRows.find((_candidate, candidateIndex) => candidateIndex !== index),
+      subtotal: stats.total,
+      savedRow: saved.outputRows?.[0],
+      unitDisplay: outputCellDisplayValue(row, "unit_price_override"),
+      amountDisplay: outputCellDisplayValue(row, "amount"),
+      outputRevision: state.outputRevision,
+      downloadFresh: downloadFileIsFresh(),
+      pdfFresh: pdfFileIsFresh(),
+    };
+  }, includedRowIndex);
+  for (const [label, row] of Object.entries({
+    browser: includedEvidence.row,
+    normalized: includedEvidence.normalized,
+    renormalized: includedEvidence.renormalized,
+    lineItem: includedEvidence.lineItem,
+    saved: includedEvidence.savedRow,
+  })) {
+    if (row?.price_mode !== "Included"
+      || row?.display_price !== "Included"
+      || row?.status !== "included"
+      || row?.unit_price_override !== null
+      || ["catalog_unit_price", "unit_price", "sale_unit_price", "_commercial_invalid_unit_price_override"]
+        .some((key) => Object.prototype.hasOwnProperty.call(row || {}, key))
+      || row?.effective_unit_price !== 0
+      || row?.pricing_basis_amount !== 0
+      || row?.approved_quote_amount !== 0
+      || row?.amount !== 0) {
+      throw new Error(`Included zero-charge ${label} evidence is invalid: ${JSON.stringify(row)}.`);
+    }
+  }
+  if (includedEvidence.unitDisplay !== "Included"
+    || includedEvidence.amountDisplay !== "0.00"
+    || includedEvidence.subtotal !== 25
+    || includedEvidence.unrelated?.amount !== 25
+    || includedEvidence.unrelated?.unit_price_override !== 25
+    || includedEvidence.outputRevision !== beforeIncludedRevision + 1
+    || includedEvidence.downloadFresh
+    || includedEvidence.pdfFresh) {
+    throw new Error(`Included browser totals, currentness, or unrelated row changed: ${JSON.stringify(includedEvidence)}.`);
+  }
   await page.locator('#pricingMatchesBody tr:first-child [data-output-delete-row]').click();
   await page.locator("#outputDeleteModal").waitFor({ state: "visible", timeout: 15000 });
   await page.locator("#cancelOutputDeleteButton").click();
@@ -4379,6 +4453,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(error.message || error);
+  console.error(error?.stack || error?.message || error);
   process.exitCode = 1;
 });

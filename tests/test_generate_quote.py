@@ -2116,6 +2116,126 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         included_row = quote.parse_cell_ref(find_cell_ref(sheet, "Saved included item"))[0]
         self.assertAlmostEqual(float(cell_value(sheet, f"E{included_row}")), 0.0)
 
+    def test_run611_included_is_zero_across_markers_lines_xlsx_and_semantic_pdf(self):
+        catalog_row = quote.PriceRow(
+            row_number=1,
+            section="Graphics",
+            description="Included graphics",
+            unit_hint="sqm",
+            cost=999,
+            gst_multiplier=1,
+            markup=1,
+            remark="",
+            pricing_id="included-graphics",
+        )
+        stale = {
+            "section": "Graphics",
+            "quantity": 2,
+            "unit": "sqm",
+            "description": "Included graphics",
+            "pricing_keyword": "included-graphics",
+            "status": "matched",
+            "catalog_unit_price": 999,
+            "effective_unit_price": 777,
+            "pricing_basis_amount": 1554,
+            "approved_quote_amount": 1554,
+            "amount": 1554,
+        }
+        markers = (
+            {"price_mode": "iNcLuDeD", "unit_price_override": 777},
+            {"price_mode": "Priced", "display_price": "INCLUDED", "unit_price_override": 777},
+            {"price_mode": "Priced", "display_price": "", "unit_price_override": "Included"},
+        )
+        for marker in markers:
+            with self.subTest(marker=marker):
+                included, priced = quote.prepare_lines(
+                    commercial_test_brief({
+                        "exchange_rate": 1,
+                        "line_items": [
+                            {**stale, **marker},
+                            {
+                                "section": "Furniture",
+                                "quantity": 2,
+                                "unit": "nos",
+                                "description": "Priced chairs",
+                                "price_mode": "Priced",
+                                "unit_price_override": 25,
+                            },
+                        ],
+                    }),
+                    [catalog_row],
+                    allow_ambiguous=True,
+                )
+                self.assertEqual(included.price_mode, "Included")
+                self.assertEqual(included.match_status, "included")
+                self.assertIsNone(included.unit_price_override)
+                self.assertIsNone(included.matched_price)
+                self.assertEqual(included.match_candidates, [])
+                self.assertEqual(included.amount, 0)
+                self.assertEqual(priced.amount, 50)
+
+        brief = commercial_test_brief({
+            "exchange_rate": 1,
+            "line_items": [{**stale, "price_mode": "Included"}, {
+                "section": "Furniture", "quantity": 2, "unit": "nos",
+                "description": "Priced chairs", "price_mode": "Priced", "unit_price_override": 25,
+            }],
+        })
+        included, priced = quote.prepare_lines(brief, [catalog_row], allow_ambiguous=True)
+        entries = quote.render_quote_entries([included, priced], brief)
+        included_entry = next(entry for entry in entries if entry.get("description_lines") == ["Included graphics"])
+        self.assertEqual(included_entry["amount"], 0)
+        self.assertEqual(quote.quote_subtotal(entries), 50)
+        pdf_cells = quote.build_pdf_cell_map(brief, [included, priced])
+        included_pdf_row = next(row for (row, column), value in pdf_cells.items() if column == 3 and value == "Included graphics")
+        self.assertEqual(pdf_cells[(included_pdf_row, 5)], 0)
+        self.assertEqual(pdf_cells[(92, 5)], 50)
+        self.assertEqual(pdf_cells[(93, 5)], 4.5)
+        self.assertEqual(pdf_cells[(94, 5)], 54.5)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "quotation.xlsx"
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, path, brief, [included, priced])
+            with zipfile.ZipFile(path) as zf:
+                sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+        included_xlsx_row = quote.parse_cell_ref(find_cell_ref(sheet, "Included graphics"))[0]
+        self.assertEqual(float(cell_value(sheet, f"E{included_xlsx_row}")), 0)
+
+    def test_run611_included_to_priced_requires_current_explicit_nonnegative_authority(self):
+        catalog_row = quote.PriceRow(
+            row_number=1, section="Graphics", description="Previously included graphics", unit_hint="sqm",
+            cost=90, gst_multiplier=1, markup=1, remark="", pricing_id="included-graphics",
+        )
+        base_item = {
+            "section": "Graphics", "quantity": 2, "unit": "sqm",
+            "description": "Previously included graphics", "pricing_keyword": "included-graphics",
+            "price_mode": "Priced", "display_price": "", "status": "pricing-required",
+            "catalog_unit_price": 90, "effective_unit_price": 90, "pricing_basis_amount": 180,
+            "approved_quote_amount": 180, "amount": 180,
+        }
+        for invalid in (None, "", -1, "-1", "not-a-price", float("inf"), float("-inf"), float("nan"), True, False):
+            with self.subTest(invalid=invalid):
+                item = dict(base_item)
+                if invalid is not None:
+                    item["unit_price_override"] = invalid
+                [line] = quote.prepare_lines({"line_items": [item]}, [catalog_row], allow_ambiguous=True)
+                self.assertEqual(line.match_status, "manual-display")
+                self.assertIsNone(line.matched_price)
+                self.assertEqual(line.match_candidates, [])
+                self.assertIsNone(line.amount)
+                self.assertTrue(quote.confirmation_issues([], [line]))
+
+        for valid, expected in ((0, 0), (10, 20), (10.125, 20.25)):
+            with self.subTest(valid=valid):
+                [line] = quote.prepare_lines(
+                    {"line_items": [{**base_item, "unit_price_override": valid}]},
+                    [catalog_row],
+                    allow_ambiguous=True,
+                )
+                self.assertEqual(line.match_status, "manual-price")
+                self.assertEqual(line.unit_price_override, valid)
+                self.assertEqual(line.amount, expected)
+
     def test_recovered_explicit_price_edit_reaches_xlsx_and_pdf_everywhere(self):
         brief = commercial_test_brief({
             "line_items": [{

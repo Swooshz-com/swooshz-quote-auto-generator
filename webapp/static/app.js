@@ -29,6 +29,7 @@ const QUOTE_SESSION_FILE_DB_NAME = "swooshz_quote_session_files_v1";
 const QUOTE_SESSION_FILE_STORE_NAME = "reference_files";
 const QUOTE_SESSION_FILE_DB_VERSION = 1;
 const QUOTE_SESSION_STATE_VERSION = 5;
+const ORIGINAL_OUTPUT_ROWS_BASELINE_SCHEMA = "swooshz.original-output-rows-baseline.v1";
 const QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA = "swooshz.quote-commercial-snapshot.v2";
 const QUOTE_COMMERCIAL_SNAPSHOT_VERSION = 2;
 const QUOTE_COMMERCIAL_LIFECYCLES = new Set(["NEW_UNINITIALISED", "EXISTING", "RECOVERED"]);
@@ -272,6 +273,7 @@ const state = {
   lineItems: [],
   outputRows: [],
   originalOutputRows: [],
+  originalOutputRowsBaseline: null,
   outputErrors: [],
   outputSortMode: "pricing_reference",
   analysisFindings: [],
@@ -3095,11 +3097,11 @@ function renderFiles() {
 
 function normalizeLineItem(item = {}) {
   item = typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(item) : item;
-  const priceMode = item.price_mode === "Included" || String(item.display_price || "").toLowerCase() === "included"
+  const priceMode = outputRowIsIncluded(item)
     ? "Included"
     : "Priced";
   const quantityParts = normalizedLineTextQuantityParts(item.description || "", item.quantity ?? "", item.unit || "");
-  return {
+  const normalized = {
     section: normalizeCategoryTitle(item.section || ""),
     quantity: quantityParts.quantity ?? "",
     unit: quantityParts.unit || "",
@@ -3124,6 +3126,7 @@ function normalizeLineItem(item = {}) {
     ...(Object.prototype.hasOwnProperty.call(item, "pricing_reference_id") ? { pricing_reference_id: item.pricing_reference_id } : {}),
     ...(Object.prototype.hasOwnProperty.call(item, "pricing_basis_digest") ? { pricing_basis_digest: item.pricing_basis_digest } : {}),
   };
+  return priceMode === "Included" ? includedZeroChargeRow(normalized) : normalized;
 }
 
 function cloneQuoteBasis(basis = {}) {
@@ -3939,6 +3942,8 @@ function clearSessionFiles() {
 
 function buildSessionSnapshot() {
   const persistedBasis = quoteBasisPersistenceProjection();
+  const outputRows = snapshotOutputRows(state.outputRows);
+  const originalOutputRows = snapshotOutputRows(state.originalOutputRows);
   return {
     version: QUOTE_SESSION_STATE_VERSION,
     browserRecoveryScope: currentBrowserRecoveryScope(),
@@ -3963,9 +3968,12 @@ function buildSessionSnapshot() {
     workflowStage: state.workflowStage,
     quoteBasis: persistedBasis.quote_basis,
     quoteBasisSections: persistedBasis.quote_basis_sections,
-    lineItems: state.lineItems,
-    outputRows: state.outputRows,
-    originalOutputRows: state.originalOutputRows,
+    lineItems: state.lineItems.map(normalizeLineItem),
+    outputRows,
+    originalOutputRows,
+    originalOutputRowsBaseline: isPlainObject(state.originalOutputRowsBaseline)
+      ? { ...state.originalOutputRowsBaseline }
+      : null,
     outputErrors: state.outputErrors,
     outputSortMode: state.outputSortMode,
     analysisFindings: state.analysisFindings,
@@ -4537,7 +4545,17 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.quoteBasisSections = restoredSections;
   state.lineItems = Array.isArray(restoredState.lineItems) ? restoredState.lineItems.map(normalizeLineItem) : [];
   state.outputRows = Array.isArray(restoredState.outputRows) ? restoredState.outputRows.map(normalizeOutputRow) : [];
-  state.originalOutputRows = Array.isArray(restoredState.originalOutputRows) ? restoredState.originalOutputRows.map(normalizeOutputRow) : [];
+  state.originalOutputRows = Array.isArray(restoredState.originalOutputRows)
+    ? restoredState.originalOutputRows.map((row) => (isPlainObject(row) ? { ...row } : row))
+    : [];
+  state.originalOutputRowsBaseline = isPlainObject(restoredState.originalOutputRowsBaseline)
+    ? { ...restoredState.originalOutputRowsBaseline }
+    : null;
+  if (state.originalOutputRows.length || state.originalOutputRowsBaseline) {
+    const baselineRows = await validatedOriginalOutputRowsBaseline();
+    if (baselineRows) state.originalOutputRows = baselineRows;
+    else clearOriginalOutputRowsBaseline();
+  }
   state.outputErrors = Array.isArray(restoredState.outputErrors) ? restoredState.outputErrors : [];
   state.outputSortMode = "pricing_reference";
   state.analysisFindings = Array.isArray(restoredState.analysisFindings) ? restoredState.analysisFindings : [];
@@ -7130,7 +7148,7 @@ function reviewBasisProposalSections(nextSections = [], currentSections = []) {
 
 function normalizeOutputRow(row = {}) {
   row = typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(row) : row;
-  const priceMode = row.price_mode === "Included" || String(row.display_price || "").toLowerCase() === "included"
+  const priceMode = outputRowIsIncluded(row)
     ? "Included"
     : "Priced";
   const currentDescription = cleanCustomerQuoteLineText(row.description || "");
@@ -7170,6 +7188,7 @@ function normalizeOutputRow(row = {}) {
     basis_order: orderNumber(row.basis_order) ?? "",
     status: row.status || "",
   });
+  if (priceMode === "Included") return includedZeroChargeRow(normalized);
   const numericFields = ["effective_unit_price", "pricing_basis_amount", "approved_quote_amount"];
   numericFields.forEach((key) => {
     if (Object.prototype.hasOwnProperty.call(row, key)) normalized[key] = numberOrNull(row[key]);
@@ -7181,7 +7200,6 @@ function normalizeOutputRow(row = {}) {
     const capturedPrice = effectiveOutputUnitPrice(normalized);
     if (capturedPrice !== null) normalized.effective_unit_price = capturedPrice;
   }
-  if (normalized.price_mode === "Included") normalized.approved_quote_amount = 0;
   return recalculateOutputRow(synchronizeOwnedOutputRowPrice(normalized, normalized.unit_price_override));
 }
 
@@ -8574,7 +8592,7 @@ function clearGeneratedQuoteState() {
   state.quoteBasisSections = [];
   state.lineItems = [];
   state.outputRows = [];
-  state.originalOutputRows = [];
+  clearOriginalOutputRowsBaseline();
   state.outputErrors = [];
   state.outputRevision = 0;
   state.analysisFindings = [];
@@ -9160,24 +9178,75 @@ function unitPriceEditKind(value) {
   const text = String(value ?? "").trim();
   if (!text) return "blank";
   if (text.toLowerCase() === "included") return "included";
-  return numberOrNull(text) === null ? "invalid" : "number";
+  const numeric = numberOrNull(text);
+  return numeric === null || numeric < 0 ? "invalid" : "number";
+}
+
+function outputRowIsIncluded(row = {}) {
+  return [row.price_mode, row.display_price, row.unit_price_override]
+    .some((value) => String(value ?? "").trim().toLowerCase() === "included");
+}
+
+function includedZeroChargeRow(row = {}) {
+  const next = {
+    ...row,
+    price_mode: "Included",
+    display_price: "Included",
+    status: "included",
+    unit_price_override: null,
+    effective_unit_price: 0,
+    pricing_basis_amount: 0,
+    approved_quote_amount: 0,
+    amount: 0,
+  };
+  delete next.unit_price;
+  delete next.sale_unit_price;
+  delete next.catalog_unit_price;
+  delete next._commercial_invalid_unit_price_override;
+  return next;
+}
+
+function pricedOutputRowAfterIncluded(row = {}, value = "") {
+  const editKind = unitPriceEditKind(value);
+  const next = {
+    ...row,
+    price_mode: "Priced",
+    display_price: "",
+    status: editKind === "number" ? "manual-price" : "pricing-required",
+    unit_price_override: editKind === "number" ? numberOrNull(value) : String(value ?? "").trim(),
+  };
+  [
+    "catalog_unit_price",
+    "unit_price",
+    "sale_unit_price",
+    "effective_unit_price",
+    "pricing_basis_amount",
+    "approved_quote_amount",
+    "amount",
+    "_commercial_invalid_unit_price_override",
+  ].forEach((key) => delete next[key]);
+  return editKind === "number" ? synchronizeOwnedOutputRowPrice(next, next.unit_price_override) : next;
 }
 
 function effectiveOutputUnitPrice(row = {}) {
+  if (outputRowIsIncluded(row)) return 0;
   const overrideText = String(row.unit_price_override ?? "").trim();
   const manual = numberOrNull(overrideText);
-  if (manual !== null) return manual;
+  if (manual !== null) return manual >= 0 ? manual : null;
   if (overrideText && overrideText.toLowerCase() !== "included") return null;
+  if (["included", "pricing-required"].includes(String(row.status || "").trim().toLowerCase())) return null;
   const captured = numberOrNull(row.effective_unit_price);
-  if (captured !== null) return captured;
+  if (captured !== null) return captured >= 0 ? captured : null;
   const basisAmount = numberOrNull(row.pricing_basis_amount);
   const quantity = numberOrNull(row.quantity);
   if (basisAmount !== null && quantity !== null && quantity > 0) {
-    return Math.round((basisAmount / quantity) * 1000000) / 1000000;
+    const derived = Math.round((basisAmount / quantity) * 1000000) / 1000000;
+    return derived >= 0 ? derived : null;
   }
   const ownedCommercial = typeof quoteCommercialStateIsOwned === "function" && quoteCommercialStateIsOwned();
   if (ownedCommercial) return null;
-  return numberOrNull(row.catalog_unit_price);
+  const catalog = numberOrNull(row.catalog_unit_price);
+  return catalog !== null && catalog >= 0 ? catalog : null;
 }
 
 function formatAmount(value) {
@@ -9225,7 +9294,8 @@ function quoteAmountValue(value, multiplier = quoteFxMultiplier()) {
 
 function recalculateOutputRow(row = {}) {
   const quantity = numberOrNull(row.quantity);
-  const priceMode = row.price_mode === "Included" ? "Included" : "Priced";
+  const priceMode = outputRowIsIncluded(row) ? "Included" : "Priced";
+  if (priceMode === "Included") return includedZeroChargeRow(row);
   const unitPrice = effectiveOutputUnitPrice({ ...row, price_mode: priceMode });
   const hasUsablePrice = unitPrice !== null && unitPrice >= 0;
   return {
@@ -9236,6 +9306,7 @@ function recalculateOutputRow(row = {}) {
 }
 
 function synchronizeOwnedOutputRowPrice(row = {}, value = row.unit_price_override) {
+  if (outputRowIsIncluded(row)) return includedZeroChargeRow(row);
   const ownedCommercial = typeof quoteCommercialStateIsOwned === "function" && quoteCommercialStateIsOwned();
   if (!ownedCommercial || unitPriceEditKind(value) !== "number") return row;
   const unitPrice = numberOrNull(value);
@@ -9824,12 +9895,110 @@ function snapshotOutputRows(rows = state.outputRows) {
   return rows.map((row) => normalizeOutputRow({ ...row }));
 }
 
+function canonicalJsonValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalJsonValue);
+  if (value && typeof value === "object") {
+    return Object.keys(value).sort().reduce((result, key) => {
+      result[key] = canonicalJsonValue(value[key]);
+      return result;
+    }, {});
+  }
+  return value;
+}
+
+async function originalOutputRowsFingerprint(rows = []) {
+  const canonicalRows = snapshotOutputRows(Array.isArray(rows) ? rows : []);
+  return sha256ContentFingerprint(new TextEncoder().encode(JSON.stringify(canonicalJsonValue(canonicalRows))));
+}
+
+function originalOutputRowsAreValidResetAuthority(rows = []) {
+  if (!Array.isArray(rows) || !rows.length) return false;
+  return rows.every((row) => {
+    if (!isPlainObject(row)) return false;
+    if (outputRowIsIncluded(row)) {
+      return row.price_mode === "Included"
+        && row.display_price === "Included"
+        && row.status === "included"
+        && row.unit_price_override === null
+        && !["catalog_unit_price", "unit_price", "sale_unit_price", "_commercial_invalid_unit_price_override"]
+          .some((key) => Object.prototype.hasOwnProperty.call(row, key))
+        && ["effective_unit_price", "pricing_basis_amount", "approved_quote_amount", "amount"]
+          .every((key) => typeof row[key] === "number" && Number.isFinite(row[key]) && row[key] === 0);
+    }
+    if (["included", "pricing-required"].includes(String(row.status || "").trim().toLowerCase())) return false;
+    const quantity = numberOrNull(row.quantity);
+    const unitPrice = effectiveOutputUnitPrice(row);
+    if (quantity === null || quantity <= 0 || unitPrice === null || unitPrice < 0) return false;
+    const expectedAmount = roundCommercialCents(quantity * unitPrice);
+    if (["pricing_basis_amount", "amount"].some((key) => numberOrNull(row[key]) !== expectedAmount)) return false;
+    const approvedAmount = numberOrNull(row.approved_quote_amount);
+    if (approvedAmount === null || approvedAmount < 0) return false;
+    if (numberOrNull(row.catalog_unit_price) !== null) {
+      return [row.pricing_reference_source, row.pricing_reference_id].every((value) => Boolean(String(value || "").trim()))
+        && /^sha256:[a-f0-9]{64}$/.test(String(row.pricing_basis_digest || "").trim().toLowerCase());
+    }
+    return true;
+  });
+}
+
+function clearOriginalOutputRowsBaseline() {
+  state.originalOutputRows = [];
+  state.originalOutputRowsBaseline = null;
+}
+
+async function captureOriginalOutputRowsBaseline(rows = state.outputRows) {
+  const sessionId = ensureClientQuoteSessionId();
+  const canonicalRows = snapshotOutputRows(rows);
+  const rowsDigest = await originalOutputRowsFingerprint(canonicalRows);
+  if (!sessionId || !originalOutputRowsAreValidResetAuthority(canonicalRows) || !rowsDigest) {
+    clearOriginalOutputRowsBaseline();
+    return false;
+  }
+  state.originalOutputRows = canonicalRows;
+  state.originalOutputRowsBaseline = {
+    schema: ORIGINAL_OUTPUT_ROWS_BASELINE_SCHEMA,
+    session_id: sessionId,
+    confirmed_output_revision: revisionNumber(state.outputRevision, 0),
+    rows_digest: rowsDigest,
+  };
+  return true;
+}
+
+async function validatedOriginalOutputRowsBaseline(
+  rows = state.originalOutputRows,
+  baseline = state.originalOutputRowsBaseline,
+  sessionId = state.quoteSessionId,
+) {
+  if (!Array.isArray(rows) || !rows.length || !isPlainObject(baseline)) return null;
+  const keys = Object.keys(baseline).sort();
+  const expectedKeys = ["confirmed_output_revision", "rows_digest", "schema", "session_id"];
+  if (keys.length !== expectedKeys.length || !expectedKeys.every((key, index) => key === keys[index])) return null;
+  const confirmedRevision = baseline.confirmed_output_revision;
+  if (
+    baseline.schema !== ORIGINAL_OUTPUT_ROWS_BASELINE_SCHEMA
+    || safeQuoteSessionId(baseline.session_id || "") !== safeQuoteSessionId(sessionId || "")
+    || !safeQuoteSessionId(sessionId || "")
+    || !Number.isSafeInteger(confirmedRevision)
+    || confirmedRevision < 0
+    || confirmedRevision > revisionNumber(state.outputRevision, 0)
+  ) return null;
+  if (!originalOutputRowsAreValidResetAuthority(rows)) return null;
+  const canonicalRows = snapshotOutputRows(rows);
+  const rowsDigest = await originalOutputRowsFingerprint(canonicalRows);
+  return rowsDigest && rowsDigest === normalizedContentFingerprint(baseline.rows_digest)
+    ? canonicalRows
+    : null;
+}
+
 function outputRowsToLineItems(rows = state.outputRows) {
   const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
   return rows.map((inputRow) => {
-    const row = ownedCommercial
-      ? synchronizeOwnedOutputRowPrice(inputRow, inputRow.unit_price_override)
+    const normalizedInputRow = outputRowIsIncluded(inputRow)
+      ? includedZeroChargeRow(inputRow)
       : inputRow;
+    const row = ownedCommercial
+      ? synchronizeOwnedOutputRowPrice(normalizedInputRow, normalizedInputRow.unit_price_override)
+      : normalizedInputRow;
     const next = {
       section: String(row.section || "").trim(),
       description: String(row.description || "").trim(),
@@ -9842,7 +10011,7 @@ function outputRowsToLineItems(rows = state.outputRows) {
     };
     if (!next.source_basis_line_id) delete next.source_basis_line_id;
     const catalogUnitPrice = numberOrNull(row.catalog_unit_price);
-    if (catalogUnitPrice !== null) next.catalog_unit_price = catalogUnitPrice;
+    if (next.price_mode !== "Included" && catalogUnitPrice !== null) next.catalog_unit_price = catalogUnitPrice;
     const catalogDescription = cleanCustomerQuoteLineText(row.catalog_description || "");
     if (catalogDescription) next.catalog_description = catalogDescription;
     const pricingReferenceDescription = pricingReferenceLineText(row.pricing_reference_description || "");
@@ -9882,8 +10051,16 @@ function outputRowsToLineItems(rows = state.outputRows) {
       }
     }
     if (next.price_mode === "Included") {
-      next.display_price = "Included";
-      if (ownedCommercial) next.approved_quote_amount = 0;
+      Object.assign(next, {
+        display_price: "Included",
+        status: "included",
+        unit_price_override: null,
+        effective_unit_price: 0,
+        pricing_basis_amount: 0,
+        approved_quote_amount: 0,
+        amount: 0,
+      });
+      delete next.catalog_unit_price;
     } else {
       const unitPrice = numberOrNull(row.unit_price_override);
       const effectivePrice = ownedCommercial ? effectiveOutputUnitPrice(row) : null;
@@ -10179,7 +10356,16 @@ function handleOutputRowEdit(event) {
     ...state.outputRows[index],
     [field]: input.value,
   };
-  if (field === "unit_price_override") nextRow = synchronizeOwnedOutputRowPrice(nextRow, input.value);
+  if (field === "price_mode" && input.value === "Included") {
+    nextRow = includedZeroChargeRow(nextRow);
+  } else if (field === "price_mode" && outputRowIsIncluded(state.outputRows[index])) {
+    nextRow = pricedOutputRowAfterIncluded(nextRow, "");
+  } else if (field === "unit_price_override") {
+    nextRow = outputRowIsIncluded(state.outputRows[index])
+      ? pricedOutputRowAfterIncluded(nextRow, input.value)
+      : synchronizeOwnedOutputRowPrice(nextRow, input.value);
+    if (unitPriceEditKind(input.value) === "number") nextRow.status = "manual-price";
+  }
   state.outputRows[index] = recalculateOutputRow(nextRow);
   state.lineItems = outputRowsToLineItems();
   markOutputRowsDirty();
@@ -10197,15 +10383,29 @@ function commitOutputEditor(editor) {
   const field = editor.dataset.outputEditorField;
   if (!Number.isInteger(index) || index < 0 || !state.outputRows[index] || !field) return;
   const currentRow = state.outputRows[index];
+  if (
+    field === "unit_price_override"
+    && editor.outputRowIncludedAtOpen === false
+    && outputRowIsIncluded(currentRow)
+  ) return;
   let nextRow = { ...currentRow, [field]: editor.value };
   if (field === "unit_price_override") {
     const value = String(editor.value || "").trim();
     if (value.toLowerCase() === "included" || (currentRow.price_mode === "Included" && value === "")) {
-      nextRow = { ...currentRow, price_mode: "Included", unit_price_override: "", display_price: "Included" };
+      nextRow = includedZeroChargeRow(currentRow);
     } else {
-      nextRow = { ...currentRow, price_mode: "Priced", display_price: "", unit_price_override: value };
-      nextRow = synchronizeOwnedOutputRowPrice(nextRow, value);
+      nextRow = outputRowIsIncluded(currentRow)
+        ? pricedOutputRowAfterIncluded(currentRow, value)
+        : { ...currentRow, price_mode: "Priced", display_price: "", unit_price_override: value };
+      if (unitPriceEditKind(value) === "number") {
+        nextRow.status = "manual-price";
+        nextRow = synchronizeOwnedOutputRowPrice(nextRow, value);
+      }
     }
+  } else if (field === "price_mode") {
+    nextRow = editor.value === "Included"
+      ? includedZeroChargeRow(currentRow)
+      : pricedOutputRowAfterIncluded(currentRow, "");
   }
   state.outputRows[index] = recalculateOutputRow(nextRow);
   state.lineItems = outputRowsToLineItems();
@@ -10224,8 +10424,6 @@ function applyOutputIncludedAction(button) {
   state.outputRows[index] = recalculateOutputRow({
     ...state.outputRows[index],
     price_mode: "Included",
-    unit_price_override: "",
-    display_price: "Included",
   });
   state.lineItems = outputRowsToLineItems();
   markOutputRowsDirty();
@@ -10245,6 +10443,7 @@ function openOutputCellEditor(cell) {
   cell.innerHTML = outputEditorHtml(state.outputRows[index], index, field);
   const editor = cell.querySelector("[data-output-editor-field]");
   if (!editor) return;
+  editor.outputRowIncludedAtOpen = outputRowIsIncluded(state.outputRows[index]);
   editor.focus();
   if (typeof editor.select === "function") editor.select();
 }
@@ -12152,7 +12351,7 @@ function applyBasisChatProposal() {
   state.quoteBasis = admitted.quoteBasis;
   state.lineItems = Array.isArray(state.lineItems) ? state.lineItems : [];
   state.outputRows = [];
-  state.originalOutputRows = [];
+  clearOriginalOutputRowsBaseline();
   state.outputErrors = [];
   setDownloadFiles([]);
   if (typeof renderPricingMatches === "function") renderPricingMatches([]);
@@ -12264,7 +12463,7 @@ function applyDraftLineItems(lineItems = []) {
     typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(item) : item
   )).map(normalizeLineItem);
   state.outputRows = [];
-  state.originalOutputRows = [];
+  clearOriginalOutputRowsBaseline();
   state.outputErrors = [];
 }
 
@@ -12301,7 +12500,7 @@ function openBlockingClarifications(questions = [], findings = [], project = {})
   state.quoteBasisSections = [];
   state.lineItems = [];
   state.outputRows = [];
-  state.originalOutputRows = [];
+  clearOriginalOutputRowsBaseline();
   state.basisConfirmed = false;
   state.boothDimensions = normalizeBoothDimensions(project || state.boothDimensions);
   setDownloadFiles([]);
@@ -12403,7 +12602,7 @@ function clearAiFailedDraftState() {
   state.quoteBasisSections = [];
   state.lineItems = [];
   state.outputRows = [];
-  state.originalOutputRows = [];
+  clearOriginalOutputRowsBaseline();
   state.outputErrors = [];
   state.originalAnalysisSnapshot = null;
   state.basisConfirmed = false;
@@ -12437,7 +12636,7 @@ function resetQuoteBasisToOriginal() {
   state.boothDimensions = normalizeBoothDimensions(snapshot.boothDimensions || state.boothDimensions);
   state.lastAnalysisMode = normalizeAnalysisMode(snapshot.analysis_mode || state.lastAnalysisMode);
   state.outputRows = [];
-  state.originalOutputRows = [];
+  clearOriginalOutputRowsBaseline();
   state.outputErrors = [];
   state.analysisFindings = [];
   state.blockingClarificationQuestions = [];
@@ -12451,7 +12650,15 @@ function resetQuoteBasisToOriginal() {
 
 async function resetOutputDraft() {
   if (appIsBusy() || !state.originalOutputRows.length) return;
-  state.outputRows = snapshotOutputRows(state.originalOutputRows);
+  const baselineRows = await validatedOriginalOutputRowsBaseline();
+  if (!baselineRows) {
+    clearOriginalOutputRowsBaseline();
+    saveSessionState();
+    syncControlStates();
+    return;
+  }
+  invalidateBasisChatAuthority();
+  state.outputRows = snapshotOutputRows(baselineRows);
   state.lineItems = outputRowsToLineItems();
   state.outputErrors = [];
   markOutputRowsDirty();
@@ -12459,6 +12666,8 @@ async function resetOutputDraft() {
   renderMatchSummary({ pricing_matches: state.outputRows });
   renderOutputValidationMessages(outputRowsValid().errors);
   setResultStatus("Output reset to confirmed basis", "is-warn");
+  saveSessionState();
+  await saveQuoteSessionDraftState({ quoteGenerated: false });
   syncControlStates();
 }
 
@@ -12907,6 +13116,7 @@ function currentQuoteSessionDraftState() {
     lineItems: snapshot.lineItems,
     outputRows: snapshot.outputRows,
     originalOutputRows: snapshot.originalOutputRows,
+    originalOutputRowsBaseline: snapshot.originalOutputRowsBaseline,
     outputErrors: snapshot.outputErrors,
     outputSortMode: snapshot.outputSortMode,
     analysisFindings: snapshot.analysisFindings,
@@ -15135,7 +15345,7 @@ async function confirmBasis(options = {}) {
     }
     state.basisConfirmed = true;
     refreshOutputRowsFromLineItems();
-    state.originalOutputRows = snapshotOutputRows(state.outputRows);
+    await captureOriginalOutputRowsBaseline(state.outputRows);
     state.lineItems = outputRowsToLineItems();
     setWorkflowStage("completed");
     await saveQuoteSessionDraftState({ quoteGenerated: true });
