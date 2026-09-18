@@ -143,6 +143,15 @@ jobs:
           node-version: "22"
           cache: npm
 
+      - name: Provision hosted LibreOffice and fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libreoffice-calc \
+            fontconfig \
+            fonts-liberation \
+            fonts-crosextra-carlito
+
       - name: Verify hosted LibreOffice and font readiness
         run: |
           set -eu

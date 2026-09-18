@@ -46,6 +46,9 @@ Source of truth: `.github/workflows/ci.yml`
   the locked Python-only provider/archive/start contract and exact
   `[phases.setup].nixPkgs = ["...", "libreoffice"]`; missing, wrong, malformed,
   duplicate, misplaced, or alternate converter bindings fail closed.
+- Before the readiness check, `Validate app` provisions the hosted Ubuntu
+  runtime with `libreoffice-calc`, `fontconfig`, `fonts-liberation`, and
+  `fonts-crosextra-carlito` using the runner's package manager.
 - `Validate app` also proves the hosted LibreOffice executable/version and
   fontconfig resolution for the canonical Arial/Calibri presentation families
   (including the pinned Linux metric-compatible Liberation Sans/Carlito
