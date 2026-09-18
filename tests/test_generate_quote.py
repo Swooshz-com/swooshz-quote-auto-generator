@@ -1,10 +1,14 @@
 import base64
 import csv
+import hashlib
 import html
 import io
 import json
+import os
 import re
+import shutil
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -476,6 +480,19 @@ def logo_data_url():
     return SANITIZED_LOGO_DATA_URL
 
 
+def non_square_logo_data_url():
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (640, 160), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, 319, 159), fill="#16324f")
+    draw.rectangle((320, 0, 639, 159), fill="#f28f3b")
+    draw.rectangle((24, 24, 616, 136), outline="#ffffff", width=8)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
 def commercial_test_brief(updates=None):
     brief = {
         "company_identity": "Saved Quotation Co",
@@ -830,7 +847,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertNotIn("xl/sharedStrings.xml", names)
         self.assertNotIn("xl/calcChain.xml", names)
 
-    def test_generated_layout_completes_sparse_template_formatting(self):
+    def test_generated_layout_preserves_template_presentation_formatting(self):
         tmp, path = generate_layout_workbook()
         self.addCleanup(tmp.cleanup)
 
@@ -852,12 +869,12 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertIsNotNone(sheet.find(f"{NS_MAIN}sheetPr"))
         self.assertEqual(sheet.find(f"{NS_MAIN}sheetFormatPr").attrib.get("defaultRowHeight"), "17")
         self.assertEqual(widths[1], "6.125")
-        self.assertEqual(widths[2], "14.25")
-        self.assertEqual(widths[3], "45.5")
-        self.assertEqual(widths[4], "22.0")
+        self.assertEqual(widths[2], "10.5")
+        self.assertEqual(widths[3], "49.375")
+        self.assertEqual(widths[4], "14")
         self.assertEqual(widths[5], "15.5")
         self.assertEqual(widths[6], "7.625")
-        self.assertEqual(widths[7], "15.0")
+        self.assertEqual(widths[7], "15")
         self.assertEqual(widths[8], "16.375")
         self.assertEqual(widths[9], "26.875")
         self.assertIn("A16:C16", merge_refs(sheet))
@@ -901,22 +918,23 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertEqual(cell_value(sheet, "B32"), "Koncept Image Pte Ltd")
         self.assertEqual(cell_value(sheet, "B38"), "Director")
 
-    def test_generated_workbook_normalizes_arial_style_fonts(self):
+    def test_generated_workbook_preserves_template_style_fonts(self):
         tmp, path = generate_layout_workbook()
         self.addCleanup(tmp.cleanup)
 
-        with zipfile.ZipFile(path) as zf:
-            sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
-            styles = ET.fromstring(zf.read("xl/styles.xml"))
-            styles = ET.fromstring(zf.read("xl/styles.xml"))
-            styles = ET.fromstring(zf.read("xl/styles.xml"))
+        with zipfile.ZipFile(KONCEPT_LAYOUT) as template_zf, zipfile.ZipFile(path) as output_zf:
+            template_styles = ET.fromstring(template_zf.read("xl/styles.xml"))
+            output_styles = ET.fromstring(output_zf.read("xl/styles.xml"))
 
-        title_font = font_for_style(styles, cell_style(sheet, "A18"))
-        self.assertEqual(font_name(title_font), "Calibri")
-        self.assertEqual(font_size(title_font), "13")
-
-        fonts = styles.find(f"{NS_MAIN}fonts")
-        self.assertEqual([font_size(font) for font in fonts if font_name(font) == "Arial"], [])
+        template_fonts = template_styles.find(f"{NS_MAIN}fonts")
+        output_fonts = output_styles.find(f"{NS_MAIN}fonts")
+        self.assertIsNotNone(template_fonts)
+        self.assertIsNotNone(output_fonts)
+        self.assertEqual(
+            [ET.tostring(font, encoding="unicode") for font in output_fonts[:len(template_fonts)]],
+            [ET.tostring(font, encoding="unicode") for font in template_fonts],
+        )
+        self.assertTrue(any(font_name(font) == "Arial" for font in output_fonts))
 
     def test_layout_workbook_scrubs_customer_visible_template_metadata(self):
         tmp, path = generate_layout_workbook(layout_template=REPO_DEFAULT_LAYOUT)
@@ -1071,6 +1089,158 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             self.assertTrue((out_dir / "quotation.pdf").exists())
             self.assertIn("pdf_mode=workbook", (out_dir / "export_status.txt").read_text(encoding="utf-8"))
             self.assertIn("pdf_status=excel_exported", (out_dir / "export_status.txt").read_text(encoding="utf-8"))
+
+    def test_real_libreoffice_pdf_render_preserves_template_fidelity(self):
+        running_in_ci = os.environ.get("CI", "").lower() in {"1", "true", "yes"}
+        executables = quote.libreoffice_candidates()
+        if not executables:
+            message = "LibreOffice is unavailable locally; hosted CI must run this regression with its readiness gate."
+            if running_in_ci:
+                self.fail(message)
+            self.skipTest(message)
+        if shutil.which("fc-match") is None:
+            message = "fontconfig fc-match is unavailable; hosted CI must prove font readiness."
+            if running_in_ci:
+                self.fail(message)
+            self.skipTest(message)
+
+        for family in ("Arial", "Calibri"):
+            result = subprocess.run(
+                ["fc-match", "-f", "%{family}\\n", family],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, family)
+            self.assertTrue(result.stdout.strip(), family)
+
+        import pypdfium2 as pdfium
+
+        brief = commercial_test_brief({
+            "company": {
+                "name": "Rendered Fidelity Co",
+                "header_lines": ["Rendered Fidelity Co", "1 Fidelity Road"],
+                "logo_data_url": non_square_logo_data_url(),
+            },
+            "project": {"title": "Rendered PDF Fidelity"},
+            "payment_terms": [],
+            "terms_heading": "",
+            "notes_heading": "",
+            "standard_notes": [],
+        })
+        price = quote.PriceRow(
+            row_number=1,
+            section="Graphics",
+            description="Non-square printed graphics",
+            unit_hint="sqm",
+            cost=120,
+            gst_multiplier=1,
+            markup=1,
+            remark="",
+        )
+        line = quote.QuoteLine(
+            section="Graphics",
+            quantity=2,
+            unit="sqm",
+            description="Non-square printed graphics",
+            pricing_keyword="non-square printed graphics",
+            display_price="",
+            matched_price=price,
+            amount=240,
+            match_status="matched",
+            match_candidates=[],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_output = root / "first"
+            second_output = root / "second"
+            first_output.mkdir()
+            second_output.mkdir()
+            xlsx_path = root / "quotation.xlsx"
+            first_pdf = first_output / "quotation.pdf"
+            second_pdf = second_output / "quotation.pdf"
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, xlsx_path, brief, [line])
+
+            self.assertEqual(quote.libreoffice_pdf_export(xlsx_path, first_pdf), "libreoffice_exported")
+            self.assertEqual(quote.libreoffice_pdf_export(xlsx_path, second_pdf), "libreoffice_exported")
+            for pdf_path in (first_pdf, second_pdf):
+                self.assertTrue(pdf_path.exists())
+                self.assertGreater(pdf_path.stat().st_size, 100)
+                self.assertTrue(pdf_path.read_bytes().startswith(b"%PDF-"))
+
+            with zipfile.ZipFile(KONCEPT_LAYOUT) as template_zf, zipfile.ZipFile(xlsx_path) as output_zf:
+                template_sheet = ET.fromstring(template_zf.read("xl/worksheets/sheet1.xml"))
+                output_sheet = ET.fromstring(output_zf.read("xl/worksheets/sheet1.xml"))
+                template_workbook = ET.fromstring(template_zf.read("xl/workbook.xml"))
+                output_workbook = ET.fromstring(output_zf.read("xl/workbook.xml"))
+                output_styles = ET.fromstring(output_zf.read("xl/styles.xml"))
+                drawing = ET.fromstring(output_zf.read("xl/drawings/drawing1.xml"))
+
+            self.assertEqual(column_widths(output_sheet), column_widths(template_sheet))
+            self.assertEqual(
+                output_sheet.find(f"{NS_MAIN}pageMargins").attrib,
+                template_sheet.find(f"{NS_MAIN}pageMargins").attrib,
+            )
+            self.assertEqual(
+                output_sheet.find(f"{NS_MAIN}pageSetup").attrib,
+                template_sheet.find(f"{NS_MAIN}pageSetup").attrib,
+            )
+            self.assertTrue(set(merge_refs(template_sheet)).issubset(set(merge_refs(output_sheet))))
+
+            output_last_row = dimension_last_row(output_sheet)
+            print_area = output_workbook.find(
+                f"{NS_MAIN}definedNames/{NS_MAIN}definedName[@name='_xlnm.Print_Area']"
+            )
+            self.assertIsNotNone(print_area)
+            self.assertEqual(print_area.text, f"Quotation!$A$1:$I${output_last_row}")
+
+            for ref in ("A20", "B20", "C20", "E20"):
+                header_font = font_for_style(output_styles, cell_style(output_sheet, ref))
+                self.assertIsNotNone(header_font.find(f"{NS_MAIN}b"), ref)
+
+            anchors = drawing.findall(f"{NS_DRAWING}twoCellAnchor")
+            text_anchor = next(anchor for anchor in anchors if anchor.find(f"{NS_DRAWING}sp") is not None)
+            logo_anchor = next(anchor for anchor in anchors if anchor.find(f"{NS_DRAWING}pic") is not None)
+            logo_ext = logo_anchor.find(f"{NS_DRAWING}pic/{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}ext")
+            logo_off = logo_anchor.find(f"{NS_DRAWING}pic/{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}off")
+            text_ext = text_anchor.find(f"{NS_DRAWING}sp/{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}ext")
+            text_off = text_anchor.find(f"{NS_DRAWING}sp/{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}off")
+            logo_width = int(logo_ext.attrib["cx"])
+            logo_height = int(logo_ext.attrib["cy"])
+            logo_bottom = int(logo_off.attrib["y"]) + logo_height
+            text_top = int(text_off.attrib["y"])
+            self.assertAlmostEqual(logo_width / logo_height, 4.0, places=2)
+            self.assertLessEqual(logo_width, quote.HEADER_LOGO_MAX_WIDTH_EMU)
+            self.assertLessEqual(logo_height, quote.HEADER_LOGO_MAX_HEIGHT_EMU)
+            self.assertLessEqual(logo_bottom, text_top)
+            self.assertEqual(text_ext.attrib["cx"], "3350000")
+
+            def rendered_signature(pdf_path):
+                document = pdfium.PdfDocument(str(pdf_path))
+                try:
+                    self.assertEqual(len(document), 1)
+                    page = document[0]
+                    page_width, page_height = page.get_size()
+                    self.assertGreater(page_width, 0)
+                    self.assertGreater(page_height, 0)
+                    text = re.sub(r"\s+", " ", page.get_textpage().get_text_range() or "")
+                    for expected in ("Rendered Fidelity Co", "Quantity", "Service", "Estimate", "2 sqm"):
+                        self.assertIn(expected, text)
+                    image = page.render(scale=1.25).to_pil().convert("RGB")
+                    mask = image.convert("L").point(lambda value: 255 if value < 245 else 0)
+                    bbox = mask.getbbox()
+                    self.assertIsNotNone(bbox)
+                    self.assertGreater(bbox[2] - bbox[0], 100)
+                    self.assertGreater(bbox[3] - bbox[1], 100)
+                    return len(document), image.size, hashlib.sha256(image.tobytes()).hexdigest()
+                finally:
+                    document.close()
+
+            first_signature = rendered_signature(first_pdf)
+            second_signature = rendered_signature(second_pdf)
+            self.assertEqual(first_signature, second_signature)
 
     def test_layout_strips_catalog_brackets_from_customer_output_descriptions(self):
         brief = {
@@ -1493,7 +1663,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             for col in sheet.find(f"{NS_MAIN}cols")
             if col.attrib.get("min") == "2" and col.attrib.get("max") == "2"
         )
-        self.assertGreaterEqual(float(quantity_col.attrib["width"]), 14.0)
+        self.assertEqual(quantity_col.attrib["width"], "10.5")
         self.assertTrue(find_cell_ref(sheet, "Director").startswith("B"))
 
     def test_layout_totals_use_bordered_styles(self):
@@ -1536,7 +1706,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
 
         cols = sheet.find(f"{NS_MAIN}cols")
         d_col = next(col for col in cols if col.attrib.get("min") == "4" and col.attrib.get("max") == "4")
-        self.assertGreaterEqual(float(d_col.attrib["width"]), 20.0)
+        self.assertEqual(d_col.attrib["width"], "14")
         calc_pr = workbook.find(f"{NS_MAIN}calcPr")
         self.assertIsNotNone(calc_pr)
         self.assertEqual(calc_pr.attrib.get("fullCalcOnLoad"), "1")
@@ -2402,8 +2572,8 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertLessEqual(text_top - (logo_top + logo_height), 220000)
         self.assertLessEqual(text_left, logo_left)
         self.assertGreaterEqual(text_left + text_width, logo_left + logo_width)
-        self.assertGreaterEqual(logo_width, 2950000)
-        self.assertGreaterEqual(logo_height, 630000)
+        self.assertEqual(logo_width, quote.HEADER_LOGO_MAX_HEIGHT_EMU)
+        self.assertEqual(logo_height, quote.HEADER_LOGO_MAX_HEIGHT_EMU)
         self.assertLessEqual(logo_from_col_off, 0)
         self.assertGreaterEqual(logo_to_col_off, 1720000)
         self.assertLessEqual(logo_from_row_off, 0)
@@ -2483,8 +2653,8 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             self.assertEqual(font_size(font), "13", ref)
             for text, run_font_name, run_font_size in cell_inline_run_fonts(sheet, ref):
                 if text:
-                    self.assertEqual(run_font_name, "Calibri", ref)
-                    self.assertEqual(run_font_size, "13", ref)
+                    self.assertEqual(run_font_name, "", ref)
+                    self.assertEqual(run_font_size, "", ref)
 
     def test_attention_contact_name_and_title_are_split_from_label(self):
         tmp, path = generate_layout_workbook({
@@ -2517,8 +2687,8 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             self.assertEqual(font_size(font), "13", ref)
             for text, run_font_name, run_font_size in cell_inline_run_fonts(sheet, ref):
                 if text:
-                    self.assertEqual(run_font_name, "Calibri", ref)
-                    self.assertEqual(run_font_size, "13", ref)
+                    self.assertEqual(run_font_name, "", ref)
+                    self.assertEqual(run_font_size, "", ref)
 
     def test_quote_date_cell_uses_customer_facing_date_format(self):
         tmp, path = generate_layout_workbook()
@@ -2657,8 +2827,8 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             self.assertEqual(font_size(font), "10", expected_text)
             for text, run_font_name, run_font_size in cell_inline_run_fonts(sheet, ref):
                 if text:
-                    self.assertEqual(run_font_name, "Calibri", expected_text)
-                    self.assertEqual(run_font_size, "10", expected_text)
+                    self.assertEqual(run_font_name, "", expected_text)
+                    self.assertEqual(run_font_size, "", expected_text)
 
         paragraphs = [
             "".join(text_node.text or "" for text_node in paragraph.findall(f".//{NS_A}t"))

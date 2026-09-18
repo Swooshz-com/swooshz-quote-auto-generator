@@ -23,6 +23,7 @@ import math
 import os
 import re
 import shutil
+import tempfile
 import subprocess
 import textwrap
 import zipfile
@@ -139,6 +140,10 @@ SIGNATURE_CONTENT_HEIGHT = 8
 SIGNATURE_BLOCK_PAGE_GUARD_ROWS = 0
 SIGNATURE_BLOCK_HEIGHT = SIGNATURE_CONTENT_HEIGHT + SIGNATURE_BLOCK_PAGE_GUARD_ROWS
 QUOTE_LAYOUT_DEFAULT_ROW_HEIGHT = "18.7"
+HEADER_LOGO_MAX_WIDTH_EMU = 2_970_000
+HEADER_LOGO_MAX_HEIGHT_EMU = 635_000
+HEADER_LOGO_OFFSET_X_EMU = 4_550_000
+HEADER_LOGO_OFFSET_Y_EMU = 260_000
 QUOTE_LAYOUT_COLUMN_WIDTHS = {
     1: 6.125,
     2: 14.25,
@@ -1353,11 +1358,14 @@ def ensure_merge_ref(root: ET.Element, ref: str) -> None:
 def ensure_quote_layout_page_settings(root: ET.Element) -> None:
     ensure_worksheet_child(root, "sheetPr")
 
-    sheet_format = ensure_worksheet_child(root, "sheetFormatPr")
-    sheet_format.attrib.setdefault("defaultColWidth", "9.125")
-    if sheet_format.attrib.get("defaultRowHeight") in {None, "", "15"}:
-        sheet_format.attrib["defaultRowHeight"] = "17"
-    sheet_format.attrib.setdefault(f"{{{XMLNS_X14AC}}}dyDescent", "0.2")
+    sheet_format = root.find(f"{NS_MAIN}sheetFormatPr")
+    if sheet_format is None:
+        sheet_format = ensure_worksheet_child(root, "sheetFormatPr")
+        sheet_format.attrib.update({
+            "defaultColWidth": "9.125",
+            "defaultRowHeight": "17",
+            f"{{{XMLNS_X14AC}}}dyDescent": "0.2",
+        })
 
     if root.find(f"{NS_MAIN}pageMargins") is None:
         page_margins = ET.Element(
@@ -1398,15 +1406,13 @@ def ensure_quote_layout_row_heights(root: ET.Element, last_row: int) -> None:
         return
     for row_number in range(1, last_row + 1):
         row = get_or_create_row(sheet_data, row_number)
-        if row.attrib.get("ht") in {None, "", "15"}:
+        if row.attrib.get("ht") in {None, ""} and row.findall(f"{NS_MAIN}c"):
             row.attrib["ht"] = QUOTE_LAYOUT_DEFAULT_ROW_HEIGHT
-        row.attrib.setdefault("customHeight", "1")
+            row.attrib["customHeight"] = "1"
 
 
 def complete_quote_layout_worksheet(root: ET.Element, last_row: int) -> None:
     ensure_quote_layout_page_settings(root)
-    for col_number, width in QUOTE_LAYOUT_COLUMN_WIDTHS.items():
-        set_ooxml_column_width(root, col_number, width)
     ensure_quote_layout_row_heights(root, last_row)
     ensure_merge_ref(root, QUOTE_DATE_MERGE_REF)
 
@@ -1668,38 +1674,21 @@ def ensure_font_for_style(
     return str(len(fonts) - 1)
 
 
-def normalize_arial_style_fonts(styles_root: ET.Element) -> None:
-    fonts = styles_root.find(f"{NS_MAIN}fonts")
-    if fonts is None:
-        raise ValueError("Layout workbook is missing fonts styles.")
-
-    for font in fonts.findall(f"{NS_MAIN}font"):
-        name = font.find(f"{NS_MAIN}name")
-        if name is None or name.attrib.get("val", "").lower() != "arial":
-            continue
-        name.attrib["val"] = "Calibri"
-        size = font.find(f"{NS_MAIN}sz")
-        if size is None:
-            size = ET.SubElement(font, f"{NS_MAIN}sz")
-        size.attrib["val"] = "13"
-
-
 def add_quote_layout_styles(parts: dict[str, bytes]) -> dict[str, str]:
     styles_root = ET.fromstring(parts["xl/styles.xml"])
-    normalize_arial_style_fonts(styles_root)
     total_border = append_border(styles_root, top="thin")
     grand_border = append_border(styles_root, top="thin", bottom="double")
     regular_amount_font = ensure_regular_font_for_style(styles_root, "5")
     bold_amount_font = ensure_regular_font_for_style(styles_root, "5", bold=True)
-    small_heading_font = ensure_font_for_style(styles_root, "37", font_name="Calibri", font_size="10")
-    small_number_font = ensure_font_for_style(styles_root, "40", font_name="Calibri", font_size="10")
-    small_body_font = ensure_font_for_style(styles_root, "41", font_name="Calibri", font_size="10")
-    signature_text_font = ensure_font_for_style(styles_root, "2", font_name="Calibri", font_size="10")
-    signature_line_font = ensure_font_for_style(styles_root, "33", font_name="Calibri", font_size="10")
-    client_name_font = ensure_font_for_style(styles_root, "12", font_name="Calibri", font_size="13")
-    client_address_font = ensure_font_for_style(styles_root, "93", font_name="Calibri", font_size="13")
-    client_attention_font = ensure_font_for_style(styles_root, "26", font_name="Calibri", font_size="13")
-    client_title_font = ensure_font_for_style(styles_root, "24", font_name="Calibri", font_size="13")
+    small_heading_font = ensure_font_for_style(styles_root, "37")
+    small_number_font = ensure_font_for_style(styles_root, "40")
+    small_body_font = ensure_font_for_style(styles_root, "41")
+    signature_text_font = ensure_font_for_style(styles_root, "2")
+    signature_line_font = ensure_font_for_style(styles_root, "33")
+    client_name_font = ensure_font_for_style(styles_root, "12")
+    client_address_font = ensure_font_for_style(styles_root, "93")
+    client_attention_font = ensure_font_for_style(styles_root, "26")
+    client_title_font = ensure_font_for_style(styles_root, "24")
     style_ids = {
         "quote_date": "98",
         "header_pos": clone_cell_style(styles_root, "23", font_id=ensure_bold_font_for_style(styles_root, "23")),
@@ -1801,17 +1790,6 @@ def update_repeating_header_drawing(
             "to",
             {"col": "8", "colOff": "1720000", "row": "2", "rowOff": "415000"},
         )
-        pic = logo_anchor.find(f"{NS_DRAWING}pic")
-        pic_pr = pic.find(f"{NS_DRAWING}spPr") if pic is not None else None
-        pic_xfrm = pic_pr.find(f"{NS_A}xfrm") if pic_pr is not None else None
-        logo_off = pic_xfrm.find(f"{NS_A}off") if pic_xfrm is not None else None
-        if logo_off is not None:
-            logo_off.attrib["x"] = "4550000"
-            logo_off.attrib["y"] = "260000"
-        logo_ext = pic_xfrm.find(f"{NS_A}ext") if pic_xfrm is not None else None
-        if logo_ext is not None:
-            logo_ext.attrib["cx"] = "2970000"
-            logo_ext.attrib["cy"] = "635000"
 
     update_marker(text_anchor, "from", {"col": "7", "colOff": "0", "row": "3", "rowOff": "90000"})
     update_marker(text_anchor, "to", {"col": "9", "colOff": "200000", "row": "13", "rowOff": "90000"})
@@ -1980,7 +1958,88 @@ def next_relationship_id(root: ET.Element) -> str:
     return f"rId{next_id}"
 
 
-def create_header_logo_anchor(rel_id: str) -> ET.Element:
+def image_dimensions(image_bytes: bytes, mime_type: str) -> tuple[int, int] | None:
+    if mime_type == "image/png" and image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        if len(image_bytes) >= 24 and image_bytes[12:16] == b"IHDR":
+            width = int.from_bytes(image_bytes[16:20], "big")
+            height = int.from_bytes(image_bytes[20:24], "big")
+            if width > 0 and height > 0:
+                return width, height
+        return None
+
+    if mime_type != "image/jpeg" or not image_bytes.startswith(b"\xff\xd8"):
+        return None
+
+    index = 2
+    sof_markers = {
+        0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+        0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+    }
+    while index + 3 < len(image_bytes):
+        if image_bytes[index] != 0xFF:
+            index += 1
+            continue
+        while index < len(image_bytes) and image_bytes[index] == 0xFF:
+            index += 1
+        if index >= len(image_bytes):
+            break
+        marker = image_bytes[index]
+        index += 1
+        if marker in {0xD8, 0xD9}:
+            continue
+        if marker == 0xDA or marker == 0x01 or 0xD0 <= marker <= 0xD7:
+            break
+        if index + 2 > len(image_bytes):
+            break
+        segment_length = int.from_bytes(image_bytes[index:index + 2], "big")
+        if segment_length < 2 or index + segment_length > len(image_bytes):
+            break
+        if marker in sof_markers and segment_length >= 7:
+            height = int.from_bytes(image_bytes[index + 3:index + 5], "big")
+            width = int.from_bytes(image_bytes[index + 5:index + 7], "big")
+            if width > 0 and height > 0:
+                return width, height
+        index += segment_length
+    return None
+
+
+def fitted_header_logo_extent(dimensions: tuple[int, int] | None) -> tuple[int, int]:
+    if not dimensions or dimensions[0] <= 0 or dimensions[1] <= 0:
+        return HEADER_LOGO_MAX_WIDTH_EMU, HEADER_LOGO_MAX_HEIGHT_EMU
+    width, height = dimensions
+    aspect = width / height
+    max_aspect = HEADER_LOGO_MAX_WIDTH_EMU / HEADER_LOGO_MAX_HEIGHT_EMU
+    if aspect >= max_aspect:
+        fitted_width = HEADER_LOGO_MAX_WIDTH_EMU
+        fitted_height = max(1, round(fitted_width / aspect))
+    else:
+        fitted_height = HEADER_LOGO_MAX_HEIGHT_EMU
+        fitted_width = max(1, round(fitted_height * aspect))
+    return fitted_width, fitted_height
+
+
+def set_header_logo_extent(pic: ET.Element, dimensions: tuple[int, int] | None) -> None:
+    pic_pr = pic.find(f"{NS_DRAWING}spPr")
+    if pic_pr is None:
+        return
+    pic_xfrm = pic_pr.find(f"{NS_A}xfrm")
+    if pic_xfrm is None:
+        pic_xfrm = ET.SubElement(pic_pr, f"{NS_A}xfrm")
+    if pic_xfrm.find(f"{NS_A}off") is None:
+        ET.SubElement(
+            pic_xfrm,
+            f"{NS_A}off",
+            {"x": str(HEADER_LOGO_OFFSET_X_EMU), "y": str(HEADER_LOGO_OFFSET_Y_EMU)},
+        )
+    logo_ext = pic_xfrm.find(f"{NS_A}ext")
+    if logo_ext is None:
+        logo_ext = ET.SubElement(pic_xfrm, f"{NS_A}ext")
+    if dimensions is not None or not logo_ext.attrib:
+        width, height = fitted_header_logo_extent(dimensions)
+        logo_ext.attrib.update({"cx": str(width), "cy": str(height)})
+
+
+def create_header_logo_anchor(rel_id: str, dimensions: tuple[int, int] | None = None) -> ET.Element:
     anchor = ET.Element(f"{NS_DRAWING}twoCellAnchor")
     from_marker = ET.SubElement(anchor, f"{NS_DRAWING}from")
     for tag, value in (("col", "7"), ("colOff", "0"), ("row", "1"), ("rowOff", "0")):
@@ -2003,8 +2062,9 @@ def create_header_logo_anchor(rel_id: str) -> ET.Element:
 
     sp_pr = ET.SubElement(pic, f"{NS_DRAWING}spPr", {"bwMode": "auto"})
     xfrm = ET.SubElement(sp_pr, f"{NS_A}xfrm")
-    ET.SubElement(xfrm, f"{NS_A}off", {"x": "4550000", "y": "260000"})
-    ET.SubElement(xfrm, f"{NS_A}ext", {"cx": "2970000", "cy": "635000"})
+    ET.SubElement(xfrm, f"{NS_A}off", {"x": str(HEADER_LOGO_OFFSET_X_EMU), "y": str(HEADER_LOGO_OFFSET_Y_EMU)})
+    logo_width, logo_height = fitted_header_logo_extent(dimensions)
+    ET.SubElement(xfrm, f"{NS_A}ext", {"cx": str(logo_width), "cy": str(logo_height)})
     prst_geom = ET.SubElement(sp_pr, f"{NS_A}prstGeom", {"prst": "rect"})
     ET.SubElement(prst_geom, f"{NS_A}avLst")
     ET.SubElement(sp_pr, f"{NS_A}noFill")
@@ -2017,7 +2077,11 @@ def create_header_logo_anchor(rel_id: str) -> ET.Element:
     return anchor
 
 
-def ensure_header_logo_anchor(parts: dict[str, bytes], rel_id: str) -> None:
+def ensure_header_logo_anchor(
+    parts: dict[str, bytes],
+    rel_id: str,
+    dimensions: tuple[int, int] | None = None,
+) -> None:
     drawing_name = "xl/drawings/drawing1.xml"
     if drawing_name not in parts:
         return
@@ -2029,9 +2093,11 @@ def ensure_header_logo_anchor(parts: dict[str, bytes], rel_id: str) -> None:
         blip = pic.find(f".//{NS_A}blip")
         if blip is not None:
             blip.attrib[f"{NS_REL}embed"] = rel_id
+        if pic is not None:
+            set_header_logo_extent(pic, dimensions)
         parts[drawing_name] = ET.tostring(drawing_root, encoding="utf-8", xml_declaration=True)
         return
-    drawing_root.insert(0, create_header_logo_anchor(rel_id))
+    drawing_root.insert(0, create_header_logo_anchor(rel_id, dimensions))
     parts[drawing_name] = ET.tostring(drawing_root, encoding="utf-8", xml_declaration=True)
 
 
@@ -2053,6 +2119,7 @@ def replace_header_logo(parts: dict[str, bytes], logo_data_url: str) -> None:
     if not logo_bytes:
         remove_header_logo(parts)
         return
+    dimensions = image_dimensions(logo_bytes, mime_type)
 
     extension = "png" if mime_type == "image/png" else "jpeg"
     media_name = f"xl/media/header_logo.{extension}"
@@ -2093,7 +2160,7 @@ def replace_header_logo(parts: dict[str, bytes], logo_data_url: str) -> None:
             },
         )
     parts[rels_name] = ET.tostring(rels_root, encoding="utf-8", xml_declaration=True)
-    ensure_header_logo_anchor(parts, logo_rel_id)
+    ensure_header_logo_anchor(parts, logo_rel_id, dimensions)
 
     content_types_name = "[Content_Types].xml"
     if content_types_name not in parts:
@@ -2591,9 +2658,6 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
     layout_styles = add_quote_layout_styles(parts)
     root = ET.fromstring(parts["xl/worksheets/sheet1.xml"])
     clear_ooxml_range(root, 1, 1000, 1, 100)
-    set_ooxml_column_width(root, 2, 14.25)
-    set_ooxml_column_width(root, 3, 45.5)
-    set_ooxml_column_width(root, 4, 22.0)
     price_style = layout_styles["price_amount"]
 
     client = brief["client"]
@@ -2603,14 +2667,12 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
     company_name = clean_text(company.get("name"))
     client_address_runs = brief_rich_text_lines(brief, "clientAddress", client.get("address") or [])
     header_line_runs = brief_rich_text_lines(brief, "headerDetails", company.get("header_lines") or [])
-    client_block_rich_text = {"font_name": "Calibri", "font_size": "13"}
-
-    set_ooxml_rich_text_cell(root, 6, 1, brief_rich_text_cell_runs(brief, "clientName", client.get("name", "")), layout_styles["client_name"], **client_block_rich_text)
+    set_ooxml_rich_text_cell(root, 6, 1, brief_rich_text_cell_runs(brief, "clientName", client.get("name", "")), layout_styles["client_name"])
     for offset, runs in enumerate(client_address_runs[:4], start=7):
-        set_ooxml_rich_text_cell(root, offset, 1, runs, layout_styles["client_address"], **client_block_rich_text)
-    set_ooxml_rich_text_cell(root, 11, 1, [RichTextRun("Attention:", bold=True)], layout_styles["client_attention"], **client_block_rich_text)
-    set_ooxml_rich_text_cell(root, 12, 2, brief_rich_text_cell_runs(brief, "clientAttention", client.get("attention", ""), fallback_bold=True), layout_styles["client_attention"], **client_block_rich_text)
-    set_ooxml_rich_text_cell(root, 13, 2, brief_rich_text_cell_runs(brief, "clientTitle", client.get("title", "")), layout_styles["client_title"], **client_block_rich_text)
+        set_ooxml_rich_text_cell(root, offset, 1, runs, layout_styles["client_address"])
+    set_ooxml_rich_text_cell(root, 11, 1, [RichTextRun("Attention:", bold=True)], layout_styles["client_attention"])
+    set_ooxml_rich_text_cell(root, 12, 2, brief_rich_text_cell_runs(brief, "clientAttention", client.get("attention", ""), fallback_bold=True), layout_styles["client_attention"])
+    set_ooxml_rich_text_cell(root, 13, 2, brief_rich_text_cell_runs(brief, "clientTitle", client.get("title", "")), layout_styles["client_title"])
     quote_date_runs = brief_quote_date_rich_text_runs(brief)
     if quote_date_runs:
         set_ooxml_rich_text_cell(root, 16, 1, quote_date_runs, layout_styles["quote_date"])
@@ -2704,19 +2766,18 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
     signature = brief.get("signature") if isinstance(brief.get("signature"), dict) else {}
     next_text_row = grand_row + 3
     last_optional_row = 0
-    footer_rich_text = {"font_name": "Calibri", "font_size": "10"}
 
     terms_heading = clean_text(brief.get("terms_heading"))
     payment_terms = brief.get("payment_terms") or []
     payment_term_runs = brief_rich_text_lines(brief, "paymentTerms", payment_terms)
     if terms_heading or payment_terms:
         if terms_heading:
-            set_ooxml_rich_text_cell(root, next_text_row, 1, brief_rich_text_cell_runs(brief, "termsHeading", terms_heading), layout_styles["terms_heading"], **footer_rich_text)
+            set_ooxml_rich_text_cell(root, next_text_row, 1, brief_rich_text_cell_runs(brief, "termsHeading", terms_heading), layout_styles["terms_heading"])
             next_text_row += 1
         for index, term in enumerate(payment_terms, start=1):
             set_ooxml_cell(root, next_text_row, 1, f"{index:.2f}", layout_styles["terms_number"])
             runs = payment_term_runs[index - 1] if index - 1 < len(payment_term_runs) else [RichTextRun(term)]
-            set_ooxml_rich_text_cell(root, next_text_row, 2, runs, layout_styles["terms_body"], **footer_rich_text)
+            set_ooxml_rich_text_cell(root, next_text_row, 2, runs, layout_styles["terms_body"])
             next_text_row += 1
         last_optional_row = next_text_row - 1
         next_text_row = last_optional_row + 2
@@ -2726,12 +2787,12 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
     standard_note_runs = brief_rich_text_lines(brief, "standardNotes", standard_notes)
     if notes_heading or standard_notes:
         if notes_heading:
-            set_ooxml_rich_text_cell(root, next_text_row, 1, brief_rich_text_cell_runs(brief, "notesHeading", notes_heading), layout_styles["terms_heading"], **footer_rich_text)
+            set_ooxml_rich_text_cell(root, next_text_row, 1, brief_rich_text_cell_runs(brief, "notesHeading", notes_heading), layout_styles["terms_heading"])
             next_text_row += 1
         for index, note in enumerate(standard_notes, start=1):
             set_ooxml_cell(root, next_text_row, 1, f"{index:.2f}", layout_styles["terms_number"])
             runs = standard_note_runs[index - 1] if index - 1 < len(standard_note_runs) else [RichTextRun(note)]
-            set_ooxml_rich_text_cell(root, next_text_row, 2, runs, layout_styles["terms_body"], **footer_rich_text)
+            set_ooxml_rich_text_cell(root, next_text_row, 2, runs, layout_styles["terms_body"])
             next_text_row += 1
         last_optional_row = next_text_row - 1
 
@@ -2741,16 +2802,16 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
         LayoutChunk("acceptance_signature", SIGNATURE_BLOCK_HEIGHT),
     )
     manual_pagination_enabled = manual_pagination_enabled or acceptance_moved
-    set_ooxml_rich_text_cell(root, acceptance_row, 2, brief_rich_text_cell_runs(brief, "quoteCompanyName", clean_text(acceptance.get("company_name")) or company_name), layout_styles["signature_text"], **footer_rich_text)
-    set_ooxml_rich_text_cell(root, acceptance_row, 5, brief_rich_text_cell_runs(brief, "acceptanceText", clean_text(acceptance.get("text"))), layout_styles["signature_text"], **footer_rich_text)
+    set_ooxml_rich_text_cell(root, acceptance_row, 2, brief_rich_text_cell_runs(brief, "quoteCompanyName", clean_text(acceptance.get("company_name")) or company_name), layout_styles["signature_text"])
+    set_ooxml_rich_text_cell(root, acceptance_row, 5, brief_rich_text_cell_runs(brief, "acceptanceText", clean_text(acceptance.get("text"))), layout_styles["signature_text"])
     set_ooxml_cell(root, acceptance_row + 4, 2, "_____________________________", layout_styles["signature_line"])
     set_ooxml_cell(root, acceptance_row + 4, 5, "_____________________________________", layout_styles["signature_line"])
-    set_ooxml_rich_text_cell(root, acceptance_row + 5, 2, brief_rich_text_cell_runs(brief, "companySignatory", clean_text(signature.get("company_signatory"))), layout_styles["signature_line"], **footer_rich_text)
-    set_ooxml_rich_text_cell(root, acceptance_row + 5, 5, brief_rich_text_cell_runs(brief, "personLabel", clean_text(acceptance.get("person_label"))), layout_styles["signature_line"], **footer_rich_text)
-    set_ooxml_rich_text_cell(root, acceptance_row + 6, 2, brief_rich_text_cell_runs(brief, "companyTitle", clean_text(signature.get("company_title"))), layout_styles["signature_line"], **footer_rich_text)
-    set_ooxml_rich_text_cell(root, acceptance_row + 6, 5, brief_rich_text_cell_runs(brief, "stampLabel", clean_text(acceptance.get("stamp_label"))), layout_styles["signature_line"], **footer_rich_text)
-    set_ooxml_rich_text_cell(root, acceptance_row + 7, 2, brief_rich_text_cell_runs(brief, "companyDateLabel", clean_text(signature.get("company_date_label"))), layout_styles["signature_line"], **footer_rich_text)
-    set_ooxml_rich_text_cell(root, acceptance_row + 7, 5, brief_rich_text_cell_runs(brief, "dateLabel", clean_text(acceptance.get("date_label"))), layout_styles["signature_line"], **footer_rich_text)
+    set_ooxml_rich_text_cell(root, acceptance_row + 5, 2, brief_rich_text_cell_runs(brief, "companySignatory", clean_text(signature.get("company_signatory"))), layout_styles["signature_line"])
+    set_ooxml_rich_text_cell(root, acceptance_row + 5, 5, brief_rich_text_cell_runs(brief, "personLabel", clean_text(acceptance.get("person_label"))), layout_styles["signature_line"])
+    set_ooxml_rich_text_cell(root, acceptance_row + 6, 2, brief_rich_text_cell_runs(brief, "companyTitle", clean_text(signature.get("company_title"))), layout_styles["signature_line"])
+    set_ooxml_rich_text_cell(root, acceptance_row + 6, 5, brief_rich_text_cell_runs(brief, "stampLabel", clean_text(acceptance.get("stamp_label"))), layout_styles["signature_line"])
+    set_ooxml_rich_text_cell(root, acceptance_row + 7, 2, brief_rich_text_cell_runs(brief, "companyDateLabel", clean_text(signature.get("company_date_label"))), layout_styles["signature_line"])
+    set_ooxml_rich_text_cell(root, acceptance_row + 7, 5, brief_rich_text_cell_runs(brief, "dateLabel", clean_text(acceptance.get("date_label"))), layout_styles["signature_line"])
 
     last_content_row = acceptance_row + SIGNATURE_CONTENT_HEIGHT
     manual_pagination_enabled = manual_pagination_enabled or last_content_row > FIRST_PRINT_PAGE_END_ROW
@@ -2856,21 +2917,23 @@ def libreoffice_pdf_export(xlsx_path: Path, pdf_path: Path) -> str | None:
     executables = libreoffice_candidates()
     if not executables:
         return None
-    result = subprocess.run(
-        [
-            executables[0],
-            "--headless",
-            "--convert-to",
-            "pdf",
-            "--outdir",
-            str(pdf_path.parent),
-            str(xlsx_path),
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-        timeout=120,
-    )
+    with tempfile.TemporaryDirectory(prefix="sqag-libreoffice-") as profile_dir:
+        result = subprocess.run(
+            [
+                executables[0],
+                f"-env:UserInstallation={Path(profile_dir).resolve().as_uri()}",
+                "--headless",
+                "--convert-to",
+                "pdf:calc_pdf_Export",
+                "--outdir",
+                str(pdf_path.parent),
+                str(xlsx_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=120,
+        )
     converted = pdf_path.parent / f"{xlsx_path.stem}.pdf"
     if result.returncode == 0 and converted.exists():
         if converted != pdf_path:

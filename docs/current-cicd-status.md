@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-09-05
+Last updated: 2026-09-18
 
 Source of truth: `.github/workflows/ci.yml`
 
@@ -46,6 +46,10 @@ Source of truth: `.github/workflows/ci.yml`
   the locked Python-only provider/archive/start contract and exact
   `[phases.setup].nixPkgs = ["...", "libreoffice"]`; missing, wrong, malformed,
   duplicate, misplaced, or alternate converter bindings fail closed.
+- `Validate app` also proves the hosted LibreOffice executable/version and
+  fontconfig resolution for the canonical Arial/Calibri presentation families
+  (including the pinned Linux metric-compatible Liberation Sans/Carlito
+  providers) before the real rendered-PDF regression runs.
 - `Validate app`: runs after retrospective fixture integrity/result and security gates pass.
 
 ## Validate App Checks
@@ -67,10 +71,14 @@ Source of truth: `.github/workflows/ci.yml`
   hosted deployment state.
 - Checks JavaScript syntax for `webapp/static/app.js`, `scripts/playwright-smoke.mjs`, and `scripts/playwright-ai-basis-chat-stress.mjs`.
 - Checks Python syntax for `webapp/server.py`, quote/pricing scripts, and validation guard scripts.
+- Verifies hosted `soffice --version` and expected font readiness before PDF
+  fidelity validation; missing converter or unsupported font resolution fails
+  the job rather than being treated as a passing skip.
 - Runs `python scripts/validate_local_pdf_dependency_usage.py` to keep `pypdfium2` and `Pillow` usage on the local PDF rendering path only.
 - The local PDF dependency guard is separate from hosted workbook conversion: it
-  does not prove live PDF success; the Nixpacks contract job verifies the locked
-  `libreoffice` binding only.
+  does not prove live PDF success. The hosted readiness step and the real
+  workbook-to-PDF/render regression provide the converter/runtime proof; the
+  Nixpacks contract job separately verifies the locked `libreoffice` binding.
 - Runs `python scripts/validate_dynamic_pricing_reference_rules.py` to keep pricing-reference matching data-driven and block source-code semantic family/synonym packs.
 - Runs `python scripts/scan_sensitive_fixtures.py --fail-on-review` so review-level sensitive fixture findings fail CI.
 - Runtime privilege-contract static validation runs `python scripts/validate_runtime_privilege_contract.py`; the canonical manifest, complete unfiltered protected-role membership evaluation across parent/member/grantor positions, closed runtime-as-member/provider-control schema, exact six-column membership tuple, fourteen-key bounded verification-query set, independent executable-token contracts, exact publication-artifact column authority, the legacy `sqag_quote_artifacts` view read, the Boundary B owner-authority model, complete `r`/`S`/`f`/`n`/`T` default-ACL object-class binding, and repository requirement binding fail closed.
@@ -78,6 +86,10 @@ Source of truth: `.github/workflows/ci.yml`
 - Boundary A remains repository-only. It performs no live database, provider, credential, Coolify, deployment, or activation mutation.
 - Green CI does not authorise Boundary B or #160; those scopes require their own exact-head authority and verification.
 - Runs `python -m unittest discover -s tests`.
+- Runs the actual generated-workbook -> LibreOffice -> PDF -> PDFium raster and
+  geometry regression, including canonical workbook styles, dimensions, bold
+  headers, merges/header placement, logo aspect/no-overlap, print area,
+  scaling, margins, page count, and deterministic rendered output.
 - Runs `npm run playwright:ai-stress`.
 - Runs `npm run playwright:smoke`.
 
