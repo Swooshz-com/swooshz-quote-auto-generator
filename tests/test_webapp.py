@@ -28750,6 +28750,7 @@ const BASIS_CHAT_PROPOSAL_ORIGIN_VERSION = 1;
 const BASIS_CHAT_AUTHORITY_MAX_DEPTH = 40;
 const BASIS_CHAT_AUTHORITY_MAX_NODES = 20000;
 const BASIS_CHAT_LINEAGE_VERSION = 1;
+let basisChatRuntimeAuthority = null;
 const state = {
   quoteBasis: {},
   quoteBasisSections: [{
@@ -28863,6 +28864,8 @@ eval([
   "cloneQuoteBasisSections",
   "canonicalQuoteBasisForPersistence",
   "quoteCommercialStrictDataEqual",
+  "basisChatRuntimeToken", "basisChatRuntimeTokenIsCurrent", "basisChatRuntimeAuthorityMatches",
+  "mintBasisChatRuntimeAuthority", "revokeBasisChatRuntimeAuthority",
   "basisChatAuthorityRecordKeys",
   "basisChatAuthorityStrictEqual",
   "basisChatRequireExactKeys",
@@ -28896,6 +28899,7 @@ const lineage = canonicalBasisChatLineage({
   requestedJobId: null,
   serverJobId: null,
 });
+const runtimeToken = mintBasisChatRuntimeAuthority("running", proposalOrigin, lineage);
 state.basisChat.authorityOwner = canonicalBasisChatAuthorityOwner({ status: "running", origin: proposalOrigin, lineage });
 const proposedSections = [{
     id: "counters-and-cabinets",
@@ -28932,7 +28936,7 @@ state.basisChat.proposal = canonicalTargetOnlyBasisChatProposal({
   message: "Update endorsement height.",
   quoteBasis: quoteBasisFromSections(proposedSections),
   quoteBasisSections: proposedSections,
-}, proposalOrigin, lineage);
+}, proposalOrigin, lineage, runtimeToken);
 state.basisChat.authorityOwner = canonicalBasisChatAuthorityOwner({ status: "proposal", origin: proposalOrigin, lineage });
 
 applyBasisChatProposal();
@@ -29294,6 +29298,7 @@ const BASIS_CHAT_AUTHORITY_MAX_DEPTH = 40;
 const BASIS_CHAT_AUTHORITY_MAX_NODES = 20000;
 const ACTIVE_JOB_CLOCK_SKEW_MS = 60000;
 const FINAL_JOB_STATUSES = new Set(["completed", "degraded", "needs_review", "blocked", "failed"]);
+let basisChatRuntimeAuthority = null;
 const state = {
   browserRecoveryScope: "scope-strict-authority",
   quoteSessionId: "quote-strict-authority",
@@ -29318,8 +29323,13 @@ state.basisChat.field = "section-one";
 state.basisChat.quantity = 1;
 state.basisChat.unit = "nos";
 state.basisChat.quantityLabel = "1 nos";
-const elements = { basisChatOverlay: { hidden: true } };
-function setBasisChatBusy() {}
+const elements = {
+  basisChatOverlay: { hidden: true },
+  basisChatPrompt: { disabled: false },
+  basisChatSendButton: { disabled: false },
+  basisChatApplyButton: { disabled: false },
+  basisChatKeepButton: { disabled: false },
+};
 function syncControlStates() {}
 function saveSessionState() {}
 function selectedBasisLine() { return state.quoteBasisSections[0].lines[0]; }
@@ -29331,6 +29341,9 @@ function quoteBasisFromSections(sections) {
 function currentBrowserRecoveryScope() { return state.browserRecoveryScope; }
 function activeJobMaxAgeMs() { return 600000; }
 eval([
+  "basisChatRuntimeToken", "basisChatRuntimeTokenIsCurrent", "basisChatRuntimeAuthorityMatches",
+  "mintBasisChatRuntimeAuthority", "basisChatRuntimeOperationIsOwned", "bindBasisChatRuntimeOperation",
+  "revokeBasisChatRuntimeAuthority", "renderBasisChatBusyControls",
   "basisChatAuthorityRecordKeys", "detachedBasisChatAuthorityValue", "recursivelyFreezeBasisChatAuthority",
   "basisChatAuthorityStrictEqual", "basisChatRequireExactKeys", "admittedBasisChatSections",
   "admittedBasisChatMap", "canonicalBasisChatSelector", "rawBasisChatTarget",
@@ -29338,7 +29351,7 @@ eval([
   "basisChatOriginIsCurrent", "canonicalBasisChatLineage", "basisChatLineageIsCurrent",
   "canonicalBasisChatAuthorityOwner", "basisChatIsoTimestamp", "canonicalBasisChatOperation",
   "basisChatOperationIsCurrent", "canonicalBasisChatJobResponse", "bindBasisChatServerOperation",
-  "installBasisChatOwner", "completeBasisChatOwner", "basisChatProposalAlias",
+  "installBasisChatOwner", "completeBasisChatOwner", "basisChatProposalAlias", "setBasisChatBusy",
   "canonicalTargetOnlyBasisChatProposal", "setBasisChatProposal", "basisChatBrowserSnapshot",
   "restoreBasisChatTransientAuthority",
  ].map(extractFunction).join("\n"));
@@ -29368,6 +29381,14 @@ assert.throws(() => detachedBasisChatAuthorityValue(extra), TypeError);
 const malformed = [1];
 Object.defineProperty(malformed, "0", { value: 1, enumerable: true, configurable: false, writable: false });
 assert.throws(() => detachedBasisChatAuthorityValue(malformed), TypeError);
+const recordWithLengthA = detachedBasisChatAuthorityValue({ metadata: { length: 1 } });
+const recordWithLengthB = detachedBasisChatAuthorityValue({ metadata: { length: 2 } });
+assert.strictEqual(basisChatAuthorityStrictEqual(recordWithLengthA, recordWithLengthB), false);
+recursivelyFreezeBasisChatAuthority(recordWithLengthA);
+assert.ok(Object.isFrozen(recordWithLengthA.metadata));
+const arrayA = detachedBasisChatAuthorityValue(["one"]);
+const arrayB = detachedBasisChatAuthorityValue(["one", "two"]);
+assert.strictEqual(basisChatAuthorityStrictEqual(arrayA, arrayB), false);
 
 const origin = basisChatProposalOrigin();
 assert.ok(Object.isFrozen(origin) && Object.isFrozen(origin.quoteBasisSections[0].lines[0].metadata));
@@ -29390,14 +29411,15 @@ const lineage = canonicalBasisChatLineage({
   _lineageVersion: 1, lineageId: "lineage-local-proof", clientOperationId: "operation-local-proof",
   source: "local_fragment", jobType: null, requestedJobId: null, serverJobId: null,
 });
-installBasisChatOwner("running", origin, lineage);
+const localToken = mintBasisChatRuntimeAuthority("running", origin, lineage);
+installBasisChatOwner("running", origin, lineage, localToken);
 const proposedSections = JSON.parse(JSON.stringify(origin.quoteBasisSections));
 proposedSections[0].lines[0].text = "Changed";
 const rawProposal = { message: "Change it", quoteBasis: quoteBasisFromSections(proposedSections), quoteBasisSections: proposedSections };
 assert.throws(() => canonicalTargetOnlyBasisChatProposal({ quoteBasisSections: proposedSections }, origin, lineage), TypeError);
 assert.throws(() => canonicalTargetOnlyBasisChatProposal({ ...rawProposal, quote_basis: { "section-one": "conflict" } }, origin, lineage), TypeError);
 assert.throws(() => canonicalTargetOnlyBasisChatProposal({ ...rawProposal, unknown: true }, origin, lineage), TypeError);
-const admittedProposal = canonicalTargetOnlyBasisChatProposal(rawProposal, origin, lineage);
+const admittedProposal = canonicalTargetOnlyBasisChatProposal(rawProposal, origin, lineage, localToken);
 assert.ok(Object.isFrozen(admittedProposal._origin) && Object.isFrozen(admittedProposal._lineage));
 assert.strictEqual(admittedProposal.quoteBasisSections[0].section_meta.retained, true);
 
@@ -29410,29 +29432,44 @@ function serverLineage(suffix) {
 function startingOperation(lineageValue) {
   return canonicalBasisChatOperation({
     _operationVersion: 1, id: lineageValue.requestedJobId, type: "basis_chat", phase: "starting",
-    startedAt: "2026-09-17T00:00:00.000Z", browserRecoveryScope: state.browserRecoveryScope,
+    startedAt: new Date().toISOString(), browserRecoveryScope: state.browserRecoveryScope,
     text: "change selected line", proposalOrigin: currentBasisChatAuthority(), lineage: lineageValue,
   });
 }
 const lineageA = serverLineage("alpha");
 const operationA = startingOperation(lineageA);
-installBasisChatOwner("running", operationA.proposalOrigin, lineageA);
+const tokenA = mintBasisChatRuntimeAuthority("running", operationA.proposalOrigin, lineageA);
+installBasisChatOwner("running", operationA.proposalOrigin, lineageA, tokenA);
 state.activeJob = operationA;
 state.basisChat.busyOwnerId = lineageA.clientOperationId;
-assert.strictEqual(basisChatOperationIsCurrent(operationA), true);
+bindBasisChatRuntimeOperation(tokenA, operationA);
+assert.strictEqual(setBasisChatBusy(true, tokenA), true);
+assert.strictEqual(basisChatOperationIsCurrent(operationA, tokenA), true);
 const lineageB = serverLineage("bravo");
 const operationB = startingOperation(lineageB);
-installBasisChatOwner("running", operationB.proposalOrigin, lineageB);
+const tokenB = mintBasisChatRuntimeAuthority("running", operationB.proposalOrigin, lineageB);
+installBasisChatOwner("running", operationB.proposalOrigin, lineageB, tokenB);
 state.activeJob = operationB;
 state.basisChat.busyOwnerId = lineageB.clientOperationId;
-assert.strictEqual(basisChatOperationIsCurrent(operationA), false);
-assert.strictEqual(completeBasisChatOwner(operationA.proposalOrigin, operationA.lineage), false);
+bindBasisChatRuntimeOperation(tokenB, operationB);
+assert.strictEqual(setBasisChatBusy(true, tokenB), true);
+assert.strictEqual(basisChatOperationIsCurrent(operationA, tokenA), false);
+assert.strictEqual(completeBasisChatOwner(operationA.proposalOrigin, operationA.lineage, tokenA), false);
+assert.strictEqual(setBasisChatBusy(false, tokenA), false);
+assert.strictEqual(setBasisChatBusy(true, tokenA), false);
 assert.strictEqual(state.basisChat.busyOwnerId, lineageB.clientOperationId);
 const runningB = bindBasisChatServerOperation(operationB, {
-  job_id: lineageB.requestedJobId, type: "basis_chat", status: "queued", created_at: "2026-09-17T00:00:01.000Z",
-});
+  job_id: lineageB.requestedJobId, type: "basis_chat", status: "queued", created_at: new Date().toISOString(),
+}, tokenB);
 assert.strictEqual(runningB.lineage.serverJobId, lineageB.requestedJobId);
-assert.strictEqual(basisChatOperationIsCurrent(runningB), true);
+assert.strictEqual(basisChatOperationIsCurrent(runningB, tokenB), true);
+const savedRunningB = basisChatBrowserSnapshot();
+const restoredRunningB = restoreBasisChatTransientAuthority(savedRunningB, runningB);
+assert.strictEqual(restoredRunningB.phase, "running");
+assert.notStrictEqual(basisChatRuntimeToken(), tokenB);
+assert.strictEqual(setBasisChatBusy(false, tokenB), false);
+const restoredTokenB = basisChatRuntimeToken();
+assert.strictEqual(basisChatOperationIsCurrent(restoredRunningB, restoredTokenB), true);
 assert.throws(() => canonicalBasisChatJobResponse({
   job_id: "job-charlie-proof", type: "basis_chat", status: "queued", created_at: "2026-09-17T00:00:01.000Z",
 }, lineageB.requestedJobId), TypeError);
@@ -29446,8 +29483,9 @@ const proposalB = {
   _origin: runningB.proposalOrigin,
   _lineage: runningB.lineage,
 };
-assert.strictEqual(setBasisChatProposal(proposalB, runningB.lineage), true);
+assert.strictEqual(setBasisChatProposal(proposalB, runningB.lineage, restoredTokenB), true);
 const savedB = basisChatBrowserSnapshot();
+assert.strictEqual(JSON.stringify(savedB).includes("basis-chat-interaction"), false);
 const restoredActiveB = restoreBasisChatTransientAuthority(savedB, null);
 assert.strictEqual(restoredActiveB, null);
 const installedProposalB = state.basisChat.proposal;
@@ -29467,7 +29505,7 @@ const staleProposalA = {
   _origin: origin,
   _lineage: lineageA,
 };
-assert.strictEqual(setBasisChatProposal(staleProposalA, lineageA), false);
+assert.strictEqual(setBasisChatProposal(staleProposalA, lineageA, tokenA), false);
 assert.strictEqual(state.basisChat.proposal, installedProposalB);
 assert.strictEqual(state.basisChat.authorityOwner, installedOwnerB);
 assert.strictEqual(state.activeJob, null);
@@ -29476,7 +29514,7 @@ assert.strictEqual(state.basisChat.completionNotice, null);
 assert.strictEqual(elements.basisChatOverlay.hidden, true);
 
 const malformedCurrentProposal = { ...installedProposalB, quoteBasisSections: [] };
-assert.strictEqual(setBasisChatProposal(malformedCurrentProposal, lineageB), false);
+assert.strictEqual(setBasisChatProposal(malformedCurrentProposal, lineageB, basisChatRuntimeToken()), false);
 assert.strictEqual(state.basisChat.proposal, installedProposalB);
 assert.strictEqual(state.basisChat.authorityOwner, installedOwnerB);
 assert.strictEqual(state.activeJob, null);

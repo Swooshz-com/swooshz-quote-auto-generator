@@ -464,8 +464,10 @@ async function main() {
   const browser = await chromium.launch({ headless: !options.headed });
   const page = await browser.newPage({ viewport: { width: 1365, height: 768 } });
   const consoleProblems = [];
+  let expectedPreservedFailure = false;
   page.on("console", (message) => {
     if (message.type() === "error") {
+      if (expectedPreservedFailure && message.text().includes("503")) return;
       const location = message.location();
       const source = location?.url ? ` (${location.url}:${location.lineNumber || 0})` : "";
       consoleProblems.push(`${message.type()}: ${message.text()}${source}`);
@@ -560,22 +562,112 @@ async function main() {
         });
       };
       const operationA = makeOperation();
-      installBasisChatOwner("running", origin, operationA.lineage);
+      const tokenA = mintBasisChatRuntimeAuthority("running", origin, operationA.lineage);
+      installBasisChatOwner("running", origin, operationA.lineage, tokenA);
       state.activeJob = operationA;
       state.basisChat.busyOwnerId = operationA.lineage.clientOperationId;
+      bindBasisChatRuntimeOperation(tokenA, operationA);
+      if (!setBasisChatBusy(true, tokenA)) throw new Error("Could not acquire basis-chat controls for A.");
       const operationB = makeOperation();
-      installBasisChatOwner("running", origin, operationB.lineage);
+      const tokenB = mintBasisChatRuntimeAuthority("running", origin, operationB.lineage);
+      installBasisChatOwner("running", origin, operationB.lineage, tokenB);
       state.activeJob = operationB;
       state.basisChat.busyOwnerId = operationB.lineage.clientOperationId;
-      if (basisChatOperationIsCurrent(operationA)
-        || completeBasisChatOwner(operationA.proposalOrigin, operationA.lineage)
-        || !basisChatOperationIsCurrent(operationB)
+      bindBasisChatRuntimeOperation(tokenB, operationB);
+      if (!setBasisChatBusy(true, tokenB)) throw new Error("Could not acquire basis-chat controls for B.");
+      if (basisChatOperationIsCurrent(operationA, tokenA)
+        || completeBasisChatOwner(operationA.proposalOrigin, operationA.lineage, tokenA)
+        || setBasisChatBusy(false, tokenA)
+        || setBasisChatBusy(true, tokenA)
+        || !basisChatOperationIsCurrent(operationB, tokenB)
         || state.basisChat.busyOwnerId !== operationB.lineage.clientOperationId) {
         throw new Error("Reversed A/B completion retained stale authority.");
       }
-      invalidateBasisChatAuthority();
-      setBasisChatBusy(false);
+      if (!invalidateBasisChatAuthority(tokenB)) throw new Error("Could not revoke the current B authority.");
     });
+    let releaseStalePost;
+    let resolveStalePost;
+    const stalePostReached = new Promise((resolve) => { resolveStalePost = resolve; });
+    const stalePostRelease = new Promise((resolve) => { releaseStalePost = resolve; });
+    const staleRoute = async (route) => {
+      if (route.request().method() !== "POST") {
+        await route.fallback();
+        return;
+      }
+      const body = JSON.parse(route.request().postData() || "{}");
+      if (body.type !== "basis_chat") {
+        await route.fallback();
+        return;
+      }
+      resolveStalePost();
+      await stalePostRelease;
+      await route.fallback();
+    };
+    await page.route("**/api/jobs", staleRoute);
+    const assistantMessagesBeforeStale = await page.locator("#basisChatMessages .basis-chat-message.assistant").allTextContents();
+    await submitBasisChat(page, "what does this mean?");
+    await stalePostReached;
+    await page.evaluate(() => invalidateBasisChatAuthority());
+    releaseStalePost();
+    await page.waitForTimeout(250);
+    await page.unroute("**/api/jobs", staleRoute);
+    const staleContinuationState = await page.evaluate(() => ({
+      activeJob: state.activeJob,
+      proposal: state.basisChat.proposal,
+      owner: state.basisChat.authorityOwner,
+      notice: state.basisChat.completionNotice,
+      busyOwnerId: state.basisChat.busyOwnerId,
+      isAnalysisRunning: state.isAnalysisRunning,
+      assistantMessages: Array.from(elements.basisChatMessages.querySelectorAll(".basis-chat-message.assistant"), (item) => item.textContent || ""),
+    }));
+    if (staleContinuationState.activeJob || staleContinuationState.proposal || staleContinuationState.owner
+      || staleContinuationState.notice || staleContinuationState.busyOwnerId || staleContinuationState.isAnalysisRunning
+      || JSON.stringify(staleContinuationState.assistantMessages) !== JSON.stringify(assistantMessagesBeforeStale)) {
+      throw new Error(`Stale basis continuation produced an effect: ${JSON.stringify(staleContinuationState)}`);
+    }
+
+    let resolvePreservedPost;
+    const preservedPostReached = new Promise((resolve) => { resolvePreservedPost = resolve; });
+    const preservedRoute = async (route) => {
+      if (route.request().method() !== "POST") {
+        await route.fallback();
+        return;
+      }
+      const body = JSON.parse(route.request().postData() || "{}");
+      if (body.type !== "basis_chat") {
+        await route.fallback();
+        return;
+      }
+      resolvePreservedPost();
+      await route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({ fetch_failed: true, page_unloading: true, errors: ["Synthetic page unload"] }),
+      });
+    };
+    expectedPreservedFailure = true;
+    await page.route("**/api/jobs", preservedRoute);
+    const assistantMessagesBeforePreserved = await page.locator("#basisChatMessages .basis-chat-message.assistant:not([data-basis-chat-typing])").allTextContents();
+    await submitBasisChat(page, "what does this mean?");
+    await preservedPostReached;
+    await page.waitForTimeout(250);
+    const preservedState = await page.evaluate(() => ({
+      activeJob: state.activeJob,
+      owner: state.basisChat.authorityOwner,
+      busyOwnerId: state.basisChat.busyOwnerId,
+      isAnalysisRunning: state.isAnalysisRunning,
+      hasTyping: Boolean(elements.basisChatMessages.querySelector("[data-basis-chat-typing]")),
+      assistantMessages: Array.from(elements.basisChatMessages.querySelectorAll(".basis-chat-message.assistant:not([data-basis-chat-typing])"), (item) => item.textContent || ""),
+    }));
+    await page.unroute("**/api/jobs", preservedRoute);
+    if (!preservedState.activeJob || preservedState.activeJob.type !== "basis_chat"
+      || preservedState.owner?.status !== "running" || !preservedState.busyOwnerId
+      || !preservedState.isAnalysisRunning || !preservedState.hasTyping
+      || JSON.stringify(preservedState.assistantMessages) !== JSON.stringify(assistantMessagesBeforePreserved)) {
+      throw new Error(`Preserved basis continuation lost ownership or displayed a fallback: ${JSON.stringify(preservedState)}`);
+    }
+    await page.evaluate(() => invalidateBasisChatAuthority());
+    expectedPreservedFailure = false;
     const chatShot = await screenshot(page, "ai-basis-chat-stress.png");
 
     await page.locator("#basisChatCloseButton").click();

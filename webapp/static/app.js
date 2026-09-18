@@ -387,6 +387,10 @@ let quoteSessionConfirmedDraftKey = "";
 let quoteSessionConfirmedDraftFileKey = "";
 let authorityProfileRequestSequence = 0;
 let activeAuthorityProfileRequestContext = null;
+// Runtime-only basis-chat authority.  The token is deliberately never placed in
+// state.activeJob, state.basisChat, browser storage, requests, proposals, or logs.
+let basisChatRuntimeAuthority = null;
+let basisChatOverlayGeneration = 0;
 
 const elements = {
   healthText: qs("#healthText"),
@@ -3862,6 +3866,7 @@ function canonicalBasisChatCompletionNotice(notice) {
 }
 
 function restoreBasisChatTransientAuthority(savedBasisChat, savedActiveJob) {
+  if (typeof revokeBasisChatRuntimeAuthority === "function") revokeBasisChatRuntimeAuthority();
   const saved = detachedBasisChatAuthorityValue(savedBasisChat);
   basisChatRequireExactKeys(saved, ["scope", "field", "sectionId", "lineIndex", "line", "quantity", "unit", "quantityLabel", "proposal", "authorityOwner", "busyOwnerId", "completionNotice"], "Saved basis chat");
   const noTransientAuthority = saved.proposal === null && saved.authorityOwner === null
@@ -3892,6 +3897,7 @@ function restoreBasisChatTransientAuthority(savedBasisChat, savedActiveJob) {
     busyOwnerId: null,
     completionNotice: null,
   };
+  revokeBasisChatRuntimeAuthority();
   currentBasisChatAuthority();
   const active = savedActiveJob === null ? null : canonicalBasisChatOperation(savedActiveJob, { restoring: true });
   if (saved.authorityOwner === null) {
@@ -3904,7 +3910,9 @@ function restoreBasisChatTransientAuthority(savedBasisChat, savedActiveJob) {
   state.basisChat.authorityOwner = owner;
   if (owner.status === "proposal") {
     if (active !== null || saved.busyOwnerId !== null || saved.proposal === null || saved.completionNotice !== null) throw new TypeError("Saved basis proposal group is invalid.");
-    state.basisChat.proposal = canonicalTargetOnlyBasisChatProposal(saved.proposal, owner.origin, owner.lineage);
+    const validatedProposal = canonicalTargetOnlyBasisChatProposal(saved.proposal, owner.origin, owner.lineage, null, { requireAuthority: false });
+    const token = mintBasisChatRuntimeAuthority("proposal", owner.origin, owner.lineage);
+    state.basisChat.proposal = canonicalTargetOnlyBasisChatProposal(validatedProposal, owner.origin, owner.lineage, token);
     return null;
   }
   if (!active || saved.proposal !== null || saved.completionNotice !== null
@@ -3912,6 +3920,10 @@ function restoreBasisChatTransientAuthority(savedBasisChat, savedActiveJob) {
     || !basisChatAuthorityStrictEqual(active.proposalOrigin, owner.origin)
     || !basisChatAuthorityStrictEqual(active.lineage, owner.lineage)) throw new TypeError("Saved running basis authority group is invalid.");
   state.basisChat.busyOwnerId = saved.busyOwnerId;
+  state.activeJob = active;
+  const token = mintBasisChatRuntimeAuthority("running", owner.origin, owner.lineage);
+  if (!bindBasisChatRuntimeOperation(token, active)) throw new TypeError("Saved running basis authority could not be owned.");
+  basisChatRuntimeAuthority.controlOwner = true;
   return active;
 }
 
@@ -4537,6 +4549,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.lastAnalysisMode = normalizeAnalysisMode(restoredState.lastAnalysisMode || restoredState.originalAnalysisSnapshot?.analysis_mode);
   state.pendingAnalysisMode = normalizeAnalysisMode(restoredState.pendingAnalysisMode || state.lastAnalysisMode);
   const savedBasisChat = canRestoreBrowserTransientAuthority ? restoredState.basisChat : null;
+  if (typeof revokeBasisChatRuntimeAuthority === "function") revokeBasisChatRuntimeAuthority();
   state.basisChat = {
     scope: "quote",
     field: "",
@@ -4577,6 +4590,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
         state.activeJob = normalizeActiveJob(detachedActiveJob, { restoring: true });
       }
     } catch (_error) {
+      if (typeof revokeBasisChatRuntimeAuthority === "function") revokeBasisChatRuntimeAuthority();
       state.activeJob = state.activeJob?.type === "basis_chat" ? null : state.activeJob;
       state.basisChat.proposal = null;
       state.basisChat.authorityOwner = null;
@@ -6935,7 +6949,7 @@ function canonicalQuoteBasisSections(value = {}) {
     const derived = canonicalQuoteBasis(quoteBasisFromSections(sections));
     if (Object.prototype.hasOwnProperty.call(admittedSource, "quote_basis")) {
       const supplied = canonicalQuoteBasis(admittedSource.quote_basis);
-      if (Object.keys(supplied).length && JSON.stringify(supplied) !== JSON.stringify(derived)) throw new TypeError("Quote basis sections do not agree with quote basis.");
+      if (Object.keys(supplied).length && !basisChatAuthorityStrictEqual(supplied, derived)) throw new TypeError("Quote basis sections do not agree with quote basis.");
     }
     return admitAuthoritativeBasisValue(sections);
   }
@@ -10823,6 +10837,72 @@ function selectedBasisLine() {
   return section?.lines?.[state.basisChat.lineIndex] || null;
 }
 
+function basisChatRuntimeToken() {
+  return basisChatRuntimeAuthority?.token || null;
+}
+
+function basisChatRuntimeTokenIsCurrent(token) {
+  return typeof token === "symbol" && Boolean(basisChatRuntimeAuthority) && basisChatRuntimeAuthority.token === token;
+}
+
+function basisChatRuntimeAuthorityMatches(token, origin, lineage, status = null) {
+  if (!basisChatRuntimeTokenIsCurrent(token)) return false;
+  try {
+    const expectedOrigin = canonicalBasisChatProposalOrigin(origin);
+    const expectedLineage = canonicalBasisChatLineage(lineage);
+    return (!status || basisChatRuntimeAuthority.status === status)
+      && basisChatAuthorityStrictEqual(basisChatRuntimeAuthority.origin, expectedOrigin)
+      && basisChatAuthorityStrictEqual(basisChatRuntimeAuthority.lineage, expectedLineage);
+  } catch (_error) {
+    return false;
+  }
+}
+
+function mintBasisChatRuntimeAuthority(status, origin, lineage) {
+  if (!["running", "proposal"].includes(status)) throw new TypeError("Basis runtime authority status is invalid.");
+  const expectedOrigin = canonicalBasisChatProposalOrigin(origin);
+  const expectedLineage = canonicalBasisChatLineage(lineage);
+  const token = Symbol("basis-chat-interaction");
+  basisChatRuntimeAuthority = {
+    token,
+    status,
+    origin: expectedOrigin,
+    lineage: expectedLineage,
+    operation: null,
+    controlOwner: false,
+    proposalOwner: status === "proposal",
+  };
+  return token;
+}
+
+function basisChatRuntimeOperationIsOwned(token, operation) {
+  if (!basisChatRuntimeTokenIsCurrent(token) || !operation) return false;
+  try {
+    return basisChatAuthorityStrictEqual(basisChatRuntimeAuthority.operation, canonicalBasisChatOperation(operation));
+  } catch (_error) {
+    return false;
+  }
+}
+
+function bindBasisChatRuntimeOperation(token, operation) {
+  if (!basisChatRuntimeTokenIsCurrent(token)) return false;
+  try {
+    const admitted = canonicalBasisChatOperation(operation);
+    basisChatRuntimeAuthority.origin = admitted.proposalOrigin;
+    basisChatRuntimeAuthority.lineage = admitted.lineage;
+    basisChatRuntimeAuthority.operation = admitted;
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function revokeBasisChatRuntimeAuthority(expectedToken = null) {
+  if (expectedToken !== null && !basisChatRuntimeTokenIsCurrent(expectedToken)) return false;
+  basisChatRuntimeAuthority = null;
+  return true;
+}
+
 function basisChatAuthorityRecordKeys(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new TypeError("Basis authority record is required.");
   return Reflect.ownKeys(value);
@@ -10898,7 +10978,8 @@ function detachedBasisChatAuthorityValue(value, depth = 0, budget = { nodes: 0 }
 function recursivelyFreezeBasisChatAuthority(value) {
   if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
   Reflect.ownKeys(value).forEach((key) => {
-    if (key !== "length") recursivelyFreezeBasisChatAuthority(Object.getOwnPropertyDescriptor(value, key).value);
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor && "value" in descriptor) recursivelyFreezeBasisChatAuthority(descriptor.value);
   });
   return Object.freeze(value);
 }
@@ -10906,13 +10987,19 @@ function recursivelyFreezeBasisChatAuthority(value) {
 function basisChatAuthorityStrictEqual(left, right) {
   if (Object.is(left, right)) return true;
   if (!left || !right || typeof left !== "object" || typeof right !== "object") return false;
-  if (Array.isArray(left) !== Array.isArray(right)) return false;
-  const leftKeys = Reflect.ownKeys(left).filter((key) => key !== "length");
-  const rightKeys = Reflect.ownKeys(right).filter((key) => key !== "length");
+  const leftIsArray = Array.isArray(left);
+  if (leftIsArray !== Array.isArray(right)) return false;
+  if (leftIsArray) {
+    const leftLength = Object.getOwnPropertyDescriptor(left, "length")?.value;
+    const rightLength = Object.getOwnPropertyDescriptor(right, "length")?.value;
+    if (!Object.is(leftLength, rightLength)) return false;
+  }
+  const leftKeys = Reflect.ownKeys(left);
+  const rightKeys = Reflect.ownKeys(right);
   if (leftKeys.length !== rightKeys.length || leftKeys.some((key) => !rightKeys.includes(key))) return false;
   return leftKeys.every((key) => basisChatAuthorityStrictEqual(
-    Object.getOwnPropertyDescriptor(left, key).value,
-    Object.getOwnPropertyDescriptor(right, key).value,
+    key === "length" && leftIsArray ? Object.getOwnPropertyDescriptor(left, key).value : Object.getOwnPropertyDescriptor(left, key)?.value,
+    key === "length" && leftIsArray ? Object.getOwnPropertyDescriptor(right, key).value : Object.getOwnPropertyDescriptor(right, key)?.value,
   ));
 }
 
@@ -11063,11 +11150,13 @@ function newBasisChatLineage(source) {
   });
 }
 
-function basisChatLineageIsCurrent(lineage) {
+function basisChatLineageIsCurrent(lineage, token) {
+  if (!basisChatRuntimeTokenIsCurrent(token)) return false;
   try {
     const supplied = canonicalBasisChatLineage(lineage);
     const owner = canonicalBasisChatAuthorityOwner(state.basisChat.authorityOwner);
-    return basisChatAuthorityStrictEqual(supplied, owner.lineage);
+    return basisChatAuthorityStrictEqual(supplied, owner.lineage)
+      && basisChatAuthorityStrictEqual(supplied, basisChatRuntimeAuthority.lineage);
   } catch (_error) {
     return false;
   }
@@ -11119,7 +11208,8 @@ function canonicalBasisChatOperation(operation, options = {}) {
   return recursivelyFreezeBasisChatAuthority(supplied);
 }
 
-function basisChatOperationIsCurrent(operation) {
+function basisChatOperationIsCurrent(operation, token) {
+  if (!basisChatRuntimeTokenIsCurrent(token)) return false;
   try {
     const supplied = canonicalBasisChatOperation(operation);
     const active = canonicalBasisChatOperation(state.activeJob);
@@ -11128,15 +11218,18 @@ function basisChatOperationIsCurrent(operation) {
       && basisChatAuthorityStrictEqual(supplied, active)
       && basisChatAuthorityStrictEqual(supplied.proposalOrigin, owner.origin)
       && basisChatAuthorityStrictEqual(supplied.lineage, owner.lineage)
-      && state.basisChat.busyOwnerId === supplied.lineage.clientOperationId;
+      && state.basisChat.busyOwnerId === supplied.lineage.clientOperationId
+      && basisChatRuntimeAuthority.status === "running"
+      && basisChatRuntimeAuthorityMatches(token, supplied.proposalOrigin, supplied.lineage, "running")
+      && basisChatRuntimeOperationIsOwned(token, supplied);
   } catch (_error) {
     return false;
   }
 }
 
-function bindBasisChatServerOperation(operation, jobResponse) {
+function bindBasisChatServerOperation(operation, jobResponse, token) {
   const current = canonicalBasisChatOperation(operation);
-  if (!basisChatOperationIsCurrent(current) || current.phase !== "starting") throw new TypeError("Basis operation cannot be bound.");
+  if (!basisChatOperationIsCurrent(current, token) || current.phase !== "starting") throw new TypeError("Basis operation cannot be bound.");
   const response = canonicalBasisChatJobResponse(jobResponse, current.lineage.requestedJobId);
   const lineage = canonicalBasisChatLineage({
     ...current.lineage,
@@ -11151,10 +11244,12 @@ function bindBasisChatServerOperation(operation, jobResponse) {
   });
   state.basisChat.authorityOwner = canonicalBasisChatAuthorityOwner({ status: "running", origin: running.proposalOrigin, lineage });
   state.activeJob = running;
+  if (!bindBasisChatRuntimeOperation(token, running)) throw new TypeError("Basis operation runtime owner could not be rebound.");
   return running;
 }
 
-function invalidateBasisChatAuthority() {
+function invalidateBasisChatAuthority(expectedToken = null) {
+  if (expectedToken !== null && !basisChatRuntimeTokenIsCurrent(expectedToken)) return false;
   const hadBusyOwner = Boolean(state.basisChat.busyOwnerId);
   if (hadBusyOwner) {
     stopElapsedTimer("basisChatElapsed");
@@ -11166,23 +11261,32 @@ function invalidateBasisChatAuthority() {
   state.basisChat.busyOwnerId = null;
   state.basisChat.completionNotice = null;
   if (hadBusyOwner) state.isAnalysisRunning = false;
+  renderBasisChatBusyControls(false);
+  revokeBasisChatRuntimeAuthority(expectedToken);
+  return true;
 }
 
-function installBasisChatOwner(status, origin, lineage) {
+function installBasisChatOwner(status, origin, lineage, token) {
+  if (!basisChatRuntimeAuthorityMatches(token, origin, lineage)) throw new TypeError("Basis authority owner token is stale.");
   const owner = canonicalBasisChatAuthorityOwner({ status, origin, lineage });
   state.basisChat.authorityOwner = owner;
   state.basisChat.completionNotice = null;
+  basisChatRuntimeAuthority.status = status;
+  basisChatRuntimeAuthority.proposalOwner = status === "proposal";
+  if (status === "proposal") basisChatRuntimeAuthority.operation = null;
   return owner;
 }
 
 function beginLocalBasisChatAuthority(source, origin) {
   invalidateBasisChatAuthority();
   const lineage = newBasisChatLineage(source);
-  installBasisChatOwner("running", origin, lineage);
-  return lineage;
+  const token = mintBasisChatRuntimeAuthority("running", origin, lineage);
+  installBasisChatOwner("running", origin, lineage, token);
+  return { lineage, token };
 }
 
-function completeBasisChatOwner(origin, lineage, options = {}) {
+function completeBasisChatOwner(origin, lineage, token, options = {}) {
+  if (!basisChatRuntimeAuthorityMatches(token, origin, lineage)) return false;
   let owner;
   try {
     owner = canonicalBasisChatAuthorityOwner(state.basisChat.authorityOwner);
@@ -11195,7 +11299,7 @@ function completeBasisChatOwner(origin, lineage, options = {}) {
     || !basisChatAuthorityStrictEqual(owner.origin, expectedOrigin)
     || !basisChatAuthorityStrictEqual(owner.lineage, expectedLineage)) return false;
   if (options.keepProposal === true) {
-    installBasisChatOwner("proposal", expectedOrigin, expectedLineage);
+    installBasisChatOwner("proposal", expectedOrigin, expectedLineage, token);
   } else {
     state.basisChat.authorityOwner = null;
     state.basisChat.proposal = null;
@@ -11211,21 +11315,22 @@ function completeBasisChatOwner(origin, lineage, options = {}) {
   }
   if (state.basisChat.busyOwnerId === expectedLineage.clientOperationId) state.basisChat.busyOwnerId = null;
   state.isAnalysisRunning = false;
+  if (options.keepProposal !== true) revokeBasisChatRuntimeAuthority(token);
   return true;
 }
 
-function finishBasisChatNotice(operation, kind, message, typingMessage = null) {
-  if (!basisChatOperationIsCurrent(operation)) return false;
+function finishBasisChatNotice(operation, kind, message, typingMessage = null, token) {
+  if (!basisChatOperationIsCurrent(operation, token)) return false;
   stopElapsedTimer("basisChatElapsed");
   removeBasisChatTyping(typingMessage);
-  if (!completeBasisChatOwner(operation.proposalOrigin, operation.lineage)) return false;
+  if (!setBasisChatBusy(false, token)) return false;
+  if (!completeBasisChatOwner(operation.proposalOrigin, operation.lineage, token)) return false;
   state.basisChat.completionNotice = canonicalBasisChatCompletionNotice({
     lineageId: operation.lineage.lineageId,
     kind,
     message,
   });
   if (!elements.basisChatOverlay.hidden) appendBasisChatMessage("assistant", message);
-  setBasisChatBusy(false);
   syncControlStates();
   saveSessionState();
   return true;
@@ -11241,10 +11346,13 @@ function basisChatProposalAlias(record, camelKey, snakeKey) {
   return hasCamel ? record[camelKey] : record[snakeKey];
 }
 
-function canonicalTargetOnlyBasisChatProposal(proposal, authoritativeOrigin, authoritativeLineage) {
+function canonicalTargetOnlyBasisChatProposal(proposal, authoritativeOrigin, authoritativeLineage, token, options = {}) {
   const origin = canonicalBasisChatProposalOrigin(authoritativeOrigin);
   const lineage = canonicalBasisChatLineage(authoritativeLineage);
-  if (!basisChatOriginIsCurrent(origin) || !basisChatLineageIsCurrent(lineage)) throw new TypeError("Basis proposal authority is stale.");
+  if (options.requireAuthority !== false
+    && (!basisChatRuntimeAuthorityMatches(token, origin, lineage)
+      || !basisChatOriginIsCurrent(origin)
+      || !basisChatLineageIsCurrent(lineage, token))) throw new TypeError("Basis proposal authority is stale.");
   const supplied = detachedBasisChatAuthorityValue(proposal);
   const allowedKeys = ["message", "quoteBasis", "quote_basis", "quoteBasisSections", "quote_basis_sections", "lineItems", "line_items", "literalReplacement", "changedLineCount", "affectedSectionCount", "snippets", "_origin", "_lineage"];
   if (Reflect.ownKeys(supplied).some((key) => typeof key !== "string" || !allowedKeys.includes(key))) throw new TypeError("Basis proposal envelope contains unsupported keys.");
@@ -11405,31 +11513,32 @@ function renderBasisChatProposalCard(proposal, changedFields = []) {
   `;
 }
 
-function basisChatOperationOwnsActiveJob(operation) {
-  return basisChatOperationIsCurrent(operation);
+function basisChatOperationOwnsActiveJob(operation, token) {
+  return basisChatOperationIsCurrent(operation, token);
 }
 
-function clearBasisChatOperation(operation) {
-  if (!basisChatOperationIsCurrent(operation)) return false;
+function clearBasisChatOperation(operation, token) {
+  if (!basisChatOperationIsCurrent(operation, token)) return false;
   const admitted = canonicalBasisChatOperation(operation);
-  completeBasisChatOwner(admitted.proposalOrigin, admitted.lineage);
+  if (!completeBasisChatOwner(admitted.proposalOrigin, admitted.lineage, token)) return false;
   saveSessionState();
   return true;
 }
 
-function setBasisChatProposal(proposal, authoritativeLineage) {
+function setBasisChatProposal(proposal, authoritativeLineage, token) {
   let admitted;
   try {
     const detachedProposal = detachedBasisChatAuthorityValue(proposal);
     const origin = canonicalBasisChatProposalOrigin(detachedProposal._origin);
     const lineage = canonicalBasisChatLineage(authoritativeLineage);
-    admitted = canonicalTargetOnlyBasisChatProposal(detachedProposal, origin, lineage);
-    if (!completeBasisChatOwner(origin, lineage, { keepProposal: true })) throw new TypeError("Basis proposal owner is stale.");
+    admitted = canonicalTargetOnlyBasisChatProposal(detachedProposal, origin, lineage, token);
+    if (basisChatRuntimeAuthority.controlOwner && !setBasisChatBusy(false, token)) throw new TypeError("Basis proposal control owner is stale.");
+    if (!completeBasisChatOwner(origin, lineage, token, { keepProposal: true })) throw new TypeError("Basis proposal owner is stale.");
   } catch (_error) {
     return false;
   }
   state.basisChat.proposal = admitted;
-  setBasisChatBusy(false);
+  renderBasisChatBusyControls(false);
   syncControlStates();
   if (elements.basisChatOverlay.hidden) {
     saveSessionState();
@@ -11453,12 +11562,30 @@ function basisChatFriendlyError(messages = []) {
   return genericFailureMessage();
 }
 
-function setBasisChatBusy(isBusy, ownerId = state.basisChat.busyOwnerId) {
-  const ownsBusy = isBusy && typeof ownerId === "string" && ownerId === state.basisChat.busyOwnerId;
-  elements.basisChatPrompt.disabled = ownsBusy;
-  elements.basisChatSendButton.disabled = ownsBusy;
-  elements.basisChatApplyButton.disabled = ownsBusy || !state.basisChat.proposal;
-  elements.basisChatKeepButton.disabled = ownsBusy || !state.basisChat.proposal;
+function renderBasisChatBusyControls(isBusy) {
+  const busy = Boolean(isBusy);
+  if (elements.basisChatPrompt) elements.basisChatPrompt.disabled = busy;
+  if (elements.basisChatSendButton) elements.basisChatSendButton.disabled = busy;
+  if (elements.basisChatApplyButton) elements.basisChatApplyButton.disabled = busy || !state.basisChat.proposal;
+  if (elements.basisChatKeepButton) elements.basisChatKeepButton.disabled = busy || !state.basisChat.proposal;
+}
+
+function setBasisChatBusy(isBusy, token) {
+  if (!basisChatRuntimeTokenIsCurrent(token) || !basisChatRuntimeAuthority) return false;
+  if (isBusy) {
+    if (basisChatRuntimeAuthority.status !== "running"
+      || state.basisChat.busyOwnerId !== basisChatRuntimeAuthority.lineage.clientOperationId) return false;
+    basisChatRuntimeAuthority.controlOwner = true;
+    state.isAnalysisRunning = true;
+  } else {
+    if (!basisChatRuntimeAuthority.controlOwner
+      || basisChatRuntimeAuthority.status !== "running"
+      || state.basisChat.busyOwnerId !== basisChatRuntimeAuthority.lineage.clientOperationId) return false;
+    basisChatRuntimeAuthority.controlOwner = false;
+    state.isAnalysisRunning = false;
+  }
+  renderBasisChatBusyControls(Boolean(isBusy));
+  return true;
 }
 
 function openBasisChatOverlay(scope = "line", options = {}) {
@@ -11529,9 +11656,15 @@ function openBasisChatOverlay(scope = "line", options = {}) {
   elements.basisChatOverlay.classList.add("is-open");
   document.body.classList.add("basis-chat-open");
   state.restorableOverlay = "basis_chat";
-  setBasisChatBusy(Boolean(state.basisChat.busyOwnerId), state.basisChat.busyOwnerId);
+  renderBasisChatBusyControls(Boolean(state.basisChat.busyOwnerId));
   saveSessionState();
-  window.setTimeout(() => elements.basisChatPrompt.focus(), 0);
+  const overlayGeneration = ++basisChatOverlayGeneration;
+  const selectorKey = `${state.basisChat.sectionId}:${state.basisChat.lineIndex}`;
+  window.setTimeout(() => {
+    if (basisChatOverlayGeneration !== overlayGeneration || elements.basisChatOverlay.hidden) return;
+    if (`${state.basisChat.sectionId}:${state.basisChat.lineIndex}` !== selectorKey) return;
+    elements.basisChatPrompt.focus();
+  }, 0);
 }
 
 function restoreBasisChatOverlay() {
@@ -11551,6 +11684,7 @@ function restoreBasisChatOverlay() {
 }
 
 function closeBasisChatOverlay() {
+  basisChatOverlayGeneration += 1;
   elements.basisChatOverlay.classList.remove("is-open");
   elements.basisChatOverlay.hidden = true;
   document.body.classList.remove("basis-chat-open");
@@ -11588,14 +11722,14 @@ function canonicalBasisChatJobResponse(response, expectedJobId) {
   return supplied;
 }
 
-function normalizeServerBasisChatProposal(proposal, operation, jobResponse) {
+function normalizeServerBasisChatProposal(proposal, operation, jobResponse, token) {
   const normalizedOperation = canonicalBasisChatOperation(operation);
-  if (!basisChatOperationIsCurrent(normalizedOperation)) throw new TypeError("Originating basis chat operation is not current.");
+  if (!basisChatOperationIsCurrent(normalizedOperation, token)) throw new TypeError("Originating basis chat operation is not current.");
   const response = canonicalBasisChatJobResponse(jobResponse, normalizedOperation.lineage.requestedJobId);
   if (normalizedOperation.phase !== "running" || normalizedOperation.lineage.serverJobId !== response.job_id) {
     throw new TypeError("Basis chat server job is not bound.");
   }
-  return canonicalTargetOnlyBasisChatProposal(proposal, normalizedOperation.proposalOrigin, normalizedOperation.lineage);
+  return canonicalTargetOnlyBasisChatProposal(proposal, normalizedOperation.proposalOrigin, normalizedOperation.lineage, token);
 }
 
 function parseLiteralReplacementCommand(text = "") {
@@ -11811,11 +11945,11 @@ function renderLiteralReplacementPreview(proposal) {
   `;
 }
 
-async function pollBasisChatOperation(operation) {
+async function pollBasisChatOperation(operation, token) {
   let current = canonicalBasisChatOperation(operation);
-  while (basisChatOperationIsCurrent(current)) {
+  while (basisChatOperationIsCurrent(current, token)) {
     const response = await getJson(`/api/jobs/${encodeURIComponent(current.lineage.serverJobId)}`, { logFetchFailure: false });
-    if (!basisChatOperationIsCurrent(current)) return { superseded: true };
+    if (!basisChatOperationIsCurrent(current, token)) return { superseded: true };
     if (!response.ok) return response.data?.fetch_failed || response.data?.page_unloading
       ? { preserved: true }
       : { invalid: true, response };
@@ -11827,22 +11961,24 @@ async function pollBasisChatOperation(operation) {
     }
     if (FINAL_JOB_STATUSES.has(job.status)) return { job };
     await delay(900);
-    if (!basisChatOperationIsCurrent(current)) return { superseded: true };
+    if (!basisChatOperationIsCurrent(current, token)) return { superseded: true };
   }
   return { superseded: true };
 }
 
 async function buildAiBasisChatResponse(text, options = {}) {
+  let token = options.token || null;
   let operation = options.resume === true
     ? normalizeActiveJob(options.operation || state.activeJob || {}, { restoring: true })
     : null;
-  if (options.resume === true && !operation) return { errorDisplayed: true };
+  if (options.resume === true && (!operation || !basisChatRuntimeTokenIsCurrent(token))) return { errorDisplayed: true };
   if (!operation && !canStartAnalysis()) return null;
   if (!operation) {
     const origin = basisChatProposalOrigin();
     invalidateBasisChatAuthority();
     const lineage = newBasisChatLineage("server");
-    installBasisChatOwner("running", origin, lineage);
+    token = mintBasisChatRuntimeAuthority("running", origin, lineage);
+    installBasisChatOwner("running", origin, lineage, token);
     state.basisChat.busyOwnerId = lineage.clientOperationId;
     operation = canonicalBasisChatOperation({
       _operationVersion: BASIS_CHAT_OPERATION_VERSION,
@@ -11856,15 +11992,17 @@ async function buildAiBasisChatResponse(text, options = {}) {
       lineage,
     });
     state.activeJob = operation;
+    if (!bindBasisChatRuntimeOperation(token, operation)) return { superseded: true };
   } else {
     const owner = canonicalBasisChatAuthorityOwner(state.basisChat.authorityOwner);
     if (!basisChatAuthorityStrictEqual(owner.origin, operation.proposalOrigin)
       || !basisChatAuthorityStrictEqual(owner.lineage, operation.lineage)
-      || state.basisChat.busyOwnerId !== operation.lineage.clientOperationId) return { errorDisplayed: true };
+      || state.basisChat.busyOwnerId !== operation.lineage.clientOperationId
+      || !basisChatRuntimeAuthorityMatches(token, operation.proposalOrigin, operation.lineage, "running")
+      || !basisChatRuntimeOperationIsOwned(token, operation)) return { errorDisplayed: true };
   }
   saveSessionState();
-  state.isAnalysisRunning = true;
-  setBasisChatBusy(true, operation.lineage.clientOperationId);
+  if (!setBasisChatBusy(true, token)) return { superseded: true };
   syncControlStates();
   const typingMessage = elements.basisChatOverlay.hidden ? null : appendBasisChatTyping();
   if (typingMessage) startElapsedTimer("basisChatElapsed", Date.now());
@@ -11872,63 +12010,65 @@ async function buildAiBasisChatResponse(text, options = {}) {
   try {
     if (operation.phase === "starting" && options.resume === true) {
       const lookup = await getJson(`/api/jobs/${encodeURIComponent(operation.lineage.requestedJobId)}`, { logFetchFailure: false });
-      if (!basisChatOperationIsCurrent(operation)) return { superseded: true };
+      if (!basisChatOperationIsCurrent(operation, token)) return { superseded: true };
       if (!lookup.ok) {
         if (lookup.data?.fetch_failed || lookup.data?.page_unloading) {
           preserveOwnership = true;
           return { preserved: true };
         }
-        finishBasisChatNotice(operation, "error", basisChatFriendlyError(lookup.data), typingMessage);
+        finishBasisChatNotice(operation, "error", basisChatFriendlyError(lookup.data), typingMessage, token);
         return { errorDisplayed: true };
       }
-      operation = bindBasisChatServerOperation(operation, lookup.data);
+      operation = bindBasisChatServerOperation(operation, lookup.data, token);
+      if (!basisChatOperationIsCurrent(operation, token)) return { superseded: true };
       saveSessionState();
     } else if (operation.phase === "starting") {
       const requestPayload = basisChatPayload(text);
       const started = await startJob("basis_chat", requestPayload, { jobId: operation.lineage.requestedJobId });
-      if (!basisChatOperationIsCurrent(operation)) return { superseded: true };
+      if (!basisChatOperationIsCurrent(operation, token)) return { superseded: true };
       if (!started.ok) {
         if (started.data?.fetch_failed || started.data?.page_unloading) {
           preserveOwnership = true;
           return { preserved: true };
         }
-        finishBasisChatNotice(operation, "error", basisChatFriendlyError(started.data), typingMessage);
+        finishBasisChatNotice(operation, "error", basisChatFriendlyError(started.data), typingMessage, token);
         return { errorDisplayed: true };
       }
-      operation = bindBasisChatServerOperation(operation, started.data);
+      operation = bindBasisChatServerOperation(operation, started.data, token);
+      if (!basisChatOperationIsCurrent(operation, token)) return { superseded: true };
       saveSessionState();
     }
-    const polled = await pollBasisChatOperation(operation);
+    const polled = await pollBasisChatOperation(operation, token);
     if (polled.superseded) return { superseded: true };
     if (polled.preserved) {
       preserveOwnership = true;
       return { preserved: true };
     }
-    if (!basisChatOperationIsCurrent(operation) || polled.invalid) {
-      if (basisChatOperationIsCurrent(operation)) finishBasisChatNotice(operation, "error", GENERIC_FAILURE_MESSAGE, typingMessage);
+    if (!basisChatOperationIsCurrent(operation, token) || polled.invalid) {
+      if (basisChatOperationIsCurrent(operation, token)) finishBasisChatNotice(operation, "error", GENERIC_FAILURE_MESSAGE, typingMessage, token);
       return { errorDisplayed: true };
     }
     const job = polled.job;
     const result = job.result && !Array.isArray(job.result) ? job.result : Object.create(null);
     if (["blocked", "failed"].includes(job.status)) {
       const message = basisChatFriendlyError(result);
-      if (!finishBasisChatNotice(operation, "error", message, typingMessage)) return { superseded: true };
+      if (!finishBasisChatNotice(operation, "error", message, typingMessage, token)) return { superseded: true };
       return { errorDisplayed: true };
     }
     if (Object.prototype.hasOwnProperty.call(result, "proposal")) {
-      const proposal = normalizeServerBasisChatProposal(result.proposal, operation, job);
-      return { proposal, lineage: operation.lineage };
+      const proposal = normalizeServerBasisChatProposal(result.proposal, operation, job, token);
+      return { proposal, lineage: operation.lineage, token };
     }
     const answer = typeof result.answer === "string" && result.answer ? result.answer : null;
-    if (answer && !finishBasisChatNotice(operation, "answer", answer, typingMessage)) return { superseded: true };
-    if (!answer && !finishBasisChatNotice(operation, "error", GENERIC_FAILURE_MESSAGE, typingMessage)) return { superseded: true };
+    if (answer && !finishBasisChatNotice(operation, "answer", answer, typingMessage, token)) return { superseded: true };
+    if (!answer && !finishBasisChatNotice(operation, "error", GENERIC_FAILURE_MESSAGE, typingMessage, token)) return { superseded: true };
     return answer ? { answer, noticeDisplayed: true } : { errorDisplayed: true };
   } catch (_error) {
-    if (!basisChatOperationIsCurrent(operation)) return { superseded: true };
-    finishBasisChatNotice(operation, "error", GENERIC_FAILURE_MESSAGE, typingMessage);
+    if (!basisChatOperationIsCurrent(operation, token)) return { superseded: true };
+    finishBasisChatNotice(operation, "error", GENERIC_FAILURE_MESSAGE, typingMessage, token);
     return { errorDisplayed: true };
   } finally {
-    if (!preserveOwnership && basisChatOperationIsCurrent(operation)) {
+    if (!preserveOwnership && basisChatOperationIsCurrent(operation, token)) {
       stopElapsedTimer("basisChatElapsed");
       removeBasisChatTyping(typingMessage);
     }
@@ -11957,21 +12097,25 @@ async function handleBasisChatSubmit(event) {
       appendBasisChatMessage("assistant", `No exact matches for "${literalCommand.from}" were found in the current basis or output rows.`);
       return;
     }
-    const lineage = beginLocalBasisChatAuthority("local_literal", canonicalBasisChatProposalOrigin(proposal._origin));
-    setBasisChatProposal(proposal, lineage);
+    const authority = beginLocalBasisChatAuthority("local_literal", canonicalBasisChatProposalOrigin(proposal._origin));
+    setBasisChatProposal(proposal, authority.lineage, authority.token);
     return;
   }
 
   const fragmentProposal = buildSelectedLineFragmentReplacementProposal(text);
   if (fragmentProposal) {
-    const lineage = beginLocalBasisChatAuthority("local_fragment", canonicalBasisChatProposalOrigin(fragmentProposal._origin));
-    setBasisChatProposal(fragmentProposal, lineage);
+    const authority = beginLocalBasisChatAuthority("local_fragment", canonicalBasisChatProposalOrigin(fragmentProposal._origin));
+    setBasisChatProposal(fragmentProposal, authority.lineage, authority.token);
     return;
   }
 
-  const aiResult = await buildAiBasisChatResponse(text);
+  const aiPromise = buildAiBasisChatResponse(text);
+  const submissionToken = basisChatRuntimeToken();
+  const aiResult = await aiPromise;
+  if (aiResult?.superseded || aiResult?.preserved) return;
+  if (submissionToken && !basisChatRuntimeTokenIsCurrent(submissionToken) && !aiResult?.noticeDisplayed) return;
   if (aiResult?.proposal) {
-    setBasisChatProposal(aiResult.proposal, aiResult.lineage);
+    setBasisChatProposal(aiResult.proposal, aiResult.lineage, aiResult.token || submissionToken);
     return;
   }
   if (aiResult?.answer) {
@@ -11986,6 +12130,7 @@ async function handleBasisChatSubmit(event) {
 function applyBasisChatProposal() {
   const proposal = state.basisChat.proposal;
   if (!proposal) return;
+  const token = basisChatRuntimeToken();
   let admitted;
   try {
     const detachedProposal = detachedBasisChatAuthorityValue(proposal);
@@ -11993,7 +12138,7 @@ function applyBasisChatProposal() {
     if (owner.status !== "proposal" || state.basisChat.busyOwnerId !== null || state.activeJob?.type === "basis_chat") {
       throw new TypeError("Basis proposal has been superseded.");
     }
-    admitted = canonicalTargetOnlyBasisChatProposal(detachedProposal, detachedProposal._origin, detachedProposal._lineage);
+    admitted = canonicalTargetOnlyBasisChatProposal(detachedProposal, detachedProposal._origin, detachedProposal._lineage, token);
     if (!basisChatAuthorityStrictEqual(owner.origin, admitted._origin)
       || !basisChatAuthorityStrictEqual(owner.lineage, admitted._lineage)) throw new TypeError("Basis proposal owner is stale.");
   } catch (_error) {
@@ -14736,6 +14881,7 @@ async function initializeSession() {
 
 function syncControlStates() {
   const busy = appIsBusy();
+  renderBasisChatBusyControls(Boolean(state.basisChat.busyOwnerId));
   elements.newQuoteButton.disabled = busy;
   elements.newQuoteButton.hidden = state.activeAppView !== "dashboard";
   elements.newQuoteButton.title = busy ? appBusyTitle() : "";
@@ -15238,9 +15384,13 @@ async function resumeSavedJob() {
     }
     const text = activeJob.text;
     if (shouldShowOverlay && text) appendBasisChatMessage("user", text);
-    const aiResult = await buildAiBasisChatResponse(text, { resume: true, operation: activeJob });
-    if (aiResult?.proposal) setBasisChatProposal(aiResult.proposal, aiResult.lineage);
-    else if (aiResult?.answer && shouldShowOverlay && !aiResult.noticeDisplayed) appendBasisChatMessage("assistant", aiResult.answer);
+    const restoreToken = basisChatRuntimeToken();
+    const aiResult = await buildAiBasisChatResponse(text, { resume: true, operation: activeJob, token: restoreToken });
+    if (aiResult?.superseded || aiResult?.preserved) return;
+    if (restoreToken && !basisChatRuntimeTokenIsCurrent(restoreToken) && !aiResult?.noticeDisplayed) return;
+    if (aiResult?.proposal) setBasisChatProposal(aiResult.proposal, aiResult.lineage, aiResult.token || restoreToken);
+    else if (aiResult?.answer && shouldShowOverlay && !aiResult.noticeDisplayed
+      && basisChatRuntimeTokenIsCurrent(restoreToken)) appendBasisChatMessage("assistant", aiResult.answer);
     else if (shouldShowOverlay && !aiResult?.errorDisplayed && !aiResult?.preserved && !aiResult?.superseded) {
       appendBasisChatMessage("assistant", "I could not produce a useful basis change. Please rephrase the request.");
     }
