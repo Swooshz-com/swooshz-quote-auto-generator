@@ -348,6 +348,24 @@ def recovered_convergence_payload(
     return payload
 
 
+def synthetic_publication_authority() -> dict:
+    digest = hashlib.sha256(b"synthetic-publication-authority").hexdigest()
+    return {
+        "pricing_reference": {
+            "id": "synthetic-exhibition-fixture-pricing",
+            "source": "local",
+            "digest": digest,
+        },
+        "profile": {
+            "id": "profile:synthetic-exhibition-fixture-template",
+            "source": "profile",
+            "digest": digest,
+            "layout_digest": digest,
+            "layout_rules_digest": digest,
+        },
+    }
+
+
 def wait_for_job(job_id: str, timeout: float = 2.0, auth_session: dict | None = None) -> dict:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -748,6 +766,34 @@ def workspace_profile_with_layout(profile_id: str = "workspace-profile") -> dict
             }
         },
     })
+
+
+def bind_database_publication_authority(storage, payload: dict, *, suffix: str) -> dict:
+    profile_id = f"publication-profile-{suffix}"
+    pricing_id = f"publication-pricing-{suffix}"
+    storage.save_profile(workspace_profile_with_layout(profile_id))
+    storage.save_pricing_reference(workspace_pricing_reference(pricing_id))
+    payload["profile_id"] = profile_id
+    payload["profile_source"] = "company"
+    payload["pricing_reference_id"] = pricing_id
+    payload["pricing_reference_source"] = "company"
+    payload["pricing_reference"] = {"id": pricing_id, "source": "company"}
+    pricing = storage.pricing_reference_detail(pricing_id, source="company")
+    draft = payload.get("quote_session", {}).get("draft_state", {})
+    details = draft.get("quoteDetails") if isinstance(draft.get("quoteDetails"), dict) else {}
+    snapshot = details.get("commercial_snapshot") if isinstance(details.get("commercial_snapshot"), dict) else {}
+    basis = snapshot.get("pricing_basis") if isinstance(snapshot.get("pricing_basis"), dict) else None
+    if basis is not None:
+        basis.update({
+            "id": pricing_id,
+            "source": "company",
+            "digest": pricing["digest_sha256"],
+            "currency": pricing["currency"],
+        })
+    authority = webapp.database_publication_authority_for_payload(storage, payload)
+    if not authority:
+        raise AssertionError("Failed to establish database publication authority fixture.")
+    return authority
 
 
 class LocalRunnerServer:
@@ -6338,7 +6384,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                     ],
                 },
                 {
-                    "id": "project-services",
+                    "id": "av-equipment-rental-items",
                     "title": "AV Equipment Rental Items",
                     "lines": [
                         {
@@ -6641,6 +6687,103 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertIn("Walls / Structures:", brief["notes"][1])
         self.assertIn("Include: White painted walling.", brief["notes"][1])
         self.assertIn("Exclude: Rigging above booth.", brief["notes"][1])
+
+    def test_run582_payload_to_brief_preserves_canonical_multiline_basis_text(self):
+        payload = valid_payload()
+        payload.pop("quote_basis")
+        payload["quote_basis_sections"] = [{
+            "id": "custom-lossless",
+            "title": "Custom Lossless",
+            "section_order": "0002",
+            "basis_order": 7,
+            "lines": [{
+                "tag": "Custom",
+                "text": "\tleading  spaces\r\n\r\n  middle\tvalue  \rtrailing  ",
+            }],
+        }]
+        admitted = webapp.canonical_quote_basis_sections(payload)
+        persisted = webapp.quote_session_draft_state({
+            "draft_state": {"quoteBasisSections": admitted},
+        })["quoteBasisSections"]
+        brief = webapp.payload_to_brief({**payload, "quote_basis_sections": persisted})
+
+        expected_text = "\tleading  spaces\n\n  middle\tvalue  \ntrailing  "
+        self.assertEqual(admitted[0]["lines"][0]["text"], expected_text)
+        self.assertEqual(persisted[0]["lines"][0]["text"], expected_text)
+        self.assertEqual(brief["quote_basis_sections"][0]["lines"][0]["text"], expected_text)
+        self.assertEqual(brief["quote_basis_sections"][0]["section_order"], 2)
+        self.assertEqual(brief["quote_basis_sections"][0]["basis_order"], 7)
+        self.assertEqual(
+            brief["notes"][1],
+            f"Custom Lossless: Custom: {expected_text}",
+        )
+
+    def test_run584_map_only_basis_round_trips_to_generator_notes_losslessly(self):
+        raw_text = "\tleading  spaces\r\n\r  middle\tvalue  \ntrailing  \t"
+        expected_text = "\tleading  spaces\n\n  middle\tvalue  \ntrailing  \t"
+        for sections_form in ("absent", "empty"):
+            with self.subTest(sections_form=sections_form), tempfile.TemporaryDirectory() as tmp:
+                data_root = Path(tmp) / "data"
+                payload = recovered_convergence_payload(
+                    effective_unit_price=100,
+                    pricing_basis_amount=100,
+                    approved_quote_amount=100,
+                    include_included_row=False,
+                )
+                payload["quote_basis"] = {"custom-map": raw_text}
+                draft_state = payload["quote_session"]["draft_state"]
+                draft_state["quoteBasis"] = {"custom-map": raw_text}
+                if sections_form == "empty":
+                    payload["quote_basis_sections"] = []
+                    draft_state["quoteBasisSections"] = []
+                else:
+                    payload.pop("quote_basis_sections", None)
+                    draft_state.pop("quoteBasisSections", None)
+                payload["quote_session"]["session_id"] = f"quote-run584-map-{sections_form}"
+                payload["quote_session"]["status"] = {"quote_generated": False}
+
+                with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                    saved = webapp.create_or_update_quote_session(payload)
+                    restored = webapp.get_quote_session(
+                        saved["session_id"],
+                        include_draft_state=True,
+                    )
+
+                restored_draft = restored["draft_state"]
+                self.assertEqual(
+                    restored_draft["quoteBasis"]["custom-map"],
+                    expected_text,
+                )
+                generator_payload = copy.deepcopy(payload)
+                generator_payload.pop("quote_session", None)
+                generator_payload["quote_basis"] = restored_draft["quoteBasis"]
+                if sections_form == "empty":
+                    generator_payload["quote_basis_sections"] = restored_draft["quoteBasisSections"]
+                brief = webapp.payload_to_brief(generator_payload)
+                self.assertEqual(
+                    brief["quote_basis_sections"],
+                    [{
+                        "id": "custom-map",
+                        "title": "Custom Map",
+                        "lines": [{"tag": "Confirm", "text": expected_text}],
+                    }],
+                )
+                self.assertEqual(
+                    brief["notes"][1],
+                    f"Custom Map: Confirm: {expected_text}",
+                )
+
+        section_backed = valid_payload()
+        section_backed["quote_basis"] = {"custom-map": "map must not override sections"}
+        section_backed["quote_basis_sections"] = [{
+            "id": "section-backed",
+            "title": "Section Backed",
+            "section_order": 2,
+            "basis_order": 3,
+            "lines": [{"tag": "Custom", "text": raw_text}],
+        }]
+        with self.assertRaises(ValueError):
+            webapp.payload_to_brief(section_backed)
 
     def test_ai_prompt_requests_dynamic_quote_basis_sections(self):
         prompt = webapp.build_quote_draft_prompt(valid_payload())
@@ -7849,7 +7992,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             )
             payload = payload_with_workspace_pricing("workspace-platform-uat-pricing")
             payload["profile_id"] = "workspace-platform-uat-profile"
-            payload["quote_session"] = {"session_id": "quote-platform-uat-smoke"}
+            payload["quote_session"] = {
+                "session_id": "quote-platform-uat-smoke",
+                "draft_state": {"outputRevision": 1},
+            }
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
             with mock.patch.dict(os.environ, env, clear=True):
@@ -12333,6 +12479,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
+                "id": "flooring-platform",
                 "title": "Flooring & Platform - Quote Basis To Confirm",
                 "lines": [
                     {
@@ -12343,6 +12490,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 ],
             }
         ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "200",
             "field": "flooring-platform",
@@ -12367,14 +12515,142 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(result["type"], "proposal")
         self.assertEqual(section["title"], "Flooring & Platform")
         self.assertEqual(line["tag"], "Confirm")
-        self.assertEqual(line["confidence"], 90)
+        self.assertEqual(line["confidence_pct"], 90)
         self.assertEqual(line["text"], "Full 200mm raised platform visible across entire 6.0m x 6.0m footprint.")
         self.assertIn("Confirm: Full 200mm raised platform", proposal["quote_basis"]["flooring-platform"])
+
+    def test_run589_server_proposal_is_target_only_and_canonically_lossless(self):
+        payload = valid_payload()
+        payload["quote_basis_sections"] = [
+            {
+                "id": "selected-section",
+                "title": "Selected",
+                "basis_order": "0003",
+                "section_order": 2,
+                "lines": [
+                    {
+                        "id": "selected-line",
+                        "tag": "Include",
+                        "text": "Selected panel",
+                        "quantity": 1,
+                        "unit": "nos",
+                        "confidence_pct": 81,
+                        "source_line_item_id": "source-selected",
+                        "pricing_keyword": "selected-panel",
+                        "arbitrary_metadata": {"origin": "synthetic", "sequence": [2, 1]},
+                        "category_order": "0004",
+                        "item_order": 5,
+                    },
+                    {
+                        "id": "same-words-in-target-section",
+                        "tag": "Confirm",
+                        "text": "Selected panel",
+                        "metadata": "must stay second",
+                    },
+                ],
+            },
+            {
+                "id": "unrelated-section",
+                "title": "Unrelated",
+                "basis_order": 7,
+                "section_order": "0008",
+                "lines": [
+                    {
+                        "id": "unrelated-line",
+                        "tag": "Exclude",
+                        "text": "\r\n  lead\t  middle  \rtrail  \r\n",
+                        "source_line_item_id": "source-unrelated",
+                        "metadata": {"keep": True, "nested": ["a", "b"]},
+                        "category_order": 9,
+                        "item_order": "0010",
+                    },
+                    {
+                        "id": "same-words-elsewhere",
+                        "tag": "Confirm",
+                        "text": "Selected panel",
+                    },
+                ],
+            },
+        ]
+        payload["line_items"] = [{
+            "id": "existing-item",
+            "description": "Existing bound line item",
+            "quantity": 1,
+            "unit": "nos",
+            "pricing_keyword": "selected-panel",
+            "category_order": 4,
+            "item_order": 5,
+        }]
+        payload["basis_chat"] = {
+            "question": "make the selected panel blue",
+            "field": "selected-section",
+            "line_index": 0,
+            "line": "Include: Selected panel",
+        }
+        parsed = {
+            "intent": "proposal",
+            "proposal": {
+                "message": "Synthetic server-backed edit.",
+                "replacement_line": {"text": "Selected panel in blue", "confidence": 94},
+                "quote_basis_sections": [{"id": "provider-rewrite", "lines": [{"text": "must be ignored"}]}],
+                "line_items": [{"id": "provider-item", "description": "must be ignored"}],
+            },
+        }
+
+        with self.assertRaises(webapp.OpenAIAnalysisError):
+            webapp.normalize_basis_chat_result(parsed, payload, "deepseek")
+
+    def test_run589_selected_line_target_selection_fails_closed(self):
+        base = valid_payload()
+        base["quote_basis_sections"] = [
+            {
+                "id": "exact-section",
+                "title": "Exact Section",
+                "lines": [
+                    {"id": "first", "tag": "Include", "text": "Duplicate wording"},
+                    {"id": "second", "tag": "Confirm", "text": "Other wording"},
+                ],
+            },
+            {
+                "id": "elsewhere",
+                "title": "Elsewhere",
+                "lines": [{"id": "duplicate", "tag": "Include", "text": "Duplicate wording"}],
+            },
+        ]
+        valid_chat = {
+            "question": "make the selected panel blue",
+            "field": "exact-section",
+            "line_index": 0,
+            "line": "Include: Duplicate wording",
+        }
+        cases = {
+            "missing section id": {key: value for key, value in valid_chat.items() if key != "field"},
+            "wrong section id": {**valid_chat, "field": "elsewhere-wrong"},
+            "normalized title": {**valid_chat, "field": "Exact Section"},
+            "slug fallback": {**valid_chat, "field": "exact section"},
+            "out of range": {**valid_chat, "line_index": 9},
+            "invalid index": {**valid_chat, "line_index": "0"},
+            "negative index": {**valid_chat, "line_index": -1},
+            "selected line mismatch": {**valid_chat, "line": "Include: Other wording"},
+            "duplicate wording does not redirect": {**valid_chat, "field": "elsewhere", "line_index": 0, "line": "Confirm: Other wording"},
+        }
+        for label, basis_chat in cases.items():
+            payload = copy.deepcopy(base)
+            payload["basis_chat"] = basis_chat
+            with self.subTest(label=label), self.assertRaises(webapp.OpenAIAnalysisError):
+                webapp.replacement_line_sections(payload, {"text": "Replacement in blue"})
+
+        colliding = copy.deepcopy(base)
+        colliding["quote_basis_sections"][1]["id"] = "exact-section"
+        colliding["basis_chat"] = valid_chat
+        with self.assertRaises(webapp.OpenAIAnalysisError):
+            webapp.replacement_line_sections(colliding, {"text": "Replacement in blue"})
 
     def test_basis_chat_replacement_preserves_quantity_and_unit_when_only_text_changes(self):
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
+                "id": "electrical-av",
                 "title": "Electrical / AV",
                 "lines": [
                     {
@@ -12387,6 +12663,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 ],
             }
         ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "20W",
             "field": "electrical-av",
@@ -12436,6 +12713,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 ],
             }
         ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "5m",
             "field": "counters-and-cabinets",
@@ -12453,10 +12731,6 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                     "tag": "Include",
                     "text": "[ Professional Engineer Endorsement for structure above 5m ] - Custom curved coffee/service counter with Kent branding and teal/blue trim.",
                     "confidence_pct": 82,
-                    "pricing_keyword": "counters-and-cabinets-professional-engineer-endorsement-for-structure-above-4m",
-                    "catalog_description": "Professional Engineer Endorsement for structure above 4m",
-                    "pricing_reference_description": "Professional Engineer Endorsement for structure above 4m",
-                    "catalog_unit_price": 1200,
                 },
             },
         }
@@ -12483,6 +12757,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
+                "id": "furniture-rental",
                 "title": "Furniture Rental",
                 "lines": [
                     {
@@ -12495,6 +12770,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 ],
             }
         ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "change from 12 to 14 chairs",
             "field": "furniture-rental",
@@ -12525,6 +12801,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
+                "id": "furniture-rental",
                 "title": "Furniture Rental",
                 "lines": [
                     {
@@ -12537,6 +12814,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 ],
             }
         ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "60 qty",
             "field": "furniture-rental",
@@ -12569,6 +12847,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
+                "id": "booth-dimensions",
                 "title": "Booth Dimensions",
                 "lines": [
                     {
@@ -12602,6 +12881,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
+                "id": "floor-design",
                 "title": "Floor Design",
                 "lines": [
                     {
@@ -12614,6 +12894,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 ],
             }
         ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": ">blue, green and yellow\n\nred",
             "field": "floor-design",
@@ -12638,13 +12919,14 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         line = result["proposal"]["quote_basis_sections"][0]["lines"][0]
         self.assertEqual(line["text"], "Needle punch carpet in Brazil red colour zones.")
-        self.assertEqual(line["quantity"], "36")
+        self.assertEqual(line["quantity"], 36)
         self.assertEqual(line["unit"], "sqm")
 
     def test_basis_chat_edit_request_rejects_replacement_missing_requested_phrase(self):
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
+                "id": "graphics-and-signage",
                 "title": "Graphics and Signage",
                 "lines": [
                     {
@@ -12654,6 +12936,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 ],
             }
         ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "GAY graphics",
             "field": "graphics-and-signage",
@@ -12679,6 +12962,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
+                "id": "flooring",
                 "title": "Flooring",
                 "lines": [
                     {
@@ -12688,6 +12972,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 ],
             }
         ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "remove aluminium edging",
             "field": "flooring",
@@ -12711,6 +12996,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
+                "id": "flooring",
                 "title": "Flooring",
                 "lines": [
                     {
@@ -12720,6 +13006,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 ],
             }
         ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "remove aluminium edging",
             "field": "flooring",
@@ -12759,6 +13046,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
+                "id": "graphics-and-signage",
                 "title": "Graphics and Signage",
                 "lines": [
                     {
@@ -12769,6 +13057,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 ],
             }
         ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "GAY graphics",
             "field": "graphics-and-signage",
@@ -12932,6 +13221,12 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
     def test_deepseek_basis_chat_uses_chat_completions_json_mode(self):
         payload = valid_payload()
+        payload["quote_basis_sections"] = [{
+            "id": "platform",
+            "title": "Platform",
+            "lines": [{"tag": "Confirm", "text": "100mm raised platform with needle punch carpet."}],
+        }]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "change 100mm to 150mm",
             "scope": "line",
@@ -13395,6 +13690,12 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
     def test_deepseek_basis_chat_bad_output_falls_back_to_openai(self):
         payload = valid_payload()
+        payload["quote_basis_sections"] = [{
+            "id": "platform",
+            "title": "Platform",
+            "lines": [{"tag": "Confirm", "text": "100mm raised platform with needle punch carpet."}],
+        }]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "change 100mm to 150mm",
             "scope": "line",
@@ -14656,9 +14957,16 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
             output_dir.mkdir(parents=True)
             (output_dir / "quotation.xlsx").write_bytes(b"xlsx")
             (output_dir / "quotation.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
-            payload = valid_payload()
-            payload["quote_session"] = {
+            payload = recovered_convergence_payload(
+                effective_unit_price=100,
+                pricing_basis_amount=100,
+                approved_quote_amount=100,
+                exchange_rate=1.3499,
+                include_included_row=False,
+            )
+            payload["quote_session"].update({
                 "session_id": "quote-export",
+                "status": {"quote_generated": True},
                 "commercials": {
                     "currency": "SGD",
                     "tax_label": "GST",
@@ -14667,10 +14975,16 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                     "tax_amount": 9,
                     "grand_total": 109,
                 },
-            }
+            })
+            payload["quote_session"]["draft_state"]["outputRevision"] = 1
             payload["quote_exchange_rate"] = 1.3499
+            expected_commercials = webapp.quote_session_commercials(
+                payload,
+                webapp.quote_session_patch_payload(payload),
+            )
             result = {
                 "status": "completed",
+                "_publication_authority": webapp.local_publication_authority_for_payload(payload),
                 "files": [
                     {"name": "quotation.xlsx", "url": "/api/jobs/job-exports/files/quotation.xlsx"},
                     {"name": "quotation.pdf", "url": "/api/jobs/job-exports/files/quotation.pdf"},
@@ -14685,7 +14999,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
 
             self.assertEqual(session["exports"]["xlsx"]["filename"], "quotation.xlsx")
             self.assertEqual(session["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-export/download/xlsx")
-            self.assertEqual(session["commercials"]["grand_total"], 109)
+            self.assertEqual(session["commercials"]["grand_total"], expected_commercials["grand_total"])
             self.assertEqual(session["commercials"]["exchange_rate"], 1.3499)
             self.assertEqual(refreshed["exports"]["xlsx"]["exists"], True)
             self.assertEqual(refreshed["exports"]["pdf"]["exists"], False)
@@ -14704,10 +15018,18 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
         (output_dir / "quotation.pdf").write_bytes(pdf_bytes)
-        payload = valid_payload()
-        payload["quote_session"] = {"session_id": session_id}
+        payload = recovered_convergence_payload(
+            effective_unit_price=100,
+            pricing_basis_amount=100,
+            approved_quote_amount=100,
+            include_included_row=False,
+        )
+        payload["quote_session"]["session_id"] = session_id
+        payload["quote_session"]["status"] = {"quote_generated": True}
+        payload["quote_session"]["draft_state"]["outputRevision"] = 1
         result = {
             "status": "completed",
+            "_publication_authority": webapp.local_publication_authority_for_payload(payload),
             "files": [
                 {"name": "quotation.xlsx", "url": f"/api/jobs/{session_id}/files/quotation.xlsx"},
                 {"name": "quotation.pdf", "url": f"/api/jobs/{session_id}/files/quotation.pdf"},
@@ -14730,6 +15052,18 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
             local_http_get_bytes(runner, f"/api/quote-sessions/{session_id}/download/pdf"),
             (200, pdf_bytes),
         )
+
+    def _assert_local_pair_unavailable(
+        self,
+        runner: LocalRunnerServer,
+        session_id: str,
+    ) -> None:
+        for kind in ("xlsx", "pdf"):
+            status, _body = local_http_get_bytes(
+                runner,
+                f"/api/quote-sessions/{session_id}/download/{kind}",
+            )
+            self.assertEqual(status, 404)
 
     def _run466_payload(
         self,
@@ -14987,9 +15321,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 for kind in ("xlsx", "pdf"):
                     self.assertTrue(failed_followup["exports"][kind]["stale"])
                 self.assertEqual(webapp.quote_session_result_files(failed_followup), [])
-                self._assert_local_pair_downloads(
-                    runner, "quote-run466", b"run466-old-xlsx", b"run466-old-pdf"
-                )
+                self._assert_local_pair_unavailable(runner, "quote-run466")
 
                 malicious_response = self._post_local_quote_session(
                     runner,
@@ -15099,7 +15431,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                         runner,
                         "/api/quote-sessions/quote-run466-partial/download/pdf",
                     ),
-                    (200, b"run466-partial-old-pdf"),
+                    (404, b'{\n  "error": "Not found"\n}'),
                 )
                 partial_followup_response = self._post_local_quote_session(
                     runner,
@@ -15378,12 +15710,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                     refreshed["draft_files"][0]["session_file_key"],
                     "run469-follow-up-reference",
                 )
-                self._assert_local_pair_downloads(
-                    runner,
-                    "quote-run469",
-                    b"run469-old-xlsx",
-                    b"run469-old-pdf",
-                )
+                self._assert_local_pair_unavailable(runner, "quote-run469")
                 self.assertFalse(
                     any(
                         path.name.startswith("pub-")
@@ -16002,7 +16329,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 )
                 self._assert_local_pair_downloads(runner, "quote-f6a", new_xlsx, new_pdf)
 
-    def test_local_legacy_publication_stays_downloadable_and_migrates_safely(self):
+    def test_local_legacy_publication_is_historical_until_genuine_regeneration(self):
         with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
             root = Path(tmp)
             data_root = root / "data"
@@ -16031,7 +16358,8 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 self.assertTrue(stale["exports"]["xlsx"]["stale"])
                 self.assertTrue(stale["exports"]["pdf"]["stale"])
                 self.assertEqual(webapp.quote_session_result_files(stale), [])
-                self._assert_local_pair_downloads(runner, session_id, legacy_xlsx, legacy_pdf)
+                self.assertEqual(local_http_get_bytes(runner, f"/api/quote-sessions/{session_id}/download/xlsx")[0], 404)
+                self.assertEqual(local_http_get_bytes(runner, f"/api/quote-sessions/{session_id}/download/pdf")[0], 404)
 
                 new_payload, new_result, new_output = self._local_publication_case(
                     root, session_id, new_xlsx, new_pdf, variant="new"
@@ -16049,7 +16377,8 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                         webapp.create_or_update_quote_session(
                             new_payload, result=new_result, output_dir=new_output
                         )
-                self._assert_local_pair_downloads(runner, session_id, legacy_xlsx, legacy_pdf)
+                self.assertEqual(local_http_get_bytes(runner, f"/api/quote-sessions/{session_id}/download/xlsx")[0], 404)
+                self.assertEqual(local_http_get_bytes(runner, f"/api/quote-sessions/{session_id}/download/pdf")[0], 404)
                 migrated = webapp.create_or_update_quote_session(
                     new_payload, result=new_result, output_dir=new_output
                 )
@@ -16103,6 +16432,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
             payload["quote_session"]["draft_state"]["quoteDetails"] = commercial_details
             result = {
                 "status": "completed",
+                "_publication_authority": synthetic_publication_authority(),
                 "files": [
                     {"name": "quotation.xlsx", "url": "/api/jobs/job-stale/files/quotation.xlsx"},
                     {"name": "quotation.pdf", "url": "/api/jobs/job-stale/files/quotation.pdf"},
@@ -16152,7 +16482,9 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 },
             }
 
-            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), mock.patch.object(
+                webapp, "local_current_publication_authority", return_value=synthetic_publication_authority()
+            ), LocalRunnerServer() as runner:
                 generated = webapp.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
                 stale = webapp.create_or_update_quote_session(stale_payload)
                 stale_downloads = {
@@ -16240,11 +16572,10 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 self.assertTrue(attempted["exports"]["pdf"]["stale"])
                 self.assertEqual(attempted["exports"]["pdf"]["url"], "/api/quote-sessions/quote-stale/download/pdf")
                 self.assertEqual(webapp.quote_session_result_files(attempted), [])
-            self.assertTrue(stale_download_path.is_file())
-            self.assertEqual(stale_download_path.read_bytes(), b"xlsx")
+            self.assertIsNone(stale_download_path)
             for downloads in (stale_downloads, blocked_downloads, failed_downloads):
-                self.assertEqual(downloads["xlsx"], (200, b"xlsx"))
-                self.assertEqual(downloads["pdf"], (200, b"pdf"))
+                self.assertEqual(downloads["xlsx"][0], 404)
+                self.assertEqual(downloads["pdf"][0], 404)
             self.assertNotIn(str(tmp_path), json.dumps(stale))
             self.assertIsNotNone(persisted_stale)
             self.assertEqual(
@@ -16314,22 +16645,22 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                     }
                     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
-                    with urllib.request.urlopen(
-                        f"{runner.base_url}/api/quote-sessions/quote-api/download/xlsx",
-                        timeout=3,
-                    ) as response:
-                        self.assertEqual(response.status, 200)
-                        self.assertEqual(response.read(), b"xlsx")
+                    with self.assertRaises(urllib.error.HTTPError) as legacy_error:
+                        urllib.request.urlopen(
+                            f"{runner.base_url}/api/quote-sessions/quote-api/download/xlsx",
+                            timeout=3,
+                        )
+                    self.assertEqual(legacy_error.exception.code, 404)
 
                     metadata["updated_at"] = "2026-01-03T00:00:00Z"
                     metadata["exports"]["xlsx"]["created_at"] = "2026-01-02T00:00:00Z"
                     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-                    with urllib.request.urlopen(
-                        f"{runner.base_url}/api/quote-sessions/quote-api/download/xlsx",
-                        timeout=3,
-                    ) as response:
-                        self.assertEqual(response.status, 200)
-                        self.assertEqual(response.read(), b"xlsx")
+                    with self.assertRaises(urllib.error.HTTPError) as stale_error:
+                        urllib.request.urlopen(
+                            f"{runner.base_url}/api/quote-sessions/quote-api/download/xlsx",
+                            timeout=3,
+                        )
+                    self.assertEqual(stale_error.exception.code, 404)
 
                     for path in (
                         "/api/quote-sessions/quote-api/download/docx",
@@ -17909,7 +18240,7 @@ const job = (type, phase, startedAt, extra = {}) => ({
 });
 const restore = (value) => normalizeActiveJob(value, { restoring: true, nowMs });
 
-for (const type of ["draft", "basis_chat", "generate", "generate_pdf", "confirm_basis"]) {
+for (const type of ["draft", "generate", "generate_pdf", "confirm_basis"]) {
   assert.ok(restore(job(type, "starting", atAge(ACTIVE_JOB_STARTING_MAX_AGE_MS - 1))), `${type} fresh starting`);
   assert.strictEqual(restore(job(type, "starting", atAge(ACTIVE_JOB_STARTING_MAX_AGE_MS + 1))), null, `${type} stale starting`);
 }
@@ -17921,7 +18252,7 @@ const runningLimits = {
   generate: ACTIVE_JOB_RUNNING_GENERATION_MAX_AGE_MS,
   generate_pdf: ACTIVE_JOB_RUNNING_GENERATION_MAX_AGE_MS,
 };
-for (const [type, limit] of Object.entries(runningLimits)) {
+for (const [type, limit] of Object.entries(runningLimits).filter(([type]) => type !== "basis_chat")) {
   assert.ok(restore(job(type, "running", atAge(limit - 1))), `${type} fresh running`);
   assert.strictEqual(restore(job(type, "running", atAge(limit + 1))), null, `${type} stale running`);
 }
@@ -17935,6 +18266,7 @@ assert.strictEqual(restore(job("draft", "running", nowMs)), null);
 assert.strictEqual(restore(job("draft", "invalid", atAge(1000))), null);
 assert.strictEqual(restore(job("draft", "running", atAge(1000), { browserRecoveryScope: "scope-b" })), null);
 assert.strictEqual(restore(job("draft", "running", atAge(1000), { browserRecoveryScope: "" })), null);
+assert.strictEqual(restore(job("basis_chat", "running", atAge(1000))), null, "historical basis chat operation without immutable origin");
 
 const newlyCreated = normalizeActiveJob({
   id: "job-new-operation123",
@@ -19252,8 +19584,9 @@ assert.strictEqual(rowNeedsManualInput(manualDisplayZeroRow), false);
         self.assertIn("const hasFeedback = Boolean(state.pendingFeedback.trim())", draft_body)
         self.assertIn("includeDraftContext: hasFeedback", draft_body)
         self.assertIn("const includeDraftContext = options.includeDraftContext !== false", js)
-        self.assertIn("quote_basis: includeDraftContext ?", js)
-        self.assertIn("quote_basis_sections: includeDraftContext ?", js)
+        self.assertIn("const persistedBasis = includeDraftContext", js)
+        self.assertIn("quote_basis: persistedBasis.quote_basis", js)
+        self.assertIn("quote_basis_sections: persistedBasis.quote_basis_sections", js)
         self.assertIn("line_items: includeDraftContext ?", js)
         self.assertIn("analysisElapsed", js)
         self.assertIn("elapsedTimerIds", js)
@@ -22833,6 +23166,10 @@ function persistSessionFiles(records) {
 
 function normalizeRestorableOverlay(value) { return value || ""; }
 function normalizeActiveJob(job) { return job?.id ? job : null; }
+function currentBrowserRecoveryScope() { return "test-recovery-scope"; }
+function quoteBasisPersistenceProjection() {
+  return { quote_basis: state.quoteBasis, quote_basis_sections: state.quoteBasisSections };
+}
 function saveWorkspaceViewState() {}
 
 eval([
@@ -22850,6 +23187,9 @@ eval([
   "emptyQuoteCommercialTouched",
   "normalizeQuoteCommercialTouched",
   "buildSessionSnapshot",
+  "detachedBasisChatAuthorityValue",
+  "basisChatBrowserSnapshot",
+  "activeJobBrowserSnapshot",
   "currentBrowserRecoveryScope",
   "saveSessionState",
 ].map(extractFunction).join("\n"));
@@ -23683,6 +24023,7 @@ eval([
   "splitBasisDecisionText",
   "normalizeBasisLines",
   "parseBasisLine",
+  "pythonWhitespaceText",
   "normalizeQuoteBasisSections",
   "confirmOnlyQuoteBasisSections",
   "basisSections",
@@ -25986,6 +26327,7 @@ const state = {
 };
 const elements = {};
 const window = { localStorage: { setItem() {} } };
+function currentBrowserRecoveryScope() { return "scope"; }
 
 function isPlainObject(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -27836,6 +28178,9 @@ const BASIS_TAGS = [
   ["Custom", "AI Proposal", "Not found in pricing reference"],
   ["Confirm", "Confirm", "Needs include, exclude, or revision"],
 ];
+const QUOTE_BASIS_LEGACY_ORDER = ["surfaces", "counters", "platform", "graphics", "furniture", "electrical"];
+const QUOTE_BASIS_KEY_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const QUOTE_BASIS_UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 function escapeHtml(value = "") {
   return String(value).replace(/[&<>"']/g, (char) => ({
     "&": "&amp;",
@@ -27851,6 +28196,7 @@ function renderAnalysisFindings() { return ""; }
 function setDownloadFiles() { state.downloadFile = null; }
 function markOutputRowsDirty() { state.downloadFile = null; }
 function quoteCommercialReviewRequired() { return Boolean(state.quoteCommercialReview && state.quoteCommercialReview.status === QUOTE_COMMERCIAL_REVIEW_STATUS); }
+eval(source.slice(source.indexOf("function canonicalBasisSectionText"), source.indexOf("function pythonWhitespaceText")));
 eval([
   "normalizeAnalysisMode",
   "normalizeTextNewlines",
@@ -27884,6 +28230,7 @@ eval([
   "splitBasisDecisionText",
   "normalizeBasisLines",
   "parseBasisLine",
+  "pythonWhitespaceText",
   "normalizeQuoteBasisSections",
   "confirmOnlyQuoteBasisSections",
   "basisSections",
@@ -27917,6 +28264,13 @@ eval([
             "renderBasisLine",
             "renderQuoteBasisMessage",
             "quoteBasisFromSections",
+            "canonicalPrimaryOrderValue",
+            "canonicalizeOrderFields",
+            "canonicalizePrimaryOrderFields",
+            "canonicalBasisSectionText",
+            "canonicalBasisSectionLine",
+            "canonicalQuoteBasisSections",
+            "canonicalQuoteBasis",
             "cloneQuoteBasisSections",
             "possibleMatchBasisDetailText",
             "catalogBackedPossibleMatchText",
@@ -27984,15 +28338,21 @@ assert.ok(!excludedPossibleMatchHtml.includes("Possible match"));
 const confirmedDraftSections = confirmOnlyQuoteBasisSections([{
   id: "graphics",
   title: "Graphics",
+  section_order: "0002",
+  basis_order: "0003",
   lines: [
     { tag: "Include", text: "catalog graphics", pricing_keyword: "graphics-vinyl-printed-graphics" },
     { tag: "Include", text: "uncertain add-on" },
     { tag: "Custom", text: "manual feature panel", custom_pricing: true },
+    { tag: "Exclude", text: "\r\n  lead\t  middle  \rtrail  \r\n" },
   ],
 }]);
 assert.strictEqual(confirmedDraftSections[0].lines[0].tag, "Confirm");
 assert.strictEqual(confirmedDraftSections[0].lines[1].tag, "Confirm");
 assert.strictEqual(confirmedDraftSections[0].lines[2].tag, "Custom");
+assert.strictEqual(confirmedDraftSections[0].lines[3].text, "\n  lead\t  middle  \ntrail  \n");
+assert.strictEqual(confirmedDraftSections[0].section_order, 2);
+assert.strictEqual(confirmedDraftSections[0].basis_order, 3);
 assert.strictEqual(basisCatalogReferenceTitle(catalogBackedLine), "");
 assert.strictEqual(basisLineTitle(catalogBackedLine), "");
 assert.strictEqual(basisPillTitle(catalogBackedLine, "Confirm"), "");
@@ -28346,7 +28706,8 @@ assert.strictEqual(
 );
 assert.ok(!/AI basis chat|JSON|replacement line/i.test(friendlyError));
 assert.ok(source.includes("line_index: state.basisChat.lineIndex"));
-assert.ok(source.includes('startJob("basis_chat", basisChatPayload(text), { jobId })'));
+assert.ok(source.includes("const requestPayload = basisChatPayload(text);"));
+assert.ok(source.includes('startJob("basis_chat", requestPayload, { jobId: operation.lineage.requestedJobId })'));
 assert.ok(!source.includes('startJob("draft", buildPayload())'));
 """
         completed = subprocess.run(
@@ -28385,6 +28746,11 @@ function extractFunction(name) {
 }
 
 const EMPTY_BASIS = { surfaces: "", counters: "", platform: "", graphics: "", furniture: "", electrical: "" };
+const BASIS_CHAT_PROPOSAL_ORIGIN_VERSION = 1;
+const BASIS_CHAT_AUTHORITY_MAX_DEPTH = 40;
+const BASIS_CHAT_AUTHORITY_MAX_NODES = 20000;
+const BASIS_CHAT_LINEAGE_VERSION = 1;
+let basisChatRuntimeAuthority = null;
 const state = {
   quoteBasis: {},
   quoteBasisSections: [{
@@ -28414,8 +28780,27 @@ const state = {
         unit: "nos",
       }],
     }],
+  }, {
+    id: "untouched-lossless",
+    title: "Untouched",
+    section_order: 2,
+    lines: [{ id: "untouched-line", tag: "Exclude", text: "\n  lead\t  middle  \ntrail  \n" }],
   }],
-  basisChat: { proposal: null },
+  quoteSessionId: "quote-static-target",
+  outputRevision: 0,
+  basisChat: {
+    scope: "line",
+    sectionId: "counters-and-cabinets",
+    field: "counters-and-cabinets",
+    lineIndex: 0,
+    line: "Include: [ Professional Engineer Endorsement for structure above 4m ] - Custom curved coffee/service counter with Kent branding and teal/blue trim.",
+    proposal: null,
+    authorityOwner: null,
+    busyOwnerId: null,
+    completionNotice: null,
+  },
+  activeJob: null,
+  isAnalysisRunning: false,
   lineItems: [],
   outputRows: [],
   originalOutputRows: [],
@@ -28433,10 +28818,18 @@ function setDownloadFiles(files = []) { state.downloadFiles = files; }
 function updateQuoteBasisCard(source) { state.updatedSource = source; }
 function setSidePanel(panelName, options = {}) { state.sidePanel = panelName; state.sidePanelOptions = options; }
 function resetBasisChatProposal() { state.basisChat.proposal = null; }
+function invalidateBasisChatAuthority() { state.activeJob = null; state.basisChat.proposal = null; state.basisChat.authorityOwner = null; state.basisChat.busyOwnerId = null; state.basisChat.completionNotice = null; }
 function closeBasisChatOverlay() { state.overlayClosed = true; }
 function syncControlStates() { state.synced = true; }
+function safeQuoteSessionId(value) { return String(value || ""); }
+function revisionNumber(value, fallback = 0) { return Number.isInteger(Number(value)) ? Number(value) : fallback; }
+const QUOTE_BASIS_LEGACY_ORDER = ["surfaces", "counters", "platform", "graphics", "furniture", "electrical"];
+const QUOTE_BASIS_KEY_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const QUOTE_BASIS_UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
+eval(source.slice(source.indexOf("function canonicalBasisSectionText"), source.indexOf("function pythonWhitespaceText")));
 eval([
+  "isPlainObject",
   "safeId",
   "pricingReferenceLineText",
   "bracketedCatalogReferenceParts",
@@ -28457,21 +28850,58 @@ eval([
   "splitBasisDecisionText",
   "normalizeBasisLines",
   "normalizeQuoteBasisTitle",
+  "pythonWhitespaceText",
   "normalizeQuoteBasisSections",
   "quoteBasisFromSections",
   "cloneQuoteBasis",
+  "canonicalPrimaryOrderValue",
+  "canonicalizeOrderFields",
+  "canonicalizePrimaryOrderFields",
+  "canonicalBasisSectionText",
+  "canonicalBasisSectionLine",
+  "canonicalQuoteBasisSections",
+  "canonicalQuoteBasis",
   "cloneQuoteBasisSections",
-  "basisLineMetadataMergeKey",
-  "basisLineCoreMatches",
-  "mergeBasisProposalLineMetadata",
-  "reviewBasisProposalSections",
+  "canonicalQuoteBasisForPersistence",
+  "quoteCommercialStrictDataEqual",
+  "basisChatRuntimeToken", "basisChatRuntimeTokenIsCurrent", "basisChatRuntimeAuthorityMatches",
+  "mintBasisChatRuntimeAuthority", "revokeBasisChatRuntimeAuthority",
+  "basisChatAuthorityRecordKeys",
+  "basisChatAuthorityStrictEqual",
+  "basisChatRequireExactKeys",
+  "admittedBasisChatSections",
+  "admittedBasisChatMap",
+  "canonicalBasisChatSelector",
+  "selectedBasisLine",
+  "rawBasisChatTarget",
+  "detachedBasisChatAuthorityValue",
+  "recursivelyFreezeBasisChatAuthority",
+  "canonicalBasisChatProposalOrigin",
+  "currentBasisChatAuthority",
+  "basisChatProposalOrigin",
+  "basisChatOriginIsCurrent",
+  "canonicalBasisChatLineage",
+  "basisChatLineageIsCurrent",
+  "canonicalBasisChatAuthorityOwner",
+  "basisChatProposalAlias",
+  "canonicalTargetOnlyBasisChatProposal",
   "applyBasisChatProposal",
 ].map(extractFunction).join("\n"));
 
-state.basisChat.proposal = {
-  message: "Update endorsement height.",
-  quoteBasis: {},
-  quoteBasisSections: [{
+state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
+const proposalOrigin = basisChatProposalOrigin();
+const lineage = canonicalBasisChatLineage({
+  _lineageVersion: BASIS_CHAT_LINEAGE_VERSION,
+  lineageId: "lineage-static-apply",
+  clientOperationId: "operation-static-apply",
+  source: "local_fragment",
+  jobType: null,
+  requestedJobId: null,
+  serverJobId: null,
+});
+const runtimeToken = mintBasisChatRuntimeAuthority("running", proposalOrigin, lineage);
+state.basisChat.authorityOwner = canonicalBasisChatAuthorityOwner({ status: "running", origin: proposalOrigin, lineage });
+const proposedSections = [{
     id: "counters-and-cabinets",
     title: "COUNTERS AND CABINETS",
     lines: [{
@@ -28483,38 +28913,43 @@ state.basisChat.proposal = {
       custom_pricing: true,
       custom_confirmed: true,
     }, {
-      id: "db-drawing",
-      tag: "Include",
-      text: "[ no. single line drawing for DB box ]",
-      quantity: 1,
-      unit: "nos",
-      pricing_keyword: "electrical-db-drawing",
-      catalog_description: "no. single line drawing for DB box",
-      pricing_reference_description: "no. single line drawing for DB box",
-      catalog_unit_price: 600,
-    }, {
       id: "custom-counter",
       tag: "Custom",
       text: "Curved reception counter with Kent logo panel, teal trim and illuminated blue plinth.",
       quantity: 1,
       unit: "nos",
       custom_pricing: true,
+      possible_pricing_matches: [{
+        pricing_keyword: "counter-laminated",
+        description: "nos. of 1m length x 1m height lockable counter",
+        section: "COUNTERS AND CABINETS",
+        unit: "nos",
+      }],
     }],
-  }],
-};
+  }, {
+    id: "untouched-lossless",
+    title: "Untouched",
+    section_order: 2,
+    lines: [{ id: "untouched-line", tag: "Exclude", text: "\n  lead\t  middle  \ntrail  \n" }],
+  }];
+state.basisChat.proposal = canonicalTargetOnlyBasisChatProposal({
+  message: "Update endorsement height.",
+  quoteBasis: quoteBasisFromSections(proposedSections),
+  quoteBasisSections: proposedSections,
+}, proposalOrigin, lineage, runtimeToken);
+state.basisChat.authorityOwner = canonicalBasisChatAuthorityOwner({ status: "proposal", origin: proposalOrigin, lineage });
 
 applyBasisChatProposal();
 const editedLine = state.quoteBasisSections[0].lines[0];
 assert.strictEqual(editedLine.text.includes("above 5m"), true);
 assert.strictEqual(editedLine.pricing_keyword, undefined);
-assert.strictEqual(editedLine.tag, "Custom");
-assert.strictEqual(editedLine.custom_confirmed, false);
-const newCatalogLine = state.quoteBasisSections[0].lines[1];
-assert.strictEqual(newCatalogLine.tag, "Confirm");
-assert.strictEqual(newCatalogLine.pricing_keyword, "electrical-db-drawing");
-const untouchedLine = state.quoteBasisSections[0].lines[2];
+assert.strictEqual(editedLine.tag, "Include");
+assert.strictEqual(editedLine.custom_confirmed, true);
+const untouchedLine = state.quoteBasisSections[0].lines[1];
 assert.strictEqual(untouchedLine.possible_pricing_matches.length, 1);
 assert.strictEqual(untouchedLine.possible_pricing_matches[0].pricing_keyword, "counter-laminated");
+assert.strictEqual(state.quoteBasisSections[1].lines[0].text, "\n  lead\t  middle  \ntrail  \n");
+assert.strictEqual(state.quoteBasisSections[1].section_order, 2);
 assert.deepStrictEqual(state.outputRows, []);
 assert.strictEqual(state.overlayClosed, true);
 assert.strictEqual(state.synced, true);
@@ -28556,6 +28991,8 @@ function extractFunction(name) {
 
 const state = {
   quoteBasis: {},
+  quoteSessionId: "quote-fragment-test",
+  outputRevision: 0,
   quoteBasisSections: [{
     id: "counters-and-cabinets",
     title: "COUNTERS AND CABINETS",
@@ -28582,6 +29019,11 @@ const state = {
   lineItems: [],
   outputRows: [],
 };
+const BASIS_CHAT_PROPOSAL_ORIGIN_VERSION = 1;
+const BASIS_CHAT_AUTHORITY_MAX_DEPTH = 40;
+const BASIS_CHAT_AUTHORITY_MAX_NODES = 20000;
+function safeQuoteSessionId(value) { return String(value || ""); }
+function revisionNumber(value, fallback = 0) { return Number.isInteger(Number(value)) ? Number(value) : fallback; }
 function cleanCustomerQuoteLineText(value = "") { return String(value || "").trim().replace(/\s+/g, " "); }
 function normalizeUnit(value = "") { return String(value || "").trim(); }
 function basisDisplayTitle(value = "") { return String(value || "").trim(); }
@@ -28589,8 +29031,13 @@ function normalizeCategoryTitle(value = "") { return basisDisplayTitle(value) ||
 function exactPricingReferenceSectionTitle() { return ""; }
 function sectionTitleKey(value = "") { return String(value || "").toLowerCase().trim(); }
 function referenceSectionTitleAliases(value = "") { return [String(value || "").trim()].filter(Boolean); }
+const QUOTE_BASIS_LEGACY_ORDER = ["surfaces", "counters", "platform", "graphics", "furniture", "electrical"];
+const QUOTE_BASIS_KEY_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const QUOTE_BASIS_UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
+eval(source.slice(source.indexOf("function canonicalBasisSectionText"), source.indexOf("function pythonWhitespaceText")));
 eval([
+  "isPlainObject",
   "safeId",
   "pricingReferenceLineText",
   "bracketedCatalogReferenceParts",
@@ -28612,9 +29059,31 @@ eval([
   "normalizeBasisLines",
   "parseBasisLine",
   "normalizeQuoteBasisTitle",
+  "pythonWhitespaceText",
   "normalizeQuoteBasisSections",
   "quoteBasisFromSections",
+  "canonicalPrimaryOrderValue",
+  "canonicalizeOrderFields",
+  "canonicalizePrimaryOrderFields",
+  "canonicalBasisSectionText",
+  "canonicalBasisSectionLine",
+  "canonicalQuoteBasisSections",
+  "canonicalQuoteBasis",
   "cloneQuoteBasisSections",
+  "canonicalQuoteBasisForPersistence",
+  "quoteCommercialStrictDataEqual",
+  "basisChatAuthorityRecordKeys",
+  "basisChatAuthorityStrictEqual",
+  "basisChatRequireExactKeys",
+  "admittedBasisChatSections",
+  "admittedBasisChatMap",
+  "canonicalBasisChatSelector",
+  "rawBasisChatTarget",
+  "detachedBasisChatAuthorityValue",
+  "recursivelyFreezeBasisChatAuthority",
+  "canonicalBasisChatProposalOrigin",
+  "currentBasisChatAuthority",
+  "basisChatProposalOrigin",
   "selectedBasisLine",
   "replaceLiteralText",
   "replaceBasisLineReferenceText",
@@ -28628,6 +29097,7 @@ eval([
   "buildSelectedLineFragmentReplacementProposal",
 ].map(extractFunction).join("\n"));
 
+state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
 const proposal = buildSelectedLineFragmentReplacementProposal("5m");
 assert.ok(proposal, "expected a deterministic proposal");
 const line = proposal.quoteBasisSections[0].lines[0];
@@ -28689,6 +29159,9 @@ function extractFunction(name) {
 }
 
 const state = {
+  quoteBasis: {},
+  quoteSessionId: "quote-quantity-test",
+  outputRevision: 0,
   quoteBasisSections: [{
     id: "furniture-rental",
     title: "Furniture Rental",
@@ -28704,17 +29177,29 @@ const state = {
   basisChat: {
     scope: "line",
     sectionId: "furniture-rental",
+    field: "furniture-rental",
     lineIndex: 0,
+    line: "Include: [ nos. Bistro Chairs ] - Loose seating for lounge area.",
   },
 };
+const BASIS_CHAT_PROPOSAL_ORIGIN_VERSION = 1;
+const BASIS_CHAT_AUTHORITY_MAX_DEPTH = 40;
+const BASIS_CHAT_AUTHORITY_MAX_NODES = 20000;
+function safeQuoteSessionId(value) { return String(value || ""); }
+function revisionNumber(value, fallback = 0) { return Number.isInteger(Number(value)) ? Number(value) : fallback; }
 function normalizeUnit(value = "") { return String(value || "").trim(); }
 function basisDisplayTitle(value = "") { return String(value || "").trim(); }
 function normalizeCategoryTitle(value = "") { return basisDisplayTitle(value) || "General"; }
 function exactPricingReferenceSectionTitle() { return ""; }
 function sectionTitleKey(value = "") { return String(value || "").toLowerCase().trim(); }
 function referenceSectionTitleAliases(value = "") { return [String(value || "").trim()].filter(Boolean); }
+const QUOTE_BASIS_LEGACY_ORDER = ["surfaces", "counters", "platform", "graphics", "furniture", "electrical"];
+const QUOTE_BASIS_KEY_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const QUOTE_BASIS_UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
+eval(source.slice(source.indexOf("function canonicalBasisSectionText"), source.indexOf("function pythonWhitespaceText")));
 eval([
+  "isPlainObject",
   "safeId",
   "normalizeQuoteBasisTitle",
   "cleanCustomerQuoteLineText",
@@ -28735,9 +29220,32 @@ eval([
   "orderNumber",
   "splitBasisDecisionText",
   "normalizeBasisLines",
+  "pythonWhitespaceText",
   "normalizeQuoteBasisSections",
   "quoteBasisFromSections",
+  "canonicalPrimaryOrderValue",
+  "canonicalizeOrderFields",
+  "canonicalizePrimaryOrderFields",
+  "canonicalBasisSectionText",
+  "canonicalBasisSectionLine",
+  "canonicalQuoteBasisSections",
+  "canonicalQuoteBasis",
   "cloneQuoteBasisSections",
+  "canonicalQuoteBasisForPersistence",
+  "quoteCommercialStrictDataEqual",
+  "basisChatAuthorityRecordKeys",
+  "basisChatAuthorityStrictEqual",
+  "basisChatRequireExactKeys",
+  "admittedBasisChatSections",
+  "admittedBasisChatMap",
+  "canonicalBasisChatSelector",
+  "selectedBasisLine",
+  "rawBasisChatTarget",
+  "detachedBasisChatAuthorityValue",
+  "recursivelyFreezeBasisChatAuthority",
+  "canonicalBasisChatProposalOrigin",
+  "currentBasisChatAuthority",
+  "basisChatProposalOrigin",
   "unbracketedCatalogReferenceText",
   "markBasisLineAsManualPricing",
   "replaceLiteralText",
@@ -28748,6 +29256,7 @@ eval([
   "buildSelectedLineFragmentReplacementProposal",
 ].map(extractFunction).join("\n"));
 
+state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
 const proposal = buildSelectedLineFragmentReplacementProposal("60 qty");
 assert.ok(proposal);
 const line = proposal.quoteBasisSections[0].lines[0];
@@ -28763,6 +29272,262 @@ assert.strictEqual(line.unit, "nos");
             check=False,
         )
 
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_basis_chat_strict_authority_identity_and_operation_lineage(self):
+        node = require_node(self)
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+function extractFunction(name) {
+  const start = source.indexOf(`function ${name}`);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}" && --depth === 0) return source.slice(start, index + 1);
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+const BASIS_CHAT_PROPOSAL_ORIGIN_VERSION = 1;
+const BASIS_CHAT_LINEAGE_VERSION = 1;
+const BASIS_CHAT_OPERATION_VERSION = 1;
+const BASIS_CHAT_AUTHORITY_MAX_DEPTH = 40;
+const BASIS_CHAT_AUTHORITY_MAX_NODES = 20000;
+const ACTIVE_JOB_CLOCK_SKEW_MS = 60000;
+const FINAL_JOB_STATUSES = new Set(["completed", "degraded", "needs_review", "blocked", "failed"]);
+let basisChatRuntimeAuthority = null;
+const state = {
+  browserRecoveryScope: "scope-strict-authority",
+  quoteSessionId: "quote-strict-authority",
+  outputRevision: 4,
+  quoteBasisSections: [{
+    id: "section-one",
+    title: "Section One",
+    section_meta: { retained: true },
+    lines: [{ id: "line-one", tag: "Include", text: "Original", metadata: { retained: true } }],
+  }],
+  quoteBasis: { "section-one": "Include: Original" },
+  basisChat: {
+    sectionId: "section-one", lineIndex: 0, line: "Include: Original",
+    proposal: null, authorityOwner: null, busyOwnerId: null, completionNotice: null,
+  },
+  activeJob: null,
+  lineItems: [],
+  isAnalysisRunning: false,
+};
+state.basisChat.scope = "line";
+state.basisChat.field = "section-one";
+state.basisChat.quantity = 1;
+state.basisChat.unit = "nos";
+state.basisChat.quantityLabel = "1 nos";
+const elements = {
+  basisChatOverlay: { hidden: true },
+  basisChatPrompt: { disabled: false },
+  basisChatSendButton: { disabled: false },
+  basisChatApplyButton: { disabled: false },
+  basisChatKeepButton: { disabled: false },
+};
+function syncControlStates() {}
+function saveSessionState() {}
+function selectedBasisLine() { return state.quoteBasisSections[0].lines[0]; }
+function quoteBasisFromSections(sections) {
+  const result = {};
+  for (const section of sections) result[section.id] = section.lines.map((line) => `${line.tag}: ${line.text}`).join("\n");
+  return result;
+}
+function currentBrowserRecoveryScope() { return state.browserRecoveryScope; }
+function activeJobMaxAgeMs() { return 600000; }
+eval([
+  "basisChatRuntimeToken", "basisChatRuntimeTokenIsCurrent", "basisChatRuntimeAuthorityMatches",
+  "mintBasisChatRuntimeAuthority", "basisChatRuntimeOperationIsOwned", "bindBasisChatRuntimeOperation",
+  "revokeBasisChatRuntimeAuthority", "renderBasisChatBusyControls",
+  "basisChatAuthorityRecordKeys", "detachedBasisChatAuthorityValue", "recursivelyFreezeBasisChatAuthority",
+  "basisChatAuthorityStrictEqual", "basisChatRequireExactKeys", "admittedBasisChatSections",
+  "admittedBasisChatMap", "canonicalBasisChatSelector", "rawBasisChatTarget",
+  "canonicalBasisChatProposalOrigin", "currentBasisChatAuthority", "basisChatProposalOrigin",
+  "basisChatOriginIsCurrent", "canonicalBasisChatLineage", "basisChatLineageIsCurrent",
+  "canonicalBasisChatAuthorityOwner", "basisChatIsoTimestamp", "canonicalBasisChatOperation",
+  "basisChatOperationIsCurrent", "canonicalBasisChatJobResponse", "bindBasisChatServerOperation",
+  "installBasisChatOwner", "completeBasisChatOwner", "basisChatProposalAlias", "setBasisChatBusy",
+  "canonicalTargetOnlyBasisChatProposal", "setBasisChatProposal", "basisChatBrowserSnapshot",
+  "restoreBasisChatTransientAuthority",
+ ].map(extractFunction).join("\n"));
+
+let getterCalls = 0;
+const accessor = {};
+Object.defineProperty(accessor, "danger", { enumerable: true, get() { getterCalls += 1; return "bad"; } });
+assert.throws(() => detachedBasisChatAuthorityValue(accessor), TypeError);
+assert.strictEqual(getterCalls, 0);
+for (const key of ["__proto__", "constructor", "prototype"]) {
+  const unsafe = {};
+  Object.defineProperty(unsafe, key, { value: "bad", enumerable: true, configurable: true, writable: true });
+  assert.throws(() => detachedBasisChatAuthorityValue(unsafe), TypeError);
+}
+const symbolRecord = { ok: true };
+symbolRecord[Symbol("bad")] = true;
+assert.throws(() => detachedBasisChatAuthorityValue(symbolRecord), TypeError);
+assert.throws(() => detachedBasisChatAuthorityValue(Object.create({ inherited: true })), TypeError);
+assert.throws(() => detachedBasisChatAuthorityValue(new Date()), TypeError);
+assert.throws(() => detachedBasisChatAuthorityValue(new Proxy({}, { ownKeys() { throw new Error("reflection failed"); } })), Error);
+const sparse = [];
+sparse.length = 1;
+assert.throws(() => detachedBasisChatAuthorityValue(sparse), TypeError);
+const extra = [1];
+extra.named = true;
+assert.throws(() => detachedBasisChatAuthorityValue(extra), TypeError);
+const malformed = [1];
+Object.defineProperty(malformed, "0", { value: 1, enumerable: true, configurable: false, writable: false });
+assert.throws(() => detachedBasisChatAuthorityValue(malformed), TypeError);
+const recordWithLengthA = detachedBasisChatAuthorityValue({ metadata: { length: 1 } });
+const recordWithLengthB = detachedBasisChatAuthorityValue({ metadata: { length: 2 } });
+assert.strictEqual(basisChatAuthorityStrictEqual(recordWithLengthA, recordWithLengthB), false);
+recursivelyFreezeBasisChatAuthority(recordWithLengthA);
+assert.ok(Object.isFrozen(recordWithLengthA.metadata));
+const arrayA = detachedBasisChatAuthorityValue(["one"]);
+const arrayB = detachedBasisChatAuthorityValue(["one", "two"]);
+assert.strictEqual(basisChatAuthorityStrictEqual(arrayA, arrayB), false);
+
+const origin = basisChatProposalOrigin();
+assert.ok(Object.isFrozen(origin) && Object.isFrozen(origin.quoteBasisSections[0].lines[0].metadata));
+for (const revision of [undefined, null, "4", 4.9, NaN, Infinity, -1, Number.MAX_SAFE_INTEGER + 1]) {
+  const candidate = { ...origin };
+  if (revision === undefined) delete candidate.outputRevision;
+  else candidate.outputRevision = revision;
+  assert.throws(() => canonicalBasisChatProposalOrigin(candidate), TypeError);
+}
+assert.doesNotThrow(() => canonicalBasisChatProposalOrigin(origin));
+const staleSections = JSON.parse(JSON.stringify(state.quoteBasisSections));
+staleSections[0].lines[0].metadata.retained = false;
+state.quoteBasisSections = staleSections;
+state.quoteBasis = quoteBasisFromSections(staleSections);
+assert.strictEqual(basisChatOriginIsCurrent(origin), false);
+state.quoteBasisSections = JSON.parse(JSON.stringify(origin.quoteBasisSections));
+state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
+
+const lineage = canonicalBasisChatLineage({
+  _lineageVersion: 1, lineageId: "lineage-local-proof", clientOperationId: "operation-local-proof",
+  source: "local_fragment", jobType: null, requestedJobId: null, serverJobId: null,
+});
+const localToken = mintBasisChatRuntimeAuthority("running", origin, lineage);
+installBasisChatOwner("running", origin, lineage, localToken);
+const proposedSections = JSON.parse(JSON.stringify(origin.quoteBasisSections));
+proposedSections[0].lines[0].text = "Changed";
+const rawProposal = { message: "Change it", quoteBasis: quoteBasisFromSections(proposedSections), quoteBasisSections: proposedSections };
+assert.throws(() => canonicalTargetOnlyBasisChatProposal({ quoteBasisSections: proposedSections }, origin, lineage), TypeError);
+assert.throws(() => canonicalTargetOnlyBasisChatProposal({ ...rawProposal, quote_basis: { "section-one": "conflict" } }, origin, lineage), TypeError);
+assert.throws(() => canonicalTargetOnlyBasisChatProposal({ ...rawProposal, unknown: true }, origin, lineage), TypeError);
+const admittedProposal = canonicalTargetOnlyBasisChatProposal(rawProposal, origin, lineage, localToken);
+assert.ok(Object.isFrozen(admittedProposal._origin) && Object.isFrozen(admittedProposal._lineage));
+assert.strictEqual(admittedProposal.quoteBasisSections[0].section_meta.retained, true);
+
+function serverLineage(suffix) {
+  return canonicalBasisChatLineage({
+    _lineageVersion: 1, lineageId: `lineage-${suffix}-proof`, clientOperationId: `operation-${suffix}-proof`,
+    source: "server", jobType: "basis_chat", requestedJobId: `job-${suffix}-proof`, serverJobId: null,
+  });
+}
+function startingOperation(lineageValue) {
+  return canonicalBasisChatOperation({
+    _operationVersion: 1, id: lineageValue.requestedJobId, type: "basis_chat", phase: "starting",
+    startedAt: new Date().toISOString(), browserRecoveryScope: state.browserRecoveryScope,
+    text: "change selected line", proposalOrigin: currentBasisChatAuthority(), lineage: lineageValue,
+  });
+}
+const lineageA = serverLineage("alpha");
+const operationA = startingOperation(lineageA);
+const tokenA = mintBasisChatRuntimeAuthority("running", operationA.proposalOrigin, lineageA);
+installBasisChatOwner("running", operationA.proposalOrigin, lineageA, tokenA);
+state.activeJob = operationA;
+state.basisChat.busyOwnerId = lineageA.clientOperationId;
+bindBasisChatRuntimeOperation(tokenA, operationA);
+assert.strictEqual(setBasisChatBusy(true, tokenA), true);
+assert.strictEqual(basisChatOperationIsCurrent(operationA, tokenA), true);
+const lineageB = serverLineage("bravo");
+const operationB = startingOperation(lineageB);
+const tokenB = mintBasisChatRuntimeAuthority("running", operationB.proposalOrigin, lineageB);
+installBasisChatOwner("running", operationB.proposalOrigin, lineageB, tokenB);
+state.activeJob = operationB;
+state.basisChat.busyOwnerId = lineageB.clientOperationId;
+bindBasisChatRuntimeOperation(tokenB, operationB);
+assert.strictEqual(setBasisChatBusy(true, tokenB), true);
+assert.strictEqual(basisChatOperationIsCurrent(operationA, tokenA), false);
+assert.strictEqual(completeBasisChatOwner(operationA.proposalOrigin, operationA.lineage, tokenA), false);
+assert.strictEqual(setBasisChatBusy(false, tokenA), false);
+assert.strictEqual(setBasisChatBusy(true, tokenA), false);
+assert.strictEqual(state.basisChat.busyOwnerId, lineageB.clientOperationId);
+const runningB = bindBasisChatServerOperation(operationB, {
+  job_id: lineageB.requestedJobId, type: "basis_chat", status: "queued", created_at: new Date().toISOString(),
+}, tokenB);
+assert.strictEqual(runningB.lineage.serverJobId, lineageB.requestedJobId);
+assert.strictEqual(basisChatOperationIsCurrent(runningB, tokenB), true);
+const savedRunningB = basisChatBrowserSnapshot();
+const restoredRunningB = restoreBasisChatTransientAuthority(savedRunningB, runningB);
+assert.strictEqual(restoredRunningB.phase, "running");
+assert.notStrictEqual(basisChatRuntimeToken(), tokenB);
+assert.strictEqual(setBasisChatBusy(false, tokenB), false);
+const restoredTokenB = basisChatRuntimeToken();
+assert.strictEqual(basisChatOperationIsCurrent(restoredRunningB, restoredTokenB), true);
+assert.throws(() => canonicalBasisChatJobResponse({
+  job_id: "job-charlie-proof", type: "basis_chat", status: "queued", created_at: "2026-09-17T00:00:01.000Z",
+}, lineageB.requestedJobId), TypeError);
+
+const proposalSectionsB = JSON.parse(JSON.stringify(runningB.proposalOrigin.quoteBasisSections));
+proposalSectionsB[0].lines[0].text = "B changed";
+const proposalB = {
+  message: "B proposal",
+  quoteBasis: quoteBasisFromSections(proposalSectionsB),
+  quoteBasisSections: proposalSectionsB,
+  _origin: runningB.proposalOrigin,
+  _lineage: runningB.lineage,
+};
+assert.strictEqual(setBasisChatProposal(proposalB, runningB.lineage, restoredTokenB), true);
+const savedB = basisChatBrowserSnapshot();
+assert.strictEqual(JSON.stringify(savedB).includes("basis-chat-interaction"), false);
+const restoredActiveB = restoreBasisChatTransientAuthority(savedB, null);
+assert.strictEqual(restoredActiveB, null);
+const installedProposalB = state.basisChat.proposal;
+const installedOwnerB = state.basisChat.authorityOwner;
+assert.ok(installedProposalB && installedOwnerB);
+assert.strictEqual(installedOwnerB.status, "proposal");
+assert.strictEqual(state.activeJob, null);
+assert.strictEqual(state.basisChat.busyOwnerId, null);
+assert.strictEqual(state.basisChat.completionNotice, null);
+
+const proposalSectionsA = JSON.parse(JSON.stringify(origin.quoteBasisSections));
+proposalSectionsA[0].lines[0].text = "A stale";
+const staleProposalA = {
+  message: "A stale proposal",
+  quoteBasis: quoteBasisFromSections(proposalSectionsA),
+  quoteBasisSections: proposalSectionsA,
+  _origin: origin,
+  _lineage: lineageA,
+};
+assert.strictEqual(setBasisChatProposal(staleProposalA, lineageA, tokenA), false);
+assert.strictEqual(state.basisChat.proposal, installedProposalB);
+assert.strictEqual(state.basisChat.authorityOwner, installedOwnerB);
+assert.strictEqual(state.activeJob, null);
+assert.strictEqual(state.basisChat.busyOwnerId, null);
+assert.strictEqual(state.basisChat.completionNotice, null);
+assert.strictEqual(elements.basisChatOverlay.hidden, true);
+
+const malformedCurrentProposal = { ...installedProposalB, quoteBasisSections: [] };
+assert.strictEqual(setBasisChatProposal(malformedCurrentProposal, lineageB, basisChatRuntimeToken()), false);
+assert.strictEqual(state.basisChat.proposal, installedProposalB);
+assert.strictEqual(state.basisChat.authorityOwner, installedOwnerB);
+assert.strictEqual(state.activeJob, null);
+assert.strictEqual(state.basisChat.busyOwnerId, null);
+assert.strictEqual(state.basisChat.completionNotice, null);
+"""
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
 
     def test_static_output_header_matches_quote_basis_structure(self):
@@ -31046,14 +31811,24 @@ main().catch((error) => {
             output_dir.mkdir(parents=True)
             xlsx_bytes = b"xlsx-db-artifact"
             (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
-            payload = valid_payload()
-            payload["quote_session"] = {"session_id": "quote-artifact"}
-            result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-artifact/files/quotation.xlsx"}]}
+            payload = recovered_convergence_payload(
+                effective_unit_price=100,
+                pricing_basis_amount=100,
+                approved_quote_amount=100,
+                include_included_row=False,
+            )
+            payload["quote_session"]["session_id"] = "quote-artifact"
+            payload["quote_session"]["status"] = {"quote_generated": True}
+            payload["quote_session"]["draft_state"]["outputRevision"] = 1
+            result = {"status": "completed", "_publication_authority": synthetic_publication_authority(), "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-artifact/files/quotation.xlsx"}]}
             env = {"SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
             with mock.patch.dict(os.environ, env, clear=True):
                 webapp.apply_sqag_storage_migrations(database_url)
                 workspace_a = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-artifact-a"))
                 workspace_b = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-artifact-b"))
+                result["_publication_authority"] = bind_database_publication_authority(
+                    workspace_a, payload, suffix="artifact"
+                )
                 session = workspace_a.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
                 artifact = workspace_a.quote_session_export_artifact("quote-artifact", "xlsx")
                 blocked_artifact = workspace_b.quote_session_export_artifact("quote-artifact", "xlsx")
@@ -31075,15 +31850,25 @@ main().catch((error) => {
             output_dir.mkdir(parents=True)
             xlsx_bytes = b"xlsx-http-artifact"
             (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
-            payload = valid_payload()
-            payload["quote_session"] = {"session_id": "quote-http-artifact"}
-            result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-http-artifact/files/quotation.xlsx"}]}
+            payload = recovered_convergence_payload(
+                effective_unit_price=100,
+                pricing_basis_amount=100,
+                approved_quote_amount=100,
+                include_included_row=False,
+            )
+            payload["quote_session"]["session_id"] = "quote-http-artifact"
+            payload["quote_session"]["status"] = {"quote_generated": True}
+            payload["quote_session"]["draft_state"]["outputRevision"] = 1
+            result = {"status": "completed", "_publication_authority": synthetic_publication_authority(), "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-http-artifact/files/quotation.xlsx"}]}
             env = {**self.platform_launch_env(), "SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
             with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
                 webapp, "validated_platform_auth_session", side_effect=lambda session: session
             ):
                 webapp.apply_sqag_storage_migrations(database_url)
                 storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-http-artifact"))
+                result["_publication_authority"] = bind_database_publication_authority(
+                    storage, payload, suffix="http-artifact"
+                )
                 storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
                 cookie = webapp.signed_cookie_value(self.platform_auth_session("workspace-http-artifact"))
                 session_cookie = f"{webapp.SESSION_COOKIE_NAME}={cookie}"
@@ -31102,8 +31887,31 @@ main().catch((error) => {
                     finally:
                         connection.close()
 
+                    metadata, _draft_files = storage._read_quote_session_metadata("quote-http-artifact")
+                    metadata["exports"]["xlsx"]["stale"] = True
+                    with storage.connection() as update_connection:
+                        update_connection.execute(
+                            "update sqag_quote_sessions set metadata_json = ? where workspace_id = ? and session_id = ?",
+                            (json.dumps(metadata), storage.workspace_id, "quote-http-artifact"),
+                        )
+                        update_connection.commit()
+                    stale_connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
+                    try:
+                        stale_connection.request(
+                            "GET",
+                            "/api/quote-sessions/quote-http-artifact/download/xlsx",
+                            headers={"Cookie": session_cookie},
+                        )
+                        stale_response = stale_connection.getresponse()
+                        stale_body = stale_response.read()
+                        stale_status = stale_response.status
+                    finally:
+                        stale_connection.close()
+
         self.assertEqual(status, 200)
         self.assertEqual(downloaded, xlsx_bytes)
+        self.assertEqual(stale_status, 404)
+        self.assertNotEqual(stale_body, xlsx_bytes)
 
     def test_database_artifact_download_fails_after_session_delete_and_legacy_route_stays_locked(self):
         tmp_path = test_temp_root() / f"db-artifact-delete-route-{time.time_ns()}"
@@ -31113,15 +31921,25 @@ main().catch((error) => {
         output_dir.mkdir(parents=True)
         xlsx_bytes = b"xlsx-db-delete"
         (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
-        payload = valid_payload()
-        payload["quote_session"] = {"session_id": "quote-db-delete"}
-        result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-db-delete/files/quotation.xlsx"}]}
+        payload = recovered_convergence_payload(
+            effective_unit_price=100,
+            pricing_basis_amount=100,
+            approved_quote_amount=100,
+            include_included_row=False,
+        )
+        payload["quote_session"]["session_id"] = "quote-db-delete"
+        payload["quote_session"]["status"] = {"quote_generated": True}
+        payload["quote_session"]["draft_state"]["outputRevision"] = 1
+        result = {"status": "completed", "_publication_authority": synthetic_publication_authority(), "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-db-delete/files/quotation.xlsx"}]}
         env = {**self.platform_launch_env(), "SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
         with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
             webapp, "validated_platform_auth_session", side_effect=lambda session: session
         ):
             webapp.apply_sqag_storage_migrations(database_url)
             storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-db-delete"))
+            result["_publication_authority"] = bind_database_publication_authority(
+                storage, payload, suffix="db-delete"
+            )
             storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
             cookie = webapp.signed_cookie_value(self.platform_auth_session("workspace-db-delete"))
             session_cookie = f"{webapp.SESSION_COOKIE_NAME}={cookie}"
@@ -31184,7 +32002,7 @@ main().catch((error) => {
         self.assertEqual(delete_response["status"], "deleted")
         self.assertIsNone(artifact_after_delete)
 
-    def test_database_artifact_stale_export_remains_downloadable_and_snapshot_is_preserved(self):
+    def test_database_artifact_stale_export_is_protected_and_snapshot_is_preserved(self):
         tmp_path = test_temp_root() / f"db-artifact-stale-{time.time_ns()}"
         tmp_path.mkdir(parents=True)
         database_url = f"sqlite:///{(tmp_path / 'sqag-storage.sqlite3').as_posix()}"
@@ -31198,15 +32016,37 @@ main().catch((error) => {
         ):
             webapp.apply_sqag_storage_migrations(database_url)
             storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-db-stale"))
-            storage.save_profile(webapp.normalize_profile_payload({"id": "stale-profile", "label": "Generated Stale Profile"}))
+            storage.save_profile(workspace_profile_with_layout("stale-profile") | {"label": "Generated Stale Profile"})
             storage.save_pricing_reference(workspace_pricing_reference("stale-pricing") | {"label": "Generated Stale Pricing"})
-            payload = valid_payload()
+            payload = recovered_convergence_payload(
+                effective_unit_price=100,
+                pricing_basis_amount=100,
+                approved_quote_amount=100,
+                include_included_row=False,
+            )
             payload["profile_id"] = "stale-profile"
+            payload["profile_source"] = "company"
             payload["pricing_reference_id"] = "stale-pricing"
-            payload["quote_session"] = {"session_id": "quote-db-stale"}
+            payload["pricing_reference_source"] = "company"
+            payload["pricing_reference"] = {"id": "stale-pricing", "source": "company"}
+            stale_pricing = storage.pricing_reference_detail("stale-pricing", source="company")
+            payload["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"].update({
+                "id": "stale-pricing",
+                "source": "company",
+                "digest": stale_pricing["digest_sha256"],
+                "currency": stale_pricing["currency"],
+            })
+            result = {
+                "status": "completed",
+                "files": [{"name": "quotation.xlsx"}, {"name": "quotation.pdf"}],
+            }
+            result["_publication_authority"] = webapp.database_publication_authority_for_payload(storage, payload)
+            payload["quote_session"]["session_id"] = "quote-db-stale"
+            payload["quote_session"]["status"] = {"quote_generated": True}
+            payload["quote_session"]["draft_state"]["outputRevision"] = 1
             generated = storage.create_or_update_quote_session(
                 payload,
-                result={"status": "completed", "files": [{"name": "quotation.xlsx"}, {"name": "quotation.pdf"}]},
+                result=result,
                 output_dir=output_dir,
             )
 
@@ -31261,10 +32101,10 @@ main().catch((error) => {
         self.assertEqual(webapp.quote_session_result_files(fetched), [])
         self.assertEqual(fetched["generation_snapshot"]["profile"]["display_name"], "Generated Stale Profile")
         self.assertEqual(fetched["generation_snapshot"]["pricing_reference"]["display_name"], "Generated Stale Pricing")
-        self.assertEqual(artifact["content"], b"xlsx-db-stale")
-        self.assertEqual(pdf_artifact["content"], b"pdf-db-stale")
-        self.assertEqual(stale_downloads["xlsx"], (200, b"xlsx-db-stale"))
-        self.assertEqual(stale_downloads["pdf"], (200, b"pdf-db-stale"))
+        self.assertIsNone(artifact)
+        self.assertIsNone(pdf_artifact)
+        self.assertEqual(stale_downloads["xlsx"][0], 404)
+        self.assertEqual(stale_downloads["pdf"][0], 404)
         self.assertEqual(cross_workspace_downloads["xlsx"][0], 404)
         self.assertEqual(cross_workspace_downloads["pdf"][0], 404)
         self.assertIn(unauthorised_downloads["xlsx"][0], {401, 403})
@@ -31281,8 +32121,15 @@ main().catch((error) => {
         pdf_bytes = b"pdf-object-artifact"
         (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
         (output_dir / "quotation.pdf").write_bytes(pdf_bytes)
-        payload = valid_payload()
-        payload["quote_session"] = {"session_id": "quote-object-artifact"}
+        payload = recovered_convergence_payload(
+            effective_unit_price=100,
+            pricing_basis_amount=100,
+            approved_quote_amount=100,
+            include_included_row=False,
+        )
+        payload["quote_session"]["session_id"] = "quote-object-artifact"
+        payload["quote_session"]["status"] = {"quote_generated": True}
+        payload["quote_session"]["draft_state"]["outputRevision"] = 1
         result = {"status": "completed", "files": [
             {"name": "quotation.xlsx", "url": "/api/jobs/job-object-artifact/files/quotation.xlsx"},
             {"name": "quotation.pdf", "url": "/api/jobs/job-object-artifact/files/quotation.pdf"},
@@ -31307,11 +32154,25 @@ main().catch((error) => {
             webapp.apply_sqag_storage_migrations(database_url)
             workspace_a = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-a"))
             workspace_b = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-b"))
-            workspace_a.save_profile(webapp.normalize_profile_payload({"id": "object-snapshot-profile", "label": "Object Snapshot Profile"}))
+            workspace_a.save_profile(workspace_profile_with_layout("object-snapshot-profile") | {"label": "Object Snapshot Profile"})
             workspace_a.save_pricing_reference(workspace_pricing_reference("object-snapshot-pricing") | {"label": "Object Snapshot Pricing"})
             payload["profile_id"] = "object-snapshot-profile"
             payload["pricing_reference_id"] = "object-snapshot-pricing"
+            payload["pricing_reference_source"] = "company"
+            payload["pricing_reference"] = {"id": "object-snapshot-pricing", "source": "company"}
+            object_pricing = workspace_a.pricing_reference_detail("object-snapshot-pricing", source="company")
+            payload["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"].update({
+                "currency": object_pricing["currency"],
+                "source": "company",
+                "id": "object-snapshot-pricing",
+                "digest": object_pricing["digest_sha256"],
+            })
+            result["_publication_authority"] = webapp.database_publication_authority_for_payload(workspace_a, payload)
+            self.assertTrue(result["_publication_authority"], result["_publication_authority"])
             session = workspace_a.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+            raw_session, _ = workspace_a._read_quote_session_metadata("quote-object-artifact")
+            self.assertTrue(webapp.quote_session_has_current_v2_publication(raw_session, storage=workspace_a), raw_session.get("publication"))
+            self.assertTrue(webapp.quote_session_publication_authority_matches(raw_session, webapp.database_current_publication_authority(workspace_a, payload)))
             artifact = workspace_a.quote_session_export_artifact("quote-object-artifact", "xlsx")
             pdf_artifact = workspace_a.quote_session_export_artifact("quote-object-artifact", "pdf")
             blocked_artifact = workspace_b.quote_session_export_artifact("quote-object-artifact", "xlsx")
@@ -31415,8 +32276,8 @@ main().catch((error) => {
         for kind, expected in (("xlsx", xlsx_bytes), ("pdf", pdf_bytes)):
             self.assertTrue(stale_session["exports"][kind]["exists"])
             self.assertTrue(stale_session["exports"][kind]["stale"])
-            self.assertEqual(stale_artifacts[kind]["content"], expected)
-            self.assertEqual(stale_downloads[kind], (200, expected))
+            self.assertIsNone(stale_artifacts[kind])
+            self.assertEqual(stale_downloads[kind][0], 404)
             self.assertEqual(replacement_artifacts[kind]["content"], expected)
             self.assertFalse(replaced_session["exports"][kind]["stale"])
             self.assertEqual(replacement_downloads[kind], (200, expected))
@@ -32602,7 +33463,7 @@ main().catch((error) => {
         xlsx_bytes = b"synthetic-xlsx-delete-failure"
         (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
         payload = valid_payload()
-        payload["quote_session"] = {"session_id": "quote-object-delete-failure"}
+        payload["quote_session"] = {"session_id": "quote-object-delete-failure", "draft_state": {"outputRevision": 0}}
         result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-object-delete-failure/files/quotation.xlsx"}]}
         env = {
             **self.deploy_auth_env(),
@@ -32622,6 +33483,9 @@ main().catch((error) => {
         ):
             webapp.apply_sqag_storage_migrations(database_url)
             storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-delete-failure"))
+            result["_publication_authority"] = bind_database_publication_authority(
+                storage, payload, suffix="object-delete-failure"
+            )
             storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
             row_before = storage._object_quote_artifact_row("quote-object-delete-failure", "xlsx")
             metadata_before = storage._object_metadata_from_row(row_before)
@@ -35318,7 +36182,7 @@ main().catch((error) => {
         output_dir.mkdir(parents=True)
         (output_dir / "quotation.xlsx").write_bytes(b"synthetic-xlsx-staging-cleanup")
         payload = valid_payload()
-        payload["quote_session"] = {"session_id": "quote-object-staging-cleanup"}
+        payload["quote_session"] = {"session_id": "quote-object-staging-cleanup", "draft_state": {"outputRevision": 0}}
         result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-object-staging-cleanup/files/quotation.xlsx"}]}
         env = {
             **self.deploy_auth_env(),
@@ -35338,6 +36202,9 @@ main().catch((error) => {
         ):
             webapp.apply_sqag_storage_migrations(database_url)
             storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-staging-cleanup"))
+            result["_publication_authority"] = bind_database_publication_authority(
+                storage, payload, suffix="object-staging-cleanup"
+            )
             session = storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
             artifact = storage.quote_session_export_artifact("quote-object-staging-cleanup", "xlsx")
 
@@ -37588,11 +38455,1238 @@ main().catch((error) => {
         self.assertIn("buildLiteralReplacementProposal", js)
         self.assertIn("replaceBasisLineReferenceText", js)
         self.assertIn("markBasisLineAsManualPricing", js)
-        self.assertIn('tag: bracketedCatalogReferenceParts(line.text || "") ? normalizeBasisTag(line.tag) : "Confirm"', js)
+        self.assertIn('tag: bracketedCatalogReferenceParts(currentLine.text || "") ? normalizeBasisTag(currentLine.tag) : "Confirm"', js)
         self.assertIn("openBlockingClarifications", js)
         self.assertIn("Generate final Quote Basis", js)
         self.assertIn('state.basisConfirmed = false', js)
         self.assertIn('setDownloadFiles([])', js)
+
+    def test_run573_quote_basis_and_primary_order_admission_are_canonical(self):
+        basis = webapp.canonical_quote_basis({
+            "custom-z": "  first\r\n\rsecond\t ",
+            "graphics": " ",
+            "custom-a": "tail\rline",
+            "surfaces": "",
+        })
+        self.assertEqual(list(basis), ["graphics", "custom-a", "custom-z"])
+        self.assertEqual(basis["graphics"], " ")
+        self.assertEqual(basis["custom-a"], "tail\nline")
+        self.assertEqual(basis["custom-z"], "  first\n\nsecond\t ")
+        for invalid in ({"Bad_Key": "x"}, {"constructor": "x"}, {"valid": 1}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                webapp.canonical_quote_basis(invalid)
+
+        accepted = {
+            1: 1,
+            9007199254740991: 9007199254740991,
+            "\t00042\r\n": 42,
+        }
+        for raw, expected in accepted.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(webapp.canonical_primary_order_value(raw), expected)
+        for raw in (True, False, 0, -1, 1.5, float("inf"), "", "0", "+1", "1e2", "１", "9007199254740992", [], {}):
+            with self.subTest(raw=raw):
+                self.assertIsNone(webapp.canonical_primary_order_value(raw))
+
+    def test_run573_v2_publication_proof_requires_regeneration_and_invalidates_commercial_edits(self):
+        patch = {
+            "status": {"quote_generated": True},
+            "draft_state": {
+                "outputRevision": 7,
+                "quoteBasis": {"graphics": "Include: Printed wall\r\nSecond line"},
+                "quoteBasisSections": [{
+                    "id": "graphics",
+                    "title": "Graphics",
+                    "lines": [{"tag": "Include", "text": "Printed wall"}, {"tag": "Confirm", "text": "Second line"}],
+                }],
+                "outputRows": [{"description": "Printed wall", "quantity": 2, "unit": "sqm", "unit_price_override": 10}],
+                "quoteDetails": {"project_number": "SYN-573"},
+            },
+        }
+        # Use the canonical section projection as the persisted basis authority.
+        patch["draft_state"]["quoteBasis"] = webapp.canonical_quote_basis(
+            webapp.quote_basis_from_sections(
+                webapp.normalize_quote_basis_sections({"quote_basis_sections": patch["draft_state"]["quoteBasisSections"]})
+            )
+        )
+        metadata = webapp.blank_quote_session_metadata("quote-run573", "2026-09-16T00:00:00Z")
+        metadata["status"]["quote_generated"] = True
+        metadata["draft_state"] = webapp.quote_session_draft_state(patch)
+        xlsx = b"PK\x03\x04synthetic-run573-xlsx"
+        metadata["exports"]["xlsx"] = {
+            "filename": "quotation.xlsx",
+            "size_bytes": len(xlsx),
+            "sha256": hashlib.sha256(xlsx).hexdigest(),
+            "stale": False,
+        }
+        publication_id = "pub-57357357357357357357357357357357"
+        metadata["exports"]["xlsx"].update({"publication_id": publication_id, "run_id": ""})
+        metadata["publication"] = {
+            "state": "published",
+            "active_publication_id": publication_id,
+            "run_id": "",
+            "job_id": "",
+        }
+        metadata["publication"]["proof"] = webapp.quote_session_publication_proof(
+            metadata,
+            patch,
+            publication_id=publication_id,
+            workspace_id="local-workspace",
+            owner_id="local-user",
+            authority={
+                **synthetic_publication_authority(),
+                "pricing_reference": {
+                    **synthetic_publication_authority()["pricing_reference"],
+                    "digest": "sha256:" + synthetic_publication_authority()["pricing_reference"]["digest"],
+                },
+            },
+        )
+        self.assertRegex(metadata["publication"]["proof"]["pricing_reference"]["digest"], r"^[0-9a-f]{64}$")
+        self.assertTrue(webapp.quote_session_publication_freshness_proof_matches(metadata, patch))
+        self.assertFalse(webapp.quote_session_publication_authority_matches(metadata, {
+            **synthetic_publication_authority(),
+            "pricing_reference": {
+                **synthetic_publication_authority()["pricing_reference"],
+                "digest": "sha256:" + synthetic_publication_authority()["pricing_reference"]["digest"],
+            },
+        }))
+
+        for field, changed in (
+            ("quantity", 3),
+            ("unit_price_override", 11),
+            ("description", "Changed detail"),
+        ):
+            edited = copy.deepcopy(patch)
+            edited["draft_state"]["outputRows"][0][field] = changed
+            with self.subTest(field=field):
+                self.assertFalse(webapp.quote_session_publication_freshness_proof_matches(metadata, edited))
+        basis_edit = copy.deepcopy(patch)
+        basis_edit["draft_state"]["quoteBasis"]["graphics"] += "\nConfirm: Changed"
+        basis_edit["draft_state"]["quoteBasisSections"][0]["lines"].append({"tag": "Confirm", "text": "Changed"})
+        self.assertFalse(webapp.quote_session_publication_freshness_proof_matches(metadata, basis_edit))
+
+        legacy = copy.deepcopy(metadata)
+        legacy["publication"].pop("proof")
+        legacy["publication"]["committed_draft_state_digest"] = metadata["publication"]["proof"]["commercial_state_digest"]
+        self.assertFalse(webapp.quote_session_publication_freshness_proof_matches(legacy, patch))
+
+    def test_run575_current_v2_publication_validator_fails_closed_for_every_authority_binding(self):
+        authority = synthetic_publication_authority()
+        patch = {
+            "status": {"quote_generated": True},
+            "draft_state": {
+                "outputRevision": 4,
+                "profileId": "profile:synthetic-exhibition-fixture-template",
+                "pricingReferenceId": authority["pricing_reference"]["id"],
+                "pricingReferenceSource": authority["pricing_reference"]["source"],
+                "quoteDetails": {"project_number": "RUN-575"},
+                "quoteBasisSections": [{
+                    "id": "custom-basis",
+                    "title": "Custom Basis",
+                    "lines": [{"tag": "Confirm", "text": "  leading\r\n\rtrailing\t  "}],
+                }],
+                "outputRows": [{"description": "Printed wall", "quantity": 2, "unit": "sqm", "unit_price_override": 10}],
+                "quoteCommercialSnapshot": {"pricing_basis": {
+                    "id": authority["pricing_reference"]["id"],
+                    "source": authority["pricing_reference"]["source"],
+                    "digest": authority["pricing_reference"]["digest"],
+                    "currency": "SGD",
+                }},
+            },
+        }
+        metadata = webapp.blank_quote_session_metadata("quote-run575-proof", "2026-09-16T00:00:00Z")
+        metadata["status"]["quote_generated"] = True
+        metadata["draft_state"] = webapp.quote_session_draft_state(patch)
+        content = b"PK\x03\x04run575-current-xlsx"
+        publication_id = "pub-57557557557557557557557557557557"
+        metadata["exports"]["xlsx"] = {
+            "filename": "quotation.xlsx",
+            "size_bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "stale": False,
+        }
+        metadata["exports"]["xlsx"].update({"publication_id": publication_id, "run_id": ""})
+        metadata["publication"] = {"state": "published", "active_publication_id": publication_id, "run_id": "", "job_id": ""}
+        metadata["publication"]["proof"] = webapp.quote_session_publication_proof(
+            metadata,
+            patch,
+            publication_id=publication_id,
+            workspace_id="local-workspace",
+            owner_id="local-user",
+            authority=authority,
+        )
+
+        def validate(candidate_metadata=metadata, candidate_patch=patch, candidate_authority=authority, workspace="local-workspace", owner="local-user"):
+            return webapp.quote_session_current_v2_publication_proof(
+                candidate_metadata,
+                candidate_patch,
+                workspace_id=workspace,
+                owner_id=owner,
+                authority=candidate_authority,
+            )
+
+        self.assertIsNotNone(validate())
+        mutations = [
+            ("schema", lambda proof: proof.__setitem__("schema", "wrong")),
+            ("version", lambda proof: proof.__setitem__("version", 1)),
+            ("commercial_schema", lambda proof: proof.__setitem__("commercial_state_schema", "wrong")),
+            ("commercial_digest", lambda proof: proof.__setitem__("commercial_state_digest", "0" * 64)),
+            ("fractional_revision", lambda proof: proof.__setitem__("output_revision", 4.5)),
+            ("publication", lambda proof: proof["publication"].__setitem__("id", "pub-wrong")),
+            ("session", lambda proof: proof["subject"].__setitem__("session_id", "quote-wrong")),
+            ("scope", lambda proof: proof["subject"].__setitem__("scope", "owner")),
+            ("workspace", lambda proof: proof["subject"].__setitem__("workspace_id", "workspace-wrong")),
+            ("owner", lambda proof: proof["subject"].__setitem__("owner_id", "owner-wrong")),
+            ("pricing", lambda proof: proof["pricing_reference"].__setitem__("digest", "1" * 64)),
+            ("profile_source", lambda proof: proof["profile"].__setitem__("source", "company")),
+            ("profile", lambda proof: proof["profile"].__setitem__("digest", "2" * 64)),
+            ("layout", lambda proof: proof["profile"].__setitem__("layout_digest", "3" * 64)),
+            ("layout_rules", lambda proof: proof["profile"].__setitem__("layout_rules_digest", "4" * 64)),
+            ("artifact_association", lambda proof: proof["artifacts"]["xlsx"].__setitem__("publication_id", "pub-wrong")),
+            ("artifact_type", lambda proof: proof["artifacts"]["xlsx"].__setitem__("content_type", "application/octet-stream")),
+            ("artifact_size", lambda proof: proof["artifacts"]["xlsx"].__setitem__("size_bytes", 0)),
+            ("artifact_checksum", lambda proof: proof["artifacts"]["xlsx"].__setitem__("sha256", "5" * 64)),
+            ("missing_run_id", lambda proof: proof["publication"].pop("run_id")),
+            ("missing_job_id", lambda proof: proof["publication"].pop("job_id")),
+            ("container_run_id", lambda proof: proof["publication"].__setitem__("run_id", [])),
+            ("container_job_id", lambda proof: proof["publication"].__setitem__("job_id", {})),
+            ("numeric_run_id", lambda proof: proof["publication"].__setitem__("run_id", 0)),
+            ("numeric_job_id", lambda proof: proof["publication"].__setitem__("job_id", 0)),
+            ("case_session", lambda proof: proof["subject"].__setitem__("session_id", "quote-Run575-proof")),
+        ]
+        for label, mutate in mutations:
+            candidate = copy.deepcopy(metadata)
+            mutate(candidate["publication"]["proof"])
+            with self.subTest(label=label):
+                self.assertIsNone(validate(candidate_metadata=candidate))
+        wrong_authority = copy.deepcopy(authority)
+        wrong_authority["pricing_reference"]["digest"] = "6" * 64
+        self.assertIsNone(validate(candidate_authority=wrong_authority))
+        case_only_pricing_authority = copy.deepcopy(authority)
+        case_only_pricing_authority["pricing_reference"]["id"] = authority["pricing_reference"]["id"].upper()
+        self.assertIsNone(validate(candidate_authority=case_only_pricing_authority))
+        case_only_profile_authority = copy.deepcopy(authority)
+        case_only_profile_authority["profile"]["id"] = authority["profile"]["id"].upper()
+        self.assertIsNone(validate(candidate_authority=case_only_profile_authority))
+        case_only_profile_source = copy.deepcopy(authority)
+        case_only_profile_source["profile"]["id"] = authority["profile"]["id"].replace("profile:", "PROFILE:")
+        case_only_profile_source["profile"]["source"] = "PROFILE"
+        self.assertIsNone(validate(candidate_authority=case_only_profile_source))
+        explicitly_empty_generation_ids = copy.deepcopy(metadata)
+        explicitly_empty_generation_ids["publication"]["proof"]["publication"].update({"run_id": "", "job_id": ""})
+        self.assertIsNotNone(validate(candidate_metadata=explicitly_empty_generation_ids))
+        stale_export = copy.deepcopy(metadata)
+        stale_export["exports"]["xlsx"]["stale"] = True
+        self.assertIsNone(validate(candidate_metadata=stale_export))
+        for label, mutate_export in (
+            ("missing_export_run_id", lambda export: export.pop("run_id")),
+            ("malformed_export_run_id", lambda export: export.__setitem__("run_id", [])),
+            ("nonempty_export_run_id", lambda export: export.__setitem__("run_id", "not-a-valid-run")),
+            ("malformed_export_publication_id", lambda export: export.__setitem__("publication_id", {})),
+            ("padded_export_publication_id", lambda export: export.__setitem__("publication_id", f" {publication_id} ")),
+            ("uppercase_export_digest", lambda export: export.__setitem__("sha256", export["sha256"].upper())),
+            ("padded_export_digest", lambda export: export.__setitem__("sha256", f" {export['sha256']} ")),
+        ):
+            candidate = copy.deepcopy(metadata)
+            mutate_export(candidate["exports"]["xlsx"])
+            with self.subTest(label=label):
+                self.assertIsNone(validate(candidate_metadata=candidate))
+        self.assertIsNone(validate(workspace="workspace-wrong"))
+        self.assertIsNone(validate(owner="owner-wrong"))
+        fractional_patch = copy.deepcopy(patch)
+        fractional_patch["draft_state"]["outputRevision"] = 4.5
+        self.assertIsNone(validate(candidate_patch=fractional_patch))
+        for raw_revision in (True, "4", " 004 "):
+            coerced_patch = copy.deepcopy(patch)
+            coerced_patch["draft_state"]["outputRevision"] = raw_revision
+            with self.subTest(raw_revision=raw_revision):
+                self.assertIsNone(validate(candidate_patch=coerced_patch))
+
+        for label, raw_digest in (
+            ("uppercase_commercial_digest", metadata["publication"]["proof"]["commercial_state_digest"].upper()),
+            ("padded_commercial_digest", f" {metadata['publication']['proof']['commercial_state_digest']} "),
+        ):
+            candidate = copy.deepcopy(metadata)
+            candidate["publication"]["proof"]["commercial_state_digest"] = raw_digest
+            with self.subTest(label=label):
+                self.assertIsNone(validate(candidate_metadata=candidate))
+
+        for label, mutate_authority in (
+            ("unqualified_profile", lambda current: current["profile"].__setitem__("id", "synthetic-exhibition-fixture-template")),
+            ("wrong_case_profile_source", lambda current: current["profile"].update({"id": "PROFILE:synthetic-exhibition-fixture-template", "source": "PROFILE"})),
+            ("prefixed_digest", lambda current: current["pricing_reference"].__setitem__("digest", "sha256:" + current["pricing_reference"]["digest"])),
+            ("uppercase_digest", lambda current: current["pricing_reference"].__setitem__("digest", current["pricing_reference"]["digest"].upper())),
+            ("missing_pricing_source", lambda current: current["pricing_reference"].pop("source")),
+            ("malformed_pricing_source", lambda current: current["pricing_reference"].__setitem__("source", [])),
+        ):
+            candidate_authority = copy.deepcopy(authority)
+            mutate_authority(candidate_authority)
+            with self.subTest(label=label):
+                self.assertIsNone(validate(candidate_authority=candidate_authority))
+
+    def test_run582_local_download_rejects_malformed_raw_authority_before_artifact_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            session_id = "quote-run582-raw-authority"
+            content = b"PK\x03\x04run582-canonical-xlsx"
+            payload, result, output_dir = self._local_publication_case(
+                root,
+                session_id,
+                content,
+                b"run582-pdf",
+            )
+            result["files"] = result["files"][:1]
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                webapp.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+                metadata_path = webapp.quote_session_metadata_path(session_id)
+                original_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                artifact_path = webapp.quote_session_recorded_export_path(
+                    session_id,
+                    "xlsx",
+                    original_metadata,
+                )
+                with LocalRunnerServer() as runner:
+                    self.assertEqual(
+                        local_http_get_bytes(
+                            runner,
+                            f"/api/quote-sessions/{session_id}/download/xlsx",
+                        ),
+                        (200, content),
+                    )
+
+                    original_read_bytes = Path.read_bytes
+                    invalid_cases = (
+                        (
+                            "nonempty_export_run_id",
+                            lambda candidate: candidate["exports"]["xlsx"].__setitem__(
+                                "run_id", "not-a-valid-run"
+                            ),
+                        ),
+                        (
+                            "padded_export_publication_id",
+                            lambda candidate: candidate["exports"]["xlsx"].__setitem__(
+                                "publication_id",
+                                f" {candidate['exports']['xlsx']['publication_id']} ",
+                            ),
+                        ),
+                        (
+                            "uppercase_export_digest",
+                            lambda candidate: candidate["exports"]["xlsx"].__setitem__(
+                                "sha256", candidate["exports"]["xlsx"]["sha256"].upper()
+                            ),
+                        ),
+                        (
+                            "padded_export_digest",
+                            lambda candidate: candidate["exports"]["xlsx"].__setitem__(
+                                "sha256", f" {candidate['exports']['xlsx']['sha256']} "
+                            ),
+                        ),
+                        (
+                            "uppercase_commercial_digest",
+                            lambda candidate: candidate["publication"]["proof"].__setitem__(
+                                "commercial_state_digest",
+                                candidate["publication"]["proof"]["commercial_state_digest"].upper(),
+                            ),
+                        ),
+                        (
+                            "padded_commercial_digest",
+                            lambda candidate: candidate["publication"]["proof"].__setitem__(
+                                "commercial_state_digest",
+                                f" {candidate['publication']['proof']['commercial_state_digest']} ",
+                            ),
+                        ),
+                    )
+                    for label, mutate in invalid_cases:
+                        candidate = copy.deepcopy(original_metadata)
+                        mutate(candidate)
+                        metadata_path.write_text(json.dumps(candidate), encoding="utf-8")
+                        artifact_reads: list[Path] = []
+
+                        def tracked_read_bytes(path: Path) -> bytes:
+                            if path.resolve() == artifact_path.resolve():
+                                artifact_reads.append(path)
+                            return original_read_bytes(path)
+
+                        with self.subTest(label=label), mock.patch.object(
+                            Path,
+                            "read_bytes",
+                            new=tracked_read_bytes,
+                        ):
+                            status, body = local_http_get_bytes(
+                                runner,
+                                f"/api/quote-sessions/{session_id}/download/xlsx",
+                            )
+                            self.assertEqual(status, 404)
+                            self.assertNotEqual(body, content)
+                            self.assertEqual(artifact_reads, [])
+
+                metadata_path.write_text(json.dumps(original_metadata), encoding="utf-8")
+
+    def test_run584_unchanged_http_save_does_not_rehabilitate_malformed_publication_authority(self):
+        invalid_cases = (
+            (
+                "padded_active_publication_id",
+                lambda candidate: candidate["publication"].__setitem__(
+                    "active_publication_id",
+                    f" {candidate['publication']['active_publication_id']} ",
+                ),
+            ),
+            (
+                "padded_export_publication_id",
+                lambda candidate: candidate["exports"]["xlsx"].__setitem__(
+                    "publication_id",
+                    f" {candidate['exports']['xlsx']['publication_id']} ",
+                ),
+            ),
+        )
+        for index, (label, mutate) in enumerate(invalid_cases, start=1):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                data_root = root / "data"
+                session_id = f"quote-run584-save-{index}"
+                content = f"PK\x03\x04run584-save-{index}".encode("utf-8")
+                payload, result, output_dir = self._local_publication_case(
+                    root,
+                    session_id,
+                    content,
+                    b"run584-unused-pdf",
+                )
+                result["files"] = result["files"][:1]
+                with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                    webapp.create_or_update_quote_session(
+                        payload,
+                        result=result,
+                        output_dir=output_dir,
+                    )
+                    metadata_path = webapp.quote_session_metadata_path(session_id)
+                    malformed = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    original_proof = copy.deepcopy(malformed["publication"]["proof"])
+                    original_publication_dirs = sorted(
+                        path.name
+                        for path in webapp.quote_session_publications_dir(session_id).iterdir()
+                        if path.is_dir()
+                    )
+                    mutate(malformed)
+                    metadata_path.write_text(json.dumps(malformed), encoding="utf-8")
+
+                    with LocalRunnerServer() as runner:
+                        self.assertEqual(
+                            local_http_get_bytes(
+                                runner,
+                                f"/api/quote-sessions/{session_id}/download/xlsx",
+                            )[0],
+                            404,
+                        )
+                        saved = self._post_local_quote_session(runner, payload)
+                        self.assertEqual(saved["status"], 200, saved)
+                        self.assertEqual(
+                            local_http_get_bytes(
+                                runner,
+                                f"/api/quote-sessions/{session_id}/download/xlsx",
+                            )[0],
+                            404,
+                        )
+
+                    persisted = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    self.assertEqual(persisted["publication"]["proof"], original_proof)
+                    self.assertTrue(persisted["exports"]["xlsx"]["stale"])
+                    self.assertFalse(persisted["status"]["quote_generated"])
+                    self.assertEqual(
+                        sorted(
+                            path.name
+                            for path in webapp.quote_session_publications_dir(session_id).iterdir()
+                            if path.is_dir()
+                        ),
+                        original_publication_dirs,
+                    )
+                    self.assertFalse(
+                        webapp.quote_session_has_current_v2_publication(persisted)
+                    )
+
+    def test_run584_proof_excluded_kind_is_denied_by_handler_before_database_or_object_fetch(self):
+        session_id = "quote-run584-proof-kind"
+        run_id = "run-run584-proof-kind"
+        publication_id = "pub-58458458458458458458458458458458"
+        content = b"PK\x03\x04run584-current-xlsx"
+        authority = synthetic_publication_authority()
+        patch = {
+            "status": {"quote_generated": True},
+            "draft_state": {
+                "outputRevision": 1,
+                "profileId": authority["profile"]["id"],
+                "pricingReferenceId": authority["pricing_reference"]["id"],
+                "pricingReferenceSource": authority["pricing_reference"]["source"],
+                "quoteDetails": {"project_number": "RUN-584"},
+                "outputRows": [{"description": "Current", "quantity": 1, "unit": "lot", "unit_price_override": 1}],
+            },
+        }
+        metadata = webapp.blank_quote_session_metadata(session_id, "2026-09-16T00:00:00Z")
+        metadata["owner"] = {"user_id": "user-run584"}
+        metadata["status"]["quote_generated"] = True
+        metadata["draft_state"] = webapp.quote_session_draft_state(patch)
+        metadata["exports"]["xlsx"] = {
+            "filename": "quotation.xlsx",
+            "publication_id": publication_id,
+            "run_id": run_id,
+            "size_bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "stale": False,
+        }
+        metadata["publication"] = {
+            "state": "published",
+            "active_publication_id": publication_id,
+            "run_id": run_id,
+            "job_id": "job-run584-proof-kind",
+        }
+        metadata["publication"]["proof"] = webapp.quote_session_publication_proof(
+            metadata,
+            patch,
+            publication_id=publication_id,
+            run_id=run_id,
+            job_id="job-run584-proof-kind",
+            workspace_id="workspace-run584",
+            owner_id="user-run584",
+            authority=authority,
+        )
+        retained_version = {
+            "session_id": session_id,
+            "state": "published",
+            "artifact_storage_mode": "database",
+            "metadata_json": json.dumps({
+                "exports": {
+                    "xlsx": metadata["exports"]["xlsx"],
+                    "pdf": {"filename": "quotation.pdf", "size_bytes": 99, "sha256": "f" * 64},
+                }
+            }),
+        }
+        xlsx_artifact = {
+            "filename": "quotation.xlsx",
+            "content_type": webapp.QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"],
+            "size_bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "content": content,
+        }
+
+        for mode in ("database", "object"):
+            storage = object.__new__(webapp.DatabaseSqagStorage)
+            storage.workspace_id = "workspace-run584"
+            storage.user_id = "user-run584"
+            storage._read_quote_session_metadata = mock.Mock(return_value=(copy.deepcopy(metadata), []))
+            storage._publication_version_row = mock.Mock(return_value={**retained_version, "artifact_storage_mode": mode})
+            storage._publication_version_artifact = mock.Mock(return_value=xlsx_artifact)
+            storage.connection = mock.Mock(side_effect=AssertionError("database artifact bytes were queried"))
+            backend = mock.Mock()
+            backend.retrieve_artifact.side_effect = AssertionError("object artifact bytes were retrieved")
+            with self.subTest(mode=mode), mock.patch.object(
+                webapp,
+                "configured_artifact_storage_mode",
+                return_value=mode,
+            ), mock.patch.object(
+                webapp,
+                "configured_object_storage_backend",
+                return_value=backend,
+            ), mock.patch.object(
+                webapp,
+                "database_current_publication_authority_for_metadata",
+                return_value=authority,
+            ), mock.patch.object(
+                webapp,
+                "quote_session_storage_for_auth_session",
+                return_value=storage,
+            ):
+                with LocalRunnerServer() as runner:
+                    self.assertEqual(
+                        local_http_get_bytes(
+                            runner,
+                            f"/api/quote-sessions/{session_id}/download/pdf",
+                        )[0],
+                        404,
+                    )
+                    self.assertEqual(
+                        local_http_get_bytes(
+                            runner,
+                            f"/api/quote-sessions/{session_id}/download/xlsx",
+                        ),
+                        (200, content),
+                    )
+            self.assertEqual(
+                storage._publication_version_artifact.call_args_list,
+                [mock.call(session_id, run_id, "xlsx")],
+            )
+            storage.connection.assert_not_called()
+            backend.retrieve_artifact.assert_not_called()
+
+    def test_run575_database_artifact_bytes_must_match_validated_proof(self):
+        content = b"PK\x03\x04run575-proof-bound-xlsx"
+        digest = hashlib.sha256(content).hexdigest()
+        expected = {
+            "session_id": "quote-run575-artifact",
+            "publication_id": "run-575-proof-bound",
+            "run_id": "run-575-proof-bound",
+            "filename": "quotation.xlsx",
+            "content_type": webapp.QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"],
+            "size_bytes": len(content),
+            "sha256": digest,
+        }
+        artifact = {
+            "filename": expected["filename"],
+            "content_type": expected["content_type"],
+            "size_bytes": len(content),
+            "sha256": digest,
+            "content": content,
+        }
+        kwargs = {"session_id": expected["session_id"], "publication_id": expected["publication_id"], "run_id": expected["run_id"]}
+        self.assertTrue(webapp.quote_artifact_matches_publication_proof(artifact, expected, **kwargs))
+        for label, field, value in (
+            ("filename", "filename", "wrong.xlsx"),
+            ("type", "content_type", "application/octet-stream"),
+            ("size", "size_bytes", len(content) + 1),
+            ("checksum", "sha256", "0" * 64),
+            ("bytes", "content", content + b"tampered"),
+        ):
+            candidate = copy.deepcopy(artifact)
+            candidate[field] = value
+            with self.subTest(label=label):
+                self.assertFalse(webapp.quote_artifact_matches_publication_proof(candidate, expected, **kwargs))
+        for label, changed in (
+            ("session", {**kwargs, "session_id": "quote-wrong"}),
+            ("publication", {**kwargs, "publication_id": "run-wrong"}),
+            ("run", {**kwargs, "run_id": "run-wrong"}),
+        ):
+            with self.subTest(label=label):
+                self.assertFalse(webapp.quote_artifact_matches_publication_proof(artifact, expected, **changed))
+
+    def test_run580_version_eligibility_rejects_before_database_or_object_byte_fetch(self):
+        session_id = "quote-run580-no-fetch"
+        run_id = "run-run580-no-fetch"
+        export = {
+            "filename": "quotation.xlsx",
+            "size_bytes": 12,
+            "sha256": "a" * 64,
+            "stale": False,
+        }
+        storage = object.__new__(webapp.DatabaseSqagStorage)
+        storage.workspace_id = "workspace-run580"
+        storage.connection = mock.Mock(side_effect=AssertionError("database artifact bytes were queried"))
+        backend = mock.Mock()
+        backend.retrieve_artifact.side_effect = AssertionError("object artifact bytes were retrieved")
+
+        cases = [
+            ("superseded", "superseded", {"xlsx": export}),
+            ("staged", "staged", {"xlsx": export}),
+            ("failed", "failed", {"xlsx": export}),
+            ("absent_kind", "published", {}),
+        ]
+        with mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend):
+            for mode in ("database", "object"):
+                for label, state, exports in cases:
+                    version = {
+                        "session_id": session_id,
+                        "state": state,
+                        "artifact_storage_mode": mode,
+                        "artifact_source": "version",
+                        "metadata_json": json.dumps({"exports": exports}),
+                    }
+                    storage._publication_version_row = mock.Mock(return_value=version)
+                    with self.subTest(mode=mode, label=label):
+                        self.assertIsNone(
+                            storage._publication_version_artifact(session_id, run_id, "xlsx")
+                        )
+        storage.connection.assert_not_called()
+        backend.retrieve_artifact.assert_not_called()
+
+    def test_run575_xlsx_only_publication_does_not_adopt_historical_pdf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            (output_dir / "quotation.xlsx").write_bytes(b"new-xlsx")
+            (output_dir / "quotation.pdf").write_bytes(b"historical-pdf")
+            result = {"status": "completed", "files": [{"name": "quotation.xlsx"}]}
+            sources = webapp.local_quote_publication_sources(result, output_dir)
+            self.assertEqual([(kind, filename) for kind, filename, _source in sources], [("xlsx", "quotation.xlsx")])
+
+            storage = object.__new__(webapp.DatabaseSqagStorage)
+            metadata = webapp.blank_quote_session_metadata("quote-run575-xlsx-only", "2026-09-16T00:00:00Z")
+            stored, pending, _plan = storage._prepare_quote_export_artifacts(
+                "quote-run575-xlsx-only", metadata, result, output_dir
+            )
+            self.assertTrue(stored)
+            self.assertEqual([item.artifact_kind for item in pending], ["xlsx"])
+            self.assertIsNone(metadata["exports"]["pdf"]["filename"])
+            self.assertFalse(metadata["status"]["pdf_exported"])
+
+            discovered_metadata = webapp.blank_quote_session_metadata("quote-run575-discovery", "2026-09-16T00:00:00Z")
+            discovered, discovered_pending, discovered_plan = storage._prepare_quote_export_artifacts(
+                "quote-run575-discovery",
+                discovered_metadata,
+                {"status": "completed", "_publication_authority": synthetic_publication_authority()},
+                output_dir,
+            )
+            self.assertFalse(discovered)
+            self.assertEqual(discovered_pending, [])
+            self.assertIsNone(discovered_plan)
+
+    def test_run575_basis_sections_are_lossless_and_collision_safe_across_two_cycles(self):
+        raw_sections = [
+            {"id": "custom-only", "title": "Custom", "section_order": "0002", "basis_order": 4, "lines": [{"tag": "Custom", "text": "\r\n  lead\t  middle  \rtrail  \r\n"}]},
+            {"id": "graphics", "title": "Graphics", "section_order": 1, "basis_order": "0003", "lines": [{"tag": "Confirm", "text": "Legacy\r\n\r\n  custom tail\t"}]},
+        ]
+        first = webapp.canonical_quote_basis_sections({"quote_basis_sections": raw_sections})
+        second = webapp.canonical_quote_basis_sections({"quote_basis_sections": copy.deepcopy(first)})
+        third = webapp.canonical_quote_basis_sections({"quote_basis_sections": copy.deepcopy(second)})
+        self.assertEqual(first, second)
+        self.assertEqual(second, third)
+        self.assertEqual(first[0]["lines"][0]["text"], "\n  lead\t  middle  \ntrail  \n")
+        self.assertEqual((first[0]["section_order"], first[0]["basis_order"]), (2, 4))
+        persisted = webapp.quote_session_draft_state({
+            "draft_state": {"quoteBasisSections": copy.deepcopy(first)},
+        })
+        reloaded = webapp.quote_session_draft_state({"draft_state": copy.deepcopy(persisted)})
+        self.assertEqual(persisted["quoteBasisSections"], first)
+        self.assertEqual(reloaded["quoteBasisSections"], first)
+        basis = webapp.quote_basis_from_sections(first)
+        self.assertEqual(basis["custom-only"], "Custom: \n  lead\t  middle  \ntrail  \n")
+        mixed = webapp.canonical_quote_basis({"graphics": basis["graphics"], "custom-only": basis["custom-only"]})
+        self.assertEqual(set(mixed), {"graphics", "custom-only"})
+        for sections in (
+            [{"id": "same", "title": "One", "lines": []}, {"id": "same", "title": "Two", "lines": [{"text": "kept"}]}],
+            [{"id": "same", "title": "One", "lines": [{"text": "kept"}]}, {"id": "same", "title": "Two", "lines": []}],
+        ):
+            with self.assertRaises(ValueError):
+                webapp.canonical_quote_basis_sections({"quote_basis_sections": sections})
+        for order_key in ("section_order", "basis_order"):
+            colliding = dict([
+                (order_key, "invalid"),
+                (f"{order_key}\u0085", "2"),
+                ("id", "ordered"),
+                ("title", "Ordered"),
+                ("lines", [{"text": "kept"}]),
+            ])
+            with self.subTest(order_key=order_key), self.assertRaises(ValueError):
+                webapp.canonical_quote_basis_sections({"quote_basis_sections": [colliding]})
+
+    def test_run575_commercial_projection_excludes_duplicate_and_ui_state(self):
+        draft = {
+            "profileId": "profile:run575",
+            "pricingReferenceId": "pricing-run575",
+            "pricingReferenceSource": "local",
+            "quoteDetails": {"project_number": "RUN575", "commercial_snapshot": {"pricing_basis": {"id": "pricing-run575", "source": "local", "digest": "a" * 64, "currency": "SGD"}}},
+            "quoteCommercialSnapshot": {"pricing_basis": {"id": "pricing-run575", "source": "local", "digest": "a" * 64, "currency": "SGD"}},
+            "quoteBasis": {"custom": "Confirm: Keep"},
+            "quoteBasisSections": [{"id": "custom", "title": "Custom", "lines": [{"tag": "Confirm", "text": "Keep"}]}],
+            "lineItems": [{"description": "duplicate", "quantity": 99}],
+            "outputRows": [{"description": "Canonical", "quantity": 2, "selected": True, "unit_price_override": 10}],
+            "originalOutputRows": [{"description": "old"}],
+            "pricingMatches": [{"description": "derived"}],
+            "activeSidePanel": "output",
+            "workflowStage": "completed",
+            "downloadFile": {"url": "old"},
+            "savedAt": "one",
+        }
+        base = webapp.quote_session_commercial_state({"draft_state": draft})
+        changed_derived = copy.deepcopy(draft)
+        changed_derived.update({"lineItems": [{"description": "changed"}], "originalOutputRows": [], "pricingMatches": [], "activeSidePanel": "basis", "workflowStage": "draft", "savedAt": "two"})
+        changed_derived["outputRows"][0]["selected"] = False
+        changed_derived["outputRows"][0]["workflow_state"] = "temporary"
+        changed_derived["outputRows"][0]["download_url"] = "/temporary/download"
+        changed_derived["quoteDetails"]["active_tab"] = "internal"
+        changed_derived["quoteDetails"].setdefault("company", {})["recovery_file_key"] = "company-recovery"
+        self.assertEqual(base, webapp.quote_session_commercial_state({"draft_state": changed_derived}))
+        unsafe_basis = copy.deepcopy(draft)
+        unsafe_basis["quoteBasisSections"][0]["lines"][0]["workflow_state"] = "reviewed"
+        with self.assertRaises(ValueError):
+            webapp.quote_session_commercial_state({"draft_state": unsafe_basis})
+        ordered = copy.deepcopy(draft)
+        ordered["quoteBasisSections"][0].update({"section_order": "0001", "basis_order": 2})
+        ordered_state = webapp.quote_session_commercial_state({"draft_state": ordered})
+        unchanged_order = copy.deepcopy(ordered)
+        unchanged_order["quoteBasisSections"][0]["section_order"] = 1
+        self.assertEqual(
+            ordered_state,
+            webapp.quote_session_commercial_state({"draft_state": unchanged_order}),
+        )
+        changed_order = copy.deepcopy(ordered)
+        changed_order["quoteBasisSections"][0]["section_order"] = 3
+        self.assertNotEqual(
+            ordered_state,
+            webapp.quote_session_commercial_state({"draft_state": changed_order}),
+        )
+        self.assertEqual(
+            json.dumps(ordered_state["commercial"]).count('"section_order"'),
+            1,
+        )
+        changed_commercial = copy.deepcopy(draft)
+        changed_commercial["outputRows"][0]["quantity"] = 3
+        self.assertNotEqual(base, webapp.quote_session_commercial_state({"draft_state": changed_commercial}))
+
+        basis_only_a = copy.deepcopy(draft)
+        basis_only_a.pop("quoteBasisSections")
+        basis_only_a["quoteBasis"] = {"custom-only": "  leading\r\n\rtrailing\t  "}
+        basis_only_b = copy.deepcopy(basis_only_a)
+        basis_only_b["quoteBasis"]["custom-only"] = "  changed\n\ntrailing\t  "
+        basis_only_state_a = webapp.quote_session_commercial_state({"draft_state": basis_only_a})
+        basis_only_state_b = webapp.quote_session_commercial_state({"draft_state": basis_only_b})
+        self.assertNotEqual(basis_only_state_a, basis_only_state_b)
+        self.assertEqual(
+            basis_only_state_a["commercial"]["quote_basis"],
+            {"custom-only": "  leading\n\ntrailing\t  "},
+        )
+
+        logo_a = copy.deepcopy(draft)
+        logo_a["quoteDetails"]["company"] = {
+            "name": "Synthetic Company",
+            "logo_content_fingerprint": "sha256:" + "7" * 64,
+            "logo_session_file_key": "recovery-a",
+        }
+        logo_b = copy.deepcopy(logo_a)
+        logo_b["quoteDetails"]["company"]["logo_session_file_key"] = "recovery-b"
+        self.assertEqual(
+            webapp.quote_session_commercial_state({"draft_state": logo_a}),
+            webapp.quote_session_commercial_state({"draft_state": logo_b}),
+        )
+        logo_material_edit = copy.deepcopy(logo_a)
+        logo_material_edit["quoteDetails"]["company"]["logo_content_fingerprint"] = "sha256:" + "8" * 64
+        self.assertNotEqual(
+            webapp.quote_session_commercial_state({"draft_state": logo_a}),
+            webapp.quote_session_commercial_state({"draft_state": logo_material_edit}),
+        )
+
+        selected_a = copy.deepcopy(draft)
+        selected_a["quoteBasisSections"][0]["lines"][0]["selected"] = False
+        selected_b = copy.deepcopy(selected_a)
+        selected_b["quoteBasisSections"][0]["lines"][0]["selected"] = True
+        self.assertEqual(
+            webapp.quote_session_commercial_state({"draft_state": selected_a}),
+            webapp.quote_session_commercial_state({"draft_state": selected_b}),
+        )
+
+    def test_run575_primary_order_collisions_fail_before_invalid_omission_in_both_orders(self):
+        for field in webapp.PRIMARY_ORDER_FIELDS:
+            for pairs in (
+                [(field, "invalid"), (f"{field}\u0085", "2")],
+                [(f"{field}\u0085", "2"), (field, "invalid")],
+            ):
+                row = dict(pairs)
+                with self.subTest(field=field, pairs=pairs), self.assertRaises(ValueError):
+                    webapp.canonicalize_primary_order_fields(row)
+                with self.assertRaises(ValueError):
+                    webapp.quote_session_draft_state_value({"row": row})
+
+    def test_run575_browser_basis_and_primary_order_parity(self):
+        node = require_node(self)
+        vectors = []
+        for character_name, character in (
+            ("feff", "\ufeff"),
+            ("nel", "\u0085"),
+            ("file_separator", "\u001c"),
+            ("nbsp", "\u00a0"),
+        ):
+            for field in webapp.PRIMARY_ORDER_FIELDS:
+                wrapped = f"{character}{field}{character}"
+                cases = (
+                    ("invalid_first_valid_second", [(field, "invalid"), (wrapped, "2")]),
+                    ("valid_first_invalid_second", [(wrapped, "2"), (field, "invalid")]),
+                    ("canonical_valid_wrapped_invalid", [(field, "2"), (wrapped, "invalid")]),
+                    ("wrapped_invalid_canonical_valid", [(wrapped, "invalid"), (field, "2")]),
+                    ("standalone_wrapped_valid", [(wrapped, "2")]),
+                    ("standalone_wrapped_invalid", [(wrapped, "invalid")]),
+                )
+                for case_name, entries in cases:
+                    try:
+                        expected = {
+                            "ok": True,
+                            "value": webapp.canonicalize_primary_order_fields(dict(entries)),
+                        }
+                    except ValueError:
+                        expected = {"ok": False}
+                    vectors.append({
+                        "label": f"{character_name}:{field}:{case_name}",
+                        "entries": entries,
+                        "expected": expected,
+                    })
+        script = r'''
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+function extractFunction(name) {
+  const marker = `function ${name}(`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}" && --depth === 0) return source.slice(start, index + 1);
+  }
+  throw new Error(`Unclosed ${name}`);
+}
+const BASIS_FIELDS = [["graphics", "Graphics"]];
+const QUOTE_BASIS_UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+function normalizeQuoteBasisTitle(value) { return String(value || "").trim(); }
+function normalizeBasisTag(value) { return ["Include", "Confirm", "Custom", "Exclude"].includes(value) ? value : "Confirm"; }
+function safeId(value, fallback) { const result = String(value || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""); return result || fallback; }
+function canonicalQuoteBasis(value) { return value || {}; }
+eval(source.slice(source.indexOf("function canonicalBasisSectionText"), source.indexOf("function pythonWhitespaceText")));
+eval(["pythonWhitespaceText", "canonicalPrimaryOrderValue", "canonicalizeOrderFields", "canonicalizePrimaryOrderFields", "canonicalBasisSectionLine", "canonicalQuoteBasisSections", "quoteBasisFromSections", "cloneQuoteBasisSections", "canonicalQuoteBasisForPersistence", "quoteBasisPersistenceProjection"].map(extractFunction).join("\n"));
+const raw = [
+  { id: "custom-only", title: "Custom", section_order: "0002", basis_order: 4, lines: [{ tag: "Custom", text: "\r\n  lead\t  middle  \rtrail  \r\n" }] },
+  { id: "graphics", title: "Graphics", section_order: 1, basis_order: "0003", lines: [{ tag: "Confirm", text: "Legacy\r\n\r\n  custom tail\t" }] },
+];
+const first = canonicalQuoteBasisSections(raw);
+const second = canonicalQuoteBasisSections(JSON.parse(JSON.stringify(first)));
+const third = canonicalQuoteBasisSections(JSON.parse(JSON.stringify(second)));
+assert.deepStrictEqual(first, second);
+assert.deepStrictEqual(second, third);
+assert.deepStrictEqual(cloneQuoteBasisSections(first), first);
+assert.strictEqual(first[0].lines[0].text, "\n  lead\t  middle  \ntrail  \n");
+assert.deepStrictEqual([first[0].section_order, first[0].basis_order], [2, 4]);
+assert.strictEqual(quoteBasisFromSections(first)["custom-only"], "Custom: \n  lead\t  middle  \ntrail  \n");
+const persisted = quoteBasisPersistenceProjection(quoteBasisFromSections(first), first);
+assert.deepStrictEqual(persisted.quote_basis_sections, first);
+assert.deepStrictEqual(persisted.quote_basis, quoteBasisFromSections(persisted.quote_basis_sections));
+for (const sections of [
+  [{ id: "same", title: "One", lines: [] }, { id: "same", title: "Two", lines: [{ text: "kept" }] }],
+  [{ id: "same", title: "One", lines: [{ text: "kept" }] }, { id: "same", title: "Two", lines: [] }],
+  [{ id: " same ", title: "One", lines: [{ text: "kept" }] }, { id: "same", title: "Two", lines: [{ text: "kept" }] }],
+]) assert.throws(() => canonicalQuoteBasisSections(sections), /colliding identities/);
+assert.deepStrictEqual(
+  canonicalQuoteBasisSections([{ id: "\u0085", title: "Whitespace Identity", lines: [{ text: "kept" }] }]),
+  [{ id: "whitespace-identity", title: "Whitespace Identity", lines: [{ tag: "Confirm", text: "kept" }] }],
+);
+const similar = canonicalQuoteBasisSections([{
+  id: "ordered", title: "Ordered", lines: [{ text: "kept" }], safe_key: 1, "safe-key": 2,
+}]);
+assert.strictEqual(similar[0].safe_key, 1);
+assert.strictEqual(similar[0]["safe-key"], 2);
+const payload = JSON.parse(fs.readFileSync(0, "utf8"));
+const observed = payload.vectors.map(({ label, entries }) => {
+  try {
+    return { label, outcome: { ok: true, value: canonicalizePrimaryOrderFields(Object.fromEntries(entries)) } };
+  } catch (_error) {
+    return { label, outcome: { ok: false } };
+  }
+});
+process.stdout.write(JSON.stringify(observed));
+'''
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            input=json.dumps({"vectors": vectors}),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        observed = json.loads(completed.stdout)
+        self.assertEqual(len(observed), len(vectors))
+        for actual, vector in zip(observed, vectors, strict=True):
+            with self.subTest(vector=vector["label"]):
+                self.assertEqual(actual["label"], vector["label"])
+                self.assertEqual(actual["outcome"], vector["expected"])
+
+    def test_run593_authoritative_basis_metadata_value_domain_and_security(self):
+        raw_sections = [{
+            "id": "custom-safe",
+            "title": "  Custom Safe  ",
+            "section_meta": {
+                "Exact-Key": "  keep\tspaces\nand lines  ",
+                "empty_object": {},
+                "empty_array": [],
+                "null_value": None,
+                "enabled": True,
+                "safe_integer": webapp.AUTHORITATIVE_BASIS_SAFE_INTEGER,
+                "fraction": 0.125,
+                "integral_float": 4.0,
+                "negative_zero": -0.0,
+                "safe_key": "underscore",
+                "safe-key": "dash",
+            },
+            "lines": [{
+                "id": "line-safe",
+                "tag": "Custom",
+                "text": "\r\n  lead\ttrail  \r",
+                "provenance": {"source": "synthetic", "ids": [1, 2, 3]},
+                "pricing_binding": {"catalog_id": "safe-id", "unit_price": 12.5},
+            }],
+        }]
+        first = webapp.canonical_quote_basis_sections({"quote_basis_sections": raw_sections})
+        second = webapp.canonical_quote_basis_sections({"quote_basis_sections": copy.deepcopy(first)})
+        self.assertEqual(first, second)
+        self.assertEqual(first[0]["section_meta"]["Exact-Key"], "  keep\tspaces\nand lines  ")
+        self.assertEqual(first[0]["section_meta"]["integral_float"], 4)
+        self.assertEqual(first[0]["section_meta"]["negative_zero"], 0)
+        self.assertEqual(first[0]["lines"][0]["text"], "\n  lead\ttrail  \n")
+        self.assertEqual(first[0]["section_meta"]["safe_key"], "underscore")
+        self.assertEqual(first[0]["section_meta"]["safe-key"], "dash")
+
+        for invalid in (
+            webapp.AUTHORITATIVE_BASIS_SAFE_INTEGER + 1,
+            -(webapp.AUTHORITATIVE_BASIS_SAFE_INTEGER + 1),
+            float("nan"),
+            float("inf"),
+            -float("inf"),
+            (1, 2),
+            {1, 2},
+            b"bytes",
+            webapp.Decimal("1.25"),
+            object(),
+        ):
+            with self.subTest(invalid=type(invalid).__name__), self.assertRaises(ValueError):
+                webapp.admit_authoritative_basis_value({"safe": invalid})
+
+        blocked = (
+            "token", "api-token", "client_secret", "cookie", "nonce", "password", "passwd",
+            "credential", "private-key", "authorization", "auth-header", "bearer", "auth_code",
+            "authorization_code", "oauth_code", "state", "auth_state", "oauth_state", "session_state",
+            "runtime_auth", "session_auth", "data_url", "logo_data_url", "brief_path", "output_dir",
+            "stdout", "stderr", "active_job", "job_id", "job_state", "workflow_state", "workflow_stage",
+            "temporary_path", "recovery_file_key", "session_file_key", "logo_session_file_key",
+            "file_handle", "download_url", "artifact_download_url", "__proto__", "constructor", "prototype",
+        )
+        for key in blocked:
+            for value in ({key: "unsafe"}, {"nested": [{key: "unsafe"}]}):
+                with self.subTest(key=key, nested="nested" in value), self.assertRaises(ValueError):
+                    webapp.canonical_quote_basis_sections({
+                        "quote_basis_sections": [{"id": "safe", "title": "Safe", "lines": [{"text": "kept", "meta": value}]}]
+                    })
+
+    def test_run593_authoritative_basis_atomic_resource_boundaries(self):
+        admit = webapp.admit_authoritative_basis_value
+
+        exact_depth: object = "leaf"
+        for _ in range(16):
+            exact_depth = [exact_depth]
+        self.assertEqual(admit(exact_depth), exact_depth)
+        with self.assertRaises(ValueError):
+            admit([exact_depth])
+
+        exact_object = {f"k{index}": index for index in range(1024)}
+        self.assertEqual(len(admit(exact_object)), 1024)
+        with self.assertRaises(ValueError):
+            admit({**exact_object, "overflow": 1})
+
+        exact_array = [None] * 4096
+        self.assertEqual(len(admit(exact_array)), 4096)
+        with self.assertRaises(ValueError):
+            admit([None] * 4097)
+
+        exact_key = "é" * 128
+        self.assertEqual(admit({exact_key: True}), {exact_key: True})
+        with self.assertRaises(ValueError):
+            admit({exact_key + "x": True})
+
+        exact_string = "x" * 262144
+        self.assertEqual(len(admit(exact_string)), 262144)
+        with self.assertRaises(ValueError):
+            admit(exact_string + "x")
+
+        exact_nodes = [[0, 0, 0, 0] for _ in range(3999)] + [[0, 0, 0]]
+        self.assertEqual(len(exact_nodes), 4000)
+        self.assertEqual(admit(exact_nodes), exact_nodes)
+        over_nodes = copy.deepcopy(exact_nodes)
+        over_nodes[-1].append(0)
+        with self.assertRaises(ValueError):
+            admit(over_nodes)
+
+        exact_bytes = ["a" * 262144 for _ in range(4)]
+        self.assertEqual(admit(exact_bytes), exact_bytes)
+        with self.assertRaises(ValueError):
+            admit([*exact_bytes, "x"])
+
+    def test_run593_browser_authoritative_value_domain_and_limit_parity(self):
+        node = require_node(self)
+        script = r'''
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+function extractFunction(name) {
+  const marker = `function ${name}(`;
+  const start = source.indexOf(marker);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}" && --depth === 0) return source.slice(start, index + 1);
+  }
+  throw new Error(`Missing ${name}`);
+}
+const QUOTE_BASIS_UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+eval(source.slice(source.indexOf("function canonicalBasisSectionText"), source.indexOf("function pythonWhitespaceText")));
+assert.strictEqual(admitAuthoritativeBasisValue(-0), 0);
+assert.strictEqual(admitAuthoritativeBasisValue(4.0), 4);
+assert.strictEqual(admitAuthoritativeBasisValue(0.125), 0.125);
+assert.strictEqual(admitAuthoritativeBasisValue(Number.MAX_SAFE_INTEGER), Number.MAX_SAFE_INTEGER);
+for (const value of [Number.MAX_SAFE_INTEGER + 1, NaN, Infinity, -Infinity, undefined, 1n, () => {}, Symbol("x"), new Date(), new Uint8Array([1])]) {
+  assert.throws(() => admitAuthoritativeBasisValue({ safe: value }));
+}
+const accessor = {};
+Object.defineProperty(accessor, "safe", { enumerable: true, get() { return 1; } });
+assert.throws(() => admitAuthoritativeBasisValue(accessor), /accessor/);
+for (const key of ["__proto__", "api-token", "client_secret", "cookie", "nonce", "password", "credential", "private-key", "authorization", "auth-header", "state", "runtime_auth", "data_url", "workflow_state", "temporary_path", "file_handle", "artifact_download_url"]) {
+  const value = Object.create(null);
+  value[key] = "unsafe";
+  assert.throws(() => admitAuthoritativeBasisValue({ nested: value }));
+}
+const exactDepth = Array.from({ length: 16 }).reduce((value) => [value], "leaf");
+assert.deepStrictEqual(admitAuthoritativeBasisValue(exactDepth), exactDepth);
+assert.throws(() => admitAuthoritativeBasisValue([exactDepth]), /depth/);
+const exactObject = Object.fromEntries(Array.from({ length: 1024 }, (_, index) => [`k${index}`, index]));
+assert.strictEqual(Object.keys(admitAuthoritativeBasisValue(exactObject)).length, 1024);
+assert.throws(() => admitAuthoritativeBasisValue({ ...exactObject, overflow: 1 }), /object/);
+assert.strictEqual(admitAuthoritativeBasisValue(Array(4096).fill(null)).length, 4096);
+assert.throws(() => admitAuthoritativeBasisValue(Array(4097).fill(null)), /array/);
+const exactKey = "é".repeat(128);
+assert.strictEqual(admitAuthoritativeBasisValue({ [exactKey]: true })[exactKey], true);
+assert.throws(() => admitAuthoritativeBasisValue({ [`${exactKey}x`]: true }), /key/);
+const exactString = "x".repeat(262144);
+assert.strictEqual(admitAuthoritativeBasisValue(exactString).length, 262144);
+assert.throws(() => admitAuthoritativeBasisValue(`${exactString}x`), /string/);
+const exactNodes = Array.from({ length: 3999 }, () => [0, 0, 0, 0]).concat([[0, 0, 0]]);
+assert.strictEqual(admitAuthoritativeBasisValue(exactNodes).length, 4000);
+exactNodes[3999].push(0);
+assert.throws(() => admitAuthoritativeBasisValue(exactNodes), /node/);
+const exactBytes = Array.from({ length: 4 }, () => "a".repeat(262144));
+assert.strictEqual(admitAuthoritativeBasisValue(exactBytes).length, 4);
+assert.throws(() => admitAuthoritativeBasisValue([...exactBytes, "x"]), /text/);
+process.stdout.write("ok");
+'''
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertEqual(completed.stdout, "ok")
+
+    def test_run593_raw_slot_selector_and_target_only_mutation(self):
+        payload = valid_payload()
+        payload["quote_basis_sections"] = [
+            {"id": "target", "title": "Target", "section_meta": {"keep": [1, None, True]}, "lines": [
+                {"id": "before", "tag": "Confirm", "text": "Duplicate words", "meta": {"slot": 0}},
+                {"id": "selected", "tag": "Include", "text": "Duplicate words", "quantity": 2, "unit": "nos", "meta": {"slot": 1}},
+                {"id": "after", "tag": "Exclude", "text": "After", "meta": {"slot": 2}},
+            ]},
+            {"id": "elsewhere", "title": "Elsewhere", "lines": [{"tag": "Confirm", "text": "Duplicate words"}]},
+        ]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
+        payload["basis_chat"] = {
+            "question": "change selected words to blue panel",
+            "field": "target",
+            "line_index": 1,
+            "line": "Include: Duplicate words",
+        }
+        before = webapp.canonical_quote_basis_sections(payload)
+        changed = webapp.replacement_line_sections(payload, {"text": "Blue panel", "confidence": 93})
+        self.assertEqual(changed[0]["lines"][1]["text"], "Blue panel")
+        self.assertEqual(changed[0]["lines"][1]["meta"], {"slot": 1})
+        self.assertEqual(changed[0]["lines"][0], before[0]["lines"][0])
+        self.assertEqual(changed[0]["lines"][2], before[0]["lines"][2])
+        self.assertEqual(changed[1], before[1])
+        self.assertEqual(changed[0]["section_meta"], before[0]["section_meta"])
+
+        for label, mutate in (
+            ("before", lambda value: value["quote_basis_sections"][0]["lines"].__setitem__(0, None)),
+            ("target", lambda value: value["quote_basis_sections"][0]["lines"].__setitem__(1, {})),
+            ("after", lambda value: value["quote_basis_sections"][0]["lines"].__setitem__(2, 7)),
+            ("boolean index", lambda value: value["basis_chat"].__setitem__("line_index", True)),
+            ("missing field", lambda value: value["basis_chat"].pop("field")),
+            ("assertion mismatch", lambda value: value["basis_chat"].__setitem__("line", "Include: other")),
+        ):
+            candidate = copy.deepcopy(payload)
+            mutate(candidate)
+            with self.subTest(label=label), self.assertRaises(webapp.OpenAIAnalysisError):
+                webapp.replacement_line_sections(candidate, {"text": "Blue panel"})
+
+    def test_run593_openai_and_deepseek_provider_expansion_is_rejected(self):
+        payload = valid_payload()
+        payload["quote_basis_sections"] = [{
+            "id": "target",
+            "title": "Target",
+            "lines": [{"tag": "Confirm", "text": "Original", "meta": {"keep": True}}],
+        }]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
+        payload["basis_chat"] = {
+            "question": "change original to replacement",
+            "field": "target",
+            "line_index": 0,
+            "line": "Confirm: Original",
+        }
+        valid = {"intent": "proposal", "proposal": {"message": "Update", "replacement_line": {"text": "Replacement"}}}
+        for provider in ("openai", "deepseek"):
+            result = webapp.normalize_basis_chat_result(copy.deepcopy(valid), payload, provider)
+            self.assertEqual(result["proposal"]["quote_basis_sections"][0]["lines"][0]["text"], "Replacement")
+            self.assertEqual(result["proposal"]["quote_basis_sections"][0]["lines"][0]["meta"], {"keep": True})
+            for key, value in (
+                ("quote_basis_sections", []),
+                ("quote_basis", {}),
+                ("line_items", []),
+                ("metadata", {"unsafe_expansion": True}),
+                ("pricing", {"catalog_unit_price": 1}),
+                ("extra_sections", [{"id": "other"}]),
+            ):
+                expanded = copy.deepcopy(valid)
+                expanded["proposal"][key] = value
+                with self.subTest(provider=provider, key=key), self.assertRaises(webapp.OpenAIAnalysisError):
+                    webapp.normalize_basis_chat_result(expanded, payload, provider)
+            for replacement in (
+                [{"text": "One"}, {"text": "Two"}],
+                {"text": "Replacement", "pricing_keyword": "forbidden"},
+                {"text": "Replacement", "arbitrary_metadata": True},
+            ):
+                expanded = copy.deepcopy(valid)
+                expanded["proposal"]["replacement_line"] = replacement
+                with self.subTest(provider=provider, replacement=type(replacement).__name__), self.assertRaises(webapp.OpenAIAnalysisError):
+                    webapp.normalize_basis_chat_result(expanded, payload, provider)
+
+    def test_run593_representation_typed_persistence_and_publication_projection(self):
+        sections = [{
+            "id": "custom",
+            "title": "Custom",
+            "section_meta": {"preserved": "  exact  "},
+            "lines": [{"tag": "Confirm", "text": "Keep", "custom_meta": {"nested": [1, {}, []]}}],
+        }]
+        basis = webapp.quote_basis_from_sections(sections)
+        self.assertEqual(webapp.canonical_quote_basis_sections({"quote_basis": basis})[0]["id"], "custom")
+        self.assertEqual(webapp.canonical_quote_basis_sections({"quote_basis_sections": [], "quote_basis": basis})[0]["id"], "custom")
+        self.assertEqual(webapp.canonical_quote_basis_sections({"quote_basis_sections": sections, "quote_basis": basis})[0]["section_meta"], {"preserved": "  exact  "})
+        with self.assertRaises(ValueError):
+            webapp.canonical_quote_basis_sections({"quote_basis_sections": sections, "quote_basis": {"custom": "Confirm: Different"}})
+
+        nested = webapp.quote_session_draft_state_value({
+            "analysis": {"quoteBasisSections": sections, "quoteBasis": basis},
+            "proposal": {"origin": {"quote_basis_sections": sections, "quote_basis": basis}},
+        })
+        self.assertEqual(nested["analysis"]["quoteBasisSections"][0]["section_meta"], {"preserved": "  exact  "})
+        self.assertEqual(nested["proposal"]["origin"]["quote_basis_sections"][0]["lines"][0]["custom_meta"], {"nested": [1, {}, []]})
+
+        draft = {
+            "profileId": "profile:run593",
+            "pricingReferenceId": "pricing-run593",
+            "pricingReferenceSource": "local",
+            "quoteBasis": basis,
+            "quoteBasisSections": sections,
+            "outputRows": [],
+        }
+        projection = webapp.quote_session_commercial_state({"draft_state": draft})
+        edited = copy.deepcopy(draft)
+        edited["quoteBasisSections"][0]["section_meta"]["preserved"] = "different excluded metadata"
+        self.assertEqual(projection, webapp.quote_session_commercial_state({"draft_state": edited}))
+
+    def test_run575_loaded_app_cleanup_uses_one_overall_deadline(self):
+        source = (ROOT / "scripts" / "playwright-smoke.mjs").read_text(encoding="utf-8")
+        cleanup = source.split("async function stopIsolatedLoadedAppServer", 1)[1].split("async function run573LoadedAppOnce", 1)[0]
+        scenario = source.split("async function run573LoadedAppOnce", 1)[1].split("async function run573LoadedAppTwice", 1)[0]
+        self.assertIn("const deadline = Date.now() + 5000;", cleanup)
+        self.assertIn("waitUntil(deadline)", cleanup)
+        self.assertNotIn("setTimeout(() => resolve(null), 1000)", cleanup)
+        self.assertIn("for (let cycle = 1; cycle <= 2; cycle += 1)", scenario)
+        self.assertIn("await page.reload", scenario)
+        self.assertIn("await modifyDashboardQuote(sessionId)", scenario)
+        self.assertIn("await saveCurrentQuoteSession", scenario)
 
 
 if __name__ == "__main__":

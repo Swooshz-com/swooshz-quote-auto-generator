@@ -17,6 +17,11 @@ const ACTIVE_JOB_RUNNING_BASIS_CHAT_MAX_AGE_MS = 10 * 60 * 1000;
 const ACTIVE_JOB_RUNNING_CONFIRM_BASIS_MAX_AGE_MS = 5 * 60 * 1000;
 const ACTIVE_JOB_RUNNING_GENERATION_MAX_AGE_MS = 15 * 60 * 1000;
 const ACTIVE_JOB_CLOCK_SKEW_MS = 60 * 1000;
+const BASIS_CHAT_PROPOSAL_ORIGIN_VERSION = 1;
+const BASIS_CHAT_LINEAGE_VERSION = 1;
+const BASIS_CHAT_OPERATION_VERSION = 1;
+const BASIS_CHAT_AUTHORITY_MAX_DEPTH = 40;
+const BASIS_CHAT_AUTHORITY_MAX_NODES = 20000;
 // Starting work should survive only an immediate refresh. Draft analysis gets 30 minutes
 // for the documented 10-15 minute AI window; chat, local normalization, and exports use
 // shorter limits that cover realistic completion without replaying abandoned work later.
@@ -364,6 +369,9 @@ const state = {
     unit: "",
     quantityLabel: "",
     proposal: null,
+    authorityOwner: null,
+    busyOwnerId: null,
+    completionNotice: null,
   },
 };
 
@@ -379,6 +387,10 @@ let quoteSessionConfirmedDraftKey = "";
 let quoteSessionConfirmedDraftFileKey = "";
 let authorityProfileRequestSequence = 0;
 let activeAuthorityProfileRequestContext = null;
+// Runtime-only basis-chat authority.  The token is deliberately never placed in
+// state.activeJob, state.basisChat, browser storage, requests, proposals, or logs.
+let basisChatRuntimeAuthority = null;
+let basisChatOverlayGeneration = 0;
 
 const elements = {
   healthText: qs("#healthText"),
@@ -752,6 +764,7 @@ function transitionGenerationContext(sessionId = "", runId = "") {
   const safeSessionId = safeQuoteSessionId(sessionId || "");
   const safeRunId = safeGenerationRunId(runId || "");
   const previousContext = currentGenerationContext();
+  if (previousContext.session_id !== safeSessionId && state.basisChat) invalidateBasisChatAuthority();
   state.quoteSessionId = safeSessionId;
   state.lastGenerationRunId = safeRunId;
   state.lastGenerationRunSessionId = safeRunId ? safeSessionId : "";
@@ -804,6 +817,10 @@ function newClientOperationId() {
   return `operation-${randomQuoteSessionToken()}`;
 }
 
+function newBasisChatLineageId() {
+  return `lineage-${randomQuoteSessionToken()}`;
+}
+
 function normalizeRestorableOverlay(value = "") {
   const overlay = String(value || "").trim();
   return RESTORABLE_OVERLAYS.has(overlay) ? overlay : "";
@@ -819,6 +836,16 @@ function activeJobMaxAgeMs(type = "", phase = "starting") {
 }
 
 function normalizeActiveJob(job = {}, options = {}) {
+  if (job && typeof job === "object" && !Array.isArray(job)) {
+    try {
+      const typeDescriptor = Object.getOwnPropertyDescriptor(job, "type");
+      if (typeDescriptor && "value" in typeDescriptor && typeDescriptor.value === "basis_chat") {
+        return canonicalBasisChatOperation(detachedBasisChatAuthorityValue(job), options);
+      }
+    } catch (_error) {
+      return null;
+    }
+  }
   if (!job || typeof job !== "object") return null;
   const type = String(job.type || "").trim();
   const id = String(job.id || "").trim();
@@ -861,7 +888,7 @@ function normalizeActiveJob(job = {}, options = {}) {
     const maxAgeMs = activeJobMaxAgeMs(type, phase);
     if (ageMs < -ACTIVE_JOB_CLOCK_SKEW_MS || !maxAgeMs || ageMs > maxAgeMs) return null;
   }
-  return {
+  const normalized = {
     ...job,
     id,
     type,
@@ -869,6 +896,7 @@ function normalizeActiveJob(job = {}, options = {}) {
     startedAt: parsedDate.toISOString(),
     browserRecoveryScope,
   };
+  return normalized;
 }
 
 function ensureClientQuoteSessionId() {
@@ -3066,6 +3094,7 @@ function renderFiles() {
 }
 
 function normalizeLineItem(item = {}) {
+  item = typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(item) : item;
   const priceMode = item.price_mode === "Included" || String(item.display_price || "").toLowerCase() === "included"
     ? "Included"
     : "Priced";
@@ -3098,14 +3127,55 @@ function normalizeLineItem(item = {}) {
 }
 
 function cloneQuoteBasis(basis = {}) {
+  return typeof canonicalQuoteBasis === "function" ? canonicalQuoteBasis(basis) : { ...basis };
+}
+
+const QUOTE_BASIS_LEGACY_ORDER = ["surfaces", "counters", "platform", "graphics", "furniture", "electrical"];
+const QUOTE_BASIS_KEY_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const QUOTE_BASIS_UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function canonicalQuoteBasis(value = {}) {
+  if (value === null || value === undefined) return {};
+  if (typeof value !== "object" || Array.isArray(value)) throw new TypeError("Quote basis must be a plain string map.");
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) throw new TypeError("Quote basis must be a plain string map.");
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const admitted = {};
+  Object.keys(descriptors).forEach((key) => {
+    const descriptor = descriptors[key];
+    if (
+      key.length < 1
+      || key.length > 80
+      || !QUOTE_BASIS_KEY_PATTERN.test(key)
+      || QUOTE_BASIS_UNSAFE_KEYS.has(key)
+      || descriptor.get
+      || descriptor.set
+      || typeof descriptor.value !== "string"
+    ) throw new TypeError("Quote basis contains an invalid entry.");
+    const text = descriptor.value.replace(/\r\n?/g, "\n");
+    if (text !== "") admitted[key] = text;
+  });
+  const orderedKeys = QUOTE_BASIS_LEGACY_ORDER.filter((key) => Object.prototype.hasOwnProperty.call(admitted, key));
+  orderedKeys.push(...Object.keys(admitted).filter((key) => !QUOTE_BASIS_LEGACY_ORDER.includes(key)).sort());
+  return Object.fromEntries(orderedKeys.map((key) => [key, admitted[key]]));
+}
+
+function canonicalQuoteBasisForPersistence(basis = state.quoteBasis, sections = state.quoteBasisSections) {
+  const admitted = canonicalQuoteBasis(basis);
+  const sectionProjection = canonicalQuoteBasis(quoteBasisFromSections(Array.isArray(sections) ? sections : []));
+  if (!Object.keys(sectionProjection).length) return admitted;
+  if (!Object.keys(admitted).length) return sectionProjection;
+  if (JSON.stringify(admitted) !== JSON.stringify(sectionProjection)) {
+    throw new TypeError("Quote basis sections do not agree with quote basis.");
+  }
+  return admitted;
+}
+
+function quoteBasisPersistenceProjection(basis = state.quoteBasis, sections = state.quoteBasisSections) {
+  const admittedSections = canonicalQuoteBasisSections(Array.isArray(sections) ? sections : []);
   return {
-    ...EMPTY_BASIS,
-    surfaces: basis.surfaces || "",
-    counters: basis.counters || "",
-    platform: basis.platform || "",
-    graphics: basis.graphics || "",
-    furniture: basis.furniture || "",
-    electrical: basis.electrical || "",
+    quote_basis: canonicalQuoteBasisForPersistence(basis, admittedSections),
+    quote_basis_sections: admittedSections,
   };
 }
 
@@ -3762,6 +3832,101 @@ function loadSessionFileMap(keys = []) {
   }));
 }
 
+function basisChatBrowserSnapshot() {
+  const snapshot = Object.create(null);
+  const chat = state.basisChat && typeof state.basisChat === "object" ? state.basisChat : Object.create(null);
+  ["scope", "field", "sectionId", "lineIndex", "line", "quantity", "unit", "quantityLabel"].forEach((key) => {
+    const fallback = key === "lineIndex" ? -1 : "";
+    const value = chat[key] === undefined ? fallback : chat[key];
+    Object.defineProperty(snapshot, key, { value: detachedBasisChatAuthorityValue(value), enumerable: true });
+  });
+  Object.defineProperties(snapshot, {
+    proposal: { value: chat.proposal ? detachedBasisChatAuthorityValue(chat.proposal) : null, enumerable: true },
+    authorityOwner: { value: chat.authorityOwner ? detachedBasisChatAuthorityValue(chat.authorityOwner) : null, enumerable: true },
+    busyOwnerId: { value: chat.busyOwnerId ?? null, enumerable: true },
+    completionNotice: { value: chat.completionNotice ? detachedBasisChatAuthorityValue(chat.completionNotice) : null, enumerable: true },
+  });
+  return detachedBasisChatAuthorityValue(snapshot);
+}
+
+function activeJobBrowserSnapshot() {
+  const activeJob = normalizeActiveJob(state.activeJob || {});
+  if (!activeJob) return null;
+  if (activeJob.type === "basis_chat") return detachedBasisChatAuthorityValue(canonicalBasisChatOperation(activeJob));
+  return JSON.parse(JSON.stringify(activeJob));
+}
+
+function canonicalBasisChatCompletionNotice(notice) {
+  const supplied = detachedBasisChatAuthorityValue(notice);
+  basisChatRequireExactKeys(supplied, ["lineageId", "kind", "message"], "Basis completion notice");
+  if (typeof supplied.lineageId !== "string" || !/^lineage-[A-Za-z0-9_-]{8,80}$/.test(supplied.lineageId)
+    || !["answer", "error"].includes(supplied.kind)
+    || typeof supplied.message !== "string" || !supplied.message) throw new TypeError("Basis completion notice is invalid.");
+  return recursivelyFreezeBasisChatAuthority(supplied);
+}
+
+function restoreBasisChatTransientAuthority(savedBasisChat, savedActiveJob) {
+  if (typeof revokeBasisChatRuntimeAuthority === "function") revokeBasisChatRuntimeAuthority();
+  const saved = detachedBasisChatAuthorityValue(savedBasisChat);
+  basisChatRequireExactKeys(saved, ["scope", "field", "sectionId", "lineIndex", "line", "quantity", "unit", "quantityLabel", "proposal", "authorityOwner", "busyOwnerId", "completionNotice"], "Saved basis chat");
+  const noTransientAuthority = saved.proposal === null && saved.authorityOwner === null
+    && saved.busyOwnerId === null && saved.completionNotice === null && savedActiveJob === null;
+  if (noTransientAuthority && saved.scope === "quote" && saved.sectionId === "" && saved.lineIndex === -1) {
+    state.basisChat = {
+      scope: "quote", field: "", sectionId: "", lineIndex: -1, line: "", quantity: "", unit: "", quantityLabel: "",
+      proposal: null, authorityOwner: null, busyOwnerId: null, completionNotice: null,
+    };
+    return null;
+  }
+  if (saved.scope !== "line" || typeof saved.field !== "string" || typeof saved.sectionId !== "string" || !saved.sectionId
+    || typeof saved.lineIndex !== "number" || !Number.isSafeInteger(saved.lineIndex) || saved.lineIndex < 0
+    || typeof saved.line !== "string" || !saved.line || typeof saved.unit !== "string" || typeof saved.quantityLabel !== "string") {
+    throw new TypeError("Saved basis chat context is invalid.");
+  }
+  state.basisChat = {
+    scope: saved.scope,
+    field: saved.field,
+    sectionId: saved.sectionId,
+    lineIndex: saved.lineIndex,
+    line: saved.line,
+    quantity: saved.quantity,
+    unit: saved.unit,
+    quantityLabel: saved.quantityLabel,
+    proposal: null,
+    authorityOwner: null,
+    busyOwnerId: null,
+    completionNotice: null,
+  };
+  revokeBasisChatRuntimeAuthority();
+  currentBasisChatAuthority();
+  const active = savedActiveJob === null ? null : canonicalBasisChatOperation(savedActiveJob, { restoring: true });
+  if (saved.authorityOwner === null) {
+    if (saved.proposal !== null || saved.busyOwnerId !== null || active !== null) throw new TypeError("Saved basis chat authority is incomplete.");
+    state.basisChat.completionNotice = saved.completionNotice === null ? null : canonicalBasisChatCompletionNotice(saved.completionNotice);
+    return null;
+  }
+  const owner = canonicalBasisChatAuthorityOwner(saved.authorityOwner);
+  if (!basisChatOriginIsCurrent(owner.origin)) throw new TypeError("Saved basis chat owner is stale.");
+  state.basisChat.authorityOwner = owner;
+  if (owner.status === "proposal") {
+    if (active !== null || saved.busyOwnerId !== null || saved.proposal === null || saved.completionNotice !== null) throw new TypeError("Saved basis proposal group is invalid.");
+    const validatedProposal = canonicalTargetOnlyBasisChatProposal(saved.proposal, owner.origin, owner.lineage, null, { requireAuthority: false });
+    const token = mintBasisChatRuntimeAuthority("proposal", owner.origin, owner.lineage);
+    state.basisChat.proposal = canonicalTargetOnlyBasisChatProposal(validatedProposal, owner.origin, owner.lineage, token);
+    return null;
+  }
+  if (!active || saved.proposal !== null || saved.completionNotice !== null
+    || saved.busyOwnerId !== owner.lineage.clientOperationId
+    || !basisChatAuthorityStrictEqual(active.proposalOrigin, owner.origin)
+    || !basisChatAuthorityStrictEqual(active.lineage, owner.lineage)) throw new TypeError("Saved running basis authority group is invalid.");
+  state.basisChat.busyOwnerId = saved.busyOwnerId;
+  state.activeJob = active;
+  const token = mintBasisChatRuntimeAuthority("running", owner.origin, owner.lineage);
+  if (!bindBasisChatRuntimeOperation(token, active)) throw new TypeError("Saved running basis authority could not be owned.");
+  basisChatRuntimeAuthority.controlOwner = true;
+  return active;
+}
+
 function clearSessionFiles() {
   return openSessionFileDb().then((db) => new Promise((resolve, reject) => {
     const transaction = db.transaction(QUOTE_SESSION_FILE_STORE_NAME, "readwrite");
@@ -3773,6 +3938,7 @@ function clearSessionFiles() {
 }
 
 function buildSessionSnapshot() {
+  const persistedBasis = quoteBasisPersistenceProjection();
   return {
     version: QUOTE_SESSION_STATE_VERSION,
     browserRecoveryScope: currentBrowserRecoveryScope(),
@@ -3795,8 +3961,8 @@ function buildSessionSnapshot() {
     images: state.images.slice(0, MAX_REFERENCE_IMAGES).map(sessionImageMetadata),
     quoteDetails: quoteDetailsWithSessionLogoMetadata(collectQuoteDetails()),
     workflowStage: state.workflowStage,
-    quoteBasis: state.quoteBasis,
-    quoteBasisSections: state.quoteBasisSections,
+    quoteBasis: persistedBasis.quote_basis,
+    quoteBasisSections: persistedBasis.quote_basis_sections,
     lineItems: state.lineItems,
     outputRows: state.outputRows,
     originalOutputRows: state.originalOutputRows,
@@ -3812,7 +3978,7 @@ function buildSessionSnapshot() {
     lastAnalysisMode: state.lastAnalysisMode,
     pendingAnalysisMode: state.pendingAnalysisMode,
     pendingFeedback: state.pendingFeedback,
-    basisChat: state.basisChat,
+    basisChat: basisChatBrowserSnapshot(),
     activeSidePanel: state.activeSidePanel,
     downloadFile: state.downloadFile,
     pdfFile: state.pdfFile,
@@ -3821,7 +3987,7 @@ function buildSessionSnapshot() {
     pdfFileRevision: state.pdfFileRevision,
     pricingMatches: state.pricingMatches,
     pricingIssues: state.pricingIssues,
-    activeJob: normalizeActiveJob(state.activeJob || {}),
+    activeJob: activeJobBrowserSnapshot(),
   };
 }
 
@@ -4226,6 +4392,11 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
       ...(draftCandidates[0] || {}),
       ...savedState,
     };
+  const canRestoreBrowserTransientAuthority = !containerMalformed
+    && !nestedSession
+    && draftCandidates.length === 0
+    && !options.sessionId
+    && savedState.browserRecoveryScope === currentBrowserRecoveryScope();
   invalidateAuthorityProfileRequests();
   let rejectedRestoredActiveJob = false;
   state.profileId = typeof restoredState.profileId === "string" ? restoredState.profileId : "";
@@ -4350,8 +4521,20 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   );
   applyQuoteDetails(restoredQuoteDetails, { includeLogo: true, clearLogo: true });
   state.images = await restoreSessionImages(restoredState.images);
-  state.quoteBasis = cloneQuoteBasis(restoredState.quoteBasis || {});
-  state.quoteBasisSections = normalizeQuoteBasisSections(restoredState.quoteBasisSections || restoredState.quoteBasis || {});
+  const restoredBasis = typeof canonicalQuoteBasis === "function"
+    ? canonicalQuoteBasis(restoredState.quoteBasis || {})
+    : cloneQuoteBasis(restoredState.quoteBasis || {});
+  const hasRestoredSections = Array.isArray(restoredState.quoteBasisSections)
+    && restoredState.quoteBasisSections.length > 0;
+  const restoredSections = hasRestoredSections
+    ? (typeof canonicalQuoteBasisSections === "function"
+      ? canonicalQuoteBasisSections(restoredState.quoteBasisSections)
+      : normalizeQuoteBasisSections(restoredState.quoteBasisSections))
+    : [];
+  state.quoteBasis = typeof canonicalQuoteBasisForPersistence === "function"
+    ? canonicalQuoteBasisForPersistence(restoredBasis, restoredSections)
+    : restoredBasis;
+  state.quoteBasisSections = restoredSections;
   state.lineItems = Array.isArray(restoredState.lineItems) ? restoredState.lineItems.map(normalizeLineItem) : [];
   state.outputRows = Array.isArray(restoredState.outputRows) ? restoredState.outputRows.map(normalizeOutputRow) : [];
   state.originalOutputRows = Array.isArray(restoredState.originalOutputRows) ? restoredState.originalOutputRows.map(normalizeOutputRow) : [];
@@ -4365,12 +4548,21 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.draftSource = restoredState.draftSource || "";
   state.lastAnalysisMode = normalizeAnalysisMode(restoredState.lastAnalysisMode || restoredState.originalAnalysisSnapshot?.analysis_mode);
   state.pendingAnalysisMode = normalizeAnalysisMode(restoredState.pendingAnalysisMode || state.lastAnalysisMode);
-  const savedBasisChat = restoredState.basisChat && typeof restoredState.basisChat === "object" ? restoredState.basisChat : {};
+  const savedBasisChat = canRestoreBrowserTransientAuthority ? restoredState.basisChat : null;
+  if (typeof revokeBasisChatRuntimeAuthority === "function") revokeBasisChatRuntimeAuthority();
   state.basisChat = {
-    ...state.basisChat,
-    ...savedBasisChat,
-    lineIndex: Number.isInteger(Number(savedBasisChat.lineIndex)) ? Number(savedBasisChat.lineIndex) : -1,
-    proposal: savedBasisChat.proposal && typeof savedBasisChat.proposal === "object" ? savedBasisChat.proposal : null,
+    scope: "quote",
+    field: "",
+    sectionId: "",
+    lineIndex: -1,
+    line: "",
+    quantity: "",
+    unit: "",
+    quantityLabel: "",
+    proposal: null,
+    authorityOwner: null,
+    busyOwnerId: null,
+    completionNotice: null,
   };
   state.aiFailed = Boolean(restoredState.aiFailed || state.draftSource === "local");
   state.downloadFile = restoredState.downloadFile || null;
@@ -4386,8 +4578,30 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   );
   state.pricingMatches = Array.isArray(restoredState.pricingMatches) ? restoredState.pricingMatches : [];
   state.pricingIssues = [];
-  state.activeJob = normalizeActiveJob(restoredState.activeJob || {}, { restoring: true });
-  rejectedRestoredActiveJob = Boolean(restoredState.activeJob && typeof restoredState.activeJob === "object" && !state.activeJob);
+  state.activeJob = null;
+  rejectedRestoredActiveJob = false;
+  if (canRestoreBrowserTransientAuthority && savedBasisChat && Reflect.ownKeys(savedBasisChat).length) {
+    try {
+      const detachedActiveJob = restoredState.activeJob === undefined || restoredState.activeJob === null
+        ? null : detachedBasisChatAuthorityValue(restoredState.activeJob);
+      const savedBasisJob = detachedActiveJob?.type === "basis_chat" ? detachedActiveJob : null;
+      state.activeJob = restoreBasisChatTransientAuthority(savedBasisChat, savedBasisJob);
+      if (!state.activeJob && detachedActiveJob && detachedActiveJob.type !== "basis_chat") {
+        state.activeJob = normalizeActiveJob(detachedActiveJob, { restoring: true });
+      }
+    } catch (_error) {
+      if (typeof revokeBasisChatRuntimeAuthority === "function") revokeBasisChatRuntimeAuthority();
+      state.activeJob = state.activeJob?.type === "basis_chat" ? null : state.activeJob;
+      state.basisChat.proposal = null;
+      state.basisChat.authorityOwner = null;
+      state.basisChat.busyOwnerId = null;
+      state.basisChat.completionNotice = null;
+      rejectedRestoredActiveJob = Boolean(restoredState.activeJob);
+    }
+  } else if (canRestoreBrowserTransientAuthority && restoredState.activeJob) {
+    state.activeJob = normalizeActiveJob(restoredState.activeJob, { restoring: true });
+    rejectedRestoredActiveJob = !state.activeJob;
+  }
   if (rejectedRestoredActiveJob) {
     state.isAnalysisRunning = false;
     state.isGenerating = false;
@@ -6534,6 +6748,7 @@ function splitBasisDecisionText(text = "", defaultTag = "Confirm") {
 }
 
 function normalizeBasisLines(line = "") {
+  if (line && typeof line === "object" && !Array.isArray(line) && typeof canonicalizePrimaryOrderFields === "function") line = canonicalizePrimaryOrderFields(line);
   if (line && typeof line === "object") {
     const quantityParts = normalizedLineTextQuantityParts(
       line.text || line.line || line.description || "",
@@ -6567,6 +6782,192 @@ function normalizeBasisLines(line = "") {
   return splitBasisDecisionText(cleanCustomerQuoteLineText(line));
 }
 
+function canonicalBasisSectionText(value = "") {
+  if (typeof value !== "string") throw new TypeError("Quote basis section text must be a string.");
+  return value.replace(/\r\n?/g, "\n");
+}
+
+const AUTHORITATIVE_BASIS_LIMITS = Object.freeze({
+  depth: 16,
+  objectKeys: 1024,
+  arrayElements: 4096,
+  keyBytes: 256,
+  stringBytes: 262144,
+  nodes: 20000,
+  textBytes: 1048576,
+});
+const AUTHORITATIVE_BASIS_BLOCKED_KEYS = new Set([
+  "__proto__", "constructor", "prototype", "auth_code", "authorization_code", "oauth_code",
+  "state", "auth_state", "oauth_state", "session_state", "runtime_auth", "session_auth",
+  "data_url", "logo_data_url", "brief_path", "output_dir", "stdout", "stderr", "active_job",
+  "job_id", "job_state", "workflow_state", "workflow_stage", "recovery_file_key",
+  "session_file_key", "logo_session_file_key", "download_url",
+]);
+
+function authoritativeBasisKeyClass(value = "") {
+  return String(value).normalize("NFKC").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
+
+function authoritativeBasisKeyIsUnsafe(value = "") {
+  if (QUOTE_BASIS_UNSAFE_KEYS.has(String(value))) return true;
+  const keyClass = authoritativeBasisKeyClass(value);
+  const parts = new Set(keyClass.split("_").filter(Boolean));
+  if (AUTHORITATIVE_BASIS_BLOCKED_KEYS.has(keyClass) || keyClass.endsWith("_download_url")) return true;
+  if (["token", "secret", "cookie", "nonce", "password", "passwd", "credential", "bearer"].some((part) => parts.has(part))) return true;
+  if (["private_key", "authorization", "auth_header", "temp_path", "temporary_path", "tmp_path", "file_handle", "file_descriptor"].includes(keyClass)) return true;
+  return ["_file_handle", "_temp_path", "_temporary_path", "_tmp_path"].some((suffix) => keyClass.endsWith(suffix));
+}
+
+function admitAuthoritativeBasisValue(value) {
+  const budget = { nodes: 0, bytes: 0 };
+  const byteLength = (text) => new TextEncoder().encode(text).length;
+  const admit = (current, depth) => {
+    if (depth > AUTHORITATIVE_BASIS_LIMITS.depth) throw new TypeError("Quote basis exceeds the maximum depth.");
+    budget.nodes += 1;
+    if (budget.nodes > AUTHORITATIVE_BASIS_LIMITS.nodes) throw new TypeError("Quote basis exceeds the aggregate node limit.");
+    if (current === null || typeof current === "boolean") return current;
+    if (typeof current === "string") {
+      const length = byteLength(current);
+      if (length > AUTHORITATIVE_BASIS_LIMITS.stringBytes) throw new TypeError("Quote basis contains an oversized string.");
+      budget.bytes += length;
+      if (budget.bytes > AUTHORITATIVE_BASIS_LIMITS.textBytes) throw new TypeError("Quote basis exceeds the aggregate text limit.");
+      return current;
+    }
+    if (typeof current === "number") {
+      if (!Number.isFinite(current)) throw new TypeError("Quote basis contains a non-finite number.");
+      if (Number.isInteger(current) && !Number.isSafeInteger(current)) throw new TypeError("Quote basis contains an unsafe integer.");
+      return Object.is(current, -0) ? 0 : current;
+    }
+    if (Array.isArray(current)) {
+      if (current.length > AUTHORITATIVE_BASIS_LIMITS.arrayElements) throw new TypeError("Quote basis contains an oversized array.");
+      return current.map((item) => admit(item, depth + 1));
+    }
+    if (!current || typeof current !== "object") throw new TypeError("Quote basis contains an unsupported runtime value.");
+    const prototype = Object.getPrototypeOf(current);
+    if (prototype !== Object.prototype && prototype !== null) throw new TypeError("Quote basis contains a non-plain object.");
+    const descriptors = Object.getOwnPropertyDescriptors(current);
+    const keys = Object.keys(descriptors);
+    if (keys.length > AUTHORITATIVE_BASIS_LIMITS.objectKeys) throw new TypeError("Quote basis contains an oversized object.");
+    const admitted = {};
+    keys.forEach((key) => {
+      const descriptor = descriptors[key];
+      if (descriptor.get || descriptor.set) throw new TypeError("Quote basis contains an accessor.");
+      const length = byteLength(key);
+      if (length > AUTHORITATIVE_BASIS_LIMITS.keyBytes) throw new TypeError("Quote basis contains an oversized key.");
+      budget.bytes += length;
+      if (budget.bytes > AUTHORITATIVE_BASIS_LIMITS.textBytes) throw new TypeError("Quote basis exceeds the aggregate text limit.");
+      if (authoritativeBasisKeyIsUnsafe(key)) throw new TypeError("Quote basis contains unsafe metadata.");
+      admitted[key] = admit(descriptor.value, depth + 1);
+    });
+    return admitted;
+  };
+  return admit(value, 0);
+}
+
+function canonicalBasisAliasText(value, aliases, defaultValue = "") {
+  const present = aliases.filter((key) => Object.prototype.hasOwnProperty.call(value, key));
+  if (!present.length) return canonicalBasisSectionText(defaultValue);
+  const values = present.map((key) => canonicalBasisSectionText(value[key]));
+  if (values.some((item) => item !== values[0])) throw new TypeError("Quote basis contains conflicting structural aliases.");
+  return values[0];
+}
+
+function pythonWhitespaceText(value = "") {
+  return String(value ?? "")
+    .replace(/[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/gu, " ")
+    .replace(/^ +| +$/g, "");
+}
+
+function canonicalBasisSectionLine(value = "") {
+  value = admitAuthoritativeBasisValue(value);
+  if (typeof value === "string") {
+    const text = canonicalBasisSectionText(value);
+    if (text === "") throw new TypeError("Quote basis line text must not be empty.");
+    return { tag: "Confirm", text };
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new TypeError("Quote basis line must be a string or object.");
+  const text = canonicalBasisAliasText(value, ["text", "line", "description"]);
+  if (text === "") throw new TypeError("Quote basis line text must not be empty.");
+  const line = { tag: normalizeBasisTag(value.tag), text };
+  Object.entries(value).forEach(([key, item]) => {
+    if (["tag", "text", "line", "description"].includes(key)) return;
+    if (["basis_order", "category_order", "item_order"].includes(key)) {
+      const order = canonicalPrimaryOrderValue(item);
+      if (order === null) throw new TypeError("Quote basis contains an invalid order value.");
+      line[key] = order;
+      return;
+    }
+    line[key] = item;
+  });
+  return line;
+}
+
+function canonicalQuoteBasisSections(value = {}) {
+  const source = Array.isArray(value)
+    ? { quote_basis_sections: value }
+    : value && typeof value === "object"
+      ? Object.fromEntries(["quote_basis_sections", "quote_basis"].filter((key) => Object.prototype.hasOwnProperty.call(value, key)).map((key) => [key, value[key]]))
+      : {};
+  const admittedSource = admitAuthoritativeBasisValue(source);
+  const sectionsSupplied = Object.prototype.hasOwnProperty.call(admittedSource, "quote_basis_sections");
+  const rawSections = sectionsSupplied ? admittedSource.quote_basis_sections : null;
+  if (sectionsSupplied && !Array.isArray(rawSections)) throw new TypeError("Quote basis sections must be a list.");
+  const usedIds = new Set();
+  if (Array.isArray(rawSections) && rawSections.length) {
+    const sections = rawSections.map((admittedSection, index) => {
+        if (!admittedSection || typeof admittedSection !== "object" || Array.isArray(admittedSection)) throw new TypeError("Quote basis section must be an object.");
+        const title = normalizeQuoteBasisTitle(admittedSection.title || "Section") || "Section";
+        if (admittedSection.id !== undefined && typeof admittedSection.id !== "string") throw new TypeError("Quote basis section id must be a string.");
+        const rawId = pythonWhitespaceText(admittedSection.id);
+        const id = safeId(rawId && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(rawId) ? rawId : title, `section-${index + 1}`);
+        if (usedIds.has(id)) throw new TypeError("Quote basis sections contain colliding identities.");
+        usedIds.add(id);
+        let rawLines = [];
+        if (Object.prototype.hasOwnProperty.call(admittedSection, "lines")) {
+          if (!Array.isArray(admittedSection.lines)) throw new TypeError("Quote basis section lines must be a list.");
+          rawLines = admittedSection.lines;
+          if (Object.prototype.hasOwnProperty.call(admittedSection, "text") || Object.prototype.hasOwnProperty.call(admittedSection, "body")) {
+            const aliasText = canonicalBasisAliasText(admittedSection, ["text", "body"]);
+            const projected = rawLines.map(canonicalBasisSectionLine).map((line) => `${normalizeBasisTag(line.tag)}: ${line.text}`).join("\n");
+            if (aliasText !== projected) throw new TypeError("Quote basis contains conflicting section aliases.");
+          }
+        } else if (Object.prototype.hasOwnProperty.call(admittedSection, "text") || Object.prototype.hasOwnProperty.call(admittedSection, "body")) {
+          rawLines = [canonicalBasisAliasText(admittedSection, ["text", "body"])];
+        }
+        const lines = rawLines.map(canonicalBasisSectionLine);
+        const result = { id, title, lines };
+        Object.entries(admittedSection).forEach(([key, item]) => {
+          if (["id", "title", "lines", "text", "body"].includes(key)) return;
+          if (["basis_order", "category_order", "item_order", "section_order"].includes(key)) {
+            const order = canonicalPrimaryOrderValue(item);
+            if (order === null) throw new TypeError("Quote basis contains an invalid order value.");
+            result[key] = order;
+          } else result[key] = item;
+        });
+        return result;
+      });
+    const derived = canonicalQuoteBasis(quoteBasisFromSections(sections));
+    if (Object.prototype.hasOwnProperty.call(admittedSource, "quote_basis")) {
+      const supplied = canonicalQuoteBasis(admittedSource.quote_basis);
+      if (Object.keys(supplied).length && !basisChatAuthorityStrictEqual(supplied, derived)) throw new TypeError("Quote basis sections do not agree with quote basis.");
+    }
+    return admitAuthoritativeBasisValue(sections);
+  }
+  const basis = Object.prototype.hasOwnProperty.call(admittedSource, "quote_basis") ? admittedSource.quote_basis : {};
+  const admittedBasis = canonicalQuoteBasis(basis);
+  const titles = Object.fromEntries(BASIS_FIELDS);
+  return Object.keys(admittedBasis)
+    .map((key) => {
+      const id = safeId(key, "section");
+      if (usedIds.has(id)) throw new TypeError("Quote basis sections contain colliding identities.");
+      usedIds.add(id);
+      const title = titles[key] || key.replace(/[-_]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+      const lines = [canonicalBasisSectionLine(admittedBasis[key])];
+      return { id, title, lines };
+    })
+    .filter(Boolean);
+}
+
 function parseBasisLine(line = "") {
   return normalizeBasisLines(line)[0] || { tag: "Confirm", text: "" };
 }
@@ -6578,10 +6979,14 @@ function normalizeQuoteBasisSections(value = {}) {
       ? value.quote_basis_sections
       : null;
   if (rawSections) {
+    const usedIds = new Set();
     return rawSections
       .map((section, index) => {
         const title = normalizeQuoteBasisTitle(section?.title || "Section") || "Section";
-        const id = safeId(section?.id && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(String(section.id)) ? section.id : title, `section-${index + 1}`);
+        const rawId = pythonWhitespaceText(section?.id);
+        const id = safeId(rawId && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(rawId) ? rawId : title, `section-${index + 1}`);
+        if (usedIds.has(id)) throw new TypeError("Quote basis sections contain colliding identities.");
+        usedIds.add(id);
         const rawLines = Array.isArray(section?.lines) ? section.lines : splitLines(section?.text || "");
         const lines = rawLines.flatMap(normalizeBasisLines).filter((line) => line.text);
         return lines.length ? { id, title, lines } : null;
@@ -6600,7 +7005,7 @@ function normalizeQuoteBasisSections(value = {}) {
 }
 
 function confirmOnlyQuoteBasisSections(sections = []) {
-  return normalizeQuoteBasisSections(sections).map((section) => ({
+  return canonicalQuoteBasisSections(sections).map((section) => ({
     ...section,
     lines: (section.lines || []).map((line) => {
       const tag = normalizeBasisTag(line.tag);
@@ -6610,18 +7015,25 @@ function confirmOnlyQuoteBasisSections(sections = []) {
 }
 
 function quoteBasisFromSections(sections = []) {
-  return (Array.isArray(sections) ? sections : []).reduce((basis, section) => {
+  const usedIds = new Set();
+  return (Array.isArray(sections) ? sections : []).reduce((basis, section, index) => {
     const id = safeId(section.id || section.title, "section");
+    if (usedIds.has(id)) throw new TypeError("Quote basis sections contain colliding identities.");
+    usedIds.add(id);
     basis[id] = (section.lines || [])
-      .map((line) => `${normalizeBasisTag(line.tag)}: ${line.text || ""}`.trim())
-      .filter((line) => !/:\s*$/.test(line))
+      .map((line) => {
+        if (typeof line?.text !== "string") throw new TypeError("Quote basis section text must be a string.");
+        return { tag: normalizeBasisTag(line.tag), text: line.text.replace(/\r\n?/g, "\n") };
+      })
+      .filter((line) => line.text !== "")
+      .map((line) => `${line.tag}: ${line.text}`)
       .join("\n");
     return basis;
   }, {});
 }
 
 function cloneQuoteBasisSections(sections = []) {
-  return normalizeQuoteBasisSections(JSON.parse(JSON.stringify(Array.isArray(sections) ? sections : [])));
+  return canonicalQuoteBasisSections(JSON.parse(JSON.stringify(Array.isArray(sections) ? sections : [])));
 }
 
 function basisLineMetadataMergeKey(line = {}) {
@@ -6717,6 +7129,7 @@ function reviewBasisProposalSections(nextSections = [], currentSections = []) {
 }
 
 function normalizeOutputRow(row = {}) {
+  row = typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(row) : row;
   const priceMode = row.price_mode === "Included" || String(row.display_price || "").toLowerCase() === "included"
     ? "Included"
     : "Priced";
@@ -8156,6 +8569,7 @@ function invalidateGeneratedExportsIfPresentationChanged(previousSignature = "")
   return invalidateGeneratedExportsForPresentationChange();
 }
 function clearGeneratedQuoteState() {
+  invalidateBasisChatAuthority();
   state.quoteBasis = { ...EMPTY_BASIS };
   state.quoteBasisSections = [];
   state.lineItems = [];
@@ -8280,6 +8694,9 @@ function buildPayload(options = {}) {
   const profileId = generationProfileIdForPayload();
   const includeBoothDimensions = options.includeBoothDimensions !== false;
   const includeDraftContext = options.includeDraftContext !== false;
+  const persistedBasis = includeDraftContext
+    ? quoteBasisPersistenceProjection()
+    : { quote_basis: {}, quote_basis_sections: [] };
   const project = {
     title: elements.projectTitle.value.trim(),
     show_name: elements.showName?.value.trim() || "",
@@ -8333,8 +8750,8 @@ function buildPayload(options = {}) {
     quote_currency: collectQuoteCurrency(),
     quote_exchange_rate: collectQuoteExchangeRate(),
     user_feedback: state.pendingFeedback,
-    quote_basis: includeDraftContext ? { ...state.quoteBasis, ...quoteBasisFromSections(state.quoteBasisSections) } : {},
-    quote_basis_sections: includeDraftContext ? cloneQuoteBasisSections(state.quoteBasisSections) : [],
+    quote_basis: persistedBasis.quote_basis,
+    quote_basis_sections: persistedBasis.quote_basis_sections,
     line_items: includeDraftContext ? (state.outputRows.length ? outputRowsToLineItems(state.outputRows) : state.lineItems) : [],
     analysis_findings: state.analysisFindings,
     blocking_clarification_questions: state.blockingClarificationQuestions,
@@ -8363,6 +8780,7 @@ function buildLineItemNormalizePayload() {
   const pricingReferenceId = pricingReference?.id || state.pricingReferenceId || "";
   const pricingReferenceSource = pricingReference?.source || state.pricingReferenceSource || "";
   const profileId = generationProfileIdForPayload();
+  const persistedBasis = quoteBasisPersistenceProjection();
   return {
     profile_id: profileId,
     quote_exchange_rate: collectQuoteExchangeRate(),
@@ -8391,8 +8809,8 @@ function buildLineItemNormalizePayload() {
       booth_size: state.boothDimensions.booth_size,
       dimension_source: state.boothDimensions.dimension_source,
     },
-    quote_basis: { ...state.quoteBasis, ...quoteBasisFromSections(state.quoteBasisSections) },
-    quote_basis_sections: cloneQuoteBasisSections(state.quoteBasisSections),
+    quote_basis: persistedBasis.quote_basis,
+    quote_basis_sections: persistedBasis.quote_basis_sections,
     line_items: state.lineItems.map(normalizeLineItem),
   };
 }
@@ -8695,6 +9113,42 @@ function numberOrNull(value) {
   if (String(value).trim().toLowerCase() === "included") return null;
   const numeric = Number(String(value ?? "").replaceAll(",", "").trim());
   return Number.isFinite(numeric) ? numeric : null;
+}
+
+function canonicalPrimaryOrderValue(value) {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value >= 1 ? value : null;
+  }
+  if (typeof value !== "string") return null;
+  const text = value.replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, "");
+  if (!/^[0-9]+$/.test(text)) return null;
+  const significant = text.replace(/^0+/, "");
+  if (!significant) return null;
+  const maximum = "9007199254740991";
+  if (significant.length > maximum.length || (significant.length === maximum.length && significant > maximum)) return null;
+  return Number(significant);
+}
+
+function canonicalizeOrderFields(row = {}, fields = new Set()) {
+  if (!row || typeof row !== "object" || Array.isArray(row)) return {};
+  const seen = new Set();
+  const admitted = {};
+  Object.keys(row).forEach((rawKey) => {
+    const key = pythonWhitespaceText(rawKey);
+    if (!fields.has(key)) {
+      admitted[rawKey] = row[rawKey];
+      return;
+    }
+    if (seen.has(key)) throw new TypeError("Order fields contain colliding keys.");
+    seen.add(key);
+    const order = canonicalPrimaryOrderValue(row[rawKey]);
+    if (order !== null) admitted[key] = order;
+  });
+  return admitted;
+}
+
+function canonicalizePrimaryOrderFields(row = {}) {
+  return canonicalizeOrderFields(row, new Set(["basis_order", "category_order", "item_order"]));
 }
 
 function orderNumber(value) {
@@ -9149,6 +9603,7 @@ function outputQuantityPartsFromPricingMatch(row = {}) {
 }
 
 function outputRowFromPricingMatch(row = {}) {
+  row = typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(row) : row;
   const status = pricingMatchStatus(row);
   const amount = String(row.amount ?? "").trim();
   const quantityParts = outputQuantityPartsFromPricingMatch(row);
@@ -9177,6 +9632,7 @@ function outputRowFromPricingMatch(row = {}) {
     pricing_reference_description: referenceDescription,
     pricing_keyword: row.keyword || row.pricing_keyword || "",
     source_basis_line_id: row.source_basis_line_id || "",
+    basis_order: row.basis_order ?? "",
     category_order: row.category_order ?? "",
     item_order: row.item_order ?? "",
     status: row.status,
@@ -9667,11 +10123,13 @@ function renderMatchSummary(result = {}) {
 }
 
 function renderPricingMatches(rows = [], options = {}) {
-  state.pricingMatches = Array.isArray(rows) ? rows : [];
+  state.pricingMatches = (Array.isArray(rows) ? rows : []).map((row) => (
+    typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(row) : row
+  ));
   if (options.fromPricingMatches) {
     state.outputRows = state.pricingMatches.map(outputRowFromPricingMatch);
-  } else if (Array.isArray(rows) && rows.length && rows[0]?.price_mode) {
-    state.outputRows = rows.map(normalizeOutputRow);
+  } else if (state.pricingMatches.length && state.pricingMatches[0]?.price_mode) {
+    state.outputRows = state.pricingMatches.map(normalizeOutputRow);
   }
   state.outputRows = sortOutputRows(state.outputRows);
   if (elements.outputSortMode) elements.outputSortMode.value = state.outputSortMode;
@@ -9986,8 +10444,8 @@ function basisQuantityDisplayLabel(line = {}) {
 
 function basisChatLineContext(line = {}) {
   const tag = normalizeBasisTag(line.tag);
-  const text = String(line.text || "").trim();
-  return `${tag}: ${text}`.trim();
+  const text = String(line.text ?? "");
+  return `${tag}: ${text}`;
 }
 
 function hasPricingReferenceDescription(line = {}) {
@@ -10379,6 +10837,561 @@ function selectedBasisLine() {
   return section?.lines?.[state.basisChat.lineIndex] || null;
 }
 
+function basisChatRuntimeToken() {
+  return basisChatRuntimeAuthority?.token || null;
+}
+
+function basisChatRuntimeTokenIsCurrent(token) {
+  return typeof token === "symbol" && Boolean(basisChatRuntimeAuthority) && basisChatRuntimeAuthority.token === token;
+}
+
+function basisChatRuntimeAuthorityMatches(token, origin, lineage, status = null) {
+  if (!basisChatRuntimeTokenIsCurrent(token)) return false;
+  try {
+    const expectedOrigin = canonicalBasisChatProposalOrigin(origin);
+    const expectedLineage = canonicalBasisChatLineage(lineage);
+    return (!status || basisChatRuntimeAuthority.status === status)
+      && basisChatAuthorityStrictEqual(basisChatRuntimeAuthority.origin, expectedOrigin)
+      && basisChatAuthorityStrictEqual(basisChatRuntimeAuthority.lineage, expectedLineage);
+  } catch (_error) {
+    return false;
+  }
+}
+
+function mintBasisChatRuntimeAuthority(status, origin, lineage) {
+  if (!["running", "proposal"].includes(status)) throw new TypeError("Basis runtime authority status is invalid.");
+  const expectedOrigin = canonicalBasisChatProposalOrigin(origin);
+  const expectedLineage = canonicalBasisChatLineage(lineage);
+  const token = Symbol("basis-chat-interaction");
+  basisChatRuntimeAuthority = {
+    token,
+    status,
+    origin: expectedOrigin,
+    lineage: expectedLineage,
+    operation: null,
+    controlOwner: false,
+    proposalOwner: status === "proposal",
+  };
+  return token;
+}
+
+function basisChatRuntimeOperationIsOwned(token, operation) {
+  if (!basisChatRuntimeTokenIsCurrent(token) || !operation) return false;
+  try {
+    return basisChatAuthorityStrictEqual(basisChatRuntimeAuthority.operation, canonicalBasisChatOperation(operation));
+  } catch (_error) {
+    return false;
+  }
+}
+
+function bindBasisChatRuntimeOperation(token, operation) {
+  if (!basisChatRuntimeTokenIsCurrent(token)) return false;
+  try {
+    const admitted = canonicalBasisChatOperation(operation);
+    basisChatRuntimeAuthority.origin = admitted.proposalOrigin;
+    basisChatRuntimeAuthority.lineage = admitted.lineage;
+    basisChatRuntimeAuthority.operation = admitted;
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function revokeBasisChatRuntimeAuthority(expectedToken = null) {
+  if (expectedToken !== null && !basisChatRuntimeTokenIsCurrent(expectedToken)) return false;
+  basisChatRuntimeAuthority = null;
+  return true;
+}
+
+function basisChatAuthorityRecordKeys(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new TypeError("Basis authority record is required.");
+  return Reflect.ownKeys(value);
+}
+
+function detachedBasisChatAuthorityValue(value, depth = 0, budget = { nodes: 0 }) {
+  const maxDepth = typeof BASIS_CHAT_AUTHORITY_MAX_DEPTH === "number" ? BASIS_CHAT_AUTHORITY_MAX_DEPTH : 40;
+  const maxNodes = typeof BASIS_CHAT_AUTHORITY_MAX_NODES === "number" ? BASIS_CHAT_AUTHORITY_MAX_NODES : 20000;
+  if (depth > maxDepth || budget.nodes >= maxNodes) {
+    throw new TypeError("Basis authority exceeds its admission limits.");
+  }
+  budget.nodes += 1;
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError("Basis authority contains a non-finite number.");
+    return value;
+  }
+  if (!value || typeof value !== "object") throw new TypeError("Basis authority contains an unsupported value.");
+  const keys = Reflect.ownKeys(value);
+  if (keys.some((key) => typeof key === "symbol")) throw new TypeError("Basis authority contains a symbol key.");
+  if (Array.isArray(value)) {
+    if (Object.getPrototypeOf(value) !== Array.prototype) throw new TypeError("Basis authority array prototype is invalid.");
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+    if (!lengthDescriptor || lengthDescriptor.enumerable || lengthDescriptor.configurable
+      || !Number.isSafeInteger(lengthDescriptor.value) || lengthDescriptor.value < 0) {
+      throw new TypeError("Basis authority array length is invalid.");
+    }
+    if (keys.length !== lengthDescriptor.value + 1 || !keys.includes("length")) {
+      throw new TypeError("Basis authority array has holes or extra properties.");
+    }
+    const copy = [];
+    for (let index = 0; index < lengthDescriptor.value; index += 1) {
+      const key = String(index);
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      const expectedFrozenDescriptor = lengthDescriptor.writable === false;
+      if (!descriptor || !descriptor.enumerable
+        || descriptor.configurable === expectedFrozenDescriptor || descriptor.writable === expectedFrozenDescriptor
+        || !("value" in descriptor) || "get" in descriptor || "set" in descriptor) {
+        throw new TypeError("Basis authority array contains a malformed element.");
+      }
+      Object.defineProperty(copy, key, {
+        value: detachedBasisChatAuthorityValue(descriptor.value, depth + 1, budget),
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+    return copy;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) throw new TypeError("Basis authority record prototype is invalid.");
+  if (prototype === Object.prototype && Reflect.ownKeys(Object.prototype).some((key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(Object.prototype, key);
+    return descriptor?.enumerable === true;
+  })) throw new TypeError("Basis authority inherited enumerable data is invalid.");
+  const copy = Object.create(null);
+  keys.forEach((key) => {
+    if (["__proto__", "constructor", "prototype"].includes(key)) throw new TypeError("Basis authority contains an unsafe key.");
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !descriptor.enumerable || !("value" in descriptor) || "get" in descriptor || "set" in descriptor) {
+      throw new TypeError("Basis authority contains hidden or accessor data.");
+    }
+    Object.defineProperty(copy, key, {
+      value: detachedBasisChatAuthorityValue(descriptor.value, depth + 1, budget),
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  });
+  return copy;
+}
+
+function recursivelyFreezeBasisChatAuthority(value) {
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+  Reflect.ownKeys(value).forEach((key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor && "value" in descriptor) recursivelyFreezeBasisChatAuthority(descriptor.value);
+  });
+  return Object.freeze(value);
+}
+
+function basisChatAuthorityStrictEqual(left, right) {
+  if (Object.is(left, right)) return true;
+  if (!left || !right || typeof left !== "object" || typeof right !== "object") return false;
+  const leftIsArray = Array.isArray(left);
+  if (leftIsArray !== Array.isArray(right)) return false;
+  if (leftIsArray) {
+    const leftLength = Object.getOwnPropertyDescriptor(left, "length")?.value;
+    const rightLength = Object.getOwnPropertyDescriptor(right, "length")?.value;
+    if (!Object.is(leftLength, rightLength)) return false;
+  }
+  const leftKeys = Reflect.ownKeys(left);
+  const rightKeys = Reflect.ownKeys(right);
+  if (leftKeys.length !== rightKeys.length || leftKeys.some((key) => !rightKeys.includes(key))) return false;
+  return leftKeys.every((key) => basisChatAuthorityStrictEqual(
+    key === "length" && leftIsArray ? Object.getOwnPropertyDescriptor(left, key).value : Object.getOwnPropertyDescriptor(left, key)?.value,
+    key === "length" && leftIsArray ? Object.getOwnPropertyDescriptor(right, key).value : Object.getOwnPropertyDescriptor(right, key)?.value,
+  ));
+}
+
+function basisChatRequireExactKeys(record, expected, label) {
+  const keys = basisChatAuthorityRecordKeys(record);
+  if (keys.length !== expected.length || keys.some((key) => typeof key !== "string" || !expected.includes(key))) {
+    throw new TypeError(`${label} contains unsupported keys.`);
+  }
+}
+
+function admittedBasisChatSections(value) {
+  const sections = detachedBasisChatAuthorityValue(value);
+  if (!Array.isArray(sections) || !sections.length) throw new TypeError("Quote basis sections must be a non-empty dense list.");
+  const ids = new Set();
+  sections.forEach((section) => {
+    if (!section || Array.isArray(section)
+      || typeof section.id !== "string" || !section.id
+      || typeof section.title !== "string" || !section.title
+      || !Array.isArray(section.lines)) throw new TypeError("Quote basis section is invalid.");
+    if (ids.has(section.id)) throw new TypeError("Quote basis section identifiers must be unique.");
+    ids.add(section.id);
+    section.lines.forEach((line) => {
+      if (!line || Array.isArray(line) || typeof line.tag !== "string" || typeof line.text !== "string") {
+        throw new TypeError("Quote basis line is invalid.");
+      }
+      if (Object.prototype.hasOwnProperty.call(line, "id") && typeof line.id !== "string") {
+        throw new TypeError("Quote basis line identifier is invalid.");
+      }
+    });
+  });
+  return sections;
+}
+
+function admittedBasisChatMap(value, sections) {
+  const map = detachedBasisChatAuthorityValue(value);
+  if (!map || Array.isArray(map)) throw new TypeError("Quote basis map must be a record.");
+  const keys = Reflect.ownKeys(map);
+  if (!keys.length || keys.some((key) => typeof key !== "string" || typeof map[key] !== "string" || !map[key])) {
+    throw new TypeError("Quote basis map must be populated with strings.");
+  }
+  const projected = detachedBasisChatAuthorityValue(quoteBasisFromSections(sections));
+  if (!basisChatAuthorityStrictEqual(map, projected)) throw new TypeError("Quote basis map does not exactly match its sections.");
+  return map;
+}
+
+function canonicalBasisChatSelector(selector) {
+  const supplied = detachedBasisChatAuthorityValue(selector);
+  basisChatRequireExactKeys(supplied, ["sectionId", "lineIndex", "line"], "Basis selector");
+  if (typeof supplied.sectionId !== "string" || !supplied.sectionId
+    || typeof supplied.lineIndex !== "number" || !Number.isSafeInteger(supplied.lineIndex) || supplied.lineIndex < 0
+    || typeof supplied.line !== "string" || !supplied.line) throw new TypeError("Basis selector is invalid.");
+  return supplied;
+}
+
+function rawBasisChatTarget(sections = state.quoteBasisSections, selector = state.basisChat) {
+  const admittedSections = admittedBasisChatSections(sections);
+  const admittedSelector = canonicalBasisChatSelector(selector);
+  const matches = admittedSections.map((section, index) => ({ section, index })).filter(({ section }) => section.id === admittedSelector.sectionId);
+  if (matches.length !== 1) throw new TypeError("Quote basis selector did not identify exactly one section.");
+  const { section, index: sectionIndex } = matches[0];
+  if (admittedSelector.lineIndex >= section.lines.length) throw new TypeError("Quote basis selector did not identify a line slot.");
+  const line = section.lines[admittedSelector.lineIndex];
+  const display = `${line.tag}: ${line.text}`;
+  if (admittedSelector.line !== line.text && admittedSelector.line !== display) {
+    throw new TypeError("Quote basis selected-line assertion did not match.");
+  }
+  return { sections: admittedSections, sectionIndex, lineIndex: admittedSelector.lineIndex, line };
+}
+
+function canonicalBasisChatProposalOrigin(origin) {
+  const supplied = detachedBasisChatAuthorityValue(origin);
+  basisChatRequireExactKeys(supplied, ["_originVersion", "quoteSessionId", "outputRevision", "quoteBasisSections", "quoteBasis", "selector", "selectedLine"], "Basis origin");
+  if (supplied._originVersion !== BASIS_CHAT_PROPOSAL_ORIGIN_VERSION
+    || typeof supplied.quoteSessionId !== "string" || !/^quote-[A-Za-z0-9_-]{3,64}$/.test(supplied.quoteSessionId)
+    || typeof supplied.outputRevision !== "number" || !Number.isSafeInteger(supplied.outputRevision) || supplied.outputRevision < 0) {
+    throw new TypeError("Basis proposal origin identity is invalid.");
+  }
+  const sections = admittedBasisChatSections(supplied.quoteBasisSections);
+  const selector = canonicalBasisChatSelector(supplied.selector);
+  const target = rawBasisChatTarget(sections, selector);
+  const basis = admittedBasisChatMap(supplied.quoteBasis, sections);
+  const selectedLine = detachedBasisChatAuthorityValue(supplied.selectedLine);
+  if (!basisChatAuthorityStrictEqual(target.line, selectedLine)) throw new TypeError("Basis proposal selected line is invalid.");
+  const canonical = Object.create(null);
+  [
+    ["_originVersion", BASIS_CHAT_PROPOSAL_ORIGIN_VERSION],
+    ["quoteSessionId", supplied.quoteSessionId],
+    ["outputRevision", supplied.outputRevision],
+    ["quoteBasisSections", sections],
+    ["quoteBasis", basis],
+    ["selector", selector],
+    ["selectedLine", selectedLine],
+  ].forEach(([key, value]) => Object.defineProperty(canonical, key, { value, enumerable: true, configurable: true, writable: true }));
+  return recursivelyFreezeBasisChatAuthority(canonical);
+}
+
+function currentBasisChatAuthority() {
+  const source = Object.create(null);
+  Object.defineProperties(source, {
+    _originVersion: { value: BASIS_CHAT_PROPOSAL_ORIGIN_VERSION, enumerable: true },
+    quoteSessionId: { value: state.quoteSessionId, enumerable: true },
+    outputRevision: { value: state.outputRevision, enumerable: true },
+    quoteBasisSections: { value: state.quoteBasisSections, enumerable: true },
+    quoteBasis: { value: state.quoteBasis, enumerable: true },
+    selector: { value: { sectionId: state.basisChat.sectionId, lineIndex: state.basisChat.lineIndex, line: state.basisChat.line }, enumerable: true },
+    selectedLine: { value: selectedBasisLine(), enumerable: true },
+  });
+  return canonicalBasisChatProposalOrigin(source);
+}
+
+function basisChatProposalOrigin() {
+  return currentBasisChatAuthority();
+}
+
+function basisChatOriginIsCurrent(origin) {
+  try {
+    return basisChatAuthorityStrictEqual(canonicalBasisChatProposalOrigin(origin), currentBasisChatAuthority());
+  } catch (_error) {
+    return false;
+  }
+}
+
+function canonicalBasisChatLineage(lineage) {
+  const supplied = detachedBasisChatAuthorityValue(lineage);
+  basisChatRequireExactKeys(supplied, ["_lineageVersion", "lineageId", "clientOperationId", "source", "jobType", "requestedJobId", "serverJobId"], "Basis lineage");
+  if (supplied._lineageVersion !== BASIS_CHAT_LINEAGE_VERSION
+    || typeof supplied.lineageId !== "string" || !/^lineage-[A-Za-z0-9_-]{8,80}$/.test(supplied.lineageId)
+    || typeof supplied.clientOperationId !== "string" || !/^operation-[A-Za-z0-9_-]{8,80}$/.test(supplied.clientOperationId)
+    || !["server", "local_literal", "local_fragment"].includes(supplied.source)
+    || (supplied.source === "server" ? supplied.jobType !== "basis_chat" : supplied.jobType !== null)
+    || (supplied.source === "server" ? typeof supplied.requestedJobId !== "string" || !/^job-[A-Za-z0-9_-]{8,80}$/.test(supplied.requestedJobId) : supplied.requestedJobId !== null)
+    || (supplied.serverJobId !== null && (supplied.source !== "server" || supplied.serverJobId !== supplied.requestedJobId))) {
+    throw new TypeError("Basis lineage is invalid.");
+  }
+  return recursivelyFreezeBasisChatAuthority(supplied);
+}
+
+function newBasisChatLineage(source) {
+  const server = source === "server";
+  return canonicalBasisChatLineage({
+    _lineageVersion: BASIS_CHAT_LINEAGE_VERSION,
+    lineageId: newBasisChatLineageId(),
+    clientOperationId: newClientOperationId(),
+    source,
+    jobType: server ? "basis_chat" : null,
+    requestedJobId: server ? newClientJobId() : null,
+    serverJobId: null,
+  });
+}
+
+function basisChatLineageIsCurrent(lineage, token) {
+  if (!basisChatRuntimeTokenIsCurrent(token)) return false;
+  try {
+    const supplied = canonicalBasisChatLineage(lineage);
+    const owner = canonicalBasisChatAuthorityOwner(state.basisChat.authorityOwner);
+    return basisChatAuthorityStrictEqual(supplied, owner.lineage)
+      && basisChatAuthorityStrictEqual(supplied, basisChatRuntimeAuthority.lineage);
+  } catch (_error) {
+    return false;
+  }
+}
+
+function canonicalBasisChatAuthorityOwner(owner) {
+  const supplied = detachedBasisChatAuthorityValue(owner);
+  basisChatRequireExactKeys(supplied, ["status", "origin", "lineage"], "Basis authority owner");
+  if (!["running", "proposal"].includes(supplied.status)) throw new TypeError("Basis authority owner status is invalid.");
+  supplied.origin = canonicalBasisChatProposalOrigin(supplied.origin);
+  supplied.lineage = canonicalBasisChatLineage(supplied.lineage);
+  return recursivelyFreezeBasisChatAuthority(supplied);
+}
+
+function basisChatIsoTimestamp(value) {
+  if (typeof value !== "string" || !/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?Z$/.test(value)) {
+    throw new TypeError("Basis operation timestamp is invalid.");
+  }
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds) || new Date(milliseconds).toISOString().slice(0, 19) !== value.slice(0, 19)) {
+    throw new TypeError("Basis operation timestamp is invalid.");
+  }
+  return { value, milliseconds };
+}
+
+function canonicalBasisChatOperation(operation, options = {}) {
+  const supplied = detachedBasisChatAuthorityValue(operation);
+  basisChatRequireExactKeys(supplied, ["_operationVersion", "id", "type", "phase", "startedAt", "browserRecoveryScope", "text", "proposalOrigin", "lineage"], "Basis operation");
+  const origin = canonicalBasisChatProposalOrigin(supplied.proposalOrigin);
+  const lineage = canonicalBasisChatLineage(supplied.lineage);
+  const timestamp = basisChatIsoTimestamp(supplied.startedAt);
+  if (supplied._operationVersion !== BASIS_CHAT_OPERATION_VERSION
+    || supplied.type !== "basis_chat" || !["starting", "running"].includes(supplied.phase)
+    || typeof supplied.text !== "string" || !supplied.text.trim()
+    || typeof supplied.browserRecoveryScope !== "string" || !supplied.browserRecoveryScope
+    || supplied.browserRecoveryScope !== currentBrowserRecoveryScope()
+    || supplied.id !== (supplied.phase === "starting" ? lineage.requestedJobId : lineage.serverJobId)
+    || !supplied.id) throw new TypeError("Basis operation is invalid.");
+  if (options.restoring === true) {
+    const nowMs = typeof options.nowMs === "number" && Number.isFinite(options.nowMs) ? options.nowMs : Date.now();
+    const ageMs = nowMs - timestamp.milliseconds;
+    const maxAgeMs = activeJobMaxAgeMs("basis_chat", supplied.phase);
+    if (ageMs < -ACTIVE_JOB_CLOCK_SKEW_MS || ageMs > maxAgeMs || !basisChatOriginIsCurrent(origin)) {
+      throw new TypeError("Saved basis operation is stale.");
+    }
+  }
+  supplied.proposalOrigin = origin;
+  supplied.lineage = lineage;
+  return recursivelyFreezeBasisChatAuthority(supplied);
+}
+
+function basisChatOperationIsCurrent(operation, token) {
+  if (!basisChatRuntimeTokenIsCurrent(token)) return false;
+  try {
+    const supplied = canonicalBasisChatOperation(operation);
+    const active = canonicalBasisChatOperation(state.activeJob);
+    const owner = canonicalBasisChatAuthorityOwner(state.basisChat.authorityOwner);
+    return basisChatOriginIsCurrent(supplied.proposalOrigin)
+      && basisChatAuthorityStrictEqual(supplied, active)
+      && basisChatAuthorityStrictEqual(supplied.proposalOrigin, owner.origin)
+      && basisChatAuthorityStrictEqual(supplied.lineage, owner.lineage)
+      && state.basisChat.busyOwnerId === supplied.lineage.clientOperationId
+      && basisChatRuntimeAuthority.status === "running"
+      && basisChatRuntimeAuthorityMatches(token, supplied.proposalOrigin, supplied.lineage, "running")
+      && basisChatRuntimeOperationIsOwned(token, supplied);
+  } catch (_error) {
+    return false;
+  }
+}
+
+function bindBasisChatServerOperation(operation, jobResponse, token) {
+  const current = canonicalBasisChatOperation(operation);
+  if (!basisChatOperationIsCurrent(current, token) || current.phase !== "starting") throw new TypeError("Basis operation cannot be bound.");
+  const response = canonicalBasisChatJobResponse(jobResponse, current.lineage.requestedJobId);
+  const lineage = canonicalBasisChatLineage({
+    ...current.lineage,
+    serverJobId: current.lineage.requestedJobId,
+  });
+  const running = canonicalBasisChatOperation({
+    ...current,
+    id: lineage.serverJobId,
+    phase: "running",
+    startedAt: response.created_at,
+    lineage,
+  });
+  state.basisChat.authorityOwner = canonicalBasisChatAuthorityOwner({ status: "running", origin: running.proposalOrigin, lineage });
+  state.activeJob = running;
+  if (!bindBasisChatRuntimeOperation(token, running)) throw new TypeError("Basis operation runtime owner could not be rebound.");
+  return running;
+}
+
+function invalidateBasisChatAuthority(expectedToken = null) {
+  if (expectedToken !== null && !basisChatRuntimeTokenIsCurrent(expectedToken)) return false;
+  const hadBusyOwner = Boolean(state.basisChat.busyOwnerId);
+  if (hadBusyOwner) {
+    stopElapsedTimer("basisChatElapsed");
+    elements.basisChatMessages?.querySelectorAll("[data-basis-chat-typing]").forEach((item) => item.remove());
+  }
+  state.activeJob = state.activeJob?.type === "basis_chat" ? null : state.activeJob;
+  state.basisChat.proposal = null;
+  state.basisChat.authorityOwner = null;
+  state.basisChat.busyOwnerId = null;
+  state.basisChat.completionNotice = null;
+  if (hadBusyOwner) state.isAnalysisRunning = false;
+  renderBasisChatBusyControls(false);
+  revokeBasisChatRuntimeAuthority(expectedToken);
+  return true;
+}
+
+function installBasisChatOwner(status, origin, lineage, token) {
+  if (!basisChatRuntimeAuthorityMatches(token, origin, lineage)) throw new TypeError("Basis authority owner token is stale.");
+  const owner = canonicalBasisChatAuthorityOwner({ status, origin, lineage });
+  state.basisChat.authorityOwner = owner;
+  state.basisChat.completionNotice = null;
+  basisChatRuntimeAuthority.status = status;
+  basisChatRuntimeAuthority.proposalOwner = status === "proposal";
+  if (status === "proposal") basisChatRuntimeAuthority.operation = null;
+  return owner;
+}
+
+function beginLocalBasisChatAuthority(source, origin) {
+  invalidateBasisChatAuthority();
+  const lineage = newBasisChatLineage(source);
+  const token = mintBasisChatRuntimeAuthority("running", origin, lineage);
+  installBasisChatOwner("running", origin, lineage, token);
+  return { lineage, token };
+}
+
+function completeBasisChatOwner(origin, lineage, token, options = {}) {
+  if (!basisChatRuntimeAuthorityMatches(token, origin, lineage)) return false;
+  let owner;
+  try {
+    owner = canonicalBasisChatAuthorityOwner(state.basisChat.authorityOwner);
+  } catch (_error) {
+    return false;
+  }
+  const expectedOrigin = canonicalBasisChatProposalOrigin(origin);
+  const expectedLineage = canonicalBasisChatLineage(lineage);
+  if (!basisChatOriginIsCurrent(expectedOrigin)
+    || !basisChatAuthorityStrictEqual(owner.origin, expectedOrigin)
+    || !basisChatAuthorityStrictEqual(owner.lineage, expectedLineage)) return false;
+  if (options.keepProposal === true) {
+    installBasisChatOwner("proposal", expectedOrigin, expectedLineage, token);
+  } else {
+    state.basisChat.authorityOwner = null;
+    state.basisChat.proposal = null;
+  }
+  if (state.activeJob?.type === "basis_chat") {
+    try {
+      const active = canonicalBasisChatOperation(state.activeJob);
+      if (basisChatAuthorityStrictEqual(active.proposalOrigin, expectedOrigin)
+        && basisChatAuthorityStrictEqual(active.lineage, expectedLineage)) state.activeJob = null;
+    } catch (_error) {
+      state.activeJob = null;
+    }
+  }
+  if (state.basisChat.busyOwnerId === expectedLineage.clientOperationId) state.basisChat.busyOwnerId = null;
+  state.isAnalysisRunning = false;
+  if (options.keepProposal !== true) revokeBasisChatRuntimeAuthority(token);
+  return true;
+}
+
+function finishBasisChatNotice(operation, kind, message, typingMessage = null, token) {
+  if (!basisChatOperationIsCurrent(operation, token)) return false;
+  stopElapsedTimer("basisChatElapsed");
+  removeBasisChatTyping(typingMessage);
+  if (!setBasisChatBusy(false, token)) return false;
+  if (!completeBasisChatOwner(operation.proposalOrigin, operation.lineage, token)) return false;
+  state.basisChat.completionNotice = canonicalBasisChatCompletionNotice({
+    lineageId: operation.lineage.lineageId,
+    kind,
+    message,
+  });
+  if (!elements.basisChatOverlay.hidden) appendBasisChatMessage("assistant", message);
+  syncControlStates();
+  saveSessionState();
+  return true;
+}
+
+function basisChatProposalAlias(record, camelKey, snakeKey) {
+  const hasCamel = Object.prototype.hasOwnProperty.call(record, camelKey);
+  const hasSnake = Object.prototype.hasOwnProperty.call(record, snakeKey);
+  if (!hasCamel && !hasSnake) throw new TypeError(`Basis proposal is missing ${camelKey}.`);
+  if (hasCamel && hasSnake && !basisChatAuthorityStrictEqual(record[camelKey], record[snakeKey])) {
+    throw new TypeError(`Basis proposal aliases conflict for ${camelKey}.`);
+  }
+  return hasCamel ? record[camelKey] : record[snakeKey];
+}
+
+function canonicalTargetOnlyBasisChatProposal(proposal, authoritativeOrigin, authoritativeLineage, token, options = {}) {
+  const origin = canonicalBasisChatProposalOrigin(authoritativeOrigin);
+  const lineage = canonicalBasisChatLineage(authoritativeLineage);
+  if (options.requireAuthority !== false
+    && (!basisChatRuntimeAuthorityMatches(token, origin, lineage)
+      || !basisChatOriginIsCurrent(origin)
+      || !basisChatLineageIsCurrent(lineage, token))) throw new TypeError("Basis proposal authority is stale.");
+  const supplied = detachedBasisChatAuthorityValue(proposal);
+  const allowedKeys = ["message", "quoteBasis", "quote_basis", "quoteBasisSections", "quote_basis_sections", "lineItems", "line_items", "literalReplacement", "changedLineCount", "affectedSectionCount", "snippets", "_origin", "_lineage"];
+  if (Reflect.ownKeys(supplied).some((key) => typeof key !== "string" || !allowedKeys.includes(key))) throw new TypeError("Basis proposal envelope contains unsupported keys.");
+  if (Object.prototype.hasOwnProperty.call(supplied, "_origin")
+    && !basisChatAuthorityStrictEqual(canonicalBasisChatProposalOrigin(supplied._origin), origin)) throw new TypeError("Basis proposal origin conflicts with its owner.");
+  if (Object.prototype.hasOwnProperty.call(supplied, "_lineage")
+    && !basisChatAuthorityStrictEqual(canonicalBasisChatLineage(supplied._lineage), lineage)) throw new TypeError("Basis proposal lineage conflicts with its owner.");
+  const nextSections = admittedBasisChatSections(basisChatProposalAlias(supplied, "quoteBasisSections", "quote_basis_sections"));
+  const nextBasis = admittedBasisChatMap(basisChatProposalAlias(supplied, "quoteBasis", "quote_basis"), nextSections);
+  const currentSections = origin.quoteBasisSections;
+  const target = origin.selector;
+  if (nextSections.length !== currentSections.length) throw new TypeError("Basis proposal changed unrelated sections.");
+  nextSections.forEach((section, sectionIndex) => {
+    const current = currentSections[sectionIndex];
+    if (!current || section.id !== current.id || section.lines.length !== current.lines.length) throw new TypeError("Basis proposal changed unrelated structure.");
+    const leftKeys = Reflect.ownKeys(current).filter((key) => key !== "lines");
+    const rightKeys = Reflect.ownKeys(section).filter((key) => key !== "lines");
+    if (leftKeys.length !== rightKeys.length || leftKeys.some((key) => !rightKeys.includes(key)
+      || !basisChatAuthorityStrictEqual(current[key], section[key]))) throw new TypeError("Basis proposal changed section metadata.");
+    section.lines.forEach((line, lineIndex) => {
+      if (section.id === target.sectionId && lineIndex === target.lineIndex) return;
+      if (!basisChatAuthorityStrictEqual(line, current.lines[lineIndex])) throw new TypeError("Basis proposal changed an unrelated line.");
+    });
+  });
+  const admitted = Object.create(null);
+  Reflect.ownKeys(supplied).filter((key) => !["quote_basis", "quote_basis_sections", "line_items", "_origin", "_lineage"].includes(key)).forEach((key) => {
+    Object.defineProperty(admitted, key, { value: supplied[key], enumerable: true, configurable: true, writable: true });
+  });
+  Object.defineProperties(admitted, {
+    message: { value: typeof supplied.message === "string" && supplied.message.trim() ? supplied.message.trim() : "AI drafted a proposed quote basis update.", enumerable: true },
+    quoteBasis: { value: nextBasis, enumerable: true },
+    quoteBasisSections: { value: nextSections, enumerable: true },
+    lineItems: { value: detachedBasisChatAuthorityValue(state.lineItems), enumerable: true },
+    _origin: { value: origin, enumerable: true },
+    _lineage: { value: lineage, enumerable: true },
+  });
+  return recursivelyFreezeBasisChatAuthority(admitted);
+}
+
 function appendBasisChatMessage(role, text, options = {}) {
   const message = document.createElement("div");
   message.className = `basis-chat-message ${role}`;
@@ -10428,7 +11441,7 @@ function resetBasisChatProposal() {
 }
 
 function proposalChangedFields(proposal) {
-  const nextSections = normalizeQuoteBasisSections(proposal?.quoteBasisSections || proposal?.quoteBasis || {});
+  const nextSections = canonicalQuoteBasisSections(proposal?.quoteBasisSections || []);
   const currentSections = cloneQuoteBasisSections(state.quoteBasisSections);
   const currentById = new Map(currentSections.map((section) => [section.id, section]));
   return nextSections
@@ -10438,7 +11451,7 @@ function proposalChangedFields(proposal) {
 
 function proposalLineDelta(proposal) {
   if (state.basisChat.scope !== "line" || !state.basisChat.sectionId) return null;
-  const nextSections = normalizeQuoteBasisSections(proposal?.quoteBasisSections || proposal?.quoteBasis || {});
+  const nextSections = canonicalQuoteBasisSections(proposal?.quoteBasisSections || []);
   const section = nextSections.find((item) => item.id === state.basisChat.sectionId);
   const nextLine = section?.lines?.[state.basisChat.lineIndex];
   const currentLine = selectedBasisLine() || parseBasisLine(state.basisChat.line);
@@ -10500,15 +11513,46 @@ function renderBasisChatProposalCard(proposal, changedFields = []) {
   `;
 }
 
-function setBasisChatProposal(proposal) {
-  state.basisChat.proposal = proposal;
-  const changedFields = proposalChangedFields(proposal);
+function basisChatOperationOwnsActiveJob(operation, token) {
+  return basisChatOperationIsCurrent(operation, token);
+}
+
+function clearBasisChatOperation(operation, token) {
+  if (!basisChatOperationIsCurrent(operation, token)) return false;
+  const admitted = canonicalBasisChatOperation(operation);
+  if (!completeBasisChatOwner(admitted.proposalOrigin, admitted.lineage, token)) return false;
+  saveSessionState();
+  return true;
+}
+
+function setBasisChatProposal(proposal, authoritativeLineage, token) {
+  let admitted;
+  try {
+    const detachedProposal = detachedBasisChatAuthorityValue(proposal);
+    const origin = canonicalBasisChatProposalOrigin(detachedProposal._origin);
+    const lineage = canonicalBasisChatLineage(authoritativeLineage);
+    admitted = canonicalTargetOnlyBasisChatProposal(detachedProposal, origin, lineage, token);
+    if (basisChatRuntimeAuthority.controlOwner && !setBasisChatBusy(false, token)) throw new TypeError("Basis proposal control owner is stale.");
+    if (!completeBasisChatOwner(origin, lineage, token, { keepProposal: true })) throw new TypeError("Basis proposal owner is stale.");
+  } catch (_error) {
+    return false;
+  }
+  state.basisChat.proposal = admitted;
+  renderBasisChatBusyControls(false);
+  syncControlStates();
+  if (elements.basisChatOverlay.hidden) {
+    saveSessionState();
+    return true;
+  }
+  const changedFields = proposalChangedFields(admitted);
   elements.basisChatProposal.hidden = false;
-  elements.basisChatProposal.innerHTML = renderBasisChatProposalCard(proposal, changedFields);
+  elements.basisChatProposal.innerHTML = renderBasisChatProposalCard(admitted, changedFields);
   elements.basisChatProposalActions.hidden = false;
   elements.basisChatApplyButton.disabled = false;
   elements.basisChatKeepButton.disabled = false;
   appendBasisChatMessage("assistant", "I drafted a proposed update below. Review it, then apply or discard.");
+  saveSessionState();
+  return true;
 }
 
 function basisChatFriendlyError(messages = []) {
@@ -10518,17 +11562,43 @@ function basisChatFriendlyError(messages = []) {
   return genericFailureMessage();
 }
 
-function setBasisChatBusy(isBusy) {
-  elements.basisChatPrompt.disabled = isBusy;
-  elements.basisChatSendButton.disabled = isBusy;
-  elements.basisChatApplyButton.disabled = isBusy || !state.basisChat.proposal;
-  elements.basisChatKeepButton.disabled = isBusy || !state.basisChat.proposal;
+function renderBasisChatBusyControls(isBusy) {
+  const busy = Boolean(isBusy);
+  if (elements.basisChatPrompt) elements.basisChatPrompt.disabled = busy;
+  if (elements.basisChatSendButton) elements.basisChatSendButton.disabled = busy;
+  if (elements.basisChatApplyButton) elements.basisChatApplyButton.disabled = busy || !state.basisChat.proposal;
+  if (elements.basisChatKeepButton) elements.basisChatKeepButton.disabled = busy || !state.basisChat.proposal;
+}
+
+function setBasisChatBusy(isBusy, token) {
+  if (!basisChatRuntimeTokenIsCurrent(token) || !basisChatRuntimeAuthority) return false;
+  if (isBusy) {
+    if (basisChatRuntimeAuthority.status !== "running"
+      || state.basisChat.busyOwnerId !== basisChatRuntimeAuthority.lineage.clientOperationId) return false;
+    basisChatRuntimeAuthority.controlOwner = true;
+    state.isAnalysisRunning = true;
+  } else {
+    if (!basisChatRuntimeAuthority.controlOwner
+      || basisChatRuntimeAuthority.status !== "running"
+      || state.basisChat.busyOwnerId !== basisChatRuntimeAuthority.lineage.clientOperationId) return false;
+    basisChatRuntimeAuthority.controlOwner = false;
+    state.isAnalysisRunning = false;
+  }
+  renderBasisChatBusyControls(Boolean(isBusy));
+  return true;
 }
 
 function openBasisChatOverlay(scope = "line", options = {}) {
   if (scope !== "line") return;
-  const preservedProposal = options.preserveState && state.basisChat?.proposal
-    ? state.basisChat.proposal : null;
+  const sameSelector = state.basisChat.sectionId === (options.sectionId || options.field || "")
+    && state.basisChat.lineIndex === (Number.isInteger(options.lineIndex) ? options.lineIndex : -1);
+  const retained = sameSelector ? {
+    proposal: state.basisChat.proposal,
+    authorityOwner: state.basisChat.authorityOwner,
+    busyOwnerId: state.basisChat.busyOwnerId,
+    completionNotice: state.basisChat.completionNotice,
+  } : { proposal: null, authorityOwner: null, busyOwnerId: null, completionNotice: null };
+  if (!sameSelector) invalidateBasisChatAuthority();
   state.basisChat = {
     scope,
     field: options.sectionId || options.field || "",
@@ -10538,9 +11608,10 @@ function openBasisChatOverlay(scope = "line", options = {}) {
     quantity: options.quantity ?? "",
     unit: options.unit || "",
     quantityLabel: options.quantityLabel || "",
-    proposal: preservedProposal,
+    ...retained,
   };
   resetBasisChatProposal();
+  state.basisChat.proposal = retained.proposal;
   elements.basisChatTitle.textContent = "Revise basis line";
   elements.basisChatContext.classList.toggle("has-selected-line", scope === "line");
   const line = selectedBasisLine() || parseBasisLine(state.basisChat.line);
@@ -10572,23 +11643,37 @@ function openBasisChatOverlay(scope = "line", options = {}) {
   elements.basisChatPrompt.placeholder = "e.g. Add teardown notes or adjust LED screen size";
   elements.basisChatMessages.innerHTML = "";
   appendBasisChatMessage("assistant", basisChatIntroMessage());
-  if (preservedProposal) setBasisChatProposal(preservedProposal);
+  if (retained.proposal && retained.authorityOwner?.status === "proposal") {
+    const changedFields = proposalChangedFields(retained.proposal);
+    elements.basisChatProposal.hidden = false;
+    elements.basisChatProposal.innerHTML = renderBasisChatProposalCard(retained.proposal, changedFields);
+    elements.basisChatProposalActions.hidden = false;
+  } else if (retained.completionNotice?.message) {
+    appendBasisChatMessage("assistant", retained.completionNotice.message);
+  }
   elements.basisChatPrompt.value = "";
   elements.basisChatOverlay.hidden = false;
   elements.basisChatOverlay.classList.add("is-open");
   document.body.classList.add("basis-chat-open");
   state.restorableOverlay = "basis_chat";
+  renderBasisChatBusyControls(Boolean(state.basisChat.busyOwnerId));
   saveSessionState();
-  window.setTimeout(() => elements.basisChatPrompt.focus(), 0);
+  const overlayGeneration = ++basisChatOverlayGeneration;
+  const selectorKey = `${state.basisChat.sectionId}:${state.basisChat.lineIndex}`;
+  window.setTimeout(() => {
+    if (basisChatOverlayGeneration !== overlayGeneration || elements.basisChatOverlay.hidden) return;
+    if (`${state.basisChat.sectionId}:${state.basisChat.lineIndex}` !== selectorKey) return;
+    elements.basisChatPrompt.focus();
+  }, 0);
 }
 
 function restoreBasisChatOverlay() {
-  const saved = { ...state.basisChat };
-  if (!saved.sectionId || !Number.isInteger(Number(saved.lineIndex))) return false;
+  const saved = detachedBasisChatAuthorityValue(state.basisChat);
+  if (!saved.sectionId || !Number.isInteger(saved.lineIndex)) return false;
   openBasisChatOverlay("line", {
     sectionId: saved.sectionId,
     field: saved.field,
-    lineIndex: Number(saved.lineIndex),
+    lineIndex: saved.lineIndex,
     line: saved.line,
     quantity: saved.quantity,
     unit: saved.unit,
@@ -10599,10 +11684,10 @@ function restoreBasisChatOverlay() {
 }
 
 function closeBasisChatOverlay() {
+  basisChatOverlayGeneration += 1;
   elements.basisChatOverlay.classList.remove("is-open");
   elements.basisChatOverlay.hidden = true;
   document.body.classList.remove("basis-chat-open");
-  resetBasisChatProposal();
   if (state.restorableOverlay === "basis_chat") {
     state.restorableOverlay = "";
     saveSessionState();
@@ -10625,20 +11710,26 @@ function basisChatPayload(text) {
   };
 }
 
-function normalizeServerBasisChatProposal(proposal = {}) {
-  const quoteBasis = proposal.quoteBasis || proposal.quote_basis || {};
-  const sections = mergeBasisProposalLineMetadata(
-    normalizeQuoteBasisSections(proposal.quoteBasisSections || proposal.quote_basis_sections || quoteBasis),
-    state.quoteBasisSections
-  );
-  return {
-    message: String(proposal.message || "AI drafted a proposed quote basis update.").trim(),
-    quoteBasis: { ...cloneQuoteBasis(quoteBasis), ...quoteBasisFromSections(sections) },
-    quoteBasisSections: sections,
-    lineItems: Array.isArray(proposal.lineItems || proposal.line_items)
-      ? (proposal.lineItems || proposal.line_items).map(normalizeLineItem)
-      : state.lineItems.map(normalizeLineItem),
-  };
+function canonicalBasisChatJobResponse(response, expectedJobId) {
+  const supplied = detachedBasisChatAuthorityValue(response);
+  if (!supplied || Array.isArray(supplied)
+    || supplied.job_id !== expectedJobId || supplied.type !== "basis_chat"
+    || !["queued", "running", ...FINAL_JOB_STATUSES].includes(supplied.status)) {
+    throw new TypeError("Basis chat job identity is invalid.");
+  }
+  basisChatIsoTimestamp(supplied.created_at);
+  if (Object.prototype.hasOwnProperty.call(supplied, "updated_at")) basisChatIsoTimestamp(supplied.updated_at);
+  return supplied;
+}
+
+function normalizeServerBasisChatProposal(proposal, operation, jobResponse, token) {
+  const normalizedOperation = canonicalBasisChatOperation(operation);
+  if (!basisChatOperationIsCurrent(normalizedOperation, token)) throw new TypeError("Originating basis chat operation is not current.");
+  const response = canonicalBasisChatJobResponse(jobResponse, normalizedOperation.lineage.requestedJobId);
+  if (normalizedOperation.phase !== "running" || normalizedOperation.lineage.serverJobId !== response.job_id) {
+    throw new TypeError("Basis chat server job is not bound.");
+  }
+  return canonicalTargetOnlyBasisChatProposal(proposal, normalizedOperation.proposalOrigin, normalizedOperation.lineage, token);
 }
 
 function parseLiteralReplacementCommand(text = "") {
@@ -10698,48 +11789,33 @@ function replaceBasisLineReferenceText(line = {}, from = "", to = "") {
 }
 
 function buildLiteralReplacementProposal(command) {
-  const sections = cloneQuoteBasisSections(state.quoteBasisSections);
-  let changedLineCount = 0;
-  const affectedSectionIds = new Set();
-  const snippets = [];
-  sections.forEach((section) => {
-    (section.lines || []).forEach((line, index) => {
-      const replaced = replaceBasisLineReferenceText(line, command.from, command.to);
-      if (!replaced.changed) return;
-      snippets.push({ section: section.title, before: line.text, after: replaced.line.text });
-      section.lines[index] = {
-        ...replaced.line,
-        tag: bracketedCatalogReferenceParts(line.text || "") ? normalizeBasisTag(line.tag) : "Confirm",
-      };
-      if (isCustomPricingBasisLine(section.lines[index])) section.lines[index].custom_pricing = true;
-      changedLineCount += 1;
-      affectedSectionIds.add(section.id);
-    });
-  });
-  const legacyBasis = quoteBasisFromSections(sections);
-  Object.keys(legacyBasis).forEach((key) => {
-    legacyBasis[key] = replaceLiteralText(legacyBasis[key], command.from, command.to).text;
-  });
-  const lineItems = state.lineItems.map((item) => {
-    const replaced = replaceLiteralText(item.description, command.from, command.to);
-    return replaced.changed ? { ...item, description: replaced.text } : item;
-  });
-  const outputRows = state.outputRows.map((row) => {
-    const replaced = replaceLiteralText(row.description, command.from, command.to);
-    return replaced.changed ? recalculateOutputRow({ ...row, description: replaced.text }) : row;
-  });
-  const changedOutputRows = outputRows.filter((row, index) => row.description !== state.outputRows[index]?.description).length;
-  if (!changedLineCount && !changedOutputRows && !lineItems.some((item, index) => item.description !== state.lineItems[index]?.description)) return null;
+  let origin;
+  try {
+    origin = basisChatProposalOrigin();
+  } catch (_error) {
+    return null;
+  }
+  const sections = cloneQuoteBasisSections(origin.quoteBasisSections);
+  const target = rawBasisChatTarget(sections, origin.selector);
+  const currentLine = target.line;
+  const replaced = replaceBasisLineReferenceText(currentLine, command.from, command.to);
+  if (!replaced.changed) return null;
+  const nextLine = {
+    ...replaced.line,
+    tag: bracketedCatalogReferenceParts(currentLine.text || "") ? normalizeBasisTag(currentLine.tag) : "Confirm",
+  };
+  if (isCustomPricingBasisLine(nextLine)) nextLine.custom_pricing = true;
+  sections[target.sectionIndex].lines[target.lineIndex] = nextLine;
   return {
-    message: `Literal replacement: changed ${changedLineCount} basis line${changedLineCount === 1 ? "" : "s"} across ${affectedSectionIds.size} section${affectedSectionIds.size === 1 ? "" : "s"}.`,
+    message: "Literal replacement: changed the selected basis line.",
     literalReplacement: true,
-    changedLineCount,
-    affectedSectionCount: affectedSectionIds.size,
-    snippets: snippets.slice(0, 5),
-    quoteBasis: legacyBasis,
+    changedLineCount: 1,
+    affectedSectionCount: 1,
+    snippets: [{ section: sections[target.sectionIndex].title, before: currentLine.text, after: nextLine.text }],
+    quoteBasis: quoteBasisFromSections(sections),
     quoteBasisSections: sections,
-    lineItems,
-    outputRows,
+    lineItems: state.lineItems,
+    _origin: origin,
   };
 }
 
@@ -10797,11 +11873,17 @@ function basisLineTextHasLiteralQuantityWord(line = {}) {
 
 function buildSelectedLineFragmentReplacementProposal(text = "") {
   if (state.basisChat.scope !== "line") return null;
-  const sections = cloneQuoteBasisSections(state.quoteBasisSections);
-  const section = sections.find((item) => item.id === state.basisChat.sectionId);
-  const lineIndex = Number(state.basisChat.lineIndex);
-  if (!section || !Number.isInteger(lineIndex) || !section.lines[lineIndex]) return null;
-  const currentLine = section.lines[lineIndex];
+  let origin;
+  try {
+    origin = basisChatProposalOrigin();
+  } catch (_error) {
+    return null;
+  }
+  const sections = cloneQuoteBasisSections(origin.quoteBasisSections);
+  const target = rawBasisChatTarget(sections, origin.selector);
+  const section = sections[target.sectionIndex];
+  const lineIndex = target.lineIndex;
+  const currentLine = target.line;
   const requestedQuantity = basisChatRequestedQuantityValue(text);
   if (requestedQuantity !== null && !basisLineTextHasLiteralQuantityWord(currentLine)) {
     const currentQuantity = leadingNumber(currentLine.quantity);
@@ -10818,6 +11900,7 @@ function buildSelectedLineFragmentReplacementProposal(text = "") {
       quoteBasis,
       quoteBasisSections: sections,
       lineItems: Array.isArray(state.lineItems) ? state.lineItems : [],
+      _origin: origin,
     };
   }
   const fragment = simpleBasisEditFragment(text);
@@ -10840,6 +11923,7 @@ function buildSelectedLineFragmentReplacementProposal(text = "") {
     quoteBasis,
     quoteBasisSections: sections,
     lineItems: Array.isArray(state.lineItems) ? state.lineItems : [],
+    _origin: origin,
   };
 }
 
@@ -10861,64 +11945,133 @@ function renderLiteralReplacementPreview(proposal) {
   `;
 }
 
+async function pollBasisChatOperation(operation, token) {
+  let current = canonicalBasisChatOperation(operation);
+  while (basisChatOperationIsCurrent(current, token)) {
+    const response = await getJson(`/api/jobs/${encodeURIComponent(current.lineage.serverJobId)}`, { logFetchFailure: false });
+    if (!basisChatOperationIsCurrent(current, token)) return { superseded: true };
+    if (!response.ok) return response.data?.fetch_failed || response.data?.page_unloading
+      ? { preserved: true }
+      : { invalid: true, response };
+    let job;
+    try {
+      job = canonicalBasisChatJobResponse(response.data, current.lineage.serverJobId);
+    } catch (_error) {
+      return { invalid: true, response };
+    }
+    if (FINAL_JOB_STATUSES.has(job.status)) return { job };
+    await delay(900);
+    if (!basisChatOperationIsCurrent(current, token)) return { superseded: true };
+  }
+  return { superseded: true };
+}
+
 async function buildAiBasisChatResponse(text, options = {}) {
-  const restoredOperation = options.resume === true ? normalizeActiveJob(options.operation || state.activeJob || {}, { restoring: true }) : null;
-  if (!restoredOperation && !canStartAnalysis()) return null;
-  const operation = restoredOperation?.type === "basis_chat" ? restoredOperation : normalizeActiveJob({
-    id: newClientJobId(),
-    type: "basis_chat",
-    phase: "starting",
-    startedAt: new Date().toISOString(),
-    text,
-  });
-  state.activeJob = operation;
+  let token = options.token || null;
+  let operation = options.resume === true
+    ? normalizeActiveJob(options.operation || state.activeJob || {}, { restoring: true })
+    : null;
+  if (options.resume === true && (!operation || !basisChatRuntimeTokenIsCurrent(token))) return { errorDisplayed: true };
+  if (!operation && !canStartAnalysis()) return null;
+  if (!operation) {
+    const origin = basisChatProposalOrigin();
+    invalidateBasisChatAuthority();
+    const lineage = newBasisChatLineage("server");
+    token = mintBasisChatRuntimeAuthority("running", origin, lineage);
+    installBasisChatOwner("running", origin, lineage, token);
+    state.basisChat.busyOwnerId = lineage.clientOperationId;
+    operation = canonicalBasisChatOperation({
+      _operationVersion: BASIS_CHAT_OPERATION_VERSION,
+      id: lineage.requestedJobId,
+      type: "basis_chat",
+      phase: "starting",
+      startedAt: new Date().toISOString(),
+      browserRecoveryScope: currentBrowserRecoveryScope(),
+      text,
+      proposalOrigin: origin,
+      lineage,
+    });
+    state.activeJob = operation;
+    if (!bindBasisChatRuntimeOperation(token, operation)) return { superseded: true };
+  } else {
+    const owner = canonicalBasisChatAuthorityOwner(state.basisChat.authorityOwner);
+    if (!basisChatAuthorityStrictEqual(owner.origin, operation.proposalOrigin)
+      || !basisChatAuthorityStrictEqual(owner.lineage, operation.lineage)
+      || state.basisChat.busyOwnerId !== operation.lineage.clientOperationId
+      || !basisChatRuntimeAuthorityMatches(token, operation.proposalOrigin, operation.lineage, "running")
+      || !basisChatRuntimeOperationIsOwned(token, operation)) return { errorDisplayed: true };
+  }
   saveSessionState();
-  const previousRunning = state.isAnalysisRunning;
-  state.isAnalysisRunning = true;
-  setBasisChatBusy(true);
+  if (!setBasisChatBusy(true, token)) return { superseded: true };
   syncControlStates();
-  const basisChatStartedAt = Date.now();
-  const typingMessage = appendBasisChatTyping();
-  startElapsedTimer("basisChatElapsed", basisChatStartedAt);
+  const typingMessage = elements.basisChatOverlay.hidden ? null : appendBasisChatTyping();
+  if (typingMessage) startElapsedTimer("basisChatElapsed", Date.now());
+  let preserveOwnership = false;
   try {
-    let jobId = operation.id;
-    if (operation.phase === "starting") {
-      const started = await startJob("basis_chat", basisChatPayload(text), { jobId });
-      if (!started.ok) {
-        if (started.data?.page_unloading) return { preserved: true };
-        clearActiveJob();
-        removeBasisChatTyping(typingMessage);
-        appendBasisChatMessage("assistant", basisChatFriendlyError(started.data));
+    if (operation.phase === "starting" && options.resume === true) {
+      const lookup = await getJson(`/api/jobs/${encodeURIComponent(operation.lineage.requestedJobId)}`, { logFetchFailure: false });
+      if (!basisChatOperationIsCurrent(operation, token)) return { superseded: true };
+      if (!lookup.ok) {
+        if (lookup.data?.fetch_failed || lookup.data?.page_unloading) {
+          preserveOwnership = true;
+          return { preserved: true };
+        }
+        finishBasisChatNotice(operation, "error", basisChatFriendlyError(lookup.data), typingMessage, token);
         return { errorDisplayed: true };
       }
-      jobId = started.data.job_id || jobId;
-      state.activeJob = {
-        ...operation,
-        id: jobId,
-        phase: "running",
-        startedAt: started.data.created_at || operation.startedAt,
-      };
+      operation = bindBasisChatServerOperation(operation, lookup.data, token);
+      if (!basisChatOperationIsCurrent(operation, token)) return { superseded: true };
+      saveSessionState();
+    } else if (operation.phase === "starting") {
+      const requestPayload = basisChatPayload(text);
+      const started = await startJob("basis_chat", requestPayload, { jobId: operation.lineage.requestedJobId });
+      if (!basisChatOperationIsCurrent(operation, token)) return { superseded: true };
+      if (!started.ok) {
+        if (started.data?.fetch_failed || started.data?.page_unloading) {
+          preserveOwnership = true;
+          return { preserved: true };
+        }
+        finishBasisChatNotice(operation, "error", basisChatFriendlyError(started.data), typingMessage, token);
+        return { errorDisplayed: true };
+      }
+      operation = bindBasisChatServerOperation(operation, started.data, token);
+      if (!basisChatOperationIsCurrent(operation, token)) return { superseded: true };
       saveSessionState();
     }
-    const polled = await pollJob(jobId);
-    if (polled.aborted || isInterruptedJobPoll(polled)) return { preserved: true };
-    clearActiveJob();
-    const data = polled.data.result || {};
-    if (!polled.ok || ["blocked", "failed"].includes(polled.data.status)) {
-      removeBasisChatTyping(typingMessage);
-      appendBasisChatMessage("assistant", basisChatFriendlyError(data || polled.data));
+    const polled = await pollBasisChatOperation(operation, token);
+    if (polled.superseded) return { superseded: true };
+    if (polled.preserved) {
+      preserveOwnership = true;
+      return { preserved: true };
+    }
+    if (!basisChatOperationIsCurrent(operation, token) || polled.invalid) {
+      if (basisChatOperationIsCurrent(operation, token)) finishBasisChatNotice(operation, "error", GENERIC_FAILURE_MESSAGE, typingMessage, token);
       return { errorDisplayed: true };
     }
-    if (data.proposal) {
-      return { proposal: normalizeServerBasisChatProposal(data.proposal) };
+    const job = polled.job;
+    const result = job.result && !Array.isArray(job.result) ? job.result : Object.create(null);
+    if (["blocked", "failed"].includes(job.status)) {
+      const message = basisChatFriendlyError(result);
+      if (!finishBasisChatNotice(operation, "error", message, typingMessage, token)) return { superseded: true };
+      return { errorDisplayed: true };
     }
-    return { answer: data.answer || null };
+    if (Object.prototype.hasOwnProperty.call(result, "proposal")) {
+      const proposal = normalizeServerBasisChatProposal(result.proposal, operation, job, token);
+      return { proposal, lineage: operation.lineage, token };
+    }
+    const answer = typeof result.answer === "string" && result.answer ? result.answer : null;
+    if (answer && !finishBasisChatNotice(operation, "answer", answer, typingMessage, token)) return { superseded: true };
+    if (!answer && !finishBasisChatNotice(operation, "error", GENERIC_FAILURE_MESSAGE, typingMessage, token)) return { superseded: true };
+    return answer ? { answer, noticeDisplayed: true } : { errorDisplayed: true };
+  } catch (_error) {
+    if (!basisChatOperationIsCurrent(operation, token)) return { superseded: true };
+    finishBasisChatNotice(operation, "error", GENERIC_FAILURE_MESSAGE, typingMessage, token);
+    return { errorDisplayed: true };
   } finally {
-    stopElapsedTimer("basisChatElapsed");
-    removeBasisChatTyping(typingMessage);
-    state.isAnalysisRunning = previousRunning;
-    setBasisChatBusy(false);
-    syncControlStates();
+    if (!preserveOwnership && basisChatOperationIsCurrent(operation, token)) {
+      stopElapsedTimer("basisChatElapsed");
+      removeBasisChatTyping(typingMessage);
+    }
   }
 }
 
@@ -10927,6 +12080,7 @@ async function handleBasisChatSubmit(event) {
   const text = elements.basisChatPrompt.value.trim();
   if (!text) return;
   elements.basisChatPrompt.value = "";
+  invalidateBasisChatAuthority();
   resetBasisChatProposal();
   appendBasisChatMessage("user", text);
   const normalized = text.toLowerCase();
@@ -10943,42 +12097,60 @@ async function handleBasisChatSubmit(event) {
       appendBasisChatMessage("assistant", `No exact matches for "${literalCommand.from}" were found in the current basis or output rows.`);
       return;
     }
-    setBasisChatProposal(proposal);
+    const authority = beginLocalBasisChatAuthority("local_literal", canonicalBasisChatProposalOrigin(proposal._origin));
+    setBasisChatProposal(proposal, authority.lineage, authority.token);
     return;
   }
 
   const fragmentProposal = buildSelectedLineFragmentReplacementProposal(text);
   if (fragmentProposal) {
-    setBasisChatProposal(fragmentProposal);
+    const authority = beginLocalBasisChatAuthority("local_fragment", canonicalBasisChatProposalOrigin(fragmentProposal._origin));
+    setBasisChatProposal(fragmentProposal, authority.lineage, authority.token);
     return;
   }
 
-  const aiResult = await buildAiBasisChatResponse(text);
+  const aiPromise = buildAiBasisChatResponse(text);
+  const submissionToken = basisChatRuntimeToken();
+  const aiResult = await aiPromise;
+  if (aiResult?.superseded || aiResult?.preserved) return;
+  if (submissionToken && !basisChatRuntimeTokenIsCurrent(submissionToken) && !aiResult?.noticeDisplayed) return;
   if (aiResult?.proposal) {
-    setBasisChatProposal(aiResult.proposal);
+    setBasisChatProposal(aiResult.proposal, aiResult.lineage, aiResult.token || submissionToken);
     return;
   }
   if (aiResult?.answer) {
-    appendBasisChatMessage("assistant", aiResult.answer);
+    if (!aiResult.noticeDisplayed && !elements.basisChatOverlay.hidden) appendBasisChatMessage("assistant", aiResult.answer);
     return;
   }
   if (aiResult?.errorDisplayed) return;
 
-  appendBasisChatMessage("assistant", GENERIC_FAILURE_MESSAGE);
+  if (!elements.basisChatOverlay.hidden) appendBasisChatMessage("assistant", GENERIC_FAILURE_MESSAGE);
 }
 
 function applyBasisChatProposal() {
   const proposal = state.basisChat.proposal;
   if (!proposal) return;
+  const token = basisChatRuntimeToken();
+  let admitted;
+  try {
+    const detachedProposal = detachedBasisChatAuthorityValue(proposal);
+    const owner = canonicalBasisChatAuthorityOwner(state.basisChat.authorityOwner);
+    if (owner.status !== "proposal" || state.basisChat.busyOwnerId !== null || state.activeJob?.type === "basis_chat") {
+      throw new TypeError("Basis proposal has been superseded.");
+    }
+    admitted = canonicalTargetOnlyBasisChatProposal(detachedProposal, detachedProposal._origin, detachedProposal._lineage, token);
+    if (!basisChatAuthorityStrictEqual(owner.origin, admitted._origin)
+      || !basisChatAuthorityStrictEqual(owner.lineage, admitted._lineage)) throw new TypeError("Basis proposal owner is stale.");
+  } catch (_error) {
+    invalidateBasisChatAuthority();
+    resetBasisChatProposal();
+    appendBasisChatMessage("assistant", "This proposal is stale. Please request the line change again.");
+    return;
+  }
   state.basisConfirmed = false;
-  const currentSections = state.quoteBasisSections;
-  const mergedSections = mergeBasisProposalLineMetadata(
-    normalizeQuoteBasisSections(proposal.quoteBasisSections || proposal.quoteBasis || state.quoteBasisSections),
-    currentSections
-  );
-  state.quoteBasisSections = reviewBasisProposalSections(mergedSections, currentSections);
-  state.quoteBasis = { ...cloneQuoteBasis(proposal.quoteBasis || state.quoteBasis), ...quoteBasisFromSections(state.quoteBasisSections) };
-  state.lineItems = Array.isArray(proposal.lineItems) ? proposal.lineItems.map(normalizeLineItem) : [];
+  state.quoteBasisSections = admitted.quoteBasisSections;
+  state.quoteBasis = admitted.quoteBasis;
+  state.lineItems = Array.isArray(state.lineItems) ? state.lineItems : [];
   state.outputRows = [];
   state.originalOutputRows = [];
   state.outputErrors = [];
@@ -10988,12 +12160,14 @@ function applyBasisChatProposal() {
   if (typeof clearPricingReviewMessages === "function") clearPricingReviewMessages();
   updateQuoteBasisCard("edited");
   setSidePanel("basis", { force: true });
+  invalidateBasisChatAuthority();
   resetBasisChatProposal();
   closeBasisChatOverlay();
   syncControlStates();
 }
 
 function keepCurrentBasis() {
+  invalidateBasisChatAuthority();
   resetBasisChatProposal();
   appendBasisChatMessage("assistant", "Kept the current quote basis unchanged.");
 }
@@ -11086,7 +12260,9 @@ function applyDraftBasis(basis = {}) {
 
 function applyDraftLineItems(lineItems = []) {
   state.basisConfirmed = false;
-  state.lineItems = lineItems.map(normalizeLineItem);
+  state.lineItems = lineItems.map((item) => (
+    typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(item) : item
+  )).map(normalizeLineItem);
   state.outputRows = [];
   state.originalOutputRows = [];
   state.outputErrors = [];
@@ -11096,14 +12272,16 @@ async function refreshLineItemsFromServer() {
   if (!state.lineItems.length) return { ok: true, data: { status: "normalized", line_items: [] } };
   const result = await postJson("/api/line-items/normalize", buildLineItemNormalizePayload());
   if (!result.ok || !Array.isArray(result.data.line_items)) return result;
-  state.lineItems = result.data.line_items.map(normalizeLineItem);
+  state.lineItems = result.data.line_items.map((item) => (
+    typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(item) : item
+  )).map(normalizeLineItem);
   state.outputRows = [];
   state.outputErrors = [];
   return result;
 }
 
 function captureOriginalAnalysisSnapshot(data = {}) {
-  const sections = normalizeQuoteBasisSections(data.quote_basis_sections || data.quote_basis || state.quoteBasisSections);
+  const sections = canonicalQuoteBasisSections(data.quote_basis_sections || data.quote_basis || state.quoteBasisSections);
   state.originalAnalysisSnapshot = {
     quote_basis_sections: cloneQuoteBasisSections(sections),
     quote_basis: { ...state.quoteBasis, ...quoteBasisFromSections(sections) },
@@ -11220,6 +12398,7 @@ async function handleClarificationSubmit(event) {
 }
 
 function clearAiFailedDraftState() {
+  invalidateBasisChatAuthority();
   state.quoteBasis = { ...EMPTY_BASIS };
   state.quoteBasisSections = [];
   state.lineItems = [];
@@ -11251,6 +12430,7 @@ function showAiFailedDraftState(data = {}) {
 function resetQuoteBasisToOriginal() {
   const snapshot = state.originalAnalysisSnapshot;
   if (!snapshot) return;
+  invalidateBasisChatAuthority();
   state.quoteBasisSections = cloneQuoteBasisSections(snapshot.quote_basis_sections || snapshot.quote_basis || []);
   state.quoteBasis = cloneQuoteBasis(snapshot.quote_basis || quoteBasisFromSections(state.quoteBasisSections));
   state.lineItems = Array.isArray(snapshot.line_items) ? snapshot.line_items.map(normalizeLineItem) : [];
@@ -11575,7 +12755,7 @@ async function getJson(url, options = {}) {
       errors: data.errors || [],
     });
   }
-  return { ok: response.ok, data };
+  return { ok: response.ok, data, status: response.status };
 }
 
 function dashboardNumberOrNull(value) {
@@ -13701,6 +14881,7 @@ async function initializeSession() {
 
 function syncControlStates() {
   const busy = appIsBusy();
+  renderBasisChatBusyControls(Boolean(state.basisChat.busyOwnerId));
   elements.newQuoteButton.disabled = busy;
   elements.newQuoteButton.hidden = state.activeAppView !== "dashboard";
   elements.newQuoteButton.title = busy ? appBusyTitle() : "";
@@ -14196,17 +15377,21 @@ async function resumeSavedJob() {
   }
 
   if (activeJob.type === "basis_chat") {
-    const restored = restoreBasisChatOverlay();
-    if (!restored) {
-      clearActiveJob();
+    const shouldShowOverlay = state.restorableOverlay === "basis_chat";
+    if (shouldShowOverlay && !restoreBasisChatOverlay()) {
+      discardInvalidRestoredActiveJob();
       return;
     }
-    const text = String(activeJob.text || "").trim();
-    if (text) appendBasisChatMessage("user", text);
-    const aiResult = await buildAiBasisChatResponse(text, { resume: true, operation: activeJob });
-    if (aiResult?.proposal) setBasisChatProposal(aiResult.proposal);
-    else if (aiResult?.answer) appendBasisChatMessage("assistant", aiResult.answer);
-    else if (!aiResult?.errorDisplayed && !aiResult?.preserved) {
+    const text = activeJob.text;
+    if (shouldShowOverlay && text) appendBasisChatMessage("user", text);
+    const restoreToken = basisChatRuntimeToken();
+    const aiResult = await buildAiBasisChatResponse(text, { resume: true, operation: activeJob, token: restoreToken });
+    if (aiResult?.superseded || aiResult?.preserved) return;
+    if (restoreToken && !basisChatRuntimeTokenIsCurrent(restoreToken) && !aiResult?.noticeDisplayed) return;
+    if (aiResult?.proposal) setBasisChatProposal(aiResult.proposal, aiResult.lineage, aiResult.token || restoreToken);
+    else if (aiResult?.answer && shouldShowOverlay && !aiResult.noticeDisplayed
+      && basisChatRuntimeTokenIsCurrent(restoreToken)) appendBasisChatMessage("assistant", aiResult.answer);
+    else if (shouldShowOverlay && !aiResult?.errorDisplayed && !aiResult?.preserved && !aiResult?.superseded) {
       appendBasisChatMessage("assistant", "I could not produce a useful basis change. Please rephrase the request.");
     }
     return;
