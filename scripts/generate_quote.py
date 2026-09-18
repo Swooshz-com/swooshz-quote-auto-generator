@@ -140,8 +140,26 @@ SIGNATURE_CONTENT_HEIGHT = 8
 SIGNATURE_BLOCK_PAGE_GUARD_ROWS = 0
 SIGNATURE_BLOCK_HEIGHT = SIGNATURE_CONTENT_HEIGHT + SIGNATURE_BLOCK_PAGE_GUARD_ROWS
 QUOTE_LAYOUT_DEFAULT_ROW_HEIGHT = "18.7"
-HEADER_LOGO_MAX_WIDTH_EMU = 2_970_000
-HEADER_LOGO_MAX_HEIGHT_EMU = 635_000
+EMU_PER_POINT = 12_700
+HEADER_LOGO_ANCHOR_FROM = {
+    "col": "7",
+    "colOff": "0",
+    "row": "1",
+    "rowOff": "0",
+}
+HEADER_LOGO_ANCHOR_TO = {
+    "col": "8",
+    "colOff": "1720000",
+    "row": "2",
+    "rowOff": "415000",
+}
+HEADER_LOGO_CANONICAL_WIDTH_EMU = int(HEADER_LOGO_ANCHOR_TO["colOff"])
+HEADER_LOGO_CANONICAL_ROW_OFFSET_EMU = int(HEADER_LOGO_ANCHOR_TO["rowOff"])
+HEADER_LOGO_MAX_WIDTH_EMU = HEADER_LOGO_CANONICAL_WIDTH_EMU
+HEADER_LOGO_MAX_HEIGHT_EMU = (
+    round(float(QUOTE_LAYOUT_DEFAULT_ROW_HEIGHT) * EMU_PER_POINT)
+    + HEADER_LOGO_CANONICAL_ROW_OFFSET_EMU
+)
 HEADER_LOGO_OFFSET_X_EMU = 4_550_000
 HEADER_LOGO_OFFSET_Y_EMU = 260_000
 QUOTE_LAYOUT_COLUMN_WIDTHS = {
@@ -1984,25 +2002,99 @@ def image_dimensions(image_bytes: bytes, mime_type: str) -> tuple[int, int] | No
     return None
 
 
-def fitted_header_logo_extent(dimensions: tuple[int, int] | None) -> tuple[int, int]:
+def header_logo_row_height_emu(parts: dict[str, bytes] | None = None) -> int:
+    row_height = QUOTE_LAYOUT_DEFAULT_ROW_HEIGHT
+    if parts and "xl/worksheets/sheet1.xml" in parts:
+        worksheet = ET.fromstring(parts["xl/worksheets/sheet1.xml"])
+        sheet_format = worksheet.find(f"{NS_MAIN}sheetFormatPr")
+        default_height = (
+            sheet_format.attrib.get("defaultRowHeight")
+            if sheet_format is not None
+            else None
+        )
+        row_height = default_height or row_height
+        for row in worksheet.findall(f"{NS_MAIN}sheetData/{NS_MAIN}row"):
+            if row.attrib.get("r") == "2":
+                row_height = row.attrib.get("ht") or row_height
+                break
+    try:
+        return max(1, round(float(row_height) * EMU_PER_POINT))
+    except (TypeError, ValueError):
+        return round(float(QUOTE_LAYOUT_DEFAULT_ROW_HEIGHT) * EMU_PER_POINT)
+
+
+def header_logo_region_extent(parts: dict[str, bytes] | None = None) -> tuple[int, int]:
+    return (
+        HEADER_LOGO_CANONICAL_WIDTH_EMU,
+        header_logo_row_height_emu(parts) + HEADER_LOGO_CANONICAL_ROW_OFFSET_EMU,
+    )
+
+
+def fitted_header_logo_extent(
+    dimensions: tuple[int, int] | None,
+    region_extent: tuple[int, int] | None = None,
+) -> tuple[int, int]:
+    max_width, max_height = region_extent or (HEADER_LOGO_MAX_WIDTH_EMU, HEADER_LOGO_MAX_HEIGHT_EMU)
     if not dimensions or dimensions[0] <= 0 or dimensions[1] <= 0:
-        return HEADER_LOGO_MAX_WIDTH_EMU, HEADER_LOGO_MAX_HEIGHT_EMU
+        return max_width, max_height
     width, height = dimensions
     aspect = width / height
-    max_aspect = HEADER_LOGO_MAX_WIDTH_EMU / HEADER_LOGO_MAX_HEIGHT_EMU
+    max_aspect = max_width / max_height
     if aspect >= max_aspect:
-        fitted_width = HEADER_LOGO_MAX_WIDTH_EMU
+        fitted_width = max_width
         fitted_height = max(1, round(fitted_width / aspect))
     else:
-        fitted_height = HEADER_LOGO_MAX_HEIGHT_EMU
+        fitted_height = max_height
         fitted_width = max(1, round(fitted_height * aspect))
     return fitted_width, fitted_height
 
 
-def set_header_logo_extent(pic: ET.Element, dimensions: tuple[int, int] | None) -> None:
+def header_logo_anchor_to_values(
+    extent: tuple[int, int],
+    row_height_emu: int,
+) -> dict[str, str]:
+    width, height = extent
+    if height < row_height_emu:
+        row = HEADER_LOGO_ANCHOR_FROM["row"]
+        row_offset = height
+    else:
+        row = HEADER_LOGO_ANCHOR_TO["row"]
+        row_offset = height - row_height_emu
+    return {
+        "col": HEADER_LOGO_ANCHOR_TO["col"],
+        "colOff": str(width),
+        "row": row,
+        "rowOff": str(row_offset),
+    }
+
+
+def set_header_logo_anchor_extent(
+    anchor: ET.Element,
+    extent: tuple[int, int],
+    row_height_emu: int,
+) -> None:
+    from_marker = anchor.find(f"{NS_DRAWING}from")
+    if from_marker is not None:
+        for tag, value in HEADER_LOGO_ANCHOR_FROM.items():
+            node = from_marker.find(f"{NS_DRAWING}{tag}")
+            if node is not None:
+                node.text = value
+    to_marker = anchor.find(f"{NS_DRAWING}to")
+    if to_marker is not None:
+        for tag, value in header_logo_anchor_to_values(extent, row_height_emu).items():
+            node = to_marker.find(f"{NS_DRAWING}{tag}")
+            if node is not None:
+                node.text = value
+
+
+def set_header_logo_extent(
+    pic: ET.Element,
+    dimensions: tuple[int, int] | None,
+    region_extent: tuple[int, int] | None = None,
+) -> tuple[int, int]:
     pic_pr = pic.find(f"{NS_DRAWING}spPr")
     if pic_pr is None:
-        return
+        return fitted_header_logo_extent(dimensions, region_extent)
     pic_xfrm = pic_pr.find(f"{NS_A}xfrm")
     if pic_xfrm is None:
         pic_xfrm = ET.SubElement(pic_pr, f"{NS_A}xfrm")
@@ -2016,18 +2108,25 @@ def set_header_logo_extent(pic: ET.Element, dimensions: tuple[int, int] | None) 
     logo_ext = pic_xfrm.find(f"{NS_A}ext")
     if logo_ext is None:
         logo_ext = ET.SubElement(pic_xfrm, f"{NS_A}ext")
-    if dimensions is not None or not logo_ext.attrib:
-        width, height = fitted_header_logo_extent(dimensions)
-        logo_ext.attrib.update({"cx": str(width), "cy": str(height)})
+    width, height = fitted_header_logo_extent(dimensions, region_extent)
+    logo_ext.attrib.update({"cx": str(width), "cy": str(height)})
+    return width, height
 
 
-def create_header_logo_anchor(rel_id: str, dimensions: tuple[int, int] | None = None) -> ET.Element:
+def create_header_logo_anchor(
+    rel_id: str,
+    dimensions: tuple[int, int] | None = None,
+    region_extent: tuple[int, int] | None = None,
+    row_height_emu: int | None = None,
+) -> ET.Element:
+    fitted_extent = fitted_header_logo_extent(dimensions, region_extent)
+    row_height_emu = row_height_emu or header_logo_row_height_emu()
     anchor = ET.Element(f"{NS_DRAWING}twoCellAnchor")
     from_marker = ET.SubElement(anchor, f"{NS_DRAWING}from")
-    for tag, value in (("col", "7"), ("colOff", "0"), ("row", "1"), ("rowOff", "0")):
+    for tag, value in HEADER_LOGO_ANCHOR_FROM.items():
         ET.SubElement(from_marker, f"{NS_DRAWING}{tag}").text = value
     to_marker = ET.SubElement(anchor, f"{NS_DRAWING}to")
-    for tag, value in (("col", "8"), ("colOff", "1720000"), ("row", "2"), ("rowOff", "415000")):
+    for tag, value in header_logo_anchor_to_values(fitted_extent, row_height_emu).items():
         ET.SubElement(to_marker, f"{NS_DRAWING}{tag}").text = value
 
     pic = ET.SubElement(anchor, f"{NS_DRAWING}pic")
@@ -2045,7 +2144,7 @@ def create_header_logo_anchor(rel_id: str, dimensions: tuple[int, int] | None = 
     sp_pr = ET.SubElement(pic, f"{NS_DRAWING}spPr", {"bwMode": "auto"})
     xfrm = ET.SubElement(sp_pr, f"{NS_A}xfrm")
     ET.SubElement(xfrm, f"{NS_A}off", {"x": str(HEADER_LOGO_OFFSET_X_EMU), "y": str(HEADER_LOGO_OFFSET_Y_EMU)})
-    logo_width, logo_height = fitted_header_logo_extent(dimensions)
+    logo_width, logo_height = fitted_extent
     ET.SubElement(xfrm, f"{NS_A}ext", {"cx": str(logo_width), "cy": str(logo_height)})
     prst_geom = ET.SubElement(sp_pr, f"{NS_A}prstGeom", {"prst": "rect"})
     ET.SubElement(prst_geom, f"{NS_A}avLst")
@@ -2070,16 +2169,28 @@ def ensure_header_logo_anchor(
     drawing_root = ET.fromstring(parts[drawing_name])
     rel_targets = rel_targets_by_id(parts)
     anchor = find_header_logo_anchor(drawing_root, rel_targets)
+    region_extent = header_logo_region_extent(parts)
+    row_height_emu = header_logo_row_height_emu(parts)
+    fitted_extent = fitted_header_logo_extent(dimensions, region_extent)
     if anchor is not None:
         pic = anchor.find(f"{NS_DRAWING}pic")
         blip = pic.find(f".//{NS_A}blip")
         if blip is not None:
             blip.attrib[f"{NS_REL}embed"] = rel_id
         if pic is not None:
-            set_header_logo_extent(pic, dimensions)
+            set_header_logo_extent(pic, dimensions, region_extent)
+        set_header_logo_anchor_extent(anchor, fitted_extent, row_height_emu)
         parts[drawing_name] = ET.tostring(drawing_root, encoding="utf-8", xml_declaration=True)
         return
-    drawing_root.insert(0, create_header_logo_anchor(rel_id, dimensions))
+    drawing_root.insert(
+        0,
+        create_header_logo_anchor(
+            rel_id,
+            dimensions,
+            region_extent,
+            row_height_emu,
+        ),
+    )
     parts[drawing_name] = ET.tostring(drawing_root, encoding="utf-8", xml_declaration=True)
 
 

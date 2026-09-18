@@ -1376,12 +1376,14 @@ class GenerateQuoteRowsTest(unittest.TestCase):
 
             with zipfile.ZipFile(KONCEPT_LAYOUT) as template_zf, zipfile.ZipFile(xlsx_path) as output_zf:
                 template_sheet = ET.fromstring(template_zf.read("xl/worksheets/sheet1.xml"))
-                output_sheet = ET.fromstring(output_zf.read("xl/worksheets/sheet1.xml"))
+                output_sheet_xml = output_zf.read("xl/worksheets/sheet1.xml")
+                output_sheet = ET.fromstring(output_sheet_xml)
                 template_workbook = ET.fromstring(template_zf.read("xl/workbook.xml"))
                 output_workbook = ET.fromstring(output_zf.read("xl/workbook.xml"))
                 output_styles = ET.fromstring(output_zf.read("xl/styles.xml"))
                 template_drawing = ET.fromstring(template_zf.read("xl/drawings/drawing1.xml"))
                 drawing = ET.fromstring(output_zf.read("xl/drawings/drawing1.xml"))
+                logo_dimensions = quote.image_dimensions(output_zf.read("xl/media/header_logo.png"), "image/png")
 
             self.assertEqual(column_widths(output_sheet), column_widths(template_sheet))
             self.assertEqual(
@@ -1426,14 +1428,20 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             logo_off = logo_anchor.find(f"{NS_DRAWING}pic/{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}off")
             logo_width = int(logo_ext.attrib["cx"])
             logo_height = int(logo_ext.attrib["cy"])
+            logo_region = quote.header_logo_region_extent({"xl/worksheets/sheet1.xml": output_sheet_xml})
+            expected_logo_extent = quote.fitted_header_logo_extent(logo_dimensions, logo_region)
+            self.assertEqual((logo_width, logo_height), expected_logo_extent)
             self.assertAlmostEqual(logo_width / logo_height, 4.0, places=2)
             self.assertLessEqual(logo_width, quote.HEADER_LOGO_MAX_WIDTH_EMU)
             self.assertLessEqual(logo_height, quote.HEADER_LOGO_MAX_HEIGHT_EMU)
             self.assertEqual(logo_off.attrib, {"x": str(quote.HEADER_LOGO_OFFSET_X_EMU), "y": str(quote.HEADER_LOGO_OFFSET_Y_EMU)})
-            self.assertEqual(logo_anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}col").text, "7")
-            self.assertEqual(logo_anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}row").text, "1")
-            self.assertEqual(logo_anchor.find(f"{NS_DRAWING}to/{NS_DRAWING}colOff").text, "1720000")
-            self.assertEqual(logo_anchor.find(f"{NS_DRAWING}to/{NS_DRAWING}rowOff").text, "415000")
+            for tag, value in quote.HEADER_LOGO_ANCHOR_FROM.items():
+                self.assertEqual(logo_anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}{tag}").text, value)
+            for tag, value in quote.header_logo_anchor_to_values(
+                expected_logo_extent,
+                quote.header_logo_row_height_emu({"xl/worksheets/sheet1.xml": output_sheet_xml}),
+            ).items():
+                self.assertEqual(logo_anchor.find(f"{NS_DRAWING}to/{NS_DRAWING}{tag}").text, value)
 
             render_scale = 2.0
 
@@ -1553,6 +1561,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                         "page_size_points": [round(value, 2) for value in first_page["size"]],
                         "orientation": "portrait",
                         "logo_bounds_px": list(logo_bbox),
+                        "logo_bounds_points": [round(value, 2) for value in logo_pdf_bbox],
                         "logo_aspect": round(logo_aspect, 3),
                         "header_bounds_points": [round(value, 2) for value in first_page["header_bbox"]],
                         "header_bounds_px": list(header_bbox_px),
@@ -2872,10 +2881,12 @@ class GenerateQuoteRowsTest(unittest.TestCase):
 
         with zipfile.ZipFile(KONCEPT_LAYOUT) as template_zf, zipfile.ZipFile(path) as output_zf:
             template_drawing = ET.fromstring(template_zf.read("xl/drawings/drawing1.xml"))
+            output_sheet_xml = output_zf.read("xl/worksheets/sheet1.xml")
             output_drawing = ET.fromstring(output_zf.read("xl/drawings/drawing1.xml"))
             template_workbook = ET.fromstring(template_zf.read("xl/workbook.xml"))
             output_workbook = ET.fromstring(output_zf.read("xl/workbook.xml"))
             media_names = set(output_zf.namelist())
+            logo_dimensions = quote.image_dimensions(output_zf.read("xl/media/header_logo.png"), "image/png")
 
         template_text_anchor = next(
             anchor for anchor in template_drawing.findall(f"{NS_DRAWING}twoCellAnchor")
@@ -2899,13 +2910,19 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         logo_off = logo_anchor.find(f"{NS_DRAWING}pic/{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}off")
         logo_width = int(logo_ext.attrib["cx"])
         logo_height = int(logo_ext.attrib["cy"])
+        logo_region = quote.header_logo_region_extent({"xl/worksheets/sheet1.xml": output_sheet_xml})
+        expected_logo_extent = quote.fitted_header_logo_extent(logo_dimensions, logo_region)
 
         self.assertGreater(text_from_row, logo_to_row)
-        self.assertEqual(logo_anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}col").text, "7")
-        self.assertEqual(logo_anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}row").text, "1")
-        self.assertEqual(logo_anchor.find(f"{NS_DRAWING}to/{NS_DRAWING}colOff").text, "1720000")
-        self.assertEqual(logo_anchor.find(f"{NS_DRAWING}to/{NS_DRAWING}rowOff").text, "415000")
+        for tag, value in quote.HEADER_LOGO_ANCHOR_FROM.items():
+            self.assertEqual(logo_anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}{tag}").text, value)
+        for tag, value in quote.header_logo_anchor_to_values(
+            expected_logo_extent,
+            quote.header_logo_row_height_emu({"xl/worksheets/sheet1.xml": output_sheet_xml}),
+        ).items():
+            self.assertEqual(logo_anchor.find(f"{NS_DRAWING}to/{NS_DRAWING}{tag}").text, value)
         self.assertEqual(logo_off.attrib, {"x": str(quote.HEADER_LOGO_OFFSET_X_EMU), "y": str(quote.HEADER_LOGO_OFFSET_Y_EMU)})
+        self.assertEqual((logo_width, logo_height), expected_logo_extent)
         self.assertAlmostEqual(logo_width / logo_height, 1.0, places=2)
         self.assertLessEqual(logo_width, quote.HEADER_LOGO_MAX_WIDTH_EMU)
         self.assertLessEqual(logo_height, quote.HEADER_LOGO_MAX_HEIGHT_EMU)
@@ -3336,6 +3353,35 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertIn("../media/header_logo.png", targets.values())
         self.assertEqual(parts["xl/media/product.png"], b"product image")
         self.assertIn("xl/media/header_logo.png", parts)
+
+    def test_existing_header_logo_replacement_keeps_outer_and_inner_geometry_coherent(self):
+        parts = {
+            "xl/drawings/drawing1.xml": ET.tostring(
+                quote.create_header_logo_anchor("rId1", (1, 1)),
+                encoding="utf-8",
+                xml_declaration=True,
+            ),
+            "xl/drawings/_rels/drawing1.xml.rels": drawing_rels_xml(("rId1", "../media/image1.png")),
+            "xl/media/image1.png": SANITIZED_LOGO_PNG_BYTES,
+            "[Content_Types].xml": empty_content_types_xml(),
+        }
+
+        quote.replace_header_logo(parts, non_square_logo_data_url())
+
+        drawing = ET.fromstring(parts["xl/drawings/drawing1.xml"])
+        logo_anchor = next(
+            anchor
+            for anchor in drawing.findall(f"{NS_DRAWING}twoCellAnchor")
+            if anchor.find(f"{NS_DRAWING}pic/{NS_DRAWING}nvPicPr/{NS_DRAWING}cNvPr").attrib.get("name") == "Header Logo"
+        )
+        logo_ext = logo_anchor.find(f"{NS_DRAWING}pic/{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}ext")
+        expected_extent = quote.fitted_header_logo_extent((640, 160))
+        self.assertEqual((int(logo_ext.attrib["cx"]), int(logo_ext.attrib["cy"])), expected_extent)
+        for tag, value in quote.header_logo_anchor_to_values(
+            expected_extent,
+            quote.header_logo_row_height_emu(),
+        ).items():
+            self.assertEqual(logo_anchor.find(f"{NS_DRAWING}to/{NS_DRAWING}{tag}").text, value)
 
     def test_header_logo_replacement_creates_missing_drawing_rels_file(self):
         parts = {
