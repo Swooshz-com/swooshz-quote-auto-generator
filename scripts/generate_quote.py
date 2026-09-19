@@ -19,6 +19,7 @@ import datetime as dt
 import html
 import io
 import json
+import hashlib
 import math
 import os
 import re
@@ -220,6 +221,8 @@ class PriceRow:
     remark: str
     pricing_id: str = ""
     aliases: list[str] = field(default_factory=list)
+    catalog_digest: str = ""
+    catalog_currency: str = ""
 
     @property
     def sale_unit_price(self) -> float:
@@ -389,52 +392,117 @@ PRICING_AUTHORITY_CONTEXT_FIELDS = (
     "unit",
     "pricing_keyword",
 )
+PRICING_AUTHORITY_DECIMAL_RE = re.compile(r"^(?:0|[1-9]\d*)(?:\.\d+)?$")
+PRICING_REFERENCE_DIGEST_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
 
 
 def pricing_authority_context(value: Any) -> dict[str, str]:
     row = value if isinstance(value, dict) else {}
     return {
-        "source_basis_line_id": clean_text(row.get("source_basis_line_id")),
-        "section": clean_text(row.get("section")) or "General",
-        "description": clean_text(row.get("description")),
-        "unit": normalize_unit(row.get("unit")),
-        "pricing_keyword": clean_text(row.get("pricing_keyword")),
+        "source_basis_line_id": canonical_pricing_authority_text(row.get("source_basis_line_id")),
+        "section": canonical_pricing_authority_text(row.get("section")) or "General",
+        "description": canonical_pricing_authority_text(row.get("description")),
+        "unit": normalize_unit(canonical_pricing_authority_text(row.get("unit"))),
+        "pricing_keyword": canonical_pricing_authority_text(row.get("pricing_keyword")),
     }
 
 
+def canonical_pricing_authority_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return unicodedata.normalize("NFC", re.sub(r"\s+", " ", str(value)).strip())
+
+
 def pricing_authority_number(value: Any) -> float | None:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or value is None:
         return None
-    number = as_float(value, float("nan"))
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str) and PRICING_AUTHORITY_DECIMAL_RE.fullmatch(value):
+        try:
+            number = float(value)
+        except ValueError:
+            return None
+    else:
+        return None
     if not math.isfinite(number) or number < 0:
         return None
     return round_commercial_cents(number)
+
+
+def trusted_pricing_reference_identity(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict) or set(value) != {"id", "source", "currency", "digest"}:
+        return None
+    if any(not isinstance(value.get(key), str) for key in ("id", "source", "currency", "digest")):
+        return None
+    if (
+        not value["id"]
+        or value["source"] not in PRICING_AUTHORITY_SOURCES
+        or not re.fullmatch(r"[A-Z]{3}", value["currency"])
+        or not PRICING_REFERENCE_DIGEST_RE.fullmatch(value["digest"])
+    ):
+        return None
+    return dict(value)
+
+
+def catalog_payload_digest(payload: dict[str, Any]) -> str:
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1 or not isinstance(payload.get("items"), list):
+        return ""
+    currency = payload.get("currency")
+    if not isinstance(currency, str) or not re.fullmatch(r"[A-Z]{3}", currency):
+        return ""
+    items = [dict(item) for item in payload["items"] if isinstance(item, dict)]
+    if not items:
+        return ""
+    canonical = {"schema_version": 1, "currency": currency, "items": items}
+    raw = json.dumps(canonical, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return f"sha256:{hashlib.sha256(raw).hexdigest()}"
 
 
 def normalize_pricing_authority(
     raw: Any,
     row: dict[str, Any],
     price_rows: list[PriceRow],
+    trusted_reference: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
     if raw.get("schema") != PRICING_AUTHORITY_SCHEMA or raw.get("version") != PRICING_AUTHORITY_VERSION:
         return None
-    variant = clean_text(raw.get("variant") or raw.get("kind")).lower()
+    if not isinstance(raw.get("variant"), str):
+        return None
+    variant = raw["variant"]
     if variant not in PRICING_AUTHORITY_VARIANTS:
         return None
-    supplied_context = raw.get("context") if isinstance(raw.get("context"), dict) else raw.get("row_context")
+    allowed_keys = (
+        {"schema", "version", "variant", "context"}
+        if variant in {"none", "historical"}
+        else (
+            {"schema", "version", "variant", "context", "price", "currency"}
+            if variant in {"manual", "included"}
+            else {
+                "schema", "version", "variant", "context", "price", "currency",
+                "catalog_source", "catalog_item_id", "catalog_digest",
+                "catalog_section", "catalog_description", "catalog_unit",
+            }
+        )
+    )
+    if set(raw) != allowed_keys:
+        return None
+    supplied_context = raw.get("context")
     if not isinstance(supplied_context, dict):
         return None
     if set(supplied_context) != set(PRICING_AUTHORITY_CONTEXT_FIELDS):
         return None
+    if any(not isinstance(supplied_context.get(key), str) for key in PRICING_AUTHORITY_CONTEXT_FIELDS):
+        return None
     context = pricing_authority_context(row)
     canonical_supplied = {
-        "source_basis_line_id": clean_text(supplied_context.get("source_basis_line_id")),
-        "section": clean_text(supplied_context.get("section")) or "General",
-        "description": clean_text(supplied_context.get("description")),
-        "unit": normalize_unit(supplied_context.get("unit")),
-        "pricing_keyword": clean_text(supplied_context.get("pricing_keyword")),
+        "source_basis_line_id": canonical_pricing_authority_text(supplied_context.get("source_basis_line_id")),
+        "section": canonical_pricing_authority_text(supplied_context.get("section")) or "General",
+        "description": canonical_pricing_authority_text(supplied_context.get("description")),
+        "unit": normalize_unit(canonical_pricing_authority_text(supplied_context.get("unit"))),
+        "pricing_keyword": canonical_pricing_authority_text(supplied_context.get("pricing_keyword")),
     }
     if canonical_supplied != context:
         return None
@@ -445,10 +513,11 @@ def normalize_pricing_authority(
             "variant": variant,
             "context": context,
         }
-    price = pricing_authority_number(raw.get("price", raw.get("authoritative_price")))
+    price = pricing_authority_number(raw.get("price"))
     if price is None or (variant == "included" and price != 0):
         return None
-    if not isinstance(raw.get("currency"), str):
+    trusted = trusted_pricing_reference_identity(trusted_reference)
+    if trusted is None or not isinstance(raw.get("currency"), str) or raw["currency"] != trusted["currency"]:
         return None
     normalized: dict[str, Any] = {
         "schema": PRICING_AUTHORITY_SCHEMA,
@@ -456,23 +525,31 @@ def normalize_pricing_authority(
         "variant": variant,
         "context": context,
         "price": 0.0 if variant == "included" else price,
-        "currency": clean_text(raw.get("currency")).upper(),
+        "currency": raw["currency"],
     }
     if variant == "catalog":
-        item_id = clean_text(raw.get("catalog_item_id") or raw.get("item_id"))
-        catalog_source = clean_text(raw.get("catalog_source") or raw.get("source"))
-        catalog_digest = clean_text(raw.get("catalog_digest") or raw.get("digest"))
+        if any(not isinstance(raw.get(key), str) for key in (
+            "catalog_source", "catalog_item_id", "catalog_digest",
+            "catalog_section", "catalog_description", "catalog_unit",
+        )):
+            return None
+        item_id = raw["catalog_item_id"]
+        catalog_source = raw["catalog_source"]
+        catalog_digest = raw["catalog_digest"]
         matches = [item for item in price_rows if item.pricing_id == item_id]
         if len(matches) != 1:
             return None
         match = matches[0]
         if (
-            catalog_source not in PRICING_AUTHORITY_SOURCES
-            or not re.fullmatch(r"sha256:[a-f0-9]{64}", catalog_digest)
+            catalog_source != trusted["source"]
+            or catalog_digest != trusted["digest"]
+            or match.catalog_digest != trusted["digest"]
+            or not PRICING_REFERENCE_DIGEST_RE.fullmatch(catalog_digest)
             or item_id != match.pricing_id
             or price != match.sale_unit_price
-            or clean_text(raw.get("catalog_section")) != clean_text(match.section) or clean_text(raw.get("catalog_description")) != clean_text(match.description)
-            or normalize_unit(raw.get("catalog_unit")) != normalize_unit(match.unit_hint)
+            or canonical_pricing_authority_text(raw.get("catalog_section")) != (canonical_pricing_authority_text(match.section) or "General")
+            or canonical_pricing_authority_text(raw.get("catalog_description")) != canonical_pricing_authority_text(match.description)
+            or normalize_unit(canonical_pricing_authority_text(raw.get("catalog_unit"))) != normalize_unit(canonical_pricing_authority_text(match.unit_hint))
         ):
             return None
         normalized.update({
@@ -512,11 +589,13 @@ def infer_unit(description: str) -> str:
     return ""
 
 
-def extract_price_rows_from_catalog(template_path: Path) -> list[PriceRow]:
+def extract_price_rows_from_catalog(template_path: Path, trusted_reference: dict[str, Any] | None = None) -> list[PriceRow]:
     payload = json.loads(template_path.read_text(encoding="utf-8-sig"))
     if payload.get("schema_version") != 1 or not isinstance(payload.get("items"), list):
         raise ValueError(f"Unsupported pricing catalog schema: {template_path}")
 
+    catalog_digest = catalog_payload_digest(payload)
+    catalog_currency = payload.get("currency") if isinstance(payload.get("currency"), str) else ""
     price_rows: list[PriceRow] = []
     for index, item in enumerate(payload["items"], start=1):
         description = clean_text(item.get("description"))
@@ -542,14 +621,16 @@ def extract_price_rows_from_catalog(template_path: Path) -> list[PriceRow]:
                 remark=remark,
                 pricing_id=clean_text(item.get("id")),
                 aliases=[clean_text(alias) for alias in aliases if clean_text(alias)],
+                catalog_digest=catalog_digest,
+                catalog_currency=catalog_currency,
             )
         )
     return price_rows
 
 
-def extract_price_rows(template_path: Path) -> list[PriceRow]:
+def extract_price_rows(template_path: Path, trusted_reference: dict[str, Any] | None = None) -> list[PriceRow]:
     if template_path.suffix.lower() == ".json":
-        return extract_price_rows_from_catalog(template_path)
+        return extract_price_rows_from_catalog(template_path, trusted_reference=trusted_reference)
     raise ValueError(
         f"Pricing source must be a JSON catalog: {template_path}. "
         "Run scripts/build_pricing_catalog.py to convert the source template first."
@@ -751,6 +832,7 @@ def prepare_lines(
     allow_ambiguous: bool,
     *,
     authority_required: bool = False,
+    trusted_pricing_reference: dict[str, Any] | None = None,
 ) -> list[QuoteLine]:
     prepared: list[QuoteLine] = []
     for item in brief.get("line_items", []):
@@ -779,7 +861,7 @@ def prepare_lines(
                 "description": clean_text(item.get("description")),
                 "unit": normalized_unit,
                 "pricing_keyword": pricing_keyword,
-            }, price_rows)
+            }, price_rows, trusted_reference=trusted_pricing_reference)
             variant = clean_text(authority.get("variant") if authority else "").lower()
             if authority is None or variant not in {"manual", "catalog", "included"}:
                 status = "unmatched"
@@ -3452,12 +3534,14 @@ def main() -> int:
     brief = load_brief(args.brief)
     out_dir = resolve_default_output_dir(brief, args.out)
     missing = validate_brief(brief)
-    price_rows = extract_price_rows(args.template)
+    trusted_pricing_reference = brief.get("_pricing_reference_authority")
+    price_rows = extract_price_rows(args.template, trusted_reference=trusted_pricing_reference)
     lines = prepare_lines(
         brief,
         price_rows,
         args.allow_ambiguous,
         authority_required=brief.get("_pricing_authority_enforced") is True,
+        trusted_pricing_reference=trusted_pricing_reference,
     )
     issues = confirmation_issues(missing, lines)
     out_dir.mkdir(parents=True, exist_ok=True)

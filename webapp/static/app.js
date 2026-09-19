@@ -2536,9 +2536,9 @@ function canonicalPricingAuthorityText(value = "") {
 function pricingAuthorityContext(row = {}) {
   return {
     source_basis_line_id: canonicalPricingAuthorityText(row.source_basis_line_id || ""),
-    section: normalizeCategoryTitle(row.section || ""),
-    description: cleanCustomerQuoteLineText(row.description || ""),
-    unit: normalizeUnit(row.unit || ""),
+    section: canonicalPricingAuthorityText(row.section || "") || "General",
+    description: canonicalPricingAuthorityText(row.description || ""),
+    unit: normalizeUnit(canonicalPricingAuthorityText(row.unit || "")),
     pricing_keyword: canonicalPricingAuthorityText(row.pricing_keyword || ""),
   };
 }
@@ -2546,20 +2546,48 @@ function pricingAuthorityContext(row = {}) {
 function pricingAuthorityContextMatches(authority, row = {}) {
   if (!authority || typeof authority !== "object" || !authority.context || typeof authority.context !== "object") return false;
   if (Object.keys(authority.context).sort().join("|") !== [...PRICING_AUTHORITY_CONTEXT_FIELDS].sort().join("|")) return false;
+  if (PRICING_AUTHORITY_CONTEXT_FIELDS.some((field) => typeof authority.context[field] !== "string")) return false;
   const supplied = {
     source_basis_line_id: canonicalPricingAuthorityText(authority.context.source_basis_line_id || ""),
-    section: normalizeCategoryTitle(authority.context.section || ""),
-    description: cleanCustomerQuoteLineText(authority.context.description || ""),
-    unit: normalizeUnit(authority.context.unit || ""),
+    section: canonicalPricingAuthorityText(authority.context.section || "") || "General",
+    description: canonicalPricingAuthorityText(authority.context.description || ""),
+    unit: normalizeUnit(canonicalPricingAuthorityText(authority.context.unit || "")),
     pricing_keyword: canonicalPricingAuthorityText(authority.context.pricing_keyword || ""),
   };
   return JSON.stringify(supplied) === JSON.stringify(pricingAuthorityContext(row));
 }
 
 function pricingAuthorityNumber(value) {
-  if (typeof value === "boolean") return null;
-  const number = numberOrNull(value);
+  if (typeof value === "boolean" || value === null || value === undefined) return null;
+  let number;
+  if (typeof value === "number") {
+    number = value;
+  } else if (typeof value === "string" && /^(?:0|[1-9]\d*)(?:\.\d+)?$/.test(value)) {
+    number = Number(value);
+  } else {
+    return null;
+  }
+  if (!Number.isFinite(number)) return null;
   return number !== null && number >= 0 ? roundCommercialCents(number) : null;
+}
+
+function pricingReferenceCatalogItem(reference = currentPricingReference(), itemId = "") {
+  const canonicalId = canonicalPricingAuthorityText(itemId);
+  const items = Array.isArray(reference?.authority_items)
+    ? reference.authority_items
+    : reference?.items;
+  if (!reference || !canonicalId || !Array.isArray(items)) return null;
+  const matches = items.filter((item) => (
+    item && typeof item === "object"
+    && canonicalPricingAuthorityText(item.id || item.pricing_keyword || "") === canonicalId
+  ));
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function pricingAuthorityCatalogDescription(item = {}) {
+  return canonicalPricingAuthorityText(
+    item.description || item.catalog_description || item.pricing_reference_description || "",
+  );
 }
 
 function buildPricingAuthority(variant = "none", row = {}, options = {}) {
@@ -2582,9 +2610,9 @@ function buildPricingAuthority(variant = "none", row = {}, options = {}) {
       authority.catalog_source = basis?.source || "";
       authority.catalog_item_id = canonicalPricingAuthorityText(item.pricing_keyword || options.catalog_item_id || "");
       authority.catalog_digest = basis?.digest || "";
-      authority.catalog_section = normalizeCategoryTitle(item.section || row.section || "");
-      authority.catalog_description = cleanCustomerQuoteLineText(item.catalog_description || item.pricing_reference_description || item.description || row.description || "");
-      authority.catalog_unit = normalizeUnit(item.unit || row.unit || "");
+      authority.catalog_section = canonicalPricingAuthorityText(item.section || row.section || "") || "General";
+      authority.catalog_description = pricingAuthorityCatalogDescription(item) || canonicalPricingAuthorityText(row.description || "");
+      authority.catalog_unit = normalizeUnit(canonicalPricingAuthorityText(item.unit || item.unit_hint || row.unit || ""));
     }
   }
   return authority;
@@ -2593,8 +2621,23 @@ function buildPricingAuthority(variant = "none", row = {}, options = {}) {
 function normalizePricingAuthority(raw, row = {}, options = {}) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   if (raw.schema !== PRICING_AUTHORITY_SCHEMA || raw.version !== PRICING_AUTHORITY_VERSION) return null;
-  const variant = canonicalPricingAuthorityText(raw.variant || raw.kind).toLowerCase();
+  if (typeof raw.variant !== "string") return null;
+  const variant = raw.variant;
   if (!PRICING_AUTHORITY_VARIANTS.has(variant) || !pricingAuthorityContextMatches(raw, row)) return null;
+  const allowedKeys = variant === "catalog"
+    ? ["catalog_digest", "catalog_description", "catalog_item_id", "catalog_section", "catalog_source", "catalog_unit", "context", "currency", "price", "schema", "variant", "version"]
+    : PRICING_AUTHORITY_TRUSTED_VARIANTS.has(variant)
+      ? ["context", "currency", "price", "schema", "variant", "version"]
+      : ["context", "schema", "variant", "version"];
+  if (Object.keys(raw).sort().join("|") !== allowedKeys.sort().join("|")) return null;
+  if (variant === "catalog" && [
+    "catalog_source",
+    "catalog_item_id",
+    "catalog_digest",
+    "catalog_section",
+    "catalog_description",
+    "catalog_unit",
+  ].some((key) => typeof raw[key] !== "string")) return null;
   const normalized = {
     schema: PRICING_AUTHORITY_SCHEMA,
     version: PRICING_AUTHORITY_VERSION,
@@ -2602,44 +2645,33 @@ function normalizePricingAuthority(raw, row = {}, options = {}) {
     context: pricingAuthorityContext(row),
   };
   if (!PRICING_AUTHORITY_TRUSTED_VARIANTS.has(variant)) return normalized;
-  const price = pricingAuthorityNumber(raw.price ?? raw.authoritative_price);
+  const price = pricingAuthorityNumber(raw.price);
   if (price === null || (variant === "included" && price !== 0)) return null;
-  if (typeof raw.currency !== "string") return null;
   const basis = pricingReferenceAuthorityBasis(options.reference || currentPricingReference());
-  const currency = normalizeCurrencyLabel(raw.currency || basis?.currency || DEFAULT_CURRENCY_LABEL);
-  if (basis && currency !== basis.currency) return null;
+  if (!basis || typeof raw.currency !== "string" || raw.currency !== basis.currency) return null;
+  const currency = raw.currency;
   normalized.price = variant === "included" ? 0 : price;
   normalized.currency = currency;
   if (variant !== "catalog") return normalized;
-  const itemId = canonicalPricingAuthorityText(raw.catalog_item_id || raw.item_id || "");
-  const source = canonicalPricingAuthorityText(raw.catalog_source || raw.source || "");
-  const digest = canonicalPricingAuthorityText(raw.catalog_digest || raw.digest || "");
-  const item = options.catalogItem || null;
-  if (!item) {
-    if (!itemId || !source || !digest || !PRICING_REFERENCE_DIGEST_RE.test(digest)
-      || !canonicalPricingAuthorityText(raw.catalog_section || "")
-      || !cleanCustomerQuoteLineText(raw.catalog_description || "")
-      || !normalizeUnit(raw.catalog_unit || "")) return null;
-    normalized.catalog_source = source;
-    normalized.catalog_item_id = itemId;
-    normalized.catalog_digest = digest;
-    normalized.catalog_section = canonicalPricingAuthorityText(raw.catalog_section || "");
-    normalized.catalog_description = cleanCustomerQuoteLineText(raw.catalog_description || "");
-    normalized.catalog_unit = normalizeUnit(raw.catalog_unit || "");
-    return normalized;
-  }
-  if (canonicalPricingAuthorityText(item.id || "") !== itemId) return null;
-  if (!basis || source !== basis.source || digest !== basis.digest || !PRICING_REFERENCE_DIGEST_RE.test(digest)) return null;
-  if (pricingAuthorityNumber(item.sale_unit_price ?? item.catalog_unit_price) !== price) return null;
-  if (canonicalPricingAuthorityText(raw.catalog_section || "") !== normalizeCategoryTitle(item.section || "")) return null;
-  if (cleanCustomerQuoteLineText(raw.catalog_description || "") !== cleanCustomerQuoteLineText(item.description || item.catalog_description || "")) return null;
-  if (normalizeUnit(raw.catalog_unit || "") !== normalizeUnit(item.unit || item.unit_hint || "")) return null;
+  const itemId = raw.catalog_item_id;
+  const source = raw.catalog_source;
+  const digest = raw.catalog_digest;
+  const item = options.catalogItem || pricingReferenceCatalogItem(options.reference || currentPricingReference(), itemId);
+  if (typeof itemId !== "string" || itemId !== canonicalPricingAuthorityText(itemId)
+    || typeof source !== "string" || source !== basis.source
+    || typeof digest !== "string" || digest !== basis.digest || !PRICING_REFERENCE_DIGEST_RE.test(digest)
+    || !item
+    || canonicalPricingAuthorityText(item.id || item.pricing_keyword || "") !== itemId
+    || pricingAuthorityNumber(item.sale_unit_price ?? item.catalog_unit_price ?? item.unit_price) !== price
+    || canonicalPricingAuthorityText(raw.catalog_section || "") !== (canonicalPricingAuthorityText(item.section || "") || "General")
+    || canonicalPricingAuthorityText(raw.catalog_description || "") !== pricingAuthorityCatalogDescription(item)
+    || normalizeUnit(canonicalPricingAuthorityText(raw.catalog_unit || "")) !== normalizeUnit(canonicalPricingAuthorityText(item.unit || item.unit_hint || ""))) return null;
   normalized.catalog_source = source;
   normalized.catalog_item_id = itemId;
   normalized.catalog_digest = digest;
-  normalized.catalog_section = normalizeCategoryTitle(item.section || "");
-  normalized.catalog_description = cleanCustomerQuoteLineText(item.description || item.catalog_description || "");
-  normalized.catalog_unit = normalizeUnit(item.unit || item.unit_hint || "");
+  normalized.catalog_section = canonicalPricingAuthorityText(item.section || "") || "General";
+  normalized.catalog_description = pricingAuthorityCatalogDescription(item);
+  normalized.catalog_unit = normalizeUnit(canonicalPricingAuthorityText(item.unit || item.unit_hint || ""));
   return normalized;
 }
 
@@ -3261,8 +3293,10 @@ function normalizeLineItem(item = {}) {
     ...(Object.prototype.hasOwnProperty.call(item, "pricing_basis_digest") ? { pricing_basis_digest: item.pricing_basis_digest } : {}),
   };
   if (Object.prototype.hasOwnProperty.call(item, "pricing_authority")) {
+    const reference = currentPricingReference();
+    const catalogItem = pricingReferenceCatalogItem(reference, item.pricing_authority?.catalog_item_id || item.pricing_keyword || "");
     const authority = typeof normalizePricingAuthority === "function"
-      ? normalizePricingAuthority(item.pricing_authority, normalized)
+      ? normalizePricingAuthority(item.pricing_authority, normalized, { reference, catalogItem })
       : null;
     const fallbackAuthority = typeof buildPricingAuthority === "function"
       ? buildPricingAuthority("historical", normalized)
@@ -7340,7 +7374,9 @@ function normalizeOutputRow(row = {}) {
     if (Object.prototype.hasOwnProperty.call(row, key) && String(row[key] || "").trim()) normalized[key] = String(row[key]).trim();
   });
   if (Object.prototype.hasOwnProperty.call(row, "pricing_authority")) {
-    const authority = normalizePricingAuthority(row.pricing_authority, normalized);
+    const reference = currentPricingReference();
+    const catalogItem = pricingReferenceCatalogItem(reference, row.pricing_authority?.catalog_item_id || normalized.pricing_keyword || "");
+    const authority = normalizePricingAuthority(row.pricing_authority, normalized, { reference, catalogItem });
     normalized.pricing_authority = authority || buildPricingAuthority("historical", normalized);
   }
   if (normalized.price_mode !== "Included" && normalized.effective_unit_price == null) {
@@ -9331,8 +9367,11 @@ function unitPriceEditKind(value) {
 
 function effectiveOutputUnitPrice(row = {}) {
   if (Object.prototype.hasOwnProperty.call(row, "pricing_authority")) {
-    if (!pricingAuthorityContextMatches(row.pricing_authority, row)) return null;
-    const authorityPrice = pricingAuthorityPrice(row.pricing_authority);
+    const reference = currentPricingReference();
+    const catalogItem = pricingReferenceCatalogItem(reference, row.pricing_authority?.catalog_item_id || row.pricing_keyword || "");
+    const authority = normalizePricingAuthority(row.pricing_authority, row, { reference, catalogItem });
+    if (!authority) return null;
+    const authorityPrice = pricingAuthorityPrice(authority);
     if (authorityPrice !== null) return authorityPrice;
     return null;
   }

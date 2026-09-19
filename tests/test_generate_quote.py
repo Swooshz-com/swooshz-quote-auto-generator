@@ -3492,6 +3492,12 @@ class GenerateQuoteRowsTest(unittest.TestCase):
     def test_run635_generator_consumes_authority_without_catalog_rematch(self):
         rows = quote.extract_price_rows(KONCEPT_CATALOG)
         catalog = rows[0]
+        trusted_reference = {
+            "id": "synthetic-exhibition-fixture-pricing",
+            "source": "local",
+            "currency": "SGD",
+            "digest": catalog.catalog_digest,
+        }
         item = {
             "section": catalog.section,
             "quantity": 2,
@@ -3514,20 +3520,30 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                 "currency": "SGD",
                 "catalog_source": "local",
                 "catalog_item_id": catalog.pricing_id,
-                "catalog_digest": "sha256:" + "a" * 64,
+                "catalog_digest": catalog.catalog_digest,
                 "catalog_section": catalog.section,
                 "catalog_description": catalog.description,
                 "catalog_unit": catalog.unit_hint,
             },
         }
-        lines = quote.prepare_lines({"_pricing_authority_enforced": True, "line_items": [item]}, rows, False)
+        lines = quote.prepare_lines(
+            {"_pricing_authority_enforced": True, "line_items": [item]},
+            rows,
+            False,
+            trusted_pricing_reference=trusted_reference,
+        )
         self.assertEqual(lines[0].match_status, "matched")
         self.assertEqual(lines[0].matched_price.pricing_id, catalog.pricing_id)
         self.assertEqual(lines[0].amount, quote.round_commercial_cents(2 * catalog.sale_unit_price))
 
         stale = copy.deepcopy(item)
         stale["pricing_authority"]["catalog_item_id"] = "different-item"
-        stale_lines = quote.prepare_lines({"_pricing_authority_enforced": True, "line_items": [stale]}, rows, False)
+        stale_lines = quote.prepare_lines(
+            {"_pricing_authority_enforced": True, "line_items": [stale]},
+            rows,
+            False,
+            trusted_pricing_reference=trusted_reference,
+        )
         self.assertEqual(stale_lines[0].match_status, "unmatched")
         self.assertIsNone(stale_lines[0].matched_price)
 
@@ -3538,11 +3554,76 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             "variant": "historical",
             "context": item["pricing_authority"]["context"],
         }
-        historical_lines = quote.prepare_lines({"_pricing_authority_enforced": True, "line_items": [historical]}, rows, False)
+        historical_lines = quote.prepare_lines(
+            {"_pricing_authority_enforced": True, "line_items": [historical]},
+            rows,
+            False,
+            trusted_pricing_reference=trusted_reference,
+        )
         self.assertEqual(historical_lines[0].match_status, "unmatched")
 
+        for field, value in (
+            ("catalog_source", "company"),
+            ("catalog_digest", "sha256:" + "a" * 64),
+            ("currency", "USD"),
+        ):
+            altered = copy.deepcopy(item)
+            altered["pricing_authority"][field] = value
+            altered_lines = quote.prepare_lines(
+                {"_pricing_authority_enforced": True, "line_items": [altered]},
+                rows,
+                False,
+                trusted_pricing_reference=trusted_reference,
+            )
+            self.assertEqual(altered_lines[0].match_status, "unmatched", field)
+            self.assertIsNone(altered_lines[0].matched_price, field)
+
+    def test_run637_generator_rejects_aliases_and_non_decimal_authority(self):
+        rows = quote.extract_price_rows(KONCEPT_CATALOG)
+        catalog = rows[0]
+        trusted_reference = {
+            "id": "synthetic-exhibition-fixture-pricing",
+            "source": "local",
+            "currency": "SGD",
+            "digest": catalog.catalog_digest,
+        }
+        row = {
+            "source_basis_line_id": "",
+            "section": catalog.section,
+            "description": catalog.description,
+            "unit": catalog.unit_hint,
+            "pricing_keyword": catalog.pricing_id,
+        }
+        authority = {
+            "schema": quote.PRICING_AUTHORITY_SCHEMA,
+            "version": quote.PRICING_AUTHORITY_VERSION,
+            "variant": "manual",
+            "context": quote.pricing_authority_context(row),
+            "price": 77,
+            "currency": "SGD",
+        }
+        for value in ([], [77], " ", "0x10", "77%", True, {}, float("inf")):
+            candidate = copy.deepcopy(authority)
+            candidate["price"] = value
+            self.assertIsNone(
+                quote.normalize_pricing_authority(candidate, row, rows, trusted_reference=trusted_reference),
+                repr(value),
+            )
+        for alias_key, value in (("kind", "manual"), ("authoritative_price", 77), ("row_context", authority["context"])):
+            candidate = copy.deepcopy(authority)
+            candidate.pop("variant" if alias_key == "kind" else "price" if alias_key == "authoritative_price" else "context")
+            candidate[alias_key] = value
+            self.assertIsNone(
+                quote.normalize_pricing_authority(candidate, row, rows, trusted_reference=trusted_reference),
+                alias_key,
+            )
+
     def test_run635_generator_canonicalizes_nfc_and_whitespace(self):
-        self.assertEqual(quote.clean_text("  e\u0301\t  item  "), "é item")
+        self.assertEqual(quote.canonical_pricing_authority_text("  e\u0301\t  item  "), "é item")
+        self.assertEqual(
+            quote.pricing_authority_context({"section": "e\u0301\t  item"})["section"],
+            quote.pricing_authority_context({"section": "é item"})["section"],
+        )
 
 if __name__ == "__main__":
     unittest.main()

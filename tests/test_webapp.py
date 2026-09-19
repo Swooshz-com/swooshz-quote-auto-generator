@@ -39791,6 +39791,203 @@ process.stdout.write("ok");
         self.assertEqual(row["pricing_authority"]["variant"], "historical")
         self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.quote_commercial_state_errors(payload))
 
+    def test_run637_server_rejects_stale_catalog_identity_before_replacement(self):
+        payload = valid_payload()
+        payload["pricing_reference"]["items"] = json.loads(KONCEPT_CATALOG.read_text(encoding="utf-8"))["items"]
+        payload["line_items"] = [{
+            "section": "Synthetic Floors",
+            "quantity": 2,
+            "unit": "sqm",
+            "description": "sqm synthetic carpet tile",
+            "pricing_keyword": "synthetic-floors-synthetic-carpet-tile",
+        }]
+        [catalog_item] = webapp.normalize_line_items(payload)
+        self.assertEqual(catalog_item["pricing_authority"]["variant"], "catalog")
+
+        for field, value in (
+            ("section", "Changed section"),
+            ("unit", "lot"),
+            ("pricing_keyword", "different-keyword"),
+            ("source_basis_line_id", "line-new"),
+            ("description", "A different admitted row"),
+        ):
+            changed = copy.deepcopy(payload)
+            changed["line_items"] = [copy.deepcopy(catalog_item)]
+            changed["line_items"][0][field] = value
+            [normalized] = webapp.normalize_line_items(changed)
+            self.assertEqual(normalized["pricing_authority"]["variant"], "historical", field)
+            self.assertEqual(normalized.get("status"), "unmatched", field)
+            self.assertNotIn("effective_unit_price", normalized, field)
+            self.assertNotIn("pricing_basis_amount", normalized, field)
+
+        quantity_only = copy.deepcopy(payload)
+        quantity_only["line_items"] = [copy.deepcopy(catalog_item)]
+        quantity_only["line_items"][0]["quantity"] = 99
+        [quantity_row] = webapp.normalize_line_items(quantity_only)
+        self.assertEqual(quantity_row["pricing_authority"]["variant"], "catalog")
+        self.assertEqual(quantity_row["pricing_basis_amount"], round(99 * catalog_item["pricing_authority"]["price"], 2))
+
+    def test_run637_server_rejects_authority_aliases_and_non_decimal_values(self):
+        payload = valid_payload()
+        payload["pricing_reference"]["items"] = json.loads(KONCEPT_CATALOG.read_text(encoding="utf-8"))["items"]
+        reference = webapp.exact_pricing_reference_authority(payload)
+        row = {
+            "source_basis_line_id": "",
+            "section": "e\u0301\t  item",
+            "description": "Synthetic item",
+            "unit": "lot",
+            "pricing_keyword": "item-1",
+        }
+        authority = {
+            "schema": webapp.PRICING_AUTHORITY_SCHEMA,
+            "version": webapp.PRICING_AUTHORITY_VERSION,
+            "variant": "manual",
+            "context": webapp.pricing_authority_context(row),
+            "price": 77,
+            "currency": "SGD",
+        }
+        for value in ([], [77], " ", "0x10", "77%", True, {}, float("inf")):
+            candidate = copy.deepcopy(authority)
+            candidate["price"] = value
+            self.assertIsNone(
+                webapp.normalize_pricing_authority(candidate, row, reference_authority=reference),
+                repr(value),
+            )
+        for alias_key, value in (("kind", "manual"), ("authoritative_price", 77), ("row_context", authority["context"])):
+            candidate = copy.deepcopy(authority)
+            candidate.pop("variant" if alias_key == "kind" else "price" if alias_key == "authoritative_price" else "context")
+            candidate[alias_key] = value
+            self.assertIsNone(
+                webapp.normalize_pricing_authority(candidate, row, reference_authority=reference),
+                alias_key,
+            )
+        self.assertEqual(
+            webapp.pricing_authority_context({"section": "e\u0301\t  item"}),
+            webapp.pricing_authority_context({"section": "é item"}),
+        )
+
+    def test_run637_browser_rejects_unproven_catalog_authority(self):
+        node = require_node(self)
+        script = r'''
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+function extractFunction(name) {
+  const marker = `function ${name}`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+const PRICING_AUTHORITY_SCHEMA = "swooshz.pricing-authority.v1";
+const PRICING_AUTHORITY_VERSION = 1;
+const PRICING_AUTHORITY_VARIANTS = new Set(["none", "historical", "manual", "catalog", "included"]);
+const PRICING_AUTHORITY_TRUSTED_VARIANTS = new Set(["manual", "catalog", "included"]);
+const PRICING_AUTHORITY_CONTEXT_FIELDS = ["source_basis_line_id", "section", "description", "unit", "pricing_keyword"];
+const PRICING_REFERENCE_SOURCES = new Set(["company", "local", "bundled"]);
+const PRICING_REFERENCE_DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
+const DEFAULT_CURRENCY_LABEL = "SGD";
+const digest = "sha256:" + "b".repeat(64);
+const state = {
+  pricingReferenceId: "ref",
+  pricingReferenceSource: "local",
+  pricingReferences: [{
+    id: "ref",
+    source: "local",
+    currency: "SGD",
+    digest_sha256: digest,
+    items: [{ id: "item-1", section: "e\u0301\t  item", description: "Synthetic item", unit_hint: "lot", sale_unit_price: 77 }],
+  }],
+};
+function currentPricingReference() {
+  return state.pricingReferences.find((reference) => reference.id === state.pricingReferenceId && reference.source === state.pricingReferenceSource) || null;
+}
+function normalizeUnit(value = "") {
+  const text = String(value ?? "").normalize("NFC").replace(/\s+/g, " ").trim().toLowerCase();
+  if (["m2", "m^2", "sq m", "square metre", "square meter"].includes(text)) return "sqm";
+  if (["nos", "no", "pcs", "piece", "pieces"].includes(text)) return "nos";
+  if (["lot", "lots"].includes(text)) return "lot";
+  return text;
+}
+function normalizeCurrencyLabel(value = "") { return String(value || "").trim().toUpperCase(); }
+function roundCommercialCents(value) { return Math.round(Number(value) * 100) / 100; }
+function numberOrNull(value) { const number = Number(value); return Number.isFinite(number) ? number : null; }
+function quoteCommercialStateIsOwned() { return false; }
+eval([
+  "canonicalPricingAuthorityText",
+  "pricingAuthorityContext",
+  "pricingAuthorityContextMatches",
+  "pricingAuthorityNumber",
+  "pricingReferenceAuthorityBasis",
+  "pricingReferenceCatalogItem",
+  "pricingAuthorityCatalogDescription",
+  "normalizePricingAuthority",
+  "pricingAuthorityPrice",
+  "effectiveOutputUnitPrice",
+].map(extractFunction).join("\n"));
+const context = {
+  source_basis_line_id: "",
+  section: "é item",
+  description: "Synthetic item",
+  unit: "lot",
+  pricing_keyword: "item-1",
+};
+const authority = {
+  schema: PRICING_AUTHORITY_SCHEMA,
+  version: PRICING_AUTHORITY_VERSION,
+  variant: "catalog",
+  context: pricingAuthorityContext(context),
+  price: 77,
+  currency: "SGD",
+  catalog_source: "local",
+  catalog_item_id: "item-1",
+  catalog_digest: digest,
+  catalog_section: "é item",
+  catalog_description: "Synthetic item",
+  catalog_unit: "lot",
+};
+assert.strictEqual(effectiveOutputUnitPrice({ ...context, pricing_authority: authority }), 77);
+const stale = { ...authority, catalog_item_id: "missing-item" };
+assert.strictEqual(effectiveOutputUnitPrice({ ...context, pricing_authority: stale }), null);
+for (const value of [[], [77], " ", "0x10", "77%", true, {}, Infinity]) {
+  const manual = {
+    schema: PRICING_AUTHORITY_SCHEMA,
+    version: PRICING_AUTHORITY_VERSION,
+    variant: "manual",
+    context: pricingAuthorityContext(context),
+    price: value,
+    currency: "SGD",
+  };
+  assert.strictEqual(normalizePricingAuthority(manual, context), null, JSON.stringify(value));
+}
+const alias = { ...authority, kind: "catalog" };
+delete alias.variant;
+assert.strictEqual(normalizePricingAuthority(alias, context), null);
+assert.deepStrictEqual(
+  pricingAuthorityContext({ section: "e\u0301\t  item" }),
+  pricingAuthorityContext({ section: "é item" }),
+);
+process.stdout.write("ok");
+'''
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertEqual(completed.stdout, "ok")
+
 
 if __name__ == "__main__":
     unittest.main()
