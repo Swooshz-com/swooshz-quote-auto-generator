@@ -1813,6 +1813,15 @@ class WebappServerTest(unittest.TestCase):
                 "amount": 0,
             },
         ]
+        saved_rows[0]["pricing_authority"] = webapp.build_pricing_authority(
+            "manual",
+            saved_rows[0],
+            price=100,
+        )
+        saved_rows[1]["pricing_authority"] = webapp.build_pricing_authority(
+            "included",
+            saved_rows[1],
+        )
         payload["quote_currency"] = "SGD"
         payload["quote_exchange_rate"] = 9
         payload["quote_tax"] = {"label": "VAT", "rate": 0.07}
@@ -1866,7 +1875,7 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(brief["acceptance"]["text"], "Saved acceptance")
         self.assertEqual(brief["signature"]["company_title"], "Saved Director")
         self.assertEqual(brief["line_items"][0]["unit_price_override"], 100)
-        self.assertEqual(brief["line_items"][0]["catalog_unit_price"], 999)
+        self.assertNotIn("catalog_unit_price", brief["line_items"][0])
         self.assertEqual(brief["line_items"][1]["pricing_basis_currency"], "SGD")
         self.assertEqual(brief["line_items"][1]["price_mode"], "Included")
         self.assertEqual(commercials, {
@@ -1890,7 +1899,7 @@ class WebappServerTest(unittest.TestCase):
         ):
             existing_brief = webapp.payload_to_brief(payload)
         self.assertEqual(existing_brief["line_items"][0]["unit_price_override"], 100)
-        self.assertEqual(existing_brief["line_items"][0]["catalog_unit_price"], 999)
+        self.assertNotIn("catalog_unit_price", existing_brief["line_items"][0])
         self.assertEqual(webapp.validate_generation_payload(payload), [])
 
     def test_recovered_quote_missing_snapshot_fails_closed_without_current_defaults(self):
@@ -2883,7 +2892,7 @@ class WebappServerTest(unittest.TestCase):
         valid_owner_payload = copy.deepcopy(payload)
         valid_owner_payload["profile_id"] = "profile:owner-a"
         valid_owner_payload["quote_company_profile"] = {"id": "profile:owner-a", "source": "profile"}
-        self.assertNotIn(
+        self.assertIn(
             webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE,
             webapp.quote_commercial_state_errors(valid_owner_payload),
         )
@@ -2992,6 +3001,16 @@ class WebappServerTest(unittest.TestCase):
 
     def test_recovered_explicit_price_edit_replaces_stale_captured_price_everywhere(self):
         payload = recovered_convergence_payload(unit_price_override=120)
+        saved_rows = payload["quote_session"]["draft_state"]["outputRows"]
+        saved_rows[0]["pricing_authority"] = webapp.build_pricing_authority(
+            "manual",
+            saved_rows[0],
+            price=120,
+        )
+        saved_rows[1]["pricing_authority"] = webapp.build_pricing_authority(
+            "included",
+            saved_rows[1],
+        )
         payload["line_items"] = copy.deepcopy(payload["quote_session"]["draft_state"]["outputRows"])
 
         with mock.patch.object(
@@ -14603,10 +14622,18 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertNotIn("Quote has too many rows", json.dumps(log_details))
 
     def test_run_quote_job_delegates_to_generator_and_returns_outputs(self):
+        payload = valid_payload()
+        payload["line_items"] = [{
+            "section": "Synthetic Floors",
+            "quantity": 1,
+            "unit": "sqm",
+            "description": "sqm synthetic carpet tile",
+            "pricing_keyword": "synthetic-floors-synthetic-carpet-tile",
+        }]
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             result = webapp.run_quote_job(
-                valid_payload(),
+                payload,
                 output_root=tmp_path / "out",
                 tmp_root=tmp_path / "tmp",
             )
@@ -36837,6 +36864,13 @@ main().catch((error) => {
             saved_profile = store.save_profile(company_id, imported_profile)
             restored_profile = store.list_profiles(company_id)[0]
             payload = valid_payload()
+            payload["line_items"] = [{
+                "section": "Synthetic Floors",
+                "quantity": 1,
+                "unit": "sqm",
+                "description": "sqm synthetic carpet tile",
+                "pricing_keyword": "synthetic-floors-synthetic-carpet-tile",
+            }]
             for section in ("company", "quote_text", "signature", "rich_text"):
                 payload[section].update(restored_profile["defaults"][section])
 
@@ -39687,6 +39721,75 @@ process.stdout.write("ok");
         self.assertIn("await page.reload", scenario)
         self.assertIn("await modifyDashboardQuote(sessionId)", scenario)
         self.assertIn("await saveCurrentQuoteSession", scenario)
+
+    def test_run635_pricing_authority_variants_and_context_contract(self):
+        payload = valid_payload()
+        payload["pricing_reference"]["items"] = json.loads(KONCEPT_CATALOG.read_text(encoding="utf-8"))["items"]
+        payload["line_items"] = [{
+            "section": "Synthetic Floors",
+            "quantity": 2,
+            "unit": "sqm",
+            "description": "sqm synthetic carpet tile",
+            "pricing_keyword": "synthetic-floors-synthetic-carpet-tile",
+        }]
+        [catalog_item] = webapp.normalize_line_items(payload)
+        authority = catalog_item["pricing_authority"]
+        self.assertEqual(authority["schema"], webapp.PRICING_AUTHORITY_SCHEMA)
+        self.assertEqual(authority["version"], 1)
+        self.assertEqual(authority["variant"], "catalog")
+        self.assertEqual(set(authority["context"]), set(webapp.PRICING_AUTHORITY_CONTEXT_FIELDS))
+        self.assertNotIn("quantity", authority["context"])
+        self.assertEqual(authority["catalog_item_id"], catalog_item["pricing_keyword"])
+        self.assertEqual(authority["catalog_digest"], catalog_item["pricing_basis_digest"])
+
+        changed_quantity = copy.deepcopy(payload)
+        changed_quantity["line_items"] = [copy.deepcopy(catalog_item)]
+        changed_quantity["line_items"][0]["quantity"] = 99
+        [quantity_item] = webapp.normalize_line_items(changed_quantity)
+        self.assertEqual(quantity_item["pricing_authority"]["variant"], "catalog")
+        self.assertEqual(quantity_item["pricing_authority"]["context"], authority["context"])
+        self.assertEqual(quantity_item["pricing_basis_amount"], round(99 * authority["price"], 2))
+
+        changed_description = copy.deepcopy(changed_quantity)
+        changed_description["line_items"][0]["description"] = "A different admitted row"
+        [changed_item] = webapp.normalize_line_items(changed_description)
+        self.assertEqual(changed_item["pricing_authority"]["variant"], "historical")
+
+        manual = copy.deepcopy(payload)
+        manual["line_items"] = [{
+            "section": "Custom",
+            "quantity": 2,
+            "unit": "nos",
+            "description": "Operator-approved custom row",
+            "pricing_keyword": "custom-not-in-catalog",
+            "unit_price_override": 0,
+        }]
+        [manual_item] = webapp.normalize_line_items(manual)
+        self.assertEqual(manual_item["pricing_authority"]["variant"], "manual")
+        self.assertEqual(manual_item["pricing_authority"]["price"], 0)
+
+        included = copy.deepcopy(payload)
+        included["line_items"] = [{
+            "section": "Services",
+            "quantity": 1,
+            "unit": "lot",
+            "description": "Included coordination",
+            "price_mode": "Included",
+            "unit_price_override": 999,
+            "catalog_unit_price": 999,
+        }]
+        [included_item] = webapp.normalize_line_items(included)
+        self.assertEqual(included_item["pricing_authority"]["variant"], "included")
+        self.assertEqual(included_item["pricing_authority"]["price"], 0)
+        self.assertNotIn("effective_unit_price", included_item)
+
+    def test_run635_legacy_recovered_rows_are_historical_and_block_generation(self):
+        payload = recovered_convergence_payload()
+        payload["pricing_reference"]["items"] = json.loads(KONCEPT_CATALOG.read_text(encoding="utf-8"))["items"]
+        saved_row = payload["quote_session"]["draft_state"]["outputRows"][0]
+        row = webapp.normalize_owned_line_item(saved_row)
+        self.assertEqual(row["pricing_authority"]["variant"], "historical")
+        self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.quote_commercial_state_errors(payload))
 
 
 if __name__ == "__main__":

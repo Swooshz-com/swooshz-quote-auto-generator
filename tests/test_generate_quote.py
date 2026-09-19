@@ -1,5 +1,6 @@
 import base64
 import csv
+import copy
 import hashlib
 import html
 import io
@@ -3487,6 +3488,61 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertEqual(data[2], "'+HYPERLINK(\"https://example.test/line\",\"line\")")
         self.assertEqual(data[3], "'-10+20")
 
+
+    def test_run635_generator_consumes_authority_without_catalog_rematch(self):
+        rows = quote.extract_price_rows(KONCEPT_CATALOG)
+        catalog = rows[0]
+        item = {
+            "section": catalog.section,
+            "quantity": 2,
+            "unit": catalog.unit_hint,
+            "description": catalog.description,
+            "pricing_keyword": catalog.pricing_id,
+            "price_mode": "Priced",
+            "pricing_authority": {
+                "schema": quote.PRICING_AUTHORITY_SCHEMA,
+                "version": quote.PRICING_AUTHORITY_VERSION,
+                "variant": "catalog",
+                "context": {
+                    "source_basis_line_id": "",
+                    "section": catalog.section,
+                    "description": catalog.description,
+                    "unit": catalog.unit_hint,
+                    "pricing_keyword": catalog.pricing_id,
+                },
+                "price": catalog.sale_unit_price,
+                "currency": "SGD",
+                "catalog_source": "local",
+                "catalog_item_id": catalog.pricing_id,
+                "catalog_digest": "sha256:" + "a" * 64,
+                "catalog_section": catalog.section,
+                "catalog_description": catalog.description,
+                "catalog_unit": catalog.unit_hint,
+            },
+        }
+        lines = quote.prepare_lines({"_pricing_authority_enforced": True, "line_items": [item]}, rows, False)
+        self.assertEqual(lines[0].match_status, "matched")
+        self.assertEqual(lines[0].matched_price.pricing_id, catalog.pricing_id)
+        self.assertEqual(lines[0].amount, quote.round_commercial_cents(2 * catalog.sale_unit_price))
+
+        stale = copy.deepcopy(item)
+        stale["pricing_authority"]["catalog_item_id"] = "different-item"
+        stale_lines = quote.prepare_lines({"_pricing_authority_enforced": True, "line_items": [stale]}, rows, False)
+        self.assertEqual(stale_lines[0].match_status, "unmatched")
+        self.assertIsNone(stale_lines[0].matched_price)
+
+        historical = copy.deepcopy(item)
+        historical["pricing_authority"] = {
+            "schema": quote.PRICING_AUTHORITY_SCHEMA,
+            "version": quote.PRICING_AUTHORITY_VERSION,
+            "variant": "historical",
+            "context": item["pricing_authority"]["context"],
+        }
+        historical_lines = quote.prepare_lines({"_pricing_authority_enforced": True, "line_items": [historical]}, rows, False)
+        self.assertEqual(historical_lines[0].match_status, "unmatched")
+
+    def test_run635_generator_canonicalizes_nfc_and_whitespace(self):
+        self.assertEqual(quote.clean_text("  e\u0301\t  item  "), "é item")
 
 if __name__ == "__main__":
     unittest.main()
