@@ -28,8 +28,8 @@ The internal lane uses Google authorization code flow with:
 - 256-bit random state, nonce, and PKCE verifier values;
 - one-time, process-local transactions with a ten-minute maximum lifetime;
 - PKCE `S256` only;
-- the exact configured public callback
-  `https://quote.swooshz.com/callback`, never the reverse-proxy request URL;
+- the exact configured public callback `<SQAG_PUBLIC_BASE_URL>/callback`,
+  never the reverse-proxy request URL;
 - Google discovery metadata pinned to the exact issuer, authorization endpoint,
   token endpoint, HTTPS JWKS URI, `S256`, and `RS256`;
 - PyJWT 2.13.0 and cryptography 50.0.0 for maintained JWK, RSA signature, and
@@ -50,6 +50,20 @@ The app never logs authorization codes, state, nonce, PKCE verifiers, provider
 tokens, client secrets, raw provider responses, or tester email addresses.
 Audit records contain bounded failure categories and an opaque subject digest
 where correlation is necessary.
+
+## Canonical origin and host binding
+
+For `APP_MODE=deploy` with `SQAG_AUTH_MODE=internal_google` and
+`SQAG_PLATFORM_LAUNCH_MODE=disabled`, the host configuration manager supplies
+`SQAG_PUBLIC_BASE_URL` as the one dedicated internal-alpha HTTPS origin. The
+value is origin-only: it has no credentials, explicit public port, path, query,
+or fragment, and it must not be the production SQAG origin. The OIDC redirect
+must equal that exact value followed by `/callback`.
+
+The same configured hostname is the only accepted deploy `Host` value. An
+unrelated host or cross-origin request is rejected. This mode does not add a
+host list or make arbitrary HTTPS origins valid. Platform mode retains its
+separate production-origin contract.
 
 ## Exact subject-bound admission and roles
 

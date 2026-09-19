@@ -29,6 +29,47 @@ const options = {
 const baseUrl = `http://${options.host}:${options.port}`;
 const outputDir = path.join(root, "_logs", "browser", "playwright-ai-basis-chat-stress");
 const quoteDataRoot = path.join(root, "_tmp", "playwright-ai-basis-chat-quote-data");
+const pricingReferenceRoot = path.join(quoteDataRoot, "pricing-references");
+const syntheticPricingReferenceId = "synthetic-playwright-pricing";
+const syntheticPricingCatalog = {
+  schema_version: 1,
+  currency: "SGD",
+  items: [{
+    category_order: 1,
+    item_order: 1,
+    section: "AV Equipment Rental Items",
+    description: 'nos. 85" LED TV Monitor (With Speaker - Full HD)',
+    unit_hint: "nos",
+    sale_unit_price: 850,
+    aliases: ["85 inch LED TV monitor"],
+    match_terms: ["85 led tv monitor"],
+    object_families: ["led_tv_monitor"],
+  }],
+};
+const syntheticPricingReferenceDigest = "sha256:d429a361782955f5146ac941ea4e51c212103917b9f35d8bdfb1437a4ad4c788";
+
+async function prepareSyntheticPricingReference() {
+  const referenceDir = path.join(pricingReferenceRoot, syntheticPricingReferenceId);
+  await fs.mkdir(referenceDir, { recursive: true });
+  await fs.writeFile(
+    path.join(referenceDir, "reference.json"),
+    `${JSON.stringify({
+      id: syntheticPricingReferenceId,
+      label: "Synthetic Playwright Pricing",
+      description: "Test-only authority-backed pricing reference.",
+      source: "local",
+      currency: "SGD",
+      tax: { label: "GST", rate: 0.09 },
+      pricing_catalog: "pricing-catalog.json",
+    }, null, 2)}\n`,
+    "utf8",
+  );
+  await fs.writeFile(
+    path.join(referenceDir, "pricing-catalog.json"),
+    `${JSON.stringify(syntheticPricingCatalog, null, 2)}\n`,
+    "utf8",
+  );
+}
 
 function pythonCommand() {
   if (process.env.PYTHON) return process.env.PYTHON;
@@ -62,7 +103,12 @@ function startServer() {
     ["webapp/server.py", "--host", options.host, "--port", String(options.port)],
     {
       cwd: root,
-      env: { ...process.env, APP_MODE: "local", QUOTE_DATA_ROOT: process.env.QUOTE_DATA_ROOT || quoteDataRoot },
+      env: {
+        ...process.env,
+        APP_MODE: "local",
+        QUOTE_DATA_ROOT: quoteDataRoot,
+        SQAG_LOCAL_PRICING_REFERENCES_ROOT: pricingReferenceRoot,
+      },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     },
@@ -154,6 +200,58 @@ function quoteBasisFromSections(sections) {
   ]));
 }
 
+function targetOnlyBasisChatResult(payload, options = {}) {
+  const chat = payload?.basis_chat;
+  const sections = payload?.quote_basis_sections;
+  const lineItems = payload?.line_items;
+  const field = chat?.field;
+  const lineIndex = chat?.line_index;
+  const fail = (detail) => ({
+    status: "failed",
+    errors: [`Invalid target-only basis-chat fixture input: ${detail}`],
+  });
+  if (!Array.isArray(sections)) return fail("quote_basis_sections must be an array");
+  if (!Array.isArray(lineItems)) return fail("line_items must be an array");
+  if (typeof field !== "string" || field !== options.expectedField) {
+    return fail(`expected selected section ${options.expectedField}, received ${String(field)}`);
+  }
+  if (typeof lineIndex !== "number" || !Number.isInteger(lineIndex) || lineIndex < 0) {
+    return fail("line_index must be a non-negative integer");
+  }
+  const matches = sections.map((section, index) => ({ section, index })).filter(({ section }) => (
+    section && typeof section === "object" && !Array.isArray(section) && section.id === field
+  ));
+  if (matches.length !== 1) return fail("selected section id must identify exactly one section");
+  const selectedSection = matches[0].section;
+  if (!Array.isArray(selectedSection.lines) || lineIndex >= selectedSection.lines.length) {
+    return fail("selected line index is out of range");
+  }
+  const selectedLine = selectedSection.lines[lineIndex];
+  if (!selectedLine || typeof selectedLine !== "object" || Array.isArray(selectedLine)) {
+    return fail("selected line must be an object");
+  }
+  const assertion = chat.line;
+  const taggedText = `${selectedLine.tag}: ${selectedLine.text}`;
+  if (typeof assertion !== "string" || (assertion !== selectedLine.text && assertion !== taggedText)) {
+    return fail("selected line assertion does not match the raw target");
+  }
+
+  const nextSections = structuredClone(sections);
+  const nextTarget = nextSections[matches[0].index].lines[lineIndex];
+  options.mutateTarget(nextTarget);
+  return {
+    status: "answered",
+    type: "proposal",
+    source: "playwright-mock",
+    proposal: {
+      message: options.message,
+      quote_basis: quoteBasisFromSections(nextSections),
+      quote_basis_sections: nextSections,
+      line_items: structuredClone(lineItems),
+    },
+  };
+}
+
 function draftResult() {
   const sections = quoteBasisSections();
   return {
@@ -191,18 +289,13 @@ function basisChatResult(payload) {
         errors: [`Selected line quantity was not included in basis chat payload: ${JSON.stringify(chat)}`],
       };
     }
-    const sections = quoteBasisSections("150mm raised platform with needle punch carpet.");
-    return {
-      status: "answered",
-      type: "proposal",
-      source: "playwright-mock",
-      proposal: {
-        message: "Change the selected platform line to 150mm?",
-        quote_basis: quoteBasisFromSections(sections),
-        quote_basis_sections: sections,
-        line_items: draftResult().line_items,
+    return targetOnlyBasisChatResult(payload, {
+      expectedField: "platform",
+      message: "Change the selected platform line to 150mm?",
+      mutateTarget: (line) => {
+        line.text = "150mm raised platform with needle punch carpet.";
       },
-    };
+    });
   }
   if (question.includes("what does")) {
     return {
@@ -213,18 +306,13 @@ function basisChatResult(payload) {
     };
   }
   if (question.includes("include all lighting")) {
-    const sections = quoteBasisSections("150mm raised platform with needle punch carpet.", "Include");
-    return {
-      status: "answered",
-      type: "proposal",
-      source: "playwright-mock",
-      proposal: {
-        message: "Mark lighting and electrical as included?",
-        quote_basis: quoteBasisFromSections(sections),
-        quote_basis_sections: sections,
-        line_items: draftResult().line_items,
+    return targetOnlyBasisChatResult(payload, {
+      expectedField: "electrical",
+      message: "Mark lighting and electrical as included?",
+      mutateTarget: (line) => {
+        line.tag = "Include";
       },
-    };
+    });
   }
   return {
     status: "failed",
@@ -275,6 +363,9 @@ async function installMockJobs(page) {
           currency: "SGD",
           tax: { label: "GST", rate: 0.09 },
           item_count: 1,
+          schema_version: syntheticPricingCatalog.schema_version,
+          items: syntheticPricingCatalog.items,
+          digest_sha256: syntheticPricingReferenceDigest,
         }],
         default_profile_id: "synthetic-playwright-profile",
         default_pricing_reference_id: "synthetic-playwright-pricing",
@@ -294,29 +385,40 @@ async function installMockJobs(page) {
       return;
     }
     const body = JSON.parse(route.request().postData() || "{}");
-    const jobId = `playwright-job-${counter += 1}`;
+    counter += 1;
+    const jobId = body.job_id;
+    const createdAt = new Date().toISOString();
+    if (typeof jobId !== "string" || !jobId.startsWith("job-")) {
+      await route.fulfill({ status: 400, contentType: "application/json", body: JSON.stringify({ status: "failed", errors: ["Missing requested job id"] }) });
+      return;
+    }
     if (body.type === "draft") {
-      jobs.set(jobId, { status: "completed", result: draftResult() });
+      jobs.set(jobId, { job_id: jobId, type: body.type, status: "completed", created_at: createdAt, updated_at: createdAt, result: draftResult() });
     } else if (body.type === "basis_chat") {
       const result = basisChatResult(body.payload || {});
       jobs.set(jobId, {
+        job_id: jobId,
+        type: body.type,
         status: result.status === "failed" ? "failed" : "completed",
+        created_at: createdAt,
+        updated_at: createdAt,
         result,
         errors: result.errors || [],
       });
     } else {
-      jobs.set(jobId, { status: "failed", errors: [`Unexpected job type: ${body.type}`] });
+      jobs.set(jobId, { job_id: jobId, type: body.type, status: "failed", created_at: createdAt, updated_at: createdAt, errors: [`Unexpected job type: ${body.type}`] });
     }
     await route.fulfill({
       status: 202,
       contentType: "application/json",
-      body: JSON.stringify({ status: "queued", job_id: jobId, created_at: new Date().toISOString() }),
+      body: JSON.stringify({ status: "queued", job_id: jobId, type: body.type, created_at: createdAt, updated_at: createdAt }),
     });
   });
 
   await page.route("**/api/jobs/*", async (route) => {
     const jobId = route.request().url().split("/").pop();
-    const job = jobs.get(jobId) || { status: "failed", errors: [`Unknown mocked job: ${jobId}`] };
+    const now = new Date().toISOString();
+    const job = jobs.get(jobId) || { job_id: jobId, type: "basis_chat", status: "failed", created_at: now, updated_at: now, errors: [`Unknown mocked job: ${jobId}`] };
     await route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -349,6 +451,7 @@ async function retagBasisLineAndWait(page, text, tag, expectedPill = tag) {
 
 async function main() {
   let serverInfo = null;
+  await prepareSyntheticPricingReference();
   if (!(await healthOk())) {
     serverInfo = startServer();
     if (!(await waitForHealth())) {
@@ -361,8 +464,10 @@ async function main() {
   const browser = await chromium.launch({ headless: !options.headed });
   const page = await browser.newPage({ viewport: { width: 1365, height: 768 } });
   const consoleProblems = [];
+  let expectedPreservedFailure = false;
   page.on("console", (message) => {
     if (message.type() === "error") {
+      if (expectedPreservedFailure && message.text().includes("503")) return;
       const location = message.location();
       const source = location?.url ? ` (${location.url}:${location.lineNumber || 0})` : "";
       consoleProblems.push(`${message.type()}: ${message.text()}${source}`);
@@ -396,7 +501,12 @@ async function main() {
     await page.locator("#analysisConfirmModal:not([hidden])").waitFor({ timeout: 15000 });
     await page.locator("#analysisConfirmStartButton").click();
     await page.locator("#quoteBasisPanel.is-active").waitFor({ timeout: 15000 });
-    await page.locator('[data-revise-section="platform"]').first().waitFor({ timeout: 15000 });
+    try {
+      await page.locator('[data-revise-section="platform"]').first().waitFor({ timeout: 15000 });
+    } catch (error) {
+      const visibleText = (await page.locator("body").innerText().catch(() => "")).slice(-4000);
+      throw new Error(`${error.message}\nConsole: ${consoleProblems.join("; ")}\nVisible UI: ${visibleText}`);
+    }
     const possibleMatchText = "Large format LED video wall mounted on deep-blue feature wall.";
     const possibleMatchReference = 'nos. 85" LED TV Monitor (With Speaker - Full HD)';
     await basisLineRow(page, possibleMatchText).locator(".basis-line-possible-match", { hasText: possibleMatchReference }).waitFor({ timeout: 15000 });
@@ -422,13 +532,142 @@ async function main() {
     await basisLineRow(page, "Standard 13A sockets and LED lighting only.").locator("[data-revise-section]").click();
     await page.locator("#basisChatOverlay:not([hidden])").waitFor({ timeout: 15000 });
     await submitBasisChat(page, "what does this mean?");
-    await page.locator("#basisChatMessages", { hasText: "This basis line describes scope" }).waitFor({ timeout: 15000 });
+    try {
+      await page.locator("#basisChatMessages", { hasText: "This basis line describes scope" }).waitFor({ timeout: 15000 });
+    } catch (error) {
+      const messages = await page.locator("#basisChatMessages").innerText().catch(() => "");
+      const blockReason = await page.evaluate(() => startAnalysisBlockReason());
+      throw new Error(`${error.message}\nConsole: ${consoleProblems.join("; ")}\nMessages: ${messages}\nBlock: ${blockReason}`);
+    }
     await submitBasisChat(page, "include all lighting and electrical lines");
     await page.locator("#basisChatProposal:not([hidden])", { hasText: "Mark lighting and electrical as included" }).waitFor({ timeout: 15000 });
     await page.locator("#basisChatKeepButton:not([disabled])").click();
     await page.locator("#basisChatMessages", { hasText: "Kept the current quote basis unchanged." }).waitFor({ timeout: 15000 });
     await submitBasisChat(page, "banana everything but also delete it");
     await page.locator("#basisChatMessages", { hasText: "Failed. Please try again." }).waitFor({ timeout: 15000 });
+    await page.evaluate(() => {
+      const origin = currentBasisChatAuthority();
+      const makeOperation = () => {
+        const lineage = newBasisChatLineage("server");
+        return canonicalBasisChatOperation({
+          _operationVersion: BASIS_CHAT_OPERATION_VERSION,
+          id: lineage.requestedJobId,
+          type: "basis_chat",
+          phase: "starting",
+          startedAt: new Date().toISOString(),
+          browserRecoveryScope: currentBrowserRecoveryScope(),
+          text: "reversed completion proof",
+          proposalOrigin: origin,
+          lineage,
+        });
+      };
+      const operationA = makeOperation();
+      const tokenA = mintBasisChatRuntimeAuthority("running", origin, operationA.lineage);
+      installBasisChatOwner("running", origin, operationA.lineage, tokenA);
+      state.activeJob = operationA;
+      state.basisChat.busyOwnerId = operationA.lineage.clientOperationId;
+      bindBasisChatRuntimeOperation(tokenA, operationA);
+      if (!setBasisChatBusy(true, tokenA)) throw new Error("Could not acquire basis-chat controls for A.");
+      const operationB = makeOperation();
+      const tokenB = mintBasisChatRuntimeAuthority("running", origin, operationB.lineage);
+      installBasisChatOwner("running", origin, operationB.lineage, tokenB);
+      state.activeJob = operationB;
+      state.basisChat.busyOwnerId = operationB.lineage.clientOperationId;
+      bindBasisChatRuntimeOperation(tokenB, operationB);
+      if (!setBasisChatBusy(true, tokenB)) throw new Error("Could not acquire basis-chat controls for B.");
+      if (basisChatOperationIsCurrent(operationA, tokenA)
+        || completeBasisChatOwner(operationA.proposalOrigin, operationA.lineage, tokenA)
+        || setBasisChatBusy(false, tokenA)
+        || setBasisChatBusy(true, tokenA)
+        || !basisChatOperationIsCurrent(operationB, tokenB)
+        || state.basisChat.busyOwnerId !== operationB.lineage.clientOperationId) {
+        throw new Error("Reversed A/B completion retained stale authority.");
+      }
+      if (!invalidateBasisChatAuthority(tokenB)) throw new Error("Could not revoke the current B authority.");
+    });
+    let releaseStalePost;
+    let resolveStalePost;
+    const stalePostReached = new Promise((resolve) => { resolveStalePost = resolve; });
+    const stalePostRelease = new Promise((resolve) => { releaseStalePost = resolve; });
+    const staleRoute = async (route) => {
+      if (route.request().method() !== "POST") {
+        await route.fallback();
+        return;
+      }
+      const body = JSON.parse(route.request().postData() || "{}");
+      if (body.type !== "basis_chat") {
+        await route.fallback();
+        return;
+      }
+      resolveStalePost();
+      await stalePostRelease;
+      await route.fallback();
+    };
+    await page.route("**/api/jobs", staleRoute);
+    const assistantMessagesBeforeStale = await page.locator("#basisChatMessages .basis-chat-message.assistant").allTextContents();
+    await submitBasisChat(page, "what does this mean?");
+    await stalePostReached;
+    await page.evaluate(() => invalidateBasisChatAuthority());
+    releaseStalePost();
+    await page.waitForTimeout(250);
+    await page.unroute("**/api/jobs", staleRoute);
+    const staleContinuationState = await page.evaluate(() => ({
+      activeJob: state.activeJob,
+      proposal: state.basisChat.proposal,
+      owner: state.basisChat.authorityOwner,
+      notice: state.basisChat.completionNotice,
+      busyOwnerId: state.basisChat.busyOwnerId,
+      isAnalysisRunning: state.isAnalysisRunning,
+      assistantMessages: Array.from(elements.basisChatMessages.querySelectorAll(".basis-chat-message.assistant"), (item) => item.textContent || ""),
+    }));
+    if (staleContinuationState.activeJob || staleContinuationState.proposal || staleContinuationState.owner
+      || staleContinuationState.notice || staleContinuationState.busyOwnerId || staleContinuationState.isAnalysisRunning
+      || JSON.stringify(staleContinuationState.assistantMessages) !== JSON.stringify(assistantMessagesBeforeStale)) {
+      throw new Error(`Stale basis continuation produced an effect: ${JSON.stringify(staleContinuationState)}`);
+    }
+
+    let resolvePreservedPost;
+    const preservedPostReached = new Promise((resolve) => { resolvePreservedPost = resolve; });
+    const preservedRoute = async (route) => {
+      if (route.request().method() !== "POST") {
+        await route.fallback();
+        return;
+      }
+      const body = JSON.parse(route.request().postData() || "{}");
+      if (body.type !== "basis_chat") {
+        await route.fallback();
+        return;
+      }
+      resolvePreservedPost();
+      await route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({ fetch_failed: true, page_unloading: true, errors: ["Synthetic page unload"] }),
+      });
+    };
+    expectedPreservedFailure = true;
+    await page.route("**/api/jobs", preservedRoute);
+    const assistantMessagesBeforePreserved = await page.locator("#basisChatMessages .basis-chat-message.assistant:not([data-basis-chat-typing])").allTextContents();
+    await submitBasisChat(page, "what does this mean?");
+    await preservedPostReached;
+    await page.waitForTimeout(250);
+    const preservedState = await page.evaluate(() => ({
+      activeJob: state.activeJob,
+      owner: state.basisChat.authorityOwner,
+      busyOwnerId: state.basisChat.busyOwnerId,
+      isAnalysisRunning: state.isAnalysisRunning,
+      hasTyping: Boolean(elements.basisChatMessages.querySelector("[data-basis-chat-typing]")),
+      assistantMessages: Array.from(elements.basisChatMessages.querySelectorAll(".basis-chat-message.assistant:not([data-basis-chat-typing])"), (item) => item.textContent || ""),
+    }));
+    await page.unroute("**/api/jobs", preservedRoute);
+    if (!preservedState.activeJob || preservedState.activeJob.type !== "basis_chat"
+      || preservedState.owner?.status !== "running" || !preservedState.busyOwnerId
+      || !preservedState.isAnalysisRunning || !preservedState.hasTyping
+      || JSON.stringify(preservedState.assistantMessages) !== JSON.stringify(assistantMessagesBeforePreserved)) {
+      throw new Error(`Preserved basis continuation lost ownership or displayed a fallback: ${JSON.stringify(preservedState)}`);
+    }
+    await page.evaluate(() => invalidateBasisChatAuthority());
+    expectedPreservedFailure = false;
     const chatShot = await screenshot(page, "ai-basis-chat-stress.png");
 
     await page.locator("#basisChatCloseButton").click();
@@ -488,6 +727,7 @@ async function main() {
   } finally {
     await browser.close();
     await stopServer(serverInfo);
+    if (!options.keepServer) await fs.rm(quoteDataRoot, { recursive: true, force: true });
   }
 }
 

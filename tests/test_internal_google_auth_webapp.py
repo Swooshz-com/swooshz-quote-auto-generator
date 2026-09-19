@@ -14,6 +14,9 @@ from tests.test_webapp import LocalRunnerServer
 from webapp import server as webapp
 
 
+INTERNAL_ALPHA_ORIGIN = "https://internal-alpha.example.test"
+
+
 class _VerifiedClaimsAdapter:
     def __init__(self, claims=None):
         self.claims = claims or {
@@ -45,7 +48,7 @@ class InternalGoogleAuthWebappTest(unittest.TestCase):
             "SQAG_TRACKING_HMAC_KEY_VERSION": "synthetic-v1",
             "SQAG_TRUSTED_PROXY_CIDRS": "127.0.0.1/32",
             "SQAG_PLATFORM_LAUNCH_MODE": "disabled",
-            "SQAG_PUBLIC_BASE_URL": "https://quote.swooshz.com",
+            "SQAG_PUBLIC_BASE_URL": INTERNAL_ALPHA_ORIGIN,
             "SQAG_INTERNAL_WORKSPACE_ID": "workspace-internal-alpha",
             "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON": json.dumps(
                 [
@@ -65,7 +68,7 @@ class InternalGoogleAuthWebappTest(unittest.TestCase):
             "OIDC_ISSUER_URL": "https://accounts.google.com",
             "OIDC_CLIENT_ID": "synthetic-client-id",
             "OIDC_CLIENT_SECRET": "synthetic-client-secret",
-            "OIDC_REDIRECT_URI": "https://quote.swooshz.com/callback",
+            "OIDC_REDIRECT_URI": f"{INTERNAL_ALPHA_ORIGIN}/callback",
             "OIDC_AUTHORIZE_URL": "https://accounts.google.com/o/oauth2/v2/auth",
             "OIDC_TOKEN_URL": "https://oauth2.googleapis.com/token",
         }
@@ -177,6 +180,12 @@ class InternalGoogleAuthWebappTest(unittest.TestCase):
             "internal_plus_platform_mode": self.internal_env(
                 SQAG_PLATFORM_LAUNCH_MODE="platform"
             ),
+            "internal_missing_launch_mode": self.internal_env(
+                SQAG_PLATFORM_LAUNCH_MODE=""
+            ),
+            "internal_unknown_launch_mode": self.internal_env(
+                SQAG_PLATFORM_LAUNCH_MODE="unexpected"
+            ),
             "internal_plus_platform_secret": self.internal_env(
                 SQAG_PLATFORM_SERVICE_SECRET="synthetic-platform-secret"
             ),
@@ -220,14 +229,28 @@ class InternalGoogleAuthWebappTest(unittest.TestCase):
 
     def test_internal_configuration_rejects_wrong_origin_redirect_and_http(self):
         cases = {
-            "wrong_public_origin": self.internal_env(
-                SQAG_PUBLIC_BASE_URL="https://wrong.example.test",
-            ),
             "wrong_redirect": self.internal_env(
                 OIDC_REDIRECT_URI="https://wrong.example.test/callback",
             ),
-            "http_redirect": self.internal_env(
-                OIDC_REDIRECT_URI="http://quote.swooshz.com/callback",
+            "http_origin": self.internal_env(
+                SQAG_PUBLIC_BASE_URL="http://internal-alpha.example.test",
+                OIDC_REDIRECT_URI="http://internal-alpha.example.test/callback",
+            ),
+            "origin_with_path": self.internal_env(
+                SQAG_PUBLIC_BASE_URL=f"{INTERNAL_ALPHA_ORIGIN}/alpha",
+            ),
+            "origin_with_query": self.internal_env(
+                SQAG_PUBLIC_BASE_URL=f"{INTERNAL_ALPHA_ORIGIN}?lane=alpha",
+            ),
+            "origin_with_fragment": self.internal_env(
+                SQAG_PUBLIC_BASE_URL=f"{INTERNAL_ALPHA_ORIGIN}#alpha",
+            ),
+            "origin_with_port": self.internal_env(
+                SQAG_PUBLIC_BASE_URL="https://internal-alpha.example.test:444",
+            ),
+            "production_origin": self.internal_env(
+                SQAG_PUBLIC_BASE_URL="https://quote.swooshz.com",
+                OIDC_REDIRECT_URI="https://quote.swooshz.com/callback",
             ),
             "wrong_issuer": self.internal_env(
                 OIDC_ISSUER_URL="https://issuer.example.test",
@@ -241,6 +264,100 @@ class InternalGoogleAuthWebappTest(unittest.TestCase):
             ):
                 self.assertFalse(webapp.internal_google_config_complete())
                 self.assertTrue(webapp.deploy_requires_auth_guard())
+
+    def test_internal_configuration_rejects_production_hostname_aliases(self):
+        origins = (
+            "https://quote.swooshz.com",
+            "https://QUOTE.SWOOSHZ.COM",
+            "https://quote.swooshz.com.",
+            "https://QUOTE.SWOOSHZ.COM.",
+        )
+        for origin in origins:
+            with self.subTest(origin=origin), mock.patch.dict(
+                os.environ,
+                self.internal_env(
+                    SQAG_PUBLIC_BASE_URL=origin,
+                    OIDC_REDIRECT_URI=f"{origin}/callback",
+                ),
+                clear=True,
+            ):
+                self.assertEqual(webapp.configured_sqag_public_base_url(), "")
+                self.assertFalse(webapp.internal_google_config_complete())
+                self.assertTrue(webapp.deploy_requires_auth_guard())
+
+    def test_internal_configuration_rejects_malformed_origins_before_callback_binding(self):
+        origins = {
+            "trailing_fragment": f"{INTERNAL_ALPHA_ORIGIN}#",
+            "trailing_query": f"{INTERNAL_ALPHA_ORIGIN}?",
+            "empty_port": f"{INTERNAL_ALPHA_ORIGIN}:",
+            "empty_userinfo": "https://@internal-alpha.example.test",
+            "hostname_whitespace": "https://internal alpha.example.test",
+            "double_terminal_dot": f"{INTERNAL_ALPHA_ORIGIN}..",
+            "empty_hostname_label": "https://internal-alpha..example.test",
+            "leading_hyphen_hostname_label": "https://-internal-alpha.example.test",
+        }
+        for name, origin in origins.items():
+            with self.subTest(name=name), mock.patch.dict(
+                os.environ,
+                self.internal_env(
+                    SQAG_PUBLIC_BASE_URL=origin,
+                    OIDC_REDIRECT_URI=f"{origin}/callback",
+                ),
+                clear=True,
+            ):
+                self.assertEqual(webapp.configured_sqag_public_base_url(), "")
+                self.assertFalse(webapp.internal_google_config_complete())
+                self.assertTrue(webapp.deploy_requires_auth_guard())
+
+    def test_internal_alpha_origin_is_exactly_configured_and_host_bound(self):
+        with mock.patch.dict(os.environ, self.internal_env(), clear=True):
+            self.assertEqual(
+                webapp.configured_sqag_public_base_url(),
+                INTERNAL_ALPHA_ORIGIN,
+            )
+            self.assertTrue(webapp.internal_google_config_complete())
+            self.assertTrue(webapp.is_allowed_host_header("internal-alpha.example.test"))
+            self.assertEqual(
+                webapp.request_sqag_origin("internal-alpha.example.test"),
+                INTERNAL_ALPHA_ORIGIN,
+            )
+            self.assertFalse(
+                webapp.is_same_origin_request(
+                    "https://unrelated.example.test",
+                    "internal-alpha.example.test",
+                )
+            )
+            self.assertFalse(webapp.is_allowed_host_header("unrelated.example.test"))
+            self.assertEqual(
+                webapp.request_sqag_origin("unrelated.example.test"),
+                "",
+            )
+            for host in (
+                "internal-alpha.example.test:443",
+                "quote.swooshz.com",
+                "www.swooshz.com",
+            ):
+                with self.subTest(host=host):
+                    self.assertFalse(webapp.is_allowed_host_header(host))
+                    self.assertEqual(webapp.request_sqag_origin(host), "")
+
+        with mock.patch.dict(
+            os.environ,
+            self.internal_env(
+                OIDC_REDIRECT_URI="https://unrelated.example.test/callback",
+            ),
+            clear=True,
+        ):
+            self.assertFalse(webapp.internal_google_config_complete())
+            self.assertTrue(webapp.deploy_requires_auth_guard())
+
+        with mock.patch.dict(
+            os.environ,
+            self.internal_env(SQAG_PLATFORM_LAUNCH_MODE="platform"),
+            clear=True,
+        ):
+            self.assertFalse(webapp.configured_sqag_public_base_url())
+            self.assertTrue(webapp.deploy_requires_auth_guard())
 
     def test_callback_query_is_strict_bounded_and_parsed_once(self):
         valid = webapp.parse_internal_google_callback_query(
@@ -294,7 +411,7 @@ class InternalGoogleAuthWebappTest(unittest.TestCase):
         )
         self.assertEqual(
             params["redirect_uri"],
-            ["https://quote.swooshz.com/callback"],
+            [f"{INTERNAL_ALPHA_ORIGIN}/callback"],
         )
         self.assertEqual(params["code_challenge_method"], ["S256"])
         self.assertTrue(params["state"][0])

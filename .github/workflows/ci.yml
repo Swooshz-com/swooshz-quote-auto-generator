@@ -143,6 +143,42 @@ jobs:
           node-version: "22"
           cache: npm
 
+      - name: Provision hosted LibreOffice and fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libreoffice-calc \
+            fontconfig \
+            fonts-liberation \
+            fonts-crosextra-carlito
+
+      - name: Verify hosted LibreOffice and font readiness
+        run: |
+          set -eu
+          command -v soffice
+          soffice --version
+          command -v fc-match
+          python - <<'PY'
+          import subprocess
+
+          accepted = {
+              "Arial": {"Arial", "Liberation Sans"},
+              "Calibri": {"Calibri", "Carlito"},
+          }
+          for requested, allowed in accepted.items():
+              result = subprocess.run(
+                  ["fc-match", "-f", "%{family}\\n", requested],
+                  capture_output=True,
+                  text=True,
+                  check=False,
+                  timeout=10,
+              )
+              resolved = result.stdout.strip().splitlines()[0].split(",", 1)[0].strip() if result.stdout.strip() else ""
+              if result.returncode != 0 or resolved not in allowed:
+                  raise SystemExit(f"Font readiness failed for {requested}: {resolved or '[none]'}")
+              print(f"{requested} -> {resolved}")
+          PY
+
       - name: Install Node dependencies
         run: npm ci
 
