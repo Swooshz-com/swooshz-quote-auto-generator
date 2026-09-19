@@ -19,6 +19,7 @@ import datetime as dt
 import html
 import io
 import json
+import hashlib
 import math
 import os
 import re
@@ -26,6 +27,7 @@ import shutil
 import tempfile
 import subprocess
 import textwrap
+import unicodedata
 import zipfile
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from dataclasses import dataclass, field
@@ -219,6 +221,8 @@ class PriceRow:
     remark: str
     pricing_id: str = ""
     aliases: list[str] = field(default_factory=list)
+    catalog_digest: str = ""
+    catalog_currency: str = ""
 
     @property
     def sale_unit_price(self) -> float:
@@ -240,6 +244,7 @@ class QuoteLine:
     match_candidates: list[PriceRow]
     price_mode: str = "Priced"
     unit_price_override: float | None = None
+    pricing_authority: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -355,7 +360,7 @@ def as_float(value: Any, default: float = 0.0) -> float:
 
 
 def clean_text(value: Any) -> str:
-    return re.sub(r"\s+", " ", str(value or "")).strip()
+    return unicodedata.normalize("NFC", re.sub(r"\s+", " ", str(value or "")).strip())
 
 
 def normalize_unit(unit: Any) -> str:
@@ -374,6 +379,214 @@ def normalize_unit(unit: Any) -> str:
     if lower in {"set", "sets"}:
         return "sets"
     return text
+
+
+PRICING_AUTHORITY_SCHEMA = "swooshz.pricing-authority.v1"
+PRICING_AUTHORITY_VERSION = 1
+PRICING_AUTHORITY_VARIANTS = {"none", "historical", "manual", "catalog", "included"}
+PRICING_AUTHORITY_SOURCES = {"company", "local", "bundled"}
+PRICING_AUTHORITY_CONTEXT_FIELDS = (
+    "source_basis_line_id",
+    "section",
+    "description",
+    "unit",
+    "pricing_keyword",
+)
+PRICING_AUTHORITY_DECIMAL_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
+PRICING_AUTHORITY_WHITESPACE_RE = re.compile(
+    r"[\u0009-\u000D\u001C-\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]+"
+)
+PRICING_REFERENCE_DIGEST_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
+
+
+def pricing_authority_context(value: Any) -> dict[str, str]:
+    row = value if isinstance(value, dict) else {}
+    return {
+        "source_basis_line_id": canonical_pricing_authority_text(row.get("source_basis_line_id")),
+        "section": canonical_pricing_authority_text(row.get("section")) or "General",
+        "description": canonical_pricing_authority_text(row.get("description")),
+        "unit": canonical_pricing_authority_unit(row.get("unit")),
+        "pricing_keyword": canonical_pricing_authority_text(row.get("pricing_keyword")),
+    }
+
+
+def canonical_pricing_authority_text(value: Any) -> str:
+    if value is None:
+        return ""
+    text = unicodedata.normalize("NFC", str(value))
+    return PRICING_AUTHORITY_WHITESPACE_RE.sub(" ", text).strip(" ")
+
+
+def canonical_pricing_authority_unit(value: Any) -> str:
+    text = canonical_pricing_authority_text(value)
+    lower = text.lower().strip(". ")
+    if lower in {"m2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"}:
+        return "sqm"
+    if lower in {"m run", "m. run"}:
+        return "m run"
+    if lower in {"m length", "m. length"}:
+        return "m length"
+    if lower in {"nos", "no", "pc", "pcs", "piece", "pieces", "unit", "units"}:
+        return "nos"
+    if lower in {"lot", "lots"}:
+        return "lot"
+    if lower in {"set", "sets"}:
+        return "sets"
+    return text
+
+
+def pricing_authority_version_is_valid(value: Any) -> bool:
+    return type(value) is int and value == PRICING_AUTHORITY_VERSION
+
+
+def pricing_authority_number(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str) and PRICING_AUTHORITY_DECIMAL_RE.fullmatch(value):
+        try:
+            number = float(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return round_commercial_cents(number)
+
+
+def trusted_pricing_reference_identity(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict) or set(value) != {"id", "source", "currency", "digest"}:
+        return None
+    if any(not isinstance(value.get(key), str) for key in ("id", "source", "currency", "digest")):
+        return None
+    if (
+        not value["id"]
+        or value["source"] not in PRICING_AUTHORITY_SOURCES
+        or not re.fullmatch(r"[A-Z]{3}", value["currency"])
+        or not PRICING_REFERENCE_DIGEST_RE.fullmatch(value["digest"])
+    ):
+        return None
+    return dict(value)
+
+
+def catalog_payload_digest(payload: dict[str, Any]) -> str:
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1 or not isinstance(payload.get("items"), list):
+        return ""
+    currency = payload.get("currency")
+    if not isinstance(currency, str) or not re.fullmatch(r"[A-Z]{3}", currency):
+        return ""
+    items = [dict(item) for item in payload["items"] if isinstance(item, dict)]
+    if not items:
+        return ""
+    canonical = {"schema_version": 1, "currency": currency, "items": items}
+    raw = json.dumps(canonical, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return f"sha256:{hashlib.sha256(raw).hexdigest()}"
+
+
+def normalize_pricing_authority(
+    raw: Any,
+    row: dict[str, Any],
+    price_rows: list[PriceRow],
+    trusted_reference: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("schema") != PRICING_AUTHORITY_SCHEMA or not pricing_authority_version_is_valid(raw.get("version")):
+        return None
+    if not isinstance(raw.get("variant"), str):
+        return None
+    variant = raw["variant"]
+    if variant not in PRICING_AUTHORITY_VARIANTS:
+        return None
+    allowed_keys = (
+        {"schema", "version", "variant", "context"}
+        if variant in {"none", "historical"}
+        else (
+            {"schema", "version", "variant", "context", "price", "currency"}
+            if variant in {"manual", "included"}
+            else {
+                "schema", "version", "variant", "context", "price", "currency",
+                "catalog_source", "catalog_item_id", "catalog_digest",
+                "catalog_section", "catalog_description", "catalog_unit",
+            }
+        )
+    )
+    if set(raw) != allowed_keys:
+        return None
+    supplied_context = raw.get("context")
+    if not isinstance(supplied_context, dict):
+        return None
+    if set(supplied_context) != set(PRICING_AUTHORITY_CONTEXT_FIELDS):
+        return None
+    if any(not isinstance(supplied_context.get(key), str) for key in PRICING_AUTHORITY_CONTEXT_FIELDS):
+        return None
+    context = pricing_authority_context(row)
+    canonical_supplied = {
+        "source_basis_line_id": canonical_pricing_authority_text(supplied_context.get("source_basis_line_id")),
+        "section": canonical_pricing_authority_text(supplied_context.get("section")) or "General",
+        "description": canonical_pricing_authority_text(supplied_context.get("description")),
+        "unit": canonical_pricing_authority_unit(supplied_context.get("unit")),
+        "pricing_keyword": canonical_pricing_authority_text(supplied_context.get("pricing_keyword")),
+    }
+    if canonical_supplied != context:
+        return None
+    if variant in {"none", "historical"}:
+        return {
+            "schema": PRICING_AUTHORITY_SCHEMA,
+            "version": PRICING_AUTHORITY_VERSION,
+            "variant": variant,
+            "context": context,
+        }
+    price = pricing_authority_number(raw.get("price"))
+    if price is None or (variant == "included" and price != 0):
+        return None
+    trusted = trusted_pricing_reference_identity(trusted_reference)
+    if trusted is None or not isinstance(raw.get("currency"), str) or raw["currency"] != trusted["currency"]:
+        return None
+    normalized: dict[str, Any] = {
+        "schema": PRICING_AUTHORITY_SCHEMA,
+        "version": PRICING_AUTHORITY_VERSION,
+        "variant": variant,
+        "context": context,
+        "price": 0.0 if variant == "included" else price,
+        "currency": raw["currency"],
+    }
+    if variant == "catalog":
+        if any(not isinstance(raw.get(key), str) for key in (
+            "catalog_source", "catalog_item_id", "catalog_digest",
+            "catalog_section", "catalog_description", "catalog_unit",
+        )):
+            return None
+        item_id = raw["catalog_item_id"]
+        catalog_source = raw["catalog_source"]
+        catalog_digest = raw["catalog_digest"]
+        matches = [item for item in price_rows if item.pricing_id == item_id]
+        if len(matches) != 1:
+            return None
+        match = matches[0]
+        if (
+            catalog_source != trusted["source"]
+            or catalog_digest != trusted["digest"]
+            or match.catalog_digest != trusted["digest"]
+            or not PRICING_REFERENCE_DIGEST_RE.fullmatch(catalog_digest)
+            or item_id != match.pricing_id
+            or price != match.sale_unit_price
+            or canonical_pricing_authority_text(raw.get("catalog_section")) != (canonical_pricing_authority_text(match.section) or "General")
+            or canonical_pricing_authority_text(raw.get("catalog_description")) != canonical_pricing_authority_text(match.description)
+            or canonical_pricing_authority_unit(raw.get("catalog_unit")) != canonical_pricing_authority_unit(match.unit_hint)
+        ):
+            return None
+        normalized.update({
+            "catalog_source": catalog_source,
+            "catalog_item_id": item_id,
+            "catalog_digest": catalog_digest,
+            "catalog_section": canonical_pricing_authority_text(match.section) or "General",
+            "catalog_description": canonical_pricing_authority_text(match.description),
+            "catalog_unit": canonical_pricing_authority_unit(match.unit_hint),
+        })
+    return normalized
 
 
 def slugify_segment(value: Any, fallback: str = "item") -> str:
@@ -402,11 +615,13 @@ def infer_unit(description: str) -> str:
     return ""
 
 
-def extract_price_rows_from_catalog(template_path: Path) -> list[PriceRow]:
+def extract_price_rows_from_catalog(template_path: Path, trusted_reference: dict[str, Any] | None = None) -> list[PriceRow]:
     payload = json.loads(template_path.read_text(encoding="utf-8-sig"))
     if payload.get("schema_version") != 1 or not isinstance(payload.get("items"), list):
         raise ValueError(f"Unsupported pricing catalog schema: {template_path}")
 
+    catalog_digest = catalog_payload_digest(payload)
+    catalog_currency = payload.get("currency") if isinstance(payload.get("currency"), str) else ""
     price_rows: list[PriceRow] = []
     for index, item in enumerate(payload["items"], start=1):
         description = clean_text(item.get("description"))
@@ -432,14 +647,16 @@ def extract_price_rows_from_catalog(template_path: Path) -> list[PriceRow]:
                 remark=remark,
                 pricing_id=clean_text(item.get("id")),
                 aliases=[clean_text(alias) for alias in aliases if clean_text(alias)],
+                catalog_digest=catalog_digest,
+                catalog_currency=catalog_currency,
             )
         )
     return price_rows
 
 
-def extract_price_rows(template_path: Path) -> list[PriceRow]:
+def extract_price_rows(template_path: Path, trusted_reference: dict[str, Any] | None = None) -> list[PriceRow]:
     if template_path.suffix.lower() == ".json":
-        return extract_price_rows_from_catalog(template_path)
+        return extract_price_rows_from_catalog(template_path, trusted_reference=trusted_reference)
     raise ValueError(
         f"Pricing source must be a JSON catalog: {template_path}. "
         "Run scripts/build_pricing_catalog.py to convert the source template first."
@@ -635,51 +852,110 @@ def validate_brief(brief: dict[str, Any]) -> list[str]:
     return missing
 
 
-def prepare_lines(brief: dict[str, Any], price_rows: list[PriceRow], allow_ambiguous: bool) -> list[QuoteLine]:
+def prepare_lines(
+    brief: dict[str, Any],
+    price_rows: list[PriceRow],
+    allow_ambiguous: bool,
+    *,
+    authority_required: bool = False,
+    trusted_pricing_reference: dict[str, Any] | None = None,
+) -> list[QuoteLine]:
     prepared: list[QuoteLine] = []
     for item in brief.get("line_items", []):
+        if not isinstance(item, dict):
+            continue
         display_price = str(item.get("display_price") or "")
         price_mode = clean_text(item.get("price_mode")).title()
         if price_mode not in {"Priced", "Included"}:
             price_mode = "Included" if display_price.lower() == "included" else "Priced"
         unit_price_override = item.get("unit_price_override")
         unit_price_override_num = as_float(unit_price_override, 0.0) if unit_price_override not in (None, "") else None
+        strict_manual_price = (
+            pricing_authority_number(unit_price_override)
+            if unit_price_override not in (None, "")
+            else None
+        )
         pricing_keyword = clean_text(item.get("pricing_keyword"))
         query = pricing_keyword or clean_text(item.get("description") or "")
-        status, match, candidates = find_price_match(
-            query,
-            price_rows,
-            section=clean_text(item.get("section")),
-            unit=clean_text(item.get("unit")),
-        )
-        exact_catalog_id_match = pricing_keyword_exactly_matches_catalog_id(pricing_keyword, match)
         quantity = item.get("quantity")
         quantity_num = as_float(quantity, 0.0) if quantity not in (None, "") else None
         normalized_unit = normalize_unit(item.get("unit"))
         amount: float | None = None
-        if price_mode == "Included":
-            status = "included"
-            amount = 0.0
-            display_price = "Included"
-            match = None
-        elif unit_price_override_num is not None:
-            status = "manual-price"
-            amount = round_commercial_cents((quantity_num or 0.0) * unit_price_override_num)
-            match = None
-        elif display_price:
-            status = "manual-display"
-        elif suspicious_piece_dimension_quantity(clean_text(item.get("description")), quantity_num, normalized_unit, match):
-            status = "quantity-review"
-            match = None
-            amount = None
-        elif suspicious_linear_catalog_quantity(quantity_num, normalized_unit, match) and not exact_catalog_id_match:
-            status = "quantity-review"
-            match = None
-            amount = None
-        elif status == "matched" or (status == "ambiguous" and allow_ambiguous):
-            amount = round_commercial_cents((quantity_num or 0.0) * (match.sale_unit_price if match else 0.0))
-            if status == "ambiguous" and allow_ambiguous:
-                status = "matched-from-ambiguous"
+        match: PriceRow | None = None
+        candidates: list[PriceRow] = []
+        authority = None
+        strict_authority = authority_required or bool(brief.get("_pricing_authority_enforced")) or "pricing_authority" in item
+        if strict_authority:
+            authority = normalize_pricing_authority(item.get("pricing_authority"), {
+                "source_basis_line_id": item.get("source_basis_line_id"),
+                "section": clean_text(item.get("section")),
+                "description": clean_text(item.get("description")),
+                "unit": normalized_unit,
+                "pricing_keyword": pricing_keyword,
+            }, price_rows, trusted_reference=trusted_pricing_reference)
+            variant = clean_text(authority.get("variant") if authority else "").lower()
+            if authority is None or variant not in {"manual", "catalog", "included"}:
+                status = "unmatched"
+            elif variant == "included":
+                status = "included"
+                amount = 0.0
+                display_price = "Included"
+                price_mode = "Included"
+            elif variant == "manual":
+                status = "manual-price"
+                unit_price_override_num = pricing_authority_number(authority.get("price"))
+                amount = (
+                    round_commercial_cents((quantity_num or 0.0) * unit_price_override_num)
+                    if unit_price_override_num is not None
+                    else None
+                )
+            else:
+                item_id = clean_text(authority.get("catalog_item_id"))
+                match = next((row for row in price_rows if row.pricing_id == item_id), None)
+                if match is None or match.sale_unit_price != pricing_authority_number(authority.get("price")):
+                    status = "unmatched"
+                    match = None
+                else:
+                    status = "matched"
+                    candidates = [match]
+                    amount = round_commercial_cents((quantity_num or 0.0) * match.sale_unit_price)
+        else:
+            status, match, candidates = find_price_match(
+                query,
+                price_rows,
+                section=clean_text(item.get("section")),
+                unit=clean_text(item.get("unit")),
+            )
+            exact_catalog_id_match = pricing_keyword_exactly_matches_catalog_id(pricing_keyword, match)
+            if price_mode == "Included":
+                status = "included"
+                amount = 0.0
+                display_price = "Included"
+                match = None
+            elif unit_price_override_num is not None and strict_manual_price is not None:
+                status = "manual-price"
+                unit_price_override_num = strict_manual_price
+                amount = round_commercial_cents((quantity_num or 0.0) * strict_manual_price)
+                match = None
+            elif unit_price_override_num is not None:
+                status = "unmatched"
+                unit_price_override_num = None
+                amount = None
+                match = None
+            elif display_price:
+                status = "manual-display"
+            elif suspicious_piece_dimension_quantity(clean_text(item.get("description")), quantity_num, normalized_unit, match):
+                status = "quantity-review"
+                match = None
+                amount = None
+            elif suspicious_linear_catalog_quantity(quantity_num, normalized_unit, match) and not exact_catalog_id_match:
+                status = "quantity-review"
+                match = None
+                amount = None
+            elif status == "matched" or (status == "ambiguous" and allow_ambiguous):
+                amount = round_commercial_cents((quantity_num or 0.0) * (match.sale_unit_price if match else 0.0))
+                if status == "ambiguous" and allow_ambiguous:
+                    status = "matched-from-ambiguous"
         prepared.append(
             QuoteLine(
                 section=clean_text(item.get("section")),
@@ -694,6 +970,7 @@ def prepare_lines(brief: dict[str, Any], price_rows: list[PriceRow], allow_ambig
                 amount=amount,
                 match_status=status,
                 match_candidates=candidates,
+                pricing_authority=authority,
             )
         )
     return prepared
@@ -3294,8 +3571,15 @@ def main() -> int:
     brief = load_brief(args.brief)
     out_dir = resolve_default_output_dir(brief, args.out)
     missing = validate_brief(brief)
-    price_rows = extract_price_rows(args.template)
-    lines = prepare_lines(brief, price_rows, args.allow_ambiguous)
+    trusted_pricing_reference = brief.get("_pricing_reference_authority")
+    price_rows = extract_price_rows(args.template, trusted_reference=trusted_pricing_reference)
+    lines = prepare_lines(
+        brief,
+        price_rows,
+        args.allow_ambiguous,
+        authority_required=brief.get("_pricing_authority_enforced") is True,
+        trusted_pricing_reference=trusted_pricing_reference,
+    )
     issues = confirmation_issues(missing, lines)
     out_dir.mkdir(parents=True, exist_ok=True)
     write_match_csv(out_dir / "pricing_matches.csv", lines)
